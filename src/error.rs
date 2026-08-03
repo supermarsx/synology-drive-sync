@@ -116,6 +116,12 @@ pub enum Error {
     #[error("source file changed while it was being uploaded: {0:?}")]
     SourceChanged(PathBuf),
 
+    #[error("OS credential vault {operation} failed: {reason}")]
+    Vault {
+        operation: &'static str,
+        reason: &'static str,
+    },
+
     #[error("{0}")]
     Message(String),
 }

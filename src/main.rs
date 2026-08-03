@@ -1,20 +1,16 @@
-use std::env;
-use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use synology_drive_sync::api::{ApiClient, ClientOptions};
 use synology_drive_sync::local::{self, IgnoreRules};
 use synology_drive_sync::path::RemoteRoot;
 use synology_drive_sync::plan::{self, CompareMode, PlanOptions, SyncPlan};
 use synology_drive_sync::sync::{self, ExecuteOptions};
 use synology_drive_sync::{Error, Result};
-use zeroize::Zeroizing;
 
-const PASSWORD_ENV: &str = "SDSYNC_PASSWORD";
-const OTP_ENV: &str = "SDSYNC_OTP";
+mod credentials;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum CompareArg {
@@ -33,23 +29,38 @@ impl From<CompareArg> for CompareMode {
     }
 }
 
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Store, inspect, or remove credentials in the current user's OS vault.
+    Credentials(credentials::CredentialsArgs),
+}
+
 /// Push a local folder to a Synology Drive-backed folder using only File Station WebAPI.
 #[derive(Debug, Parser)]
-#[command(version, about, long_about = None)]
+#[command(
+    version,
+    about,
+    long_about = None,
+    subcommand_negates_reqs = true,
+    args_conflicts_with_subcommands = true,
+    after_help = "Use `synology-drive-sync credentials --help` to manage OS-vault authentication."
+)]
 struct Cli {
     /// Authoritative local directory. It is never modified.
-    source: PathBuf,
+    #[arg(required = true)]
+    source: Option<PathBuf>,
 
     /// File Station path beginning with a shared folder, e.g. /team/project.
-    remote: String,
+    #[arg(required = true)]
+    remote: Option<String>,
 
     /// Public HTTPS reverse-proxy base URL. May include a rewritten path prefix.
-    #[arg(long, env = "SDSYNC_URL")]
-    url: String,
+    #[arg(long, env = "SDSYNC_URL", required = true)]
+    url: Option<String>,
 
     /// Dedicated DSM account with File Station and destination write access.
-    #[arg(long, env = "SDSYNC_USERNAME")]
-    username: String,
+    #[arg(long, env = "SDSYNC_USERNAME", required = true)]
+    username: Option<String>,
 
     /// Delete remote-only entries and permit remote type replacement.
     #[arg(long)]
@@ -83,6 +94,10 @@ struct Cli {
     #[arg(long)]
     password_stdin: bool,
 
+    /// Do not read the password or TOTP seed from the OS credential vault.
+    #[arg(long)]
+    no_vault: bool,
+
     /// Retry transient metadata/upload failures this many times.
     #[arg(long, default_value_t = 2)]
     retries: u32,
@@ -110,11 +125,18 @@ struct Cli {
     /// Print each completed operation.
     #[arg(short, long)]
     verbose: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    match run(cli) {
+    let mut cli = Cli::parse();
+    let result = match cli.command.take() {
+        Some(Command::Credentials(arguments)) => credentials::run(arguments),
+        None => run(cli),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             print_error(&error);
@@ -124,6 +146,22 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    let source = cli
+        .source
+        .as_deref()
+        .ok_or_else(|| Error::Message("local source is required".to_owned()))?;
+    let remote = cli
+        .remote
+        .as_deref()
+        .ok_or_else(|| Error::Message("remote destination is required".to_owned()))?;
+    let url = cli
+        .url
+        .as_deref()
+        .ok_or_else(|| Error::Message("--url is required".to_owned()))?;
+    let username = cli
+        .username
+        .as_deref()
+        .ok_or_else(|| Error::Message("--username is required".to_owned()))?;
     if !(1..=16).contains(&cli.jobs) {
         return Err(Error::Message("--jobs must be between 1 and 16".to_owned()));
     }
@@ -137,11 +175,11 @@ fn run(cli: Cli) -> Result<()> {
             "--timeout and --connect-timeout must be at least 1 second".to_owned(),
         ));
     }
-    let root = RemoteRoot::parse(&cli.remote)?;
-    let rules = IgnoreRules::build(&cli.source, &cli.excludes)?;
+    let root = RemoteRoot::parse(remote)?;
+    let rules = IgnoreRules::build(source, &cli.excludes)?;
 
-    eprintln!("Scanning local source {:?} ...", cli.source);
-    let local = local::scan(&cli.source, &rules)?;
+    eprintln!("Scanning local source {source:?} ...");
+    let local = local::scan(source, &rules)?;
     eprintln!(
         "Found {} files and {} directories locally.",
         local.files(),
@@ -157,9 +195,9 @@ fn run(cli: Cli) -> Result<()> {
         eprintln!("warning: TLS certificate verification is disabled");
     }
 
-    eprintln!("Discovering File Station WebAPI through {:?} ...", cli.url);
+    eprintln!("Discovering File Station WebAPI through {url:?} ...");
     let mut client = ApiClient::connect(&ClientOptions {
-        base_url: cli.url.clone(),
+        base_url: url.to_owned(),
         allow_http: cli.allow_http,
         accept_invalid_certs: cli.danger_accept_invalid_certs,
         ca_certificate: cli.ca_certificate.clone(),
@@ -171,8 +209,9 @@ fn run(cli: Cli) -> Result<()> {
         client.require_delete_api()?;
     }
 
-    let password = read_password(cli.password_stdin)?;
-    authenticate(&mut client, &cli.username, &password)?;
+    let mut vault = credentials::VaultSession::new(!cli.no_vault, url, username, cli.allow_http);
+    let password = credentials::read_password(cli.password_stdin, &mut vault)?;
+    credentials::authenticate(&mut client, username, &password, &mut vault)?;
     drop(password);
 
     let operation_result = (|| {
@@ -245,94 +284,6 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn authenticate(client: &mut ApiClient, username: &str, password: &str) -> Result<()> {
-    let mut otp = secret_from_env(OTP_ENV)?;
-    let mut prompted = false;
-    loop {
-        match client.login(username, password, otp.as_deref().map(String::as_str)) {
-            Ok(()) => return Ok(()),
-            Err(error)
-                if matches!(error.api_code(), Some(403 | 406)) && otp.is_none() && !prompted =>
-            {
-                otp = Some(prompt_otp()?);
-                prompted = true;
-            }
-            Err(error)
-                if error.api_code() == Some(404) && !prompted && io::stdin().is_terminal() =>
-            {
-                eprintln!("The supplied DSM OTP was invalid or expired; enter a fresh code.");
-                otp = Some(prompt_otp()?);
-                prompted = true;
-            }
-            Err(error) if matches!(error.api_code(), Some(403 | 406)) => {
-                return Err(Error::Message(format!(
-                    "DSM requires a TOTP code; set {OTP_ENV} for non-interactive runs or run from a terminal ({error})"
-                )));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-fn read_password(from_stdin: bool) -> Result<Zeroizing<String>> {
-    if from_stdin {
-        let mut line = String::new();
-        io::stdin().lock().read_line(&mut line).map_err(|error| {
-            Error::Message(format!("failed to read password from stdin: {error}"))
-        })?;
-        while line.ends_with(['\r', '\n']) {
-            line.pop();
-        }
-        if line.is_empty() {
-            return Err(Error::Message(
-                "password read from stdin was empty".to_owned(),
-            ));
-        }
-        return Ok(Zeroizing::new(line));
-    }
-    if let Some(password) = secret_from_env(PASSWORD_ENV)? {
-        if password.is_empty() {
-            return Err(Error::Message(format!("{PASSWORD_ENV} is empty")));
-        }
-        return Ok(password);
-    }
-    if !io::stdin().is_terminal() {
-        return Err(Error::Message(format!(
-            "no DSM password available; set {PASSWORD_ENV} or pass --password-stdin"
-        )));
-    }
-    let password = rpassword::prompt_password("DSM password: ")
-        .map_err(|error| Error::Message(format!("failed to read DSM password: {error}")))?;
-    if password.is_empty() {
-        return Err(Error::Message("DSM password was empty".to_owned()));
-    }
-    Ok(Zeroizing::new(password))
-}
-
-fn prompt_otp() -> Result<Zeroizing<String>> {
-    if !io::stdin().is_terminal() {
-        return Err(Error::Message(format!(
-            "DSM requires a TOTP code; set {OTP_ENV} for a non-interactive run"
-        )));
-    }
-    let otp = rpassword::prompt_password("DSM TOTP code: ")
-        .map_err(|error| Error::Message(format!("failed to read DSM TOTP code: {error}")))?;
-    if otp.is_empty() {
-        return Err(Error::Message("DSM TOTP code was empty".to_owned()));
-    }
-    Ok(Zeroizing::new(otp))
-}
-
-fn secret_from_env(name: &str) -> Result<Option<Zeroizing<String>>> {
-    match env::var(name) {
-        Ok(value) => Ok(Some(Zeroizing::new(value))),
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(env::VarError::NotUnicode(_)) => Err(Error::Message(format!(
-            "environment variable {name} is not valid Unicode"
-        ))),
-    }
-}
-
 fn print_plan(plan: &SyncPlan, detailed: bool) {
     eprintln!(
         "Plan: {} uploads ({}), {} directories, {} deletions, {} unchanged files, {} protected remote entries.",
@@ -390,5 +341,71 @@ mod tests {
     fn formats_human_sizes() {
         assert_eq!(format_bytes(12), "12 B");
         assert_eq!(format_bytes(1536), "1.5 KiB");
+    }
+
+    #[test]
+    fn legacy_sync_invocation_remains_required_and_compatible() {
+        let cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "./source",
+            "/team/project",
+            "--url",
+            "https://files.example.test/nas",
+            "--username",
+            "alice",
+            "--no-vault",
+        ])
+        .unwrap();
+
+        assert!(cli.command.is_none());
+        assert_eq!(cli.source, Some(PathBuf::from("./source")));
+        assert_eq!(cli.remote.as_deref(), Some("/team/project"));
+        assert!(cli.no_vault);
+
+        let reserved_source = Cli::try_parse_from([
+            "synology-drive-sync",
+            "--url",
+            "https://files.example.test",
+            "--username",
+            "alice",
+            "--",
+            "credentials",
+            "/team/project",
+        ])
+        .unwrap();
+        assert!(reserved_source.command.is_none());
+        assert_eq!(reserved_source.source, Some(PathBuf::from("credentials")));
+    }
+
+    #[test]
+    fn credential_command_has_no_secret_valued_argument() {
+        let cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "credentials",
+            "set-totp",
+            "--url",
+            "https://files.example.test/nas",
+            "--username",
+            "alice",
+            "--secret-stdin",
+        ])
+        .unwrap();
+
+        assert!(matches!(cli.command, Some(Command::Credentials(_))));
+
+        assert!(
+            Cli::try_parse_from([
+                "synology-drive-sync",
+                "credentials",
+                "set-totp",
+                "--url",
+                "https://files.example.test",
+                "--username",
+                "alice",
+                "--secret",
+                "must-not-be-accepted",
+            ])
+            .is_err()
+        );
     }
 }
