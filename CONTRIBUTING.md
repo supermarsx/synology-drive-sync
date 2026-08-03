@@ -11,4 +11,4 @@ cargo test --locked --all-targets
 cargo build --release --locked
 ```
 
-Never commit DSM credentials, OTPs, session IDs, SynoTokens, private endpoint names, or captures containing file data. New remote-mutation behavior must include failure-ordering and delete-safety tests.
+Never commit DSM passwords, TOTP seeds, `otpauth` provisioning URIs, one-time codes, session IDs, SynoTokens, private endpoint names, or captures containing file data. New remote-mutation behavior must include failure-ordering and delete-safety tests.

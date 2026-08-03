@@ -770,7 +770,7 @@ fn error_details(value: Value) -> Vec<Value> {
     }
 }
 
-fn normalize_base_url(input: &str, allow_http: bool) -> Result<Url> {
+pub(crate) fn normalize_base_url(input: &str, allow_http: bool) -> Result<Url> {
     let raw = input.trim();
     let normalized = if raw.ends_with('/') {
         raw.to_owned()

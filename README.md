@@ -82,7 +82,7 @@ export SDSYNC_USERNAME=mirror-bot
 synology-drive-sync ./project /team-folder/project --dry-run
 ```
 
-The password is prompted with terminal echo disabled. If DSM requires two-factor authentication, the CLI recognizes the OTP-required response and prompts for a current TOTP code.
+The password is read from the OS credential vault when one has been enrolled, otherwise it is prompted with terminal echo disabled. If DSM requires two-factor authentication, the CLI can generate a current code from an explicitly enrolled vault seed or prompt for a one-time code.
 
 PowerShell:
 
@@ -102,20 +102,73 @@ The remote path is a File Station logical path beginning with a shared folder, n
 
 ## Authentication and 2FA
 
-Passwords and OTPs are never accepted as command-line values, so they do not appear in process listings. Credential precedence is:
+Passwords, TOTP seeds, and one-time codes are never accepted as command-line values, so they do not appear in process listings. Vault writes are always explicit: a normal sync never saves a prompted or environment-provided secret.
+
+### OS credential vault
+
+Enroll the password for one reverse-proxy URL and DSM username:
+
+```bash
+synology-drive-sync credentials set-password \
+  --url https://files.example.com \
+  --username mirror-bot
+```
+
+Interactive input is masked and confirmed. For a pipe or secret-provider integration, pass `--password-stdin`; the first line is stored without a second read. `SDSYNC_PASSWORD` is also accepted by `set-password`, but a command-line password value deliberately is not.
+
+If the DSM account uses authenticator-app TOTP, capture the manual key during DSM's 2FA setup or re-enrollment (the wizard's **Can't scan it** path), or use the original `otpauth://totp` provisioning URI. The CLI cannot recover a seed that DSM no longer displays:
+
+```bash
+synology-drive-sync credentials set-totp \
+  --url https://files.example.com \
+  --username mirror-bot
+```
+
+The input is masked and can instead come from the first line of standard input with `--secret-stdin`. The command imports an existing DSM seed; it does not create or enroll a new factor. Base32 keys may contain spaces or hyphens. Provisioning URIs must describe SHA-1, six-digit, 30-second TOTP. Only a canonical unpadded Base32 seed is stored, and generated six-digit codes are never persisted.
+
+Inspect presence without revealing values, rotate by rerunning either `set` command, or remove entries independently:
+
+```bash
+synology-drive-sync credentials status --url https://files.example.com --username mirror-bot
+synology-drive-sync credentials remove --url https://files.example.com --username mirror-bot password
+synology-drive-sync credentials remove --url https://files.example.com --username mirror-bot totp
+synology-drive-sync credentials remove --url https://files.example.com --username mirror-bot all
+```
+
+The removal target is required; the command never assumes `all`.
+
+The profile key is derived from the normalized reverse-proxy URL and exact DSM username. The remote folder is intentionally excluded, so one account works across destinations. A path-prefixed proxy URL and a host-only URL are different profiles; trailing-slash variants are the same.
+
+The native backends are:
+
+- Windows Credential Manager, with current-user local-machine persistence;
+- macOS login Keychain;
+- freedesktop Secret Service on Linux, using a provider such as GNOME Keyring, KWallet, or KeePassXC.
+
+On headless Linux, Secret Service needs a usable user-session D-Bus, an unlocked default collection, and the same OS user that enrolled the entries. Cron, containers, SSH-only sessions, and system services frequently lack that environment. In those cases use a deliberately configured stdin/environment source or `--no-vault`; the program never falls back to a plaintext credential file and never tries to start or unlock a vault daemon.
+
+An OS vault protects secrets at rest, but software running as the same unlocked OS user may still retrieve them. Storing both the password and TOTP seed enables unattended login, but it also places both factors behind that one OS account. For stronger factor separation, store only the password and keep the current TOTP code interactive or provide `SDSYNC_OTP` for a single run.
+
+### Resolution order
+
+Credential precedence during sync is:
 
 Password:
 
 1. first line of standard input with `--password-stdin`;
 2. `SDSYNC_PASSWORD`;
-3. masked terminal prompt.
+3. the OS credential vault;
+4. masked terminal prompt.
 
 OTP:
 
-1. `SDSYNC_OTP`;
-2. masked terminal prompt when DSM reports that OTP is required.
+1. `SDSYNC_OTP`, containing a current six-digit code, not a seed;
+2. a code generated just in time from the explicitly stored vault seed;
+3. a masked terminal prompt when DSM reports that OTP is required.
 
-For an unattended run:
+Explicit stdin/environment sources bypass the corresponding vault lookup. `--no-vault` disables both password and TOTP-seed reads for that sync. If a vault-generated code is rejected, synchronize the client and NAS clocks, verify the enrolled seed, or provide one fresh code interactively; the CLI does not guess adjacent time windows.
+
+For a deliberately environment-driven unattended run:
 
 ```bash
 export SDSYNC_PASSWORD='use-a-secret-provider-in-production'
@@ -124,7 +177,7 @@ synology-drive-sync /srv/export /team/export
 unset SDSYNC_PASSWORD SDSYNC_OTP
 ```
 
-Prefer injecting these variables from the scheduler's or operating system's secret store instead of saving them in a script.
+Prefer the OS vault or inject these variables from the scheduler's secret store instead of saving them in a script. `SDSYNC_OTP` expires every 30 seconds, so the stored TOTP seed is the practical unattended option when its factor-separation trade-off is acceptable.
 
 The CLI uses `SYNO.API.Auth` v6 when available, `session=FileStation`, `format=sid`, and `enable_syno_token=yes`. Authenticated requests are POST bodies, not URL queries. The returned SID and exact-cased `SynoToken` are sent on subsequent calls and the session is explicitly logged out.
 
@@ -197,6 +250,10 @@ Metadata comparison can also miss a deliberately changed file whose size and sec
 
 ```text
 Usage: synology-drive-sync [OPTIONS] --url <URL> --username <USERNAME> <SOURCE> <REMOTE>
+       synology-drive-sync <COMMAND>
+
+Commands:
+  credentials  Store, inspect, or remove credentials in the current user's OS vault
 
 Arguments:
   <SOURCE>  Authoritative local directory. It is never modified
@@ -211,12 +268,15 @@ Important options:
       --jobs <N>                   [default: 2; accepted: 1..16]
       --exclude <PATTERN>
       --password-stdin
+      --no-vault
       --ca-certificate <PEM>
       --timeout <SECONDS>          [default: 7200]
   -v, --verbose
 ```
 
-Run `synology-drive-sync --help` for the complete current list.
+Run `synology-drive-sync --help` or `synology-drive-sync credentials --help` for the complete current lists.
+
+`credentials` and `help` are reserved command names. Prefix a same-named relative source with `./` (or `.\` on Windows), or place positional paths after `--`.
 
 ## Failure behavior
 
@@ -254,7 +314,7 @@ cargo test --all-targets
 cargo build --release
 ```
 
-Tests cover path containment and traversal rejection, reverse-proxy prefix joining, API discovery, DSM 7 object-shaped OTP challenges, SID/SynoToken placement, pagination, mounted-filesystem boundaries, multipart `Content-Length`, binary-part ordering, Drive-name and ignore protection, planning, type conflicts, deletion limits, real dry-run execution, upload preflight ordering, and failure-before-delete behavior.
+Tests cover path containment and traversal rejection, reverse-proxy prefix joining, API discovery, DSM 7 object-shaped OTP challenges, lazy vault-TOTP challenge handling, RFC 6238 vectors, 80-bit DSM-seed compatibility, provisioning-input redaction, vault profile scoping, credential CLI parsing, SID/SynoToken placement, pagination, mounted-filesystem boundaries, multipart `Content-Length`, binary-part ordering, Drive-name and ignore protection, planning, type conflicts, deletion limits, real dry-run execution, upload preflight ordering, and failure-before-delete behavior. Tests never read or write the host OS credential vault.
 
 ## Official references
 
@@ -263,6 +323,9 @@ Tests cover path containment and traversal rejection, reverse-proxy prefix joini
 - [DSM reverse proxy settings](https://kb.synology.com/en-global/DSM/help/DSM/AdminCenter/system_login_portal_advanced?version=7)
 - [DSM Login Portal applications](https://kb.synology.com/en-global/DSM/help/DSM/AdminCenter/system_login_portal_applications?version=7)
 - [DSM two-factor authentication](https://kb.synology.com/en-global/DSM/help/DSM/SecureSignIn/2factor_authentication?version=7)
+- [RFC 6238: Time-Based One-Time Password Algorithm](https://www.rfc-editor.org/rfc/rfc6238.html)
+- [Keyring platform backends](https://docs.rs/keyring/latest/keyring/v1/)
+- [freedesktop Secret Service specification](https://specifications.freedesktop.org/secret-service/latest-single/)
 - [Synology Drive Admin Console and Team Folders](https://kb.synology.com/en-global/DSM/help/SynologyDrive/drive_admin_console)
 - [Synology Drive file-name, path, and attribute limits](https://kb.synology.com/en-uk/DSM/tutorial/Why_are_files_not_synced_between_Synology_Drive_and_Drive_desktop_application)
 
