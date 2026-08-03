@@ -3,7 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
-use crate::api::ApiClient;
+use crate::api::{ApiClient, UploadObserver};
+use crate::local::LocalEntry;
 use crate::path::RemoteRoot;
 use crate::plan::SyncPlan;
 use crate::{Error, Result};
@@ -12,7 +13,12 @@ trait SyncOperations: Clone + Send + Sync {
     fn preflight_upload_source(&self, local: &crate::local::LocalEntry) -> Result<()>;
     fn delete_non_recursive(&self, root: &RemoteRoot, remote_path: &str) -> Result<()>;
     fn create_folder(&self, remote_path: &str) -> Result<()>;
-    fn upload(&self, local: &crate::local::LocalEntry, remote_path: &str) -> Result<()>;
+    fn upload(
+        &self,
+        local: &crate::local::LocalEntry,
+        remote_path: &str,
+        observer: Option<UploadObserver>,
+    ) -> Result<()>;
 }
 
 impl SyncOperations for ApiClient {
@@ -28,8 +34,13 @@ impl SyncOperations for ApiClient {
         self.create_folder(remote_path)
     }
 
-    fn upload(&self, local: &crate::local::LocalEntry, remote_path: &str) -> Result<()> {
-        self.upload(local, remote_path)
+    fn upload(
+        &self,
+        local: &crate::local::LocalEntry,
+        remote_path: &str,
+        observer: Option<UploadObserver>,
+    ) -> Result<()> {
+        self.upload_observed(local, remote_path, observer)
     }
 }
 
@@ -46,6 +57,27 @@ pub struct ExecutionReport {
     pub uploaded: usize,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.is_cancelled() {
+            Err(Error::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 pub fn execute(
     client: &ApiClient,
     root: &RemoteRoot,
@@ -56,11 +88,54 @@ pub fn execute(
     execute_with(client, root, plan, options, report)
 }
 
+pub type UploadObserverFactory =
+    Arc<dyn Fn(&LocalEntry) -> Option<UploadObserver> + Send + Sync + 'static>;
+
+pub fn execute_observed(
+    client: &ApiClient,
+    root: &RemoteRoot,
+    plan: &SyncPlan,
+    options: ExecuteOptions,
+    cancellation: CancellationToken,
+    observer_factory: UploadObserverFactory,
+    report: impl FnMut(String),
+) -> Result<ExecutionReport> {
+    execute_with_observer(
+        client,
+        root,
+        plan,
+        options,
+        cancellation,
+        observer_factory,
+        report,
+    )
+}
+
 fn execute_with<O: SyncOperations>(
     client: &O,
     root: &RemoteRoot,
     plan: &SyncPlan,
     options: ExecuteOptions,
+    report: impl FnMut(String),
+) -> Result<ExecutionReport> {
+    execute_with_observer(
+        client,
+        root,
+        plan,
+        options,
+        CancellationToken::default(),
+        Arc::new(|_| None),
+        report,
+    )
+}
+
+fn execute_with_observer<O: SyncOperations>(
+    client: &O,
+    root: &RemoteRoot,
+    plan: &SyncPlan,
+    options: ExecuteOptions,
+    cancellation: CancellationToken,
+    observer_factory: UploadObserverFactory,
     mut report: impl FnMut(String),
 ) -> Result<ExecutionReport> {
     if options.dry_run {
@@ -69,16 +144,19 @@ fn execute_with<O: SyncOperations>(
 
     // Open every scheduled source before a type-conflict deletion can remove remote data.
     for action in &plan.uploads {
+        cancellation.check()?;
         client.preflight_upload_source(&action.local)?;
     }
 
     let mut completed = ExecutionReport::default();
     for action in &plan.pre_deletes {
+        cancellation.check()?;
         client.delete_non_recursive(root, &action.remote_path)?;
         completed.deleted += 1;
         report(format!("deleted type conflict: {}", action.remote_path));
     }
     for action in &plan.creates {
+        cancellation.check()?;
         client.create_folder(&action.remote_path)?;
         completed.created += 1;
         report(format!("created directory: {}", action.remote_path));
@@ -96,9 +174,11 @@ fn execute_with<O: SyncOperations>(
                 let stop = Arc::clone(&stop);
                 let sender = sender.clone();
                 let worker_client = (*client).clone();
+                let observer_factory = Arc::clone(&observer_factory);
+                let cancellation = cancellation.clone();
                 scope.spawn(move || {
                     loop {
-                        if stop.load(Ordering::Acquire) {
+                        if stop.load(Ordering::Acquire) || cancellation.is_cancelled() {
                             break;
                         }
                         let action = match queue.lock() {
@@ -118,7 +198,16 @@ fn execute_with<O: SyncOperations>(
                             break;
                         };
                         let relative = action.local.relative.clone();
-                        let result = worker_client.upload(&action.local, &action.remote_path);
+                        let user_observer = observer_factory(&action.local);
+                        let cancellation_for_observer = cancellation.clone();
+                        let observer: Option<UploadObserver> = Some(Arc::new(move |event| {
+                            let user_continues = user_observer
+                                .as_ref()
+                                .is_none_or(|observer| observer(event));
+                            user_continues && !cancellation_for_observer.is_cancelled()
+                        }));
+                        let result =
+                            worker_client.upload(&action.local, &action.remote_path, observer);
                         if result.is_err() {
                             stop.store(true, Ordering::Release);
                         }
@@ -148,8 +237,11 @@ fn execute_with<O: SyncOperations>(
         })?;
     }
 
+    cancellation.check()?;
+
     // Remote-only deletion is deliberately last. Any earlier failure returns before this point.
     for action in &plan.post_deletes {
+        cancellation.check()?;
         client.delete_non_recursive(root, &action.remote_path)?;
         completed.deleted += 1;
         report(format!("deleted remote extra: {}", action.remote_path));
@@ -200,7 +292,12 @@ mod tests {
             Ok(())
         }
 
-        fn upload(&self, local: &LocalEntry, _remote_path: &str) -> Result<()> {
+        fn upload(
+            &self,
+            local: &LocalEntry,
+            _remote_path: &str,
+            _observer: Option<UploadObserver>,
+        ) -> Result<()> {
             self.event(format!("upload:{}", local.relative));
             if self.fail_upload {
                 Err(Error::Message("upload failed".to_owned()))
@@ -263,6 +360,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.deleted + report.created + report.uploaded, 0);
+        assert!(client.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancellation_happens_before_remote_mutation() {
+        let client = MockOperations::default();
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let result = execute_with_observer(
+            &client,
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &populated_plan(),
+            ExecuteOptions {
+                jobs: 1,
+                dry_run: false,
+            },
+            cancellation,
+            Arc::new(|_| None),
+            |_| {},
+        );
+        assert!(matches!(result, Err(Error::Cancelled)));
         assert!(client.events.lock().unwrap().is_empty());
     }
 

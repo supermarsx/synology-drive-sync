@@ -1,0 +1,745 @@
+name: Calendar release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: calendar-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Allocate calendar version
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      sha: ${{ steps.version.outputs.sha }}
+      build_timestamp: ${{ steps.version.outputs.build_timestamp }}
+      image: ${{ steps.version.outputs.image }}
+      already_published: ${{ steps.version.outputs.already_published }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'refs/heads/main' || github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - id: version
+        name: Select YY.N
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin
+          sha=$(git rev-parse HEAD)
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            ci_runs="$RUNNER_TEMP/sdsync-ci-runs.json"
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=main&event=push&status=completed&head_sha=$sha&per_page=100" \
+              > "$ci_runs"
+            if ! jq -s -e --arg sha "$sha" --arg repository "$GITHUB_REPOSITORY" '
+              any(.[].workflow_runs[];
+                .head_sha == $sha and
+                .head_branch == "main" and
+                .event == "push" and
+                .status == "completed" and
+                .conclusion == "success" and
+                .head_repository.full_name == $repository)
+            ' "$ci_runs" >/dev/null; then
+              echo "manual release refused: $sha has no successful completed CI push run on main" >&2
+              exit 1
+            fi
+          fi
+
+          release_pages="$RUNNER_TEMP/sdsync-release-pages.json"
+          release_index="$RUNNER_TEMP/sdsync-release-index.json"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            > "$release_pages"
+          jq -s 'add // []' "$release_pages" > "$release_index"
+
+          mapfile -t published_for_sha < <(
+            jq -r '.[] | select(.draft == false) | .tag_name' "$release_index" \
+              | grep -E '^[0-9]{2}\.[1-9][0-9]*$' \
+              | while read -r candidate; do
+                  if git rev-parse --verify --quiet "refs/tags/$candidate" >/dev/null && \
+                    [[ "$(git rev-list -n 1 "$candidate")" == "$sha" ]]; then
+                    printf '%s\n' "$candidate"
+                  fi
+                done \
+              | sort -V
+          )
+          mapfile -t drafts_for_sha < <(
+            jq -r --arg sha "$sha" \
+              '.[] | select(.draft == true and .target_commitish == $sha) | .tag_name' \
+              "$release_index" \
+              | grep -E '^[0-9]{2}\.[1-9][0-9]*$' \
+              | sort -V
+          )
+
+          already_published=false
+          if (( ${#published_for_sha[@]} > 0 )); then
+            tag=${published_for_sha[-1]}
+            already_published=true
+          elif (( ${#drafts_for_sha[@]} > 1 )); then
+            echo "multiple calendar-release drafts target $sha; refusing ambiguous resume" >&2
+            exit 1
+          elif (( ${#drafts_for_sha[@]} == 1 )); then
+            tag=${drafts_for_sha[0]}
+            if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null && \
+              [[ "$(git rev-list -n 1 "$tag")" != "$sha" ]]; then
+              echo "draft release $tag conflicts with an existing tag" >&2
+              exit 1
+            fi
+          else
+            mapfile -t tags_for_sha < <(
+              git tag --list \
+                | grep -E '^[0-9]{2}\.[1-9][0-9]*$' \
+                | while read -r candidate; do
+                    if [[ "$(git rev-list -n 1 "$candidate")" == "$sha" ]]; then
+                      printf '%s\n' "$candidate"
+                    fi
+                  done \
+                | sort -V
+            )
+            if (( ${#tags_for_sha[@]} > 0 )); then
+              tag=${tags_for_sha[-1]}
+            else
+              year=$(date -u +%y)
+              latest=$(
+                {
+                  git tag --list "$year.*"
+                  jq -r '.[].tag_name' "$release_index"
+                } \
+                  | grep -E "^${year}\.[1-9][0-9]*$" \
+                  | cut -d. -f2 \
+                  | sort -n \
+                  | tail -n 1 || true
+              )
+              tag="$year.$((${latest:-0} + 1))"
+            fi
+          fi
+          repository=${GITHUB_REPOSITORY,,}
+          build_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          {
+            echo "tag=$tag"
+            echo "sha=$sha"
+            echo "build_timestamp=$build_timestamp"
+            echo "image=ghcr.io/$repository"
+            echo "already_published=$already_published"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release version: $tag ($sha); already published: $already_published"
+
+  build-unix:
+    name: Build ${{ matrix.platform }} ${{ matrix.architecture }}
+    needs: version
+    if: needs.version.outputs.already_published != 'true'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+            architecture: x86_64
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux
+            architecture: aarch64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos
+            architecture: x86_64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            platform: macos
+            architecture: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
+        with:
+          toolchain: 1.88.0
+          targets: ${{ matrix.target }}
+      - name: Build native release binary
+        env:
+          SDSYNC_BUILD_VERSION: ${{ needs.version.outputs.tag }}
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Verify Linux ABI baseline
+        if: matrix.platform == 'linux'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/synology-drive-sync"
+          mapfile -t glibc_versions < <(
+            readelf --version-info --wide "$binary" |
+              grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' |
+              sort -Vu
+          )
+          [[ "${#glibc_versions[@]}" -gt 0 ]]
+          max_glibc="${glibc_versions[${#glibc_versions[@]} - 1]#GLIBC_}"
+          if [[ "$(printf '%s\n' "$max_glibc" '2.35' | sort -V | tail -n 1)" != '2.35' ]]; then
+            echo "Linux binary requires GLIBC_$max_glibc; release ceiling is GLIBC_2.35" >&2
+            exit 1
+          fi
+
+          needed=$(readelf --dynamic --wide "$binary" | awk '/NEEDED/ { gsub(/[\[\]]/, "", $NF); print $NF }')
+          printf 'Maximum GLIBC version: GLIBC_%s\nDynamic dependencies:\n%s\n' "$max_glibc" "$needed"
+          if grep -Eq '^(libsecret|libdbus|libssl|libcrypto)' <<<"$needed"; then
+            echo 'Linux release unexpectedly links a forbidden native vault or TLS library' >&2
+            exit 1
+          fi
+      - name: Assemble archive
+        shell: bash
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          set -euo pipefail
+          archive_root="synology-drive-sync-$TAG-$PLATFORM-$ARCHITECTURE"
+          package_root="package/$archive_root"
+          binary="target/$TARGET/release/synology-drive-sync"
+          mkdir -p "$package_root/completions" "$package_root/man"
+          install -m 0755 "$binary" "$package_root/synology-drive-sync"
+          install -m 0644 LICENSE README.md SECURITY.md THIRD_PARTY_LICENSES.html "$package_root/"
+          "$binary" completions bash > "$package_root/completions/synology-drive-sync.bash"
+          "$binary" completions zsh > "$package_root/completions/_synology-drive-sync"
+          "$binary" completions fish > "$package_root/completions/synology-drive-sync.fish"
+          "$binary" completions powershell > "$package_root/completions/synology-drive-sync.ps1"
+          "$binary" completions elvish > "$package_root/completions/synology-drive-sync.elv"
+          if ! "$binary" manpage --all "$package_root/man"; then
+            echo 'recursive manpage generation failed' >&2
+            exit 1
+          fi
+          reported=$("$binary" --version)
+          expected="synology-drive-sync $TAG"
+          [[ "$reported" == "$expected" ]] || {
+            echo "binary version did not exactly match $expected: $reported" >&2
+            exit 1
+          }
+          tar -czf "$archive_root.tar.gz" -C package "$archive_root"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.platform }}-${{ matrix.architecture }}
+          path: synology-drive-sync-${{ needs.version.outputs.tag }}-${{ matrix.platform }}-${{ matrix.architecture }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  build-windows:
+    name: Build windows ${{ matrix.architecture }}
+    needs: version
+    if: needs.version.outputs.already_published != 'true'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            architecture: x86_64
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            architecture: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
+        with:
+          toolchain: 1.88.0
+          targets: ${{ matrix.target }}
+      - name: Build native release binary
+        env:
+          SDSYNC_BUILD_VERSION: ${{ needs.version.outputs.tag }}
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Assemble archive
+        shell: pwsh
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = "synology-drive-sync-$env:TAG-windows-$env:ARCHITECTURE"
+          $packageRoot = Join-Path 'package' $root
+          $completionRoot = Join-Path $packageRoot 'completions'
+          $manRoot = Join-Path $packageRoot 'man'
+          New-Item -ItemType Directory -Path $completionRoot, $manRoot | Out-Null
+          $binary = Join-Path "target/$env:TARGET/release" 'synology-drive-sync.exe'
+          Copy-Item -LiteralPath $binary -Destination $packageRoot
+          Copy-Item -LiteralPath LICENSE, README.md, SECURITY.md, THIRD_PARTY_LICENSES.html -Destination $packageRoot
+          & $binary completions bash | Out-File (Join-Path $completionRoot 'synology-drive-sync.bash') -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw 'bash completion generation failed' }
+          & $binary completions zsh | Out-File (Join-Path $completionRoot '_synology-drive-sync') -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw 'zsh completion generation failed' }
+          & $binary completions fish | Out-File (Join-Path $completionRoot 'synology-drive-sync.fish') -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw 'fish completion generation failed' }
+          & $binary completions powershell | Out-File (Join-Path $completionRoot 'synology-drive-sync.ps1') -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw 'PowerShell completion generation failed' }
+          & $binary completions elvish | Out-File (Join-Path $completionRoot 'synology-drive-sync.elv') -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw 'Elvish completion generation failed' }
+          & $binary manpage --all $manRoot
+          if ($LASTEXITCODE -ne 0) { throw 'recursive manpage generation failed' }
+          $reportedLines = @(& $binary --version)
+          $versionExitCode = $LASTEXITCODE
+          $expected = "synology-drive-sync $env:TAG"
+          if ($versionExitCode -ne 0 -or
+              $reportedLines.Count -ne 1 -or
+              ([string] $reportedLines[0]) -cne $expected) {
+            $reported = $reportedLines -join "`n"
+            throw "binary version did not exactly match ${expected}: $reported"
+          }
+          Compress-Archive -Path $packageRoot -DestinationPath "$root.zip"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-windows-${{ matrix.architecture }}
+          path: synology-drive-sync-${{ needs.version.outputs.tag }}-windows-${{ matrix.architecture }}.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  sbom:
+    name: Dependency SBOM
+    needs: version
+    if: needs.version.outputs.already_published != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
+        with:
+          toolchain: 1.88.0
+      - name: Generate CycloneDX JSON
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^[0-9]{2}\.[1-9][0-9]*$ ]]
+          [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          export SOURCE_DATE_EPOCH
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          cargo cyclonedx -f json --all-features --target all
+          source_sbom=$(find . -maxdepth 2 -type f -name '*.cdx.json' -print -quit)
+          [[ -n "$source_sbom" ]]
+          old_ref=$(jq -er '.metadata.component["bom-ref"] | select(type == "string" and length > 0)' "$source_sbom")
+          old_purl=$(jq -er '.metadata.component.purl | select(type == "string" and length > 0)' "$source_sbom")
+          root_purl="pkg:github/$REPOSITORY@$TAG"
+          normalized=$(mktemp)
+          trap 'rm -f -- "$normalized"' EXIT
+          jq \
+            --arg tag "$TAG" \
+            --arg old_ref "$old_ref" \
+            --arg old_purl "$old_purl" \
+            --arg root_purl "$root_purl" '
+              def reprefix($old; $new):
+                if type == "string" and startswith($old)
+                then $new + .[($old | length):]
+                else .
+                end;
+              walk(reprefix($old_ref; $root_purl) | reprefix($old_purl; $root_purl))
+              | .metadata.component.version = $tag
+              | .metadata.component.purl = $root_purl
+              | .metadata.component["bom-ref"] = $root_purl
+              | .metadata.component.components |= map(.version = $tag)
+            ' "$source_sbom" > "$normalized"
+          mv "$normalized" "synology-drive-sync-$TAG.cdx.json"
+          jq -e \
+            --arg tag "$TAG" \
+            --arg old_ref "$old_ref" \
+            --arg old_purl "$old_purl" \
+            --arg root_purl "$root_purl" '
+              ([.metadata.component, .components[]?]
+                | [.[] | recurse(.components[]?) | .["bom-ref"]]
+                | unique) as $component_refs
+              |
+              .bomFormat == "CycloneDX"
+              and ((.components | type) == "array")
+              and any(.metadata.properties[]?;
+                .name == "cdx:rustc:sbom:target:all_targets" and .value == "true")
+              and .metadata.component.name == "synology-drive-sync"
+              and .metadata.component.version == $tag
+              and .metadata.component.purl == $root_purl
+              and .metadata.component["bom-ref"] == $root_purl
+              and ((.metadata.component.components | type) == "array")
+              and ((.metadata.component.components | length) > 0)
+              and all(.metadata.component.components[];
+                .version == $tag
+                and (.purl | startswith($root_purl))
+                and (.["bom-ref"] | startswith($root_purl)))
+              and any(.dependencies[]; .ref == $root_purl)
+              and all(.dependencies[]?;
+                (.ref as $ref | $component_refs | index($ref)) != null
+                and all(.dependsOn[]?;
+                  . as $ref | ($component_refs | index($ref)) != null))
+              and ([.. | strings | select(startswith($old_ref) or startswith($old_purl))] | length) == 0
+            ' "synology-drive-sync-$TAG.cdx.json" >/dev/null
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-sbom
+          path: synology-drive-sync-${{ needs.version.outputs.tag }}.cdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+  image:
+    name: Build image ${{ matrix.architecture }}
+    needs: version
+    if: needs.version.outputs.already_published != 'true'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            architecture: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
+      - name: Log in to GHCR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+      - name: Create native BuildKit builder
+        shell: bash
+        run: |
+          docker buildx create --name release-builder --driver docker-container --use
+          docker buildx inspect --bootstrap
+      - name: Build and push immutable architecture image
+        shell: bash
+        env:
+          IMAGE: ${{ needs.version.outputs.image }}
+          TAG: ${{ needs.version.outputs.tag }}
+          SHA: ${{ needs.version.outputs.sha }}
+          CREATED: ${{ needs.version.outputs.build_timestamp }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform "$PLATFORM" \
+            --build-arg "VERSION=$TAG" \
+            --build-arg "VCS_REF=$SHA" \
+            --build-arg "BUILD_DATE=$CREATED" \
+            --label "org.opencontainers.image.created=$CREATED" \
+            --label "org.opencontainers.image.revision=$SHA" \
+            --label "org.opencontainers.image.version=$TAG" \
+            --provenance=mode=max \
+            --sbom=true \
+            --tag "$IMAGE:$TAG-$ARCHITECTURE" \
+            --push .
+          reported=$(docker run --rm "$IMAGE:$TAG-$ARCHITECTURE" --version)
+          expected="synology-drive-sync $TAG"
+          [[ "$reported" == "$expected" ]] || {
+            echo "image binary version did not exactly match $expected: $reported" >&2
+            exit 1
+          }
+
+  stage-release:
+    name: Stage GitHub Release draft
+    needs: [version, build-unix, build-windows, sbom, image]
+    if: needs.version.outputs.already_published != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Prepare checksums and installer assets
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 0755 packaging/install.sh dist/install.sh
+          install -m 0644 packaging/install.ps1 dist/install.ps1
+          install -m 0644 THIRD_PARTY_LICENSES.html dist/THIRD_PARTY_LICENSES.html
+          cd dist
+          mapfile -t archives < <(
+            find . -maxdepth 1 -type f \
+              \( -name '*.tar.gz' -o -name '*.zip' \) \
+              -printf '%f\n' \
+              | sort
+          )
+          [[ ${#archives[@]} -eq 6 ]]
+          sbom="synology-drive-sync-$TAG.cdx.json"
+          [[ -f "$sbom" ]]
+          LC_ALL=C sha256sum -- "${archives[@]}" > ARCHIVE_SHA256SUMS
+          release_inputs=("${archives[@]}" "$sbom" THIRD_PARTY_LICENSES.html install.sh install.ps1)
+          LC_ALL=C sha256sum -- "${release_inputs[@]}" \
+            | sort -k2 > SHA256SUMS
+      - name: Attest release provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - name: Attest dependency SBOM
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-checksums: dist/ARCHIVE_SHA256SUMS
+          sbom-path: dist/synology-drive-sync-${{ needs.version.outputs.tag }}.cdx.json
+      - name: Attest checksum manifest
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: dist/SHA256SUMS
+      - name: Stage verified draft assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          SHA: ${{ needs.version.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm dist/ARCHIVE_SHA256SUMS
+          git fetch --force --tags origin
+          release_json="$RUNNER_TEMP/sdsync-release.json"
+          release_error="$RUNNER_TEMP/sdsync-release-error.txt"
+          release_exists=false
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
+            > "$release_json" 2> "$release_error"; then
+            release_exists=true
+          elif ! grep -Eq 'HTTP 404|Not Found' "$release_error"; then
+            sed 's/^/GitHub API: /' "$release_error" >&2
+            exit 1
+          fi
+
+          tag_matches=false
+          if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+            tagged_sha=$(git rev-list -n 1 "$TAG")
+            [[ "$tagged_sha" == "$SHA" ]] || {
+              echo "tag $TAG already points to $tagged_sha, expected $SHA" >&2
+              exit 1
+            }
+            tag_matches=true
+          fi
+
+          if [[ "$release_exists" == true ]]; then
+            draft=$(jq -r '.draft' "$release_json")
+            target=$(jq -r '.target_commitish' "$release_json")
+            if [[ "$draft" != true ]]; then
+              [[ "$tag_matches" == true ]] || {
+                echo "published release $TAG does not resolve to expected commit $SHA" >&2
+                exit 1
+              }
+              echo "release $TAG is already published; refusing to modify immutable assets" >&2
+              exit 1
+            fi
+            if [[ "$tag_matches" != true && "$target" != "$SHA" ]]; then
+              echo "draft release $TAG targets $target, expected $SHA" >&2
+              exit 1
+            fi
+          elif [[ "$tag_matches" == true ]]; then
+            gh release create "$TAG" \
+              --draft \
+              --verify-tag \
+              --title "synology-drive-sync $TAG" \
+              --generate-notes
+          else
+            gh release create "$TAG" \
+              --draft \
+              --target "$SHA" \
+              --title "synology-drive-sync $TAG" \
+              --generate-notes
+          fi
+
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > "$release_json"
+          [[ "$(jq -r '.draft' "$release_json")" == true ]]
+          release_id=$(jq -r '.id' "$release_json")
+          mapfile -d '' -t assets < <(
+            find dist -maxdepth 1 -type f -print0 | sort -z
+          )
+          [[ ${#assets[@]} -eq 11 ]]
+          gh release upload "$TAG" "${assets[@]}" --clobber
+
+          mapfile -t local_names < <(
+            for asset_path in "${assets[@]}"; do
+              basename "$asset_path"
+            done | sort
+          )
+          mapfile -t remote_names < <(
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" \
+              --jq '.[].name' \
+              | sort
+          )
+          diff -u \
+            <(printf '%s\n' "${local_names[@]}") \
+            <(printf '%s\n' "${remote_names[@]}")
+
+  publish-image:
+    name: Publish multi-architecture image
+    needs: [version, stage-release, sbom, image]
+    if: needs.version.outputs.already_published != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-sbom
+          path: sbom
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+      - name: Create manifest and immutable tags
+        env:
+          IMAGE: ${{ needs.version.outputs.image }}
+          TAG: ${{ needs.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/sdsync-image-metadata.json"
+          docker buildx imagetools create \
+            --metadata-file "$metadata" \
+            --tag "$IMAGE:$TAG" \
+            --tag "$IMAGE:latest" \
+            "$IMAGE:$TAG-amd64" \
+            "$IMAGE:$TAG-arm64"
+          docker buildx imagetools inspect "$IMAGE:$TAG"
+      - id: digest
+        name: Resolve manifest digest
+        env:
+          IMAGE: ${{ needs.version.outputs.image }}
+          TAG: ${{ needs.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/sdsync-image-metadata.json"
+          digest=$(jq -r '."containerimage.descriptor".digest // empty' "$metadata")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "value=$digest" >> "$GITHUB_OUTPUT"
+      - name: Attest image provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ${{ needs.version.outputs.image }}
+          subject-digest: ${{ steps.digest.outputs.value }}
+          push-to-registry: true
+      - name: Attest image dependency SBOM
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ${{ needs.version.outputs.image }}
+          subject-digest: ${{ steps.digest.outputs.value }}
+          sbom-path: sbom/synology-drive-sync-${{ needs.version.outputs.tag }}.cdx.json
+          push-to-registry: true
+
+  publish-release:
+    name: Publish immutable GitHub Release
+    needs: [version, stage-release, publish-image]
+    if: needs.version.outputs.already_published != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
+      - name: Publish verified draft exactly once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          SHA: ${{ needs.version.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_json="$RUNNER_TEMP/sdsync-final-release.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > "$release_json"
+          [[ "$(jq -r '.draft' "$release_json")" == true ]] || {
+            echo "release $TAG is no longer a draft; refusing a second publication" >&2
+            exit 1
+          }
+          target=$(jq -r '.target_commitish' "$release_json")
+          git fetch --force --tags origin
+          if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+            tagged_sha=$(git rev-list -n 1 "$TAG")
+            [[ "$tagged_sha" == "$SHA" ]] || {
+              echo "tag $TAG points to $tagged_sha, expected $SHA" >&2
+              exit 1
+            }
+          elif [[ "$target" != "$SHA" ]]; then
+            echo "draft release $TAG targets $target, expected $SHA" >&2
+            exit 1
+          fi
+          asset_count=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/releases/$(jq -r '.id' "$release_json")/assets?per_page=100" \
+            --jq '.[].name' \
+            | wc -l)
+          [[ "$asset_count" -eq 11 ]]
+
+          gh release edit "$TAG" --draft=false --latest
+
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > "$release_json"
+          [[ "$(jq -r '.draft' "$release_json")" == false ]]
+          git fetch --force --tags origin
+          published_sha=$(git rev-list -n 1 "$TAG")
+          [[ "$published_sha" == "$SHA" ]]

@@ -1,46 +1,113 @@
 # synology-drive-sync
 
-A lean Rust CLI that pushes one local directory into a Synology Drive-backed folder using only the documented Synology File Station WebAPI through one reverse-proxy URL.
+[![CI](https://github.com/supermarsx/synology-drive-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/supermarsx/synology-drive-sync/actions/workflows/ci.yml)
 
-It is deliberately one-way:
+A lean Rust CLI that pushes one local directory to a Synology Drive-backed folder through the documented File Station WebAPI and a single HTTPS reverse-proxy URL.
 
-- the local source is authoritative and is never modified;
-- missing and changed local files are uploaded;
-- empty local directories are created;
-- remote-only content is preserved by default;
-- `--delete` opts into an exact remote mirror.
+This is deliberately one-way and stateless. It is not a Synology Drive protocol client, daemon, two-way reconciler, SMB/WebDAV wrapper, or QuickConnect client. It writes to the underlying DSM folder through File Station; Synology Drive can index that folder when it belongs to My Drive or an enabled Team Folder.
 
-This is **not** a Synology Drive protocol client. It writes to the underlying DSM folder through File Station. Synology Drive can then index that folder when it belongs to My Drive or an enabled Team Folder.
+> [!IMPORTANT]
+> The automated suite uses deterministic local and mock-HTTP tests; it does not log in to a live NAS. Before trusting a deployment, run `doctor`, review `plan`, test with non-critical data, and keep `--delete` disabled.
 
-## Why this shape
+## Safety contract
 
-File Station provides the small API surface a push mirror needs: API discovery, DSM authentication, directory listing, folder creation, upload/overwrite, and deletion. That keeps the tool stateless: no database, daemon, DSM port probing, SMB, WebDAV, SSH, QuickConnect, or private Drive protocol.
+- The local source is authoritative and is never modified.
+- Missing and changed local files are uploaded; empty local directories are created.
+- Remote-only content is preserved unless `--delete` is explicit.
+- A normal sync stops on file/directory type conflicts rather than removing them.
+- `plan` performs discovery, authentication, scanning, and planning without remote mutation.
+- Mirror deletion is guarded by path containment, an explicit deletion cap, empty-source protection, protected-path handling, and failure-before-delete ordering.
 
-The implementation is synchronous Rust with two upload workers by default. Upload bodies are streamed from disk, carry a known `Content-Length`, and put the binary part last as File Station requires.
+| Command | Creates/uploads | Deletes remote-only data | Intended use |
+| --- | ---: | ---: | --- |
+| `plan` | No | No | Inspect the exact pending work |
+| `sync` | Yes | No | Safe additive/update-only push |
+| `sync --delete` | Yes | Yes, within guards | Deliberate exact remote mirror |
 
-## Reverse proxy
+## Quick start
 
-The recommended topology is a dedicated public hostname:
+Download a verified release with the platform installer described in [Installation](docs/installation.md), or build with Rust 1.88 or newer:
+
+```bash
+git clone https://github.com/supermarsx/synology-drive-sync.git
+cd synology-drive-sync
+cargo build --release --locked
+```
+
+Use a dedicated, non-administrator DSM account with File Station application permission and read/write access to the destination shared folder. Then verify the proxy without authenticating:
+
+```bash
+synology-drive-sync doctor \
+  --url https://files.example.com \
+  --routing-only
+```
+
+Enroll the DSM password in the current user's OS vault:
+
+```bash
+synology-drive-sync credentials set-password \
+  --url https://files.example.com \
+  --username mirror-bot
+```
+
+If the account uses authenticator-app TOTP, import the existing DSM manual key or `otpauth://` URI as well:
+
+```bash
+synology-drive-sync credentials set-totp \
+  --url https://files.example.com \
+  --username mirror-bot
+```
+
+Review the plan, then run the additive sync:
+
+```bash
+synology-drive-sync plan ./project /team-folder/project \
+  --url https://files.example.com \
+  --username mirror-bot
+
+synology-drive-sync sync ./project /team-folder/project \
+  --url https://files.example.com \
+  --username mirror-bot
+```
+
+`/team-folder/project` is a File Station logical path beginning with a shared folder. Never pass a physical path such as `/volume1/team-folder/project`.
+
+PowerShell uses the same command tree:
+
+```powershell
+$env:SDSYNC_URL = 'https://files.example.com'
+$env:SDSYNC_USERNAME = 'mirror-bot'
+synology-drive-sync.exe plan 'C:\Data\Project' '/team-folder/project'
+synology-drive-sync.exe sync 'C:\Data\Project' '/team-folder/project'
+```
+
+## Reverse-proxy requirements
+
+The smallest recommended topology is a dedicated public hostname routed to File Station's customized HTTPS port:
 
 ```text
 https://files.example.com:443
         |
-        | Synology reverse proxy
+        | DSM reverse proxy
         v
-https://nas.lan:7001       # File Station customized HTTPS port
+https://nas.lan:7001       File Station customized HTTPS port
 ```
 
-Configure DSM 7 under **Control Panel > Login Portal**:
+On DSM 7:
 
-1. Give File Station a customized HTTPS port.
+1. In **Control Panel > Login Portal > Applications**, give File Station a customized HTTPS port.
 2. Create a host-based reverse-proxy rule from the public HTTPS hostname to that port.
-3. Assign a valid certificate to the public hostname.
-4. Raise proxy send/read timeouts and any request-body limit to cover the largest upload.
-5. Confirm the same origin exposes `/webapi/entry.cgi`; routing only the File Station browser UI is insufficient.
+3. Assign a certificate valid for the public hostname.
+4. Set request-body limits and proxy send/read timeouts high enough for the largest file.
+5. Confirm the same public origin routes `/webapi/entry.cgi`; routing only the browser UI is insufficient.
 
-No WebSocket headers are required. File Station's documented sync operations use ordinary HTTP requests.
+No WebSocket upgrade is required. Discovery, authentication, listing, creation, upload, and deletion are ordinary HTTP requests. HTTPS is mandatory by default; `--allow-http` exists only for controlled LAN testing. Prefer `--ca-certificate` for private PKI instead of disabling certificate validation.
 
-Probe routing without credentials:
+Every DSM endpoint is derived from the one configured public base URL. The CLI does not probe ports 5000/5001, discover a LAN address, bypass the proxy, or fall back to another transport.
+
+An optional public prefix is supported, for example `https://gateway.example.com/nas/`. The proxy must rewrite `/nas/webapi/*` to the backend's `/webapi/*`. A dedicated hostname without a prefix is simpler, and a File Station browser alias is not a substitute for routing the WebAPI.
+
+You can probe the raw route before installing the CLI:
 
 ```bash
 curl -fsS -X POST https://files.example.com/webapi/entry.cgi \
@@ -50,169 +117,129 @@ curl -fsS -X POST https://files.example.com/webapi/entry.cgi \
   --data-urlencode query=SYNO.API.Auth,SYNO.FileStation.List
 ```
 
-The response should be JSON with `"success": true`, not HTML or a redirect to a login page.
+The response should be JSON with `"success": true`, not HTML or a redirect to a login page. `doctor --routing-only` performs the corresponding TLS, routing, and API-discovery checks. Without `--routing-only`, `doctor` also authenticates and can validate a logical folder with `--remote` without creating, uploading, overwriting, or deleting anything.
 
-An optional URL prefix is supported, for example `https://gateway.example.com/nas/`. The proxy must explicitly rewrite `/nas/webapi/*` to the backend's `/webapi/*`; Synology's documented and simpler setup is a dedicated hostname without a prefix.
+## Commands
 
-## Build
+The explicit command tree is preferred:
 
-Rust 1.88 or newer is required.
+| Command | Purpose |
+| --- | --- |
+| `sync SOURCE REMOTE` | Apply a one-way push |
+| `plan SOURCE REMOTE` | Print the pending work without mutation; `--exit-code` returns 10 when changes exist |
+| `doctor` | Validate configuration, proxy routing, API discovery, authentication, and optional remote access |
+| `config path\|validate\|show` | Locate, validate, or inspect non-secret effective configuration |
+| `credentials set-password\|set-totp\|status\|remove` | Manage the current user's OS-vault entries |
+| `completions SHELL` | Generate Bash, Zsh, Fish, PowerShell, or Elvish completion source |
+| `manpage [--all DIRECTORY]` | Generate the root roff page on stdout, or every nested command page in a directory |
 
-```bash
-git clone https://github.com/supermarsx/synology-drive-sync.git
-cd synology-drive-sync
-cargo build --release
-```
-
-The binary is `target/release/synology-drive-sync` (`.exe` on Windows). HTTPS uses rustls and platform certificate verification, so no OpenSSL runtime is needed.
-
-## First run
-
-Use a dedicated, non-administrator DSM account with:
-
-- File Station application permission;
-- read/write access to the destination shared folder;
-- access to the relevant My Drive or Team Folder path.
-
-Set the non-secret connection values, then perform a dry run:
+The former positional spelling remains compatible and is interpreted as `sync`:
 
 ```bash
-export SDSYNC_URL=https://files.example.com
-export SDSYNC_USERNAME=mirror-bot
-synology-drive-sync ./project /team-folder/project --dry-run
-```
-
-The password is read from the OS credential vault when one has been enrolled, otherwise it is prompted with terminal echo disabled. If DSM requires two-factor authentication, the CLI can generate a current code from an explicitly enrolled vault seed or prompt for a one-time code.
-
-PowerShell:
-
-```powershell
-$env:SDSYNC_URL = 'https://files.example.com'
-$env:SDSYNC_USERNAME = 'mirror-bot'
-synology-drive-sync.exe C:\Data\Project /team-folder/project --dry-run
-```
-
-Apply the additive/update-only plan by removing `--dry-run`:
-
-```bash
-synology-drive-sync ./project /team-folder/project
-```
-
-The remote path is a File Station logical path beginning with a shared folder, never a physical path such as `/volume1/...`.
-
-## Authentication and 2FA
-
-Passwords, TOTP seeds, and one-time codes are never accepted as command-line values, so they do not appear in process listings. Vault writes are always explicit: a normal sync never saves a prompted or environment-provided secret.
-
-### OS credential vault
-
-Enroll the password for one reverse-proxy URL and DSM username:
-
-```bash
-synology-drive-sync credentials set-password \
+synology-drive-sync ./project /team-folder/project \
   --url https://files.example.com \
   --username mirror-bot
 ```
 
-Interactive input is masked and confirmed. For a pipe or secret-provider integration, pass `--password-stdin`; the first line is stored without a second read. `SDSYNC_PASSWORD` is also accepted by `set-password`, but a command-line password value deliberately is not.
+Legacy `--dry-run` is equivalent to planning, but new scripts should use the explicit `plan` command. Use `synology-drive-sync --help` and `<command> --help` for the complete current interface.
 
-If the DSM account uses authenticator-app TOTP, capture the manual key during DSM's 2FA setup or re-enrollment (the wizard's **Can't scan it** path), or use the original `otpauth://totp` provisioning URI. The CLI cannot recover a seed that DSM no longer displays:
+## Configuration and profiles
 
-```bash
-synology-drive-sync credentials set-totp \
-  --url https://files.example.com \
-  --username mirror-bot
-```
-
-The input is masked and can instead come from the first line of standard input with `--secret-stdin`. The command imports an existing DSM seed; it does not create or enroll a new factor. Base32 keys may contain spaces or hyphens. Provisioning URIs must describe SHA-1, six-digit, 30-second TOTP. Only a canonical unpadded Base32 seed is stored, and generated six-digit codes are never persisted.
-
-Inspect presence without revealing values, rotate by rerunning either `set` command, or remove entries independently:
+Copy [config.example.toml](config.example.toml) and ask the CLI for the platform-specific default location:
 
 ```bash
-synology-drive-sync credentials status --url https://files.example.com --username mirror-bot
-synology-drive-sync credentials remove --url https://files.example.com --username mirror-bot password
-synology-drive-sync credentials remove --url https://files.example.com --username mirror-bot totp
-synology-drive-sync credentials remove --url https://files.example.com --username mirror-bot all
+synology-drive-sync config path
+synology-drive-sync config validate --config ./config.toml
+synology-drive-sync config show --config ./config.toml --profile production
 ```
 
-The removal target is required; the command never assumes `all`.
+Default locations are:
 
-The profile key is derived from the normalized reverse-proxy URL and exact DSM username. The remote folder is intentionally excluded, so one account works across destinations. A path-prefixed proxy URL and a host-only URL are different profiles; trailing-slash variants are the same.
+- Linux: `$XDG_CONFIG_HOME/synology-drive-sync/config.toml`, or `~/.config/synology-drive-sync/config.toml`;
+- macOS: `~/Library/Application Support/synology-drive-sync/config.toml`;
+- Windows: `%APPDATA%\synology-drive-sync\config.toml`.
 
-The native backends are:
+Resolution is deterministic:
 
-- Windows Credential Manager, with current-user local-machine persistence;
-- macOS login Keychain;
-- freedesktop Secret Service on Linux, using a provider such as GNOME Keyring, KWallet, or KeePassXC.
+1. command-line value;
+2. the matching `SDSYNC_*` environment value parsed by the CLI;
+3. selected profile (`--profile`, `SDSYNC_PROFILE`, then `default-profile`);
+4. built-in default.
 
-On headless Linux, Secret Service needs a usable user-session D-Bus, an unlocked default collection, and the same OS user that enrolled the entries. Cron, containers, SSH-only sessions, and system services frequently lack that environment. In those cases use a deliberately configured stdin/environment source or `--no-vault`; the program never falls back to a plaintext credential file and never tries to start or unlock a vault daemon.
+Command-line exclusion rules are appended to profile exclusions. `--no-delete` can disable a profile's `delete=true`, `--vault` can override a profile's `no-vault=true`, and `--no-quiet` can re-enable terminal diagnostics over `quiet=true`. Relative paths in a profile are anchored to the configuration file's directory.
 
-An OS vault protects secrets at rest, but software running as the same unlocked OS user may still retrieve them. Storing both the password and TOTP seed enables unattended login, but it also places both factors behind that one OS account. For stronger factor separation, store only the password and keep the current TOTP code interactive or provide `SDSYNC_OTP` for a single run.
+The TOML schema is strict and non-secret. It accepts protected `password-file`, `totp-secret-file`, and remote-log token-file paths, but has no password, seed, current-code, or bearer-token value field. Unknown keys are rejected, and `config show` can display paths or environment-variable names but never secret values.
 
-### Resolution order
+## Password and two-factor authentication
 
-Credential precedence during sync is:
+Passwords, TOTP seeds, and current OTP codes have no secret-valued command-line option, keeping values out of process listings. A normal sync never stores credentials: vault writes happen only through an explicit `credentials set-*` command.
 
-Password:
+Native vault backends are Windows Credential Manager, the macOS login Keychain, and freedesktop Secret Service on Linux. Each profile is scoped to the normalized reverse-proxy URL and exact DSM username; the remote destination is intentionally excluded.
 
-1. first line of standard input with `--password-stdin`;
-2. `SDSYNC_PASSWORD`;
-3. the OS credential vault;
-4. masked terminal prompt.
-
-OTP:
-
-1. `SDSYNC_OTP`, containing a current six-digit code, not a seed;
-2. a code generated just in time from the explicitly stored vault seed;
-3. a masked terminal prompt when DSM reports that OTP is required.
-
-Explicit stdin/environment sources bypass the corresponding vault lookup. `--no-vault` disables both password and TOTP-seed reads for that sync. If a vault-generated code is rejected, synchronize the client and NAS clocks, verify the enrolled seed, or provide one fresh code interactively; the CLI does not guess adjacent time windows.
-
-For a deliberately environment-driven unattended run:
+Useful vault operations are:
 
 ```bash
-export SDSYNC_PASSWORD='use-a-secret-provider-in-production'
-export SDSYNC_OTP='123456'
-synology-drive-sync /srv/export /team/export
-unset SDSYNC_PASSWORD SDSYNC_OTP
+synology-drive-sync credentials status \
+  --url https://files.example.com --username mirror-bot
+synology-drive-sync credentials remove \
+  --url https://files.example.com --username mirror-bot password
+synology-drive-sync credentials remove \
+  --url https://files.example.com --username mirror-bot totp
+synology-drive-sync credentials remove \
+  --url https://files.example.com --username mirror-bot all
 ```
 
-Prefer the OS vault or inject these variables from the scheduler's secret store instead of saving them in a script. `SDSYNC_OTP` expires every 30 seconds, so the stored TOTP seed is the practical unattended option when its factor-separation trade-off is acceptable.
+The removal kind is required; the CLI never assumes `all`.
 
-The CLI uses `SYNO.API.Auth` v6 when available, `session=FileStation`, `format=sid`, and `enable_syno_token=yes`. Authenticated requests are POST bodies, not URL queries. The returned SID and exact-cased `SynoToken` are sent on subsequent calls and the session is explicitly logged out.
+For DSM TOTP, import the manual Base32 key or original provisioning URI shown during DSM enrollment. The CLI does not enroll a new factor and cannot recover a seed DSM no longer displays. Supported provisioning data is SHA-1, six digits, and a 30-second period. Codes are generated only when DSM challenges for OTP, are refreshed once across a time-step boundary, and are never persisted.
 
-The documented API supports DSM TOTP through `otp_code`. Synology Secure SignIn approval and hardware/security-key flows are browser-only and have no public File Station WebAPI challenge flow, so they are not supported here. Configure OTP as the account's app-compatible second factor.
+Effective password resolution is:
 
-## Exact mirror mode
+1. `--password-stdin`, when selected;
+2. `--password-file`, `SDSYNC_PASSWORD_FILE`, or the profile's protected file path;
+3. `SDSYNC_PASSWORD`;
+4. the OS vault;
+5. a masked terminal prompt.
 
-`--delete` removes remote entries absent locally and permits file/directory type replacement:
+Effective OTP resolution is:
+
+1. `SDSYNC_OTP`, containing one current six-digit code;
+2. a code generated from `--totp-secret-file`, `SDSYNC_TOTP_SECRET_FILE`, or the profile's seed-file path;
+3. a code generated from the OS-vault seed;
+4. a masked current-code prompt after DSM requests OTP.
+
+`--no-vault` disables both vault reads; `--vault` re-enables them over a profile default. Protect referenced files with OS permissions and store one secret on the first line. For unattended use, prefer the OS vault in a real user session or scheduler-native credentials. `SDSYNC_OTP` is an ephemeral fallback, not seed storage.
+
+Headless Linux services and containers usually do not have an unlocked Secret Service session. The supplied systemd, cron, and Compose examples therefore use protected secret-file mounts with `--no-vault`. Storing both password and TOTP seed in one vault enables unattended login but reduces factor separation to the security of that OS account.
+
+DSM Secure SignIn approval and hardware/security-key challenges have no documented File Station WebAPI flow and are not supported. Configure an app-compatible TOTP factor for this account.
+
+## Planning, deletion, and exclusions
+
+Exact mirror mode is deliberately noisy:
 
 ```bash
-synology-drive-sync ./project /team-folder/project \
-  --delete --dry-run
+synology-drive-sync plan ./project /team-folder/project \
+  --delete --max-delete 25 \
+  --url https://files.example.com --username mirror-bot
 
-synology-drive-sync ./project /team-folder/project \
-  --delete
+synology-drive-sync sync ./project /team-folder/project \
+  --delete --max-delete 25 \
+  --url https://files.example.com --username mirror-bot
 ```
 
-Deletion has several independent guards:
+Independent guards include:
 
-- it is off by default;
-- `/` is never a valid destination;
-- every delete must be a strict child of the configured destination;
-- the default maximum is 100 entries (`--max-delete` changes it explicitly);
-- a source with no payload files cannot trigger deletion unless `--allow-empty-source` is present;
+- `/` can never be a destination, and every deletion must remain a strict child of the configured root;
+- the default maximum is 100 deletions and `--max-delete` changes it explicitly;
+- a source with no payload files cannot drive deletion without `--allow-empty-source`;
 - ignored, DSM-managed, and File Station-mounted paths are protected;
-- all scans, directory creation, and uploads must succeed before remote-only deletion begins;
-- entries are deleted deepest-first with `recursive=false`.
+- the local preflight, remote scan, directory creation, and uploads must succeed before remote-only deletion;
+- remote-only directories are removed deepest-first and non-recursively, so a concurrent new child prevents their removal.
 
-That final rule is an intentional race guard. If another client creates a file inside a directory after the inventory scan, File Station refuses to remove the now-nonempty directory instead of silently deleting the new file.
+Type replacement under `--delete` is not transactionally atomic: a conflicting remote entry may be removed before its local replacement upload, and a later failure can leave it absent. Use `plan`, an intentionally small deletion cap, a quiescent source tree, and the DSM shared-folder recycle bin.
 
-Enable the DSM shared-folder recycle bin as an additional operational safety net, and always inspect the first mirror run with `--dry-run`.
-
-## Exclusions
-
-Put gitignore-style rules in `.sdsyncignore` at the local source root:
+Place gitignore-style rules in `.sdsyncignore` at the source root or repeat `--exclude`:
 
 ```gitignore
 target/
@@ -220,90 +247,83 @@ target/
 .cache/
 ```
 
-Or add repeatable command-line rules:
+Excluded paths are outside the sync scope, not considered absent. Matching remote entries and required parent directories are preserved even under `--delete`. The root `.sdsyncignore` itself is never uploaded.
 
-```bash
-synology-drive-sync ./project /team/project \
-  --exclude 'target/' \
-  --exclude '*.tmp'
-```
+Hidden regular files are included. Symlinks, junctions/reparse points, special or unreadable entries, non-UTF-8 names, unsafe Drive names, case collisions, and obvious platform path overflows fail preflight before remote mutation. File Station CIFS/NFS/ISO/remote mounts are never traversed or deleted.
 
-Excluded paths are out of scope, not absent. In `--delete` mode, matching remote paths and the directories needed to contain them are preserved.
+Path checks and later file opens are not a transactional filesystem snapshot. Run under an unprivileged account that exclusively owns the source, keep the tree quiescent during synchronization, and never run elevated over a source that another user or less-trusted process can rename or replace. A concurrent path-component swap can otherwise race portable link/reparse checks and redirect a later traversal or upload outside the tree that was originally inspected. See [Security policy](SECURITY.md).
 
-The root `.sdsyncignore` is control data: it is never uploaded, and an existing remote copy is preserved.
+The default `--compare metadata` compares byte length and modification time at File Station's one-second resolution. `--compare size-only` ignores time and can miss same-size changes. Neither mode hashes content.
 
-Hidden files are included unless excluded. In-scope symlinks, junctions/reparse points, special files, unreadable entries, non-UTF-8 names, and DSM/Drive working names fail the preflight scan. On Windows, Drive-incompatible `OFFLINE`, `SYSTEM`, `TEMPORARY`, and reparse-point entries also fail. Portable Drive name checks reject leading `~`, control characters, case-colliding paths, Windows-invalid/reserved names, and obvious documented name/path overflows before any remote mutation. A Drive client installed under a long local sync-root path can have a lower effective path limit.
+## Output, progress, and logs
 
-Every planned upload is opened and rechecked before destructive type replacements, then rechecked on each upload attempt and after transfer. A process that can rewrite the source concurrently can still create an unavoidable scan-to-open race; use a quiescent, trusted source tree for mirror runs.
+Command results and diagnostics are independent streams:
 
-File Station CIFS/NFS/ISO/remote mounts are never traversed. A destination at or below a reported mount point is rejected, and a mount encountered inside the destination is preserved even with `--delete`.
+- `--output human|json|ndjson` controls result records on standard output;
+- `--log-format human|json` controls secret-free diagnostic events on standard error and optional sinks;
+- `-v` selects debug logging, `-vv` trace, while `--log-level` is explicit;
+- `--progress auto|always|never` controls progress for human result output; `auto` additionally requires a terminal and human-formatted logs, while machine result modes suppress progress;
+- `--quiet` suppresses non-error terminal diagnostics and progress without disabling configured file or remote logs;
+- `--log-file` appends local logs;
+- `--remote-log-url` sends structured events to an HTTPS collector, with a bearer token read from a protected file or named environment variable;
+- `--remote-log-mode best-effort|required` decides whether collector failure can fail the run.
 
-## Change detection
+For schemas, redaction boundaries, rotation, remote-delivery behavior, and operational examples, see [Observability](docs/observability.md).
 
-The default `--compare metadata` considers a file unchanged when byte length and modification time match. File Station lists modification time in Unix seconds but accepts upload time in Unix milliseconds, so local milliseconds are truncated for comparison and preserved on upload.
+## Exit codes
 
-`--compare size-only` ignores time. It can be useful when another service continually rewrites remote timestamps, but it can miss same-size content changes.
+Stable automation behavior is:
 
-Metadata comparison can also miss a deliberately changed file whose size and second-level timestamp were both preserved. A future strict mode can use File Station's asynchronous MD5 API; MD5 would be an equality mechanism here, not a security hash.
+- `0`: command completed successfully; for `plan --exit-code`, no changes are pending;
+- `10`: `plan --exit-code` found pending changes;
+- `2`: command-line usage or configuration error;
+- `1`: operational failure, including network, DSM, filesystem, vault, or required-log-delivery failure;
+- `130`: cooperative cancellation requested with Ctrl+C/SIGINT or SIGTERM.
 
-## CLI
+Scripts should treat any other nonzero value as failure and should not infer success from human-readable output.
 
-```text
-Usage: synology-drive-sync [OPTIONS] --url <URL> --username <USERNAME> <SOURCE> <REMOTE>
-       synology-drive-sync <COMMAND>
+## Installation and unattended operation
 
-Commands:
-  credentials  Store, inspect, or remove credentials in the current user's OS vault
+See [Installation and deployment](docs/installation.md) for:
 
-Arguments:
-  <SOURCE>  Authoritative local directory. It is never modified
-  <REMOTE>  File Station path beginning with a shared folder
+- checksum-verifying Unix and Windows installers;
+- manual archive installation, completions, and manpage setup;
+- the non-root, read-only Docker/Compose job and optional TOTP secret overlay;
+- hardened systemd service/timer and cron fallback;
+- per-user macOS LaunchAgent and Windows Task Scheduler setup using the OS vault.
 
-Important options:
-      --dry-run
-      --delete
-      --max-delete <N>             [default: 100]
-      --allow-empty-source
-      --compare metadata|size-only [default: metadata]
-      --jobs <N>                   [default: 2; accepted: 1..16]
-      --exclude <PATTERN>
-      --password-stdin
-      --no-vault
-      --ca-certificate <PEM>
-      --timeout <SECONDS>          [default: 7200]
-  -v, --verbose
-```
+The native schedulers are preferred because their identity and credential-session behavior is clearer. Never place a password, TOTP seed, current OTP, or logging token value directly in a unit, plist, crontab, task argument, or TOML profile.
 
-Run `synology-drive-sync --help` or `synology-drive-sync credentials --help` for the complete current lists.
+## Releases and supply-chain verification
 
-`credentials` and `help` are reserved command names. Prefix a same-named relative source with `./` (or `.\` on Windows), or place positional paths after `--`.
+Calendar releases use `YY.N` tags and provide native Linux, Windows, and macOS archives for both x86-64 and ARM64. Each release also includes `SHA256SUMS`, a CycloneDX dependency SBOM, generated third-party license notices, installer scripts, and GitHub artifact provenance/SBOM attestations. CI audits the locked graph against current RustSec data and refuses stale notices. The GHCR image is published for `linux/amd64` and `linux/arm64` as both `YY.N` and `latest`.
 
-## Failure behavior
+See [Release artifacts and verification](docs/releases.md) before deploying a binary or container in a sensitive environment. Pin a calendar version or container digest rather than relying on mutable `latest`.
 
-DSM frequently returns HTTP 200 with a JSON API error. The CLI checks both layers and translates common auth, permission, quota, no-space, illegal-path, session, upload, and reverse-proxy failures.
+## Failure clues
 
-Useful diagnostics include:
+DSM often returns HTTP 200 with a JSON API error, so the CLI validates both layers. Common proxy symptoms are:
 
-- HTML instead of JSON: `/webapi/*` is routed to the UI or another service;
-- HTTP 413: increase the proxy request-body limit;
-- HTTP 502: fix the proxy's File Station backend route;
-- HTTP 504 or File Station `1801`: increase proxy/File Station upload timeouts;
-- DSM `150`: login and later requests appear to come from different source IPs;
-- DSM `1800`: multipart `Content-Length` is absent or mismatched.
+- HTML instead of JSON: `/webapi/*` reached a UI or another service;
+- HTTP 413: raise the proxy request-body limit;
+- HTTP 502: correct the File Station backend route;
+- HTTP 504 or File Station `1801`: raise proxy/File Station upload timeouts;
+- DSM `150`: login and later requests appear to originate from different client IPs;
+- DSM `1800`: multipart content length is absent or inconsistent.
 
-Transient transport, busy, 408/429, and 502/503/504 failures are retried with bounded backoff. Upload retry restarts the whole file because File Station documents no resumable upload protocol. `overwrite=true` makes retry converge on the same remote content. A source file that changes during an upload fails the run before mirror deletions.
+Transient transport, busy, 408/429, and 502/503/504 failures use bounded retry. File Station exposes no resumable upload protocol, so an upload retry restarts the entire file. A source file that changes during transfer fails the run before remote-only deletion.
 
 ## Deliberate limitations
 
 - One direction only: local to remote.
+- File Station WebAPI only; no private Drive protocol, SMB, WebDAV, SSH, or QuickConnect.
 - No block-level delta or resumable upload.
-- No claim of crash-atomic overwrite; File Station does not document it.
-- Type replacement under `--delete` is non-atomic: after source preflight, a later network, quota, or upload failure can leave the conflicting remote entry absent. The run still stops before remote-only deletion.
-- File content, names, hierarchy, and file mtime only.
-- No ACL, owner, POSIX mode, xattr, hard-link, sparse-file, or directory-mtime preservation.
-- No Drive conflict-resolution or client identity semantics.
-- Drive indexing may lag behind a successful File Station upload.
-- A Drive-locked file can still be changed through File Station, per Synology's documented behavior.
+- No claim of crash-atomic overwrite or transactional type replacement.
+- Content, names, hierarchy, and file mtime only; no ACL, owner, mode, xattr, hard-link, sparse-file, or directory-mtime preservation.
+- No Drive conflict resolution or client identity semantics; Drive indexing may lag behind File Station writes.
+- A Drive-locked file can still be changed through File Station according to Synology's documented behavior.
+- Metadata comparison can miss content changed while both size and second-level mtime are preserved.
+- The automated suite does not prove compatibility with every DSM/File Station release or reverse-proxy product, and currently contains no live-NAS end-to-end job.
 
 ## Development
 
@@ -311,24 +331,22 @@ Transient transport, busy, 408/429, and 502/503/504 failures are retried with bo
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
-cargo build --release
+cargo build --release --locked
 ```
 
-Tests cover path containment and traversal rejection, reverse-proxy prefix joining, API discovery, DSM 7 object-shaped OTP challenges, lazy vault-TOTP challenge handling, RFC 6238 vectors, 80-bit DSM-seed compatibility, provisioning-input redaction, vault profile scoping, credential CLI parsing, SID/SynoToken placement, pagination, mounted-filesystem boundaries, multipart `Content-Length`, binary-part ordering, Drive-name and ignore protection, planning, type conflicts, deletion limits, real dry-run execution, upload preflight ordering, and failure-before-delete behavior. Tests never read or write the host OS credential vault.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). Tests do not read or write the host OS credential vault.
 
 ## Official references
 
 - [Synology File Station API Guide](https://global.download.synology.com/download/Document/Software/DeveloperGuide/Package/FileStation/All/enu/Synology_File_Station_API_Guide.pdf)
-- [DSM Login Web API Guide](https://global.download.synology.com/download/Document/Software/DeveloperGuide/Os/DSM/All/enu/DSM_Login_Web_API_Guide_enu.pdf)
-- [DSM reverse proxy settings](https://kb.synology.com/en-global/DSM/help/DSM/AdminCenter/system_login_portal_advanced?version=7)
+- [DSM Login WebAPI Guide, including API v6 OTP](https://kb.synology.com/en-my/DG/DSM_Login_Web_API_Guide/3)
 - [DSM Login Portal applications](https://kb.synology.com/en-global/DSM/help/DSM/AdminCenter/system_login_portal_applications?version=7)
-- [DSM two-factor authentication](https://kb.synology.com/en-global/DSM/help/DSM/SecureSignIn/2factor_authentication?version=7)
-- [RFC 6238: Time-Based One-Time Password Algorithm](https://www.rfc-editor.org/rfc/rfc6238.html)
-- [Keyring platform backends](https://docs.rs/keyring/latest/keyring/v1/)
-- [freedesktop Secret Service specification](https://specifications.freedesktop.org/secret-service/latest-single/)
+- [DSM Login Portal and reverse proxy](https://kb.synology.com/en-global/DSM/help/DSM/AdminCenter/system_login_portal?version=7)
 - [Synology Drive Admin Console and Team Folders](https://kb.synology.com/en-global/DSM/help/SynologyDrive/drive_admin_console)
-- [Synology Drive file-name, path, and attribute limits](https://kb.synology.com/en-uk/DSM/tutorial/Why_are_files_not_synced_between_Synology_Drive_and_Drive_desktop_application)
+- [RFC 6238: Time-Based One-Time Password Algorithm](https://www.rfc-editor.org/rfc/rfc6238.html)
+- [freedesktop Secret Service specification](https://specifications.freedesktop.org/secret-service/latest-single/)
 
 ## License
 
-MIT
+[MIT](LICENSE). Dependency license texts and attributions are in
+[THIRD_PARTY_LICENSES.html](THIRD_PARTY_LICENSES.html).

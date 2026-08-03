@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily one-way local folder sync to Synology Drive
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=yes
+RandomizedDelaySec=10m
+AccuracySec=1m
+Unit=synology-drive-sync.service
+
+[Install]
+WantedBy=timers.target

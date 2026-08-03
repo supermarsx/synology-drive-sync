@@ -1,157 +1,107 @@
 use std::env;
+use std::fs::File;
 use std::io::{self, BufRead, IsTerminal, Read};
+use std::path::Path;
 
-use clap::{Args, Subcommand, ValueEnum};
 use synology_drive_sync::api::ApiClient;
 use synology_drive_sync::vault::{CredentialKind, OsVault, generate_totp, parse_totp_secret};
 use synology_drive_sync::{Error, Result};
 use zeroize::Zeroizing;
 
-const PASSWORD_ENV: &str = "SDSYNC_PASSWORD";
-const OTP_ENV: &str = "SDSYNC_OTP";
+use crate::cli::{CredentialAction, CredentialsArgs, OTP_ENV, PASSWORD_ENV, RemoveKind};
+use crate::config::{Profile, ResolvedCredentialProfile};
+
 const MAX_STDIN_SECRET_BYTES: u64 = 4098;
 
-#[derive(Debug, Args)]
-pub(crate) struct CredentialsArgs {
-    #[command(subcommand)]
-    action: CredentialAction,
-}
-
-#[derive(Debug, Args)]
-struct CredentialProfileArgs {
-    /// Reverse-proxy base URL that owns this credential profile.
-    #[arg(long, env = "SDSYNC_URL")]
-    url: String,
-
-    /// DSM account that owns this credential profile.
-    #[arg(long, env = "SDSYNC_USERNAME")]
-    username: String,
-
-    /// Permit an HTTP profile. Intended only for trusted testing/LAN use.
-    #[arg(long)]
-    allow_http: bool,
-}
-
-#[derive(Debug, Args)]
-struct SetPasswordArgs {
-    #[command(flatten)]
-    profile: CredentialProfileArgs,
-
-    /// Read the password from the first line of standard input.
-    #[arg(long)]
-    password_stdin: bool,
-}
-
-#[derive(Debug, Args)]
-struct SetTotpArgs {
-    #[command(flatten)]
-    profile: CredentialProfileArgs,
-
-    /// Read the TOTP seed/URI from the first line of standard input.
-    #[arg(long)]
-    secret_stdin: bool,
-}
-
-#[derive(Debug, Args)]
-struct StatusArgs {
-    #[command(flatten)]
-    profile: CredentialProfileArgs,
-}
-
-#[derive(Debug, Args)]
-struct RemoveArgs {
-    #[command(flatten)]
-    profile: CredentialProfileArgs,
-
-    #[arg(value_enum)]
-    kind: RemoveKind,
-}
-
-#[derive(Debug, Subcommand)]
-enum CredentialAction {
-    /// Store or replace the DSM password using masked input.
-    SetPassword(SetPasswordArgs),
-    /// Import DSM's existing TOTP manual key or provisioning URI.
-    SetTotp(SetTotpArgs),
-    /// Report only whether each vault entry exists.
-    Status(StatusArgs),
-    /// Remove one or both entries from the OS vault.
-    Remove(RemoveArgs),
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum RemoveKind {
-    Password,
-    Totp,
-    All,
-}
-
-pub(crate) fn run(credentials: CredentialsArgs) -> Result<()> {
-    match credentials.action {
+pub(crate) fn run(
+    credentials: &CredentialsArgs,
+    resolved: &ResolvedCredentialProfile,
+    selected_profile: Option<&Profile>,
+    quiet: bool,
+) -> Result<CredentialOutcome> {
+    match &credentials.action {
         CredentialAction::SetPassword(arguments) => {
-            let vault = open_credential_vault(&arguments.profile)?;
-            let password = read_new_password(arguments.password_stdin)?;
+            let vault = open_credential_vault(resolved, quiet)?;
+            let password_file = if arguments.password_stdin {
+                None
+            } else {
+                arguments.password_file.as_deref().or_else(|| {
+                    selected_profile.and_then(|profile| profile.password_file.as_deref())
+                })
+            };
+            let password = read_new_password(arguments.password_stdin, password_file)?;
             vault.store_password(&password)?;
-            eprintln!("Stored the DSM password in the OS credential vault.");
+            Ok(CredentialOutcome::StoredPassword)
         }
         CredentialAction::SetTotp(arguments) => {
-            let vault = open_credential_vault(&arguments.profile)?;
-            eprintln!(
-                "warning: storing the TOTP seed enables unattended login but places both factors under the same OS account"
-            );
-            let provisioning = read_totp_provisioning(arguments.secret_stdin)?;
+            let vault = open_credential_vault(resolved, quiet)?;
+            if !quiet {
+                eprintln!(
+                    "warning: storing the TOTP seed enables unattended login but places both factors under the same OS account"
+                );
+            }
+            let secret_file = if arguments.secret_stdin {
+                None
+            } else {
+                arguments.totp_secret_file.as_deref().or_else(|| {
+                    selected_profile.and_then(|profile| profile.totp_secret_file.as_deref())
+                })
+            };
+            let provisioning = read_totp_provisioning(arguments.secret_stdin, secret_file)?;
             let secret = parse_totp_secret(&provisioning)?;
             drop(provisioning);
             vault.store_totp_secret(&secret)?;
-            eprintln!("Stored the DSM TOTP seed in the OS credential vault.");
+            Ok(CredentialOutcome::StoredTotp)
         }
-        CredentialAction::Status(arguments) => {
-            let vault = open_credential_vault(&arguments.profile)?;
+        CredentialAction::Status(_) => {
+            let vault = open_credential_vault(resolved, quiet)?;
             let status = vault.status()?;
-            eprintln!(
-                "Password: {}",
-                if status.password {
-                    "stored"
-                } else {
-                    "not stored"
-                }
-            );
-            eprintln!(
-                "TOTP seed: {}",
-                if status.totp { "stored" } else { "not stored" }
-            );
+            Ok(CredentialOutcome::Status {
+                password_stored: status.password,
+                totp_stored: status.totp,
+            })
         }
         CredentialAction::Remove(arguments) => {
-            let vault = open_credential_vault(&arguments.profile)?;
+            let vault = open_credential_vault(resolved, quiet)?;
             match arguments.kind {
-                RemoveKind::Password => {
-                    print_removal("Password", vault.remove(CredentialKind::Password)?)
-                }
-                RemoveKind::Totp => print_removal("TOTP seed", vault.remove(CredentialKind::Totp)?),
-                RemoveKind::All => {
-                    print_removal("Password", vault.remove(CredentialKind::Password)?);
-                    print_removal("TOTP seed", vault.remove(CredentialKind::Totp)?);
-                }
+                RemoveKind::Password => Ok(CredentialOutcome::Removed {
+                    password_removed: Some(vault.remove(CredentialKind::Password)?),
+                    totp_removed: None,
+                }),
+                RemoveKind::Totp => Ok(CredentialOutcome::Removed {
+                    password_removed: None,
+                    totp_removed: Some(vault.remove(CredentialKind::Totp)?),
+                }),
+                RemoveKind::All => Ok(CredentialOutcome::Removed {
+                    password_removed: Some(vault.remove(CredentialKind::Password)?),
+                    totp_removed: Some(vault.remove(CredentialKind::Totp)?),
+                }),
             }
         }
     }
-    Ok(())
 }
 
-fn open_credential_vault(profile: &CredentialProfileArgs) -> Result<OsVault> {
-    if profile.allow_http {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CredentialOutcome {
+    StoredPassword,
+    StoredTotp,
+    Status {
+        password_stored: bool,
+        totp_stored: bool,
+    },
+    Removed {
+        password_removed: Option<bool>,
+        totp_removed: Option<bool>,
+    },
+}
+
+fn open_credential_vault(profile: &ResolvedCredentialProfile, quiet: bool) -> Result<OsVault> {
+    if profile.allow_http && !quiet {
         eprintln!(
             "warning: this vault profile permits HTTP; credentials may be exposed during sync"
         );
     }
     OsVault::new(&profile.url, &profile.username, profile.allow_http)
-}
-
-fn print_removal(label: &str, removed: bool) {
-    eprintln!(
-        "{label}: {}.",
-        if removed { "removed" } else { "not stored" }
-    );
 }
 
 #[derive(Clone, Copy)]
@@ -235,17 +185,29 @@ impl LoginClient for ApiClient {
     }
 }
 
-pub(crate) fn authenticate(
+pub(crate) fn authenticate_with_sources(
     client: &mut ApiClient,
     username: &str,
     password: &str,
     vault: &mut VaultSession<'_>,
+    totp_secret_file: Option<&Path>,
 ) -> Result<()> {
     let otp = secret_from_env(OTP_ENV)?;
     if let Some(code) = &otp {
         validate_otp_code(code, OTP_ENV)?;
     }
-    authenticate_with_otp(client, username, password, otp, || vault.generate_totp())
+    authenticate_with_otp(client, username, password, otp, || {
+        if let Some(path) = totp_secret_file {
+            let provisioning = read_secret_file(path, "TOTP seed")?;
+            let secret = parse_totp_secret(&provisioning)?;
+            drop(provisioning);
+            let code = generate_totp(&secret)?;
+            drop(secret);
+            Ok(Some(code))
+        } else {
+            vault.generate_totp()
+        }
+    })
 }
 
 fn authenticate_with_otp<C, F>(
@@ -373,10 +335,14 @@ fn generated_totp_rejected() -> Error {
     ))
 }
 
-pub(crate) fn read_password(
+pub(crate) fn read_password_with_file(
     from_stdin: bool,
+    from_file: Option<&Path>,
     vault: &mut VaultSession<'_>,
 ) -> Result<Zeroizing<String>> {
+    if let Some(path) = from_file {
+        return read_secret_file(path, "password");
+    }
     if from_stdin {
         return read_secret_line("password");
     }
@@ -402,7 +368,10 @@ pub(crate) fn read_password(
     prompt_secret("DSM password: ", "DSM password")
 }
 
-fn read_new_password(from_stdin: bool) -> Result<Zeroizing<String>> {
+fn read_new_password(from_stdin: bool, from_file: Option<&Path>) -> Result<Zeroizing<String>> {
+    if let Some(path) = from_file {
+        return read_secret_file(path, "password");
+    }
     if from_stdin {
         return read_secret_line("password");
     }
@@ -425,7 +394,10 @@ fn read_new_password(from_stdin: bool) -> Result<Zeroizing<String>> {
     Ok(password)
 }
 
-fn read_totp_provisioning(from_stdin: bool) -> Result<Zeroizing<String>> {
+fn read_totp_provisioning(from_stdin: bool, from_file: Option<&Path>) -> Result<Zeroizing<String>> {
+    if let Some(path) = from_file {
+        return read_secret_file(path, "TOTP seed");
+    }
     if from_stdin {
         return read_secret_line("TOTP seed");
     }
@@ -443,6 +415,24 @@ fn read_secret_line(label: &str) -> Result<Zeroizing<String>> {
     input
         .read_line(&mut line)
         .map_err(|error| Error::Message(format!("failed to read {label} from stdin: {error}")))?;
+    while line.ends_with(['\r', '\n']) {
+        line.pop();
+    }
+    validate_secret_input(&line, label)?;
+    Ok(line)
+}
+
+fn read_secret_file(path: &Path, label: &str) -> Result<Zeroizing<String>> {
+    let file = File::open(path).map_err(|source| Error::FileIo {
+        path: path.to_owned(),
+        source,
+    })?;
+    let mut line = Zeroizing::new(String::new());
+    let mut input = io::BufReader::new(file).take(MAX_STDIN_SECRET_BYTES);
+    input.read_line(&mut line).map_err(|source| Error::FileIo {
+        path: path.to_owned(),
+        source,
+    })?;
     while line.ends_with(['\r', '\n']) {
         line.pop();
     }
@@ -501,8 +491,23 @@ fn secret_from_env(name: &str) -> Result<Option<Zeroizing<String>>> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn secret_files_use_the_first_line_without_echoing_values() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("sdsync-secret-{nonce}.txt"));
+        fs::write(&path, b"first-secret\r\nignored\n").unwrap();
+        let secret = read_secret_file(&path, "test secret").unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(secret.as_str(), "first-secret");
+    }
 
     struct FakeLoginClient {
         replies: VecDeque<Result<()>>,

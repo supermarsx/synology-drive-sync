@@ -116,11 +116,19 @@ pub enum Error {
     #[error("source file changed while it was being uploaded: {0:?}")]
     SourceChanged(PathBuf),
 
+    #[error("operation cancelled")]
+    Cancelled,
+
     #[error("OS credential vault {operation} failed: {reason}")]
     Vault {
         operation: &'static str,
         reason: &'static str,
     },
+
+    /// Invalid non-secret CLI configuration. The binary maps this class to usage exit 2;
+    /// transport, DSM, filesystem, vault, and delivery failures remain operational exit 1.
+    #[error("{0}")]
+    Configuration(String),
 
     #[error("{0}")]
     Message(String),
