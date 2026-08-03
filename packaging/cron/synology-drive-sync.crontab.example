@@ -1,0 +1,3 @@
+# Run daily at 03:00. flock prevents overlap if a previous large upload is still running.
+# Create the state directory first and replace USER in all three paths.
+0 3 * * * /usr/bin/flock -n /home/USER/.local/state/synology-drive-sync.lock /usr/local/libexec/synology-drive-sync/cron-run /home/USER/.config/synology-drive-sync/cron.env >> /home/USER/.local/state/synology-drive-sync.log 2>&1

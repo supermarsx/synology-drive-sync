@@ -1,0 +1,419 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "synology-drive-sync observability and sync output records",
+  "description": "Stable JSON records for logs, progress, and plan/sync command output.",
+  "oneOf": [
+    { "$ref": "#/$defs/logEvent" },
+    { "$ref": "#/$defs/progressRecord" },
+    { "$ref": "#/$defs/jsonPlanDocument" },
+    { "$ref": "#/$defs/jsonSyncDocument" },
+    { "$ref": "#/$defs/ndjsonPlanSummary" },
+    { "$ref": "#/$defs/ndjsonPlanAction" },
+    { "$ref": "#/$defs/ndjsonCompletion" }
+  ],
+  "$defs": {
+    "nonNegativeInteger": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "nullableNonNegativeInteger": {
+      "oneOf": [
+        { "$ref": "#/$defs/nonNegativeInteger" },
+        { "type": "null" }
+      ]
+    },
+    "entryKind": {
+      "enum": ["file", "directory"]
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1
+    },
+    "remotePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^/"
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operations",
+        "files",
+        "bytes",
+        "elapsed_ms",
+        "throughput_bytes_per_second",
+        "eta_ms"
+      ],
+      "properties": {
+        "operations": { "$ref": "#/$defs/nonNegativeInteger" },
+        "files": { "$ref": "#/$defs/nonNegativeInteger" },
+        "bytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "elapsed_ms": { "$ref": "#/$defs/nonNegativeInteger" },
+        "throughput_bytes_per_second": { "$ref": "#/$defs/nonNegativeInteger" },
+        "eta_ms": { "$ref": "#/$defs/nullableNonNegativeInteger" }
+      }
+    },
+    "logEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "timestamp_ms",
+        "level",
+        "event",
+        "operation_id",
+        "attempt",
+        "metrics"
+      ],
+      "properties": {
+        "schema": { "const": "sdsync.log.v1" },
+        "timestamp_ms": { "$ref": "#/$defs/nonNegativeInteger" },
+        "level": {
+          "enum": ["error", "warn", "info", "debug", "trace"]
+        },
+        "event": {
+          "enum": [
+            "run.started",
+            "run.completed",
+            "run.failed",
+            "local_scan.started",
+            "local_scan.completed",
+            "api_discovery.started",
+            "api_discovery.completed",
+            "authentication.started",
+            "authentication.completed",
+            "remote_scan.started",
+            "remote_scan.completed",
+            "plan.ready",
+            "upload.started",
+            "upload.attempt_started",
+            "upload.progress",
+            "upload.completed",
+            "upload.failed",
+            "directory.created",
+            "entry.deleted",
+            "retry.scheduled",
+            "cancellation.requested"
+          ]
+        },
+        "operation_id": { "$ref": "#/$defs/nullableNonNegativeInteger" },
+        "attempt": { "$ref": "#/$defs/nullableNonNegativeInteger" },
+        "metrics": { "$ref": "#/$defs/metrics" }
+      }
+    },
+    "progressUpdate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "operation",
+        "kind",
+        "attempt",
+        "attempt_bytes",
+        "total_bytes"
+      ],
+      "properties": {
+        "operation_id": { "$ref": "#/$defs/nonNegativeInteger" },
+        "operation": {
+          "enum": [
+            "upload",
+            "create_directory",
+            "delete_entry",
+            "scan_local",
+            "scan_remote"
+          ]
+        },
+        "kind": {
+          "enum": [
+            "started",
+            "attempt_started",
+            "attempt_reset",
+            "advanced",
+            "succeeded",
+            "failed"
+          ]
+        },
+        "attempt": { "$ref": "#/$defs/nonNegativeInteger" },
+        "attempt_bytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "total_bytes": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "progressRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "totals",
+        "completed_operations",
+        "failed_operations",
+        "completed_files",
+        "failed_files",
+        "logical_bytes",
+        "wire_bytes",
+        "active_operations",
+        "elapsed_ms",
+        "throughput_bytes_per_second",
+        "eta_ms"
+      ],
+      "properties": {
+        "schema": { "const": "sdsync.progress.v1" },
+        "totals": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operations", "files", "bytes"],
+          "properties": {
+            "operations": { "$ref": "#/$defs/nonNegativeInteger" },
+            "files": { "$ref": "#/$defs/nonNegativeInteger" },
+            "bytes": { "$ref": "#/$defs/nonNegativeInteger" }
+          }
+        },
+        "completed_operations": { "$ref": "#/$defs/nonNegativeInteger" },
+        "failed_operations": { "$ref": "#/$defs/nonNegativeInteger" },
+        "completed_files": { "$ref": "#/$defs/nonNegativeInteger" },
+        "failed_files": { "$ref": "#/$defs/nonNegativeInteger" },
+        "logical_bytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "wire_bytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "active_operations": { "$ref": "#/$defs/nonNegativeInteger" },
+        "elapsed_ms": { "$ref": "#/$defs/nonNegativeInteger" },
+        "throughput_bytes_per_second": {
+          "type": "number",
+          "minimum": 0
+        },
+        "eta_ms": { "$ref": "#/$defs/nullableNonNegativeInteger" },
+        "update": { "$ref": "#/$defs/progressUpdate" }
+      }
+    },
+    "planSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "uploads",
+        "upload_bytes",
+        "directories",
+        "deletions",
+        "unchanged_files",
+        "protected_entries",
+        "changes"
+      ],
+      "properties": {
+        "uploads": { "$ref": "#/$defs/nonNegativeInteger" },
+        "upload_bytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "directories": { "$ref": "#/$defs/nonNegativeInteger" },
+        "deletions": { "$ref": "#/$defs/nonNegativeInteger" },
+        "unchanged_files": { "$ref": "#/$defs/nonNegativeInteger" },
+        "protected_entries": { "$ref": "#/$defs/nonNegativeInteger" },
+        "changes": { "type": "boolean" }
+      }
+    },
+    "deletePlanAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relative", "remote_path", "entry_kind", "type_conflict"],
+      "properties": {
+        "relative": { "$ref": "#/$defs/relativePath" },
+        "remote_path": { "$ref": "#/$defs/remotePath" },
+        "entry_kind": { "$ref": "#/$defs/entryKind" },
+        "type_conflict": { "type": "boolean" }
+      }
+    },
+    "createPlanAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relative", "remote_path"],
+      "properties": {
+        "relative": { "$ref": "#/$defs/relativePath" },
+        "remote_path": { "$ref": "#/$defs/remotePath" }
+      }
+    },
+    "uploadPlanAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relative", "remote_path", "bytes", "mtime_ms"],
+      "properties": {
+        "relative": { "$ref": "#/$defs/relativePath" },
+        "remote_path": { "$ref": "#/$defs/remotePath" },
+        "bytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "mtime_ms": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary", "actions"],
+      "properties": {
+        "summary": { "$ref": "#/$defs/planSummary" },
+        "actions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["pre_deletes", "creates", "uploads", "post_deletes"],
+          "properties": {
+            "pre_deletes": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/deletePlanAction" }
+            },
+            "creates": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/createPlanAction" }
+            },
+            "uploads": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/uploadPlanAction" }
+            },
+            "post_deletes": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/deletePlanAction" }
+            }
+          }
+        }
+      }
+    },
+    "executionResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "changed",
+        "uploaded",
+        "upload_bytes",
+        "directories_created",
+        "deleted",
+        "elapsed_ms"
+      ],
+      "properties": {
+        "changed": { "type": "boolean" },
+        "uploaded": { "$ref": "#/$defs/nonNegativeInteger" },
+        "upload_bytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "directories_created": { "$ref": "#/$defs/nonNegativeInteger" },
+        "deleted": { "$ref": "#/$defs/nonNegativeInteger" },
+        "elapsed_ms": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "unchangedResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["changed"],
+      "properties": {
+        "changed": { "const": false }
+      }
+    },
+    "jsonPlanDocument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "plan"],
+      "properties": {
+        "schema": { "const": "sdsync.plan.v1" },
+        "plan": { "$ref": "#/$defs/plan" }
+      }
+    },
+    "jsonSyncDocument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "plan", "result"],
+      "properties": {
+        "schema": { "const": "sdsync.sync.v1" },
+        "plan": { "$ref": "#/$defs/plan" },
+        "result": {
+          "oneOf": [
+            { "$ref": "#/$defs/executionResult" },
+            { "$ref": "#/$defs/unchangedResult" }
+          ]
+        }
+      }
+    },
+    "ndjsonPlanSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "kind",
+        "uploads",
+        "upload_bytes",
+        "directories",
+        "deletions",
+        "unchanged_files",
+        "protected_entries",
+        "changes"
+      ],
+      "properties": {
+        "schema": { "const": "sdsync.plan.v1" },
+        "kind": { "const": "summary" },
+        "uploads": { "$ref": "#/$defs/nonNegativeInteger" },
+        "upload_bytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "directories": { "$ref": "#/$defs/nonNegativeInteger" },
+        "deletions": { "$ref": "#/$defs/nonNegativeInteger" },
+        "unchanged_files": { "$ref": "#/$defs/nonNegativeInteger" },
+        "protected_entries": { "$ref": "#/$defs/nonNegativeInteger" },
+        "changes": { "type": "boolean" }
+      }
+    },
+    "ndjsonDeleteAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "action", "relative", "remote_path", "entry_kind"],
+      "properties": {
+        "schema": { "const": "sdsync.plan-action.v1" },
+        "action": { "enum": ["delete-conflict", "delete"] },
+        "relative": { "$ref": "#/$defs/relativePath" },
+        "remote_path": { "$ref": "#/$defs/remotePath" },
+        "entry_kind": { "$ref": "#/$defs/entryKind" }
+      }
+    },
+    "ndjsonCreateAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "action", "relative", "remote_path"],
+      "properties": {
+        "schema": { "const": "sdsync.plan-action.v1" },
+        "action": { "const": "create-directory" },
+        "relative": { "$ref": "#/$defs/relativePath" },
+        "remote_path": { "$ref": "#/$defs/remotePath" }
+      }
+    },
+    "ndjsonUploadAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "action", "relative", "remote_path", "bytes", "mtime_ms"],
+      "properties": {
+        "schema": { "const": "sdsync.plan-action.v1" },
+        "action": { "const": "upload" },
+        "relative": { "$ref": "#/$defs/relativePath" },
+        "remote_path": { "$ref": "#/$defs/remotePath" },
+        "bytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "mtime_ms": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "ndjsonPlanAction": {
+      "oneOf": [
+        { "$ref": "#/$defs/ndjsonDeleteAction" },
+        { "$ref": "#/$defs/ndjsonCreateAction" },
+        { "$ref": "#/$defs/ndjsonUploadAction" }
+      ]
+    },
+    "ndjsonCompletionWithResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "kind", "result"],
+      "properties": {
+        "schema": { "const": "sdsync.output.v1" },
+        "kind": { "const": "completion" },
+        "result": { "$ref": "#/$defs/executionResult" }
+      }
+    },
+    "ndjsonUnchangedCompletion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "kind", "changed"],
+      "properties": {
+        "schema": { "const": "sdsync.output.v1" },
+        "kind": { "const": "completion" },
+        "changed": { "const": false }
+      }
+    },
+    "ndjsonCompletion": {
+      "oneOf": [
+        { "$ref": "#/$defs/ndjsonCompletionWithResult" },
+        { "$ref": "#/$defs/ndjsonUnchangedCompletion" }
+      ]
+    }
+  }
+}

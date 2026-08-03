@@ -1,0 +1,47 @@
+[Unit]
+Description=One-way local folder sync to Synology Drive
+Documentation=https://github.com/supermarsx/synology-drive-sync
+Wants=network-online.target
+After=network-online.target
+ConditionPathIsExecutable=/usr/local/bin/synology-drive-sync
+ConditionPathExists=/etc/synology-drive-sync/sync.env
+
+[Service]
+Type=oneshot
+User=sdsync
+Group=sdsync
+EnvironmentFile=/etc/synology-drive-sync/sync.env
+LoadCredential=dsm-password:/etc/synology-drive-sync/dsm-password
+ExecStart=/usr/local/libexec/synology-drive-sync/systemd-run
+TimeoutStartSec=2h15m
+UMask=0077
+
+# The sync process needs outbound HTTPS and read access to its configured source.
+# RestrictAddressFamilies reduces socket-family surface; it is not an egress firewall.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,5 @@
+[Service]
+# Install this file as:
+# /etc/systemd/system/synology-drive-sync.service.d/totp.conf
+LoadCredential=dsm-totp:/etc/synology-drive-sync/dsm-totp
+Environment=SDSYNC_USE_TOTP_CREDENTIAL=true

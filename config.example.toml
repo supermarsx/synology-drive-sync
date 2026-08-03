@@ -1,0 +1,70 @@
+# synology-drive-sync configuration is deliberately non-secret.
+#
+# Copy this file to the platform path printed by:
+#   synology-drive-sync config path
+#
+# Relative paths are resolved from the directory containing this file. Unknown
+# keys are rejected. Passwords, TOTP seeds, current OTP codes, and bearer-token
+# values are not valid TOML fields; only protected file paths or the name of a
+# token-bearing environment variable may be configured.
+
+default-profile = "production"
+
+[profiles.production]
+# SOURCE and REMOTE may be omitted here and supplied to each sync/plan command.
+source = "./data/export"
+remote = "/team-folder/project"
+
+# Public File Station reverse-proxy URL and dedicated DSM account.
+url = "https://files.example.com"
+username = "mirror-bot"
+
+# Prefer the current user's OS vault. For headless services, uncomment protected
+# secret-file paths and set no-vault=true. Never paste secret values into TOML.
+# password-file = "./secrets/dsm-password"
+# totp-secret-file = "./secrets/dsm-totp"
+no-vault = false
+
+# Sync selection and comparison.
+compare = "metadata" # metadata | size-only
+jobs = 2              # 1..16
+excludes = ["target/", "*.tmp", ".cache/"]
+
+# Additive/update-only is the safe default. Enabling delete makes the remote an
+# exact mirror and should be paired with an intentionally small deletion cap.
+delete = false
+allow-empty-source = false
+max-delete = 100
+
+# Network behavior.
+retries = 2            # 0..5
+timeout = 7200         # per-request seconds; cover the largest upload
+connect-timeout = 15   # TCP/TLS connection seconds
+# ca-certificate = "./pki/private-root.pem"
+allow-http = false
+danger-accept-invalid-certs = false
+
+# Diagnostics and result output are independent. -v/-vv and CLI options override
+# these values. Secret-free logs go to stderr unless quiet=true.
+verbose = 0
+quiet = false
+log-level = "info"       # trace | debug | info | warn | error | off
+log-format = "human"     # human | json
+# log-file = "./logs/synology-drive-sync.log"
+progress = "auto"        # auto | always | never
+output = "human"         # human | json | ndjson
+
+# Optional HTTPS structured-log collector. Select at most one token source.
+# When neither is set, SDSYNC_REMOTE_LOG_TOKEN is used.
+# remote-log-url = "https://logs.example.com/v1/events"
+# remote-log-token-file = "./secrets/log-token"
+# remote-log-token-env = "SDSYNC_REMOTE_LOG_TOKEN"
+remote-log-mode = "best-effort" # best-effort | required
+
+# Profiles are independent; there is no inheritance. This minimal profile leaves
+# SOURCE and REMOTE to each invocation:
+#
+# [profiles.personal]
+# url = "https://files.example.com/nas/"
+# username = "alice"
+# jobs = 4

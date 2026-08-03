@@ -1,0 +1,14 @@
+.git
+.github
+.gitignore
+.secrets
+secrets
+target
+packaging/cron
+packaging/launchd
+packaging/systemd
+packaging/windows
+*.log
+*.md
+!README.md
+!LICENSE

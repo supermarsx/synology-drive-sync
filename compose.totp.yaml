@@ -1,0 +1,20 @@
+services:
+  sync:
+    secrets:
+      - sdsync_totp
+    command:
+      - sync
+      - /source
+      - ${SDSYNC_REMOTE:-/team-folder/project}
+      - --password-file
+      - /run/secrets/sdsync_password
+      - --totp-secret-file
+      - /run/secrets/sdsync_totp
+      - --no-vault
+      - --jobs
+      - ${SDSYNC_JOBS:-2}
+
+secrets:
+  sdsync_totp:
+    # Store the Base32 TOTP seed, not a generated one-time code.
+    file: ${SDSYNC_TOTP_SECRET_FILE:?Set SDSYNC_TOTP_SECRET_FILE to an absolute host secret-file path}

@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -84,6 +86,17 @@ pub struct RemoteInventory {
     pub entries: BTreeMap<String, RemoteEntry>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UploadTransferEvent {
+    AttemptStarted { attempt: u32 },
+    Advanced { bytes: u64 },
+    Completed,
+    Failed,
+}
+
+/// Return `false` from an observer to cancel the transfer at the next safe read boundary.
+pub type UploadObserver = Arc<dyn Fn(UploadTransferEvent) -> bool + Send + Sync>;
+
 impl ApiClient {
     pub fn connect(options: &ClientOptions) -> Result<Self> {
         let base = normalize_base_url(&options.base_url, options.allow_http)?;
@@ -91,7 +104,7 @@ impl ApiClient {
             .connect_timeout(options.connect_timeout)
             .timeout(options.request_timeout)
             .redirect(Policy::none())
-            .user_agent(concat!("synology-drive-sync/", env!("CARGO_PKG_VERSION")));
+            .user_agent(concat!("synology-drive-sync/", env!("SDSYNC_VERSION")));
 
         if options.accept_invalid_certs {
             builder = builder.danger_accept_invalid_certs(true);
@@ -335,15 +348,54 @@ impl ApiClient {
     }
 
     pub fn upload(&self, local: &LocalEntry, remote_file: &str) -> Result<()> {
+        self.upload_observed(local, remote_file, None)
+    }
+
+    pub fn upload_observed(
+        &self,
+        local: &LocalEntry,
+        remote_file: &str,
+        observer: Option<UploadObserver>,
+    ) -> Result<()> {
+        let result = self.upload_observed_inner(local, remote_file, observer.clone());
+        if let Some(observer) = observer {
+            let _ = observer(if result.is_ok() {
+                UploadTransferEvent::Completed
+            } else {
+                UploadTransferEvent::Failed
+            });
+        }
+        result
+    }
+
+    fn upload_observed_inner(
+        &self,
+        local: &LocalEntry,
+        remote_file: &str,
+        observer: Option<UploadObserver>,
+    ) -> Result<()> {
         let (remote_parent, remote_name) = parent_and_name(remote_file)?;
+        let observer_cancelled = Arc::new(AtomicBool::new(false));
         for attempt in 0..=self.retries {
+            if observer.as_ref().is_some_and(|observer| {
+                !observer(UploadTransferEvent::AttemptStarted {
+                    attempt: attempt + 1,
+                })
+            }) {
+                return Err(Error::Cancelled);
+            }
             verify_local_snapshot(local)?;
             let file = File::open(&local.full_path).map_err(|source| Error::FileIo {
                 path: local.full_path.clone(),
                 source,
             })?;
             verify_open_file_snapshot(local, &file)?;
-            let part = Part::reader_with_length(file, local.size)
+            let reader = ObservedReader {
+                inner: file,
+                observer: observer.clone(),
+                cancelled: Arc::clone(&observer_cancelled),
+            };
+            let part = Part::reader_with_length(reader, local.size)
                 .file_name(remote_name.to_owned())
                 .mime_str("application/octet-stream")
                 .map_err(|source| Error::Http {
@@ -378,6 +430,7 @@ impl ApiClient {
                     source,
                 }),
             };
+            let result = prioritize_observer_cancellation(&observer_cancelled, result);
             match result {
                 Ok(()) => {
                     verify_local_snapshot(local)?;
@@ -558,9 +611,12 @@ impl ApiClient {
         method: &str,
         allow_retry: bool,
     ) -> Result<Option<T>> {
+        // These owned copies can include SID/SynoToken values. Erase them after the final
+        // attempt; each per-attempt clone is erased by `send_form_once` as well.
+        let fields = Zeroizing::new(fields);
         let attempts = if allow_retry { self.retries } else { 0 };
         for attempt in 0..=attempts {
-            let result = self.send_form_once(url.clone(), fields.clone(), api, method);
+            let result = self.send_form_once(url.clone(), fields.to_vec(), api, method);
             match result {
                 Ok(value) => return Ok(value),
                 Err(error) if attempt < attempts && retryable(&error) => retry_pause(attempt),
@@ -577,10 +633,14 @@ impl ApiClient {
         api: &str,
         method: &str,
     ) -> Result<Option<T>> {
+        // Passwords, OTPs, and session values enter this owned form field list. reqwest must
+        // still serialize its own request-body copy, but this caller-owned copy is short-lived
+        // and explicitly erased.
+        let fields = Zeroizing::new(fields);
         let response = self
             .http
             .post(url)
-            .form(&fields)
+            .form(&*fields)
             .send()
             .map_err(|source| Error::Http {
                 operation: format!("{api}.{method}"),
@@ -694,7 +754,16 @@ fn decode_response<T: DeserializeOwned>(
     method: &str,
 ) -> Result<Option<T>> {
     let status = response.status();
-    let mut body = Vec::new();
+    // API discovery is the only unauthenticated response decoded here. Every other API either
+    // receives login material or an authenticated SID/SynoToken. Default to withholding those
+    // response bodies so a diagnostic proxy cannot reflect request secrets into user-visible
+    // errors or logs.
+    let withhold_response_body = api != "SYNO.API.Info";
+    // Successful authentication responses contain the SID and may contain a SynoToken;
+    // challenge responses can contain a short-lived challenge token. Erase the raw response
+    // allocation after decoding. Deserialized and reqwest-owned intermediary allocations are
+    // separate and cannot all be guaranteed zeroized by this layer.
+    let mut body = Zeroizing::new(Vec::new());
     response
         .by_ref()
         .take(MAX_JSON_RESPONSE + 1)
@@ -713,8 +782,8 @@ fn decode_response<T: DeserializeOwned>(
         return Err(Error::HttpStatus {
             operation: format!("{api}.{method}"),
             status,
-            message: if api == "SYNO.API.Auth" {
-                "authentication response body withheld".to_owned()
+            message: if withhold_response_body {
+                withheld_response_message(api).to_owned()
             } else {
                 http_status_hint(status, &body)
             },
@@ -722,8 +791,8 @@ fn decode_response<T: DeserializeOwned>(
     }
 
     let envelope: Envelope<T> = serde_json::from_slice(&body).map_err(|error| {
-        let snippet = if api == "SYNO.API.Auth" {
-            "[authentication response body withheld]".to_owned()
+        let snippet = if withhold_response_body {
+            format!("[{}]", withheld_response_message(api))
         } else {
             response_snippet(&body)
         };
@@ -752,14 +821,23 @@ fn decode_response<T: DeserializeOwned>(
         operation: method.to_owned(),
         code: error.code,
         description,
-        // DSM 7 auth challenges can contain a short-lived challenge token. Never retain it
-        // in an error that the CLI (or Debug logging) might print.
-        details: if api == "SYNO.API.Auth" {
+        // Auth challenges can contain short-lived challenge tokens, and a diagnostic proxy can
+        // reflect authenticated request fields. Never retain either class of response detail in
+        // an error that the CLI (or Debug logging) might print.
+        details: if withhold_response_body {
             Vec::new()
         } else {
             error_details(error.errors)
         },
     })
+}
+
+fn withheld_response_message(api: &str) -> &'static str {
+    if api == "SYNO.API.Auth" {
+        "authentication response body withheld"
+    } else {
+        "authenticated API response body withheld"
+    }
 }
 
 fn error_details(value: Value) -> Vec<Value> {
@@ -822,6 +900,39 @@ fn endpoint_url(base: &Url, discovered_path: &str) -> Result<Url> {
         });
     }
     Ok(endpoint)
+}
+
+struct ObservedReader<R> {
+    inner: R,
+    observer: Option<UploadObserver>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl<R: Read> Read for ObservedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        if count > 0
+            && let Some(observer) = &self.observer
+            && !observer(UploadTransferEvent::Advanced {
+                bytes: count as u64,
+            })
+        {
+            self.cancelled.store(true, Ordering::Release);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "upload cancelled",
+            ));
+        }
+        Ok(count)
+    }
+}
+
+fn prioritize_observer_cancellation(cancelled: &AtomicBool, result: Result<()>) -> Result<()> {
+    if cancelled.load(Ordering::Acquire) {
+        Err(Error::Cancelled)
+    } else {
+        result
+    }
 }
 
 fn verify_local_snapshot(local: &LocalEntry) -> Result<()> {
@@ -1013,6 +1124,7 @@ fn api_error_description(api: &str, code: i64) -> Option<&'static str> {
 mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
+    use std::sync::Mutex;
     use std::thread::JoinHandle;
     use std::time::SystemTime;
 
@@ -1026,11 +1138,22 @@ mod tests {
     }
 
     fn scripted_server(responses: Vec<String>) -> (String, JoinHandle<Vec<CapturedRequest>>) {
+        scripted_server_with_status(
+            responses
+                .into_iter()
+                .map(|body| (StatusCode::OK, body))
+                .collect(),
+        )
+    }
+
+    fn scripted_server_with_status(
+        responses: Vec<(StatusCode, String)>,
+    ) -> (String, JoinHandle<Vec<CapturedRequest>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
             let mut requests = Vec::new();
-            for response_body in responses {
+            for (status, response_body) in responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut received = Vec::new();
                 let header_end = loop {
@@ -1070,7 +1193,9 @@ mod tests {
 
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status.as_u16(),
+                    status.canonical_reason().unwrap_or("Unknown"),
                     response_body.len(),
                     response_body
                 )
@@ -1086,6 +1211,129 @@ mod tests {
         haystack
             .windows(needle.len())
             .position(|window| window == needle)
+    }
+
+    fn decode_scripted_error(status: StatusCode, body: String, api: &str, method: &str) -> Error {
+        let (base, server) = scripted_server_with_status(vec![(status, body)]);
+        let url = Url::parse(&base).unwrap().join("webapi/entry.cgi").unwrap();
+        let response = HttpClient::new().post(url).send().unwrap();
+        let error = decode_response::<Value>(response, api, method).unwrap_err();
+        assert_eq!(server.join().unwrap().len(), 1);
+        error
+    }
+
+    fn rendered_error(error: &Error) -> String {
+        format!("{error}\n{error:?}")
+    }
+
+    #[test]
+    fn authenticated_responses_never_echo_raw_server_content() {
+        let session_marker = "reflected-secret-sid-and-synotoken";
+
+        let status_error = decode_scripted_error(
+            StatusCode::BAD_GATEWAY,
+            format!("proxy reflected _sid={session_marker}&SynoToken={session_marker}"),
+            "SYNO.FileStation.List",
+            "list",
+        );
+        let rendered = rendered_error(&status_error);
+        assert!(rendered.contains("HTTP 502 Bad Gateway"));
+        assert!(rendered.contains("authenticated API response body withheld"));
+        assert!(!rendered.contains(session_marker));
+
+        let malformed_error = decode_scripted_error(
+            StatusCode::OK,
+            format!("<html>reflected {session_marker}</html>"),
+            "SYNO.FileStation.Upload",
+            "upload",
+        );
+        let rendered = rendered_error(&malformed_error);
+        assert!(rendered.contains("authenticated API response body withheld"));
+        assert!(rendered.contains("proxy returned HTML"));
+        assert!(!rendered.contains(session_marker));
+
+        let api_error = decode_scripted_error(
+            StatusCode::OK,
+            serde_json::json!({
+                "success": false,
+                "error": {"code": 900, "errors": {"reflected": session_marker}}
+            })
+            .to_string(),
+            "SYNO.FileStation.Delete",
+            "delete",
+        );
+        let rendered = rendered_error(&api_error);
+        assert!(rendered.contains("code 900: delete failed"));
+        assert!(!rendered.contains(session_marker));
+        assert!(matches!(api_error, Error::Api { details, .. } if details.is_empty()));
+    }
+
+    #[test]
+    fn authentication_is_redacted_while_discovery_keeps_safe_route_diagnostics() {
+        let password_marker = "reflected-password-marker";
+        let auth_error = decode_scripted_error(
+            StatusCode::OK,
+            format!("<html>passwd={password_marker}&otp_code=654321</html>"),
+            "SYNO.API.Auth",
+            "login",
+        );
+        let rendered = rendered_error(&auth_error);
+        assert!(rendered.contains("authentication response body withheld"));
+        assert!(rendered.contains("proxy returned HTML"));
+        assert!(!rendered.contains(password_marker));
+        assert!(!rendered.contains("654321"));
+
+        let discovery_marker = "safe-unauthenticated-route-diagnostic";
+        let discovery_error = decode_scripted_error(
+            StatusCode::OK,
+            format!("<html>{discovery_marker}</html>"),
+            "SYNO.API.Info",
+            "query",
+        );
+        let rendered = rendered_error(&discovery_error);
+        assert!(rendered.contains(discovery_marker));
+        assert!(rendered.contains("proxy returned HTML"));
+    }
+
+    #[test]
+    fn observed_reader_reports_bytes_and_can_cancel() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let observer: UploadObserver = Arc::new(move |event| {
+            captured.lock().unwrap().push(event);
+            true
+        });
+        let mut reader = ObservedReader {
+            inner: std::io::Cursor::new(b"payload"),
+            observer: Some(observer),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output, b"payload");
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[UploadTransferEvent::Advanced { bytes: 7 }]
+        );
+
+        let observer: UploadObserver = Arc::new(|_| false);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut reader = ObservedReader {
+            inner: std::io::Cursor::new(b"cancel"),
+            observer: Some(observer),
+            cancelled: Arc::clone(&cancelled),
+        };
+        let error = reader.read(&mut [0_u8; 8]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert!(cancelled.load(Ordering::Acquire));
+
+        let wrapped = Err(Error::Message(
+            "reqwest wrapped the interrupted body read".to_owned(),
+        ));
+        assert!(matches!(
+            prioritize_observer_cancellation(&cancelled, wrapped),
+            Err(Error::Cancelled)
+        ));
     }
 
     #[test]

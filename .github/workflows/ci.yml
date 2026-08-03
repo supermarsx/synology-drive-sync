@@ -9,6 +9,25 @@ permissions:
   contents: read
 
 jobs:
+  supply-chain:
+    name: RustSec and license notices
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Audit locked dependencies against fresh RustSec data
+        run: bash .github/scripts/run-cargo-audit.sh
+      - name: Reproduce third-party notices from Cargo.lock
+        run: bash .github/scripts/generate-third-party-notices.sh "$RUNNER_TEMP/THIRD_PARTY_LICENSES.html"
+      - name: Refuse stale third-party notices
+        run: cmp --silent THIRD_PARTY_LICENSES.html "$RUNNER_TEMP/THIRD_PARTY_LICENSES.html"
+
   test:
     strategy:
       fail-fast: false
@@ -16,11 +35,11 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Formatting
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
@@ -34,10 +53,10 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
         with:
           toolchain: 1.88.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Rust 1.88 compatibility
         run: cargo test --locked --all-targets

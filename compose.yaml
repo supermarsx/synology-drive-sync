@@ -1,0 +1,44 @@
+name: synology-drive-sync
+
+services:
+  sync:
+    build:
+      context: .
+      args:
+        VERSION: local
+    image: synology-drive-sync:local
+    init: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    environment:
+      SDSYNC_URL: ${SDSYNC_URL:?Set SDSYNC_URL to the public HTTPS File Station reverse-proxy URL}
+      SDSYNC_USERNAME: ${SDSYNC_USERNAME:?Set SDSYNC_USERNAME to the DSM account}
+    volumes:
+      - type: bind
+        source: ${SDSYNC_SOURCE:?Set SDSYNC_SOURCE to the absolute host source directory}
+        target: /source
+        read_only: true
+    secrets:
+      - sdsync_password
+    command:
+      - sync
+      - /source
+      - ${SDSYNC_REMOTE:-/team-folder/project}
+      - --password-file
+      - /run/secrets/sdsync_password
+      - --no-vault
+      - --jobs
+      - ${SDSYNC_JOBS:-2}
+    restart: "no"
+
+secrets:
+  sdsync_password:
+    # Keep this file outside the repository and make it readable only by its owner.
+    file: ${SDSYNC_PASSWORD_FILE:?Set SDSYNC_PASSWORD_FILE to an absolute host secret-file path}
