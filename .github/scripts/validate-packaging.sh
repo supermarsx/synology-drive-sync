@@ -5,7 +5,11 @@ repository_root=$(git rev-parse --show-toplevel)
 cd "$repository_root"
 
 mapfile -d '' shell_scripts < <(
-    git ls-files --cached --others --exclude-standard -z -- '*.sh'
+    git ls-files --cached --others --exclude-standard -z -- \
+        '*.sh' \
+        'packaging/synology/package/bin/*' \
+        'packaging/synology/package/libexec/*' \
+        'packaging/synology/scripts/*'
 )
 if (( ${#shell_scripts[@]} == 0 )); then
     echo 'no shell scripts found to validate' >&2

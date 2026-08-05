@@ -6,10 +6,12 @@ accepted = [
     "Unicode-3.0",
 ]
 
-# Release notices cover every native target, including platform-vault dependencies.
+# Release notices cover every archive and DSM target, including platform-vault dependencies.
 targets = [
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
     "x86_64-pc-windows-msvc",
     "aarch64-pc-windows-msvc",
     "x86_64-apple-darwin",

@@ -99,6 +99,90 @@ jobs:
       - name: Rust 1.88 compatibility
         run: cargo test --locked --all-targets
 
+  synology-package:
+    name: Synology package ${{ matrix.synology_arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-musl
+            synology_arch: x86_64
+            elf_machine: Advanced Micro Devices X86-64
+          - runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+            synology_arch: armv8
+            elf_machine: AArch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
+        with:
+          toolchain: 1.88.0
+          targets: ${{ matrix.rust_target }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: synology-${{ matrix.synology_arch }}
+      - name: Install native musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes musl-tools
+      - name: Build DSM-portable static binary
+        env:
+          SDSYNC_BUILD_VERSION: 0.0.0
+          RUST_TARGET: ${{ matrix.rust_target }}
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --locked --target "$RUST_TARGET"
+      - name: Verify DSM binary architecture and static linkage
+        shell: bash
+        env:
+          ELF_MACHINE: ${{ matrix.elf_machine }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          set -euo pipefail
+          binary="target/$RUST_TARGET/release/synology-drive-sync"
+          machine=$(readelf --file-header --wide "$binary" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')
+          [[ "$machine" == "$ELF_MACHINE" ]] || {
+            echo "unexpected ELF machine: $machine (expected $ELF_MACHINE)" >&2
+            exit 1
+          }
+          if readelf --program-headers --wide "$binary" | grep -q 'INTERP'; then
+            echo 'DSM binary must not require a host ELF interpreter' >&2
+            exit 1
+          fi
+          if readelf --dynamic --wide "$binary" 2>/dev/null | grep -q 'NEEDED'; then
+            echo 'DSM binary must not require host dynamic libraries' >&2
+            exit 1
+          fi
+          reported=$("$binary" --version)
+          [[ "$reported" == 'synology-drive-sync 0.0.0' ]]
+      - name: Assemble and validate installable SPK
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          SYNOLOGY_ARCH: ${{ matrix.synology_arch }}
+        run: |
+          set -euo pipefail
+          binary="target/$RUST_TARGET/release/synology-drive-sync"
+          bash packaging/synology/build-spk.sh \
+            --binary "$binary" \
+            --arch "$SYNOLOGY_ARCH" \
+            --version 0.0.0 \
+            --output dist
+          spk="dist/synology-drive-sync-0.0.0-$SYNOLOGY_ARCH.spk"
+          python3 packaging/synology/validate_spk.py \
+            --binary "$binary" \
+            --arch "$SYNOLOGY_ARCH" \
+            "$spk"
+
   packaging:
     name: Packaging and container smoke test
     runs-on: ubuntu-24.04
@@ -111,9 +195,17 @@ jobs:
           persist-credentials: false
       - name: Validate shell and Docker input line endings
         run: bash .github/scripts/validate-packaging.sh
+      - name: Validate Synology package templates
+        run: python3 packaging/synology/validate_spk.py
+      - name: Test Synology package builder and DSM lifecycle
+        run: python3 packaging/synology/test_synology_package.py
       - name: Parse PowerShell packaging scripts
         shell: pwsh
         run: ./.github/scripts/validate-powershell.ps1
+      - name: Validate GitHub Actions workflows
+        env:
+          ACTIONLINT_VERSION: v1.7.12
+        run: go run "github.com/rhysd/actionlint/cmd/actionlint@$ACTIONLINT_VERSION"
       - name: Validate Compose configurations
         env:
           SDSYNC_URL: https://files.example.invalid

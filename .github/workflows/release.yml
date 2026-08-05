@@ -332,6 +332,102 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  build-synology:
+    name: Build Synology DSM ${{ matrix.synology_arch }}
+    needs: version
+    if: needs.version.outputs.already_published != 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-musl
+            synology_arch: x86_64
+            elf_machine: Advanced Micro Devices X86-64
+          - runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+            synology_arch: armv8
+            elf_machine: AArch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
+        with:
+          toolchain: 1.88.0
+          targets: ${{ matrix.rust_target }}
+      - name: Install native musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes musl-tools
+      - name: Build DSM-portable static binary
+        env:
+          SDSYNC_BUILD_VERSION: ${{ needs.version.outputs.tag }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --locked --target "$RUST_TARGET"
+      - name: Verify DSM binary architecture and static linkage
+        shell: bash
+        env:
+          ELF_MACHINE: ${{ matrix.elf_machine }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          binary="target/$RUST_TARGET/release/synology-drive-sync"
+          machine=$(readelf --file-header --wide "$binary" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')
+          [[ "$machine" == "$ELF_MACHINE" ]] || {
+            echo "unexpected ELF machine: $machine (expected $ELF_MACHINE)" >&2
+            exit 1
+          }
+          if readelf --program-headers --wide "$binary" | grep -q 'INTERP'; then
+            echo 'DSM binary must not require a host ELF interpreter' >&2
+            exit 1
+          fi
+          if readelf --dynamic --wide "$binary" 2>/dev/null | grep -q 'NEEDED'; then
+            echo 'DSM binary must not require host dynamic libraries' >&2
+            exit 1
+          fi
+          reported=$("$binary" --version)
+          expected="synology-drive-sync $TAG"
+          [[ "$reported" == "$expected" ]] || {
+            echo "DSM binary version did not exactly match $expected: $reported" >&2
+            exit 1
+          }
+      - name: Assemble and validate installable SPK
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          SYNOLOGY_ARCH: ${{ matrix.synology_arch }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          binary="target/$RUST_TARGET/release/synology-drive-sync"
+          bash packaging/synology/build-spk.sh \
+            --binary "$binary" \
+            --arch "$SYNOLOGY_ARCH" \
+            --version "$TAG" \
+            --output dist
+          spk="dist/synology-drive-sync-$TAG-$SYNOLOGY_ARCH.spk"
+          python3 packaging/synology/validate_spk.py \
+            --binary "$binary" \
+            --arch "$SYNOLOGY_ARCH" \
+            "$spk"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-synology-${{ matrix.synology_arch }}
+          path: dist/synology-drive-sync-${{ needs.version.outputs.tag }}-${{ matrix.synology_arch }}.spk
+          if-no-files-found: error
+          retention-days: 7
+
   sbom:
     name: Dependency SBOM
     needs: version
@@ -488,7 +584,7 @@ jobs:
 
   stage-release:
     name: Stage GitHub Release draft
-    needs: [version, build-unix, build-windows, sbom, image]
+    needs: [version, build-unix, build-windows, build-synology, sbom, image]
     if: needs.version.outputs.already_published != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -517,14 +613,33 @@ jobs:
           install -m 0755 packaging/install.sh dist/install.sh
           install -m 0644 packaging/install.ps1 dist/install.ps1
           install -m 0644 THIRD_PARTY_LICENSES.html dist/THIRD_PARTY_LICENSES.html
+          python3 packaging/synology/validate_spk.py \
+            --arch armv8 \
+            "dist/synology-drive-sync-$TAG-armv8.spk"
+          python3 packaging/synology/validate_spk.py \
+            --arch x86_64 \
+            "dist/synology-drive-sync-$TAG-x86_64.spk"
           cd dist
-          mapfile -t archives < <(
+          expected_archives=(
+            "synology-drive-sync-$TAG-armv8.spk"
+            "synology-drive-sync-$TAG-linux-aarch64.tar.gz"
+            "synology-drive-sync-$TAG-linux-x86_64.tar.gz"
+            "synology-drive-sync-$TAG-macos-aarch64.tar.gz"
+            "synology-drive-sync-$TAG-macos-x86_64.tar.gz"
+            "synology-drive-sync-$TAG-windows-aarch64.zip"
+            "synology-drive-sync-$TAG-windows-x86_64.zip"
+            "synology-drive-sync-$TAG-x86_64.spk"
+          )
+          mapfile -t actual_archives < <(
             find . -maxdepth 1 -type f \
-              \( -name '*.tar.gz' -o -name '*.zip' \) \
+              \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.spk' \) \
               -printf '%f\n' \
               | sort
           )
-          [[ ${#archives[@]} -eq 6 ]]
+          diff -u \
+            <(printf '%s\n' "${expected_archives[@]}") \
+            <(printf '%s\n' "${actual_archives[@]}")
+          archives=("${expected_archives[@]}")
           sbom="synology-drive-sync-$TAG.cdx.json"
           [[ -f "$sbom" ]]
           LC_ALL=C sha256sum -- "${archives[@]}" > ARCHIVE_SHA256SUMS
@@ -610,7 +725,7 @@ jobs:
           mapfile -d '' -t assets < <(
             find dist -maxdepth 1 -type f -print0 | sort -z
           )
-          [[ ${#assets[@]} -eq 11 ]]
+          [[ ${#assets[@]} -eq 13 ]]
           gh release upload "$TAG" "${assets[@]}" --clobber
 
           mapfile -t local_names < <(
@@ -730,11 +845,30 @@ jobs:
             echo "draft release $TAG targets $target, expected $SHA" >&2
             exit 1
           fi
-          asset_count=$(gh api --paginate \
+          mapfile -t remote_names < <(
+            gh api --paginate \
             "repos/$GITHUB_REPOSITORY/releases/$(jq -r '.id' "$release_json")/assets?per_page=100" \
-            --jq '.[].name' \
-            | wc -l)
-          [[ "$asset_count" -eq 11 ]]
+              --jq '.[].name' \
+              | sort
+          )
+          expected_names=(
+            SHA256SUMS
+            THIRD_PARTY_LICENSES.html
+            install.ps1
+            install.sh
+            "synology-drive-sync-$TAG-armv8.spk"
+            "synology-drive-sync-$TAG-linux-aarch64.tar.gz"
+            "synology-drive-sync-$TAG-linux-x86_64.tar.gz"
+            "synology-drive-sync-$TAG-macos-aarch64.tar.gz"
+            "synology-drive-sync-$TAG-macos-x86_64.tar.gz"
+            "synology-drive-sync-$TAG-windows-aarch64.zip"
+            "synology-drive-sync-$TAG-windows-x86_64.zip"
+            "synology-drive-sync-$TAG-x86_64.spk"
+            "synology-drive-sync-$TAG.cdx.json"
+          )
+          diff -u \
+            <(printf '%s\n' "${expected_names[@]}") \
+            <(printf '%s\n' "${remote_names[@]}")
 
           gh release edit "$TAG" --draft=false --latest
 
