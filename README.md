@@ -401,7 +401,8 @@ cargo test --locked --all-targets
 cargo build --release --locked
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). Tests do not read or write the host OS credential vault.
+See [Testing and coverage](docs/testing.md), [CONTRIBUTING.md](CONTRIBUTING.md), and
+[SECURITY.md](SECURITY.md). Tests do not read or write the host OS credential vault.
 
 ## Official references
 

@@ -53,6 +53,38 @@ jobs:
       - name: Release build
         run: cargo build --release --locked
 
+  coverage:
+    name: Coverage (90% line gate)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
+        with:
+          toolchain: 1.88.0
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install pinned cargo-llvm-cov
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .config/coverage.env
+          cargo "+$RUST_TOOLCHAIN" install cargo-llvm-cov \
+            --version "$CARGO_LLVM_COV_VERSION" \
+            --locked
+      - name: Enforce repository line coverage
+        run: bash scripts/coverage.sh check
+      - name: Preserve coverage summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-summary
+          path: target/llvm-cov/coverage-summary.json
+          if-no-files-found: warn
+          retention-days: 14
+
   msrv:
     runs-on: ubuntu-latest
     timeout-minutes: 15
