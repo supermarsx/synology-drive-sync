@@ -34,8 +34,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
         with:
           components: rustfmt, clippy
@@ -52,11 +55,90 @@ jobs:
 
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
         with:
           toolchain: 1.88.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Rust 1.88 compatibility
         run: cargo test --locked --all-targets
+
+  packaging:
+    name: Packaging and container smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate shell and Docker input line endings
+        run: bash .github/scripts/validate-packaging.sh
+      - name: Parse PowerShell packaging scripts
+        shell: pwsh
+        run: ./.github/scripts/validate-powershell.ps1
+      - name: Validate Compose configurations
+        env:
+          SDSYNC_URL: https://files.example.invalid
+          SDSYNC_USERNAME: ci-audit
+          SDSYNC_SOURCE: ${{ github.workspace }}
+          SDSYNC_REMOTE: /ci-audit
+          SDSYNC_PASSWORD_FILE: ${{ github.workspace }}/LICENSE
+          SDSYNC_TOTP_SECRET_FILE: ${{ github.workspace }}/LICENSE
+          SDSYNC_JOBS: "2"
+        run: |
+          docker compose -f compose.yaml config --quiet
+          docker compose -f compose.yaml -f compose.totp.yaml config --quiet
+      - name: Build documented Compose image
+        env:
+          SDSYNC_URL: https://files.example.invalid
+          SDSYNC_USERNAME: ci-audit
+          SDSYNC_SOURCE: ${{ github.workspace }}
+          SDSYNC_REMOTE: /ci-audit
+          SDSYNC_PASSWORD_FILE: ${{ github.workspace }}/LICENSE
+          SDSYNC_JOBS: "2"
+          DOCKER_BUILDKIT: "1"
+        run: docker compose -f compose.yaml build sync
+      - name: Smoke-test hardened container entrypoint
+        env:
+          SDSYNC_URL: https://files.example.invalid
+          SDSYNC_USERNAME: ci-audit
+          SDSYNC_SOURCE: ${{ github.workspace }}
+          SDSYNC_REMOTE: /ci-audit
+          SDSYNC_PASSWORD_FILE: ${{ github.workspace }}/LICENSE
+          SDSYNC_TOTP_SECRET_FILE: ${{ github.workspace }}/LICENSE
+          SDSYNC_JOBS: "2"
+        run: |
+          set -euo pipefail
+          reported=$(docker compose -f compose.yaml run --rm --no-deps -T sync --version)
+          expected='synology-drive-sync local'
+          if [[ "$reported" != "$expected" ]]; then
+            echo "Compose entrypoint version did not exactly match $expected: $reported" >&2
+            exit 1
+          fi
+
+          docker compose -f compose.yaml run --rm --no-deps -T \
+            --entrypoint /bin/sh sync -eu -c '
+              [ "$(id -u):$(id -g)" = "10001:10001" ]
+              [ -r /source/LICENSE ]
+              [ -s /run/secrets/sdsync_password ]
+              [ -r /run/secrets/sdsync_password ]
+            '
+
+          docker compose -f compose.yaml -f compose.totp.yaml run \
+            --rm --no-deps -T --entrypoint /bin/sh sync -eu -c '
+              [ "$(id -u):$(id -g)" = "10001:10001" ]
+              [ -r /source/LICENSE ]
+              [ -s /run/secrets/sdsync_password ]
+              [ -r /run/secrets/sdsync_password ]
+              [ -s /run/secrets/sdsync_totp ]
+              [ -r /run/secrets/sdsync_totp ]
+            '
+
+          user=$(docker image inspect synology-drive-sync:local --format '{{.Config.User}}')
+          [[ "$user" == '10001:10001' ]]
