@@ -2,24 +2,30 @@
 
 [![CI](https://github.com/supermarsx/synology-drive-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/supermarsx/synology-drive-sync/actions/workflows/ci.yml)
 
-A lean Rust CLI that pushes one local directory to a Synology Drive-backed folder through the documented File Station WebAPI and a single HTTPS reverse-proxy URL.
+A lean Rust CLI that pushes one local directory—or a deterministic batch of complete named profile jobs—to Synology Drive-backed folders through the documented File Station WebAPI and HTTPS reverse-proxy URLs.
 
 This is deliberately one-way and stateless. It is not a Synology Drive protocol client, daemon, two-way reconciler, SMB/WebDAV wrapper, or QuickConnect client. It writes to the underlying DSM folder through File Station; Synology Drive can index that folder when it belongs to My Drive or an enabled Team Folder.
 
 > [!IMPORTANT]
-> The automated suite uses deterministic local and mock-HTTP tests; it does not log in to a live NAS. Before trusting a deployment, run `doctor`, review `plan`, test with non-critical data, and keep `--delete` disabled.
+> The automated suite uses deterministic local and mock-HTTP tests; it does not log in to a live NAS. Before trusting a deployment, run the [source and target diagnostics](docs/diagnostics-and-batch.md), review `plan`, complete the [disposable live-NAS acceptance](docs/production-acceptance.md), and keep `--delete` disabled.
 
 ## Safety contract
 
 - The local source is authoritative and is never modified.
 - Missing and changed local files are uploaded; empty local directories are created.
 - Remote-only content is preserved unless `--delete` is explicit.
+- The default content comparison hashes every local payload and the remote files needed for comparison, deletion guards, or safe reuse on every run; it verifies uploads after transfer and can reuse a unique matching remote file with a non-overwriting server-side copy when that is safer than uploading it again.
 - A normal sync stops on file/directory type conflicts rather than removing them.
 - `plan` performs discovery, authentication, scanning, and planning without remote mutation.
-- Mirror deletion is guarded by path containment, an explicit deletion cap, empty-source protection, protected-path handling, and failure-before-delete ordering.
+- `doctor source` validates one or more local trees without contacting DSM; `doctor target` is non-mutating unless its explicit disposable `--write-test` is selected.
+- A mutating profile batch plans and preflights every selected source and target before its first remote mutation, then executes jobs sequentially in deterministic profile-name order.
+- Mirror deletion is guarded by path containment, an explicit deletion cap, empty-source protection, protected-path handling, fresh remote snapshot checks, and failure-before-delete ordering.
 
 | Command | Creates/uploads | Deletes remote-only data | Intended use |
 | --- | ---: | ---: | --- |
+| `doctor source [SOURCE] [--hash]` | No | No | Validate a local tree, optionally reading and hashing every file |
+| `doctor target [REMOTE]` | No | No | Validate routing, authentication, permission, and inventory |
+| `doctor target [REMOTE] --write-test` | Disposable probe only | Probe cleanup only | Live create/upload/copy/verify/cleanup acceptance |
 | `plan` | No | No | Inspect the exact pending work |
 | `sync` | Yes | No | Safe additive/update-only push |
 | `sync --delete` | Yes | Yes, within guards | Deliberate exact remote mirror |
@@ -32,6 +38,12 @@ Download a verified release with the platform installer described in [Installati
 git clone https://github.com/supermarsx/synology-drive-sync.git
 cd synology-drive-sync
 cargo build --release --locked
+```
+
+Validate the local source with exactly the exclusions used by sync. Add `--hash` to read every payload file and require a stable MD5 snapshot:
+
+```bash
+synology-drive-sync doctor source ./project --hash
 ```
 
 Use a dedicated, non-administrator DSM account with File Station application permission and read/write access to the destination shared folder. Then verify the proxy without authenticating:
@@ -56,6 +68,15 @@ If the account uses authenticator-app TOTP, import the existing DSM manual key o
 synology-drive-sync credentials set-totp \
   --url https://files.example.com \
   --username mirror-bot
+```
+
+Authenticate and inspect the exact destination without changing it:
+
+```bash
+synology-drive-sync doctor \
+  --url https://files.example.com \
+  --username mirror-bot \
+  target /team-folder/project
 ```
 
 Review the plan, then run the additive sync:
@@ -117,7 +138,7 @@ curl -fsS -X POST https://files.example.com/webapi/entry.cgi \
   --data-urlencode query=SYNO.API.Auth,SYNO.FileStation.List
 ```
 
-The response should be JSON with `"success": true`, not HTML or a redirect to a login page. `doctor --routing-only` performs the corresponding TLS, routing, and API-discovery checks. Without `--routing-only`, `doctor` also authenticates and can validate a logical folder with `--remote` without creating, uploading, overwriting, or deleting anything.
+The response should be JSON with `"success": true`, not HTML or a redirect to a login page. `doctor --routing-only` performs the corresponding TLS, routing, and API-discovery checks. `doctor target REMOTE` also authenticates, inventories the destination, and uses File Station's non-mutating permission check for the exact logical destination, or the first missing component under its nearest existing ancestor. See [Diagnostics and multi-profile batches](docs/diagnostics-and-batch.md) before using the mutating disposable `target --write-test`.
 
 ## Commands
 
@@ -127,7 +148,9 @@ The explicit command tree is preferred:
 | --- | --- |
 | `sync SOURCE REMOTE` | Apply a one-way push |
 | `plan SOURCE REMOTE` | Print the pending work without mutation; `--exit-code` returns 10 when changes exist |
-| `doctor` | Validate configuration, proxy routing, API discovery, authentication, and optional remote access |
+| `doctor source [SOURCE] [--hash]` | Validate a local source without DSM access, optionally hashing every file |
+| `doctor target [REMOTE] [--write-test]` | Diagnose a File Station destination; write only with the explicit disposable probe |
+| `doctor --routing-only` | Validate TLS, proxy routing, and API discovery without authentication |
 | `config path\|validate\|show` | Locate, validate, or inspect non-secret effective configuration |
 | `credentials set-password\|set-totp\|status\|remove` | Manage the current user's OS-vault entries |
 | `completions SHELL` | Generate Bash, Zsh, Fish, PowerShell, or Elvish completion source |
@@ -167,6 +190,23 @@ Resolution is deterministic:
 4. built-in default.
 
 Command-line exclusion rules are appended to profile exclusions. `--no-delete` can disable a profile's `delete=true`, `--vault` can override a profile's `no-vault=true`, and `--no-quiet` can re-enable terminal diagnostics over `quiet=true`. Relative paths in a profile are anchored to the configuration file's directory.
+
+Select complete profile jobs with `--profiles NAME[,NAME...]` or every named profile with
+`--all-profiles`. Batch sync/plan takes SOURCE and REMOTE from each profile, rejects equal or nested
+roots on one normalized endpoint, preflights every job before mutation, and executes sequentially in
+deterministic profile-name order. Every job keeps its own `max-delete`; `--max-total-delete` adds an
+aggregate cap (default 100). For examples, partial-failure semantics, URL-alias limits, and scheduler
+locking, see [Diagnostics and multi-profile batches](docs/diagnostics-and-batch.md).
+
+Batch plan/sync and target diagnostics reject `--password-stdin`; use the OS vault or protected
+per-profile password/TOTP files so each job resolves its own credentials.
+
+```bash
+synology-drive-sync plan --config ./config.toml \
+  --profiles photos,documents --max-total-delete 20 --output json
+synology-drive-sync sync --config ./config.toml \
+  --all-profiles --max-total-delete 20 --output ndjson
+```
 
 The TOML schema is strict and non-secret. It accepts protected `password-file`, `totp-secret-file`, and remote-log token-file paths, but has no password, seed, current-code, or bearer-token value field. Unknown keys are rejected, and `config show` can display paths or environment-variable names but never secret values.
 
@@ -232,12 +272,15 @@ Independent guards include:
 
 - `/` can never be a destination, and every deletion must remain a strict child of the configured root;
 - the default maximum is 100 deletions and `--max-delete` changes it explicitly;
+- a selected profile batch also refuses a combined count above `--max-total-delete` (default 100), after checking every per-job cap;
 - a source with no payload files cannot drive deletion without `--allow-empty-source`;
 - ignored, DSM-managed, and File Station-mounted paths are protected;
-- the local preflight, remote scan, directory creation, and uploads must succeed before remote-only deletion;
+- the local preflight, remote scan, directory creation, copies, and uploads must succeed before remote-only deletion;
+- immediately before a planned file deletion, the current remote kind, size, mtime, and—under content comparison—MD5 must still match the inventoried snapshot;
+- a copied source is removed only after the local snapshot and copied destination are reverified;
 - remote-only directories are removed deepest-first and non-recursively, so a concurrent new child prevents their removal.
 
-Type replacement under `--delete` is not transactionally atomic: a conflicting remote entry may be removed before its local replacement upload, and a later failure can leave it absent. Use `plan`, an intentionally small deletion cap, a quiescent source tree, and the DSM shared-folder recycle bin.
+Type replacement under `--delete` is not transactionally atomic: a conflicting remote entry may be removed before its local replacement upload, and a later failure can leave it absent. File Station provides no atomic compare-and-delete primitive, so a remote writer can still race the final check and deletion. Use `plan`, an intentionally small deletion cap, quiescent single-writer source and destination trees, and a tested DSM snapshot/versioning/recycle recovery layer.
 
 Place gitignore-style rules in `.sdsyncignore` at the source root or repeat `--exclude`:
 
@@ -253,7 +296,13 @@ Hidden regular files are included. Symlinks, junctions/reparse points, special o
 
 Path checks and later file opens are not a transactional filesystem snapshot. Run under an unprivileged account that exclusively owns the source, keep the tree quiescent during synchronization, and never run elevated over a source that another user or less-trusted process can rename or replace. A concurrent path-component swap can otherwise race portable link/reparse checks and redirect a later traversal or upload outside the tree that was originally inspected. See [Security policy](SECURITY.md).
 
-The default `--compare metadata` compares byte length and modification time at File Station's one-second resolution. `--compare size-only` ignores time and can miss same-size changes. Neither mode hashes content.
+The default `--compare content` requires matching byte length, MD5, and file mtime at File Station's one-second resolution. An upload is successful only after the local file is rehashed and the exact remote destination reports the expected bytes; a final rescan and replan also enforce the expected mtime before success. The correspondence is rebuilt from current local and NAS state on every run; there is no persistent path/hash database that can become stale.
+
+When one missing local file has one unique remote-only counterpart with the same byte length, MD5, second-resolution mtime, and basename in a different directory, the plan can use File Station's non-overwriting server-side copy instead of retransmitting the bytes. Additive sync keeps the old remote path. Mirror mode removes it only after the local snapshot and new copy have been reverified. Ambiguous duplicate-content groups, same-parent renames, basename changes, unavailable copy support, and any unsafe case fall back to a normal verified upload. Inspect `server_copies` and `upload_bytes` in JSON/NDJSON plan output before execution.
+
+MD5 is the strongest content digest exposed by the documented File Station API, but it is not collision-resistant against maliciously constructed files. Use an independently downloaded SHA-256 manifest for production acceptance. Explicit `--compare metadata` also compares length and modification time at File Station's one-second resolution but omits content hashing; `--compare size-only` checks length only. Those performance modes can miss changes and do not provide post-upload content verification.
+
+Missing folders are planned shallowest-first and created before copies/uploads. The client also requests parent creation from File Station, while all generated remote paths remain contained under the configured logical root. This preserves the source hierarchy and empty directories; directory mtimes, ACLs, ownership, modes, xattrs, and other filesystem metadata remain outside the parity contract.
 
 ## Output, progress, and logs
 
@@ -267,6 +316,15 @@ Command results and diagnostics are independent streams:
 - `--log-file` appends local logs;
 - `--remote-log-url` sends structured events to an HTTPS collector, with a bearer token read from a protected file or named environment variable;
 - `--remote-log-mode best-effort|required` decides whether collector failure can fail the run.
+
+Batch JSON/NDJSON includes deterministic per-profile status and an aggregate summary. Each sync job
+separates its non-mutating `preflight_plan` from its fresh `execution_plan` and reports whether
+`mutation_authorized` was reached. A job marked `partial` may have mutated before it failed; earlier
+successful jobs are not rolled back and later jobs are left `not-run`. The aggregate separately
+reports initial `preflight_deletions` and fresh `execution_reserved_deletions`; its
+`all_targets_preflighted_before_mutation` field is observed evidence and is false after an
+interrupted or failed preflight. See
+[Diagnostics and multi-profile batches](docs/diagnostics-and-batch.md) for the execution contract.
 
 For schemas, redaction boundaries, rotation, remote-delivery behavior, and operational examples, see [Observability](docs/observability.md).
 
@@ -282,6 +340,11 @@ Stable automation behavior is:
 
 Scripts should treat any other nonzero value as failure and should not infer success from human-readable output.
 
+An initial aggregate deletion-cap breach and a breach caused by a fresh execution replan are
+operational safety failures with exit `1`, not configuration/usage errors. The initial breach occurs
+before any selected mutation. A fresh breach denies mutation for that profile, but earlier completed
+profiles remain committed.
+
 ## Installation and unattended operation
 
 See [Installation and deployment](docs/installation.md) for:
@@ -292,7 +355,7 @@ See [Installation and deployment](docs/installation.md) for:
 - hardened systemd service/timer and cron fallback;
 - per-user macOS LaunchAgent and Windows Task Scheduler setup using the OS vault.
 
-The native schedulers are preferred because their identity and credential-session behavior is clearer. Never place a password, TOTP seed, current OTP, or logging token value directly in a unit, plist, crontab, task argument, or TOML profile.
+The native schedulers are preferred because their identity and credential-session behavior is clearer. Prefer one scheduled batch for profiles sharing an operational window; otherwise make every related job use one shared host-level lock. The built-in overlap check does not coordinate separate processes or hosts, and a scheduler timeout must cover the complete sequential batch. Never place a password, TOTP seed, current OTP, or logging token value directly in a unit, plist, crontab, task argument, or TOML profile.
 
 ## Releases and supply-chain verification
 
@@ -311,26 +374,30 @@ DSM often returns HTTP 200 with a JSON API error, so the CLI validates both laye
 - DSM `150`: login and later requests appear to originate from different client IPs;
 - DSM `1800`: multipart content length is absent or inconsistent.
 
-Transient transport, busy, 408/429, and 502/503/504 failures use bounded retry. File Station exposes no resumable upload protocol, so an upload retry restarts the entire file. A source file that changes during transfer fails the run before remote-only deletion.
+Transient transport, busy, 408/429, and 502/503/504 failures use bounded retry. File Station exposes no resumable upload protocol. In the default content mode, the client first checks whether a lost/retryable response nevertheless left the exact expected size and MD5 at the destination; it accepts that completed upload, otherwise the retry restarts the entire file. A source file that changes during transfer fails the run before remote-only deletion. Before reporting success, the client rescans and rehashes both sides and requires a fresh plan with no pending in-scope operation.
 
 ## Deliberate limitations
 
 - One direction only: local to remote.
 - File Station WebAPI only; no private Drive protocol, SMB, WebDAV, SSH, or QuickConnect.
+- A mapped or mounted NAS share can be the source only when the operating system exposes it as an ordinary readable directory; this client does not connect to a second NAS itself. File Station CIFS/NFS/ISO mount points are protected destination boundaries and cannot be sync roots.
 - No block-level delta or resumable upload.
+- No persistent content index or universal rename operation. Only the explicitly safe server-copy case above avoids retransmission; other rename/duplicate cases use verified upload fallback.
 - No claim of crash-atomic overwrite or transactional type replacement.
+- No transactional multi-profile batch or rollback: a failed job can follow already completed jobs, and later jobs are then not run.
+- Remote overlap detection compares normalized configured URLs; different DNS names or reverse-proxy prefixes that reach the same NAS are aliases the client cannot identify.
 - Content, names, hierarchy, and file mtime only; no ACL, owner, mode, xattr, hard-link, sparse-file, or directory-mtime preservation.
 - No Drive conflict resolution or client identity semantics; Drive indexing may lag behind File Station writes.
 - A Drive-locked file can still be changed through File Station according to Synology's documented behavior.
-- Metadata comparison can miss content changed while both size and second-level mtime are preserved.
-- The automated suite does not prove compatibility with every DSM/File Station release or reverse-proxy product, and currently contains no live-NAS end-to-end job.
+- Explicit metadata comparison can miss content changed while both size and second-level mtime are preserved; size-only comparison is weaker still.
+- The automated suite does not prove compatibility with every DSM/File Station release or reverse-proxy product, and currently contains no live-NAS end-to-end job; `target --write-test` must therefore be exercised against a disposable destination during acceptance.
 
 ## Development
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets
 cargo build --release --locked
 ```
 

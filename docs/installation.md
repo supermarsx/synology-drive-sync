@@ -4,6 +4,8 @@ Release installers are the shortest path to a native binary. Containers and sche
 
 Before scheduling anything, configure the File Station reverse proxy, use a dedicated DSM account, run `doctor`, and review a non-critical `plan`. Keep mirror deletion disabled until the complete deployment path has been tested.
 
+Passing unit tests or `doctor` is not production acceptance. Before trusting real data, complete the [disposable live-NAS acceptance and recovery runbook](production-acceptance.md), including external byte verification, Synology Drive indexing visibility, a retry exercise, alert delivery, and a restore drill.
+
 ## Verified native installer
 
 The installers detect OS and architecture, resolve only a strict `YY.N` release, download the matching archive plus `SHA256SUMS`, verify SHA-256, check the embedded binary version, and atomically replace only the selected executable. They do not invoke a package manager or silently change system-wide configuration.
@@ -84,7 +86,7 @@ Each archive contains one top-level version/platform directory with:
 - `synology-drive-sync` or `synology-drive-sync.exe`;
 - `LICENSE`, `THIRD_PARTY_LICENSES.html`, `README.md`, and `SECURITY.md`;
 - completion source for Bash, Zsh, Fish, PowerShell, and Elvish under `completions/`;
-- 15 roff pages under `man/`: the root `synology-drive-sync.1` page and one page for every top-level and nested subcommand.
+- 17 roff pages under `man/`: the root `synology-drive-sync.1` page and one page for every top-level and nested subcommand.
 
 The automated installers install only the executable. Install the optional files where appropriate for your shell and OS, or regenerate them from the installed binary:
 
@@ -113,7 +115,7 @@ The executable is `target/release/synology-drive-sync` (`.exe` on Windows). HTTP
 
 ## Docker and Compose
 
-The image is a finite sync job built in two stages. The runtime uses Debian Bookworm, a fixed non-root UID/GID (`10001`), no shell entry logic beyond `exec`, and a side-effect-free binary health probe. The project license and generated dependency notices are installed under `/usr/share/licenses/synology-drive-sync/`. The supplied Compose service additionally drops every capability, enables `no-new-privileges`, makes the root filesystem read-only, and mounts the authoritative source read-only.
+The image is a finite sync job built in two stages. The runtime image defaults to non-root UID/GID `10001`, has no shell entry logic beyond `exec`, and uses a side-effect-free binary health probe. The managed Compose wrapper renders the service with the invoking account's nonzero UID/GID so its owner-only source and bind-mounted secret files remain readable without broadening host permissions. The project license and generated dependency notices are installed under `/usr/share/licenses/synology-drive-sync/`. The supplied Compose service additionally drops every capability, enables `no-new-privileges`, makes the root filesystem read-only, and mounts the authoritative source read-only.
 
 ### Build from the checkout
 
@@ -125,16 +127,20 @@ export SDSYNC_USERNAME=mirror-bot
 export SDSYNC_SOURCE=/srv/export
 export SDSYNC_REMOTE=/team/export
 export SDSYNC_PASSWORD_FILE=/secure/location/dsm-password
-docker compose run --rm sync
+chmod 0600 "$SDSYNC_PASSWORD_FILE"
+packaging/docker/run-compose.sh validate
+packaging/docker/run-compose.sh build
+packaging/docker/run-compose.sh run
 ```
 
-Compose mounts the password at `/run/secrets/sdsync_password`; the CLI receives only that path through `--password-file` and uses `--no-vault`.
+Compose mounts the password at `/run/secrets/sdsync_password`; the CLI receives only that path through `--password-file` and uses `--no-vault`. Direct `docker compose run` defaults to UID/GID `10001` and therefore requires the source and owner-only secret files to be readable by that numeric identity; prefer the managed wrapper, which validates and exports the current non-root UID/GID.
 
 For unattended TOTP, put the Base32 DSM seed or provisioning URI in a separate protected file and add the overlay:
 
 ```bash
 export SDSYNC_TOTP_SECRET_FILE=/secure/location/dsm-totp
-docker compose -f compose.yaml -f compose.totp.yaml run --rm sync
+chmod 0600 "$SDSYNC_TOTP_SECRET_FILE"
+packaging/docker/run-compose.sh run
 ```
 
 The overlay mounts `/run/secrets/sdsync_totp` and adds `--totp-secret-file`. Do not put the seed in a Compose environment block. `SDSYNC_OTP` may carry one current six-digit code for a deliberately ephemeral run; it is not seed storage and expires quickly.
@@ -155,7 +161,7 @@ The image supports `linux/amd64` and `linux/arm64`. To use it without Compose, p
 
 ```bash
 docker run --rm --init \
-  --user 10001:10001 \
+  --user "$(id -u):$(id -g)" \
   --read-only \
   --cap-drop ALL \
   --security-opt no-new-privileges \
@@ -173,7 +179,25 @@ Add a second read-only bind mount and `--totp-secret-file /run/secrets/sdsync_to
 
 ## Scheduled native deployments
 
-Always run the scheduler as the same least-privileged OS identity that owns the intended vault entries or protected credential files. Grant that identity read/traverse access to the local source and no more DSM permission than the destination requires. The examples prevent overlapping runs and leave deletion disabled.
+Always run the scheduler as the same least-privileged OS identity that owns the intended vault entries or protected credential files. Grant that identity read/traverse access to the local source and no more DSM permission than the destination requires. The examples prevent overlapping runs and leave deletion disabled. They retain diagnostics through journald or the CLI's bounded rotating file sink; connect their documented nonzero result to a real alert destination and test that alert before relying on the schedule.
+
+For several profiles in one operational window, prefer one batch invocation so every selected
+target is preflighted before the first mutation and jobs then run sequentially in deterministic
+profile-name order:
+
+```bash
+synology-drive-sync sync --config /etc/synology-drive-sync/config.toml \
+  --all-profiles --max-total-delete 20 --output ndjson
+```
+
+The built-in overlap check covers only profiles selected by that process. It is not a lock and
+cannot coordinate separate services, containers, hosts, or manual commands. If related profiles
+must use separate scheduler entries, put every batch and single-profile invocation behind the same
+host-level lock; use a distributed operational lock as well when more than one host can reach the
+same destination. Size the scheduler's outer timeout for all source scans and hashes, every target
+preflight, all sequential operations and retries, final reconciliation, log flushing, and cleanup.
+See [Diagnostics and multi-profile batches](diagnostics-and-batch.md) for overlap, deletion-budget,
+and partial-failure behavior.
 
 ### Linux systemd timer
 
@@ -221,6 +245,18 @@ A task configured to run while no user is logged in may not have access to the s
 
 ## Updating and removing
 
-Rerun an installer with an explicit `--version`/`-Version` to upgrade or roll back. It replaces only the executable in the selected directory. Remove that exact executable manually to uninstall; scheduler units, logs, configuration, and OS-vault entries are intentionally left untouched so their deletion remains a separate decision.
+Stop the scheduler and record the currently installed version before an upgrade. Rerun an installer with an explicit `--version`/`-Version`; it replaces only the executable in the selected directory. Then run `--version`, `config validate`, authenticated `doctor target`, and a fresh additive `plan` before restarting the schedule. If validation fails, keep the schedule stopped and rerun the installer with the recorded calendar version. Binary rollback does not reverse remote writes already performed by a sync.
 
-Use `credentials remove ... password|totp|all` before retiring a credential profile. Remove scheduler definitions with the platform's normal `systemctl`, `launchctl`, Task Scheduler, or crontab tooling after confirming the exact target.
+Remove only the exact binary to uninstall:
+
+```bash
+rm -- "$HOME/.local/bin/synology-drive-sync"
+```
+
+```powershell
+Remove-Item -LiteralPath "$env:LOCALAPPDATA\Programs\synology-drive-sync\synology-drive-sync.exe"
+```
+
+Scheduler definitions, logs, configuration, and OS-vault entries are intentionally retained so data removal remains explicit. Disable and remove the exact scheduler definition with `systemctl disable --now synology-drive-sync.timer`, `launchctl bootout "gui/$(id -u)/io.github.supermarsx.synology-drive-sync"`, `Unregister-ScheduledTask -TaskName 'Synology Drive Sync'`, or an inspected `crontab -e` as appropriate. Review paths before removing units, plists, log files, or configuration.
+
+Use `credentials remove ... password|totp|all` before retiring a credential profile; removal kind is deliberately explicit.

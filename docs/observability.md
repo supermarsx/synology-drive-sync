@@ -7,10 +7,11 @@
 - live progress goes to standard error only when its terminal policy allows it.
 
 This separation makes stdout safe to pipe into a parser without losing durable diagnostics. The
-log, progress, and plan/sync machine contracts are described by
+log, progress, and single-profile plan/sync machine contracts are described by
 [`observability.schema.json`](observability.schema.json). Doctor and credential results, plus
 configuration path and validation results, use their own schema tags; `config show` emits the
-non-secret effective-profile object directly.
+non-secret effective-profile object directly. Diagnostic and aggregate batch records are described
+in [Diagnostics and multi-profile batches](diagnostics-and-batch.md).
 
 ## Defaults
 
@@ -150,36 +151,42 @@ on the file-creation default.
 
 - `human` prints concise result sentences;
 - `json` writes one complete command result object;
-- `ndjson` streams a plan summary, each planned action, and—after a sync—a completion record.
+- `ndjson` writes deterministic command-specific records, one complete JSON object per line.
 
-For example, `plan --output json` returns the full plan in one `sdsync.plan.v1` object:
+For example, a single-profile `plan --output json` returns the full plan in one
+`sdsync.plan.v1` object:
 
 ```json
-{"schema":"sdsync.plan.v1","plan":{"summary":{"uploads":1,"upload_bytes":5242880,"directories":1,"deletions":0,"unchanged_files":41,"protected_entries":0,"changes":true},"actions":{"pre_deletes":[],"creates":[{"relative":"releases","remote_path":"/team/export/releases"}],"uploads":[{"relative":"release.bin","remote_path":"/team/export/release.bin","bytes":5242880,"mtime_ms":1785769200000}],"post_deletes":[]}}}
+{"schema":"sdsync.plan.v1","plan":{"summary":{"uploads":1,"upload_bytes":5242880,"server_copy_fallback_bytes":0,"server_copies":0,"directories":1,"deletions":0,"unchanged_files":41,"protected_entries":0,"changes":true},"actions":{"pre_deletes":[],"creates":[{"relative":"releases","remote_path":"/team/export/releases"}],"copies":[],"uploads":[{"relative":"release.bin","remote_path":"/team/export/release.bin","bytes":5242880,"mtime_ms":1785769200000}],"post_deletes":[]}}}
 ```
 
 `sync --output json` uses `sdsync.sync.v1`, retains the complete `plan`, and adds `result`. A changed
-sync result contains `changed`, `uploaded`, `upload_bytes`, `directories_created`, `deleted`, and
-`elapsed_ms`; an already-synchronized run uses `"result":{"changed":false}`.
+sync result contains `changed`, `uploaded`, `server_copied`, `upload_bytes`,
+`directories_created`, `deleted`, and `elapsed_ms`; an already-synchronized run uses
+`"result":{"changed":false}`. `server_copy_fallback_bytes` is the amount that may still be uploaded
+only when a planned server copy cannot be started; it is deliberately separate from
+`upload_bytes`.
 
 NDJSON uses a streaming contract rather than splitting the JSON object mechanically. Records are
 ordered as follows:
 
 1. one `sdsync.plan.v1` record with `kind: "summary"`;
 2. zero or more `sdsync.plan-action.v1` records in execution order—`delete-conflict`,
-   `create-directory`, `upload`, then `delete`;
+   `create-directory`, `copy-remote-content`, `upload`, then `delete`;
 3. for `sync` only, one `sdsync.output.v1` record with `kind: "completion"`.
 
 ```ndjson
-{"schema":"sdsync.plan.v1","kind":"summary","uploads":1,"upload_bytes":5242880,"directories":1,"deletions":0,"unchanged_files":41,"protected_entries":0,"changes":true}
+{"schema":"sdsync.plan.v1","kind":"summary","uploads":1,"upload_bytes":5242880,"server_copy_fallback_bytes":4096,"server_copies":1,"directories":1,"deletions":0,"unchanged_files":41,"protected_entries":0,"changes":true}
 {"schema":"sdsync.plan-action.v1","action":"create-directory","relative":"releases","remote_path":"/team/export/releases"}
+{"schema":"sdsync.plan-action.v1","action":"copy-remote-content","from_relative":"old/report.bin","from_remote_path":"/team/export/old/report.bin","to_relative":"new/report.bin","to_remote_path":"/team/export/new/report.bin","expected_size":4096,"expected_mtime_seconds":1785769200,"content_md5":"d41d8cd98f00b204e9800998ecf8427e","source_snapshot_guard":{"entry_kind":"file","size":4096,"mtime_seconds":1785769200,"content_md5":"d41d8cd98f00b204e9800998ecf8427e","require_mtime":true},"verified_upload_fallback":"only-before-copy-task-start"}
 {"schema":"sdsync.plan-action.v1","action":"upload","relative":"release.bin","remote_path":"/team/export/release.bin","bytes":5242880,"mtime_ms":1785769200000}
-{"schema":"sdsync.output.v1","kind":"completion","result":{"changed":true,"uploaded":1,"upload_bytes":5242880,"directories_created":1,"deleted":0,"elapsed_ms":8421}}
+{"schema":"sdsync.output.v1","kind":"completion","result":{"changed":true,"uploaded":1,"server_copied":1,"upload_bytes":5242880,"directories_created":1,"deleted":0,"elapsed_ms":8421}}
 ```
 
 A plan-only NDJSON stream ends after its last action. An unchanged sync emits the summary followed
-by `{"schema":"sdsync.output.v1","kind":"completion","changed":false}`. The linked JSON Schema
-defines every plan/action/result variant.
+by `{"schema":"sdsync.output.v1","kind":"completion","changed":false}`. Guarded delete records
+include their exact `snapshot_guard`; a post-delete also includes nullable `destination_guard`.
+The linked JSON Schema defines every single-profile plan/action/result variant strictly.
 
 Plan results intentionally contain relative local paths and File Station logical remote paths so
 automation can review exact work. Treat stdout as path-sensitive operational data even though it
@@ -188,6 +195,43 @@ never contains file contents or authentication secrets.
 JSON logs are not command output: `--log-format json` never changes stdout, and `--output json`
 never changes the log sinks. This makes combinations such as human results plus JSON file logs, or
 NDJSON results plus human diagnostics, explicit and predictable.
+
+### Diagnostic and batch records
+
+A single local source diagnostic uses `sdsync.source-doctor.v1`. A source-diagnostic batch uses
+`sdsync.source-doctor-job.v1` records and an `sdsync.source-doctor-batch.v1` summary. A single
+target diagnostic uses `sdsync.doctor.v1`; its `write_test` member distinguishes `not-requested`,
+`success`, and `failed` and retains the disposable-probe report, cleanup state, and any leftover
+probe path. Target-diagnostic batches use `sdsync.doctor-job.v1` and
+`sdsync.doctor-batch.v1`. A target job marked `partial` may have mutated before its probe failed;
+the report must be inspected even when cleanup appears complete.
+
+Multi-profile plan and sync use one `sdsync.batch-job.v1` result per selected profile and one
+`sdsync.batch.v1` summary. JSON nests the ordered job objects under the summary. NDJSON writes the
+ordered job objects first and the summary last. A job may be `preflighted`, `success`, `partial`,
+`failed`, or `not-run`; aggregate status is `success`, `partial`, or `failed`.
+
+Each sync job keeps `preflight_plan` (the first non-mutating plan) separate from `execution_plan`
+(the fresh plan produced when that job reaches execution). `mutation_authorized` is true only when
+a non-empty execution plan passed its aggregate deletion reservation and remote operations were
+allowed to start. A `failed` job did not cross that boundary; a `partial` job did and therefore may
+have changed the target. A converged successful job can legitimately report
+`mutation_authorized: false`.
+
+The aggregate exposes `max_total_delete`, the accepted initial `preflight_deletions`, and the
+`execution_reserved_deletions` accumulated from fresh plans. The two counts are intentionally
+distinct and may be `null` before or outside their phase. Its
+`all_targets_preflighted_before_mutation` value is calculated from observed per-job evidence and is
+false after a failed or interrupted preflight. Individual plans retain their own deletion counts.
+
+Batch output is emitted before a nonzero result is returned for a preflight or execution failure.
+An initial aggregate-cap breach and a fresh-plan cap breach both return operational exit `1`. The
+initial breach authorizes no selected mutation; a fresh breach authorizes no mutation for the
+blocked job but does not roll back earlier successes. If a mutating job otherwise fails, earlier
+successful jobs remain committed and later jobs are `not-run`. Preserve both stdout and stderr,
+and treat nested paths and error strings as path-sensitive operational data. Use an explicit common
+`--output json` or `--output ndjson` when selected profiles otherwise resolve different output
+defaults.
 
 ## Progress
 

@@ -10,6 +10,18 @@
 
 default-profile = "production"
 
+# Every named profile is an independent job; profiles do not inherit from one
+# another. Batch plan/sync therefore requires source, remote, url, username, and
+# authentication settings to resolve separately for every selected profile.
+# Examples (the aggregate cap is a CLI/environment guard, not a TOML field):
+#   synology-drive-sync plan --config ./config.toml --profiles production,archive --max-total-delete 20 --output json
+#   synology-drive-sync sync --config ./config.toml --all-profiles --max-total-delete 20 --output ndjson
+# When omitted, --max-total-delete / SDSYNC_MAX_TOTAL_DELETE defaults to 100.
+# An initial or fresh-replan aggregate-cap breach is an operational exit 1;
+# neither authorizes mutation for the blocked profile.
+# Batch plan/sync and target diagnostics reject --password-stdin; use vault entries or a
+# protected password-file (and totp-secret-file when required) for each profile.
+
 [profiles.production]
 # SOURCE and REMOTE may be omitted here and supplied to each sync/plan command.
 source = "./data/export"
@@ -26,7 +38,7 @@ username = "mirror-bot"
 no-vault = false
 
 # Sync selection and comparison.
-compare = "metadata" # metadata | size-only
+compare = "content"  # content | metadata | size-only
 jobs = 2              # 1..16
 excludes = ["target/", "*.tmp", ".cache/"]
 
@@ -38,8 +50,12 @@ max-delete = 100
 
 # Network behavior.
 retries = 2            # 0..5
-timeout = 7200         # per-request seconds; cover the largest upload
+timeout = 7200         # upload/background-operation seconds; cover the largest upload
 connect-timeout = 15   # TCP/TLS connection seconds
+# Discovery, login, inventory, hash, and other control requests are capped at 10s.
+# An outer scheduler limit covers the whole workload, not one request. Size it
+# above measured worst-case scanning, hashing, every operation/retry, and shutdown.
+# A retry restarts the file unless content mode proves the first attempt completed.
 # ca-certificate = "./pki/private-root.pem"
 allow-http = false
 danger-accept-invalid-certs = false
@@ -50,6 +66,8 @@ verbose = 0
 quiet = false
 log-level = "info"       # trace | debug | info | warn | error | off
 log-format = "human"     # human | json
+# A configured file sink rotates at 10 MiB with three backups. Provision its
+# directory for the service identity before enabling it.
 # log-file = "./logs/synology-drive-sync.log"
 progress = "auto"        # auto | always | never
 output = "human"         # human | json | ndjson
@@ -61,8 +79,27 @@ output = "human"         # human | json | ndjson
 # remote-log-token-env = "SDSYNC_REMOTE_LOG_TOKEN"
 remote-log-mode = "best-effort" # best-effort | required
 
-# Profiles are independent; there is no inheritance. This minimal profile leaves
-# SOURCE and REMOTE to each invocation:
+# A second complete profile can participate in a batch. Use one canonical public
+# URL for each NAS: overlap checks cannot recognize that different DNS names or
+# reverse-proxy prefixes are aliases for the same appliance.
+#
+# [profiles.archive]
+# source = "./data/archive"
+# remote = "/team-folder/archive"
+# url = "https://files.example.com"
+# username = "archive-bot"
+# password-file = "./secrets/archive-dsm-password"
+# totp-secret-file = "./secrets/archive-dsm-totp" # only when the account uses app TOTP
+# no-vault = true
+# compare = "content"
+# jobs = 2
+# delete = false
+# allow-empty-source = false
+# max-delete = 25
+# output = "json"
+#
+# A minimal profile may instead leave SOURCE and REMOTE to a single-profile
+# invocation. Such an incomplete profile cannot be selected for batch plan/sync:
 #
 # [profiles.personal]
 # url = "https://files.example.com/nas/"
