@@ -1,0 +1,156 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+# shellcheck source=sdsync-common
+. "$script_dir/sdsync-common"
+
+require_package_identity
+ensure_layout
+controller_log=$log_root/controller.log
+[ ! -L "$controller_log" ] || { echo "refusing symlinked controller log: $controller_log" >&2; exit 73; }
+rotate_log "$controller_log" 10485760 5
+
+acquire_controller_lock() {
+    if mkdir "$controller_lock" 2>/dev/null; then
+        chmod 0700 "$controller_lock"
+        set_private_owner "$controller_lock"
+        return 0
+    fi
+    if [ -L "$controller_lock" ] || [ ! -d "$controller_lock" ]; then
+        echo "controller lock is not a private directory: $controller_lock" >&2
+        return 73
+    fi
+    existing_pid=$(read_pid "$controller_pid_file" 2>/dev/null || true)
+    if [ -n "$existing_pid" ] && pid_is_live "$existing_pid"; then
+        echo "controller already runs as PID $existing_pid" >&2
+        return 75
+    fi
+    rmdir "$controller_lock" 2>/dev/null || {
+        echo "cannot recover stale controller lock safely: $controller_lock" >&2
+        return 73
+    }
+    mkdir "$controller_lock"
+    chmod 0700 "$controller_lock"
+    set_private_owner "$controller_lock"
+}
+
+acquire_controller_lock
+umask 077
+controller_pid_temp=$controller_pid_file.tmp.$$
+printf '%s\n' "$$" > "$controller_pid_temp"
+finish_private_file "$controller_pid_temp"
+mv -f "$controller_pid_temp" "$controller_pid_file"
+
+shutdown=false
+active_pid=
+sleep_pid=
+next_run=0
+wait_interrupted=false
+reload_requested=false
+
+cleanup_controller() {
+    write_controller_state stopped 0 0 0 2>/dev/null || true
+    current_pid=$(read_pid "$controller_pid_file" 2>/dev/null || true)
+    if [ "$current_pid" = "$$" ]; then
+        rm -f "$controller_pid_file"
+        rmdir "$controller_lock" 2>/dev/null || true
+    fi
+}
+request_shutdown() {
+    shutdown=true
+    wait_interrupted=true
+    if [ -n "$sleep_pid" ] && pid_is_live "$sleep_pid"; then
+        kill -TERM "$sleep_pid" 2>/dev/null || true
+    fi
+    if [ -n "$active_pid" ] && pid_is_live "$active_pid"; then
+        kill -TERM "$active_pid" 2>/dev/null || true
+    fi
+}
+request_reload() {
+    reload_requested=true
+    wait_interrupted=true
+    if [ -n "$sleep_pid" ] && pid_is_live "$sleep_pid"; then
+        kill -TERM "$sleep_pid" 2>/dev/null || true
+    fi
+}
+trap request_shutdown TERM INT
+trap request_reload HUP
+trap cleanup_controller 0
+
+write_controller_state running "$$" 0 0
+while [ "$shutdown" = false ]; do
+    if [ "$reload_requested" = true ]; then
+        # Rebase the next deadline on the newly persisted cadence. This is what makes
+        # a 1-hour -> 60-second reconfiguration take effect promptly after HUP.
+        next_run=0
+        reload_requested=false
+    fi
+    enabled=$(setting "$schedule_file" enabled false)
+    interval=$(setting "$schedule_file" interval_seconds 3600)
+    allow_delete=$(setting "$schedule_file" allow_delete false)
+    maximum_total=$(setting "$schedule_file" max_total_delete 100)
+    case $enabled in true|false) ;; *) enabled=false ;; esac
+    case $allow_delete in true|false) ;; *) allow_delete=false ;; esac
+    case $interval in ''|*[!0-9]*) interval=3600 ;; esac
+    case $maximum_total in ''|*[!0-9]*) maximum_total=100 ;; esac
+    if [ "$interval" -lt 60 ] || [ "$interval" -gt 2592000 ]; then
+        interval=3600
+    fi
+
+    now=$(epoch_now)
+    if [ "$enabled" != true ]; then
+        next_run=0
+    elif [ "$next_run" -eq 0 ]; then
+        next_run=$((now + interval))
+    elif [ "$now" -ge "$next_run" ]; then
+        write_controller_state running "$$" "$next_run" 0
+        "$runner" sync all "$allow_delete" scheduled "$maximum_total" &
+        active_pid=$!
+        write_controller_state running "$$" "$next_run" "$active_pid"
+        previous_wait_status=
+        while :; do
+            wait_interrupted=false
+            set +e
+            wait "$active_pid"
+            current_wait_status=$?
+            set -e
+            if [ "$wait_interrupted" = true ]; then
+                previous_wait_status=$current_wait_status
+                continue
+            fi
+            if [ "$current_wait_status" -eq 127 ] && [ -n "$previous_wait_status" ]; then
+                run_exit=$previous_wait_status
+            else
+                run_exit=$current_wait_status
+            fi
+            break
+        done
+        active_pid=
+        now=$(epoch_now)
+        next_run=$((now + interval))
+        # Failure is recorded by sdsync-run and does not trigger an immediate retry.
+        append_rotating_log "$controller_log" 10485760 5 \
+            "scheduled_run exit=$run_exit next=$next_run"
+    fi
+
+    [ "$shutdown" = false ] || break
+
+    write_controller_state running "$$" "$next_run" 0
+    sleep_for=30
+    if [ "$enabled" = true ] && [ "$next_run" -gt "$now" ]; then
+        remaining=$((next_run - now))
+        if [ "$remaining" -lt "$sleep_for" ]; then
+            sleep_for=$remaining
+        fi
+    fi
+    [ "$sleep_for" -gt 0 ] || sleep_for=1
+    sleep "$sleep_for" &
+    sleep_pid=$!
+    set +e
+    wait "$sleep_pid"
+    set -e
+    sleep_pid=
+done
+
+exit 0

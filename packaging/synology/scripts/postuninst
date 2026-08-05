@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/common"
+
+if [ "${SYNOPKG_PKG_STATUS:-}" = UNINSTALL ]; then
+    # DSM retains package FHS data by default. Purge only this package's exact
+    # private subdirectories so credentials do not survive an uninstall.
+    for purge_root in "$package_home" "$package_var"; do
+        if [ -z "$purge_root" ] || [ "$purge_root" = / ] || [ ! -d "$purge_root" ]; then
+            package_message "refusing unsafe package-data purge root: $purge_root"
+            exit 1
+        fi
+    done
+    for private_child in \
+        "$package_home/config" "$package_home/secrets" "$package_home/state" \
+        "$package_var/run" "$package_var/state" "$package_var/log"
+    do
+        case $private_child in
+            "$package_home"/*|"$package_var"/*) rm -rf "$private_child" ;;
+            *) package_message "refusing out-of-package purge path: $private_child"; exit 1 ;;
+        esac
+    done
+    package_message "Removed package-owned configuration, credentials, state, and logs"
+fi
+exit 0

@@ -1,0 +1,646 @@
+#!/bin/sh
+set -eu
+
+self_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+package_root=$(CDPATH='' cd -- "$self_dir/.." && pwd -P)
+# shellcheck source=../libexec/sdsync-common
+. "$package_root/libexec/sdsync-common"
+
+usage() {
+    cat <<'EOF'
+Synology Drive Sync DSM package manager
+
+Usage:
+  sdsync-dsm configure-profile --name NAME --source PATH --url URL --username USER --remote REMOTE [options]
+  sdsync-dsm remove-profile NAME
+  sdsync-dsm list-profiles | set-default NAME | show-config [NAME]
+  sdsync-dsm set-password NAME [--from-file FILE]
+  sdsync-dsm set-totp NAME [--from-file FILE] | remove-totp NAME
+  sdsync-dsm doctor [NAME|--all] [--write-test]
+  sdsync-dsm plan [NAME|--all] [--allow-delete] [--max-total-delete N]
+  sdsync-dsm run [NAME|--all] [--allow-delete] [--max-total-delete N]
+  sdsync-dsm enable [--interval SECONDS] [--allow-delete] [--max-total-delete N]
+  sdsync-dsm disable | status | logs [LINES] | paths
+
+configure-profile options:
+  --compare content|metadata|size-only   (default: content)
+  --jobs 1..16                          (default: 2)
+  --delete --max-delete N               (explicit exact-mirror mode)
+  --allow-http                          (HTTPS is otherwise required)
+  --default                             (make this the default profile)
+
+REMOTE is your chosen File Station logical path, for example
+/home/Drive/Backups or /TeamShare/Backups. It is never a /volumeN path.
+
+Secret values are read from a masked prompt, standard input, or --from-file;
+they are never accepted as command-line values or written to config.toml.
+EOF
+}
+
+die() {
+    echo "$*" >&2
+    exit 64
+}
+
+need_value() {
+    [ "$#" -ge 2 ] || die "$1 requires a value"
+}
+
+valid_name() {
+    case ${1:-} in ''|all|*[!A-Za-z0-9_-]*) return 1 ;; *) return 0 ;; esac
+}
+
+manager_lock_acquired=false
+tty_active=false
+saved_tty=
+restore_tty() {
+    if [ "$tty_active" = true ]; then
+        stty "$saved_tty" 2>/dev/null || true
+        tty_active=false
+        printf '\n' >&2
+    fi
+}
+cleanup_manager_lock() {
+    restore_tty
+    for cleanup_path in "${fragment_temp:-}" "${secret_temp:-}" "${candidate:-}" "${schedule_temp:-}"; do
+        [ -n "$cleanup_path" ] || continue
+        case $cleanup_path in "$package_home"/*) [ -L "$cleanup_path" ] || rm -f "$cleanup_path" 2>/dev/null || true ;; esac
+    done
+    if [ "$manager_lock_acquired" = true ] && [ -d "$management_lock" ] && [ ! -L "$management_lock" ]; then
+        lock_pid=$(read_pid "$management_lock/pid" 2>/dev/null || true)
+        if [ "$lock_pid" = "$$" ]; then
+            rm -f "$management_lock/pid"
+            rmdir "$management_lock" 2>/dev/null || true
+        fi
+    fi
+    manager_lock_acquired=false
+}
+
+manager_signal() {
+    cleanup_manager_lock
+    trap - 0 HUP INT TERM
+    exit 130
+}
+
+begin_mutation() {
+    require_package_identity || {
+        echo "retry with: sudo -u synology-drive-sync -- $manager ..." >&2
+        exit 77
+    }
+    ensure_layout
+    if ! mkdir "$management_lock" 2>/dev/null; then
+        if [ ! -d "$management_lock" ] || [ -L "$management_lock" ]; then
+            echo "unsafe package-manager lock" >&2
+            exit 73
+        fi
+        existing_manager=$(read_pid "$management_lock/pid" 2>/dev/null || true)
+        if [ -n "$existing_manager" ] && pid_is_live "$existing_manager"; then
+            echo "another package-management operation is active" >&2
+            exit 75
+        fi
+        [ ! -f "$management_lock/pid" ] || rm -f "$management_lock/pid"
+        rmdir "$management_lock" 2>/dev/null || { echo "cannot recover stale package-manager lock" >&2; exit 73; }
+        mkdir "$management_lock"
+    fi
+    chmod 0700 "$management_lock"; set_private_owner "$management_lock"
+    printf '%s\n' "$$" > "$management_lock/pid"; finish_private_file "$management_lock/pid"
+    manager_lock_acquired=true
+    trap cleanup_manager_lock 0
+    trap manager_signal HUP INT TERM
+    if [ -d "$run_lock" ] && [ ! -L "$run_lock" ]; then
+        active_run=$(read_pid "$run_lock/pid" 2>/dev/null || true)
+        if [ -n "$active_run" ] && pid_is_live "$active_run"; then
+            echo "cannot change profiles, credentials, or schedule while PID $active_run is planning/syncing" >&2
+            exit 75
+        fi
+    fi
+}
+
+end_mutation() {
+    cleanup_manager_lock
+    trap - 0 HUP INT TERM
+}
+
+reload_controller_if_running() {
+    running_pid=$(read_pid "$controller_pid_file" 2>/dev/null || true)
+    [ -n "$running_pid" ] || return 0
+    pid_is_live "$running_pid" || return 0
+    if ! pid_matches_command "$running_pid" "$controller"; then
+        echo "refusing to signal unverified controller PID $running_pid" >&2
+        return 73
+    fi
+    kill -HUP "$running_pid"
+}
+
+write_disabled_schedule() {
+    schedule_temp=$schedule_file.tmp.$$
+    {
+        printf 'enabled=false\ninterval_seconds=%s\nallow_delete=false\nmax_total_delete=%s\n' \
+            "$(setting "$schedule_file" interval_seconds 3600)" \
+            "$(setting "$schedule_file" max_total_delete 100)"
+    } > "$schedule_temp"
+    finish_private_file "$schedule_temp"
+    mv -f "$schedule_temp" "$schedule_file"
+    schedule_temp=
+    reload_controller_if_running
+}
+
+validate_toml_text() {
+    value_label=$1
+    value_text=$2
+    carriage_return=$(printf '\r')
+    case $value_text in
+        ''|*'"'*|*\\*|*"$carriage_return"*) die "$value_label is empty or contains a quote, backslash, or carriage return" ;;
+    esac
+    case $value_text in
+        *'
+'*) die "$value_label must be one line" ;;
+    esac
+}
+
+validate_source() {
+    source_candidate=$1
+    validate_toml_text source "$source_candidate"
+    case $source_candidate in /*) ;; *) die "source must be an absolute local DSM path" ;; esac
+    [ ! -L "$source_candidate" ] || die "source must not be a symlink: $source_candidate"
+    if [ ! -d "$source_candidate" ] || [ ! -r "$source_candidate" ] || [ ! -x "$source_candidate" ]; then
+        die "package identity cannot read/traverse source: $source_candidate"
+    fi
+    canonical_source=$(CDPATH='' cd -- "$source_candidate" 2>/dev/null && pwd -P) ||
+        die "cannot resolve source safely: $source_candidate"
+    case $canonical_source in
+        /*) ;;
+        *) die "resolved source is not an absolute local DSM path" ;;
+    esac
+    [ "$canonical_source" != / ] || die "source cannot resolve to the filesystem root"
+    validate_toml_text source "$canonical_source"
+    source_lower=$(printf '%s' "$canonical_source" | tr '[:upper:]' '[:lower:]')
+    case "$source_lower/" in
+        */#recycle/*|*/#snapshot/*|*/@eadir/*|*/@tmp/*|*/@sharebin/*|\
+        */@apphome/*|*/@appdata/*|*/@appstore/*|*/@apptemp/*|*/@appconf/*|\
+        */.synologyworkingdirectory/*)
+            die "source cannot be inside a DSM-managed directory: $canonical_source"
+            ;;
+    esac
+    for protected_root in "$package_home" "$package_var" "$package_root"; do
+        canonical_protected=$(CDPATH='' cd -- "$protected_root" 2>/dev/null && pwd -P) ||
+            die "cannot resolve DSM package storage safely: $protected_root"
+        case $canonical_source in
+            "$canonical_protected"|"$canonical_protected"/*)
+                die "source cannot be package-owned DSM storage: $canonical_source"
+                ;;
+        esac
+        case $canonical_protected in
+            "$canonical_source"/*)
+                die "source cannot contain package-owned DSM storage: $canonical_source"
+                ;;
+        esac
+    done
+}
+
+require_private_readable_file() {
+    readable_path=$1
+    readable_label=$2
+    if [ -L "$readable_path" ]; then
+        echo "refusing symlinked $readable_label: $readable_path" >&2
+        return 73
+    fi
+    if [ -e "$readable_path" ] && { [ ! -f "$readable_path" ] || [ ! -r "$readable_path" ]; }; then
+        echo "$readable_label is not a readable regular file: $readable_path" >&2
+        return 73
+    fi
+}
+
+validate_remote() {
+    remote_value=$1
+    case $remote_value in /*) ;; *) die "remote must be a File Station logical path beginning with /" ;; esac
+    [ "$remote_value" != / ] || die "remote cannot be /"
+    case $remote_value in
+        *'//'*|*/|*'/../'*|*'/./'*|*/..|*/.)
+            die "remote contains an empty, trailing, '.' or '..' segment"
+            ;;
+    esac
+    remote_lower=$(printf '%s' "$remote_value" | tr '[:upper:]' '[:lower:]')
+    case $remote_lower in
+        */#recycle|*/#recycle/*|*/#snapshot|*/#snapshot/*|*/@eadir|*/@eadir/*|\
+        */@tmp|*/@tmp/*|*/@sharebin|*/@sharebin/*|\
+        */@apphome|*/@apphome/*|*/@appdata|*/@appdata/*|\
+        */@appstore|*/@appstore/*|*/@apptemp|*/@apptemp/*|\
+        */@appconf|*/@appconf/*|\
+        */.synologyworkingdirectory|*/.synologyworkingdirectory/*)
+            die "remote contains a DSM-managed component that cannot be a sync root"
+            ;;
+    esac
+    validate_toml_text remote "$remote_value"
+    if printf '%s' "$remote_value" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
+        die "remote contains a control character"
+    fi
+    remote_relative=${remote_value#/}
+    [ "${#remote_relative}" -le 247 ] || die "remote exceeds Synology Drive's 247-character compatibility limit"
+    remaining_remote=$remote_relative
+    while :; do
+        case $remaining_remote in
+            */*) remote_component=${remaining_remote%%/*}; remaining_remote=${remaining_remote#*/} ;;
+            *) remote_component=$remaining_remote; remaining_remote= ;;
+        esac
+        [ "${#remote_component}" -le 255 ] || die "remote component exceeds 255 characters"
+        case $remote_component in
+            '~'*) die "remote components cannot begin with '~'" ;;
+            *'*'*|*':'*|*'?'*|*'"'*|*'<'*|*'>'*|*'|'*)
+                die "remote contains a character unsupported by Windows Synology Drive clients"
+                ;;
+            *.|*' ') die "remote components cannot end with a dot or space" ;;
+        esac
+        remote_stem=${remote_component%%.*}
+        remote_stem_upper=$(printf '%s' "$remote_stem" | tr '[:lower:]' '[:upper:]')
+        case $remote_stem_upper in
+            CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])
+                die "remote contains a Windows-reserved component"
+                ;;
+        esac
+        [ -n "$remaining_remote" ] || break
+    done
+}
+
+atomic_file() {
+    target_file=$1
+    source_file=$2
+    target_temp=$target_file.tmp.$$
+    [ ! -L "$target_file" ] || die "refusing symlinked package file: $target_file"
+    umask 077
+    cp "$source_file" "$target_temp"
+    finish_private_file "$target_temp"
+    mv -f "$target_temp" "$target_file"
+}
+
+sorted_fragments() {
+    for fragment_path in "$profiles_dir"/*.toml; do
+        [ -f "$fragment_path" ] || continue
+        [ ! -L "$fragment_path" ] || die "refusing symlinked profile fragment: $fragment_path"
+        printf '%s\n' "$fragment_path"
+    done | sort
+}
+
+render_candidate() {
+    selected_default=$1
+    replacement_name=${2:-}
+    replacement_file=${3:-}
+    omitted_name=${4:-}
+    candidate_path=$config_file.candidate.$$
+    umask 077
+    {
+        printf 'default-profile = "%s"\n\n' "$selected_default"
+        sorted_fragments | while IFS= read -r profile_fragment; do
+            base_name=${profile_fragment##*/}
+            base_name=${base_name%.toml}
+            [ "$base_name" != "$replacement_name" ] || continue
+            [ "$base_name" != "$omitted_name" ] || continue
+            cat "$profile_fragment"
+            printf '\n'
+        done
+        if [ -n "$replacement_file" ]; then
+            cat "$replacement_file"
+            printf '\n'
+        fi
+    } > "$candidate_path"
+    finish_private_file "$candidate_path"
+    "$binary" --config "$candidate_path" --quiet config validate >/dev/null
+    printf '%s\n' "$candidate_path"
+}
+
+write_default() {
+    default_name=$1
+    default_temp=$default_profile_file.tmp.$$
+    printf '%s\n' "$default_name" > "$default_temp"
+    finish_private_file "$default_temp"
+    mv -f "$default_temp" "$default_profile_file"
+}
+
+current_default() {
+    if [ -f "$default_profile_file" ] && [ ! -L "$default_profile_file" ]; then
+        IFS= read -r configured_default < "$default_profile_file" || true
+        if valid_name "${configured_default:-}" && profile_exists "$configured_default"; then
+            printf '%s\n' "$configured_default"
+            return
+        fi
+    fi
+    first_fragment=$(sorted_fragments | sed -n '1p')
+    [ -n "$first_fragment" ] || return 1
+    first_name=${first_fragment##*/}
+    printf '%s\n' "${first_name%.toml}"
+}
+
+configure_profile() {
+    profile_name=
+    source_path=
+    remote_path=
+    base_url=
+    dsm_username=
+    compare=content jobs=2 delete=false max_delete=100 max_delete_set=false
+    allow_http=false make_default=false
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --name) need_value "$@"; profile_name=$2; shift 2 ;;
+            --source) need_value "$@"; source_path=$2; shift 2 ;;
+            --remote) need_value "$@"; remote_path=$2; shift 2 ;;
+            --url) need_value "$@"; base_url=$2; shift 2 ;;
+            --username) need_value "$@"; dsm_username=$2; shift 2 ;;
+            --compare) need_value "$@"; compare=$2; shift 2 ;;
+            --jobs) need_value "$@"; jobs=$2; shift 2 ;;
+            --delete) delete=true; shift ;;
+            --max-delete) need_value "$@"; max_delete=$2; max_delete_set=true; shift 2 ;;
+            --allow-http) allow_http=true; shift ;;
+            --default) make_default=true; shift ;;
+            *) die "unknown configure-profile option: $1" ;;
+        esac
+    done
+    valid_name "$profile_name" || die "profile name may contain only letters, digits, '_' and '-'"
+    validate_source "$source_path"
+    source_path=$canonical_source
+    validate_remote "$remote_path"
+    validate_toml_text url "$base_url"
+    validate_toml_text username "$dsm_username"
+    case $base_url in https://*) ;; http://*) [ "$allow_http" = true ] || die "HTTP requires --allow-http" ;; *) die "url must begin with https:// (or http:// with --allow-http)" ;; esac
+    case $compare in content|metadata|size-only) ;; *) die "compare must be content, metadata, or size-only" ;; esac
+    case $jobs in ''|*[!0-9]*) die "jobs must be an integer from 1 through 16" ;; esac
+    if [ "$jobs" -lt 1 ] || [ "$jobs" -gt 16 ]; then die "jobs must be from 1 through 16"; fi
+    case $max_delete in ''|*[!0-9]*) die "max-delete must be a non-negative integer" ;; esac
+    if [ "$delete" = true ] && [ "$max_delete_set" != true ]; then
+        die "--delete requires an explicit --max-delete bound"
+    fi
+    ensure_layout
+    fragment_temp=$profiles_dir/.${profile_name}.toml.$$
+    umask 077
+    {
+        printf '[profiles.%s]\n' "$profile_name"
+        printf 'source = "%s"\n' "$source_path"
+        printf 'remote = "%s"\n' "$remote_path"
+        printf 'url = "%s"\n' "$base_url"
+        printf 'username = "%s"\n' "$dsm_username"
+        printf 'password-file = "%s/%s.password"\n' "$secret_root" "$profile_name"
+        printf 'totp-secret-file = "%s/%s.totp"\n' "$secret_root" "$profile_name"
+        printf 'no-vault = true\ncompare = "%s"\njobs = %s\n' "$compare" "$jobs"
+        printf 'excludes = ["@eaDir/", "**/@eaDir/", "#recycle/", "#snapshot/"]\n'
+        printf 'delete = %s\nallow-empty-source = false\nmax-delete = %s\n' "$delete" "$max_delete"
+        printf 'retries = 2\ntimeout = 7200\nconnect-timeout = 15\n'
+        printf 'allow-http = %s\ndanger-accept-invalid-certs = false\n' "$allow_http"
+        printf 'log-level = "info"\nlog-format = "json"\n'
+        printf 'log-file = "%s/sync.log"\nprogress = "never"\noutput = "human"\n' "$log_root"
+    } > "$fragment_temp"
+    finish_private_file "$fragment_temp"
+    if [ "$make_default" = true ]; then
+        selected_default=$profile_name
+    else
+        selected_default=$(current_default 2>/dev/null || printf '%s\n' "$profile_name")
+    fi
+    candidate=$(render_candidate "$selected_default" "$profile_name" "$fragment_temp")
+    mv -f "$fragment_temp" "$profiles_dir/$profile_name.toml"
+    finish_private_file "$profiles_dir/$profile_name.toml"
+    mv -f "$candidate" "$config_file"
+    finish_private_file "$config_file"
+    write_default "$selected_default"
+    echo "configured profile '$profile_name': $source_path -> $remote_path"
+    echo "next: set its password, run doctor, review plan, then enable the schedule"
+}
+
+read_secret() {
+    secret_label=$1
+    source_path=${2:-}
+    if [ -n "$source_path" ]; then
+        if [ ! -f "$source_path" ] || [ -L "$source_path" ] || [ ! -r "$source_path" ]; then
+            die "$secret_label source is not a readable non-symlink file"
+        fi
+        IFS= read -r secret_value < "$source_path" || true
+    elif [ -t 0 ]; then
+        printf '%s: ' "$secret_label" >&2
+        saved_tty=$(stty -g)
+        stty -echo
+        tty_active=true
+        IFS= read -r secret_value || true
+        restore_tty
+    else
+        IFS= read -r secret_value || true
+    fi
+    [ -n "${secret_value:-}" ] || die "$secret_label cannot be empty"
+    [ "${#secret_value}" -le 4096 ] || die "$secret_label exceeds 4096 characters"
+    printf '%s\n' "$secret_value"
+    unset secret_value
+}
+
+set_secret() {
+    secret_kind=$1
+    shift
+    [ "$#" -ge 1 ] || die "set-$secret_kind requires a profile name"
+    profile_name=$1
+    shift
+    from_file=
+    if [ "$#" -gt 0 ]; then
+        [ "$1" = --from-file ] || die "unknown set-$secret_kind option: $1"
+        need_value "$@"
+        from_file=$2
+        shift 2
+    fi
+    [ "$#" -eq 0 ] || die "too many set-$secret_kind arguments"
+    profile_exists "$profile_name" || die "unknown profile: $profile_name"
+    ensure_layout
+    case $secret_kind in password) suffix=password; label='DSM password' ;; totp) suffix=totp; label='DSM Base32 TOTP seed or otpauth URI' ;; *) die "invalid secret kind" ;; esac
+    target=$secret_root/$profile_name.$suffix
+    [ ! -L "$target" ] || die "refusing symlinked secret file: $target"
+    secret_temp=$target.tmp.$$
+    read_secret "$label" "$from_file" > "$secret_temp"
+    finish_private_file "$secret_temp"
+    mv -f "$secret_temp" "$target"
+    finish_private_file "$target"
+    echo "stored protected $secret_kind material for '$profile_name'"
+}
+
+selection() {
+    selection_command=$1
+    shift
+    selected_scope=
+    scope_seen=false
+    allow_selected_delete=false
+    write_test=false
+    selected_max_total=100
+    max_total_seen=false
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --all)
+                [ "$scope_seen" = false ] || die "choose exactly one profile scope"
+                selected_scope=all; scope_seen=true
+                ;;
+            --allow-delete)
+                case $selection_command in plan|run) ;; *) die "--allow-delete is only valid for plan or run" ;; esac
+                allow_selected_delete=true
+                ;;
+            --write-test)
+                [ "$selection_command" = doctor ] || die "--write-test is only valid for doctor"
+                write_test=true
+                ;;
+            --max-total-delete)
+                case $selection_command in plan|run) ;; *) die "--max-total-delete is only valid for plan or run" ;; esac
+                need_value "$@"
+                selected_max_total=$2
+                max_total_seen=true
+                shift
+                ;;
+            --*) die "unknown option: $1" ;;
+            *) valid_name "$1" || die "invalid profile name: $1"; [ "$scope_seen" = false ] || die "choose exactly one profile scope"; selected_scope=$1; scope_seen=true ;;
+        esac
+        shift
+    done
+    if [ "$scope_seen" = false ]; then
+        selected_scope=$(current_default 2>/dev/null) || die "no configured default profile"
+    fi
+    case $selected_max_total in ''|*[!0-9]*) die "max-total-delete must be non-negative" ;; esac
+    if [ "$max_total_seen" = true ] && [ "$selected_scope" != all ]; then
+        die "--max-total-delete is only valid with explicit --all"
+    fi
+}
+
+command_name=${1:-help}
+[ "$#" -eq 0 ] || shift
+case $command_name in
+    help|-h|--help) [ "$#" -eq 0 ] || die "help accepts no arguments"; usage ;;
+    configure-profile) begin_mutation; configure_profile "$@"; end_mutation ;;
+    list-profiles)
+        require_package_identity || exit 77
+        [ "$#" -eq 0 ] || die "list-profiles accepts no arguments"
+        default_name=$(current_default 2>/dev/null || true)
+        sorted_fragments | while IFS= read -r fragment; do
+            name=${fragment##*/}; name=${name%.toml}
+            marker=; [ "$name" != "$default_name" ] || marker=' (default)'
+            printf '%s%s\n' "$name" "$marker"
+        done
+        ;;
+    set-default)
+        begin_mutation
+        if [ "$#" -ne 1 ] || ! profile_exists "$1"; then die "set-default requires an existing profile"; fi
+        candidate=$(render_candidate "$1")
+        mv -f "$candidate" "$config_file"; finish_private_file "$config_file"; write_default "$1"
+        echo "default profile is now '$1'"
+        end_mutation
+        ;;
+    show-config)
+        require_package_identity || exit 77
+        [ "$#" -le 1 ] || die "show-config accepts at most one profile"
+        [ -f "$config_file" ] || die "no configuration"
+        if [ "$#" -eq 1 ]; then set -- --profile "$1"; else set --; fi
+        exec "$binary" --config "$config_file" config show "$@"
+        ;;
+    remove-profile)
+        begin_mutation
+        if [ "$#" -ne 1 ] || ! profile_exists "$1"; then die "remove-profile requires an existing profile"; fi
+        remove_name=$1
+        previous_default=$(current_default 2>/dev/null || true)
+        remaining=$(sorted_fragments | while IFS= read -r fragment; do name=${fragment##*/}; name=${name%.toml}; [ "$name" = "$remove_name" ] || printf '%s\n' "$name"; done | sed -n '1p')
+        if [ -n "$remaining" ]; then
+            if [ -n "$previous_default" ] && [ "$previous_default" != "$remove_name" ]; then
+                selected_default=$previous_default
+            else
+                selected_default=$remaining
+            fi
+            candidate=$(render_candidate "$selected_default" '' '' "$remove_name")
+        else
+            # Disable scheduling atomically before deleting the final runnable profile.
+            write_disabled_schedule
+        fi
+        rm -f "$profiles_dir/$remove_name.toml" "$secret_root/$remove_name.password" "$secret_root/$remove_name.totp"
+        if [ -n "$remaining" ]; then mv -f "$candidate" "$config_file"; finish_private_file "$config_file"; write_default "$selected_default"; else rm -f "$config_file" "$default_profile_file"; fi
+        echo "removed profile '$remove_name' and its package-owned credentials"
+        end_mutation
+        ;;
+    set-password) begin_mutation; set_secret password "$@"; end_mutation ;;
+    set-totp) begin_mutation; set_secret totp "$@"; end_mutation ;;
+    remove-totp)
+        begin_mutation
+        if [ "$#" -ne 1 ] || ! profile_exists "$1"; then die "remove-totp requires an existing profile"; fi
+        [ ! -L "$secret_root/$1.totp" ] || die "refusing symlinked secret file"
+        rm -f "$secret_root/$1.totp"; echo "removed TOTP material for '$1'"
+        end_mutation
+        ;;
+    doctor)
+        require_package_identity || exit 77
+        selection doctor "$@"
+        if [ "$selected_scope" = all ]; then set -- --all-profiles; else set -- --profile "$selected_scope"; fi
+        "$binary" --config "$config_file" doctor "$@" source --hash
+        if [ "$write_test" = true ]; then
+            exec "$binary" --config "$config_file" doctor "$@" target --write-test
+        fi
+        exec "$binary" --config "$config_file" doctor "$@" target
+        ;;
+    plan|run)
+        require_package_identity || exit 77
+        selection "$command_name" "$@"
+        if [ "$command_name" = plan ]; then run_mode=plan; else run_mode=sync; fi
+        if [ "$selected_scope" = all ]; then
+            runner_max_total=$selected_max_total
+        else
+            runner_max_total=-
+        fi
+        exec "$runner" "$run_mode" "$selected_scope" "$allow_selected_delete" foreground "$runner_max_total"
+        ;;
+    enable)
+        begin_mutation
+        interval=3600; allow_schedule_delete=false; maximum_total=100
+        while [ "$#" -gt 0 ]; do
+            case $1 in
+                --interval) need_value "$@"; interval=$2; shift 2 ;;
+                --allow-delete) allow_schedule_delete=true; shift ;;
+                --max-total-delete) need_value "$@"; maximum_total=$2; shift 2 ;;
+                *) die "unknown enable option: $1" ;;
+            esac
+        done
+        case $interval in ''|*[!0-9]*) die "interval must be an integer" ;; esac
+        if [ "$interval" -lt 60 ] || [ "$interval" -gt 2592000 ]; then die "interval must be 60..2592000 seconds"; fi
+        case $maximum_total in ''|*[!0-9]*) die "max-total-delete must be non-negative" ;; esac
+        found=false; for fragment in "$profiles_dir"/*.toml; do [ -f "$fragment" ] || continue; found=true; name=${fragment##*/}; name=${name%.toml}; profile_secret_exists "$name" || die "profile '$name' has no password"; done
+        [ "$found" = true ] || die "configure at least one profile first"
+        "$binary" --config "$config_file" --quiet config validate
+        schedule_temp=$schedule_file.tmp.$$
+        { printf 'enabled=true\ninterval_seconds=%s\nallow_delete=%s\nmax_total_delete=%s\n' "$interval" "$allow_schedule_delete" "$maximum_total"; } > "$schedule_temp"
+        finish_private_file "$schedule_temp"; mv -f "$schedule_temp" "$schedule_file"
+        reload_controller_if_running
+        echo "scheduler enabled every $interval seconds (delete=$allow_schedule_delete); next run is not immediate"
+        end_mutation
+        ;;
+    disable)
+        begin_mutation
+        [ "$#" -eq 0 ] || die "disable accepts no arguments"
+        write_disabled_schedule
+        echo "scheduler disabled; an active sync is not interrupted"
+        end_mutation
+        ;;
+    status)
+        require_package_identity || exit 77
+        [ "$#" -eq 0 ] || die "status accepts no arguments"
+        pid=$(read_pid "$controller_pid_file" 2>/dev/null || true)
+        if [ -n "$pid" ] && pid_matches_command "$pid" "$controller"; then
+            service=running
+        elif [ -n "$pid" ] && pid_is_live "$pid"; then
+            service=untrusted
+        else
+            service=stopped
+        fi
+        printf 'service=%s\npid=%s\nscheduler_enabled=%s\ninterval_seconds=%s\n' "$service" "${pid:-0}" "$(setting "$schedule_file" enabled false)" "$(setting "$schedule_file" interval_seconds 3600)"
+        require_private_readable_file "$controller_state" "controller state" || exit $?
+        require_private_readable_file "$run_state" "run state" || exit $?
+        [ ! -f "$controller_state" ] || cat "$controller_state"
+        [ ! -f "$run_state" ] || cat "$run_state"
+        ;;
+    logs)
+        require_package_identity || exit 77
+        lines=${1:-100}; [ "$#" -le 1 ] || die "logs accepts one line count"
+        case $lines in ''|*[!0-9]*) die "line count must be an integer" ;; esac
+        [ "$lines" -le 1000 ] || die "line count cannot exceed 1000"
+        for log_file in "$log_root/controller.log" "$log_root/scheduler.log" "$log_root/sync.log"; do
+            require_private_readable_file "$log_file" "package log" || exit $?
+            [ ! -f "$log_file" ] || { printf '\n==> %s <==\n' "$log_file"; tail -n "$lines" "$log_file"; }
+        done
+        ;;
+    paths)
+        [ "$#" -eq 0 ] || die "paths accepts no arguments"
+        printf 'manager=%s\nconfig=%s\nprofiles=%s\nsecrets=%s\nlogs=%s\n' "$manager" "$config_file" "$profiles_dir" "$secret_root" "$log_root"
+        ;;
+    *) usage >&2; exit 64 ;;
+esac

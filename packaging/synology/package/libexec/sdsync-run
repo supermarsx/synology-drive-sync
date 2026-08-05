@@ -1,0 +1,209 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+# shellcheck source=sdsync-common
+. "$script_dir/sdsync-common"
+
+usage() {
+    echo "usage: sdsync-run sync|plan PROFILE|all true|false foreground|scheduled MAX_TOTAL_DELETE|-" >&2
+    exit 64
+}
+
+[ "$#" -eq 5 ] || usage
+require_package_identity
+run_mode=$1
+run_scope=$2
+allow_delete=$3
+run_output=$4
+maximum_total=$5
+case $run_mode in sync|plan) ;; *) usage ;; esac
+case $allow_delete in true|false) ;; *) usage ;; esac
+case $run_output in foreground|scheduled) ;; *) usage ;; esac
+if [ "$run_scope" != all ]; then
+    case $run_scope in ''|*[!A-Za-z0-9_-]*) usage ;; esac
+    [ "$maximum_total" = - ] || usage
+else
+    case $maximum_total in ''|*[!0-9]*) usage ;; esac
+fi
+
+ensure_layout
+if [ ! -x "$binary" ] || [ -L "$binary" ]; then
+    echo "installed sync binary is missing, symlinked, or not executable: $binary" >&2
+    exit 69
+fi
+if [ -L "$config_file" ] || [ ! -f "$config_file" ] || [ ! -r "$config_file" ]; then
+    echo "no readable package configuration; run sdsync-dsm configure-profile first" >&2
+    exit 66
+fi
+
+management_is_active() {
+    [ -d "$management_lock" ] && [ ! -L "$management_lock" ] || return 1
+    management_pid=$(read_pid "$management_lock/pid" 2>/dev/null || true)
+    [ -n "$management_pid" ] && pid_is_live "$management_pid"
+}
+if management_is_active; then
+    echo "package configuration is being changed; retry the plan/sync later" >&2
+    exit 75
+fi
+
+acquire_run_lock() {
+    if mkdir "$run_lock" 2>/dev/null; then
+        chmod 0700 "$run_lock"
+        set_private_owner "$run_lock"
+        return 0
+    fi
+    if [ -L "$run_lock" ] || [ ! -d "$run_lock" ]; then
+        echo "run lock is not a private directory: $run_lock" >&2
+        return 73
+    fi
+    stale_pid=$(read_pid "$run_lock/pid" 2>/dev/null || true)
+    if [ -n "$stale_pid" ] && pid_is_live "$stale_pid"; then
+        echo "another package plan/sync is running as PID $stale_pid" >&2
+        return 75
+    fi
+    if [ -f "$run_lock/pid" ] && [ ! -L "$run_lock/pid" ]; then
+        rm -f "$run_lock/pid"
+    fi
+    rmdir "$run_lock" 2>/dev/null || {
+        echo "cannot recover the stale run lock safely: $run_lock" >&2
+        return 73
+    }
+    mkdir "$run_lock"
+    chmod 0700 "$run_lock"
+    set_private_owner "$run_lock"
+}
+
+acquire_run_lock
+umask 077
+printf '%s\n' "$$" > "$run_lock/pid"
+finish_private_file "$run_lock/pid"
+if management_is_active; then
+    rm -f "$run_lock/pid"
+    rmdir "$run_lock" 2>/dev/null || true
+    echo "package configuration began changing; retry the plan/sync later" >&2
+    exit 75
+fi
+
+core_pid=
+termination_requested=false
+wait_interrupted=false
+started=$(epoch_now)
+run_label=$run_scope
+cleanup_run() {
+    if [ -f "$run_lock/pid" ] && [ ! -L "$run_lock/pid" ]; then
+        lock_pid=$(read_pid "$run_lock/pid" 2>/dev/null || true)
+        if [ "$lock_pid" = "$$" ]; then
+            rm -f "$run_lock/pid"
+            rmdir "$run_lock" 2>/dev/null || true
+        fi
+    fi
+}
+forward_term() {
+    termination_requested=true
+    wait_interrupted=true
+    if [ -n "$core_pid" ] && pid_is_live "$core_pid"; then
+        kill -TERM "$core_pid" 2>/dev/null || true
+    fi
+}
+trap forward_term TERM INT HUP
+trap cleanup_run 0
+
+if [ "$run_scope" = all ]; then
+    found_profile=false
+    for fragment in "$profiles_dir"/*.toml; do
+        [ -f "$fragment" ] || continue
+        found_profile=true
+        profile_name=${fragment##*/}
+        profile_name=${profile_name%.toml}
+        if ! profile_secret_exists "$profile_name"; then
+            echo "profile '$profile_name' has no protected password; use sdsync-dsm set-password" >&2
+            exit 66
+        fi
+    done
+    [ "$found_profile" = true ] || {
+        echo "no configured profiles" >&2
+        exit 66
+    }
+else
+    profile_secret_exists "$run_scope" || {
+        echo "profile '$run_scope' is missing or has no protected password" >&2
+        exit 66
+    }
+fi
+
+if [ "$run_scope" = all ]; then
+    for totp_path in "$secret_root"/*.totp; do
+        [ -e "$totp_path" ] || continue
+        private_secret_file "$totp_path" || {
+            echo "TOTP material is not a package-owned 0600 regular file: $totp_path" >&2
+            exit 66
+        }
+    done
+else
+    totp_path=$secret_root/$run_scope.totp
+    if [ -e "$totp_path" ] && ! private_secret_file "$totp_path"; then
+        echo "TOTP material is not a package-owned 0600 regular file: $totp_path" >&2
+        exit 66
+    fi
+fi
+
+"$binary" --config "$config_file" --quiet config validate
+[ "$termination_requested" = false ] || exit 143
+
+set -- "$binary" --config "$config_file" "$run_mode"
+if [ "$run_scope" = all ]; then
+    set -- "$@" --all-profiles --max-total-delete "$maximum_total"
+else
+    set -- "$@" --profile "$run_scope"
+fi
+if [ "$allow_delete" != true ]; then
+    set -- "$@" --no-delete
+fi
+
+write_run_state running "$started" 0 -1 "$run_label"
+scheduled_log=$log_root/scheduler.log
+if [ "$run_output" = scheduled ]; then
+    rotate_log "$scheduled_log" 10485760 5
+    {
+        printf '%s\n' "run_started epoch=$started mode=$run_mode scope=$run_label delete=$allow_delete"
+        "$@"
+    } >> "$scheduled_log" 2>&1 &
+else
+    "$@" &
+fi
+core_pid=$!
+# A trapped signal interrupts POSIX `wait` before a cooperatively shutting-down child necessarily
+# exits. Keep waiting so the run lock remains authoritative until the core process is actually
+# reaped. If the first wait already reaped it, a follow-up wait may return 127; retain the prior
+# status in that narrow race.
+previous_wait_status=
+while :; do
+    wait_interrupted=false
+    set +e
+    wait "$core_pid"
+    current_wait_status=$?
+    set -e
+    if [ "$wait_interrupted" = true ]; then
+        previous_wait_status=$current_wait_status
+        continue
+    fi
+    if [ "$current_wait_status" -eq 127 ] && [ -n "$previous_wait_status" ]; then
+        exit_code=$previous_wait_status
+    else
+        exit_code=$current_wait_status
+    fi
+    break
+done
+core_pid=
+finished=$(epoch_now)
+if [ "$exit_code" -eq 0 ]; then
+    final_state=succeeded
+else
+    final_state=failed
+fi
+write_run_state "$final_state" "$started" "$finished" "$exit_code" "$run_label"
+if [ "$run_output" = scheduled ]; then
+    printf '%s\n' "run_finished epoch=$finished mode=$run_mode scope=$run_label exit=$exit_code" >> "$scheduled_log"
+fi
+exit "$exit_code"

@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/common"
+
+refuse_active_run || exit 1
+
+pid=$(script_pid "$controller_pid_file" 2>/dev/null || true)
+if [ -n "$pid" ] && script_pid_live "$pid"; then
+    package_message "controller is still running; stop the package before uninstall"
+    exit 1
+fi
+exit 0

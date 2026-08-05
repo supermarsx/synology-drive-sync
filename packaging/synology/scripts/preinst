@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/common"
+
+case ${SYNOPKG_DSM_VERSION_MAJOR:-7} in
+    ''|*[!0-9]*) package_message "cannot determine DSM major version"; exit 1 ;;
+    0|1|2|3|4|5|6) package_message "DSM 7 or newer is required"; exit 1 ;;
+esac
+exit 0

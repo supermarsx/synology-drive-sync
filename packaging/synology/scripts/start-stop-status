@@ -1,0 +1,105 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/common"
+
+status_code() {
+    saved_pid=$(script_pid "$controller_pid_file" 2>/dev/null || true)
+    if [ -n "$saved_pid" ]; then
+        if script_pid_matches "$saved_pid" "$controller"; then return 0; fi
+        if script_pid_live "$saved_pid"; then return 2; else return 1; fi
+    fi
+    if [ -d "$controller_lock" ] || [ -L "$controller_lock" ]; then return 2; fi
+    return 3
+}
+
+case ${1:-} in
+    prestart)
+        [ -x "$package_root/bin/synology-drive-sync" ] || exit 150
+        [ -x "$controller" ] || exit 150
+        [ -r "$common_runtime" ] || exit 150
+        exit 0
+        ;;
+    start)
+        if status_code; then exit 0; fi
+        lifecycle_controller=$controller
+        . "$common_runtime"
+        ensure_layout
+        rotate_log "$log_root/controller.log" 10485760 5
+        # The controller deliberately owns SIGHUP as its schedule-reload signal.
+        # stdin is detached and DSM supervises the package, so do not mask HUP with nohup.
+        "$lifecycle_controller" >> "$log_root/controller.log" 2>&1 </dev/null &
+        launched_pid=$!
+        count=0
+        while [ "$count" -lt 10 ]; do
+            saved_pid=$(script_pid "$controller_pid_file" 2>/dev/null || true)
+            if [ -n "$saved_pid" ] && script_pid_matches "$saved_pid" "$lifecycle_controller"; then
+                package_message "controller started as PID $saved_pid"
+                exit 0
+            fi
+            script_pid_live "$launched_pid" || break
+            sleep 1
+            count=$((count + 1))
+        done
+        package_message "controller failed to start; inspect $log_root/controller.log"
+        exit 1
+        ;;
+    prestop) exit 0 ;;
+    stop)
+        saved_pid=$(script_pid "$controller_pid_file" 2>/dev/null || true)
+        run_pid=$(script_pid "$run_lock/pid" 2>/dev/null || true)
+        controller_active=false
+        run_active=false
+        if [ -n "$saved_pid" ] && script_pid_live "$saved_pid"; then
+            if ! script_pid_matches "$saved_pid" "$controller"; then
+                package_message "refusing to signal unverified controller PID $saved_pid"
+                exit 1
+            fi
+            controller_active=true
+        fi
+        if [ -n "$run_pid" ] && script_pid_live "$run_pid"; then
+            if ! script_pid_matches "$run_pid" "$runner"; then
+                package_message "refusing to signal unverified plan/sync PID $run_pid"
+                exit 1
+            fi
+            run_active=true
+        fi
+        [ "$controller_active" = true ] || [ "$run_active" = true ] || exit 0
+
+        if [ "$controller_active" = true ]; then
+            kill -TERM "$saved_pid"
+        fi
+        if [ "$run_active" = true ] && { [ "$controller_active" != true ] || [ "$run_pid" != "$saved_pid" ]; }; then
+            kill -TERM "$run_pid"
+        fi
+        timeout=${SDSYNC_DSM_STOP_TIMEOUT:-120}
+        case $timeout in ''|*[!0-9]*) timeout=120 ;; esac
+        elapsed=0
+        while :; do
+            controller_still_active=false
+            run_still_active=false
+            if [ "$controller_active" = true ] && script_pid_matches "$saved_pid" "$controller"; then
+                controller_still_active=true
+            fi
+            if [ "$run_active" = true ] && script_pid_matches "$run_pid" "$runner"; then
+                run_still_active=true
+            fi
+            [ "$controller_still_active" = true ] || [ "$run_still_active" = true ] || break
+            if [ "$elapsed" -ge "$timeout" ]; then
+                package_message "graceful stop timed out after $timeout seconds; process was not force-killed"
+                exit 1
+            fi
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        package_message "controller and active plan/sync stopped gracefully"
+        exit 0
+        ;;
+    status)
+        set +e
+        status_code
+        result=$?
+        set -e
+        exit "$result"
+        ;;
+    *) echo "usage: $0 prestart|start|prestop|stop|status" >&2; exit 64 ;;
+esac

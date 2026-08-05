@@ -1,5 +1,8 @@
 THIRD_PARTY_LICENSES.html -whitespace
 *.sh text eol=lf
+packaging/synology/package/bin/* text eol=lf
+packaging/synology/package/libexec/* text eol=lf
+packaging/synology/scripts/* text eol=lf
 Dockerfile text eol=lf
 .dockerignore text eol=lf
 compose*.yaml text eol=lf

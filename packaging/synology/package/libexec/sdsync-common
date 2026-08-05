@@ -1,0 +1,257 @@
+#!/bin/sh
+# Shared DSM package paths and narrowly scoped filesystem helpers.
+
+package_name=synology-drive-sync
+package_base=/var/packages/$package_name
+package_root=${SYNOPKG_PKGDEST:-$package_base/target}
+package_home=${SYNOPKG_PKGHOME:-$package_base/home}
+package_var_candidate=${SYNOPKG_PKGVAR:-$package_base/var}
+
+if [ -d "$package_var_candidate" ]; then
+    package_var=$package_var_candidate
+else
+    # SYNOPKG_PKGVAR was introduced during DSM 7.0. Keep early DSM 7 builds
+    # functional without ever falling back to a shared or world-writable path.
+    package_var=$package_home/state
+fi
+
+binary=$package_root/bin/synology-drive-sync
+manager=$package_root/bin/sdsync-dsm
+controller=$package_root/libexec/sdsync-controller
+runner=$package_root/libexec/sdsync-run
+config_root=$package_home/config
+profiles_dir=$config_root/profiles.d
+config_file=$config_root/config.toml
+default_profile_file=$config_root/default-profile
+schedule_file=$config_root/schedule.conf
+secret_root=$package_home/secrets
+state_root=$package_var/state
+runtime_root=$package_var/run
+log_root=$package_var/log
+controller_pid_file=$runtime_root/controller.pid
+controller_lock=$runtime_root/controller.lock
+controller_state=$state_root/controller.state
+run_lock=$runtime_root/run.lock
+run_state=$state_root/run.state
+management_lock=$runtime_root/management.lock
+
+path_owner=
+path_group=
+if command -v stat >/dev/null 2>&1 && [ -d "$package_home" ]; then
+    # Follow DSM's framework-owned /var/packages/.../home symlink so identity
+    # checks use the @apphome owner, not the root-owned link itself.
+    path_owner=$(stat -L -c '%u' "$package_home" 2>/dev/null || true)
+    path_group=$(stat -L -c '%g' "$package_home" 2>/dev/null || true)
+fi
+
+set_private_owner() {
+    private_path=$1
+    if [ "$(id -u)" = 0 ] && [ -n "$path_owner" ] && [ -n "$path_group" ]; then
+        chown "$path_owner:$path_group" "$private_path"
+    fi
+}
+
+require_package_identity() {
+    identity_uid=$(id -u)
+    if [ "$identity_uid" = 0 ]; then
+        echo "refusing to operate as root; use the synology-drive-sync DSM package identity" >&2
+        return 77
+    fi
+    if [ -z "$path_owner" ] || [ "$identity_uid" != "$path_owner" ]; then
+        echo "operation must run as the DSM package identity (expected uid ${path_owner:-unknown})" >&2
+        return 77
+    fi
+}
+
+ensure_layout() {
+    old_umask=$(umask)
+    umask 077
+    # DSM deliberately exposes home/var/target as framework-owned symlinks to
+    # @apphome/@appdata/@appstore. Follow those roots, but never accept a
+    # symlink for a package-created child below them.
+    if [ ! -d "$package_home" ]; then
+        echo "DSM package home is unavailable: $package_home" >&2
+        umask "$old_umask"
+        return 73
+    fi
+    if [ "$package_var" = "$package_var_candidate" ]; then
+        if [ ! -d "$package_var" ]; then
+            echo "DSM package data root is unavailable: $package_var" >&2
+            umask "$old_umask"
+            return 73
+        fi
+        private_roots=
+    else
+        private_roots=$package_var
+    fi
+    for private_dir in $private_roots "$config_root" "$profiles_dir" \
+        "$secret_root" "$state_root" "$runtime_root" "$log_root"
+    do
+        if [ -L "$private_dir" ]; then
+            echo "refusing symlinked package data directory: $private_dir" >&2
+            umask "$old_umask"
+            return 73
+        fi
+        mkdir -p "$private_dir"
+        chmod 0700 "$private_dir"
+        set_private_owner "$private_dir"
+    done
+    umask "$old_umask"
+}
+
+finish_private_file() {
+    private_file=$1
+    chmod 0600 "$private_file"
+    set_private_owner "$private_file"
+}
+
+is_pid() {
+    case ${1:-} in
+        ''|*[!0-9]*) return 1 ;;
+        *) [ "$1" -gt 1 ] 2>/dev/null ;;
+    esac
+}
+
+pid_is_live() {
+    is_pid "${1:-}" && kill -0 "$1" 2>/dev/null
+}
+
+pid_matches_command() {
+    checked_pid=$1
+    expected_command=$2
+    pid_is_live "$checked_pid" || return 1
+    [ -n "$path_owner" ] || return 1
+    actual_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "/proc/$checked_pid/status" 2>/dev/null | sed -n '1p')
+    [ "$actual_uid" = "$path_owner" ] || return 1
+    [ -r "/proc/$checked_pid/cmdline" ] || return 1
+    canonical_command_dir=$(CDPATH='' cd -- "$(dirname -- "$expected_command")" 2>/dev/null && pwd -P) || return 1
+    canonical_command=$canonical_command_dir/$(basename -- "$expected_command")
+    if tr '\000' '\n' < "/proc/$checked_pid/cmdline" 2>/dev/null |
+        grep -F -x "$expected_command" >/dev/null 2>&1
+    then
+        return 0
+    fi
+    [ "$canonical_command" != "$expected_command" ] || return 1
+    tr '\000' '\n' < "/proc/$checked_pid/cmdline" 2>/dev/null |
+        grep -F -x "$canonical_command" >/dev/null 2>&1
+}
+
+read_pid() {
+    pid_path=$1
+    if [ -L "$pid_path" ] || [ ! -f "$pid_path" ]; then
+        return 1
+    fi
+    IFS= read -r saved_pid < "$pid_path" || return 1
+    is_pid "$saved_pid" || return 1
+    printf '%s\n' "$saved_pid"
+}
+
+setting() {
+    setting_file=$1
+    setting_name=$2
+    setting_default=$3
+    if [ -L "$setting_file" ] || [ ! -f "$setting_file" ]; then
+        printf '%s\n' "$setting_default"
+        return
+    fi
+    setting_value=$(sed -n "s/^${setting_name}=//p" "$setting_file" | sed -n '1p')
+    if [ -n "$setting_value" ]; then
+        printf '%s\n' "$setting_value"
+    else
+        printf '%s\n' "$setting_default"
+    fi
+}
+
+epoch_now() {
+    date +%s
+}
+
+write_controller_state() {
+    controller_status=$1
+    controller_pid=${2:-0}
+    controller_next=${3:-0}
+    controller_active=${4:-0}
+    controller_temp=$controller_state.tmp.$$
+    umask 077
+    {
+        printf 'state=%s\n' "$controller_status"
+        printf 'pid=%s\n' "$controller_pid"
+        printf 'next_run_epoch=%s\n' "$controller_next"
+        printf 'active_pid=%s\n' "$controller_active"
+        printf 'updated_epoch=%s\n' "$(epoch_now)"
+    } > "$controller_temp"
+    finish_private_file "$controller_temp"
+    mv -f "$controller_temp" "$controller_state"
+}
+
+write_run_state() {
+    run_status=$1
+    run_started=${2:-0}
+    run_finished=${3:-0}
+    run_exit=${4:--1}
+    run_scope=${5:-none}
+    run_temp=$run_state.tmp.$$
+    umask 077
+    {
+        printf 'state=%s\n' "$run_status"
+        printf 'started_epoch=%s\n' "$run_started"
+        printf 'finished_epoch=%s\n' "$run_finished"
+        printf 'exit_code=%s\n' "$run_exit"
+        printf 'scope=%s\n' "$run_scope"
+    } > "$run_temp"
+    finish_private_file "$run_temp"
+    mv -f "$run_temp" "$run_state"
+}
+
+rotate_log() {
+    rotate_path=$1
+    rotate_limit=${2:-10485760}
+    rotate_keep=${3:-5}
+    if [ -L "$rotate_path" ]; then
+        echo "refusing symlinked log file: $rotate_path" >&2
+        return 73
+    fi
+    [ -f "$rotate_path" ] || return 0
+    rotate_size=$(wc -c < "$rotate_path" | tr -d ' ')
+    case $rotate_size in ''|*[!0-9]*) return 73 ;; esac
+    [ "$rotate_size" -ge "$rotate_limit" ] || return 0
+    rotate_index=$rotate_keep
+    while [ "$rotate_index" -gt 1 ]; do
+        rotate_previous=$((rotate_index - 1))
+        if [ -f "$rotate_path.$rotate_previous" ] && [ ! -L "$rotate_path.$rotate_previous" ]; then
+            mv -f "$rotate_path.$rotate_previous" "$rotate_path.$rotate_index"
+        fi
+        rotate_index=$rotate_previous
+    done
+    mv -f "$rotate_path" "$rotate_path.1"
+}
+
+append_rotating_log() {
+    append_path=$1
+    append_limit=$2
+    append_keep=$3
+    append_line=$4
+    rotate_log "$append_path" "$append_limit" "$append_keep"
+    printf '%s\n' "$append_line" >> "$append_path"
+}
+
+profile_exists() {
+    case ${1:-} in
+        ''|*[!A-Za-z0-9_-]*) return 1 ;;
+    esac
+    [ -f "$profiles_dir/$1.toml" ] && [ ! -L "$profiles_dir/$1.toml" ]
+}
+
+profile_secret_exists() {
+    profile_exists "$1" || return 1
+    password_path=$secret_root/$1.password
+    private_secret_file "$password_path"
+}
+
+private_secret_file() {
+    secret_path=$1
+    [ -f "$secret_path" ] && [ ! -L "$secret_path" ] && [ -r "$secret_path" ] || return 1
+    secret_mode=$(stat -c '%a' "$secret_path" 2>/dev/null || true)
+    secret_owner=$(stat -c '%u' "$secret_path" 2>/dev/null || true)
+    [ "$secret_mode" = 600 ] && [ -n "$path_owner" ] && [ "$secret_owner" = "$path_owner" ]
+}

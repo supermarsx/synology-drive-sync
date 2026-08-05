@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/common"
+
+[ -r "$common_runtime" ] || { package_message "upgraded runtime helper is missing"; exit 1; }
+. "$common_runtime"
+ensure_layout
+if [ -f "$config_file" ]; then
+    "$binary" --config "$config_file" --quiet config validate || {
+        package_message "existing configuration is incompatible with the upgraded binary"
+        exit 1
+    }
+fi
+package_message "Upgrade completed; private configuration and credentials were retained"
+exit 0

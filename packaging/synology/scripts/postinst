@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/common"
+
+[ -x "$package_root/bin/synology-drive-sync" ] || { package_message "installed binary is not executable"; exit 1; }
+[ -r "$common_runtime" ] || { package_message "installed runtime helper is missing"; exit 1; }
+. "$common_runtime"
+ensure_layout
+if [ ! -f "$schedule_file" ]; then
+    schedule_temp=$schedule_file.tmp.$$
+    umask 077
+    printf 'enabled=false\ninterval_seconds=3600\nallow_delete=false\nmax_total_delete=100\n' > "$schedule_temp"
+    finish_private_file "$schedule_temp"
+    mv -f "$schedule_temp" "$schedule_file"
+fi
+package_message "Installed safely with scheduling disabled. Configure profiles with $manager"
+exit 0

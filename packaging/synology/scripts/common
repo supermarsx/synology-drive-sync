@@ -1,0 +1,68 @@
+#!/bin/sh
+
+package_name=synology-drive-sync
+package_base=/var/packages/$package_name
+package_root=${SYNOPKG_PKGDEST:-$package_base/target}
+package_home=${SYNOPKG_PKGHOME:-$package_base/home}
+package_var=${SYNOPKG_PKGVAR:-$package_base/var}
+runtime_root=$package_var/run
+log_root=$package_var/log
+controller_pid_file=$runtime_root/controller.pid
+controller_lock=$runtime_root/controller.lock
+controller=$package_root/libexec/sdsync-controller
+runner=$package_root/libexec/sdsync-run
+common_runtime=$package_root/libexec/sdsync-common
+run_lock=$runtime_root/run.lock
+
+package_message() {
+    if [ -n "${SYNOPKG_TEMP_LOGFILE:-}" ]; then
+        printf '%s\n' "$*" >> "$SYNOPKG_TEMP_LOGFILE"
+    fi
+    printf '%s\n' "$*"
+}
+
+script_pid() {
+    pid_file=$1
+    [ -f "$pid_file" ] && [ ! -L "$pid_file" ] || return 1
+    IFS= read -r found_pid < "$pid_file" || return 1
+    case $found_pid in ''|*[!0-9]*) return 1 ;; esac
+    [ "$found_pid" -gt 1 ] 2>/dev/null || return 1
+    printf '%s\n' "$found_pid"
+}
+
+script_pid_live() {
+    kill -0 "$1" 2>/dev/null
+}
+
+script_pid_matches() {
+    checked_pid=$1
+    expected_command=$2
+    script_pid_live "$checked_pid" || return 1
+    expected_uid=$(stat -L -c '%u' "$package_home" 2>/dev/null || true)
+    [ -n "$expected_uid" ] || return 1
+    actual_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "/proc/$checked_pid/status" 2>/dev/null | sed -n '1p')
+    [ "$actual_uid" = "$expected_uid" ] || return 1
+    [ -r "/proc/$checked_pid/cmdline" ] || return 1
+    canonical_command_dir=$(CDPATH='' cd -- "$(dirname -- "$expected_command")" 2>/dev/null && pwd -P) || return 1
+    canonical_command=$canonical_command_dir/$(basename -- "$expected_command")
+    if tr '\000' '\n' < "/proc/$checked_pid/cmdline" 2>/dev/null |
+        grep -F -x "$expected_command" >/dev/null 2>&1
+    then
+        return 0
+    fi
+    [ "$canonical_command" != "$expected_command" ] || return 1
+    tr '\000' '\n' < "/proc/$checked_pid/cmdline" 2>/dev/null |
+        grep -F -x "$canonical_command" >/dev/null 2>&1
+}
+
+refuse_active_run() {
+    run_pid=$(script_pid "$run_lock/pid" 2>/dev/null || true)
+    if [ -n "$run_pid" ] && script_pid_live "$run_pid"; then
+        if script_pid_matches "$run_pid" "$runner"; then
+            package_message "plan/sync PID $run_pid is still active; stop it before changing the package"
+        else
+            package_message "refusing to trust live PID $run_pid from the package run lock"
+        fi
+        return 1
+    fi
+}

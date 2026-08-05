@@ -1,0 +1,50 @@
+{
+  "defaults": {
+    "run-as": "package"
+  },
+  "ctrl-script": [
+    { "action": "preinst", "run-as": "package" },
+    { "action": "postinst", "run-as": "package" },
+    { "action": "preuninst", "run-as": "package" },
+    { "action": "postuninst", "run-as": "package" },
+    { "action": "preupgrade", "run-as": "package" },
+    { "action": "postupgrade", "run-as": "package" },
+    { "action": "prestart", "run-as": "package" },
+    { "action": "start", "run-as": "package" },
+    { "action": "prestop", "run-as": "package" },
+    { "action": "stop", "run-as": "package" },
+    { "action": "status", "run-as": "package" }
+  ],
+  "tool": [
+    {
+      "relpath": "bin/synology-drive-sync",
+      "user": "package",
+      "group": "package",
+      "permission": "0755"
+    },
+    {
+      "relpath": "bin/sdsync-dsm",
+      "user": "package",
+      "group": "package",
+      "permission": "0755"
+    },
+    {
+      "relpath": "libexec/sdsync-common",
+      "user": "package",
+      "group": "package",
+      "permission": "0755"
+    },
+    {
+      "relpath": "libexec/sdsync-controller",
+      "user": "package",
+      "group": "package",
+      "permission": "0755"
+    },
+    {
+      "relpath": "libexec/sdsync-run",
+      "user": "package",
+      "group": "package",
+      "permission": "0755"
+    }
+  ]
+}
