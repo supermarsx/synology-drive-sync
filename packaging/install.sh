@@ -4,13 +4,17 @@ set -eu
 repository=supermarsx/synology-drive-sync
 version=
 bin_dir=${HOME:+"$HOME/.local/bin"}
+action=install
 
 usage() {
     cat <<'EOF'
 Usage: install.sh [--version YY.N] [--bin-dir PATH] [--repository OWNER/REPO]
+       install.sh --uninstall [--bin-dir PATH]
 
 Downloads the native GitHub Release archive, verifies it against SHA256SUMS,
-and atomically installs only the synology-drive-sync executable.
+and atomically installs or upgrades only the synology-drive-sync executable.
+Uninstall removes only that executable; scheduler configuration and credentials
+are deliberately left for their native manager.
 EOF
 }
 
@@ -31,6 +35,10 @@ while [ "$#" -gt 0 ]; do
             repository=$2
             shift 2
             ;;
+        --uninstall)
+            action=uninstall
+            shift
+            ;;
         --help|-h)
             usage
             exit 0
@@ -44,6 +52,37 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$bin_dir" ] || { echo "HOME is unset; pass --bin-dir" >&2; exit 64; }
+
+if [ "$action" = uninstall ]; then
+    [ -z "$version" ] || { echo "--version cannot be combined with --uninstall" >&2; exit 64; }
+    [ "$repository" = supermarsx/synology-drive-sync ] || {
+        echo "--repository cannot be combined with --uninstall" >&2
+        exit 64
+    }
+    if [ ! -e "$bin_dir" ]; then
+        echo "synology-drive-sync is already absent from $bin_dir"
+        exit 0
+    fi
+    [ -d "$bin_dir" ] && [ ! -L "$bin_dir" ] || {
+        echo "install directory is not a non-symlink directory: $bin_dir" >&2
+        exit 73
+    }
+    bin_dir=$(CDPATH='' cd -- "$bin_dir" && pwd -P)
+    target="$bin_dir/synology-drive-sync"
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+        echo "synology-drive-sync is already absent from $target"
+        exit 0
+    fi
+    [ -f "$target" ] && [ ! -L "$target" ] || {
+        echo "refusing to remove a non-regular or linked install target: $target" >&2
+        exit 73
+    }
+    rm -f -- "$target"
+    echo "Removed $target"
+    echo "Scheduler definitions, configuration, logs, and credentials were not removed."
+    exit 0
+fi
+
 printf '%s\n' "$repository" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || {
     echo "repository must be OWNER/REPO" >&2
     exit 64
@@ -177,6 +216,8 @@ while read -r member; do
         "$archive_root/man/synology-drive-sync-credentials-status.1"|\
         "$archive_root/man/synology-drive-sync-credentials.1"|\
         "$archive_root/man/synology-drive-sync-doctor.1"|\
+        "$archive_root/man/synology-drive-sync-doctor-source.1"|\
+        "$archive_root/man/synology-drive-sync-doctor-target.1"|\
         "$archive_root/man/synology-drive-sync-manpage.1"|\
         "$archive_root/man/synology-drive-sync-plan.1"|\
         "$archive_root/man/synology-drive-sync-sync.1"|\
@@ -201,10 +242,10 @@ mkdir "$temp_dir/extract"
 tar -xzf "$temp_dir/$asset" -C "$temp_dir/extract" \
     "$archive_root/synology-drive-sync"
 candidate="$temp_dir/extract/$archive_root/synology-drive-sync"
-[ -f "$candidate" ] && [ ! -L "$candidate" ] || {
+if [ ! -f "$candidate" ] || [ -L "$candidate" ]; then
     echo "verified archive did not contain the expected regular executable" >&2
     exit 65
-}
+fi
 chmod 0755 "$candidate"
 candidate_version=$("$candidate" --version)
 expected_version="synology-drive-sync $version"
@@ -216,7 +257,12 @@ expected_version="synology-drive-sync $version"
 mkdir -p -- "$bin_dir"
 bin_dir=$(CDPATH='' cd -- "$bin_dir" && pwd -P)
 target="$bin_dir/synology-drive-sync"
-[ ! -d "$target" ] || { echo "install target is a directory: $target" >&2; exit 73; }
+if [ -e "$target" ] || [ -L "$target" ]; then
+    [ -f "$target" ] && [ ! -L "$target" ] || {
+        echo "install target is not a non-symlink regular file: $target" >&2
+        exit 73
+    }
+fi
 staged_target=$(mktemp "$bin_dir/.synology-drive-sync.install.XXXXXX")
 cp -- "$candidate" "$staged_target"
 chmod 0755 "$staged_target"

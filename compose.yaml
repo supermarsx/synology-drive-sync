@@ -8,7 +8,10 @@ services:
         VERSION: local
     image: synology-drive-sync:local
     init: true
-    user: "10001:10001"
+    # The managed wrapper exports the invoking non-root UID/GID so owner-only bind-mounted
+    # secrets and the source stay readable without broadening host permissions. Direct Compose
+    # use retains the image's fixed non-root identity unless these are set explicitly.
+    user: "${SDSYNC_RUNTIME_UID:-10001}:${SDSYNC_RUNTIME_GID:-10001}"
     read_only: true
     cap_drop:
       - ALL

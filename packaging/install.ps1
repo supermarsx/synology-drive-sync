@@ -1,4 +1,4 @@
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess)]
 param(
     [ValidatePattern('^[0-9]{2}\.[1-9][0-9]*$')]
     [string] $Version,
@@ -9,7 +9,9 @@ param(
     [ValidatePattern('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')]
     [string] $Repository = 'supermarsx/synology-drive-sync',
 
-    [switch] $AddToUserPath
+    [switch] $AddToUserPath,
+
+    [switch] $Uninstall
 )
 
 $ErrorActionPreference = 'Stop'
@@ -17,6 +19,40 @@ Set-StrictMode -Version Latest
 
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw 'install.ps1 supports Windows only.'
+}
+
+if ($Uninstall) {
+    foreach ($incompatible in @('Version', 'Repository', 'AddToUserPath')) {
+        if ($PSBoundParameters.ContainsKey($incompatible)) {
+            throw "-$incompatible cannot be combined with -Uninstall."
+        }
+    }
+    $resolvedInstallDir = [IO.Path]::GetFullPath($InstallDir)
+    if (-not (Test-Path -LiteralPath $resolvedInstallDir)) {
+        Write-Host "synology-drive-sync is already absent from $resolvedInstallDir"
+        return
+    }
+    $installItem = Get-Item -LiteralPath $resolvedInstallDir -Force
+    if (-not $installItem.PSIsContainer -or
+        (($installItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "Install directory is not a non-reparse directory: $resolvedInstallDir"
+    }
+    $target = Join-Path $resolvedInstallDir 'synology-drive-sync.exe'
+    if (-not (Test-Path -LiteralPath $target)) {
+        Write-Host "synology-drive-sync is already absent from $target"
+        return
+    }
+    $targetItem = Get-Item -LiteralPath $target -Force
+    if ($targetItem.PSIsContainer -or
+        (($targetItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "Refusing to remove a directory or reparse-point install target: $target"
+    }
+    if ($PSCmdlet.ShouldProcess($target, 'Remove synology-drive-sync executable')) {
+        Remove-Item -LiteralPath $target -Force
+        Write-Host "Removed $target"
+        Write-Host 'Scheduled tasks, configuration, logs, credentials, and user PATH entries were not removed.'
+    }
+    return
 }
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -90,6 +126,8 @@ try {
         "$archiveRoot/man/synology-drive-sync-credentials-status.1",
         "$archiveRoot/man/synology-drive-sync-credentials.1",
         "$archiveRoot/man/synology-drive-sync-doctor.1",
+        "$archiveRoot/man/synology-drive-sync-doctor-source.1",
+        "$archiveRoot/man/synology-drive-sync-doctor-target.1",
         "$archiveRoot/man/synology-drive-sync-manpage.1",
         "$archiveRoot/man/synology-drive-sync-plan.1",
         "$archiveRoot/man/synology-drive-sync-sync.1",
@@ -194,7 +232,19 @@ try {
         throw "Archive binary version did not exactly match ${expectedVersion}: $reportedVersion"
     }
 
-    [void] (New-Item -ItemType Directory -Path $InstallDir -Force)
+    if (Test-Path -LiteralPath $InstallDir) {
+        $installItem = Get-Item -LiteralPath $InstallDir -Force
+        if (-not $installItem.PSIsContainer -or
+            (($installItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            throw "Install directory is not a non-reparse directory: $InstallDir"
+        }
+    }
+    elseif ($PSCmdlet.ShouldProcess($InstallDir, 'Create install directory')) {
+        [void] (New-Item -ItemType Directory -Path $InstallDir)
+    }
+    else {
+        return
+    }
     $resolvedInstallDir = (Resolve-Path -LiteralPath $InstallDir).Path
     $target = Join-Path $resolvedInstallDir 'synology-drive-sync.exe'
     if (Test-Path -LiteralPath $target) {
@@ -204,33 +254,35 @@ try {
             throw "Install target is a directory or reparse point: $target"
         }
     }
-    $staged = Join-Path $resolvedInstallDir ('.synology-drive-sync.install.' + [Guid]::NewGuid().ToString('N'))
-    try {
-        Copy-Item -LiteralPath $candidate -Destination $staged
-        if ([IO.File]::Exists($target)) {
-            [IO.File]::Replace($staged, $target, $null)
+    if ($PSCmdlet.ShouldProcess($target, "Install or upgrade synology-drive-sync $Version")) {
+        $staged = Join-Path $resolvedInstallDir ('.synology-drive-sync.install.' + [Guid]::NewGuid().ToString('N'))
+        try {
+            Copy-Item -LiteralPath $candidate -Destination $staged
+            if ([IO.File]::Exists($target)) {
+                [IO.File]::Replace($staged, $target, $null)
+            }
+            else {
+                [IO.File]::Move($staged, $target)
+            }
         }
-        else {
-            [IO.File]::Move($staged, $target)
+        finally {
+            if (Test-Path -LiteralPath $staged -PathType Leaf) {
+                Remove-Item -LiteralPath $staged -Force
+            }
         }
-    }
-    finally {
-        if (Test-Path -LiteralPath $staged -PathType Leaf) {
-            Remove-Item -LiteralPath $staged -Force
-        }
-    }
 
-    if ($AddToUserPath) {
-        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-        $parts = @($userPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        if ($parts -notcontains $resolvedInstallDir) {
-            $updated = (@($parts) + $resolvedInstallDir) -join ';'
-            [Environment]::SetEnvironmentVariable('Path', $updated, 'User')
-            Write-Host 'Updated the current user PATH; open a new terminal to use it.'
+        if ($AddToUserPath -and $PSCmdlet.ShouldProcess('current-user PATH', "Add $resolvedInstallDir")) {
+            $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+            $parts = @($userPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            if ($parts -notcontains $resolvedInstallDir) {
+                $updated = (@($parts) + $resolvedInstallDir) -join ';'
+                [Environment]::SetEnvironmentVariable('Path', $updated, 'User')
+                Write-Host 'Updated the current user PATH; open a new terminal to use it.'
+            }
         }
-    }
 
-    Write-Host "Installed synology-drive-sync $Version to $target"
+        Write-Host "Installed synology-drive-sync $Version to $target"
+    }
 }
 finally {
     $expectedPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
