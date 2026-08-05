@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -9,7 +9,7 @@ use md5::{Digest, Md5};
 
 use crate::cancel::CancellationToken;
 use crate::integrity::ContentMd5;
-use crate::path::{is_dsm_managed, path_for_match, validate_relative};
+use crate::path::{drive_path_issue, is_dsm_managed, path_for_match, validate_relative};
 use crate::{Error, Result};
 
 pub const DEFAULT_IGNORE_FILE: &str = ".sdsyncignore";
@@ -76,6 +76,7 @@ impl IgnoreRules {
             path: source.to_owned(),
             source: source_error,
         })?;
+        reject_filesystem_root(&source_root)?;
         let mut builder = GitignoreBuilder::new(&source_root);
         let default_file = source_root.join(DEFAULT_IGNORE_FILE);
         match fs::symlink_metadata(&default_file) {
@@ -145,6 +146,13 @@ pub fn scan(source: &Path, rules: &IgnoreRules) -> Result<LocalInventory> {
     })?;
     if !root.is_dir() {
         return Err(Error::InvalidSource(root));
+    }
+    reject_filesystem_root(&root)?;
+    if path_contains_dsm_managed_component(&root) {
+        return Err(Error::UnsupportedLocalEntry {
+            path: root,
+            reason: "a DSM-managed directory cannot be selected as the source root".to_owned(),
+        });
     }
 
     let mut entries = BTreeMap::new();
@@ -269,19 +277,19 @@ fn scan_dir(
         } else {
             format!("{relative_parent}/{name}")
         };
+        // DSM creates these administrative entries inside otherwise ordinary shares. They are
+        // never payload, and pruning them before metadata lookup guarantees that a linked or
+        // otherwise unusual managed entry is not traversed. Remote planning protects the same
+        // names, so mirror mode cannot interpret the omission as authorization to delete them.
+        if is_dsm_managed(&relative) {
+            continue;
+        }
+
         validate_relative(&relative)?;
-        if let Some(reason) = drive_name_issue(&relative) {
+        if let Some(reason) = drive_path_issue(&relative) {
             return Err(Error::UnsupportedLocalEntry {
                 path: child.path(),
                 reason,
-            });
-        }
-
-        if is_dsm_managed(&relative) {
-            return Err(Error::UnsupportedLocalEntry {
-                path: child.path(),
-                reason: "DSM-managed names (#recycle, #snapshot, and @eaDir) are not sync payload"
-                    .to_owned(),
             });
         }
 
@@ -362,66 +370,21 @@ fn scan_dir(
     Ok(())
 }
 
-fn drive_name_issue(relative: &str) -> Option<String> {
-    if relative.chars().count() > 247 {
-        return Some(
-            "relative path exceeds Synology Drive's 247-character Windows compatibility limit"
-                .to_owned(),
-        );
-    }
-    for component in relative.split('/') {
-        if component.chars().count() > 255 {
-            return Some(
-                "a path component exceeds Synology Drive's 255-character limit".to_owned(),
-            );
-        }
-        if component.starts_with('~') {
-            return Some(
-                "names beginning with ~ are not synchronized by Synology Drive".to_owned(),
-            );
-        }
-        if component.chars().any(char::is_control) {
-            return Some("name contains a terminal-unsafe control character".to_owned());
-        }
-        if component.contains(['*', ':', '?', '"', '<', '>', '|']) {
-            return Some(
-                "name contains characters unsupported by Windows Synology Drive clients".to_owned(),
-            );
-        }
-        if component.ends_with(['.', ' ']) {
-            return Some("name ends with a dot or space and is not Windows-compatible".to_owned());
-        }
+fn path_contains_dsm_managed_component(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        Component::Normal(name) => name.to_str().is_some_and(is_dsm_managed),
+        _ => false,
+    })
+}
 
-        let stem = component.split('.').next().unwrap_or(component);
-        if matches!(
-            stem.to_ascii_uppercase().as_str(),
-            "CON"
-                | "PRN"
-                | "AUX"
-                | "NUL"
-                | "COM1"
-                | "COM2"
-                | "COM3"
-                | "COM4"
-                | "COM5"
-                | "COM6"
-                | "COM7"
-                | "COM8"
-                | "COM9"
-                | "LPT1"
-                | "LPT2"
-                | "LPT3"
-                | "LPT4"
-                | "LPT5"
-                | "LPT6"
-                | "LPT7"
-                | "LPT8"
-                | "LPT9"
-        ) {
-            return Some("name is reserved by Windows and cannot sync portably".to_owned());
-        }
+fn reject_filesystem_root(path: &Path) -> Result<()> {
+    if path.parent().is_none() {
+        return Err(Error::UnsupportedLocalEntry {
+            path: path.to_owned(),
+            reason: "the canonical source root cannot be a filesystem root".to_owned(),
+        });
     }
-    None
+    Ok(())
 }
 
 fn portable_case_collision<'a>(
@@ -512,25 +475,78 @@ mod tests {
     }
 
     #[test]
-    fn rejects_dsm_managed_local_names() {
-        let root = temp_dir("managed");
-        fs::create_dir(root.join("@eaDir")).unwrap();
+    fn prunes_dsm_managed_entries_without_losing_user_directories() {
+        let root = temp_dir("managed-prune");
+        fs::write(root.join("payload.txt"), b"payload").unwrap();
+        fs::create_dir_all(root.join("album/@eaDir/thumbnails")).unwrap();
+        fs::write(root.join("album/@eaDir/thumbnails/preview.jpg"), b"preview").unwrap();
+        fs::create_dir(root.join("#recycle")).unwrap();
+        fs::write(root.join("#recycle/deleted.txt"), b"deleted").unwrap();
+        fs::create_dir(root.join("#snapshot")).unwrap();
+        fs::write(root.join("#snapshot/history.txt"), b"history").unwrap();
+        fs::create_dir(root.join("@appdata")).unwrap();
+        fs::write(root.join("@appdata/package.db"), b"private package data").unwrap();
+        fs::write(root.join("@tmp"), b"administrative placeholder").unwrap();
 
         let rules = IgnoreRules::build(&root, &[]).unwrap();
-        assert!(matches!(
-            scan(&root, &rules),
-            Err(Error::UnsupportedLocalEntry { .. })
-        ));
+        let inventory = scan(&root, &rules).unwrap();
+        assert_eq!(
+            inventory.entries.keys().cloned().collect::<Vec<_>>(),
+            ["album", "payload.txt"]
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
+    fn rejects_a_source_root_inside_a_dsm_managed_directory() {
+        let parent = temp_dir("managed-root");
+        let root = parent.join("@eaDir").join("nested");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("payload.txt"), b"payload").unwrap();
+
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        assert!(matches!(
+            scan(&root, &rules),
+            Err(Error::UnsupportedLocalEntry { path, reason })
+                if path == fs::canonicalize(&root).unwrap()
+                    && reason.contains("source root")
+        ));
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn rejects_canonical_filesystem_roots_before_reading_or_scanning_them() {
+        let fixture = temp_dir("filesystem-root");
+        let canonical_fixture = fs::canonicalize(&fixture).unwrap();
+        let filesystem_root = canonical_fixture
+            .ancestors()
+            .find(|ancestor| ancestor.parent().is_none())
+            .unwrap()
+            .to_owned();
+        let rules = IgnoreRules::build(&fixture, &[]).unwrap();
+
+        assert!(matches!(
+            IgnoreRules::build(&filesystem_root, &[]),
+            Err(Error::UnsupportedLocalEntry { path, reason })
+                if path == filesystem_root && reason.contains("filesystem root")
+        ));
+        assert!(matches!(
+            scan(&filesystem_root, &rules),
+            Err(Error::UnsupportedLocalEntry { path, reason })
+                if path == filesystem_root && reason.contains("filesystem root")
+        ));
+
+        fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
     fn rejects_nonportable_drive_names_before_upload() {
         for relative in ["~scratch", "bad:name", "folder/NUL.txt", "trailing."] {
-            assert!(drive_name_issue(relative).is_some(), "{relative}");
+            assert!(drive_path_issue(relative).is_some(), "{relative}");
         }
-        assert!(drive_name_issue("normal/fichier.txt").is_none());
+        assert!(drive_path_issue("normal/fichier.txt").is_none());
     }
 
     #[test]
@@ -697,7 +713,7 @@ mod tests {
             ("folder/trailing ", "dot or space"),
             ("folder/COM9.log", "reserved by Windows"),
         ] {
-            assert!(drive_name_issue(relative).unwrap().contains(expected));
+            assert!(drive_path_issue(relative).unwrap().contains(expected));
         }
     }
 }

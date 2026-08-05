@@ -507,6 +507,125 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
 }
 
 #[test]
+fn missing_home_destination_is_provisioned_below_the_existing_home_root() {
+    let fixture = TestDir::new("missing-home-destination");
+    let source = fixture.child("source");
+    fs::create_dir_all(source.join("empty")).expect("create empty source directory");
+    fs::write(source.join("payload.txt"), b"home-backup").expect("write source payload");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/home");
+
+    let target = "/home/Drive/Chosen Folder";
+    let output = run(&[
+        "--quiet",
+        "--output",
+        "json",
+        "sync",
+        source.to_str().expect("UTF-8 source path"),
+        target,
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password.to_str().expect("UTF-8 password path"),
+        "--no-vault",
+        "--allow-http",
+        "--jobs",
+        "1",
+    ]);
+    assert_success(&output);
+
+    let synced = stdout_json(&output);
+    assert_eq!(synced["plan"]["summary"]["directories"], 2);
+    assert_eq!(synced["plan"]["summary"]["uploads"], 1);
+    assert_eq!(synced["result"]["directories_created"], 2);
+    assert_eq!(synced["result"]["uploaded"], 1);
+    assert_eq!(synced["result"]["deleted"], 0);
+
+    let directories = server.directories();
+    for expected in [
+        "/home",
+        "/home/Drive",
+        "/home/Drive/Chosen Folder",
+        "/home/Drive/Chosen Folder/empty",
+    ] {
+        assert!(
+            directories.contains(&expected.to_owned()),
+            "missing {expected}"
+        );
+    }
+    assert_eq!(
+        server.file_contents("/home/Drive/Chosen Folder/payload.txt"),
+        Some(b"home-backup".to_vec())
+    );
+
+    let requests = server.requests();
+    let created_paths = requests
+        .iter()
+        .filter(|request| request.operation() == "SYNO.FileStation.CreateFolder.create")
+        .map(|request| {
+            let parent = serde_json::from_str::<Vec<String>>(
+                request
+                    .fields
+                    .get("folder_path")
+                    .expect("create folder parent"),
+            )
+            .expect("create folder parent JSON")
+            .into_iter()
+            .next()
+            .expect("one create folder parent");
+            let name = serde_json::from_str::<Vec<String>>(
+                request.fields.get("name").expect("create folder name"),
+            )
+            .expect("create folder name JSON")
+            .into_iter()
+            .next()
+            .expect("one create folder name");
+            format!("{}/{}", parent.trim_end_matches('/'), name)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        created_paths,
+        [
+            "/home/Drive/Chosen Folder",
+            "/home/Drive/Chosen Folder/empty"
+        ]
+    );
+    assert!(
+        !created_paths.iter().any(|path| path == "/home"),
+        "the provisioned DSM home root must never be synthesized by sync"
+    );
+
+    let upload_index = requests
+        .iter()
+        .position(|request| request.operation() == "SYNO.FileStation.Upload.upload")
+        .expect("payload upload request");
+    let encoded_target = serde_json::to_string(target).expect("encode target path");
+    let reconciliation_list_index = requests
+        .iter()
+        .enumerate()
+        .skip(upload_index + 1)
+        .find_map(|(index, request)| {
+            (request.operation() == "SYNO.FileStation.List.list"
+                && request.fields.get("folder_path") == Some(&encoded_target))
+            .then_some(index)
+        })
+        .expect("post-upload reconciliation inventory of the chosen target");
+    assert!(
+        requests[reconciliation_list_index + 1..]
+            .iter()
+            .any(|request| request.operation() == "SYNO.FileStation.MD5.start"),
+        "final reconciliation must content-verify the uploaded payload"
+    );
+    assert_eq!(
+        requests.last().map(|request| request.operation()),
+        Some("SYNO.API.Auth.logout".to_owned())
+    );
+}
+
+#[test]
 fn reflected_authentication_failure_is_redacted_and_never_logs_out() {
     let fixture = TestDir::new("auth-redaction");
     let password = fixture.write("password", PASSWORD);

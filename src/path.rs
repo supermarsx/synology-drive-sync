@@ -8,6 +8,11 @@ const DSM_MANAGED_NAMES: &[&str] = &[
     "@eaDir",
     "@tmp",
     "@sharebin",
+    "@apphome",
+    "@appdata",
+    "@appstore",
+    "@apptemp",
+    "@appconf",
     ".SynologyWorkingDirectory",
 ];
 
@@ -51,6 +56,9 @@ impl RemoteRoot {
                 "DSM-managed directories cannot be sync roots",
             ));
         }
+        if let Some(reason) = drive_path_issue(&value[1..]) {
+            return Err(unsafe_path(value, &reason));
+        }
 
         Ok(Self(value.to_owned()))
     }
@@ -72,11 +80,15 @@ impl RemoteRoot {
 
     pub fn join(&self, relative: &str) -> Result<String> {
         validate_relative(relative)?;
-        if relative.is_empty() {
-            Ok(self.0.clone())
+        let joined = if relative.is_empty() {
+            self.0.clone()
         } else {
-            Ok(format!("{}/{}", self.0, relative))
+            format!("{}/{}", self.0, relative)
+        };
+        if let Some(reason) = drive_path_issue(&joined[1..]) {
+            return Err(unsafe_path(&joined, &reason));
         }
+        Ok(joined)
     }
 
     pub fn relative(&self, remote: &str) -> Result<String> {
@@ -146,6 +158,67 @@ pub fn path_for_match(relative: &str) -> &Path {
     Path::new(relative)
 }
 
+pub(crate) fn drive_path_issue(path: &str) -> Option<String> {
+    if path.chars().count() > 247 {
+        return Some(
+            "path exceeds Synology Drive's 247-character Windows compatibility limit".to_owned(),
+        );
+    }
+    for component in path.split('/') {
+        if component.chars().count() > 255 {
+            return Some(
+                "a path component exceeds Synology Drive's 255-character limit".to_owned(),
+            );
+        }
+        if component.starts_with('~') {
+            return Some(
+                "names beginning with ~ are not synchronized by Synology Drive".to_owned(),
+            );
+        }
+        if component.chars().any(char::is_control) {
+            return Some("name contains a terminal-unsafe control character".to_owned());
+        }
+        if component.contains(['*', ':', '?', '"', '<', '>', '|']) {
+            return Some(
+                "name contains characters unsupported by Windows Synology Drive clients".to_owned(),
+            );
+        }
+        if component.ends_with(['.', ' ']) {
+            return Some("name ends with a dot or space and is not Windows-compatible".to_owned());
+        }
+
+        let stem = component.split('.').next().unwrap_or(component);
+        if matches!(
+            stem.to_ascii_uppercase().as_str(),
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        ) {
+            return Some("name is reserved by Windows and cannot sync portably".to_owned());
+        }
+    }
+    None
+}
+
 fn is_dsm_managed_name(name: &str) -> bool {
     DSM_MANAGED_NAMES.contains(&name)
 }
@@ -171,6 +244,35 @@ mod tests {
     }
 
     #[test]
+    fn accepts_user_home_and_arbitrary_nested_destinations() {
+        for (value, share) in [
+            ("/home/Drive/Photos", "home"),
+            ("/homes/alice/Drive/Archive", "homes"),
+            ("/team-folder/Chosen Folder/Nested", "team-folder"),
+        ] {
+            let root = RemoteRoot::parse(value).unwrap();
+            assert_eq!(root.as_str(), value);
+            assert_eq!(root.share_name(), share);
+        }
+    }
+
+    #[test]
+    fn enforces_drive_portability_on_the_chosen_root_and_mapped_children() {
+        for value in [
+            "/home/Drive/~not-synced",
+            "/team/COM1.txt",
+            "/team/trailing. ",
+            "/team/bad?.txt",
+        ] {
+            assert!(RemoteRoot::parse(value).is_err(), "{value}");
+        }
+
+        let near_limit = format!("/share/{}", "x".repeat(240));
+        let root = RemoteRoot::parse(&near_limit).unwrap();
+        assert!(root.join("a").is_err());
+    }
+
+    #[test]
     fn rejects_dangerous_roots_and_traversal() {
         for value in [
             "/",
@@ -179,6 +281,7 @@ mod tests {
             "/share//x",
             "/share/../x",
             "/share/@eaDir",
+            "/share/@appdata",
             "/share/escape\u{1b}",
         ] {
             assert!(RemoteRoot::parse(value).is_err(), "{value}");

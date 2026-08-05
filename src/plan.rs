@@ -202,6 +202,14 @@ pub fn build_plan(
     rules: &IgnoreRules,
     options: &PlanOptions,
 ) -> Result<SyncPlan> {
+    // The selected destination prefix is part of every Synology Drive-visible path. Validate the
+    // complete mapping even for entries that may ultimately compare as unchanged, then reject
+    // case variants across either inventory before File Station can create a second spelling.
+    for relative in local.entries.keys() {
+        root.join(relative)?;
+    }
+    validate_portable_case_mapping(root, local, remote)?;
+
     let mut plan = SyncPlan {
         pre_deletes: Vec::new(),
         creates: Vec::new(),
@@ -351,6 +359,36 @@ pub fn build_plan(
         });
     }
     Ok(plan)
+}
+
+fn validate_portable_case_mapping(
+    root: &RemoteRoot,
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+) -> Result<()> {
+    let mut seen = BTreeMap::<String, String>::new();
+    for relative in local.entries.keys().chain(remote.entries.keys()) {
+        let mut prefix = String::new();
+        for component in relative.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            let folded = prefix.to_lowercase();
+            if let Some(first) = seen.get(&folded)
+                && first != &prefix
+            {
+                return Err(Error::UnsafeRemotePath {
+                    path: format!("{}/{}", root.as_str(), prefix),
+                    reason: format!(
+                        "{first:?} and {prefix:?} differ only by case and cannot coexist portably on Synology Drive clients"
+                    ),
+                });
+            }
+            seen.entry(folded).or_insert_with(|| prefix.clone());
+        }
+    }
+    Ok(())
 }
 
 fn schedule_missing(root: &RemoteRoot, plan: &mut SyncPlan, entry: &LocalEntry) -> Result<()> {
@@ -737,6 +775,46 @@ mod tests {
         assert_eq!(plan.uploads.len(), 2);
         assert_eq!(plan.unchanged_files, 1);
         assert!(plan.post_deletes.is_empty());
+    }
+
+    #[test]
+    fn rejects_case_variant_paths_across_and_within_remote_inventory() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let local_inventory = local(&[
+            ("folder", EntryKind::Directory, 0, 0),
+            ("folder/local.bin", EntryKind::File, 1, 1_000),
+        ]);
+        let remote_inventory = remote(&[
+            ("Folder", EntryKind::Directory, 0, 0),
+            ("Folder/remote.bin", EntryKind::File, 1, 1),
+        ]);
+        assert!(matches!(
+            build_plan(
+                &root,
+                &local_inventory,
+                &remote_inventory,
+                &rules(&[]),
+                &options(false),
+            ),
+            Err(Error::UnsafeRemotePath { reason, .. })
+                if reason.contains("differ only by case")
+        ));
+
+        let remote_collision = remote(&[
+            ("Archive", EntryKind::Directory, 0, 0),
+            ("archive", EntryKind::Directory, 0, 0),
+        ]);
+        assert!(matches!(
+            build_plan(
+                &root,
+                &local(&[]),
+                &remote_collision,
+                &rules(&[]),
+                &options(false),
+            ),
+            Err(Error::UnsafeRemotePath { reason, .. })
+                if reason.contains("differ only by case")
+        ));
     }
 
     #[test]

@@ -269,9 +269,30 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_prune_dsm_managed_entries_like_sync() {
+        let root = TestDir::new("scanner-dsm-prune");
+        fs::create_dir(root.path().join("@eaDir")).unwrap();
+        fs::write(root.path().join("@eaDir/thumbnail.bin"), b"metadata").unwrap();
+        fs::write(root.path().join("payload.bin"), b"payload").unwrap();
+
+        let report = diagnose_source(
+            root.path(),
+            &[],
+            SourceDiagnosticOptions::default(),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.entries, 1);
+        assert_eq!(report.files, 1);
+        assert!(report.inventory.entries.contains_key("payload.bin"));
+        assert!(!report.inventory.entries.contains_key("@eaDir"));
+    }
+
+    #[test]
     fn scanner_safeguards_are_propagated_unchanged() {
         let root = TestDir::new("scanner-guard");
-        fs::create_dir(root.path().join("@eaDir")).unwrap();
+        fs::write(root.path().join("~unsupported"), b"payload").unwrap();
 
         assert!(matches!(
             diagnose_source(
