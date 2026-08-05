@@ -1086,4 +1086,82 @@ mod tests {
             ])
         );
     }
+
+    #[test]
+    fn missing_share_root_is_not_created_but_a_missing_subdirectory_is() {
+        let local = local(&[("payload.bin", EntryKind::File, 4, 1_000)]);
+        let mut missing_remote = remote(&[]);
+        missing_remote.root_exists = false;
+
+        assert!(matches!(
+            build_plan(
+                &RemoteRoot::parse("/share").unwrap(),
+                &local,
+                &missing_remote,
+                &rules(&[]),
+                &options(false),
+            ),
+            Err(Error::ShareNotWritable(share)) if share == "share"
+        ));
+
+        let plan = build_plan(
+            &RemoteRoot::parse("/share/new-root").unwrap(),
+            &local,
+            &missing_remote,
+            &rules(&[]),
+            &options(false),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.creates
+                .iter()
+                .map(|action| (action.relative.as_str(), action.remote_path.as_str()))
+                .collect::<Vec<_>>(),
+            [("", "/share/new-root")]
+        );
+        assert_eq!(plan.uploads[0].remote_path, "/share/new-root/payload.bin");
+    }
+
+    #[test]
+    fn content_mode_mirror_delete_requires_a_plan_time_remote_digest() {
+        let mut local = local(&[("keep.bin", EntryKind::File, 4, 1_000)]);
+        local.entries.get_mut("keep.bin").unwrap().content_md5 = Some(digest(1));
+        let mut remote = remote(&[
+            ("extra.bin", EntryKind::File, 4, 1),
+            ("keep.bin", EntryKind::File, 4, 1),
+        ]);
+        remote.entries.get_mut("keep.bin").unwrap().content_md5 = Some(digest(1));
+
+        let error = build_plan(
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &local,
+            &remote,
+            &rules(&[]),
+            &content_options(true, false),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Message(message)
+                if message.contains("plan-time MD5 snapshot")
+                    && message.contains("/share/root/extra.bin")
+        ));
+    }
+
+    #[test]
+    fn server_copy_planning_fails_closed_without_a_local_digest() {
+        let local = local(&[("new/report.bin", EntryKind::File, 4, 1_000)]);
+
+        assert!(matches!(
+            build_plan(
+                &RemoteRoot::parse("/share/root").unwrap(),
+                &local,
+                &remote(&[]),
+                &rules(&[]),
+                &content_options(false, true),
+            ),
+            Err(Error::Message(message))
+                if message == "content comparison requires every local file digest"
+        ));
+    }
 }

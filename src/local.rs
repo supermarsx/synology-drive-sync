@@ -555,4 +555,149 @@ mod tests {
         );
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn ignore_control_path_must_be_a_regular_file() {
+        let root = temp_dir("ignore-control-directory");
+        let control_path = root.join(DEFAULT_IGNORE_FILE);
+        fs::create_dir(&control_path).unwrap();
+        let expected_control_path = fs::canonicalize(&control_path).unwrap();
+
+        let result = IgnoreRules::build(&root, &[]);
+        assert!(matches!(
+            result,
+            Err(Error::UnsupportedLocalEntry { path, reason })
+                if path == expected_control_path && reason.contains("regular file")
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hashing_rejects_a_file_changed_since_the_scan() {
+        let root = temp_dir("changed-before-hash");
+        let payload = root.join("payload.bin");
+        fs::write(&payload, b"abc").unwrap();
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        let inventory = scan(&root, &rules).unwrap();
+        let scanned = inventory.entries["payload.bin"].clone();
+        let scanned_path = scanned.full_path.clone();
+
+        fs::write(&payload, b"content changed after the scan").unwrap();
+
+        assert!(matches!(
+            hash_file_snapshot(&scanned, &CancellationToken::default()),
+            Err(Error::SourceChanged(path)) if path == scanned_path
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pre_cancelled_content_hashing_returns_no_partial_digests() {
+        let root = temp_dir("cancelled-content-md5");
+        fs::write(root.join("a.bin"), b"a").unwrap();
+        fs::write(root.join("b.bin"), b"b").unwrap();
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        let mut inventory = scan(&root, &rules).unwrap();
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        assert!(matches!(
+            populate_content_md5(&mut inventory, &cancellation),
+            Err(Error::Cancelled)
+        ));
+        assert!(
+            inventory
+                .entries
+                .values()
+                .all(|entry| entry.content_md5.is_none())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_rejects_a_regular_file_as_the_source_root() {
+        let root = temp_dir("source-file");
+        let source_file = root.join("payload.bin");
+        fs::write(&source_file, b"payload").unwrap();
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        let expected = fs::canonicalize(&source_file).unwrap();
+
+        assert!(matches!(
+            scan(&source_file, &rules),
+            Err(Error::InvalidSource(path)) if path == expected
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_sources_and_removed_hash_inputs_report_the_exact_path() {
+        let root = temp_dir("missing-source");
+        let missing = root.join("does-not-exist");
+        assert!(matches!(
+            IgnoreRules::build(&missing, &[]),
+            Err(Error::FileIo { path, .. }) if path == missing
+        ));
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        assert!(matches!(
+            scan(&missing, &rules),
+            Err(Error::FileIo { path, .. }) if path == missing
+        ));
+
+        let payload = root.join("payload.bin");
+        fs::write(&payload, b"payload").unwrap();
+        let entry = scan(&root, &rules).unwrap().entries["payload.bin"].clone();
+        let expected_entry_path = entry.full_path.clone();
+        fs::remove_file(&payload).unwrap();
+        assert!(matches!(
+            hash_file_snapshot(&entry, &CancellationToken::default()),
+            Err(Error::FileIo { path, .. }) if path == expected_entry_path
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ignore_rules_protect_the_control_file_and_apply_parent_patterns() {
+        let root = temp_dir("ignore-semantics");
+        let rules = IgnoreRules::build(&root, &["cache/".to_owned(), "*.tmp".to_owned()]).unwrap();
+        assert!(!rules.is_ignored("", true));
+        assert!(rules.is_ignored(DEFAULT_IGNORE_FILE, false));
+        assert!(rules.is_ignored("cache", true));
+        assert!(rules.is_ignored("cache/nested/file.bin", false));
+        assert!(rules.is_ignored("folder/scratch.tmp", false));
+        assert!(!rules.is_ignored("folder/keep.txt", false));
+        assert_eq!(EntryKind::File.as_str(), "file");
+        assert_eq!(EntryKind::Directory.as_str(), "directory");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_ignore_file_and_cli_globs_are_rejected_with_source_context() {
+        let root = temp_dir("invalid-ignore");
+        let invalid_pattern = "[z-a]";
+        assert!(IgnoreRules::build(&root, &[invalid_pattern.to_owned()]).is_err());
+        fs::write(root.join(DEFAULT_IGNORE_FILE), invalid_pattern).unwrap();
+        let error = match IgnoreRules::build(&root, &[]) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid ignore file was accepted"),
+        };
+        assert!(error.to_string().contains("invalid ignore file"));
+        assert!(error.to_string().contains(DEFAULT_IGNORE_FILE));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn drive_name_diagnostics_cover_every_portability_class() {
+        let long_path = "x".repeat(248);
+        for (relative, expected) in [
+            (long_path.as_str(), "247-character"),
+            ("~temporary", "beginning with ~"),
+            ("folder/control\u{7}", "control character"),
+            ("folder/bad?.txt", "unsupported by Windows"),
+            ("folder/trailing ", "dot or space"),
+            ("folder/COM9.log", "reserved by Windows"),
+        ] {
+            assert!(drive_name_issue(relative).unwrap().contains(expected));
+        }
+    }
 }

@@ -2172,12 +2172,14 @@ fn api_error_description(api: &str, code: i64) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use std::io::{Read as _, Write as _};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::Mutex;
     use std::thread::JoinHandle;
     use std::time::SystemTime;
 
     use super::*;
+
+    const SCRIPTED_SERVER_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[derive(Debug)]
     struct CapturedRequest {
@@ -2209,62 +2211,156 @@ mod tests {
         F: FnMut(usize) + Send + 'static,
     {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
             let mut requests = Vec::new();
             for (index, (status, response_body)) in responses.into_iter().enumerate() {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut received = Vec::new();
-                let header_end = loop {
-                    let mut buffer = [0_u8; 4096];
-                    let count = stream.read(&mut buffer).unwrap();
-                    assert!(count > 0, "connection closed before request headers");
-                    received.extend_from_slice(&buffer[..count]);
-                    if let Some(position) = find_bytes(&received, b"\r\n\r\n") {
-                        break position + 4;
-                    }
-                };
-                let header_text = String::from_utf8(received[..header_end].to_vec()).unwrap();
-                let mut lines = header_text.split("\r\n");
-                let request_line = lines.next().unwrap().to_owned();
-                let headers: Vec<_> = lines
-                    .filter_map(|line| line.split_once(':'))
-                    .map(|(name, value)| {
-                        (name.trim().to_ascii_lowercase(), value.trim().to_owned())
-                    })
-                    .collect();
-                let content_length = headers
-                    .iter()
-                    .find(|(name, _)| name == "content-length")
-                    .and_then(|(_, value)| value.parse::<usize>().ok())
-                    .unwrap_or(0);
-                while received.len() - header_end < content_length {
-                    let mut buffer = [0_u8; 8192];
-                    let count = stream.read(&mut buffer).unwrap();
-                    assert!(count > 0, "connection closed before complete request body");
-                    received.extend_from_slice(&buffer[..count]);
-                }
-                requests.push(CapturedRequest {
-                    request_line,
-                    headers,
-                    body: received[header_end..header_end + content_length].to_vec(),
-                });
-
-                write!(
-                    stream,
-                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    status.as_u16(),
-                    status.canonical_reason().unwrap_or("Unknown"),
-                    response_body.len(),
-                    response_body
-                )
-                .unwrap();
-                stream.flush().unwrap();
+                let mut stream = accept_scripted_connection(&listener, index);
+                requests.push(read_scripted_request(&mut stream, index));
+                write_scripted_response(&mut stream, status, &response_body);
                 after_response(index);
             }
             requests
         });
         (format!("http://{address}/prefix/"), handle)
+    }
+
+    fn scripted_server_monitoring_extra_requests(
+        response: String,
+    ) -> (
+        String,
+        std::sync::mpsc::Sender<()>,
+        JoinHandle<Vec<CapturedRequest>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (done_send, done_receive) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            let mut stream = accept_scripted_connection(&listener, 0);
+            requests.push(read_scripted_request(&mut stream, 0));
+            write_scripted_response(&mut stream, StatusCode::OK, &response);
+
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let index = requests.len();
+                        requests.push(read_scripted_request(&mut stream, index));
+                        write_scripted_response(
+                            &mut stream,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            r#"{"success":false,"error":{"code":500}}"#,
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        match done_receive.recv_timeout(Duration::from_millis(1)) {
+                            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        }
+                    }
+                    Err(error) => panic!("scripted server failed while monitoring: {error}"),
+                }
+            }
+            requests
+        });
+        (format!("http://{address}/prefix/"), done_send, handle)
+    }
+
+    fn accept_scripted_connection(listener: &TcpListener, index: usize) -> TcpStream {
+        let deadline = Instant::now() + SCRIPTED_SERVER_TIMEOUT;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for scripted request {index}"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("failed to accept scripted request {index}: {error}"),
+            }
+        }
+    }
+
+    fn read_scripted_request(stream: &mut TcpStream, index: usize) -> CapturedRequest {
+        let deadline = Instant::now() + SCRIPTED_SERVER_TIMEOUT;
+        let mut received = Vec::new();
+        let header_end = loop {
+            let mut buffer = [0_u8; 4096];
+            let count = read_scripted_bytes(stream, &mut buffer, deadline, index, "headers");
+            assert!(
+                count > 0,
+                "connection closed before request {index} headers"
+            );
+            received.extend_from_slice(&buffer[..count]);
+            if let Some(position) = find_bytes(&received, b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let header_text = String::from_utf8(received[..header_end].to_vec()).unwrap();
+        let mut lines = header_text.split("\r\n");
+        let request_line = lines.next().unwrap().to_owned();
+        let headers: Vec<_> = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+            .collect();
+        let content_length = headers
+            .iter()
+            .find(|(name, _)| name == "content-length")
+            .and_then(|(_, value)| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        while received.len() - header_end < content_length {
+            let mut buffer = [0_u8; 8192];
+            let count = read_scripted_bytes(stream, &mut buffer, deadline, index, "body");
+            assert!(count > 0, "connection closed before request {index} body");
+            received.extend_from_slice(&buffer[..count]);
+        }
+        CapturedRequest {
+            request_line,
+            headers,
+            body: received[header_end..header_end + content_length].to_vec(),
+        }
+    }
+
+    fn read_scripted_bytes(
+        stream: &mut TcpStream,
+        buffer: &mut [u8],
+        deadline: Instant,
+        index: usize,
+        part: &str,
+    ) -> usize {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out reading scripted request {index} {part}"
+        );
+        stream.set_read_timeout(Some(remaining)).unwrap();
+        stream.read(buffer).unwrap_or_else(|error| {
+            panic!("failed reading scripted request {index} {part}: {error}")
+        })
+    }
+
+    fn write_scripted_response(stream: &mut TcpStream, status: StatusCode, response_body: &str) {
+        stream
+            .set_write_timeout(Some(SCRIPTED_SERVER_TIMEOUT))
+            .unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("Unknown"),
+            response_body.len(),
+            response_body
+        )
+        .unwrap();
+        stream.flush().unwrap();
     }
 
     fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -2353,6 +2449,743 @@ mod tests {
             }]}
         })
         .to_string()
+    }
+
+    fn connect_test_client(base_url: String) -> ApiClient {
+        ApiClient::connect(&ClientOptions {
+            base_url,
+            allow_http: true,
+            accept_invalid_certs: false,
+            ca_certificate: None,
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(5),
+            retries: 0,
+        })
+        .unwrap()
+    }
+
+    fn login_response() -> String {
+        r#"{"success":true,"data":{"sid":"test-session","synotoken":"test-token"}}"#.to_owned()
+    }
+
+    fn task_start_response(taskid: &str) -> String {
+        serde_json::json!({"success": true, "data": {"taskid": taskid}}).to_string()
+    }
+
+    #[test]
+    fn remote_md5_stops_started_tasks_on_cancel_timeout_and_missing_status() {
+        let cancellation = CancellationToken::default();
+        let hook_cancellation = cancellation.clone();
+        let responses = vec![
+            (StatusCode::OK, write_probe_discovery(false)),
+            (StatusCode::OK, login_response()),
+            (StatusCode::OK, task_start_response("cancelled-md5")),
+            (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+        ];
+        let (url, server) = scripted_server_with_status_hook(responses, move |index| {
+            if index == 2 {
+                hook_cancellation.cancel();
+            }
+        });
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        assert!(matches!(
+            client.remote_content_md5("/share/file.bin", &cancellation),
+            Err(Error::Cancelled)
+        ));
+        let requests = server.join().unwrap();
+        assert!(String::from_utf8_lossy(&requests[3].body).contains("method=stop"));
+
+        let responses = vec![
+            write_probe_discovery(false),
+            login_response(),
+            task_start_response("timed-out-md5"),
+            r#"{"success":true}"#.to_owned(),
+        ];
+        let (url, server) = scripted_server(responses);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        client.operation_timeout = Duration::ZERO;
+        assert!(matches!(
+            client.remote_content_md5("/share/file.bin", &CancellationToken::default()),
+            Err(Error::OperationTimedOut {
+                operation: "remote MD5 calculation"
+            })
+        ));
+        let requests = server.join().unwrap();
+        assert!(String::from_utf8_lossy(&requests[3].body).contains("method=stop"));
+
+        let responses = vec![
+            write_probe_discovery(false),
+            login_response(),
+            task_start_response("missing-status-md5"),
+            r#"{"success":true}"#.to_owned(),
+            r#"{"success":true}"#.to_owned(),
+        ];
+        let (url, server) = scripted_server(responses);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let error = client
+            .remote_content_md5("/share/file.bin", &CancellationToken::default())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::InvalidResponse { ref operation, .. }
+                if operation == "SYNO.FileStation.MD5.status"
+        ));
+        let requests = server.join().unwrap();
+        assert!(String::from_utf8_lossy(&requests[4].body).contains("method=stop"));
+    }
+
+    #[test]
+    fn remote_md5_rejects_invalid_task_and_finished_digest_data() {
+        let responses = vec![
+            write_probe_discovery(false),
+            login_response(),
+            task_start_response(""),
+        ];
+        let (url, server) = scripted_server(responses);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let error = client
+            .remote_content_md5("/share/file.bin", &CancellationToken::default())
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidResponse { .. }));
+        assert_eq!(server.join().unwrap().len(), 3);
+
+        for status in [
+            r#"{"success":true,"data":{"finished":true}}"#.to_owned(),
+            r#"{"success":true,"data":{"finished":true,"md5":"not-a-digest"}}"#.to_owned(),
+        ] {
+            let responses = vec![
+                write_probe_discovery(false),
+                login_response(),
+                task_start_response("finished-md5"),
+                status,
+            ];
+            let (url, server) = scripted_server(responses);
+            let mut client = connect_test_client(url);
+            client.login("alice", "password", None).unwrap();
+            assert!(
+                client
+                    .remote_content_md5("/share/file.bin", &CancellationToken::default())
+                    .is_err()
+            );
+            assert_eq!(server.join().unwrap().len(), 4);
+        }
+    }
+
+    #[test]
+    fn content_selection_and_server_copy_fail_closed_before_network_mutation() {
+        let (url, finish_server, server) =
+            scripted_server_monitoring_extra_requests(write_probe_discovery(true));
+        let client = connect_test_client(url);
+        let mut inventory = RemoteInventory {
+            root_exists: true,
+            entries: BTreeMap::from([(
+                "folder".to_owned(),
+                RemoteEntry {
+                    relative: "folder".to_owned(),
+                    remote_path: "/share/root/folder".to_owned(),
+                    kind: EntryKind::Directory,
+                    size: 0,
+                    mtime_seconds: 0,
+                    mount_point_type: None,
+                    content_md5: None,
+                },
+            )]),
+        };
+        let cancellation = CancellationToken::default();
+        let missing = BTreeSet::from(["missing.bin".to_owned()]);
+        assert!(matches!(
+            client
+                .populate_remote_content_md5(&mut inventory, &missing, &cancellation)
+                .unwrap_err(),
+            Error::Message(message)
+                if message
+                    == "remote content selection referenced missing inventory path \"missing.bin\""
+        ));
+        let directory = BTreeSet::from(["folder".to_owned()]);
+        assert!(matches!(
+            client
+                .populate_remote_content_md5(&mut inventory, &directory, &cancellation)
+                .unwrap_err(),
+            Error::Message(message)
+                if message == "remote content selection referenced non-file path \"folder\""
+        ));
+
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let digest = ContentMd5::from_bytes([0_u8; 16]);
+        for (source, destination) in [
+            ("/share/root/a/file.bin", "/share/root/a/file.bin"),
+            ("/share/root/a/file.bin", "/share/root/b/renamed.bin"),
+        ] {
+            assert!(matches!(
+                client.copy_file_verified(
+                    &root,
+                    source,
+                    destination,
+                    1,
+                    digest,
+                    &CancellationToken::default(),
+                ),
+                Err(Error::Message(message))
+                    if message
+                        == "safe server-side copy requires different parents and an unchanged basename"
+            ));
+        }
+        assert!(matches!(
+            client.copy_file_verified(
+                &root,
+                "/share/root/a/file.bin",
+                "/share/escape/file.bin",
+                1,
+                digest,
+                &CancellationToken::default(),
+            ),
+            Err(Error::UnsafeRemotePath { path, reason })
+                if path == "/share/escape/file.bin"
+                    && reason
+                        == "delete target must be a normalized strict child of the configured destination"
+        ));
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        assert!(matches!(
+            client.copy_file_verified(
+                &root,
+                "/share/root/a/file.bin",
+                "/share/root/b/file.bin",
+                1,
+                digest,
+                &cancelled,
+            ),
+            Err(Error::Cancelled)
+        ));
+        finish_server.send(()).unwrap();
+        assert_eq!(
+            server.join().unwrap().len(),
+            1,
+            "local validation unexpectedly issued a second HTTP request"
+        );
+
+        let (url, server) = scripted_server(vec![required_discovery()]);
+        let client = connect_test_client(url);
+        assert!(matches!(
+            client.copy_file_verified(
+                &root,
+                "/share/root/a/file.bin",
+                "/share/root/b/file.bin",
+                1,
+                digest,
+                &CancellationToken::default(),
+            ),
+            Err(Error::ServerCopyNotStarted)
+        ));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn task_ids_and_retry_classification_enforce_bounded_safe_values() {
+        assert!(validate_task_id("task-123", "test.task").is_ok());
+        for invalid in ["", "line\nbreak"] {
+            assert!(matches!(
+                validate_task_id(invalid, "test.task"),
+                Err(Error::InvalidResponse { .. })
+            ));
+        }
+        let oversized = "x".repeat(1025);
+        assert!(validate_task_id(&oversized, "test.task").is_err());
+
+        for status in [408, 425, 429, 502, 503, 504] {
+            assert!(retryable(&Error::HttpStatus {
+                operation: "test".to_owned(),
+                status: StatusCode::from_u16(status).unwrap(),
+                message: String::new(),
+            }));
+        }
+        assert!(!retryable(&Error::HttpStatus {
+            operation: "test".to_owned(),
+            status: StatusCode::UNAUTHORIZED,
+            message: String::new(),
+        }));
+        for code in [102, 103, 104, 105, 407, 409] {
+            assert!(matches!(
+                copy_start_error(Error::Api {
+                    api: "SYNO.FileStation.CopyMove".to_owned(),
+                    operation: "start".to_owned(),
+                    code,
+                    description: String::new(),
+                    details: Vec::new(),
+                }),
+                Error::ServerCopyNotStarted
+            ));
+        }
+        assert!(matches!(
+            copy_start_error(Error::Cancelled),
+            Error::Cancelled
+        ));
+    }
+
+    #[test]
+    fn remote_inventory_preserves_hierarchy_metadata_and_mount_boundaries() {
+        let root_listing = serde_json::json!({"success":true,"data":{"total":3,"files":[
+            {"path":"/share/root/file.bin","name":"file.bin","isdir":false,"additional":{"size":7,"time":{"mtime":11}}},
+            {"path":"/share/root/sub","name":"sub","isdir":true,"additional":{}},
+            {"path":"/share/root/mounted","name":"mounted","isdir":true,"additional":{"mount_point_type":"cifs"}}
+        ]}}).to_string();
+        let sub_listing = serde_json::json!({"success":true,"data":{"total":1,"files":[
+            {"path":"/share/root/sub/nested.txt","name":"nested.txt","isdir":false,"additional":{"size":9}}
+        ]}}).to_string();
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            getinfo_directory("/share"),
+            getinfo_directory("/share/root"),
+            root_listing,
+            sub_listing,
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let inventory = client
+            .remote_inventory(&RemoteRoot::parse("/share/root").unwrap())
+            .unwrap();
+        assert!(inventory.root_exists);
+        assert_eq!(inventory.entries.len(), 4);
+        let file = &inventory.entries["file.bin"];
+        assert_eq!(
+            (file.kind, file.size, file.mtime_seconds),
+            (EntryKind::File, 7, 11)
+        );
+        assert_eq!(
+            inventory.entries["mounted"].mount_point_type.as_deref(),
+            Some("cifs")
+        );
+        assert_eq!(
+            inventory.entries["sub/nested.txt"].remote_path,
+            "/share/root/sub/nested.txt"
+        );
+        assert_eq!(server.join().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn remote_inventory_rejects_stalled_or_inconsistent_directory_pages() {
+        let bad_pages = [
+            serde_json::json!({"success":true,"data":{"total":1,"files":[]}}),
+            serde_json::json!({"success":true,"data":{"total":1,"files":[{"path":"/share/root","name":"root","isdir":true}]}}),
+            serde_json::json!({"success":true,"data":{"total":1,"files":[{"path":"/share/root/a","name":"wrong","isdir":false}]}}),
+            serde_json::json!({"success":true,"data":{"total":2,"files":[
+                {"path":"/share/root/a","name":"a","isdir":false},
+                {"path":"/share/root/a","name":"a","isdir":false}
+            ]}}),
+        ];
+        for page in bad_pages {
+            let (url, server) = scripted_server(vec![
+                required_discovery(),
+                login_response(),
+                getinfo_directory("/share"),
+                getinfo_directory("/share/root"),
+                page.to_string(),
+            ]);
+            let mut client = connect_test_client(url);
+            client.login("alice", "password", None).unwrap();
+            assert!(matches!(
+                client.remote_inventory(&RemoteRoot::parse("/share/root").unwrap()),
+                Err(Error::InvalidResponse { .. })
+            ));
+            assert_eq!(server.join().unwrap().len(), 5);
+        }
+    }
+
+    #[test]
+    fn remote_inventory_distinguishes_missing_roots_from_invalid_ancestors() {
+        let missing = r#"{"success":false,"error":{"code":408}}"#.to_owned();
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            missing.clone(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let inventory = client
+            .remote_inventory(&RemoteRoot::parse("/share/root").unwrap())
+            .unwrap();
+        assert!(!inventory.root_exists && inventory.entries.is_empty());
+        assert_eq!(server.join().unwrap().len(), 3);
+
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            getinfo_file("/share", 1, None),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        assert!(
+            client
+                .remote_inventory(&RemoteRoot::parse("/share/root").unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("not a directory")
+        );
+        assert_eq!(server.join().unwrap().len(), 3);
+
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            getinfo_directory("/share"),
+            getinfo_directory("/share/root"),
+            missing,
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let inventory = client
+            .remote_inventory(&RemoteRoot::parse("/share/root").unwrap())
+            .unwrap();
+        assert!(!inventory.root_exists && inventory.entries.is_empty());
+        assert_eq!(server.join().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn discovery_falls_back_to_query_cgi_and_mutations_use_bounded_forms() {
+        let (url, server) = scripted_server_with_status(vec![
+            (StatusCode::BAD_GATEWAY, "backend unavailable".to_owned()),
+            (StatusCode::OK, write_probe_discovery(false)),
+            (StatusCode::OK, login_response()),
+            (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+            (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        client.create_folder("/share/root/new").unwrap();
+        client
+            .delete_non_recursive(
+                &RemoteRoot::parse("/share/root").unwrap(),
+                "/share/root/new",
+            )
+            .unwrap();
+        let requests = server.join().unwrap();
+        assert!(
+            requests[0]
+                .request_line
+                .contains("/prefix/webapi/entry.cgi")
+        );
+        assert!(
+            requests[1]
+                .request_line
+                .contains("/prefix/webapi/query.cgi")
+        );
+        assert!(String::from_utf8_lossy(&requests[3].body).contains("method=create"));
+        assert!(String::from_utf8_lossy(&requests[4].body).contains("recursive=false"));
+    }
+
+    #[test]
+    fn copy_tasks_are_stopped_after_timeout_missing_status_and_poll_failure() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let digest = ContentMd5::from_bytes([0_u8; 16]);
+        let copy = |client: &ApiClient| {
+            client.copy_file_verified(
+                &root,
+                "/share/root/a/file.bin",
+                "/share/root/b/file.bin",
+                1,
+                digest,
+                &CancellationToken::default(),
+            )
+        };
+
+        let (url, server) = scripted_server(vec![
+            write_probe_discovery(true),
+            login_response(),
+            task_start_response("timeout-copy"),
+            r#"{"success":true}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        client.operation_timeout = Duration::ZERO;
+        assert!(matches!(
+            copy(&client),
+            Err(Error::OperationTimedOut {
+                operation: "server-side file copy"
+            })
+        ));
+        assert!(String::from_utf8_lossy(&server.join().unwrap()[3].body).contains("method=stop"));
+
+        for status in [
+            r#"{"success":true}"#.to_owned(),
+            r#"{"success":false,"error":{"code":402}}"#.to_owned(),
+        ] {
+            let (url, server) = scripted_server(vec![
+                write_probe_discovery(true),
+                login_response(),
+                task_start_response("failed-copy"),
+                status,
+                r#"{"success":true}"#.to_owned(),
+            ]);
+            let mut client = connect_test_client(url);
+            client.login("alice", "password", None).unwrap();
+            assert!(copy(&client).is_err());
+            assert!(
+                String::from_utf8_lossy(&server.join().unwrap()[4].body).contains("method=stop")
+            );
+        }
+
+        let cancellation = CancellationToken::default();
+        let hook = cancellation.clone();
+        let (url, server) = scripted_server_with_status_hook(
+            vec![
+                (StatusCode::OK, write_probe_discovery(true)),
+                (StatusCode::OK, login_response()),
+                (StatusCode::OK, task_start_response("poll-copy")),
+                (
+                    StatusCode::OK,
+                    r#"{"success":true,"data":{"finished":false}}"#.to_owned(),
+                ),
+                (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+            ],
+            move |index| {
+                if index == 3 {
+                    hook.cancel()
+                }
+            },
+        );
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        assert!(matches!(
+            client.copy_file_verified(
+                &root,
+                "/share/root/a/file.bin",
+                "/share/root/b/file.bin",
+                1,
+                digest,
+                &cancellation,
+            ),
+            Err(Error::Cancelled)
+        ));
+        assert!(String::from_utf8_lossy(&server.join().unwrap()[4].body).contains("method=stop"));
+    }
+
+    #[test]
+    fn remote_content_verification_fails_closed_for_missing_directory_and_size_mismatch() {
+        let root_digest = ContentMd5::from_bytes([0_u8; 16]);
+        let cases = [
+            r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+            getinfo_directory("/share/file.bin"),
+            getinfo_file("/share/file.bin", 8, None),
+        ];
+        for response in cases {
+            let (url, server) =
+                scripted_server(vec![required_discovery(), login_response(), response]);
+            let mut client = connect_test_client(url);
+            client.login("alice", "password", None).unwrap();
+            assert!(matches!(client.verify_remote_content(
+                "/share/file.bin", 7, root_digest, &CancellationToken::default(),
+            ), Err(Error::ContentVerificationFailed(path)) if path == "/share/file.bin"));
+            assert_eq!(server.join().unwrap().len(), 3);
+        }
+
+        let missing_size = serde_json::json!({"success":true,"data":{"files":[{
+            "path":"/share/file.bin","name":"file.bin","isdir":false,"additional":{}
+        }]}})
+        .to_string();
+        let (url, server) =
+            scripted_server(vec![required_discovery(), login_response(), missing_size]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        assert!(matches!(
+            client.verify_remote_content(
+                "/share/file.bin",
+                7,
+                root_digest,
+                &CancellationToken::default(),
+            ),
+            Err(Error::InvalidResponse { .. })
+        ));
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn metadata_revalidation_rejects_missing_ambiguous_and_misdirected_results() {
+        let responses = [
+            r#"{"success":true}"#.to_owned(),
+            r#"{"success":true,"data":{"files":[]}}"#.to_owned(),
+            getinfo_file("/share/other.bin", 7, None),
+            r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+        ];
+        for response in responses {
+            let (url, server) =
+                scripted_server(vec![required_discovery(), login_response(), response]);
+            let mut client = connect_test_client(url);
+            client.login("alice", "password", None).unwrap();
+            assert!(
+                client
+                    .verify_remote_metadata_snapshot(
+                        "/share/file.bin",
+                        EntryKind::File,
+                        7,
+                        0,
+                        false,
+                        &CancellationToken::default(),
+                    )
+                    .is_err()
+            );
+            assert_eq!(server.join().unwrap().len(), 3);
+        }
+
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            getinfo_directory("/share/folder"),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        client
+            .verify_remote_metadata_snapshot(
+                "/share/folder",
+                EntryKind::Directory,
+                0,
+                0,
+                false,
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn failed_relogin_clears_session_and_logout_without_session_is_idempotent() {
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            r#"{"success":true}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        assert!(matches!(
+            client.login("alice", "new-password", Some("123456")),
+            Err(Error::InvalidResponse { .. })
+        ));
+        assert!(client.required_session().is_err());
+        client.logout().unwrap();
+        assert_eq!(server.join().unwrap().len(), 3);
+
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            r#"{"success":true,"data":{"sid":""}}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        assert!(matches!(
+            client.login("alice", "password", None),
+            Err(Error::InvalidResponse { .. })
+        ));
+        assert_eq!(server.join().unwrap().len(), 2);
+
+        let (url, server) = scripted_server(vec![required_discovery()]);
+        let mut client = connect_test_client(url);
+        let auth = client.apis.get_mut("SYNO.API.Auth").unwrap();
+        auth.min_version = 1;
+        auth.max_version = 2;
+        assert!(matches!(
+            client.login("alice", "password", None),
+            Err(Error::UnsupportedApiVersion { .. })
+        ));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tls_configuration_and_probe_failures_keep_diagnostics_bounded() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let missing = std::env::temp_dir().join(format!("missing-sdsync-ca-{nonce}.pem"));
+        let options = |path| ClientOptions {
+            base_url: "https://files.example.test".to_owned(),
+            allow_http: false,
+            accept_invalid_certs: false,
+            ca_certificate: Some(path),
+            connect_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_secs(1),
+            retries: 0,
+        };
+        assert!(
+            matches!(ApiClient::connect(&options(missing.clone())), Err(Error::FileIo { path, .. }) if path == missing)
+        );
+        let invalid = std::env::temp_dir().join(format!("invalid-sdsync-ca-{nonce}.pem"));
+        fs::write(
+            &invalid,
+            b"-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            ApiClient::connect(&options(invalid.clone())),
+            Err(Error::Http { .. })
+        ));
+        fs::remove_file(invalid).unwrap();
+
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let mut report = initial_write_probe_report(
+            &root,
+            "/share/root/probe".to_owned(),
+            1,
+            ContentMd5::from_bytes([0_u8; 16]),
+            0,
+            false,
+        );
+        report.leftover_remote_probe_path = Some("/share/root/probe".to_owned());
+        let failure = WriteProbeFailure {
+            cause: Error::Cancelled,
+            cleanup_error: Some(Error::Message("cleanup failed".to_owned())),
+            report,
+        };
+        let rendered = failure.to_string();
+        assert!(rendered.contains("operation cancelled"));
+        assert!(rendered.contains("cleanup also failed"));
+        assert!(rendered.contains("leftover probe path"));
+        assert_eq!(
+            std::error::Error::source(&failure).unwrap().to_string(),
+            "operation cancelled"
+        );
+    }
+
+    #[test]
+    fn operator_diagnostics_distinguish_proxy_auth_and_storage_failures() {
+        assert!(http_status_hint(StatusCode::FOUND, b"").contains("redirects are disabled"));
+        assert!(http_status_hint(StatusCode::PAYLOAD_TOO_LARGE, b"").contains("body-size limit"));
+        assert!(http_status_hint(StatusCode::BAD_GATEWAY, b"").contains("could not reach"));
+        assert!(http_status_hint(StatusCode::GATEWAY_TIMEOUT, b"").contains("timed out"));
+        assert_eq!(
+            http_status_hint(StatusCode::BAD_REQUEST, b""),
+            "empty response body"
+        );
+        assert_eq!(
+            http_status_hint(StatusCode::BAD_REQUEST, b"bad\nbody"),
+            "bad\\nbody"
+        );
+        assert!(looks_like_html(b"  <!DOCTYPE HTML><title>proxy</title>"));
+        assert!(!looks_like_html(b"{\"success\":false}"));
+
+        for (api, code, expected) in [
+            ("SYNO.API.Auth", 400, "password is incorrect"),
+            ("SYNO.API.Auth", 403, "OTP is required"),
+            ("SYNO.API.Auth", 407, "source IP is blocked"),
+            ("SYNO.API.Auth", 410, "must be changed"),
+            ("SYNO.FileStation.List", 106, "session timed out"),
+            ("SYNO.FileStation.List", 150, "reverse-proxy routing"),
+            ("SYNO.FileStation.List", 408, "does not exist"),
+            ("SYNO.FileStation.List", 415, "quota"),
+            ("SYNO.FileStation.List", 418, "illegal remote name"),
+            ("SYNO.FileStation.Delete", 900, "delete failed"),
+            (
+                "SYNO.FileStation.CreateFolder",
+                1100,
+                "folder creation failed",
+            ),
+            ("SYNO.FileStation.Upload", 1800, "Content-Length"),
+            ("SYNO.FileStation.Upload", 1805, "overwrite/skip policy"),
+        ] {
+            assert!(api_error_description(api, code).unwrap().contains(expected));
+        }
+        assert!(api_error_description("SYNO.API.Auth", 9999).is_none());
+        assert!(api_error_description("SYNO.FileStation.List", 9999).is_none());
     }
 
     #[test]

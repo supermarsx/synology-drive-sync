@@ -571,6 +571,7 @@ mod tests {
         fail_snapshot_path: Option<String>,
         fail_live_snapshot_path: Option<String>,
         fail_upload: bool,
+        fail_create: bool,
     }
 
     impl MockOperations {
@@ -600,7 +601,11 @@ mod tests {
 
         fn create_folder(&self, remote_path: &str) -> Result<()> {
             self.event(format!("create:{remote_path}"));
-            Ok(())
+            if self.fail_create {
+                Err(Error::Message("create failed".to_owned()))
+            } else {
+                Ok(())
+            }
         }
 
         fn copy_file_verified(
@@ -837,6 +842,69 @@ mod tests {
         assert_eq!(
             *client.events.lock().unwrap(),
             ["preflight:file.txt", "upload:file.txt"]
+        );
+    }
+
+    #[test]
+    fn folder_creation_failure_prevents_upload_and_mirror_deletion() {
+        let client = MockOperations {
+            fail_create: true,
+            ..MockOperations::default()
+        };
+        let mut plan = populated_plan();
+        plan.pre_deletes.clear();
+
+        let result = execute_with(
+            &client,
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &plan,
+            ExecuteOptions {
+                jobs: 1,
+                dry_run: false,
+            },
+            |_| {},
+        );
+
+        assert!(matches!(result, Err(Error::Message(message)) if message == "create failed"));
+        assert_eq!(
+            *client.events.lock().unwrap(),
+            ["preflight:file.txt", "create:/share/root/folder"]
+        );
+    }
+
+    #[test]
+    fn successful_execution_reports_every_mutation_phase_and_upload_bytes() {
+        let client = MockOperations::default();
+        let report = execute_with(
+            &client,
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &populated_plan(),
+            ExecuteOptions {
+                jobs: 1,
+                dry_run: false,
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(report.deleted, 2);
+        assert_eq!(report.created, 1);
+        assert_eq!(report.copied, 0);
+        assert_eq!(report.uploaded, 1);
+        assert_eq!(report.uploaded_bytes, 1);
+        assert_eq!(
+            *client.events.lock().unwrap(),
+            [
+                "preflight:file.txt",
+                "snapshot:/share/root/conflict",
+                "delete:/share/root/conflict",
+                "create:/share/root/folder",
+                "upload:file.txt",
+                "preflight:file.txt",
+                "snapshot:/share/root/extra",
+                "snapshot:/share/root/file.txt",
+                "delete:/share/root/extra",
+            ]
         );
     }
 
