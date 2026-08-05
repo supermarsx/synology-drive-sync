@@ -42,15 +42,12 @@ tool="$temporary_root/cargo-about"
 chmod 0755 "$tool"
 [[ "$($tool --version)" == "cargo-about $version" ]]
 
-# Fetch every target-specific crate by Cargo.lock checksum, then prohibit the notice
-# generator from consulting mutable network license metadata.
-cargo fetch --locked \
-    --target x86_64-unknown-linux-gnu \
-    --target aarch64-unknown-linux-gnu \
-    --target x86_64-pc-windows-msvc \
-    --target aarch64-pc-windows-msvc \
-    --target x86_64-apple-darwin \
-    --target aarch64-apple-darwin
+# cargo-about requests all-feature Cargo metadata before applying its configured
+# release-target filter. An unqualified locked fetch therefore intentionally
+# populates every target-conditioned Cargo.lock entry, including crates used only
+# by non-release targets. Prove that metadata is complete offline before generating.
+cargo fetch --locked
+cargo metadata --frozen --all-features --format-version 1 >/dev/null
 
 generate_arguments=(--frozen --all-features --fail --config about.toml)
 "$tool" generate "${generate_arguments[@]}" --output-file "$output" about.hbs
