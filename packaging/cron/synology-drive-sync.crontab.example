@@ -1,3 +1,6 @@
-# Run daily at 03:00. flock prevents overlap if a previous large upload is still running.
-# Create the state directory first and replace USER in all three paths.
-0 3 * * * /usr/bin/flock -n /home/USER/.local/state/synology-drive-sync.lock /usr/local/libexec/synology-drive-sync/cron-run /home/USER/.config/synology-drive-sync/cron.env >> /home/USER/.local/state/synology-drive-sync.log 2>&1
+# Run daily at 03:00. The wrapper holds its private state-directory flock for
+# the complete validation and sync process, including a sequential batch.
+# Create the state directory, replace USER, and set a monitored address.
+# Successful runs are quiet. Every nonzero result, including overlap, emits mail-worthy stderr.
+MAILTO=ops@example.com
+0 3 * * * /home/USER/.local/bin/synology-drive-sync-cron /home/USER/.config/synology-drive-sync/cron.env || { status=$?; if [ "$status" -eq 75 ]; then echo 'synology-drive-sync skipped because another managed run holds the lock' >&2; else echo "synology-drive-sync failed with exit status $status" >&2; fi; exit "$status"; }

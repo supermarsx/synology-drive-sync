@@ -3,8 +3,6 @@ Description=One-way local folder sync to Synology Drive
 Documentation=https://github.com/supermarsx/synology-drive-sync
 Wants=network-online.target
 After=network-online.target
-ConditionPathIsExecutable=/usr/local/bin/synology-drive-sync
-ConditionPathExists=/etc/synology-drive-sync/sync.env
 
 [Service]
 Type=oneshot
@@ -13,8 +11,17 @@ Group=sdsync
 EnvironmentFile=/etc/synology-drive-sync/sync.env
 LoadCredential=dsm-password:/etc/synology-drive-sync/dsm-password
 ExecStart=/usr/local/libexec/synology-drive-sync/systemd-run
-TimeoutStartSec=2h15m
+StateDirectory=synology-drive-sync
+StateDirectoryMode=0750
+# Whole-workload ceiling: scanning, hashing, every operation/retry, and shutdown.
+# Measure the deployed workload and override this value with a service drop-in if needed.
+TimeoutStartSec=24h
+TimeoutStopSec=2m
+Restart=no
 UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=synology-drive-sync
 
 # The sync process needs outbound HTTPS and read access to its configured source.
 # RestrictAddressFamilies reduces socket-family surface; it is not an egress firewall.

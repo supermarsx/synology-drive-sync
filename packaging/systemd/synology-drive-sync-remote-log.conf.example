@@ -1,0 +1,5 @@
+[Service]
+# Install this file as:
+# /etc/systemd/system/synology-drive-sync.service.d/remote-log.conf
+LoadCredential=remote-log-token:/etc/synology-drive-sync/remote-log-token
+Environment=SDSYNC_USE_REMOTE_LOG_CREDENTIAL=true

@@ -7,6 +7,7 @@
 
     <key>ProgramArguments</key>
     <array>
+        <string>/ABSOLUTE/PATH/TO/launchd-run</string>
         <string>/ABSOLUTE/PATH/TO/synology-drive-sync</string>
         <string>sync</string>
         <string>/ABSOLUTE/PATH/TO/SOURCE</string>
@@ -17,6 +18,13 @@
         <string>mirror-bot</string>
         <string>--jobs</string>
         <string>2</string>
+        <string>--quiet</string>
+        <string>--log-format</string>
+        <string>json</string>
+        <string>--log-file</string>
+        <string>/Users/YOU/Library/Logs/synology-drive-sync.log</string>
+        <string>--progress</string>
+        <string>never</string>
     </array>
 
     <key>StartCalendarInterval</key>
@@ -37,10 +45,12 @@
     <false/>
     <key>ThrottleInterval</key>
     <integer>60</integer>
+    <key>ExitTimeOut</key>
+    <integer>120</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/YOU/Library/Logs/synology-drive-sync.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
-    <string>/Users/YOU/Library/Logs/synology-drive-sync.log</string>
+    <string>/dev/null</string>
 </dict>
 </plist>
