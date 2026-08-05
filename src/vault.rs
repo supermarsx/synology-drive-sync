@@ -517,4 +517,120 @@ mod tests {
             assert!(parse_totp_secret(input).is_err());
         }
     }
+
+    #[test]
+    fn current_totp_is_six_ascii_digits_and_rejects_short_seeds() {
+        let secret = parse_totp_secret(RFC_SECRET).unwrap();
+        let code = generate_totp(&secret).unwrap();
+        assert_eq!(code.len(), 6);
+        assert!(code.bytes().all(|byte| byte.is_ascii_digit()));
+        assert!(generate_totp(&[0_u8; 9]).is_err());
+    }
+
+    #[test]
+    fn provisioning_uri_rejects_ambiguous_and_malformed_parameters() {
+        let secret = RFC_SECRET;
+        for uri in [
+            format!("otpauth://totp/alice?secret={secret}#fragment"),
+            "otpauth://totp/alice?issuer".to_owned(),
+            format!("otpauth://totp/alice?secret={secret}&secret={secret}"),
+            format!("otpauth://totp/alice?secret={secret}&algorithm=SHA1&algorithm=SHA1"),
+            format!("otpauth://totp/alice?secret={secret}&digits=6&digits=6"),
+            format!("otpauth://totp/alice?secret={secret}&period=30&period=30"),
+            "otpauth://totp/alice?issuer=Synology".to_owned(),
+            "otpauth://totp/alice?secret=%".to_owned(),
+            "otpauth://totp/alice?secret=%GG".to_owned(),
+            "otpauth://totp/alice?secret=%FF".to_owned(),
+        ] {
+            assert!(parse_totp_secret(&uri).is_err(), "accepted {uri}");
+        }
+        let upper_hex = parse_totp_secret(
+            "otpauth://totp/alice?secret=%4A%42%53%57%59%33%44%50%45%48%50%4B%33%50%58%50",
+        )
+        .unwrap();
+        assert_eq!(
+            &*upper_hex,
+            &*parse_totp_secret("JBSWY3DPEHPK3PXP").unwrap()
+        );
+    }
+
+    #[test]
+    fn vault_rejects_empty_passwords_and_malformed_stored_totp_data() {
+        let store: Arc<CredentialStore> = keyring_core::mock::Store::new().unwrap();
+        let vault =
+            OsVault::with_store("https://files.example.test", "alice", false, store).unwrap();
+        assert_eq!(
+            vault.store_password("").unwrap_err().to_string(),
+            "DSM password must not be empty"
+        );
+        assert!(vault.store_totp_secret(&[0_u8; 9]).is_err());
+        vault
+            .entry(CredentialKind::Totp, "test")
+            .unwrap()
+            .set_password("NOT-BASE32!")
+            .unwrap();
+        let error = vault.load_totp_secret().unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Vault {
+                operation: "TOTP seed lookup",
+                ..
+            }
+        ));
+        assert!(!error.to_string().contains("NOT-BASE32"));
+    }
+
+    #[test]
+    fn keyring_failures_map_to_stable_secret_free_reasons() {
+        let platform = || -> keyring_core::error::PlatformError {
+            Box::new(std::io::Error::other("sensitive platform detail"))
+        };
+        let cases = vec![
+            (
+                KeyringError::NoStorageAccess(platform()),
+                "locked or unavailable",
+            ),
+            (
+                KeyringError::NoDefaultStore,
+                "no supported credential vault",
+            ),
+            (
+                KeyringError::NotSupportedByStore("detail".to_owned()),
+                "does not support",
+            ),
+            (
+                KeyringError::TooLong("secret".to_owned(), 1),
+                "rejected the entry size",
+            ),
+            (
+                KeyringError::BadEncoding(b"LEAK-ME".to_vec()),
+                "malformed secret data",
+            ),
+            (
+                KeyringError::BadDataFormat(b"LEAK-ME".to_vec(), platform()),
+                "malformed secret data",
+            ),
+            (KeyringError::Ambiguous(Vec::new()), "duplicate entries"),
+            (
+                KeyringError::PlatformFailure(platform()),
+                "vault is unavailable",
+            ),
+        ];
+        for (source, expected) in cases {
+            let rendered = vault_error("test operation", source).to_string();
+            assert!(rendered.contains(expected), "{rendered}");
+            assert!(!rendered.contains("sensitive platform detail"));
+            assert!(!rendered.contains("LEAK-ME"));
+            assert!(!rendered.contains("detail"));
+        }
+    }
+
+    #[test]
+    fn vault_profile_rejects_empty_user_before_platform_access() {
+        let error = match OsVault::new("https://files.example.test", "", false) {
+            Err(error) => error,
+            Ok(_) => panic!("an empty username must not create a vault profile"),
+        };
+        assert_eq!(error.to_string(), "DSM username must not be empty");
+    }
 }
