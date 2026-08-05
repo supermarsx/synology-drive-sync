@@ -632,6 +632,86 @@ mod tests {
     }
 
     #[test]
+    fn reset_attempt_preserves_attempt_number_and_wire_bytes() {
+        let tracker = ProgressTracker::new(ProgressTotals {
+            operations: 1,
+            files: 1,
+            bytes: 10,
+        });
+        let operation = tracker.start(OperationKind::Upload, 10);
+        operation.begin_attempt().unwrap();
+        operation.advance(7).unwrap();
+
+        let reset = operation.reset_attempt().unwrap();
+        assert_eq!(reset.kind, UpdateKind::AttemptReset);
+        assert_eq!(reset.attempt, 1);
+        assert_eq!(reset.attempt_bytes, 0);
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.logical_bytes, 0);
+        assert_eq!(snapshot.wire_bytes, 7);
+        operation.fail().unwrap();
+    }
+
+    #[test]
+    fn explicit_failure_rolls_back_logical_bytes_and_finishes_the_handle() {
+        let tracker = ProgressTracker::new(ProgressTotals {
+            operations: 1,
+            files: 1,
+            bytes: 5,
+        });
+        let operation = tracker.start(OperationKind::Upload, 5);
+        operation.begin_attempt().unwrap();
+        let update = operation.advance(99).unwrap();
+        assert_eq!(update.attempt_bytes, 5);
+        let failed = operation.fail().unwrap();
+        assert_eq!(failed.kind, UpdateKind::Failed);
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.failed_operations, 1);
+        assert_eq!(snapshot.failed_files, 1);
+        assert_eq!(snapshot.logical_bytes, 0);
+        assert_eq!(snapshot.wire_bytes, 5);
+        assert!(matches!(
+            operation.advance(1),
+            Err(ProgressError::OperationFinished)
+        ));
+    }
+
+    #[test]
+    fn non_file_success_does_not_increment_file_counters() {
+        let tracker = ProgressTracker::new(ProgressTotals {
+            operations: 1,
+            files: 0,
+            bytes: 0,
+        });
+        let operation = tracker.start(OperationKind::CreateDirectory, 0);
+        let completed = operation.finish_success().unwrap();
+        assert_eq!(completed.kind, UpdateKind::Succeeded);
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.completed_operations, 1);
+        assert_eq!(snapshot.completed_files, 0);
+        assert_eq!(snapshot.failed_files, 0);
+    }
+
+    #[test]
+    fn progress_fractions_are_optional_and_clamped() {
+        let empty = ProgressTracker::new(ProgressTotals::default()).snapshot();
+        assert_eq!(empty.file_fraction(), None);
+        assert_eq!(empty.byte_fraction(), None);
+
+        let tracker = ProgressTracker::new(ProgressTotals {
+            operations: 1,
+            files: 1,
+            bytes: 4,
+        });
+        let operation = tracker.start(OperationKind::Upload, 8);
+        operation.finish_success().unwrap();
+        let over_total = tracker.snapshot();
+        assert_eq!(over_total.file_fraction(), Some(1.0));
+        assert_eq!(over_total.byte_fraction(), Some(1.0));
+    }
+
+    #[test]
     fn cloned_handles_finish_exactly_once() {
         let tracker = ProgressTracker::new(ProgressTotals {
             operations: 1,
@@ -721,5 +801,65 @@ mod tests {
         let output = String::from_utf8(renderer.into_inner()).unwrap();
         let value: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
         assert_eq!(value["schema"], "sdsync.progress.v1");
+    }
+
+    #[test]
+    fn ndjson_renderer_includes_the_bounded_operation_update() {
+        let tracker = ProgressTracker::new(ProgressTotals {
+            operations: 1,
+            files: 1,
+            bytes: 10,
+        });
+        let operation = tracker.start(OperationKind::Upload, 10);
+        operation.begin_attempt().unwrap();
+        let update = operation.advance(4).unwrap();
+        let mut renderer = ProgressRenderer::new(
+            Vec::new(),
+            ProgressMode::Always,
+            ProgressFormat::Ndjson,
+            false,
+        );
+        renderer.render(&tracker.snapshot(), Some(&update)).unwrap();
+        let output = String::from_utf8(renderer.into_inner()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(value["update"]["operation"], "upload");
+        assert_eq!(value["update"]["kind"], "advanced");
+        assert_eq!(value["update"]["attempt"], 1);
+        assert_eq!(value["update"]["attempt_bytes"], 4);
+        assert_eq!(value["active_operations"], 1);
+        operation.fail().unwrap();
+    }
+
+    #[test]
+    fn interactive_renderer_uses_carriage_return_and_finishes_one_line() {
+        let tracker = ProgressTracker::new(ProgressTotals {
+            operations: 1,
+            files: 1,
+            bytes: 1,
+        });
+        let snapshot = tracker.snapshot();
+        let mut renderer = ProgressRenderer::new(
+            Vec::new(),
+            ProgressMode::Always,
+            ProgressFormat::Human,
+            true,
+        );
+        renderer.render(&snapshot, None).unwrap();
+        renderer.finish().unwrap();
+        renderer.finish().unwrap();
+        let output = String::from_utf8(renderer.into_inner()).unwrap();
+        assert!(output.starts_with('\r'));
+        assert_eq!(output.matches('\r').count(), 1);
+        assert_eq!(output.matches('\n').count(), 1);
+    }
+
+    #[test]
+    fn human_units_and_durations_are_stable_at_boundaries() {
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_duration(Duration::from_secs(59)), "00:59");
+        assert_eq!(format_duration(Duration::from_secs(60)), "01:00");
+        assert_eq!(format_duration(Duration::from_secs(3_661)), "01:01:01");
     }
 }

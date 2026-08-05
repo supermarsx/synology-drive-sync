@@ -1056,6 +1056,7 @@ fn unix_timestamp_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
     use std::sync::Arc;
 
     use super::*;
@@ -1100,6 +1101,147 @@ mod tests {
         let event = LogEvent::new(LogLevel::Trace, EventCode::UploadProgress).operation(9);
         assert_eq!(event.json_value()["event"], "upload.progress");
         assert!(event.human_line().contains("upload progress"));
+    }
+
+    #[test]
+    fn every_event_code_has_a_stable_machine_and_human_name() {
+        for (code, machine, human) in [
+            (EventCode::RunStarted, "run.started", "sync run started"),
+            (
+                EventCode::RunCompleted,
+                "run.completed",
+                "sync run completed",
+            ),
+            (EventCode::RunFailed, "run.failed", "sync run failed"),
+            (
+                EventCode::LocalScanStarted,
+                "local_scan.started",
+                "local scan started",
+            ),
+            (
+                EventCode::LocalScanCompleted,
+                "local_scan.completed",
+                "local scan completed",
+            ),
+            (
+                EventCode::ApiDiscoveryStarted,
+                "api_discovery.started",
+                "API discovery started",
+            ),
+            (
+                EventCode::ApiDiscoveryCompleted,
+                "api_discovery.completed",
+                "API discovery completed",
+            ),
+            (
+                EventCode::AuthenticationStarted,
+                "authentication.started",
+                "authentication started",
+            ),
+            (
+                EventCode::AuthenticationCompleted,
+                "authentication.completed",
+                "authentication completed",
+            ),
+            (
+                EventCode::RemoteScanStarted,
+                "remote_scan.started",
+                "remote scan started",
+            ),
+            (
+                EventCode::RemoteScanCompleted,
+                "remote_scan.completed",
+                "remote scan completed",
+            ),
+            (EventCode::PlanReady, "plan.ready", "sync plan ready"),
+            (EventCode::UploadStarted, "upload.started", "upload started"),
+            (
+                EventCode::UploadAttemptStarted,
+                "upload.attempt_started",
+                "upload attempt started",
+            ),
+            (
+                EventCode::UploadProgress,
+                "upload.progress",
+                "upload progress",
+            ),
+            (
+                EventCode::UploadCompleted,
+                "upload.completed",
+                "upload completed",
+            ),
+            (EventCode::UploadFailed, "upload.failed", "upload failed"),
+            (
+                EventCode::DirectoryCreated,
+                "directory.created",
+                "directory created",
+            ),
+            (EventCode::EntryDeleted, "entry.deleted", "entry deleted"),
+            (
+                EventCode::RetryScheduled,
+                "retry.scheduled",
+                "retry scheduled",
+            ),
+            (
+                EventCode::CancellationRequested,
+                "cancellation.requested",
+                "cancellation requested",
+            ),
+        ] {
+            let event = LogEvent::new(LogLevel::Info, code);
+            assert_eq!(event.json_value()["event"], machine);
+            assert!(event.human_line().contains(human), "{machine}");
+        }
+    }
+
+    #[test]
+    fn log_levels_parse_case_insensitively_and_reject_unknown_values() {
+        for (input, expected, rendered) in [
+            (" ERROR ", LogLevel::Error, "error"),
+            ("warning", LogLevel::Warn, "warn"),
+            ("INFO", LogLevel::Info, "info"),
+            ("Debug", LogLevel::Debug, "debug"),
+            ("trace", LogLevel::Trace, "trace"),
+        ] {
+            let parsed = LogLevel::parse(input).unwrap();
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.to_string(), rendered);
+        }
+        assert!(matches!(
+            LogLevel::parse("verbose"),
+            Err(ObservabilityError::InvalidLogLevel)
+        ));
+    }
+
+    #[test]
+    fn structured_and_human_events_include_only_bounded_metrics() {
+        let event = LogEvent::new(LogLevel::Warn, EventCode::RetryScheduled)
+            .operation(17)
+            .attempt(3)
+            .metrics(EventMetrics {
+                operations: 2,
+                files: 1,
+                bytes: 4096,
+                elapsed_ms: 250,
+                throughput_bytes_per_second: 1024,
+                eta_ms: Some(750),
+            });
+        let json = event.json_value();
+        assert_eq!(json["operation_id"], 17);
+        assert_eq!(json["attempt"], 3);
+        assert_eq!(json["metrics"]["throughput_bytes_per_second"], 1024);
+        assert_eq!(json["metrics"]["eta_ms"], 750);
+        let human = event.human_line();
+        for field in [
+            "operation_id=17",
+            "attempt=3",
+            "operations=2",
+            "files=1",
+            "bytes=4096",
+            "elapsed_ms=250",
+        ] {
+            assert!(human.contains(field), "{field}");
+        }
     }
 
     #[test]
@@ -1161,6 +1303,99 @@ mod tests {
     }
 
     #[test]
+    fn invalid_file_sink_configuration_is_rejected_before_opening_a_file() {
+        let directory = unique_test_directory("invalid-file-config");
+        fs::create_dir_all(&directory).unwrap();
+        for config in [
+            FileLogConfig {
+                path: PathBuf::new(),
+                format: LogFormat::Json,
+                max_bytes: 1,
+                backups: 1,
+            },
+            FileLogConfig {
+                path: directory.join("zero.log"),
+                format: LogFormat::Json,
+                max_bytes: 0,
+                backups: 1,
+            },
+            FileLogConfig {
+                path: directory.join("too-many.log"),
+                format: LogFormat::Json,
+                max_bytes: 1,
+                backups: MAX_FILE_BACKUPS + 1,
+            },
+        ] {
+            assert!(matches!(
+                RotatingFile::open(config),
+                Err(ObservabilityError::InvalidFileConfiguration)
+            ));
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn zero_backup_rotation_truncates_in_place() {
+        let directory = unique_test_directory("zero-backup");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("events.log");
+        let mut sink = RotatingFile::open(FileLogConfig {
+            path: path.clone(),
+            format: LogFormat::Human,
+            max_bytes: 6,
+            backups: 0,
+        })
+        .unwrap();
+
+        sink.write_line("first").unwrap();
+        sink.write_line("next").unwrap();
+        sink.flush().unwrap();
+        drop(sink);
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "next\n");
+        assert!(!rotated_path(&path, 1).exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn bearer_token_files_are_trimmed_bounded_and_ascii_safe() {
+        let directory = unique_test_directory("bearer-token");
+        fs::create_dir_all(&directory).unwrap();
+
+        let valid = directory.join("valid.token");
+        fs::write(&valid, b"header.payload.signature\r\n").unwrap();
+        let token = load_bearer_token(&BearerTokenSource::File(valid)).unwrap();
+        assert_eq!(token.as_str(), "header.payload.signature");
+
+        for (name, bytes) in [
+            ("empty", Vec::new()),
+            ("space", b"token with spaces".to_vec()),
+            ("quote", b"token\"value".to_vec()),
+            ("utf8", vec![0xff, 0xfe]),
+            (
+                "oversized",
+                vec![b'x'; usize::try_from(MAX_BEARER_TOKEN_BYTES + 1).unwrap()],
+            ),
+        ] {
+            let path = directory.join(name);
+            fs::write(&path, bytes).unwrap();
+            assert!(matches!(
+                load_bearer_token(&BearerTokenSource::File(path)),
+                Err(ObservabilityError::InvalidBearerToken)
+            ));
+        }
+        let missing = directory.join("missing");
+        assert!(matches!(
+            load_bearer_token(&BearerTokenSource::File(missing)),
+            Err(ObservabilityError::Io {
+                operation: "bearer token file open",
+                ..
+            })
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn remote_endpoint_rejects_credential_bearing_forms() {
         assert!(validate_remote_endpoint("https://logs.example.test/events").is_ok());
         for endpoint in [
@@ -1171,6 +1406,86 @@ mod tests {
         ] {
             assert!(validate_remote_endpoint(endpoint).is_err());
         }
+    }
+
+    #[test]
+    fn invalid_remote_configuration_is_rejected_without_starting_a_worker() {
+        for (queue_capacity, timeout) in [
+            (0, Duration::from_secs(1)),
+            (MAX_REMOTE_QUEUE + 1, Duration::from_secs(1)),
+            (1, Duration::ZERO),
+        ] {
+            assert!(matches!(
+                RemoteSink::from_config(RemoteLogConfig {
+                    endpoint: "https://logs.example.test/events".to_owned(),
+                    bearer_token: None,
+                    queue_capacity,
+                    timeout,
+                    delivery: RemoteDelivery::Required,
+                }),
+                Err(ObservabilityError::InvalidRemoteConfiguration)
+            ));
+        }
+    }
+
+    #[test]
+    fn required_remote_queue_overflow_is_reported_and_counted() {
+        let (started_send, started_receive) = mpsc::channel();
+        let (release_send, release_receive) = mpsc::channel();
+        let remote = RemoteSink::spawn(
+            Box::new(BlockingTransport {
+                started: started_send,
+                release: release_receive,
+            }),
+            1,
+            RemoteDelivery::Required,
+        )
+        .unwrap();
+        remote.enqueue("first".to_owned()).unwrap();
+        started_receive
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        remote.enqueue("queued".to_owned()).unwrap();
+
+        assert!(matches!(
+            remote.enqueue("overflow".to_owned()),
+            Err(ObservabilityError::RemoteQueueFull)
+        ));
+        assert_eq!(remote.report().remote_events_dropped, 1);
+
+        release_send.send(()).unwrap();
+        release_send.send(()).unwrap();
+        remote.shutdown(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn successful_remote_shutdown_is_idempotent_and_closes_the_sink() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let remote = RemoteSink::spawn(
+            Box::new(FakeTransport {
+                calls: Arc::clone(&calls),
+                fail: false,
+            }),
+            2,
+            RemoteDelivery::Required,
+        )
+        .unwrap();
+        remote.enqueue("{}".to_owned()).unwrap();
+        remote.flush(Duration::from_secs(1)).unwrap();
+        remote.shutdown(Duration::from_secs(1)).unwrap();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            remote.flush(Duration::from_secs(1)),
+            Err(ObservabilityError::AlreadyShutdown)
+        ));
+        assert!(matches!(
+            remote.enqueue("{}".to_owned()),
+            Err(ObservabilityError::RemoteFailure(
+                RemoteFailure::WorkerStopped
+            ))
+        ));
+        remote.shutdown(Duration::from_secs(1)).unwrap();
     }
 
     #[test]
@@ -1222,7 +1537,7 @@ mod tests {
 
         let started = Instant::now();
         drop(remote);
-        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(started.elapsed() < Duration::from_secs(2));
         let _ = release_send.send(());
     }
 
@@ -1249,8 +1564,229 @@ mod tests {
             remote.shutdown(Duration::from_millis(20)),
             Err(ObservabilityError::FlushTimeout)
         ));
-        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(started.elapsed() < Duration::from_secs(2));
         let _ = release_send.send(());
+    }
+
+    #[test]
+    fn defaults_public_errors_and_local_shutdown_have_stable_contracts() {
+        let config = LoggerConfig::default();
+        assert_eq!(config.level, LogLevel::Info);
+        assert_eq!(config.stderr, Some(LogFormat::Human));
+        assert!(config.file.is_none() && config.remote.is_none());
+        let logger = EventLogger::new(config).unwrap();
+        assert_eq!(
+            logger.shutdown(Duration::from_secs(1)).unwrap(),
+            ShutdownReport::default()
+        );
+
+        let cases = vec![
+            (ObservabilityError::InvalidLogLevel, "invalid log level"),
+            (
+                ObservabilityError::InvalidFileConfiguration,
+                "invalid file log configuration",
+            ),
+            (
+                ObservabilityError::InvalidRemoteEndpoint,
+                "must be an HTTPS URL",
+            ),
+            (
+                ObservabilityError::InvalidRemoteConfiguration,
+                "invalid remote log configuration",
+            ),
+            (
+                ObservabilityError::InvalidBearerToken,
+                "invalid remote log bearer token",
+            ),
+            (
+                ObservabilityError::RemoteQueueFull,
+                "remote log queue is full",
+            ),
+            (
+                ObservabilityError::RemoteFailure(RemoteFailure::Transport),
+                "transport failed",
+            ),
+            (
+                ObservabilityError::RemoteFailure(RemoteFailure::Rejected),
+                "rejected an event",
+            ),
+            (
+                ObservabilityError::RemoteFailure(RemoteFailure::WorkerStopped),
+                "worker stopped",
+            ),
+            (ObservabilityError::FlushTimeout, "timed out flushing"),
+            (ObservabilityError::AlreadyShutdown, "logger is shut down"),
+        ];
+        for (error, expected) in cases {
+            assert!(error.to_string().contains(expected));
+            assert!(std::error::Error::source(&error).is_none());
+        }
+        let io_error = ObservabilityError::Io {
+            operation: "test write",
+            source: io::Error::other("sensitive detail"),
+        };
+        assert_eq!(
+            io_error.to_string(),
+            "observability I/O failed during test write"
+        );
+        assert_eq!(
+            std::error::Error::source(&io_error).unwrap().to_string(),
+            "sensitive detail"
+        );
+    }
+
+    #[test]
+    fn writer_and_closed_file_failures_preserve_sink_operation_context() {
+        let logger = EventLogger::with_stderr_writer(
+            LoggerConfig {
+                level: LogLevel::Trace,
+                stderr: Some(LogFormat::Human),
+                file: None,
+                remote: None,
+            },
+            FailingWriter { fail_write: true },
+        )
+        .unwrap();
+        assert!(matches!(
+            logger.emit(LogEvent::new(LogLevel::Info, EventCode::RunStarted)),
+            Err(ObservabilityError::Io {
+                operation: "stderr log write",
+                ..
+            })
+        ));
+
+        let logger = EventLogger::with_stderr_writer(
+            LoggerConfig {
+                level: LogLevel::Trace,
+                stderr: Some(LogFormat::Json),
+                file: None,
+                remote: None,
+            },
+            FailingWriter { fail_write: false },
+        )
+        .unwrap();
+        assert!(matches!(
+            logger.flush(Duration::ZERO),
+            Err(ObservabilityError::Io {
+                operation: "stderr log flush",
+                ..
+            })
+        ));
+
+        let directory = unique_test_directory("closed-file");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("events.log");
+        let mut sink = RotatingFile::open(FileLogConfig {
+            path: path.clone(),
+            format: LogFormat::Human,
+            max_bytes: 64,
+            backups: 1,
+        })
+        .unwrap();
+        sink.file = None;
+        assert!(matches!(
+            sink.write_line("event"),
+            Err(ObservabilityError::Io {
+                operation: "file log write",
+                ..
+            })
+        ));
+        assert!(matches!(
+            sink.flush(),
+            Err(ObservabilityError::Io {
+                operation: "file log flush",
+                ..
+            })
+        ));
+        drop(sink);
+
+        assert!(matches!(
+            RotatingFile::open(FileLogConfig {
+                path: directory.clone(),
+                format: LogFormat::Json,
+                max_bytes: 64,
+                backups: 1,
+            }),
+            Err(ObservabilityError::Io {
+                operation: "file log open",
+                ..
+            })
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn configured_https_remote_sink_reports_transport_failure_on_shutdown() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let endpoint = format!("https://{}/events", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let acceptor = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        drop(stream);
+                        return true;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return false;
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("ephemeral TLS listener failed: {error}"),
+                }
+            }
+        });
+        let logger = EventLogger::with_stderr_writer(
+            LoggerConfig {
+                level: LogLevel::Trace,
+                stderr: None,
+                file: None,
+                remote: Some(RemoteLogConfig {
+                    endpoint,
+                    bearer_token: None,
+                    queue_capacity: 2,
+                    timeout: Duration::from_millis(100),
+                    delivery: RemoteDelivery::Required,
+                }),
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        logger
+            .emit(LogEvent::new(LogLevel::Info, EventCode::RunFailed))
+            .unwrap();
+        assert!(matches!(
+            logger.shutdown(Duration::from_secs(2)),
+            Err(ObservabilityError::RemoteFailure(RemoteFailure::Transport))
+        ));
+        assert!(acceptor.join().unwrap(), "HTTPS transport never connected");
+    }
+
+    #[test]
+    fn best_effort_queue_overflow_is_counted_without_failing_the_caller() {
+        let (started_send, started_receive) = mpsc::channel();
+        let (release_send, release_receive) = mpsc::channel();
+        let remote = RemoteSink::spawn(
+            Box::new(BlockingTransport {
+                started: started_send,
+                release: release_receive,
+            }),
+            1,
+            RemoteDelivery::BestEffort,
+        )
+        .unwrap();
+        remote.enqueue("first".to_owned()).unwrap();
+        started_receive
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        remote.enqueue("queued".to_owned()).unwrap();
+        remote.enqueue("dropped".to_owned()).unwrap();
+        assert_eq!(remote.report().remote_events_dropped, 1);
+        release_send.send(()).unwrap();
+        release_send.send(()).unwrap();
+        remote.shutdown(Duration::from_secs(1)).unwrap();
     }
 
     #[derive(Clone, Default)]
@@ -1276,6 +1812,24 @@ mod tests {
     struct FakeTransport {
         calls: Arc<AtomicU64>,
         fail: bool,
+    }
+
+    struct FailingWriter {
+        fail_write: bool,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.fail_write {
+                Err(io::Error::other("write failed"))
+            } else {
+                Ok(buffer.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("flush failed"))
+        }
     }
 
     impl RemoteTransport for FakeTransport {

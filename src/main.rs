@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
+use std::fmt::Write as FmtWrite;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -360,13 +361,20 @@ fn write_source_doctor_output(
     result: &TimedSourceDiagnostic,
     output: &config::ResolvedOutput,
 ) -> Result<()> {
+    write_rendered_output(source_doctor_output(result, output.output))
+}
+
+fn source_doctor_output(
+    result: &TimedSourceDiagnostic,
+    format: cli::OutputFormat,
+) -> RenderedOutput {
     let value = json!({
         "schema": "sdsync.source-doctor.v1",
         "source": source_diagnostic_value(result),
     });
-    match output.output {
-        cli::OutputFormat::Human => {
-            println!(
+    match format {
+        cli::OutputFormat::Human => RenderedOutput::Human(
+            format!(
                 "Source is healthy: {} files, {} directories, {} across {} entries; {} files hashed in {} ms ({}).",
                 result.report.files,
                 result.report.directories,
@@ -375,11 +383,10 @@ fn write_source_doctor_output(
                 result.report.hashed_files,
                 duration_millis(result.elapsed),
                 result.report.canonical_root.display(),
-            );
-            io::stdout().flush().map_err(output_error)
-        }
-        cli::OutputFormat::Json => write_json(&value),
-        cli::OutputFormat::Ndjson => write_json_line(&value),
+            ) + "\n",
+        ),
+        cli::OutputFormat::Json => RenderedOutput::Json(value),
+        cli::OutputFormat::Ndjson => RenderedOutput::Ndjson(vec![value]),
     }
 }
 
@@ -428,7 +435,11 @@ fn run_source_doctor_batch(mut jobs: Vec<NamedSourceSettings>) -> Result<ExitCod
     }
     cancelled |= cancellation.is_cancelled();
     write_source_batch_output(&outcomes, &output)?;
-    if cancelled || cancellation.is_cancelled() {
+    source_batch_completion(&outcomes, cancelled || cancellation.is_cancelled())
+}
+
+fn source_batch_completion(outcomes: &[SourceBatchOutcome], cancelled: bool) -> Result<ExitCode> {
+    if cancelled {
         Err(Error::Cancelled)
     } else if outcomes.iter().any(|outcome| outcome.error.is_some()) {
         Err(Error::Message(
@@ -443,6 +454,26 @@ fn run_source_doctor_batch(mut jobs: Vec<NamedSourceSettings>) -> Result<ExitCod
 fn write_source_batch_output(
     outcomes: &[SourceBatchOutcome],
     output: &config::ResolvedOutput,
+) -> Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write_source_batch_output_to(&mut stdout, outcomes, output.output)
+}
+
+fn source_batch_job_value(outcome: &SourceBatchOutcome) -> Value {
+    json!({
+        "schema": "sdsync.source-doctor-job.v1",
+        "profile": outcome.name,
+        "status": if outcome.result.is_some() { "success" } else if outcome.not_run { "not-run" } else { "failed" },
+        "source": outcome.result.as_ref().map(source_diagnostic_value),
+        "error": outcome.error,
+    })
+}
+
+fn write_source_batch_output_to<W: Write>(
+    writer: &mut W,
+    outcomes: &[SourceBatchOutcome],
+    format: cli::OutputFormat,
 ) -> Result<()> {
     let succeeded = outcomes
         .iter()
@@ -460,18 +491,6 @@ fn write_source_batch_output(
     } else {
         "partial"
     };
-    let job_values = outcomes
-        .iter()
-        .map(|outcome| {
-            json!({
-                "schema": "sdsync.source-doctor-job.v1",
-                "profile": outcome.name,
-                "status": if outcome.result.is_some() { "success" } else if outcome.not_run { "not-run" } else { "failed" },
-                "source": outcome.result.as_ref().map(source_diagnostic_value),
-                "error": outcome.error,
-            })
-        })
-        .collect::<Vec<_>>();
     let summary = json!({
         "schema": "sdsync.source-doctor-batch.v1",
         "status": status,
@@ -482,14 +501,17 @@ fn write_source_batch_output(
             "not_run": not_run,
         },
     });
-    match output.output {
+    match format {
         cli::OutputFormat::Human => {
-            println!(
+            writeln!(
+                writer,
                 "Source diagnostic batch: {succeeded} succeeded, {failed} failed, {not_run} not run."
-            );
+            )
+            .map_err(output_error)?;
             for outcome in outcomes {
                 if let Some(result) = &outcome.result {
-                    println!(
+                    writeln!(
+                        writer,
                         "  [{}] healthy: {} files, {} directories, {}, {} hashed ({})",
                         outcome.name,
                         result.report.files,
@@ -497,31 +519,49 @@ fn write_source_batch_output(
                         format_bytes(result.report.bytes),
                         result.report.hashed_files,
                         result.report.canonical_root.display(),
-                    );
+                    )
+                    .map_err(output_error)?;
                 } else if outcome.not_run {
-                    println!("  [{}] not run", outcome.name);
+                    writeln!(writer, "  [{}] not run", outcome.name).map_err(output_error)?;
                 } else {
-                    println!(
+                    writeln!(
+                        writer,
                         "  [{}] failed: {}",
                         outcome.name,
                         outcome.error.as_deref().unwrap_or("unknown failure")
-                    );
+                    )
+                    .map_err(output_error)?;
                 }
             }
-            io::stdout().flush().map_err(output_error)
+            writer.flush().map_err(output_error)
         }
         cli::OutputFormat::Json => {
+            let job_values = outcomes
+                .iter()
+                .map(source_batch_job_value)
+                .collect::<Vec<_>>();
             let mut value = summary;
             value["jobs"] = Value::Array(job_values);
-            write_json(&value)
+            write_json_to(writer, &value)
         }
         cli::OutputFormat::Ndjson => {
-            for value in job_values {
-                write_json_line(&value)?;
+            for outcome in outcomes {
+                write_json_line_to(writer, &source_batch_job_value(outcome))?;
             }
-            write_json_line(&summary)
+            write_json_line_to(writer, &summary)
         }
     }
+}
+
+#[cfg(test)]
+fn source_batch_output(
+    outcomes: &[SourceBatchOutcome],
+    format: cli::OutputFormat,
+) -> RenderedOutput {
+    let mut buffer = Vec::new();
+    write_source_batch_output_to(&mut buffer, outcomes, format)
+        .expect("writing rendered source batch output to a Vec cannot fail");
+    captured_rendered_output(format, buffer)
 }
 
 fn common_batch_output<'a>(
@@ -700,14 +740,7 @@ fn run_sync_batch(
             None,
             None,
         )?;
-        if cancellation.is_cancelled() {
-            return Err(Error::Cancelled);
-        }
-        return if changes_exit_code && changes {
-            Ok(ExitCode::from(cli::PLAN_CHANGES_EXIT_CODE))
-        } else {
-            Ok(ExitCode::SUCCESS)
-        };
+        return changes_completion(changes, cancellation.is_cancelled(), changes_exit_code);
     }
 
     // Execute deterministically and serially. Each job is replanned immediately before it can
@@ -771,7 +804,11 @@ fn run_sync_batch(
         Some(reserved_deletions),
         None,
     )?;
-    if cancelled || cancellation.is_cancelled() {
+    sync_batch_completion(&outcomes, cancelled || cancellation.is_cancelled())
+}
+
+fn sync_batch_completion(outcomes: &[SyncBatchOutcome], cancelled: bool) -> Result<ExitCode> {
+    if cancelled {
         Err(Error::Cancelled)
     } else if outcomes.iter().any(|outcome| {
         matches!(
@@ -944,10 +981,43 @@ fn write_sync_batch_output(
     execution_reserved_deletions: Option<usize>,
     batch_error: Option<&str>,
 ) -> Result<()> {
-    let job_values = outcomes
-        .iter()
-        .map(sync_batch_job_value)
-        .collect::<Vec<_>>();
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write_sync_batch_output_to(
+        &mut stdout,
+        SyncBatchRender {
+            outcomes,
+            output,
+            plan_only,
+            max_total_delete,
+            preflight_deletions,
+            execution_reserved_deletions,
+            batch_error,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct SyncBatchRender<'a> {
+    outcomes: &'a [SyncBatchOutcome],
+    output: &'a config::ResolvedOutput,
+    plan_only: bool,
+    max_total_delete: usize,
+    preflight_deletions: Option<usize>,
+    execution_reserved_deletions: Option<usize>,
+    batch_error: Option<&'a str>,
+}
+
+fn write_sync_batch_output_to<W: Write>(writer: &mut W, render: SyncBatchRender<'_>) -> Result<()> {
+    let SyncBatchRender {
+        outcomes,
+        output,
+        plan_only,
+        max_total_delete,
+        preflight_deletions,
+        execution_reserved_deletions,
+        batch_error,
+    } = render;
     let succeeded = outcomes
         .iter()
         .filter(|outcome| outcome.status == SyncBatchStatus::Success)
@@ -969,7 +1039,7 @@ fn write_sync_batch_output(
         .filter(|outcome| outcome.status == SyncBatchStatus::NotRun)
         .count();
     let status = sync_batch_status(outcomes, batch_error);
-    let mut summary = sync_batch_summary_value(
+    let summary = sync_batch_summary_value(
         outcomes,
         plan_only,
         max_total_delete,
@@ -979,34 +1049,40 @@ fn write_sync_batch_output(
     );
     match output.output {
         cli::OutputFormat::Human => {
-            println!(
+            writeln!(
+                writer,
                 "Batch {}: status {status}; {succeeded} succeeded, {preflighted} preflighted, {partial} potentially partial, {failed} failed before mutation authorization, {not_run} not run; aggregate deletion cap {max_total_delete}.",
                 if plan_only { "plan" } else { "sync" },
-            );
+            )
+            .map_err(output_error)?;
             if let Some(error) = batch_error {
-                println!("Batch safety check failed: {error}");
+                writeln!(writer, "Batch safety check failed: {error}").map_err(output_error)?;
             }
             for outcome in outcomes {
-                println!("\n[{}] {}", outcome.name, outcome.status.as_str());
+                writeln!(writer, "\n[{}] {}", outcome.name, outcome.status.as_str())
+                    .map_err(output_error)?;
                 let display_plan = outcome
                     .execution_plan
                     .as_ref()
                     .or(outcome.preflight_plan.as_ref());
                 if let Some(plan) = display_plan {
-                    print_plan_human(plan, plan_only || output.verbosity > 0);
+                    write_plan_human_to(writer, plan, plan_only || output.verbosity > 0)?;
                 }
                 if let (Some(preflight), Some(execution)) =
                     (&outcome.preflight_plan, &outcome.execution_plan)
                     && preflight.delete_count() != execution.delete_count()
                 {
-                    println!(
+                    writeln!(
+                        writer,
                         "Deletion-plan drift: preflight {}, fresh execution {}.",
                         preflight.delete_count(),
                         execution.delete_count()
-                    );
+                    )
+                    .map_err(output_error)?;
                 }
                 if let Some(report) = &outcome.report {
-                    println!(
+                    writeln!(
+                        writer,
                         "Result: {} uploaded ({}), {} copied on NAS, {} directories created, {} deleted in {} ms.",
                         report.uploaded,
                         format_bytes(report.uploaded_bytes),
@@ -1014,25 +1090,58 @@ fn write_sync_batch_output(
                         report.created,
                         report.deleted,
                         duration_millis(outcome.elapsed.unwrap_or_default()),
-                    );
+                    )
+                    .map_err(output_error)?;
                 }
                 if let Some(error) = &outcome.error {
-                    println!("Error: {error}");
+                    writeln!(writer, "Error: {error}").map_err(output_error)?;
                 }
             }
-            io::stdout().flush().map_err(output_error)
+            writer.flush().map_err(output_error)
         }
         cli::OutputFormat::Json => {
+            let job_values = outcomes
+                .iter()
+                .map(sync_batch_job_value)
+                .collect::<Vec<_>>();
+            let mut summary = summary;
             summary["jobs"] = Value::Array(job_values);
-            write_json(&summary)
+            write_json_to(writer, &summary)
         }
         cli::OutputFormat::Ndjson => {
-            for value in job_values {
-                write_json_line(&value)?;
+            for outcome in outcomes {
+                write_json_line_to(writer, &sync_batch_job_value(outcome))?;
             }
-            write_json_line(&summary)
+            write_json_line_to(writer, &summary)
         }
     }
+}
+
+#[cfg(test)]
+fn sync_batch_output(
+    outcomes: &[SyncBatchOutcome],
+    output: &config::ResolvedOutput,
+    plan_only: bool,
+    max_total_delete: usize,
+    preflight_deletions: Option<usize>,
+    execution_reserved_deletions: Option<usize>,
+    batch_error: Option<&str>,
+) -> RenderedOutput {
+    let mut buffer = Vec::new();
+    write_sync_batch_output_to(
+        &mut buffer,
+        SyncBatchRender {
+            outcomes,
+            output,
+            plan_only,
+            max_total_delete,
+            preflight_deletions,
+            execution_reserved_deletions,
+            batch_error,
+        },
+    )
+    .expect("writing rendered batch output to a Vec cannot fail");
+    captured_rendered_output(output.output, buffer)
 }
 
 fn run_sync(
@@ -1050,12 +1159,17 @@ fn run_sync(
         &settings.output,
         plan_only,
     )?;
+    changes_completion(
+        !result.plan.is_empty(),
+        cancellation.is_cancelled(),
+        changes_exit_code,
+    )
+}
 
-    if cancellation.is_cancelled() {
-        return Err(Error::Cancelled);
-    }
-
-    if changes_exit_code && !result.plan.is_empty() {
+fn changes_completion(changes: bool, cancelled: bool, changes_exit_code: bool) -> Result<ExitCode> {
+    if cancelled {
+        Err(Error::Cancelled)
+    } else if changes_exit_code && changes {
         Ok(ExitCode::from(cli::PLAN_CHANGES_EXIT_CODE))
     } else {
         Ok(ExitCode::SUCCESS)
@@ -1838,7 +1952,11 @@ fn run_doctor_batch(mut jobs: Vec<NamedDoctorSettings>) -> Result<ExitCode> {
     cancelled |= cancellation.is_cancelled();
 
     write_doctor_batch_output(&outcomes, &output, write_tests)?;
-    if cancelled || cancellation.is_cancelled() {
+    doctor_batch_completion(&outcomes, cancelled || cancellation.is_cancelled())
+}
+
+fn doctor_batch_completion(outcomes: &[DoctorBatchOutcome], cancelled: bool) -> Result<ExitCode> {
+    if cancelled {
         Err(Error::Cancelled)
     } else if outcomes.iter().any(|outcome| {
         matches!(
@@ -2112,7 +2230,14 @@ impl ProgressWiring {
 }
 
 fn renderer_progress_mode(output: &config::ResolvedOutput) -> RendererProgressMode {
-    if !output.terminal_progress_enabled(io::stderr().is_terminal()) {
+    renderer_progress_mode_for_terminal(output, io::stderr().is_terminal())
+}
+
+fn renderer_progress_mode_for_terminal(
+    output: &config::ResolvedOutput,
+    stderr_is_terminal: bool,
+) -> RendererProgressMode {
+    if !output.terminal_progress_enabled(stderr_is_terminal) {
         return RendererProgressMode::Never;
     }
     match output.progress {
@@ -2614,11 +2739,25 @@ fn write_sync_output(
     output: &config::ResolvedOutput,
     plan_only: bool,
 ) -> Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write_sync_output_to(&mut stdout, plan, report, elapsed, output, plan_only)
+}
+
+fn write_sync_output_to<W: Write>(
+    writer: &mut W,
+    plan: &SyncPlan,
+    report: Option<&ExecutionReport>,
+    elapsed: Duration,
+    output: &config::ResolvedOutput,
+    plan_only: bool,
+) -> Result<()> {
     match output.output {
         cli::OutputFormat::Human => {
-            print_plan_human(plan, plan_only || output.verbosity > 0);
+            write_plan_human_to(writer, plan, plan_only || output.verbosity > 0)?;
             if let Some(report) = report {
-                println!(
+                writeln!(
+                    writer,
                     "Sync complete: {} uploaded ({}), {} copied on NAS, {} directories created, {} remote entries deleted in {} ms.",
                     report.uploaded,
                     format_bytes(report.uploaded_bytes),
@@ -2626,39 +2765,64 @@ fn write_sync_output(
                     report.created,
                     report.deleted,
                     duration_millis(elapsed),
-                );
+                )
+                .map_err(output_error)?;
             } else if !plan_only && plan.is_empty() {
-                println!("Already in sync; no remote changes were needed.");
+                writeln!(writer, "Already in sync; no remote changes were needed.")
+                    .map_err(output_error)?;
             } else if plan_only {
-                println!("Plan only; no remote changes were made.");
+                writeln!(writer, "Plan only; no remote changes were made.")
+                    .map_err(output_error)?;
             }
-            io::stdout().flush().map_err(output_error)
+            writer.flush().map_err(output_error)
         }
-        cli::OutputFormat::Json => {
-            write_json(&command_json_value(plan, report, elapsed, plan_only))
-        }
+        cli::OutputFormat::Json => write_json_to(
+            writer,
+            &command_json_value(plan, report, elapsed, plan_only),
+        ),
         cli::OutputFormat::Ndjson => {
-            write_plan_ndjson(plan)?;
+            write_plan_ndjson_to(writer, plan)?;
             if let Some(report) = report {
-                write_json_line(&json!({
-                    "schema": "sdsync.output.v1",
-                    "kind": "completion",
-                    "result": execution_value(report, elapsed),
-                }))?;
+                write_json_line_to(
+                    writer,
+                    &json!({
+                        "schema": "sdsync.output.v1",
+                        "kind": "completion",
+                        "result": execution_value(report, elapsed),
+                    }),
+                )?;
             } else if !plan_only {
-                write_json_line(&json!({
-                    "schema": "sdsync.output.v1",
-                    "kind": "completion",
-                    "changed": false,
-                }))?;
+                write_json_line_to(
+                    writer,
+                    &json!({
+                        "schema": "sdsync.output.v1",
+                        "kind": "completion",
+                        "changed": false,
+                    }),
+                )?;
             }
             Ok(())
         }
     }
 }
 
-fn print_plan_human(plan: &SyncPlan, detailed: bool) {
-    println!(
+#[cfg(test)]
+fn sync_output(
+    plan: &SyncPlan,
+    report: Option<&ExecutionReport>,
+    elapsed: Duration,
+    output: &config::ResolvedOutput,
+    plan_only: bool,
+) -> RenderedOutput {
+    let mut buffer = Vec::new();
+    write_sync_output_to(&mut buffer, plan, report, elapsed, output, plan_only)
+        .expect("writing rendered sync output to a Vec cannot fail");
+    captured_rendered_output(output.output, buffer)
+}
+
+fn write_plan_human_to<W: Write>(writer: &mut W, plan: &SyncPlan, detailed: bool) -> Result<()> {
+    writeln!(
+        writer,
         "Plan: {} uploads ({}), {} server copies (verified upload fallback up to {}), {} directories, {} deletions, {} unchanged files, {} protected remote entries.",
         plan.uploads.len(),
         format_bytes(plan.upload_bytes),
@@ -2668,43 +2832,66 @@ fn print_plan_human(plan: &SyncPlan, detailed: bool) {
         plan.delete_count(),
         plan.unchanged_files,
         plan.protected_entries
-    );
+    )
+    .map_err(output_error)?;
     if !detailed {
-        return;
+        return Ok(());
     }
     for action in &plan.pre_deletes {
-        println!(
+        writeln!(
+            writer,
             "  DELETE-CONFLICT {} (remote snapshot guarded)",
             action.remote_path
-        );
+        )
+        .map_err(output_error)?;
     }
     for action in &plan.creates {
-        println!("  MKDIR  {}", action.remote_path);
+        writeln!(writer, "  MKDIR  {}", action.remote_path).map_err(output_error)?;
     }
     for action in &plan.copies {
-        println!(
+        writeln!(
+            writer,
             "  COPY   {} -> {} ({}; verified upload fallback allowed before task start)",
             action.from_remote_path,
             action.to_remote_path,
             format_bytes(action.expected_size)
-        );
+        )
+        .map_err(output_error)?;
     }
     for action in &plan.uploads {
-        println!(
+        writeln!(
+            writer,
             "  UPLOAD {} -> {}",
             action.local.relative, action.remote_path
-        );
+        )
+        .map_err(output_error)?;
     }
     for action in &plan.post_deletes {
         if let Some(guard) = &action.destination_guard {
-            println!(
+            writeln!(
+                writer,
                 "  DELETE {} (remote snapshot guarded; destination guarded by {} bytes+mtime+MD5 at {})",
                 action.remote_path, guard.expected_size, guard.remote_path
-            );
+            )
+            .map_err(output_error)?;
         } else {
-            println!("  DELETE {} (remote snapshot guarded)", action.remote_path);
+            writeln!(
+                writer,
+                "  DELETE {} (remote snapshot guarded)",
+                action.remote_path
+            )
+            .map_err(output_error)?;
         }
     }
+    Ok(())
+}
+
+#[cfg(test)]
+fn plan_human(plan: &SyncPlan, detailed: bool) -> String {
+    let mut output = Vec::new();
+    write_plan_human_to(&mut output, plan, detailed)
+        .expect("writing rendered human plan to a Vec cannot fail");
+    String::from_utf8(output).expect("human plan output is UTF-8")
 }
 
 fn remote_snapshot_value(snapshot: &RemoteSnapshot) -> Value {
@@ -2795,59 +2982,82 @@ fn command_json_value(
     value
 }
 
-fn write_plan_ndjson(plan: &SyncPlan) -> Result<()> {
-    write_json_line(&plan_summary_record(plan))?;
+fn write_plan_ndjson_to<W: Write>(writer: &mut W, plan: &SyncPlan) -> Result<()> {
+    write_json_line_to(writer, &plan_summary_record(plan))?;
     for action in &plan.pre_deletes {
-        write_json_line(&json!({
-            "schema": "sdsync.plan-action.v1", "action": "delete-conflict",
-            "relative": action.relative, "remote_path": action.remote_path,
-            "entry_kind": action.kind.as_str(),
-            "snapshot_guard": remote_snapshot_value(&action.snapshot),
-        }))?;
+        write_json_line_to(
+            writer,
+            &json!({
+                "schema": "sdsync.plan-action.v1", "action": "delete-conflict",
+                "relative": action.relative, "remote_path": action.remote_path,
+                "entry_kind": action.kind.as_str(),
+                "snapshot_guard": remote_snapshot_value(&action.snapshot),
+            }),
+        )?;
     }
     for action in &plan.creates {
-        write_json_line(&json!({
-            "schema": "sdsync.plan-action.v1", "action": "create-directory",
-            "relative": action.relative, "remote_path": action.remote_path,
-        }))?;
+        write_json_line_to(
+            writer,
+            &json!({
+                "schema": "sdsync.plan-action.v1", "action": "create-directory",
+                "relative": action.relative, "remote_path": action.remote_path,
+            }),
+        )?;
     }
     for action in &plan.copies {
-        write_json_line(&json!({
-            "schema": "sdsync.plan-action.v1", "action": "copy-remote-content",
-            "from_relative": action.from_relative,
-            "from_remote_path": action.from_remote_path,
-            "to_relative": action.to_relative,
-            "to_remote_path": action.to_remote_path,
-            "expected_size": action.expected_size,
-            "expected_mtime_seconds": action.local.mtime_ms.div_euclid(1000),
-            "content_md5": action.content_md5.to_string(),
-            "source_snapshot_guard": remote_snapshot_value(&action.source_snapshot),
-            "verified_upload_fallback": "only-before-copy-task-start",
-        }))?;
+        write_json_line_to(
+            writer,
+            &json!({
+                "schema": "sdsync.plan-action.v1", "action": "copy-remote-content",
+                "from_relative": action.from_relative,
+                "from_remote_path": action.from_remote_path,
+                "to_relative": action.to_relative,
+                "to_remote_path": action.to_remote_path,
+                "expected_size": action.expected_size,
+                "expected_mtime_seconds": action.local.mtime_ms.div_euclid(1000),
+                "content_md5": action.content_md5.to_string(),
+                "source_snapshot_guard": remote_snapshot_value(&action.source_snapshot),
+                "verified_upload_fallback": "only-before-copy-task-start",
+            }),
+        )?;
     }
     for action in &plan.uploads {
-        write_json_line(&json!({
-            "schema": "sdsync.plan-action.v1", "action": "upload",
-            "relative": action.local.relative, "remote_path": action.remote_path,
-            "bytes": action.local.size, "mtime_ms": action.local.mtime_ms,
-        }))?;
+        write_json_line_to(
+            writer,
+            &json!({
+                "schema": "sdsync.plan-action.v1", "action": "upload",
+                "relative": action.local.relative, "remote_path": action.remote_path,
+                "bytes": action.local.size, "mtime_ms": action.local.mtime_ms,
+            }),
+        )?;
     }
     for action in &plan.post_deletes {
-        write_json_line(&json!({
-            "schema": "sdsync.plan-action.v1", "action": "delete",
-            "relative": action.relative, "remote_path": action.remote_path,
-            "entry_kind": action.kind.as_str(),
-            "snapshot_guard": remote_snapshot_value(&action.snapshot),
-            "destination_guard": action.destination_guard.as_ref().map(|guard| json!({
-                "remote_path": guard.remote_path,
-                "local_relative": guard.local.relative,
-                "expected_size": guard.expected_size,
-                "expected_mtime_seconds": guard.expected_mtime_seconds,
-                "content_md5": guard.content_md5.to_string(),
-            })),
-        }))?;
+        write_json_line_to(
+            writer,
+            &json!({
+                "schema": "sdsync.plan-action.v1", "action": "delete",
+                "relative": action.relative, "remote_path": action.remote_path,
+                "entry_kind": action.kind.as_str(),
+                "snapshot_guard": remote_snapshot_value(&action.snapshot),
+                "destination_guard": action.destination_guard.as_ref().map(|guard| json!({
+                    "remote_path": guard.remote_path,
+                    "local_relative": guard.local.relative,
+                    "expected_size": guard.expected_size,
+                    "expected_mtime_seconds": guard.expected_mtime_seconds,
+                    "content_md5": guard.content_md5.to_string(),
+                })),
+            }),
+        )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn plan_ndjson_values(plan: &SyncPlan) -> Vec<Value> {
+    let mut output = Vec::new();
+    write_plan_ndjson_to(&mut output, plan)
+        .expect("writing rendered NDJSON plan to a Vec cannot fail");
+    parse_ndjson_output(&output)
 }
 
 fn plan_summary_record(plan: &SyncPlan) -> Value {
@@ -2926,10 +3136,12 @@ fn doctor_value(result: &DoctorResult, elapsed: Duration) -> Value {
     })
 }
 
-fn print_doctor_human(result: &DoctorResult) {
+fn doctor_human(result: &DoctorResult) -> String {
+    let mut human = String::new();
     if result.authenticated {
         if result.remote_checked {
-            println!(
+            writeln!(
+                human,
                 "Doctor: routing, API discovery, authentication, and remote access are healthy ({} entries; destination {}; write permission checked at {} {}).",
                 result.remote_entries.unwrap_or(0),
                 if result.remote_exists == Some(true) {
@@ -2946,22 +3158,35 @@ fn print_doctor_human(result: &DoctorResult) {
                     .write_permission_path
                     .as_deref()
                     .unwrap_or("<unknown>"),
-            );
+            )
+            .expect("writing to a String cannot fail");
         } else {
-            println!("Doctor: routing, API discovery, and authentication are healthy.");
+            writeln!(
+                human,
+                "Doctor: routing, API discovery, and authentication are healthy."
+            )
+            .expect("writing to a String cannot fail");
         }
     } else {
-        println!("Doctor: reverse-proxy routing and File Station API discovery are healthy.");
+        writeln!(
+            human,
+            "Doctor: reverse-proxy routing and File Station API discovery are healthy."
+        )
+        .expect("writing to a String cannot fail");
     }
     if result.write_probe_requested {
         if !result.write_probe_performed {
-            println!(
+            writeln!(
+                human,
                 "Disposable write probe prerequisites passed; no remote probe mutation was attempted."
-            );
+            )
+            .expect("writing to a String cannot fail");
         } else if let Some(error) = &result.write_probe_error {
-            println!("Disposable write probe failed: {error}");
+            writeln!(human, "Disposable write probe failed: {error}")
+                .expect("writing to a String cannot fail");
         } else if let Some(report) = &result.write_probe {
-            println!(
+            writeln!(
+                human,
                 "Disposable write probe passed: directory creation, {}-byte upload with size/MD5/mtime verification{}; cleanup completed{}.",
                 report.uploaded_size,
                 if report.server_copy_supported {
@@ -2974,9 +3199,11 @@ fn print_doctor_human(result: &DoctorResult) {
                     .as_ref()
                     .map(|path| format!(" (unexpected leftover: {path})"))
                     .unwrap_or_default(),
-            );
+            )
+            .expect("writing to a String cannot fail");
         }
     }
+    human
 }
 
 fn write_doctor_output(
@@ -2984,14 +3211,19 @@ fn write_doctor_output(
     elapsed: Duration,
     output: &config::ResolvedOutput,
 ) -> Result<()> {
+    write_rendered_output(doctor_output(result, elapsed, output.output))
+}
+
+fn doctor_output(
+    result: &DoctorResult,
+    elapsed: Duration,
+    format: cli::OutputFormat,
+) -> RenderedOutput {
     let value = doctor_value(result, elapsed);
-    match output.output {
-        cli::OutputFormat::Human => {
-            print_doctor_human(result);
-            io::stdout().flush().map_err(output_error)
-        }
-        cli::OutputFormat::Json => write_json(&value),
-        cli::OutputFormat::Ndjson => write_json_line(&value),
+    match format {
+        cli::OutputFormat::Human => RenderedOutput::Human(doctor_human(result)),
+        cli::OutputFormat::Json => RenderedOutput::Json(value),
+        cli::OutputFormat::Ndjson => RenderedOutput::Ndjson(vec![value]),
     }
 }
 
@@ -3078,6 +3310,17 @@ fn write_doctor_batch_output(
     output: &config::ResolvedOutput,
     write_tests: bool,
 ) -> Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write_doctor_batch_output_to(&mut stdout, outcomes, output.output, write_tests)
+}
+
+fn write_doctor_batch_output_to<W: Write>(
+    writer: &mut W,
+    outcomes: &[DoctorBatchOutcome],
+    format: cli::OutputFormat,
+    write_tests: bool,
+) -> Result<()> {
     let succeeded = outcomes
         .iter()
         .filter(|outcome| outcome.status == DoctorBatchStatus::Success)
@@ -3099,44 +3342,67 @@ fn write_doctor_batch_output(
         .filter(|outcome| outcome.status == DoctorBatchStatus::NotRun)
         .count();
     let status = doctor_batch_status(outcomes);
-    let job_values = outcomes
-        .iter()
-        .map(doctor_batch_job_value)
-        .collect::<Vec<_>>();
-    let mut summary = doctor_batch_summary_value(outcomes, write_tests);
-    match output.output {
+    let summary = doctor_batch_summary_value(outcomes, write_tests);
+    match format {
         cli::OutputFormat::Human => {
-            println!(
+            writeln!(
+                writer,
                 "Target diagnostic batch: status {status}; {succeeded} succeeded, {preflighted} preflighted, {partial} potentially partial, {failed} failed before a probe could mutate, {not_run} not run."
-            );
+            )
+            .map_err(output_error)?;
             for outcome in outcomes {
-                println!("\n[{}] {}", outcome.name, outcome.status.as_str());
+                writeln!(writer, "\n[{}] {}", outcome.name, outcome.status.as_str())
+                    .map_err(output_error)?;
                 if let Some(result) = &outcome.result {
-                    print_doctor_human(&result.result);
+                    write!(writer, "{}", doctor_human(&result.result)).map_err(output_error)?;
                 }
                 if let Some(error) = &outcome.error {
-                    println!("Error: {error}");
+                    writeln!(writer, "Error: {error}").map_err(output_error)?;
                 }
             }
-            io::stdout().flush().map_err(output_error)
+            writer.flush().map_err(output_error)
         }
         cli::OutputFormat::Json => {
+            let job_values = outcomes
+                .iter()
+                .map(doctor_batch_job_value)
+                .collect::<Vec<_>>();
+            let mut summary = summary;
             summary["jobs"] = Value::Array(job_values);
-            write_json(&summary)
+            write_json_to(writer, &summary)
         }
         cli::OutputFormat::Ndjson => {
-            for value in job_values {
-                write_json_line(&value)?;
+            for outcome in outcomes {
+                write_json_line_to(writer, &doctor_batch_job_value(outcome))?;
             }
-            write_json_line(&summary)
+            write_json_line_to(writer, &summary)
         }
     }
+}
+
+#[cfg(test)]
+fn doctor_batch_output(
+    outcomes: &[DoctorBatchOutcome],
+    format: cli::OutputFormat,
+    write_tests: bool,
+) -> RenderedOutput {
+    let mut buffer = Vec::new();
+    write_doctor_batch_output_to(&mut buffer, outcomes, format, write_tests)
+        .expect("writing rendered doctor batch output to a Vec cannot fail");
+    captured_rendered_output(format, buffer)
 }
 
 fn write_credential_output(
     result: credentials::CredentialOutcome,
     format: cli::OutputFormat,
 ) -> Result<()> {
+    write_rendered_output(credential_output(result, format))
+}
+
+fn credential_output(
+    result: credentials::CredentialOutcome,
+    format: cli::OutputFormat,
+) -> RenderedOutput {
     let (human, value) = match result {
         credentials::CredentialOutcome::StoredPassword => (
             "Stored the DSM password in the OS credential vault.".to_owned(),
@@ -3202,32 +3468,86 @@ fn write_credential_output(
             )
         }
     };
-    write_simple_value(format, human, value)
+    simple_output(format, human, value)
 }
 
 fn write_simple_value(format: cli::OutputFormat, human: String, value: Value) -> Result<()> {
+    write_rendered_output(simple_output(format, human, value))
+}
+
+#[derive(Debug, PartialEq)]
+enum RenderedOutput {
+    Human(String),
+    Json(Value),
+    Ndjson(Vec<Value>),
+}
+
+#[cfg(test)]
+fn captured_rendered_output(format: cli::OutputFormat, output: Vec<u8>) -> RenderedOutput {
     match format {
-        cli::OutputFormat::Human => {
-            println!("{human}");
+        cli::OutputFormat::Human => RenderedOutput::Human(
+            String::from_utf8(output).expect("captured human output is UTF-8"),
+        ),
+        cli::OutputFormat::Json => RenderedOutput::Json(
+            serde_json::from_slice(&output).expect("captured JSON output is valid"),
+        ),
+        cli::OutputFormat::Ndjson => RenderedOutput::Ndjson(parse_ndjson_output(&output)),
+    }
+}
+
+#[cfg(test)]
+fn parse_ndjson_output(output: &[u8]) -> Vec<Value> {
+    String::from_utf8(output.to_vec())
+        .expect("captured NDJSON output is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("captured NDJSON record is valid"))
+        .collect()
+}
+
+fn simple_output(format: cli::OutputFormat, human: String, value: Value) -> RenderedOutput {
+    match format {
+        cli::OutputFormat::Human => RenderedOutput::Human(format!("{human}\n")),
+        cli::OutputFormat::Json => RenderedOutput::Json(value),
+        cli::OutputFormat::Ndjson => RenderedOutput::Ndjson(vec![value]),
+    }
+}
+
+fn write_rendered_output(output: RenderedOutput) -> Result<()> {
+    match output {
+        RenderedOutput::Human(value) => {
+            print!("{value}");
             io::stdout().flush().map_err(output_error)
         }
-        cli::OutputFormat::Json => write_json(&value),
-        cli::OutputFormat::Ndjson => write_json_line(&value),
+        RenderedOutput::Json(value) => write_json(&value),
+        RenderedOutput::Ndjson(values) => {
+            for value in values {
+                write_json_line(&value)?;
+            }
+            Ok(())
+        }
     }
 }
 
 fn write_json(value: &Value) -> Result<()> {
     let mut stdout = io::stdout().lock();
-    serde_json::to_writer_pretty(&mut stdout, value)
+    write_json_to(&mut stdout, value)
+}
+
+fn write_json_to<W: Write>(writer: &mut W, value: &Value) -> Result<()> {
+    serde_json::to_writer_pretty(&mut *writer, value)
         .map_err(|error| Error::Message(format!("failed to write JSON output: {error}")))?;
-    writeln!(stdout).map_err(output_error)
+    writeln!(writer).map_err(output_error)
 }
 
 fn write_json_line(value: &Value) -> Result<()> {
     let mut stdout = io::stdout().lock();
-    serde_json::to_writer(&mut stdout, value)
+    write_json_line_to(&mut stdout, value)
+}
+
+fn write_json_line_to<W: Write>(writer: &mut W, value: &Value) -> Result<()> {
+    serde_json::to_writer(&mut *writer, value)
         .map_err(|error| Error::Message(format!("failed to write JSON output: {error}")))?;
-    writeln!(stdout).map_err(output_error)
+    writeln!(writer).map_err(output_error)
 }
 
 fn warn_for_insecure_network(network: &config::ResolvedNetwork, output: &config::ResolvedOutput) {
@@ -3329,6 +3649,10 @@ fn error_exit_code(error: &Error) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
 
     fn json_object_keys(value: &Value) -> BTreeSet<&str> {
@@ -3350,6 +3674,176 @@ mod tests {
             unchanged_files: 2,
             protected_entries: 1,
             upload_bytes: 0,
+        }
+    }
+
+    fn resolved_output(format: cli::OutputFormat) -> config::ResolvedOutput {
+        config::ResolvedOutput {
+            verbosity: 0,
+            quiet: true,
+            log_level: cli::LogLevel::Off,
+            log_format: cli::LogFormat::Human,
+            log_file: None,
+            remote_log_url: None,
+            remote_log_token: None,
+            remote_log_mode: cli::RemoteLogMode::BestEffort,
+            progress: cli::ProgressMode::Never,
+            output: format,
+        }
+    }
+
+    fn resolved_authentication(password_stdin: bool) -> config::ResolvedAuthentication {
+        config::ResolvedAuthentication {
+            password_stdin,
+            password_file: None,
+            totp_secret_file: None,
+            no_vault: true,
+        }
+    }
+
+    fn resolved_network() -> config::ResolvedNetwork {
+        config::ResolvedNetwork {
+            retries: 0,
+            timeout: 30,
+            connect_timeout: 2,
+            ca_certificate: None,
+            allow_http: false,
+            danger_accept_invalid_certs: false,
+        }
+    }
+
+    fn resolved_sync(url: &str, username: &str, remote: &str) -> config::ResolvedSync {
+        config::ResolvedSync {
+            source: PathBuf::from("source"),
+            remote: remote.to_owned(),
+            connection: config::ResolvedConnection {
+                url: url.to_owned(),
+                username: username.to_owned(),
+            },
+            authentication: resolved_authentication(false),
+            behavior: config::ResolvedSyncBehavior {
+                compare: cli::CompareArg::Content,
+                jobs: 2,
+                excludes: Vec::new(),
+            },
+            safety: config::ResolvedSafety {
+                delete: false,
+                allow_empty_source: false,
+                max_delete: 10,
+            },
+            network: resolved_network(),
+            output: resolved_output(cli::OutputFormat::Json),
+        }
+    }
+
+    fn resolved_doctor(
+        url: &str,
+        username: Option<&str>,
+        remote: Option<&str>,
+    ) -> config::ResolvedDoctor {
+        config::ResolvedDoctor {
+            remote: remote.map(str::to_owned),
+            routing_only: false,
+            compare: cli::CompareArg::Content,
+            delete: false,
+            write_test: false,
+            url: url.to_owned(),
+            username: username.map(str::to_owned),
+            authentication: resolved_authentication(false),
+            network: resolved_network(),
+            output: resolved_output(cli::OutputFormat::Json),
+        }
+    }
+
+    fn local_file(relative: &str, size: u64, mtime_ms: i64) -> LocalEntry {
+        LocalEntry {
+            relative: relative.to_owned(),
+            full_path: PathBuf::from("source").join(relative),
+            kind: local::EntryKind::File,
+            size,
+            mtime_ms,
+            content_md5: Some(synology_drive_sync::integrity::ContentMd5::from_bytes(
+                [0x2a; 16],
+            )),
+        }
+    }
+
+    fn rich_plan() -> SyncPlan {
+        let digest = synology_drive_sync::integrity::ContentMd5::from_bytes([0x2a; 16]);
+        let copied = local_file("copied.bin", 7, 1_700_000_000_250);
+        let uploaded = local_file("uploaded.bin", 11, 1_700_000_000_500);
+        let guarded_local = local_file("guarded.bin", 13, 1_700_000_001_000);
+        let file_snapshot = RemoteSnapshot {
+            kind: local::EntryKind::File,
+            size: 7,
+            mtime_seconds: 1_700_000_000,
+            content_md5: Some(digest),
+            require_mtime: true,
+        };
+        SyncPlan {
+            pre_deletes: vec![plan::DeleteAction {
+                relative: "conflict".to_owned(),
+                remote_path: "/share/root/conflict".to_owned(),
+                kind: local::EntryKind::Directory,
+                type_conflict: true,
+                snapshot: RemoteSnapshot {
+                    kind: local::EntryKind::Directory,
+                    size: 0,
+                    mtime_seconds: 1_700_000_000,
+                    content_md5: None,
+                    require_mtime: false,
+                },
+                destination_guard: None,
+            }],
+            creates: vec![plan::CreateAction {
+                relative: "new-directory".to_owned(),
+                remote_path: "/share/root/new-directory".to_owned(),
+            }],
+            copies: vec![plan::CopyAction {
+                from_relative: "source/copied.bin".to_owned(),
+                from_remote_path: "/share/root/source/copied.bin".to_owned(),
+                to_relative: copied.relative.clone(),
+                to_remote_path: "/share/root/copied.bin".to_owned(),
+                local: copied,
+                expected_size: 7,
+                content_md5: digest,
+                source_snapshot: file_snapshot.clone(),
+            }],
+            uploads: vec![plan::UploadAction {
+                local: uploaded,
+                remote_path: "/share/root/uploaded.bin".to_owned(),
+            }],
+            post_deletes: vec![plan::DeleteAction {
+                relative: "old/guarded.bin".to_owned(),
+                remote_path: "/share/root/old/guarded.bin".to_owned(),
+                kind: local::EntryKind::File,
+                type_conflict: false,
+                snapshot: file_snapshot,
+                destination_guard: Some(plan::DestinationGuard {
+                    remote_path: "/share/root/guarded.bin".to_owned(),
+                    local: guarded_local,
+                    expected_size: 13,
+                    expected_mtime_seconds: 1_700_000_001,
+                    content_md5: digest,
+                }),
+            }],
+            unchanged_files: 3,
+            protected_entries: 2,
+            upload_bytes: 11,
+        }
+    }
+
+    fn loaded_profiles(names: &[&str]) -> config::LoadedConfig {
+        let profiles = names
+            .iter()
+            .map(|name| ((*name).to_owned(), config::Profile::default()))
+            .collect::<BTreeMap<_, _>>();
+        config::LoadedConfig {
+            path: PathBuf::from("config.toml"),
+            values: config::ConfigFile {
+                default_profile: names.first().map(|name| (*name).to_owned()),
+                profiles,
+            },
         }
     }
 
@@ -3445,6 +3939,63 @@ mod tests {
                 elapsed: Duration::from_millis(7),
             }),
             error: None,
+        }
+    }
+
+    fn source_result() -> TimedSourceDiagnostic {
+        let root = PathBuf::from("canonical-source");
+        TimedSourceDiagnostic {
+            report: SourceDiagnosticReport {
+                canonical_root: root.clone(),
+                entries: 3,
+                files: 2,
+                directories: 1,
+                bytes: 1_536,
+                hashed_files: 2,
+                inventory: local::LocalInventory {
+                    root,
+                    entries: BTreeMap::new(),
+                },
+            },
+            hash_content: true,
+            elapsed: Duration::from_millis(9),
+        }
+    }
+
+    fn routing_doctor_result() -> DoctorResult {
+        DoctorResult {
+            authenticated: false,
+            remote_checked: false,
+            remote_exists: None,
+            remote_entries: None,
+            write_permission_scope: None,
+            write_permission_path: None,
+            write_probe_requested: false,
+            write_probe_performed: false,
+            write_probe: None,
+            write_probe_error: None,
+            write_probe_cancelled: false,
+        }
+    }
+
+    fn rendered_human(output: RenderedOutput) -> String {
+        match output {
+            RenderedOutput::Human(value) => value,
+            other => panic!("expected human output, got {other:?}"),
+        }
+    }
+
+    fn rendered_json(output: RenderedOutput) -> Value {
+        match output {
+            RenderedOutput::Json(value) => value,
+            other => panic!("expected JSON output, got {other:?}"),
+        }
+    }
+
+    fn rendered_ndjson(output: RenderedOutput) -> Vec<Value> {
+        match output {
+            RenderedOutput::Ndjson(values) => values,
+            other => panic!("expected NDJSON output, got {other:?}"),
         }
     }
 
@@ -3930,6 +4481,938 @@ mod tests {
         assert!(matches!(
             ensure_reconciled(&pending),
             Err(Error::ReconciliationPending { operations: 1 })
+        ));
+    }
+
+    #[test]
+    fn rich_plan_values_preserve_every_action_snapshot_and_fallback_guard() {
+        let plan = rich_plan();
+        let value = plan_value(&plan);
+
+        assert_eq!(operation_count(&plan), 5);
+        assert_eq!(copy_fallback_bytes(&plan), 7);
+        assert_eq!(value["summary"]["changes"], true);
+        assert_eq!(value["summary"]["server_copy_fallback_bytes"], 7);
+        assert_eq!(
+            value["actions"]["pre_deletes"][0]["entry_kind"],
+            "directory"
+        );
+        assert_eq!(
+            value["actions"]["pre_deletes"][0]["snapshot_guard"]["require_mtime"],
+            false
+        );
+        assert_eq!(value["actions"]["creates"][0]["relative"], "new-directory");
+        assert_eq!(value["actions"]["copies"][0]["expected_size"], 7);
+        assert_eq!(
+            value["actions"]["copies"][0]["verified_upload_fallback"],
+            "only-before-copy-task-start"
+        );
+        assert_eq!(value["actions"]["uploads"][0]["bytes"], 11);
+        assert_eq!(
+            value["actions"]["post_deletes"][0]["destination_guard"]["expected_size"],
+            13
+        );
+        assert_eq!(
+            value["actions"]["post_deletes"][0]["snapshot_guard"]["content_md5"],
+            "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
+        );
+
+        assert!(matches!(
+            ensure_reconciled(&plan),
+            Err(Error::ReconciliationPending { operations: 5 })
+        ));
+    }
+
+    #[test]
+    fn status_labels_and_aggregate_statuses_cover_every_terminal_state() {
+        assert_eq!(SyncBatchStatus::Preflighted.as_str(), "preflighted");
+        assert_eq!(SyncBatchStatus::Success.as_str(), "success");
+        assert_eq!(SyncBatchStatus::Partial.as_str(), "partial");
+        assert_eq!(SyncBatchStatus::Failed.as_str(), "failed");
+        assert_eq!(SyncBatchStatus::NotRun.as_str(), "not-run");
+        assert_eq!(DoctorBatchStatus::Preflighted.as_str(), "preflighted");
+        assert_eq!(DoctorBatchStatus::Success.as_str(), "success");
+        assert_eq!(DoctorBatchStatus::Partial.as_str(), "partial");
+        assert_eq!(DoctorBatchStatus::Failed.as_str(), "failed");
+        assert_eq!(DoctorBatchStatus::NotRun.as_str(), "not-run");
+
+        let sync_success = vec![sync_outcome(
+            "alpha",
+            SyncBatchStatus::Success,
+            Some(empty_plan()),
+            Some(empty_plan()),
+            false,
+        )];
+        assert_eq!(sync_batch_status(&sync_success, None), "success");
+        let sync_partial = vec![
+            sync_outcome(
+                "alpha",
+                SyncBatchStatus::Success,
+                Some(empty_plan()),
+                Some(empty_plan()),
+                false,
+            ),
+            sync_outcome("beta", SyncBatchStatus::NotRun, None, None, false),
+        ];
+        assert_eq!(sync_batch_status(&sync_partial, None), "partial");
+
+        let doctor_success = vec![doctor_outcome(
+            "alpha",
+            DoctorBatchStatus::Success,
+            Some(doctor_result(false, None, None)),
+        )];
+        assert_eq!(doctor_batch_status(&doctor_success), "success");
+        let doctor_partial = vec![
+            doctor_outcome(
+                "alpha",
+                DoctorBatchStatus::Success,
+                Some(doctor_result(false, None, None)),
+            ),
+            doctor_outcome("beta", DoctorBatchStatus::Failed, None),
+        ];
+        assert_eq!(doctor_batch_status(&doctor_partial), "partial");
+        assert_eq!(
+            doctor_batch_status(&[doctor_outcome("beta", DoctorBatchStatus::NotRun, None)]),
+            "failed"
+        );
+    }
+
+    #[test]
+    fn outcome_values_include_reports_elapsed_errors_and_write_probe_states() {
+        let mut outcome = sync_outcome(
+            "alpha",
+            SyncBatchStatus::Success,
+            Some(empty_plan()),
+            Some(empty_plan()),
+            true,
+        );
+        outcome.report = Some(ExecutionReport {
+            deleted: 1,
+            created: 2,
+            copied: 3,
+            uploaded: 4,
+            uploaded_bytes: 5,
+        });
+        outcome.elapsed = Some(Duration::from_millis(17));
+        outcome.error = Some("retained diagnostic".to_owned());
+        let value = sync_batch_job_value(&outcome);
+        assert_eq!(value["result"]["changed"], true);
+        assert_eq!(value["result"]["server_copied"], 3);
+        assert_eq!(value["elapsed_ms"], 17);
+        assert_eq!(value["error"], "retained diagnostic");
+
+        let mut preflighted = doctor_result(false, None, None);
+        assert_eq!(
+            doctor_value(&preflighted, Duration::ZERO)["write_test"]["status"],
+            "preflighted"
+        );
+        preflighted.write_probe_performed = true;
+        preflighted.write_probe = Some(write_probe_report());
+        assert_eq!(
+            doctor_value(&preflighted, Duration::ZERO)["write_test"]["status"],
+            "success"
+        );
+        preflighted.write_probe_error = Some("probe failed".to_owned());
+        let failed = doctor_value(&preflighted, Duration::ZERO);
+        assert_eq!(failed["write_test"]["status"], "failed");
+        assert_eq!(failed["write_test"]["report"]["uploaded_size"], 23);
+        assert_eq!(failed["write_test"]["error"], "probe failed");
+    }
+
+    #[test]
+    fn common_output_and_profile_selection_fail_closed_for_ambiguous_batches() {
+        let empty = Vec::<config::ResolvedOutput>::new();
+        assert!(matches!(
+            common_batch_output(empty.iter()),
+            Err(Error::Configuration(_))
+        ));
+        let json_output = resolved_output(cli::OutputFormat::Json);
+        let ndjson_output = resolved_output(cli::OutputFormat::Ndjson);
+        assert!(matches!(
+            common_batch_output([&json_output, &ndjson_output].into_iter()),
+            Err(Error::Configuration(_))
+        ));
+        assert_eq!(
+            common_batch_output([&json_output, &json_output].into_iter())
+                .unwrap()
+                .output,
+            cli::OutputFormat::Json
+        );
+
+        assert!(select_optional_profile(None, None).unwrap().is_none());
+        assert!(matches!(
+            select_optional_profile(None, Some("alpha")),
+            Err(Error::Configuration(_))
+        ));
+        let loaded = loaded_profiles(&["alpha", "beta"]);
+        assert_eq!(
+            select_optional_profile(Some(&loaded), Some("beta"))
+                .unwrap()
+                .unwrap()
+                .name,
+            "beta"
+        );
+
+        let all = cli::BatchArgs {
+            profiles: Vec::new(),
+            all_profiles: true,
+            max_total_delete: None,
+        };
+        let selected = select_job_profiles(Some(&loaded), None, &all).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|profile| profile.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+        assert!(matches!(
+            select_job_profiles(None, None, &all),
+            Err(Error::Configuration(_))
+        ));
+        let empty_loaded = loaded_profiles(&[]);
+        assert!(matches!(
+            select_job_profiles(Some(&empty_loaded), None, &all),
+            Err(Error::Configuration(_))
+        ));
+        let invalid = cli::BatchArgs {
+            profiles: vec![" alpha".to_owned()],
+            all_profiles: false,
+            max_total_delete: None,
+        };
+        assert!(matches!(
+            select_job_profiles(Some(&loaded), None, &invalid),
+            Err(Error::Configuration(_))
+        ));
+        let missing = cli::BatchArgs {
+            profiles: vec!["gamma".to_owned()],
+            all_profiles: false,
+            max_total_delete: None,
+        };
+        assert!(matches!(
+            select_job_profiles(Some(&loaded), None, &missing),
+            Err(Error::Configuration(_))
+        ));
+    }
+
+    #[test]
+    fn sync_and_doctor_batch_validators_reject_stdin_and_overlapping_targets() {
+        let mut sync_jobs = vec![
+            NamedSyncSettings {
+                name: "alpha".to_owned(),
+                settings: resolved_sync(
+                    "https://files.example.test/proxy",
+                    "alpha-user",
+                    "/team/alpha",
+                ),
+            },
+            NamedSyncSettings {
+                name: "beta".to_owned(),
+                settings: resolved_sync(
+                    "https://files.example.test/proxy",
+                    "beta-user",
+                    "/team/beta",
+                ),
+            },
+        ];
+        validate_sync_batch(&sync_jobs).unwrap();
+        sync_jobs[0].settings.authentication.password_stdin = true;
+        assert!(matches!(
+            validate_sync_batch(&sync_jobs),
+            Err(Error::Configuration(_))
+        ));
+        sync_jobs[0].settings.authentication.password_stdin = false;
+        sync_jobs[1].settings.remote = "/team/alpha/nested".to_owned();
+        let overlap = validate_sync_batch(&sync_jobs).unwrap_err();
+        assert!(overlap.to_string().contains("invalid batch configuration"));
+
+        let mut doctor_jobs = vec![
+            NamedDoctorSettings {
+                name: "alpha".to_owned(),
+                settings: resolved_doctor(
+                    "https://files.example.test/proxy",
+                    Some("alpha-user"),
+                    Some("/team/alpha"),
+                ),
+            },
+            NamedDoctorSettings {
+                name: "beta".to_owned(),
+                settings: resolved_doctor(
+                    "https://files.example.test/proxy",
+                    Some("beta-user"),
+                    Some("/team/beta"),
+                ),
+            },
+        ];
+        validate_doctor_batch(&doctor_jobs).unwrap();
+        doctor_jobs[0].settings.authentication.password_stdin = true;
+        assert!(matches!(
+            validate_doctor_batch(&doctor_jobs),
+            Err(Error::Configuration(_))
+        ));
+        doctor_jobs[0].settings.authentication.password_stdin = false;
+        doctor_jobs[1].settings.remote = Some("/team/alpha/nested".to_owned());
+        assert!(matches!(
+            validate_doctor_batch(&doctor_jobs),
+            Err(Error::Configuration(_))
+        ));
+        assert!(
+            validate_doctor_batch(&[NamedDoctorSettings {
+                name: "routing-only".to_owned(),
+                settings: resolved_doctor("https://files.example.test", None, None),
+            }])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn progress_observer_tracks_success_failure_and_attempt_mismatch_without_output() {
+        let plan = rich_plan();
+        let output = resolved_output(cli::OutputFormat::Human);
+        let cancellation = CancellationToken::default();
+        let wiring = ProgressWiring::new(&plan, &output, None, cancellation.clone());
+        let factory = wiring.observer_factory();
+        let observer = factory(&plan.uploads[0].local).unwrap();
+        assert!(observer(UploadTransferEvent::AttemptStarted { attempt: 1 }));
+        assert!(observer(UploadTransferEvent::Advanced { bytes: 4 }));
+        assert!(observer(UploadTransferEvent::Completed));
+        let metrics = progress_metrics(&wiring.tracker.snapshot());
+        assert_eq!(metrics.operations, 1);
+        assert_eq!(metrics.files, 1);
+        assert_eq!(metrics.bytes, 11);
+        wiring.finish().unwrap();
+
+        let cancellation = CancellationToken::default();
+        let failed = ProgressWiring::new(&plan, &output, None, cancellation.clone());
+        let observer = failed.observer_factory()(&plan.uploads[0].local).unwrap();
+        assert!(observer(UploadTransferEvent::AttemptStarted { attempt: 1 }));
+        assert!(observer(UploadTransferEvent::Failed));
+        failed.finish().unwrap();
+
+        let cancellation = CancellationToken::default();
+        let mismatched = ProgressWiring::new(&plan, &output, None, cancellation.clone());
+        let observer = mismatched.observer_factory()(&plan.uploads[0].local).unwrap();
+        assert!(!observer(UploadTransferEvent::AttemptStarted {
+            attempt: 2
+        }));
+        assert!(cancellation.is_cancelled());
+        assert!(
+            mismatched
+                .finish()
+                .unwrap_err()
+                .to_string()
+                .contains("attempt accounting")
+        );
+    }
+
+    #[test]
+    fn progress_decisions_and_failure_slot_are_deterministic() {
+        let mut output = resolved_output(cli::OutputFormat::Human);
+        output.quiet = false;
+        output.progress = cli::ProgressMode::Auto;
+        assert_eq!(
+            renderer_progress_mode_for_terminal(&output, true),
+            RendererProgressMode::Auto
+        );
+        assert_eq!(
+            renderer_progress_mode_for_terminal(&output, false),
+            RendererProgressMode::Never
+        );
+        output.progress = cli::ProgressMode::Always;
+        assert_eq!(
+            renderer_progress_mode_for_terminal(&output, false),
+            RendererProgressMode::Always
+        );
+        output.progress = cli::ProgressMode::Never;
+        assert_eq!(
+            renderer_progress_mode_for_terminal(&output, true),
+            RendererProgressMode::Never
+        );
+
+        let recent = Mutex::new(Instant::now());
+        assert!(!render_is_due(&recent));
+        let old = Mutex::new(Instant::now() - PROGRESS_RENDER_INTERVAL);
+        assert!(render_is_due(&old));
+
+        let failure = Mutex::new(None);
+        record_progress_failure(&failure, "first".to_owned());
+        record_progress_failure(&failure, "second".to_owned());
+        assert!(has_progress_failure(&failure));
+        assert_eq!(
+            take_recorded_failure(&failure).unwrap().as_deref(),
+            Some("first")
+        );
+        assert!(!has_progress_failure(&failure));
+        let cancellation = CancellationToken::default();
+        assert!(continue_after_progress_event(&cancellation, &failure));
+        cancellation.cancel();
+        assert!(!continue_after_progress_event(&cancellation, &failure));
+    }
+
+    #[test]
+    fn file_logger_and_error_adapters_preserve_classification_without_global_output() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("sdsync-main-logger-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let log_path = root.join("events.ndjson");
+        let mut output = resolved_output(cli::OutputFormat::Json);
+        output.log_level = cli::LogLevel::Info;
+        output.log_format = cli::LogFormat::Json;
+        output.log_file = Some(log_path.clone());
+        let logger = build_logger(&output).unwrap().unwrap();
+        log_event(
+            Some(&logger),
+            LogEvent::new(EventLogLevel::Info, EventCode::RunStarted),
+        )
+        .unwrap();
+        assert_eq!(finish_logger(Some(&logger), Ok(41_u8), true).unwrap(), 41);
+        let logged = fs::read_to_string(&log_path).unwrap();
+        assert!(logged.contains("\"event\":\"run.started\""));
+        fs::remove_dir_all(&root).unwrap();
+
+        assert!(
+            build_logger(&resolved_output(cli::OutputFormat::Human))
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            observability_error(
+                synology_drive_sync::observability::ObservabilityError::InvalidLogLevel
+            ),
+            Error::Configuration(_)
+        ));
+        assert!(matches!(
+            observability_error(
+                synology_drive_sync::observability::ObservabilityError::RemoteQueueFull
+            ),
+            Error::Message(_)
+        ));
+        assert!(
+            output_error(io::Error::other("closed"))
+                .to_string()
+                .contains("failed to write command output")
+        );
+        assert_eq!(error_exit_code(&Error::InvalidUrl("bad".to_owned())), 2);
+        assert_eq!(error_exit_code(&Error::HttpsRequired), 2);
+        assert_eq!(
+            error_exit_code(&Error::UnsafeRemotePath {
+                path: "../escape".to_owned(),
+                reason: "traversal".to_owned(),
+            }),
+            2
+        );
+        assert_eq!(
+            error_exit_code(&Error::InvalidSource(PathBuf::from("missing"))),
+            1
+        );
+    }
+
+    #[test]
+    fn comparison_duration_and_size_helpers_cover_boundary_values() {
+        assert_eq!(compare_mode(cli::CompareArg::Content), CompareMode::Content);
+        assert_eq!(
+            compare_mode(cli::CompareArg::Metadata),
+            CompareMode::Metadata
+        );
+        assert_eq!(
+            compare_mode(cli::CompareArg::SizeOnly),
+            CompareMode::SizeOnly
+        );
+        assert_eq!(duration_millis(Duration::MAX), u64::MAX);
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_bytes(1024_u64.pow(4)), "1.0 TiB");
+    }
+
+    #[test]
+    fn plan_and_sync_renderers_cover_every_format_and_completion_state() {
+        let plan = rich_plan();
+        let concise = plan_human(&plan, false);
+        assert!(concise.starts_with("Plan: 1 uploads (11 B), 1 server copies"));
+        assert!(!concise.contains("DELETE-CONFLICT"));
+
+        let detailed = plan_human(&plan, true);
+        assert!(detailed.contains("DELETE-CONFLICT /share/root/conflict"));
+        assert!(detailed.contains("MKDIR  /share/root/new-directory"));
+        assert!(detailed.contains("COPY   /share/root/source/copied.bin"));
+        assert!(detailed.contains("UPLOAD uploaded.bin -> /share/root/uploaded.bin"));
+        assert!(detailed.contains("destination guarded by 13 bytes+mtime+MD5"));
+        assert!(
+            plan_human(&plan_with_deletions(1), true)
+                .contains("DELETE /share/root/stale-0 (remote snapshot guarded)")
+        );
+
+        let records = plan_ndjson_values(&plan);
+        assert_eq!(records.len(), 6);
+        assert_eq!(records[0]["kind"], "summary");
+        assert_eq!(records[1]["action"], "delete-conflict");
+        assert_eq!(records[2]["action"], "create-directory");
+        assert_eq!(records[3]["action"], "copy-remote-content");
+        assert_eq!(records[4]["action"], "upload");
+        assert_eq!(records[5]["action"], "delete");
+        assert_eq!(records[5]["destination_guard"]["expected_size"], 13);
+        assert!(plan_ndjson_values(&plan_with_deletions(1))[1]["destination_guard"].is_null());
+
+        let report = ExecutionReport {
+            deleted: 1,
+            created: 2,
+            copied: 3,
+            uploaded: 4,
+            uploaded_bytes: 5,
+        };
+        let mut human_output = resolved_output(cli::OutputFormat::Human);
+        human_output.verbosity = 1;
+        let completed = rendered_human(sync_output(
+            &plan,
+            Some(&report),
+            Duration::from_millis(17),
+            &human_output,
+            false,
+        ));
+        assert!(completed.contains("Sync complete: 4 uploaded (5 B), 3 copied on NAS"));
+        let unchanged = rendered_human(sync_output(
+            &empty_plan(),
+            None,
+            Duration::ZERO,
+            &human_output,
+            false,
+        ));
+        assert!(unchanged.contains("Already in sync"));
+        let planned = rendered_human(sync_output(
+            &plan,
+            None,
+            Duration::ZERO,
+            &human_output,
+            true,
+        ));
+        assert!(planned.contains("Plan only; no remote changes were made."));
+
+        let json_output = resolved_output(cli::OutputFormat::Json);
+        let json = rendered_json(sync_output(
+            &plan,
+            Some(&report),
+            Duration::from_millis(17),
+            &json_output,
+            false,
+        ));
+        assert_eq!(json["schema"], "sdsync.sync.v1");
+        assert_eq!(json["result"]["uploaded"], 4);
+        let unchanged = rendered_json(sync_output(
+            &empty_plan(),
+            None,
+            Duration::ZERO,
+            &json_output,
+            false,
+        ));
+        assert_eq!(unchanged["result"]["changed"], false);
+        let plan_json = rendered_json(sync_output(&plan, None, Duration::ZERO, &json_output, true));
+        assert!(plan_json.get("result").is_none());
+
+        let ndjson_output = resolved_output(cli::OutputFormat::Ndjson);
+        let completed = rendered_ndjson(sync_output(
+            &plan,
+            Some(&report),
+            Duration::from_millis(17),
+            &ndjson_output,
+            false,
+        ));
+        assert_eq!(completed.last().unwrap()["kind"], "completion");
+        assert_eq!(completed.last().unwrap()["result"]["uploaded"], 4);
+        let unchanged = rendered_ndjson(sync_output(
+            &empty_plan(),
+            None,
+            Duration::ZERO,
+            &ndjson_output,
+            false,
+        ));
+        assert_eq!(unchanged.last().unwrap()["changed"], false);
+        assert_eq!(
+            rendered_ndjson(sync_output(
+                &plan,
+                None,
+                Duration::ZERO,
+                &ndjson_output,
+                true,
+            ))
+            .len(),
+            6
+        );
+    }
+
+    #[test]
+    fn sync_batch_renderers_cover_drift_reports_errors_and_stream_shapes() {
+        let mut completed = sync_outcome(
+            "alpha",
+            SyncBatchStatus::Success,
+            Some(plan_with_deletions(2)),
+            Some(plan_with_deletions(1)),
+            true,
+        );
+        completed.report = Some(ExecutionReport {
+            deleted: 1,
+            created: 2,
+            copied: 3,
+            uploaded: 4,
+            uploaded_bytes: 5,
+        });
+        completed.elapsed = Some(Duration::from_millis(19));
+        completed.error = Some("retained warning".to_owned());
+        let outcomes = vec![
+            completed,
+            sync_outcome("beta", SyncBatchStatus::NotRun, None, None, false),
+        ];
+
+        let mut human_output = resolved_output(cli::OutputFormat::Human);
+        human_output.verbosity = 1;
+        let human = rendered_human(sync_batch_output(
+            &outcomes,
+            &human_output,
+            false,
+            20,
+            Some(2),
+            Some(1),
+            Some("aggregate guard rejected the plan"),
+        ));
+        assert!(human.contains("Batch sync: status failed"));
+        assert!(human.contains("Batch safety check failed: aggregate guard rejected the plan"));
+        assert!(human.contains("Deletion-plan drift: preflight 2, fresh execution 1."));
+        assert!(human.contains("Result: 4 uploaded (5 B), 3 copied on NAS"));
+        assert!(human.contains("Error: retained warning"));
+        let planned = rendered_human(sync_batch_output(
+            &outcomes,
+            &human_output,
+            true,
+            20,
+            Some(2),
+            None,
+            None,
+        ));
+        assert!(planned.contains("Batch plan: status partial"));
+
+        let json = rendered_json(sync_batch_output(
+            &outcomes,
+            &resolved_output(cli::OutputFormat::Json),
+            false,
+            20,
+            Some(2),
+            Some(1),
+            None,
+        ));
+        assert_eq!(json["schema"], "sdsync.batch.v1");
+        assert_eq!(json["jobs"].as_array().unwrap().len(), 2);
+        assert_eq!(json["summary"]["not_run"], 1);
+
+        let records = rendered_ndjson(sync_batch_output(
+            &outcomes,
+            &resolved_output(cli::OutputFormat::Ndjson),
+            false,
+            20,
+            Some(2),
+            Some(1),
+            None,
+        ));
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["schema"], "sdsync.batch-job.v1");
+        assert_eq!(records[2]["kind"], "summary");
+    }
+
+    #[test]
+    fn doctor_renderers_cover_routing_remote_probe_and_batch_states() {
+        let routing = routing_doctor_result();
+        assert!(doctor_human(&routing).contains("reverse-proxy routing"));
+
+        let mut authenticated = routing.clone();
+        authenticated.authenticated = true;
+        assert!(doctor_human(&authenticated).contains("authentication are healthy"));
+
+        let preflight = doctor_result(false, None, None);
+        let preflight_human = doctor_human(&preflight);
+        assert!(preflight_human.contains("destination exists"));
+        assert!(preflight_human.contains("probe prerequisites passed"));
+
+        let mut ancestor = preflight.clone();
+        ancestor.remote_exists = Some(false);
+        ancestor.write_permission_scope = Some("nearest_existing_ancestor");
+        ancestor.write_permission_path = None;
+        let ancestor_human = doctor_human(&ancestor);
+        assert!(ancestor_human.contains("will be created"));
+        assert!(ancestor_human.contains("nearest existing ancestor <unknown>"));
+
+        let failed = doctor_result(true, None, Some("probe upload failed"));
+        assert!(doctor_human(&failed).contains("Disposable write probe failed"));
+
+        let mut passed_report = write_probe_report();
+        passed_report.leftover_remote_probe_path = Some("/share/leftover".to_owned());
+        let passed = doctor_result(true, Some(passed_report), None);
+        let passed_human = doctor_human(&passed);
+        assert!(passed_human.contains("server-side copy verification"));
+        assert!(passed_human.contains("unexpected leftover: /share/leftover"));
+        let mut no_copy_report = write_probe_report();
+        no_copy_report.server_copy_supported = false;
+        let no_copy = doctor_result(true, Some(no_copy_report), None);
+        assert!(!doctor_human(&no_copy).contains("server-side copy verification"));
+
+        assert!(
+            rendered_human(doctor_output(
+                &routing,
+                Duration::from_millis(3),
+                cli::OutputFormat::Human,
+            ))
+            .contains("reverse-proxy")
+        );
+        assert_eq!(
+            rendered_json(doctor_output(
+                &passed,
+                Duration::from_millis(3),
+                cli::OutputFormat::Json,
+            ))["write_test"]["status"],
+            "success"
+        );
+        assert_eq!(
+            rendered_ndjson(doctor_output(
+                &failed,
+                Duration::from_millis(3),
+                cli::OutputFormat::Ndjson,
+            ))
+            .len(),
+            1
+        );
+
+        let mut failed_outcome = doctor_outcome("beta", DoctorBatchStatus::Failed, None);
+        failed_outcome.error = Some("authentication failed".to_owned());
+        let outcomes = vec![
+            doctor_outcome("alpha", DoctorBatchStatus::Success, Some(passed)),
+            failed_outcome,
+            doctor_outcome("gamma", DoctorBatchStatus::Preflighted, Some(preflight)),
+            doctor_outcome("omega", DoctorBatchStatus::NotRun, None),
+        ];
+        let batch_human = rendered_human(doctor_batch_output(
+            &outcomes,
+            cli::OutputFormat::Human,
+            true,
+        ));
+        assert!(batch_human.contains("Target diagnostic batch: status partial"));
+        assert!(batch_human.contains("[alpha] success"));
+        assert!(batch_human.contains("Error: authentication failed"));
+        let batch_json = rendered_json(doctor_batch_output(
+            &outcomes,
+            cli::OutputFormat::Json,
+            true,
+        ));
+        assert_eq!(batch_json["jobs"].as_array().unwrap().len(), 4);
+        let batch_records = rendered_ndjson(doctor_batch_output(
+            &outcomes,
+            cli::OutputFormat::Ndjson,
+            true,
+        ));
+        assert_eq!(batch_records.len(), 5);
+        assert_eq!(batch_records.last().unwrap()["kind"], "summary");
+    }
+
+    #[test]
+    fn credential_renderers_cover_every_outcome_without_touching_stdout() {
+        assert!(
+            rendered_human(credential_output(
+                credentials::CredentialOutcome::StoredPassword,
+                cli::OutputFormat::Human,
+            ))
+            .contains("Stored the DSM password")
+        );
+        assert_eq!(
+            rendered_json(credential_output(
+                credentials::CredentialOutcome::StoredTotp,
+                cli::OutputFormat::Json,
+            ))["credential"],
+            "totp"
+        );
+        assert_eq!(
+            rendered_ndjson(credential_output(
+                credentials::CredentialOutcome::StoredPassword,
+                cli::OutputFormat::Ndjson,
+            ))[0]["kind"],
+            "stored"
+        );
+
+        let status = rendered_human(credential_output(
+            credentials::CredentialOutcome::Status {
+                password_stored: true,
+                totp_stored: false,
+            },
+            cli::OutputFormat::Human,
+        ));
+        assert_eq!(status, "Password: stored; TOTP seed: not stored.\n");
+        let inverse = rendered_json(credential_output(
+            credentials::CredentialOutcome::Status {
+                password_stored: false,
+                totp_stored: true,
+            },
+            cli::OutputFormat::Json,
+        ));
+        assert_eq!(inverse["password_stored"], false);
+        assert_eq!(inverse["totp_stored"], true);
+
+        let removed = rendered_human(credential_output(
+            credentials::CredentialOutcome::Removed {
+                password_removed: Some(true),
+                totp_removed: Some(false),
+            },
+            cli::OutputFormat::Human,
+        ));
+        assert_eq!(removed, "Password: removed; TOTP seed: not stored.\n");
+        let absent = rendered_json(credential_output(
+            credentials::CredentialOutcome::Removed {
+                password_removed: None,
+                totp_removed: None,
+            },
+            cli::OutputFormat::Json,
+        ));
+        assert!(absent["password_removed"].is_null());
+        assert!(absent["totp_removed"].is_null());
+    }
+
+    #[test]
+    fn source_renderers_and_completion_decisions_cover_success_failure_and_cancel() {
+        let source = source_result();
+        let human = rendered_human(source_doctor_output(&source, cli::OutputFormat::Human));
+        assert!(human.contains("2 files, 1 directories, 1.5 KiB"));
+        assert_eq!(
+            rendered_json(source_doctor_output(&source, cli::OutputFormat::Json))["source"]["hashed_files"],
+            2
+        );
+        assert_eq!(
+            rendered_ndjson(source_doctor_output(&source, cli::OutputFormat::Ndjson)).len(),
+            1
+        );
+
+        let outcomes = vec![
+            SourceBatchOutcome {
+                name: "alpha".to_owned(),
+                result: Some(source_result()),
+                error: None,
+                not_run: false,
+            },
+            SourceBatchOutcome {
+                name: "beta".to_owned(),
+                result: None,
+                error: None,
+                not_run: true,
+            },
+            SourceBatchOutcome {
+                name: "gamma".to_owned(),
+                result: None,
+                error: Some("scan failed".to_owned()),
+                not_run: false,
+            },
+            SourceBatchOutcome {
+                name: "omega".to_owned(),
+                result: None,
+                error: None,
+                not_run: false,
+            },
+        ];
+        let batch_human = rendered_human(source_batch_output(&outcomes, cli::OutputFormat::Human));
+        assert!(batch_human.contains("1 succeeded, 1 failed, 1 not run"));
+        assert!(batch_human.contains("[alpha] healthy"));
+        assert!(batch_human.contains("[beta] not run"));
+        assert!(batch_human.contains("[gamma] failed: scan failed"));
+        assert!(batch_human.contains("[omega] failed: unknown failure"));
+        let batch_json = rendered_json(source_batch_output(&outcomes, cli::OutputFormat::Json));
+        assert_eq!(batch_json["status"], "partial");
+        assert_eq!(batch_json["jobs"].as_array().unwrap().len(), 4);
+        let records = rendered_ndjson(source_batch_output(&outcomes, cli::OutputFormat::Ndjson));
+        assert_eq!(records.len(), 5);
+        assert_eq!(
+            records.last().unwrap()["schema"],
+            "sdsync.source-doctor-batch.v1"
+        );
+
+        assert!(matches!(
+            source_batch_completion(&outcomes, true),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            source_batch_completion(&outcomes, false),
+            Err(Error::Message(_))
+        ));
+        let success = [SourceBatchOutcome {
+            name: "alpha".to_owned(),
+            result: Some(source_result()),
+            error: None,
+            not_run: false,
+        }];
+        assert!(source_batch_completion(&success, false).is_ok());
+    }
+
+    #[test]
+    fn completion_helpers_map_changes_partial_failures_and_cancellation() {
+        assert!(matches!(
+            changes_completion(true, true, true),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(
+            changes_completion(true, false, true).unwrap(),
+            ExitCode::from(cli::PLAN_CHANGES_EXIT_CODE)
+        );
+        assert_eq!(
+            changes_completion(false, false, true).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            changes_completion(true, false, false).unwrap(),
+            ExitCode::SUCCESS
+        );
+
+        let sync_success = [sync_outcome(
+            "alpha",
+            SyncBatchStatus::Success,
+            Some(empty_plan()),
+            Some(empty_plan()),
+            false,
+        )];
+        assert_eq!(
+            sync_batch_completion(&sync_success, false).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert!(matches!(
+            sync_batch_completion(&sync_success, true),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            sync_batch_completion(
+                &[sync_outcome(
+                    "alpha",
+                    SyncBatchStatus::Partial,
+                    Some(empty_plan()),
+                    Some(empty_plan()),
+                    true,
+                )],
+                false,
+            ),
+            Err(Error::Message(_))
+        ));
+
+        let doctor_success = [doctor_outcome(
+            "alpha",
+            DoctorBatchStatus::Success,
+            Some(routing_doctor_result()),
+        )];
+        assert_eq!(
+            doctor_batch_completion(&doctor_success, false).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert!(matches!(
+            doctor_batch_completion(&doctor_success, true),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            doctor_batch_completion(
+                &[doctor_outcome("alpha", DoctorBatchStatus::Failed, None)],
+                false,
+            ),
+            Err(Error::Message(_))
         ));
     }
 }

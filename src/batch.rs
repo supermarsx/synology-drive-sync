@@ -811,4 +811,57 @@ mod tests {
             .unwrap();
         }
     }
+
+    #[test]
+    fn empty_batches_and_ambiguous_endpoints_fail_closed() {
+        assert!(matches!(
+            BatchCatalog::new(Vec::<BatchJob>::new()),
+            Err(BatchError::EmptyBatch)
+        ));
+        assert!(matches!(
+            ValidatedBatch::new(Vec::<BatchJob>::new()),
+            Err(BatchError::EmptyBatch)
+        ));
+
+        for endpoint in [
+            "not a URL",
+            "ftp://nas.test/path",
+            "https://nas.test/path?target=other",
+            "https://nas.test/path#other",
+        ] {
+            assert!(
+                matches!(
+                    BatchJob::parse("job", endpoint, "alice", "/team/root", false, 0),
+                    Err(BatchError::InvalidEndpoint { job_name, .. }) if job_name == "job"
+                ),
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn control_characters_are_rejected_in_batch_identity_fields() {
+        assert!(matches!(
+            BatchJob::parse(
+                "job\nother",
+                "https://nas.test",
+                "alice",
+                "/team/root",
+                false,
+                0,
+            ),
+            Err(BatchError::InvalidJobName { .. })
+        ));
+        assert!(matches!(
+            BatchJob::parse(
+                "job",
+                "https://nas.test",
+                "alice\tadmin",
+                "/team/root",
+                false,
+                0,
+            ),
+            Err(BatchError::InvalidUsername { job_name, .. }) if job_name == "job"
+        ));
+    }
 }
