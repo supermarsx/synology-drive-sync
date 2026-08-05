@@ -24,7 +24,17 @@ default-profile = "production"
 
 [profiles.production]
 # SOURCE and REMOTE may be omitted here and supplied to each sync/plan command.
+# In the DSM package, source is an absolute local NAS path such as
+# /volume1/Source and the system-internal package user needs read-only access.
 source = "./data/export"
+# REMOTE is a File Station logical path, never /volume1/.... It can be any
+# writable chosen subdirectory. For example, use /home/Drive/NAS-A Backup for
+# the remote account's Drive home or /team-folder/Chosen Folder for a Team
+# Folder. DSM must create the user-home/shared-folder root and grant permission;
+# sync creates a missing destination below that existing share and all children.
+# The DSM manager also rejects trailing/empty/dot segments and DSM-managed
+# components such as @eaDir, @tmp, #recycle, #snapshot, @sharebin, and DSM
+# package roots such as @apphome/@appdata/@appstore/@apptemp/@appconf.
 remote = "/team-folder/project"
 
 # Public File Station reverse-proxy URL and dedicated DSM account.
@@ -85,7 +95,7 @@ remote-log-mode = "best-effort" # best-effort | required
 #
 # [profiles.archive]
 # source = "./data/archive"
-# remote = "/team-folder/archive"
+# remote = "/home/Drive/NAS-A Archive"
 # url = "https://files.example.com"
 # username = "archive-bot"
 # password-file = "./secrets/archive-dsm-password"

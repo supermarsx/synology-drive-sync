@@ -1,10 +1,80 @@
 # Installation and deployment
 
-Release installers are the shortest path to a native binary. Containers and scheduler examples are finite one-shot jobs: each invocation scans, plans, applies the requested operations, logs out of File Station, and exits. Ctrl+C/SIGINT and service or container SIGTERM request cooperative cancellation; a cancelled run exits with status `130`.
+Release installers are the shortest path to a native workstation binary; use the architecture-specific
+SPK when the source is on a Synology NAS. Containers and scheduler examples are finite one-shot
+jobs: each invocation scans, plans, applies the requested operations, logs out of File Station, and
+exits. Ctrl+C/SIGINT and service or container SIGTERM request cooperative cancellation; a cancelled
+run exits with status `130`.
 
 Before scheduling anything, configure the File Station reverse proxy, use a dedicated DSM account, run `doctor`, and review a non-critical `plan`. Keep mirror deletion disabled until the complete deployment path has been tested.
 
 Passing unit tests or `doctor` is not production acceptance. Before trusting real data, complete the [disposable live-NAS acceptance and recovery runbook](production-acceptance.md), including external byte verification, Synology Drive indexing visibility, a retry exercise, alert delivery, and a restore drill.
+
+## Synology DSM 7 package
+
+Install the architecture-specific SPK when the source directory is physically on a Synology NAS:
+
+| Source NAS architecture | Release asset |
+| --- | --- |
+| DSM `x86_64` | `synology-drive-sync-YY.N-x86_64.spk` |
+| DSM `armv8` | `synology-drive-sync-YY.N-armv8.spk` |
+
+Both packages embed a fully static musl ELF and require DSM `7.0-40759` or newer. Download the
+matching SPK and `SHA256SUMS`, verify the selected file as described in [Release artifacts and
+verification](releases.md), then use **Package Center > Manual Install**. DSM displays its normal
+warning for a package not published by Synology. Treat that warning as a trust decision and proceed
+only after verifying the repository, exact asset name, SHA-256, and optional GitHub attestation.
+
+The headless package installs the manager here:
+
+```text
+/var/packages/synology-drive-sync/target/bin/sdsync-dsm
+```
+
+The schedule is disabled at installation. Grant the `synology-drive-sync` system-internal user
+read-only access to the intended local source share, then configure it from an administrator SSH
+session as the package identity. Mutating and sync/diagnostic manager commands refuse root or a
+different identity with exit `77`, preventing an administrator ACL from masking a missing package
+source permission. For example:
+
+```bash
+MANAGER=/var/packages/synology-drive-sync/target/bin/sdsync-dsm
+
+sudo -u synology-drive-sync -- "$MANAGER" configure-profile \
+  --name nas-b \
+  --source '/volume1/Source' \
+  --url 'https://files-b.example.com' \
+  --username 'mirror-bot' \
+  --remote '/home/Drive/NAS-A Backup' \
+  --default
+sudo -u synology-drive-sync -- "$MANAGER" set-password nas-b
+sudo -u synology-drive-sync -- "$MANAGER" set-totp nas-b # only for app TOTP
+sudo -u synology-drive-sync -- "$MANAGER" doctor nas-b
+sudo -u synology-drive-sync -- "$MANAGER" plan nas-b
+sudo -u synology-drive-sync -- "$MANAGER" run nas-b
+sudo -u synology-drive-sync -- "$MANAGER" enable --interval 3600
+sudo synopkg start synology-drive-sync
+```
+
+The target is your choice, not a provisioned constant. `/home/Drive/...` addresses the configured
+remote user's Drive home; `/<share>/...` addresses a writable Team Folder or ordinary shared-folder
+subdirectory. DSM must first provision the user home or shared-folder root and grant the remote
+account access. The sync creates a missing selected subdirectory and all descendants below an
+existing writable share, but it does not create a DSM shared folder, enable User Home service, or
+enable a Team Folder.
+
+Configure multiple profiles to address multiple target NAS devices or directories, then use
+`doctor --all`, `plan --all`, and `run --all`. The package uses protected per-profile password and
+optional TOTP files, one package-local run lock, bounded logs/state, and interval scheduling.
+Deletion remains suppressed unless it is enabled independently in the profile and for a reviewed
+manual/scheduled invocation.
+
+Upgrades retain package-private configuration and secrets and validate the existing config. A
+completed uninstall removes the package's configuration, credentials, state, and logs, but never
+the local source or remote target data. Stop the package before either operation. See the
+[complete Synology DSM package guide](synology-package.md) for ACL setup, arbitrary destination
+examples, exact lifecycle commands and paths, build instructions, deletion controls, and the
+mandatory live two-NAS acceptance. No live NAS install has been validated by the automated suite.
 
 ## Verified native installer
 
@@ -244,6 +314,14 @@ Its default executable is the release installer's per-user path, `%LOCALAPPDATA%
 A task configured to run while no user is logged in may not have access to the same vault material. Test that logon mode with the exact service account rather than falling back to plaintext arguments.
 
 ## Updating and removing
+
+For the DSM SPK, disable the package schedule, stop the package, verify the new matching-architecture
+SPK, and use Package Center's manual upgrade flow. The upgrade retains and validates package-private
+profiles and credentials. Run package `doctor` and review an additive `plan` before restarting.
+Package Center uninstall removes this package's private config, secrets, state, and logs after the
+controller has stopped; it leaves both source and target data untouched. See
+[Synology DSM package](synology-package.md#upgrade-rollback-and-uninstall) before accepting the
+non-Synology-package warning or uninstall data-removal prompt.
 
 Stop the scheduler and record the currently installed version before an upgrade. Rerun an installer with an explicit `--version`/`-Version`; it replaces only the executable in the selected directory. Then run `--version`, `config validate`, authenticated `doctor target`, and a fresh additive `plan` before restarting the schedule. If validation fails, keep the schedule stopped and rerun the installer with the recorded calendar version. Binary rollback does not reverse remote writes already performed by a sync.
 

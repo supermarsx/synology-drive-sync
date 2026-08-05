@@ -1,6 +1,6 @@
 # Disposable live-NAS acceptance and recovery
 
-The automated suite does not log in to a NAS. Production approval therefore requires a disposable end-to-end exercise against the exact DSM version, File Station package, reverse proxy, account policy, scheduler identity, and Synology Drive indexing configuration that will be used in service.
+The automated suite does not log in to a NAS. Production approval therefore requires a disposable end-to-end exercise against the exact DSM version, File Station package, reverse proxy, account policy, scheduler identity, and Synology Drive indexing configuration that will be used in service. For the DSM SPK, this must be a real two-NAS test: install the package on the source NAS and target the second NAS through its production-equivalent File Station URL.
 
 > [!WARNING]
 > Use a new destination containing no valuable data. Keep `--delete` disabled until the deletion-isolation step, use an intentionally small deletion cap there, and never use the shared-folder root. The local source is authoritative: additive sync can overwrite changed remote files even without deletion.
@@ -13,6 +13,12 @@ Create two sibling logical paths in an enabled Synology Drive Team Folder or the
 
 - `/team-folder/sdsync-acceptance-UNIQUE`, the disposable sync destination;
 - `/team-folder/sdsync-acceptance-canary-UNIQUE`, an out-of-scope canary that must never change.
+
+For a user-home deployment, substitute `/home/Drive/sdsync-acceptance-UNIQUE` and
+`/home/Drive/sdsync-acceptance-canary-UNIQUE` consistently. User Home service, the target account's
+home, and its Drive directory must already exist. For a Team Folder, the shared-folder root must
+already exist and be enabled in Drive. The sync may create a chosen missing subdirectory below an
+existing writable share; it never provisions either DSM root or its ACL.
 
 Enable and verify at least one independent recovery layer before continuing: Synology Drive version history, a shared-folder snapshot, or a separate backup. Perform a small manual restore from it now. A recycle bin helps with deletion but is not sufficient proof that an interrupted overwrite can be recovered.
 
@@ -254,6 +260,100 @@ compare each `preflight_plan` with its fresh `execution_plan`, review `mutation_
 reconcile `preflight_deletions` against `execution_reserved_deletions`. Any `partial` job or
 aggregate status, aggregate-cap exit `1`, or unexplained drift fails acceptance.
 
+## 10. Prove DSM package installation and lifecycle
+
+This section is mandatory when the executable is deployed as an SPK. The generic mock suite and
+static SPK validator are not substitutes.
+
+Record the source NAS model, CPU architecture, DSM build, selected `x86_64` or `armv8` SPK filename,
+SHA-256, GitHub attestation result, and the Package Center warning shown for a non-Synology package.
+Verify that an SPK for the wrong architecture is not used. Install through **Package Center > Manual
+Install** and confirm scheduling is disabled before entering any target credentials.
+
+On the source NAS, grant the `synology-drive-sync` system-internal user read-only permission to one
+disposable source share and no access to unrelated shares. Confirm the physical source path is not a
+symlink and run every check as that identity:
+
+```bash
+MANAGER=/var/packages/synology-drive-sync/target/bin/sdsync-dsm
+sudo -u synology-drive-sync -- "$MANAGER" paths
+sudo -u synology-drive-sync -- "$MANAGER" configure-profile \
+  --name acceptance-nas-b \
+  --source '/volume1/sdsync-acceptance-source' \
+  --url 'https://files-b.example.com' \
+  --username 'acceptance-bot' \
+  --remote '/home/Drive/sdsync-acceptance-UNIQUE' \
+  --default
+sudo -u synology-drive-sync -- "$MANAGER" set-password acceptance-nas-b
+sudo -u synology-drive-sync -- "$MANAGER" set-totp acceptance-nas-b # when required
+sudo -u synology-drive-sync -- "$MANAGER" doctor acceptance-nas-b
+sudo -u synology-drive-sync -- "$MANAGER" plan acceptance-nas-b
+sudo -u synology-drive-sync -- "$MANAGER" run acceptance-nas-b
+```
+
+Repeat with a Team Folder or shared-folder profile if that is the production destination type. Test
+the arbitrary-folder and provisioning boundary explicitly: choose a new nested destination beneath
+an existing writable share, leave the nested destination absent, require `doctor` to report the
+nearest-existing-parent permission evidence, require `plan` to contain only the expected folder and
+payload creation, then run and confirm the whole descendant hierarchy appears. Separately prove
+that a nonexistent top-level shared-folder path fails closed rather than creating a DSM share, and
+that a trailing slash, dot segment, Drive-incompatible name such as `~temporary`, or case-varied
+DSM-managed component such as `@EADIR`/`@APPDATA` is rejected before any target request can mutate
+data. Include a case-only local/remote directory conflict and a path whose selected prefix plus
+relative name exceeds the Drive portability limit; both must fail during planning.
+
+Add a second profile with a different target URL or destination and distinct protected credentials.
+Require these commands to preflight every target and run in deterministic profile-name order:
+
+```bash
+sudo -u synology-drive-sync -- "$MANAGER" doctor --all
+sudo -u synology-drive-sync -- "$MANAGER" plan --all
+sudo -u synology-drive-sync -- "$MANAGER" run --all
+```
+
+When TOTP is used, prove a scheduled, non-interactive challenge with synchronized clocks and the
+package-owned seed file; do not accept an interactive current-code prompt as unattended evidence.
+When the URL has a reverse-proxy prefix, prove every discovery, login, inventory, upload, verify,
+copy, and delete-probe request remains under that prefix. Exercise a file larger than the deployed
+proxy's request-body threshold and measure the full run time. These combinations must be tested live
+because they are not established by the mock suite.
+
+Exercise the built-in controller with deletion disabled:
+
+```bash
+sudo -u synology-drive-sync -- "$MANAGER" enable --interval 60
+sudo synopkg start synology-drive-sync
+sudo -u synology-drive-sync -- "$MANAGER" status
+sudo -u synology-drive-sync -- "$MANAGER" logs 200
+```
+
+Require no immediate sync at enable time, one run after the interval, rejection of an overlapping
+manual run, a recorded successful exit state, bounded logs, and an externally delivered alert for a
+later deliberately failed scheduled run. Reboot the source NAS and require the package controller,
+schedule, package identity, profile, credentials, and source ACL to recover without widening
+permissions. Stop the package during a large disposable transfer and verify cooperative cancellation
+and a clean subsequent plan; a timed-out stop must not force-kill the worker.
+
+Deletion acceptance requires both a profile configured with `--delete --max-delete N` and manager
+execution/scheduling with `--allow-delete`; prove that omitting either opt-in suppresses deletion.
+Then perform the existing one-file containment/canary test with both a small per-profile cap and
+`--max-total-delete`. Disable deletion again immediately afterward.
+
+Test an upgrade from the previous verified compatible SPK to the candidate. Stop the package first,
+then require Package Center to retain private profiles, password/TOTP material, schedule, state, and
+logs; require upgrade-time config validation; and rerun `doctor` plus an additive `plan` before
+resuming. A package rollback does not revert completed File Station writes.
+
+Finally, on a disposable package installation, disable and stop the package, uninstall it, and
+verify that `/var/packages/synology-drive-sync/home` private configuration/secrets and package
+`var` state/logs are removed while the complete local source, remote target, sibling canary,
+snapshots, and DSM ACL configuration remain unchanged. Export the non-secret config and audit logs
+before this test. Package-owned credentials removed by uninstall are intentionally unrecoverable.
+
+The package reads the source NAS filesystem and uploads the bytes to the target NAS. Do not record a
+claim of a direct NAS-to-NAS File Station server-copy primitive: server-side copy optimization is
+limited to matching content already present within the one target NAS.
+
 ## Acceptance record
 
 Production approval should retain evidence for all of the following:
@@ -268,6 +368,8 @@ Production approval should retain evidence for all of the following:
 - deletion containment with the sibling canary preserved;
 - an enforced single-writer window for every destructive run;
 - successful restore with verified bytes;
-- deletion still disabled unless its operational need and cap were separately approved.
+- deletion still disabled unless its operational need and cap were separately approved;
+- for SPK deployments, source-share ACL isolation, arbitrary nested target creation, Package Center
+  install/upgrade/start/stop/uninstall evidence, reboot persistence, and two-NAS TOTP/proxy results.
 
 Repeat the relevant steps after DSM/File Station upgrades, reverse-proxy changes, authentication-policy changes, scheduler identity changes, or a major application upgrade.

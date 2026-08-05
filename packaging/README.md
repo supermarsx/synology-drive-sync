@@ -1,9 +1,14 @@
 # Deployment and service assets
 
-The release installers manage one verified executable. Native managers own schedules, identities, lifecycle, logs, and overlap control; uninstalling the executable never silently removes those operational records.
+The workstation release installers manage one verified executable; the DSM SPK manages its own
+packaged executable, controller, and private state. Native managers own schedules, identities,
+lifecycle, logs, and overlap control. Uninstalling a workstation executable never silently removes
+those operational records, while DSM package uninstall explicitly purges only its package-owned
+configuration, credentials, state, and logs after a confirmation.
 
 | Deployment | Identity and credentials | Non-overlap boundary | Authoritative diagnostics |
 | --- | --- | --- | --- |
+| DSM 7 SPK | `synology-drive-sync` system-internal user; package-owned `0600` password/TOTP files | one package run lock across manual and scheduled jobs on that NAS | `sdsync-dsm status`, bounded package logs, and exit status |
 | systemd | dedicated `sdsync` user; `LoadCredential` files | shared packaged `flock` path across related units on one host | journald plus exit status |
 | launchd | logged-in user; login Keychain | one launchd label only | rotating JSON file plus unified-log fallback |
 | Task Scheduler | current interactive user; Credential Manager | one task name (`IgnoreNew`) only | rotating JSON file plus `LastTaskResult` |
@@ -25,6 +30,46 @@ Every unattended deployment must:
 - complete the [disposable production acceptance runbook](../docs/production-acceptance.md) before enabling deletion.
 
 The per-manager directories provide exact install/upgrade/uninstall, enable/disable, start/stop/restart, status/log, locking, batch, and recovery guidance.
+
+## Synology DSM package lifecycle
+
+[`packaging/synology`](synology/) assembles a manually installable DSM 7 SPK around one validated
+static musl ELF. Releases contain separate `x86_64` and `armv8` packages. The SPK runs without root
+or Linux capabilities, keeps scheduling disabled after installation, and supplies the headless
+manager at:
+
+```text
+/var/packages/synology-drive-sync/target/bin/sdsync-dsm
+```
+
+Install it through **Package Center > Manual Install** only after verifying `SHA256SUMS` and the
+optional GitHub attestation. DSM warns for a non-Synology package; the project does not suppress or
+bypass that warning. Grant the `synology-drive-sync` system-internal user read-only permission to
+each local source share, then configure, diagnose, plan, and run as that identity. Those manager
+operations reject root or any identity other than the installed package owner, so a broad
+administrator ACL cannot make source validation pass accidentally.
+
+The manager supports arbitrary remote File Station logical destinations. `/home/Drive/...` selects
+the target account's Drive home, while `/<share>/...` selects any writable Team Folder/shared-folder
+subdirectory. DSM must create the user home or shared-folder root and establish its ACL first. Sync
+creates missing descendant folders beneath an existing writable parent; it never creates a DSM
+shared folder or enables a Team Folder.
+
+Multiple profiles may use different sources, URLs, accounts, credentials, and destination roots.
+`doctor --all`, `plan --all`, and `run --all` reuse the core all-target preflight and deterministic
+batch behavior. Passwords and optional TOTP seeds enter through masked prompts or readable
+non-symlink input files and are copied into private package storage; secret values never enter
+arguments or generated TOML.
+
+The package controller provides interval scheduling, cooperative start/stop, one run lock, state,
+and bounded logs. Deletion requires both profile-level `--delete --max-delete N` and a manager-level
+`--allow-delete` opt-in. Upgrade retains private configuration and credentials and validates them;
+uninstall removes package-owned configuration, credentials, state, locks, and logs while leaving
+both NAS data trees untouched.
+
+See the [complete DSM package guide](../docs/synology-package.md) for exact install, ACL, profile,
+secret, diagnostic, scheduling, upgrade, and acceptance commands. The package has static/mock
+validation but no recorded live two-NAS installation test.
 
 ## Verified binary installer lifecycle
 

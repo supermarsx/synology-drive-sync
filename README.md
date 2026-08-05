@@ -4,7 +4,18 @@
 
 A lean Rust CLI that pushes one local directory—or a deterministic batch of complete named profile jobs—to Synology Drive-backed folders through the documented File Station WebAPI and HTTPS reverse-proxy URLs.
 
-This is deliberately one-way and stateless. It is not a Synology Drive protocol client, daemon, two-way reconciler, SMB/WebDAV wrapper, or QuickConnect client. It writes to the underlying DSM folder through File Station; Synology Drive can index that folder when it belongs to My Drive or an enabled Team Folder.
+The sync engine is deliberately one-way and stateless. It is not a Synology Drive protocol client,
+continuous watcher, two-way reconciler, SMB/WebDAV wrapper, or QuickConnect client. It writes to the
+underlying DSM folder through File Station; Synology Drive can index that folder when it belongs to
+My Drive or an enabled Team Folder. Service managers, including the DSM package controller, only
+schedule isolated finite runs.
+
+An architecture-specific DSM 7 `.spk` can run the same engine directly on the source NAS. Its
+remote destination is configurable: `/home/Drive/...` targets the remote account's Drive home, and
+any writable `/<shared-folder>/...` subdirectory can be selected instead. DSM must provision the
+remote user home or shared-folder root and its permissions first; the sync creates a missing chosen
+subdirectory and all descendants beneath an existing writable parent. See the
+[Synology DSM package guide](docs/synology-package.md).
 
 > [!IMPORTANT]
 > The automated suite uses deterministic local and mock-HTTP tests; it does not log in to a live NAS. Before trusting a deployment, run the [source and target diagnostics](docs/diagnostics-and-batch.md), review `plan`, complete the [disposable live-NAS acceptance](docs/production-acceptance.md), and keep `--delete` disabled.
@@ -292,7 +303,7 @@ target/
 
 Excluded paths are outside the sync scope, not considered absent. Matching remote entries and required parent directories are preserved even under `--delete`. The root `.sdsyncignore` itself is never uploaded.
 
-Hidden regular files are included. Symlinks, junctions/reparse points, special or unreadable entries, non-UTF-8 names, unsafe Drive names, case collisions, and obvious platform path overflows fail preflight before remote mutation. File Station CIFS/NFS/ISO/remote mounts are never traversed or deleted.
+Hidden regular files are included. Symlinks, junctions/reparse points, special or unreadable entries, non-UTF-8 names, unsafe Drive names, case collisions, and obvious platform path overflows fail preflight before remote mutation. The selected remote prefix is included in Drive portability and path-length checks, and case variants across the local and remote hierarchies fail before File Station can create both spellings. File Station CIFS/NFS/ISO/remote mounts are never traversed or deleted.
 
 Path checks and later file opens are not a transactional filesystem snapshot. Run under an unprivileged account that exclusively owns the source, keep the tree quiescent during synchronization, and never run elevated over a source that another user or less-trusted process can rename or replace. A concurrent path-component swap can otherwise race portable link/reparse checks and redirect a later traversal or upload outside the tree that was originally inspected. See [Security policy](SECURITY.md).
 
@@ -349,6 +360,8 @@ profiles remain committed.
 
 See [Installation and deployment](docs/installation.md) for:
 
+- manually installable DSM 7 SPKs for `x86_64` and `armv8`, with a package-owned scheduler and
+  multi-target manager;
 - checksum-verifying Unix and Windows installers;
 - manual archive installation, completions, and manpage setup;
 - the non-root, read-only Docker/Compose job and optional TOTP secret overlay;
@@ -359,7 +372,7 @@ The native schedulers are preferred because their identity and credential-sessio
 
 ## Releases and supply-chain verification
 
-Calendar releases use `YY.N` tags and provide native Linux, Windows, and macOS archives for both x86-64 and ARM64. Each release also includes `SHA256SUMS`, a CycloneDX dependency SBOM, generated third-party license notices, installer scripts, and GitHub artifact provenance/SBOM attestations. CI audits the locked graph against current RustSec data and refuses stale notices. The GHCR image is published for `linux/amd64` and `linux/arm64` as both `YY.N` and `latest`.
+Calendar releases use `YY.N` tags and provide native Linux, Windows, and macOS archives for both x86-64 and ARM64, plus architecture-specific DSM 7 SPKs for `x86_64` and `armv8`. Each release also includes `SHA256SUMS`, a CycloneDX dependency SBOM, generated third-party license notices, installer scripts, and GitHub artifact provenance/SBOM attestations. CI audits the locked graph against current RustSec data and refuses stale notices. The GHCR image is published for `linux/amd64` and `linux/arm64` as both `YY.N` and `latest`.
 
 See [Release artifacts and verification](docs/releases.md) before deploying a binary or container in a sensitive environment. Pin a calendar version or container digest rather than relying on mutable `latest`.
 
@@ -380,7 +393,7 @@ Transient transport, busy, 408/429, and 502/503/504 failures use bounded retry. 
 
 - One direction only: local to remote.
 - File Station WebAPI only; no private Drive protocol, SMB, WebDAV, SSH, or QuickConnect.
-- A mapped or mounted NAS share can be the source only when the operating system exposes it as an ordinary readable directory; this client does not connect to a second NAS itself. File Station CIFS/NFS/ISO mount points are protected destination boundaries and cannot be sync roots.
+- A mapped or mounted NAS share can be the source only when the operating system exposes it as an ordinary readable directory. The DSM package is intended to run where the source is physically local; File Station has no direct remote-NAS-to-remote-NAS transfer operation. File Station CIFS/NFS/ISO mount points are protected destination boundaries and cannot be sync roots.
 - No block-level delta or resumable upload.
 - No persistent content index or universal rename operation. Only the explicitly safe server-copy case above avoids retransmission; other rename/duplicate cases use verified upload fallback.
 - No claim of crash-atomic overwrite or transactional type replacement.
@@ -411,6 +424,7 @@ See [Testing and coverage](docs/testing.md), [CONTRIBUTING.md](CONTRIBUTING.md),
 - [DSM Login Portal applications](https://kb.synology.com/en-global/DSM/help/DSM/AdminCenter/system_login_portal_applications?version=7)
 - [DSM Login Portal and reverse proxy](https://kb.synology.com/en-global/DSM/help/DSM/AdminCenter/system_login_portal?version=7)
 - [Synology Drive Admin Console and Team Folders](https://kb.synology.com/en-global/DSM/help/SynologyDrive/drive_admin_console)
+- [Synology DSM Package Developer Guide](https://help.synology.com/developer-guide/)
 - [RFC 6238: Time-Based One-Time Password Algorithm](https://www.rfc-editor.org/rfc/rfc6238.html)
 - [freedesktop Secret Service specification](https://specifications.freedesktop.org/secret-service/latest-single/)
 
