@@ -1,10 +1,14 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use md5::{Digest, Md5};
 
+use crate::cancel::CancellationToken;
+use crate::integrity::ContentMd5;
 use crate::path::{is_dsm_managed, path_for_match, validate_relative};
 use crate::{Error, Result};
 
@@ -32,6 +36,7 @@ pub struct LocalEntry {
     pub kind: EntryKind,
     pub size: u64,
     pub mtime_ms: i64,
+    pub content_md5: Option<ContentMd5>,
 }
 
 #[derive(Debug)]
@@ -155,6 +160,82 @@ pub fn scan(source: &Path, rules: &IgnoreRules) -> Result<LocalInventory> {
     Ok(LocalInventory { root, entries })
 }
 
+pub fn populate_content_md5(
+    inventory: &mut LocalInventory,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    for entry in inventory.entries.values_mut() {
+        cancellation.check()?;
+        if entry.kind == EntryKind::File {
+            entry.content_md5 = Some(hash_file_snapshot(entry, cancellation)?);
+        }
+    }
+    Ok(())
+}
+
+pub fn hash_file_snapshot(
+    entry: &LocalEntry,
+    cancellation: &CancellationToken,
+) -> Result<ContentMd5> {
+    verify_entry_snapshot(entry)?;
+    let mut file = fs::File::open(&entry.full_path).map_err(|source| Error::FileIo {
+        path: entry.full_path.clone(),
+        source,
+    })?;
+    verify_open_snapshot(entry, &file)?;
+
+    let mut hasher = Md5::new();
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        cancellation.check()?;
+        let count = file.read(&mut buffer).map_err(|source| Error::FileIo {
+            path: entry.full_path.clone(),
+            source,
+        })?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    verify_open_snapshot(entry, &file)?;
+    verify_entry_snapshot(entry)?;
+    Ok(ContentMd5::from_bytes(hasher.finalize().into()))
+}
+
+fn verify_entry_snapshot(entry: &LocalEntry) -> Result<()> {
+    let metadata = fs::symlink_metadata(&entry.full_path).map_err(|source| Error::FileIo {
+        path: entry.full_path.clone(),
+        source,
+    })?;
+    if is_link_or_reparse(&metadata) {
+        return Err(Error::SourceChanged(entry.full_path.clone()));
+    }
+    verify_metadata_snapshot(entry, &metadata)
+}
+
+fn verify_open_snapshot(entry: &LocalEntry, file: &fs::File) -> Result<()> {
+    let metadata = file.metadata().map_err(|source| Error::FileIo {
+        path: entry.full_path.clone(),
+        source,
+    })?;
+    verify_metadata_snapshot(entry, &metadata)
+}
+
+fn verify_metadata_snapshot(entry: &LocalEntry, metadata: &fs::Metadata) -> Result<()> {
+    let modified = metadata.modified().map_err(|source| Error::FileIo {
+        path: entry.full_path.clone(),
+        source,
+    })?;
+    let millis = modified
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok());
+    if !metadata.is_file() || metadata.len() != entry.size || millis != Some(entry.mtime_ms) {
+        return Err(Error::SourceChanged(entry.full_path.clone()));
+    }
+    Ok(())
+}
+
 fn scan_dir(
     directory: &Path,
     relative_parent: &str,
@@ -238,6 +319,7 @@ fn scan_dir(
                     kind: EntryKind::Directory,
                     size: 0,
                     mtime_ms: 0,
+                    content_md5: None,
                 },
             );
             scan_dir(&full_path, &relative, rules, output)?;
@@ -267,6 +349,7 @@ fn scan_dir(
                     kind: EntryKind::File,
                     size: metadata.len(),
                     mtime_ms,
+                    content_md5: None,
                 },
             );
         } else {
@@ -456,5 +539,20 @@ mod tests {
         assert!(portable_case_collision(paths.iter()).is_some());
         let distinct = ["Folder/A.txt".to_owned(), "Folder/B.txt".to_owned()];
         assert!(portable_case_collision(distinct.iter()).is_none());
+    }
+
+    #[test]
+    fn content_hashing_records_the_scanned_file_snapshot() {
+        let root = temp_dir("content-md5");
+        fs::write(root.join("payload.bin"), b"abc").unwrap();
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        let mut inventory = scan(&root, &rules).unwrap();
+
+        populate_content_md5(&mut inventory, &CancellationToken::default()).unwrap();
+        assert_eq!(
+            inventory.entries["payload.bin"].content_md5,
+            Some(ContentMd5::parse_hex("900150983cd24fb0d6963f7d28e17f72").unwrap())
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

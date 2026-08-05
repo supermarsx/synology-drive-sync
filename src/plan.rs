@@ -1,12 +1,14 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::api::{RemoteEntry, RemoteInventory};
+use crate::integrity::ContentMd5;
 use crate::local::{EntryKind, IgnoreRules, LocalEntry, LocalInventory};
 use crate::path::{RemoteRoot, depth, is_dsm_managed};
 use crate::{Error, Result};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompareMode {
+    Content,
     Metadata,
     SizeOnly,
 }
@@ -17,6 +19,7 @@ pub struct PlanOptions {
     pub allow_empty_source: bool,
     pub max_delete: usize,
     pub compare: CompareMode,
+    pub server_copy: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -32,17 +35,53 @@ pub struct UploadAction {
 }
 
 #[derive(Clone, Debug)]
+pub struct CopyAction {
+    pub from_relative: String,
+    pub from_remote_path: String,
+    pub to_relative: String,
+    pub to_remote_path: String,
+    pub local: LocalEntry,
+    pub expected_size: u64,
+    pub content_md5: ContentMd5,
+    pub source_snapshot: RemoteSnapshot,
+}
+
+#[derive(Clone, Debug)]
+pub struct DestinationGuard {
+    pub remote_path: String,
+    pub local: LocalEntry,
+    pub expected_size: u64,
+    pub expected_mtime_seconds: i64,
+    pub content_md5: ContentMd5,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteSnapshot {
+    pub kind: EntryKind,
+    pub size: u64,
+    pub mtime_seconds: i64,
+    pub content_md5: Option<ContentMd5>,
+    /// Deleting descendants changes a directory's mtime. Such directories are instead
+    /// guarded by their kind, size, observed emptiness, and File Station's nonrecursive delete.
+    pub require_mtime: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct DeleteAction {
     pub relative: String,
     pub remote_path: String,
     pub kind: EntryKind,
     pub type_conflict: bool,
+    pub snapshot: RemoteSnapshot,
+    /// Present only when this mirror deletion removes the source of a verified server copy.
+    pub destination_guard: Option<DestinationGuard>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SyncPlan {
     pub pre_deletes: Vec<DeleteAction>,
     pub creates: Vec<CreateAction>,
+    pub copies: Vec<CopyAction>,
     pub uploads: Vec<UploadAction>,
     pub post_deletes: Vec<DeleteAction>,
     pub unchanged_files: usize,
@@ -58,9 +97,102 @@ impl SyncPlan {
     pub fn is_empty(&self) -> bool {
         self.pre_deletes.is_empty()
             && self.creates.is_empty()
+            && self.copies.is_empty()
             && self.uploads.is_empty()
             && self.post_deletes.is_empty()
     }
+}
+
+/// Select the minimum remote files whose content is needed to build a content-mode plan.
+/// Same-path equal-size files need a digest for comparison. Remote-only files are considered
+/// only when CopyMove is available and their size/basename can satisfy a supported copy action.
+pub fn select_remote_content_hashes(
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+    rules: &IgnoreRules,
+    server_copy: bool,
+) -> BTreeSet<String> {
+    select_remote_content_hashes_for_plan(local, remote, rules, server_copy, false)
+}
+
+/// Select remote content needed for comparison, optional server-copy reuse, and deletion guards.
+/// A content-mode mirror must pass `delete = true` so every file that could be removed has a
+/// plan-time digest. `build_plan` fails closed if such a digest is absent.
+pub fn select_remote_content_hashes_for_plan(
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+    rules: &IgnoreRules,
+    server_copy: bool,
+    delete: bool,
+) -> BTreeSet<String> {
+    let mut selected = BTreeSet::new();
+    for local_entry in local.entries.values() {
+        if local_entry.kind != EntryKind::File {
+            continue;
+        }
+        let Some(remote_entry) = remote.entries.get(&local_entry.relative) else {
+            continue;
+        };
+        if remote_entry.kind == EntryKind::File
+            && remote_entry.size == local_entry.size
+            && local_mtime_seconds(local_entry) == remote_entry.mtime_seconds
+            && !is_protected(remote_entry, rules)
+        {
+            selected.insert(remote_entry.relative.clone());
+        }
+    }
+
+    if delete {
+        for entry in remote.entries.values() {
+            if entry.kind != EntryKind::File || is_protected(entry, rules) {
+                continue;
+            }
+            let is_delete_candidate = local
+                .entries
+                .get(&entry.relative)
+                .is_none_or(|local_entry| local_entry.kind != EntryKind::File);
+            if is_delete_candidate {
+                selected.insert(entry.relative.clone());
+            }
+        }
+    }
+
+    if !server_copy {
+        return selected;
+    }
+
+    let mut missing_by_size_name_and_mtime: BTreeMap<(u64, String, i64), BTreeSet<String>> =
+        BTreeMap::new();
+    for entry in local.entries.values() {
+        if entry.kind != EntryKind::File || remote.entries.contains_key(&entry.relative) {
+            continue;
+        }
+        let (parent, name) = relative_parent_and_name(&entry.relative);
+        missing_by_size_name_and_mtime
+            .entry((entry.size, name.to_owned(), local_mtime_seconds(entry)))
+            .or_default()
+            .insert(parent.to_owned());
+    }
+
+    for entry in remote.entries.values() {
+        if entry.kind != EntryKind::File
+            || local.entries.contains_key(&entry.relative)
+            || is_protected(entry, rules)
+            || has_local_file_ancestor(&entry.relative, local)
+        {
+            continue;
+        }
+        let (parent, name) = relative_parent_and_name(&entry.relative);
+        let Some(target_parents) =
+            missing_by_size_name_and_mtime.get(&(entry.size, name.to_owned(), entry.mtime_seconds))
+        else {
+            continue;
+        };
+        if target_parents.iter().any(|target| target != parent) {
+            selected.insert(entry.relative.clone());
+        }
+    }
+    selected
 }
 
 pub fn build_plan(
@@ -73,6 +205,7 @@ pub fn build_plan(
     let mut plan = SyncPlan {
         pre_deletes: Vec::new(),
         creates: Vec::new(),
+        copies: Vec::new(),
         uploads: Vec::new(),
         post_deletes: Vec::new(),
         unchanged_files: 0,
@@ -131,7 +264,13 @@ pub fn build_plan(
                 });
             }
             (EntryKind::Directory, EntryKind::File) => {
-                push_predelete(&mut plan, remote_entry, &mut predeleted);
+                push_predelete(
+                    &mut plan,
+                    remote_entry,
+                    &remote.entries,
+                    options.compare,
+                    &mut predeleted,
+                )?;
                 schedule_create(root, &mut plan, entry)?;
             }
             (EntryKind::File, EntryKind::Directory) => {
@@ -143,11 +282,21 @@ pub fn build_plan(
                     return Err(Error::ProtectedConflict(remote_entry.remote_path.clone()));
                 }
                 for candidate in subtree {
-                    push_predelete(&mut plan, candidate, &mut predeleted);
+                    push_predelete(
+                        &mut plan,
+                        candidate,
+                        &remote.entries,
+                        options.compare,
+                        &mut predeleted,
+                    )?;
                 }
                 schedule_upload(root, &mut plan, entry)?;
             }
         }
+    }
+
+    if options.compare == CompareMode::Content {
+        replace_uploads_with_server_copies(root, &mut plan, local, remote, rules, options)?;
     }
 
     if options.delete {
@@ -168,11 +317,24 @@ pub fn build_plan(
             {
                 continue;
             }
+            let destination_guard = plan
+                .copies
+                .iter()
+                .find(|copy| copy.from_relative == entry.relative)
+                .map(|copy| DestinationGuard {
+                    remote_path: copy.to_remote_path.clone(),
+                    local: copy.local.clone(),
+                    expected_size: copy.expected_size,
+                    expected_mtime_seconds: local_mtime_seconds(&copy.local),
+                    content_md5: copy.content_md5,
+                });
             plan.post_deletes.push(DeleteAction {
                 relative: entry.relative.clone(),
                 remote_path: entry.remote_path.clone(),
                 kind: entry.kind,
                 type_conflict: false,
+                snapshot: deletion_snapshot(entry, &remote.entries, options.compare)?,
+                destination_guard,
             });
         }
     }
@@ -215,15 +377,24 @@ fn schedule_upload(root: &RemoteRoot, plan: &mut SyncPlan, entry: &LocalEntry) -
     Ok(())
 }
 
-fn push_predelete(plan: &mut SyncPlan, remote: &RemoteEntry, predeleted: &mut BTreeSet<String>) {
+fn push_predelete(
+    plan: &mut SyncPlan,
+    remote: &RemoteEntry,
+    remote_entries: &BTreeMap<String, RemoteEntry>,
+    compare: CompareMode,
+    predeleted: &mut BTreeSet<String>,
+) -> Result<()> {
     if predeleted.insert(remote.relative.clone()) {
         plan.pre_deletes.push(DeleteAction {
             relative: remote.relative.clone(),
             remote_path: remote.remote_path.clone(),
             kind: remote.kind,
             type_conflict: true,
+            snapshot: deletion_snapshot(remote, remote_entries, compare)?,
+            destination_guard: None,
         });
     }
+    Ok(())
 }
 
 fn files_match(local: &LocalEntry, remote: &RemoteEntry, mode: CompareMode) -> bool {
@@ -231,9 +402,128 @@ fn files_match(local: &LocalEntry, remote: &RemoteEntry, mode: CompareMode) -> b
         return false;
     }
     match mode {
+        CompareMode::Content => {
+            local.content_md5.is_some()
+                && local.content_md5 == remote.content_md5
+                && local_mtime_seconds(local) == remote.mtime_seconds
+        }
         CompareMode::SizeOnly => true,
         CompareMode::Metadata => local.mtime_ms.div_euclid(1000) == remote.mtime_seconds,
     }
+}
+
+fn replace_uploads_with_server_copies(
+    root: &RemoteRoot,
+    plan: &mut SyncPlan,
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+    rules: &IgnoreRules,
+    options: &PlanOptions,
+) -> Result<()> {
+    if !options.server_copy {
+        return Ok(());
+    }
+
+    let predeleted: BTreeSet<&str> = plan
+        .pre_deletes
+        .iter()
+        .map(|action| action.relative.as_str())
+        .collect();
+    let mut local_by_content: BTreeMap<(u64, ContentMd5, i64), Vec<usize>> = BTreeMap::new();
+    for (index, upload) in plan.uploads.iter().enumerate() {
+        if remote.entries.contains_key(&upload.local.relative) {
+            continue;
+        }
+        let digest = upload.local.content_md5.ok_or_else(|| {
+            Error::Message("content comparison requires every local file digest".to_owned())
+        })?;
+        local_by_content
+            .entry((
+                upload.local.size,
+                digest,
+                local_mtime_seconds(&upload.local),
+            ))
+            .or_default()
+            .push(index);
+    }
+
+    let mut remote_by_content: BTreeMap<(u64, ContentMd5, i64), Vec<&RemoteEntry>> =
+        BTreeMap::new();
+    for entry in remote.entries.values() {
+        if entry.kind != EntryKind::File
+            || local.entries.contains_key(&entry.relative)
+            || is_protected(entry, rules)
+            || predeleted.contains(entry.relative.as_str())
+        {
+            continue;
+        }
+        let Some(digest) = entry.content_md5 else {
+            continue;
+        };
+        remote_by_content
+            .entry((entry.size, digest, entry.mtime_seconds))
+            .or_default()
+            .push(entry);
+    }
+
+    let mut replacements = BTreeMap::new();
+    for ((expected_size, digest, expected_mtime_seconds), local_candidates) in local_by_content {
+        let Some(remote_candidates) =
+            remote_by_content.get(&(expected_size, digest, expected_mtime_seconds))
+        else {
+            continue;
+        };
+        // Ambiguity is not an integrity failure: retain each independently verified upload.
+        if local_candidates.len() != 1 || remote_candidates.len() != 1 {
+            continue;
+        }
+
+        let upload_index = local_candidates[0];
+        let upload = &plan.uploads[upload_index];
+        let source = remote_candidates[0];
+        let (source_parent, source_name) = crate::path::parent_and_name(&source.remote_path)?;
+        let (target_parent, target_name) = crate::path::parent_and_name(&upload.remote_path)?;
+        // CopyMove can copy without removing the source, but it cannot assign a new basename.
+        // Only optimize a parent change whose final name is already exact; every other rename
+        // safely keeps the verified-upload path.
+        if source_parent == target_parent || source_name != target_name {
+            continue;
+        }
+        replacements.insert(
+            upload_index,
+            CopyAction {
+                from_relative: source.relative.clone(),
+                from_remote_path: source.remote_path.clone(),
+                to_relative: upload.local.relative.clone(),
+                to_remote_path: root.join(&upload.local.relative)?,
+                local: upload.local.clone(),
+                expected_size,
+                content_md5: digest,
+                source_snapshot: RemoteSnapshot {
+                    kind: EntryKind::File,
+                    size: source.size,
+                    mtime_seconds: source.mtime_seconds,
+                    content_md5: Some(digest),
+                    require_mtime: true,
+                },
+            },
+        );
+    }
+
+    if replacements.is_empty() {
+        return Ok(());
+    }
+    let mut kept = Vec::with_capacity(plan.uploads.len() - replacements.len());
+    for (index, upload) in plan.uploads.drain(..).enumerate() {
+        if let Some(copy) = replacements.remove(&index) {
+            plan.upload_bytes = plan.upload_bytes.saturating_sub(upload.local.size);
+            plan.copies.push(copy);
+        } else {
+            kept.push(upload);
+        }
+    }
+    plan.uploads = kept;
+    Ok(())
 }
 
 fn remote_subtree<'a>(
@@ -251,6 +541,57 @@ fn is_protected(entry: &RemoteEntry, rules: &IgnoreRules) -> bool {
     entry.mount_point_type.is_some()
         || is_dsm_managed(&entry.relative)
         || rules.is_ignored(&entry.relative, entry.kind == EntryKind::Directory)
+}
+
+fn local_mtime_seconds(local: &LocalEntry) -> i64 {
+    local.mtime_ms.div_euclid(1000)
+}
+
+fn deletion_snapshot(
+    entry: &RemoteEntry,
+    remote_entries: &BTreeMap<String, RemoteEntry>,
+    compare: CompareMode,
+) -> Result<RemoteSnapshot> {
+    let content_md5 = if compare == CompareMode::Content && entry.kind == EntryKind::File {
+        Some(entry.content_md5.ok_or_else(|| {
+            Error::Message(format!(
+                "content-mode deletion requires a plan-time MD5 snapshot for {:?}",
+                entry.remote_path
+            ))
+        })?)
+    } else {
+        None
+    };
+    let has_descendants = entry.kind == EntryKind::Directory
+        && remote_entries
+            .keys()
+            .any(|relative| relative.starts_with(&format!("{}/", entry.relative)));
+    Ok(RemoteSnapshot {
+        kind: entry.kind,
+        size: entry.size,
+        mtime_seconds: entry.mtime_seconds,
+        content_md5,
+        require_mtime: !has_descendants,
+    })
+}
+
+fn relative_parent_and_name(relative: &str) -> (&str, &str) {
+    relative.rsplit_once('/').unwrap_or(("", relative))
+}
+
+fn has_local_file_ancestor(relative: &str, local: &LocalInventory) -> bool {
+    let mut current = relative;
+    while let Some((parent, _)) = current.rsplit_once('/') {
+        if local
+            .entries
+            .get(parent)
+            .is_some_and(|entry| entry.kind == EntryKind::File)
+        {
+            return true;
+        }
+        current = parent;
+    }
+    false
 }
 
 fn add_ancestor_directories(relative: &str, output: &mut HashSet<String>) {
@@ -272,6 +613,8 @@ fn sort_plan(plan: &mut SyncPlan) {
             .cmp(&depth(&right.relative))
             .then_with(|| left.relative.cmp(&right.relative))
     });
+    plan.copies
+        .sort_by(|left, right| left.to_relative.cmp(&right.to_relative));
     plan.uploads
         .sort_by(|left, right| left.local.relative.cmp(&right.local.relative));
     plan.post_deletes.sort_by(|left, right| {
@@ -303,6 +646,7 @@ mod tests {
                             kind: *kind,
                             size: *size,
                             mtime_ms: *mtime_ms,
+                            content_md5: None,
                         },
                     )
                 })
@@ -325,6 +669,7 @@ mod tests {
                             size: *size,
                             mtime_seconds: *mtime_seconds,
                             mount_point_type: None,
+                            content_md5: None,
                         },
                     )
                 })
@@ -351,6 +696,19 @@ mod tests {
             allow_empty_source: false,
             max_delete: 100,
             compare: CompareMode::Metadata,
+            server_copy: false,
+        }
+    }
+
+    fn digest(value: u8) -> ContentMd5 {
+        ContentMd5::from_bytes([value; 16])
+    }
+
+    fn content_options(delete: bool, server_copy: bool) -> PlanOptions {
+        PlanOptions {
+            compare: CompareMode::Content,
+            server_copy,
+            ..options(delete)
         }
     }
 
@@ -489,5 +847,243 @@ mod tests {
             ),
             Err(Error::ProtectedConflict(_))
         ));
+    }
+
+    #[test]
+    fn content_mode_detects_same_size_same_mtime_changes() {
+        let mut local = local(&[("same-metadata.bin", EntryKind::File, 4, 3_000)]);
+        let mut remote = remote(&[("same-metadata.bin", EntryKind::File, 4, 3)]);
+        local
+            .entries
+            .get_mut("same-metadata.bin")
+            .unwrap()
+            .content_md5 = Some(digest(1));
+        remote
+            .entries
+            .get_mut("same-metadata.bin")
+            .unwrap()
+            .content_md5 = Some(digest(2));
+
+        let plan = build_plan(
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &local,
+            &remote,
+            &rules(&[]),
+            &content_options(false, false),
+        )
+        .unwrap();
+        assert_eq!(plan.uploads.len(), 1);
+        assert_eq!(plan.unchanged_files, 0);
+    }
+
+    #[test]
+    fn content_mode_detects_mtime_only_changes_at_file_station_resolution() {
+        let mut local = local(&[("mtime-only.bin", EntryKind::File, 4, 3_999)]);
+        let mut remote = remote(&[("mtime-only.bin", EntryKind::File, 4, 4)]);
+        local.entries.get_mut("mtime-only.bin").unwrap().content_md5 = Some(digest(6));
+        remote
+            .entries
+            .get_mut("mtime-only.bin")
+            .unwrap()
+            .content_md5 = Some(digest(6));
+
+        let plan = build_plan(
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &local,
+            &remote,
+            &rules(&[]),
+            &content_options(false, false),
+        )
+        .unwrap();
+        assert_eq!(plan.uploads.len(), 1);
+        assert_eq!(plan.unchanged_files, 0);
+    }
+
+    #[test]
+    fn unique_cross_parent_content_match_becomes_non_destructive_server_copy() {
+        let mut local = local(&[("new/report.bin", EntryKind::File, 4, 3_000)]);
+        let mut remote = remote(&[("old/report.bin", EntryKind::File, 4, 3)]);
+        local.entries.get_mut("new/report.bin").unwrap().content_md5 = Some(digest(7));
+        remote
+            .entries
+            .get_mut("old/report.bin")
+            .unwrap()
+            .content_md5 = Some(digest(7));
+
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let additive = build_plan(
+            &root,
+            &local,
+            &remote,
+            &rules(&[]),
+            &content_options(false, true),
+        )
+        .unwrap();
+        assert!(additive.uploads.is_empty());
+        assert_eq!(additive.copies.len(), 1);
+        assert!(additive.post_deletes.is_empty());
+        assert_eq!(additive.upload_bytes, 0);
+
+        let mirror = build_plan(
+            &root,
+            &local,
+            &remote,
+            &rules(&[]),
+            &content_options(true, true),
+        )
+        .unwrap();
+        assert_eq!(mirror.copies.len(), 1);
+        assert_eq!(mirror.post_deletes.len(), 1);
+        assert_eq!(mirror.post_deletes[0].relative, "old/report.bin");
+        let guard = mirror.post_deletes[0].destination_guard.as_ref().unwrap();
+        assert_eq!(guard.remote_path, "/share/root/new/report.bin");
+        assert_eq!(guard.expected_size, 4);
+        assert_eq!(guard.expected_mtime_seconds, 3);
+        assert_eq!(guard.local.relative, "new/report.bin");
+    }
+
+    #[test]
+    fn server_copy_candidate_with_wrong_mtime_keeps_upload_fallback() {
+        let mut local = local(&[("new/report.bin", EntryKind::File, 4, 3_000)]);
+        let mut remote = remote(&[("old/report.bin", EntryKind::File, 4, 2)]);
+        local.entries.get_mut("new/report.bin").unwrap().content_md5 = Some(digest(7));
+        remote
+            .entries
+            .get_mut("old/report.bin")
+            .unwrap()
+            .content_md5 = Some(digest(7));
+
+        let plan = build_plan(
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &local,
+            &remote,
+            &rules(&[]),
+            &content_options(false, true),
+        )
+        .unwrap();
+        assert_eq!(plan.uploads.len(), 1);
+        assert!(plan.copies.is_empty());
+    }
+
+    #[test]
+    fn basename_change_keeps_verified_upload_fallback() {
+        let mut local = local(&[("folder/new.bin", EntryKind::File, 4, 3_000)]);
+        let mut remote = remote(&[("folder/old.bin", EntryKind::File, 4, 3)]);
+        local.entries.get_mut("folder/new.bin").unwrap().content_md5 = Some(digest(4));
+        remote
+            .entries
+            .get_mut("folder/old.bin")
+            .unwrap()
+            .content_md5 = Some(digest(4));
+
+        let plan = build_plan(
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &local,
+            &remote,
+            &rules(&[]),
+            &content_options(false, true),
+        )
+        .unwrap();
+        assert_eq!(plan.uploads.len(), 1);
+        assert!(plan.copies.is_empty());
+    }
+
+    #[test]
+    fn duplicate_content_matches_keep_verified_upload_fallback() {
+        let mut local = local(&[("new/report.bin", EntryKind::File, 4, 3_000)]);
+        let mut remote = remote(&[
+            ("old-a/report.bin", EntryKind::File, 4, 3),
+            ("old-b/report.bin", EntryKind::File, 4, 3),
+        ]);
+        local.entries.get_mut("new/report.bin").unwrap().content_md5 = Some(digest(9));
+        for entry in remote.entries.values_mut() {
+            entry.content_md5 = Some(digest(9));
+        }
+
+        let plan = build_plan(
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &local,
+            &remote,
+            &rules(&[]),
+            &content_options(false, true),
+        )
+        .unwrap();
+        assert_eq!(plan.uploads.len(), 1);
+        assert!(plan.copies.is_empty());
+    }
+
+    #[test]
+    fn same_digest_with_different_size_is_never_reused() {
+        let mut local = local(&[("new/report.bin", EntryKind::File, 5, 3_000)]);
+        let mut remote = remote(&[("old/report.bin", EntryKind::File, 4, 3)]);
+        local.entries.get_mut("new/report.bin").unwrap().content_md5 = Some(digest(3));
+        remote
+            .entries
+            .get_mut("old/report.bin")
+            .unwrap()
+            .content_md5 = Some(digest(3));
+
+        let plan = build_plan(
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &local,
+            &remote,
+            &rules(&[]),
+            &content_options(false, true),
+        )
+        .unwrap();
+        assert_eq!(plan.uploads.len(), 1);
+        assert!(plan.copies.is_empty());
+    }
+
+    #[test]
+    fn unavailable_copy_api_does_not_require_remote_only_hashes() {
+        let mut local = local(&[("new/report.bin", EntryKind::File, 4, 3_000)]);
+        let remote = remote(&[("old/report.bin", EntryKind::File, 4, 1)]);
+        local.entries.get_mut("new/report.bin").unwrap().content_md5 = Some(digest(4));
+
+        let plan = build_plan(
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &local,
+            &remote,
+            &rules(&[]),
+            &content_options(false, false),
+        )
+        .unwrap();
+        assert_eq!(plan.uploads.len(), 1);
+        assert!(plan.copies.is_empty());
+    }
+
+    #[test]
+    fn remote_hash_selection_is_minimal_and_protection_aware() {
+        let local = local(&[
+            ("same.bin", EntryKind::File, 4, 1_000),
+            ("new/report.bin", EntryKind::File, 4, 1_000),
+            ("ignored.bin", EntryKind::File, 4, 1_000),
+        ]);
+        let remote = remote(&[
+            ("same.bin", EntryKind::File, 4, 1),
+            ("old/report.bin", EntryKind::File, 4, 1),
+            ("ignored.bin", EntryKind::File, 4, 1),
+            ("other/report.bin", EntryKind::File, 9, 1),
+            ("@eaDir/report.bin", EntryKind::File, 4, 1),
+        ]);
+        let ignore = rules(&["ignored.bin"]);
+
+        assert_eq!(
+            select_remote_content_hashes(&local, &remote, &ignore, false),
+            BTreeSet::from(["same.bin".to_owned()])
+        );
+        assert_eq!(
+            select_remote_content_hashes(&local, &remote, &ignore, true),
+            BTreeSet::from(["old/report.bin".to_owned(), "same.bin".to_owned()])
+        );
+        assert_eq!(
+            select_remote_content_hashes_for_plan(&local, &remote, &ignore, false, true),
+            BTreeSet::from([
+                "old/report.bin".to_owned(),
+                "other/report.bin".to_owned(),
+                "same.bin".to_owned()
+            ])
+        );
     }
 }

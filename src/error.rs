@@ -113,8 +113,30 @@ pub enum Error {
     )]
     DeleteLimit { planned: usize, maximum: usize },
 
-    #[error("source file changed while it was being uploaded: {0:?}")]
+    #[error("source file changed while it was being synchronized: {0:?}")]
     SourceChanged(PathBuf),
+
+    #[error("DSM returned an invalid MD5 content digest")]
+    InvalidContentHash,
+
+    #[error("remote content verification failed for {0:?}")]
+    ContentVerificationFailed(String),
+
+    #[error("remote path {0:?} changed since planning; it was preserved")]
+    RemoteSnapshotChanged(String),
+
+    #[error(
+        "server-side copy was rejected before a task was created; verified upload fallback is safe"
+    )]
+    ServerCopyNotStarted,
+
+    #[error("{operation} did not finish within the configured request timeout")]
+    OperationTimedOut { operation: &'static str },
+
+    #[error(
+        "final reconciliation found {operations} pending in-scope operations; inspect a fresh plan before rerunning"
+    )]
+    ReconciliationPending { operations: usize },
 
     #[error("operation cancelled")]
     Cancelled,

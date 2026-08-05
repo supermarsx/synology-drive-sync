@@ -34,6 +34,52 @@
       "minLength": 1,
       "pattern": "^/"
     },
+    "contentMd5": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "nullableContentMd5": {
+      "oneOf": [
+        { "$ref": "#/$defs/contentMd5" },
+        { "type": "null" }
+      ]
+    },
+    "remoteSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entry_kind", "size", "mtime_seconds", "content_md5", "require_mtime"],
+      "properties": {
+        "entry_kind": { "$ref": "#/$defs/entryKind" },
+        "size": { "$ref": "#/$defs/nonNegativeInteger" },
+        "mtime_seconds": { "type": "integer" },
+        "content_md5": { "$ref": "#/$defs/nullableContentMd5" },
+        "require_mtime": { "type": "boolean" }
+      }
+    },
+    "destinationGuard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "remote_path",
+        "local_relative",
+        "expected_size",
+        "expected_mtime_seconds",
+        "content_md5"
+      ],
+      "properties": {
+        "remote_path": { "$ref": "#/$defs/remotePath" },
+        "local_relative": { "$ref": "#/$defs/relativePath" },
+        "expected_size": { "$ref": "#/$defs/nonNegativeInteger" },
+        "expected_mtime_seconds": { "type": "integer" },
+        "content_md5": { "$ref": "#/$defs/contentMd5" }
+      }
+    },
+    "nullableDestinationGuard": {
+      "oneOf": [
+        { "$ref": "#/$defs/destinationGuard" },
+        { "type": "null" }
+      ]
+    },
     "metrics": {
       "type": "object",
       "additionalProperties": false,
@@ -190,6 +236,8 @@
       "required": [
         "uploads",
         "upload_bytes",
+        "server_copy_fallback_bytes",
+        "server_copies",
         "directories",
         "deletions",
         "unchanged_files",
@@ -199,6 +247,8 @@
       "properties": {
         "uploads": { "$ref": "#/$defs/nonNegativeInteger" },
         "upload_bytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "server_copy_fallback_bytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "server_copies": { "$ref": "#/$defs/nonNegativeInteger" },
         "directories": { "$ref": "#/$defs/nonNegativeInteger" },
         "deletions": { "$ref": "#/$defs/nonNegativeInteger" },
         "unchanged_files": { "$ref": "#/$defs/nonNegativeInteger" },
@@ -209,12 +259,20 @@
     "deletePlanAction": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["relative", "remote_path", "entry_kind", "type_conflict"],
+      "required": [
+        "relative",
+        "remote_path",
+        "entry_kind",
+        "type_conflict",
+        "snapshot_guard"
+      ],
       "properties": {
         "relative": { "$ref": "#/$defs/relativePath" },
         "remote_path": { "$ref": "#/$defs/remotePath" },
         "entry_kind": { "$ref": "#/$defs/entryKind" },
-        "type_conflict": { "type": "boolean" }
+        "type_conflict": { "type": "boolean" },
+        "snapshot_guard": { "$ref": "#/$defs/remoteSnapshot" },
+        "destination_guard": { "$ref": "#/$defs/nullableDestinationGuard" }
       }
     },
     "createPlanAction": {
@@ -222,8 +280,34 @@
       "additionalProperties": false,
       "required": ["relative", "remote_path"],
       "properties": {
-        "relative": { "$ref": "#/$defs/relativePath" },
+        "relative": { "type": "string" },
         "remote_path": { "$ref": "#/$defs/remotePath" }
+      }
+    },
+    "copyPlanAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "from_relative",
+        "from_remote_path",
+        "to_relative",
+        "to_remote_path",
+        "expected_size",
+        "expected_mtime_seconds",
+        "content_md5",
+        "source_snapshot_guard",
+        "verified_upload_fallback"
+      ],
+      "properties": {
+        "from_relative": { "$ref": "#/$defs/relativePath" },
+        "from_remote_path": { "$ref": "#/$defs/remotePath" },
+        "to_relative": { "$ref": "#/$defs/relativePath" },
+        "to_remote_path": { "$ref": "#/$defs/remotePath" },
+        "expected_size": { "$ref": "#/$defs/nonNegativeInteger" },
+        "expected_mtime_seconds": { "type": "integer" },
+        "content_md5": { "$ref": "#/$defs/contentMd5" },
+        "source_snapshot_guard": { "$ref": "#/$defs/remoteSnapshot" },
+        "verified_upload_fallback": { "const": "only-before-copy-task-start" }
       }
     },
     "uploadPlanAction": {
@@ -246,7 +330,7 @@
         "actions": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["pre_deletes", "creates", "uploads", "post_deletes"],
+          "required": ["pre_deletes", "creates", "copies", "uploads", "post_deletes"],
           "properties": {
             "pre_deletes": {
               "type": "array",
@@ -255,6 +339,10 @@
             "creates": {
               "type": "array",
               "items": { "$ref": "#/$defs/createPlanAction" }
+            },
+            "copies": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/copyPlanAction" }
             },
             "uploads": {
               "type": "array",
@@ -274,6 +362,7 @@
       "required": [
         "changed",
         "uploaded",
+        "server_copied",
         "upload_bytes",
         "directories_created",
         "deleted",
@@ -282,6 +371,7 @@
       "properties": {
         "changed": { "type": "boolean" },
         "uploaded": { "$ref": "#/$defs/nonNegativeInteger" },
+        "server_copied": { "$ref": "#/$defs/nonNegativeInteger" },
         "upload_bytes": { "$ref": "#/$defs/nonNegativeInteger" },
         "directories_created": { "$ref": "#/$defs/nonNegativeInteger" },
         "deleted": { "$ref": "#/$defs/nonNegativeInteger" },
@@ -328,6 +418,8 @@
         "kind",
         "uploads",
         "upload_bytes",
+        "server_copy_fallback_bytes",
+        "server_copies",
         "directories",
         "deletions",
         "unchanged_files",
@@ -339,6 +431,8 @@
         "kind": { "const": "summary" },
         "uploads": { "$ref": "#/$defs/nonNegativeInteger" },
         "upload_bytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "server_copy_fallback_bytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "server_copies": { "$ref": "#/$defs/nonNegativeInteger" },
         "directories": { "$ref": "#/$defs/nonNegativeInteger" },
         "deletions": { "$ref": "#/$defs/nonNegativeInteger" },
         "unchanged_files": { "$ref": "#/$defs/nonNegativeInteger" },
@@ -346,16 +440,46 @@
         "changes": { "type": "boolean" }
       }
     },
-    "ndjsonDeleteAction": {
+    "ndjsonPreDeleteAction": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema", "action", "relative", "remote_path", "entry_kind"],
+      "required": [
+        "schema",
+        "action",
+        "relative",
+        "remote_path",
+        "entry_kind",
+        "snapshot_guard"
+      ],
       "properties": {
         "schema": { "const": "sdsync.plan-action.v1" },
-        "action": { "enum": ["delete-conflict", "delete"] },
+        "action": { "const": "delete-conflict" },
         "relative": { "$ref": "#/$defs/relativePath" },
         "remote_path": { "$ref": "#/$defs/remotePath" },
-        "entry_kind": { "$ref": "#/$defs/entryKind" }
+        "entry_kind": { "$ref": "#/$defs/entryKind" },
+        "snapshot_guard": { "$ref": "#/$defs/remoteSnapshot" }
+      }
+    },
+    "ndjsonPostDeleteAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "action",
+        "relative",
+        "remote_path",
+        "entry_kind",
+        "snapshot_guard",
+        "destination_guard"
+      ],
+      "properties": {
+        "schema": { "const": "sdsync.plan-action.v1" },
+        "action": { "const": "delete" },
+        "relative": { "$ref": "#/$defs/relativePath" },
+        "remote_path": { "$ref": "#/$defs/remotePath" },
+        "entry_kind": { "$ref": "#/$defs/entryKind" },
+        "snapshot_guard": { "$ref": "#/$defs/remoteSnapshot" },
+        "destination_guard": { "$ref": "#/$defs/nullableDestinationGuard" }
       }
     },
     "ndjsonCreateAction": {
@@ -365,7 +489,7 @@
       "properties": {
         "schema": { "const": "sdsync.plan-action.v1" },
         "action": { "const": "create-directory" },
-        "relative": { "$ref": "#/$defs/relativePath" },
+        "relative": { "type": "string" },
         "remote_path": { "$ref": "#/$defs/remotePath" }
       }
     },
@@ -382,10 +506,42 @@
         "mtime_ms": { "$ref": "#/$defs/nonNegativeInteger" }
       }
     },
+    "ndjsonCopyAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "action",
+        "from_relative",
+        "from_remote_path",
+        "to_relative",
+        "to_remote_path",
+        "expected_size",
+        "expected_mtime_seconds",
+        "content_md5",
+        "source_snapshot_guard",
+        "verified_upload_fallback"
+      ],
+      "properties": {
+        "schema": { "const": "sdsync.plan-action.v1" },
+        "action": { "const": "copy-remote-content" },
+        "from_relative": { "$ref": "#/$defs/relativePath" },
+        "from_remote_path": { "$ref": "#/$defs/remotePath" },
+        "to_relative": { "$ref": "#/$defs/relativePath" },
+        "to_remote_path": { "$ref": "#/$defs/remotePath" },
+        "expected_size": { "$ref": "#/$defs/nonNegativeInteger" },
+        "expected_mtime_seconds": { "type": "integer" },
+        "content_md5": { "$ref": "#/$defs/contentMd5" },
+        "source_snapshot_guard": { "$ref": "#/$defs/remoteSnapshot" },
+        "verified_upload_fallback": { "const": "only-before-copy-task-start" }
+      }
+    },
     "ndjsonPlanAction": {
       "oneOf": [
-        { "$ref": "#/$defs/ndjsonDeleteAction" },
+        { "$ref": "#/$defs/ndjsonPreDeleteAction" },
+        { "$ref": "#/$defs/ndjsonPostDeleteAction" },
         { "$ref": "#/$defs/ndjsonCreateAction" },
+        { "$ref": "#/$defs/ndjsonCopyAction" },
         { "$ref": "#/$defs/ndjsonUploadAction" }
       ]
     },

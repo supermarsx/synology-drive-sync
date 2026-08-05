@@ -57,6 +57,8 @@ fn root_and_recursive_manpage_modes_are_complete() {
         "synology-drive-sync-credentials-set-totp.1",
         "synology-drive-sync-credentials-status.1",
         "synology-drive-sync-credentials.1",
+        "synology-drive-sync-doctor-source.1",
+        "synology-drive-sync-doctor-target.1",
         "synology-drive-sync-doctor.1",
         "synology-drive-sync-manpage.1",
         "synology-drive-sync-plan.1",
@@ -71,6 +73,54 @@ fn root_and_recursive_manpage_modes_are_complete() {
             .expect("generated manpage is readable UTF-8 roff");
         assert!(text.starts_with(".ie \\n(.g .ds Aq"));
         assert!(text.contains(".SH NAME"));
+    }
+
+    let asserted_controls = [
+        (
+            "synology-drive-sync-sync.1",
+            &[
+                "\\-\\-profiles",
+                "\\-\\-all\\-profiles",
+                "\\-\\-max\\-total\\-delete",
+                "\\-\\-delete",
+                "\\-\\-max\\-delete",
+                "\\-\\-password\\-file",
+                "\\-\\-totp\\-secret\\-file",
+            ][..],
+        ),
+        (
+            "synology-drive-sync-plan.1",
+            &[
+                "\\-\\-profiles",
+                "\\-\\-all\\-profiles",
+                "\\-\\-max\\-total\\-delete",
+                "\\-\\-exit\\-code",
+            ][..],
+        ),
+        (
+            "synology-drive-sync-doctor.1",
+            &[
+                "\\-\\-profiles",
+                "\\-\\-all\\-profiles",
+                "\\-\\-routing\\-only",
+                "\\-\\-totp\\-secret\\-file",
+            ][..],
+        ),
+        ("synology-drive-sync-doctor-source.1", &["\\-\\-hash"]),
+        (
+            "synology-drive-sync-doctor-target.1",
+            &["\\-\\-write\\-test"],
+        ),
+    ];
+    for (name, controls) in asserted_controls {
+        let text = fs::read_to_string(output_directory.join(name))
+            .expect("generated control-bearing manpage is readable UTF-8 roff");
+        for control in controls {
+            assert!(
+                text.contains(control),
+                "generated {name} omitted the {control} control"
+            );
+        }
     }
 
     fs::remove_dir_all(&output_directory).expect("remove isolated manpage test directory");

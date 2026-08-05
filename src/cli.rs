@@ -18,7 +18,7 @@ const ROOT_LONG_ABOUT: &str = "Push one local folder into a Synology Drive-backe
 
 const ROOT_EXAMPLES: &str = "Examples:\n  synology-drive-sync sync ./export /team/export --url https://files.example.com --username mirror-bot\n  synology-drive-sync plan ./export /team/export --profile production --delete --output json\n  synology-drive-sync doctor --profile production\n  synology-drive-sync config validate --profile production\n  synology-drive-sync credentials set-password --profile production\n  synology-drive-sync completions powershell\n  synology-drive-sync manpage > synology-drive-sync.1\n  synology-drive-sync manpage --all ./man\n\nLegacy compatibility:\n  synology-drive-sync ./export /team/export --url https://files.example.com --username mirror-bot\n\nSecrets are never accepted as command-line or TOML values. Configuration may contain only paths to secret files. See `credentials --help` and the Authentication options.";
 
-const SYNC_LONG_ABOUT: &str = "Make the remote File Station folder converge toward the local source. Missing and changed files are uploaded, and empty local directories are created. Remote-only entries are preserved by default. With --delete, the command plans an exact one-way mirror subject to deletion guards.\n\nSOURCE and REMOTE may come from positional arguments or the selected non-secret profile. CLI values override environment values, which override profile values. The local source is never modified.";
+const SYNC_LONG_ABOUT: &str = "Make the remote File Station folder converge toward the local source. Missing and changed files are uploaded, and empty local directories are created. Remote-only entries are preserved by default. With --delete, the command plans an exact one-way mirror subject to deletion guards.\n\nSOURCE and REMOTE may come from positional arguments or the selected non-secret profile. CLI values override environment values, which override profile values. The local source is never modified. Select multiple complete profile jobs with --profiles or --all-profiles; every job is preflighted before sequential mutation.";
 
 const SYNC_EXAMPLES: &str = "Examples:\n  synology-drive-sync sync ./build /team/releases --profile nas\n  synology-drive-sync sync ./photos /home/Drive/photos --url https://files.example.com --username alice --jobs 4\n  synology-drive-sync sync ./export /team/export --delete --max-delete 25 --progress always\n  printf '%s\\n' \"$DSM_PASSWORD\" | synology-drive-sync sync ./export /team/export --password-stdin --no-vault";
 
@@ -26,9 +26,9 @@ const PLAN_LONG_ABOUT: &str = "Discover and authenticate to File Station, scan b
 
 const PLAN_EXAMPLES: &str = "Examples:\n  synology-drive-sync plan ./export /team/export --profile nas\n  synology-drive-sync plan --profile production --delete --output json\n  synology-drive-sync plan ./export /team/export --compare size-only --exclude '*.tmp' --output ndjson\n  synology-drive-sync plan --profile production --exit-code || test $? -eq 10";
 
-const DOCTOR_LONG_ABOUT: &str = "Validate the selected profile and network settings, probe reverse-proxy routing, discover the required DSM/File Station APIs, and optionally authenticate and check a remote path. Doctor must not upload, create, overwrite, or delete content.\n\nUse --routing-only when credentials are intentionally unavailable. Without it, normal password and TOTP resolution applies.";
+const DOCTOR_LONG_ABOUT: &str = "Validate local sources, selected profiles, reverse-proxy routing, required DSM/File Station APIs, authentication, and remote destinations. The default and `target` checks are non-mutating. `target --write-test` is an explicit opt-in disposable create/upload/copy/verify/cleanup probe and must be used only on a prepared non-critical destination.\n\nUse `source` for a local-only scan, --routing-only when credentials are intentionally unavailable, or `target` for an exact destination check. Without --routing-only, normal password and TOTP resolution applies.";
 
-const DOCTOR_EXAMPLES: &str = "Examples:\n  synology-drive-sync doctor --profile production\n  synology-drive-sync doctor --url https://files.example.com --username mirror-bot --routing-only\n  synology-drive-sync doctor --profile production --remote /team/export --output json";
+const DOCTOR_EXAMPLES: &str = "Examples:\n  synology-drive-sync doctor source ./export --hash --output json\n  synology-drive-sync doctor --url https://files.example.com --username mirror-bot --routing-only\n  synology-drive-sync doctor --profile production target /team/export --output json\n  synology-drive-sync doctor --profile acceptance target --write-test\n  synology-drive-sync doctor --config ./config.toml --profiles nas-a,nas-b target --output ndjson";
 
 /// Full CLI parser. An absent subcommand represents the legacy sync form.
 #[derive(Debug, Parser)]
@@ -243,6 +243,43 @@ pub struct SyncArgs {
 
     #[command(flatten)]
     pub network: NetworkArgs,
+
+    #[command(flatten)]
+    pub batch: BatchArgs,
+}
+
+/// Select complete named profile jobs for one preflighted sequential batch.
+#[derive(Debug, Args, Default)]
+pub struct BatchArgs {
+    /// Select comma-separated profile jobs. May be repeated; execution is deterministic by profile name.
+    #[arg(
+        long,
+        value_name = "NAME[,NAME...]",
+        value_delimiter = ',',
+        action = ArgAction::Append,
+        conflicts_with = "all_profiles",
+        help_heading = "Batch"
+    )]
+    pub profiles: Vec<String>,
+
+    /// Select every named profile in deterministic configuration order.
+    #[arg(long, conflicts_with = "profiles", help_heading = "Batch")]
+    pub all_profiles: bool,
+
+    /// Refuse a batch whose combined planned deletions exceed N.
+    #[arg(
+        long,
+        env = "SDSYNC_MAX_TOTAL_DELETE",
+        value_name = "N",
+        help_heading = "Batch"
+    )]
+    pub max_total_delete: Option<usize>,
+}
+
+impl BatchArgs {
+    pub fn requested(&self) -> bool {
+        self.all_profiles || !self.profiles.is_empty()
+    }
 }
 
 #[derive(Debug, Args)]
@@ -372,7 +409,7 @@ pub struct NetworkArgs {
     )]
     pub retries: Option<u8>,
 
-    /// Per-request timeout in seconds; it must cover the largest upload.
+    /// Upload/background-operation timeout in seconds; it must cover the largest upload. Control-plane requests are capped at 10 seconds.
     #[arg(
         long,
         env = "SDSYNC_TIMEOUT",
@@ -552,6 +589,9 @@ pub struct DoctorArgs {
     #[command(flatten)]
     pub network: NetworkArgs,
 
+    #[command(flatten)]
+    pub batch: BatchArgs,
+
     /// Optionally validate access to this File Station logical path.
     #[arg(
         long,
@@ -564,6 +604,48 @@ pub struct DoctorArgs {
     /// Stop after TLS, reverse-proxy, and API-discovery checks; do not authenticate.
     #[arg(long, help_heading = "Safety")]
     pub routing_only: bool,
+
+    #[command(subcommand)]
+    pub action: Option<DoctorAction>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DoctorAction {
+    /// Validate a local source without contacting DSM or modifying any file.
+    Source(DoctorSourceArgs),
+    /// Diagnose one File Station destination; optionally run a disposable write probe.
+    Target(DoctorTargetArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DoctorSourceArgs {
+    /// Local source folder; may instead come from each selected profile.
+    #[arg(value_name = "SOURCE", help_heading = "Source diagnostic")]
+    pub source: Option<PathBuf>,
+
+    /// Read every payload file and verify a stable MD5 snapshot.
+    #[arg(long, help_heading = "Source diagnostic")]
+    pub hash: bool,
+
+    /// Add a gitignore-style exclusion for this diagnostic. May be repeated.
+    #[arg(
+        long = "exclude",
+        value_name = "PATTERN",
+        action = ArgAction::Append,
+        help_heading = "Source diagnostic"
+    )]
+    pub excludes: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct DoctorTargetArgs {
+    /// File Station logical destination; may instead come from each selected profile.
+    #[arg(value_name = "REMOTE", help_heading = "Target diagnostic")]
+    pub remote: Option<String>,
+
+    /// Create, upload, verify, optionally server-copy, and remove a unique disposable probe.
+    #[arg(long, help_heading = "Target diagnostic")]
+    pub write_test: bool,
 }
 
 #[derive(Debug, Args)]
@@ -719,6 +801,7 @@ pub struct ManpageArgs {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CompareArg {
+    Content,
     Metadata,
     SizeOnly,
 }
@@ -1083,5 +1166,178 @@ mod tests {
         ] {
             assert!(help.contains(subcommand));
         }
+    }
+
+    #[test]
+    fn parses_doctor_source_and_target_diagnostics() {
+        let source_cli = Cli::try_parse_checked_from([
+            "synology-drive-sync",
+            "doctor",
+            "source",
+            "./payload",
+            "--hash",
+            "--exclude",
+            "*.tmp",
+            "--exclude",
+            "cache/**",
+            "--output",
+            "json",
+        ])
+        .unwrap();
+        let Invocation::Doctor(source_doctor) = source_cli.invocation() else {
+            panic!("expected doctor invocation");
+        };
+        let Some(DoctorAction::Source(source)) = source_doctor.action.as_ref() else {
+            panic!("expected doctor source action");
+        };
+        assert_eq!(
+            source.source.as_deref(),
+            Some(std::path::Path::new("./payload"))
+        );
+        assert!(source.hash);
+        assert_eq!(source.excludes, ["*.tmp", "cache/**"]);
+        assert_eq!(source_cli.global.output.output, Some(OutputFormat::Json));
+
+        let target_cli = Cli::try_parse_checked_from([
+            "synology-drive-sync",
+            "doctor",
+            "--url",
+            "https://files.example.test",
+            "--username",
+            "mirror-bot",
+            "target",
+            "/team/export",
+            "--write-test",
+        ])
+        .unwrap();
+        let Invocation::Doctor(target_doctor) = target_cli.invocation() else {
+            panic!("expected doctor invocation");
+        };
+        let Some(DoctorAction::Target(target)) = target_doctor.action.as_ref() else {
+            panic!("expected doctor target action");
+        };
+        assert_eq!(target.remote.as_deref(), Some("/team/export"));
+        assert!(target.write_test);
+    }
+
+    #[test]
+    fn batch_profile_selection_parses_csv_repetition_and_total_delete_cap() {
+        let cli = Cli::try_parse_checked_from([
+            "synology-drive-sync",
+            "sync",
+            "--profiles",
+            "alpha,beta",
+            "--profiles",
+            "gamma",
+            "--max-total-delete",
+            "17",
+        ])
+        .unwrap();
+        let Invocation::Sync { arguments, .. } = cli.invocation() else {
+            panic!("expected sync invocation");
+        };
+        assert_eq!(arguments.batch.profiles, ["alpha", "beta", "gamma"]);
+        assert!(!arguments.batch.all_profiles);
+        assert_eq!(arguments.batch.max_total_delete, Some(17));
+        assert!(arguments.batch.requested());
+
+        let doctor_cli = Cli::try_parse_checked_from([
+            "synology-drive-sync",
+            "doctor",
+            "--profiles",
+            "alpha,beta",
+            "--profiles",
+            "gamma",
+            "target",
+        ])
+        .unwrap();
+        let Invocation::Doctor(doctor) = doctor_cli.invocation() else {
+            panic!("expected doctor invocation");
+        };
+        assert_eq!(doctor.batch.profiles, ["alpha", "beta", "gamma"]);
+        assert!(matches!(
+            doctor.action.as_ref(),
+            Some(DoctorAction::Target(_))
+        ));
+    }
+
+    #[test]
+    fn all_profiles_and_total_delete_cap_parse_for_plan() {
+        let cli = Cli::try_parse_checked_from([
+            "synology-drive-sync",
+            "plan",
+            "--all-profiles",
+            "--max-total-delete",
+            "23",
+        ])
+        .unwrap();
+        let Invocation::Plan(arguments) = cli.invocation() else {
+            panic!("expected plan invocation");
+        };
+        assert!(arguments.sync.batch.all_profiles);
+        assert!(arguments.sync.batch.profiles.is_empty());
+        assert_eq!(arguments.sync.batch.max_total_delete, Some(23));
+        assert!(arguments.sync.batch.requested());
+    }
+
+    #[test]
+    fn batch_conflicts_and_invalid_doctor_positionals_are_rejected() {
+        let conflict = Cli::try_parse_checked_from([
+            "synology-drive-sync",
+            "sync",
+            "--profiles",
+            "alpha",
+            "--all-profiles",
+        ])
+        .unwrap_err();
+        assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        for arguments in [
+            vec!["synology-drive-sync", "doctor", "/team/export"],
+            vec!["synology-drive-sync", "doctor", "source", "./one", "./two"],
+            vec!["synology-drive-sync", "doctor", "target", "/one", "/two"],
+            vec!["synology-drive-sync", "doctor", "source", "--write-test"],
+            vec!["synology-drive-sync", "doctor", "target", "--hash"],
+        ] {
+            let parsed = Cli::try_parse_checked_from(arguments.iter().copied());
+            assert!(parsed.is_err(), "accepted invalid arguments {arguments:?}");
+        }
+    }
+
+    #[test]
+    fn diagnostic_and_batch_help_exposes_safety_controls() {
+        let mut command = Cli::command();
+        let doctor = command.find_subcommand_mut("doctor").unwrap();
+        let mut doctor_bytes = Vec::new();
+        doctor.write_long_help(&mut doctor_bytes).unwrap();
+        let doctor_help = String::from_utf8(doctor_bytes).unwrap();
+        assert!(doctor_help.contains("source"));
+        assert!(doctor_help.contains("target"));
+
+        let source = doctor.find_subcommand_mut("source").unwrap();
+        let mut source_bytes = Vec::new();
+        source.write_long_help(&mut source_bytes).unwrap();
+        let source_help = String::from_utf8(source_bytes).unwrap();
+        assert!(source_help.contains("--hash"));
+        assert!(source_help.contains("--exclude"));
+
+        let target = doctor.find_subcommand_mut("target").unwrap();
+        let mut target_bytes = Vec::new();
+        target.write_long_help(&mut target_bytes).unwrap();
+        let target_help = String::from_utf8(target_bytes).unwrap();
+        assert!(target_help.contains("--write-test"));
+        assert!(target_help.contains("disposable"));
+
+        let sync = command.find_subcommand_mut("sync").unwrap();
+        let mut sync_bytes = Vec::new();
+        sync.write_long_help(&mut sync_bytes).unwrap();
+        let sync_help = String::from_utf8(sync_bytes).unwrap();
+        for option in ["--profiles", "--all-profiles", "--max-total-delete"] {
+            assert!(
+                sync_help.contains(option),
+                "missing {option:?} in:\n{sync_help}"
+            );
+        }
+        assert!(sync_help.contains("deterministic by profile name"));
     }
 }

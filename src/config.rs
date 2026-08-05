@@ -29,6 +29,7 @@ pub const DEFAULT_MAX_DELETE: usize = 100;
 pub const DEFAULT_RETRIES: u8 = 2;
 pub const DEFAULT_TIMEOUT_SECONDS: u64 = 7200;
 pub const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 15;
+pub const DEFAULT_MAX_TOTAL_DELETE: usize = 100;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -291,7 +292,7 @@ impl NonSecretProfileView {
             password_file: profile.password_file.clone(),
             totp_secret_file: profile.totp_secret_file.clone(),
             no_vault: profile.no_vault.unwrap_or(false),
-            compare: profile.compare.unwrap_or(CompareArg::Metadata),
+            compare: profile.compare.unwrap_or(CompareArg::Content),
             jobs: profile.jobs.unwrap_or(DEFAULT_JOBS),
             excludes: profile.excludes.clone(),
             delete: profile.delete.unwrap_or(false),
@@ -412,10 +413,21 @@ pub struct ResolvedSync {
 pub struct ResolvedDoctor {
     pub remote: Option<String>,
     pub routing_only: bool,
+    pub compare: CompareArg,
+    pub delete: bool,
+    pub write_test: bool,
     pub url: String,
     pub username: Option<String>,
     pub authentication: ResolvedAuthentication,
     pub network: ResolvedNetwork,
+    pub output: ResolvedOutput,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedSourceDoctor {
+    pub source: PathBuf,
+    pub excludes: Vec<String>,
+    pub hash_content: bool,
     pub output: ResolvedOutput,
 }
 
@@ -488,13 +500,63 @@ pub fn resolve_doctor(
     if !arguments.routing_only && username.is_none() {
         return Err(ConfigError::MissingValue("--username"));
     }
+    let (action_remote, write_test) = match arguments.action.as_ref() {
+        Some(crate::cli::DoctorAction::Target(target)) => {
+            (target.remote.clone(), target.write_test)
+        }
+        Some(crate::cli::DoctorAction::Source(_)) => {
+            return Err(ConfigError::Invalid(
+                "doctor source must be resolved as a local-only diagnostic".to_owned(),
+            ));
+        }
+        None => (None, false),
+    };
+    if arguments.routing_only && arguments.action.is_some() {
+        return Err(ConfigError::Invalid(
+            "--routing-only cannot be combined with a doctor source or target subcommand"
+                .to_owned(),
+        ));
+    }
+    let remote = action_remote
+        .or_else(|| arguments.remote.clone())
+        .or_else(|| profile.remote.clone());
+    if write_test && remote.is_none() {
+        return Err(ConfigError::Invalid(
+            "doctor target --write-test requires REMOTE or a profile remote".to_owned(),
+        ));
+    }
     Ok(ResolvedDoctor {
-        remote: arguments.remote.clone().or_else(|| profile.remote.clone()),
+        remote,
         routing_only: arguments.routing_only,
+        compare: profile.compare.unwrap_or(CompareArg::Content),
+        delete: profile.delete.unwrap_or(false),
+        write_test,
         url,
         username,
         authentication: resolve_authentication(profile, &arguments.authentication),
         network,
+        output: resolve_output(profile, output)?,
+    })
+}
+
+pub fn resolve_source_doctor(
+    profile: Option<&Profile>,
+    arguments: &crate::cli::DoctorSourceArgs,
+    output: &OutputArgs,
+) -> Result<ResolvedSourceDoctor, ConfigError> {
+    let fallback = Profile::default();
+    let profile = profile.unwrap_or(&fallback);
+    let source = arguments
+        .source
+        .clone()
+        .or_else(|| profile.source.clone())
+        .ok_or(ConfigError::MissingValue("SOURCE"))?;
+    let mut excludes = profile.excludes.clone();
+    excludes.extend(arguments.excludes.iter().cloned());
+    Ok(ResolvedSourceDoctor {
+        source,
+        excludes,
+        hash_content: arguments.hash,
         output: resolve_output(profile, output)?,
     })
 }
@@ -681,7 +743,7 @@ fn resolve_behavior(
         compare: arguments
             .compare
             .or(profile.compare)
-            .unwrap_or(CompareArg::Metadata),
+            .unwrap_or(CompareArg::Content),
         jobs,
         excludes,
     })
@@ -879,7 +941,7 @@ mod tests {
     use clap::Parser;
 
     use super::*;
-    use crate::cli::{Cli, Invocation};
+    use crate::cli::{Cli, DoctorAction, Invocation};
 
     const CONFIG: &str = r#"
 default-profile = "production"
@@ -1217,5 +1279,164 @@ output = "json"
             loaded.select_profile(Some("missing")),
             Err(ConfigError::MissingProfile(name)) if name == "missing"
         ));
+    }
+
+    #[test]
+    fn doctor_inherits_selected_profile_integrity_and_delete_capabilities() {
+        let profile = Profile {
+            compare: Some(CompareArg::Metadata),
+            delete: Some(true),
+            ..Profile::default()
+        };
+        let cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "doctor",
+            "--url",
+            "https://files.example.test",
+            "--routing-only",
+        ])
+        .unwrap();
+        let Invocation::Doctor(arguments) = cli.invocation() else {
+            panic!("expected doctor");
+        };
+        let resolved = resolve_doctor(Some(&profile), arguments, &cli.global.output).unwrap();
+        assert_eq!(resolved.compare, CompareArg::Metadata);
+        assert!(resolved.delete);
+    }
+
+    #[test]
+    fn source_doctor_resolves_cli_overrides_and_profile_defaults() {
+        let profile = Profile {
+            source: Some(PathBuf::from("profile-source")),
+            excludes: vec!["profile-cache/**".to_owned()],
+            output: Some(OutputFormat::Ndjson),
+            ..Profile::default()
+        };
+        let cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "doctor",
+            "source",
+            "./cli-source",
+            "--hash",
+            "--exclude",
+            "*.tmp",
+            "--output",
+            "json",
+        ])
+        .unwrap();
+        let Invocation::Doctor(arguments) = cli.invocation() else {
+            panic!("expected doctor invocation");
+        };
+        let Some(DoctorAction::Source(source)) = arguments.action.as_ref() else {
+            panic!("expected doctor source action");
+        };
+        let resolved = resolve_source_doctor(Some(&profile), source, &cli.global.output).unwrap();
+        assert_eq!(resolved.source, PathBuf::from("./cli-source"));
+        assert_eq!(resolved.excludes, ["profile-cache/**", "*.tmp"]);
+        assert!(resolved.hash_content);
+        assert_eq!(resolved.output.output, OutputFormat::Json);
+
+        let fallback_cli =
+            Cli::try_parse_from(["synology-drive-sync", "doctor", "source"]).unwrap();
+        let Invocation::Doctor(fallback_arguments) = fallback_cli.invocation() else {
+            panic!("expected doctor invocation");
+        };
+        let Some(DoctorAction::Source(fallback_source)) = fallback_arguments.action.as_ref() else {
+            panic!("expected doctor source action");
+        };
+        let fallback =
+            resolve_source_doctor(Some(&profile), fallback_source, &fallback_cli.global.output)
+                .unwrap();
+        assert_eq!(fallback.source, PathBuf::from("profile-source"));
+        assert_eq!(fallback.excludes, ["profile-cache/**"]);
+        assert!(!fallback.hash_content);
+        assert_eq!(fallback.output.output, OutputFormat::Ndjson);
+    }
+
+    #[test]
+    fn source_doctor_requires_a_cli_or_profile_source() {
+        let cli = Cli::try_parse_from(["synology-drive-sync", "doctor", "source"]).unwrap();
+        let Invocation::Doctor(arguments) = cli.invocation() else {
+            panic!("expected doctor invocation");
+        };
+        let Some(DoctorAction::Source(source)) = arguments.action.as_ref() else {
+            panic!("expected doctor source action");
+        };
+        assert!(matches!(
+            resolve_source_doctor(None, source, &cli.global.output),
+            Err(ConfigError::MissingValue("SOURCE"))
+        ));
+    }
+
+    #[test]
+    fn target_doctor_write_test_is_opt_in_and_uses_resolved_remote() {
+        let profile = Profile {
+            remote: Some("/team/profile".to_owned()),
+            url: Some("https://files.example.test/proxy".to_owned()),
+            username: Some("mirror-bot".to_owned()),
+            ..Profile::default()
+        };
+
+        let write_cli =
+            Cli::try_parse_from(["synology-drive-sync", "doctor", "target", "--write-test"])
+                .unwrap();
+        let Invocation::Doctor(write_arguments) = write_cli.invocation() else {
+            panic!("expected doctor invocation");
+        };
+        let write =
+            resolve_doctor(Some(&profile), write_arguments, &write_cli.global.output).unwrap();
+        assert_eq!(write.remote.as_deref(), Some("/team/profile"));
+        assert!(write.write_test);
+
+        let explicit_cli =
+            Cli::try_parse_from(["synology-drive-sync", "doctor", "target", "/team/explicit"])
+                .unwrap();
+        let Invocation::Doctor(explicit_arguments) = explicit_cli.invocation() else {
+            panic!("expected doctor invocation");
+        };
+        let explicit = resolve_doctor(
+            Some(&profile),
+            explicit_arguments,
+            &explicit_cli.global.output,
+        )
+        .unwrap();
+        assert_eq!(explicit.remote.as_deref(), Some("/team/explicit"));
+        assert!(!explicit.write_test);
+
+        let default_cli = Cli::try_parse_from(["synology-drive-sync", "doctor"]).unwrap();
+        let Invocation::Doctor(default_arguments) = default_cli.invocation() else {
+            panic!("expected doctor invocation");
+        };
+        let default = resolve_doctor(
+            Some(&profile),
+            default_arguments,
+            &default_cli.global.output,
+        )
+        .unwrap();
+        assert_eq!(default.remote.as_deref(), Some("/team/profile"));
+        assert!(!default.write_test);
+        assert_eq!(default.compare, CompareArg::Content);
+        assert!(!default.delete);
+    }
+
+    #[test]
+    fn target_doctor_write_test_rejects_a_missing_destination() {
+        let cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "doctor",
+            "--url",
+            "https://files.example.test",
+            "--username",
+            "mirror-bot",
+            "target",
+            "--write-test",
+        ])
+        .unwrap();
+        let Invocation::Doctor(arguments) = cli.invocation() else {
+            panic!("expected doctor invocation");
+        };
+        let error = resolve_doctor(None, arguments, &cli.global.output).unwrap_err();
+        assert!(matches!(error, ConfigError::Invalid(_)));
+        assert!(error.to_string().contains("write-test requires REMOTE"));
     }
 }
