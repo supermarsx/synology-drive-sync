@@ -554,7 +554,8 @@ impl Scenario {
     }
 
     /// A purely additive mirror. Progress rendering is suppressed whenever command output is
-    /// machine readable, so the progress sample needs its own run with real work to do.
+    /// machine readable, so the progress sample needs its own run with real work to do; running
+    /// it twice also reaches both the executed and the unchanged sync-document branches.
     fn additive(label: &str) -> Self {
         let fixture = TestDir::new(label);
         let server = MockFileStation::start();
@@ -563,24 +564,6 @@ impl Scenario {
         fixture.write("source/one.txt", b"first payload");
         fixture.write("source/nested/two.bin", b"second payload");
         server.add_directory(remote);
-
-        Self::assemble(fixture, server, remote)
-    }
-
-    /// A mirror that already matches, so plan and sync take the no-change branch that emits
-    /// the schema's `unchangedResult` and unchanged completion shapes.
-    fn already_in_sync(label: &str) -> Self {
-        let fixture = TestDir::new(label);
-        let server = MockFileStation::start();
-        let remote = "/team/in-sync";
-
-        let settled = fixture.write("source/settled.txt", b"settled");
-        server.add_directory(remote);
-        server.add_file(
-            &format!("{remote}/settled.txt"),
-            b"settled",
-            modified_seconds(&settled),
-        );
 
         Self::assemble(fixture, server, remote)
     }
@@ -926,16 +909,27 @@ fn real_retry_and_failure_records_conform_to_the_shipped_schema() {
     );
 }
 
+/// `sdsync.sync.v1` carries two mutually exclusive result shapes. Reconciling the same mirror
+/// twice reaches both from the real emitter: an execution report, then the unchanged form.
 #[test]
-fn real_unchanged_sync_document_conforms_to_the_shipped_schema() {
+fn real_sync_json_documents_conform_to_the_shipped_schema() {
     let schema = parsed_schema();
-    let scenario = Scenario::already_in_sync("schema-real-unchanged");
+    let scenario = Scenario::additive("schema-real-sync-document");
+    let machine = ["--quiet", "--progress", "never", "--output", "json", "sync"];
 
-    let source = "sync --output json (already in sync)";
-    let (stdout, _) = scenario.run(
-        &["--quiet", "--progress", "never", "--output", "json", "sync"],
-        &[],
+    let source = "sync --output json";
+    let (stdout, _) = scenario.run(&machine, &[]);
+    let document = json_document(&stdout, source);
+    assert_real_output_valid(&schema, &document, source);
+    assert_eq!(document["schema"], "sdsync.sync.v1");
+    assert_eq!(document["result"]["changed"], true);
+    assert!(
+        document["result"]["elapsed_ms"].is_number(),
+        "the executed branch must carry a full execution report: {document}"
     );
+
+    let source = "sync --output json (already reconciled)";
+    let (stdout, _) = scenario.run(&machine, &[]);
     let document = json_document(&stdout, source);
     assert_real_output_valid(&schema, &document, source);
     assert_eq!(document["schema"], "sdsync.sync.v1");
