@@ -4849,6 +4849,50 @@ mod tests {
         assert!(!continue_after_progress_event(&cancellation, &failure));
     }
 
+    /// Poisons `mutex` by panicking while holding its lock on a scoped thread, then swallows
+    /// the resulting join error. This is the deliberate fault-injection path for the assertions
+    /// below: no production seam is needed because the state these helpers act on is already
+    /// taken by reference.
+    fn poison<T: Send>(mutex: &Mutex<T>) {
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let _guard = mutex.lock().unwrap();
+                panic!("deliberately poisoning mutex for test coverage");
+            });
+            let _ = handle.join();
+        });
+    }
+
+    #[test]
+    fn progress_state_helpers_fail_safe_when_their_mutex_is_poisoned() {
+        let last_render = Mutex::new(Instant::now());
+        poison(&last_render);
+        assert!(last_render.is_poisoned());
+        // render_is_due treats a poisoned clock as "due": rendering degrades gracefully
+        // instead of silently freezing progress output.
+        assert!(render_is_due(&last_render));
+
+        let failure: Mutex<Option<String>> = Mutex::new(None);
+        poison(&failure);
+        assert!(failure.is_poisoned());
+        // record_progress_failure cannot record into a poisoned slot; it silently no-ops
+        // rather than panicking or propagating the poison.
+        record_progress_failure(&failure, "dropped because the lock is poisoned".to_owned());
+        // has_progress_failure fails closed: a poisoned lock reads as "a failure occurred".
+        assert!(has_progress_failure(&failure));
+        assert!(matches!(
+            take_recorded_failure(&failure),
+            Err(Error::Message(message))
+                if message == "observability failure lock was poisoned"
+        ));
+
+        let cancellation = CancellationToken::default();
+        // has_progress_failure() reads true, so continue_after_progress_event cancels and
+        // reports "stop" even though nothing ever called cancellation.cancel() directly.
+        assert!(!continue_after_progress_event(&cancellation, &failure));
+        assert!(cancellation.is_cancelled());
+    }
+
     #[test]
     fn file_logger_and_error_adapters_preserve_classification_without_global_output() {
         let nonce = SystemTime::now()

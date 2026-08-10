@@ -368,7 +368,8 @@ pub struct SyncBehaviorArgs {
         long = "exclude",
         value_name = "PATTERN",
         action = ArgAction::Append,
-        help_heading = "Sync"
+        help_heading = "Sync",
+        long_help = "Add a gitignore-style exclusion; may be repeated. Patterns are matched in the order given, and a pattern beginning with `!` negates a prior match instead of excluding it, exactly like a .gitignore line. This makes it possible to exclude everything and then re-include a narrow subset. For example, `--exclude '*' --exclude '!*.pdf'` excludes every file except PDFs."
     )]
     pub excludes: Vec<String>,
 }

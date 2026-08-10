@@ -455,6 +455,25 @@ mod tests {
         path
     }
 
+    // Directory junctions (Windows) and symlinks (Unix) are the two portable ways to build a
+    // reparse point without elevated privileges or Developer Mode; Windows symlinks require
+    // both and would make CI flaky on unprivileged runners, so junctions stand in for them here.
+    #[cfg(windows)]
+    fn try_make_link(link: &Path, target: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    fn try_make_link(link: &Path, target: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
     #[test]
     fn scan_is_deterministic_and_honors_rules() {
         let root = temp_dir("scan");
@@ -539,6 +558,83 @@ mod tests {
         ));
 
         fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_link_as_the_source_root() {
+        let parent = temp_dir("link-root");
+        let target = parent.join("target");
+        fs::create_dir(&target).unwrap();
+        let link = parent.join("link");
+        if !try_make_link(&link, &target) {
+            eprintln!("skipping rejects_a_link_as_the_source_root: could not create a link");
+            fs::remove_dir_all(parent).unwrap();
+            return;
+        }
+
+        assert!(matches!(
+            IgnoreRules::build(&link, &[]),
+            Err(Error::UnsupportedLocalEntry { path, reason })
+                if path == link && reason.contains("symbolic link")
+        ));
+        let rules = IgnoreRules::build(&target, &[]).unwrap();
+        assert!(matches!(
+            scan(&link, &rules),
+            Err(Error::UnsupportedLocalEntry { path, reason })
+                if path == link && reason.contains("symbolic link")
+        ));
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn scan_rejects_a_link_within_the_source_tree() {
+        let root = temp_dir("link-child");
+        let outside = temp_dir("link-child-target");
+        fs::write(outside.join("payload.txt"), b"payload").unwrap();
+        let link = root.join("linked");
+        if !try_make_link(&link, &outside) {
+            eprintln!(
+                "skipping scan_rejects_a_link_within_the_source_tree: could not create a link"
+            );
+            fs::remove_dir_all(root).unwrap();
+            fs::remove_dir_all(outside).unwrap();
+            return;
+        }
+        let expected_link_path = fs::canonicalize(&root).unwrap().join("linked");
+
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        assert!(matches!(
+            scan(&root, &rules),
+            Err(Error::UnsupportedLocalEntry { path, reason })
+                if path == expected_link_path && reason.contains("not followed")
+        ));
+
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn scan_rejects_case_colliding_entries_on_case_sensitive_filesystems() {
+        let root = temp_dir("case-collision-scan");
+        fs::write(root.join("Config.txt"), b"a").unwrap();
+        fs::write(root.join("config.txt"), b"b").unwrap();
+        if fs::read_dir(&root).unwrap().count() < 2 {
+            // The filesystem folded the two names together (the default on Windows and
+            // macOS), so there is nothing left to collide. Skip on this platform.
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let expected_path = fs::canonicalize(&root).unwrap().join("config.txt");
+
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        assert!(matches!(
+            scan(&root, &rules),
+            Err(Error::UnsupportedLocalEntry { path, reason })
+                if path == expected_path && reason.contains("differ only by case")
+        ));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -684,6 +780,18 @@ mod tests {
         assert!(!rules.is_ignored("folder/keep.txt", false));
         assert_eq!(EntryKind::File.as_str(), "file");
         assert_eq!(EntryKind::Directory.as_str(), "directory");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exclude_negation_reincludes_a_narrower_pattern() {
+        // `IgnoreRules::build` feeds every `--exclude` value to `GitignoreBuilder::add_line`,
+        // which honors gitignore `!` negation. This pins that a leading `!` re-includes a
+        // narrower match from an earlier, broader exclusion (documented on --exclude).
+        let root = temp_dir("exclude-negation");
+        let rules = IgnoreRules::build(&root, &["*".to_owned(), "!*.pdf".to_owned()]).unwrap();
+        assert!(rules.is_ignored("notes.txt", false));
+        assert!(!rules.is_ignored("report.pdf", false));
         fs::remove_dir_all(root).unwrap();
     }
 
