@@ -25,6 +25,12 @@ jobs:
         run: bash .github/scripts/run-cargo-audit.sh
       - name: Reproduce third-party notices from Cargo.lock
         run: bash .github/scripts/generate-third-party-notices.sh "$RUNNER_TEMP/THIRD_PARTY_LICENSES.html"
+      - name: TEMP diagnostic diff (to be reverted, not for merge)
+        run: |
+          echo "committed sha256: $(sha256sum THIRD_PARTY_LICENSES.html)"
+          echo "generated sha256: $(sha256sum "$RUNNER_TEMP/THIRD_PARTY_LICENSES.html")"
+          diff -u THIRD_PARTY_LICENSES.html "$RUNNER_TEMP/THIRD_PARTY_LICENSES.html" || true
+        continue-on-error: true
       - name: Refuse stale third-party notices
         run: cmp --silent THIRD_PARTY_LICENSES.html "$RUNNER_TEMP/THIRD_PARTY_LICENSES.html"
 
