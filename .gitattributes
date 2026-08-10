@@ -1,5 +1,6 @@
 THIRD_PARTY_LICENSES.html -whitespace
 *.sh text eol=lf
+.config/*.env text eol=lf
 packaging/synology/package/bin/* text eol=lf
 packaging/synology/package/libexec/* text eol=lf
 packaging/synology/scripts/* text eol=lf

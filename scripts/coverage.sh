@@ -38,6 +38,8 @@ rust_toolchain=""
 tool_version=""
 minimum_lines=""
 while IFS='=' read -r key value; do
+  key="${key%$'\r'}"
+  value="${value%$'\r'}"
   case "$key" in
     RUST_TOOLCHAIN) rust_toolchain="$value" ;;
     CARGO_LLVM_COV_VERSION) tool_version="$value" ;;
