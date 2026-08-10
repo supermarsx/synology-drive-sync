@@ -378,10 +378,22 @@ fn path_contains_dsm_managed_component(path: &Path) -> bool {
 }
 
 fn reject_filesystem_root(path: &Path) -> Result<()> {
-    if path.parent().is_none() && !is_unc_share_root(path) {
+    if path.parent().is_some() {
+        return Ok(());
+    }
+    let Some(share) = unc_share_root_name(path) else {
         return Err(Error::UnsupportedLocalEntry {
             path: path.to_owned(),
             reason: "the canonical source root cannot be a filesystem root".to_owned(),
+        });
+    };
+    if is_administrative_share(&share) {
+        return Err(Error::UnsupportedLocalEntry {
+            path: path.to_owned(),
+            reason: format!(
+                "`{share}` is a Windows administrative share, which names a whole disk or a \
+                 system endpoint rather than a folder of files"
+            ),
         });
     }
     Ok(())
@@ -392,15 +404,33 @@ fn reject_filesystem_root(path: &Path) -> Result<()> {
 // ask to sync, and refusing it while accepting `\\nas\media\photos` is arbitrary. A mapped
 // drive letter is a disk-like alias, so `\\?\Z:\` stays rejected along with the real roots.
 // A prefix that names a server but no share (`\\?\UNC\nas`) is not a directory anyone can
-// sync either, so an empty share is rejected too.
-fn is_unc_share_root(path: &Path) -> bool {
+// sync either, so an empty share yields no name and is rejected too.
+fn unc_share_root_name(path: &Path) -> Option<String> {
     let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return None;
+    };
+    let share = match prefix.kind() {
+        Prefix::UNC(_, share) | Prefix::VerbatimUNC(_, share) => share,
+        _ => return None,
+    };
+    (!share.is_empty()).then(|| share.to_string_lossy().into_owned())
+}
+
+// Accepting share roots makes the share name load-bearing, and Windows publishes a family of
+// shares that are disk- rather than folder-shaped: one per drive letter (`C$`), `ADMIN$` for
+// the system directory, and `IPC$`, which is a named-pipe endpoint with no files behind it at
+// all. Those are exactly what the filesystem-root guard exists to refuse, so they are named
+// explicitly. Every other `$` share is allowed through: the suffix only marks a share as
+// hidden from browsing, and hiding an ordinary data share (`backup$`) is a normal habit, so
+// rejecting the whole suffix would reintroduce the false rejections that accepting share roots
+// was meant to fix. Share names are case-insensitive on Windows, so `c$` is caught as well.
+fn is_administrative_share(share: &str) -> bool {
+    let Some(name) = share.strip_suffix('$') else {
         return false;
     };
-    match prefix.kind() {
-        Prefix::UNC(_, share) | Prefix::VerbatimUNC(_, share) => !share.is_empty(),
-        _ => false,
-    }
+    let drive_share =
+        name.len() == 1 && name.starts_with(|letter: char| letter.is_ascii_alphabetic());
+    drive_share || name.eq_ignore_ascii_case("admin") || name.eq_ignore_ascii_case("ipc")
 }
 
 fn portable_case_collision<'a>(
@@ -595,6 +625,32 @@ mod tests {
         assert_rejected_as_filesystem_root("/");
     }
 
+    #[cfg(windows)]
+    #[track_caller]
+    fn assert_accepted_as_share_root(root: &Path) {
+        assert!(
+            reject_filesystem_root(root).is_ok(),
+            "{} should be accepted as a share root",
+            root.display()
+        );
+    }
+
+    #[cfg(windows)]
+    #[track_caller]
+    fn assert_rejected_as_administrative_share(root: &Path, share: &str) {
+        assert!(
+            matches!(
+                reject_filesystem_root(root),
+                Err(Error::UnsupportedLocalEntry { path, reason })
+                    if path == root
+                        && reason.contains("administrative share")
+                        && reason.contains(share)
+            ),
+            "{} should be rejected as an administrative share",
+            root.display()
+        );
+    }
+
     // An SMB share is a folder-like unit, so a share root is a legitimate source even though
     // it has no parent. Drive-shaped roots, including a mapped network drive, stay rejected.
     #[cfg(windows)]
@@ -604,13 +660,10 @@ mod tests {
         // user types. `is_dir` holds for both, so only this guard decides the outcome.
         for accepted in [
             r"\\?\UNC\server\share",
-            r"\\?\UNC\localhost\C$",
+            r"\\?\UNC\server\media",
             r"\\server\share",
         ] {
-            assert!(
-                reject_filesystem_root(Path::new(accepted)).is_ok(),
-                "{accepted} should be accepted as a share root"
-            );
+            assert_accepted_as_share_root(Path::new(accepted));
         }
 
         // A drive letter names a disk, not a folder, whether or not it is a mapped network
@@ -620,19 +673,57 @@ mod tests {
         }
     }
 
-    // A share root reaches the guard only after canonicalization, so prove the accepted form
-    // is exactly what `fs::canonicalize` produces rather than a hand-written approximation.
+    // The administrative shares are the disk- and endpoint-shaped ones, so they stay rejected
+    // even though they are spelled like any other share. Other hidden shares are ordinary data
+    // shares wearing a `$`, and they keep the acceptance that share roots were given.
     #[cfg(windows)]
     #[test]
-    fn treats_a_canonicalized_share_root_as_a_sync_candidate() {
-        let Ok(share_root) = fs::canonicalize(r"\\localhost\C$") else {
+    fn rejects_administrative_share_roots_but_accepts_other_hidden_shares() {
+        for (root, share) in [
+            (r"\\?\UNC\localhost\C$", "C$"),
+            (r"\\localhost\c$", "c$"),
+            (r"\\?\UNC\server\D$", "D$"),
+            (r"\\server\ADMIN$", "ADMIN$"),
+            (r"\\?\UNC\server\admin$", "admin$"),
+            (r"\\server\IPC$", "IPC$"),
+            (r"\\?\UNC\server\ipc$", "ipc$"),
+        ] {
+            assert_rejected_as_administrative_share(Path::new(root), share);
+        }
+
+        // `backup$` is merely hidden, `CD$` is not a drive letter, and `C` is not hidden at
+        // all: none of them name a disk, so none of them are the guard's business.
+        for accepted in [
+            r"\\?\UNC\server\backup$",
+            r"\\server\backup$",
+            r"\\?\UNC\server\CD$",
+            r"\\?\UNC\server\C",
+        ] {
+            assert_accepted_as_share_root(Path::new(accepted));
+        }
+    }
+
+    // A share root reaches the guard only after canonicalization, so prove the verdicts are
+    // keyed to the spelling `fs::canonicalize` really produces rather than to a hand-written
+    // approximation. `C$` is the one share an ordinary Windows host is sure to publish, so
+    // borrow its canonical form and swap in an ordinary share name for the accepted case.
+    #[cfg(windows)]
+    #[test]
+    fn judges_a_canonicalized_share_root_by_its_share_name() {
+        let Ok(admin_share) = fs::canonicalize(r"\\localhost\C$") else {
             eprintln!(
-                "skipping treats_a_canonicalized_share_root_as_a_sync_candidate: no admin share"
+                "skipping judges_a_canonicalized_share_root_by_its_share_name: no admin share"
             );
             return;
         };
-        assert_eq!(share_root.parent(), None);
-        assert!(reject_filesystem_root(&share_root).is_ok());
+        assert_eq!(admin_share.parent(), None);
+        assert_rejected_as_administrative_share(&admin_share, "C$");
+
+        let canonical = admin_share.to_string_lossy();
+        let server = canonical
+            .strip_suffix("C$")
+            .expect("a canonical share root ends with its share name");
+        assert_accepted_as_share_root(Path::new(&format!("{server}media")));
     }
 
     #[test]
