@@ -4356,10 +4356,14 @@ mod tests {
             panic!("expected a transport error, got {error}");
         };
         assert_eq!(operation, "SYNO.FileStation.List.getinfo");
-        assert!(source.is_connect() || source.is_timeout());
+        assert!(
+            error.to_string().contains("SYNO.FileStation.List.getinfo"),
+            "the reported failure must name the operation: {error}"
+        );
         assert!(
             retryable(&error),
-            "connect failures must remain retryable so a flapping proxy is retried"
+            "a failure to reach the NAS must remain retryable so a flapping proxy is retried: \
+             {source:?}"
         );
     }
 
@@ -5101,19 +5105,65 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    /// A transport failure must fail the upload, name the file it was carrying, and consume
+    /// exactly the configured attempt budget -- no silent extra retransmission of a file the NAS
+    /// may already have. Which reqwest error kind a dead peer produces is an implementation
+    /// detail of the transport and varies with timing, so it is deliberately not asserted here;
+    /// the retry classification itself is pinned by
+    /// `transport_failures_name_the_operation_and_stay_retryable`.
     #[test]
     fn upload_transport_failures_name_the_file_and_are_not_retried_past_the_budget() {
         let (path, local) = temp_upload_source("transport", b"abc");
+        // A budget of zero retries: the single permitted attempt must also be the last one.
         let (client, server) = upload_client(upload_preamble(), 0);
-        server.join().unwrap();
+        // The scripted server stops listening once the preamble is served, so the upload has no
+        // peer left to talk to.
+        assert_eq!(server.join().unwrap().len(), 2, "discovery and login only");
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&attempts);
+        let observer: UploadObserver = Arc::new(move |event| {
+            recorded.lock().unwrap().push(event);
+            true
+        });
         let error = client
-            .upload(&local, "/share/root/abc.bin")
-            .expect_err("a refused connection must not look like a completed upload");
-        let Error::Http { operation, source } = &error else {
+            .upload_observed(
+                &local,
+                "/share/root/abc.bin",
+                Some(observer),
+                &CancellationToken::default(),
+            )
+            .expect_err("a dead peer must not look like a completed upload");
+        let Error::Http { operation, .. } = &error else {
             panic!("expected a transport error, got {error}");
         };
         assert_eq!(operation, "uploading abc.bin");
-        assert!(source.is_connect() || source.is_timeout());
+        assert!(
+            error.to_string().contains("abc.bin"),
+            "the reported failure must name the file: {error}"
+        );
+        // How far the multipart body is read before a dead peer surfaces the failure is timing
+        // dependent, so only the attempt and outcome events are pinned.
+        let events = attempts.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    UploadTransferEvent::AttemptStarted { attempt } => Some(*attempt),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![1],
+            "a zero-retry budget allows exactly one attempt: {events:?}"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&UploadTransferEvent::Failed),
+            "the transfer must be reported failed: {events:?}"
+        );
+        assert!(
+            !events.contains(&UploadTransferEvent::Completed),
+            "a failed transfer must never be announced as completed: {events:?}"
+        );
         fs::remove_file(path).unwrap();
     }
 
