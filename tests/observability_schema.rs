@@ -1,4 +1,16 @@
+// The shared mock exposes one API surface for the whole suite; this binary drives only the
+// slice it needs to reach every schema-governed emitter offline.
+#[allow(dead_code)]
+mod support;
+
+use std::fs;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::UNIX_EPOCH;
+
 use serde_json::{Value, json};
+use support::TestDir;
+use support::file_station_mock::MockFileStation;
 
 const SCHEMA_TEXT: &str = include_str!("../docs/observability.schema.json");
 const DIGEST: &str = "d41d8cd98f00b204e9800998ecf8427e";
@@ -362,4 +374,622 @@ fn strict_schema_requires_a_known_change_reason_on_creates_and_uploads() {
         .unwrap()
         .remove("reason");
     assert!(validate(&schema, &schema, &missing, "$").is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Real-output conformance.
+//
+// Everything above validates hand-written fixtures, which certifies only that the schema
+// accepts what a test author believed the CLI emits. The tests below spawn the real binary
+// against the hand-rolled File Station mock and feed its actual stdout and stderr through the
+// same shipped schema customers validate against, so production emitters and
+// `docs/observability.schema.json` cannot drift apart in either direction unnoticed.
+// ---------------------------------------------------------------------------
+
+const MOCK_ACCOUNT: &str = "e2e-user";
+const MOCK_PASSWORD: &[u8] = b"correct horse battery staple\n";
+
+fn parsed_schema() -> Value {
+    serde_json::from_str(SCHEMA_TEXT).expect("schema must be valid JSON")
+}
+
+/// Fail with the verbatim validator error, the offending record, and the command that
+/// produced it: a drift report is only actionable if it names all three.
+fn assert_real_output_valid(schema: &Value, record: &Value, source: &str) {
+    if let Err(error) = validate(schema, schema, record, "$") {
+        panic!(
+            "real CLI output from `{source}` violates the shipped docs/observability.schema.json\n\
+             validator error: {error}\n\
+             record: {record}\n\
+             Fix the emitter or the schema deliberately; never relax the schema to silence this."
+        );
+    }
+}
+
+fn json_document(stdout: &str, source: &str) -> Value {
+    serde_json::from_str(stdout).unwrap_or_else(|error| {
+        panic!("`{source}` stdout was not one JSON document: {error}\nstdout:\n{stdout}")
+    })
+}
+
+fn json_records(stream: &str, source: &str) -> Vec<Value> {
+    stream
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|error| {
+                panic!("`{source}` emitted a non-JSON record {line:?}: {error}")
+            })
+        })
+        .collect()
+}
+
+/// Standard error interleaves human diagnostics (the plain-HTTP warning, for one) with the
+/// structured stream, so keep only record lines — after proving no structured record hides in
+/// what the filter drops.
+fn structured_records(stream: &str, source: &str) -> Vec<Value> {
+    let (records, diagnostics): (Vec<_>, Vec<_>) = stream
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .partition(|line| line.starts_with('{'));
+    for line in diagnostics {
+        assert!(
+            !line.contains("sdsync."),
+            "`{source}` emitted a structured record this filter would skip: {line:?}"
+        );
+    }
+    json_records(&records.join("\n"), source)
+}
+
+fn modified_seconds(path: &Path) -> i64 {
+    i64::try_from(
+        fs::metadata(path)
+            .expect("fixture metadata")
+            .modified()
+            .expect("fixture modification time")
+            .duration_since(UNIX_EPOCH)
+            .expect("fixture predates the Unix epoch")
+            .as_secs(),
+    )
+    .expect("fixture timestamp fits i64")
+}
+
+/// Spawn the real binary with every ambient influence removed: a redirected home, config, and
+/// cache root per platform, no colour, and no inherited `SDSYNC_*` variable. Output shape must
+/// depend only on the arguments, otherwise a conformance sample proves nothing.
+fn run_cli(environment: &Path, arguments: &[&str]) -> (String, String) {
+    run_cli_expecting(environment, arguments, 0)
+}
+
+fn run_cli_expecting(environment: &Path, arguments: &[&str], expected: i32) -> (String, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_synology-drive-sync"));
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .env("HOME", environment.join("home"))
+        .env("USERPROFILE", environment.join("home"))
+        .env("APPDATA", environment.join("appdata"))
+        .env("LOCALAPPDATA", environment.join("local-appdata"))
+        .env("XDG_CONFIG_HOME", environment.join("xdg"))
+        .env("NO_COLOR", "1")
+        .env_remove("CLICOLOR_FORCE")
+        .env_remove("FORCE_COLOR");
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("SDSYNC_")
+        {
+            command.env_remove(name);
+        }
+    }
+
+    let output = command.output().expect("run the real CLI subprocess");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("CLI stderr is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(expected),
+        "the CLI took an unexpected exit path, so its output is not the intended conformance \
+         sample: {arguments:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    (stdout, stderr)
+}
+
+fn hermetic_environment(fixture: &TestDir) -> &Path {
+    for directory in ["home", "appdata", "local-appdata", "xdg"] {
+        fs::create_dir_all(fixture.child(directory)).expect("create isolated environment root");
+    }
+    fixture.path()
+}
+
+struct Scenario {
+    fixture: TestDir,
+    server: MockFileStation,
+    source: String,
+    remote: String,
+    password: String,
+    retries: String,
+}
+
+impl Scenario {
+    /// One offline mirror that provokes every plan action kind at once: a remote directory
+    /// standing where a file belongs, a remote file standing where a directory belongs, a
+    /// cross-parent rename the planner can satisfy with a verified server copy, a stale remote
+    /// subtree, and one already-matching file.
+    fn every_plan_action(label: &str) -> Self {
+        let fixture = TestDir::new(label);
+        let server = MockFileStation::start();
+        let remote = "/team/conformance";
+
+        let keep = fixture.write("source/keep.txt", b"keep");
+        fixture.write("source/node", b"replacement");
+        fixture.write("source/folder/new.txt", b"new");
+        let renamed = fixture.write("source/new/item.bin", b"copy-me-on-nas");
+
+        server.add_directory(remote);
+        server.add_file(
+            &format!("{remote}/keep.txt"),
+            b"keep",
+            modified_seconds(&keep),
+        );
+        server.add_directory(&format!("{remote}/node"));
+        server.add_directory(&format!("{remote}/node/child"));
+        server.add_file(
+            &format!("{remote}/node/child/old.bin"),
+            b"old",
+            1_700_000_000,
+        );
+        server.add_file(&format!("{remote}/folder"), b"old-file", 1_700_000_001);
+        server.add_directory(&format!("{remote}/old"));
+        server.add_file(
+            &format!("{remote}/old/item.bin"),
+            b"copy-me-on-nas",
+            modified_seconds(&renamed),
+        );
+        server.add_directory(&format!("{remote}/stale"));
+        server.add_file(&format!("{remote}/stale/gone.bin"), b"stale", 1_700_000_002);
+
+        Self::assemble(fixture, server, remote)
+    }
+
+    /// A purely additive mirror. Progress rendering is suppressed whenever command output is
+    /// machine readable, so the progress sample needs its own run with real work to do.
+    fn additive(label: &str) -> Self {
+        let fixture = TestDir::new(label);
+        let server = MockFileStation::start();
+        let remote = "/team/progress";
+
+        fixture.write("source/one.txt", b"first payload");
+        fixture.write("source/nested/two.bin", b"second payload");
+        server.add_directory(remote);
+
+        Self::assemble(fixture, server, remote)
+    }
+
+    /// A mirror that already matches, so plan and sync take the no-change branch that emits
+    /// the schema's `unchangedResult` and unchanged completion shapes.
+    fn already_in_sync(label: &str) -> Self {
+        let fixture = TestDir::new(label);
+        let server = MockFileStation::start();
+        let remote = "/team/in-sync";
+
+        let settled = fixture.write("source/settled.txt", b"settled");
+        server.add_directory(remote);
+        server.add_file(
+            &format!("{remote}/settled.txt"),
+            b"settled",
+            modified_seconds(&settled),
+        );
+
+        Self::assemble(fixture, server, remote)
+    }
+
+    fn assemble(fixture: TestDir, server: MockFileStation, remote: &str) -> Self {
+        hermetic_environment(&fixture);
+        let password = fixture.write("password", MOCK_PASSWORD);
+        let source = fixture
+            .child("source")
+            .to_str()
+            .expect("UTF-8 fixture source path")
+            .to_owned();
+        let password = password
+            .to_str()
+            .expect("UTF-8 fixture password path")
+            .to_owned();
+        Self {
+            fixture,
+            server,
+            source,
+            remote: remote.to_owned(),
+            password,
+            retries: "0".to_owned(),
+        }
+    }
+
+    fn retrying(mut self, retries: u8) -> Self {
+        self.retries = retries.to_string();
+        self
+    }
+
+    /// `leading` carries global flags and the subcommand; `trailing` carries per-command flags.
+    fn run(&self, leading: &[&str], trailing: &[&str]) -> (String, String) {
+        self.run_expecting(leading, trailing, 0)
+    }
+
+    fn run_expecting(
+        &self,
+        leading: &[&str],
+        trailing: &[&str],
+        expected: i32,
+    ) -> (String, String) {
+        let mut arguments = leading.to_vec();
+        arguments.extend([
+            self.source.as_str(),
+            self.remote.as_str(),
+            "--url",
+            self.server.base_url(),
+            "--username",
+            MOCK_ACCOUNT,
+            "--password-file",
+            self.password.as_str(),
+            "--no-vault",
+            "--allow-http",
+            // Content comparison is what lets the planner recognise the cross-parent rename and
+            // emit a verified server copy, so the sample keeps covering that record.
+            "--compare",
+            "content",
+            "--jobs",
+            "1",
+            "--retries",
+            self.retries.as_str(),
+        ]);
+        arguments.extend(trailing);
+        run_cli_expecting(self.fixture.path(), &arguments, expected)
+    }
+}
+
+fn assert_every_action_kind_is_present(actions: &Value, document: &Value) {
+    for kind in [
+        "pre_deletes",
+        "creates",
+        "copies",
+        "uploads",
+        "post_deletes",
+    ] {
+        assert!(
+            !actions[kind]
+                .as_array()
+                .unwrap_or_else(|| panic!("plan actions must expose {kind} as an array"))
+                .is_empty(),
+            "the conformance scenario stopped exercising {kind}, so the schema check for it \
+             became vacuous: {document}"
+        );
+    }
+    assert!(
+        actions["post_deletes"]
+            .as_array()
+            .expect("post-delete actions")
+            .iter()
+            .any(|action| !action["destination_guard"].is_null()),
+        "the scenario must keep producing a populated destination_guard: {document}"
+    );
+}
+
+#[test]
+fn real_plan_json_and_ndjson_stdout_conform_to_the_shipped_schema() {
+    let schema = parsed_schema();
+    let scenario = Scenario::every_plan_action("schema-real-plan");
+    let destructive = ["--delete", "--max-delete", "20"];
+
+    let source = "plan --output json";
+    let (stdout, _) = scenario.run(
+        &["--quiet", "--progress", "never", "--output", "json", "plan"],
+        &destructive,
+    );
+    let document = json_document(&stdout, source);
+    assert_real_output_valid(&schema, &document, source);
+    assert_eq!(document["schema"], "sdsync.plan.v1");
+    assert_every_action_kind_is_present(&document["plan"]["actions"], &document);
+
+    let source = "plan --output ndjson";
+    let (stdout, _) = scenario.run(
+        &[
+            "--quiet",
+            "--progress",
+            "never",
+            "--output",
+            "ndjson",
+            "plan",
+        ],
+        &destructive,
+    );
+    let records = json_records(&stdout, source);
+    for record in &records {
+        assert_real_output_valid(&schema, record, source);
+    }
+    assert_eq!(records[0]["schema"], "sdsync.plan.v1");
+    assert_eq!(records[0]["kind"], "summary");
+
+    let observed = records
+        .iter()
+        .filter_map(|record| record["action"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        observed,
+        std::collections::BTreeSet::from([
+            "copy-remote-content",
+            "create-directory",
+            "delete",
+            "delete-conflict",
+            "upload",
+        ]),
+        "the NDJSON conformance sample stopped covering every action record: {records:?}"
+    );
+}
+
+#[test]
+fn real_sync_stdout_and_json_logs_conform_to_the_shipped_schema() {
+    let schema = parsed_schema();
+    let scenario = Scenario::every_plan_action("schema-real-sync");
+
+    // The command result lands on stdout while structured logs land on stderr, so one run
+    // samples both governed streams.
+    let source = "sync --output ndjson --log-format json";
+    let (stdout, stderr) = scenario.run(
+        &[
+            "--output",
+            "ndjson",
+            "--log-format",
+            "json",
+            "--log-level",
+            "trace",
+            "--progress",
+            "never",
+            "sync",
+        ],
+        &["--delete", "--max-delete", "20"],
+    );
+
+    let stdout_records = json_records(&stdout, source);
+    for record in &stdout_records {
+        assert_real_output_valid(&schema, record, source);
+    }
+    let completion = stdout_records.last().expect("a completion record");
+    assert_eq!(completion["schema"], "sdsync.output.v1");
+    assert_eq!(completion["kind"], "completion");
+    assert_eq!(completion["result"]["changed"], true);
+
+    let stderr_records = structured_records(&stderr, source);
+    for record in &stderr_records {
+        assert_real_output_valid(&schema, record, source);
+    }
+    let identifiers = stderr_records
+        .iter()
+        .filter_map(|record| record["schema"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        identifiers.contains("sdsync.log.v1"),
+        "structured logging produced no log event to validate: {stderr}"
+    );
+
+    // A second identical run now has nothing to do, which reaches the schema's separate
+    // unchanged-completion branch through the same real emitter.
+    let source = "sync --output ndjson (already reconciled)";
+    let (stdout, _) = scenario.run(
+        &[
+            "--quiet",
+            "--progress",
+            "never",
+            "--output",
+            "ndjson",
+            "sync",
+        ],
+        &["--delete", "--max-delete", "20"],
+    );
+    let records = json_records(&stdout, source);
+    for record in &records {
+        assert_real_output_valid(&schema, record, source);
+    }
+    let completion = records.last().expect("a completion record");
+    assert_eq!(completion["schema"], "sdsync.output.v1");
+    assert_eq!(completion["changed"], false);
+}
+
+/// `terminal_progress_enabled` suppresses the progress stream whenever command output is
+/// machine readable, so the only way to sample real progress records is a human-output sync
+/// with JSON logging, which switches the renderer to its NDJSON form on stderr.
+#[test]
+fn real_progress_records_conform_to_the_shipped_schema() {
+    let schema = parsed_schema();
+    let scenario = Scenario::additive("schema-real-progress");
+
+    let source = "sync --output human --log-format json --progress always";
+    let (_, stderr) = scenario.run(
+        &[
+            "--output",
+            "human",
+            "--log-format",
+            "json",
+            "--log-level",
+            "trace",
+            "--progress",
+            "always",
+            "sync",
+        ],
+        &[],
+    );
+
+    let records = structured_records(&stderr, source);
+    for record in &records {
+        assert_real_output_valid(&schema, record, source);
+    }
+    let progress = records
+        .iter()
+        .filter(|record| record["schema"] == "sdsync.progress.v1")
+        .collect::<Vec<_>>();
+    assert!(
+        !progress.is_empty(),
+        "progress rendering produced no record to validate: {stderr}"
+    );
+    assert!(
+        progress
+            .iter()
+            .any(|record| record.get("update").is_some_and(|update| !update.is_null())),
+        "no progress record carried the optional per-operation update: {stderr}"
+    );
+}
+
+/// Happy-path runs never reach the failure half of the `logEvent` and `progressUpdate` enums.
+/// Injected transport faults do, and those records ship to customers exactly like the rest.
+#[test]
+fn real_retry_and_failure_records_conform_to_the_shipped_schema() {
+    let schema = parsed_schema();
+    let scenario = Scenario::additive("schema-real-retry").retrying(2);
+    scenario
+        .server
+        .fail_next_http_operation("SYNO.FileStation.Upload.upload", 503);
+
+    let source = "sync with an injected retryable upload failure";
+    let (_, stderr) = scenario.run(
+        &[
+            "--output",
+            "human",
+            "--log-format",
+            "json",
+            "--log-level",
+            "trace",
+            "--progress",
+            "always",
+            "sync",
+        ],
+        &[],
+    );
+    let records = structured_records(&stderr, source);
+    for record in &records {
+        assert_real_output_valid(&schema, record, source);
+    }
+    assert!(
+        records
+            .iter()
+            .any(|record| record["event"] == "retry.scheduled"),
+        "the injected fault produced no retry.scheduled record to validate: {stderr}"
+    );
+    assert_eq!(
+        scenario.server.pending_faults(),
+        0,
+        "the injected fault never fired, so the failure records were never exercised"
+    );
+
+    // A run that exhausts its budget emits the terminal `upload.failed` and `run.failed`
+    // events and a failed progress update, then exits non-zero. That stream is governed by the
+    // same schema as a successful one.
+    let failing = Scenario::additive("schema-real-run-failed");
+    failing
+        .server
+        .fail_next_http_operation("SYNO.FileStation.Upload.upload", 503);
+    let source = "sync with an unrecoverable upload failure";
+    let (_, stderr) = failing.run_expecting(
+        &[
+            "--output",
+            "human",
+            "--log-format",
+            "json",
+            "--log-level",
+            "trace",
+            "--progress",
+            "always",
+            "sync",
+        ],
+        &[],
+        1,
+    );
+    let records = structured_records(&stderr, source);
+    for record in &records {
+        assert_real_output_valid(&schema, record, source);
+    }
+    let events = records
+        .iter()
+        .filter_map(|record| record["event"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for event in ["upload.failed", "run.failed"] {
+        assert!(
+            events.contains(event),
+            "the failing run emitted no {event} record to validate: {stderr}"
+        );
+    }
+    assert!(
+        records
+            .iter()
+            .any(|record| record["update"]["kind"] == "failed"),
+        "the failing run emitted no failed progress update to validate: {stderr}"
+    );
+}
+
+#[test]
+fn real_unchanged_sync_document_conforms_to_the_shipped_schema() {
+    let schema = parsed_schema();
+    let scenario = Scenario::already_in_sync("schema-real-unchanged");
+
+    let source = "sync --output json (already in sync)";
+    let (stdout, _) = scenario.run(
+        &["--quiet", "--progress", "never", "--output", "json", "sync"],
+        &[],
+    );
+    let document = json_document(&stdout, source);
+    assert_real_output_valid(&schema, &document, source);
+    assert_eq!(document["schema"], "sdsync.sync.v1");
+    assert_eq!(document["result"], json!({"changed": false}));
+    assert_eq!(document["plan"]["summary"]["changes"], false);
+}
+
+/// The config surface emits its own record identifiers that this schema deliberately does not
+/// govern. Pinning that boundary means adding one of them to `oneOf` fails here until real
+/// output is fed through the validator too, instead of being silently assumed conformant.
+#[test]
+fn config_records_stay_outside_the_governed_schema_until_output_is_validated() {
+    let schema = parsed_schema();
+    let fixture = TestDir::new("schema-config-boundary");
+    let environment = hermetic_environment(&fixture).to_owned();
+    let source = fixture.child("source");
+    fs::create_dir_all(&source).expect("create configured source directory");
+    let config = fixture.write(
+        "config.toml",
+        format!(
+            r#"default-profile = "alpha"
+
+[profiles.alpha]
+source = '{}'
+remote = "/team/alpha"
+url = "https://files.example.invalid/reverse-proxy"
+username = "alpha-user"
+no-vault = true
+"#,
+            source.to_str().expect("UTF-8 configured source path")
+        )
+        .as_bytes(),
+    );
+    let config = config.to_str().expect("UTF-8 config path");
+
+    for command in [
+        ["config", "path"],
+        ["config", "validate"],
+        ["config", "show"],
+    ] {
+        let label = command.join(" ");
+        let (stdout, _) = run_cli(
+            &environment,
+            &[
+                "--config", config, "--output", "json", command[0], command[1],
+            ],
+        );
+        let document = json_document(&stdout, &label);
+        let identifier = document["schema"].as_str().unwrap_or_default().to_owned();
+        assert!(
+            validate(&schema, &schema, &document, "$").is_err(),
+            "`{label}` emits {identifier:?}, which docs/observability.schema.json now accepts. \
+             Governed records must be validated from real output: add this command to the \
+             real-output conformance tests rather than leaving it unchecked."
+        );
+    }
 }
