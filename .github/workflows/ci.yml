@@ -29,29 +29,57 @@ jobs:
         run: cmp --silent THIRD_PARTY_LICENSES.html "$RUNNER_TEMP/THIRD_PARTY_LICENSES.html"
 
   test:
+    name: Test ${{ matrix.platform }} ${{ matrix.architecture }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+            architecture: x86_64
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux
+            architecture: aarch64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos
+            architecture: x86_64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            platform: macos
+            architecture: aarch64
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            platform: windows
+            architecture: x86_64
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            platform: windows
+            architecture: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
         with:
+          targets: ${{ matrix.target }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: test-${{ matrix.target }}
       - name: Formatting
-        if: runner.os == 'Linux'
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features --target "${{ matrix.target }}" -- -D warnings
       - name: Tests
-        run: cargo test --locked --all-targets
+        run: cargo test --locked --all-targets --target "${{ matrix.target }}"
       - name: Release build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target "${{ matrix.target }}"
 
   coverage:
     name: Coverage (90% line gate)
