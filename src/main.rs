@@ -30,7 +30,9 @@ use synology_drive_sync::progress::{
 use synology_drive_sync::source_diagnostics::{
     SourceDiagnosticOptions, SourceDiagnosticReport, diagnose_source,
 };
-use synology_drive_sync::sync::{self, ExecuteOptions, ExecutionReport, UploadObserverFactory};
+use synology_drive_sync::sync::{
+    self, ExecuteOptions, ExecutionEvent, ExecutionReport, UploadObserverFactory,
+};
 use synology_drive_sync::{Error, Result};
 
 mod cli;
@@ -1412,15 +1414,15 @@ fn prepare_and_run_sync(
             },
             cancellation.clone(),
             progress.observer_factory(),
-            |message| {
-                let code = if message.starts_with("created directory:") {
-                    Some(EventCode::DirectoryCreated)
-                } else if message.starts_with("deleted type conflict:")
-                    || message.starts_with("deleted remote extra:")
-                {
-                    Some(EventCode::EntryDeleted)
-                } else {
-                    None
+            |event| {
+                progress.record_execution_event(&event);
+                let code = match event {
+                    ExecutionEvent::DirectoryCreated { .. } => Some(EventCode::DirectoryCreated),
+                    ExecutionEvent::TypeConflictDeleted { .. }
+                    | ExecutionEvent::RemoteExtraDeleted { .. } => Some(EventCode::EntryDeleted),
+                    ExecutionEvent::RemoteContentCopied { .. }
+                    | ExecutionEvent::CopyFallbackUploaded { .. }
+                    | ExecutionEvent::Uploaded { .. } => None,
                 };
                 if let Some(code) = code
                     && let Some(logger) = &execution_logger
@@ -1435,7 +1437,7 @@ fn prepare_and_run_sync(
                     cancellation_for_report.cancel();
                 }
                 if settings.output.verbosity > 0 && !settings.output.quiet {
-                    eprintln!("  {message}");
+                    eprintln!("  {event}");
                 }
             },
         );
@@ -2056,10 +2058,15 @@ impl ProgressWiring {
         logger: Option<Arc<EventLogger>>,
         cancellation: CancellationToken,
     ) -> Self {
+        // Deletes and directory creates carry no bytes but are real work: a mirror that
+        // removes ninety entries and uploads one file must not render as a single upload
+        // and then sit still. `files` and `bytes` stay upload-shaped, and a server-side
+        // copy counts there too because it delivers a file and falls back to a real
+        // upload when the server refuses the copy.
         let tracker = ProgressTracker::new(ProgressTotals {
-            operations: plan.uploads.len() as u64,
-            files: plan.uploads.len() as u64,
-            bytes: plan.upload_bytes,
+            operations: operation_count(plan),
+            files: (plan.uploads.len() + plan.copies.len()) as u64,
+            bytes: plan.upload_bytes.saturating_add(copy_fallback_bytes(plan)),
         });
         let mode = renderer_progress_mode(output);
         let format = if output.log_format == cli::LogFormat::Json {
@@ -2083,6 +2090,46 @@ impl ProgressWiring {
             )),
             logger,
             cancellation,
+        }
+    }
+
+    /// Account one completed remote mutation reported by `sync::execute_observed`.
+    ///
+    /// `ExecutionEvent::Uploaded` is deliberately ignored: `observer_factory` already
+    /// opened and closed a tracker operation for that transfer, so counting it here
+    /// would double it. Every other variant runs without an upload observer, making this
+    /// its only path into the tracker.
+    fn record_execution_event(&self, event: &ExecutionEvent) {
+        let (kind, bytes) = match event {
+            ExecutionEvent::TypeConflictDeleted { .. }
+            | ExecutionEvent::RemoteExtraDeleted { .. } => (OperationKind::DeleteEntry, 0),
+            ExecutionEvent::DirectoryCreated { .. } => (OperationKind::CreateDirectory, 0),
+            ExecutionEvent::RemoteContentCopied { bytes, .. }
+            | ExecutionEvent::CopyFallbackUploaded { bytes, .. } => (OperationKind::Upload, *bytes),
+            ExecutionEvent::Uploaded { .. } => return,
+        };
+        // The event arrives only after the mutation succeeded, so the operation opens and
+        // closes together; `finish_success` credits the whole declared byte count.
+        let operation = self.tracker.start(kind, bytes);
+        let Ok(update) = operation.finish_success() else {
+            record_progress_failure(
+                &self.failure,
+                "progress operation state became inconsistent".to_owned(),
+            );
+            self.cancellation.cancel();
+            return;
+        };
+        let snapshot = self.tracker.snapshot();
+        match self.renderer.lock() {
+            Ok(mut renderer) => {
+                if let Err(error) = renderer.render(&snapshot, Some(&update)) {
+                    record_progress_failure(&self.failure, error.to_string());
+                }
+            }
+            Err(_) => record_progress_failure(
+                &self.failure,
+                "progress renderer lock was poisoned".to_owned(),
+            ),
         }
     }
 
@@ -5017,6 +5064,91 @@ mod tests {
             }])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn progress_totals_count_every_planned_action_kind() {
+        let plan = rich_plan();
+        let wiring = ProgressWiring::new(
+            &plan,
+            &resolved_output(cli::OutputFormat::Human),
+            None,
+            CancellationToken::default(),
+        );
+
+        // One pre-delete, one create, one copy, one upload and one post-delete.
+        assert_eq!(
+            wiring.tracker.snapshot().totals,
+            ProgressTotals {
+                operations: 5,
+                // The copy delivers a file just as the upload does.
+                files: 2,
+                // 11 upload bytes plus the 7-byte copy, which becomes a real upload when
+                // the server refuses the copy.
+                bytes: 18,
+            }
+        );
+        wiring.finish().unwrap();
+    }
+
+    #[test]
+    fn execution_events_advance_progress_without_double_counting_observed_uploads() {
+        let plan = rich_plan();
+        let wiring = ProgressWiring::new(
+            &plan,
+            &resolved_output(cli::OutputFormat::Human),
+            None,
+            CancellationToken::default(),
+        );
+
+        for event in [
+            ExecutionEvent::TypeConflictDeleted {
+                remote_path: "/share/root/conflict".to_owned(),
+            },
+            ExecutionEvent::DirectoryCreated {
+                remote_path: "/share/root/new-directory".to_owned(),
+            },
+            ExecutionEvent::RemoteContentCopied {
+                from_remote_path: "/share/root/source/copied.bin".to_owned(),
+                to_remote_path: "/share/root/copied.bin".to_owned(),
+                bytes: 7,
+            },
+            ExecutionEvent::RemoteExtraDeleted {
+                remote_path: "/share/root/old/guarded.bin".to_owned(),
+            },
+        ] {
+            wiring.record_execution_event(&event);
+        }
+
+        let snapshot = wiring.tracker.snapshot();
+        assert_eq!(snapshot.completed_operations, 4);
+        assert_eq!(snapshot.failed_operations, 0);
+        // Only the copy is file-shaped; deletes and creates carry no file or byte count.
+        assert_eq!(snapshot.completed_files, 1);
+        assert_eq!(snapshot.logical_bytes, 7);
+        assert_eq!(snapshot.active_operations, 0);
+
+        // `observer_factory` already accounted this transfer, so the event must not
+        // count it a second time.
+        wiring.record_execution_event(&ExecutionEvent::Uploaded {
+            relative: "uploaded.bin".to_owned(),
+            bytes: 11,
+        });
+        let after_upload = wiring.tracker.snapshot();
+        assert_eq!(after_upload.completed_operations, 4);
+        assert_eq!(after_upload.completed_files, 1);
+        assert_eq!(after_upload.logical_bytes, 7);
+
+        // The copy fallback has no observer, so its event carries the bytes instead.
+        wiring.record_execution_event(&ExecutionEvent::CopyFallbackUploaded {
+            relative: "copied.bin".to_owned(),
+            bytes: 11,
+        });
+        let after_fallback = wiring.tracker.snapshot();
+        assert_eq!(after_fallback.completed_operations, 5);
+        assert_eq!(after_fallback.completed_files, 2);
+        assert_eq!(after_fallback.logical_bytes, 18);
+        wiring.finish().unwrap();
     }
 
     #[test]

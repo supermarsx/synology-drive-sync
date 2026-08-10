@@ -247,6 +247,71 @@ pub struct ExecuteOptions {
     pub dry_run: bool,
 }
 
+/// One completed remote mutation, reported as it happens.
+///
+/// Every variant corresponds to exactly one successful operation, so a caller can count
+/// progress by matching on the variant instead of parsing the rendered text. `Display`
+/// produces the diagnostic line shown under `-v`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecutionEvent {
+    /// A remote entry of the wrong kind was removed to make room for the planned entry.
+    TypeConflictDeleted {
+        remote_path: String,
+    },
+    DirectoryCreated {
+        remote_path: String,
+    },
+    /// The server duplicated existing remote content instead of accepting an upload.
+    RemoteContentCopied {
+        from_remote_path: String,
+        to_remote_path: String,
+        bytes: u64,
+    },
+    /// A planned server-side copy the server refused to start, uploaded instead. Unlike
+    /// `Uploaded`, this transfer runs without an upload observer, so it reaches a progress
+    /// caller only through this event.
+    CopyFallbackUploaded {
+        relative: String,
+        bytes: u64,
+    },
+    Uploaded {
+        relative: String,
+        bytes: u64,
+    },
+    /// A remote entry with no local counterpart was removed by mirror deletion.
+    RemoteExtraDeleted {
+        remote_path: String,
+    },
+}
+
+impl std::fmt::Display for ExecutionEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TypeConflictDeleted { remote_path } => {
+                write!(formatter, "deleted type conflict: {remote_path}")
+            }
+            Self::DirectoryCreated { remote_path } => {
+                write!(formatter, "created directory: {remote_path}")
+            }
+            Self::RemoteContentCopied {
+                from_remote_path,
+                to_remote_path,
+                ..
+            } => write!(
+                formatter,
+                "copied remote content: {from_remote_path} -> {to_remote_path}"
+            ),
+            Self::CopyFallbackUploaded { relative, .. } => {
+                write!(formatter, "server copy unavailable; uploaded: {relative}")
+            }
+            Self::Uploaded { relative, .. } => write!(formatter, "uploaded: {relative}"),
+            Self::RemoteExtraDeleted { remote_path } => {
+                write!(formatter, "deleted remote extra: {remote_path}")
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExecutionReport {
     pub deleted: usize,
@@ -261,7 +326,7 @@ pub fn execute(
     root: &RemoteRoot,
     plan: &SyncPlan,
     options: ExecuteOptions,
-    report: impl FnMut(String),
+    report: impl FnMut(ExecutionEvent),
 ) -> Result<ExecutionReport> {
     execute_with(client, root, plan, options, report)
 }
@@ -276,7 +341,7 @@ pub fn execute_observed(
     options: ExecuteOptions,
     cancellation: CancellationToken,
     observer_factory: UploadObserverFactory,
-    report: impl FnMut(String),
+    report: impl FnMut(ExecutionEvent),
 ) -> Result<ExecutionReport> {
     execute_with_observer(
         client,
@@ -294,7 +359,7 @@ fn execute_with<O: SyncOperations>(
     root: &RemoteRoot,
     plan: &SyncPlan,
     options: ExecuteOptions,
-    report: impl FnMut(String),
+    report: impl FnMut(ExecutionEvent),
 ) -> Result<ExecutionReport> {
     execute_with_observer(
         client,
@@ -314,7 +379,7 @@ fn execute_with_observer<O: SyncOperations>(
     options: ExecuteOptions,
     cancellation: CancellationToken,
     observer_factory: UploadObserverFactory,
-    mut report: impl FnMut(String),
+    mut report: impl FnMut(ExecutionEvent),
 ) -> Result<ExecutionReport> {
     if options.dry_run {
         return Ok(ExecutionReport::default());
@@ -342,13 +407,17 @@ fn execute_with_observer<O: SyncOperations>(
         verify_live_snapshot(client, check, &cancellation)?;
         client.delete_non_recursive(root, &action.remote_path)?;
         completed.deleted += 1;
-        report(format!("deleted type conflict: {}", action.remote_path));
+        report(ExecutionEvent::TypeConflictDeleted {
+            remote_path: action.remote_path.clone(),
+        });
     }
     for action in &plan.creates {
         cancellation.check()?;
         client.create_folder(&action.remote_path)?;
         completed.created += 1;
-        report(format!("created directory: {}", action.remote_path));
+        report(ExecutionEvent::DirectoryCreated {
+            remote_path: action.remote_path.clone(),
+        });
     }
     let copy_source_checks = plan
         .copies
@@ -369,10 +438,11 @@ fn execute_with_observer<O: SyncOperations>(
             Ok(()) => {
                 client.preflight_upload_source(&action.local, &cancellation)?;
                 completed.copied += 1;
-                report(format!(
-                    "copied remote content: {} -> {}",
-                    action.from_remote_path, action.to_remote_path
-                ));
+                report(ExecutionEvent::RemoteContentCopied {
+                    from_remote_path: action.from_remote_path.clone(),
+                    to_remote_path: action.to_remote_path.clone(),
+                    bytes: action.expected_size,
+                });
             }
             Err(Error::ServerCopyNotStarted) => {
                 client.upload(&action.local, &action.to_remote_path, None, &cancellation)?;
@@ -380,10 +450,10 @@ fn execute_with_observer<O: SyncOperations>(
                 completed.uploaded_bytes = completed
                     .uploaded_bytes
                     .saturating_add(action.expected_size);
-                report(format!(
-                    "server copy unavailable; uploaded: {}",
-                    action.local.relative
-                ));
+                report(ExecutionEvent::CopyFallbackUploaded {
+                    relative: action.local.relative.clone(),
+                    bytes: action.expected_size,
+                });
             }
             Err(error) => return Err(error),
         }
@@ -467,7 +537,10 @@ fn execute_with_observer<O: SyncOperations>(
                     Ok(()) => {
                         completed.uploaded += 1;
                         completed.uploaded_bytes = completed.uploaded_bytes.saturating_add(size);
-                        report(format!("uploaded: {relative}"));
+                        report(ExecutionEvent::Uploaded {
+                            relative,
+                            bytes: size,
+                        });
                     }
                     Err(error) if first_error.is_none() => first_error = Some(error),
                     Err(_) => {}
@@ -546,7 +619,9 @@ fn execute_with_observer<O: SyncOperations>(
         verify_live_snapshot(client, &delete_snapshot_check(action), &cancellation)?;
         client.delete_non_recursive(root, &action.remote_path)?;
         completed.deleted += 1;
-        report(format!("deleted remote extra: {}", action.remote_path));
+        report(ExecutionEvent::RemoteExtraDeleted {
+            remote_path: action.remote_path.clone(),
+        });
     }
 
     Ok(completed)
@@ -912,6 +987,133 @@ mod tests {
                 "snapshot:/share/root/extra",
                 "snapshot:/share/root/file.txt",
                 "delete:/share/root/extra",
+            ]
+        );
+    }
+
+    #[test]
+    fn every_completed_mutation_reports_one_typed_event_in_phase_order() {
+        let client = MockOperations::default();
+        let mut plan = populated_plan();
+        plan.copies.push(copy_action());
+
+        let mut events = Vec::new();
+        let report = execute_with(
+            &client,
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &plan,
+            ExecuteOptions {
+                jobs: 1,
+                dry_run: false,
+            },
+            |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(
+            events,
+            [
+                ExecutionEvent::TypeConflictDeleted {
+                    remote_path: "/share/root/conflict".to_owned(),
+                },
+                ExecutionEvent::DirectoryCreated {
+                    remote_path: "/share/root/folder".to_owned(),
+                },
+                ExecutionEvent::RemoteContentCopied {
+                    from_remote_path: "/share/root/old/file.txt".to_owned(),
+                    to_remote_path: "/share/root/new/file.txt".to_owned(),
+                    bytes: 1,
+                },
+                ExecutionEvent::Uploaded {
+                    relative: "file.txt".to_owned(),
+                    bytes: 1,
+                },
+                ExecutionEvent::RemoteExtraDeleted {
+                    remote_path: "/share/root/extra".to_owned(),
+                },
+            ]
+        );
+        // One event per counted mutation keeps a progress caller's totals exact.
+        assert_eq!(
+            events.len() as u64,
+            (report.deleted + report.created + report.copied + report.uploaded) as u64
+        );
+    }
+
+    #[test]
+    fn copy_fallback_reports_an_upload_event_carrying_the_copy_size() {
+        let client = MockOperations {
+            copy_not_started: true,
+            ..MockOperations::default()
+        };
+        let mut plan = populated_plan();
+        plan.pre_deletes.clear();
+        plan.creates.clear();
+        plan.uploads.clear();
+        plan.post_deletes.clear();
+        plan.copies.push(copy_action());
+
+        let mut events = Vec::new();
+        execute_with(
+            &client,
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &plan,
+            ExecuteOptions {
+                jobs: 1,
+                dry_run: false,
+            },
+            |event| events.push(event),
+        )
+        .unwrap();
+
+        // The fallback upload runs without an observer, so this event is the only signal
+        // a progress caller gets for those bytes.
+        assert_eq!(
+            events,
+            [ExecutionEvent::CopyFallbackUploaded {
+                relative: "new/file.txt".to_owned(),
+                bytes: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn execution_events_render_the_verbose_diagnostic_lines() {
+        let lines = [
+            ExecutionEvent::TypeConflictDeleted {
+                remote_path: "/share/root/conflict".to_owned(),
+            },
+            ExecutionEvent::DirectoryCreated {
+                remote_path: "/share/root/folder".to_owned(),
+            },
+            ExecutionEvent::RemoteContentCopied {
+                from_remote_path: "/share/root/old.txt".to_owned(),
+                to_remote_path: "/share/root/new.txt".to_owned(),
+                bytes: 4,
+            },
+            ExecutionEvent::CopyFallbackUploaded {
+                relative: "new.txt".to_owned(),
+                bytes: 4,
+            },
+            ExecutionEvent::Uploaded {
+                relative: "file.txt".to_owned(),
+                bytes: 9,
+            },
+            ExecutionEvent::RemoteExtraDeleted {
+                remote_path: "/share/root/extra".to_owned(),
+            },
+        ]
+        .map(|event| event.to_string());
+
+        assert_eq!(
+            lines,
+            [
+                "deleted type conflict: /share/root/conflict",
+                "created directory: /share/root/folder",
+                "copied remote content: /share/root/old.txt -> /share/root/new.txt",
+                "server copy unavailable; uploaded: new.txt",
+                "uploaded: file.txt",
+                "deleted remote extra: /share/root/extra",
             ]
         );
     }
