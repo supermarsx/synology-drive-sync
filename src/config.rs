@@ -361,6 +361,8 @@ pub struct ResolvedNetwork {
     pub retries: u8,
     pub timeout: u64,
     pub connect_timeout: u64,
+    /// Upload bytes per second shared by every job; `None` leaves uploads unlimited.
+    pub max_rate: Option<u64>,
     pub ca_certificate: Option<PathBuf>,
     pub allow_http: bool,
     pub danger_accept_invalid_certs: bool,
@@ -800,6 +802,8 @@ fn resolve_network(
         .connect_timeout
         .or(profile.connect_timeout)
         .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECONDS);
+    // Absent stays absent: there is no default rate, and absent is what means unlimited.
+    let max_rate = arguments.max_rate.or(profile.max_rate);
     if retries > 5 {
         return Err(ConfigError::Invalid(
             "retries must be between 0 and 5".to_owned(),
@@ -810,10 +814,16 @@ fn resolve_network(
             "timeout and connect-timeout must be at least 1 second".to_owned(),
         ));
     }
+    if max_rate == Some(0) {
+        return Err(ConfigError::Invalid(
+            "max-rate must be at least 1 byte per second".to_owned(),
+        ));
+    }
     Ok(ResolvedNetwork {
         retries,
         timeout,
         connect_timeout,
+        max_rate,
         ca_certificate: arguments
             .ca_certificate
             .clone()
@@ -1626,6 +1636,82 @@ output = "json"
             ..Profile::default()
         })
         .unwrap();
+    }
+
+    /// The rate limit follows the same precedence as every other option, and unlimited has to
+    /// survive resolution as `None` -- any default here would silently throttle every user.
+    #[test]
+    fn max_rate_resolves_from_the_command_line_then_the_profile_then_unlimited() {
+        let loaded = LoadedConfig::from_toml("settings/profiles.toml", CONFIG).unwrap();
+        let selected = loaded.select_profile(None).unwrap();
+
+        let profile_only =
+            Cli::try_parse_from(["synology-drive-sync", "sync", "./source", "/team"]).unwrap();
+        let Invocation::Sync { arguments, .. } = profile_only.invocation() else {
+            panic!("expected sync");
+        };
+        let resolved =
+            resolve_sync(selected.values, arguments, &profile_only.global.output).unwrap();
+        assert_eq!(resolved.network.max_rate, Some(65536));
+
+        let overridden = Cli::try_parse_from([
+            "synology-drive-sync",
+            "sync",
+            "./source",
+            "/team",
+            "--max-rate",
+            "4096",
+        ])
+        .unwrap();
+        let Invocation::Sync { arguments, .. } = overridden.invocation() else {
+            panic!("expected sync");
+        };
+        let resolved = resolve_sync(selected.values, arguments, &overridden.global.output).unwrap();
+        assert_eq!(resolved.network.max_rate, Some(4096));
+
+        // No profile value and no flag: uploads stay unlimited.
+        let Invocation::Sync { arguments, .. } = profile_only.invocation() else {
+            panic!("expected sync");
+        };
+        let resolved = resolve_sync(
+            Some(&Profile {
+                source: Some(PathBuf::from("./source")),
+                remote: Some("/team".to_owned()),
+                url: Some("https://files.example.test".to_owned()),
+                username: Some("mirror-bot".to_owned()),
+                ..Profile::default()
+            }),
+            arguments,
+            &profile_only.global.output,
+        )
+        .unwrap();
+        assert_eq!(resolved.network.max_rate, None);
+    }
+
+    /// A zero rate reaching resolution from a profile is an upload that never progresses, so it
+    /// must be refused there too and not only by clap's range on the flag.
+    #[test]
+    fn resolve_network_rejects_a_zero_profile_max_rate() {
+        let cli =
+            Cli::try_parse_from(["synology-drive-sync", "sync", "./source", "/team"]).unwrap();
+        let Invocation::Sync { arguments, .. } = cli.invocation() else {
+            panic!("expected sync");
+        };
+        let error = resolve_sync(
+            Some(&Profile {
+                url: Some("https://files.example.test".to_owned()),
+                username: Some("mirror-bot".to_owned()),
+                max_rate: Some(0),
+                ..Profile::default()
+            }),
+            arguments,
+            &cli.global.output,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid effective configuration: max-rate must be at least 1 byte per second"
+        );
     }
 
     /// An unset rate limit must stay absent rather than materialising as some default, because

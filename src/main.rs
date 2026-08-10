@@ -2027,6 +2027,9 @@ fn connect_client(url: &str, network: &config::ResolvedNetwork) -> Result<ApiCli
         request_timeout: Duration::from_secs(network.timeout),
         retries: u32::from(network.retries),
     })
+    // The limit is applied to the connected client rather than to the HTTP transport: it paces
+    // the upload body, and it is deliberately shared by every worker clone of this client.
+    .map(|client| client.with_max_upload_rate(network.max_rate))
 }
 
 fn finish_authenticated_operation<T>(client: &mut ApiClient, operation: Result<T>) -> Result<T> {
@@ -3845,6 +3848,7 @@ mod tests {
             retries: 0,
             timeout: 30,
             connect_timeout: 2,
+            max_rate: None,
             ca_certificate: None,
             allow_http: false,
             danger_accept_invalid_certs: false,
