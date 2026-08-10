@@ -824,4 +824,273 @@ mod tests {
             assert!(drive_path_issue(relative).unwrap().contains(expected));
         }
     }
+
+    #[cfg(windows)]
+    fn write_non_utf8_named_file(dir: &Path) -> bool {
+        use std::os::windows::ffi::OsStringExt;
+
+        // NTFS filenames are validated as UTF-16 code units, not as well-formed Unicode, so a
+        // lone surrogate is a legal (if unusual) file name that OsString::into_string cannot
+        // represent as valid Unicode.
+        let wide: Vec<u16> = vec![u16::from(b'b'), 0xD800, u16::from(b'b')];
+        let name = std::ffi::OsString::from_wide(&wide);
+        fs::write(dir.join(&name), b"payload").is_ok()
+    }
+
+    #[cfg(unix)]
+    fn write_non_utf8_named_file(dir: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+
+        let bytes = [b'b', 0xFF, b'b'];
+        let name = std::ffi::OsStr::from_bytes(&bytes);
+        fs::write(dir.join(name), b"payload").is_ok()
+    }
+
+    #[test]
+    fn scan_rejects_a_non_utf8_file_name() {
+        let root = temp_dir("non-utf8-name");
+        if !write_non_utf8_named_file(&root) {
+            eprintln!("skipping scan_rejects_a_non_utf8_file_name: filesystem rejected the name");
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        assert!(matches!(
+            scan(&root, &rules),
+            Err(Error::UnsupportedLocalEntry { reason, .. }) if reason.contains("UTF-8")
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_dir_reports_the_missing_directory_it_could_not_read() {
+        let root = temp_dir("scan-dir-missing");
+        let missing = root.join("does-not-exist");
+        let mut output = BTreeMap::new();
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+
+        assert!(matches!(
+            scan_dir(&missing, "does-not-exist", &rules, &mut output),
+            Err(Error::FileIo { path, .. }) if path == missing
+        ));
+        assert!(output.is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hashing_rejects_a_file_replaced_by_a_link_since_the_scan() {
+        let root = temp_dir("replaced-by-link");
+        let target_dir = temp_dir("replaced-by-link-target");
+        let replaced = root.join("replaced.bin");
+        fs::write(&replaced, b"payload").unwrap();
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        let entry = scan(&root, &rules).unwrap().entries["replaced.bin"].clone();
+
+        fs::remove_file(&replaced).unwrap();
+        if !try_make_link(&replaced, &target_dir) {
+            eprintln!(
+                "skipping hashing_rejects_a_file_replaced_by_a_link_since_the_scan: could not create a link"
+            );
+            fs::remove_dir_all(root).unwrap();
+            fs::remove_dir_all(target_dir).unwrap();
+            return;
+        }
+
+        assert!(matches!(
+            hash_file_snapshot(&entry, &CancellationToken::default()),
+            Err(Error::SourceChanged(path)) if path == entry.full_path
+        ));
+
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&target_dir).unwrap();
+    }
+
+    #[test]
+    fn scan_rejects_files_modified_before_the_unix_epoch() {
+        let root = temp_dir("before-epoch");
+        let target = root.join("old.bin");
+        fs::write(&target, b"payload").unwrap();
+
+        let before_epoch = std::time::SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        let file = fs::OpenOptions::new().write(true).open(&target).unwrap();
+        let set = file.set_times(fs::FileTimes::new().set_modified(before_epoch));
+        drop(file);
+        if set.is_err() {
+            eprintln!(
+                "skipping scan_rejects_files_modified_before_the_unix_epoch: platform or \
+                 filesystem rejected a pre-epoch mtime"
+            );
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+
+        let expected_path = fs::canonicalize(&target).unwrap();
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        assert!(matches!(
+            scan(&root, &rules),
+            Err(Error::UnsupportedLocalEntry { path, reason })
+                if path == expected_path && reason.contains("before the Unix epoch")
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scan_rejects_windows_system_attribute_files() {
+        let root = temp_dir("windows-system-attribute");
+        let target = root.join("system.dat");
+        fs::write(&target, b"payload").unwrap();
+
+        let status = std::process::Command::new("attrib")
+            .arg("+S")
+            .arg(&target)
+            .status();
+        if !matches!(status, Ok(status) if status.success()) {
+            eprintln!(
+                "skipping scan_rejects_windows_system_attribute_files: could not set the SYSTEM attribute"
+            );
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+
+        let expected_path = fs::canonicalize(&target).unwrap();
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        assert!(matches!(
+            scan(&root, &rules),
+            Err(Error::UnsupportedLocalEntry { path, reason })
+                if path == expected_path && reason.contains("SYSTEM")
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hashing_reports_the_open_failure_when_another_handle_holds_an_exclusive_lock() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = temp_dir("exclusive-lock");
+        let target = root.join("locked.bin");
+        fs::write(&target, b"payload").unwrap();
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        let entry = scan(&root, &rules).unwrap().entries["locked.bin"].clone();
+
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&target);
+        let lock = match lock {
+            Ok(lock) => lock,
+            Err(_) => {
+                eprintln!(
+                    "skipping hashing_reports_the_open_failure_when_another_handle_holds_an_exclusive_lock: \
+                     could not take an exclusive lock"
+                );
+                fs::remove_dir_all(root).unwrap();
+                return;
+            }
+        };
+
+        let result = hash_file_snapshot(&entry, &CancellationToken::default());
+        drop(lock);
+        assert!(matches!(
+            result,
+            Err(Error::FileIo { path, .. }) if path == entry.full_path
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hashing_reports_the_open_failure_when_read_permission_is_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("permission-denied-open");
+        let target = root.join("secret.bin");
+        fs::write(&target, b"payload").unwrap();
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        let entry = scan(&root, &rules).unwrap().entries["secret.bin"].clone();
+
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = hash_file_snapshot(&entry, &CancellationToken::default());
+        // Restore permissions unconditionally: cleanup needs it, and a root-owned CI runner
+        // that ignores mode bits must not leave an unreadable fixture behind either way.
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+
+        if result.is_ok() {
+            eprintln!(
+                "skipping hashing_reports_the_open_failure_when_read_permission_is_denied: \
+                 running with privileges that bypass file permissions"
+            );
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        assert!(matches!(
+            result,
+            Err(Error::FileIo { path, .. }) if path == entry.full_path
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_rejects_unusual_file_types() {
+        let root = temp_dir("fifo-entry");
+        let fifo_path = root.join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status();
+        if !matches!(status, Ok(status) if status.success()) {
+            eprintln!("skipping scan_rejects_unusual_file_types: mkfifo unavailable");
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+
+        let expected_path = fs::canonicalize(&fifo_path).unwrap();
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        assert!(matches!(
+            scan(&root, &rules),
+            Err(Error::UnsupportedLocalEntry { path, reason })
+                if path == expected_path && reason.contains("only regular files and directories")
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // If the source itself is a regular file, ".sdsyncignore" becomes "<file>/.sdsyncignore" -
+    // stating a path that walks through a file as if it were a directory. POSIX reports that as
+    // ENOTDIR, a real (non-NotFound) I/O error, which pins the `Err(source) if not NotFound`
+    // branch of IgnoreRules::build distinctly from the ordinary "no ignore file present" case
+    // handled just above it. Windows instead reports plain NotFound for the same composition
+    // (verified empirically: denying directory permissions via icacls also would not reliably
+    // reproduce a non-NotFound stat error on this platform), so there is no portable trigger and
+    // this stays POSIX-only.
+    #[cfg(unix)]
+    #[test]
+    fn ignore_rules_report_a_non_not_found_stat_error_on_the_default_ignore_path() {
+        let root = temp_dir("ignore-control-not-a-directory");
+        let source_file = root.join("payload.bin");
+        fs::write(&source_file, b"payload").unwrap();
+        let expected_default_file = fs::canonicalize(&source_file)
+            .unwrap()
+            .join(DEFAULT_IGNORE_FILE);
+
+        let error = match IgnoreRules::build(&source_file, &[]) {
+            Err(error) => error,
+            Ok(_) => panic!("a file used as the source root was accepted"),
+        };
+        assert!(matches!(
+            error,
+            Error::FileIo { path, source } if path == expected_default_file
+                && source.kind() != std::io::ErrorKind::NotFound
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }
