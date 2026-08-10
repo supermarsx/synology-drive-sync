@@ -194,6 +194,18 @@ impl ApiClient {
                 path: path.clone(),
                 source,
             })?;
+            // The rustls backend only stores the PEM bytes here and parses them when the client
+            // is built, so a file holding no CERTIFICATE section at all -- an empty, truncated,
+            // or simply mistaken file -- would be accepted in silence and leave the operator
+            // believing a CA was pinned when nothing was added to the trust store. Counting the
+            // sections up front makes that loud; an unreadable payload is deliberately left to
+            // surface where reqwest actually rejects it, when the client is built.
+            if Certificate::from_pem_bundle(&pem).is_ok_and(|certificates| certificates.is_empty())
+            {
+                return Err(Error::Message(format!(
+                    "CA certificate file {path:?} contains no certificate; --ca-certificate must name a PEM file with at least one CERTIFICATE block"
+                )));
+            }
             let certificate = Certificate::from_pem(&pem).map_err(|source| Error::Http {
                 operation: format!("loading CA certificate {path:?}"),
                 source,
@@ -3136,6 +3148,37 @@ mod tests {
         assert_eq!(operation, "building HTTP client");
         fs::remove_file(invalid).unwrap();
 
+        // A file that parses cleanly but yields no certificate is the dangerous case: the
+        // operator asked for a pinned CA and would otherwise get one that was never added.
+        for (label, contents) in [
+            ("empty", &b""[..]),
+            ("textual", &b"this file is not a certificate\n"[..]),
+            (
+                "key-only",
+                &b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIA==\n-----END PRIVATE KEY-----\n"[..],
+            ),
+        ] {
+            let path = std::env::temp_dir().join(format!("{label}-sdsync-ca-{nonce}.pem"));
+            fs::write(&path, contents).unwrap();
+            let Err(error) = ApiClient::connect(&options(path.clone())) else {
+                panic!("a {label} CA file must never produce a client");
+            };
+            let Error::Message(message) = &error else {
+                panic!("expected a rejected CA file, got {error}");
+            };
+            assert_eq!(
+                *message,
+                format!(
+                    "CA certificate file {path:?} contains no certificate; --ca-certificate must name a PEM file with at least one CERTIFICATE block"
+                )
+            );
+            assert!(
+                message.contains(&format!("{path:?}")),
+                "the rejected CA path must be named: {message}"
+            );
+            fs::remove_file(&path).unwrap();
+        }
+
         let root = RemoteRoot::parse("/share/root").unwrap();
         let mut report = initial_write_probe_report(
             &root,
@@ -5515,6 +5558,27 @@ FplE
         .expect("a valid PEM certificate must be accepted");
         assert_eq!(server.join().unwrap().len(), 1);
         fs::remove_file(&ca_path).unwrap();
+
+        // Surrounding commentary is ordinary in distributed CA bundles; the certificate-present
+        // check must not turn that into a spurious rejection.
+        let annotated_path = std::env::temp_dir().join(format!("sdsync-test-ca-notes-{nonce}.pem"));
+        let mut annotated = b"issued by the lab CA, rotate before 2126\n".to_vec();
+        annotated.extend_from_slice(TEST_CA_PEM);
+        annotated.extend_from_slice(b"trailing operator notes, not a PEM section\n");
+        fs::write(&annotated_path, &annotated).unwrap();
+        let (url, server) = scripted_server(vec![required_discovery()]);
+        ApiClient::connect(&ClientOptions {
+            base_url: url,
+            allow_http: true,
+            accept_invalid_certs: false,
+            ca_certificate: Some(annotated_path.clone()),
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(5),
+            retries: 0,
+        })
+        .expect("a certificate surrounded by comments must still be accepted");
+        assert_eq!(server.join().unwrap().len(), 1);
+        fs::remove_file(&annotated_path).unwrap();
 
         // Certificate validation may be disabled only when explicitly requested.
         let (url, server) = scripted_server(vec![required_discovery()]);
