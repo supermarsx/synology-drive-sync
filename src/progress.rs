@@ -507,8 +507,20 @@ fn human_progress(snapshot: &ProgressSnapshot, update: Option<&OperationUpdate>)
         .eta
         .map(format_duration)
         .unwrap_or_else(|| "--:--".to_owned());
+    // Deletes and directory creates weigh nothing in files or bytes, so a mirror that removes
+    // ninety entries and uploads one file would otherwise crawl through `1/1 files` while the
+    // per-operation suffix kept moving. The counter is only shown when the plan holds work
+    // beyond uploads; an upload-only run would just repeat the file counter.
+    let operations = if snapshot.totals.operations > snapshot.totals.files {
+        format!(
+            "{}/{} ops, ",
+            snapshot.completed_operations, snapshot.totals.operations
+        )
+    } else {
+        String::new()
+    };
     let mut line = format!(
-        "Progress {}/{} files, {}/{} at {}/s, {} active, ETA {eta}",
+        "Progress {operations}{}/{} files, {}/{} at {}/s, {} active, ETA {eta}",
         snapshot.completed_files,
         snapshot.totals.files,
         human_bytes(snapshot.logical_bytes),
@@ -945,5 +957,110 @@ mod tests {
             )
         );
         operation.fail().unwrap();
+    }
+
+    /// Elapsed time, throughput, and ETA come from the wall clock; the counters do not. Pin
+    /// the clock-derived fields so a rendered line can be asserted exactly.
+    fn steady(
+        snapshot: ProgressSnapshot,
+        throughput: f64,
+        eta: Option<Duration>,
+    ) -> ProgressSnapshot {
+        ProgressSnapshot {
+            elapsed: Duration::from_secs(2),
+            throughput_bytes_per_second: throughput,
+            eta,
+            ..snapshot
+        }
+    }
+
+    #[test]
+    fn human_line_omits_the_operation_counter_for_an_upload_only_run() {
+        let tracker = ProgressTracker::new(ProgressTotals {
+            operations: 2,
+            files: 2,
+            bytes: 2_048,
+        });
+        let done = tracker.start(OperationKind::Upload, 1_024);
+        done.begin_attempt().unwrap();
+        done.advance(1_024).unwrap();
+        done.finish_success().unwrap();
+        let in_flight = tracker.start(OperationKind::Upload, 1_024);
+        in_flight.begin_attempt().unwrap();
+        in_flight.advance(512).unwrap();
+
+        let snapshot = steady(tracker.snapshot(), 512.0, Some(Duration::from_secs(90)));
+        // Every planned operation is an upload, so an operation counter would only repeat
+        // the file counter.
+        assert_eq!(snapshot.completed_operations, snapshot.completed_files);
+        assert_eq!(
+            human_progress(&snapshot, None),
+            "Progress 1/2 files, 1.5 KiB/2.0 KiB at 512 B/s, 1 active, ETA 01:30"
+        );
+        in_flight.fail().unwrap();
+    }
+
+    #[test]
+    fn human_line_reports_operations_for_a_delete_only_mirror() {
+        let tracker = ProgressTracker::new(ProgressTotals {
+            operations: 90,
+            files: 0,
+            bytes: 0,
+        });
+        let mut last = None;
+        for _ in 0..45 {
+            let delete = tracker.start(OperationKind::DeleteEntry, 0);
+            last = Some(delete.finish_success().unwrap());
+        }
+        let in_flight = tracker.start(OperationKind::DeleteEntry, 0);
+        let update = last.expect("forty-five deletions produce an update");
+        assert_eq!(update.operation_id, 45);
+
+        // A deletion carries no file and no byte weight, so those counters stay at zero for
+        // the whole mirror and only the operation counter shows the run advancing.
+        let snapshot = steady(tracker.snapshot(), 0.0, None);
+        assert_eq!(snapshot.completed_operations, 45);
+        assert_eq!(snapshot.completed_files, 0);
+        assert_eq!(
+            human_progress(&snapshot, Some(&update)),
+            "Progress 45/90 ops, 0/0 files, 0 B/0 B at 0 B/s, 1 active, ETA --:-- \
+             | op=45 delete_entry succeeded attempt=0"
+        );
+        in_flight.fail().unwrap();
+    }
+
+    #[test]
+    fn human_line_reports_operations_for_a_mixed_run() {
+        let tracker = ProgressTracker::new(ProgressTotals {
+            operations: 5,
+            files: 2,
+            bytes: 18,
+        });
+        tracker
+            .start(OperationKind::DeleteEntry, 0)
+            .finish_success()
+            .unwrap();
+        tracker
+            .start(OperationKind::CreateDirectory, 0)
+            .finish_success()
+            .unwrap();
+        let upload = tracker.start(OperationKind::Upload, 11);
+        upload.begin_attempt().unwrap();
+        upload.advance(11).unwrap();
+        upload.finish_success().unwrap();
+        let in_flight = tracker.start(OperationKind::Upload, 7);
+        in_flight.begin_attempt().unwrap();
+        in_flight.advance(3).unwrap();
+
+        let snapshot = steady(tracker.snapshot(), 7.0, Some(Duration::from_secs(1)));
+        // One delete, one directory and one upload are done; the second file is in flight and
+        // one deletion has not started.
+        assert_eq!(snapshot.completed_operations, 3);
+        assert_eq!(snapshot.completed_files, 1);
+        assert_eq!(
+            human_progress(&snapshot, None),
+            "Progress 3/5 ops, 1/2 files, 14 B/18 B at 7 B/s, 1 active, ETA 00:01"
+        );
+        in_flight.fail().unwrap();
     }
 }
