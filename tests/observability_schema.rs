@@ -185,6 +185,7 @@ fn representative_plan() -> Value {
             "creates": [{
                 "relative": "",
                 "remote_path": "/team/export",
+                "reason": "missing-remote",
             }],
             "copies": [copy_fields()],
             "uploads": [{
@@ -192,6 +193,7 @@ fn representative_plan() -> Value {
                 "remote_path": "/team/export/payload.bin",
                 "bytes": 8192,
                 "mtime_ms": 1_785_769_200_000_u64,
+                "reason": "content-differs",
             }],
             "post_deletes": [{
                 "relative": "old/report.bin",
@@ -274,6 +276,7 @@ fn strict_schema_accepts_runtime_server_copy_and_guard_shapes() {
             "action": "create-directory",
             "relative": "",
             "remote_path": "/team/export",
+            "reason": "missing-remote",
         }),
         {
             let mut record = copy_fields();
@@ -281,6 +284,15 @@ fn strict_schema_accepts_runtime_server_copy_and_guard_shapes() {
             record["action"] = json!("copy-remote-content");
             record
         },
+        json!({
+            "schema": "sdsync.plan-action.v1",
+            "action": "upload",
+            "relative": "payload.bin",
+            "remote_path": "/team/export/payload.bin",
+            "bytes": 8192,
+            "mtime_ms": 1_785_769_200_000_u64,
+            "reason": "content-differs",
+        }),
         json!({
             "schema": "sdsync.plan-action.v1",
             "action": "delete",
@@ -321,4 +333,33 @@ fn strict_schema_rejects_missing_or_unknown_server_copy_fields() {
     let mut unknown = json!({"schema": "sdsync.plan.v1", "plan": representative_plan()});
     unknown["plan"]["summary"]["server_copy_mode"] = json!("implicit");
     assert!(validate(&schema, &schema, &unknown, "$").is_err());
+}
+
+#[test]
+fn strict_schema_requires_a_known_change_reason_on_creates_and_uploads() {
+    let schema: Value = serde_json::from_str(SCHEMA_TEXT).expect("schema must be valid JSON");
+
+    for reason in [
+        "missing-remote",
+        "size-differs",
+        "mtime-differs",
+        "content-differs",
+        "type-replaced",
+    ] {
+        let mut plan = representative_plan();
+        plan["actions"]["uploads"][0]["reason"] = json!(reason);
+        plan["actions"]["creates"][0]["reason"] = json!(reason);
+        assert_valid(&schema, &json!({"schema": "sdsync.plan.v1", "plan": plan}));
+    }
+
+    let mut invented = json!({"schema": "sdsync.plan.v1", "plan": representative_plan()});
+    invented["plan"]["actions"]["uploads"][0]["reason"] = json!("vibes-differ");
+    assert!(validate(&schema, &schema, &invented, "$").is_err());
+
+    let mut missing = json!({"schema": "sdsync.plan.v1", "plan": representative_plan()});
+    missing["plan"]["actions"]["creates"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("reason");
+    assert!(validate(&schema, &schema, &missing, "$").is_err());
 }

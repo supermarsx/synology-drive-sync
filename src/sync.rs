@@ -557,7 +557,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::local::{EntryKind, LocalEntry};
-    use crate::plan::{CreateAction, DeleteAction, DestinationGuard, UploadAction};
+    use crate::plan::{ChangeReason, CreateAction, DeleteAction, DestinationGuard, UploadAction};
 
     use super::*;
 
@@ -743,11 +743,13 @@ mod tests {
             creates: vec![CreateAction {
                 relative: "folder".to_owned(),
                 remote_path: "/share/root/folder".to_owned(),
+                reason: ChangeReason::MissingRemote,
             }],
             copies: Vec::new(),
             uploads: vec![UploadAction {
                 local: local("file.txt"),
                 remote_path: "/share/root/file.txt".to_owned(),
+                reason: ChangeReason::MissingRemote,
             }],
             post_deletes: vec![DeleteAction {
                 relative: "extra".to_owned(),
@@ -1270,10 +1272,12 @@ mod tests {
             UploadAction {
                 local: local("one.txt"),
                 remote_path: "/share/root/one.txt".to_owned(),
+                reason: ChangeReason::MissingRemote,
             },
             UploadAction {
                 local: local("two.txt"),
                 remote_path: "/share/root/two.txt".to_owned(),
+                reason: ChangeReason::MissingRemote,
             },
         ];
 

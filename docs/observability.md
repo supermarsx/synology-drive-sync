@@ -157,8 +157,30 @@ For example, a single-profile `plan --output json` returns the full plan in one
 `sdsync.plan.v1` object:
 
 ```json
-{"schema":"sdsync.plan.v1","plan":{"summary":{"uploads":1,"upload_bytes":5242880,"server_copy_fallback_bytes":0,"server_copies":0,"directories":1,"deletions":0,"unchanged_files":41,"protected_entries":0,"changes":true},"actions":{"pre_deletes":[],"creates":[{"relative":"releases","remote_path":"/team/export/releases"}],"copies":[],"uploads":[{"relative":"release.bin","remote_path":"/team/export/release.bin","bytes":5242880,"mtime_ms":1785769200000}],"post_deletes":[]}}}
+{"schema":"sdsync.plan.v1","plan":{"summary":{"uploads":1,"upload_bytes":5242880,"server_copy_fallback_bytes":0,"server_copies":0,"directories":1,"deletions":0,"unchanged_files":41,"protected_entries":0,"changes":true},"actions":{"pre_deletes":[],"creates":[{"relative":"releases","remote_path":"/team/export/releases","reason":"missing-remote"}],"copies":[],"uploads":[{"relative":"release.bin","remote_path":"/team/export/release.bin","bytes":5242880,"mtime_ms":1785769200000,"reason":"content-differs"}],"post_deletes":[]}}}
 ```
+
+### Change reasons
+
+Every `upload` and `create-directory` action carries the comparison that scheduled it. The human
+plan renders the reason and its explanation after the action line:
+
+```text
+  UPLOAD release.bin -> /team/export/release.bin (content-differs: size equal, MD5 did not match)
+```
+
+| `reason` | Meaning | Emitted by |
+| --- | --- | --- |
+| `missing-remote` | No remote entry exists at the mapped path | every compare mode |
+| `size-differs` | Local and remote sizes differ | every compare mode |
+| `mtime-differs` | Sizes agree and the second-resolution modification times differ | `metadata`, `content` |
+| `content-differs` | Sizes agree and the content digests did not compare equal | `content` |
+| `type-replaced` | A remote entry of the other kind occupies the path and is replaced | every compare mode |
+
+The reason never claims a comparison the selected mode did not make. `--compare size-only`
+therefore reports only `missing-remote`, `size-differs`, and `type-replaced`, and only
+`--compare content` can report `content-differs`. When content mode has no usable digest pair but
+the modification times differ, it reports the difference it did observe, `mtime-differs`.
 
 `sync --output json` uses `sdsync.sync.v1`, retains the complete `plan`, and adds `result`. A changed
 sync result contains `changed`, `uploaded`, `server_copied`, `upload_bytes`,
@@ -177,9 +199,9 @@ ordered as follows:
 
 ```ndjson
 {"schema":"sdsync.plan.v1","kind":"summary","uploads":1,"upload_bytes":5242880,"server_copy_fallback_bytes":4096,"server_copies":1,"directories":1,"deletions":0,"unchanged_files":41,"protected_entries":0,"changes":true}
-{"schema":"sdsync.plan-action.v1","action":"create-directory","relative":"releases","remote_path":"/team/export/releases"}
+{"schema":"sdsync.plan-action.v1","action":"create-directory","relative":"releases","remote_path":"/team/export/releases","reason":"missing-remote"}
 {"schema":"sdsync.plan-action.v1","action":"copy-remote-content","from_relative":"old/report.bin","from_remote_path":"/team/export/old/report.bin","to_relative":"new/report.bin","to_remote_path":"/team/export/new/report.bin","expected_size":4096,"expected_mtime_seconds":1785769200,"content_md5":"d41d8cd98f00b204e9800998ecf8427e","source_snapshot_guard":{"entry_kind":"file","size":4096,"mtime_seconds":1785769200,"content_md5":"d41d8cd98f00b204e9800998ecf8427e","require_mtime":true},"verified_upload_fallback":"only-before-copy-task-start"}
-{"schema":"sdsync.plan-action.v1","action":"upload","relative":"release.bin","remote_path":"/team/export/release.bin","bytes":5242880,"mtime_ms":1785769200000}
+{"schema":"sdsync.plan-action.v1","action":"upload","relative":"release.bin","remote_path":"/team/export/release.bin","bytes":5242880,"mtime_ms":1785769200000,"reason":"content-differs"}
 {"schema":"sdsync.output.v1","kind":"completion","result":{"changed":true,"uploaded":1,"server_copied":1,"upload_bytes":5242880,"directories_created":1,"deleted":0,"elapsed_ms":8421}}
 ```
 

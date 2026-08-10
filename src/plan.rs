@@ -22,16 +22,57 @@ pub struct PlanOptions {
     pub server_copy: bool,
 }
 
+/// Why the planner scheduled an action. Every variant names a comparison the planner actually
+/// performed, so a mode that never reads content cannot report a content difference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChangeReason {
+    /// No remote entry exists at the mapped path.
+    MissingRemote,
+    /// Sizes differ. This is the only comparison `--compare size-only` makes.
+    SizeDiffers,
+    /// Sizes agree and the File Station-resolution modification times differ.
+    MtimeDiffers,
+    /// Sizes agree and the content digests did not compare equal.
+    ContentDiffers,
+    /// A remote entry of the other kind occupies the path and is replaced.
+    TypeReplaced,
+}
+
+impl ChangeReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingRemote => "missing-remote",
+            Self::SizeDiffers => "size-differs",
+            Self::MtimeDiffers => "mtime-differs",
+            Self::ContentDiffers => "content-differs",
+            Self::TypeReplaced => "type-replaced",
+        }
+    }
+
+    /// The comparison behind the reason, phrased for a human plan line.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::MissingRemote => "no remote entry at this path",
+            Self::SizeDiffers => "local and remote sizes differ",
+            Self::MtimeDiffers => "size equal, modification time differs",
+            Self::ContentDiffers => "size equal, MD5 did not match",
+            Self::TypeReplaced => "remote entry has the conflicting kind",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CreateAction {
     pub relative: String,
     pub remote_path: String,
+    pub reason: ChangeReason,
 }
 
 #[derive(Clone, Debug)]
 pub struct UploadAction {
     pub local: LocalEntry,
     pub remote_path: String,
+    pub reason: ChangeReason,
 }
 
 #[derive(Clone, Debug)]
@@ -228,6 +269,7 @@ pub fn build_plan(
         plan.creates.push(CreateAction {
             relative: String::new(),
             remote_path: root.as_str().to_owned(),
+            reason: ChangeReason::MissingRemote,
         });
     }
 
@@ -258,10 +300,9 @@ pub fn build_plan(
         match (entry.kind, remote_entry.kind) {
             (EntryKind::Directory, EntryKind::Directory) => {}
             (EntryKind::File, EntryKind::File) => {
-                if files_match(entry, remote_entry, options.compare) {
-                    plan.unchanged_files += 1;
-                } else {
-                    schedule_upload(root, &mut plan, entry)?;
+                match compare_files(entry, remote_entry, options.compare) {
+                    None => plan.unchanged_files += 1,
+                    Some(reason) => schedule_upload(root, &mut plan, entry, reason)?,
                 }
             }
             (local_kind, remote_kind) if !options.delete => {
@@ -279,7 +320,7 @@ pub fn build_plan(
                     options.compare,
                     &mut predeleted,
                 )?;
-                schedule_create(root, &mut plan, entry)?;
+                schedule_create(root, &mut plan, entry, ChangeReason::TypeReplaced)?;
             }
             (EntryKind::File, EntryKind::Directory) => {
                 let subtree = remote_subtree(&remote.entries, &entry.relative);
@@ -298,7 +339,7 @@ pub fn build_plan(
                         &mut predeleted,
                     )?;
                 }
-                schedule_upload(root, &mut plan, entry)?;
+                schedule_upload(root, &mut plan, entry, ChangeReason::TypeReplaced)?;
             }
         }
     }
@@ -393,24 +434,36 @@ fn validate_portable_case_mapping(
 
 fn schedule_missing(root: &RemoteRoot, plan: &mut SyncPlan, entry: &LocalEntry) -> Result<()> {
     match entry.kind {
-        EntryKind::Directory => schedule_create(root, plan, entry),
-        EntryKind::File => schedule_upload(root, plan, entry),
+        EntryKind::Directory => schedule_create(root, plan, entry, ChangeReason::MissingRemote),
+        EntryKind::File => schedule_upload(root, plan, entry, ChangeReason::MissingRemote),
     }
 }
 
-fn schedule_create(root: &RemoteRoot, plan: &mut SyncPlan, entry: &LocalEntry) -> Result<()> {
+fn schedule_create(
+    root: &RemoteRoot,
+    plan: &mut SyncPlan,
+    entry: &LocalEntry,
+    reason: ChangeReason,
+) -> Result<()> {
     plan.creates.push(CreateAction {
         relative: entry.relative.clone(),
         remote_path: root.join(&entry.relative)?,
+        reason,
     });
     Ok(())
 }
 
-fn schedule_upload(root: &RemoteRoot, plan: &mut SyncPlan, entry: &LocalEntry) -> Result<()> {
+fn schedule_upload(
+    root: &RemoteRoot,
+    plan: &mut SyncPlan,
+    entry: &LocalEntry,
+    reason: ChangeReason,
+) -> Result<()> {
     plan.upload_bytes = plan.upload_bytes.saturating_add(entry.size);
     plan.uploads.push(UploadAction {
         local: entry.clone(),
         remote_path: root.join(&entry.relative)?,
+        reason,
     });
     Ok(())
 }
@@ -435,18 +488,31 @@ fn push_predelete(
     Ok(())
 }
 
-fn files_match(local: &LocalEntry, remote: &RemoteEntry, mode: CompareMode) -> bool {
+/// Compare a same-path file pair under `mode`, returning `None` when the mode considers them
+/// equal and otherwise the single comparison that decided the difference. The reason is limited
+/// to what the mode actually inspects: `SizeOnly` can only ever report a size difference.
+fn compare_files(
+    local: &LocalEntry,
+    remote: &RemoteEntry,
+    mode: CompareMode,
+) -> Option<ChangeReason> {
     if local.size != remote.size {
-        return false;
+        return Some(ChangeReason::SizeDiffers);
     }
+    let mtime_differs = local_mtime_seconds(local) != remote.mtime_seconds;
     match mode {
-        CompareMode::Content => {
-            local.content_md5.is_some()
-                && local.content_md5 == remote.content_md5
-                && local_mtime_seconds(local) == remote.mtime_seconds
-        }
-        CompareMode::SizeOnly => true,
-        CompareMode::Metadata => local.mtime_ms.div_euclid(1000) == remote.mtime_seconds,
+        CompareMode::SizeOnly => None,
+        CompareMode::Metadata => mtime_differs.then_some(ChangeReason::MtimeDiffers),
+        CompareMode::Content => match (local.content_md5, remote.content_md5) {
+            (Some(local_digest), Some(remote_digest)) if local_digest == remote_digest => {
+                mtime_differs.then_some(ChangeReason::MtimeDiffers)
+            }
+            (Some(_), Some(_)) => Some(ChangeReason::ContentDiffers),
+            // A digest is unavailable, so content equality was never established. Name the
+            // metadata difference when there is one rather than an unperformed content check.
+            _ if mtime_differs => Some(ChangeReason::MtimeDiffers),
+            _ => Some(ChangeReason::ContentDiffers),
+        },
     }
 }
 
@@ -775,6 +841,153 @@ mod tests {
         assert_eq!(plan.uploads.len(), 2);
         assert_eq!(plan.unchanged_files, 1);
         assert!(plan.post_deletes.is_empty());
+        assert_eq!(plan.creates[0].reason, ChangeReason::MissingRemote);
+        assert_eq!(
+            plan.uploads
+                .iter()
+                .map(|action| (action.local.relative.as_str(), action.reason))
+                .collect::<Vec<_>>(),
+            [
+                ("changed.txt", ChangeReason::MtimeDiffers),
+                ("new.txt", ChangeReason::MissingRemote),
+            ]
+        );
+    }
+
+    #[test]
+    fn change_reasons_name_only_the_comparison_each_mode_performs() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let grown = local(&[("payload.bin", EntryKind::File, 5, 1_000)]);
+        let touched = local(&[("payload.bin", EntryKind::File, 4, 9_000)]);
+        let remote_entry = remote(&[("payload.bin", EntryKind::File, 4, 1)]);
+
+        for mode in [
+            options(false),
+            PlanOptions {
+                compare: CompareMode::SizeOnly,
+                ..options(false)
+            },
+            content_options(false, false),
+        ] {
+            let plan = build_plan(&root, &grown, &remote_entry, &rules(&[]), &mode).unwrap();
+            assert_eq!(
+                plan.uploads[0].reason,
+                ChangeReason::SizeDiffers,
+                "a size difference outranks every other comparison in {:?} mode",
+                mode.compare
+            );
+        }
+
+        // Size-only never inspects a timestamp, so an mtime change is not a change at all.
+        let size_only = PlanOptions {
+            compare: CompareMode::SizeOnly,
+            ..options(false)
+        };
+        let unchanged =
+            build_plan(&root, &touched, &remote_entry, &rules(&[]), &size_only).unwrap();
+        assert!(unchanged.uploads.is_empty());
+        assert_eq!(unchanged.unchanged_files, 1);
+
+        let metadata =
+            build_plan(&root, &touched, &remote_entry, &rules(&[]), &options(false)).unwrap();
+        assert_eq!(metadata.uploads[0].reason, ChangeReason::MtimeDiffers);
+    }
+
+    #[test]
+    fn content_mode_reports_the_metadata_difference_when_a_digest_is_unavailable() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+
+        // Remote digests are fetched only for equal size and mtime, so a same-size mtime change
+        // has no digest pair to compare and must not be reported as a content difference.
+        let mut moved = local(&[("payload.bin", EntryKind::File, 4, 9_000)]);
+        moved.entries.get_mut("payload.bin").unwrap().content_md5 = Some(digest(1));
+        let plan = build_plan(
+            &root,
+            &moved,
+            &remote(&[("payload.bin", EntryKind::File, 4, 1)]),
+            &rules(&[]),
+            &content_options(false, false),
+        )
+        .unwrap();
+        assert_eq!(plan.uploads[0].reason, ChangeReason::MtimeDiffers);
+
+        // With metadata identical, an absent digest leaves content equality unestablished.
+        let unhashed = local(&[("payload.bin", EntryKind::File, 4, 1_000)]);
+        let plan = build_plan(
+            &root,
+            &unhashed,
+            &remote(&[("payload.bin", EntryKind::File, 4, 1)]),
+            &rules(&[]),
+            &content_options(false, false),
+        )
+        .unwrap();
+        assert_eq!(plan.uploads[0].reason, ChangeReason::ContentDiffers);
+    }
+
+    #[test]
+    fn type_replacement_is_reported_in_both_directions() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let file_over_directory = build_plan(
+            &root,
+            &local(&[("node", EntryKind::File, 1, 1_000)]),
+            &remote(&[("node", EntryKind::Directory, 0, 0)]),
+            &rules(&[]),
+            &options(true),
+        )
+        .unwrap();
+        assert_eq!(
+            file_over_directory.uploads[0].reason,
+            ChangeReason::TypeReplaced
+        );
+
+        // A source holding at least one file keeps the empty-source deletion guard out of the way.
+        let directory_over_file = build_plan(
+            &root,
+            &local(&[
+                ("keep.txt", EntryKind::File, 1, 1_000),
+                ("node", EntryKind::Directory, 0, 0),
+            ]),
+            &remote(&[
+                ("keep.txt", EntryKind::File, 1, 1),
+                ("node", EntryKind::File, 1, 1),
+            ]),
+            &rules(&[]),
+            &options(true),
+        )
+        .unwrap();
+        assert_eq!(
+            directory_over_file.creates[0].reason,
+            ChangeReason::TypeReplaced
+        );
+    }
+
+    #[test]
+    fn every_change_reason_has_a_distinct_tag_and_explanation() {
+        let reasons = [
+            ChangeReason::MissingRemote,
+            ChangeReason::SizeDiffers,
+            ChangeReason::MtimeDiffers,
+            ChangeReason::ContentDiffers,
+            ChangeReason::TypeReplaced,
+        ];
+        assert_eq!(
+            reasons.map(ChangeReason::as_str),
+            [
+                "missing-remote",
+                "size-differs",
+                "mtime-differs",
+                "content-differs",
+                "type-replaced",
+            ]
+        );
+        assert_eq!(
+            reasons
+                .iter()
+                .map(|reason| reason.detail())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            reasons.len()
+        );
     }
 
     #[test]
@@ -952,6 +1165,7 @@ mod tests {
         .unwrap();
         assert_eq!(plan.uploads.len(), 1);
         assert_eq!(plan.unchanged_files, 0);
+        assert_eq!(plan.uploads[0].reason, ChangeReason::ContentDiffers);
     }
 
     #[test]
@@ -975,6 +1189,7 @@ mod tests {
         .unwrap();
         assert_eq!(plan.uploads.len(), 1);
         assert_eq!(plan.unchanged_files, 0);
+        assert_eq!(plan.uploads[0].reason, ChangeReason::MtimeDiffers);
     }
 
     #[test]
@@ -1197,6 +1412,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("", "/share/new-root")]
         );
+        assert_eq!(plan.creates[0].reason, ChangeReason::MissingRemote);
         assert_eq!(plan.uploads[0].remote_path, "/share/new-root/payload.bin");
     }
 

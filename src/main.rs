@@ -2846,7 +2846,14 @@ fn write_plan_human_to<W: Write>(writer: &mut W, plan: &SyncPlan, detailed: bool
         .map_err(output_error)?;
     }
     for action in &plan.creates {
-        writeln!(writer, "  MKDIR  {}", action.remote_path).map_err(output_error)?;
+        writeln!(
+            writer,
+            "  MKDIR  {} ({}: {})",
+            action.remote_path,
+            action.reason.as_str(),
+            action.reason.detail()
+        )
+        .map_err(output_error)?;
     }
     for action in &plan.copies {
         writeln!(
@@ -2861,8 +2868,11 @@ fn write_plan_human_to<W: Write>(writer: &mut W, plan: &SyncPlan, detailed: bool
     for action in &plan.uploads {
         writeln!(
             writer,
-            "  UPLOAD {} -> {}",
-            action.local.relative, action.remote_path
+            "  UPLOAD {} -> {} ({}: {})",
+            action.local.relative,
+            action.remote_path,
+            action.reason.as_str(),
+            action.reason.detail()
         )
         .map_err(output_error)?;
     }
@@ -2928,6 +2938,7 @@ fn plan_value(plan: &SyncPlan) -> Value {
             "creates": plan.creates.iter().map(|action| json!({
                 "relative": action.relative,
                 "remote_path": action.remote_path,
+                "reason": action.reason.as_str(),
             })).collect::<Vec<_>>(),
             "copies": plan.copies.iter().map(|action| json!({
                 "from_relative": action.from_relative,
@@ -2945,6 +2956,7 @@ fn plan_value(plan: &SyncPlan) -> Value {
                 "remote_path": action.remote_path,
                 "bytes": action.local.size,
                 "mtime_ms": action.local.mtime_ms,
+                "reason": action.reason.as_str(),
             })).collect::<Vec<_>>(),
             "post_deletes": plan.post_deletes.iter().map(|action| json!({
                 "relative": action.relative,
@@ -3001,6 +3013,7 @@ fn write_plan_ndjson_to<W: Write>(writer: &mut W, plan: &SyncPlan) -> Result<()>
             &json!({
                 "schema": "sdsync.plan-action.v1", "action": "create-directory",
                 "relative": action.relative, "remote_path": action.remote_path,
+                "reason": action.reason.as_str(),
             }),
         )?;
     }
@@ -3028,6 +3041,7 @@ fn write_plan_ndjson_to<W: Write>(writer: &mut W, plan: &SyncPlan) -> Result<()>
                 "schema": "sdsync.plan-action.v1", "action": "upload",
                 "relative": action.local.relative, "remote_path": action.remote_path,
                 "bytes": action.local.size, "mtime_ms": action.local.mtime_ms,
+                "reason": action.reason.as_str(),
             }),
         )?;
     }
@@ -3798,6 +3812,7 @@ mod tests {
             creates: vec![plan::CreateAction {
                 relative: "new-directory".to_owned(),
                 remote_path: "/share/root/new-directory".to_owned(),
+                reason: plan::ChangeReason::MissingRemote,
             }],
             copies: vec![plan::CopyAction {
                 from_relative: "source/copied.bin".to_owned(),
@@ -3812,6 +3827,7 @@ mod tests {
             uploads: vec![plan::UploadAction {
                 local: uploaded,
                 remote_path: "/share/root/uploaded.bin".to_owned(),
+                reason: plan::ChangeReason::ContentDiffers,
             }],
             post_deletes: vec![plan::DeleteAction {
                 relative: "old/guarded.bin".to_owned(),
@@ -4477,6 +4493,7 @@ mod tests {
         pending.creates.push(plan::CreateAction {
             relative: "late".to_owned(),
             remote_path: "/share/root/late".to_owned(),
+            reason: plan::ChangeReason::MissingRemote,
         });
         assert!(matches!(
             ensure_reconciled(&pending),
@@ -4502,6 +4519,8 @@ mod tests {
             false
         );
         assert_eq!(value["actions"]["creates"][0]["relative"], "new-directory");
+        assert_eq!(value["actions"]["creates"][0]["reason"], "missing-remote");
+        assert_eq!(value["actions"]["uploads"][0]["reason"], "content-differs");
         assert_eq!(value["actions"]["copies"][0]["expected_size"], 7);
         assert_eq!(
             value["actions"]["copies"][0]["verified_upload_fallback"],
@@ -4521,6 +4540,77 @@ mod tests {
             ensure_reconciled(&plan),
             Err(Error::ReconciliationPending { operations: 5 })
         ));
+        assert_eq!(
+            json_object_keys(&value["actions"]["creates"][0]),
+            BTreeSet::from(["reason", "relative", "remote_path"])
+        );
+        assert_eq!(
+            json_object_keys(&value["actions"]["uploads"][0]),
+            BTreeSet::from(["bytes", "mtime_ms", "reason", "relative", "remote_path"])
+        );
+    }
+
+    #[test]
+    fn every_change_reason_reaches_human_json_and_ndjson_output() {
+        for (reason, tag, detail) in [
+            (
+                plan::ChangeReason::MissingRemote,
+                "missing-remote",
+                "no remote entry at this path",
+            ),
+            (
+                plan::ChangeReason::SizeDiffers,
+                "size-differs",
+                "local and remote sizes differ",
+            ),
+            (
+                plan::ChangeReason::MtimeDiffers,
+                "mtime-differs",
+                "size equal, modification time differs",
+            ),
+            (
+                plan::ChangeReason::ContentDiffers,
+                "content-differs",
+                "size equal, MD5 did not match",
+            ),
+            (
+                plan::ChangeReason::TypeReplaced,
+                "type-replaced",
+                "remote entry has the conflicting kind",
+            ),
+        ] {
+            let mut plan = rich_plan();
+            plan.uploads[0].reason = reason;
+            plan.creates[0].reason = reason;
+
+            let human = plan_human(&plan, true);
+            assert!(
+                human.contains(&format!(
+                    "UPLOAD uploaded.bin -> /share/root/uploaded.bin ({tag}: {detail})"
+                )),
+                "{tag} is missing from the human plan:\n{human}"
+            );
+            assert!(
+                human.contains(&format!(
+                    "MKDIR  /share/root/new-directory ({tag}: {detail})"
+                )),
+                "{tag} is missing from the human plan:\n{human}"
+            );
+            assert!(
+                !plan_human(&plan, false).contains(tag),
+                "a concise plan stays a one-line summary"
+            );
+
+            let value = plan_value(&plan);
+            assert_eq!(value["actions"]["uploads"][0]["reason"], tag);
+            assert_eq!(value["actions"]["creates"][0]["reason"], tag);
+
+            let records = plan_ndjson_values(&plan);
+            assert_eq!(records[2]["action"], "create-directory");
+            assert_eq!(records[2]["reason"], tag);
+            assert_eq!(records[4]["action"], "upload");
+            assert_eq!(records[4]["reason"], tag);
+        }
     }
 
     #[test]
@@ -4980,9 +5070,13 @@ mod tests {
 
         let detailed = plan_human(&plan, true);
         assert!(detailed.contains("DELETE-CONFLICT /share/root/conflict"));
-        assert!(detailed.contains("MKDIR  /share/root/new-directory"));
+        assert!(detailed.contains(
+            "MKDIR  /share/root/new-directory (missing-remote: no remote entry at this path)"
+        ));
         assert!(detailed.contains("COPY   /share/root/source/copied.bin"));
-        assert!(detailed.contains("UPLOAD uploaded.bin -> /share/root/uploaded.bin"));
+        assert!(detailed.contains(
+            "UPLOAD uploaded.bin -> /share/root/uploaded.bin (content-differs: size equal, MD5 did not match)"
+        ));
         assert!(detailed.contains("destination guarded by 13 bytes+mtime+MD5"));
         assert!(
             plan_human(&plan_with_deletions(1), true)
@@ -4995,7 +5089,9 @@ mod tests {
         assert_eq!(records[1]["action"], "delete-conflict");
         assert_eq!(records[2]["action"], "create-directory");
         assert_eq!(records[3]["action"], "copy-remote-content");
+        assert_eq!(records[2]["reason"], "missing-remote");
         assert_eq!(records[4]["action"], "upload");
+        assert_eq!(records[4]["reason"], "content-differs");
         assert_eq!(records[5]["action"], "delete");
         assert_eq!(records[5]["destination_guard"]["expected_size"], 13);
         assert!(plan_ndjson_values(&plan_with_deletions(1))[1]["destination_guard"].is_null());

@@ -34,6 +34,15 @@
       "minLength": 1,
       "pattern": "^/"
     },
+    "changeReason": {
+      "enum": [
+        "missing-remote",
+        "size-differs",
+        "mtime-differs",
+        "content-differs",
+        "type-replaced"
+      ]
+    },
     "contentMd5": {
       "type": "string",
       "pattern": "^[0-9a-f]{32}$"
@@ -278,10 +287,11 @@
     "createPlanAction": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["relative", "remote_path"],
+      "required": ["relative", "remote_path", "reason"],
       "properties": {
         "relative": { "type": "string" },
-        "remote_path": { "$ref": "#/$defs/remotePath" }
+        "remote_path": { "$ref": "#/$defs/remotePath" },
+        "reason": { "$ref": "#/$defs/changeReason" }
       }
     },
     "copyPlanAction": {
@@ -313,12 +323,13 @@
     "uploadPlanAction": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["relative", "remote_path", "bytes", "mtime_ms"],
+      "required": ["relative", "remote_path", "bytes", "mtime_ms", "reason"],
       "properties": {
         "relative": { "$ref": "#/$defs/relativePath" },
         "remote_path": { "$ref": "#/$defs/remotePath" },
         "bytes": { "$ref": "#/$defs/nonNegativeInteger" },
-        "mtime_ms": { "$ref": "#/$defs/nonNegativeInteger" }
+        "mtime_ms": { "$ref": "#/$defs/nonNegativeInteger" },
+        "reason": { "$ref": "#/$defs/changeReason" }
       }
     },
     "plan": {
@@ -485,25 +496,27 @@
     "ndjsonCreateAction": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema", "action", "relative", "remote_path"],
+      "required": ["schema", "action", "relative", "remote_path", "reason"],
       "properties": {
         "schema": { "const": "sdsync.plan-action.v1" },
         "action": { "const": "create-directory" },
         "relative": { "type": "string" },
-        "remote_path": { "$ref": "#/$defs/remotePath" }
+        "remote_path": { "$ref": "#/$defs/remotePath" },
+        "reason": { "$ref": "#/$defs/changeReason" }
       }
     },
     "ndjsonUploadAction": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema", "action", "relative", "remote_path", "bytes", "mtime_ms"],
+      "required": ["schema", "action", "relative", "remote_path", "bytes", "mtime_ms", "reason"],
       "properties": {
         "schema": { "const": "sdsync.plan-action.v1" },
         "action": { "const": "upload" },
         "relative": { "$ref": "#/$defs/relativePath" },
         "remote_path": { "$ref": "#/$defs/remotePath" },
         "bytes": { "$ref": "#/$defs/nonNegativeInteger" },
-        "mtime_ms": { "$ref": "#/$defs/nonNegativeInteger" }
+        "mtime_ms": { "$ref": "#/$defs/nonNegativeInteger" },
+        "reason": { "$ref": "#/$defs/changeReason" }
       }
     },
     "ndjsonCopyAction": {

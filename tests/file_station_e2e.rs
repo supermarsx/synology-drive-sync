@@ -366,9 +366,17 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
             .as_array()
             .expect("upload actions")
             .iter()
-            .map(|action| action["relative"].as_str().expect("relative path"))
+            .map(|action| {
+                (
+                    action["relative"].as_str().expect("relative path"),
+                    action["reason"].as_str().expect("change reason"),
+                )
+            })
             .collect::<Vec<_>>(),
-        ["alpha.txt", "nested/beta.bin"]
+        [
+            ("alpha.txt", "missing-remote"),
+            ("nested/beta.bin", "missing-remote"),
+        ]
     );
     assert!(planned.get("result").is_none());
     let plan_requests = server.requests();
@@ -1391,6 +1399,27 @@ fn destructive_type_conflicts_delete_deepest_first_then_fully_reconcile() {
             .map(|action| action["relative"].as_str().expect("relative path"))
             .collect::<Vec<_>>(),
         ["stale/sub/old.bin", "stale/sub", "stale"]
+    );
+    assert_eq!(
+        planned["plan"]["actions"]["uploads"]
+            .as_array()
+            .expect("upload actions")
+            .iter()
+            .map(|action| {
+                (
+                    action["relative"].as_str().expect("relative path"),
+                    action["reason"].as_str().expect("change reason"),
+                )
+            })
+            .collect::<Vec<_>>(),
+        [
+            ("folder/new.txt", "missing-remote"),
+            ("node", "type-replaced"),
+        ]
+    );
+    assert_eq!(
+        planned["plan"]["actions"]["creates"][0]["reason"],
+        "type-replaced"
     );
     let plan_request_count = server.requests().len();
 
