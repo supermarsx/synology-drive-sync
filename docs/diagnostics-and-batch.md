@@ -31,7 +31,8 @@ log in to or mount that source NAS: SMB/NFS credentials and mount lifecycle rema
 responsibility. In particular, a Windows drive mapping created in an interactive session may not
 exist for a scheduled task; validate the exact path with `doctor source` under the scheduler
 identity before relying on it. DSM password/TOTP options authenticate the File Station target, not
-the mounted source.
+the mounted source. See [Local, mapped-drive, and SMB sources](local-and-smb-sources.md) for
+per-platform paths, the share-root limitation, and expected SMB performance.
 
 Without `--hash`, the scanner validates names, types, metadata, case portability, link/reparse
 boundaries, and readability needed to enumerate the tree. With `--hash`, it additionally reads every

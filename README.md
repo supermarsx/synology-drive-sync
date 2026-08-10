@@ -315,6 +315,21 @@ MD5 is the strongest content digest exposed by the documented File Station API, 
 
 Missing folders are planned shallowest-first and created before copies/uploads. The client also requests parent creation from File Station, while all generated remote paths remain contained under the configured logical root. This preserves the source hierarchy and empty directories; directory mtimes, ACLs, ownership, modes, xattrs, and other filesystem metadata remain outside the parity contract.
 
+## Local, mapped-drive, and SMB sources
+
+`SOURCE` is any local path the running identity can read as an ordinary directory, including a
+drive mapped from a NAS or a share mounted over SMB/CIFS. This is first-class supported usage, not
+a workaround: mounting a Windows UNC path (`\\nas\media\photos`), a mapped drive (`Z:\photos`), a
+macOS `/Volumes/...` mount, or a Linux `/mnt/...` mount, then pointing `SOURCE` at it, is enough.
+The client never mounts or authenticates the share itself; that stays the operating system's job.
+
+A share's own root cannot currently be `SOURCE` — sync a subdirectory of it instead — and a mounted
+share is exercised through the same portable filesystem calls as local disk, so every stat and every
+byte becomes a network round trip; content comparison rehashes changed files multiple times as a
+deliberate TOCTOU defense, which is safe but not fast. See
+[Local, mapped-drive, and SMB sources](docs/local-and-smb-sources.md) for per-platform examples, the
+share-root limitation, and when to prefer `--compare metadata` for a large share.
+
 ## Output, progress, and logs
 
 Command results and diagnostics are independent streams:
@@ -393,7 +408,7 @@ Transient transport, busy, 408/429, and 502/503/504 failures use bounded retry. 
 
 - One direction only: local to remote.
 - File Station WebAPI only; no private Drive protocol, SMB, WebDAV, SSH, or QuickConnect.
-- A mapped or mounted NAS share can be the source only when the operating system exposes it as an ordinary readable directory. The DSM package is intended to run where the source is physically local; File Station has no direct remote-NAS-to-remote-NAS transfer operation. File Station CIFS/NFS/ISO mount points are protected destination boundaries and cannot be sync roots.
+- A mapped or mounted NAS share is a supported source once the operating system exposes it as an ordinary readable directory (see [Local, mapped-drive, and SMB sources](docs/local-and-smb-sources.md)), but the share's own root cannot yet be selected directly and SMB round trips make it slower than local disk. The DSM package is intended to run where the source is physically local; File Station has no direct remote-NAS-to-remote-NAS transfer operation. File Station CIFS/NFS/ISO mount points are protected destination boundaries and cannot be sync roots.
 - No block-level delta or resumable upload.
 - No persistent content index or universal rename operation. Only the explicitly safe server-copy case above avoids retransmission; other rename/duplicate cases use verified upload fallback.
 - No claim of crash-atomic overwrite or transactional type replacement.
