@@ -572,6 +572,9 @@ mod tests {
         fail_live_snapshot_path: Option<String>,
         fail_upload: bool,
         fail_create: bool,
+        /// When set, `upload` blocks until every worker has entered the call, guaranteeing
+        /// concurrent workers fail together instead of one racing ahead and stopping the rest.
+        upload_barrier: Option<Arc<std::sync::Barrier>>,
     }
 
     impl MockOperations {
@@ -677,6 +680,9 @@ mod tests {
             _observer: Option<UploadObserver>,
             _cancellation: &CancellationToken,
         ) -> Result<()> {
+            if let Some(barrier) = &self.upload_barrier {
+                barrier.wait();
+            }
             self.event(format!("upload:{}", local.relative));
             if self.fail_upload {
                 Err(Error::Message("upload failed".to_owned()))
@@ -1247,5 +1253,165 @@ mod tests {
                 .unwrap()
                 .contains(&"upload:new/file.txt".to_owned())
         );
+    }
+
+    #[test]
+    fn a_second_concurrent_upload_failure_does_not_override_the_first_reported_error() {
+        let client = MockOperations {
+            fail_upload: true,
+            upload_barrier: Some(Arc::new(std::sync::Barrier::new(2))),
+            ..MockOperations::default()
+        };
+        let mut plan = populated_plan();
+        plan.pre_deletes.clear();
+        plan.creates.clear();
+        plan.post_deletes.clear();
+        plan.uploads = vec![
+            UploadAction {
+                local: local("one.txt"),
+                remote_path: "/share/root/one.txt".to_owned(),
+            },
+            UploadAction {
+                local: local("two.txt"),
+                remote_path: "/share/root/two.txt".to_owned(),
+            },
+        ];
+
+        let error = execute_with(
+            &client,
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &plan,
+            ExecuteOptions {
+                jobs: 2,
+                dry_run: false,
+            },
+            |_| {},
+        )
+        .unwrap_err();
+
+        // The barrier forces both workers into `upload` before either can observe the other's
+        // failure, so both fail and only the first failure is surfaced to the caller.
+        assert!(matches!(error, Error::Message(message) if message == "upload failed"));
+        let events = client.events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("upload:"))
+                .count(),
+            2
+        );
+    }
+
+    /// A minimal hand-rolled HTTP/1.1 server answering exactly one `SYNO.API.Info` discovery
+    /// request, enough for `ApiClient::connect` to succeed without a full DSM handshake.
+    fn spawn_discovery_only_server() -> (String, thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+
+            let mut received = Vec::new();
+            let mut buffer = [0_u8; 8192];
+            let header_end = loop {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0, "connection closed before request headers");
+                received.extend_from_slice(&buffer[..count]);
+                if let Some(position) = received.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    break position + 4;
+                }
+            };
+            let header_text = String::from_utf8(received[..header_end].to_vec()).unwrap();
+            let mut content_length = 0usize;
+            for line in header_text.split("\r\n") {
+                if let Some((name, value)) = line.split_once(':')
+                    && name.trim().eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse().unwrap_or(0);
+                }
+            }
+            while received.len() - header_end < content_length {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0, "connection closed before request body");
+                received.extend_from_slice(&buffer[..count]);
+            }
+
+            let body = serde_json::json!({
+                "success": true,
+                "data": {
+                    "SYNO.API.Auth": {"path": "entry.cgi", "minVersion": 3, "maxVersion": 7},
+                    "SYNO.FileStation.List": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+                    "SYNO.FileStation.CreateFolder": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+                    "SYNO.FileStation.Upload": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+                    "SYNO.FileStation.CheckPermission": {"path": "entry.cgi", "minVersion": 3, "maxVersion": 3},
+                }
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        (format!("http://{address}/prefix/"), handle)
+    }
+
+    #[test]
+    fn execute_wrapper_delegates_to_execute_with_using_a_real_api_client() {
+        let (base_url, server) = spawn_discovery_only_server();
+        let client = ApiClient::connect(&crate::api::ClientOptions {
+            base_url,
+            allow_http: true,
+            accept_invalid_certs: false,
+            ca_certificate: None,
+            connect_timeout: std::time::Duration::from_secs(2),
+            request_timeout: std::time::Duration::from_secs(5),
+            retries: 0,
+        })
+        .unwrap();
+        server.join().unwrap();
+
+        let empty_plan = SyncPlan {
+            pre_deletes: Vec::new(),
+            creates: Vec::new(),
+            copies: Vec::new(),
+            uploads: Vec::new(),
+            post_deletes: Vec::new(),
+            unchanged_files: 0,
+            protected_entries: 0,
+            upload_bytes: 0,
+        };
+        let mut reported = Vec::new();
+        // `execute` (unlike `execute_with`, used by every other test in this module) is the
+        // real public entry point over a concrete `ApiClient`; an empty plan never reaches the
+        // network beyond the discovery handshake above, since every snapshot-batch check list
+        // it builds is empty and short-circuits before any request.
+        let report = execute(
+            &client,
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &empty_plan,
+            ExecuteOptions {
+                jobs: 1,
+                dry_run: false,
+            },
+            |line| reported.push(line),
+        )
+        .unwrap();
+
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.created, 0);
+        assert_eq!(report.copied, 0);
+        assert_eq!(report.uploaded, 0);
+        assert_eq!(report.uploaded_bytes, 0);
+        assert!(reported.is_empty());
     }
 }

@@ -1305,6 +1305,83 @@ mod tests {
     }
 
     #[test]
+    fn credentials_profile_accessor_covers_every_action_variant() {
+        let set_password = CredentialsArgs {
+            action: CredentialAction::SetPassword(SetPasswordArgs {
+                profile: CredentialProfileArgs {
+                    url: Some("https://files.example.test".to_owned()),
+                    username: None,
+                    allow_http: false,
+                },
+                password_stdin: false,
+                password_file: None,
+            }),
+        };
+        assert_eq!(
+            set_password.profile().url.as_deref(),
+            Some("https://files.example.test")
+        );
+
+        let set_totp = CredentialsArgs {
+            action: CredentialAction::SetTotp(SetTotpArgs {
+                profile: CredentialProfileArgs {
+                    url: None,
+                    username: Some("alice".to_owned()),
+                    allow_http: false,
+                },
+                secret_stdin: false,
+                totp_secret_file: None,
+            }),
+        };
+        assert_eq!(set_totp.profile().username.as_deref(), Some("alice"));
+
+        let status = CredentialsArgs {
+            action: CredentialAction::Status(CredentialStatusArgs {
+                profile: CredentialProfileArgs {
+                    url: None,
+                    username: None,
+                    allow_http: true,
+                },
+            }),
+        };
+        assert!(status.profile().allow_http);
+
+        let remove = CredentialsArgs {
+            action: CredentialAction::Remove(CredentialRemoveArgs {
+                profile: CredentialProfileArgs {
+                    url: Some("https://remove.example.test".to_owned()),
+                    username: None,
+                    allow_http: false,
+                },
+                kind: RemoveKind::All,
+            }),
+        };
+        assert_eq!(
+            remove.profile().url.as_deref(),
+            Some("https://remove.example.test")
+        );
+    }
+
+    #[test]
+    fn checked_parser_rejects_a_misplaced_positional_legacy_argument() {
+        let error = Cli::try_parse_checked_from([
+            "synology-drive-sync",
+            "./source",
+            "sync",
+            "./other",
+            "/team/export",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("<SOURCE>"),
+            "unexpected message: {rendered}"
+        );
+        assert!(rendered.contains("place it after the subcommand"));
+    }
+
+    #[test]
     fn diagnostic_and_batch_help_exposes_safety_controls() {
         let mut command = Cli::command();
         let doctor = command.find_subcommand_mut("doctor").unwrap();

@@ -862,4 +862,88 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(60)), "01:00");
         assert_eq!(format_duration(Duration::from_secs(3_661)), "01:01:01");
     }
+
+    #[test]
+    fn operation_kind_as_str_and_display_cover_every_variant() {
+        let cases = [
+            (OperationKind::Upload, "upload"),
+            (OperationKind::CreateDirectory, "create_directory"),
+            (OperationKind::DeleteEntry, "delete_entry"),
+            (OperationKind::ScanLocal, "scan_local"),
+            (OperationKind::ScanRemote, "scan_remote"),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(kind.as_str(), expected);
+            assert_eq!(kind.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn update_kind_as_str_covers_every_variant() {
+        let cases = [
+            (UpdateKind::Started, "started"),
+            (UpdateKind::AttemptStarted, "attempt_started"),
+            (UpdateKind::AttemptReset, "attempt_reset"),
+            (UpdateKind::Advanced, "advanced"),
+            (UpdateKind::Succeeded, "succeeded"),
+            (UpdateKind::Failed, "failed"),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(kind.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn progress_error_display_covers_every_variant() {
+        assert_eq!(
+            ProgressError::OperationFinished.to_string(),
+            "progress operation is already finished"
+        );
+        assert_eq!(
+            ProgressError::UnknownOperation.to_string(),
+            "progress operation is not active"
+        );
+        assert_eq!(
+            ProgressError::CounterUnavailable.to_string(),
+            "progress counter is unavailable"
+        );
+    }
+
+    #[test]
+    fn operation_handle_exposes_its_operation_id() {
+        let tracker = ProgressTracker::new(ProgressTotals::default());
+        let first = tracker.start(OperationKind::ScanLocal, 0);
+        let second = tracker.start(OperationKind::ScanRemote, 0);
+        assert_eq!(first.operation_id(), 1);
+        assert_eq!(second.operation_id(), 2);
+        first.finish_success().unwrap();
+        second.finish_success().unwrap();
+    }
+
+    #[test]
+    fn human_renderer_includes_the_bounded_operation_update() {
+        let tracker = ProgressTracker::new(ProgressTotals {
+            operations: 1,
+            files: 1,
+            bytes: 10,
+        });
+        let operation = tracker.start(OperationKind::Upload, 10);
+        let update = operation.begin_attempt().unwrap();
+        let mut renderer = ProgressRenderer::new(
+            Vec::new(),
+            ProgressMode::Always,
+            ProgressFormat::Human,
+            false,
+        );
+        renderer.render(&tracker.snapshot(), Some(&update)).unwrap();
+        let output = String::from_utf8(renderer.into_inner()).unwrap();
+        assert_eq!(
+            output.trim_end(),
+            format!(
+                "Progress 0/1 files, 0 B/10 B at 0 B/s, 1 active, ETA --:-- | op={} upload attempt_started attempt=1",
+                update.operation_id
+            )
+        );
+        operation.fail().unwrap();
+    }
 }
