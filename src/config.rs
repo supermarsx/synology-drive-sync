@@ -1439,4 +1439,488 @@ output = "json"
         assert!(matches!(error, ConfigError::Invalid(_)));
         assert!(error.to_string().contains("write-test requires REMOTE"));
     }
+
+    #[test]
+    fn oversized_config_text_is_rejected_before_parsing() {
+        let oversized = "a".repeat(MAX_CONFIG_BYTES + 1);
+        let error = LoadedConfig::from_toml("config.toml", &oversized).unwrap_err();
+        assert!(matches!(error, ConfigError::TooLarge { .. }));
+    }
+
+    #[test]
+    fn oversized_config_file_is_rejected_before_reading() {
+        let path = std::env::temp_dir().join(format!(
+            "sdsync-oversized-config-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, vec![b'a'; MAX_CONFIG_BYTES + 1]).unwrap();
+        let error = LoadedConfig::load(&path).unwrap_err();
+        let _ = fs::remove_file(&path);
+        assert!(matches!(error, ConfigError::TooLarge { .. }));
+    }
+
+    #[test]
+    fn resolve_doctor_requires_username_unless_routing_only() {
+        let cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "doctor",
+            "--url",
+            "https://files.example.test",
+        ])
+        .unwrap();
+        let Invocation::Doctor(arguments) = cli.invocation() else {
+            panic!("expected doctor");
+        };
+        let error = resolve_doctor(None, arguments, &cli.global.output).unwrap_err();
+        assert!(matches!(error, ConfigError::MissingValue("--username")));
+    }
+
+    #[test]
+    fn resolve_doctor_rejects_source_action_directly() {
+        let cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "doctor",
+            "--url",
+            "https://files.example.test",
+            "--routing-only",
+            "source",
+        ])
+        .unwrap();
+        let Invocation::Doctor(arguments) = cli.invocation() else {
+            panic!("expected doctor");
+        };
+        let error = resolve_doctor(None, arguments, &cli.global.output).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid effective configuration: doctor source must be resolved as a local-only diagnostic"
+        );
+    }
+
+    #[test]
+    fn resolve_doctor_rejects_routing_only_combined_with_target_subcommand() {
+        let cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "doctor",
+            "--url",
+            "https://files.example.test",
+            "--routing-only",
+            "target",
+        ])
+        .unwrap();
+        let Invocation::Doctor(arguments) = cli.invocation() else {
+            panic!("expected doctor");
+        };
+        let error = resolve_doctor(None, arguments, &cli.global.output).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid effective configuration: --routing-only cannot be combined with a doctor source or target subcommand"
+        );
+    }
+
+    #[test]
+    fn resolve_credential_profile_combines_cli_url_and_profile_username() {
+        let profile = Profile {
+            username: Some("mirror-bot".to_owned()),
+            ..Profile::default()
+        };
+        let cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "credentials",
+            "status",
+            "--url",
+            "https://files.example.test",
+            "--allow-http",
+        ])
+        .unwrap();
+        let Invocation::Credentials(arguments) = cli.invocation() else {
+            panic!("expected credentials");
+        };
+        let resolved = resolve_credential_profile(Some(&profile), arguments.profile()).unwrap();
+        assert_eq!(resolved.url, "https://files.example.test");
+        assert_eq!(resolved.username, "mirror-bot");
+        assert!(resolved.allow_http);
+    }
+
+    #[test]
+    fn resolve_credential_profile_requires_username() {
+        let cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "credentials",
+            "status",
+            "--url",
+            "https://files.example.test",
+        ])
+        .unwrap();
+        let Invocation::Credentials(arguments) = cli.invocation() else {
+            panic!("expected credentials");
+        };
+        let error = resolve_credential_profile(None, arguments.profile()).unwrap_err();
+        assert!(matches!(error, ConfigError::MissingValue("--username")));
+    }
+
+    #[test]
+    fn validate_profile_rejects_out_of_range_jobs_retries_and_timeouts() {
+        let jobs_error = validate_profile(&Profile {
+            jobs: Some(0),
+            ..Profile::default()
+        })
+        .unwrap_err();
+        assert_eq!(
+            jobs_error.to_string(),
+            "invalid effective configuration: jobs must be between 1 and 16"
+        );
+
+        let retries_error = validate_profile(&Profile {
+            retries: Some(6),
+            ..Profile::default()
+        })
+        .unwrap_err();
+        assert_eq!(
+            retries_error.to_string(),
+            "invalid effective configuration: retries must be between 0 and 5"
+        );
+
+        let timeout_error = validate_profile(&Profile {
+            timeout: Some(0),
+            ..Profile::default()
+        })
+        .unwrap_err();
+        assert_eq!(
+            timeout_error.to_string(),
+            "invalid effective configuration: timeout and connect-timeout must be at least 1 second"
+        );
+
+        let connect_timeout_error = validate_profile(&Profile {
+            connect_timeout: Some(0),
+            ..Profile::default()
+        })
+        .unwrap_err();
+        assert_eq!(
+            connect_timeout_error.to_string(),
+            "invalid effective configuration: timeout and connect-timeout must be at least 1 second"
+        );
+    }
+
+    #[test]
+    fn validate_profile_requires_delete_true_for_allow_empty_source() {
+        let error = validate_profile(&Profile {
+            allow_empty_source: Some(true),
+            ..Profile::default()
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid effective configuration: allow-empty-source requires delete=true in the same profile"
+        );
+    }
+
+    #[test]
+    fn validate_profile_rejects_conflicting_remote_log_token_sources() {
+        let error = validate_profile(&Profile {
+            remote_log_token_file: Some(PathBuf::from("token-file")),
+            remote_log_token_env: Some("TOKEN_ENV".to_owned()),
+            ..Profile::default()
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid effective configuration: remote-log-token-file conflicts with remote-log-token-env"
+        );
+    }
+
+    #[test]
+    fn validate_profile_requires_remote_log_url_when_mode_required() {
+        let error = validate_profile(&Profile {
+            remote_log_mode: Some(RemoteLogMode::Required),
+            ..Profile::default()
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid effective configuration: remote-log-mode=required requires remote-log-url"
+        );
+    }
+
+    #[test]
+    fn validate_profile_requires_remote_log_url_for_token_source() {
+        let error = validate_profile(&Profile {
+            remote_log_token_file: Some(PathBuf::from("token-file")),
+            ..Profile::default()
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid effective configuration: a remote-log token source requires remote-log-url"
+        );
+    }
+
+    #[test]
+    fn validate_profile_rejects_invalid_remote_log_token_env_name() {
+        let error = validate_profile(&Profile {
+            remote_log_url: Some("https://logs.example.test/ingest".to_owned()),
+            remote_log_token_env: Some("BAD NAME".to_owned()),
+            ..Profile::default()
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid effective configuration: remote-log-token-env must be a non-empty environment variable name"
+        );
+    }
+
+    #[test]
+    fn validate_dsm_url_reports_http_wording_when_allow_http_enabled() {
+        let error = validate_profile(&Profile {
+            url: Some("http://alice:secret@nas.lan/proxy".to_owned()),
+            allow_http: Some(true),
+            ..Profile::default()
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid effective configuration: url must be an absolute HTTP(S) reverse-proxy URL without credentials, query, or fragment"
+        );
+    }
+
+    #[test]
+    fn validate_remote_log_url_rejects_an_unparseable_url() {
+        let error = validate_profile(&Profile {
+            remote_log_url: Some("not a url".to_owned()),
+            ..Profile::default()
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid effective configuration: remote-log-url must be an absolute HTTPS URL"
+        );
+    }
+
+    #[test]
+    fn resolve_behavior_rejects_out_of_range_profile_jobs() {
+        let profile = Profile {
+            source: Some(PathBuf::from("profile-source")),
+            remote: Some("/team/export".to_owned()),
+            url: Some("https://files.example.test".to_owned()),
+            username: Some("alice".to_owned()),
+            jobs: Some(20),
+            ..Profile::default()
+        };
+        let cli = Cli::try_parse_from(["synology-drive-sync", "sync"]).unwrap();
+        let Invocation::Sync { arguments, .. } = cli.invocation() else {
+            panic!("expected sync");
+        };
+        let error = resolve_sync(Some(&profile), arguments, &cli.global.output).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid effective configuration: jobs must be between 1 and 16"
+        );
+    }
+
+    #[test]
+    fn resolve_safety_rejects_allow_empty_source_without_delete() {
+        let cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "sync",
+            "./source",
+            "/team/export",
+            "--url",
+            "https://files.example.test",
+            "--username",
+            "alice",
+            "--allow-empty-source",
+        ])
+        .unwrap();
+        let Invocation::Sync { arguments, .. } = cli.invocation() else {
+            panic!("expected sync");
+        };
+        let error = resolve_sync(None, arguments, &cli.global.output).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid effective configuration: allow-empty-source requires delete"
+        );
+    }
+
+    #[test]
+    fn resolve_network_rejects_out_of_range_profile_retries_and_timeouts() {
+        let base_profile = Profile {
+            source: Some(PathBuf::from("profile-source")),
+            remote: Some("/team/export".to_owned()),
+            url: Some("https://files.example.test".to_owned()),
+            username: Some("alice".to_owned()),
+            ..Profile::default()
+        };
+        let cli = Cli::try_parse_from(["synology-drive-sync", "sync"]).unwrap();
+        let Invocation::Sync { arguments, .. } = cli.invocation() else {
+            panic!("expected sync");
+        };
+
+        let retries_profile = Profile {
+            retries: Some(6),
+            ..base_profile.clone()
+        };
+        let error =
+            resolve_sync(Some(&retries_profile), arguments, &cli.global.output).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid effective configuration: retries must be between 0 and 5"
+        );
+
+        let timeout_profile = Profile {
+            timeout: Some(0),
+            ..base_profile
+        };
+        let error =
+            resolve_sync(Some(&timeout_profile), arguments, &cli.global.output).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid effective configuration: timeout and connect-timeout must be at least 1 second"
+        );
+    }
+
+    #[test]
+    fn resolve_output_derives_log_level_and_verbosity_from_cli_flags() {
+        let two = Cli::try_parse_from([
+            "synology-drive-sync",
+            "doctor",
+            "--url",
+            "https://files.example.test",
+            "--routing-only",
+            "-v",
+            "-v",
+        ])
+        .unwrap();
+        let resolved_two = resolve_output(&Profile::default(), &two.global.output).unwrap();
+        assert_eq!(resolved_two.verbosity, 2);
+        assert_eq!(resolved_two.log_level, LogLevel::Trace);
+
+        let one = Cli::try_parse_from([
+            "synology-drive-sync",
+            "doctor",
+            "--url",
+            "https://files.example.test",
+            "--routing-only",
+            "-v",
+        ])
+        .unwrap();
+        let resolved_one = resolve_output(&Profile::default(), &one.global.output).unwrap();
+        assert_eq!(resolved_one.verbosity, 1);
+        assert_eq!(resolved_one.log_level, LogLevel::Debug);
+    }
+
+    #[test]
+    fn resolve_output_derives_log_level_from_profile_verbosity_when_cli_is_silent() {
+        let cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "doctor",
+            "--url",
+            "https://files.example.test",
+            "--routing-only",
+        ])
+        .unwrap();
+
+        let trace_profile = Profile {
+            verbose: Some(2),
+            ..Profile::default()
+        };
+        let trace = resolve_output(&trace_profile, &cli.global.output).unwrap();
+        assert_eq!(trace.verbosity, 2);
+        assert_eq!(trace.log_level, LogLevel::Trace);
+
+        let debug_profile = Profile {
+            verbose: Some(1),
+            ..Profile::default()
+        };
+        let debug = resolve_output(&debug_profile, &cli.global.output).unwrap();
+        assert_eq!(debug.verbosity, 1);
+        assert_eq!(debug.log_level, LogLevel::Debug);
+    }
+
+    #[test]
+    fn resolve_output_uses_cli_remote_log_token_file_over_profile_env() {
+        let profile = Profile {
+            remote_log_token_env: Some("PROFILE_ENV".to_owned()),
+            ..Profile::default()
+        };
+        let cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "doctor",
+            "--url",
+            "https://files.example.test",
+            "--routing-only",
+            "--remote-log-url",
+            "https://logs.example.test/ingest",
+            "--remote-log-token-file",
+            "cli-token",
+        ])
+        .unwrap();
+        let resolved = resolve_output(&profile, &cli.global.output).unwrap();
+        assert_eq!(
+            resolved.remote_log_token,
+            Some(RemoteTokenSource::File(PathBuf::from("cli-token")))
+        );
+    }
+
+    #[test]
+    fn resolve_output_rejects_conflicting_profile_remote_log_token_sources() {
+        let profile = Profile {
+            remote_log_token_file: Some(PathBuf::from("token-file")),
+            remote_log_token_env: Some("TOKEN_ENV".to_owned()),
+            ..Profile::default()
+        };
+        let cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "doctor",
+            "--url",
+            "https://files.example.test",
+            "--routing-only",
+        ])
+        .unwrap();
+        let error = resolve_output(&profile, &cli.global.output).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid effective configuration: remote-log-token-file conflicts with remote-log-token-env"
+        );
+    }
+
+    #[test]
+    fn resolve_output_defaults_remote_log_token_to_env_var_when_unspecified() {
+        let profile = Profile {
+            remote_log_url: Some("https://logs.example.test/ingest".to_owned()),
+            ..Profile::default()
+        };
+        let cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "doctor",
+            "--url",
+            "https://files.example.test",
+            "--routing-only",
+        ])
+        .unwrap();
+        let resolved = resolve_output(&profile, &cli.global.output).unwrap();
+        assert_eq!(
+            resolved.remote_log_token,
+            Some(RemoteTokenSource::Environment(
+                REMOTE_LOG_TOKEN_ENV.to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_output_rejects_token_source_without_remote_log_url() {
+        let cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "doctor",
+            "--url",
+            "https://files.example.test",
+            "--routing-only",
+            "--remote-log-token-file",
+            "cli-token",
+        ])
+        .unwrap();
+        let error = resolve_output(&Profile::default(), &cli.global.output).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid effective configuration: a remote-log token source requires remote-log-url"
+        );
+    }
 }

@@ -864,4 +864,44 @@ mod tests {
             Err(BatchError::InvalidUsername { job_name, .. }) if job_name == "job"
         ));
     }
+
+    #[test]
+    fn batch_job_exposes_username_remote_delete_and_max_delete() {
+        let mirror = job(
+            "mirror",
+            "https://nas.test",
+            "alice",
+            "/team/root",
+            true,
+            12,
+        );
+        assert_eq!(mirror.username(), "alice");
+        assert_eq!(mirror.remote().as_str(), "/team/root");
+        assert!(mirror.delete());
+        assert_eq!(mirror.max_delete(), 12);
+
+        let additive = job(
+            "additive",
+            "https://nas.test",
+            "bob",
+            "/team/other",
+            false,
+            0,
+        );
+        assert_eq!(additive.username(), "bob");
+        assert_eq!(additive.remote().as_str(), "/team/other");
+        assert!(!additive.delete());
+        assert_eq!(additive.max_delete(), 0);
+    }
+
+    #[test]
+    fn from_selected_rejects_an_empty_job_list_directly() {
+        // `BatchCatalog::new` and `select`/`select_all` already reject an empty batch before
+        // calling this private helper, but the helper carries its own defensive check. Call it
+        // directly so that invariant is exercised rather than left to trust.
+        assert!(matches!(
+            ValidatedBatch::from_selected(Vec::new()),
+            Err(BatchError::EmptyBatch)
+        ));
+    }
 }
