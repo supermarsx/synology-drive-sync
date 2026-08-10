@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::num::NonZeroU64;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -39,6 +40,10 @@ const LIST_PAGE_SIZE: usize = 500;
 const MAX_JSON_RESPONSE: u64 = 32 * 1024 * 1024;
 const MAX_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+/// Longest a rate-limited reader sleeps before it looks at the cancellation token again.
+const RATE_LIMIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// Rate-limit tokens are held scaled by this factor so refill stays exact integer arithmetic.
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
 const WRITE_PROBE_PAYLOAD: &[u8] = b"synology-drive-sync disposable write probe v1\n";
 const WRITE_PROBE_FILE_NAME: &str = "probe.bin";
 const WRITE_PROBE_COPY_DIRECTORY: &str = "copy";
@@ -82,6 +87,7 @@ pub struct ApiClient {
     control_timeout: Duration,
     upload_timeout: Duration,
     operation_timeout: Duration,
+    upload_rate_limit: Option<Arc<Mutex<TokenBucket>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -226,6 +232,7 @@ impl ApiClient {
             control_timeout: control_request_timeout(options.request_timeout),
             upload_timeout: options.request_timeout,
             operation_timeout: options.request_timeout,
+            upload_rate_limit: None,
         };
         client.apis = client.discover()?;
         client.validate_api("SYNO.API.Auth", 3)?;
@@ -238,6 +245,17 @@ impl ApiClient {
             client.validate_api(api, version)?;
         }
         Ok(client)
+    }
+
+    /// Cap upload throughput at `bytes_per_second`, shared by this client and every clone of it
+    /// so concurrent jobs divide one budget instead of each receiving the full rate.
+    ///
+    /// `None` (and a zero rate, which the configuration layer already rejects) leaves uploads
+    /// unlimited, which is the default and the only behaviour that existed before.
+    #[must_use]
+    pub fn with_max_upload_rate(mut self, bytes_per_second: Option<u64>) -> Self {
+        self.upload_rate_limit = upload_rate_bucket(bytes_per_second);
+        self
     }
 
     pub fn require_delete_api(&self) -> Result<()> {
@@ -1164,6 +1182,7 @@ impl ApiClient {
                 inner: file,
                 observer: observer.clone(),
                 cancelled: Arc::clone(&observer_cancelled),
+                throttle: upload_throttle(self.upload_rate_limit.as_ref(), cancellation),
             };
             let part = Part::reader_with_length(reader, local.size)
                 .file_name(remote_name.to_owned())
@@ -1777,6 +1796,136 @@ struct ObservedReader<R> {
     inner: R,
     observer: Option<UploadObserver>,
     cancelled: Arc<AtomicBool>,
+    /// `None` leaves the reader on the unmetered path it has always taken.
+    throttle: Option<UploadThrottle>,
+}
+
+/// A token bucket written as a pure state machine: every operation is handed the current
+/// instant instead of reading the clock itself, so refill, burst and starvation are all
+/// testable without a single sleep.
+///
+/// Tokens are stored scaled by [`NANOS_PER_SECOND`], which makes the arithmetic exact: one byte
+/// costs `NANOS_PER_SECOND` scaled units and one elapsed nanosecond mints `bytes_per_second` of
+/// them. Nothing is rounded away, so a slow trickle still accumulates into whole bytes.
+#[derive(Debug)]
+struct TokenBucket {
+    bytes_per_second: u64,
+    capacity_scaled: u128,
+    available_scaled: u128,
+    updated: Instant,
+}
+
+/// What the bucket permits a reader to do right now.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RateGrant {
+    /// Read at most this many bytes immediately.
+    Ready(u64),
+    /// Nothing is available yet; wait no longer than this and ask again.
+    Wait(Duration),
+}
+
+impl TokenBucket {
+    /// The bucket starts full and holds one second of traffic. That burst size is also what
+    /// bounds every wait it can report: a caller is never queued for more than a full bucket,
+    /// so `Wait` never exceeds one second no matter how large the read or how small the rate.
+    fn new(bytes_per_second: NonZeroU64, now: Instant) -> Self {
+        let capacity_scaled = u128::from(bytes_per_second.get()) * NANOS_PER_SECOND;
+        Self {
+            bytes_per_second: bytes_per_second.get(),
+            capacity_scaled,
+            available_scaled: capacity_scaled,
+            updated: now,
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.updated).as_nanos();
+        if elapsed == 0 {
+            return;
+        }
+        self.updated = now;
+        let minted = elapsed.saturating_mul(u128::from(self.bytes_per_second));
+        self.available_scaled = self
+            .available_scaled
+            .saturating_add(minted)
+            .min(self.capacity_scaled);
+    }
+
+    /// Hand out as much of `requested` as the budget currently allows, or report how long the
+    /// caller should wait before asking again. A grant is deducted immediately, so two workers
+    /// sharing a bucket cannot both spend the same byte.
+    fn take(&mut self, requested: u64, now: Instant) -> RateGrant {
+        self.refill(now);
+        // Never queue for more than one bucket's worth; that is what keeps waits short.
+        let wanted = requested.min(self.bytes_per_second);
+        let available = u64::try_from(self.available_scaled / NANOS_PER_SECOND).unwrap_or(u64::MAX);
+        if wanted == 0 || available > 0 {
+            let granted = available.min(wanted);
+            self.available_scaled -= u128::from(granted) * NANOS_PER_SECOND;
+            return RateGrant::Ready(granted);
+        }
+        let shortfall = u128::from(wanted) * NANOS_PER_SECOND - self.available_scaled;
+        let nanos = shortfall.div_ceil(u128::from(self.bytes_per_second));
+        RateGrant::Wait(Duration::from_nanos(
+            u64::try_from(nanos).unwrap_or(u64::MAX),
+        ))
+    }
+}
+
+/// Upload pacing for one transfer: the byte budget shared with every other worker, plus the
+/// token that lets a waiting reader give up.
+#[derive(Clone)]
+struct UploadThrottle {
+    bucket: Arc<Mutex<TokenBucket>>,
+    cancellation: CancellationToken,
+}
+
+impl UploadThrottle {
+    /// Block until the shared budget allows at least one byte, then report how much of
+    /// `requested` may be read now.
+    ///
+    /// The wait is served in [`RATE_LIMIT_POLL_INTERVAL`] slices rather than one long sleep, so
+    /// a cancelled transfer is abandoned within that interval however slow the limit is. The
+    /// bucket lock is deliberately released before each sleep; holding it would serialise every
+    /// other worker behind this one.
+    fn claim(&self, requested: usize) -> std::io::Result<usize> {
+        loop {
+            if self.cancellation.is_cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "upload cancelled",
+                ));
+            }
+            let grant = {
+                let mut bucket = self.bucket.lock().unwrap_or_else(PoisonError::into_inner);
+                bucket.take(u64::try_from(requested).unwrap_or(u64::MAX), Instant::now())
+            };
+            match grant {
+                RateGrant::Ready(allowance) => {
+                    return Ok(usize::try_from(allowance).unwrap_or(requested));
+                }
+                RateGrant::Wait(remaining) => {
+                    thread::sleep(remaining.min(RATE_LIMIT_POLL_INTERVAL));
+                }
+            }
+        }
+    }
+}
+
+fn upload_rate_bucket(bytes_per_second: Option<u64>) -> Option<Arc<Mutex<TokenBucket>>> {
+    bytes_per_second
+        .and_then(NonZeroU64::new)
+        .map(|rate| Arc::new(Mutex::new(TokenBucket::new(rate, Instant::now()))))
+}
+
+fn upload_throttle(
+    bucket: Option<&Arc<Mutex<TokenBucket>>>,
+    cancellation: &CancellationToken,
+) -> Option<UploadThrottle> {
+    bucket.map(|bucket| UploadThrottle {
+        bucket: Arc::clone(bucket),
+        cancellation: cancellation.clone(),
+    })
 }
 
 struct ProbeCleanup {
@@ -1909,7 +2058,19 @@ fn write_probe_md5() -> ContentMd5 {
 
 impl<R: Read> Read for ObservedReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let count = self.inner.read(buffer)?;
+        // An unlimited upload takes exactly the path it always has: one full-buffer read.
+        // A limited one is metered by shortening the read rather than by sleeping on bytes it
+        // has already taken, which keeps the pacing smooth and every wait bounded.
+        let count = match self.throttle.as_ref() {
+            Some(throttle) => match throttle.claim(buffer.len()) {
+                Ok(allowance) => self.inner.read(&mut buffer[..allowance])?,
+                Err(error) => {
+                    self.cancelled.store(true, Ordering::Release);
+                    return Err(error);
+                }
+            },
+            None => self.inner.read(buffer)?,
+        };
         if count > 0
             && let Some(observer) = &self.observer
             && !observer(UploadTransferEvent::Advanced {
@@ -3327,6 +3488,7 @@ mod tests {
             inner: std::io::Cursor::new(b"payload"),
             observer: Some(observer),
             cancelled: Arc::new(AtomicBool::new(false)),
+            throttle: None,
         };
         let mut output = Vec::new();
         reader.read_to_end(&mut output).unwrap();
@@ -3342,6 +3504,7 @@ mod tests {
             inner: std::io::Cursor::new(b"cancel"),
             observer: Some(observer),
             cancelled: Arc::clone(&cancelled),
+            throttle: None,
         };
         let error = reader.read(&mut [0_u8; 8]).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
@@ -3352,6 +3515,184 @@ mod tests {
         ));
         assert!(matches!(
             prioritize_observer_cancellation(&cancelled, wrapped),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    fn rate(bytes_per_second: u64) -> NonZeroU64 {
+        NonZeroU64::new(bytes_per_second).expect("test rates are non-zero")
+    }
+
+    /// The bucket is a pure function of the instants it is handed, so its whole behaviour is
+    /// pinned here without waiting on a real clock.
+    #[test]
+    fn a_token_bucket_starts_full_and_refills_at_the_configured_rate() {
+        let start = Instant::now();
+        let mut bucket = TokenBucket::new(rate(1000), start);
+
+        // It opens holding one second of traffic and hands that burst over in one grant.
+        assert_eq!(bucket.take(1000, start), RateGrant::Ready(1000));
+        // Drained, it quotes the wait for a whole chunk rather than granting nothing.
+        assert_eq!(
+            bucket.take(1000, start),
+            RateGrant::Wait(Duration::from_secs(1))
+        );
+        // Half a second of refill affords exactly half the chunk.
+        assert_eq!(
+            bucket.take(1000, start + Duration::from_millis(500)),
+            RateGrant::Ready(500)
+        );
+        // An idle minute does not bank a minute of credit: refill stops at the burst size.
+        assert_eq!(
+            bucket.take(4000, start + Duration::from_secs(60)),
+            RateGrant::Ready(1000)
+        );
+    }
+
+    /// The wait a starved reader is quoted is what bounds how long it sleeps between
+    /// cancellation checks, so it must never scale with the size of the read.
+    #[test]
+    fn a_token_bucket_never_queues_a_reader_for_more_than_one_burst() {
+        let start = Instant::now();
+        let mut bucket = TokenBucket::new(rate(4), start);
+
+        assert_eq!(bucket.take(u64::MAX, start), RateGrant::Ready(4));
+        assert_eq!(
+            bucket.take(u64::MAX, start),
+            RateGrant::Wait(Duration::from_secs(1))
+        );
+        // A partial refill is credited to the byte instead of being rounded away.
+        let quarter = start + Duration::from_millis(250);
+        assert_eq!(bucket.take(2, quarter), RateGrant::Ready(1));
+        assert_eq!(
+            bucket.take(2, quarter),
+            RateGrant::Wait(Duration::from_millis(500))
+        );
+        // A clock that fails to advance must not mint credit out of nothing.
+        assert_eq!(
+            bucket.take(2, start),
+            RateGrant::Wait(Duration::from_millis(500))
+        );
+        // An empty read never waits.
+        assert_eq!(bucket.take(0, quarter), RateGrant::Ready(0));
+    }
+
+    #[test]
+    fn an_absent_or_zero_rate_leaves_uploads_unlimited() {
+        assert!(upload_rate_bucket(None).is_none());
+        assert!(upload_rate_bucket(Some(0)).is_none());
+        assert!(upload_rate_bucket(Some(1)).is_some());
+        assert!(upload_throttle(None, &CancellationToken::default()).is_none());
+    }
+
+    fn throttled_reader(
+        payload: &[u8],
+        bytes_per_second: Option<u64>,
+        cancellation: &CancellationToken,
+        cancelled: &Arc<AtomicBool>,
+    ) -> ObservedReader<std::io::Cursor<Vec<u8>>> {
+        let bucket = upload_rate_bucket(bytes_per_second);
+        ObservedReader {
+            inner: std::io::Cursor::new(payload.to_vec()),
+            observer: None,
+            cancelled: Arc::clone(cancelled),
+            throttle: upload_throttle(bucket.as_ref(), cancellation),
+        }
+    }
+
+    /// The regression that matters most: with no limit configured the reader must behave
+    /// exactly as it always has -- full-buffer reads, byte-identical payload.
+    #[test]
+    fn an_unlimited_observed_reader_is_unchanged_by_the_rate_limiter() {
+        let payload: Vec<u8> = (0..64_u32 * 1024).map(|index| index as u8).collect();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut reader =
+            throttled_reader(&payload, None, &CancellationToken::default(), &cancelled);
+
+        // The first read fills the whole buffer: nothing shortens it.
+        let mut window = [0_u8; 4096];
+        assert_eq!(reader.read(&mut window).unwrap(), window.len());
+        assert_eq!(window.as_slice(), &payload[..window.len()]);
+
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest.as_slice(), &payload[window.len()..]);
+        assert!(!cancelled.load(Ordering::Acquire));
+    }
+
+    /// A limit that the opening burst already covers must change the bytes not at all -- only
+    /// the pace at which they are handed over.
+    #[test]
+    fn a_throttled_reader_delivers_the_same_bytes_as_an_unlimited_one() {
+        let payload: Vec<u8> = (0..64_u32 * 1024).map(|index| index as u8).collect();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut reader = throttled_reader(
+            &payload,
+            Some(1024 * 1024),
+            &CancellationToken::default(),
+            &cancelled,
+        );
+
+        let mut delivered = Vec::new();
+        reader.read_to_end(&mut delivered).unwrap();
+        assert_eq!(delivered, payload);
+        assert!(!cancelled.load(Ordering::Acquire));
+    }
+
+    /// A reader that outruns the budget waits for refill and then continues, rather than
+    /// reporting a short read as end of file.
+    #[test]
+    fn a_throttled_reader_waits_for_refill_and_then_continues() {
+        let payload = vec![9_u8; 4096];
+        let cancelled = Arc::new(AtomicBool::new(false));
+        // One kilobyte per second: one millisecond of refill buys one byte.
+        let mut reader = throttled_reader(
+            &payload,
+            Some(1000),
+            &CancellationToken::default(),
+            &cancelled,
+        );
+
+        // The opening burst is exactly one second of traffic, however large the buffer.
+        let mut window = [0_u8; 4096];
+        assert_eq!(reader.read(&mut window).unwrap(), 1000);
+
+        // The budget is spent, so this read can only be served after a real wait.
+        let mut next = [0_u8; 4];
+        let count = reader.read(&mut next).unwrap();
+        assert!(
+            (1..=next.len()).contains(&count),
+            "a waiting reader must return bytes, not end of file: {count}"
+        );
+        assert!(next[..count].iter().all(|byte| *byte == 9));
+    }
+
+    /// Throttling must not blunt cancellation: a reader parked on the bucket has to notice the
+    /// token and surface the same interruption an unthrottled reader does.
+    #[test]
+    fn a_throttled_reader_is_interrupted_promptly_by_cancellation() {
+        // A waiting reader re-checks the token at least this often, so a limit can never park
+        // a cancelled transfer behind one long sleep.
+        assert!(RATE_LIMIT_POLL_INTERVAL <= Duration::from_millis(50));
+
+        let cancellation = CancellationToken::default();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        // One byte per second: after the opening byte every read has to wait.
+        let mut reader = throttled_reader(&[7_u8; 64], Some(1), &cancellation, &cancelled);
+        assert_eq!(reader.read(&mut [0_u8; 64]).unwrap(), 1);
+
+        let signal = cancellation.clone();
+        let canceller = thread::spawn(move || signal.cancel());
+        let error = reader
+            .read(&mut [0_u8; 64])
+            .expect_err("a cancelled transfer must not keep waiting on the bucket");
+        canceller.join().unwrap();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        // The interruption has to reach the caller as a cancellation, not as a transport error.
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(matches!(
+            prioritize_observer_cancellation(&cancelled, Ok(())),
             Err(Error::Cancelled)
         ));
     }
@@ -5146,6 +5487,34 @@ mod tests {
             "discovery and login only: the upload must never be sent"
         );
         fs::remove_file(path).unwrap();
+    }
+
+    /// A configured limit must still deliver the whole file. The throttle works by shortening
+    /// reads, and a shortened read must never be mistaken for the end of the body.
+    #[test]
+    fn a_rate_limited_client_still_uploads_the_complete_file() {
+        let (path, local) = temp_upload_source("throttled", b"abc");
+        let digest = local.content_md5.unwrap().to_string();
+        let mut responses = upload_preamble();
+        responses.extend([
+            (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+            (
+                StatusCode::OK,
+                getinfo_file("/share/root/abc.bin", local.size, None),
+            ),
+            (StatusCode::OK, task_start_response("throttled-md5")),
+            (
+                StatusCode::OK,
+                format!(r#"{{"success":true,"data":{{"finished":true,"md5":"{digest}"}}}}"#),
+            ),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+        // A megabyte per second: the opening burst covers this payload outright, so the limited
+        // path is exercised without the test depending on any wall-clock delay.
+        let client = client.with_max_upload_rate(Some(1024 * 1024));
+        client.upload(&local, "/share/root/abc.bin").unwrap();
+        assert_eq!(server.join().unwrap().len(), 6);
+        fs::remove_file(&path).unwrap();
     }
 
     /// A transport failure must fail the upload, name the file it was carrying, and consume

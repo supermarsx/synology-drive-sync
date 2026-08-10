@@ -102,6 +102,7 @@ pub struct Profile {
     pub retries: Option<u8>,
     pub timeout: Option<u64>,
     pub connect_timeout: Option<u64>,
+    pub max_rate: Option<u64>,
     pub ca_certificate: Option<PathBuf>,
     pub allow_http: Option<bool>,
     pub danger_accept_invalid_certs: Option<bool>,
@@ -263,6 +264,8 @@ pub struct NonSecretProfileView {
     pub retries: u8,
     pub timeout: u64,
     pub connect_timeout: u64,
+    /// Upload bytes per second shared by every job; absent means unlimited.
+    pub max_rate: Option<u64>,
     pub ca_certificate: Option<PathBuf>,
     pub allow_http: bool,
     pub danger_accept_invalid_certs: bool,
@@ -303,6 +306,7 @@ impl NonSecretProfileView {
             connect_timeout: profile
                 .connect_timeout
                 .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECONDS),
+            max_rate: profile.max_rate,
             ca_certificate: profile.ca_certificate.clone(),
             allow_http: profile.allow_http.unwrap_or(false),
             danger_accept_invalid_certs: profile.danger_accept_invalid_certs.unwrap_or(false),
@@ -607,6 +611,11 @@ pub fn validate_profile(profile: &Profile) -> Result<(), ConfigError> {
     if profile.timeout == Some(0) || profile.connect_timeout == Some(0) {
         return Err(ConfigError::Invalid(
             "timeout and connect-timeout must be at least 1 second".to_owned(),
+        ));
+    }
+    if profile.max_rate == Some(0) {
+        return Err(ConfigError::Invalid(
+            "max-rate must be at least 1 byte per second".to_owned(),
         ));
     }
     if profile.allow_empty_source == Some(true) && profile.delete != Some(true) {
@@ -961,6 +970,7 @@ max-delete = 20
 retries = 1
 timeout = 900
 connect-timeout = 10
+max-rate = 65536
 ca-certificate = "pki/root.pem"
 log-level = "warn"
 log-format = "json"
@@ -1599,6 +1609,36 @@ output = "json"
             connect_timeout_error.to_string(),
             "invalid effective configuration: timeout and connect-timeout must be at least 1 second"
         );
+
+        // A zero rate would be an upload that never makes progress, not an unlimited one;
+        // unlimited is spelled by leaving the key out.
+        let max_rate_error = validate_profile(&Profile {
+            max_rate: Some(0),
+            ..Profile::default()
+        })
+        .unwrap_err();
+        assert_eq!(
+            max_rate_error.to_string(),
+            "invalid effective configuration: max-rate must be at least 1 byte per second"
+        );
+        validate_profile(&Profile {
+            max_rate: Some(1),
+            ..Profile::default()
+        })
+        .unwrap();
+    }
+
+    /// An unset rate limit must stay absent rather than materialising as some default, because
+    /// absent is what the client reads as "unlimited".
+    #[test]
+    fn the_non_secret_view_reports_the_profile_rate_limit() {
+        let loaded = LoadedConfig::from_toml("settings/profiles.toml", CONFIG).unwrap();
+        let view = loaded.select_profile(None).unwrap().non_secret_view();
+        assert_eq!(view.max_rate, Some(65536));
+
+        let unset = NonSecretProfileView::new("default", None);
+        assert_eq!(unset.max_rate, None);
+        assert!(!serde_json::to_string(&unset).unwrap().contains("65536"));
     }
 
     #[test]

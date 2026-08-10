@@ -410,7 +410,7 @@ pub struct NetworkArgs {
     )]
     pub retries: Option<u8>,
 
-    /// Upload/background-operation timeout in seconds; it must cover the largest upload. Control-plane requests are capped at 10 seconds.
+    /// Upload/background-operation timeout in seconds; it must cover the largest upload, at the rate --max-rate allows. Control-plane requests are capped at 10 seconds.
     #[arg(
         long,
         env = "SDSYNC_TIMEOUT",
@@ -419,6 +419,17 @@ pub struct NetworkArgs {
         help_heading = "Network"
     )]
     pub timeout: Option<u64>,
+
+    /// Cap upload throughput in bytes per second; unlimited when unset.
+    #[arg(
+        long,
+        env = "SDSYNC_MAX_RATE",
+        value_name = "BYTES_PER_SECOND",
+        value_parser = clap::value_parser!(u64).range(1..),
+        help_heading = "Network",
+        long_help = "Cap upload throughput at N bytes per second. The budget is shared by every concurrent upload, so --jobs divides the limit instead of multiplying it. The value is a plain byte count, like the other numeric options: 1048576 is 1 MiB/s. Uploads are unlimited when this is unset. A limit stretches every transfer by definition, so raise --timeout to match: it must still cover the largest single upload at the limited rate."
+    )]
+    pub max_rate: Option<u64>,
 
     /// TCP/TLS connection timeout in seconds.
     #[arg(
