@@ -3115,10 +3115,16 @@ mod tests {
             b"-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n",
         )
         .unwrap();
-        assert!(matches!(
-            ApiClient::connect(&options(invalid.clone())),
-            Err(Error::Http { .. })
-        ));
+        // reqwest defers certificate parsing, so a PEM block with an unusable payload is caught
+        // when the TLS client is built rather than when the file is read. Either way the client
+        // must not come up with an unverifiable trust anchor.
+        let Err(error) = ApiClient::connect(&options(invalid.clone())) else {
+            panic!("an unparsable CA certificate must never produce a client");
+        };
+        let Error::Http { operation, .. } = &error else {
+            panic!("expected a TLS setup failure, got {error}");
+        };
+        assert_eq!(operation, "building HTTP client");
         fs::remove_file(invalid).unwrap();
 
         let root = RemoteRoot::parse("/share/root").unwrap();
@@ -4158,5 +4164,1615 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::RemoteMountRoot { .. }));
         assert_eq!(server.join().unwrap().len(), 4);
+    }
+
+    /// Every mapped DSM code must render the exact operator-facing sentence, because that string
+    /// is the whole contract a user has when a sync fails against a NAS they cannot inspect.
+    #[test]
+    fn dsm_error_codes_map_to_their_exact_operator_facing_descriptions() {
+        for (code, expected) in [
+            (400, "account does not exist or password is incorrect"),
+            (401, "account is disabled"),
+            (402, "account is not permitted to sign in"),
+            (403, "two-factor OTP is required"),
+            (404, "two-factor OTP is invalid or expired"),
+            (406, "two-factor OTP is enforced"),
+            (407, "source IP is blocked"),
+            (408, "password has expired"),
+            (409, "password has expired"),
+            (410, "password must be changed"),
+        ] {
+            assert_eq!(
+                api_error_description("SYNO.API.Auth", code),
+                Some(expected),
+                "SYNO.API.Auth code {code}"
+            );
+        }
+
+        for (code, expected) in [
+            (100, "unknown error"),
+            (101, "missing API, method, or version parameter"),
+            (102, "requested API does not exist"),
+            (103, "requested method does not exist"),
+            (104, "requested API version is unsupported"),
+            (105, "session does not have permission"),
+            (106, "session timed out; rerun to authenticate again"),
+            (107, "session was interrupted by a duplicate login"),
+            (119, "session is invalid; rerun to authenticate again"),
+            (
+                150,
+                "request source IP differs from login IP; fix reverse-proxy routing",
+            ),
+            (400, "invalid file-operation parameter"),
+            (402, "file subsystem is busy"),
+            (407, "operation is not permitted"),
+            (408, "remote file or directory does not exist"),
+            (411, "remote filesystem is read-only"),
+            (414, "remote item already exists"),
+            (415, "disk quota exceeded"),
+            (416, "no space left on the device"),
+            (417, "remote input/output error"),
+            (418, "illegal remote name or path"),
+            (421, "remote resource is busy"),
+            (900, "delete failed"),
+            (1100, "folder creation failed"),
+            (1101, "parent folder item-count limit exceeded"),
+            (1800, "upload Content-Length is missing or mismatched"),
+            (1801, "upload receive timeout"),
+            (1802, "upload file part has no filename"),
+            (1803, "upload was cancelled"),
+            (1804, "file is too large for the destination filesystem"),
+            (1805, "upload overwrite/skip policy is missing"),
+        ] {
+            assert_eq!(
+                api_error_description("SYNO.FileStation.List", code),
+                Some(expected),
+                "File Station code {code}"
+            );
+        }
+
+        // The two tables overlap numerically and must never be confused: 408 means an expired
+        // password during authentication and a missing path everywhere else.
+        assert_eq!(
+            api_error_description("SYNO.API.Auth", 408),
+            Some("password has expired")
+        );
+        assert_eq!(
+            api_error_description("SYNO.FileStation.Delete", 408),
+            Some("remote file or directory does not exist")
+        );
+        // Auth never falls through to the File Station table for codes it does not define.
+        for code in [106, 119, 150, 414, 1100] {
+            assert_eq!(
+                api_error_description("SYNO.API.Auth", code),
+                None,
+                "SYNO.API.Auth must not borrow File Station code {code}"
+            );
+        }
+        for api in ["SYNO.API.Auth", "SYNO.FileStation.Upload"] {
+            assert_eq!(api_error_description(api, -1), None);
+            assert_eq!(api_error_description(api, 0), None);
+        }
+
+        // Redirect refusal is a credential-safety guarantee: every redirect status must produce
+        // the refusal hint rather than a reflected body.
+        for status in [
+            StatusCode::MOVED_PERMANENTLY,
+            StatusCode::FOUND,
+            StatusCode::SEE_OTHER,
+            StatusCode::TEMPORARY_REDIRECT,
+            StatusCode::PERMANENT_REDIRECT,
+        ] {
+            assert_eq!(
+                http_status_hint(status, b"Location: https://attacker.example/"),
+                "redirects are disabled to prevent credentials crossing origins; expose /webapi/* directly at the configured HTTPS URL",
+                "status {status}"
+            );
+        }
+        assert_eq!(
+            http_status_hint(StatusCode::PAYLOAD_TOO_LARGE, b"ignored"),
+            "request body is larger than the reverse proxy permits; raise its upload/body-size limit"
+        );
+        assert_eq!(
+            http_status_hint(StatusCode::BAD_GATEWAY, b"ignored"),
+            "reverse proxy could not reach the File Station backend"
+        );
+        assert_eq!(
+            http_status_hint(StatusCode::GATEWAY_TIMEOUT, b"ignored"),
+            "reverse proxy timed out; raise its send/read timeout for large uploads"
+        );
+        // Unmapped statuses fall back to a bounded, escaped snippet of the body.
+        assert_eq!(
+            http_status_hint(StatusCode::SERVICE_UNAVAILABLE, b"  maintenance\tmode  "),
+            "maintenance\\tmode"
+        );
+        let long = vec![b'x'; 4096];
+        assert_eq!(http_status_hint(StatusCode::IM_A_TEAPOT, &long).len(), 512);
+    }
+
+    #[test]
+    fn connect_rejects_an_api_whose_advertised_range_excludes_the_required_version() {
+        let discovery = serde_json::json!({
+            "success": true,
+            "data": {
+                "SYNO.API.Auth": {"path": "entry.cgi", "minVersion": 3, "maxVersion": 7},
+                "SYNO.FileStation.List": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+                "SYNO.FileStation.CreateFolder": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+                "SYNO.FileStation.Upload": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+                "SYNO.FileStation.CheckPermission": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2}
+            }
+        })
+        .to_string();
+        let (url, server) = scripted_server(vec![discovery]);
+        let Err(error) = ApiClient::connect(&ClientOptions {
+            base_url: url,
+            allow_http: true,
+            accept_invalid_certs: false,
+            ca_certificate: None,
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(5),
+            retries: 0,
+        }) else {
+            panic!("connect must reject an unsupported CheckPermission version range");
+        };
+        assert!(
+            matches!(
+                &error,
+                Error::UnsupportedApiVersion { api, version: 3, min: 1, max: 2 }
+                    if api == "SYNO.FileStation.CheckPermission"
+            ),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "required Synology API SYNO.FileStation.CheckPermission version 3 is not available (server offers 1..=2)"
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn transport_failures_name_the_operation_and_stay_retryable() {
+        let responses = vec![required_discovery(), login_response()];
+        let (url, server) = scripted_server(responses);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        // The scripted server stops listening after its final response, so the next control
+        // request cannot connect at all.
+        server.join().unwrap();
+
+        let error = client
+            .verify_destination_writable(&RemoteRoot::parse("/share/root").unwrap())
+            .unwrap_err();
+        let Error::Http { operation, source } = &error else {
+            panic!("expected a transport error, got {error}");
+        };
+        assert_eq!(operation, "SYNO.FileStation.List.getinfo");
+        assert!(source.is_connect() || source.is_timeout());
+        assert!(
+            retryable(&error),
+            "connect failures must remain retryable so a flapping proxy is retried"
+        );
+    }
+
+    /// A started MD5 task is server-side work. Every abandonment path must stop it, and a start
+    /// response without a task ID must fail closed rather than poll a task that may not exist.
+    #[test]
+    fn md5_task_abandonment_always_stops_the_task_and_missing_ids_fail_closed() {
+        let (url, server) = scripted_server(vec![
+            write_probe_discovery(false),
+            login_response(),
+            r#"{"success":true}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let error = client
+            .remote_content_md5("/share/file.bin", &CancellationToken::default())
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unexpected response during SYNO.FileStation.MD5.start: successful response contained no task ID"
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            3,
+            "no task exists, so nothing may be stopped"
+        );
+
+        // A failing status poll abandons the task, so it must be stopped before returning.
+        let (url, server) = scripted_server(vec![
+            write_probe_discovery(false),
+            login_response(),
+            task_start_response("failing-status-md5"),
+            r#"{"success":false,"error":{"code":417}}"#.to_owned(),
+            r#"{"success":true}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let error = client
+            .remote_content_md5("/share/file.bin", &CancellationToken::default())
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Api { code: 417, .. }),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "Synology API SYNO.FileStation.MD5.status failed with code 417: remote input/output error"
+        );
+        let requests = server.join().unwrap();
+        let stop = String::from_utf8_lossy(&requests[4].body);
+        assert!(stop.contains("method=stop"));
+        assert!(stop.contains("failing-status-md5"));
+
+        // Cancelling while the poll loop is sleeping must also stop the task.
+        let cancellation = CancellationToken::default();
+        let cancel_after_status = cancellation.clone();
+        let (url, server) = scripted_server_with_status_hook(
+            vec![
+                (StatusCode::OK, write_probe_discovery(false)),
+                (StatusCode::OK, login_response()),
+                (StatusCode::OK, task_start_response("sleeping-md5")),
+                (
+                    StatusCode::OK,
+                    r#"{"success":true,"data":{"finished":false}}"#.to_owned(),
+                ),
+                (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+            ],
+            move |index| {
+                if index == 3 {
+                    cancel_after_status.cancel();
+                }
+            },
+        );
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        assert!(matches!(
+            client.remote_content_md5("/share/file.bin", &cancellation),
+            Err(Error::Cancelled)
+        ));
+        let requests = server.join().unwrap();
+        let stop = String::from_utf8_lossy(&requests[4].body);
+        assert!(stop.contains("method=stop"));
+        assert!(stop.contains("sleeping-md5"));
+    }
+
+    #[test]
+    fn copy_start_without_a_task_id_fails_closed_and_cancellation_stops_the_task() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let (url, server) = scripted_server(vec![
+            write_probe_discovery(true),
+            login_response(),
+            r#"{"success":true}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let error = client
+            .copy_file_verified(
+                &root,
+                "/share/root/a/report.bin",
+                "/share/root/b/report.bin",
+                7,
+                ContentMd5::from_bytes([1_u8; 16]),
+                &CancellationToken::default(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unexpected response during SYNO.FileStation.CopyMove.start: successful response contained no task ID"
+        );
+        assert_eq!(server.join().unwrap().len(), 3);
+
+        let cancellation = CancellationToken::default();
+        let cancel_after_start = cancellation.clone();
+        let (url, server) = scripted_server_with_status_hook(
+            vec![
+                (StatusCode::OK, write_probe_discovery(true)),
+                (StatusCode::OK, login_response()),
+                (StatusCode::OK, task_start_response("cancelled-copy")),
+                (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+            ],
+            move |index| {
+                if index == 2 {
+                    cancel_after_start.cancel();
+                }
+            },
+        );
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        assert!(matches!(
+            client.copy_file_verified(
+                &root,
+                "/share/root/a/report.bin",
+                "/share/root/b/report.bin",
+                7,
+                ContentMd5::from_bytes([1_u8; 16]),
+                &cancellation,
+            ),
+            Err(Error::Cancelled)
+        ));
+        let requests = server.join().unwrap();
+        let stop = String::from_utf8_lossy(&requests[3].body);
+        assert!(stop.contains("method=stop"));
+        assert!(stop.contains("cancelled-copy"));
+    }
+
+    #[test]
+    fn share_and_destination_write_checks_fail_closed_without_mutating_the_nas() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+
+        // A successful envelope with no share list is not evidence of a writable share.
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            r#"{"success":true}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        assert_eq!(
+            client.verify_share_writable(&root).unwrap_err().to_string(),
+            "unexpected response during SYNO.FileStation.List.list_share: successful response contained no share list"
+        );
+        server.join().unwrap();
+
+        // A share list that omits the configured share must name that share, not another one.
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            r#"{"success":true,"data":{"shares":[{"path":"/other"},{"path":"/shared"}]}}"#
+                .to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let error = client.verify_share_writable(&root).unwrap_err();
+        assert!(matches!(&error, Error::ShareNotWritable(share) if share == "share"));
+        assert_eq!(
+            error.to_string(),
+            "DSM shared folder /share is unavailable or not writable by this account"
+        );
+        server.join().unwrap();
+
+        // An ancestor that exists as a file is a configuration error, not a permission error.
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            getinfo_file("/share", 4, None),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        assert_eq!(
+            client
+                .verify_destination_writable(&root)
+                .unwrap_err()
+                .to_string(),
+            "remote destination ancestor /share exists but is not a directory"
+        );
+        server.join().unwrap();
+
+        // Nothing exists at all: report the unavailable share rather than probing a missing tree.
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        assert!(matches!(
+            client.verify_destination_writable(&root),
+            Err(Error::ShareNotWritable(ref share)) if share == "share"
+        ));
+        server.join().unwrap();
+
+        // A non-"missing path" DSM failure is surfaced verbatim instead of being reinterpreted.
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            r#"{"success":false,"error":{"code":105}}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let error = client.verify_destination_writable(&root).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Synology API SYNO.FileStation.List.getinfo failed with code 105: session does not have permission"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn remote_inventory_surfaces_non_missing_ancestor_failures() {
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            r#"{"success":false,"error":{"code":105}}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let error = client
+            .remote_inventory(&RemoteRoot::parse("/share/root").unwrap())
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Synology API SYNO.FileStation.List.getinfo failed with code 105: session does not have permission"
+        );
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn upload_preflight_rejects_missing_resized_and_rewritten_sources() {
+        let (url, server) = scripted_server(vec![required_discovery(), login_response()]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        server.join().unwrap();
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let missing = std::env::temp_dir().join(format!("sdsync-preflight-missing-{nonce}.bin"));
+        let absent = LocalEntry {
+            relative: "missing.bin".to_owned(),
+            full_path: missing.clone(),
+            kind: EntryKind::File,
+            size: 3,
+            mtime_ms: 0,
+            content_md5: None,
+        };
+        let error = client
+            .preflight_upload_source(&absent, &CancellationToken::default())
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::FileIo { path, .. } if *path == missing),
+            "unexpected error: {error}"
+        );
+
+        let path = std::env::temp_dir().join(format!("sdsync-preflight-{nonce}.bin"));
+        fs::write(&path, b"payload").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let mtime_ms = i64::try_from(
+            metadata
+                .modified()
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+
+        // A stale size in the planning snapshot means the file changed under us.
+        let resized = LocalEntry {
+            relative: "payload.bin".to_owned(),
+            full_path: path.clone(),
+            kind: EntryKind::File,
+            size: metadata.len() + 1,
+            mtime_ms,
+            content_md5: None,
+        };
+        assert!(matches!(
+            client.preflight_upload_source(&resized, &CancellationToken::default()),
+            Err(Error::SourceChanged(ref changed)) if *changed == path
+        ));
+
+        // Same size and mtime, different bytes: only the digest can catch this.
+        let rewritten = LocalEntry {
+            relative: "payload.bin".to_owned(),
+            full_path: path.clone(),
+            kind: EntryKind::File,
+            size: metadata.len(),
+            mtime_ms,
+            content_md5: Some(ContentMd5::from_bytes([0_u8; 16])),
+        };
+        assert!(matches!(
+            client.preflight_upload_source(&rewritten, &CancellationToken::default()),
+            Err(Error::SourceChanged(ref changed)) if *changed == path
+        ));
+
+        let unchanged = LocalEntry {
+            relative: "payload.bin".to_owned(),
+            full_path: path.clone(),
+            kind: EntryKind::File,
+            size: metadata.len(),
+            mtime_ms,
+            content_md5: Some(ContentMd5::from_bytes(Md5::digest(b"payload").into())),
+        };
+        client
+            .preflight_upload_source(&unchanged, &CancellationToken::default())
+            .unwrap();
+        fs::remove_file(&path).unwrap();
+    }
+
+    fn write_probe_client(responses: Vec<String>) -> (ApiClient, JoinHandle<Vec<CapturedRequest>>) {
+        let (url, server) = scripted_server(responses);
+        let mut client = connect_test_client(url);
+        client.login("probe-user", "password", None).unwrap();
+        (client, server)
+    }
+
+    /// One refusal case: the responses that follow login, the total request count they should
+    /// produce, and an assertion over the resulting probe failure cause.
+    type ProbeRefusalCase = (Vec<String>, usize, Box<dyn Fn(&Error)>);
+
+    /// The probe must prove its target is a real, unmounted directory and that its unique child
+    /// name is free before it creates anything. Each refusal happens before the first mutation.
+    #[test]
+    fn write_probe_verifies_its_target_before_creating_anything() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let probe_path = "/share/root/.synology-drive-sync-probe-test-target";
+        let local = ProbeLocalFile::create(write_probe_md5()).unwrap();
+        let cancellation = CancellationToken::default();
+
+        let cases: Vec<ProbeRefusalCase> = vec![
+            (
+                vec![getinfo_file("/share", 4, None)],
+                3,
+                Box::new(|error: &Error| {
+                    assert_eq!(
+                        error.to_string(),
+                        "write-probe target ancestor \"/share\" is not a directory"
+                    );
+                }),
+            ),
+            (
+                vec![r#"{"success":false,"error":{"code":105}}"#.to_owned()],
+                3,
+                Box::new(|error: &Error| {
+                    assert_eq!(
+                        error.to_string(),
+                        "Synology API SYNO.FileStation.List.getinfo failed with code 105: session does not have permission"
+                    );
+                }),
+            ),
+            (
+                vec![
+                    getinfo_directory("/share"),
+                    r#"{"success":true,"data":{"files":[{"path":"/share/root","name":"root","isdir":true,"additional":{"mount_point_type":"nfs"}}]}}"#.to_owned(),
+                ],
+                4,
+                Box::new(|error: &Error| {
+                    assert!(
+                        matches!(error, Error::RemoteMountRoot { path, mount_type }
+                            if path == "/share/root" && mount_type == "nfs"),
+                        "unexpected error: {error}"
+                    );
+                }),
+            ),
+            (
+                vec![
+                    getinfo_directory("/share"),
+                    getinfo_directory("/share/root"),
+                    getinfo_directory(probe_path),
+                ],
+                5,
+                Box::new(move |error: &Error| {
+                    assert_eq!(
+                        error.to_string(),
+                        format!(
+                            "refusing write probe because unique path {probe_path:?} already exists"
+                        )
+                    );
+                }),
+            ),
+            (
+                vec![
+                    getinfo_directory("/share"),
+                    getinfo_directory("/share/root"),
+                    r#"{"success":false,"error":{"code":407}}"#.to_owned(),
+                ],
+                5,
+                Box::new(|error: &Error| {
+                    assert_eq!(
+                        error.to_string(),
+                        "Synology API SYNO.FileStation.List.getinfo failed with code 407: operation is not permitted"
+                    );
+                }),
+            ),
+        ];
+
+        for (index, (tail, expected_requests, check)) in cases.into_iter().enumerate() {
+            let mut responses = vec![write_probe_discovery(false), login_response()];
+            responses.extend(tail);
+            let (client, server) = write_probe_client(responses);
+            let failure = client
+                .run_write_probe_with_local(&root, probe_path, &local.entry, &cancellation)
+                .unwrap_err();
+            check(&failure.cause);
+            assert!(!failure.report.directory_created, "case {index}");
+            assert!(failure.report.cleanup_completed, "case {index}");
+            assert_eq!(
+                failure.report.leftover_remote_probe_path, None,
+                "case {index}"
+            );
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), expected_requests, "case {index}");
+            assert!(
+                // Request 0 is discovery, whose query parameter necessarily names every API.
+                requests.iter().skip(1).all(|request| {
+                    let body = String::from_utf8_lossy(&request.body);
+                    !body.contains("api=SYNO.FileStation.CreateFolder")
+                        && !body.contains("api=SYNO.FileStation.Delete")
+                        && !body.contains("api=SYNO.FileStation.Upload")
+                }),
+                "case {index} must not mutate the NAS"
+            );
+        }
+    }
+
+    /// A deterministic name collision (414) is somebody else's directory and must never be
+    /// cleaned up. Any other creation failure may have partially landed, so cleanup must run.
+    #[test]
+    fn write_probe_cleans_up_after_ambiguous_creation_but_never_after_a_collision() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let probe_path = "/share/root/.synology-drive-sync-probe-test-create";
+        let local = ProbeLocalFile::create(write_probe_md5()).unwrap();
+        let cancellation = CancellationToken::default();
+        let preamble = || {
+            vec![
+                write_probe_discovery(false),
+                login_response(),
+                getinfo_directory("/share"),
+                getinfo_directory("/share/root"),
+                r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+            ]
+        };
+
+        let mut responses = preamble();
+        responses.push(r#"{"success":false,"error":{"code":414}}"#.to_owned());
+        let (client, server) = write_probe_client(responses);
+        let failure = client
+            .run_write_probe_with_local(&root, probe_path, &local.entry, &cancellation)
+            .unwrap_err();
+        assert_eq!(
+            failure.cause.to_string(),
+            "Synology API SYNO.FileStation.CreateFolder.create failed with code 414: remote item already exists"
+        );
+        assert!(!failure.report.directory_created);
+        assert!(failure.report.cleanup_completed);
+        assert_eq!(failure.report.leftover_remote_probe_path, None);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 6);
+        assert!(
+            !String::from_utf8_lossy(&requests[5].body).contains("Delete"),
+            "a colliding directory belongs to someone else and must never be deleted"
+        );
+
+        // A non-collision failure may have landed, so cleanup runs; a failing final absence check
+        // is reported as an independent cleanup error alongside the original cause.
+        let mut responses = preamble();
+        responses.push(r#"{"success":false,"error":{"code":407}}"#.to_owned());
+        responses.extend(std::iter::repeat_n(
+            r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+            4,
+        ));
+        responses.push(r#"{"success":false,"error":{"code":105}}"#.to_owned());
+        let (client, server) = write_probe_client(responses);
+        let failure = client
+            .run_write_probe_with_local(&root, probe_path, &local.entry, &cancellation)
+            .unwrap_err();
+        assert!(
+            matches!(failure.cause, Error::Api { code: 407, .. }),
+            "unexpected cause: {}",
+            failure.cause
+        );
+        assert!(
+            matches!(failure.cleanup_error, Some(Error::Api { code: 105, .. })),
+            "an unverifiable cleanup must be reported separately from the original cause"
+        );
+        assert!(!failure.report.cleanup_completed);
+        assert_eq!(
+            failure.report.leftover_remote_probe_path.as_deref(),
+            Some(probe_path)
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 11);
+        for request in &requests[6..=9] {
+            let body = String::from_utf8_lossy(&request.body);
+            assert!(body.contains("api=SYNO.FileStation.Delete"));
+            assert!(body.contains("recursive=false"));
+        }
+    }
+
+    #[test]
+    fn write_probe_refuses_a_directory_it_did_not_get_exclusively() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let probe_path = "/share/root/.synology-drive-sync-probe-test-exclusive";
+        let local = ProbeLocalFile::create(write_probe_md5()).unwrap();
+        let cancellation = CancellationToken::default();
+        let preamble = || {
+            vec![
+                write_probe_discovery(false),
+                login_response(),
+                getinfo_directory("/share"),
+                getinfo_directory("/share/root"),
+                r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+                r#"{"success":true}"#.to_owned(),
+            ]
+        };
+        let cleanup = || {
+            let mut responses =
+                std::iter::repeat_n(r#"{"success":false,"error":{"code":408}}"#.to_owned(), 4)
+                    .collect::<Vec<_>>();
+            responses.push(r#"{"success":false,"error":{"code":408}}"#.to_owned());
+            responses
+        };
+
+        // "Created" but readable as a file: refuse rather than upload into an unknown object.
+        let mut responses = preamble();
+        responses.push(getinfo_file(probe_path, 9, None));
+        responses.extend(cleanup());
+        let (client, server) = write_probe_client(responses);
+        let failure = client
+            .run_write_probe_with_local(&root, probe_path, &local.entry, &cancellation)
+            .unwrap_err();
+        assert_eq!(
+            failure.cause.to_string(),
+            format!("write-probe path {probe_path:?} was not created as a directory")
+        );
+        assert!(failure.report.directory_created);
+        assert!(!failure.report.upload_attempted);
+        assert!(failure.report.cleanup_completed);
+        assert_eq!(server.join().unwrap().len(), 12);
+
+        // A non-empty "fresh" directory means the name was not exclusively ours.
+        let mut responses = preamble();
+        responses.push(getinfo_directory(probe_path));
+        responses.push(
+            serde_json::json!({
+                "success": true,
+                "data": {"total": 1, "files": [{
+                    "path": format!("{probe_path}/stranger.txt"),
+                    "name": "stranger.txt",
+                    "isdir": false,
+                    "additional": {}
+                }]}
+            })
+            .to_string(),
+        );
+        responses.extend(cleanup());
+        let (client, server) = write_probe_client(responses);
+        let failure = client
+            .run_write_probe_with_local(&root, probe_path, &local.entry, &cancellation)
+            .unwrap_err();
+        assert_eq!(
+            failure.cause.to_string(),
+            format!("write-probe directory {probe_path:?} was not empty after creation")
+        );
+        assert!(!failure.report.upload_attempted);
+        assert!(failure.report.cleanup_completed);
+        assert_eq!(server.join().unwrap().len(), 13);
+    }
+
+    /// When the probe itself succeeds but cleanup cannot prove the directory is gone, the caller
+    /// must still get a failure naming the leftover path -- a silent success would leave litter.
+    #[test]
+    fn successful_write_probe_still_fails_when_cleanup_leaves_the_directory_behind() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let probe_path = "/share/root/.synology-drive-sync-probe-test-leftover";
+        let upload_path = format!("{probe_path}/{WRITE_PROBE_FILE_NAME}");
+        let local = ProbeLocalFile::create(write_probe_md5()).unwrap();
+        let size = local.entry.size;
+        let mtime_seconds = local.entry.mtime_ms.div_euclid(1000);
+        let digest = local.entry.content_md5.unwrap().to_string();
+        let responses = vec![
+            write_probe_discovery(false),
+            login_response(),
+            getinfo_directory("/share"),
+            getinfo_directory("/share/root"),
+            r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+            r#"{"success":true}"#.to_owned(),
+            getinfo_directory(probe_path),
+            r#"{"success":true,"data":{"total":0,"files":[]}}"#.to_owned(),
+            r#"{"success":true}"#.to_owned(),
+            getinfo_file(&upload_path, size, None),
+            task_start_response("leftover-md5"),
+            format!(r#"{{"success":true,"data":{{"finished":true,"md5":"{digest}"}}}}"#),
+            getinfo_file(&upload_path, size, Some(mtime_seconds)),
+            r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+            r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+            r#"{"success":true}"#.to_owned(),
+            r#"{"success":true}"#.to_owned(),
+            getinfo_directory(probe_path),
+        ];
+        let (client, server) = write_probe_client(responses);
+        let failure = client
+            .run_write_probe_with_local(
+                &root,
+                probe_path,
+                &local.entry,
+                &CancellationToken::default(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            failure.cause.to_string(),
+            format!("write-probe cleanup left remote path {probe_path:?}")
+        );
+        assert!(
+            failure.cleanup_error.is_none(),
+            "the cleanup failure is already the cause and must not be duplicated"
+        );
+        assert!(failure.report.upload_verified);
+        assert!(!failure.report.server_copy_supported);
+        assert!(!failure.report.server_copy_attempted);
+        assert!(!failure.report.cleanup_completed);
+        assert_eq!(
+            failure.report.leftover_remote_probe_path.as_deref(),
+            Some(probe_path)
+        );
+        assert!(failure.to_string().contains("inspect and remove leftover"));
+        assert_eq!(server.join().unwrap().len(), 18);
+    }
+
+    fn temp_upload_source(tag: &str, contents: &[u8]) -> (PathBuf, LocalEntry) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("sdsync-upload-{tag}-{nonce}.bin"));
+        fs::write(&path, contents).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let entry = LocalEntry {
+            relative: "abc.bin".to_owned(),
+            full_path: path.clone(),
+            kind: EntryKind::File,
+            size: metadata.len(),
+            mtime_ms: i64::try_from(
+                metadata
+                    .modified()
+                    .unwrap()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap(),
+            content_md5: Some(ContentMd5::from_bytes(Md5::digest(contents).into())),
+        };
+        (path, entry)
+    }
+
+    fn upload_client(
+        responses: Vec<(StatusCode, String)>,
+        retries: u32,
+    ) -> (ApiClient, JoinHandle<Vec<CapturedRequest>>) {
+        let (url, server) = scripted_server_with_status(responses);
+        let mut client = ApiClient::connect(&ClientOptions {
+            base_url: url,
+            allow_http: true,
+            accept_invalid_certs: false,
+            ca_certificate: None,
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(5),
+            retries,
+        })
+        .unwrap();
+        client.login("mirror-user", "password", None).unwrap();
+        (client, server)
+    }
+
+    fn upload_preamble() -> Vec<(StatusCode, String)> {
+        vec![
+            (StatusCode::OK, write_probe_discovery(false)),
+            (StatusCode::OK, login_response()),
+        ]
+    }
+
+    /// An observer that declines the attempt must stop the upload before a single byte reaches
+    /// the network, and must still be told the transfer failed.
+    #[test]
+    fn an_observer_can_refuse_an_attempt_before_any_bytes_are_sent() {
+        let (path, local) = temp_upload_source("observer", b"abc");
+        let (client, server) = upload_client(upload_preamble(), 0);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&events);
+        let observer: UploadObserver = Arc::new(move |event| {
+            recorded.lock().unwrap().push(event);
+            !matches!(event, UploadTransferEvent::AttemptStarted { .. })
+        });
+        assert!(matches!(
+            client.upload_observed(
+                &local,
+                "/share/root/abc.bin",
+                Some(observer),
+                &CancellationToken::default(),
+            ),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                UploadTransferEvent::AttemptStarted { attempt: 1 },
+                UploadTransferEvent::Failed
+            ]
+        );
+        assert_eq!(
+            server.join().unwrap().len(),
+            2,
+            "discovery and login only: the upload must never be sent"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn upload_transport_failures_name_the_file_and_are_not_retried_past_the_budget() {
+        let (path, local) = temp_upload_source("transport", b"abc");
+        let (client, server) = upload_client(upload_preamble(), 0);
+        server.join().unwrap();
+        let error = client
+            .upload(&local, "/share/root/abc.bin")
+            .expect_err("a refused connection must not look like a completed upload");
+        let Error::Http { operation, source } = &error else {
+            panic!("expected a transport error, got {error}");
+        };
+        assert_eq!(operation, "uploading abc.bin");
+        assert!(source.is_connect() || source.is_timeout());
+        fs::remove_file(path).unwrap();
+    }
+
+    /// After a retryable failure the client must never blindly retransmit: it re-reads the local
+    /// file and asks the NAS what actually landed. Each answer drives a different decision.
+    #[test]
+    fn a_retryable_upload_failure_reconciles_remote_state_before_deciding() {
+        // The remote object is absent, so the upload genuinely has to be retransmitted.
+        let (path, local) = temp_upload_source("absent", b"abc");
+        let digest = local.content_md5.unwrap().to_string();
+        let mut responses = upload_preamble();
+        responses.extend([
+            (
+                StatusCode::BAD_GATEWAY,
+                "temporary proxy failure".to_owned(),
+            ),
+            (
+                StatusCode::OK,
+                r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+            ),
+            (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+            (
+                StatusCode::OK,
+                getinfo_file("/share/root/abc.bin", local.size, None),
+            ),
+            (StatusCode::OK, task_start_response("retry-md5")),
+            (
+                StatusCode::OK,
+                format!(r#"{{"success":true,"data":{{"finished":true,"md5":"{digest}"}}}}"#),
+            ),
+        ]);
+        let (client, server) = upload_client(responses, 1);
+        client.upload(&local, "/share/root/abc.bin").unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 8);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.headers.iter().any(|(name, value)| {
+                    name == "content-type" && value.starts_with("multipart/form-data")
+                }))
+                .count(),
+            2,
+            "an absent remote object must be retransmitted exactly once more"
+        );
+        fs::remove_file(path).unwrap();
+
+        // The reconciliation probe itself fails transiently: retry rather than give up.
+        let (path, local) = temp_upload_source("flaky-probe", b"abc");
+        let digest = local.content_md5.unwrap().to_string();
+        let mut responses = upload_preamble();
+        responses.extend([
+            (
+                StatusCode::BAD_GATEWAY,
+                "temporary proxy failure".to_owned(),
+            ),
+            (StatusCode::GATEWAY_TIMEOUT, "probe also failed".to_owned()),
+            (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+            (
+                StatusCode::OK,
+                getinfo_file("/share/root/abc.bin", local.size, None),
+            ),
+            (StatusCode::OK, task_start_response("flaky-md5")),
+            (
+                StatusCode::OK,
+                format!(r#"{{"success":true,"data":{{"finished":true,"md5":"{digest}"}}}}"#),
+            ),
+        ]);
+        let (client, server) = upload_client(responses, 1);
+        client.upload(&local, "/share/root/abc.bin").unwrap();
+        assert_eq!(server.join().unwrap().len(), 8);
+        fs::remove_file(path).unwrap();
+
+        // A permission failure during reconciliation is decisive and must surface immediately
+        // instead of being masked by another upload attempt.
+        let (path, local) = temp_upload_source("denied-probe", b"abc");
+        let mut responses = upload_preamble();
+        responses.extend([
+            (
+                StatusCode::BAD_GATEWAY,
+                "temporary proxy failure".to_owned(),
+            ),
+            (
+                StatusCode::OK,
+                r#"{"success":false,"error":{"code":105}}"#.to_owned(),
+            ),
+        ]);
+        let (client, server) = upload_client(responses, 1);
+        let error = client.upload(&local, "/share/root/abc.bin").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Synology API SYNO.FileStation.List.getinfo failed with code 105: session does not have permission"
+        );
+        assert_eq!(server.join().unwrap().len(), 4);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// The planning digest is authoritative. If the bytes on disk no longer match it, the upload
+    /// must abort rather than publish content nobody planned.
+    #[test]
+    fn upload_aborts_when_the_source_no_longer_matches_its_planned_digest() {
+        // Detected after a successful transfer, before the remote object is trusted.
+        let (path, mut local) = temp_upload_source("rewritten", b"abc");
+        local.content_md5 = Some(ContentMd5::from_bytes([0_u8; 16]));
+        let mut responses = upload_preamble();
+        responses.push((StatusCode::OK, r#"{"success":true}"#.to_owned()));
+        let (client, server) = upload_client(responses, 0);
+        assert!(matches!(
+            client.upload(&local, "/share/root/abc.bin"),
+            Err(Error::SourceChanged(ref changed)) if *changed == path
+        ));
+        assert_eq!(server.join().unwrap().len(), 3);
+        fs::remove_file(&path).unwrap();
+
+        // Detected while deciding whether a retryable failure is worth retrying.
+        let (path, mut local) = temp_upload_source("rewritten-retry", b"abc");
+        local.content_md5 = Some(ContentMd5::from_bytes([0_u8; 16]));
+        let mut responses = upload_preamble();
+        responses.push((
+            StatusCode::BAD_GATEWAY,
+            "temporary proxy failure".to_owned(),
+        ));
+        let (client, server) = upload_client(responses, 1);
+        assert!(matches!(
+            client.upload(&local, "/share/root/abc.bin"),
+            Err(Error::SourceChanged(ref changed)) if *changed == path
+        ));
+        assert_eq!(
+            server.join().unwrap().len(),
+            3,
+            "a changed source must not be retransmitted"
+        );
+        fs::remove_file(&path).unwrap();
+
+        // The upload reported success but the NAS holds something else: fail closed.
+        let (path, local) = temp_upload_source("mismatched", b"abc");
+        let mut responses = upload_preamble();
+        responses.extend([
+            (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+            (
+                StatusCode::OK,
+                getinfo_file("/share/root/abc.bin", local.size + 5, None),
+            ),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+        let error = client.upload(&local, "/share/root/abc.bin").unwrap_err();
+        assert!(
+            matches!(&error, Error::ContentVerificationFailed(remote)
+                if remote == "/share/root/abc.bin"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(server.join().unwrap().len(), 4);
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn discovery_failures_report_both_routes_and_reject_unusable_payloads() {
+        // Neither CGI endpoint answers usefully; the operator needs to see both attempts.
+        let (url, server) = scripted_server_with_status(vec![
+            (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+            (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+        ]);
+        let Err(error) = ApiClient::connect(&ClientOptions {
+            base_url: url,
+            allow_http: true,
+            accept_invalid_certs: false,
+            ca_certificate: None,
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(5),
+            retries: 0,
+        }) else {
+            panic!("a discovery response with no API map must not produce a client");
+        };
+        let rendered = error.to_string();
+        assert!(
+            rendered.starts_with("File Station API discovery failed through the reverse proxy")
+        );
+        assert!(rendered.contains("entry.cgi: unexpected response during SYNO.API.Info.query"));
+        assert!(rendered.contains("query.cgi fallback:"));
+        assert_eq!(
+            rendered
+                .matches("successful response contained no API map")
+                .count(),
+            2
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]
+                .request_line
+                .contains("/prefix/webapi/entry.cgi")
+        );
+        assert!(
+            requests[1]
+                .request_line
+                .contains("/prefix/webapi/query.cgi")
+        );
+
+        // Discovery is unauthenticated, so a malformed body may be quoted back verbatim -- but
+        // only a bounded snippet, and the HTML hint must not fire for non-HTML noise.
+        let (url, server) = scripted_server_with_status(vec![
+            (StatusCode::OK, "not json at all".to_owned()),
+            (StatusCode::OK, "not json at all".to_owned()),
+        ]);
+        let Err(error) = ApiClient::connect(&ClientOptions {
+            base_url: url,
+            allow_http: true,
+            accept_invalid_certs: false,
+            ca_certificate: None,
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(5),
+            retries: 0,
+        }) else {
+            panic!("a non-JSON discovery response must not produce a client");
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains("expected a DSM JSON envelope"));
+        assert!(rendered.contains("response: not json at all"));
+        assert!(
+            !rendered.contains("proxy returned HTML"),
+            "the HTML routing hint must only appear for actual HTML"
+        );
+        server.join().unwrap();
+
+        // A discovery-time DSM error keeps its unauthenticated detail, which is safe to show.
+        let (url, server) = scripted_server_with_status(vec![
+            (
+                StatusCode::OK,
+                r#"{"success":false,"error":{"code":102,"errors":[{"api":"SYNO.FileStation.List"}]}}"#
+                    .to_owned(),
+            ),
+            (
+                StatusCode::OK,
+                r#"{"success":false,"error":{"code":102}}"#.to_owned(),
+            ),
+        ]);
+        let Err(error) = ApiClient::connect(&ClientOptions {
+            base_url: url,
+            allow_http: true,
+            accept_invalid_certs: false,
+            ca_certificate: None,
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(5),
+            retries: 0,
+        }) else {
+            panic!("a discovery DSM error must not produce a client");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("code 102: requested API does not exist")
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn error_detail_shapes_are_normalized_without_dropping_information() {
+        assert!(error_details(Value::Null).is_empty());
+        assert_eq!(
+            error_details(serde_json::json!([{"code": 1}, {"code": 2}])),
+            vec![
+                serde_json::json!({"code": 1}),
+                serde_json::json!({"code": 2})
+            ]
+        );
+        assert_eq!(
+            error_details(serde_json::json!({"path": "/share"})),
+            vec![serde_json::json!({"path": "/share"})]
+        );
+        assert_eq!(
+            error_details(Value::String("scalar".to_owned())),
+            vec![Value::String("scalar".to_owned())]
+        );
+    }
+
+    #[test]
+    fn retry_classification_covers_body_and_non_transport_failures() {
+        assert!(retryable(&Error::HttpBody {
+            operation: "SYNO.FileStation.List.list".to_owned(),
+            source: std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated"),
+        }));
+        for error in [
+            Error::Cancelled,
+            Error::HttpsRequired,
+            Error::MissingApi("SYNO.FileStation.MD5".to_owned()),
+            Error::SourceChanged(PathBuf::from("/tmp/a")),
+            Error::InvalidResponse {
+                operation: "SYNO.FileStation.List.list".to_owned(),
+                message: "malformed".to_owned(),
+            },
+        ] {
+            assert!(!retryable(&error), "must not retry: {error}");
+        }
+    }
+
+    #[test]
+    fn discovered_cgi_paths_that_change_origin_are_refused() {
+        let base = Url::parse("http://files.example.test/prefix/").unwrap();
+        let error = endpoint_url(&base, "a:b").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unexpected response during API endpoint discovery: server returned escaping CGI path \"a:b\""
+        );
+    }
+
+    /// Both TLS relaxations are opt-in and must be honoured exactly as configured: a supplied CA
+    /// is loaded, and `--insecure` never becomes the default.
+    #[test]
+    fn tls_options_load_a_supplied_ca_and_stay_opt_in() {
+        const TEST_CA_PEM: &[u8] = b"-----BEGIN CERTIFICATE-----
+MIIDLzCCAhegAwIBAgIUcLvianya9E7OvdW+lA817dSrDWcwDQYJKoZIhvcNAQEL
+BQAwJjEkMCIGA1UEAwwbc3lub2xvZ3ktZHJpdmUtc3luYyB0ZXN0IENBMCAXDTI2
+MDgxMDAwMjIzNVoYDzIxMjYwNzE3MDAyMjM1WjAmMSQwIgYDVQQDDBtzeW5vbG9n
+eS1kcml2ZS1zeW5jIHRlc3QgQ0EwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEK
+AoIBAQCrmm7c6Tv4rJvcbgQ7GaKAcab3gRjHI/dkh3XxNl/Qtbvm8wq1Ap7mxYIM
+tKXGShFpmYgu67aqtLc1CEYrpc7vSqcCyHDzGBEzc7MCtKz4wuVT+pzqD2YuFOqB
+Oi9lrmTIk+Odl8CaBb1/okMOSKjQvh7YTW7TMPXW8+cP+1yts+jQwfYgco3Awgfl
+Ptfkh+mXioRzcEkqE7yNL/VFRjAFxDzb3Ld4UHyQzMnGdUm7eelWpO7vn5oE3VFp
+x4eJZG6lG26TdnJC/TJArMimQmJds+gV39JS4Lop5z0Ys6kgFba4S5N7dF4Ugsum
+KxuFSPq9WqLK8xdpo4/MylNhrOy5AgMBAAGjUzBRMB0GA1UdDgQWBBTsj7InEyT+
+U/HEZYBh/HRx6zejbjAfBgNVHSMEGDAWgBTsj7InEyT+U/HEZYBh/HRx6zejbjAP
+BgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAC/dCDOIZwNInXqSYL
+8b+a2VD9eq7VlI9l5IZIsrs5ps9xJ90NrHCyetFVP2Uue3e9vz1njlMeQ7ktPtlc
+fSMaMJxq1zQEAvj7aQU6xllOI8JapViZeyBkC2+RU+gKnHPrtA4KhFv8TgdLgBE+
+N48JfJ7rV01YAIfcMhoyeQ3tGz7PMJkGKR9hxcAN/mfxt8cgySZ5mjqUuoaGaGih
+Y8afjx8rE5f79lV35/dT77PX2v5VjT6ONqbnIoATrI6spez5vvTL2MsFLk9Tmrvz
+OkbEiszT+gQ1PhePf0E73iXu+Zlfch80DMdAOdgzxZ1UVvkZAjsaisQ4po1WxSYn
+FplE
+-----END CERTIFICATE-----
+";
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let ca_path = std::env::temp_dir().join(format!("sdsync-test-ca-{nonce}.pem"));
+        fs::write(&ca_path, TEST_CA_PEM).unwrap();
+
+        // A well-formed CA is accepted and the client is usable afterwards.
+        let (url, server) = scripted_server(vec![required_discovery()]);
+        ApiClient::connect(&ClientOptions {
+            base_url: url,
+            allow_http: true,
+            accept_invalid_certs: false,
+            ca_certificate: Some(ca_path.clone()),
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(5),
+            retries: 0,
+        })
+        .expect("a valid PEM certificate must be accepted");
+        assert_eq!(server.join().unwrap().len(), 1);
+        fs::remove_file(&ca_path).unwrap();
+
+        // Certificate validation may be disabled only when explicitly requested.
+        let (url, server) = scripted_server(vec![required_discovery()]);
+        ApiClient::connect(&ClientOptions {
+            base_url: url,
+            allow_http: true,
+            accept_invalid_certs: true,
+            ca_certificate: None,
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(5),
+            retries: 0,
+        })
+        .expect("explicitly disabled certificate validation must build a client");
+        assert_eq!(server.join().unwrap().len(), 1);
+
+        // HTTPS remains mandatory regardless of either TLS relaxation.
+        for accept_invalid_certs in [false, true] {
+            let Err(error) = ApiClient::connect(&ClientOptions {
+                base_url: "http://files.example.test".to_owned(),
+                allow_http: false,
+                accept_invalid_certs,
+                ca_certificate: None,
+                connect_timeout: Duration::from_secs(1),
+                request_timeout: Duration::from_secs(1),
+                retries: 0,
+            }) else {
+                panic!("plaintext HTTP must be refused without --allow-http");
+            };
+            assert!(matches!(error, Error::HttpsRequired));
+        }
+    }
+
+    #[test]
+    fn a_rejected_md5_start_never_polls_and_a_failing_stop_never_masks_the_cause() {
+        let (url, server) = scripted_server(vec![
+            write_probe_discovery(false),
+            login_response(),
+            r#"{"success":false,"error":{"code":402}}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let error = client
+            .remote_content_md5("/share/file.bin", &CancellationToken::default())
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Synology API SYNO.FileStation.MD5.start failed with code 402: file subsystem is busy"
+        );
+        assert_eq!(
+            server.join().unwrap().len(),
+            3,
+            "a task that never started must not be polled or stopped"
+        );
+
+        // Best-effort task cleanup must not replace the cancellation the caller asked for.
+        let cancellation = CancellationToken::default();
+        let cancel_after_status = cancellation.clone();
+        let (url, server) = scripted_server_with_status_hook(
+            vec![
+                (StatusCode::OK, write_probe_discovery(false)),
+                (StatusCode::OK, login_response()),
+                (StatusCode::OK, task_start_response("unstoppable-md5")),
+                (
+                    StatusCode::OK,
+                    r#"{"success":true,"data":{"finished":false}}"#.to_owned(),
+                ),
+                (
+                    StatusCode::OK,
+                    r#"{"success":false,"error":{"code":407}}"#.to_owned(),
+                ),
+            ],
+            move |index| {
+                if index == 3 {
+                    cancel_after_status.cancel();
+                }
+            },
+        );
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        assert!(matches!(
+            client.remote_content_md5("/share/file.bin", &cancellation),
+            Err(Error::Cancelled)
+        ));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(String::from_utf8_lossy(&requests[4].body).contains("method=stop"));
+    }
+
+    #[test]
+    fn a_directory_listing_without_data_is_not_treated_as_empty() {
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            getinfo_directory("/share"),
+            getinfo_directory("/share/root"),
+            r#"{"success":true}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let error = client
+            .remote_inventory(&RemoteRoot::parse("/share/root").unwrap())
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unexpected response during SYNO.FileStation.List.list: successful response contained no directory data"
+        );
+        assert_eq!(server.join().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn folder_creation_failures_are_reported_to_the_caller() {
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            r#"{"success":false,"error":{"code":1101}}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let error = client.create_folder("/share/root/new").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Synology API SYNO.FileStation.CreateFolder.create failed with code 1101: parent folder item-count limit exceeded"
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        let create = String::from_utf8_lossy(&requests[2].body);
+        assert!(create.contains("api=SYNO.FileStation.CreateFolder"));
+        assert!(create.contains("force_parent=true"));
+    }
+
+    #[test]
+    fn a_server_copy_is_polled_until_it_finishes_before_content_is_verified() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let destination = "/share/root/new/report.bin";
+        let digest = ContentMd5::from_bytes(Md5::digest(b"report").into());
+        let (url, server) = scripted_server(vec![
+            write_probe_discovery(true),
+            login_response(),
+            task_start_response("slow-copy"),
+            r#"{"success":true,"data":{"finished":false}}"#.to_owned(),
+            r#"{"success":true,"data":{"finished":true}}"#.to_owned(),
+            getinfo_file(destination, 6, None),
+            task_start_response("slow-copy-md5"),
+            format!(r#"{{"success":true,"data":{{"finished":true,"md5":"{digest}"}}}}"#),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        client
+            .copy_file_verified(
+                &root,
+                "/share/root/old/report.bin",
+                destination,
+                6,
+                digest,
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 8);
+        for index in [3, 4] {
+            assert!(String::from_utf8_lossy(&requests[index].body).contains("method=status"));
+        }
+    }
+
+    /// Every verification step after the upload lands is a fail-closed gate: if any of them cannot
+    /// be proven, the probe reports failure and still cleans up after itself.
+    #[test]
+    fn write_probe_copy_phase_failures_all_fail_closed_and_clean_up() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let probe_path = "/share/root/.synology-drive-sync-probe-test-copy";
+        let upload_path = format!("{probe_path}/{WRITE_PROBE_FILE_NAME}");
+        let copy_directory = format!("{probe_path}/{WRITE_PROBE_COPY_DIRECTORY}");
+        let copy_path = format!("{copy_directory}/{WRITE_PROBE_FILE_NAME}");
+        let local = ProbeLocalFile::create(write_probe_md5()).unwrap();
+        let size = local.entry.size;
+        let mtime_seconds = local.entry.mtime_ms.div_euclid(1000);
+        let digest = local.entry.content_md5.unwrap().to_string();
+        let md5_finished =
+            format!(r#"{{"success":true,"data":{{"finished":true,"md5":"{digest}"}}}}"#);
+        let missing = r#"{"success":false,"error":{"code":408}}"#.to_owned();
+        let succeeded = r#"{"success":true}"#.to_owned();
+
+        // Responses 0..=11: everything up to and including the uploaded file's MD5 check.
+        let uploaded = || {
+            vec![
+                write_probe_discovery(true),
+                login_response(),
+                getinfo_directory("/share"),
+                getinfo_directory("/share/root"),
+                missing.clone(),
+                succeeded.clone(),
+                getinfo_directory(probe_path),
+                r#"{"success":true,"data":{"total":0,"files":[]}}"#.to_owned(),
+                succeeded.clone(),
+                getinfo_file(&upload_path, size, None),
+                task_start_response("copy-phase-md5"),
+                md5_finished.clone(),
+            ]
+        };
+        // Cleanup: four non-recursive deletes then a final absence check that succeeds.
+        let cleanup = || {
+            vec![
+                missing.clone(),
+                missing.clone(),
+                succeeded.clone(),
+                succeeded.clone(),
+                missing.clone(),
+            ]
+        };
+
+        // The uploaded file's own metadata does not match what was sent.
+        let mut responses = uploaded();
+        responses.push(getinfo_file(&upload_path, size, Some(mtime_seconds + 60)));
+        responses.extend(cleanup());
+        let (client, server) = write_probe_client(responses);
+        let failure = client
+            .run_write_probe_with_local(
+                &root,
+                probe_path,
+                &local.entry,
+                &CancellationToken::default(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&failure.cause, Error::RemoteSnapshotChanged(path) if *path == upload_path),
+            "unexpected cause: {}",
+            failure.cause
+        );
+        assert!(failure.report.upload_attempted);
+        assert!(!failure.report.upload_verified);
+        assert!(!failure.report.server_copy_attempted);
+        assert!(failure.report.cleanup_completed);
+        assert_eq!(server.join().unwrap().len(), 18);
+
+        // The copy directory cannot be created.
+        let mut responses = uploaded();
+        responses.push(getinfo_file(&upload_path, size, Some(mtime_seconds)));
+        responses.push(r#"{"success":false,"error":{"code":411}}"#.to_owned());
+        responses.extend(cleanup());
+        let (client, server) = write_probe_client(responses);
+        let failure = client
+            .run_write_probe_with_local(
+                &root,
+                probe_path,
+                &local.entry,
+                &CancellationToken::default(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            failure.cause.to_string(),
+            "Synology API SYNO.FileStation.CreateFolder.create failed with code 411: remote filesystem is read-only"
+        );
+        assert!(failure.report.upload_verified);
+        assert!(!failure.report.server_copy_attempted);
+        assert!(failure.report.cleanup_completed);
+        assert_eq!(server.join().unwrap().len(), 19);
+
+        // The copy task itself fails after the destination was prepared.
+        let mut responses = uploaded();
+        responses.extend([
+            getinfo_file(&upload_path, size, Some(mtime_seconds)),
+            succeeded.clone(),
+            getinfo_directory(&copy_directory),
+            r#"{"success":true,"data":{"total":0,"files":[]}}"#.to_owned(),
+            missing.clone(),
+            r#"{"success":false,"error":{"code":417}}"#.to_owned(),
+        ]);
+        responses.extend(cleanup());
+        let (client, server) = write_probe_client(responses);
+        let failure = client
+            .run_write_probe_with_local(
+                &root,
+                probe_path,
+                &local.entry,
+                &CancellationToken::default(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            failure.cause.to_string(),
+            "Synology API SYNO.FileStation.CopyMove.start failed with code 417: remote input/output error"
+        );
+        assert!(failure.report.server_copy_attempted);
+        assert!(!failure.report.server_copy_verified);
+        assert!(failure.report.cleanup_completed);
+        assert_eq!(server.join().unwrap().len(), 23);
+
+        // The copy completes and its content matches, but its metadata does not.
+        let mut responses = uploaded();
+        responses.extend([
+            getinfo_file(&upload_path, size, Some(mtime_seconds)),
+            succeeded.clone(),
+            getinfo_directory(&copy_directory),
+            r#"{"success":true,"data":{"total":0,"files":[]}}"#.to_owned(),
+            missing.clone(),
+            task_start_response("probe-copy-task"),
+            r#"{"success":true,"data":{"finished":true}}"#.to_owned(),
+            getinfo_file(&copy_path, size, None),
+            task_start_response("probe-copy-md5"),
+            md5_finished.clone(),
+            getinfo_file(&copy_path, size, Some(mtime_seconds + 60)),
+        ]);
+        responses.extend(cleanup());
+        let (client, server) = write_probe_client(responses);
+        let failure = client
+            .run_write_probe_with_local(
+                &root,
+                probe_path,
+                &local.entry,
+                &CancellationToken::default(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&failure.cause, Error::RemoteSnapshotChanged(path) if *path == copy_path),
+            "unexpected cause: {}",
+            failure.cause
+        );
+        assert!(failure.report.server_copy_attempted);
+        assert!(!failure.report.server_copy_verified);
+        assert!(failure.report.cleanup_completed);
+        assert_eq!(server.join().unwrap().len(), 28);
     }
 }
