@@ -4711,6 +4711,38 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// The starter's commented-out options are documentation, not configuration: nothing parses
+    /// them, so a key renamed in the schema or misspelled here would drift silently until a user
+    /// uncommented it and got a rejection. Parse each one on its own -- individually, because
+    /// several are mutually exclusive by design and would fail validation together.
+    #[test]
+    fn every_commented_starter_option_still_matches_the_schema() {
+        let commented = STARTER_CONFIGURATION
+            .lines()
+            .filter_map(|line| line.strip_prefix("# "))
+            .filter(|line| {
+                let Some((key, _)) = line.split_once(" = ") else {
+                    return false;
+                };
+                !key.is_empty()
+                    && key
+                        .chars()
+                        .all(|character| character.is_ascii_lowercase() || character == '-')
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            commented.iter().any(|line| line.starts_with("max-rate = ")),
+            "the documented options are no longer being found: {commented:?}"
+        );
+
+        for option in commented {
+            let document = format!("[profiles.example]\n{option}\n");
+            config::LoadedConfig::from_toml("config.example.toml", &document).unwrap_or_else(
+                |error| panic!("commented starter option {option:?} is not in the schema: {error}"),
+            );
+        }
+    }
+
     #[test]
     fn a_starter_never_replaces_an_existing_configuration_without_force() {
         let root = starter_directory("force");
