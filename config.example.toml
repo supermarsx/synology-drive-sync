@@ -62,6 +62,9 @@ max-delete = 100
 retries = 2            # 0..5
 timeout = 7200         # upload/background-operation seconds; cover the largest upload
 connect-timeout = 15   # TCP/TLS connection seconds
+# max-rate = 1048576   # upload bytes per second, shared by all jobs; unset is unlimited.
+# A limit stretches every transfer, so keep timeout above the largest single
+# upload at the limited rate: 1048576 is 1 MiB/s, so a 4 GiB file needs ~4096s.
 # Discovery, login, inventory, hash, and other control requests are capped at 10s.
 # An outer scheduler limit covers the whole workload, not one request. Size it
 # above measured worst-case scanning, hashing, every operation/retry, and shutdown.

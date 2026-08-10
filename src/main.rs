@@ -3855,6 +3855,67 @@ mod tests {
         }
     }
 
+    /// A stand-in DSM that answers exactly one API discovery request and stops, which is the
+    /// least `connect_client` needs to hand back a client.
+    fn discovery_only_server() -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let received = stream.read(&mut request).unwrap();
+            assert!(received > 0, "the client must send a discovery request");
+            let entry = serde_json::json!({"path": "entry.cgi", "minVersion": 1, "maxVersion": 7});
+            let body = serde_json::json!({
+                "success": true,
+                "data": {
+                    "SYNO.API.Auth": entry,
+                    "SYNO.FileStation.List": entry,
+                    "SYNO.FileStation.CreateFolder": entry,
+                    "SYNO.FileStation.Upload": entry,
+                    "SYNO.FileStation.CheckPermission": entry,
+                }
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        (format!("http://{address}/prefix/"), handle)
+    }
+
+    /// The resolved limit has to reach the client. A flag that parses and validates and is then
+    /// dropped on the way to the transfer is worse than no flag at all, so this asserts the
+    /// value arrives rather than merely that it was accepted.
+    #[test]
+    fn connect_client_applies_the_resolved_upload_rate_limit() {
+        let (url, server) = discovery_only_server();
+        let limited = config::ResolvedNetwork {
+            max_rate: Some(65536),
+            allow_http: true,
+            ..resolved_network()
+        };
+        let client = connect_client(&url, &limited).unwrap();
+        assert_eq!(client.max_upload_rate(), Some(65536));
+        server.join().unwrap();
+
+        // Unset must stay unset: no default may be invented on the way to the client.
+        let (url, server) = discovery_only_server();
+        let unlimited = config::ResolvedNetwork {
+            allow_http: true,
+            ..resolved_network()
+        };
+        let client = connect_client(&url, &unlimited).unwrap();
+        assert_eq!(client.max_upload_rate(), None);
+        server.join().unwrap();
+    }
+
     fn resolved_sync(url: &str, username: &str, remote: &str) -> config::ResolvedSync {
         config::ResolvedSync {
             source: PathBuf::from("source"),

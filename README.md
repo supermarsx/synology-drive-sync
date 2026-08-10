@@ -225,6 +225,12 @@ synology-drive-sync sync --config ./config.toml \
   --all-profiles --max-total-delete 20 --output ndjson
 ```
 
+`--max-rate BYTES_PER_SECOND` (profile `max-rate`, `SDSYNC_MAX_RATE`) caps upload throughput. The
+budget is shared by every concurrent upload, so `--jobs` divides the limit rather than multiplying
+it. The value is a plain byte count like the other numeric options, so `1048576` is 1 MiB/s, and
+uploads are unlimited when it is unset. A limit stretches every transfer, so `--timeout` must still
+cover the largest single upload at the limited rate.
+
 The TOML schema is strict and non-secret. It accepts protected `password-file`, `totp-secret-file`, and remote-log token-file paths, but has no password, seed, current-code, or bearer-token value field. Unknown keys are rejected, and `config show` can display paths or environment-variable names but never secret values.
 
 ## Password and two-factor authentication
@@ -404,7 +410,8 @@ DSM often returns HTTP 200 with a JSON API error, so the CLI validates both laye
 - HTML instead of JSON: `/webapi/*` reached a UI or another service;
 - HTTP 413: raise the proxy request-body limit;
 - HTTP 502: correct the File Station backend route;
-- HTTP 504 or File Station `1801`: raise proxy/File Station upload timeouts;
+- HTTP 504 or File Station `1801`: raise proxy/File Station upload timeouts, and check whether a
+  `--max-rate` limit has pushed the largest upload past `--timeout`;
 - DSM `150`: login and later requests appear to originate from different client IPs;
 - DSM `1800`: multipart content length is absent or inconsistent.
 

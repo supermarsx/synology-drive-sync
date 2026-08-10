@@ -258,6 +258,19 @@ impl ApiClient {
         self
     }
 
+    /// The limit this client is pacing uploads against, or `None` when unlimited. This exists so
+    /// callers can prove the configured rate actually reached the client instead of being
+    /// dropped on the way.
+    #[must_use]
+    pub fn max_upload_rate(&self) -> Option<u64> {
+        self.upload_rate_limit.as_ref().map(|bucket| {
+            bucket
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .bytes_per_second
+        })
+    }
+
     pub fn require_delete_api(&self) -> Result<()> {
         self.validate_api("SYNO.FileStation.Delete", 2)
     }
@@ -3583,6 +3596,51 @@ mod tests {
         assert!(upload_rate_bucket(Some(0)).is_none());
         assert!(upload_rate_bucket(Some(1)).is_some());
         assert!(upload_throttle(None, &CancellationToken::default()).is_none());
+    }
+
+    /// The budget has to be shared by the worker clones, not handed out per clone -- otherwise
+    /// `--jobs` would quietly multiply the limit instead of dividing it.
+    #[test]
+    fn worker_clones_report_and_share_one_budget() {
+        let client = ApiClient {
+            http: HttpClient::new(),
+            base: Url::parse("https://files.example.test/webapi/").unwrap(),
+            apis: HashMap::new(),
+            session: None,
+            retries: 0,
+            control_timeout: Duration::from_secs(1),
+            upload_timeout: Duration::from_secs(1),
+            operation_timeout: Duration::from_secs(1),
+            upload_rate_limit: None,
+        };
+        assert_eq!(client.max_upload_rate(), None);
+
+        let limited = client.clone().with_max_upload_rate(Some(4096));
+        assert_eq!(limited.max_upload_rate(), Some(4096));
+        // A zero rate is not a limit of zero, it is no limit at all.
+        assert_eq!(
+            limited
+                .clone()
+                .with_max_upload_rate(Some(0))
+                .max_upload_rate(),
+            None
+        );
+
+        // Spending the budget through one clone must leave nothing for the other.
+        let worker = limited.clone();
+        let budget = limited.upload_rate_limit.clone().unwrap();
+        let worker_budget = worker.upload_rate_limit.clone().unwrap();
+        assert!(Arc::ptr_eq(&budget, &worker_budget));
+        let now = Instant::now();
+        assert_eq!(
+            budget.lock().unwrap().take(4096, now),
+            RateGrant::Ready(4096)
+        );
+        assert_eq!(
+            worker_budget.lock().unwrap().take(4096, now),
+            RateGrant::Wait(Duration::from_secs(1)),
+            "a clone must draw on the same drained budget, not a fresh one"
+        );
     }
 
     fn throttled_reader(
