@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::time::UNIX_EPOCH;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -378,13 +378,29 @@ fn path_contains_dsm_managed_component(path: &Path) -> bool {
 }
 
 fn reject_filesystem_root(path: &Path) -> Result<()> {
-    if path.parent().is_none() {
+    if path.parent().is_none() && !is_unc_share_root(path) {
         return Err(Error::UnsupportedLocalEntry {
             path: path.to_owned(),
             reason: "the canonical source root cannot be a filesystem root".to_owned(),
         });
     }
     Ok(())
+}
+
+// An SMB share root has no parent, exactly like `/` or `C:\`, but a share is the network
+// analogue of a folder rather than of a disk: `\\nas\media` is a perfectly ordinary thing to
+// ask to sync, and refusing it while accepting `\\nas\media\photos` is arbitrary. A mapped
+// drive letter is a disk-like alias, so `\\?\Z:\` stays rejected along with the real roots.
+// A prefix that names a server but no share (`\\?\UNC\nas`) is not a directory anyone can
+// sync either, so an empty share is rejected too.
+fn is_unc_share_root(path: &Path) -> bool {
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return false;
+    };
+    match prefix.kind() {
+        Prefix::UNC(_, share) | Prefix::VerbatimUNC(_, share) => !share.is_empty(),
+        _ => false,
+    }
 }
 
 fn portable_case_collision<'a>(
@@ -558,6 +574,65 @@ mod tests {
         ));
 
         fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[track_caller]
+    fn assert_rejected_as_filesystem_root(root: &str) {
+        let root = Path::new(root);
+        assert!(
+            matches!(
+                reject_filesystem_root(root),
+                Err(Error::UnsupportedLocalEntry { path, reason })
+                    if path == root && reason.contains("filesystem root")
+            ),
+            "{} should be rejected as a filesystem root",
+            root.display()
+        );
+    }
+
+    #[test]
+    fn rejects_the_unix_filesystem_root_by_name() {
+        assert_rejected_as_filesystem_root("/");
+    }
+
+    // An SMB share is a folder-like unit, so a share root is a legitimate source even though
+    // it has no parent. Drive-shaped roots, including a mapped network drive, stay rejected.
+    #[cfg(windows)]
+    #[test]
+    fn accepts_smb_share_roots_but_still_rejects_drive_and_server_roots() {
+        // Canonicalizing a real share root yields the verbatim form; the plain form is what a
+        // user types. `is_dir` holds for both, so only this guard decides the outcome.
+        for accepted in [
+            r"\\?\UNC\server\share",
+            r"\\?\UNC\localhost\C$",
+            r"\\server\share",
+        ] {
+            assert!(
+                reject_filesystem_root(Path::new(accepted)).is_ok(),
+                "{accepted} should be accepted as a share root"
+            );
+        }
+
+        // A drive letter names a disk, not a folder, whether or not it is a mapped network
+        // drive, and a UNC prefix naming no share is not a directory at all.
+        for rejected in [r"\\?\C:\", r"C:\", r"\\?\Z:\", r"Z:\", r"\\?\UNC\server"] {
+            assert_rejected_as_filesystem_root(rejected);
+        }
+    }
+
+    // A share root reaches the guard only after canonicalization, so prove the accepted form
+    // is exactly what `fs::canonicalize` produces rather than a hand-written approximation.
+    #[cfg(windows)]
+    #[test]
+    fn treats_a_canonicalized_share_root_as_a_sync_candidate() {
+        let Ok(share_root) = fs::canonicalize(r"\\localhost\C$") else {
+            eprintln!(
+                "skipping treats_a_canonicalized_share_root_as_a_sync_candidate: no admin share"
+            );
+            return;
+        };
+        assert_eq!(share_root.parent(), None);
+        assert!(reject_filesystem_root(&share_root).is_ok());
     }
 
     #[test]
