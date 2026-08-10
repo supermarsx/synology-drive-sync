@@ -11,6 +11,9 @@ ENV SDSYNC_BUILD_VERSION=$VERSION
 COPY Cargo.toml Cargo.lock ./
 COPY build.rs ./
 COPY src ./src
+# `config init` embeds the starter configuration with include_str!, so the
+# example is a build input rather than a documentation-only file.
+COPY config.example.toml ./
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
