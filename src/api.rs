@@ -2203,9 +2203,18 @@ mod tests {
         scripted_server_with_status_hook(responses, |_| {})
     }
 
+    /// Run `before_response(index)` on the server thread immediately *before* response `index` is
+    /// written.
+    ///
+    /// The hook must not run after the write. Tests use it to trip a cancellation token, and the
+    /// client checks that token as soon as it has parsed the response -- so a hook that fired
+    /// after the write would race the client and only usually win. Writing the response after the
+    /// hook gives the side effect a happens-before edge to everything the client does with that
+    /// response, which is also the honest scenario: the operator cancelled while the response was
+    /// still in flight.
     fn scripted_server_with_status_hook<F>(
         responses: Vec<(StatusCode, String)>,
-        mut after_response: F,
+        mut before_response: F,
     ) -> (String, JoinHandle<Vec<CapturedRequest>>)
     where
         F: FnMut(usize) + Send + 'static,
@@ -2218,8 +2227,8 @@ mod tests {
             for (index, (status, response_body)) in responses.into_iter().enumerate() {
                 let mut stream = accept_scripted_connection(&listener, index);
                 requests.push(read_scripted_request(&mut stream, index));
+                before_response(index);
                 write_scripted_response(&mut stream, status, &response_body);
-                after_response(index);
             }
             requests
         });
@@ -3691,7 +3700,7 @@ mod tests {
         let copy_directory = format!("{probe_path}/{WRITE_PROBE_COPY_DIRECTORY}");
         let local = ProbeLocalFile::create(write_probe_md5()).unwrap();
         let cancellation = CancellationToken::default();
-        let cancel_after_create = cancellation.clone();
+        let cancel_before_create_response = cancellation.clone();
         let responses = vec![
             (StatusCode::OK, write_probe_discovery(false)),
             (
@@ -3726,7 +3735,7 @@ mod tests {
         ];
         let (url, server) = scripted_server_with_status_hook(responses, move |index| {
             if index == 5 {
-                cancel_after_create.cancel();
+                cancel_before_create_response.cancel();
             }
         });
         let mut client = ApiClient::connect(&ClientOptions {
@@ -4407,7 +4416,7 @@ mod tests {
 
         // Cancelling while the poll loop is sleeping must also stop the task.
         let cancellation = CancellationToken::default();
-        let cancel_after_status = cancellation.clone();
+        let cancel_before_status_response = cancellation.clone();
         let (url, server) = scripted_server_with_status_hook(
             vec![
                 (StatusCode::OK, write_probe_discovery(false)),
@@ -4421,7 +4430,7 @@ mod tests {
             ],
             move |index| {
                 if index == 3 {
-                    cancel_after_status.cancel();
+                    cancel_before_status_response.cancel();
                 }
             },
         );
@@ -4464,7 +4473,7 @@ mod tests {
         assert_eq!(server.join().unwrap().len(), 3);
 
         let cancellation = CancellationToken::default();
-        let cancel_after_start = cancellation.clone();
+        let cancel_before_start_response = cancellation.clone();
         let (url, server) = scripted_server_with_status_hook(
             vec![
                 (StatusCode::OK, write_probe_discovery(true)),
@@ -4474,7 +4483,7 @@ mod tests {
             ],
             move |index| {
                 if index == 2 {
-                    cancel_after_start.cancel();
+                    cancel_before_start_response.cancel();
                 }
             },
         );
@@ -4784,9 +4793,11 @@ mod tests {
             );
             let requests = server.join().unwrap();
             assert_eq!(requests.len(), expected_requests, "case {index}");
+            // Match the `api=` form field rather than a bare API name: the discovery request
+            // legitimately lists every API in its `query` parameter, and a substring test would
+            // mistake that for a mutation.
             assert!(
-                // Request 0 is discovery, whose query parameter necessarily names every API.
-                requests.iter().skip(1).all(|request| {
+                requests.iter().all(|request| {
                     let body = String::from_utf8_lossy(&request.body);
                     !body.contains("api=SYNO.FileStation.CreateFolder")
                         && !body.contains("api=SYNO.FileStation.Delete")
@@ -5510,7 +5521,7 @@ FplE
 
         // Best-effort task cleanup must not replace the cancellation the caller asked for.
         let cancellation = CancellationToken::default();
-        let cancel_after_status = cancellation.clone();
+        let cancel_before_status_response = cancellation.clone();
         let (url, server) = scripted_server_with_status_hook(
             vec![
                 (StatusCode::OK, write_probe_discovery(false)),
@@ -5527,7 +5538,7 @@ FplE
             ],
             move |index| {
                 if index == 3 {
-                    cancel_after_status.cancel();
+                    cancel_before_status_response.cancel();
                 }
             },
         );
