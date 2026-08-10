@@ -19,9 +19,22 @@ pub(crate) fn run(
     selected_profile: Option<&Profile>,
     quiet: bool,
 ) -> Result<CredentialOutcome> {
-    match &credentials.action {
+    let vault = open_credential_vault(resolved, quiet)?;
+    run_with_vault(&credentials.action, &vault, selected_profile, quiet)
+}
+
+/// Dispatch one credential action against an already-opened vault.
+///
+/// Split out from [`run`] so tests can exercise every arm; production always reaches this via
+/// [`run`], which opens the real OS vault first.
+fn run_with_vault(
+    action: &CredentialAction,
+    vault: &OsVault,
+    selected_profile: Option<&Profile>,
+    quiet: bool,
+) -> Result<CredentialOutcome> {
+    match action {
         CredentialAction::SetPassword(arguments) => {
-            let vault = open_credential_vault(resolved, quiet)?;
             let password_file = if arguments.password_stdin {
                 None
             } else {
@@ -34,7 +47,6 @@ pub(crate) fn run(
             Ok(CredentialOutcome::StoredPassword)
         }
         CredentialAction::SetTotp(arguments) => {
-            let vault = open_credential_vault(resolved, quiet)?;
             if !quiet {
                 eprintln!(
                     "warning: storing the TOTP seed enables unattended login but places both factors under the same OS account"
@@ -54,30 +66,26 @@ pub(crate) fn run(
             Ok(CredentialOutcome::StoredTotp)
         }
         CredentialAction::Status(_) => {
-            let vault = open_credential_vault(resolved, quiet)?;
             let status = vault.status()?;
             Ok(CredentialOutcome::Status {
                 password_stored: status.password,
                 totp_stored: status.totp,
             })
         }
-        CredentialAction::Remove(arguments) => {
-            let vault = open_credential_vault(resolved, quiet)?;
-            match arguments.kind {
-                RemoveKind::Password => Ok(CredentialOutcome::Removed {
-                    password_removed: Some(vault.remove(CredentialKind::Password)?),
-                    totp_removed: None,
-                }),
-                RemoveKind::Totp => Ok(CredentialOutcome::Removed {
-                    password_removed: None,
-                    totp_removed: Some(vault.remove(CredentialKind::Totp)?),
-                }),
-                RemoveKind::All => Ok(CredentialOutcome::Removed {
-                    password_removed: Some(vault.remove(CredentialKind::Password)?),
-                    totp_removed: Some(vault.remove(CredentialKind::Totp)?),
-                }),
-            }
-        }
+        CredentialAction::Remove(arguments) => match arguments.kind {
+            RemoveKind::Password => Ok(CredentialOutcome::Removed {
+                password_removed: Some(vault.remove(CredentialKind::Password)?),
+                totp_removed: None,
+            }),
+            RemoveKind::Totp => Ok(CredentialOutcome::Removed {
+                password_removed: None,
+                totp_removed: Some(vault.remove(CredentialKind::Totp)?),
+            }),
+            RemoveKind::All => Ok(CredentialOutcome::Removed {
+                password_removed: Some(vault.remove(CredentialKind::Password)?),
+                totp_removed: Some(vault.remove(CredentialKind::Totp)?),
+            }),
+        },
     }
 }
 
@@ -521,9 +529,283 @@ fn secret_from_env(name: &str) -> Result<Option<Zeroizing<String>>> {
 mod tests {
     use std::collections::VecDeque;
     use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use keyring_core::CredentialStore;
+
     use super::*;
+    use crate::cli::{
+        CredentialProfileArgs, CredentialRemoveArgs, CredentialStatusArgs, SetPasswordArgs,
+        SetTotpArgs,
+    };
+
+    const TEST_SEED: &str = "JBSWY3DPEHPK3PXP";
+
+    fn mock_vault() -> OsVault {
+        let store: Arc<CredentialStore> = keyring_core::mock::Store::new().unwrap();
+        OsVault::with_store("https://files.example.test/nas", "alice", false, store).unwrap()
+    }
+
+    fn scratch_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("sdsync-{label}-{nonce}"));
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn secret_file(directory: &Path, name: &str, contents: &str) -> PathBuf {
+        let path = directory.join(name);
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn profile_args() -> CredentialProfileArgs {
+        CredentialProfileArgs {
+            url: None,
+            username: None,
+            allow_http: false,
+        }
+    }
+
+    fn set_password_action(password_file: Option<PathBuf>) -> CredentialAction {
+        CredentialAction::SetPassword(SetPasswordArgs {
+            profile: profile_args(),
+            password_stdin: false,
+            password_file,
+        })
+    }
+
+    fn set_totp_action(totp_secret_file: Option<PathBuf>) -> CredentialAction {
+        CredentialAction::SetTotp(SetTotpArgs {
+            profile: profile_args(),
+            secret_stdin: false,
+            totp_secret_file,
+        })
+    }
+
+    fn status_action() -> CredentialAction {
+        CredentialAction::Status(CredentialStatusArgs {
+            profile: profile_args(),
+        })
+    }
+
+    fn remove_action(kind: RemoveKind) -> CredentialAction {
+        CredentialAction::Remove(CredentialRemoveArgs {
+            profile: profile_args(),
+            kind,
+        })
+    }
+
+    fn dispatch(action: &CredentialAction, vault: &OsVault) -> Result<CredentialOutcome> {
+        run_with_vault(action, vault, None, true)
+    }
+
+    #[test]
+    fn credential_actions_store_report_and_remove_both_entries() {
+        let directory = scratch_dir("credential-lifecycle");
+        let password_path = secret_file(&directory, "password.txt", "stored-password\nignored\n");
+        let totp_path = secret_file(&directory, "totp.txt", "jbsw-y3dp ehpk-3pxp\nignored\n");
+        let vault = mock_vault();
+
+        assert_eq!(
+            dispatch(&status_action(), &vault).unwrap(),
+            CredentialOutcome::Status {
+                password_stored: false,
+                totp_stored: false,
+            }
+        );
+
+        assert_eq!(
+            dispatch(&set_password_action(Some(password_path)), &vault).unwrap(),
+            CredentialOutcome::StoredPassword
+        );
+        assert_eq!(
+            vault.load_password().unwrap().unwrap().as_str(),
+            "stored-password"
+        );
+
+        // `quiet: false` also exercises the shared-OS-account warning on the set-totp path.
+        assert_eq!(
+            run_with_vault(&set_totp_action(Some(totp_path)), &vault, None, false).unwrap(),
+            CredentialOutcome::StoredTotp
+        );
+        assert_eq!(
+            &*vault.load_totp_secret().unwrap().unwrap(),
+            &*parse_totp_secret(TEST_SEED).unwrap()
+        );
+
+        assert_eq!(
+            dispatch(&status_action(), &vault).unwrap(),
+            CredentialOutcome::Status {
+                password_stored: true,
+                totp_stored: true,
+            }
+        );
+
+        assert_eq!(
+            dispatch(&remove_action(RemoveKind::All), &vault).unwrap(),
+            CredentialOutcome::Removed {
+                password_removed: Some(true),
+                totp_removed: Some(true),
+            }
+        );
+        assert_eq!(
+            dispatch(&status_action(), &vault).unwrap(),
+            CredentialOutcome::Status {
+                password_stored: false,
+                totp_stored: false,
+            }
+        );
+        assert_eq!(
+            dispatch(&remove_action(RemoveKind::All), &vault).unwrap(),
+            CredentialOutcome::Removed {
+                password_removed: Some(false),
+                totp_removed: Some(false),
+            }
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn removing_one_credential_kind_leaves_the_other_factor_intact() {
+        let directory = scratch_dir("credential-remove-kinds");
+        let password_path = secret_file(&directory, "password.txt", "stored-password\n");
+        let totp_path = secret_file(&directory, "totp.txt", &format!("{TEST_SEED}\n"));
+        let vault = mock_vault();
+        dispatch(&set_password_action(Some(password_path.clone())), &vault).unwrap();
+        dispatch(&set_totp_action(Some(totp_path)), &vault).unwrap();
+
+        assert_eq!(
+            dispatch(&remove_action(RemoveKind::Password), &vault).unwrap(),
+            CredentialOutcome::Removed {
+                password_removed: Some(true),
+                totp_removed: None,
+            }
+        );
+        assert_eq!(
+            dispatch(&status_action(), &vault).unwrap(),
+            CredentialOutcome::Status {
+                password_stored: false,
+                totp_stored: true,
+            }
+        );
+        assert_eq!(
+            dispatch(&remove_action(RemoveKind::Password), &vault).unwrap(),
+            CredentialOutcome::Removed {
+                password_removed: Some(false),
+                totp_removed: None,
+            }
+        );
+
+        dispatch(&set_password_action(Some(password_path)), &vault).unwrap();
+        assert_eq!(
+            dispatch(&remove_action(RemoveKind::Totp), &vault).unwrap(),
+            CredentialOutcome::Removed {
+                password_removed: None,
+                totp_removed: Some(true),
+            }
+        );
+        assert_eq!(
+            dispatch(&status_action(), &vault).unwrap(),
+            CredentialOutcome::Status {
+                password_stored: true,
+                totp_stored: false,
+            }
+        );
+        assert_eq!(
+            dispatch(&remove_action(RemoveKind::Totp), &vault).unwrap(),
+            CredentialOutcome::Removed {
+                password_removed: None,
+                totp_removed: Some(false),
+            }
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn profile_secret_files_are_a_fallback_that_command_line_files_override() {
+        let directory = scratch_dir("credential-profile-files");
+        let profile = Profile {
+            password_file: Some(secret_file(
+                &directory,
+                "profile-password.txt",
+                "profile-password\n",
+            )),
+            totp_secret_file: Some(secret_file(&directory, "profile-totp.txt", TEST_SEED)),
+            ..Profile::default()
+        };
+        let vault = mock_vault();
+
+        assert_eq!(
+            run_with_vault(&set_password_action(None), &vault, Some(&profile), true).unwrap(),
+            CredentialOutcome::StoredPassword
+        );
+        assert_eq!(
+            run_with_vault(&set_totp_action(None), &vault, Some(&profile), true).unwrap(),
+            CredentialOutcome::StoredTotp
+        );
+        assert_eq!(
+            vault.load_password().unwrap().unwrap().as_str(),
+            "profile-password"
+        );
+        assert_eq!(
+            &*vault.load_totp_secret().unwrap().unwrap(),
+            &*parse_totp_secret(TEST_SEED).unwrap()
+        );
+
+        let explicit = secret_file(&directory, "cli-password.txt", "cli-password\n");
+        run_with_vault(
+            &set_password_action(Some(explicit)),
+            &vault,
+            Some(&profile),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            vault.load_password().unwrap().unwrap().as_str(),
+            "cli-password"
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejected_secrets_leave_the_vault_unchanged_without_echoing_the_value() {
+        let directory = scratch_dir("credential-rejections");
+        let vault = mock_vault();
+
+        let marker = "REJECT-ME-NOT-BASE32";
+        let bad_totp = secret_file(&directory, "bad-totp.txt", &format!("{marker}!\n"));
+        let error = dispatch(&set_totp_action(Some(bad_totp)), &vault).unwrap_err();
+        assert!(!error.to_string().contains(marker), "{error}");
+
+        let empty_password = secret_file(&directory, "empty-password.txt", "\n");
+        let error = dispatch(&set_password_action(Some(empty_password)), &vault).unwrap_err();
+        assert_eq!(error.to_string(), "password was empty");
+
+        let missing = directory.join("absent.txt");
+        assert!(matches!(
+            dispatch(&set_password_action(Some(missing.clone())), &vault),
+            Err(Error::FileIo { path, .. }) if path == missing
+        ));
+
+        assert_eq!(
+            dispatch(&status_action(), &vault).unwrap(),
+            CredentialOutcome::Status {
+                password_stored: false,
+                totp_stored: false,
+            }
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn secret_files_use_the_first_line_without_echoing_values() {

@@ -135,13 +135,23 @@ impl OsVault {
         entry.map_err(|error| vault_error(operation, error))
     }
 
-    #[cfg(test)]
-    fn with_store(
+    /// Test seam: build a profile over a caller-supplied store instead of the platform vault.
+    ///
+    /// Production code must use [`OsVault::new`]. This exists only so the binary crate's tests
+    /// can drive the credential commands against `keyring_core::mock::Store`; it is hidden from
+    /// the documented API and carries no stability guarantee. It applies exactly the same
+    /// username and URL validation as [`OsVault::new`] — the only difference is that the store
+    /// is injected rather than opened from the operating system.
+    #[doc(hidden)]
+    pub fn with_store(
         base_url: &str,
         username: &str,
         allow_http: bool,
         store: Arc<CredentialStore>,
     ) -> Result<Self> {
+        if username.is_empty() {
+            return Err(Error::Message("DSM username must not be empty".to_owned()));
+        }
         let base_url = normalize_base_url(base_url, allow_http)?;
         let (password_account, totp_account) = profile_accounts(base_url.as_str(), username);
         Ok(Self {
@@ -623,6 +633,47 @@ mod tests {
             assert!(!rendered.contains("LEAK-ME"));
             assert!(!rendered.contains("detail"));
         }
+    }
+
+    #[test]
+    fn injected_store_seam_enforces_the_same_profile_validation_as_new() {
+        let store: Arc<CredentialStore> = keyring_core::mock::Store::new().unwrap();
+        let rejected = |base_url: &str, username: &str, allow_http: bool| match OsVault::with_store(
+            base_url,
+            username,
+            allow_http,
+            store.clone(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the test seam accepted {base_url:?}"),
+        };
+
+        assert_eq!(
+            rejected("https://files.example.test", "", false).to_string(),
+            "DSM username must not be empty"
+        );
+        assert!(matches!(
+            rejected("http://files.example.test", "alice", false),
+            Error::HttpsRequired
+        ));
+        assert!(matches!(
+            rejected("not a URL", "alice", true),
+            Error::InvalidUrl(_)
+        ));
+        assert!(matches!(
+            rejected("https://alice:secret@files.example.test", "alice", false),
+            Error::InvalidUrl(_)
+        ));
+
+        // The seam still honors an explicitly opted-in HTTP profile, exactly like `new`.
+        let vault = OsVault::with_store("http://files.example.test", "alice", true, store).unwrap();
+        assert_eq!(
+            vault.status().unwrap(),
+            VaultStatus {
+                password: false,
+                totp: false
+            }
+        );
     }
 
     #[test]
