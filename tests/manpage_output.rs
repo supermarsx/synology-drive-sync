@@ -48,6 +48,7 @@ fn root_and_recursive_manpage_modes_are_complete() {
 
     let mut expected = vec![
         "synology-drive-sync-completions.1",
+        "synology-drive-sync-config-init.1",
         "synology-drive-sync-config-path.1",
         "synology-drive-sync-config-show.1",
         "synology-drive-sync-config-validate.1",

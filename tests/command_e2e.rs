@@ -261,6 +261,85 @@ fn config_path_has_stable_human_json_and_ndjson_contracts() {
 }
 
 #[test]
+fn config_init_provisions_the_platform_path_and_refuses_to_clobber() {
+    let fixture = Fixture::new();
+    let target = fixture.root.join("fresh").join("config.toml");
+    let target_text = target.to_str().expect("UTF-8 fixture path");
+
+    let created = fixture.run(&["config", "init", "--config", target_text]);
+    created.assert_clean_success();
+    assert!(
+        created
+            .stdout
+            .starts_with("Wrote the starter configuration at ")
+    );
+    assert_eq!(
+        fs::read_to_string(&target).expect("the starter must exist"),
+        include_str!("../config.example.toml"),
+        "config init must write the documented example verbatim"
+    );
+
+    // The generated file is immediately usable by the rest of the config surface.
+    let validated = fixture.run(&["config", "validate", "--config", target_text]);
+    validated.assert_clean_success();
+    assert!(validated.stdout.contains("Configuration is valid"));
+
+    let refused = fixture.run(&["config", "init", "--config", target_text]);
+    refused.assert_code(2);
+    assert!(refused.stdout.is_empty(), "a refusal leaked stdout");
+    assert!(
+        refused.stderr.contains("pass --force to replace it"),
+        "unhelpful refusal: {}",
+        refused.stderr
+    );
+
+    let edited = "default-profile = \"mine\"\n";
+    fs::write(&target, edited).expect("stand in for a configuration the user edited");
+    fixture
+        .run(&["config", "init", "--config", target_text])
+        .assert_code(2);
+    assert_eq!(
+        fs::read_to_string(&target).expect("read the protected configuration"),
+        edited,
+        "a refused init must not touch the existing file"
+    );
+
+    let forced = fixture.run(&[
+        "--output",
+        "json",
+        "config",
+        "init",
+        "--force",
+        "--config",
+        target_text,
+    ]);
+    forced.assert_clean_success();
+    let value = forced.json();
+    assert_eq!(value["schema"], "sdsync.config-init.v1");
+    assert_eq!(value["replaced"], true);
+    assert_eq!(value["path"], target.to_string_lossy().as_ref());
+
+    // Without --config the starter lands on the isolated platform-default path.
+    let default_path = fixture.run(&["config", "path"]);
+    default_path.assert_clean_success();
+    let expected = PathBuf::from(default_path.stdout.trim_end());
+    assert!(
+        !expected.exists(),
+        "the fixture must start without a config"
+    );
+    let defaulted = fixture.run(&["--output", "ndjson", "config", "init"]);
+    defaulted.assert_clean_success();
+    let lines = defaulted.ndjson();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["schema"], "sdsync.config-init.v1");
+    assert_eq!(lines[0]["replaced"], false);
+    assert!(
+        expected.is_file(),
+        "config init must create missing parent directories at {expected:?}"
+    );
+}
+
+#[test]
 fn config_validate_has_stable_human_json_and_ndjson_contracts() {
     let fixture = Fixture::new();
 
@@ -366,7 +445,7 @@ fn recursive_manpage_generation_preserves_unrelated_files_and_fails_on_a_file_pa
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.path().extension().is_some_and(|value| value == "1"))
         .count();
-    assert_eq!(generated_pages, 17);
+    assert_eq!(generated_pages, 18);
     assert!(root_page.contains(".SH SUBCOMMANDS"));
     assert!(nested_page.contains(".SH NAME"));
     assert!(nested_page.contains(".SH SYNOPSIS"));

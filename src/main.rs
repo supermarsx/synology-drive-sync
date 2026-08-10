@@ -2441,20 +2441,30 @@ fn finish_doctor_logger(
     }
 }
 
+/// The shipped example is the starter file, so `config init` and the documented example can
+/// never drift apart.
+const STARTER_CONFIGURATION: &str = include_str!("../config.example.toml");
+
 fn run_config(arguments: &cli::Cli, action: cli::ConfigAction) -> Result<()> {
+    // Neither action can load a configuration: `path` reports where one belongs and `init`
+    // creates the file that every other action requires.
+    let requested_format = arguments
+        .global
+        .output
+        .output
+        .unwrap_or(cli::OutputFormat::Human);
     if action == cli::ConfigAction::Path {
         let path = configured_path(&arguments.global).ok_or_else(|| {
             Error::Configuration("no platform configuration directory is available".to_owned())
         })?;
         return write_simple_value(
-            arguments
-                .global
-                .output
-                .output
-                .unwrap_or(cli::OutputFormat::Human),
+            requested_format,
             path.display().to_string(),
             json!({"schema": "sdsync.config-path.v1", "path": path}),
         );
+    }
+    if let cli::ConfigAction::Init { force } = action {
+        return run_config_init(&arguments.global, force, requested_format);
     }
 
     let loaded = load_required_config(&arguments.global)?;
@@ -2470,7 +2480,7 @@ fn run_config(arguments: &cli::Cli, action: cli::ConfigAction) -> Result<()> {
         .map_err(config_error)?;
 
     match action {
-        cli::ConfigAction::Path => unreachable!(),
+        cli::ConfigAction::Path | cli::ConfigAction::Init { .. } => unreachable!(),
         cli::ConfigAction::Validate => write_simple_value(
             output.output,
             format!(
@@ -2511,6 +2521,74 @@ fn run_config(arguments: &cli::Cli, action: cli::ConfigAction) -> Result<()> {
             }
         }
     }
+}
+
+fn run_config_init(global: &cli::GlobalArgs, force: bool, format: cli::OutputFormat) -> Result<()> {
+    let path = configured_path(global).ok_or_else(|| {
+        Error::Configuration("no platform configuration directory is available".to_owned())
+    })?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|source| Error::FileIo {
+            path: parent.to_owned(),
+            source,
+        })?;
+    }
+    let replaced = write_starter_configuration(&path, force)?;
+
+    let action = if replaced { "Replaced" } else { "Wrote" };
+    write_simple_value(
+        format,
+        format!(
+            "{action} the starter configuration at {}. Edit it, then run `config validate`.",
+            path.display()
+        ),
+        json!({
+            "schema": "sdsync.config-init.v1",
+            "path": path,
+            "replaced": replaced,
+        }),
+    )
+}
+
+/// Write the starter configuration, reporting whether an existing file was replaced. Without
+/// `force` the create is exclusive, so a configuration that appears between the decision and the
+/// write is still never clobbered.
+fn write_starter_configuration(path: &std::path::Path, force: bool) -> Result<bool> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    if force {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    // Truncation destroys the evidence, so record the prior state before opening.
+    let replaced = force && path.exists();
+
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(Error::Configuration(format!(
+                "a configuration file already exists at {}; pass --force to replace it",
+                path.display()
+            )));
+        }
+        Err(source) => {
+            return Err(Error::FileIo {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    file.write_all(STARTER_CONFIGURATION.as_bytes())
+        .and_then(|()| file.flush())
+        .map_err(|source| Error::FileIo {
+            path: path.to_owned(),
+            source,
+        })?;
+    Ok(replaced)
 }
 
 fn load_optional_config(global: &cli::GlobalArgs) -> Result<Option<config::LoadedConfig>> {
@@ -4484,6 +4562,92 @@ mod tests {
 
         assert!(!continue_after_progress_event(&cancellation, &failure));
         assert!(cancellation.is_cancelled());
+    }
+
+    fn starter_directory(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "sdsync-starter-{}-{name}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after the Unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create isolated starter directory");
+        root
+    }
+
+    #[test]
+    fn the_starter_configuration_is_the_shipped_example_and_parses_cleanly() {
+        let root = starter_directory("valid");
+        let path = root.join("config.toml");
+        assert!(!write_starter_configuration(&path, false).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), STARTER_CONFIGURATION);
+        assert_eq!(
+            STARTER_CONFIGURATION,
+            include_str!("../config.example.toml"),
+            "config init must hand out the documented example verbatim"
+        );
+
+        // A starter a user cannot validate is not a starter.
+        let loaded = config::LoadedConfig::load(&path).expect("the starter must parse");
+        for profile in loaded.values.profiles.values() {
+            config::validate_profile(profile).expect("every starter profile must validate");
+        }
+        assert!(!loaded.values.profiles.is_empty());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_starter_never_replaces_an_existing_configuration_without_force() {
+        let root = starter_directory("force");
+        let path = root.join("config.toml");
+        fs::write(&path, "default-profile = \"mine\"\n").expect("write a configuration to protect");
+
+        let refusal = write_starter_configuration(&path, false).unwrap_err();
+        assert!(
+            refusal.to_string().contains("already exists at ")
+                && refusal.to_string().contains("pass --force to replace it"),
+            "unexpected refusal: {refusal}"
+        );
+        assert_eq!(error_exit_code(&refusal), 2);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "default-profile = \"mine\"\n",
+            "a refused init must leave the existing configuration byte-identical"
+        );
+
+        assert!(
+            write_starter_configuration(&path, true).unwrap(),
+            "replacing an existing file is reported as a replacement"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), STARTER_CONFIGURATION);
+
+        // Forcing onto a fresh path is a creation, not a replacement.
+        assert!(!write_starter_configuration(&root.join("new.toml"), true).unwrap());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn config_init_creates_missing_parent_directories_and_reports_the_path() {
+        let root = starter_directory("parents");
+        let path = root.join("nested").join("deep").join("config.toml");
+        let invocation = cli::Cli::try_parse_checked_from([
+            "synology-drive-sync",
+            "--config",
+            path.to_str().expect("UTF-8 fixture path"),
+            "config",
+            "init",
+        ])
+        .expect("the fixture invocation must parse");
+
+        run_config(&invocation, cli::ConfigAction::Init { force: false })
+            .expect("init must succeed");
+        assert_eq!(fs::read_to_string(&path).unwrap(), STARTER_CONFIGURATION);
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -9,7 +9,8 @@
 This separation makes stdout safe to pipe into a parser without losing durable diagnostics. The
 log, progress, and single-profile plan/sync machine contracts are described by
 [`observability.schema.json`](observability.schema.json). Doctor and credential results, plus
-configuration path and validation results, use their own schema tags; `config show` emits the
+configuration path, starter-creation, and validation results, use their own schema tags
+(`sdsync.config-path.v1`, `sdsync.config-init.v1`, `sdsync.config-validation.v1`); `config show` emits the
 non-secret effective-profile object directly. Diagnostic and aggregate batch records are described
 in [Diagnostics and multi-profile batches](diagnostics-and-batch.md).
 

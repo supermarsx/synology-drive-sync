@@ -162,7 +162,7 @@ The explicit command tree is preferred:
 | `doctor source [SOURCE] [--hash]` | Validate a local source without DSM access, optionally hashing every file |
 | `doctor target [REMOTE] [--write-test]` | Diagnose a File Station destination; write only with the explicit disposable probe |
 | `doctor --routing-only` | Validate TLS, proxy routing, and API discovery without authentication |
-| `config path\|validate\|show` | Locate, validate, or inspect non-secret effective configuration |
+| `config path\|init\|validate\|show` | Locate, create, validate, or inspect non-secret effective configuration |
 | `credentials set-password\|set-totp\|status\|remove` | Manage the current user's OS-vault entries |
 | `completions SHELL` | Generate Bash, Zsh, Fish, PowerShell, or Elvish completion source |
 | `manpage [--all DIRECTORY]` | Generate the root roff page on stdout, or every nested command page in a directory |
@@ -179,13 +179,19 @@ Legacy `--dry-run` is equivalent to planning, but new scripts should use the exp
 
 ## Configuration and profiles
 
-Copy [config.example.toml](config.example.toml) and ask the CLI for the platform-specific default location:
+`config init` writes [config.example.toml](config.example.toml) verbatim to the platform-specific
+default location, creating missing parent directories:
 
 ```bash
 synology-drive-sync config path
+synology-drive-sync config init
 synology-drive-sync config validate --config ./config.toml
 synology-drive-sync config show --config ./config.toml --profile production
 ```
+
+The starter contains placeholder values and must be edited before it describes a real NAS. An
+existing configuration is never replaced without `--force`, which discards the previous contents.
+Pass `--config PATH` to write somewhere other than the default location.
 
 Default locations are:
 

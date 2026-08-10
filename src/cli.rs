@@ -659,6 +659,15 @@ pub struct ConfigArgs {
 pub enum ConfigAction {
     /// Print the selected or platform-default configuration path.
     Path,
+    /// Write a commented starter configuration to the selected or platform-default path.
+    #[command(
+        long_about = "Write the documented starter configuration to --config, or to the platform-default path when --config is absent. Missing parent directories are created. An existing file is never replaced without --force, and the starter file contains placeholder values that must be edited before use. It is non-secret by construction: it configures only secret-file paths and a token environment-variable name, never a secret value."
+    )]
+    Init {
+        /// Replace an existing configuration file. Its previous contents are lost.
+        #[arg(long)]
+        force: bool,
+    },
     /// Parse and validate the configuration and selected profile without contacting DSM.
     Validate,
     /// Print effective non-secret values for the selected profile.
@@ -1034,7 +1043,7 @@ mod tests {
 
     #[test]
     fn config_commands_accept_global_profile_after_the_action() {
-        for action in ["path", "validate", "show"] {
+        for action in ["path", "init", "validate", "show"] {
             let cli = Cli::try_parse_from([
                 "synology-drive-sync",
                 "config",
@@ -1045,6 +1054,33 @@ mod tests {
             .unwrap();
             assert_eq!(cli.global.profile.as_deref(), Some("production"));
             assert!(matches!(cli.invocation(), Invocation::Config(_)));
+        }
+    }
+
+    #[test]
+    fn config_init_replacement_is_opt_in_and_belongs_only_to_init() {
+        let default = Cli::try_parse_from(["synology-drive-sync", "config", "init"]).unwrap();
+        assert!(matches!(
+            default.invocation(),
+            Invocation::Config(ConfigArgs {
+                action: ConfigAction::Init { force: false }
+            })
+        ));
+
+        let forced =
+            Cli::try_parse_from(["synology-drive-sync", "config", "init", "--force"]).unwrap();
+        assert!(matches!(
+            forced.invocation(),
+            Invocation::Config(ConfigArgs {
+                action: ConfigAction::Init { force: true }
+            })
+        ));
+
+        for action in ["path", "validate", "show"] {
+            assert!(
+                Cli::try_parse_from(["synology-drive-sync", "config", action, "--force"]).is_err(),
+                "--force must not be accepted by config {action}"
+            );
         }
     }
 
