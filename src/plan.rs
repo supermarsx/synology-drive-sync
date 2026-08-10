@@ -22,8 +22,9 @@ pub struct PlanOptions {
     pub server_copy: bool,
 }
 
-/// Why the planner scheduled an action. Every variant names a comparison the planner actually
-/// performed, so a mode that never reads content cannot report a content difference.
+/// Why the planner scheduled an action. Every variant names what the planner actually observed:
+/// either a comparison it performed, or a comparison it could not perform. A mode that never
+/// reads content cannot report a content difference, and an uncompared digest is never one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChangeReason {
     /// No remote entry exists at the mapped path.
@@ -32,8 +33,14 @@ pub enum ChangeReason {
     SizeDiffers,
     /// Sizes agree and the File Station-resolution modification times differ.
     MtimeDiffers,
-    /// Sizes agree and the content digests did not compare equal.
+    /// Sizes agree and the content digests were both present and did not compare equal.
     ContentDiffers,
+    /// Sizes and modification times agree but the local file carries no digest, so no content
+    /// comparison happened. The file is scheduled rather than assumed equal.
+    LocalDigestUnavailable,
+    /// Sizes and modification times agree but no remote MD5 was retrieved, so no content
+    /// comparison happened. The file is scheduled rather than assumed equal.
+    RemoteDigestUnavailable,
     /// A remote entry of the other kind occupies the path and is replaced.
     TypeReplaced,
 }
@@ -45,6 +52,8 @@ impl ChangeReason {
             Self::SizeDiffers => "size-differs",
             Self::MtimeDiffers => "mtime-differs",
             Self::ContentDiffers => "content-differs",
+            Self::LocalDigestUnavailable => "local-digest-unavailable",
+            Self::RemoteDigestUnavailable => "remote-digest-unavailable",
             Self::TypeReplaced => "type-replaced",
         }
     }
@@ -56,6 +65,12 @@ impl ChangeReason {
             Self::SizeDiffers => "local and remote sizes differ",
             Self::MtimeDiffers => "size equal, modification time differs",
             Self::ContentDiffers => "size equal, MD5 did not match",
+            Self::LocalDigestUnavailable => {
+                "size and time equal, no local digest to compare, uploading unverified"
+            }
+            Self::RemoteDigestUnavailable => {
+                "size and time equal, no remote MD5 to compare, uploading unverified"
+            }
             Self::TypeReplaced => "remote entry has the conflicting kind",
         }
     }
@@ -489,8 +504,9 @@ fn push_predelete(
 }
 
 /// Compare a same-path file pair under `mode`, returning `None` when the mode considers them
-/// equal and otherwise the single comparison that decided the difference. The reason is limited
-/// to what the mode actually inspects: `SizeOnly` can only ever report a size difference.
+/// equal and otherwise the single observation that decided the difference. The reason is limited
+/// to what the mode actually inspects: `SizeOnly` can only ever report a size difference, and
+/// content mode reports a missing digest as such rather than as a digest mismatch.
 fn compare_files(
     local: &LocalEntry,
     remote: &RemoteEntry,
@@ -511,7 +527,11 @@ fn compare_files(
             // A digest is unavailable, so content equality was never established. Name the
             // metadata difference when there is one rather than an unperformed content check.
             _ if mtime_differs => Some(ChangeReason::MtimeDiffers),
-            _ => Some(ChangeReason::ContentDiffers),
+            // Nothing distinguishes the pair except an absent digest. Upload anyway, and name
+            // the side that could not be hashed instead of claiming the MD5s disagreed. A local
+            // digest is the precondition for the remote lookup, so it is named first.
+            (None, _) => Some(ChangeReason::LocalDigestUnavailable),
+            (Some(_), None) => Some(ChangeReason::RemoteDigestUnavailable),
         },
     }
 }
@@ -894,34 +914,93 @@ mod tests {
     }
 
     #[test]
-    fn content_mode_reports_the_metadata_difference_when_a_digest_is_unavailable() {
+    fn content_mode_names_the_missing_digest_instead_of_a_comparison_it_never_made() {
         let root = RemoteRoot::parse("/share/root").unwrap();
+        // Metadata identical, so only a digest pair could decide equality.
+        let matched_remote = || remote(&[("payload.bin", EntryKind::File, 4, 1)]);
+        let plan_for = |local: &LocalInventory, remote: &RemoteInventory| {
+            build_plan(
+                &root,
+                local,
+                remote,
+                &rules(&[]),
+                &content_options(false, false),
+            )
+            .unwrap()
+        };
 
         // Remote digests are fetched only for equal size and mtime, so a same-size mtime change
         // has no digest pair to compare and must not be reported as a content difference.
         let mut moved = local(&[("payload.bin", EntryKind::File, 4, 9_000)]);
         moved.entries.get_mut("payload.bin").unwrap().content_md5 = Some(digest(1));
-        let plan = build_plan(
-            &root,
-            &moved,
-            &remote(&[("payload.bin", EntryKind::File, 4, 1)]),
-            &rules(&[]),
-            &content_options(false, false),
-        )
-        .unwrap();
-        assert_eq!(plan.uploads[0].reason, ChangeReason::MtimeDiffers);
+        assert_eq!(
+            plan_for(&moved, &matched_remote()).uploads[0].reason,
+            ChangeReason::MtimeDiffers
+        );
 
-        // With metadata identical, an absent digest leaves content equality unestablished.
+        // A local file left unhashed - hashing skipped or cancelled - was never compared, so the
+        // conservative upload must say the local digest was missing, not that the MD5s disagreed.
         let unhashed = local(&[("payload.bin", EntryKind::File, 4, 1_000)]);
-        let plan = build_plan(
-            &root,
-            &unhashed,
-            &remote(&[("payload.bin", EntryKind::File, 4, 1)]),
-            &rules(&[]),
-            &content_options(false, false),
-        )
-        .unwrap();
-        assert_eq!(plan.uploads[0].reason, ChangeReason::ContentDiffers);
+        let mut hashed_remote = matched_remote();
+        hashed_remote
+            .entries
+            .get_mut("payload.bin")
+            .unwrap()
+            .content_md5 = Some(digest(1));
+        assert_eq!(
+            plan_for(&unhashed, &hashed_remote).uploads[0].reason,
+            ChangeReason::LocalDigestUnavailable
+        );
+
+        // Neither side hashed: the local digest is the precondition for the remote lookup, so it
+        // is the side named.
+        assert_eq!(
+            plan_for(&unhashed, &matched_remote()).uploads[0].reason,
+            ChangeReason::LocalDigestUnavailable
+        );
+
+        // The mirror image: the local file was hashed but the remote entry carries no MD5,
+        // as happens when digest selection skipped it - a protected path, say.
+        let mut hashed = local(&[("payload.bin", EntryKind::File, 4, 1_000)]);
+        hashed.entries.get_mut("payload.bin").unwrap().content_md5 = Some(digest(1));
+        assert_eq!(
+            plan_for(&hashed, &matched_remote()).uploads[0].reason,
+            ChangeReason::RemoteDigestUnavailable
+        );
+
+        // The regression guard that matters: two present, differing digests are still a genuine
+        // content difference.
+        let mut differing_remote = matched_remote();
+        differing_remote
+            .entries
+            .get_mut("payload.bin")
+            .unwrap()
+            .content_md5 = Some(digest(2));
+        assert_eq!(
+            plan_for(&hashed, &differing_remote).uploads[0].reason,
+            ChangeReason::ContentDiffers
+        );
+
+        // Two present, equal digests remain no change at all.
+        let unchanged = plan_for(&hashed, &hashed_remote);
+        assert!(unchanged.uploads.is_empty());
+        assert_eq!(unchanged.unchanged_files, 1);
+    }
+
+    #[test]
+    fn unverified_content_details_report_the_missing_digest_not_a_mismatch() {
+        assert_eq!(
+            ChangeReason::LocalDigestUnavailable.detail(),
+            "size and time equal, no local digest to compare, uploading unverified"
+        );
+        assert_eq!(
+            ChangeReason::RemoteDigestUnavailable.detail(),
+            "size and time equal, no remote MD5 to compare, uploading unverified"
+        );
+        assert_eq!(
+            ChangeReason::ContentDiffers.detail(),
+            "size equal, MD5 did not match"
+        );
     }
 
     #[test]
@@ -968,6 +1047,8 @@ mod tests {
             ChangeReason::SizeDiffers,
             ChangeReason::MtimeDiffers,
             ChangeReason::ContentDiffers,
+            ChangeReason::LocalDigestUnavailable,
+            ChangeReason::RemoteDigestUnavailable,
             ChangeReason::TypeReplaced,
         ];
         assert_eq!(
@@ -977,6 +1058,8 @@ mod tests {
                 "size-differs",
                 "mtime-differs",
                 "content-differs",
+                "local-digest-unavailable",
+                "remote-digest-unavailable",
                 "type-replaced",
             ]
         );
