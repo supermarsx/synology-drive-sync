@@ -462,19 +462,30 @@ jobs:
           old_ref=$(jq -er '.metadata.component["bom-ref"] | select(type == "string" and length > 0)' "$source_sbom")
           old_purl=$(jq -er '.metadata.component.purl | select(type == "string" and length > 0)' "$source_sbom")
           root_purl="pkg:github/$REPOSITORY@$TAG"
+          # cargo-cyclonedx omits the random serial number whenever SOURCE_DATE_EPOCH
+          # is set, but actions/attest only recognises a CycloneDX document that
+          # carries bomFormat, specVersion and serialNumber. Derive a stable UUIDv5
+          # so the SBOM stays byte-reproducible and remains attestable.
+          serial="urn:uuid:$(
+            python3 -c 'import sys, uuid; print(uuid.uuid5(uuid.NAMESPACE_URL, sys.argv[1]))' \
+              "https://github.com/$REPOSITORY/releases/tag/$TAG"
+          )"
+          [[ "$serial" =~ ^urn:uuid:[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]]
           normalized=$(mktemp)
           trap 'rm -f -- "$normalized"' EXIT
           jq \
             --arg tag "$TAG" \
             --arg old_ref "$old_ref" \
             --arg old_purl "$old_purl" \
-            --arg root_purl "$root_purl" '
+            --arg root_purl "$root_purl" \
+            --arg serial "$serial" '
               def reprefix($old; $new):
                 if type == "string" and startswith($old)
                 then $new + .[($old | length):]
                 else .
                 end;
               walk(reprefix($old_ref; $root_purl) | reprefix($old_purl; $root_purl))
+              | .serialNumber = $serial
               | .metadata.component.version = $tag
               | .metadata.component.purl = $root_purl
               | .metadata.component["bom-ref"] = $root_purl
@@ -485,12 +496,16 @@ jobs:
             --arg tag "$TAG" \
             --arg old_ref "$old_ref" \
             --arg old_purl "$old_purl" \
-            --arg root_purl "$root_purl" '
+            --arg root_purl "$root_purl" \
+            --arg serial "$serial" '
               ([.metadata.component, .components[]?]
                 | [.[] | recurse(.components[]?) | .["bom-ref"]]
                 | unique) as $component_refs
               |
               .bomFormat == "CycloneDX"
+              and .serialNumber == $serial
+              and ((.specVersion | type) == "string")
+              and ((.specVersion | length) > 0)
               and ((.components | type) == "array")
               and any(.metadata.properties[]?;
                 .name == "cdx:rustc:sbom:target:all_targets" and .value == "true")
