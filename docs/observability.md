@@ -59,7 +59,9 @@ then built-in default. Log-level resolution is deliberately more specific:
 5. `info`.
 
 An explicit log level therefore wins over verbosity. Levels are `trace`, `debug`, `info`, `warn`,
-`error`, and `off`. `-v` conflicts with `--quiet` on the command line.
+`error`, and `off`. `-v` and `--quiet` are independent: `--quiet` only governs the standard-error
+sink and progress, so `-v --quiet` raises the file/remote log level while keeping the terminal
+silent.
 
 The corresponding non-secret profile fields are:
 
@@ -307,8 +309,11 @@ endpoint rather than forwarding them to another origin. Configure the collector'
 certificate trusted by the host running `synology-drive-sync`.
 
 Bearer tokens are loaded at startup from `--remote-log-token-file FILE` or the environment variable
-named by `--remote-log-token-env NAME`. The two options conflict. The token is limited to 16 KiB,
-must be visible ASCII without quotes, has trailing CR/LF removed, and is held in zeroizing memory.
+named by `--remote-log-token-env NAME`. A profile that sets both `remote-log-token-file` and
+`remote-log-token-env` is rejected; on the command line or through `SDSYNC_REMOTE_LOG_TOKEN_FILE` /
+`SDSYNC_REMOTE_LOG_TOKEN_ENV`, the file source silently takes precedence when both are given. The
+token is limited to 16 KiB, must be visible ASCII without quotes, has trailing CR/LF removed, and is
+held in zeroizing memory.
 The token is never accepted directly as a command-line or TOML value. Provision token files with
 service-account-only permissions.
 

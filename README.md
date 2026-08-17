@@ -206,7 +206,7 @@ Resolution is deterministic:
 3. selected profile (`--profile`, `SDSYNC_PROFILE`, then `default-profile`);
 4. built-in default.
 
-Command-line exclusion rules are appended to profile exclusions. `--no-delete` can disable a profile's `delete=true`, `--vault` can override a profile's `no-vault=true`, and `--no-quiet` can re-enable terminal diagnostics over `quiet=true`. Relative paths in a profile are anchored to the configuration file's directory.
+Command-line exclusion rules are appended to profile exclusions. `--no-delete` can disable a profile or environment `delete=true`, `--vault` can override a profile or environment `no-vault=true`, and `--no-quiet` can re-enable terminal diagnostics over a profile or environment `quiet=true`. Relative paths in a profile are anchored to the configuration file's directory.
 
 Select complete profile jobs with `--profiles NAME[,NAME...]` or every named profile with
 `--all-profiles`. Batch sync/plan takes SOURCE and REMOTE from each profile, rejects equal or nested
@@ -271,7 +271,7 @@ Effective OTP resolution is:
 3. a code generated from the OS-vault seed;
 4. a masked current-code prompt after DSM requests OTP.
 
-`--no-vault` disables both vault reads; `--vault` re-enables them over a profile default. Protect referenced files with OS permissions and store one secret on the first line. For unattended use, prefer the OS vault in a real user session or scheduler-native credentials. `SDSYNC_OTP` is an ephemeral fallback, not seed storage.
+`--no-vault` disables both vault reads; `--vault` re-enables them over a profile or environment default. Protect referenced files with OS permissions and store one secret on the first line. For unattended use, prefer the OS vault in a real user session or scheduler-native credentials. `SDSYNC_OTP` is an ephemeral fallback, not seed storage.
 
 Headless Linux services and containers usually do not have an unlocked Secret Service session. The supplied systemd, cron, and Compose examples therefore use protected secret-file mounts with `--no-vault`. Storing both password and TOTP seed in one vault enables unattended login but reduces factor separation to the security of that OS account.
 
