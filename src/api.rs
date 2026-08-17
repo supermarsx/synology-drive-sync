@@ -522,11 +522,13 @@ impl ApiClient {
         } else {
             EntryKind::File
         };
+        if actual_kind != expected_kind {
+            return Err(Error::RemoteSnapshotChanged(remote_path.to_owned()));
+        }
         let additional = item.additional.unwrap_or_default();
-        let actual_size = additional.size.unwrap_or(0);
-        let actual_mtime_seconds = additional.time.map_or(0, |time| time.mtime);
-        if actual_kind != expected_kind
-            || actual_size != expected_size
+        let (actual_size, actual_mtime_seconds) =
+            file_metadata("SYNO.FileStation.List.getinfo", actual_kind, &additional)?;
+        if actual_size != expected_size
             || (require_mtime && actual_mtime_seconds != expected_mtime_seconds)
         {
             return Err(Error::RemoteSnapshotChanged(remote_path.to_owned()));
@@ -1077,6 +1079,8 @@ impl ApiClient {
                     EntryKind::File
                 };
                 let additional = item.additional.unwrap_or_default();
+                let (size, mtime_seconds) =
+                    file_metadata("SYNO.FileStation.List.list", kind, &additional)?;
                 let mount_point_type = additional
                     .mount_point_type
                     .filter(|value| !value.trim().is_empty());
@@ -1084,8 +1088,8 @@ impl ApiClient {
                     relative: relative.clone(),
                     remote_path: item.path.clone(),
                     kind,
-                    size: additional.size.unwrap_or(0),
-                    mtime_seconds: additional.time.map_or(0, |time| time.mtime),
+                    size,
+                    mtime_seconds,
                     mount_point_type: mount_point_type.clone(),
                     content_md5: None,
                 };
@@ -1649,6 +1653,36 @@ struct ApiErrorWire {
     code: i64,
     #[serde(default)]
     errors: Value,
+}
+
+/// Read the size and modified time a snapshot comparison depends on.
+///
+/// File Station reports both for every file when `size` and `time` are requested, so an absent
+/// value is a malformed response rather than a real zero. Coercing it to `0` would let a file
+/// that was replaced after planning compare equal to its stored snapshot and be deleted anyway,
+/// so files fail closed here exactly as [`ApiClient::remote_file_size`] does. Directories are
+/// exempt: DSM omits both fields for them, and directory snapshots are additionally guarded by
+/// the descendant check in the sync executor.
+fn file_metadata(
+    operation: &str,
+    kind: EntryKind,
+    additional: &RemoteAdditionalWire,
+) -> Result<(u64, i64)> {
+    let size = additional.size;
+    let mtime_seconds = additional.time.as_ref().map(|time| time.mtime);
+    if kind == EntryKind::Directory {
+        return Ok((size.unwrap_or(0), mtime_seconds.unwrap_or(0)));
+    }
+    let missing = match (size, mtime_seconds) {
+        (Some(size), Some(mtime_seconds)) => return Ok((size, mtime_seconds)),
+        (None, Some(_)) => "byte size",
+        (Some(_), None) => "modified time",
+        (None, None) => "byte size or modified time",
+    };
+    Err(Error::InvalidResponse {
+        operation: operation.to_owned(),
+        message: format!("file information contained no {missing}"),
+    })
 }
 
 fn decode_response<T: DeserializeOwned>(
@@ -2929,7 +2963,7 @@ mod tests {
             {"path":"/share/root/mounted","name":"mounted","isdir":true,"additional":{"mount_point_type":"cifs"}}
         ]}}).to_string();
         let sub_listing = serde_json::json!({"success":true,"data":{"total":1,"files":[
-            {"path":"/share/root/sub/nested.txt","name":"nested.txt","isdir":false,"additional":{"size":9}}
+            {"path":"/share/root/sub/nested.txt","name":"nested.txt","isdir":false,"additional":{"size":9,"time":{"mtime":13}}}
         ]}}).to_string();
         let (url, server) = scripted_server(vec![
             required_discovery(),
@@ -2962,15 +2996,177 @@ mod tests {
         assert_eq!(server.join().unwrap().len(), 6);
     }
 
+    /// A snapshot is only worth taking if it can disagree with what is on the NAS later. An
+    /// absent `size` or `time` on a file must therefore be rejected outright rather than stored
+    /// as `0`, which would compare equal to the same coercion at delete time and wave through a
+    /// file whose content was replaced after planning.
+    #[test]
+    fn remote_inventory_rejects_a_file_missing_the_metadata_a_snapshot_compares() {
+        let incomplete = [
+            (
+                serde_json::json!({}),
+                "file information contained no byte size or modified time",
+            ),
+            (
+                serde_json::json!({"time": {"mtime": 13}}),
+                "file information contained no byte size",
+            ),
+            (
+                serde_json::json!({"size": 9}),
+                "file information contained no modified time",
+            ),
+        ];
+        for (additional, expected_message) in incomplete {
+            let listing = serde_json::json!({"success":true,"data":{"total":1,"files":[
+                {"path":"/share/root/file.bin","name":"file.bin","isdir":false,"additional":additional}
+            ]}})
+            .to_string();
+            let (url, server) = scripted_server(vec![
+                required_discovery(),
+                login_response(),
+                getinfo_directory("/share"),
+                getinfo_directory("/share/root"),
+                listing,
+            ]);
+            let mut client = connect_test_client(url);
+            client.login("alice", "password", None).unwrap();
+            let error = client
+                .remote_inventory(&RemoteRoot::parse("/share/root").unwrap())
+                .expect_err("an unusable file snapshot must not be stored as zero");
+            let Error::InvalidResponse { operation, message } = &error else {
+                panic!("expected a malformed-response error, got {error}");
+            };
+            assert_eq!(operation, "SYNO.FileStation.List.list");
+            assert_eq!(message, expected_message);
+            assert_eq!(server.join().unwrap().len(), 5);
+        }
+    }
+
+    /// Directories are exempt: File Station omits both fields for them, and an empty
+    /// `additional` object is the shape it actually sends. Rejecting those would fail every
+    /// inventory containing a subdirectory.
+    #[test]
+    fn remote_inventory_accepts_directories_without_size_or_mtime() {
+        let root_listing = serde_json::json!({"success":true,"data":{"total":2,"files":[
+            {"path":"/share/root/sub","name":"sub","isdir":true,"additional":{}},
+            {"path":"/share/root/plain","name":"plain","isdir":true}
+        ]}})
+        .to_string();
+        let empty = serde_json::json!({"success":true,"data":{"total":0,"files":[]}}).to_string();
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            getinfo_directory("/share"),
+            getinfo_directory("/share/root"),
+            root_listing,
+            empty.clone(),
+            empty,
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let inventory = client
+            .remote_inventory(&RemoteRoot::parse("/share/root").unwrap())
+            .unwrap();
+        for relative in ["sub", "plain"] {
+            let entry = &inventory.entries[relative];
+            assert_eq!(
+                (entry.kind, entry.size, entry.mtime_seconds),
+                (EntryKind::Directory, 0, 0)
+            );
+        }
+        assert_eq!(server.join().unwrap().len(), 7);
+    }
+
+    /// The pre-delete re-verify must fail closed on the same absence, including against the
+    /// all-zero snapshot that the previous coercion would have accepted unconditionally.
+    #[test]
+    fn live_metadata_snapshot_rejects_absent_file_metadata_against_a_zero_snapshot() {
+        let absent = [
+            serde_json::json!({}),
+            serde_json::json!({"time": {"mtime": 0}}),
+            serde_json::json!({"size": 0}),
+        ];
+        for additional in absent {
+            let response = serde_json::json!({"success":true,"data":{"files":[
+                {"path":"/share/root/file.bin","name":"file.bin","isdir":false,"additional":additional}
+            ]}})
+            .to_string();
+            let (url, server) =
+                scripted_server(vec![required_discovery(), login_response(), response]);
+            let mut client = connect_test_client(url);
+            client.login("alice", "password", None).unwrap();
+            let error = client
+                .verify_remote_metadata_snapshot(
+                    "/share/root/file.bin",
+                    EntryKind::File,
+                    0,
+                    0,
+                    true,
+                    &CancellationToken::default(),
+                )
+                .expect_err("absent metadata must never satisfy a stored snapshot");
+            assert!(
+                matches!(&error, Error::InvalidResponse { operation, .. }
+                    if operation == "SYNO.FileStation.List.getinfo"),
+                "expected a malformed-response error, got {error}"
+            );
+            assert_eq!(server.join().unwrap().len(), 3);
+        }
+
+        // The fully populated response the NAS actually sends still satisfies its snapshot.
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            getinfo_file("/share/root/file.bin", 9, Some(123)),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        client
+            .verify_remote_metadata_snapshot(
+                "/share/root/file.bin",
+                EntryKind::File,
+                9,
+                123,
+                true,
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn file_metadata_fails_closed_for_files_and_defaults_only_for_directories() {
+        let complete = RemoteAdditionalWire {
+            size: Some(9),
+            time: Some(RemoteTimeWire { mtime: 13 }),
+            mount_point_type: None,
+        };
+        for kind in [EntryKind::File, EntryKind::Directory] {
+            assert_eq!(
+                file_metadata("op", kind, &complete).unwrap(),
+                (9, 13),
+                "a complete response is read the same way for either kind"
+            );
+        }
+        assert_eq!(
+            file_metadata("op", EntryKind::Directory, &RemoteAdditionalWire::default()).unwrap(),
+            (0, 0)
+        );
+        assert!(matches!(
+            file_metadata("op", EntryKind::File, &RemoteAdditionalWire::default()),
+            Err(Error::InvalidResponse { .. })
+        ));
+    }
+
     #[test]
     fn remote_inventory_rejects_stalled_or_inconsistent_directory_pages() {
         let bad_pages = [
             serde_json::json!({"success":true,"data":{"total":1,"files":[]}}),
             serde_json::json!({"success":true,"data":{"total":1,"files":[{"path":"/share/root","name":"root","isdir":true}]}}),
-            serde_json::json!({"success":true,"data":{"total":1,"files":[{"path":"/share/root/a","name":"wrong","isdir":false}]}}),
+            serde_json::json!({"success":true,"data":{"total":1,"files":[{"path":"/share/root/a","name":"wrong","isdir":false,"additional":{"size":1,"time":{"mtime":1}}}]}}),
             serde_json::json!({"success":true,"data":{"total":2,"files":[
-                {"path":"/share/root/a","name":"a","isdir":false},
-                {"path":"/share/root/a","name":"a","isdir":false}
+                {"path":"/share/root/a","name":"a","isdir":false,"additional":{"size":1,"time":{"mtime":1}}},
+                {"path":"/share/root/a","name":"a","isdir":false,"additional":{"size":1,"time":{"mtime":1}}}
             ]}}),
         ];
         for page in bad_pages {
