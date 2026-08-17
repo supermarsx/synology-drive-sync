@@ -3,6 +3,15 @@
 //! Secret *values* deliberately have no command-line argument. Passwords, DSM TOTP seeds,
 //! and remote-log bearer tokens may be supplied through a masked prompt, standard input, an
 //! OS vault, a referenced file, or a dedicated environment variable at execution time.
+//!
+//! Options that override a lower layer (`--no-delete`, `--no-quiet`, `--vault`) and options that
+//! select between two sources of the same value (`--password-stdin` against `--password-file`)
+//! deliberately carry no `conflicts_with`. Clap enforces a conflict against values sourced from
+//! the environment as well as the command line, and counts even `SDSYNC_DELETE=false` as present,
+//! so a shipped environment file plus the documented override aborts with a usage error before any
+//! work happens. Precedence for every such pair is decided by the resolvers in [`crate::config`]
+//! and by [`crate::credentials`], never by the parser. `--profiles` against `--all-profiles` keeps
+//! its conflict: neither is environment-sourced and neither overrides the other.
 
 use std::path::PathBuf;
 
@@ -306,12 +315,7 @@ pub struct ConnectionArgs {
 #[derive(Debug, Args)]
 pub struct AuthenticationArgs {
     /// Read the DSM password from the first line of standard input.
-    #[arg(
-        long,
-        env = "SDSYNC_PASSWORD_STDIN",
-        conflicts_with = "password_file",
-        help_heading = "Authentication"
-    )]
+    #[arg(long, env = "SDSYNC_PASSWORD_STDIN", help_heading = "Authentication")]
     pub password_stdin: bool,
 
     /// Read the DSM password from FILE; the file contents are never stored in config.
@@ -319,7 +323,6 @@ pub struct AuthenticationArgs {
         long,
         env = "SDSYNC_PASSWORD_FILE",
         value_name = "FILE",
-        conflicts_with = "password_stdin",
         help_heading = "Authentication"
     )]
     pub password_file: Option<PathBuf>,
@@ -334,16 +337,11 @@ pub struct AuthenticationArgs {
     pub totp_secret_file: Option<PathBuf>,
 
     /// Do not read the password or TOTP seed from the OS credential vault.
-    #[arg(
-        long,
-        env = "SDSYNC_NO_VAULT",
-        conflicts_with = "vault",
-        help_heading = "Authentication"
-    )]
+    #[arg(long, env = "SDSYNC_NO_VAULT", help_heading = "Authentication")]
     pub no_vault: bool,
 
-    /// Enable OS-vault lookup even when the selected profile has no-vault=true.
-    #[arg(long, conflicts_with = "no_vault", help_heading = "Authentication")]
+    /// Enable OS-vault lookup even when the profile or environment sets no-vault.
+    #[arg(long, help_heading = "Authentication")]
     pub vault: bool,
 }
 
@@ -380,8 +378,8 @@ pub struct SafetyArgs {
     #[arg(long, env = "SDSYNC_DELETE", help_heading = "Safety")]
     pub delete: bool,
 
-    /// Preserve remote-only entries even when the selected profile has delete=true.
-    #[arg(long, conflicts_with = "delete", help_heading = "Safety")]
+    /// Preserve remote-only entries even when the profile or environment selects delete.
+    #[arg(long, help_heading = "Safety")]
     pub no_delete: bool,
 
     /// Permit --delete when the local scan contains no payload files.
@@ -465,13 +463,12 @@ pub struct NetworkArgs {
 
 #[derive(Debug, Args)]
 pub struct OutputArgs {
-    /// Increase diagnostic detail; repeat as -vv. Conflicts with --quiet.
+    /// Increase diagnostic detail; repeat as -vv. Raises severity even under --quiet.
     #[arg(
         short = 'v',
         long,
         global = true,
         action = ArgAction::Count,
-        conflicts_with = "quiet",
         help_heading = "Output/Logging"
     )]
     pub verbose: u8,
@@ -482,18 +479,12 @@ pub struct OutputArgs {
         long = "quiet",
         global = true,
         env = "SDSYNC_QUIET",
-        conflicts_with = "verbose",
         help_heading = "Output/Logging"
     )]
     pub quiet: bool,
 
-    /// Re-enable terminal diagnostics when the selected profile has quiet=true.
-    #[arg(
-        long = "no-quiet",
-        global = true,
-        conflicts_with = "quiet",
-        help_heading = "Output/Logging"
-    )]
+    /// Re-enable terminal diagnostics when the profile or environment sets quiet.
+    #[arg(long = "no-quiet", global = true, help_heading = "Output/Logging")]
     pub no_quiet: bool,
 
     /// Set the minimum log severity; overrides -v and profile verbosity.
@@ -542,7 +533,6 @@ pub struct OutputArgs {
         global = true,
         env = "SDSYNC_REMOTE_LOG_TOKEN_FILE",
         value_name = "FILE",
-        conflicts_with = "remote_log_token_env",
         help_heading = "Output/Logging"
     )]
     pub remote_log_token_file: Option<PathBuf>,
@@ -553,7 +543,6 @@ pub struct OutputArgs {
         global = true,
         env = "SDSYNC_REMOTE_LOG_TOKEN_ENV",
         value_name = "NAME",
-        conflicts_with = "remote_log_token_file",
         help_heading = "Output/Logging",
         long_help = "Read the remote-log bearer token from environment variable NAME. If neither token-source option is present, SDSYNC_REMOTE_LOG_TOKEN is used. This argument carries a variable name, never the token value."
     )]
@@ -748,11 +737,7 @@ pub struct SetPasswordArgs {
     pub profile: CredentialProfileArgs,
 
     /// Read the password from the first line of standard input.
-    #[arg(
-        long,
-        conflicts_with = "password_file",
-        help_heading = "Authentication"
-    )]
+    #[arg(long, help_heading = "Authentication")]
     pub password_stdin: bool,
 
     /// Read the password from FILE. There is intentionally no --password option.
@@ -760,7 +745,6 @@ pub struct SetPasswordArgs {
         long,
         env = "SDSYNC_PASSWORD_FILE",
         value_name = "FILE",
-        conflicts_with = "password_stdin",
         help_heading = "Authentication"
     )]
     pub password_file: Option<PathBuf>,
@@ -772,11 +756,7 @@ pub struct SetTotpArgs {
     pub profile: CredentialProfileArgs,
 
     /// Read the seed or otpauth URI from the first line of standard input.
-    #[arg(
-        long = "secret-stdin",
-        conflicts_with = "totp_secret_file",
-        help_heading = "Authentication"
-    )]
+    #[arg(long = "secret-stdin", help_heading = "Authentication")]
     pub secret_stdin: bool,
 
     /// Read the seed or otpauth URI from FILE. There is no secret-valued option.
@@ -784,7 +764,6 @@ pub struct SetTotpArgs {
         long,
         env = "SDSYNC_TOTP_SECRET_FILE",
         value_name = "FILE",
-        conflicts_with = "secret_stdin",
         help_heading = "Authentication"
     )]
     pub totp_secret_file: Option<PathBuf>,
