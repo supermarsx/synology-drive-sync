@@ -1,0 +1,25 @@
+[package]
+name = "synology-drive-sync-ffi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Stable C ABI for the synology-drive-sync synchronous SDK"
+license = "MIT"
+repository = "https://github.com/supermarsx/synology-drive-sync"
+publish = false
+
+[lib]
+name = "sdsync"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+synology-drive-sync = { path = "../.." }
+zeroize = "1.8"
+
+[dev-dependencies]
+md-5 = { version = "0.11.0", default-features = false }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

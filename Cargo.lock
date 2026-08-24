@@ -2122,6 +2122,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "synology-drive-sync-ffi"
+version = "0.1.0"
+dependencies = [
+ "md-5",
+ "serde",
+ "serde_json",
+ "synology-drive-sync",
+ "zeroize",
+]
+
+[[package]]
 name = "synstructure"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -8,6 +8,26 @@ license = "MIT"
 repository = "https://github.com/supermarsx/synology-drive-sync"
 keywords = ["synology", "file-station", "sync", "backup", "cli"]
 categories = ["command-line-utilities", "filesystem"]
+include = [
+    "Cargo.lock",
+    "LICENSE",
+    "README.md",
+    "THIRD_PARTY_LICENSES.html",
+    "build.rs",
+    "config.example.toml",
+    "docs/observability.schema.json",
+    "examples/sdk/**",
+    "src/**",
+    "tests/**",
+]
+
+[[example]]
+name = "sdk-basic"
+path = "examples/sdk/basic.rs"
+
+[workspace]
+members = ["crates/synology-drive-sync-ffi"]
+resolver = "3"
 
 [dependencies]
 clap = { version = "4.6.5", features = ["derive", "env"] }
@@ -41,3 +61,10 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+# A C ABI must contain panics instead of aborting an embedding process. The
+# FFI package is built with this profile; normal CLI releases retain the
+# smaller fail-fast `release` profile above.
+[profile.ffi-release]
+inherits = "release"
+panic = "unwind"

@@ -43,6 +43,7 @@ struct ServerState {
     expected_password: String,
     reflected_login_failure: Option<String>,
     require_totp: bool,
+    reject_next_valid_otp: bool,
     next_task: u64,
     md5_tasks: BTreeMap<String, String>,
     copy_tasks: BTreeSet<String>,
@@ -100,6 +101,7 @@ impl MockFileStation {
             expected_password: "correct horse battery staple".to_owned(),
             reflected_login_failure: None,
             require_totp: false,
+            reject_next_valid_otp: false,
             next_task: 1,
             md5_tasks: BTreeMap::new(),
             copy_tasks: BTreeSet::new(),
@@ -167,6 +169,14 @@ impl MockFileStation {
 
     pub fn require_totp(&self) {
         self.state.lock().expect("mock state lock").require_totp = true;
+    }
+
+    #[allow(dead_code)]
+    pub fn reject_next_valid_otp(&self) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .reject_next_valid_otp = true;
     }
 
     pub fn mutate_file_after_next_listing(&self, path: &str, contents: &[u8], mtime_seconds: i64) {
@@ -355,6 +365,9 @@ fn route_request(
             match fields.get("otp_code") {
                 None => return api_error_with_marker(403, "challenge-token-must-not-leak"),
                 Some(code) if code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_digit()) => {
+                    if std::mem::take(&mut state.reject_next_valid_otp) {
+                        return api_error_with_marker(404, "rejected-otp-must-not-leak");
+                    }
                 }
                 Some(_) => return api_error_with_marker(404, "rejected-otp-must-not-leak"),
             }

@@ -10,6 +10,7 @@ pub mod observability;
 pub mod path;
 pub mod plan;
 pub mod progress;
+pub mod sdk;
 pub mod source_diagnostics;
 pub mod sync;
 pub mod vault;
