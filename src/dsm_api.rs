@@ -81,6 +81,42 @@ const SERVER_JOB_ID_BYTES: usize = 24;
 type HmacSha256 = Hmac<Sha256>;
 type BridgeResult<T> = Result<T, BridgeError>;
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct ControlPaths<'a> {
+    root: &'a Path,
+    requests: &'a Path,
+    processing: &'a Path,
+    responses: &'a Path,
+    csrf_key: &'a Path,
+    enqueue_lock: &'a Path,
+}
+
+#[cfg(target_os = "linux")]
+struct EnqueueRequest<'a> {
+    package_uid: u32,
+    client_request_id: &'a str,
+    requested_by: &'a str,
+    session_binding: &'a [u8; 32],
+    issued_at_epoch: u64,
+    mutation: &'a Mutation,
+    secret: Option<&'a [u8]>,
+}
+
+#[cfg(target_os = "linux")]
+impl ControlPaths<'static> {
+    fn production() -> Self {
+        Self {
+            root: Path::new(CONTROL_ROOT),
+            requests: Path::new(REQUESTS_DIR),
+            processing: Path::new(PROCESSING_DIR),
+            responses: Path::new(RESPONSES_DIR),
+            csrf_key: Path::new(CSRF_KEY_PATH),
+            enqueue_lock: Path::new(ENQUEUE_LOCK_PATH),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ErrorKind {
     BadRequest,
@@ -1829,10 +1865,12 @@ fn hex_decode_exact<const N: usize>(value: &str) -> Option<[u8; N]> {
         return None;
     }
     let mut decoded = [0_u8; N];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    for (output, pair) in decoded.iter_mut().zip(pairs) {
         let high = hex_nibble(pair[0])?;
         let low = hex_nibble(pair[1])?;
-        decoded[index] = (high << 4) | low;
+        *output = (high << 4) | low;
     }
     Some(decoded)
 }
@@ -2524,22 +2562,21 @@ mod linux_files {
 
     const NOFOLLOW_CLOEXEC: i32 = libc::O_NOFOLLOW | libc::O_CLOEXEC;
 
-    pub(super) fn load_or_create_csrf_key(package_uid: u32) -> BridgeResult<Zeroizing<[u8; 32]>> {
-        validate_private_directory(Path::new(CONTROL_ROOT), package_uid)?;
-        match read_exact_private_file(Path::new(CSRF_KEY_PATH), package_uid, 32) {
+    pub(super) fn load_or_create_csrf_key(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+    ) -> BridgeResult<Zeroizing<[u8; 32]>> {
+        validate_private_directory(paths.root, package_uid)?;
+        match read_exact_private_file(paths.csrf_key, package_uid, 32) {
             Ok(bytes) => key_from_bytes(bytes),
             Err(error) if error.kind == ErrorKind::Unavailable => {
                 let mut generated = Zeroizing::new([0_u8; 32]);
                 fill_random(&mut generated[..])?;
-                match create_private_file(Path::new(CSRF_KEY_PATH), package_uid, &generated[..]) {
+                match create_private_file(paths.csrf_key, package_uid, &generated[..]) {
                     Ok(()) => Ok(generated),
                     Err(error) if error.kind == ErrorKind::Conflict => {
                         generated.zeroize();
-                        key_from_bytes(read_exact_private_file(
-                            Path::new(CSRF_KEY_PATH),
-                            package_uid,
-                            32,
-                        )?)
+                        key_from_bytes(read_exact_private_file(paths.csrf_key, package_uid, 32)?)
                     }
                     Err(error) => Err(error),
                 }
@@ -2555,18 +2592,22 @@ mod linux_files {
     }
 
     pub(super) fn enqueue(
-        package_uid: u32,
-        client_request_id: &str,
-        requested_by: &str,
-        session_binding: &[u8; 32],
-        issued_at_epoch: u64,
-        mutation: &Mutation,
-        secret: Option<&[u8]>,
+        paths: &ControlPaths<'_>,
+        request: EnqueueRequest<'_>,
     ) -> BridgeResult<String> {
-        validate_private_directory(Path::new(CONTROL_ROOT), package_uid)?;
-        validate_private_directory(Path::new(REQUESTS_DIR), package_uid)?;
-        let mut enqueue_lock = open_enqueue_lock(package_uid)?;
-        validate_outstanding_queue_capacity(package_uid)?;
+        let EnqueueRequest {
+            package_uid,
+            client_request_id,
+            requested_by,
+            session_binding,
+            issued_at_epoch,
+            mutation,
+            secret,
+        } = request;
+        validate_private_directory(paths.root, package_uid)?;
+        validate_private_directory(paths.requests, package_uid)?;
+        let mut enqueue_lock = open_enqueue_lock(paths, package_uid)?;
+        validate_outstanding_queue_capacity(paths, package_uid)?;
         let request_id = next_job_id(&mut enqueue_lock)?;
         let job = canonical_job_bytes(
             &request_id,
@@ -2579,10 +2620,11 @@ mod linux_files {
         if job.is_empty() || job.len() > MAX_JOB_BYTES {
             return Err(BridgeError::bad_request());
         }
-        let final_job = Path::new(REQUESTS_DIR).join(format!("{request_id}.json"));
-        let temporary_job =
-            Path::new(REQUESTS_DIR).join(format!(".{request_id}.{}.job", std::process::id()));
-        let secret_path = Path::new(REQUESTS_DIR).join(format!("{request_id}.secret"));
+        let final_job = paths.requests.join(format!("{request_id}.json"));
+        let temporary_job = paths
+            .requests
+            .join(format!(".{request_id}.{}.job", std::process::id()));
+        let secret_path = paths.requests.join(format!("{request_id}.secret"));
         if final_job.exists() || secret_path.exists() {
             return Err(BridgeError::new(ErrorKind::Conflict));
         }
@@ -2601,7 +2643,7 @@ mod linux_files {
             create_private_file(&temporary_job, package_uid, &job)?;
             fs::hard_link(&temporary_job, &final_job).map_err(|error| map_create_error(&error))?;
             fs::remove_file(&temporary_job).map_err(|_| BridgeError::unsafe_runtime())?;
-            sync_directory(Path::new(REQUESTS_DIR))
+            sync_directory(paths.requests)
         })();
         if publish_result.is_err() {
             let _ = fs::remove_file(&temporary_job);
@@ -2613,26 +2655,32 @@ mod linux_files {
         Ok(request_id)
     }
 
-    pub(super) fn read_job(path: &Path, package_uid: u32) -> BridgeResult<Zeroizing<Vec<u8>>> {
-        validate_private_directory(Path::new(CONTROL_ROOT), package_uid)?;
-        validate_private_directory(Path::new(PROCESSING_DIR), package_uid)?;
+    pub(super) fn read_job(
+        paths: &ControlPaths<'_>,
+        path: &Path,
+        package_uid: u32,
+    ) -> BridgeResult<Zeroizing<Vec<u8>>> {
+        validate_private_directory(paths.root, package_uid)?;
+        validate_private_directory(paths.processing, package_uid)?;
         read_exact_private_file(path, package_uid, MAX_JOB_BYTES)
     }
 
     pub(super) fn read_optional_response(
+        paths: &ControlPaths<'_>,
         request_id: &str,
         package_uid: u32,
     ) -> BridgeResult<Option<Zeroizing<Vec<u8>>>> {
         if !valid_server_job_id(request_id) {
             return Err(BridgeError::bad_request());
         }
-        validate_private_directory(Path::new(CONTROL_ROOT), package_uid)?;
-        validate_private_directory(Path::new(RESPONSES_DIR), package_uid)?;
-        let path = Path::new(RESPONSES_DIR).join(format!("{request_id}.json"));
+        validate_private_directory(paths.root, package_uid)?;
+        validate_private_directory(paths.responses, package_uid)?;
+        let path = paths.responses.join(format!("{request_id}.json"));
         read_optional_private_file(&path, package_uid, MAX_MANAGER_OUTPUT_BYTES)
     }
 
     pub(super) fn read_optional_pending_job(
+        paths: &ControlPaths<'_>,
         request_id: &str,
         package_uid: u32,
         processing: bool,
@@ -2640,23 +2688,27 @@ mod linux_files {
         if !valid_server_job_id(request_id) {
             return Err(BridgeError::bad_request());
         }
-        validate_private_directory(Path::new(CONTROL_ROOT), package_uid)?;
+        validate_private_directory(paths.root, package_uid)?;
         let directory = if processing {
-            Path::new(PROCESSING_DIR)
+            paths.processing
         } else {
-            Path::new(REQUESTS_DIR)
+            paths.requests
         };
         validate_private_directory(directory, package_uid)?;
         let path = directory.join(format!("{request_id}.json"));
         read_optional_private_file(&path, package_uid, MAX_JOB_BYTES)
     }
 
-    pub(super) fn remove_expired_response(request_id: &str, package_uid: u32) -> BridgeResult<()> {
+    pub(super) fn remove_expired_response(
+        paths: &ControlPaths<'_>,
+        request_id: &str,
+        package_uid: u32,
+    ) -> BridgeResult<()> {
         if !valid_server_job_id(request_id) {
             return Err(BridgeError::bad_request());
         }
-        validate_private_directory(Path::new(RESPONSES_DIR), package_uid)?;
-        let path = Path::new(RESPONSES_DIR).join(format!("{request_id}.json"));
+        validate_private_directory(paths.responses, package_uid)?;
+        let path = paths.responses.join(format!("{request_id}.json"));
         let metadata = fs::symlink_metadata(&path).map_err(|_| BridgeError::unsafe_runtime())?;
         if !metadata.file_type().is_file()
             || metadata.st_uid() != package_uid
@@ -2666,15 +2718,16 @@ mod linux_files {
             return Err(BridgeError::unsafe_runtime());
         }
         fs::remove_file(&path).map_err(|_| BridgeError::unsafe_runtime())?;
-        sync_directory(Path::new(RESPONSES_DIR))
+        sync_directory(paths.responses)
     }
 
     pub(super) fn read_claimed_secret(
+        paths: &ControlPaths<'_>,
         request_id: &str,
         package_uid: u32,
         required: bool,
     ) -> BridgeResult<Option<Zeroizing<Vec<u8>>>> {
-        let path = Path::new(PROCESSING_DIR).join(format!("{request_id}.secret"));
+        let path = paths.processing.join(format!("{request_id}.secret"));
         let guard = SecretRemovalGuard { path: path.clone() };
         if !path.exists() {
             return if required {
@@ -2700,9 +2753,13 @@ mod linux_files {
         Ok(Some(line))
     }
 
-    pub(super) fn reject_unexpected_secret(request_id: &str, package_uid: u32) -> BridgeResult<()> {
-        validate_private_directory(Path::new(PROCESSING_DIR), package_uid)?;
-        let path = Path::new(PROCESSING_DIR).join(format!("{request_id}.secret"));
+    pub(super) fn reject_unexpected_secret(
+        paths: &ControlPaths<'_>,
+        request_id: &str,
+        package_uid: u32,
+    ) -> BridgeResult<()> {
+        validate_private_directory(paths.processing, package_uid)?;
+        let path = paths.processing.join(format!("{request_id}.secret"));
         if path.exists() || fs::symlink_metadata(&path).is_ok() {
             let guard = SecretRemovalGuard { path };
             drop(guard);
@@ -2711,23 +2768,25 @@ mod linux_files {
         Ok(())
     }
 
-    pub(super) fn remove_claimed_secret(request_id: &str) {
-        let path = Path::new(PROCESSING_DIR).join(format!("{request_id}.secret"));
+    pub(super) fn remove_claimed_secret(paths: &ControlPaths<'_>, request_id: &str) {
+        let path = paths.processing.join(format!("{request_id}.secret"));
         let _ = fs::remove_file(path);
     }
 
     pub(super) fn write_response(
+        paths: &ControlPaths<'_>,
         path: &Path,
         request_id: &str,
         package_uid: u32,
         response: &[u8],
     ) -> BridgeResult<()> {
-        validate_private_directory(Path::new(RESPONSES_DIR), package_uid)?;
+        validate_private_directory(paths.responses, package_uid)?;
         if response.is_empty() || response.len() > MAX_MANAGER_OUTPUT_BYTES {
             return Err(BridgeError::new(ErrorKind::Unavailable));
         }
-        let temporary =
-            Path::new(RESPONSES_DIR).join(format!(".{request_id}.{}.response", std::process::id()));
+        let temporary = paths
+            .responses
+            .join(format!(".{request_id}.{}.response", std::process::id()));
         if path.exists() {
             return Err(BridgeError::new(ErrorKind::Conflict));
         }
@@ -2735,7 +2794,7 @@ mod linux_files {
             create_private_file(&temporary, package_uid, response)?;
             fs::hard_link(&temporary, path).map_err(|error| map_create_error(&error))?;
             fs::remove_file(&temporary).map_err(|_| BridgeError::unsafe_runtime())?;
-            sync_directory(Path::new(RESPONSES_DIR))
+            sync_directory(paths.responses)
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
@@ -2752,7 +2811,7 @@ mod linux_files {
         Ok(key)
     }
 
-    fn open_enqueue_lock(package_uid: u32) -> BridgeResult<File> {
+    fn open_enqueue_lock(paths: &ControlPaths<'_>, package_uid: u32) -> BridgeResult<File> {
         let mut options = OpenOptions::new();
         options
             .read(true)
@@ -2761,7 +2820,7 @@ mod linux_files {
             .mode(0o600)
             .custom_flags(NOFOLLOW_CLOEXEC);
         let file = options
-            .open(ENQUEUE_LOCK_PATH)
+            .open(paths.enqueue_lock)
             .map_err(|_| BridgeError::unsafe_runtime())?;
         let metadata = file.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
         if !metadata.file_type().is_file()
@@ -2778,9 +2837,12 @@ mod linux_files {
         Ok(file)
     }
 
-    fn validate_outstanding_queue_capacity(package_uid: u32) -> BridgeResult<()> {
+    fn validate_outstanding_queue_capacity(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+    ) -> BridgeResult<()> {
         let mut jobs = 0_usize;
-        for directory in [Path::new(REQUESTS_DIR), Path::new(PROCESSING_DIR)] {
+        for directory in [paths.requests, paths.processing] {
             validate_private_directory(directory, package_uid)?;
             for entry in fs::read_dir(directory).map_err(|_| BridgeError::unsafe_runtime())? {
                 let entry = entry.map_err(|_| BridgeError::unsafe_runtime())?;
@@ -3096,11 +3158,15 @@ fn run_cgi() -> BridgeResult<CgiResponse> {
         // package controller's private queue instead.
         linux_runtime::permanently_drop_to_package_uid(identity.effective_uid)?;
         let now = current_epoch()?;
+        let control_paths = ControlPaths::production();
 
         match request {
             ValidatedHttpRequest::Get { action, .. } => match action {
                 ReadAction::Csrf => {
-                    let key = linux_files::load_or_create_csrf_key(identity.effective_uid)?;
+                    let key = linux_files::load_or_create_csrf_key(
+                        &control_paths,
+                        identity.effective_uid,
+                    )?;
                     let nonce = linux_files::random_nonce()?;
                     let token = issue_csrf_token(&key[..], &session.binding, now, &nonce)?;
                     let body = serde_json::to_vec(&json!({
@@ -3111,9 +3177,13 @@ fn run_cgi() -> BridgeResult<CgiResponse> {
                     .map_err(|_| BridgeError::internal())?;
                     Ok(CgiResponse::success(body))
                 }
-                ReadAction::Result { job_id } => {
-                    execute_result_action(&job_id, &session.binding, identity.effective_uid, now)
-                }
+                ReadAction::Result { job_id } => execute_result_action(
+                    &control_paths,
+                    &job_id,
+                    &session.binding,
+                    identity.effective_uid,
+                    now,
+                ),
                 action => execute_read_action(&action),
             },
             ValidatedHttpRequest::Post {
@@ -3121,18 +3191,22 @@ fn run_cgi() -> BridgeResult<CgiResponse> {
                 csrf_token,
                 ..
             } => {
-                let key = linux_files::load_or_create_csrf_key(identity.effective_uid)?;
+                let key =
+                    linux_files::load_or_create_csrf_key(&control_paths, identity.effective_uid)?;
                 verify_csrf_token(&csrf_token, &key[..], &session.binding, now)?;
                 let body = read_exact_body(&mut io::stdin().lock(), content_length)?;
                 let parsed = parse_mutation_request(&body)?;
                 let job_id = linux_files::enqueue(
-                    identity.effective_uid,
-                    &parsed.request_id,
-                    &session.username,
-                    &session.binding,
-                    now,
-                    &parsed.mutation,
-                    parsed.secret.as_ref().map(|secret| secret.as_slice()),
+                    &control_paths,
+                    EnqueueRequest {
+                        package_uid: identity.effective_uid,
+                        client_request_id: &parsed.request_id,
+                        requested_by: &session.username,
+                        session_binding: &session.binding,
+                        issued_at_epoch: now,
+                        mutation: &parsed.mutation,
+                        secret: parsed.secret.as_ref().map(|secret| secret.as_slice()),
+                    },
                 )?;
                 let response = serde_json::to_vec(&json!({
                     "schema": "sdsync.dsm-queued.v1",
@@ -3150,6 +3224,7 @@ fn run_cgi() -> BridgeResult<CgiResponse> {
 
 #[cfg(target_os = "linux")]
 fn execute_result_action(
+    paths: &ControlPaths<'_>,
     job_id: &str,
     session_binding: &[u8; 32],
     package_uid: u32,
@@ -3158,14 +3233,17 @@ fn execute_result_action(
     if !valid_server_job_id(job_id) {
         return Err(BridgeError::bad_request());
     }
-    if let Some(response) = completed_result_response(job_id, session_binding, package_uid, now)? {
+    if let Some(response) =
+        completed_result_response(paths, job_id, session_binding, package_uid, now)?
+    {
         return Ok(response);
     }
 
     // Read requests before processing: an atomic request -> processing rename
     // can then be observed in either location without a false missing result.
     for processing in [false, true] {
-        let Some(bytes) = linux_files::read_optional_pending_job(job_id, package_uid, processing)?
+        let Some(bytes) =
+            linux_files::read_optional_pending_job(paths, job_id, package_uid, processing)?
         else {
             continue;
         };
@@ -3186,7 +3264,9 @@ fn execute_result_action(
     }
     // Close the processing -> response publish/removal race before declaring
     // the server-generated identifier gone.
-    if let Some(response) = completed_result_response(job_id, session_binding, package_uid, now)? {
+    if let Some(response) =
+        completed_result_response(paths, job_id, session_binding, package_uid, now)?
+    {
         return Ok(response);
     }
     queued_expired_response(job_id)
@@ -3194,12 +3274,13 @@ fn execute_result_action(
 
 #[cfg(target_os = "linux")]
 fn completed_result_response(
+    paths: &ControlPaths<'_>,
     job_id: &str,
     session_binding: &[u8; 32],
     package_uid: u32,
     now: u64,
 ) -> BridgeResult<Option<CgiResponse>> {
-    let Some(bytes) = linux_files::read_optional_response(job_id, package_uid)? else {
+    let Some(bytes) = linux_files::read_optional_response(paths, job_id, package_uid)? else {
         return Ok(None);
     };
     let response = parse_queued_response(&bytes, job_id)?;
@@ -3210,7 +3291,7 @@ fn completed_result_response(
         return Err(BridgeError::new(ErrorKind::Unavailable));
     }
     if now.saturating_sub(response.completed_at_epoch) > RESULT_RETENTION_SECONDS {
-        linux_files::remove_expired_response(job_id, package_uid)?;
+        linux_files::remove_expired_response(paths, job_id, package_uid)?;
         return queued_expired_response(job_id).map(Some);
     }
     queued_complete_response(job_id, &response.result).map(Some)
@@ -3283,22 +3364,24 @@ fn run_consumer(request: &Path, response: &Path) -> BridgeResult<()> {
         validate_consumer_identity(&identity)?;
         let request_id = validate_consumer_paths(request, response)?;
         linux_runtime::clear_environment()?;
+        let control_paths = ControlPaths::production();
 
         let response_result = (|| {
-            let job_bytes = linux_files::read_job(request, identity.effective_uid)?;
+            let job_bytes = linux_files::read_job(&control_paths, request, identity.effective_uid)?;
             let job = parse_job(&job_bytes)?;
             let now = current_epoch()?;
             validate_job_freshness(job.issued_at_epoch, now)?;
             if job.request_id != request_id {
                 return Err(BridgeError::bad_request());
             }
-            let result = consume_job_inner(&job, identity.effective_uid)
+            let result = consume_job_inner(&control_paths, &job, identity.effective_uid)
                 .unwrap_or_else(|_| generic_manager_result_value());
             canonical_queued_response_bytes(&job, current_epoch()?, &result)
         })();
-        linux_files::remove_claimed_secret(&request_id);
+        linux_files::remove_claimed_secret(&control_paths, &request_id);
         let response_bytes = response_result?;
         linux_files::write_response(
+            &control_paths,
             response,
             &request_id,
             identity.effective_uid,
@@ -3308,17 +3391,21 @@ fn run_consumer(request: &Path, response: &Path) -> BridgeResult<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn consume_job_inner(job: &ParsedJob, package_uid: u32) -> BridgeResult<Value> {
+fn consume_job_inner(
+    paths: &ControlPaths<'_>,
+    job: &ParsedJob,
+    package_uid: u32,
+) -> BridgeResult<Value> {
     let mut secret = match &job.mutation {
         Mutation::SetSecret(arguments) if arguments.mode == SecretMode::Replace => {
-            linux_files::read_claimed_secret(&job.request_id, package_uid, true)?
+            linux_files::read_claimed_secret(paths, &job.request_id, package_uid, true)?
         }
         Mutation::SetSecret(_) => {
-            linux_files::reject_unexpected_secret(&job.request_id, package_uid)?;
+            linux_files::reject_unexpected_secret(paths, &job.request_id, package_uid)?;
             None
         }
         _ => {
-            linux_files::reject_unexpected_secret(&job.request_id, package_uid)?;
+            linux_files::reject_unexpected_secret(paths, &job.request_id, package_uid)?;
             None
         }
     };
@@ -3374,6 +3461,10 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::io::Cursor;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    #[cfg(target_os = "linux")]
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     const REQUEST_ID: &str = "0123456789abcdef0123456789abcdef";
     const JOB_ID: &str = "00060f5e12345678fedcba98765432100123456789abcdef";
@@ -3469,6 +3560,450 @@ mod tests {
             .into_iter()
             .map(|value| value.into_string().unwrap())
             .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    static NEXT_CONTROL_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(target_os = "linux")]
+    struct TestControlFixture {
+        root: PathBuf,
+        requests: PathBuf,
+        processing: PathBuf,
+        responses: PathBuf,
+        csrf_key: PathBuf,
+        enqueue_lock: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl TestControlFixture {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_CONTROL_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "sdsync-dsm-api-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            let requests = root.join("requests");
+            let processing = root.join("processing");
+            let responses = root.join("responses");
+            for directory in [&root, &requests, &processing, &responses] {
+                fs::create_dir(directory).unwrap();
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            Self {
+                csrf_key: root.join("csrf.key"),
+                enqueue_lock: root.join("enqueue.lock"),
+                root,
+                requests,
+                processing,
+                responses,
+            }
+        }
+
+        fn paths(&self) -> ControlPaths<'_> {
+            ControlPaths {
+                root: &self.root,
+                requests: &self.requests,
+                processing: &self.processing,
+                responses: &self.responses,
+                csrf_key: &self.csrf_key,
+                enqueue_lock: &self.enqueue_lock,
+            }
+        }
+
+        fn write_private(&self, path: &Path, bytes: &[u8]) {
+            fs::write(path, bytes).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        fn package_uid() -> u32 {
+            // SAFETY: geteuid has no pointer arguments or preconditions.
+            unsafe { libc::geteuid() }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for TestControlFixture {
+        fn drop(&mut self) {
+            let safe_name = self
+                .root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("sdsync-dsm-api-"));
+            if safe_name {
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_control_paths_are_fixed_to_the_dsm_contract() {
+        let paths = ControlPaths::production();
+        assert_eq!(paths.root, Path::new(CONTROL_ROOT));
+        assert_eq!(paths.requests, Path::new(REQUESTS_DIR));
+        assert_eq!(paths.processing, Path::new(PROCESSING_DIR));
+        assert_eq!(paths.responses, Path::new(RESPONSES_DIR));
+        assert_eq!(paths.csrf_key, Path::new(CSRF_KEY_PATH));
+        assert_eq!(paths.enqueue_lock, Path::new(ENQUEUE_LOCK_PATH));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_queue_key_secret_result_and_fifo_round_trip() {
+        let fixture = TestControlFixture::new("round-trip");
+        let paths = fixture.paths();
+        let package_uid = TestControlFixture::package_uid();
+        let session = [7_u8; 32];
+
+        let first_key = linux_files::load_or_create_csrf_key(&paths, package_uid).unwrap();
+        assert_eq!(first_key.len(), 32);
+        assert_eq!(
+            fs::metadata(&fixture.csrf_key)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let second_key = linux_files::load_or_create_csrf_key(&paths, package_uid).unwrap();
+        assert_eq!(&first_key[..], &second_key[..]);
+        assert_eq!(linux_files::random_nonce().unwrap().len(), 16);
+
+        let secret_mutation = Mutation::SetSecret(SecretJobArgs {
+            profile: "nightly".to_owned(),
+            kind: SecretKind::Password,
+            mode: SecretMode::Replace,
+        });
+        let first_id = linux_files::enqueue(
+            &paths,
+            EnqueueRequest {
+                package_uid,
+                client_request_id: REQUEST_ID,
+                requested_by: "admin",
+                session_binding: &session,
+                issued_at_epoch: 10_000,
+                mutation: &secret_mutation,
+                secret: Some(b"queue-secret"),
+            },
+        )
+        .unwrap();
+        let plain_mutation = Mutation::RemoveProfile(NameArgs {
+            name: "archive".to_owned(),
+        });
+        let second_id = linux_files::enqueue(
+            &paths,
+            EnqueueRequest {
+                package_uid,
+                client_request_id: "11111111111111111111111111111111",
+                requested_by: "admin",
+                session_binding: &session,
+                issued_at_epoch: 10_001,
+                mutation: &plain_mutation,
+                secret: None,
+            },
+        )
+        .unwrap();
+        assert!(valid_server_job_id(&first_id));
+        assert!(first_id < second_id);
+
+        let first_request = fixture.requests.join(format!("{first_id}.json"));
+        let first_secret = fixture.requests.join(format!("{first_id}.secret"));
+        let first_job_bytes = fs::read(&first_request).unwrap();
+        assert!(!contains_bytes(&first_job_bytes, b"queue-secret"));
+        assert_eq!(
+            fs::metadata(&first_request).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&first_secret).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read(&first_secret).unwrap(), b"queue-secret\n");
+        assert!(
+            linux_files::read_optional_pending_job(&paths, &first_id, package_uid, false)
+                .unwrap()
+                .is_some()
+        );
+
+        let claimed_request = fixture.processing.join(format!("{first_id}.json"));
+        let claimed_secret = fixture.processing.join(format!("{first_id}.secret"));
+        fs::rename(&first_request, &claimed_request).unwrap();
+        fs::rename(&first_secret, &claimed_secret).unwrap();
+        assert!(
+            linux_files::read_optional_pending_job(&paths, &first_id, package_uid, false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            linux_files::read_optional_pending_job(&paths, &first_id, package_uid, true)
+                .unwrap()
+                .is_some()
+        );
+        let claimed_job = linux_files::read_job(&paths, &claimed_request, package_uid).unwrap();
+        let parsed_job = parse_job(&claimed_job).unwrap();
+        assert_eq!(parsed_job.request_id, first_id);
+        let claimed = linux_files::read_claimed_secret(&paths, &first_id, package_uid, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&claimed[..], b"queue-secret");
+        assert!(!claimed_secret.exists());
+        assert!(linux_files::reject_unexpected_secret(&paths, &first_id, package_uid).is_ok());
+
+        let manager_result = parse_manager_result(
+            br#"{"schema":"sdsync.dsm-result.v1","ok":true,"message":"secret stored"}"#,
+            None,
+        )
+        .unwrap();
+        let response_bytes =
+            canonical_queued_response_bytes(&parsed_job, 10_005, &manager_result).unwrap();
+        let response_path = fixture.responses.join(format!("{first_id}.json"));
+        linux_files::write_response(
+            &paths,
+            &response_path,
+            &first_id,
+            package_uid,
+            &response_bytes,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&response_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            linux_files::read_optional_response(&paths, &first_id, package_uid)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            linux_files::write_response(
+                &paths,
+                &response_path,
+                &first_id,
+                package_uid,
+                &response_bytes,
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::Conflict
+        );
+
+        let concealed =
+            completed_result_response(&paths, &first_id, &[8_u8; 32], package_uid, 10_006)
+                .unwrap()
+                .unwrap();
+        assert_eq!(concealed.status, 202);
+        let completed = completed_result_response(&paths, &first_id, &session, package_uid, 10_006)
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&completed.body).unwrap()["state"],
+            "complete"
+        );
+
+        let pending =
+            execute_result_action(&paths, &second_id, &session, package_uid, 10_002).unwrap();
+        assert_eq!(pending.status, 202);
+        let expired_pending = execute_result_action(
+            &paths,
+            &second_id,
+            &session,
+            package_uid,
+            10_001 + MAX_JOB_AGE_SECONDS + 1,
+        )
+        .unwrap();
+        assert_eq!(expired_pending.status, 410);
+        let expired_response = completed_result_response(
+            &paths,
+            &first_id,
+            &session,
+            package_uid,
+            10_005 + RESULT_RETENTION_SECONDS + 1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(expired_response.status, 410);
+        assert!(!response_path.exists());
+
+        let missing_id = "ffffffffffffffffffffffffffffffffffffffffffffffff";
+        let missing =
+            execute_result_action(&paths, missing_id, &session, package_uid, 10_000).unwrap();
+        assert_eq!(missing.status, 410);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_queue_rejects_owner_mode_symlink_secret_and_capacity_tampering() {
+        let fixture = TestControlFixture::new("tamper");
+        let paths = fixture.paths();
+        let package_uid = TestControlFixture::package_uid();
+        let other_uid = if package_uid == u32::MAX {
+            package_uid - 1
+        } else {
+            package_uid + 1
+        };
+        assert_eq!(
+            linux_files::load_or_create_csrf_key(&paths, other_uid)
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnsafeRuntime
+        );
+
+        fixture.write_private(&fixture.csrf_key, &[1_u8; 31]);
+        assert_eq!(
+            linux_files::load_or_create_csrf_key(&paths, package_uid)
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnsafeRuntime
+        );
+        fs::remove_file(&fixture.csrf_key).unwrap();
+        fixture.write_private(&fixture.csrf_key, &[2_u8; 32]);
+        fs::set_permissions(&fixture.csrf_key, fs::Permissions::from_mode(0o640)).unwrap();
+        assert_eq!(
+            linux_files::load_or_create_csrf_key(&paths, package_uid)
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnsafeRuntime
+        );
+
+        assert_eq!(
+            linux_files::read_optional_response(&paths, REQUEST_ID, package_uid)
+                .unwrap_err()
+                .kind,
+            ErrorKind::BadRequest
+        );
+        let outside = fixture.root.join("outside-response");
+        fixture.write_private(&outside, b"not a response");
+        let linked_response = fixture.responses.join(format!("{JOB_ID}.json"));
+        symlink(&outside, &linked_response).unwrap();
+        assert_eq!(
+            linux_files::read_optional_response(&paths, JOB_ID, package_uid)
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnsafeRuntime
+        );
+        fs::remove_file(&linked_response).unwrap();
+
+        assert_eq!(
+            linux_files::read_claimed_secret(&paths, JOB_ID, package_uid, true)
+                .unwrap_err()
+                .kind,
+            ErrorKind::BadRequest
+        );
+        let claimed_secret = fixture.processing.join(format!("{JOB_ID}.secret"));
+        fixture.write_private(&claimed_secret, b"missing-newline");
+        assert_eq!(
+            linux_files::read_claimed_secret(&paths, JOB_ID, package_uid, true)
+                .unwrap_err()
+                .kind,
+            ErrorKind::BadRequest
+        );
+        assert!(!claimed_secret.exists());
+        fixture.write_private(&claimed_secret, b"unexpected\n");
+        assert_eq!(
+            linux_files::read_claimed_secret(&paths, JOB_ID, package_uid, false)
+                .unwrap_err()
+                .kind,
+            ErrorKind::BadRequest
+        );
+        assert!(!claimed_secret.exists());
+
+        let mutation = Mutation::RemoveProfile(NameArgs {
+            name: "archive".to_owned(),
+        });
+        let unknown_entry = fixture.requests.join("unreviewed-entry");
+        fixture.write_private(&unknown_entry, b"");
+        assert_eq!(
+            linux_files::enqueue(
+                &paths,
+                EnqueueRequest {
+                    package_uid,
+                    client_request_id: REQUEST_ID,
+                    requested_by: "admin",
+                    session_binding: &[7_u8; 32],
+                    issued_at_epoch: 10_000,
+                    mutation: &mutation,
+                    secret: None,
+                },
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::UnsafeRuntime
+        );
+        fs::remove_file(&unknown_entry).unwrap();
+
+        let wrong_mode_job = fixture.requests.join(format!("{JOB_ID}.json"));
+        fixture.write_private(&wrong_mode_job, b"");
+        fs::set_permissions(&wrong_mode_job, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            linux_files::enqueue(
+                &paths,
+                EnqueueRequest {
+                    package_uid,
+                    client_request_id: REQUEST_ID,
+                    requested_by: "admin",
+                    session_binding: &[7_u8; 32],
+                    issued_at_epoch: 10_000,
+                    mutation: &mutation,
+                    secret: None,
+                },
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::UnsafeRuntime
+        );
+        fs::remove_file(&wrong_mode_job).unwrap();
+
+        for index in 0..MAX_OUTSTANDING_JOBS {
+            let path = fixture.requests.join(format!("{index:048x}.json"));
+            fixture.write_private(&path, b"");
+        }
+        assert_eq!(
+            linux_files::enqueue(
+                &paths,
+                EnqueueRequest {
+                    package_uid,
+                    client_request_id: REQUEST_ID,
+                    requested_by: "admin",
+                    session_binding: &[7_u8; 32],
+                    issued_at_epoch: 10_000,
+                    mutation: &mutation,
+                    secret: None,
+                },
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::Conflict
+        );
+
+        let response_path = fixture.responses.join(format!("{JOB_ID}.json"));
+        assert_eq!(
+            linux_files::write_response(&paths, &response_path, JOB_ID, package_uid, b"")
+                .unwrap_err()
+                .kind,
+            ErrorKind::Unavailable
+        );
+        assert_eq!(
+            linux_files::write_response(
+                &paths,
+                &response_path,
+                JOB_ID,
+                package_uid,
+                &vec![0_u8; MAX_MANAGER_OUTPUT_BYTES + 1],
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::Unavailable
+        );
+
+        fs::set_permissions(&fixture.responses, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            linux_files::read_optional_response(&paths, JOB_ID, package_uid)
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnsafeRuntime
+        );
     }
 
     #[test]
