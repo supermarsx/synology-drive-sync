@@ -39,12 +39,12 @@ following fields are accepted:
 | `ca_certificate` | string or null | none | Path to an additional PEM CA certificate. |
 | `connect_timeout_seconds` | unsigned integer or null | `15` | Positive connection timeout. |
 | `request_timeout_seconds` | unsigned integer or null | `7200` | Positive complete-request timeout. |
-| `retries` | unsigned integer or null | `2` | Retries after the first request. |
+| `retries` | unsigned integer or null | `2` | Retries after the first request, from `0` through `5`. |
 | `max_upload_rate` | unsigned integer or null | unlimited | Shared positive upload limit in bytes per second. |
 | `exclusions` | string array | `[]` | Gitignore-style local exclusion patterns. |
 | `comparison` | string or null | `content` | `content`, `metadata`, or `size-only`. |
 | `deletion` | object or null | disabled | Explicit bounded mirror-deletion policy. |
-| `jobs` | unsigned integer or null | `2` | Positive concurrent mutation-worker count. |
+| `jobs` | unsigned integer or null | `2` | Concurrent mutation-worker count, from `1` through `16`. |
 
 When `deletion.enabled` is `true`, `deletion.max_delete` is required and must be positive.
 `deletion.allow_empty_source` defaults to `false`. When deletion is disabled, neither a maximum nor
@@ -80,7 +80,8 @@ prefix or a non-zero reserved field.
 
 The secret kinds are password, OTP-required, and OTP-rejected. On the first secret call, `buffer` is
 `NULL` and `capacity` is zero; write the required UTF-8 byte length to `*written`. On the second,
-copy at most `capacity` bytes and write the actual length. A secret must be between 1 byte and 64 KiB.
+copy exactly the first-pass queried byte length into `buffer` and write that same length to `*written`.
+A secret must be between 1 byte and 64 KiB.
 
 The plan payload is shaped as `{ "schema": "sdsync.plan.v1", "plan": ... }`. Event payloads use
 `{ "schema": "sdsync.event.v1", "event": ... }`; their tagged event kinds cover phase start/end,

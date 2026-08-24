@@ -4,10 +4,13 @@ The normal local gate mirrors the Rust portions of CI:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-targets
-cargo build --release --locked
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-targets
+cargo build --release --locked -p synology-drive-sync
+cargo build --profile ffi-release --locked -p synology-drive-sync-ffi
 ```
+
+The CLI uses the workspace release profile. Build the C ABI with the dedicated unwind-safe `ffi-release` profile.
 
 ## Test layers
 

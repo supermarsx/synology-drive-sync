@@ -4,6 +4,8 @@ Releases use calendar tags in strict `YY.N` form. `YY` is the two-digit UTC year
 
 An automatic release starts only after the repository's exact `CI` workflow completes successfully for a `push` to `main`. That CI run includes a hash-pinned `cargo-audit` 0.22.2 binary which updates the RustSec advisory database and rejects vulnerabilities, yanked crates, unsoundness, and unmaintained warnings. A separate daily workflow reruns the same gate so a new advisory is detected even when `Cargo.lock` has not changed. A maintainer can also dispatch a release manually against `main`, but the workflow refuses to continue unless that exact commit already has a completed, successful `CI` push run. Release jobs check out that approved commit, serialize version allocation, and compile the reported binary version from the allocated tag.
 
+Release concurrency is rolling and coalesces push bursts rather than creating one release per individual commit. GitHub keeps at most one pending release run while another is active, so intermediate queued runs can be cancelled. The latest surviving green push contains the dropped commits and ships their superset; a freshness guard prevents an excessively stale candidate from publishing.
+
 Provenance shows what repository workflow and commit produced an artifact; it does not prove application correctness or live-NAS compatibility. The automated release remains subject to the no-live-NAS caveat on the [documentation home](index.md).
 
 ## Native archives

@@ -7,12 +7,15 @@ Before proposing a change:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo test --all-targets --all-features --locked
-cargo build --release --locked
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-targets
+cargo build --release --locked -p synology-drive-sync
+cargo build --profile ffi-release --locked -p synology-drive-sync-ffi
 mdbook test
 mdbook build
 ```
+
+The C ABI must use the dedicated unwind-safe `ffi-release` profile; the ordinary release profile is for the CLI.
 
 Run the focused package/service tests for any affected deployment surface and keep generated
 third-party notices synchronized with the locked graph. See [testing and coverage](testing.md) for
