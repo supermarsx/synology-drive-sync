@@ -411,6 +411,32 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertGreaterEqual(workflow.count("verify-remote-assets"), 2)
         self.assertIn("name: staged-release-contract", workflow)
 
+    def test_stage_retries_eventually_consistent_listing_by_immutable_id(self):
+        workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        start = workflow.index("name: Create or resume the draft release")
+        end = workflow.index("name: Upload and verify draft assets", start)
+        stage = workflow[start:end]
+
+        self.assertIn("max_visibility_attempts=6", stage)
+        self.assertIn(
+            "visibility_delay_seconds=$((visibility_delay_seconds * 2))", stage
+        )
+        self.assertIn("any(.[]; .id == $id)", stage)
+        self.assertIn("any(.[]; .tag_name == $tag)", stage)
+        self.assertIn("unexpected immutable state $conflicting_releases", stage)
+        self.assertIn("expected_release_id: $expected_release_id,", stage)
+        self.assertIn("release-contract.py resolve-publish-state", stage)
+        self.assertIn("jq -e '.published | type == \"boolean\"'", stage)
+        self.assertIn("resolved_published=$(jq -r '.published'", stage)
+        self.assertNotIn("resolved_published=$(jq -er '.published'", stage)
+        self.assertIn(
+            "was still absent from the releases collection after "
+            "$max_visibility_attempts attempts",
+            stage,
+        )
+
     def test_workspace_sbom_is_hierarchically_merged_and_validated(self):
         workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
             encoding="utf-8"

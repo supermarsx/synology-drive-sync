@@ -1244,41 +1244,81 @@ jobs:
           jq -e --rawfile notes "$notes" '.body == $notes' "$updated" >/dev/null
 
           # Re-list after the mutation so a concurrent human-created duplicate
-          # cannot turn the tag-addressed asset upload below into a guess.
+          # cannot turn the tag-addressed asset upload below into a guess. The
+          # releases collection is eventually consistent after POST/PATCH even
+          # though the mutation response already carries the immutable id, so
+          # retry only while that exact id is absent. Once visible, the contract
+          # helper still fails closed on duplicates or any identity mismatch.
           git fetch --force --tags origin
           release_pages="$RUNNER_TEMP/sdsync-created-pages.json"
           release_index="$RUNNER_TEMP/sdsync-created-index.json"
-          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            > "$release_pages"
-          jq -s 'add // []' "$release_pages" > "$release_index"
           tag_sha_json=null
           if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
             tag_sha_json=$(git rev-list -n 1 "$TAG" | jq -R .)
           fi
           state_input="$RUNNER_TEMP/sdsync-created-state-input.json"
           state="$RUNNER_TEMP/sdsync-created-state.json"
-          jq -n \
-            --arg tag "$TAG" \
-            --arg sha "$SHA" \
-            --arg repository "$GITHUB_REPOSITORY" \
-            --argjson tag_sha "$tag_sha_json" \
-            --slurpfile releases "$release_index" '
-              {
-                tag: $tag,
-                sha: $sha,
-                repository: $repository,
-                tag_sha: $tag_sha,
-                releases: $releases[0]
-              }
-            ' > "$state_input"
-          python3 .github/scripts/release-contract.py resolve-state \
-            --input "$state_input" \
-            --output "$state"
-          resolved_id=$(jq -er '.release_id' "$state")
-          [[ "$resolved_id" == "$release_id" ]] || {
-            echo "release id changed after draft update: $release_id -> $resolved_id" >&2
-            exit 1
-          }
+          max_visibility_attempts=6
+          visibility_delay_seconds=1
+          for visibility_attempt in $(seq 1 "$max_visibility_attempts"); do
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              > "$release_pages"
+            jq -s 'add // []' "$release_pages" > "$release_index"
+
+            if ! jq -e --argjson id "$release_id" \
+              'any(.[]; .id == $id)' "$release_index" >/dev/null; then
+              if jq -e --arg tag "$TAG" \
+                'any(.[]; .tag_name == $tag)' "$release_index" >/dev/null; then
+                conflicting_releases=$(jq -c --arg tag "$TAG" '
+                  [.[] | select(.tag_name == $tag) |
+                    {id, draft, target_commitish, html_url}]
+                  ' "$release_index")
+                echo "release tag $TAG is already visible on unexpected immutable state $conflicting_releases while expected id $release_id is absent" >&2
+                exit 1
+              fi
+              if [[ "$visibility_attempt" -eq "$max_visibility_attempts" ]]; then
+                echo "draft release $TAG (immutable id $release_id) was still absent from the releases collection after $max_visibility_attempts attempts" >&2
+                exit 1
+              fi
+              echo "draft release $TAG (immutable id $release_id) is not visible in the releases collection yet (attempt $visibility_attempt/$max_visibility_attempts); retrying in ${visibility_delay_seconds}s" >&2
+              sleep "$visibility_delay_seconds"
+              visibility_delay_seconds=$((visibility_delay_seconds * 2))
+              continue
+            fi
+
+            jq -n \
+              --arg tag "$TAG" \
+              --arg sha "$SHA" \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --argjson expected_release_id "$release_id" \
+              --argjson tag_sha "$tag_sha_json" \
+              --slurpfile releases "$release_index" '
+                {
+                  tag: $tag,
+                  sha: $sha,
+                  repository: $repository,
+                  expected_release_id: $expected_release_id,
+                  tag_sha: $tag_sha,
+                  releases: $releases[0]
+                }
+              ' > "$state_input"
+            python3 .github/scripts/release-contract.py resolve-publish-state \
+              --input "$state_input" \
+              --output "$state"
+            resolved_id=$(jq -er '.release_id' "$state")
+            jq -e '.published | type == "boolean"' "$state" >/dev/null
+            resolved_published=$(jq -r '.published' "$state")
+            [[ "$resolved_id" == "$release_id" ]] || {
+              echo "release id changed after draft update: $release_id -> $resolved_id" >&2
+              exit 1
+            }
+            [[ "$resolved_published" == false ]] || {
+              echo "release $TAG (immutable id $release_id) was published concurrently while staging" >&2
+              exit 1
+            }
+            echo "draft release $TAG (immutable id $release_id) became visible after attempt $visibility_attempt/$max_visibility_attempts"
+            break
+          done
           echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
           echo "staged draft release $TAG (id $release_id)"
       - name: Upload and verify draft assets
