@@ -12,7 +12,17 @@ The source is independently selectable for every profile and is a physical local
 
 ## Build and validate
 
-Supply a fully static, little-endian ELF64 Linux binary. The builder rejects a wrong machine type, a dynamic interpreter, `DT_NEEDED`, malformed program headers, or an ELF without an executable load segment.
+Supply one fully static, little-endian Linux ELF matching the selected release architecture. The
+builder rejects the wrong ELF class or machine, a dynamic interpreter, `DT_NEEDED`, malformed
+program headers, or an ELF without an executable load segment. ARMv7 is additionally required to
+be EABI5 hard-float; an ARM soft-float binary cannot be made compatible by changing its filename.
+
+| `--arch` | Rust target | ELF contract | DSM `INFO` arch value |
+| --- | --- | --- | --- |
+| `x86_64` | `x86_64-unknown-linux-musl` | ELF64, `EM_X86_64` | `x86_64` |
+| `i686` | `i686-unknown-linux-musl` | ELF32, `EM_386` | `i686` |
+| `armv7` | `armv7-unknown-linux-musleabihf` | ELF32, `EM_ARM`, EABI5 hard-float | `armv7 armada370 armada375 armada38x armadaxp comcerto2k monaco` |
+| `armv8` | `aarch64-unknown-linux-musl` | ELF64, `EM_AARCH64` | `armv8` |
 
 ```sh
 bash packaging/synology/build-spk.sh \
@@ -23,12 +33,26 @@ bash packaging/synology/build-spk.sh \
   --binary dist/aarch64-unknown-linux-musl/synology-drive-sync \
   --arch armv8 --version v0.1.0 --output dist/spk
 
+bash packaging/synology/build-spk.sh \
+  --binary dist/armv7-unknown-linux-musleabihf/synology-drive-sync \
+  --arch armv7 --version v0.1.0 --output dist/spk
+
 python packaging/synology/validate_spk.py \
   --arch x86_64 dist/spk/synology-drive-sync-0.1.0-x86_64.spk
 python packaging/synology/test_synology_package.py
 ```
 
-Artifacts are named `synology-drive-sync-VERSION-x86_64.spk` and `synology-drive-sync-VERSION-armv8.spk`; a leading `v` is removed. A semantic version such as `0.1.0` is rendered as DSM version `0.1.0-1` in `INFO`. `SOURCE_DATE_EPOCH` controls every tar member and the inner gzip header for reproducible output.
+Artifacts are named `synology-drive-sync-VERSION-ARCH.spk`, where `ARCH` is `x86_64`, `i686`,
+`armv7`, or `armv8`; a leading `v` is removed. A semantic version such as `0.1.0` is rendered as
+DSM version `0.1.0-1` in `INFO`. `SOURCE_DATE_EPOCH` controls every tar member and the inner gzip
+header for reproducible output.
+
+Linux reports a compatible 32-bit ARM NAS as `armv7l`, but `armv7l` is not a valid package-builder
+argument or DSM `INFO` family. Select the `armv7` artifact. Its `INFO` includes the unified `armv7`
+family used for Alpine platforms and the exact aliases which Synology's DSM 7 toolkit does not
+unify. The package has no kernel module, so all aliases use the same validated userspace binary.
+ARMv5/88f628x and PowerPC devices are not part of this DSM 7 package: their official toolchains and
+supported DSM generations require a separate legacy package design.
 
 The SPK contains the project license, generated third-party notices, and musl's upstream `COPYRIGHT` both in the outer package and under the installed `share/licenses` directory.
 
@@ -129,4 +153,4 @@ On a real uninstall (`SYNOPKG_PKG_STATUS=UNINSTALL`), the post-uninstall script 
 
 Static validation proves archive structure, lower privilege, modes, architecture, static linkage, lifecycle contracts, and reproducibility. Before relying on the package, test its exact NAS model and DSM version with a disposable source and target, including reverse-proxy upload limits, TLS trust, TOTP clock synchronization, large files, Drive indexing, restart during a long transfer, upgrade, and uninstall. A manually built SPK is not automatically a Synology Package Center-approved release.
 
-Official framework references: [package structure](https://help.synology.com/developer-guide/synology_package/introduction.html), [privilege configuration](https://help.synology.com/developer-guide/privilege/privilege_config.html), [FHS paths](https://help.synology.com/developer-guide/integrate_dsm/fhs.html), and [lifecycle status codes](https://help.synology.com/developer-guide/synology_package/scripts.html).
+Official framework references: [package structure](https://help.synology.com/developer-guide/synology_package/introduction.html), [architecture mapping](https://help.synology.com/developer-guide/appendix/platarchs.html), [privilege configuration](https://help.synology.com/developer-guide/privilege/privilege_config.html), [FHS paths](https://help.synology.com/developer-guide/integrate_dsm/fhs.html), and [lifecycle status codes](https://help.synology.com/developer-guide/synology_package/scripts.html).

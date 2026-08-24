@@ -32,17 +32,26 @@ Every archive has one versioned top-level directory and contains:
 
 ## Synology DSM packages
 
-Two DSM 7 packages are published separately from the GNU/Linux archives:
+Four DSM 7 packages are published separately from the GNU/Linux archives:
 
-| DSM architecture | Rust target embedded in the SPK | Release asset |
-| --- | --- | --- |
-| `x86_64` | `x86_64-unknown-linux-musl` | `synology-drive-sync-YY.N-x86_64.spk` |
-| `armv8` | `aarch64-unknown-linux-musl` | `synology-drive-sync-YY.N-armv8.spk` |
+| SPK `INFO` arch | Official CPU-table Package Arch mapping | Rust target embedded in the SPK | Release asset |
+| --- | --- | --- | --- |
+| `x86_64` | Supported DSM 7 x86-64 families in the selector snapshot | `x86_64-unknown-linux-musl` | `synology-drive-sync-YY.N-x86_64.spk` |
+| `armv8` | `armada37xx`, `rtd1296`, `rtd1619b` | `aarch64-unknown-linux-musl` | `synology-drive-sync-YY.N-armv8.spk` |
+| `armv7 armada370 armada375 armada38x armadaxp comcerto2k monaco` | `alpine`, `alpine4k`, `armada370`, `armada375`, `armada38x`, `armadaxp`, `comcerto2k`, `monaco` | `armv7-unknown-linux-musleabihf` | `synology-drive-sync-YY.N-armv7.spk` |
+| `i686` | `evansport` (DSM 7.0/7.1 only) | `i686-unknown-linux-musl` | `synology-drive-sync-YY.N-i686.spk` |
 
-Each SPK contains one matching static ELF64 executable, the headless `sdsync-dsm` package manager,
-controller/runner helpers, DSM lifecycle scripts, a lower-privilege `conf/privilege`, icons, and
-license texts. The package requires DSM `7.0-40759` or newer. It is not `noarch`, and the two native
-architectures are never combined into one SPK.
+Each SPK contains one matching static ELF32 or ELF64 executable, the headless `sdsync-dsm` package
+manager, controller/runner helpers, DSM lifecycle scripts, a lower-privilege `conf/privilege`, icons,
+and license texts. The package requires DSM `7.0-40759` or newer, while platform availability remains
+constrained by Synology's DSM-version table. It is not `noarch`; the four binary ABIs are never
+combined into one SPK. The ARMv7 INFO field combines the generic `armv7` family token used for
+Alpine/Alpine4k with the six compatible platform-specific aliases; every value selects the same
+ARMv7-A little-endian hard-float ABI.
+
+An ABI match alone is insufficient. The [release selector's DSM toolkit intervals](release-selector.md#dsm-toolkit-intervals)
+also require the model's Package Arch to exist in the selected official DSM 7.0–7.4 branch, including
+the introduction floors for newer platforms and the removal ceilings for legacy platforms.
 
 Release CI rejects an embedded ELF with the wrong machine type, a dynamic program interpreter, or
 a required dynamic library. It validates the SPK INFO, archive member safety and modes, package
@@ -50,9 +59,11 @@ icons, licenses, lifecycle/privilege policy, and embedded binary again before st
 Static validation is not proof of installation or File Station behavior on a live NAS.
 
 Install a verified SPK through **Package Center > Manual Install**. DSM 7 displays its normal alert
-for a non-Synology package; these artifacts are not published or signed by Synology. See the
-[Synology DSM package guide](synology-package.md) before granting source-share access or entering a
-target password/TOTP seed.
+for a non-Synology package; these artifacts are not published or signed by Synology. Use the
+[release selector](release-selector.md) to resolve an exact model, DSM build, and reported processor
+without guessing, then see the [Synology DSM package guide](synology-package.md) before granting
+source-share access or entering a target password/TOTP seed. ARMv5, PowerPC, unknown models, and
+conflicting inputs are unsupported and fail closed.
 
 ## Rust and C SDK archives
 
@@ -84,13 +95,16 @@ Each C SDK contains `include/sdsync.h`, `examples/ffi/basic.c`, license/notices,
 `sdsync.lib` import library. See the [Rust library guide](sdk/index.md) and
 [C ABI guide](ffi/index.md) before integrating.
 
-The release also publishes:
+Together, a complete release has 22 public assets: 17 archives (six native CLI, four DSM SPK, six C
+SDK, and one Rust SDK), four auxiliary payloads, and the checksum manifest. The auxiliary payloads
+are:
 
-- `SHA256SUMS`, covering all native archives, Rust/C SDKs, both DSM SPKs, both installer scripts, the
-  SBOM, and the notice bundle;
 - `synology-drive-sync-YY.N.cdx.json`, a CycloneDX JSON Rust dependency SBOM;
 - `THIRD_PARTY_LICENSES.html`, the generated dependency license and attribution bundle;
 - `install.sh` and `install.ps1` bootstrap installers.
+
+`SHA256SUMS` contains exactly 21 entries, covering every payload above and every archive; the
+manifest itself is the twenty-second release asset and is not self-listed.
 
 ## Checksum verification
 
@@ -132,7 +146,14 @@ Checksums detect corruption and substitution relative to the manifest, but the m
 
 ## GitHub artifact attestations
 
-The release workflow creates GitHub-hosted provenance for every file named by `SHA256SUMS`, an attestation for the checksum manifest itself, and a Cargo-dependency CycloneDX SBOM attestation associated with the six native archives and two DSM SPKs.
+The release workflow creates three GitHub-hosted attestation envelopes for release assets:
+
+- provenance subject checksums cover all 21 files named by `SHA256SUMS`;
+- the Cargo-dependency CycloneDX SBOM attestation covers all 17 archives;
+- a checksum-manifest attestation covers `SHA256SUMS` itself.
+
+That is 39 subject references across the three envelopes and 22 unique released artifacts. The OCI
+image attestations described below are separate.
 
 With a current GitHub CLI, verify a downloaded archive or installer against this public repository:
 
@@ -164,7 +185,7 @@ jq -e '.bomFormat == "CycloneDX" and ((.components | type) == "array")' \
 The release SBOM describes the locked Rust application dependencies. It does not inventory the DSM package shell helpers, the statically linked musl runtime, or every target OS component, and it is not a claim that those components have been scanned. Container builds additionally request BuildKit SBOM and maximum-mode provenance attestations.
 
 `THIRD_PARTY_LICENSES.html` is generated by hash-pinned `cargo-about` 0.9.1 from
-the locked graph for all eight native archive and DSM target triples. Generation runs
+the locked graph for all ten native archive and DSM target triples. Generation runs
 offline after Cargo fetches checksum-pinned crates, uses explicit accepted-license
 policy and known upstream clarifications, and fails on an unreadable or
 unclassified license. CI regenerates the file and requires a byte-for-byte match,
@@ -223,18 +244,24 @@ The final multi-architecture digest receives GitHub provenance and SBOM attestat
 ## Release reproducibility boundaries
 
 - `Cargo.lock` and the Rust toolchain version are fixed in the workflow.
-- Each archive is built on a matching GitHub-hosted OS/architecture runner; see GitHub's current [hosted-runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+- The six native CLI binaries and six C SDK libraries are built on matching GitHub-hosted
+  OS/architecture runners; the Rust SDK is a platform-neutral source archive. See GitHub's current
+  [hosted-runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 - Linux archives are built against a glibc 2.35 ceiling, verified from the binary's versioned symbol requirements before packaging.
-- DSM SPKs are built on matching x86-64/ARM64 Linux runners from static musl targets, and the
-  builder normalizes archive ownership, modes, ordering, and timestamps with `SOURCE_DATE_EPOCH`.
+- The `x86_64` and `armv8` DSM SPKs are built on matching x86-64/ARM64 Linux runners. The `i686` and
+  ARMv7 SPKs are cross-built with pinned Zig and `cargo-zigbuild`, then executed under pinned QEMU
+  user emulators. All four use static musl targets, and the builder normalizes archive ownership,
+  modes, ordering, and timestamps with `SOURCE_DATE_EPOCH`.
 - The binary embeds the calendar release through `SDSYNC_BUILD_VERSION` and is checked with `--version` before packaging.
 - Completions and all 17 root/subcommand manpages are generated by the just-built native binary.
 - Third-party notices are generated from all supported target graphs with a hash-pinned tool and are reproduced byte-for-byte in CI.
-- Archive checksums and attestations are generated only after all six native builds, both DSM SPK
-  builds, and both architecture-specific container builds succeed.
+- Archive checksums and attestations are generated only after all six native builds, all four DSM
+  SPK builds, and both architecture-specific container builds succeed.
 - Native archives are not claimed to be byte-for-byte reproducible across independent runner images.
 - The deterministic SPK assembler reduces packaging variance, but independently compiled Rust
   binaries and complete SPKs are not claimed to be bit-for-bit reproducible across runner images.
-- The DSM builders install `musl-tools` from the hosted runner's current Ubuntu repository snapshot;
-  that system package version is not independently pinned by this repository.
+- The native `x86_64` and `armv8` DSM builders install `musl-tools` from the hosted runner's current
+  Ubuntu repository snapshot; that system package version is not independently pinned by this
+  repository. The `i686` and ARMv7 cross-builds instead pin Zig, `cargo-zigbuild`, and a QEMU image
+  digest in the workflow.
 - Release assets are not separately platform-code-signed or notarized. SHA-256 and GitHub attestations are the provided verification mechanisms.

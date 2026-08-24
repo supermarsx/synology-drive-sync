@@ -50,6 +50,7 @@
 
 # Release and assurance
 
+- [Release selector](release-selector.md)
 - [Release artifacts and verification](releases.md)
 - [Testing and coverage](testing.md)
 - [Security](security.md)

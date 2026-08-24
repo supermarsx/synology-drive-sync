@@ -34,9 +34,12 @@ The per-manager directories provide exact install/upgrade/uninstall, enable/disa
 ## Synology DSM package lifecycle
 
 [`packaging/synology`](synology/) assembles a manually installable DSM 7 SPK around one validated
-static musl ELF. Releases contain separate `x86_64` and `armv8` packages. The SPK runs without root
-or Linux capabilities, keeps scheduling disabled after installation, and supplies the headless
-manager at:
+static musl ELF. Releases contain four separate ABI packages: `x86_64`, `armv8`, ARMv7-A hard-float
+(`INFO` arch `armv7 armada370 armada375 armada38x armadaxp comcerto2k monaco`), and `i686` for
+Evansport on the DSM 7.0/7.1 line. Use the
+[release selector](../docs/release-selector.md) instead of guessing from a CPU label; ARMv5, PowerPC,
+unknown, and conflicting inputs fail closed. The SPK runs without root or Linux capabilities, keeps
+scheduling disabled after installation, and supplies the headless manager at:
 
 ```text
 /var/packages/synology-drive-sync/target/bin/sdsync-dsm

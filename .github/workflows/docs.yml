@@ -43,6 +43,14 @@ jobs:
       - name: Test documentation code blocks
         run: mdbook test
 
+      - name: Validate release selector logic and JavaScript
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check docs/theme/release-selector-data.js
+          node --check docs/theme/release-selector.js
+          node --test tests/release-selector.test.cjs
+
       - name: Build Rust SDK API reference
         run: cargo doc --locked --no-deps --lib -p synology-drive-sync
 
@@ -55,6 +63,7 @@ jobs:
           cp -R target/doc/. target/site/api/
           test -s target/site/index.html
           test -s target/site/404.html
+          test -s target/site/release-selector.html
           compgen -G 'target/site/searchindex-*.js' > /dev/null
           compgen -G 'target/site/book-*.js' > /dev/null
           compgen -G 'target/site/docs/theme/sdsync-*.css' > /dev/null
@@ -64,6 +73,14 @@ jobs:
           grep -Eq 'searchindex-[0-9a-f]+\.js' target/site/index.html
           grep -Fq 'SDSYNC_MAX_RATE' target/site/searchindex-*.js
           grep -Fq 'sdsync_run_v1' target/site/searchindex-*.js
+          for control in purpose model dsmVersion reportedArch desktopOs desktopCpu; do
+            grep -Fq "name=\"$control\"" target/site/release-selector.html
+          done
+          grep -Fq 'data-selector-result' target/site/release-selector.html
+          if grep -Fq '&lt;fieldset' target/site/release-selector.html; then
+            echo 'release selector fieldset was escaped instead of rendered' >&2
+            exit 1
+          fi
           grep -Fq \
             'https://github.com/supermarsx/synology-drive-sync/edit/main/docs/index.md' \
             target/site/index.html

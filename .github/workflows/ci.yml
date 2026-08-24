@@ -144,11 +144,39 @@ jobs:
           - runner: ubuntu-24.04
             rust_target: x86_64-unknown-linux-musl
             synology_arch: x86_64
+            elf_class: ELF64
             elf_machine: Advanced Micro Devices X86-64
+            cross_compile: false
+            qemu_binary: ""
+            qemu_cpu: ""
+            arm_hard_float: false
           - runner: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-musl
             synology_arch: armv8
+            elf_class: ELF64
             elf_machine: AArch64
+            cross_compile: false
+            qemu_binary: ""
+            qemu_cpu: ""
+            arm_hard_float: false
+          - runner: ubuntu-24.04
+            rust_target: i686-unknown-linux-musl
+            synology_arch: i686
+            elf_class: ELF32
+            elf_machine: Intel 80386
+            cross_compile: true
+            qemu_binary: qemu-i386
+            qemu_cpu: qemu32
+            arm_hard_float: false
+          - runner: ubuntu-24.04
+            rust_target: armv7-unknown-linux-musleabihf
+            synology_arch: armv7
+            elf_class: ELF32
+            elf_machine: ARM
+            cross_compile: true
+            qemu_binary: qemu-arm
+            qemu_cpu: cortex-a9,neon=off,vfp-d32=off
+            arm_hard_float: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -160,11 +188,38 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: synology-${{ matrix.synology_arch }}
+      - name: Install pinned Zig cross-linker
+        if: matrix.cross_compile == true
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+      - name: Install pinned cargo-zigbuild
+        if: matrix.cross_compile == true
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+        with:
+          tool: cargo-zigbuild@0.23.2
+      - name: Extract pinned QEMU user emulator
+        if: matrix.cross_compile == true
+        env:
+          QEMU_BINARY: ${{ matrix.qemu_binary }}
+          QEMU_IMAGE: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+        run: |
+          set -euo pipefail
+          container=$(docker create "$QEMU_IMAGE")
+          cleanup() {
+            docker rm --force "$container" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker cp "$container:/usr/bin/$QEMU_BINARY" "$RUNNER_TEMP/$QEMU_BINARY"
+          chmod 0755 "$RUNNER_TEMP/$QEMU_BINARY"
+          "$RUNNER_TEMP/$QEMU_BINARY" --version
       - name: Install native musl toolchain
+        if: matrix.cross_compile != true
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes musl-tools
-      - name: Build DSM-portable static binary
+      - name: Build native DSM-portable static binary
+        if: matrix.cross_compile != true
         env:
           SDSYNC_BUILD_VERSION: 0.0.0
           RUST_TARGET: ${{ matrix.rust_target }}
@@ -172,15 +227,36 @@ jobs:
           CC_aarch64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-        run: cargo build --release --locked --target "$RUST_TARGET"
+        run: >-
+          cargo build --release --locked
+          --package synology-drive-sync --bin synology-drive-sync
+          --target "$RUST_TARGET"
+      - name: Cross-build DSM-portable static binary
+        if: matrix.cross_compile == true
+        env:
+          SDSYNC_BUILD_VERSION: 0.0.0
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: >-
+          cargo zigbuild --release --locked
+          --package synology-drive-sync --bin synology-drive-sync
+          --target "$RUST_TARGET"
       - name: Verify DSM binary architecture and static linkage
         shell: bash
         env:
+          ARM_HARD_FLOAT: ${{ matrix.arm_hard_float }}
+          ELF_CLASS: ${{ matrix.elf_class }}
           ELF_MACHINE: ${{ matrix.elf_machine }}
+          QEMU_BINARY: ${{ matrix.qemu_binary }}
+          QEMU_CPU: ${{ matrix.qemu_cpu }}
           RUST_TARGET: ${{ matrix.rust_target }}
         run: |
           set -euo pipefail
           binary="target/$RUST_TARGET/release/synology-drive-sync"
+          class=$(readelf --file-header --wide "$binary" | awk -F: '/Class:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')
+          [[ "$class" == "$ELF_CLASS" ]] || {
+            echo "unexpected ELF class: $class (expected $ELF_CLASS)" >&2
+            exit 1
+          }
           machine=$(readelf --file-header --wide "$binary" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')
           [[ "$machine" == "$ELF_MACHINE" ]] || {
             echo "unexpected ELF machine: $machine (expected $ELF_MACHINE)" >&2
@@ -194,7 +270,25 @@ jobs:
             echo 'DSM binary must not require host dynamic libraries' >&2
             exit 1
           fi
-          reported=$("$binary" --version)
+          if [[ "$ARM_HARD_FLOAT" == true ]]; then
+            flags=$(readelf --file-header --wide "$binary" | awk -F: '/Flags:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')
+            [[ "$flags" == *'Version5 EABI'* && "$flags" == *'hard-float ABI'* ]] || {
+              echo "ARMv7 binary does not declare EABI5 hard-float: $flags" >&2
+              exit 1
+            }
+          fi
+          if [[ -n "$QEMU_BINARY" ]]; then
+            emulator="$RUNNER_TEMP/$QEMU_BINARY"
+            [[ -x "$emulator" ]] || {
+              echo "pinned QEMU emulator is missing: $emulator" >&2
+              exit 1
+            }
+            # This extracted tonistiigi binfmt QEMU treats the first post-binary
+            # guest argument as argv[0], so supply it before the real arguments.
+            reported=$(QEMU_CPU="$QEMU_CPU" "$emulator" "$binary" synology-drive-sync --version)
+          else
+            reported=$("$binary" --version)
+          fi
           [[ "$reported" == 'synology-drive-sync 0.0.0' ]]
       - name: Assemble and validate installable SPK
         shell: bash

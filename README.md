@@ -415,8 +415,8 @@ profiles remain committed.
 
 See [Installation and deployment](docs/installation.md) for:
 
-- manually installable DSM 7 SPKs for `x86_64` and `armv8`, with a package-owned scheduler and
-  multi-target manager;
+- four manually installable DSM 7 SPKs for `x86_64`, `armv8`, ARMv7-A hard-float, and Evansport
+  `i686`, with a package-owned scheduler and multi-target manager;
 - checksum-verifying Unix and Windows installers;
 - manual archive installation, completions, and manpage setup;
 - the non-root, read-only Docker/Compose job and optional TOTP secret overlay;
@@ -427,9 +427,19 @@ The native schedulers are preferred because their identity and credential-sessio
 
 ## Releases and supply-chain verification
 
-Calendar releases use `YY.N` tags and provide native Linux, Windows, and macOS archives for both x86-64 and ARM64, architecture-specific DSM 7 SPKs for `x86_64` and `armv8`, `synology-drive-sync-YY.N-rust-sdk.tar.gz`, and six platform/architecture C SDK archives. Each release also includes `SHA256SUMS`, a CycloneDX dependency SBOM, generated third-party license notices, installer scripts, and GitHub artifact provenance/SBOM attestations. CI audits the locked graph against current RustSec data and refuses stale notices. The GHCR image is published for `linux/amd64` and `linux/arm64` as both `YY.N` and `latest`.
+Calendar releases use `YY.N` tags and publish 22 assets: six native Linux, Windows, and macOS CLI
+archives for x86-64 and ARM64; four architecture-specific DSM 7 SPKs for `x86_64`, `armv8`,
+ARMv7-A hard-float, and Evansport `i686`; one Rust SDK archive; six platform/architecture C SDK
+archives; a CycloneDX dependency SBOM; generated third-party license notices; two installer scripts;
+and `SHA256SUMS`. The manifest covers the other 21 payloads, provenance covers those 21 payloads,
+the dependency-SBOM attestation covers all 17 archives, and the manifest has its own attestation. CI
+audits the locked graph against current RustSec data and refuses stale notices. The GHCR image is
+published separately for `linux/amd64` and `linux/arm64` as both `YY.N` and `latest`.
 
-See [Release artifacts and verification](docs/releases.md) before deploying a binary or container in a sensitive environment. Pin a calendar version or container digest rather than relying on mutable `latest`.
+Use the [release selector](docs/release-selector.md) to resolve an exact Synology model/DSM/runtime
+combination or desktop OS/CPU, then see [Release artifacts and verification](docs/releases.md) before
+deploying in a sensitive environment. Pin a calendar version or container digest rather than relying
+on mutable `latest`.
 
 ## Failure clues
 

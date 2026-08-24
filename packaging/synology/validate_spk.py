@@ -15,7 +15,7 @@ import tarfile
 from pathlib import Path, PurePosixPath
 
 from build_spk import (
-    ARCH_MACHINES,
+    ARCHITECTURES,
     HERE,
     PackageError,
     elf_contract,
@@ -61,7 +61,7 @@ class ValidationError(AssertionError):
 
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--arch", choices=sorted(ARCH_MACHINES))
+    parser.add_argument("--arch", choices=sorted(ARCHITECTURES))
     parser.add_argument("--binary", type=Path)
     parser.add_argument("spk", nargs="*", type=Path)
     return parser.parse_args()
@@ -227,11 +227,19 @@ def validate_spk(
         if missing:
             raise ValidationError(f"{path.name} is missing members: {sorted(missing)}")
         info = parse_info(member_bytes(outer, members["INFO"]))
-        arch = info["arch"]
-        if arch not in ARCH_MACHINES:
-            raise ValidationError(f"unsupported INFO arch: {arch}")
+        info_arch = info["arch"]
+        matching_arches = [
+            name
+            for name, contract in ARCHITECTURES.items()
+            if contract.info_value == info_arch
+        ]
+        if len(matching_arches) != 1:
+            raise ValidationError(f"unsupported INFO arch value: {info_arch}")
+        arch = matching_arches[0]
         if requested_arch and requested_arch != arch:
-            raise ValidationError(f"INFO arch {arch} does not match requested {requested_arch}")
+            raise ValidationError(
+                f"INFO arch {info_arch} resolves to {arch}, not requested {requested_arch}"
+            )
         if info["package"] != PACKAGE or info["os_min_ver"] < "7.0-40000":
             raise ValidationError("INFO package identity or DSM minimum is invalid")
         expected_info_version = filename_info_version(path, arch)

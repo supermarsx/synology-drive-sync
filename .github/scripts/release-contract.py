@@ -24,6 +24,7 @@ TIMESTAMP = re.compile(
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 MANIFEST_LINE = re.compile(r"^([0-9a-f]{64})  ([^/\\\r\n]+)$")
 ASSET_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+SYNOLOGY_ARCHITECTURES = ("armv7", "armv8", "i686", "x86_64")
 
 
 class ContractError(ValueError):
@@ -449,14 +450,12 @@ def verify_image_index_match(expected_document: Any, actual_document: Any) -> No
 def archive_names(tag: str) -> list[str]:
     _tag(tag)
     names = [
-        f"synology-drive-sync-{tag}-armv8.spk",
         f"synology-drive-sync-{tag}-linux-aarch64.tar.gz",
         f"synology-drive-sync-{tag}-linux-x86_64.tar.gz",
         f"synology-drive-sync-{tag}-macos-aarch64.tar.gz",
         f"synology-drive-sync-{tag}-macos-x86_64.tar.gz",
         f"synology-drive-sync-{tag}-windows-aarch64.zip",
         f"synology-drive-sync-{tag}-windows-x86_64.zip",
-        f"synology-drive-sync-{tag}-x86_64.spk",
         f"synology-drive-sync-{tag}-c-sdk-linux-aarch64.tar.gz",
         f"synology-drive-sync-{tag}-c-sdk-linux-x86_64.tar.gz",
         f"synology-drive-sync-{tag}-c-sdk-macos-aarch64.tar.gz",
@@ -465,6 +464,10 @@ def archive_names(tag: str) -> list[str]:
         f"synology-drive-sync-{tag}-c-sdk-windows-x86_64.zip",
         f"synology-drive-sync-{tag}-rust-sdk.tar.gz",
     ]
+    names.extend(
+        f"synology-drive-sync-{tag}-{architecture}.spk"
+        for architecture in SYNOLOGY_ARCHITECTURES
+    )
     return sorted(names)
 
 
@@ -621,7 +624,7 @@ def _manifest_text(files: dict[str, Path], names: Iterable[str]) -> str:
 
 
 def prepare_assets(directory: Path, tag: str) -> None:
-    """Validate the 19 inputs and write deterministic checksum manifests."""
+    """Validate the 21 inputs and write deterministic checksum manifests."""
 
     expected = payload_names(tag)
     files = _directory_files(directory)
@@ -702,7 +705,7 @@ def verify_asset_names(tag: str, names: Iterable[str]) -> None:
 
 
 def asset_index(directory: Path, tag: str) -> dict[str, Any]:
-    """Build a deterministic local size/digest inventory for all 20 assets."""
+    """Build a deterministic local size/digest inventory for all 22 assets."""
 
     verify_assets(directory, tag)
     assets = []

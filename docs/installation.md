@@ -14,16 +14,25 @@ Passing unit tests or `doctor` is not production acceptance. Before trusting rea
 
 Install the architecture-specific SPK when the source directory is physically on a Synology NAS:
 
-| Source NAS architecture | Release asset |
-| --- | --- |
-| DSM `x86_64` | `synology-drive-sync-YY.N-x86_64.spk` |
-| DSM `armv8` | `synology-drive-sync-YY.N-armv8.spk` |
+| CPU / official model Package Arch | SPK `INFO` arch | Release asset |
+| --- | --- | --- |
+| x86-64 / supported DSM 7 x86-64 member platforms (resolved by selector) | `x86_64` | `synology-drive-sync-YY.N-x86_64.spk` |
+| AArch64 / `armada37xx`, `rtd1296`, or `rtd1619b` | `armv8` | `synology-drive-sync-YY.N-armv8.spk` |
+| ARMv7-A hard-float / `alpine`, `alpine4k`, `armada370`, `armada375`, `armada38x`, `armadaxp`, `comcerto2k`, or `monaco` | `armv7 armada370 armada375 armada38x armadaxp comcerto2k monaco` | `synology-drive-sync-YY.N-armv7.spk` |
+| Intel `i686` / `evansport` (DSM 7.0/7.1 only) | `i686` | `synology-drive-sync-YY.N-i686.spk` |
 
-Both packages embed a fully static musl ELF and require DSM `7.0-40759` or newer. Download the
-matching SPK and `SHA256SUMS`, verify the selected file as described in [Release artifacts and
-verification](releases.md), then use **Package Center > Manual Install**. DSM displays its normal
-warning for a package not published by Synology. Treat that warning as a trust decision and proceed
-only after verifying the repository, exact asset name, SHA-256, and optional GitHub attestation.
+All four packages embed one fully static musl ELF (ELF32 or ELF64) and require DSM `7.0-40759` or
+newer. Platform availability also follows the exact DSM 7.0–7.4 `pkgscripts-ng` interval for the
+model's Package Arch: for example, Evansport `i686` ends at DSM 7.1, while `rtd1619b`,
+`geminilakenk`, and `epyc7003` first appear in DSM 7.1, 7.2, and 7.3 respectively. Use the
+[release selector](release-selector.md) with the exact model, DSM build, and reported architecture.
+It rejects pre-introduction and post-removal DSM branches, ARMv5, PowerPC, unknown models, and
+conflicting inputs instead of guessing. It also rejects `PAS7700`: that model remains in the factual
+CPU snapshot but runs DSM Enterprise 1.0, not DSM 7. Download the selected SPK and `SHA256SUMS`,
+verify the file as described in [Release artifacts and verification](releases.md), then use **Package
+Center > Manual Install**. DSM displays its normal warning for a package not published by Synology.
+Treat that warning as a trust decision and proceed only after verifying the repository, exact asset
+name, SHA-256, and optional GitHub attestation.
 
 The headless package installs the manager here:
 

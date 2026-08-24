@@ -28,33 +28,103 @@ HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[1]
 
 
-def fake_elf(machine: int, *, interpreter: bool = False, no_headers: bool = False) -> bytes:
+ARM_EABI5_HARD_FLOAT = 0x05000400
+
+
+def fake_elf(
+    machine: int,
+    *,
+    elf_class: int = 2,
+    data_encoding: int = 1,
+    elf_flags: int = 0,
+    interpreter: bool = False,
+    needed_library: bool = False,
+    no_headers: bool = False,
+) -> bytes:
     size = 160
     payload = bytearray(size)
-    payload[:16] = b"\x7fELF\x02\x01\x01" + b"\0" * 9
+    payload[:16] = b"\x7fELF" + bytes((elf_class, data_encoding, 1)) + b"\0" * 9
+    byte_order = ">" if data_encoding == 2 else "<"
     program_count = 0 if no_headers else 1
-    struct.pack_into(
-        "<HHIQQQIHHHHHH",
-        payload,
-        16,
-        2,
-        machine,
-        1,
-        0x400000,
-        64,
-        0,
-        0,
-        64,
-        56,
-        program_count,
-        0,
-        0,
-        0,
-    )
+    if elf_class == 2:
+        struct.pack_into(
+            f"{byte_order}HHIQQQIHHHHHH",
+            payload,
+            16,
+            2,
+            machine,
+            1,
+            0x400000,
+            64,
+            0,
+            elf_flags,
+            64,
+            56,
+            program_count,
+            0,
+            0,
+            0,
+        )
+    else:
+        struct.pack_into(
+            f"{byte_order}HHIIIIIHHHHHH",
+            payload,
+            16,
+            2,
+            machine,
+            1,
+            0x10000,
+            52,
+            0,
+            elf_flags,
+            52,
+            32,
+            program_count,
+            0,
+            0,
+            0,
+        )
     if not no_headers:
-        kind = 3 if interpreter else 1
-        flags = 4 if interpreter else 5
-        struct.pack_into("<IIQQQQQQ", payload, 64, kind, flags, 0, 0x400000, 0, size, size, 4096)
+        kind = 2 if needed_library else 3 if interpreter else 1
+        flags = 4 if interpreter or needed_library else 5
+        file_offset = 128 if needed_library else 0
+        file_size = (16 if elf_class == 2 else 8) if needed_library else size
+        if elf_class == 2:
+            struct.pack_into(
+                f"{byte_order}IIQQQQQQ",
+                payload,
+                64,
+                kind,
+                flags,
+                file_offset,
+                0x400000,
+                0,
+                file_size,
+                file_size,
+                4096,
+            )
+        else:
+            struct.pack_into(
+                f"{byte_order}IIIIIIII",
+                payload,
+                52,
+                kind,
+                file_offset,
+                0x10000,
+                0,
+                file_size,
+                file_size,
+                flags,
+                4096,
+            )
+        if needed_library:
+            struct.pack_into(
+                f"{byte_order}{'qQ' if elf_class == 2 else 'iI'}",
+                payload,
+                file_offset,
+                1,
+                0,
+            )
     return bytes(payload)
 
 
@@ -98,9 +168,19 @@ class BuilderTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def build(self, arch: str, machine: int, output: str = "out") -> Path:
+    def build(
+        self,
+        arch: str,
+        machine: int,
+        output: str = "out",
+        *,
+        elf_class: int = 2,
+        elf_flags: int = 0,
+    ) -> Path:
         binary = self.root / f"{arch}.elf"
-        binary.write_bytes(fake_elf(machine))
+        binary.write_bytes(
+            fake_elf(machine, elf_class=elf_class, elf_flags=elf_flags)
+        )
         binary.chmod(0o755)
         destination = self.root / output
         environment = os.environ.copy()
@@ -125,9 +205,27 @@ class BuilderTests(unittest.TestCase):
         self.assertTrue(artifact.is_file())
         return artifact
 
-    def test_builds_and_validates_both_supported_architectures(self) -> None:
-        for arch, machine in (("x86_64", 62), ("armv8", 183)):
-            artifact = self.build(arch, machine, arch)
+    def test_builds_and_validates_every_supported_architecture(self) -> None:
+        fixtures = (
+            ("x86_64", 62, 2, 0, "x86_64"),
+            ("i686", 3, 1, 0, "i686"),
+            (
+                "armv7",
+                40,
+                1,
+                ARM_EABI5_HARD_FLOAT,
+                "armv7 armada370 armada375 armada38x armadaxp comcerto2k monaco",
+            ),
+            ("armv8", 183, 2, 0, "armv8"),
+        )
+        for arch, machine, elf_class, elf_flags, info_arch in fixtures:
+            artifact = self.build(
+                arch,
+                machine,
+                arch,
+                elf_class=elf_class,
+                elf_flags=elf_flags,
+            )
             result = subprocess.run(
                 [sys.executable, str(HERE / "validate_spk.py"), "--arch", arch, str(artifact)],
                 capture_output=True,
@@ -137,6 +235,130 @@ class BuilderTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(f"({arch})", result.stdout)
+            with tarfile.open(artifact, "r:") as outer:
+                info = outer.extractfile("INFO").read()  # type: ignore[union-attr]
+            self.assertIn(f'arch="{info_arch}"'.encode(), info)
+
+    def test_armv7_info_has_family_and_required_platform_aliases(self) -> None:
+        artifact = self.build(
+            "armv7",
+            40,
+            elf_class=1,
+            elf_flags=ARM_EABI5_HARD_FLOAT,
+        )
+        with tarfile.open(artifact, "r:") as outer:
+            info = outer.extractfile("INFO").read()  # type: ignore[union-attr]
+        expected = (
+            b'arch="armv7 armada370 armada375 armada38x armadaxp '
+            b'comcerto2k monaco"'
+        )
+        self.assertIn(expected, info)
+
+        incomplete = self.root / "incomplete-aliases" / artifact.name
+        incomplete.parent.mkdir()
+        repack_outer(
+            artifact,
+            incomplete,
+            info_payload=info.replace(expected, b'arch="armv7"'),
+        )
+        result = subprocess.run(
+            [sys.executable, str(HERE / "validate_spk.py"), str(incomplete)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsupported INFO arch value", result.stderr)
+
+    def test_rejects_wrong_elf_class_and_endianness(self) -> None:
+        cases = (
+            (
+                "i686-elf64",
+                fake_elf(3, elf_class=2),
+                "i686",
+                "expected ELF32",
+            ),
+            (
+                "x86-elf32",
+                fake_elf(62, elf_class=1),
+                "x86_64",
+                "expected ELF64",
+            ),
+            (
+                "i686-big-endian",
+                fake_elf(3, elf_class=1, data_encoding=2),
+                "i686",
+                "expected little-endian",
+            ),
+        )
+        for name, payload, arch, marker in cases:
+            result = self.run_rejected_build(name, payload, arch)
+            self.assertIn(marker, result.stderr)
+
+    def test_rejects_swapped_armv7_and_i686_machines(self) -> None:
+        cases = (
+            (
+                "arm-in-i686",
+                fake_elf(
+                    40,
+                    elf_class=1,
+                    elf_flags=ARM_EABI5_HARD_FLOAT,
+                ),
+                "i686",
+                "expected 3",
+            ),
+            (
+                "i686-in-arm",
+                fake_elf(3, elf_class=1),
+                "armv7",
+                "expected 40",
+            ),
+        )
+        for name, payload, arch, marker in cases:
+            result = self.run_rejected_build(name, payload, arch)
+            self.assertIn(marker, result.stderr)
+
+    def test_rejects_armv7_wrong_eabi_or_float_abi(self) -> None:
+        cases = (
+            ("eabi4", 0x04000400, "expected EABI5"),
+            ("soft-float", 0x05000200, "expected EABI5 hard-float"),
+            ("unspecified-float", 0x05000000, "expected EABI5 hard-float"),
+            ("conflicting-float", 0x05000600, "expected EABI5 hard-float"),
+        )
+        for name, flags, marker in cases:
+            result = self.run_rejected_build(
+                name,
+                fake_elf(40, elf_class=1, elf_flags=flags),
+                "armv7",
+            )
+            self.assertIn(marker, result.stderr)
+
+    def run_rejected_build(
+        self, name: str, payload: bytes, arch: str
+    ) -> subprocess.CompletedProcess[str]:
+        binary = self.root / f"{name}.elf"
+        binary.write_bytes(payload)
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(HERE / "build_spk.py"),
+                "--binary",
+                str(binary),
+                "--arch",
+                arch,
+                "--version",
+                "1.0.0",
+                "--output",
+                str(self.root / f"bad-{name}"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        return result
 
     def test_output_is_reproducible_and_extractsize_is_uncompressed_content(self) -> None:
         first = self.build("x86_64", 62, "one")
@@ -152,24 +374,24 @@ class BuilderTests(unittest.TestCase):
 
     def test_rejects_wrong_machine_dynamic_interpreter_and_headerless_elf(self) -> None:
         cases = (
-            (fake_elf(183), "machine"),
-            (fake_elf(62, interpreter=True), "interpreter"),
-            (fake_elf(62, no_headers=True), "program headers"),
+            ("wrong-machine", fake_elf(183), "x86_64", "machine"),
+            ("elf64-interpreter", fake_elf(62, interpreter=True), "x86_64", "interpreter"),
+            (
+                "elf32-interpreter",
+                fake_elf(3, elf_class=1, interpreter=True),
+                "i686",
+                "interpreter",
+            ),
+            (
+                "elf32-needed",
+                fake_elf(3, elf_class=1, needed_library=True),
+                "i686",
+                "DT_NEEDED",
+            ),
+            ("headerless", fake_elf(62, no_headers=True), "x86_64", "program headers"),
         )
-        for index, (payload, marker) in enumerate(cases):
-            binary = self.root / f"bad-{index}.elf"
-            binary.write_bytes(payload)
-            result = subprocess.run(
-                [
-                    sys.executable, str(HERE / "build_spk.py"), "--binary", str(binary),
-                    "--arch", "x86_64", "--version", "1.0.0", "--output", str(self.root / "bad"),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-            self.assertNotEqual(result.returncode, 0)
+        for name, payload, arch, marker in cases:
+            result = self.run_rejected_build(name, payload, arch)
             self.assertIn(marker, result.stderr)
 
     @unittest.skipUnless(os.name == "posix", "creating a symlink is not portable on Windows")

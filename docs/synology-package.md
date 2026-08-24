@@ -80,18 +80,48 @@ on the source NAS, such as `/volume1/Photos`.
 
 One release SPK must match the source NAS architecture:
 
-| DSM architecture | Release asset | Embedded executable |
-| --- | --- | --- |
-| `x86_64` | `synology-drive-sync-YY.N-x86_64.spk` | static `x86_64-unknown-linux-musl` ELF64 |
-| `armv8` | `synology-drive-sync-YY.N-armv8.spk` | static `aarch64-unknown-linux-musl` ELF64 |
+| NAS machine | DSM package family | Release asset | Embedded executable |
+| --- | --- | --- | --- |
+| `x86_64` | `x86_64` | `synology-drive-sync-YY.N-x86_64.spk` | static `x86_64-unknown-linux-musl` ELF64 |
+| `i686` | `i686` (Evansport) | `synology-drive-sync-YY.N-i686.spk` | static `i686-unknown-linux-musl` ELF32 |
+| `armv7l` | ARMv7 family and platform aliases | `synology-drive-sync-YY.N-armv7.spk` | static `armv7-unknown-linux-musleabihf` ELF32, EABI5 hard-float |
+| `aarch64` | `armv8` | `synology-drive-sync-YY.N-armv8.spk` | static `aarch64-unknown-linux-musl` ELF64 |
 
-The package builder and validator require the requested ELF machine and reject a dynamic
-interpreter or `DT_NEEDED` library. The executable does not depend on the source NAS's glibc or a
-desktop D-Bus Secret Service. `x86_64` and `armv8` are separate SPKs; neither is `noarch`, and an
-SPK for one architecture will not be accepted as the other.
+For `armv7`, the generated `INFO` value is exactly:
 
-Models using Synology architecture labels other than `x86_64` or `armv8` are not currently in the
-release matrix. Confirm the model's architecture in Synology's platform table before installation.
+```text
+armv7 armada370 armada375 armada38x armadaxp comcerto2k monaco
+```
+
+Synology's DSM 7 package toolkit unifies Alpine and Alpine4k as the `armv7` family but retains the
+other compatible ARMv7 systems as exact platform tokens. `armv7l` is the value printed by Linux
+`uname -m`; it is not an `INFO` token or release-asset suffix. An `armv7l` NAS uses the `armv7` SPK.
+The package contains no kernel module, so the same hard-float userspace executable is used for all
+of those aliases.
+
+The package builder and validator bind the requested target to ELF class, little-endian encoding,
+machine type, program-header layout, and static-link contract. ARMv7 also requires EABI5 and the
+hard-float flag. A renamed ARM64, ARM soft-float, or IA-32 binary therefore fails before packaging.
+The executable does not depend on the source NAS's glibc or a desktop D-Bus Secret Service. Every
+CPU family has a separate SPK; none is marked `noarch`.
+
+These four artifacts cover every feasible DSM 7 CPU family for this package. ARMv5/88f628x and
+PowerPC models belong to older DSM generations and cannot run this package's DSM 7 FHS/lifecycle
+contract. Supporting those models would be a separate DSM 6 package port, not another alias on a
+DSM 7 SPK.
+
+Confirm the source NAS before downloading:
+
+```bash
+uname -m
+cat /proc/sys/kernel/syno_hw_version
+get_key_value /etc.defaults/synoinfo.conf unique
+```
+
+Use the machine-to-asset table above and verify the exact model/platform in Synology's
+[platform and architecture mapping](https://help.synology.com/developer-guide/appendix/platarchs.html).
+The [release selector](release-selector.md) provides the same mapping as a short install-oriented
+decision guide.
 
 ## Download, verify, and install
 
@@ -432,12 +462,47 @@ python3 packaging/synology/validate_spk.py \
   dist/synology-drive-sync-26.1-x86_64.spk
 ```
 
-For ARMv8, use a matching ARM64 Linux builder and replace the Rust target with
-`aarch64-unknown-linux-musl` and `--arch` with `armv8`. The builder accepts one regular, non-symlink
-static ELF, rejects an architecture mismatch or dynamic dependency, assembles deterministic archive
-metadata under `SOURCE_DATE_EPOCH`, and emits one architecture-specific SPK. The validator checks
-the INFO, icons, licenses, privilege policy, lifecycle scripts, safe archive members, executable
-modes, and embedded ELF contract. This static validation is not an installation test.
+Use these target/argument pairs for the remaining DSM 7 artifacts:
+
+| Rust target | Builder argument |
+| --- | --- |
+| `i686-unknown-linux-musl` | `--arch i686` |
+| `armv7-unknown-linux-musleabihf` | `--arch armv7` |
+| `aarch64-unknown-linux-musl` | `--arch armv8` |
+
+For example, the release CI and supported local cross-build path use Rust 1.88.0, Zig 0.16.0, and
+`cargo-zigbuild` 0.23.2. With those pinned tools installed, an ARMv7 build and validation is:
+
+```bash
+rustup toolchain install 1.88.0 --profile minimal \
+  --target armv7-unknown-linux-musleabihf
+cargo install --locked cargo-zigbuild --version 0.23.2
+cargo +1.88.0 zigbuild \
+  --release --locked \
+  --package synology-drive-sync \
+  --bin synology-drive-sync \
+  --target armv7-unknown-linux-musleabihf
+bash packaging/synology/build-spk.sh \
+  --binary target/armv7-unknown-linux-musleabihf/release/synology-drive-sync \
+  --arch armv7 \
+  --version 26.1 \
+  --output dist
+python3 packaging/synology/validate_spk.py \
+  --binary target/armv7-unknown-linux-musleabihf/release/synology-drive-sync \
+  --arch armv7 \
+  dist/synology-drive-sync-26.1-armv7.spk
+```
+
+Do not substitute plain `cargo build` on an x86 host unless a compatible ARM musl cross-linker is
+separately configured. The release lane also runs the resulting binary under 32-bit ARM emulation
+before it is accepted; local static SPK validation is not a substitute for that execution check.
+
+The builder accepts one regular, non-symlink static ELF, rejects an architecture, class,
+endianness, ARM ABI, or dynamic-dependency mismatch, assembles deterministic archive metadata under
+`SOURCE_DATE_EPOCH`, and emits one architecture-specific SPK. The validator checks the INFO
+family/platform aliases, icons, licenses, privilege policy, lifecycle scripts, safe archive
+members, executable modes, and embedded ELF contract. This static validation is not an
+installation test.
 
 ## No remote-to-remote shortcut
 

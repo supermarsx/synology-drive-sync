@@ -265,10 +265,15 @@ aggregate status, aggregate-cap exit `1`, or unexplained drift fails acceptance.
 This section is mandatory when the executable is deployed as an SPK. The generic mock suite and
 static SPK validator are not substitutes.
 
-Record the source NAS model, CPU architecture, DSM build, selected `x86_64` or `armv8` SPK filename,
-SHA-256, GitHub attestation result, and the Package Center warning shown for a non-Synology package.
-Verify that an SPK for the wrong architecture is not used. Install through **Package Center > Manual
-Install** and confirm scheduling is disabled before entering any target credentials.
+Record the source NAS model, CPU architecture, Package Arch, reported `uname -m`, exact DSM version
+and build, selected `x86_64`, `armv8`, `armv7`, or `i686` SPK filename, SHA-256, GitHub attestation
+result, and the Package Center warning shown for a non-Synology package. For ARMv7, also record the
+compatible INFO token (`armv7`, `armada370`, `armada375`, `armada38x`, `armadaxp`, `comcerto2k`, or
+`monaco`); for Evansport `i686`, prove the NAS remains on the supported DSM 7.0/7.1 line. Resolve the
+asset with the [release selector](release-selector.md) and fail acceptance if its model, DSM, and
+runtime inputs conflict. Verify that an SPK for the wrong architecture is not used. Install through
+**Package Center > Manual Install** and confirm scheduling is disabled before entering any target
+credentials.
 
 On the source NAS, grant the `synology-drive-sync` system-internal user read-only permission to one
 disposable source share and no access to unrelated shares. Confirm the physical source path is not a

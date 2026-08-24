@@ -12,15 +12,82 @@ import re
 import struct
 import tarfile
 import zlib
+from dataclasses import dataclass
 from pathlib import Path
 
 
 HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[1]
 PACKAGE = "synology-drive-sync"
-ARCH_MACHINES = {"x86_64": 62, "armv8": 183}
+
+
+@dataclass(frozen=True)
+class ArchitectureContract:
+    """Binary and DSM metadata contract for one release artifact."""
+
+    elf_class: int
+    machine: int
+    info_arches: tuple[str, ...]
+    rust_target: str
+    arm_eabi: int | None = None
+    hard_float: bool = False
+
+    @property
+    def info_value(self) -> str:
+        return " ".join(self.info_arches)
+
+
+# Synology's current package toolkit unifies alpine/alpine4k as ``armv7`` but
+# deliberately leaves the other compatible ARMv7 platforms as exact platform
+# values. One hard-float userspace binary can serve them because this package
+# has no platform-specific kernel module. Do not replace these values with
+# ``armv7l``: that is Linux's uname machine name, not a DSM INFO arch token.
+ARCHITECTURES = {
+    "x86_64": ArchitectureContract(
+        elf_class=2,
+        machine=62,
+        info_arches=("x86_64",),
+        rust_target="x86_64-unknown-linux-musl",
+    ),
+    "i686": ArchitectureContract(
+        elf_class=1,
+        machine=3,
+        info_arches=("i686",),
+        rust_target="i686-unknown-linux-musl",
+    ),
+    "armv7": ArchitectureContract(
+        elf_class=1,
+        machine=40,
+        info_arches=(
+            "armv7",
+            "armada370",
+            "armada375",
+            "armada38x",
+            "armadaxp",
+            "comcerto2k",
+            "monaco",
+        ),
+        rust_target="armv7-unknown-linux-musleabihf",
+        arm_eabi=5,
+        hard_float=True,
+    ),
+    "armv8": ArchitectureContract(
+        elf_class=2,
+        machine=183,
+        info_arches=("armv8",),
+        rust_target="aarch64-unknown-linux-musl",
+    ),
+}
+# Kept as a small compatibility surface for scripts importing the old mapping.
+ARCH_MACHINES = {name: contract.machine for name, contract in ARCHITECTURES.items()}
 VERSION_PATTERN = re.compile(r"[0-9]+(?:[._-][0-9]+)*\Z")
 SOURCE_DATE_EPOCH = int(os.environ.get("SOURCE_DATE_EPOCH", "0"))
+
+ELF_CLASS_NAMES = {1: "ELF32", 2: "ELF64"}
+ELF_DATA_NAMES = {1: "little-endian", 2: "big-endian"}
+EF_ARM_EABIMASK = 0xFF000000
+EF_ARM_ABI_FLOAT_SOFT = 0x00000200
+EF_ARM_ABI_FLOAT_HARD = 0x00000400
 
 
 class PackageError(ValueError):
@@ -32,7 +99,7 @@ def parse_arguments() -> argparse.Namespace:
         description="Build a DSM 7 SPK around a prebuilt static Linux binary."
     )
     parser.add_argument("--binary", required=True, type=Path)
-    parser.add_argument("--arch", required=True, choices=sorted(ARCH_MACHINES))
+    parser.add_argument("--arch", required=True, choices=sorted(ARCHITECTURES))
     parser.add_argument("--version", required=True)
     parser.add_argument("--output", required=True, type=Path)
     return parser.parse_args()
@@ -51,35 +118,99 @@ def normalized_versions(raw: str) -> tuple[str, str]:
 
 
 def elf_data_contract(data: bytes, arch: str) -> None:
-    if len(data) < 64 or data[:4] != b"\x7fELF":
+    contract = ARCHITECTURES[arch]
+    if len(data) < 16 or data[:4] != b"\x7fELF":
         raise PackageError("binary is not an ELF executable")
-    if data[4] != 2 or data[5] != 1:
-        raise PackageError("binary must be a little-endian ELF64 executable")
+    elf_class = data[4]
+    if elf_class != contract.elf_class:
+        expected_class = ELF_CLASS_NAMES[contract.elf_class]
+        actual_class = ELF_CLASS_NAMES.get(elf_class, f"unknown class {elf_class}")
+        raise PackageError(
+            f"binary is {actual_class}, expected {expected_class} for DSM arch {arch}"
+        )
+    data_encoding = data[5]
+    if data_encoding != 1:
+        actual_encoding = ELF_DATA_NAMES.get(
+            data_encoding, f"unknown data encoding {data_encoding}"
+        )
+        raise PackageError(
+            f"binary is {actual_encoding}, expected little-endian for DSM arch {arch}"
+        )
+    if data[6] != 1:
+        raise PackageError("binary has an unsupported ELF identification version")
+
+    is_64_bit = elf_class == 2
+    elf_header_size = 64 if is_64_bit else 52
+    program_header_size = 56 if is_64_bit else 32
+    dynamic_entry_size = 16 if is_64_bit else 8
+    if len(data) < elf_header_size:
+        raise PackageError(f"binary has a truncated {ELF_CLASS_NAMES[elf_class]} header")
     elf_type = struct.unpack_from("<H", data, 16)[0]
     if elf_type not in (2, 3):
         raise PackageError("binary must be an ELF ET_EXEC or ET_DYN executable")
     machine = struct.unpack_from("<H", data, 18)[0]
-    expected = ARCH_MACHINES[arch]
+    expected = contract.machine
     if machine != expected:
         raise PackageError(
             f"binary ELF machine is {machine}, expected {expected} for DSM arch {arch}"
         )
-    program_offset = struct.unpack_from("<Q", data, 32)[0]
-    program_size = struct.unpack_from("<H", data, 54)[0]
-    program_count = struct.unpack_from("<H", data, 56)[0]
-    if program_size < 56:
-        raise PackageError("binary has an invalid ELF64 program-header size")
+    if struct.unpack_from("<I", data, 20)[0] != 1:
+        raise PackageError("binary has an unsupported ELF header version")
+    if is_64_bit:
+        program_offset = struct.unpack_from("<Q", data, 32)[0]
+        elf_flags = struct.unpack_from("<I", data, 48)[0]
+        declared_header_size = struct.unpack_from("<H", data, 52)[0]
+        declared_program_size = struct.unpack_from("<H", data, 54)[0]
+        program_count = struct.unpack_from("<H", data, 56)[0]
+    else:
+        program_offset = struct.unpack_from("<I", data, 28)[0]
+        elf_flags = struct.unpack_from("<I", data, 36)[0]
+        declared_header_size = struct.unpack_from("<H", data, 40)[0]
+        declared_program_size = struct.unpack_from("<H", data, 42)[0]
+        program_count = struct.unpack_from("<H", data, 44)[0]
+    if declared_header_size != elf_header_size:
+        raise PackageError(
+            f"binary has an invalid {ELF_CLASS_NAMES[elf_class]} header size"
+        )
+    if declared_program_size < program_header_size:
+        raise PackageError(
+            f"binary has an invalid {ELF_CLASS_NAMES[elf_class]} program-header size"
+        )
     if program_count == 0:
         raise PackageError("binary has no ELF program headers")
-    if program_offset + program_size * program_count > len(data):
+    if program_offset + declared_program_size * program_count > len(data):
         raise PackageError("binary has truncated ELF program headers")
+
+    if contract.arm_eabi is not None:
+        eabi = (elf_flags & EF_ARM_EABIMASK) >> 24
+        if eabi != contract.arm_eabi:
+            raise PackageError(
+                f"binary ARM EABI is {eabi}, expected EABI{contract.arm_eabi} "
+                f"for DSM arch {arch}"
+            )
+        float_abi = elf_flags & (EF_ARM_ABI_FLOAT_SOFT | EF_ARM_ABI_FLOAT_HARD)
+        expected_float = (
+            EF_ARM_ABI_FLOAT_HARD if contract.hard_float else EF_ARM_ABI_FLOAT_SOFT
+        )
+        if float_abi != expected_float:
+            expected_name = "hard-float" if contract.hard_float else "soft-float"
+            raise PackageError(
+                f"binary ARM float ABI flags are 0x{float_abi:x}, expected "
+                f"EABI{contract.arm_eabi} {expected_name} for DSM arch {arch}"
+            )
+
     executable_load = False
     for index in range(program_count):
-        offset = program_offset + index * program_size
+        offset = program_offset + index * declared_program_size
         kind = struct.unpack_from("<I", data, offset)[0]
-        flags = struct.unpack_from("<I", data, offset + 4)[0]
-        file_offset = struct.unpack_from("<Q", data, offset + 8)[0]
-        file_size = struct.unpack_from("<Q", data, offset + 32)[0]
+        if is_64_bit:
+            flags = struct.unpack_from("<I", data, offset + 4)[0]
+            file_offset = struct.unpack_from("<Q", data, offset + 8)[0]
+            file_size = struct.unpack_from("<Q", data, offset + 32)[0]
+        else:
+            file_offset = struct.unpack_from("<I", data, offset + 4)[0]
+            file_size = struct.unpack_from("<I", data, offset + 16)[0]
+            flags = struct.unpack_from("<I", data, offset + 24)[0]
         if kind == 1:
             if file_offset + file_size > len(data):
                 raise PackageError("binary has a truncated PT_LOAD segment")
@@ -91,14 +222,16 @@ def elf_data_contract(data: bytes, arch: str) -> None:
             )
         if kind != 2:  # PT_DYNAMIC
             continue
-        dynamic_offset = struct.unpack_from("<Q", data, offset + 8)[0]
-        dynamic_size = struct.unpack_from("<Q", data, offset + 32)[0]
+        dynamic_offset = file_offset
+        dynamic_size = file_size
         if dynamic_offset + dynamic_size > len(data):
             raise PackageError("binary has a truncated PT_DYNAMIC segment")
-        for entry in range(dynamic_offset, dynamic_offset + dynamic_size, 16):
-            if entry + 16 > len(data):
+        for entry in range(
+            dynamic_offset, dynamic_offset + dynamic_size, dynamic_entry_size
+        ):
+            if entry + dynamic_entry_size > len(data):
                 raise PackageError("binary has a truncated dynamic entry")
-            tag = struct.unpack_from("<q", data, entry)[0]
+            tag = struct.unpack_from("<q" if is_64_bit else "<i", data, entry)[0]
             if tag == 0:
                 break
             if tag == 1:  # DT_NEEDED
@@ -226,7 +359,7 @@ def payload_archive(binary: Path) -> tuple[bytes, int]:
 def render_info(arch: str, dsm_version: str, extract_size: int) -> bytes:
     template = (HERE / "INFO.template").read_text(encoding="utf-8")
     rendered = (
-        template.replace("@ARCH@", arch)
+        template.replace("@ARCH@", ARCHITECTURES[arch].info_value)
         .replace("@DSM_VERSION@", dsm_version)
         .replace("@EXTRACT_SIZE_KIB@", str((extract_size + 1023) // 1024))
     )

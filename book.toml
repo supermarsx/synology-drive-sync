@@ -27,6 +27,10 @@ git-repository-url = "https://github.com/supermarsx/synology-drive-sync"
 git-repository-icon = "fab-github"
 edit-url-template = "https://github.com/supermarsx/synology-drive-sync/edit/main/{path}"
 additional-css = ["docs/theme/sdsync.css"]
+additional-js = [
+    "docs/theme/release-selector-data.js",
+    "docs/theme/release-selector.js",
+]
 
 [output.html.fold]
 enable = true

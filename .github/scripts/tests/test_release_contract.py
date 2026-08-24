@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 import unittest
 import zipfile
 from pathlib import Path
@@ -17,12 +18,21 @@ TEST_ROOT = Path(__file__).resolve().parent
 REPOSITORY_ROOT = TEST_ROOT.parents[2]
 SCRIPT = TEST_ROOT.parent / "release-contract.py"
 FIXTURES = TEST_ROOT / "fixtures"
+NOTICE_SCRIPT = TEST_ROOT.parent / "verify-third-party-notices.py"
 
 SPEC = importlib.util.spec_from_file_location("release_contract", SCRIPT)
 if SPEC is None or SPEC.loader is None:  # pragma: no cover - import machinery invariant
     raise RuntimeError(f"could not load {SCRIPT}")
 release_contract = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(release_contract)
+
+NOTICE_SPEC = importlib.util.spec_from_file_location(
+    "verify_third_party_notices", NOTICE_SCRIPT
+)
+if NOTICE_SPEC is None or NOTICE_SPEC.loader is None:  # pragma: no cover
+    raise RuntimeError(f"could not load {NOTICE_SCRIPT}")
+verify_third_party_notices = importlib.util.module_from_spec(NOTICE_SPEC)
+NOTICE_SPEC.loader.exec_module(verify_third_party_notices)
 
 
 class FixtureContractTests(unittest.TestCase):
@@ -303,6 +313,7 @@ class AssetContractTests(unittest.TestCase):
             "THIRD_PARTY_LICENSES.html",
             "install.ps1",
             "install.sh",
+            "synology-drive-sync-26.7-armv7.spk",
             "synology-drive-sync-26.7-armv8.spk",
             "synology-drive-sync-26.7-c-sdk-linux-aarch64.tar.gz",
             "synology-drive-sync-26.7-c-sdk-linux-x86_64.tar.gz",
@@ -310,6 +321,7 @@ class AssetContractTests(unittest.TestCase):
             "synology-drive-sync-26.7-c-sdk-macos-x86_64.tar.gz",
             "synology-drive-sync-26.7-c-sdk-windows-aarch64.zip",
             "synology-drive-sync-26.7-c-sdk-windows-x86_64.zip",
+            "synology-drive-sync-26.7-i686.spk",
             "synology-drive-sync-26.7-linux-aarch64.tar.gz",
             "synology-drive-sync-26.7-linux-x86_64.tar.gz",
             "synology-drive-sync-26.7-macos-aarch64.tar.gz",
@@ -342,10 +354,14 @@ class AssetContractTests(unittest.TestCase):
                         archive.addfile(info, io.BytesIO(content))
 
     def test_exact_assets_and_checksum_membership(self):
+        self.assertEqual(
+            release_contract.SYNOLOGY_ARCHITECTURES,
+            ("armv7", "armv8", "i686", "x86_64"),
+        )
         self.assertEqual(release_contract.release_asset_names(self.TAG), self.EXACT_ASSETS)
-        self.assertEqual(len(release_contract.archive_names(self.TAG)), 15)
-        self.assertEqual(len(release_contract.payload_names(self.TAG)), 19)
-        self.assertEqual(len(release_contract.release_asset_names(self.TAG)), 20)
+        self.assertEqual(len(release_contract.archive_names(self.TAG)), 17)
+        self.assertEqual(len(release_contract.payload_names(self.TAG)), 21)
+        self.assertEqual(len(release_contract.release_asset_names(self.TAG)), 22)
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -353,10 +369,18 @@ class AssetContractTests(unittest.TestCase):
             release_contract.prepare_assets(root, self.TAG)
             self.assertEqual(
                 len((root / "ARCHIVE_SHA256SUMS").read_text().splitlines()),
-                15,
+                17,
             )
-            self.assertEqual(len((root / "SHA256SUMS").read_text().splitlines()), 19)
+            self.assertEqual(len((root / "SHA256SUMS").read_text().splitlines()), 21)
             release_contract.verify_assets(root, self.TAG, include_archive_manifest=True)
+            archive_manifest = (root / "ARCHIVE_SHA256SUMS").read_text(
+                encoding="utf-8"
+            )
+            for architecture in release_contract.SYNOLOGY_ARCHITECTURES:
+                self.assertIn(
+                    f"  synology-drive-sync-{self.TAG}-{architecture}.spk\n",
+                    archive_manifest,
+                )
             (root / "ARCHIVE_SHA256SUMS").unlink()
             release_contract.verify_assets(root, self.TAG)
             release_contract.verify_asset_names(self.TAG, self.EXACT_ASSETS)
@@ -461,6 +485,102 @@ class AssetContractTests(unittest.TestCase):
 
 
 class WorkflowWiringTests(unittest.TestCase):
+    def test_documentation_selector_is_a_required_rendered_gate(self):
+        workflow = (REPOSITORY_ROOT / ".github/workflows/docs.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("node --check docs/theme/release-selector-data.js", workflow)
+        self.assertIn("node --check docs/theme/release-selector.js", workflow)
+        self.assertIn("node --test tests/release-selector.test.cjs", workflow)
+        self.assertIn("test -s target/site/release-selector.html", workflow)
+        self.assertIn(
+            "for control in purpose model dsmVersion reportedArch desktopOs desktopCpu; do",
+            workflow,
+        )
+        self.assertIn("grep -Fq 'data-selector-result'", workflow)
+        self.assertIn("grep -Fq '&lt;fieldset'", workflow)
+
+    def test_release_notice_targets_cover_every_native_and_dsm_binary(self):
+        expected_targets = {
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+            "i686-unknown-linux-musl",
+            "armv7-unknown-linux-musleabihf",
+            "x86_64-pc-windows-msvc",
+            "aarch64-pc-windows-msvc",
+            "x86_64-apple-darwin",
+            "aarch64-apple-darwin",
+        }
+        with (REPOSITORY_ROOT / "about.toml").open("rb") as config_file:
+            configured_targets = set(tomllib.load(config_file)["targets"])
+        self.assertEqual(configured_targets, expected_targets)
+        self.assertEqual(
+            verify_third_party_notices.REQUIRED_TARGETS,
+            expected_targets,
+        )
+
+    def test_synology_matrix_is_dsm7_complete_pinned_and_emulated(self):
+        ci = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+        release = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        sections = (
+            ci[ci.index("  synology-package:") : ci.index("\n  packaging:")],
+            release[
+                release.index("  build-synology:") : release.index("\n  sbom:")
+            ],
+        )
+        targets = {
+            "x86_64": "x86_64-unknown-linux-musl",
+            "armv8": "aarch64-unknown-linux-musl",
+            "i686": "i686-unknown-linux-musl",
+            "armv7": "armv7-unknown-linux-musleabihf",
+        }
+        zig_action = (
+            "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29"
+        )
+        installer_action = (
+            "taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc"
+        )
+        qemu_image = (
+            "docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:"
+            "400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0"
+        )
+
+        for section in sections:
+            for architecture, target in targets.items():
+                self.assertEqual(section.count(f"synology_arch: {architecture}"), 1)
+                self.assertEqual(section.count(f"rust_target: {target}"), 1)
+            self.assertEqual(section.count("cross_compile: true"), 2)
+            self.assertEqual(section.count("cross_compile: false"), 2)
+            self.assertIn(zig_action, section)
+            self.assertIn("version: 0.16.0", section)
+            self.assertIn(installer_action, section)
+            self.assertIn("tool: cargo-zigbuild@0.23.2", section)
+            self.assertIn(qemu_image, section)
+            self.assertIn("qemu_binary: qemu-i386", section)
+            self.assertIn("qemu_binary: qemu-arm", section)
+            self.assertIn("qemu_cpu: qemu32", section)
+            self.assertIn("qemu_cpu: cortex-a9,neon=off,vfp-d32=off", section)
+            self.assertIn("cargo zigbuild --release --locked", section)
+            self.assertIn("QEMU_CPU=\"$QEMU_CPU\"", section)
+            self.assertIn(
+                '"$emulator" "$binary" synology-drive-sync --version', section
+            )
+            self.assertIn("Version5 EABI", section)
+            self.assertIn("hard-float ABI", section)
+            self.assertIn("elf_class: ELF32", section)
+            self.assertNotIn("armv5", section.lower())
+            self.assertNotIn("powerpc", section.lower())
+
+        self.assertIn(
+            "for synology_arch in armv7 armv8 i686 x86_64; do", release
+        )
+
     def test_release_precedes_ghcr_and_contract_helper_is_wired(self):
         workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
             encoding="utf-8"
