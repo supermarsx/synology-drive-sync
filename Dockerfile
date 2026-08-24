@@ -9,6 +9,8 @@ WORKDIR /build
 ENV SDSYNC_BUILD_VERSION=$VERSION
 
 COPY Cargo.toml Cargo.lock ./
+COPY crates/synology-drive-sync-ffi/Cargo.toml ./crates/synology-drive-sync-ffi/Cargo.toml
+COPY crates/synology-drive-sync-ffi/src/lib.rs ./crates/synology-drive-sync-ffi/src/lib.rs
 COPY build.rs ./
 COPY src ./src
 # `config init` embeds the starter configuration with include_str!, so the
@@ -17,7 +19,7 @@ COPY config.example.toml ./
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    cargo build --release --locked && \
+    cargo build --release --locked --package synology-drive-sync --bin synology-drive-sync && \
     cp target/release/synology-drive-sync /tmp/synology-drive-sync
 
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
