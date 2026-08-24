@@ -96,11 +96,7 @@ jobs:
           set -euo pipefail
 
           # `grep` exits 1 when nothing matches, which is a legitimate empty
-          # result for every filter below; any other status is a real failure
-          # and must propagate. Audit H4: the previous `mapfile < <(...)` form
-          # discarded the exit status of the whole pipeline, so an API error or
-          # a jq parse failure produced an empty array and the script carried on
-          # against false data. Everything below materialises to a file first.
+          # result for the tag filter below; any other status is a real failure.
           grep_optional() {
             local status=0
             grep -E "$1" || status=$?
@@ -144,149 +140,85 @@ jobs:
             > "$release_pages"
           jq -s 'add // []' "$release_pages" > "$release_index"
 
-          published_file="$RUNNER_TEMP/sdsync-published-for-sha.txt"
-          jq -r '.[] | select(.draft == false) | .tag_name' "$release_index" \
+          # Normalize git state once, then make every calendar-tag and stale-run
+          # decision in the fixture-tested helper. A merge-base exit status of
+          # 1 means "not an ancestor"; anything else is an infrastructure error.
+          calendar_tags="$RUNNER_TEMP/sdsync-calendar-tags.txt"
+          git tag --list \
             | grep_optional '^[0-9]{2}\.[1-9][0-9]*$' \
-            | while read -r candidate; do
-                if git rev-parse --verify --quiet "refs/tags/$candidate" >/dev/null && \
-                  [[ "$(git rev-list -n 1 "$candidate")" == "$sha" ]]; then
-                  printf '%s\n' "$candidate"
-                fi
-              done \
-            | LC_ALL=C sort -V > "$published_file"
-          mapfile -t published_for_sha < "$published_file"
-
-          drafts_file="$RUNNER_TEMP/sdsync-drafts-for-sha.txt"
-          jq -r --arg sha "$sha" \
-            '.[] | select(.draft == true and .target_commitish == $sha) | .tag_name' \
-            "$release_index" \
-            | grep_optional '^[0-9]{2}\.[1-9][0-9]*$' \
-            | LC_ALL=C sort -V > "$drafts_file"
-          mapfile -t drafts_for_sha < "$drafts_file"
-
-          already_published=false
-          if (( ${#published_for_sha[@]} > 0 )); then
-            tag=${published_for_sha[-1]}
-            already_published=true
-          elif (( ${#drafts_for_sha[@]} > 1 )); then
-            # Audit C3: this used to exit 1 with a one-line message and no way
-            # out, wedging every future run for this commit. Print exactly what
-            # a human has to delete.
-            {
-              echo "multiple calendar-release drafts target $sha; refusing an ambiguous resume."
-              echo
-              echo "Offending draft releases:"
-              jq -r --arg sha "$sha" '
-                .[]
-                | select(.draft == true
-                    and .target_commitish == $sha
-                    and (.tag_name | test("^[0-9]{2}\\.[1-9][0-9]*$")))
-                | "  id=\(.id)  tag=\(.tag_name)  \(.html_url)"
-              ' "$release_index"
-              echo
-              echo "Delete all but the one to keep, then re-run this workflow:"
-              jq -r --arg sha "$sha" --arg repo "$GITHUB_REPOSITORY" '
-                .[]
-                | select(.draft == true
-                    and .target_commitish == $sha
-                    and (.tag_name | test("^[0-9]{2}\\.[1-9][0-9]*$")))
-                | "  gh api --method DELETE repos/\($repo)/releases/\(.id)"
-              ' "$release_index"
-              echo
-              echo "Delete by id as shown. 'gh release delete <tag>' resolves a duplicated"
-              echo "tag name non-deterministically and may remove the wrong draft."
-            } >&2
-            exit 1
-          elif (( ${#drafts_for_sha[@]} == 1 )); then
-            tag=${drafts_for_sha[0]}
-            if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null && \
-              [[ "$(git rev-list -n 1 "$tag")" != "$sha" ]]; then
-              echo "draft release $tag conflicts with an existing tag" >&2
-              exit 1
-            fi
-          else
-            tags_file="$RUNNER_TEMP/sdsync-tags-for-sha.txt"
-            git tag --list \
-              | grep_optional '^[0-9]{2}\.[1-9][0-9]*$' \
-              | while read -r candidate; do
-                  if [[ "$(git rev-list -n 1 "$candidate")" == "$sha" ]]; then
-                    printf '%s\n' "$candidate"
-                  fi
-                done \
-              | LC_ALL=C sort -V > "$tags_file"
-            mapfile -t tags_for_sha < "$tags_file"
-            if (( ${#tags_for_sha[@]} > 0 )); then
-              tag=${tags_for_sha[-1]}
-            else
-              year=$(date -u +%y)
-              year_candidates="$RUNNER_TEMP/sdsync-year-candidates.txt"
-              {
-                git tag --list "$year.*"
-                jq -r '.[].tag_name' "$release_index"
-              } > "$year_candidates"
-              year_numbers="$RUNNER_TEMP/sdsync-year-numbers.txt"
-              grep_optional "^${year}\.[1-9][0-9]*$" < "$year_candidates" \
-                | cut -d. -f2 \
-                | LC_ALL=C sort -n > "$year_numbers"
-              latest=$(tail -n 1 "$year_numbers")
-              tag="$year.$((${latest:-0} + 1))"
-            fi
-          fi
-
-          # Audit H2: nothing above establishes that $sha is still part of main
-          # or newer than what has already shipped. Re-running an old green CI
-          # run re-fires workflow_run, and a workflow_dispatch only proves "this
-          # commit was green on main at some point" -- true forever, including
-          # for a commit that was later reverted or force-pushed away. Without
-          # these two assertions such a run allocates a fresh YY.N for stale
-          # code and publishes it as --latest.
-          #
-          # Skipped when the commit is already published: that path exists
-          # precisely so a re-run of an old, successful release is a clean
-          # no-op, and its commit is legitimately behind main.
-          if [[ "$already_published" != true ]]; then
-            main_sha=$(git rev-parse refs/remotes/origin/main)
-            if ! git merge-base --is-ancestor "$sha" "$main_sha"; then
-              echo "refusing to release $sha: it is not reachable from origin/main ($main_sha)" >&2
-              exit 1
-            fi
-            newest_tags="$RUNNER_TEMP/sdsync-newest-tags.txt"
-            git tag --list \
-              | grep_optional '^[0-9]{2}\.[1-9][0-9]*$' \
-              | LC_ALL=C sort -V > "$newest_tags"
-            newest_tag=$(tail -n 1 "$newest_tags")
-            if [[ -n "$newest_tag" ]]; then
-              newest_commit=$(git rev-list -n 1 "$newest_tag")
-              if ! git merge-base --is-ancestor "$newest_commit" "$sha"; then
-                echo "refusing to release $sha: it predates the newest release $newest_tag ($newest_commit)" >&2
-                echo "re-running an old CI run cannot cut a new release of stale code" >&2
-                exit 1
-              fi
-            fi
-          fi
-
-          # Newest calendar tag reachable from $sha, excluding $sha's own tag on
-          # the resume path. Empty for the first release; the notes renderer
-          # turns that into "Initial release".
-          prev_tag_candidates="$RUNNER_TEMP/sdsync-prev-tags.txt"
-          git tag --list --merged "$sha" \
-            | grep_optional '^[0-9]{2}\.[1-9][0-9]*$' \
-            | LC_ALL=C sort -V > "$prev_tag_candidates"
-          prev_tag=""
+            | LC_ALL=C sort -V > "$calendar_tags"
+          tag_index="$RUNNER_TEMP/sdsync-tag-index.json"
+          printf '[]\n' > "$tag_index"
           while IFS= read -r candidate; do
-            if [[ "$candidate" != "$tag" ]]; then
-              prev_tag="$candidate"
-            fi
-          done < "$prev_tag_candidates"
+            [[ -n "$candidate" ]] || continue
+            candidate_sha=$(git rev-list -n 1 "$candidate")
+            ancestor_status=0
+            git merge-base --is-ancestor "$candidate_sha" "$sha" || ancestor_status=$?
+            case "$ancestor_status" in
+              0) ancestor=true ;;
+              1) ancestor=false ;;
+              *) echo "could not compare tag $candidate with $sha" >&2; exit "$ancestor_status" ;;
+            esac
+            next_tag_index="$RUNNER_TEMP/sdsync-tag-index-next.json"
+            jq \
+              --arg name "$candidate" \
+              --arg sha "$candidate_sha" \
+              --argjson ancestor "$ancestor" \
+              '. + [{name: $name, sha: $sha, ancestor_of_sha: $ancestor}]' \
+              "$tag_index" > "$next_tag_index"
+            mv "$next_tag_index" "$tag_index"
+          done < "$calendar_tags"
 
-          repository=${GITHUB_REPOSITORY,,}
-          build_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          main_sha=$(git rev-parse refs/remotes/origin/main)
+          main_status=0
+          git merge-base --is-ancestor "$sha" "$main_sha" || main_status=$?
+          case "$main_status" in
+            0) sha_reachable=true ;;
+            1) sha_reachable=false ;;
+            *) echo "could not compare $sha with origin/main ($main_sha)" >&2; exit "$main_status" ;;
+          esac
+
+          selection_input="$RUNNER_TEMP/sdsync-version-input.json"
+          selection="$RUNNER_TEMP/sdsync-version.json"
+          jq -n \
+            --arg sha "$sha" \
+            --arg main_sha "$main_sha" \
+            --argjson sha_reachable "$sha_reachable" \
+            --arg year "$(date -u +%y)" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg build_timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --slurpfile releases "$release_index" \
+            --slurpfile tags "$tag_index" '
+              {
+                sha: $sha,
+                main_sha: $main_sha,
+                sha_reachable_from_main: $sha_reachable,
+                year: $year,
+                repository: $repository,
+                build_timestamp: $build_timestamp,
+                releases: $releases[0],
+                tags: $tags[0]
+              }
+            ' > "$selection_input"
+          python3 .github/scripts/release-contract.py select-version \
+            --input "$selection_input" \
+            --output "$selection"
+
+          tag=$(jq -er '.tag' "$selection")
+          prev_tag=$(jq -er '.prev_tag' "$selection")
+          build_timestamp=$(jq -er '.build_timestamp' "$selection")
+          image=$(jq -er '.image' "$selection")
+          already_published=$(jq -r '.already_published' "$selection")
+          [[ "$already_published" == true || "$already_published" == false ]] || {
+            echo "release helper returned a malformed already_published value" >&2
+            exit 1
+          }
           {
             echo "tag=$tag"
             echo "prev_tag=$prev_tag"
             echo "sha=$sha"
             echo "build_timestamp=$build_timestamp"
-            echo "image=ghcr.io/$repository"
+            echo "image=$image"
             echo "already_published=$already_published"
           } >> "$GITHUB_OUTPUT"
           echo "Release version: $tag ($sha); previous: ${prev_tag:-<none>}; already published: $already_published"
@@ -332,6 +264,46 @@ jobs:
         env:
           SDSYNC_BUILD_VERSION: ${{ needs.version.outputs.tag }}
         run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Build unwind-safe C SDK shared library
+        env:
+          SDSYNC_BUILD_VERSION: ${{ needs.version.outputs.tag }}
+        run: >-
+          cargo build -p synology-drive-sync-ffi --profile ffi-release --locked
+          --target "${{ matrix.target }}"
+      - name: Compile, link and load the C SDK example
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          library_dir="target/$TARGET/ffi-release"
+          smoke="$RUNNER_TEMP/sdsync-c-sdk-smoke"
+          cc \
+            -std=c11 \
+            -Wall -Wextra -Wpedantic -Werror \
+            -I include \
+            examples/ffi/basic.c \
+            -L "$library_dir" \
+            -lsdsync \
+            -o "$smoke"
+          smoke_status=0
+          if [[ "$PLATFORM" == linux ]]; then
+            LD_LIBRARY_PATH="$library_dir" "$smoke" \
+              > "$RUNNER_TEMP/sdsync-c-smoke.stdout" \
+              2> "$RUNNER_TEMP/sdsync-c-smoke.stderr" || smoke_status=$?
+          else
+            DYLD_LIBRARY_PATH="$library_dir" "$smoke" \
+              > "$RUNNER_TEMP/sdsync-c-smoke.stdout" \
+              2> "$RUNNER_TEMP/sdsync-c-smoke.stderr" || smoke_status=$?
+          fi
+          [[ "$smoke_status" -eq 2 ]] || {
+            echo "C SDK example no-argument probe exited $smoke_status, expected 2" >&2
+            cat "$RUNNER_TEMP/sdsync-c-smoke.stderr" >&2
+            exit 1
+          }
+          grep -F 'usage:' "$RUNNER_TEMP/sdsync-c-smoke.stderr" >/dev/null
+          grep -F 'REQUEST.json' "$RUNNER_TEMP/sdsync-c-smoke.stderr" >/dev/null
       - name: Verify Linux ABI baseline
         if: matrix.platform == 'linux'
         shell: bash
@@ -339,31 +311,37 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          binary="target/$TARGET/release/synology-drive-sync"
-          glibc_file="$RUNNER_TEMP/sdsync-glibc-versions.txt"
-          if ! readelf --version-info --wide "$binary" \
-            | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' \
-            | LC_ALL=C sort -Vu > "$glibc_file"; then
-            echo "could not read GLIBC version requirements from $binary" >&2
-            exit 1
-          fi
-          mapfile -t glibc_versions < "$glibc_file"
-          [[ "${#glibc_versions[@]}" -gt 0 ]] || {
-            echo "$binary declares no GLIBC symbol versions; refusing to ship an unverifiable ABI" >&2
-            exit 1
-          }
-          max_glibc="${glibc_versions[${#glibc_versions[@]} - 1]#GLIBC_}"
-          if [[ "$(printf '%s\n' "$max_glibc" '2.35' | LC_ALL=C sort -V | tail -n 1)" != '2.35' ]]; then
-            echo "Linux binary requires GLIBC_$max_glibc; release ceiling is GLIBC_2.35" >&2
-            exit 1
-          fi
+          artifacts=(
+            "target/$TARGET/release/synology-drive-sync"
+            "target/$TARGET/ffi-release/libsdsync.so"
+          )
+          for artifact in "${artifacts[@]}"; do
+            glibc_file="$RUNNER_TEMP/$(basename -- "$artifact").glibc-versions.txt"
+            if ! readelf --version-info --wide "$artifact" \
+              | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' \
+              | LC_ALL=C sort -Vu > "$glibc_file"; then
+              echo "could not read GLIBC version requirements from $artifact" >&2
+              exit 1
+            fi
+            mapfile -t glibc_versions < "$glibc_file"
+            [[ "${#glibc_versions[@]}" -gt 0 ]] || {
+              echo "$artifact declares no GLIBC symbol versions; refusing to ship an unverifiable ABI" >&2
+              exit 1
+            }
+            max_glibc="${glibc_versions[${#glibc_versions[@]} - 1]#GLIBC_}"
+            if [[ "$(printf '%s\n' "$max_glibc" '2.35' | LC_ALL=C sort -V | tail -n 1)" != '2.35' ]]; then
+              echo "$artifact requires GLIBC_$max_glibc; release ceiling is GLIBC_2.35" >&2
+              exit 1
+            fi
 
-          needed=$(readelf --dynamic --wide "$binary" | awk '/NEEDED/ { gsub(/[\[\]]/, "", $NF); print $NF }')
-          printf 'Maximum GLIBC version: GLIBC_%s\nDynamic dependencies:\n%s\n' "$max_glibc" "$needed"
-          if grep -Eq '^(libsecret|libdbus|libssl|libcrypto)' <<<"$needed"; then
-            echo 'Linux release unexpectedly links a forbidden native vault or TLS library' >&2
-            exit 1
-          fi
+            needed=$(readelf --dynamic --wide "$artifact" | awk '/NEEDED/ { gsub(/[\[\]]/, "", $NF); print $NF }')
+            printf '%s maximum GLIBC version: GLIBC_%s\nDynamic dependencies:\n%s\n' \
+              "$artifact" "$max_glibc" "$needed"
+            if grep -Eq '^(libsecret|libdbus|libssl|libcrypto)' <<<"$needed"; then
+              echo "$artifact unexpectedly links a forbidden native vault or TLS library" >&2
+              exit 1
+            fi
+          done
       - name: Assemble archive
         shell: bash
         env:
@@ -395,10 +373,68 @@ jobs:
             exit 1
           }
           tar -czf "$archive_root.tar.gz" -C package "$archive_root"
+      - name: Assemble C SDK archive
+        shell: bash
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          set -euo pipefail
+          sdk_root="synology-drive-sync-$TAG-c-sdk-$PLATFORM-$ARCHITECTURE"
+          sdk_package="package/$sdk_root"
+          mkdir -p "$sdk_package/include" "$sdk_package/lib" "$sdk_package/examples/ffi"
+          install -m 0644 include/sdsync.h "$sdk_package/include/sdsync.h"
+          install -m 0644 examples/ffi/basic.c "$sdk_package/examples/ffi/basic.c"
+          install -m 0644 LICENSE THIRD_PARTY_LICENSES.html "$sdk_package/"
+          case "$PLATFORM" in
+            linux) library="target/$TARGET/ffi-release/libsdsync.so" ;;
+            macos) library="target/$TARGET/ffi-release/libsdsync.dylib" ;;
+            *) echo "unsupported C SDK platform: $PLATFORM" >&2; exit 1 ;;
+          esac
+          description=$(file -b "$library")
+          case "$PLATFORM/$ARCHITECTURE" in
+            linux/x86_64) expected_machine='Advanced Micro Devices X86-64' ;;
+            linux/aarch64) expected_machine='AArch64' ;;
+            macos/x86_64)
+              [[ "$description" == *'Mach-O 64-bit dynamically linked shared library x86_64'* ]] || {
+                echo "unexpected macOS x86_64 library kind: $description" >&2
+                exit 1
+              }
+              ;;
+            macos/aarch64)
+              [[ "$description" == *'Mach-O 64-bit dynamically linked shared library arm64'* ]] || {
+                echo "unexpected macOS arm64 library kind: $description" >&2
+                exit 1
+              }
+              ;;
+            *) echo "unsupported C SDK architecture: $PLATFORM/$ARCHITECTURE" >&2; exit 1 ;;
+          esac
+          if [[ "$PLATFORM" == linux ]]; then
+            [[ "$description" == *'ELF 64-bit LSB shared object'* ]] || {
+              echo "unexpected Linux shared-library kind: $description" >&2
+              exit 1
+            }
+            elf_type=$(readelf --file-header --wide "$library" | awk -F: '/Type:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')
+            elf_machine=$(readelf --file-header --wide "$library" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')
+            [[ "$elf_type" == DYN* ]] || {
+              echo "Linux C SDK output is not a shared object: $elf_type" >&2
+              exit 1
+            }
+            [[ "$elf_machine" == "$expected_machine" ]] || {
+              echo "Linux C SDK machine is $elf_machine, expected $expected_machine" >&2
+              exit 1
+            }
+          fi
+          install -m 0755 "$library" "$sdk_package/lib/$(basename -- "$library")"
+          tar -czf "$sdk_root.tar.gz" -C package "$sdk_root"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-${{ matrix.platform }}-${{ matrix.architecture }}
-          path: synology-drive-sync-${{ needs.version.outputs.tag }}-${{ matrix.platform }}-${{ matrix.architecture }}.tar.gz
+          path: |
+            synology-drive-sync-${{ needs.version.outputs.tag }}-${{ matrix.platform }}-${{ matrix.architecture }}.tar.gz
+            synology-drive-sync-${{ needs.version.outputs.tag }}-c-sdk-${{ matrix.platform }}-${{ matrix.architecture }}.tar.gz
           if-no-files-found: error
           retention-days: 7
 
@@ -433,6 +469,76 @@ jobs:
         env:
           SDSYNC_BUILD_VERSION: ${{ needs.version.outputs.tag }}
         run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Build unwind-safe C SDK shared library
+        env:
+          SDSYNC_BUILD_VERSION: ${{ needs.version.outputs.tag }}
+        run: >-
+          cargo build -p synology-drive-sync-ffi --profile ffi-release --locked
+          --target "${{ matrix.target }}"
+      - name: Compile, link and load the C SDK example
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $installationPath = @(& $vswhere -latest -products * -property installationPath)[0]
+          if (-not $installationPath) { throw 'Visual Studio installation was not found' }
+          $devCmd = Join-Path $installationPath 'Common7/Tools/VsDevCmd.bat'
+          $vcArch = switch ($env:ARCHITECTURE) {
+            'x86_64' { 'x64' }
+            'aarch64' { 'arm64' }
+            default { throw "unsupported Windows C SDK architecture $env:ARCHITECTURE" }
+          }
+          $devCommand = "`"$devCmd`" -no_logo -arch=$vcArch -host_arch=$vcArch >nul && set"
+          $environmentLines = @(& $env:ComSpec /d /s /c $devCommand)
+          if ($LASTEXITCODE -ne 0) { throw 'Visual Studio developer environment setup failed' }
+          foreach ($line in $environmentLines) {
+            $separator = $line.IndexOf('=')
+            if ($separator -gt 0) {
+              [Environment]::SetEnvironmentVariable(
+                $line.Substring(0, $separator),
+                $line.Substring($separator + 1),
+                'Process')
+            }
+          }
+          if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+            throw "MSVC compiler is unavailable for $vcArch"
+          }
+          $libraryRoot = "target/$env:TARGET/ffi-release"
+          $smokeRoot = Join-Path $env:RUNNER_TEMP 'sdsync-c-sdk-smoke'
+          New-Item -ItemType Directory -Path $smokeRoot | Out-Null
+          $smokeExe = Join-Path $smokeRoot 'sdsync-c-sdk-smoke.exe'
+          $objectFile = Join-Path $smokeRoot 'basic.obj'
+          $importLibrary = Join-Path $libraryRoot 'sdsync.dll.lib'
+          $compileArgs = @(
+            '/nologo'
+            '/std:c11'
+            '/W4'
+            '/WX'
+            '/D_CRT_SECURE_NO_WARNINGS'
+            '/Iinclude'
+            'examples/ffi/basic.c'
+            $importLibrary
+            "/Fo$objectFile"
+            "/Fe$smokeExe"
+          )
+          & cl.exe @compileArgs
+          if ($LASTEXITCODE -ne 0) { throw 'strict C SDK example compilation failed' }
+          Copy-Item -LiteralPath (Join-Path $libraryRoot 'sdsync.dll') -Destination $smokeRoot
+          $usageOutput = @(& $smokeExe 2>&1)
+          $usageStatus = $LASTEXITCODE
+          if ($usageStatus -ne 2) {
+            throw "C SDK example no-argument probe exited $usageStatus, expected 2: $($usageOutput -join [Environment]::NewLine)"
+          }
+          $renderedUsage = $usageOutput -join [Environment]::NewLine
+          if (-not $renderedUsage.Contains('usage:') -or
+              -not $renderedUsage.Contains('REQUEST.json')) {
+            throw "C SDK example did not render its usage contract: $renderedUsage"
+          }
+          $global:LASTEXITCODE = 0
       - name: Assemble archive
         shell: pwsh
         env:
@@ -471,10 +577,60 @@ jobs:
             throw "binary version did not exactly match ${expected}: $reported"
           }
           Compress-Archive -Path $packageRoot -DestinationPath "$root.zip"
+      - name: Assemble C SDK archive
+        shell: pwsh
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sdkRoot = "synology-drive-sync-$env:TAG-c-sdk-windows-$env:ARCHITECTURE"
+          $sdkPackage = Join-Path 'package' $sdkRoot
+          $includeRoot = Join-Path $sdkPackage 'include'
+          $libraryRoot = Join-Path $sdkPackage 'lib'
+          $exampleRoot = Join-Path $sdkPackage 'examples/ffi'
+          New-Item -ItemType Directory -Path $includeRoot, $libraryRoot, $exampleRoot | Out-Null
+          Copy-Item -LiteralPath include/sdsync.h -Destination (Join-Path $includeRoot 'sdsync.h')
+          Copy-Item -LiteralPath examples/ffi/basic.c -Destination (Join-Path $exampleRoot 'basic.c')
+          Copy-Item -LiteralPath LICENSE, THIRD_PARTY_LICENSES.html -Destination $sdkPackage
+          $targetRoot = "target/$env:TARGET/ffi-release"
+          $dll = Join-Path $targetRoot 'sdsync.dll'
+          $dllBytes = [IO.File]::ReadAllBytes($dll)
+          if ($dllBytes.Length -lt 64 -or $dllBytes[0] -ne 0x4d -or $dllBytes[1] -ne 0x5a) {
+            throw "$dll is not a valid PE image"
+          }
+          $peOffset = [BitConverter]::ToInt32($dllBytes, 0x3c)
+          if ($peOffset -lt 0 -or $peOffset + 24 -gt $dllBytes.Length -or
+              [Text.Encoding]::ASCII.GetString($dllBytes, $peOffset, 4) -cne "PE`0`0") {
+            throw "$dll has an invalid PE header"
+          }
+          $machine = [BitConverter]::ToUInt16($dllBytes, $peOffset + 4)
+          $expectedMachine = switch ($env:ARCHITECTURE) {
+            'x86_64' { 0x8664 }
+            'aarch64' { 0xaa64 }
+            default { throw "unsupported Windows C SDK architecture $env:ARCHITECTURE" }
+          }
+          if ($machine -ne $expectedMachine) {
+            throw ('{0} PE machine is 0x{1:x4}, expected 0x{2:x4}' -f $dll, $machine, $expectedMachine)
+          }
+          $characteristics = [BitConverter]::ToUInt16($dllBytes, $peOffset + 22)
+          if (($characteristics -band 0x2000) -eq 0) {
+            throw "$dll is not marked as a DLL"
+          }
+          Copy-Item -LiteralPath $dll -Destination $libraryRoot
+          $generatedImportLibrary = Join-Path $targetRoot 'sdsync.dll.lib'
+          if (-not (Test-Path -LiteralPath $generatedImportLibrary -PathType Leaf)) {
+            throw "MSVC did not generate expected import library $generatedImportLibrary"
+          }
+          Copy-Item -LiteralPath $generatedImportLibrary -Destination (Join-Path $libraryRoot 'sdsync.lib')
+          Compress-Archive -Path $sdkPackage -DestinationPath "$sdkRoot.zip"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-windows-${{ matrix.architecture }}
-          path: synology-drive-sync-${{ needs.version.outputs.tag }}-windows-${{ matrix.architecture }}.zip
+          path: |
+            synology-drive-sync-${{ needs.version.outputs.tag }}-windows-${{ matrix.architecture }}.zip
+            synology-drive-sync-${{ needs.version.outputs.tag }}-c-sdk-windows-${{ matrix.architecture }}.zip
           if-no-files-found: error
           retention-days: 7
 
@@ -590,10 +746,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
         with:
           toolchain: 1.88.0
+      - name: Validate the Rust SDK package
+        run: cargo package -p synology-drive-sync --locked
       - name: Generate CycloneDX JSON
         env:
           TAG: ${{ needs.version.outputs.tag }}
           REPOSITORY: ${{ github.repository }}
+          BUILD_TIMESTAMP: ${{ needs.version.outputs.build_timestamp }}
         shell: bash
         run: |
           set -euo pipefail
@@ -608,19 +767,54 @@ jobs:
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
           export SOURCE_DATE_EPOCH
           cargo install cargo-cyclonedx --version 0.5.9 --locked
-          cargo cyclonedx -f json --all-features --target all
-          source_sbom=$(find . -maxdepth 2 -type f -name '*.cdx.json' -print -quit)
-          [[ -n "$source_sbom" ]] || {
-            echo 'cargo-cyclonedx produced no *.cdx.json document' >&2
+          cargo cyclonedx -f json --spec-version 1.5 --all-features --target all
+          root_source_sbom="synology-drive-sync.cdx.json"
+          ffi_source_sbom="crates/synology-drive-sync-ffi/synology-drive-sync-ffi.cdx.json"
+          [[ -f "$root_source_sbom" && -f "$ffi_source_sbom" ]] || {
+            echo 'cargo-cyclonedx did not produce both exact workspace-member SBOMs' >&2
             exit 1
           }
-          old_ref=$(jq -er '.metadata.component["bom-ref"] | select(type == "string" and length > 0)' "$source_sbom")
-          old_purl=$(jq -er '.metadata.component.purl | select(type == "string" and length > 0)' "$source_sbom")
+          jq -e '
+            .metadata.component.name == "synology-drive-sync"
+          ' "$root_source_sbom" >/dev/null || {
+            echo 'root workspace-member SBOM has an unexpected component' >&2
+            exit 1
+          }
+          jq -e '
+            .metadata.component.name == "synology-drive-sync-ffi"
+            and any(.components[]?; .name == "synology-drive-sync")
+          ' "$ffi_source_sbom" >/dev/null || {
+            echo 'FFI workspace-member SBOM does not include both FFI and root packages' >&2
+            exit 1
+          }
+
+          cyclonedx_cli="$RUNNER_TEMP/cyclonedx"
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            "https://github.com/CycloneDX/cyclonedx-cli/releases/download/v0.33.1/cyclonedx-linux-x64" \
+            --output "$cyclonedx_cli"
+          printf '%s  %s\n' \
+            'bfc8b2538da86fe239bc53658bbb63c1c8c510a293c1e6891aa5bea5d3c58746' \
+            "$cyclonedx_cli" | sha256sum --check --status || {
+              echo 'CycloneDX CLI v0.33.1 checksum verification failed' >&2
+              exit 1
+            }
+          chmod 0755 "$cyclonedx_cli"
+
+          merged="$RUNNER_TEMP/sdsync-workspace.cdx.json"
+          "$cyclonedx_cli" merge \
+            --input-files "$root_source_sbom" "$ffi_source_sbom" \
+            --hierarchical \
+            --group supermarsx \
+            --name synology-drive-sync \
+            --version "$TAG" \
+            --output-format json \
+            --output-version v1_5 \
+            --output-file "$merged"
+          aggregate_ref=$(jq -er '.metadata.component["bom-ref"] | select(type == "string" and length > 0)' "$merged")
           root_purl="pkg:github/$REPOSITORY@$TAG"
-          # cargo-cyclonedx omits the random serial number whenever SOURCE_DATE_EPOCH
-          # is set, but actions/attest only recognises a CycloneDX document that
-          # carries bomFormat, specVersion and serialNumber. Derive a stable UUIDv5
-          # so the SBOM stays byte-reproducible and remains attestable.
+          # The hierarchical merge retains both workspace-member identities.
+          # Normalize only the aggregate release identity, serial and timestamp
+          # so the published SBOM remains byte-reproducible and attestable.
           serial="urn:uuid:$(
             python3 -c 'import sys, uuid; print(uuid.uuid5(uuid.NAMESPACE_URL, sys.argv[1]))' \
               "https://github.com/$REPOSITORY/releases/tag/$TAG"
@@ -633,57 +827,58 @@ jobs:
           trap 'rm -f -- "$normalized"' EXIT
           jq \
             --arg tag "$TAG" \
-            --arg old_ref "$old_ref" \
-            --arg old_purl "$old_purl" \
+            --arg aggregate_ref "$aggregate_ref" \
+            --arg build_timestamp "$BUILD_TIMESTAMP" \
             --arg root_purl "$root_purl" \
             --arg serial "$serial" '
-              def reprefix($old; $new):
-                if type == "string" and startswith($old)
-                then $new + .[($old | length):]
-                else .
-                end;
-              walk(reprefix($old_ref; $root_purl) | reprefix($old_purl; $root_purl))
+              walk(if type == "string" and . == $aggregate_ref then $root_purl else . end)
               | .serialNumber = $serial
+              | .metadata.timestamp = $build_timestamp
+              | .metadata.component.type = "application"
+              | .metadata.component.group = "supermarsx"
+              | .metadata.component.name = "synology-drive-sync"
               | .metadata.component.version = $tag
               | .metadata.component.purl = $root_purl
               | .metadata.component["bom-ref"] = $root_purl
-              | .metadata.component.components |= map(.version = $tag)
-            ' "$source_sbom" > "$normalized"
+            ' "$merged" > "$normalized"
           mv "$normalized" "synology-drive-sync-$TAG.cdx.json"
           jq -e \
             --arg tag "$TAG" \
-            --arg old_ref "$old_ref" \
-            --arg old_purl "$old_purl" \
+            --arg build_timestamp "$BUILD_TIMESTAMP" \
             --arg root_purl "$root_purl" \
             --arg serial "$serial" '
               ([.metadata.component, .components[]?]
-                | [.[] | recurse(.components[]?) | .["bom-ref"]]
-                | unique) as $component_refs
+                | [.[] | recurse(.components[]?)]) as $components
+              | ($components | map(.["bom-ref"])) as $refs
+              | ($refs | unique) as $component_refs
               |
               .bomFormat == "CycloneDX"
               and .serialNumber == $serial
-              and ((.specVersion | type) == "string")
-              and ((.specVersion | length) > 0)
+              and .specVersion == "1.5"
+              and .metadata.timestamp == $build_timestamp
               and ((.components | type) == "array")
-              and any(.metadata.properties[]?;
-                .name == "cdx:rustc:sbom:target:all_targets" and .value == "true")
+              and .metadata.component.type == "application"
+              and .metadata.component.group == "supermarsx"
               and .metadata.component.name == "synology-drive-sync"
               and .metadata.component.version == $tag
               and .metadata.component.purl == $root_purl
               and .metadata.component["bom-ref"] == $root_purl
-              and ((.metadata.component.components | type) == "array")
-              and ((.metadata.component.components | length) > 0)
-              and all(.metadata.component.components[];
-                .version == $tag
-                and (.purl | startswith($root_purl))
-                and (.["bom-ref"] | startswith($root_purl)))
+              and any($components[]; .name == "synology-drive-sync-ffi")
+              and any($components[];
+                .name == "synology-drive-sync" and .["bom-ref"] != $root_purl)
+              and all($refs[]; type == "string" and length > 0)
+              and ($refs | length) == ($component_refs | length)
               and any(.dependencies[]; .ref == $root_purl)
               and all(.dependencies[]?;
                 (.ref as $ref | $component_refs | index($ref)) != null
                 and all(.dependsOn[]?;
                   . as $ref | ($component_refs | index($ref)) != null))
-              and ([.. | strings | select(startswith($old_ref) or startswith($old_purl))] | length) == 0
             ' "synology-drive-sync-$TAG.cdx.json" >/dev/null
+          "$cyclonedx_cli" validate \
+            --input-file "synology-drive-sync-$TAG.cdx.json" \
+            --input-format json \
+            --input-version v1_5 \
+            --fail-on-errors
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-sbom
@@ -814,6 +1009,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
+      actions: read
       contents: write
       id-token: write
       attestations: write
@@ -846,79 +1042,70 @@ jobs:
           set -euo pipefail
           git fetch --force --tags origin
 
-          # Audit C1: `GET /repos/{owner}/{repo}/releases/tags/{tag}` returns
-          # PUBLISHED releases only. A draft has no git tag and is structurally
-          # unresolvable by tag name at any permission level, so the previous
-          # lookup 404'd on every first run -- after the draft had already been
-          # created. List releases and select by tag_name instead, then address
-          # the release by .id from here on.
+          # Drafts cannot be resolved by the tag endpoint. List every release,
+          # then let the tested helper reject duplicates, stale targets,
+          # conflicting tags and already-published immutable state.
           release_pages="$RUNNER_TEMP/sdsync-stage-release-pages.json"
-          matches="$RUNNER_TEMP/sdsync-stage-release-matches.json"
+          release_index="$RUNNER_TEMP/sdsync-stage-release-index.json"
           gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
             > "$release_pages"
-          jq -s --arg tag "$TAG" 'add // [] | map(select(.tag_name == $tag))' \
-            "$release_pages" > "$matches"
-          match_count=$(jq 'length' "$matches")
+          jq -s 'add // []' "$release_pages" > "$release_index"
 
-          if (( match_count > 1 )); then
-            {
-              echo "$match_count releases carry the tag name $TAG; refusing an ambiguous resume."
-              echo
-              echo "Offending releases:"
-              jq -r '.[] | "  id=\(.id)  draft=\(.draft)  target=\(.target_commitish)  \(.html_url)"' "$matches"
-              echo
-              echo "Delete all but the one to keep, then re-run this workflow:"
-              jq -r --arg repo "$GITHUB_REPOSITORY" \
-                '.[] | "  gh api --method DELETE repos/\($repo)/releases/\(.id)"' "$matches"
-              echo
-              echo "Delete by id as shown. 'gh release delete \"$TAG\"' resolves a duplicated"
-              echo "tag name non-deterministically and may remove the wrong release."
-            } >&2
-            exit 1
-          fi
-
-          tag_matches=false
+          tag_sha_json=null
           if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
-            tagged_sha=$(git rev-list -n 1 "$TAG")
-            [[ "$tagged_sha" == "$SHA" ]] || {
-              echo "tag $TAG already points to $tagged_sha, expected $SHA" >&2
-              exit 1
-            }
-            tag_matches=true
+            tag_sha_json=$(git rev-list -n 1 "$TAG" | jq -R .)
           fi
-
-          release_id=
-          if (( match_count == 1 )); then
-            release_id=$(jq -r '.[0].id' "$matches")
-            draft=$(jq -r '.[0].draft' "$matches")
-            target=$(jq -r '.[0].target_commitish' "$matches")
-            if [[ "$draft" != true ]]; then
-              [[ "$tag_matches" == true ]] || {
-                echo "published release $TAG does not resolve to expected commit $SHA" >&2
-                exit 1
+          state_input="$RUNNER_TEMP/sdsync-stage-state-input.json"
+          state="$RUNNER_TEMP/sdsync-stage-state.json"
+          jq -n \
+            --arg tag "$TAG" \
+            --arg sha "$SHA" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --argjson tag_sha "$tag_sha_json" \
+            --slurpfile releases "$release_index" '
+              {
+                tag: $tag,
+                sha: $sha,
+                repository: $repository,
+                tag_sha: $tag_sha,
+                releases: $releases[0]
               }
-              echo "release $TAG is already published; refusing to modify immutable assets" >&2
-              exit 1
-            fi
-            if [[ "$tag_matches" != true && "$target" != "$SHA" ]]; then
-              echo "draft release $TAG (id $release_id) targets $target, expected $SHA" >&2
-              exit 1
-            fi
-            echo "resuming draft release $TAG (id $release_id)"
-          else
-            echo "no release carries tag $TAG yet; a draft will be created"
-          fi
-
+            ' > "$state_input"
+          python3 .github/scripts/release-contract.py resolve-state \
+            --input "$state_input" \
+            --output "$state"
+          release_id=$(jq -r '.release_id // ""' "$state")
+          tag_matches=$(jq -r '.tag_matches' "$state")
+          [[ "$tag_matches" == true || "$tag_matches" == false ]] || {
+            echo "release helper returned a malformed tag_matches value" >&2
+            exit 1
+          }
           {
             echo "release_id=$release_id"
             echo "tag_matches=$tag_matches"
           } >> "$GITHUB_OUTPUT"
+          if [[ -n "$release_id" ]]; then
+            echo "resuming draft release $TAG (id $release_id)"
+          else
+            echo "no release carries tag $TAG yet; a draft will be created"
+          fi
       - name: Prepare checksums and installer assets
         env:
           TAG: ${{ needs.version.outputs.tag }}
+          SHA: ${{ needs.version.outputs.sha }}
         shell: bash
         run: |
           set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SHA" ]] || {
+            echo "checkout does not match approved release SHA $SHA" >&2
+            exit 1
+          }
+          rust_sdk="synology-drive-sync-$TAG-rust-sdk.tar.gz"
+          git archive \
+            --format=tar.gz \
+            --prefix="synology-drive-sync-$TAG-rust-sdk/" \
+            -o "dist/$rust_sdk" \
+            "$SHA"
           install -m 0755 packaging/install.sh dist/install.sh
           install -m 0644 packaging/install.ps1 dist/install.ps1
           install -m 0644 THIRD_PARTY_LICENSES.html dist/THIRD_PARTY_LICENSES.html
@@ -928,41 +1115,16 @@ jobs:
           python3 packaging/synology/validate_spk.py \
             --arch x86_64 \
             "dist/synology-drive-sync-$TAG-x86_64.spk"
-          cd dist
-          expected_archives=(
-            "synology-drive-sync-$TAG-armv8.spk"
-            "synology-drive-sync-$TAG-linux-aarch64.tar.gz"
-            "synology-drive-sync-$TAG-linux-x86_64.tar.gz"
-            "synology-drive-sync-$TAG-macos-aarch64.tar.gz"
-            "synology-drive-sync-$TAG-macos-x86_64.tar.gz"
-            "synology-drive-sync-$TAG-windows-aarch64.zip"
-            "synology-drive-sync-$TAG-windows-x86_64.zip"
-            "synology-drive-sync-$TAG-x86_64.spk"
-          )
-          # Audit M2: the literal list above is in C byte order, so every sort
-          # compared against it must be too, or the diff fails under any
-          # collating locale.
-          archive_list="$RUNNER_TEMP/sdsync-actual-archives.txt"
-          find . -maxdepth 1 -type f \
-            \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.spk' \) \
-            -printf '%f\n' \
-            | LC_ALL=C sort > "$archive_list"
-          mapfile -t actual_archives < "$archive_list"
-          diff -u \
-            <(printf '%s\n' "${expected_archives[@]}") \
-            <(printf '%s\n' "${actual_archives[@]}")
-          archives=("${expected_archives[@]}")
-          sbom="synology-drive-sync-$TAG.cdx.json"
-          [[ -f "$sbom" ]] || {
-            echo "expected SBOM $sbom is missing from the downloaded artifacts" >&2
-            exit 1
-          }
-          LC_ALL=C sha256sum -- "${archives[@]}" > ARCHIVE_SHA256SUMS
-          release_inputs=("${archives[@]}" "$sbom" THIRD_PARTY_LICENSES.html install.sh install.ps1)
-          # Audit M3: the LC_ALL=C prefix binds only to sha256sum, so the sort
-          # that actually determines line order needs its own.
-          LC_ALL=C sha256sum -- "${release_inputs[@]}" \
-            | LC_ALL=C sort -k2 > SHA256SUMS
+          python3 .github/scripts/release-contract.py verify-sdk-archives \
+            --directory dist \
+            --tag "$TAG"
+          python3 .github/scripts/release-contract.py prepare-assets \
+            --directory dist \
+            --tag "$TAG"
+          python3 .github/scripts/release-contract.py verify-assets \
+            --directory dist \
+            --tag "$TAG" \
+            --include-archive-manifest
       - name: Render release notes
         env:
           TAG: ${{ needs.version.outputs.tag }}
@@ -1006,22 +1168,24 @@ jobs:
           subject-path: dist/SHA256SUMS
       - id: assets
         name: Verify the release asset set
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
           # ARCHIVE_SHA256SUMS exists only as an attestation subject list and is
           # never a release asset.
           rm dist/ARCHIVE_SHA256SUMS
+          python3 .github/scripts/release-contract.py verify-assets \
+            --directory dist \
+            --tag "$TAG"
           asset_list="$RUNNER_TEMP/sdsync-assets.bin"
           find dist -maxdepth 1 -type f -print0 | LC_ALL=C sort -z > "$asset_list"
           mapfile -d '' -t assets < "$asset_list"
-          # Audit M4: a bare `[[ ... ]]` here failed with no output at all, in a
-          # job that had already minted three attestations.
-          [[ ${#assets[@]} -eq 13 ]] || {
-            printf 'expected 13 release assets, found %d:\n' "${#assets[@]}" >&2
-            printf '  %s\n' "${assets[@]}" >&2
-            exit 1
-          }
+          python3 .github/scripts/release-contract.py asset-index \
+            --directory dist \
+            --tag "$TAG" \
+            --output "$RUNNER_TEMP/sdsync-local-asset-index.json"
           printf '%s\n' "${assets[@]}"
       - id: draft
         name: Create or resume the draft release
@@ -1038,70 +1202,81 @@ jobs:
         run: |
           set -euo pipefail
           notes="$RUNNER_TEMP/sdsync-release-notes.md"
+          payload="$RUNNER_TEMP/sdsync-draft-payload.json"
+          updated="$RUNNER_TEMP/sdsync-updated-draft.json"
           release_id="$RELEASE_ID"
+          python3 .github/scripts/release-contract.py draft-payload \
+            --tag "$TAG" \
+            --sha "$SHA" \
+            --notes "$notes" \
+            --output "$payload"
 
           if [[ -z "$release_id" ]]; then
-            if [[ "$TAG_MATCHES" == true ]]; then
-              gh release create "$TAG" \
-                --draft \
-                --verify-tag \
-                --title "synology-drive-sync $TAG" \
-                --notes-file "$notes"
-            else
-              gh release create "$TAG" \
-                --draft \
-                --target "$SHA" \
-                --title "synology-drive-sync $TAG" \
-                --notes-file "$notes"
-            fi
-
-            # Re-resolve to learn the new id. Still list-and-filter: the release
-            # is a draft, so releases/tags/{tag} cannot see it.
-            created_pages="$RUNNER_TEMP/sdsync-created-pages.json"
-            created="$RUNNER_TEMP/sdsync-created.json"
-            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-              > "$created_pages"
-            jq -s --arg tag "$TAG" 'add // [] | map(select(.tag_name == $tag))' \
-              "$created_pages" > "$created"
-            created_count=$(jq 'length' "$created")
-            (( created_count == 1 )) || {
-              echo "expected exactly 1 release named $TAG after creating it, found $created_count" >&2
-              jq -r '.[] | "  id=\(.id)  draft=\(.draft)  \(.html_url)"' "$created" >&2
-              exit 1
-            }
-            release_id=$(jq -r '.[0].id' "$created")
+            gh api --method POST \
+              "repos/$GITHUB_REPOSITORY/releases" \
+              --input "$payload" > "$updated"
+            release_id=$(jq -er '.id | select(type == "number" and . > 0)' "$updated")
           else
             # A resumed draft may have been left by an older failed run or
             # deliberately retargeted during recovery. Refresh every mutable
             # identity field and the freshly rendered notes by immutable id so
             # publication can never ship stale release metadata.
-            updated="$RUNNER_TEMP/sdsync-updated-draft.json"
             gh api --method PATCH \
               "repos/$GITHUB_REPOSITORY/releases/$release_id" \
-              -f tag_name="$TAG" \
-              -f target_commitish="$SHA" \
-              -f name="synology-drive-sync $TAG" \
-              -F body=@"$notes" \
-              -F draft=true > "$updated"
-            jq -e \
-              --arg tag "$TAG" \
-              --arg sha "$SHA" \
-              --arg title "synology-drive-sync $TAG" '
-                .draft == true
-                and .tag_name == $tag
-                and .target_commitish == $sha
-                and .name == $title
-              ' "$updated" >/dev/null
-            # Compare JSON body text directly. `jq -r` always writes a record
-            # terminator, which doubled an existing terminal LF and made an
-            # exact successful update look different on every retry.
-            jq -e --rawfile notes "$notes" '.body == $notes' "$updated" >/dev/null
+              --input "$payload" > "$updated"
           fi
 
-          state="$RUNNER_TEMP/sdsync-draft-state.json"
-          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$state"
-          [[ "$(jq -r '.draft' "$state")" == true ]] || {
-            echo "release $TAG (id $release_id) is not a draft; refusing to stage assets onto it" >&2
+          jq -e \
+            --argjson id "$release_id" \
+            --argjson tag_matches "$TAG_MATCHES" \
+            --arg tag "$TAG" \
+            --arg sha "$SHA" \
+            --arg title "synology-drive-sync $TAG" '
+              .id == $id
+              and .draft == true
+              and .prerelease == false
+              and .tag_name == $tag
+              and ($tag_matches or .target_commitish == $sha)
+              and .name == $title
+            ' "$updated" >/dev/null
+          # Compare body strings inside jq. Materialising `.body` with `jq -r`
+          # appends a record terminator and used to double a terminal LF.
+          jq -e --rawfile notes "$notes" '.body == $notes' "$updated" >/dev/null
+
+          # Re-list after the mutation so a concurrent human-created duplicate
+          # cannot turn the tag-addressed asset upload below into a guess.
+          git fetch --force --tags origin
+          release_pages="$RUNNER_TEMP/sdsync-created-pages.json"
+          release_index="$RUNNER_TEMP/sdsync-created-index.json"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            > "$release_pages"
+          jq -s 'add // []' "$release_pages" > "$release_index"
+          tag_sha_json=null
+          if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+            tag_sha_json=$(git rev-list -n 1 "$TAG" | jq -R .)
+          fi
+          state_input="$RUNNER_TEMP/sdsync-created-state-input.json"
+          state="$RUNNER_TEMP/sdsync-created-state.json"
+          jq -n \
+            --arg tag "$TAG" \
+            --arg sha "$SHA" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --argjson tag_sha "$tag_sha_json" \
+            --slurpfile releases "$release_index" '
+              {
+                tag: $tag,
+                sha: $sha,
+                repository: $repository,
+                tag_sha: $tag_sha,
+                releases: $releases[0]
+              }
+            ' > "$state_input"
+          python3 .github/scripts/release-contract.py resolve-state \
+            --input "$state_input" \
+            --output "$state"
+          resolved_id=$(jq -er '.release_id' "$state")
+          [[ "$resolved_id" == "$release_id" ]] || {
+            echo "release id changed after draft update: $release_id -> $resolved_id" >&2
             exit 1
           }
           echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
@@ -1124,22 +1299,24 @@ jobs:
           # tag name; with duplicates gh picks a match non-deterministically.
           gh release upload "$TAG" "${assets[@]}" --clobber
 
-          local_list="$RUNNER_TEMP/sdsync-local-asset-names.txt"
-          for asset_path in "${assets[@]}"; do
-            basename -- "$asset_path"
-          done | LC_ALL=C sort > "$local_list"
-          mapfile -t local_names < "$local_list"
-
-          remote_list="$RUNNER_TEMP/sdsync-remote-asset-names.txt"
+          remote_pages="$RUNNER_TEMP/sdsync-remote-asset-pages.json"
+          remote_index="$RUNNER_TEMP/sdsync-remote-assets.json"
           gh api --paginate \
             "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" \
-            --jq '.[].name' \
-            | LC_ALL=C sort > "$remote_list"
-          mapfile -t remote_names < "$remote_list"
-
-          diff -u \
-            <(printf '%s\n' "${local_names[@]}") \
-            <(printf '%s\n' "${remote_names[@]}")
+            > "$remote_pages"
+          jq -s 'add // []' "$remote_pages" > "$remote_index"
+          python3 .github/scripts/release-contract.py verify-remote-assets \
+            --input "$remote_index" \
+            --tag "$TAG" \
+            --directory dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: needs.version.outputs.dry_run != 'true'
+        with:
+          name: staged-release-contract
+          path: ${{ runner.temp }}/sdsync-local-asset-index.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
       - name: Collect the dry-run bundle
         if: needs.version.outputs.dry_run == 'true'
         shell: bash
@@ -1173,6 +1350,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
+      actions: read
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1180,6 +1358,10 @@ jobs:
           fetch-depth: 0
           ref: ${{ needs.version.outputs.sha }}
           persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: staged-release-contract
+          path: release-contract
       - name: Publish verified draft exactly once
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1189,96 +1371,111 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]] || {
+            echo "staging did not provide a valid immutable release id: $RELEASE_ID" >&2
+            exit 1
+          }
 
-          # Audit C1: resolve draft-aware and by id, never by tag name.
+          # Resolve by the immutable id handed off by stage-release. The
+          # published state is accepted only for recovery when this exact job
+          # is re-run after PATCH succeeded but a later verification failed.
+          git fetch --force --tags origin
           release_pages="$RUNNER_TEMP/sdsync-final-pages.json"
-          matches="$RUNNER_TEMP/sdsync-final-matches.json"
+          release_index="$RUNNER_TEMP/sdsync-final-index.json"
           gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
             > "$release_pages"
-          jq -s --arg tag "$TAG" 'add // [] | map(select(.tag_name == $tag))' \
-            "$release_pages" > "$matches"
-          match_count=$(jq 'length' "$matches")
-
-          if (( match_count == 0 )); then
-            echo "no release carries the tag name $TAG; stage-release did not leave a draft" >&2
-            exit 1
+          jq -s 'add // []' "$release_pages" > "$release_index"
+          tag_sha_json=null
+          if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+            tag_sha_json=$(git rev-list -n 1 "$TAG" | jq -R .)
           fi
-          if (( match_count > 1 )); then
-            {
-              echo "$match_count releases carry the tag name $TAG; refusing to guess which to publish."
-              echo
-              echo "Offending releases:"
-              jq -r '.[] | "  id=\(.id)  draft=\(.draft)  target=\(.target_commitish)  \(.html_url)"' "$matches"
-              echo
-              echo "Delete all but the one to keep, then re-run this workflow:"
-              jq -r --arg repo "$GITHUB_REPOSITORY" \
-                '.[] | "  gh api --method DELETE repos/\($repo)/releases/\(.id)"' "$matches"
-            } >&2
+          state_input="$RUNNER_TEMP/sdsync-final-state-input.json"
+          state="$RUNNER_TEMP/sdsync-final-state.json"
+          jq -n \
+            --arg tag "$TAG" \
+            --arg sha "$SHA" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --argjson expected_release_id "$RELEASE_ID" \
+            --argjson tag_sha "$tag_sha_json" \
+            --slurpfile releases "$release_index" '
+              {
+                tag: $tag,
+                sha: $sha,
+                repository: $repository,
+                expected_release_id: $expected_release_id,
+                tag_sha: $tag_sha,
+                releases: $releases[0]
+              }
+            ' > "$state_input"
+          python3 .github/scripts/release-contract.py resolve-publish-state \
+            --input "$state_input" \
+            --output "$state"
+          release_id=$(jq -er '.release_id | select(type == "number" and . > 0)' "$state")
+          tag_matches=$(jq -r '.tag_matches' "$state")
+          [[ "$tag_matches" == true || "$tag_matches" == false ]] || {
+            echo "release helper returned a malformed tag_matches value" >&2
             exit 1
-          fi
-
-          release_id=$(jq -r '.[0].id' "$matches")
-          if [[ -n "$RELEASE_ID" && "$RELEASE_ID" != "$release_id" ]]; then
+          }
+          published=$(jq -r '.published' "$state")
+          [[ "$published" == true || "$published" == false ]] || {
+            echo "release helper returned a malformed published value" >&2
+            exit 1
+          }
+          if [[ "$RELEASE_ID" != "$release_id" ]]; then
             echo "release id changed between staging ($RELEASE_ID) and publication ($release_id)" >&2
             exit 1
           fi
 
           release_json="$RUNNER_TEMP/sdsync-final-release.json"
           gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$release_json"
-          [[ "$(jq -r '.draft' "$release_json")" == true ]] || {
-            echo "release $TAG (id $release_id) is no longer a draft; refusing a second publication" >&2
-            exit 1
-          }
-          target=$(jq -r '.target_commitish' "$release_json")
-          git fetch --force --tags origin
-          if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
-            tagged_sha=$(git rev-list -n 1 "$TAG")
-            [[ "$tagged_sha" == "$SHA" ]] || {
-              echo "tag $TAG points to $tagged_sha, expected $SHA" >&2
+          jq -e \
+            --argjson id "$release_id" \
+            --argjson tag_matches "$tag_matches" \
+            --argjson published "$published" \
+            --arg tag "$TAG" \
+            --arg sha "$SHA" '
+              .id == $id
+              and .draft == (if $published then false else true end)
+              and .tag_name == $tag
+              and ($tag_matches or .target_commitish == $sha)
+            ' "$release_json" >/dev/null || {
+              echo "release $TAG (id $release_id) changed after state resolution" >&2
               exit 1
             }
-          elif [[ "$target" != "$SHA" ]]; then
-            echo "draft release $TAG targets $target, expected $SHA" >&2
-            exit 1
-          fi
 
-          remote_list="$RUNNER_TEMP/sdsync-final-asset-names.txt"
+          remote_pages="$RUNNER_TEMP/sdsync-final-asset-pages.json"
+          remote_index="$RUNNER_TEMP/sdsync-final-assets.json"
           gh api --paginate \
             "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" \
-            --jq '.[].name' \
-            | LC_ALL=C sort > "$remote_list"
-          mapfile -t remote_names < "$remote_list"
-          # This literal list is in C byte order; the sort above must match it.
-          expected_names=(
-            SHA256SUMS
-            THIRD_PARTY_LICENSES.html
-            install.ps1
-            install.sh
-            "synology-drive-sync-$TAG-armv8.spk"
-            "synology-drive-sync-$TAG-linux-aarch64.tar.gz"
-            "synology-drive-sync-$TAG-linux-x86_64.tar.gz"
-            "synology-drive-sync-$TAG-macos-aarch64.tar.gz"
-            "synology-drive-sync-$TAG-macos-x86_64.tar.gz"
-            "synology-drive-sync-$TAG-windows-aarch64.zip"
-            "synology-drive-sync-$TAG-windows-x86_64.zip"
-            "synology-drive-sync-$TAG-x86_64.spk"
-            "synology-drive-sync-$TAG.cdx.json"
-          )
-          diff -u \
-            <(printf '%s\n' "${expected_names[@]}") \
-            <(printf '%s\n' "${remote_names[@]}")
+            > "$remote_pages"
+          jq -s 'add // []' "$remote_pages" > "$remote_index"
+          python3 .github/scripts/release-contract.py verify-remote-assets \
+            --input "$remote_index" \
+            --tag "$TAG" \
+            --index release-contract/sdsync-local-asset-index.json
 
-          # MUTATION: publishing the draft is what creates the git tag.
-          # Addressed by id, not by tag name -- a draft cannot be resolved by
-          # tag, and gh's own fallback is non-deterministic across duplicates.
-          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
-            -F draft=false -f make_latest=true > /dev/null
+          if [[ "$published" == false ]]; then
+            # MUTATION: publishing the draft is what creates the git tag.
+            # Addressed by id, not by tag name -- a draft cannot be resolved by
+            # tag, and gh's own fallback is non-deterministic across duplicates.
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+              -F draft=false -f make_latest=true > /dev/null
+          else
+            echo "release $TAG (id $release_id) is already published; verifying recovery state"
+          fi
 
           gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$release_json"
-          [[ "$(jq -r '.draft' "$release_json")" == false ]] || {
-            echo "release $TAG (id $release_id) is still a draft after publication" >&2
-            exit 1
-          }
+          jq -e \
+            --argjson id "$release_id" \
+            --arg tag "$TAG" '
+              .id == $id
+              and .tag_name == $tag
+              and .draft == false
+              and .prerelease == false
+            ' "$release_json" >/dev/null || {
+              echo "release $TAG (id $release_id) is not in the exact published state" >&2
+              exit 1
+            }
           git fetch --force --tags origin
           published_sha=$(git rev-list -n 1 "$TAG")
           [[ "$published_sha" == "$SHA" ]] || {
@@ -1293,10 +1490,10 @@ jobs:
     # can never point at an unreleased build.
     #
     # Failure here leaves a published release whose container tags are missing.
-    # Recovery is "Re-run failed jobs" on this same workflow run: the per-arch
-    # digests are workflow artifacts and stay available for 7 days. A fresh run
-    # of the whole workflow will NOT repair it -- already_published short-circuits
-    # every job. Re-run the job, do not re-trigger the workflow.
+    # Recovery is "Re-run failed jobs" on this same workflow run: publish-release
+    # accepts only its exact staged id/tag/SHA and the per-arch digests remain
+    # available for 7 days. A fresh workflow run remains a no-op for an already
+    # published SHA, so re-run the failed jobs rather than re-triggering it.
     needs: [version, stage-release, sbom, image, publish-release]
     # MUTATION GUARD: creates the public GHCR tags and pushes two attestations.
     if: >-
@@ -1311,6 +1508,10 @@ jobs:
       attestations: write
       artifact-metadata: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-sbom
@@ -1324,7 +1525,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-      - name: Create manifest and immutable tags
+      - id: digest
+        name: Publish and verify immutable manifest tags
         env:
           IMAGE: ${{ needs.version.outputs.image }}
           TAG: ${{ needs.version.outputs.tag }}
@@ -1346,40 +1548,83 @@ jobs:
             exit 1
           }
 
-          metadata="$RUNNER_TEMP/sdsync-image-metadata.json"
-          docker buildx imagetools create \
-            --metadata-file "$metadata" \
-            --tag "$IMAGE:$TAG" \
-            --tag "$IMAGE:latest" \
+          expected_index="$RUNNER_TEMP/sdsync-expected-image-index.json"
+          docker buildx imagetools create --dry-run \
             "$IMAGE@$amd64" \
-            "$IMAGE@$arm64"
+            "$IMAGE@$arm64" > "$expected_index"
+          python3 .github/scripts/release-contract.py verify-image-index \
+            --input "$expected_index"
+          expected_digest="sha256:$(sha256sum "$expected_index" | cut -d ' ' -f 1)"
+          [[ "$expected_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "could not derive the expected image-index digest" >&2
+            exit 1
+          }
 
-          index="$RUNNER_TEMP/sdsync-image-index.json"
-          docker buildx imagetools inspect --raw "$IMAGE:$TAG" > "$index"
-          jq -e '
-            [.manifests[]
-              | select((.platform.os // "unknown") != "unknown")
-              | "\(.platform.os)/\(.platform.architecture)"]
-            | sort == ["linux/amd64", "linux/arm64"]
-          ' "$index" > /dev/null || {
-            echo "manifest for $IMAGE:$TAG does not contain exactly linux/amd64 and linux/arm64:" >&2
-            jq -r '.manifests[] | "  \(.platform.os // "?")/\(.platform.architecture // "?") \(.digest)"' \
-              "$index" >&2
+          # A calendar-version tag is immutable. If it already exists during a
+          # failed-job rerun, accept it only when its raw manifest is byte-for-
+          # byte the exact index that these two architecture jobs produced.
+          existing_index="$RUNNER_TEMP/sdsync-existing-version-index.json"
+          existing_error="$RUNNER_TEMP/sdsync-existing-version-error.log"
+          version_exists=false
+          if docker buildx imagetools inspect --raw "$IMAGE:$TAG" \
+            > "$existing_index" 2> "$existing_error"; then
+            version_exists=true
+          elif ! grep -Fq ': not found' "$existing_error"; then
+            echo "could not safely determine whether $IMAGE:$TAG exists:" >&2
+            cat "$existing_error" >&2
             exit 1
-          }
-          docker buildx imagetools inspect "$IMAGE:$TAG"
-      - id: digest
-        name: Resolve manifest digest
-        shell: bash
-        run: |
-          set -euo pipefail
+          fi
+
           metadata="$RUNNER_TEMP/sdsync-image-metadata.json"
-          digest=$(jq -r '."containerimage.descriptor".digest // empty' "$metadata")
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
-            echo "imagetools did not report a usable manifest digest: '${digest:-<empty>}'" >&2
-            exit 1
-          }
-          echo "value=$digest" >> "$GITHUB_OUTPUT"
+          if [[ "$version_exists" == true ]]; then
+            python3 .github/scripts/release-contract.py verify-image-index \
+              --input "$existing_index"
+            existing_digest="sha256:$(sha256sum "$existing_index" | cut -d ' ' -f 1)"
+            [[ "$existing_digest" == "$expected_digest" ]] || {
+              echo "$IMAGE:$TAG already resolves to $existing_digest, expected $expected_digest; refusing to overwrite the immutable version tag" >&2
+              exit 1
+            }
+            cmp --silent "$expected_index" "$existing_index" || {
+              echo "$IMAGE:$TAG differs from the exact expected manifest despite its digest" >&2
+              exit 1
+            }
+            docker buildx imagetools create \
+              --prefer-index=false \
+              --tag "$IMAGE:latest" \
+              "$IMAGE@$expected_digest"
+          else
+            docker buildx imagetools create \
+              --metadata-file "$metadata" \
+              --tag "$IMAGE:$TAG" \
+              --tag "$IMAGE:latest" \
+              "$IMAGE@$amd64" \
+              "$IMAGE@$arm64"
+            created_digest=$(jq -r '."containerimage.descriptor".digest // empty' "$metadata")
+            [[ "$created_digest" == "$expected_digest" ]] || {
+              echo "imagetools created $created_digest, expected $expected_digest" >&2
+              exit 1
+            }
+          fi
+
+          for remote_tag in "$TAG" latest; do
+            remote_index="$RUNNER_TEMP/sdsync-remote-$remote_tag-image-index.json"
+            docker buildx imagetools inspect --raw "$IMAGE:$remote_tag" > "$remote_index"
+            python3 .github/scripts/release-contract.py verify-image-index \
+              --input "$remote_index"
+            remote_digest=$(docker buildx imagetools inspect \
+              "$IMAGE:$remote_tag" --format '{{.Manifest.Digest}}')
+            calculated_digest="sha256:$(sha256sum "$remote_index" | cut -d ' ' -f 1)"
+            [[ "$remote_digest" == "$expected_digest" && "$calculated_digest" == "$expected_digest" ]] || {
+              echo "$IMAGE:$remote_tag resolves to $remote_digest (raw $calculated_digest), expected $expected_digest" >&2
+              exit 1
+            }
+            cmp --silent "$expected_index" "$remote_index" || {
+              echo "$IMAGE:$remote_tag does not contain the exact expected manifest" >&2
+              exit 1
+            }
+          done
+          echo "value=$expected_digest" >> "$GITHUB_OUTPUT"
+          docker buildx imagetools inspect "$IMAGE:$TAG"
       - name: Attest image provenance
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:

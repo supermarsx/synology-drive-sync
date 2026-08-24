@@ -1,0 +1,127 @@
+[
+  {
+    "name": "new draft may be created when no state exists",
+    "input": {
+      "tag": "26.4",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "repository": "example/synology-drive-sync",
+      "tag_sha": null,
+      "releases": []
+    },
+    "expected": {"release_id": null, "tag_matches": false}
+  },
+  {
+    "name": "exact draft target is adopted by immutable id",
+    "input": {
+      "tag": "26.4",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "repository": "example/synology-drive-sync",
+      "tag_sha": null,
+      "releases": [
+        {
+          "id": 4242,
+          "tag_name": "26.4",
+          "draft": true,
+          "target_commitish": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "html_url": "https://example.invalid/releases/4242"
+        }
+      ]
+    },
+    "expected": {"release_id": 4242, "tag_matches": false}
+  },
+  {
+    "name": "exact git tag permits draft target branch",
+    "input": {
+      "tag": "26.4",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "repository": "example/synology-drive-sync",
+      "tag_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "releases": [
+        {
+          "id": 4343,
+          "tag_name": "26.4",
+          "draft": true,
+          "target_commitish": "main",
+          "html_url": "https://example.invalid/releases/4343"
+        }
+      ]
+    },
+    "expected": {"release_id": 4343, "tag_matches": true}
+  },
+  {
+    "name": "duplicate release names fail closed",
+    "input": {
+      "tag": "26.4",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "repository": "example/synology-drive-sync",
+      "tag_sha": null,
+      "releases": [
+        {
+          "id": 51,
+          "tag_name": "26.4",
+          "draft": true,
+          "target_commitish": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "html_url": "https://example.invalid/releases/51"
+        },
+        {
+          "id": 52,
+          "tag_name": "26.4",
+          "draft": true,
+          "target_commitish": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "html_url": "https://example.invalid/releases/52"
+        }
+      ]
+    },
+    "error_contains": "2 releases carry the tag name 26.4",
+    "error_ids": [51, 52]
+  },
+  {
+    "name": "stale draft target fails closed",
+    "input": {
+      "tag": "26.4",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "repository": "example/synology-drive-sync",
+      "tag_sha": null,
+      "releases": [
+        {
+          "id": 53,
+          "tag_name": "26.4",
+          "draft": true,
+          "target_commitish": "dddddddddddddddddddddddddddddddddddddddd",
+          "html_url": "https://example.invalid/releases/53"
+        }
+      ]
+    },
+    "error_contains": "targets dddddddddddddddddddddddddddddddddddddddd, expected"
+  },
+  {
+    "name": "conflicting git tag fails closed",
+    "input": {
+      "tag": "26.4",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "repository": "example/synology-drive-sync",
+      "tag_sha": "dddddddddddddddddddddddddddddddddddddddd",
+      "releases": []
+    },
+    "error_contains": "tag 26.4 already points to"
+  },
+  {
+    "name": "published release is immutable",
+    "input": {
+      "tag": "26.4",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "repository": "example/synology-drive-sync",
+      "tag_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "releases": [
+        {
+          "id": 54,
+          "tag_name": "26.4",
+          "draft": false,
+          "target_commitish": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "html_url": "https://example.invalid/releases/54"
+        }
+      ]
+    },
+    "error_contains": "already published; refusing to modify immutable assets"
+  }
+]

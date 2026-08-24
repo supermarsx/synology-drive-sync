@@ -1,0 +1,219 @@
+[
+  {
+    "name": "first release",
+    "input": {
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "main_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sha_reachable_from_main": true,
+      "year": "26",
+      "repository": "Example/Synology-Drive-Sync",
+      "build_timestamp": "2026-08-24T12:34:56Z",
+      "releases": [],
+      "tags": []
+    },
+    "expected": {
+      "tag": "26.1",
+      "prev_tag": "",
+      "already_published": false,
+      "draft_release_id": null
+    }
+  },
+  {
+    "name": "next release considers tags and release reservations",
+    "input": {
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "main_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sha_reachable_from_main": true,
+      "year": "26",
+      "repository": "Example/Synology-Drive-Sync",
+      "build_timestamp": "2026-08-24T12:34:56Z",
+      "releases": [
+        {
+          "id": 12,
+          "tag_name": "26.2",
+          "draft": true,
+          "target_commitish": "dddddddddddddddddddddddddddddddddddddddd",
+          "html_url": "https://example.invalid/releases/12"
+        }
+      ],
+      "tags": [
+        {
+          "name": "26.1",
+          "sha": "cccccccccccccccccccccccccccccccccccccccc",
+          "ancestor_of_sha": true
+        }
+      ]
+    },
+    "expected": {
+      "tag": "26.3",
+      "prev_tag": "26.1",
+      "already_published": false,
+      "draft_release_id": null
+    }
+  },
+  {
+    "name": "year rollover",
+    "input": {
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "main_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sha_reachable_from_main": true,
+      "year": "27",
+      "repository": "Example/Synology-Drive-Sync",
+      "build_timestamp": "2027-01-02T03:04:05Z",
+      "releases": [],
+      "tags": [
+        {
+          "name": "26.9",
+          "sha": "cccccccccccccccccccccccccccccccccccccccc",
+          "ancestor_of_sha": true
+        }
+      ]
+    },
+    "expected": {
+      "tag": "27.1",
+      "prev_tag": "26.9",
+      "already_published": false,
+      "draft_release_id": null
+    }
+  },
+  {
+    "name": "adopt exact draft by target SHA and immutable id",
+    "input": {
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "main_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sha_reachable_from_main": true,
+      "year": "26",
+      "repository": "Example/Synology-Drive-Sync",
+      "build_timestamp": "2026-08-24T12:34:56Z",
+      "releases": [
+        {
+          "id": 4242,
+          "tag_name": "26.4",
+          "draft": true,
+          "target_commitish": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "html_url": "https://example.invalid/releases/4242"
+        }
+      ],
+      "tags": [
+        {
+          "name": "26.3",
+          "sha": "cccccccccccccccccccccccccccccccccccccccc",
+          "ancestor_of_sha": true
+        }
+      ]
+    },
+    "expected": {
+      "tag": "26.4",
+      "prev_tag": "26.3",
+      "already_published": false,
+      "draft_release_id": 4242
+    }
+  },
+  {
+    "name": "published release for SHA is a no-op even behind main",
+    "input": {
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "main_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sha_reachable_from_main": false,
+      "year": "26",
+      "repository": "Example/Synology-Drive-Sync",
+      "build_timestamp": "2026-08-24T12:34:56Z",
+      "releases": [
+        {
+          "id": 44,
+          "tag_name": "26.4",
+          "draft": false,
+          "target_commitish": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "html_url": "https://example.invalid/releases/44"
+        }
+      ],
+      "tags": [
+        {
+          "name": "26.4",
+          "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "ancestor_of_sha": true
+        },
+        {
+          "name": "26.5",
+          "sha": "dddddddddddddddddddddddddddddddddddddddd",
+          "ancestor_of_sha": false
+        }
+      ]
+    },
+    "expected": {
+      "tag": "26.4",
+      "prev_tag": "",
+      "already_published": true,
+      "draft_release_id": null
+    }
+  },
+  {
+    "name": "duplicate drafts fail closed",
+    "input": {
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "main_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sha_reachable_from_main": true,
+      "year": "26",
+      "repository": "Example/Synology-Drive-Sync",
+      "build_timestamp": "2026-08-24T12:34:56Z",
+      "releases": [
+        {
+          "id": 81,
+          "tag_name": "26.7",
+          "draft": true,
+          "target_commitish": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "html_url": "https://example.invalid/releases/81"
+        },
+        {
+          "id": 82,
+          "tag_name": "26.8",
+          "draft": true,
+          "target_commitish": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "html_url": "https://example.invalid/releases/82"
+        }
+      ],
+      "tags": []
+    },
+    "error_contains": "multiple calendar-release drafts target",
+    "error_ids": [81, 82]
+  },
+  {
+    "name": "stale commit no longer on main fails closed",
+    "input": {
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "main_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sha_reachable_from_main": false,
+      "year": "26",
+      "repository": "Example/Synology-Drive-Sync",
+      "build_timestamp": "2026-08-24T12:34:56Z",
+      "releases": [],
+      "tags": []
+    },
+    "error_contains": "not reachable from origin/main"
+  },
+  {
+    "name": "commit predating newest release fails closed",
+    "input": {
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "main_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sha_reachable_from_main": true,
+      "year": "26",
+      "repository": "Example/Synology-Drive-Sync",
+      "build_timestamp": "2026-08-24T12:34:56Z",
+      "releases": [],
+      "tags": [
+        {
+          "name": "26.8",
+          "sha": "cccccccccccccccccccccccccccccccccccccccc",
+          "ancestor_of_sha": true
+        },
+        {
+          "name": "26.9",
+          "sha": "dddddddddddddddddddddddddddddddddddddddd",
+          "ancestor_of_sha": false
+        }
+      ]
+    },
+    "error_contains": "predates the newest release 26.9"
+  }
+]

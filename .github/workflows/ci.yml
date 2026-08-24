@@ -75,11 +75,15 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --locked --all-targets --all-features --target "${{ matrix.target }}" -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features --target "${{ matrix.target }}" -- -D warnings
       - name: Tests
-        run: cargo test --locked --all-targets --target "${{ matrix.target }}"
-      - name: Release build
-        run: cargo build --release --locked --target "${{ matrix.target }}"
+        run: cargo test --locked --workspace --all-targets --target "${{ matrix.target }}"
+      - name: Release CLI build
+        run: cargo build --release --locked -p synology-drive-sync --target "${{ matrix.target }}"
+      - name: Unwind-safe C SDK build
+        run: >-
+          cargo build --profile ffi-release --locked
+          -p synology-drive-sync-ffi --target "${{ matrix.target }}"
 
   coverage:
     name: Coverage (90% line gate)
@@ -125,7 +129,7 @@ jobs:
           toolchain: 1.88.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Rust 1.88 compatibility
-        run: cargo test --locked --all-targets
+        run: cargo test --locked --workspace --all-targets
 
   synology-package:
     name: Synology package ${{ matrix.synology_arch }}
@@ -235,6 +239,10 @@ jobs:
         run: python3 packaging/synology/validate_spk.py
       - name: Test Synology package builder and DSM lifecycle
         run: python3 packaging/synology/test_synology_package.py
+      - name: Test calendar release contract
+        run: >-
+          python3 -m unittest discover -s .github/scripts/tests
+          -p 'test_release_contract.py' -v
       - name: Parse PowerShell packaging scripts
         shell: pwsh
         run: ./.github/scripts/validate-powershell.ps1

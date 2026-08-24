@@ -1,0 +1,122 @@
+[
+  {
+    "name": "exact staged draft is ready for first publication",
+    "input": {
+      "tag": "26.4",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "repository": "example/synology-drive-sync",
+      "expected_release_id": 4242,
+      "tag_sha": null,
+      "releases": [
+        {
+          "id": 4242,
+          "tag_name": "26.4",
+          "draft": true,
+          "target_commitish": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "html_url": "https://example.invalid/releases/4242"
+        }
+      ]
+    },
+    "expected": {"release_id": 4242, "tag_matches": false, "published": false}
+  },
+  {
+    "name": "same job rerun accepts the exact already-published release",
+    "input": {
+      "tag": "26.4",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "repository": "example/synology-drive-sync",
+      "expected_release_id": 4242,
+      "tag_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "releases": [
+        {
+          "id": 4242,
+          "tag_name": "26.4",
+          "draft": false,
+          "target_commitish": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "html_url": "https://example.invalid/releases/4242"
+        }
+      ]
+    },
+    "expected": {"release_id": 4242, "tag_matches": true, "published": true}
+  },
+  {
+    "name": "published recovery requires the exact git tag SHA",
+    "input": {
+      "tag": "26.4",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "repository": "example/synology-drive-sync",
+      "expected_release_id": 4242,
+      "tag_sha": null,
+      "releases": [
+        {
+          "id": 4242,
+          "tag_name": "26.4",
+          "draft": false,
+          "target_commitish": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "html_url": "https://example.invalid/releases/4242"
+        }
+      ]
+    },
+    "error_contains": "does not resolve to expected commit"
+  },
+  {
+    "name": "published recovery rejects a different immutable release id",
+    "input": {
+      "tag": "26.4",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "repository": "example/synology-drive-sync",
+      "expected_release_id": 4242,
+      "tag_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "releases": [
+        {
+          "id": 5252,
+          "tag_name": "26.4",
+          "draft": false,
+          "target_commitish": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "html_url": "https://example.invalid/releases/5252"
+        }
+      ]
+    },
+    "error_contains": "changed immutable id from 4242 to 5252"
+  },
+  {
+    "name": "published recovery rejects a missing staged release",
+    "input": {
+      "tag": "26.4",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "repository": "example/synology-drive-sync",
+      "expected_release_id": 4242,
+      "tag_sha": null,
+      "releases": []
+    },
+    "error_contains": "expected id 4242"
+  },
+  {
+    "name": "published recovery rejects duplicate release tag names",
+    "input": {
+      "tag": "26.4",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "repository": "example/synology-drive-sync",
+      "expected_release_id": 4242,
+      "tag_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "releases": [
+        {
+          "id": 4242,
+          "tag_name": "26.4",
+          "draft": false,
+          "target_commitish": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "html_url": "https://example.invalid/releases/4242"
+        },
+        {
+          "id": 4343,
+          "tag_name": "26.4",
+          "draft": true,
+          "target_commitish": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "html_url": "https://example.invalid/releases/4343"
+        }
+      ]
+    },
+    "error_contains": "2 releases carry the tag name 26.4",
+    "error_ids": [4242, 4343]
+  }
+]
