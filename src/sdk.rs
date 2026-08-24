@@ -28,6 +28,8 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(7_200);
 const DEFAULT_RETRIES: u32 = 2;
 const DEFAULT_JOBS: usize = 2;
 const DEFAULT_MAX_DELETE: usize = 100;
+const MAX_RETRIES: u32 = 5;
+const MAX_JOBS: usize = 16;
 
 /// Product build version embedded by the approved release workflow. This is a
 /// calendar release such as `26.1`; it is intentionally distinct from Cargo's
@@ -460,10 +462,16 @@ impl SyncRequestBuilder {
                 "timeouts must be positive",
             ));
         }
-        if request.jobs == 0 {
+        if request.jobs == 0 || request.jobs > MAX_JOBS {
             return Err(SdkError::new(
                 ErrorCode::InvalidRequest,
-                "worker count must be positive",
+                "jobs must be between 1 and 16",
+            ));
+        }
+        if request.retries > MAX_RETRIES {
+            return Err(SdkError::new(
+                ErrorCode::InvalidRequest,
+                "retries must be between 0 and 5",
             ));
         }
         if request.max_upload_rate == Some(0) {
@@ -982,13 +990,24 @@ impl Engine {
             }
         };
 
-        let logout_start = emit(
-            cancellation,
-            &mut on_event,
-            SdkEvent::PhaseStarted {
-                phase: Phase::Logout,
-            },
-        );
+        let logout_start = catch_unwind(AssertUnwindSafe(|| {
+            emit(
+                cancellation,
+                &mut on_event,
+                SdkEvent::PhaseStarted {
+                    phase: Phase::Logout,
+                },
+            )
+        }));
+        let logout_start = match logout_start {
+            Ok(logout_start) => logout_start,
+            Err(payload) => {
+                // A caller panic must not strand the authenticated session or
+                // trigger another observer invocation during panic cleanup.
+                let _ = catch_unwind(AssertUnwindSafe(|| client.logout()));
+                resume_unwind(payload);
+            }
+        };
         let logout = client.logout().map_err(SdkError::from_core);
         let logout_end = emit_without_cancellation(
             &mut on_event,
@@ -1250,6 +1269,40 @@ mod tests {
         assert_eq!(request.comparison, Comparison::Content);
         assert_eq!(request.deletion, DeletionPolicy::disabled());
         assert_eq!(request.jobs, DEFAULT_JOBS);
+
+        SyncRequest::builder(
+            "https://files.example.invalid",
+            "user",
+            ".",
+            "/home/Drive/backup",
+        )
+        .jobs(MAX_JOBS)
+        .retries(MAX_RETRIES)
+        .build()
+        .expect("public production limits are inclusive");
+
+        for error in [
+            SyncRequest::builder(
+                "https://files.example.invalid",
+                "user",
+                ".",
+                "/home/Drive/backup",
+            )
+            .jobs(MAX_JOBS + 1)
+            .build()
+            .expect_err("worker count above the production limit must fail"),
+            SyncRequest::builder(
+                "https://files.example.invalid",
+                "user",
+                ".",
+                "/home/Drive/backup",
+            )
+            .retries(MAX_RETRIES + 1)
+            .build()
+            .expect_err("retry count above the production limit must fail"),
+        ] {
+            assert_eq!(error.code(), ErrorCode::InvalidRequest);
+        }
 
         let error = SyncRequest::builder(
             "http://files.example.invalid",

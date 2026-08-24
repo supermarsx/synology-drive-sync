@@ -344,3 +344,52 @@ fn panic_after_authentication_logs_out_without_reinvoking_the_observer() {
             .any(|operation| operation == "SYNO.API.Auth.logout")
     );
 }
+
+#[test]
+fn panic_when_logout_starts_logs_out_without_reinvoking_the_observer() {
+    let server = MockFileStation::start();
+    let source = TestDir::new("sdk-panic-at-logout");
+    source.write("hello.txt", b"panic at logout");
+    let request = request(&server, &source);
+    let mut secrets = FixedSecrets::new();
+    let observer_panicked = Arc::new(AtomicBool::new(false));
+    let calls_after_panic = Arc::new(AtomicUsize::new(0));
+    let observer_panicked_for_callback = Arc::clone(&observer_panicked);
+    let calls_after_panic_for_callback = Arc::clone(&calls_after_panic);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = Engine.run(
+            &request,
+            &mut secrets,
+            &CancellationToken::default(),
+            |_| PlanDecision::PreviewOnly,
+            |event| {
+                if observer_panicked_for_callback.load(Ordering::SeqCst) {
+                    calls_after_panic_for_callback.fetch_add(1, Ordering::SeqCst);
+                    return EventControl::Continue;
+                }
+                if matches!(
+                    event,
+                    SdkEvent::PhaseStarted {
+                        phase: synology_drive_sync::sdk::Phase::Logout
+                    }
+                ) {
+                    observer_panicked_for_callback.store(true, Ordering::SeqCst);
+                    panic!("observer panic when logout starts");
+                }
+                EventControl::Continue
+            },
+        );
+    }));
+
+    assert!(result.is_err(), "the logout observer panic must resume");
+    assert!(observer_panicked.load(Ordering::SeqCst));
+    assert_eq!(calls_after_panic.load(Ordering::SeqCst), 0);
+    assert_eq!(secrets.password_calls, 1);
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|request| request.operation() == "SYNO.API.Auth.logout")
+    );
+}

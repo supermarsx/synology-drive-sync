@@ -77,6 +77,10 @@ static uint8_t *read_file(const char *path, uint64_t *length) {
 }
 
 int main(int argc, char **argv) {
+    if (sdsync_abi_version_v1() != SDSYNC_ABI_VERSION_V1) {
+        fputs("incompatible sdsync C ABI version\n", stderr);
+        return 2;
+    }
     if (argc != 2) {
         fprintf(stderr, "usage: %s REQUEST.json\n", argv[0]);
         return 2;

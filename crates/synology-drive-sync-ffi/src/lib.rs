@@ -931,6 +931,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn production_job_and_retry_limits_are_invalid_ffi_requests() {
+        for (field, expected_message) in [
+            (r#""jobs":17"#, "jobs must be between 1 and 16"),
+            (r#""retries":6"#, "retries must be between 0 and 5"),
+        ] {
+            let request = format!(
+                r#"{{
+                    "schema":"sdsync.request.v1",
+                    "endpoint":"https://files.example.invalid",
+                    "username":"user",
+                    "source":".",
+                    "remote":"/home/Drive/backup",
+                    {field}
+                }}"#
+            );
+            let mut result = ptr::null_mut();
+            // SAFETY: The UTF-8 request and out pointer remain valid for this call.
+            let status = unsafe {
+                sdsync_run_v1(
+                    request.as_ptr(),
+                    request.len() as u64,
+                    ptr::null(),
+                    ptr::null(),
+                    &mut result,
+                )
+            };
+            assert_eq!(status, SDSYNC_STATUS_INVALID_ARGUMENT);
+            assert!(!result.is_null());
+            // SAFETY: `result` is live and uniquely owned by this iteration.
+            let json = unsafe { result_json(result) };
+            assert!(json.contains(r#""code":"invalid-argument""#));
+            assert!(json.contains(expected_message));
+            // SAFETY: Transfer the live handle exactly once.
+            unsafe { sdsync_result_free_v1(result) };
+        }
+    }
+
     unsafe extern "C" fn secret_callback(
         user_data: *mut c_void,
         _kind: u32,
