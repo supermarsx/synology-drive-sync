@@ -2391,7 +2391,6 @@ fn api_error_description(api: &str, code: i64) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
     use std::sync::Mutex;
     use std::thread::JoinHandle;
