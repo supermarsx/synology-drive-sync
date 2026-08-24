@@ -410,6 +410,42 @@ def verify_image_index(document: Any) -> None:
         )
 
 
+def verify_image_index_match(expected_document: Any, actual_document: Any) -> None:
+    """Require two valid OCI indexes to have identical parsed JSON content."""
+
+    verify_image_index(expected_document)
+    verify_image_index(actual_document)
+    expected_canonical = json.dumps(
+        expected_document,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    actual_canonical = json.dumps(
+        actual_document,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if actual_canonical != expected_canonical:
+        expected = _object(expected_document, "expected image index")
+        actual = _object(actual_document, "actual image index")
+        expected_digests = sorted(
+            _string(item.get("digest"), "expected image index manifest digest")
+            for item in _array(expected.get("manifests"), "expected image index manifests")
+            if isinstance(item, dict)
+        )
+        actual_digests = sorted(
+            _string(item.get("digest"), "actual image index manifest digest")
+            for item in _array(actual.get("manifests"), "actual image index manifests")
+            if isinstance(item, dict)
+        )
+        raise ContractError(
+            "image index content differs from the exact expected index; "
+            f"expected child digests {expected_digests}, actual child digests {actual_digests}"
+        )
+
+
 def archive_names(tag: str) -> list[str]:
     _tag(tag)
     names = [
@@ -827,6 +863,10 @@ def _parser() -> argparse.ArgumentParser:
 
     image = commands.add_parser("verify-image-index")
     image.add_argument("--input", required=True, type=Path)
+
+    image_match = commands.add_parser("verify-image-index-match")
+    image_match.add_argument("--expected", required=True, type=Path)
+    image_match.add_argument("--actual", required=True, type=Path)
     return parser
 
 
@@ -867,6 +907,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "verify-image-index":
             verify_image_index(_load_json(args.input))
+        elif args.command == "verify-image-index-match":
+            verify_image_index_match(
+                _load_json(args.expected),
+                _load_json(args.actual),
+            )
         else:  # pragma: no cover - argparse owns this branch.
             raise ContractError(f"unknown command: {args.command}")
     except (ContractError, OSError, UnicodeError) as error:

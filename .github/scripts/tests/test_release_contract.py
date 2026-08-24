@@ -193,6 +193,86 @@ class ImageIndexContractTests(unittest.TestCase):
     def test_exact_runtime_platform_set_accepts_attestation_descriptors(self):
         release_contract.verify_image_index(self.index())
 
+    def test_semantically_identical_indexes_ignore_json_serialization(self):
+        expected = self.index()
+        actual = json.loads(json.dumps(expected, sort_keys=True, separators=(",", ":")))
+        release_contract.verify_image_index_match(expected, actual)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            expected_path = root / "expected.json"
+            actual_path = root / "actual.json"
+            expected_path.write_text(
+                json.dumps(expected, indent=2) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            actual_path.write_text(
+                json.dumps(actual, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+                newline="\n",
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "verify-image-index-match",
+                    "--expected",
+                    str(expected_path),
+                    "--actual",
+                    str(actual_path),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_index_match_rejects_any_child_descriptor_change(self):
+        expected = self.index()
+        cases = {}
+
+        changed_digest = copy.deepcopy(expected)
+        changed_digest["manifests"][0]["digest"] = "sha256:" + "d" * 64
+        cases["digest"] = changed_digest
+
+        changed_size = copy.deepcopy(expected)
+        changed_size["manifests"][0]["size"] += 1
+        cases["size"] = changed_size
+
+        changed_annotations = copy.deepcopy(expected)
+        changed_annotations["manifests"][1]["annotations"] = {
+            "vnd.docker.reference.type": "attestation-manifest"
+        }
+        cases["annotations"] = changed_annotations
+
+        reordered = copy.deepcopy(expected)
+        reordered["manifests"][0], reordered["manifests"][2] = (
+            reordered["manifests"][2],
+            reordered["manifests"][0],
+        )
+        cases["order"] = reordered
+
+        for name, actual in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    release_contract.ContractError,
+                    "content differs from the exact expected index",
+                ):
+                    release_contract.verify_image_index_match(expected, actual)
+
+    def test_index_match_distinguishes_json_boolean_from_integer(self):
+        expected = self.index()
+        expected["annotations"] = {"test.example/generation": 1}
+        actual = copy.deepcopy(expected)
+        actual["annotations"]["test.example/generation"] = True
+
+        with self.assertRaisesRegex(
+            release_contract.ContractError,
+            "content differs from the exact expected index",
+        ):
+            release_contract.verify_image_index_match(expected, actual)
+
     def test_wrong_duplicate_or_half_unknown_platforms_fail_closed(self):
         cases = {}
 
@@ -469,8 +549,24 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("refusing to overwrite the immutable version tag", workflow)
         self.assertIn('for remote_tag in "$TAG" latest; do', workflow)
         self.assertIn("--format '{{.Manifest.Digest}}'", workflow)
-        self.assertGreaterEqual(workflow.count("verify-image-index"), 3)
-        self.assertGreaterEqual(workflow.count('cmp --silent "$expected_index"'), 2)
+        self.assertGreaterEqual(
+            workflow.count("release-contract.py verify-image-index-match"), 2
+        )
+        self.assertIn('[[ "$remote_digest" == "$version_digest" ]]', workflow)
+        self.assertIn('"$IMAGE@$version_digest"', workflow)
+        self.assertNotIn('sha256sum "$expected_index"', workflow)
+        self.assertNotIn('sha256sum "$remote_index"', workflow)
+        self.assertNotIn('sha256sum "$version_index"', workflow)
+        self.assertNotIn('cmp --silent "$expected_index"', workflow)
+
+        existing_start = workflow.index('if [[ "$version_exists" == true ]]; then')
+        fresh_start = workflow.index("\n          else", existing_start)
+        existing_branch = workflow[existing_start:fresh_start]
+        self.assertLess(
+            existing_branch.index("release-contract.py verify-image-index-match"),
+            existing_branch.index("docker buildx imagetools create"),
+        )
+        self.assertNotIn('--tag "$IMAGE:$TAG"', existing_branch)
 
     def test_sdk_profiles_paths_and_retry_body_comparison_are_exact(self):
         workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(

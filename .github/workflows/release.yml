@@ -1594,20 +1594,17 @@ jobs:
             "$IMAGE@$arm64" > "$expected_index"
           python3 .github/scripts/release-contract.py verify-image-index \
             --input "$expected_index"
-          expected_digest="sha256:$(sha256sum "$expected_index" | cut -d ' ' -f 1)"
-          [[ "$expected_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
-            echo "could not derive the expected image-index digest" >&2
-            exit 1
-          }
 
           # A calendar-version tag is immutable. If it already exists during a
-          # failed-job rerun, accept it only when its raw manifest is byte-for-
-          # byte the exact index that these two architecture jobs produced.
-          existing_index="$RUNNER_TEMP/sdsync-existing-version-index.json"
+          # failed-job rerun, accept it only when its parsed manifest is exactly
+          # the index that these two architecture jobs produced. Buildx and the
+          # registry can serialize the same JSON object differently, so rendered
+          # bytes cannot predict the registry's authoritative digest.
+          version_index="$RUNNER_TEMP/sdsync-version-image-index.json"
           existing_error="$RUNNER_TEMP/sdsync-existing-version-error.log"
           version_exists=false
           if docker buildx imagetools inspect --raw "$IMAGE:$TAG" \
-            > "$existing_index" 2> "$existing_error"; then
+            > "$version_index" 2> "$existing_error"; then
             version_exists=true
           elif ! grep -Fq ': not found' "$existing_error"; then
             echo "could not safely determine whether $IMAGE:$TAG exists:" >&2
@@ -1616,22 +1613,24 @@ jobs:
           fi
 
           metadata="$RUNNER_TEMP/sdsync-image-metadata.json"
+          version_digest=''
           if [[ "$version_exists" == true ]]; then
-            python3 .github/scripts/release-contract.py verify-image-index \
-              --input "$existing_index"
-            existing_digest="sha256:$(sha256sum "$existing_index" | cut -d ' ' -f 1)"
-            [[ "$existing_digest" == "$expected_digest" ]] || {
-              echo "$IMAGE:$TAG already resolves to $existing_digest, expected $expected_digest; refusing to overwrite the immutable version tag" >&2
+            if ! python3 .github/scripts/release-contract.py verify-image-index-match \
+              --expected "$expected_index" \
+              --actual "$version_index"; then
+              echo "$IMAGE:$TAG differs from the exact intended index; refusing to overwrite the immutable version tag" >&2
               exit 1
-            }
-            cmp --silent "$expected_index" "$existing_index" || {
-              echo "$IMAGE:$TAG differs from the exact expected manifest despite its digest" >&2
+            fi
+            version_digest=$(docker buildx imagetools inspect \
+              "$IMAGE:$TAG" --format '{{.Manifest.Digest}}')
+            [[ "$version_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+              echo "$IMAGE:$TAG returned a malformed registry digest: '$version_digest'" >&2
               exit 1
             }
             docker buildx imagetools create \
               --prefer-index=false \
               --tag "$IMAGE:latest" \
-              "$IMAGE@$expected_digest"
+              "$IMAGE@$version_digest"
           else
             docker buildx imagetools create \
               --metadata-file "$metadata" \
@@ -1639,9 +1638,9 @@ jobs:
               --tag "$IMAGE:latest" \
               "$IMAGE@$amd64" \
               "$IMAGE@$arm64"
-            created_digest=$(jq -r '."containerimage.descriptor".digest // empty' "$metadata")
-            [[ "$created_digest" == "$expected_digest" ]] || {
-              echo "imagetools created $created_digest, expected $expected_digest" >&2
+            version_digest=$(jq -r '."containerimage.descriptor".digest // empty' "$metadata")
+            [[ "$version_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+              echo "imagetools returned a malformed created digest: '$version_digest'" >&2
               exit 1
             }
           fi
@@ -1649,21 +1648,21 @@ jobs:
           for remote_tag in "$TAG" latest; do
             remote_index="$RUNNER_TEMP/sdsync-remote-$remote_tag-image-index.json"
             docker buildx imagetools inspect --raw "$IMAGE:$remote_tag" > "$remote_index"
-            python3 .github/scripts/release-contract.py verify-image-index \
-              --input "$remote_index"
+            python3 .github/scripts/release-contract.py verify-image-index-match \
+              --expected "$expected_index" \
+              --actual "$remote_index"
             remote_digest=$(docker buildx imagetools inspect \
               "$IMAGE:$remote_tag" --format '{{.Manifest.Digest}}')
-            calculated_digest="sha256:$(sha256sum "$remote_index" | cut -d ' ' -f 1)"
-            [[ "$remote_digest" == "$expected_digest" && "$calculated_digest" == "$expected_digest" ]] || {
-              echo "$IMAGE:$remote_tag resolves to $remote_digest (raw $calculated_digest), expected $expected_digest" >&2
+            [[ "$remote_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+              echo "$IMAGE:$remote_tag returned a malformed registry digest: '$remote_digest'" >&2
               exit 1
             }
-            cmp --silent "$expected_index" "$remote_index" || {
-              echo "$IMAGE:$remote_tag does not contain the exact expected manifest" >&2
+            [[ "$remote_digest" == "$version_digest" ]] || {
+              echo "$IMAGE:$remote_tag resolves to $remote_digest, expected immutable version digest $version_digest" >&2
               exit 1
             }
           done
-          echo "value=$expected_digest" >> "$GITHUB_OUTPUT"
+          echo "value=$version_digest" >> "$GITHUB_OUTPUT"
           docker buildx imagetools inspect "$IMAGE:$TAG"
       - name: Attest image provenance
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
