@@ -1092,9 +1092,10 @@ jobs:
                 and .target_commitish == $sha
                 and .name == $title
               ' "$updated" >/dev/null
-            remote_notes="$RUNNER_TEMP/sdsync-updated-draft-notes.md"
-            jq -r '.body' "$updated" > "$remote_notes"
-            diff -u "$notes" "$remote_notes"
+            # Compare JSON body text directly. `jq -r` always writes a record
+            # terminator, which doubled an existing terminal LF and made an
+            # exact successful update look different on every retry.
+            jq -e --rawfile notes "$notes" '.body == $notes' "$updated" >/dev/null
           fi
 
           state="$RUNNER_TEMP/sdsync-draft-state.json"
