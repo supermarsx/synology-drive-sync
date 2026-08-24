@@ -8,7 +8,7 @@ configuration, credentials, state, and logs after a confirmation.
 
 | Deployment | Identity and credentials | Non-overlap boundary | Authoritative diagnostics |
 | --- | --- | --- | --- |
-| DSM 7 SPK | `synology-drive-sync` system-internal user; package-owned `0600` password/TOTP files | one package run lock across manual and scheduled jobs on that NAS | `sdsync-dsm status`, bounded package logs, and exit status |
+| DSM 7 SPK | `synology-drive-sync` system-internal user; package-owned `0600` password/TOTP/token files | one package run lock across dashboard, manual, and scheduled jobs on that NAS | native dashboard, `sdsync-dsm status`, bounded package logs, and exit status |
 | systemd | dedicated `sdsync` user; `LoadCredential` files | shared packaged `flock` path across related units on one host | journald plus exit status |
 | launchd | logged-in user; login Keychain | one launchd label only | rotating JSON file plus unified-log fallback |
 | Task Scheduler | current interactive user; Credential Manager | one task name (`IgnoreNew`) only | rotating JSON file plus `LastTaskResult` |
@@ -39,7 +39,8 @@ static musl ELF. Releases contain four separate ABI packages: `x86_64`, `armv8`,
 Evansport on the DSM 7.0/7.1 line. Use the
 [release selector](../docs/release-selector.md) instead of guessing from a CPU label; ARMv5, PowerPC,
 unknown, and conflicting inputs fail closed. The SPK runs without root or Linux capabilities, keeps
-scheduling disabled after installation, and supplies the headless manager at:
+scheduling disabled after installation, registers an administrator-only DSM dashboard, and supplies
+the CLI recovery/automation manager at:
 
 ```text
 /var/packages/synology-drive-sync/target/bin/sdsync-dsm
@@ -64,15 +65,19 @@ batch behavior. Passwords and optional TOTP seeds enter through masked prompts o
 non-symlink input files and are copied into private package storage; secret values never enter
 arguments or generated TOML.
 
-The package controller provides interval scheduling, cooperative start/stop, one run lock, state,
-and bounded logs. Deletion requires both profile-level `--delete --max-delete N` and a manager-level
-`--allow-delete` opt-in. Upgrade retains private configuration and credentials and validates them;
-uninstall removes package-owned configuration, credentials, state, locks, and logs while leaving
-both NAS data trees untouched.
+The package controller provides per-profile interval/daily/realtime routines, native-watcher polling
+fallback, dependencies, bounded retry/backoff, a legacy global interval schedule, cooperative
+start/stop, one run lock, state, bounded logs, and fixed DSM notifications. The dashboard uses DSM
+cookie authentication, an independent administrator check, SynoToken, package CSRF, and a private
+controller queue; stored secrets are never returned. Deletion requires profile and action-level
+approval. Upgrade retains private configuration and credentials and validates them; uninstall removes
+package-owned configuration, credentials, state, locks, and logs while leaving both NAS data trees
+untouched.
 
-See the [complete DSM package guide](../docs/synology-package.md) for exact install, ACL, profile,
-secret, diagnostic, scheduling, upgrade, and acceptance commands. The package has static/mock
-validation but no recorded live two-NAS installation test.
+See the [complete DSM package and dashboard guide](../docs/synology-package.md) for exact install,
+ACL, graphical configuration, secret, diagnostic, routine, security, CLI, upgrade, and acceptance
+behavior. The package has static/mock validation but no recorded physical installation or live
+two-NAS test; DSM 7 AppLaunch SynoToken forwarding also remains a live acceptance gap.
 
 ## Verified binary installer lifecycle
 

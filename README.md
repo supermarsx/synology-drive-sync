@@ -12,12 +12,14 @@ underlying DSM folder through File Station; Synology Drive can index that folder
 My Drive or an enabled Team Folder. Service managers, including the DSM package controller, only
 schedule isolated finite runs.
 
-An architecture-specific DSM 7 `.spk` can run the same engine directly on the source NAS. Its
-remote destination is configurable: `/home/Drive/...` targets the remote account's Drive home, and
-any writable `/<shared-folder>/...` subdirectory can be selected instead. DSM must provision the
-remote user home or shared-folder root and its permissions first; the sync creates a missing chosen
+An architecture-specific DSM 7 `.spk` can run the same engine directly on the source NAS. It includes
+a dark-first administrator dashboard for profiles, secrets, routines, Doctor, health, activity,
+logs, and notifications, plus the `sdsync-dsm` SSH recovery/automation manager. Its remote
+destination is configurable: `/home/Drive/...` targets the remote account's Drive home, and any
+writable `/<shared-folder>/...` subdirectory can be selected instead. DSM must provision the remote
+user home or shared-folder root and its permissions first; the sync creates a missing chosen
 subdirectory and all descendants beneath an existing writable parent. See the
-[Synology DSM package guide](docs/synology-package.md).
+[Synology DSM package and dashboard guide](docs/synology-package.md).
 
 > [!IMPORTANT]
 > The automated suite uses deterministic local and mock-HTTP tests; it does not log in to a live NAS. Before trusting a deployment, run the [source and target diagnostics](docs/diagnostics-and-batch.md), review `plan`, complete the [disposable live-NAS acceptance](docs/production-acceptance.md), and keep `--delete` disabled.
@@ -416,7 +418,7 @@ profiles remain committed.
 See [Installation and deployment](docs/installation.md) for:
 
 - four manually installable DSM 7 SPKs for `x86_64`, `armv8`, ARMv7-A hard-float, and Evansport
-  `i686`, with a package-owned scheduler and multi-target manager;
+  `i686`, with a native administrator dashboard, per-profile routines, and CLI manager;
 - checksum-verifying Unix and Windows installers;
 - manual archive installation, completions, and manpage setup;
 - the non-root, read-only Docker/Compose job and optional TOTP secret overlay;
