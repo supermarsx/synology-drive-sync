@@ -22,19 +22,25 @@ Install the architecture-specific SPK when the source directory is physically on
 | Intel `i686` / `evansport` (DSM 7.0/7.1 only) | `i686` | `synology-drive-sync-YY.N-i686.spk` |
 
 All four packages embed one fully static musl ELF (ELF32 or ELF64) and require DSM `7.0-40759` or
-newer. Platform availability also follows the exact DSM 7.0–7.4 `pkgscripts-ng` interval for the
-model's Package Arch: for example, Evansport `i686` ends at DSM 7.1, while `rtd1619b`,
-`geminilakenk`, and `epyc7003` first appear in DSM 7.1, 7.2, and 7.3 respectively. Use the
-[release selector](release-selector.md) with the exact model, DSM build, and reported architecture.
-It rejects pre-introduction and post-removal DSM branches, ARMv5, PowerPC, unknown models, and
-conflicting inputs instead of guessing. It also rejects `PAS7700`: that model remains in the factual
-CPU snapshot but runs DSM Enterprise 1.0, not DSM 7. Download the selected SPK and `SHA256SUMS`,
+newer. Availability is the intersection of the exact model's DSM lifecycle and the DSM 7.0–7.4
+`pkgscripts-ng` interval for its Package Arch. A platform can remain in a toolkit after an older
+model on that platform stops receiving DSM, and a new model can require a later DSM even when its
+CPU family already existed. Use the [release selector](release-selector.md) with the searchable
+model, explicit OS product/version, and reported architecture. The exact build is optional for DSM
+7.1–7.3 but mandatory for DSM 7.0 and 7.4 so the `7.0-40759` floor and `7.4-99999` ceiling can be
+proven. The selector covers all 231 models in the captured official CPU table, including
+informational DSM 5.2/6.2 systems that
+receive no asset. It rejects model/branch conflicts, pre-introduction and post-removal toolkit
+branches, unknown or contradictory runtime inputs, and `PAS7700`, whose product line is DSM
+Enterprise 1.0 rather than ordinary DSM. For an unsupported NAS, run the desktop CLI or container
+on a supported workstation that can read the source over an intentionally configured share; do not
+relabel an SPK. Download the selected SPK and `SHA256SUMS`,
 verify the file as described in [Release artifacts and verification](releases.md), then use **Package
 Center > Manual Install**. DSM displays its normal warning for a package not published by Synology.
 Treat that warning as a trust decision and proceed only after verifying the repository, exact asset
 name, SHA-256, and optional GitHub attestation.
 
-The headless package installs the manager here:
+The native DSM package installs the CLI manager here:
 
 ```text
 /var/packages/synology-drive-sync/target/bin/sdsync-dsm

@@ -41,17 +41,20 @@ Four DSM 7 packages are published separately from the GNU/Linux archives:
 | `armv7 armada370 armada375 armada38x armadaxp comcerto2k monaco` | `alpine`, `alpine4k`, `armada370`, `armada375`, `armada38x`, `armadaxp`, `comcerto2k`, `monaco` | `armv7-unknown-linux-musleabihf` | `synology-drive-sync-YY.N-armv7.spk` |
 | `i686` | `evansport` (DSM 7.0/7.1 only) | `i686-unknown-linux-musl` | `synology-drive-sync-YY.N-i686.spk` |
 
-Each SPK contains one matching static ELF32 or ELF64 executable, the headless `sdsync-dsm` package
-manager, controller/runner helpers, DSM lifecycle scripts, a lower-privilege `conf/privilege`, icons,
+Each SPK contains one matching static ELF32 or ELF64 sync executable, a native administrator DSM
+dashboard, the `sdsync-dsm` CLI manager, authenticated bridge, controller/runner helpers, DSM
+lifecycle scripts, a lower-privilege `conf/privilege`, icons,
 and license texts. The package requires DSM `7.0-40759` or newer, while platform availability remains
 constrained by Synology's DSM-version table. It is not `noarch`; the four binary ABIs are never
 combined into one SPK. The ARMv7 INFO field combines the generic `armv7` family token used for
 Alpine/Alpine4k with the six compatible platform-specific aliases; every value selects the same
 ARMv7-A little-endian hard-float ABI.
 
-An ABI match alone is insufficient. The [release selector's DSM toolkit intervals](release-selector.md#dsm-toolkit-intervals)
-also require the model's Package Arch to exist in the selected official DSM 7.0–7.4 branch, including
-the introduction floors for newer platforms and the removal ceilings for legacy platforms.
+An ABI match alone is insufficient. The [release selector's model lifecycle and DSM toolkit intervals](release-selector.md#dsm-toolkit-intervals)
+require both the exact model and its Package Arch to exist in the selected official DSM 7.0–7.4
+branch. The captured 231-model catalog includes model-specific introduction floors and retirement
+ceilings as well as toolkit-level changes. DSM 5.2/6.2 and DSM Enterprise entries remain
+searchable for an explicit no-asset result; they are never mapped to one of these four DSM 7 SPKs.
 
 Release CI rejects an embedded ELF with the wrong machine type, a dynamic program interpreter, or
 a required dynamic library. It validates the SPK INFO, archive member safety and modes, package
@@ -60,10 +63,13 @@ Static validation is not proof of installation or File Station behavior on a liv
 
 Install a verified SPK through **Package Center > Manual Install**. DSM 7 displays its normal alert
 for a non-Synology package; these artifacts are not published or signed by Synology. Use the
-[release selector](release-selector.md) to resolve an exact model, DSM build, and reported processor
-without guessing, then see the [Synology DSM package guide](synology-package.md) before granting
-source-share access or entering a target password/TOTP seed. ARMv5, PowerPC, unknown models, and
-conflicting inputs are unsupported and fail closed.
+[release selector](release-selector.md) to resolve an exact model, OS product/version, reported
+processor, and exact build (required on DSM 7.0/7.4; optional on DSM 7.1–7.3) without guessing,
+then see the [Synology DSM package guide](synology-package.md) before granting source-share access or
+entering a target password/TOTP seed. Unsupported historical models, DSM Enterprise, ARMv5,
+PowerPC, unknown models,
+and conflicting inputs fail closed. Their safe released alternatives are the desktop CLI or
+container on a supported host, not a relabeled SPK.
 
 ## Rust and C SDK archives
 

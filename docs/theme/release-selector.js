@@ -27,7 +27,11 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function createReleaseSelector(data) {
     "use strict";
 
-    if (!data || !Array.isArray(data.modelGroups)) {
+    if (
+        !data ||
+        !Array.isArray(data.modelGroups) ||
+        !Array.isArray(data.compatibilityGroups)
+    ) {
         throw new Error("release selector model data is unavailable");
     }
 
@@ -36,7 +40,12 @@
     const RELEASE_API_URL = `https://api.github.com/repos/${REPOSITORY}/releases/latest`;
     const PACKAGE_URL = `https://github.com/${REPOSITORY}/pkgs/container/synology-drive-sync`;
     const FALLBACK_TAG = "YY.N";
-    const MAX_VERIFIED_DSM_MINOR = 4;
+    const DSM_PACKAGE_MAXIMUM = Object.freeze({
+        major: 7,
+        minor: 4,
+        build: 99999,
+        display: "7.4-99999",
+    });
 
     const ARMV7_PACKAGES = new Set([
         "alpine",
@@ -112,12 +121,7 @@
     });
     const DESKTOP_OSES = new Set(["linux", "macos", "windows"]);
     const DESKTOP_CPUS = new Set(["aarch64", "x86_64"]);
-    const NON_DSM_MODELS = Object.freeze({
-        PAS7700: Object.freeze({
-            operatingSystem: "DSM Enterprise 1.0",
-            sourceUrl: "https://www.synology.com/en-us/support/download/PAS7700",
-        }),
-    });
+    const PRODUCT_LINES = new Set(["dsm", "dsm-enterprise"]);
 
     function normalizedModel(value) {
         return String(value || "")
@@ -156,7 +160,46 @@
 
     const MODEL_INDEX = buildModelIndex(data.modelGroups);
 
-    if (!Number.isInteger(data.modelCount) || data.modelCount !== MODEL_INDEX.size) {
+    function buildCompatibilityIndex(groups) {
+        const index = new Map();
+
+        for (const group of groups) {
+            for (const model of group.models) {
+                const key = normalizedModel(model);
+
+                if (index.has(key)) {
+                    throw new Error(`duplicate Synology lifecycle entry: ${model}`);
+                }
+
+                index.set(
+                    key,
+                    Object.freeze({
+                        productLine: group.productLine,
+                        status: group.status,
+                        minMinor: Number.isInteger(group.minMinor) ? group.minMinor : null,
+                        maxMinor: Number.isInteger(group.maxMinor) ? group.maxMinor : null,
+                        lastVersion: group.lastVersion || null,
+                    }),
+                );
+            }
+        }
+
+        return index;
+    }
+
+    const MODEL_COMPATIBILITY_INDEX = buildCompatibilityIndex(data.compatibilityGroups);
+
+    if (
+        !Number.isInteger(data.modelCount) ||
+        data.modelCount !== MODEL_INDEX.size ||
+        MODEL_COMPATIBILITY_INDEX.size !== MODEL_INDEX.size ||
+        [...MODEL_INDEX.keys()].some(function missingCompatibility(model) {
+            return !MODEL_COMPATIBILITY_INDEX.has(model);
+        }) ||
+        [...MODEL_COMPATIBILITY_INDEX.keys()].some(function unknownCompatibility(model) {
+            return !MODEL_INDEX.has(model);
+        })
+    ) {
         throw new Error("release selector model snapshot count does not match its model records");
     }
 
@@ -173,8 +216,10 @@
         return MODEL_INDEX.get(normalizedModel(model)) || null;
     }
 
-    function nonDsmModelMetadata(model) {
-        return model ? NON_DSM_MODELS[normalizedModel(model.model)] || null : null;
+    function modelCompatibility(model) {
+        const key = typeof model === "object" && model ? model.model : model;
+
+        return MODEL_COMPATIBILITY_INDEX.get(normalizedModel(key)) || null;
     }
 
     function normalizeCpuArch(value) {
@@ -211,6 +256,60 @@
         }
 
         return normalized;
+    }
+
+    function normalizeProductLine(value) {
+        const normalized = String(value || "")
+            .trim()
+            .toLowerCase()
+            .replace(/[_\s]+/g, "-");
+
+        if (normalized === "dsm" || normalized === "diskstation-manager") {
+            return "dsm";
+        }
+        if (normalized === "dsm-enterprise" || normalized === "dsmenterprise") {
+            return "dsm-enterprise";
+        }
+
+        return null;
+    }
+
+    function parseOsVersionSelection(value) {
+        const normalized = String(value || "").trim().toLowerCase();
+        const dsm7 = /^dsm-7\.([0-4])$/.exec(normalized);
+
+        if (dsm7) {
+            return Object.freeze({
+                key: normalized,
+                productLine: "dsm",
+                display: `DSM 7.${dsm7[1]}`,
+                supported: true,
+                major: 7,
+                minor: Number(dsm7[1]),
+            });
+        }
+        if (normalized === "dsm-6.x-or-earlier") {
+            return Object.freeze({
+                key: normalized,
+                productLine: "dsm",
+                display: "DSM 6.x or earlier",
+                supported: false,
+                major: 6,
+                minor: null,
+            });
+        }
+        if (normalized === "dsm-enterprise-1.0") {
+            return Object.freeze({
+                key: normalized,
+                productLine: "dsm-enterprise",
+                display: "DSM Enterprise 1.0",
+                supported: false,
+                major: 1,
+                minor: 0,
+            });
+        }
+
+        return null;
     }
 
     function parseDsmVersion(value) {
@@ -280,6 +379,20 @@
             : `DSM 7.${bounds.min}–7.${bounds.max}`;
     }
 
+    function compatibilityLabel(compatibility) {
+        if (compatibility.productLine === "DSM Enterprise") {
+            return `DSM Enterprise ${compatibility.lastVersion} · no published SPK`;
+        }
+        if (compatibility.status === "legacy") {
+            return `last upgradable DSM ${compatibility.lastVersion} · no published SPK`;
+        }
+
+        return dsmMinorRangeLabel({
+            min: compatibility.minMinor,
+            max: compatibility.maxMinor,
+        });
+    }
+
     const DSM_ASSET_PACKAGES = new Set([
         ...ARMV7_PACKAGES,
         ...ARMV8_PACKAGES,
@@ -301,58 +414,142 @@
 
     function resolveDsmSelection(input) {
         const catalogModel = lookupModel(input.model);
-        const nonDsmModel = nonDsmModelMetadata(catalogModel);
-
-        if (nonDsmModel) {
-            return failure(
-                "non_dsm_model",
-                `${catalogModel.model} runs ${nonDsmModel.operatingSystem}, not DSM 7.`,
-                `The factual CPU snapshot retains this model, but DSM 7 SPKs are not compatible with its operating-system and package lifecycle. Confirm the product OS in Synology's Download Center: ${nonDsmModel.sourceUrl}`,
-            );
-        }
-
-        const version = parseDsmVersion(input.dsmVersion);
-
-        if (!version) {
-            return failure(
-                "invalid_dsm_version",
-                "Enter the complete DSM version and build, for example 7.2.2-72806.",
-            );
-        }
-        if (
-            version.major < 7 ||
-            (version.major === 7 && version.build < 40759)
-        ) {
-            return failure(
-                "dsm_too_old",
-                "This package requires DSM 7.0-40759 or newer.",
-                "DSM 6 and earlier require a separately designed package; changing the INFO label would not make this DSM 7 package compatible.",
-            );
-        }
-        if (version.major > 7) {
-            return failure(
-                "dsm_unverified_major",
-                `DSM ${version.major} is newer than the verified DSM 7 package contract.`,
-                "Check the current release notes before installing; the selector does not infer forward compatibility.",
-            );
-        }
-        if (version.minor > MAX_VERIFIED_DSM_MINOR) {
-            return failure(
-                "dsm_unverified_minor",
-                `DSM 7.${version.minor} is newer than the DSM 7.4 toolkit matrix captured by this selector.`,
-                "Check the current release notes and official Synology platform table; the selector does not infer compatibility for a newer DSM branch.",
-            );
-        }
-
-        const model = catalogModel;
-
-        if (!model) {
+        if (!catalogModel) {
             return failure(
                 "unknown_model",
                 "That model is not in the captured Synology CPU-table snapshot.",
                 `Check Synology's live Package Arch table (snapshot captured ${data.snapshotCapturedDate}) and report the exact model, DSM build, and Package Arch. The selector will not guess from a model year or marketing name.`,
             );
         }
+
+        const compatibility = modelCompatibility(catalogModel);
+        const productLine = normalizeProductLine(input.productLine);
+        const osVersion = parseOsVersionSelection(input.osVersion);
+
+        if (!productLine || !PRODUCT_LINES.has(productLine)) {
+            return failure(
+                "invalid_product_line",
+                "Select the operating-system product line reported by the NAS.",
+                "Choose DiskStation Manager (DSM) or DSM Enterprise; sharing a CPU family does not make their package lifecycles interchangeable.",
+            );
+        }
+        if (!osVersion) {
+            return failure(
+                "invalid_os_version_selection",
+                "Select one of the catalogued Synology OS versions.",
+                `The selector covers DSM 7.0 through 7.4, informational DSM 6.x or earlier, and DSM Enterprise 1.0 as captured ${data.snapshotCapturedDate}. Newer or unknown lines fail closed until the catalog is refreshed.`,
+            );
+        }
+        if (productLine !== osVersion.productLine) {
+            return failure(
+                "os_selection_conflict",
+                "The selected product line and OS version belong to different Synology products.",
+                "Choose a DSM version with DiskStation Manager, or DSM Enterprise 1.0 with DSM Enterprise.",
+            );
+        }
+
+        const expectedProductLine =
+            compatibility.productLine === "DSM Enterprise" ? "dsm-enterprise" : "dsm";
+
+        if (productLine !== expectedProductLine) {
+            return failure(
+                "product_line_conflict",
+                `${catalogModel.model} is catalogued for ${compatibility.productLine}, not ${productLine === "dsm" ? "DSM" : "DSM Enterprise"}.`,
+                `Recheck the exact model and OS product. The selector does not transfer a package between product lines. Source: ${expectedProductLine === "dsm-enterprise" ? data.enterpriseSourceUrl : data.lifecycleSourceUrl}`,
+            );
+        }
+        if (compatibility.status === "unsupported-product-line") {
+            return failure(
+                "unsupported_product_line",
+                `${catalogModel.model} runs DSM Enterprise ${compatibility.lastVersion}; no ordinary DSM SPK is offered.`,
+                `DSM Enterprise has a separate package lifecycle that this release does not publish or claim to support. Confirm the product in Synology's Download Center: ${data.enterpriseSourceUrl}`,
+            );
+        }
+        if (!osVersion.supported) {
+            const lastKnown = compatibility.lastVersion
+                ? ` Synology lists ${catalogModel.model}'s last upgradable DSM as ${compatibility.lastVersion}.`
+                : "";
+
+            return failure(
+                "unsupported_dsm_line",
+                `${osVersion.display} is informational only; this release publishes DSM 7 SPKs.`,
+                `${lastKnown} A safe older-DSM port needs its own toolchain, package metadata, lifecycle tests, and release assets. Desktop CLI or a container on a supported workstation is the safe alternative.`,
+            );
+        }
+        if (compatibility.status !== "supported") {
+            return failure(
+                "model_dsm_conflict",
+                `${catalogModel.model} cannot run the selected ${osVersion.display}; Synology lists its last upgradable DSM as ${compatibility.lastVersion}.`,
+                `Use the official lifecycle table (${data.lifecycleSourceUrl}) and Download Center for that exact model. No incompatible DSM 7 asset is offered; use the desktop CLI or container on another supported system instead.`,
+            );
+        }
+        if (
+            osVersion.minor < compatibility.minMinor ||
+            osVersion.minor > compatibility.maxMinor
+        ) {
+            const modelRange = dsmMinorRangeLabel({
+                min: compatibility.minMinor,
+                max: compatibility.maxMinor,
+            });
+
+            return failure(
+                "model_dsm_conflict",
+                `${catalogModel.model} is catalogued for ${modelRange}, not ${osVersion.display}.`,
+                `Model-specific availability is checked separately from CPU Package Arch. Review Synology's lifecycle table and archived release directories captured ${data.snapshotCapturedDate}; the selector does not infer support from the model year.`,
+            );
+        }
+
+        const exactVersionInput = String(input.dsmVersion || "").trim();
+        const version = exactVersionInput ? parseDsmVersion(exactVersionInput) : null;
+
+        if (exactVersionInput && !version) {
+            return failure(
+                "invalid_dsm_version",
+                "The exact build, when supplied, must use a complete form such as 7.2.2-72806.",
+            );
+        }
+        if ((osVersion.minor === 0 || osVersion.minor === 4) && !version) {
+            const boundary = osVersion.minor === 0 ? "minimum" : "maximum";
+            const manifestVersion =
+                osVersion.minor === 0 ? "DSM 7.0-40759" : DSM_PACKAGE_MAXIMUM.display;
+
+            return failure(
+                "dsm_build_required",
+                `${osVersion.display} requires the exact installed build before an SPK can be recommended.`,
+                `The package ${boundary} is ${manifestVersion}. Enter the complete installed version/build so the selector can prove that compatibility boundary.`,
+            );
+        }
+        if (
+            version &&
+            (version.major !== osVersion.major || version.minor !== osVersion.minor)
+        ) {
+            return failure(
+                "os_version_conflict",
+                `The exact build ${version.display} conflicts with the selected ${osVersion.display} branch.`,
+                "Recheck Control Panel > Info Center. The branch selector and exact build, when supplied, must describe the same installed OS.",
+            );
+        }
+        if (version && version.build < 40759) {
+            return failure(
+                "dsm_too_old",
+                "This package requires DSM 7.0-40759 or newer.",
+                "An older build requires a separately designed package; changing the INFO label would not make this DSM 7 package compatible.",
+            );
+        }
+        if (
+            version &&
+            version.major === DSM_PACKAGE_MAXIMUM.major &&
+            version.minor === DSM_PACKAGE_MAXIMUM.minor &&
+            version.build > DSM_PACKAGE_MAXIMUM.build
+        ) {
+            return failure(
+                "dsm_too_new",
+                `This package declares a maximum supported DSM version/build of ${DSM_PACKAGE_MAXIMUM.display}.`,
+                "A later DSM 7.4 build needs a package whose INFO compatibility ceiling has been reviewed and tested; the selector will not recommend this artifact beyond its declared maximum.",
+            );
+        }
+
+        const model = catalogModel;
 
         const expectedCpu = normalizeCpuArch(model.cpuArch);
         const reportedCpu = normalizeCpuArch(input.reportedArch);
@@ -397,20 +594,30 @@
                 "Update the captured official platform matrix and its regression tests before recommending an artifact.",
             );
         }
-        if (version.minor < bounds.min || version.minor > bounds.max) {
+        const selectedMinor = osVersion.minor;
+
+        if (selectedMinor < bounds.min || selectedMinor > bounds.max) {
             return failure(
                 "platform_dsm_conflict",
-                `${model.model}/${model.packageArch} is present in the official ${dsmMinorRangeLabel(bounds)} toolkit interval, not DSM 7.${version.minor}.`,
+                `${model.model}/${model.packageArch} is present in the official ${dsmMinorRangeLabel(bounds)} toolkit interval, not DSM 7.${selectedMinor}.`,
                 "Recheck the DSM version and model. The selector does not infer support before a platform was introduced or after Synology removed it from pkgscripts-ng.",
             );
         }
 
+        const modelBounds = Object.freeze({
+            min: compatibility.minMinor,
+            max: compatibility.maxMinor,
+        });
+        const versionDisplay = version
+            ? version.display
+            : `7.${selectedMinor} (exact build not supplied)`;
+
         return Object.freeze({
             ok: true,
             kind: "release-asset",
-            purpose: "DSM direct SPK",
+            purpose: "DSM dashboard package (SPK)",
             assetTemplate: `synology-drive-sync-{tag}-${assetArch}.spk`,
-            detected: `${model.model} · ${model.cpuArch} · Package Arch ${model.packageArch} · DSM ${version.display} · Toolkit ${dsmMinorRangeLabel(bounds)}`,
+            detected: `${model.model} · Product line DSM · ${model.cpuArch} · Package Arch ${model.packageArch} · DSM ${versionDisplay} · Model ${dsmMinorRangeLabel(modelBounds)} · Toolkit ${dsmMinorRangeLabel(bounds)}`,
             rationale:
                 assetArch === "armv7"
                     ? "The ARMv7 SPK carries one little-endian EABI5 hard-float binary and explicitly lists every verified DSM 7 ARMv7 family in INFO."
@@ -513,7 +720,7 @@
             !payload ||
             payload.draft !== false ||
             payload.prerelease !== false ||
-            !/^\d{2}\.\d+$/.test(String(payload.tag_name || ""))
+            !/^\d{2}\.[1-9]\d*$/.test(String(payload.tag_name || ""))
         ) {
             return null;
         }
@@ -526,8 +733,9 @@
             const parsed = new URL(value);
 
             return (
-                parsed.protocol === "https:" &&
-                parsed.hostname === "github.com" &&
+                parsed.origin === "https://github.com" &&
+                !parsed.username &&
+                !parsed.password &&
                 parsed.pathname === `/${REPOSITORY}/releases/download/${tag}/${name}` &&
                 !parsed.search &&
                 !parsed.hash
@@ -719,6 +927,8 @@
         return {
             purpose: values.get("purpose"),
             model: values.get("model"),
+            productLine: values.get("productLine"),
+            osVersion: values.get("osVersion"),
             dsmVersion: values.get("dsmVersion"),
             reportedArch: values.get("reportedArch"),
             desktopOs: values.get("desktopOs"),
@@ -748,11 +958,9 @@
 
             for (const model of listModels()) {
                 const option = documentRef.createElement("option");
-                const nonDsmModel = nonDsmModelMetadata(model);
+                const compatibility = modelCompatibility(model);
                 option.value = model.model;
-                option.label = nonDsmModel
-                    ? `${model.cpuArch} · ${model.packageArch} · ${nonDsmModel.operatingSystem}, no DSM SPK`
-                    : `${model.cpuArch} · ${model.packageArch}`;
+                option.label = `${model.cpuArch} · ${model.packageArch} · ${compatibilityLabel(compatibility)}`;
                 fragment.append(option);
             }
 
@@ -761,12 +969,10 @@
 
         function updateModelFact() {
             const model = lookupModel(modelInput.value);
-            const nonDsmModel = nonDsmModelMetadata(model);
-            modelFact.textContent = nonDsmModel
-                ? `Official table snapshot: ${model.cpuArch} · Package Arch ${model.packageArch} · ${nonDsmModel.operatingSystem}, DSM SPK unsupported`
-                : model
-                  ? `Official table snapshot: ${model.cpuArch} · Package Arch ${model.packageArch}`
-                  : "Choose an exact model from the captured official table.";
+            const compatibility = modelCompatibility(model);
+            modelFact.textContent = model
+                ? `Official snapshot: ${model.cpuArch} · Package Arch ${model.packageArch} · Product line ${compatibility.productLine} · ${compatibilityLabel(compatibility)}`
+                : "Choose an exact model from the captured official table.";
         }
 
         purpose.addEventListener("change", function purposeChanged() {
@@ -814,9 +1020,11 @@
         initSelectors,
         listModels,
         lookupModel,
+        modelCompatibility,
         materializeRecommendation,
         normalizeCpuArch,
         parseDsmVersion,
+        parseOsVersionSelection,
         resolveSelection,
     });
 });

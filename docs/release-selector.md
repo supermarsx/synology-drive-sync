@@ -2,8 +2,10 @@
 
 Choose a deployment target and this page will resolve it to one release asset. For a DSM
 package, the decision checks three independent facts: the exact Synology model, the installed
-DSM build, and the processor architecture reported by the NAS. A mismatch stops the selector
-instead of guessing.
+Synology OS line/version, and the processor architecture reported by the NAS. An exact build is
+required on DSM 7.0 to prove the package minimum and on DSM 7.4 to prove the package maximum. It is
+optional on DSM 7.1–7.3. DSM 7.4 must not exceed the SPK manifest maximum of `7.4-99999`. A missing
+boundary build or mismatch stops the selector instead of guessing.
 
 The 231-model catalog is a factual snapshot of Synology's
 [CPU and Package Arch table](https://kb.synology.com/en-us/DSM/tutorial/What_kind_of_CPU_does_my_NAS_have),
@@ -25,7 +27,7 @@ reviewed and updated.
 <div class="selector-field">
 <label for="release-purpose">What do you need?</label>
 <select id="release-purpose" name="purpose">
-<option value="dsm-spk">Install directly in DSM Package Center</option>
+<option value="dsm-spk">Install the DSM dashboard package (SPK)</option>
 <option value="desktop-cli">Run the desktop command-line tool</option>
 <option value="rust-sdk">Integrate the Rust library</option>
 <option value="c-abi">Integrate the C ABI / DLL / shared library</option>
@@ -44,9 +46,32 @@ reviewed and updated.
 <small id="model-fact" data-model-fact aria-live="polite"></small>
 </div>
 <div class="selector-field">
-<label for="dsm-version">DSM version and build</label>
+<label for="product-line">Synology OS product line</label>
+<select id="product-line" name="productLine">
+<option value="dsm">DiskStation Manager (DSM)</option>
+<option value="dsm-enterprise">DSM Enterprise (informational; no published SPK)</option>
+</select>
+</div>
+<div class="selector-field">
+<label for="os-version">Installed OS branch</label>
+<select id="os-version" name="osVersion">
+<optgroup label="Supported DSM 7 release contract">
+<option value="dsm-7.4">DSM 7.4</option>
+<option value="dsm-7.3">DSM 7.3</option>
+<option value="dsm-7.2" selected>DSM 7.2</option>
+<option value="dsm-7.1">DSM 7.1</option>
+<option value="dsm-7.0">DSM 7.0</option>
+</optgroup>
+<optgroup label="Informational only — no compatible SPK">
+<option value="dsm-6.x-or-earlier">DSM 6.x or earlier</option>
+<option value="dsm-enterprise-1.0">DSM Enterprise 1.0</option>
+</optgroup>
+</select>
+</div>
+<div class="selector-field">
+<label for="dsm-version">Exact installed version/build</label>
 <input id="dsm-version" name="dsmVersion" inputmode="text" placeholder="7.2.2-72806" aria-describedby="dsm-version-help">
-<small id="dsm-version-help">Include the build after the hyphen.</small>
+<small id="dsm-version-help">Required for DSM 7.0 and 7.4 to prove the package's minimum or maximum; optional for DSM 7.1–7.3. Use the complete version and build after the hyphen.</small>
 </div>
 <div class="selector-field selector-field-wide">
 <label for="reported-arch">Reported processor architecture</label>
@@ -87,8 +112,9 @@ reviewed and updated.
 
 <noscript>
   <div class="selector-noscript">
-    <strong>JavaScript is disabled.</strong> Use the static matrix below, replace <code>YY.N</code>
-    with the current release tag, and verify the filename in GitHub Releases before installing it.
+    <strong>JavaScript is disabled.</strong> The static matrix below is an ABI inventory, not enough
+    to select an SPK by itself. Cross-check the exact model in the linked Synology lifecycle,
+    archive, and CPU tables, then verify that the exact filename exists in GitHub Releases.
   </div>
 </noscript>
 
@@ -96,16 +122,50 @@ reviewed and updated.
 
 | Purpose | Supported target | Release form |
 | --- | --- | --- |
-| DSM Package Center | `x86_64` family | `synology-drive-sync-YY.N-x86_64.spk` |
-| DSM Package Center | AArch64 / `armv8` family | `synology-drive-sync-YY.N-armv8.spk` |
-| DSM Package Center | ARMv7-A hard-float: Alpine, Armada 370/375/38x/XP, Comcerto2k, Monaco | `synology-drive-sync-YY.N-armv7.spk` |
-| DSM Package Center | Evansport `i686` on DSM 7.0–7.1 | `synology-drive-sync-YY.N-i686.spk` |
+| DSM dashboard package | `x86_64` family on a model/DSM branch accepted by the selector | `synology-drive-sync-YY.N-x86_64.spk` |
+| DSM dashboard package | AArch64 / `armv8` family on a model/DSM branch accepted by the selector | `synology-drive-sync-YY.N-armv8.spk` |
+| DSM dashboard package | ARMv7-A hard-float: Alpine, Armada 370/375/38x/XP, Comcerto2k, Monaco | `synology-drive-sync-YY.N-armv7.spk` |
+| DSM dashboard package | Evansport `i686` on DSM 7.0–7.1 | `synology-drive-sync-YY.N-i686.spk` |
 | Desktop CLI | Linux, macOS, Windows on x86-64 or ARM64 | `synology-drive-sync-YY.N-OS-ARCHIVE` |
 | Rust library | Platform-neutral source bundle | `synology-drive-sync-YY.N-rust-sdk.tar.gz` |
 | C ABI | Linux `.so`, macOS `.dylib`, or Windows DLL on x86-64/ARM64 | `synology-drive-sync-YY.N-c-sdk-OS-ARCHIVE` |
 | Container | Linux amd64/arm64 OCI index | `ghcr.io/supermarsx/synology-drive-sync:YY.N` |
 
 ### DSM toolkit intervals
+
+The selector has two independent compatibility layers. First, every one of the 231 models in the
+CPU-table snapshot has an explicit OS product and model-specific DSM interval. Second, the model's
+Package Arch must exist in Synology's toolkit branch. Passing only one layer is not enough.
+
+Model lifecycle data was reconciled on **2026-08-24** against Synology's official
+[last-upgradable software version table](https://kb.synology.com/en-us/DSM/tutorial/What_is_the_last_upgradable_software_version_for_my_Synology_product)
+and the official model-specific PAT indexes for
+[DSM 7.0](https://archive.synology.com/download/Os/DSM/7.0.1-42218),
+[DSM 7.1](https://archive.synology.com/download/Os/DSM/7.1-42661-1),
+[DSM 7.2](https://archive.synology.com/download/Os/DSM/7.2.2-72806),
+[DSM 7.3](https://archive.synology.com/download/Os/DSM/7.3-81180), and
+[DSM 7.4](https://archive.synology.com/download/Os/DSM/7.4-90075). The catalog partitions all
+231 records exactly once:
+
+| Product/model lifecycle | Models | Selector behavior |
+| --- | ---: | --- |
+| Last upgradable DSM 5.2 | 10 | Informational; no SPK |
+| Last upgradable DSM 6.2 | 41 | Informational; no SPK |
+| DSM 7.0–7.1 | 42 | Exact model and branch must agree |
+| DSM 7.0–7.4 | 92 | Exact model and branch must agree |
+| DSM 7.1–7.4 | 7 | Reject DSM 7.0 |
+| DSM 7.2–7.4 | 22 | Reject DSM 7.0/7.1 |
+| DSM 7.4 only | 16 | Reject every earlier branch |
+| DSM Enterprise 1.0 | 1 (`PAS7700`) | Informational; no ordinary DSM SPK |
+
+Synology's lifecycle article intentionally omits models whose final version is not yet fixed and
+directs users to Download Center. For those models, the catalog uses the earliest official DSM 7
+branch that publishes that exact model and caps recommendations at the latest reviewed DSM 7.4
+branch. The four Japanese-market `neo+` models in Synology's official
+[2026 product announcement](https://www.synology.com/ja-jp/company/news/article/dsneoplus), published
+after the base DSM 7.4 archive, are explicit DSM 7.4-only records; they are never
+backfilled onto an older branch. A future model or DSM 7.5+ remains unknown until the source
+snapshot is refreshed.
 
 The selector requires the model's official Package Arch to appear in the entered DSM minor branch.
 The intervals below are derived from `AllPlatformOptionNames` in SynologyOpenSource's official
@@ -156,8 +216,9 @@ get_key_value /etc.defaults/synoinfo.conf unique
 grep -E '^(majorversion|minorversion|productversion|buildnumber|smallfixnumber)=' /etc.defaults/VERSION
 ```
 
-Use the printed hardware model in the model field, the DSM product version plus build number in the
-version field, and `uname -m` in the reported-architecture field. If Synology has added a model
+Use the printed hardware model in the model field, choose its OS product and minor branch, enter the
+exact product version plus build number for DSM 7.0 or 7.4 (optional for DSM 7.1–7.3), and put
+`uname -m` in the reported-architecture field. If Synology has added a model
 after the snapshot date, consult the live
 [official CPU table](https://kb.synology.com/en-us/DSM/tutorial/What_kind_of_CPU_does_my_NAS_have)
 and open an issue with all four outputs. The selector intentionally has no "closest model" rule.
