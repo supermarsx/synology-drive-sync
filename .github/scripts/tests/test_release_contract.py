@@ -567,10 +567,25 @@ class WorkflowWiringTests(unittest.TestCase):
             self.assertIn("qemu_cpu: qemu32", section)
             self.assertIn("qemu_cpu: cortex-a9,neon=off,vfp-d32=off", section)
             self.assertIn("cargo zigbuild --release --locked", section)
+            self.assertIn(
+                "--bin synology-drive-sync --bin sdsync-dsm-api", section
+            )
+            self.assertIn(
+                'api_binary="target/$RUST_TARGET/release/sdsync-dsm-api"', section
+            )
+            self.assertEqual(section.count('--api-binary "$api_binary"'), 2)
             self.assertIn("QEMU_CPU=\"$QEMU_CPU\"", section)
             self.assertIn(
                 '"$emulator" "$binary" synology-drive-sync --version', section
             )
+            self.assertIn(
+                'REQUEST_METHOD=GET QEMU_CPU="$QEMU_CPU" "$emulator" '
+                '"$api_binary" sdsync-dsm-api',
+                section,
+            )
+            self.assertIn('REQUEST_METHOD=GET "$api_binary"', section)
+            self.assertIn("Status: 400 Bad Request", section)
+            self.assertIn('"schema":"sdsync.dsm-error.v1"', section)
             self.assertIn("Version5 EABI", section)
             self.assertIn("hard-float ABI", section)
             self.assertIn("elf_class: ELF32", section)

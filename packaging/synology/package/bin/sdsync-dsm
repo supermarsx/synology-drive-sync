@@ -5,6 +5,7 @@ self_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 package_root=$(CDPATH='' cd -- "$self_dir/.." && pwd -P)
 # shellcheck source=../libexec/sdsync-common
 . "$package_root/libexec/sdsync-common"
+umask 077
 
 usage() {
     cat <<'EOF'
@@ -14,19 +15,33 @@ Usage:
   sdsync-dsm configure-profile --name NAME --source PATH --url URL --username USER --remote REMOTE [options]
   sdsync-dsm remove-profile NAME
   sdsync-dsm list-profiles | set-default NAME | show-config [NAME]
-  sdsync-dsm set-password NAME [--from-file FILE]
-  sdsync-dsm set-totp NAME [--from-file FILE] | remove-totp NAME
+  sdsync-dsm set-password NAME [--from-file FILE] | set-totp NAME [--from-file FILE]
+  sdsync-dsm set-remote-log-token NAME [--from-file FILE]
+  sdsync-dsm remove-password NAME | remove-totp NAME | remove-remote-log-token NAME
+  sdsync-dsm configure-routine --profile NAME [options] | remove-routine NAME
   sdsync-dsm doctor [NAME|--all] [--write-test]
   sdsync-dsm plan [NAME|--all] [--allow-delete] [--max-total-delete N]
   sdsync-dsm run [NAME|--all] [--allow-delete] [--max-total-delete N]
   sdsync-dsm enable [--interval SECONDS] [--allow-delete] [--max-total-delete N]
   sdsync-dsm disable | status | logs [LINES] | paths
+  sdsync-dsm api snapshot | logs --lines N | activity --lines N
+  sdsync-dsm api configure-profile ... | remove-profile NAME | set-default NAME
+  sdsync-dsm api set-secret --profile NAME --kind password|totp|remote-log-token --mode replace|clear
+  sdsync-dsm api schedule ... | routine ... | alert-policy ... | action ...
 
 configure-profile options:
   --compare content|metadata|size-only   (default: content)
   --jobs 1..16                          (default: 2)
   --delete --max-delete N               (explicit exact-mirror mode)
   --allow-http                          (HTTPS is otherwise required)
+  --allow-empty-source true|false       (default: false)
+  --exclude PATTERN                     (repeatable; defaults include DSM metadata)
+  --clear-excludes                      (start with an empty exclude list)
+  --retries 0..5 --timeout SECONDS --connect-timeout SECONDS
+  --max-rate BYTES_PER_SECOND|none --ca-certificate FILE
+  --danger-accept-invalid-certs true|false
+  --log-level trace|debug|info|warn|error|off
+  --remote-log-url URL --remote-log-mode best-effort|required
   --default                             (make this the default profile)
 
 REMOTE is your chosen File Station logical path, for example
@@ -62,7 +77,9 @@ restore_tty() {
 }
 cleanup_manager_lock() {
     restore_tty
-    for cleanup_path in "${fragment_temp:-}" "${secret_temp:-}" "${candidate:-}" "${schedule_temp:-}"; do
+    for cleanup_path in "${fragment_temp:-}" "${secret_temp:-}" "${candidate:-}" \
+        "${schedule_temp:-}" "${routine_temp:-}" "${routine_graph_temp:-}" "${alert_temp:-}" \
+        "${api_stdout:-}" "${api_stderr:-}" "${snapshot_json:-}" "${activity_json:-}"; do
         [ -n "$cleanup_path" ] || continue
         case $cleanup_path in "$package_home"/*) [ -L "$cleanup_path" ] || rm -f "$cleanup_path" 2>/dev/null || true ;; esac
     done
@@ -156,6 +173,9 @@ validate_toml_text() {
         *'
 '*) die "$value_label must be one line" ;;
     esac
+    if printf '%s' "$value_text" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
+        die "$value_label contains a control character"
+    fi
 }
 
 validate_source() {
@@ -337,7 +357,13 @@ configure_profile() {
     base_url=
     dsm_username=
     compare=content jobs=2 delete=false max_delete=100 max_delete_set=false
-    allow_http=false make_default=false
+    allow_http=false allow_empty_source=false make_default=false
+    retries=2 timeout=7200 connect_timeout=15 max_rate=none
+    ca_certificate= danger_invalid=false verbosity=0 quiet=false
+    log_level=info log_format=json progress=never output=human
+    log_file=$log_root/sync.log
+    remote_log_url= remote_log_mode=best-effort
+    excludes_toml='"@eaDir/", "**/@eaDir/", "#recycle/", "#snapshot/"'
     while [ "$#" -gt 0 ]; do
         case $1 in
             --name) need_value "$@"; profile_name=$2; shift 2 ;;
@@ -347,10 +373,44 @@ configure_profile() {
             --username) need_value "$@"; dsm_username=$2; shift 2 ;;
             --compare) need_value "$@"; compare=$2; shift 2 ;;
             --jobs) need_value "$@"; jobs=$2; shift 2 ;;
-            --delete) delete=true; shift ;;
+            --delete)
+                delete=true
+                if [ "$#" -ge 2 ]; then case $2 in true|false) delete=$2; shift ;; esac; fi
+                shift
+                ;;
             --max-delete) need_value "$@"; max_delete=$2; max_delete_set=true; shift 2 ;;
-            --allow-http) allow_http=true; shift ;;
-            --default) make_default=true; shift ;;
+            --allow-http)
+                allow_http=true
+                if [ "$#" -ge 2 ]; then case $2 in true|false) allow_http=$2; shift ;; esac; fi
+                shift
+                ;;
+            --allow-empty-source) need_value "$@"; allow_empty_source=$2; shift 2 ;;
+            --exclude)
+                need_value "$@"; validate_toml_text exclude "$2"
+                if [ -n "$excludes_toml" ]; then excludes_toml="$excludes_toml, \"$2\""; else excludes_toml="\"$2\""; fi
+                shift 2
+                ;;
+            --clear-excludes) excludes_toml=; shift ;;
+            --retries) need_value "$@"; retries=$2; shift 2 ;;
+            --timeout) need_value "$@"; timeout=$2; shift 2 ;;
+            --connect-timeout) need_value "$@"; connect_timeout=$2; shift 2 ;;
+            --max-rate) need_value "$@"; max_rate=$2; shift 2 ;;
+            --ca-certificate) need_value "$@"; ca_certificate=$2; shift 2 ;;
+            --danger-accept-invalid-certs) need_value "$@"; danger_invalid=$2; shift 2 ;;
+            --verbose) need_value "$@"; verbosity=$2; shift 2 ;;
+            --quiet) need_value "$@"; quiet=$2; shift 2 ;;
+            --log-level) need_value "$@"; log_level=$2; shift 2 ;;
+            --log-format) need_value "$@"; log_format=$2; shift 2 ;;
+            --log-file) need_value "$@"; log_file=$2; shift 2 ;;
+            --progress) need_value "$@"; progress=$2; shift 2 ;;
+            --output) need_value "$@"; output=$2; shift 2 ;;
+            --remote-log-url) need_value "$@"; remote_log_url=$2; shift 2 ;;
+            --remote-log-mode) need_value "$@"; remote_log_mode=$2; shift 2 ;;
+            --default)
+                make_default=true
+                if [ "$#" -ge 2 ]; then case $2 in true|false) make_default=$2; shift ;; esac; fi
+                shift
+                ;;
             *) die "unknown configure-profile option: $1" ;;
         esac
     done
@@ -368,6 +428,37 @@ configure_profile() {
     if [ "$delete" = true ] && [ "$max_delete_set" != true ]; then
         die "--delete requires an explicit --max-delete bound"
     fi
+    for boolean_value in "$delete" "$allow_http" "$allow_empty_source" "$danger_invalid" "$make_default" "$quiet"; do
+        case $boolean_value in true|false) ;; *) die "boolean configure-profile values must be true or false" ;; esac
+    done
+    case $retries in ''|*[!0-9]*) die "retries must be an integer from 0 through 5" ;; esac
+    [ "$retries" -le 5 ] || die "retries must be from 0 through 5"
+    for timeout_value in "$timeout" "$connect_timeout"; do
+        case $timeout_value in ''|*[!0-9]*) die "timeouts must be positive integers" ;; esac
+        [ "$timeout_value" -gt 0 ] || die "timeouts must be positive integers"
+    done
+    case $max_rate in none) ;; ''|*[!0-9]*) die "max-rate must be a positive integer or none" ;; *) [ "$max_rate" -gt 0 ] || die "max-rate must be positive" ;; esac
+    case $log_level in trace|debug|info|warn|error|off) ;; *) die "invalid log-level" ;; esac
+    case $log_format in human|json) ;; *) die "log-format must be human or json" ;; esac
+    case $progress in auto|always|never) ;; *) die "progress must be auto, always, or never" ;; esac
+    case $output in human|json) ;; *) die "output must be human or json" ;; esac
+    case $verbosity in ''|*[!0-9]*) die "verbose must be 0, 1, or 2" ;; esac
+    [ "$verbosity" -le 2 ] || die "verbose must be 0, 1, or 2"
+    [ "$quiet" != true ] || [ "$verbosity" = 0 ] || die "quiet and verbose cannot both be enabled"
+    validate_toml_text log-file "$log_file"
+    case $log_file in "$log_root"/*) ;; *) die "DSM log-file must remain inside the private package log directory" ;; esac
+    [ ! -L "$log_file" ] || die "log-file must not be a symlink"
+    case $remote_log_mode in best-effort|required) ;; *) die "invalid remote-log-mode" ;; esac
+    if [ -n "$remote_log_url" ]; then
+        validate_toml_text remote-log-url "$remote_log_url"
+        case $remote_log_url in https://*) ;; *) die "remote-log-url must use HTTPS" ;; esac
+    fi
+    [ "$remote_log_mode" != required ] || [ -n "$remote_log_url" ] || die "required remote logging needs --remote-log-url"
+    if [ -n "$ca_certificate" ]; then
+        validate_toml_text ca-certificate "$ca_certificate"
+        case $ca_certificate in /*) ;; *) die "ca-certificate must be an absolute path" ;; esac
+        [ -f "$ca_certificate" ] && [ ! -L "$ca_certificate" ] && [ -r "$ca_certificate" ] || die "ca-certificate must be a readable non-symlink file"
+    fi
     ensure_layout
     fragment_temp=$profiles_dir/.${profile_name}.toml.$$
     umask 077
@@ -379,13 +470,19 @@ configure_profile() {
         printf 'username = "%s"\n' "$dsm_username"
         printf 'password-file = "%s/%s.password"\n' "$secret_root" "$profile_name"
         printf 'totp-secret-file = "%s/%s.totp"\n' "$secret_root" "$profile_name"
+        printf 'remote-log-token-file = "%s/%s.remote-log-token"\n' "$secret_root" "$profile_name"
         printf 'no-vault = true\ncompare = "%s"\njobs = %s\n' "$compare" "$jobs"
-        printf 'excludes = ["@eaDir/", "**/@eaDir/", "#recycle/", "#snapshot/"]\n'
-        printf 'delete = %s\nallow-empty-source = false\nmax-delete = %s\n' "$delete" "$max_delete"
-        printf 'retries = 2\ntimeout = 7200\nconnect-timeout = 15\n'
-        printf 'allow-http = %s\ndanger-accept-invalid-certs = false\n' "$allow_http"
-        printf 'log-level = "info"\nlog-format = "json"\n'
-        printf 'log-file = "%s/sync.log"\nprogress = "never"\noutput = "human"\n' "$log_root"
+        printf 'excludes = [%s]\n' "$excludes_toml"
+        printf 'delete = %s\nallow-empty-source = %s\nmax-delete = %s\n' "$delete" "$allow_empty_source" "$max_delete"
+        printf 'retries = %s\ntimeout = %s\nconnect-timeout = %s\n' "$retries" "$timeout" "$connect_timeout"
+        [ "$max_rate" = none ] || printf 'max-rate = %s\n' "$max_rate"
+        [ -z "$ca_certificate" ] || printf 'ca-certificate = "%s"\n' "$ca_certificate"
+        printf 'allow-http = %s\ndanger-accept-invalid-certs = %s\n' "$allow_http" "$danger_invalid"
+        printf 'verbose = %s\nquiet = %s\n' "$verbosity" "$quiet"
+        printf 'log-level = "%s"\nlog-format = "%s"\n' "$log_level" "$log_format"
+        [ -z "$remote_log_url" ] || printf 'remote-log-url = "%s"\n' "$remote_log_url"
+        printf 'remote-log-mode = "%s"\n' "$remote_log_mode"
+        printf 'log-file = "%s"\nprogress = "%s"\noutput = "%s"\n' "$log_file" "$progress" "$output"
     } > "$fragment_temp"
     finish_private_file "$fragment_temp"
     if [ "$make_default" = true ]; then
@@ -420,11 +517,260 @@ read_secret() {
         restore_tty
     else
         IFS= read -r secret_value || true
+        if [ "${SDSYNC_DSM_EXACT_SECRET_INPUT:-false}" = true ]; then
+            unexpected_secret_line=
+            if IFS= read -r unexpected_secret_line || [ -n "$unexpected_secret_line" ]; then
+                unset unexpected_secret_line secret_value
+                die "$secret_label input must contain exactly one line"
+            fi
+        fi
     fi
     [ -n "${secret_value:-}" ] || die "$secret_label cannot be empty"
-    [ "${#secret_value}" -le 4096 ] || die "$secret_label exceeds 4096 characters"
+    secret_bytes=$(printf '%s' "$secret_value" | wc -c | tr -d ' ')
+    case $secret_bytes in ''|*[!0-9]*) unset secret_value; die "cannot measure $secret_label safely" ;; esac
+    [ "$secret_bytes" -le 4096 ] || { unset secret_value; die "$secret_label exceeds 4096 bytes"; }
     printf '%s\n' "$secret_value"
     unset secret_value
+}
+
+clear_secret() {
+    secret_kind=$1
+    profile_name=$2
+    profile_exists "$profile_name" || die "unknown profile: $profile_name"
+    case $secret_kind in password|totp|remote-log-token) ;; *) die "invalid secret kind" ;; esac
+    target=$secret_root/$profile_name.$secret_kind
+    [ ! -L "$target" ] || die "refusing symlinked secret file: $target"
+    if [ -e "$target" ]; then
+        [ -f "$target" ] || die "secret target is not a regular file"
+        rm -f "$target"
+    fi
+    echo "removed protected $secret_kind material for '$profile_name'"
+}
+
+validate_weekdays() {
+    weekday_list=$1
+    [ -n "$weekday_list" ] || die "weekdays cannot be empty"
+    seen_weekdays=,
+    remaining_weekdays=$weekday_list
+    while :; do
+        case $remaining_weekdays in
+            *,*) weekday=${remaining_weekdays%%,*}; remaining_weekdays=${remaining_weekdays#*,} ;;
+            *) weekday=$remaining_weekdays; remaining_weekdays= ;;
+        esac
+        case $weekday in 1|2|3|4|5|6|7) ;; *) die "weekdays must be a comma-separated subset of 1..7" ;; esac
+        case $seen_weekdays in *,$weekday,*) die "weekdays must not contain duplicates" ;; esac
+        seen_weekdays=$seen_weekdays$weekday,
+        [ -n "$remaining_weekdays" ] || break
+    done
+}
+
+validate_clock_time() {
+    clock_value=$1
+    case $clock_value in
+        [0-1][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;;
+        *) die "time windows must use 24-hour HH:MM" ;;
+    esac
+}
+
+configure_routine() {
+    routine_profile= routine_enabled=true routine_action=sync routine_mode=interval
+    routine_interval=3600 routine_weekdays=1,2,3,4,5,6,7
+    routine_window_start=00:00 routine_window_end=23:59
+    routine_debounce=5 routine_retries=2 routine_backoff=60 routine_poll=30
+    routine_allow_delete=false routine_max_total=100 routine_dependencies=
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --profile) need_value "$@"; routine_profile=$2; shift 2 ;;
+            --enabled) need_value "$@"; routine_enabled=$2; shift 2 ;;
+            --action) need_value "$@"; routine_action=$2; shift 2 ;;
+            --mode) need_value "$@"; routine_mode=$2; shift 2 ;;
+            --interval) need_value "$@"; routine_interval=$2; shift 2 ;;
+            --weekdays) need_value "$@"; routine_weekdays=$2; shift 2 ;;
+            --window-start|--time-window-start) need_value "$@"; routine_window_start=$2; shift 2 ;;
+            --window-end|--time-window-end) need_value "$@"; routine_window_end=$2; shift 2 ;;
+            --debounce-seconds) need_value "$@"; routine_debounce=$2; shift 2 ;;
+            --retry-attempts|--retry-count) need_value "$@"; routine_retries=$2; shift 2 ;;
+            --retry-backoff|--retry-backoff-seconds) need_value "$@"; routine_backoff=$2; shift 2 ;;
+            --poll-seconds) need_value "$@"; routine_poll=$2; shift 2 ;;
+            --allow-delete) need_value "$@"; routine_allow_delete=$2; shift 2 ;;
+            --max-total-delete) need_value "$@"; routine_max_total=$2; shift 2 ;;
+            --depends-on)
+                need_value "$@"
+                if [ -n "$routine_dependencies" ]; then routine_dependencies=$routine_dependencies,$2; else routine_dependencies=$2; fi
+                shift 2
+                ;;
+            *) die "unknown configure-routine option: $1" ;;
+        esac
+    done
+    valid_name "$routine_profile" && profile_exists "$routine_profile" || die "configure-routine requires an existing profile"
+    case $routine_enabled:$routine_allow_delete in true:true|true:false|false:true|false:false) ;; *) die "routine booleans must be true or false" ;; esac
+    case $routine_action in plan|sync) ;; *) die "routine action must be plan or sync" ;; esac
+    case $routine_mode in interval|daily|realtime) ;; *) die "routine mode must be interval, daily, or realtime" ;; esac
+    case $routine_interval in ''|*[!0-9]*) die "routine interval must be an integer" ;; esac
+    [ "$routine_interval" -ge 60 ] && [ "$routine_interval" -le 2592000 ] || die "routine interval must be 60..2592000 seconds"
+    validate_weekdays "$routine_weekdays"
+    validate_clock_time "$routine_window_start"
+    validate_clock_time "$routine_window_end"
+    case $routine_debounce in ''|*[!0-9]*) die "debounce-seconds must be an integer" ;; esac
+    [ "$routine_debounce" -ge 1 ] && [ "$routine_debounce" -le 3600 ] || die "debounce-seconds must be 1..3600"
+    case $routine_retries in ''|*[!0-9]*) die "retry-attempts must be 0..5" ;; esac
+    [ "$routine_retries" -le 5 ] || die "retry-attempts must be 0..5"
+    case $routine_backoff in ''|*[!0-9]*) die "retry-backoff must be an integer" ;; esac
+    [ "$routine_backoff" -ge 10 ] && [ "$routine_backoff" -le 86400 ] || die "retry-backoff must be 10..86400 seconds"
+    case $routine_poll in ''|*[!0-9]*) die "poll-seconds must be an integer" ;; esac
+    [ "$routine_poll" -ge 5 ] && [ "$routine_poll" -le 3600 ] || die "poll-seconds must be 5..3600"
+    case $routine_max_total in ''|*[!0-9]*) die "max-total-delete must be a non-negative integer" ;; esac
+    if [ "$routine_allow_delete" = true ]; then
+        profile_delete_bound=$(sed -n 's/^max-delete = //p' "$profiles_dir/$routine_profile.toml" | sed -n '1p')
+        case $profile_delete_bound in ''|*[!0-9]*) die "profile has an invalid deletion bound" ;; esac
+        [ "$routine_max_total" -ge "$profile_delete_bound" ] || die "routine max-total-delete cannot be lower than the profile max-delete bound"
+    fi
+    seen_dependencies=,
+    if [ -n "$routine_dependencies" ]; then
+        old_ifs=$IFS; IFS=,
+        for dependency in $routine_dependencies; do
+            IFS=$old_ifs
+            valid_name "$dependency" && profile_exists "$dependency" || die "routine dependency must name an existing profile"
+            [ "$dependency" != "$routine_profile" ] || die "routine cannot depend on itself"
+            case $seen_dependencies in *,$dependency,*) die "routine dependency is duplicated: $dependency" ;; esac
+            seen_dependencies=$seen_dependencies$dependency,
+            IFS=,
+        done
+        IFS=$old_ifs
+    fi
+    routine_temp=$routines_dir/.${routine_profile}.conf.$$
+    {
+        printf 'enabled=%s\naction=%s\nmode=%s\ninterval_seconds=%s\n' "$routine_enabled" "$routine_action" "$routine_mode" "$routine_interval"
+        printf 'weekdays=%s\ntime_window_start=%s\ntime_window_end=%s\ndebounce_seconds=%s\n' \
+            "$routine_weekdays" "$routine_window_start" "$routine_window_end" "$routine_debounce"
+        printf 'retry_count=%s\nretry_backoff_seconds=%s\npoll_seconds=%s\n' "$routine_retries" "$routine_backoff" "$routine_poll"
+        printf 'allow_delete=%s\nmax_total_delete=%s\ndepends_on=%s\n' \
+            "$routine_allow_delete" "$routine_max_total" "$routine_dependencies"
+    } > "$routine_temp"
+    finish_private_file "$routine_temp"
+    routine_graph_temp=$state_root/.routine-graph.$$
+    for graph_path in "$routines_dir"/*.conf; do
+        [ -f "$graph_path" ] || continue
+        [ ! -L "$graph_path" ] || die "refusing symlinked routine config"
+        graph_name=${graph_path##*/}; graph_name=${graph_name%.conf}
+        [ "$graph_name" = "$routine_profile" ] || printf '%s=%s\n' "$graph_name" "$(setting "$graph_path" depends_on '')"
+    done > "$routine_graph_temp"
+    printf '%s=%s\n' "$routine_profile" "$routine_dependencies" >> "$routine_graph_temp"
+    finish_private_file "$routine_graph_temp"
+    if ! awk -F= '
+        { deps[$1] = $2 }
+        function visit(node, chain, count, parts, i, dep) {
+            if (("," chain ",") ~ ("," node ",")) return 1
+            if (done[node]) return 0
+            count = split(deps[node], parts, ",")
+            for (i = 1; i <= count; i++) {
+                dep = parts[i]
+                if (dep != "" && visit(dep, chain == "" ? node : chain "," node)) return 1
+            }
+            done[node] = 1
+            return 0
+        }
+        END { for (node in deps) if (visit(node, "")) exit 1 }
+    ' "$routine_graph_temp"; then
+        die "routine dependencies contain a cycle"
+    fi
+    rm -f "$routine_graph_temp"; routine_graph_temp=
+    mv -f "$routine_temp" "$routines_dir/$routine_profile.conf"
+    routine_temp=
+    reload_controller_if_running
+    append_activity configuration.changed "$routine_profile" changed "Routine configuration changed" 2>/dev/null || true
+    echo "configured $routine_mode routine for '$routine_profile'"
+}
+
+configure_alert_policy() {
+    alerts_enabled=true alerts_success=false alerts_failure=true
+    alerts_threshold=1 alerts_cooldown=3600
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --enabled) need_value "$@"; alerts_enabled=$2; shift 2 ;;
+            --on-success) need_value "$@"; alerts_success=$2; shift 2 ;;
+            --on-failure) need_value "$@"; alerts_failure=$2; shift 2 ;;
+            --failure-threshold) need_value "$@"; alerts_threshold=$2; shift 2 ;;
+            --cooldown) need_value "$@"; alerts_cooldown=$2; shift 2 ;;
+            *) die "unknown configure-alerts option: $1" ;;
+        esac
+    done
+    case $alerts_enabled:$alerts_success:$alerts_failure in
+        true:true:true|true:true:false|true:false:true|true:false:false|false:true:true|false:true:false|false:false:true|false:false:false) ;;
+        *) die "alert policy booleans must be true or false" ;;
+    esac
+    case $alerts_threshold in ''|*[!0-9]*) die "failure-threshold must be an integer" ;; esac
+    [ "$alerts_threshold" -ge 1 ] && [ "$alerts_threshold" -le 100 ] || die "failure-threshold must be 1..100"
+    case $alerts_cooldown in ''|*[!0-9]*) die "cooldown must be an integer" ;; esac
+    [ "$alerts_cooldown" -ge 60 ] && [ "$alerts_cooldown" -le 2592000 ] || die "cooldown must be 60..2592000 seconds"
+    alert_temp=$alert_policy_file.tmp.$$
+    {
+        printf 'enabled=%s\non_success=%s\non_failure=%s\n' "$alerts_enabled" "$alerts_success" "$alerts_failure"
+        printf 'failure_threshold=%s\ncooldown_seconds=%s\n' "$alerts_threshold" "$alerts_cooldown"
+    } > "$alert_temp"
+    finish_private_file "$alert_temp"
+    mv -f "$alert_temp" "$alert_policy_file"
+    alert_temp=
+    reload_controller_if_running
+    append_activity configuration.changed all changed "Alert policy changed" 2>/dev/null || true
+    echo "updated DSM alert policy"
+}
+
+configure_schedule() {
+    schedule_enabled= schedule_interval=3600 schedule_allow_delete=false schedule_max_total=100
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --enabled) need_value "$@"; schedule_enabled=$2; shift 2 ;;
+            --interval) need_value "$@"; schedule_interval=$2; shift 2 ;;
+            --allow-delete) need_value "$@"; schedule_allow_delete=$2; shift 2 ;;
+            --max-total-delete) need_value "$@"; schedule_max_total=$2; shift 2 ;;
+            *) die "unknown set-schedule option: $1" ;;
+        esac
+    done
+    case $schedule_enabled:$schedule_allow_delete in true:true|true:false|false:true|false:false) ;; *) die "schedule booleans must be true or false" ;; esac
+    case $schedule_interval in ''|*[!0-9]*) die "interval must be an integer" ;; esac
+    [ "$schedule_interval" -ge 60 ] && [ "$schedule_interval" -le 2592000 ] || die "interval must be 60..2592000 seconds"
+    case $schedule_max_total in ''|*[!0-9]*) die "max-total-delete must be non-negative" ;; esac
+    if [ "$schedule_enabled" = true ]; then
+        found=false
+        for fragment in "$profiles_dir"/*.toml; do
+            [ -f "$fragment" ] || continue
+            found=true; name=${fragment##*/}; name=${name%.toml}
+            profile_secret_exists "$name" || die "profile '$name' has no password"
+        done
+        [ "$found" = true ] || die "configure at least one profile first"
+        "$binary" --config "$config_file" --quiet config validate
+    else
+        schedule_allow_delete=false
+    fi
+    schedule_temp=$schedule_file.tmp.$$
+    printf 'enabled=%s\ninterval_seconds=%s\nallow_delete=%s\nmax_total_delete=%s\n' \
+        "$schedule_enabled" "$schedule_interval" "$schedule_allow_delete" "$schedule_max_total" > "$schedule_temp"
+    finish_private_file "$schedule_temp"
+    mv -f "$schedule_temp" "$schedule_file"
+    schedule_temp=
+    reload_controller_if_running
+    append_activity configuration.changed all changed "Global schedule changed" 2>/dev/null || true
+    echo "updated global schedule (enabled=$schedule_enabled interval=$schedule_interval)"
+}
+
+write_health_cache() {
+    health_scope=$1
+    health_status=$2
+    health_exit=$3
+    health_write_test=$4
+    case $health_scope in all) health_targets=$(sorted_fragments) ;; *) health_targets=$profiles_dir/$health_scope.toml ;; esac
+    for health_fragment in $health_targets; do
+        [ -f "$health_fragment" ] || continue
+        health_profile=${health_fragment##*/}; health_profile=${health_profile%.toml}
+        health_temp=$health_dir/.${health_profile}.state.$$
+        {
+            printf 'state=%s\nchecked_epoch=%s\nexit_code=%s\nwrite_test=%s\n' \
+                "$health_status" "$(epoch_now)" "$health_exit" "$health_write_test"
+        } > "$health_temp"
+        finish_private_file "$health_temp"
+        mv -f "$health_temp" "$health_dir/$health_profile.state"
+    done
 }
 
 set_secret() {
@@ -443,7 +789,12 @@ set_secret() {
     [ "$#" -eq 0 ] || die "too many set-$secret_kind arguments"
     profile_exists "$profile_name" || die "unknown profile: $profile_name"
     ensure_layout
-    case $secret_kind in password) suffix=password; label='DSM password' ;; totp) suffix=totp; label='DSM Base32 TOTP seed or otpauth URI' ;; *) die "invalid secret kind" ;; esac
+    case $secret_kind in
+        password) suffix=password; label='DSM password' ;;
+        totp) suffix=totp; label='DSM Base32 TOTP seed or otpauth URI' ;;
+        remote-log-token) suffix=remote-log-token; label='remote log bearer token' ;;
+        *) die "invalid secret kind" ;;
+    esac
     target=$secret_root/$profile_name.$suffix
     [ ! -L "$target" ] || die "refusing symlinked secret file: $target"
     secret_temp=$target.tmp.$$
@@ -498,11 +849,748 @@ selection() {
     fi
 }
 
+api_error() {
+    api_code=$1
+    api_message=$2
+    api_status=${3:-64}
+    if [ "${api_error_fd3:-false}" = true ]; then
+        printf '{"schema":"sdsync.dsm-result.v1","ok":false,"code":%s,"message":%s}\n' \
+            "$(json_quote "$api_code")" "$(json_quote "$api_message")" >&3
+    else
+        printf '{"schema":"sdsync.dsm-result.v1","ok":false,"code":%s,"message":%s}\n' \
+            "$(json_quote "$api_code")" "$(json_quote "$api_message")"
+    fi
+    exit "$api_status"
+}
+
+api_result() {
+    api_message=$1
+    printf '{"schema":"sdsync.dsm-result.v1","ok":true,"message":%s}\n' "$(json_quote "$api_message")"
+}
+
+api_need_value() {
+    [ "$#" -ge 2 ] || api_error invalid_request "$1 requires a value" 64
+}
+
+api_guard() {
+    require_package_identity >/dev/null 2>&1 || api_error forbidden "DSM API commands require the package identity" 77
+    # A dsmuidir CGI is intentionally not a privilege bridge.  The dedicated
+    # authenticated compiled bridge queues allowlisted work for the clean
+    # package controller; raw web-stack execution must remain fail-closed.
+    [ -z "${REQUEST_METHOD:-}" ] || api_error bridge_required "authenticated DSM control bridge required" 77
+    ensure_layout >/dev/null 2>&1 || api_error unsafe_state "private package state is unavailable" 73
+}
+
+api_map_exit_code() {
+    case $1 in
+        64) api_mapped_code=invalid_request ;;
+        66) api_mapped_code=not_configured ;;
+        69) api_mapped_code=unavailable ;;
+        73) api_mapped_code=unsafe_state ;;
+        75) api_mapped_code=busy ;;
+        77) api_mapped_code=forbidden ;;
+        *) api_mapped_code=operation_failed ;;
+    esac
+}
+
+api_preflight_secret_material() {
+    for api_secret_path in "$secret_root"/*.password "$secret_root"/*.totp "$secret_root"/*.remote-log-token; do
+        [ -e "$api_secret_path" ] || [ -L "$api_secret_path" ] || continue
+        private_secret_file "$api_secret_path" || api_error unsafe_state "secret material is not a package-owned 0600 regular file" 73
+    done
+}
+
+api_redact_file() {
+    redact_path=$1
+    [ -f "$redact_path" ] || return 0
+    LC_ALL=C awk -v home="$package_home" -v var="$package_var" \
+        -v real_home="$package_home_real" -v real_var="$package_var_real" -v byte_limit=65536 '
+        function replace_literal(text, needle, replacement, at) {
+            if (needle == "") return text
+            while ((at = index(text, needle)) != 0)
+                text = substr(text, 1, at - 1) replacement substr(text, at + length(needle))
+            return text
+        }
+        BEGIN {
+            for (argument = 1; argument < ARGC - 1; argument++) {
+                secret = ""
+                if ((getline secret < ARGV[argument]) > 0 && secret != "") needles[++needle_count] = secret
+                close(ARGV[argument])
+                ARGV[argument] = ""
+            }
+        }
+        {
+            line = $0
+            for (needle_index = 1; needle_index <= needle_count; needle_index++)
+                line = replace_literal(line, needles[needle_index], "[redacted]")
+            gsub(/\033\[[0-9;?]*[ -\/]*[@-~]/, "", line)
+            line = replace_literal(line, home, "[package-home]")
+            line = replace_literal(line, var, "[package-var]")
+            line = replace_literal(line, real_home, "[package-home]")
+            line = replace_literal(line, real_var, "[package-var]")
+            gsub(/\[package-home\]\/secrets\/[^ ]+/, "[secret]", line)
+            if (emitted >= byte_limit) next
+            remaining = byte_limit - emitted
+            if (length(line) > remaining) line = substr(line, 1, remaining)
+            print line
+            emitted += length(line) + 1
+        }
+    ' "$secret_root"/*.password "$secret_root"/*.totp "$secret_root"/*.remote-log-token "$redact_path"
+}
+
+api_capture() {
+    api_exact_secret=$1
+    shift
+    api_preflight_secret_material
+    api_stdout=$state_root/.api.$$.stdout
+    api_stderr=$state_root/.api.$$.stderr
+    [ ! -L "$api_stdout" ] && [ ! -L "$api_stderr" ] || api_error unsafe_state "unsafe API capture path" 73
+    umask 077
+    set +e
+    if [ "$api_exact_secret" = true ]; then
+        SDSYNC_DSM_EXACT_SECRET_INPUT=true "$@" > "$api_stdout" 2> "$api_stderr"
+    else
+        "$@" > "$api_stdout" 2> "$api_stderr"
+    fi
+    api_exit=$?
+    set -e
+    finish_private_file "$api_stdout"
+    finish_private_file "$api_stderr"
+    if [ -s "$api_stderr" ]; then api_output=$(api_redact_file "$api_stderr"); else api_output=$(api_redact_file "$api_stdout"); fi
+    rm -f "$api_stdout" "$api_stderr"
+    api_stdout= api_stderr=
+}
+
+api_capture_or_error() {
+    api_exact_secret=$1
+    shift
+    api_capture "$api_exact_secret" "$@"
+    if [ "$api_exit" -ne 0 ]; then
+        api_map_exit_code "$api_exit"
+        [ -n "$api_output" ] || api_output="operation failed"
+        printf '{"schema":"sdsync.dsm-result.v1","ok":false,"code":%s,"message":%s,"exit_code":%s}\n' \
+            "$(json_quote "$api_mapped_code")" "$(json_quote "$api_output")" "$api_exit"
+        exit "$api_exit"
+    fi
+}
+
+api_load_kv() {
+    kv_file=$1
+    kv_key=$2
+    kv_default=$3
+    kv_value=$kv_default
+    [ -e "$kv_file" ] || return 0
+    if [ -L "$kv_file" ] || [ ! -f "$kv_file" ] || [ ! -r "$kv_file" ]; then
+        api_error unsafe_state "unsafe package state file" 73
+    fi
+    kv_count=$(grep -c "^${kv_key}=" "$kv_file" 2>/dev/null || true)
+    [ "$kv_count" = 1 ] || api_error corrupt_state "package state is missing or duplicates $kv_key" 73
+    kv_value=$(sed -n "s/^${kv_key}=//p" "$kv_file")
+    if printf '%s' "$kv_value" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
+        api_error corrupt_state "package state contains control characters" 73
+    fi
+}
+
+api_load_kv_optional() {
+    kv_file=$1
+    kv_key=$2
+    kv_default=$3
+    kv_value=$kv_default
+    [ -e "$kv_file" ] || return 0
+    if [ -L "$kv_file" ] || [ ! -f "$kv_file" ] || [ ! -r "$kv_file" ]; then api_error unsafe_state "unsafe package state file" 73; fi
+    kv_count=$(grep -c "^${kv_key}=" "$kv_file" 2>/dev/null || true)
+    case $kv_count in 0) return 0 ;; 1) ;; *) api_error corrupt_state "package state duplicates $kv_key" 73 ;; esac
+    kv_value=$(sed -n "s/^${kv_key}=//p" "$kv_file")
+    if printf '%s' "$kv_value" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then api_error corrupt_state "package state contains control characters" 73; fi
+}
+
+api_toml_string() {
+    toml_file=$1
+    toml_key=$2
+    toml_default=${3-}
+    toml_required=${4:-false}
+    toml_count=$(grep -c "^${toml_key} = \"" "$toml_file" 2>/dev/null || true)
+    if [ "$toml_count" = 0 ] && [ "$toml_required" = false ]; then
+        toml_value=$toml_default
+        return
+    fi
+    [ "$toml_count" = 1 ] || api_error corrupt_config "profile has invalid $toml_key" 73
+    toml_line=$(sed -n "s/^${toml_key} = \"\(.*\)\"$/\1/p" "$toml_file")
+    [ -n "$toml_line" ] || api_error corrupt_config "profile has malformed $toml_key" 73
+    case $toml_line in *'"'*|*\\*) api_error corrupt_config "profile has unsafe $toml_key" 73 ;; esac
+    if printf '%s' "$toml_line" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
+        api_error corrupt_config "profile has unsafe $toml_key" 73
+    fi
+    toml_value=$toml_line
+}
+
+api_toml_scalar() {
+    toml_file=$1
+    toml_key=$2
+    toml_default=$3
+    toml_kind=$4
+    toml_count=$(grep -c "^${toml_key} = " "$toml_file" 2>/dev/null || true)
+    if [ "$toml_count" = 0 ]; then toml_value=$toml_default; else
+        [ "$toml_count" = 1 ] || api_error corrupt_config "profile duplicates $toml_key" 73
+        toml_value=$(sed -n "s/^${toml_key} = //p" "$toml_file")
+    fi
+    case $toml_kind in
+        bool) case $toml_value in true|false) ;; *) api_error corrupt_config "profile has invalid $toml_key" 73 ;; esac ;;
+        number) case $toml_value in ''|*[!0-9]*) api_error corrupt_config "profile has invalid $toml_key" 73 ;; esac ;;
+        *) api_error internal_error "invalid scalar parser" 70 ;;
+    esac
+}
+
+api_secret_boolean() {
+    secret_check=$1
+    if [ -e "$secret_check" ] || [ -L "$secret_check" ]; then
+        private_secret_file "$secret_check" || api_error unsafe_state "secret material is not a package-owned 0600 regular file" 73
+        secret_boolean=true
+    else
+        secret_boolean=false
+    fi
+}
+
+api_json_log_lines() {
+    json_log_path=$1
+    json_log_lines=$2
+    [ -e "$json_log_path" ] || { printf '[]'; return; }
+    if [ -L "$json_log_path" ] || [ ! -f "$json_log_path" ] || [ ! -r "$json_log_path" ]; then
+        api_error unsafe_state "unsafe package log file" 73
+    fi
+    LC_ALL=C awk -v home="$package_home" -v var="$package_var" \
+        -v real_home="$package_home_real" -v real_var="$package_var_real" \
+        -v requested="$json_log_lines" -v byte_limit=262144 -v line_limit=8192 '
+        function replace_literal(text, needle, replacement, at) {
+            if (needle == "") return text
+            while ((at = index(text, needle)) != 0)
+                text = substr(text, 1, at - 1) replacement substr(text, at + length(needle))
+            return text
+        }
+        function quote(text) {
+            gsub(/\033\[[0-9;?]*[ -\/]*[@-~]/, "", text)
+            text = replace_literal(text, home, "[package-home]")
+            text = replace_literal(text, var, "[package-var]")
+            text = replace_literal(text, real_home, "[package-home]")
+            text = replace_literal(text, real_var, "[package-var]")
+            gsub(/\[package-home\]\/secrets\/[^ ]+/, "[secret]", text)
+            gsub(/\\/, "\\\\", text); gsub(/\"/, "\\\"", text)
+            gsub(/\t/, "\\t", text); gsub(/\r/, "\\r", text)
+            gsub(/[\001-\010\013\014\016-\037]/, "?", text)
+            return "\"" text "\""
+        }
+        BEGIN {
+            for (argument = 1; argument < ARGC - 1; argument++) {
+                secret = ""
+                if ((getline secret < ARGV[argument]) > 0 && secret != "") needles[++needle_count] = secret
+                close(ARGV[argument])
+                ARGV[argument] = ""
+            }
+        }
+        {
+            line = $0
+            for (needle_index = 1; needle_index <= needle_count; needle_index++)
+                line = replace_literal(line, needles[needle_index], "[redacted]")
+            line = replace_literal(line, home, "[package-home]")
+            line = replace_literal(line, var, "[package-var]")
+            line = replace_literal(line, real_home, "[package-home]")
+            line = replace_literal(line, real_var, "[package-var]")
+            gsub(/\[package-home\]\/secrets\/[^ ]+/, "[secret]", line)
+            if (length(line) > line_limit) line = substr(line, 1, line_limit)
+            record_count++
+            ring[((record_count - 1) % requested) + 1] = quote(line)
+        }
+        END {
+            available = record_count < requested ? record_count : requested
+            first_record = record_count - available + 1
+            selected_first = record_count + 1
+            selected_bytes = 2
+            for (record = record_count; record >= first_record; record--) {
+                encoded = ring[((record - 1) % requested) + 1]
+                cost = length(encoded) + (selected_first <= record_count ? 1 : 0)
+                if (selected_bytes + cost > byte_limit) break
+                selected_bytes += cost
+                selected_first = record
+            }
+            printf "["
+            for (record = selected_first; record <= record_count; record++) {
+                if (record > selected_first) printf ","
+                printf "%s", ring[((record - 1) % requested) + 1]
+            }
+            printf "]"
+        }
+    ' "$secret_root"/*.password "$secret_root"/*.totp "$secret_root"/*.remote-log-token "$json_log_path"
+}
+
+api_logs() {
+    log_lines=100
+    while [ "$#" -gt 0 ]; do
+        case $1 in --lines) api_need_value "$@"; log_lines=$2; shift 2 ;; *) api_error invalid_request "unknown logs option" 64 ;; esac
+    done
+    case $log_lines in ''|*[!0-9]*) api_error invalid_request "lines must be an integer" 64 ;; esac
+    [ "$log_lines" -ge 1 ] && [ "$log_lines" -le 1000 ] || api_error invalid_request "lines must be 1..1000" 64
+    for log_preflight in "$log_root/controller.log" "$log_root/scheduler.log" "$log_root/sync.log"; do
+        if [ -e "$log_preflight" ] || [ -L "$log_preflight" ]; then
+            [ ! -L "$log_preflight" ] && [ -f "$log_preflight" ] && [ -r "$log_preflight" ] || api_error unsafe_state "unsafe package log file" 73
+        fi
+    done
+    api_preflight_secret_material
+    printf '{"schema":"sdsync.dsm-logs.v1","logs":['
+    printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/controller.log" "$log_lines"; printf '},'
+    printf '{"source":"scheduler","lines":'; api_json_log_lines "$log_root/scheduler.log" "$log_lines"; printf '},'
+    printf '{"source":"sync","lines":'; api_json_log_lines "$log_root/sync.log" "$log_lines"; printf '}]}\n'
+}
+
+api_activity() {
+    activity_lines=100
+    while [ "$#" -gt 0 ]; do
+        case $1 in --lines) api_need_value "$@"; activity_lines=$2; shift 2 ;; *) api_error invalid_request "unknown activity option" 64 ;; esac
+    done
+    case $activity_lines in ''|*[!0-9]*) api_error invalid_request "lines must be an integer" 64 ;; esac
+    [ "$activity_lines" -ge 1 ] && [ "$activity_lines" -le 1000 ] || api_error invalid_request "lines must be 1..1000" 64
+    [ -e "$activity_log" ] || { printf '{"schema":"sdsync.dsm-activity.v1","events":[]}\n'; return; }
+    if [ -L "$activity_log" ] || [ ! -f "$activity_log" ] || [ ! -r "$activity_log" ]; then
+        api_error unsafe_state "unsafe activity log" 73
+    fi
+    activity_json=$state_root/.api.$$.activity
+    [ ! -L "$activity_json" ] || api_error unsafe_state "unsafe API activity path" 73
+    set +e
+    tail -n "$activity_lines" "$activity_log" | LC_ALL=C awk -F'|' '
+        function quote(text) {
+            gsub(/\\/, "\\\\", text); gsub(/\"/, "\\\"", text)
+            return "\"" text "\""
+        }
+        BEGIN { printf "{\"schema\":\"sdsync.dsm-activity.v1\",\"events\":[" }
+        {
+            if (NF != 5 || $1 !~ /^[0-9]+$/ || $2 !~ /^[a-z_]+\.[a-z_]+$/ ||
+                $3 !~ /^(none|all|[A-Za-z0-9_-]+)$/ ||
+                $4 !~ /^(running|succeeded|failed|deferred|scheduled|changed|unavailable)$/ ||
+                length($5) > 4096 || $5 ~ /[\001-\037]/) exit 73
+            if (seen++) printf ","
+            printf "{\"epoch\":%s,\"code\":%s,\"profile\":%s,\"state\":%s,\"message\":%s}",
+                $1, quote($2), quote($3), quote($4), quote($5)
+        }
+        END { printf "]}\n" }
+    ' > "$activity_json"
+    activity_exit=$?
+    set -e
+    if [ "$activity_exit" -ne 0 ]; then rm -f "$activity_json"; api_error corrupt_state "activity feed is malformed" 73; fi
+    finish_private_file "$activity_json"
+    activity_size=$(wc -c < "$activity_json" | tr -d ' ')
+    case $activity_size in ''|*[!0-9]*) rm -f "$activity_json"; activity_json=; api_error unsafe_state "cannot measure activity response" 73 ;; esac
+    if [ "$activity_size" -gt 1048576 ]; then rm -f "$activity_json"; activity_json=; api_error response_too_large "activity response exceeds its safe bound" 69; fi
+    cat "$activity_json"
+    rm -f "$activity_json"
+}
+
+api_profile_json() {
+    profile_fragment=$1
+    profile_default=$2
+    if [ -L "$profile_fragment" ] || [ ! -f "$profile_fragment" ] || [ ! -r "$profile_fragment" ]; then
+        api_error unsafe_state "unsafe profile fragment" 73
+    fi
+    profile_name=${profile_fragment##*/}; profile_name=${profile_name%.toml}
+    valid_name "$profile_name" || api_error corrupt_config "invalid profile fragment name" 73
+    api_toml_string "$profile_fragment" source '' true; profile_source=$toml_value
+    api_toml_string "$profile_fragment" url '' true; profile_url=$toml_value
+    api_toml_string "$profile_fragment" username '' true; profile_username=$toml_value
+    api_toml_string "$profile_fragment" remote '' true; profile_remote=$toml_value
+    api_toml_string "$profile_fragment" password-file '' true; profile_password_locator=$toml_value
+    api_toml_string "$profile_fragment" totp-secret-file '' true; profile_totp_locator=$toml_value
+    api_toml_string "$profile_fragment" remote-log-token-file '' true; profile_remote_token_locator=$toml_value
+    [ "$profile_password_locator" = "$secret_root/$profile_name.password" ] || api_error corrupt_config "profile password locator escaped package storage" 73
+    [ "$profile_totp_locator" = "$secret_root/$profile_name.totp" ] || api_error corrupt_config "profile TOTP locator escaped package storage" 73
+    [ "$profile_remote_token_locator" = "$secret_root/$profile_name.remote-log-token" ] || api_error corrupt_config "profile remote log token locator escaped package storage" 73
+    api_toml_scalar "$profile_fragment" no-vault true bool
+    [ "$toml_value" = true ] || api_error corrupt_config "DSM profiles must keep the OS vault disabled" 73
+    api_toml_string "$profile_fragment" compare content false; profile_compare=$toml_value
+    case $profile_compare in content|metadata|size-only) ;; *) api_error corrupt_config "invalid profile compare mode" 73 ;; esac
+    api_toml_scalar "$profile_fragment" jobs 2 number; profile_jobs=$toml_value
+    [ "$profile_jobs" -ge 1 ] && [ "$profile_jobs" -le 16 ] || api_error corrupt_config "invalid profile jobs" 73
+    api_toml_scalar "$profile_fragment" delete false bool; profile_delete=$toml_value
+    api_toml_scalar "$profile_fragment" max-delete 100 number; profile_max_delete=$toml_value
+    api_toml_scalar "$profile_fragment" allow-http false bool; profile_allow_http=$toml_value
+    api_toml_scalar "$profile_fragment" allow-empty-source false bool; profile_allow_empty=$toml_value
+    api_toml_scalar "$profile_fragment" retries 2 number; profile_retries=$toml_value
+    [ "$profile_retries" -le 5 ] || api_error corrupt_config "invalid profile retries" 73
+    api_toml_scalar "$profile_fragment" timeout 7200 number; profile_timeout=$toml_value
+    api_toml_scalar "$profile_fragment" connect-timeout 15 number; profile_connect_timeout=$toml_value
+    [ "$profile_timeout" -gt 0 ] && [ "$profile_connect_timeout" -gt 0 ] || api_error corrupt_config "invalid profile timeout" 73
+    api_toml_scalar "$profile_fragment" danger-accept-invalid-certs false bool; profile_invalid_certs=$toml_value
+    api_toml_scalar "$profile_fragment" verbose 0 number; profile_verbose=$toml_value
+    api_toml_scalar "$profile_fragment" quiet false bool; profile_quiet=$toml_value
+    api_toml_string "$profile_fragment" log-level info false; profile_log_level=$toml_value
+    api_toml_string "$profile_fragment" log-format json false; profile_log_format=$toml_value
+    api_toml_string "$profile_fragment" log-file "$log_root/sync.log" false; profile_log_file=$toml_value
+    api_toml_string "$profile_fragment" progress never false; profile_progress=$toml_value
+    api_toml_string "$profile_fragment" output human false; profile_output=$toml_value
+    api_toml_string "$profile_fragment" remote-log-url '' false; profile_remote_log_url=$toml_value
+    api_toml_string "$profile_fragment" remote-log-mode best-effort false; profile_remote_log_mode=$toml_value
+    case $profile_log_level in trace|debug|info|warn|error|off) ;; *) api_error corrupt_config "invalid profile log level" 73 ;; esac
+    case $profile_log_format in human|json) ;; *) api_error corrupt_config "invalid profile log format" 73 ;; esac
+    case $profile_progress in auto|always|never) ;; *) api_error corrupt_config "invalid profile progress mode" 73 ;; esac
+    case $profile_output in human|json) ;; *) api_error corrupt_config "invalid profile output mode" 73 ;; esac
+    case $profile_remote_log_mode in best-effort|required) ;; *) api_error corrupt_config "invalid remote log mode" 73 ;; esac
+    case $profile_log_file in "$log_root"/*) ;; *) api_error corrupt_config "profile log file escaped package storage" 73 ;; esac
+    if [ -n "$profile_remote_log_url" ]; then case $profile_remote_log_url in https://*) ;; *) api_error corrupt_config "remote log URL is not HTTPS" 73 ;; esac; fi
+    api_toml_string "$profile_fragment" ca-certificate '' false; profile_ca_certificate=$toml_value
+    api_toml_scalar "$profile_fragment" max-rate 0 number; profile_max_rate=$toml_value
+    excludes_count=$(grep -c '^excludes = ' "$profile_fragment" 2>/dev/null || true)
+    [ "$excludes_count" = 1 ] || api_error corrupt_config "profile has invalid excludes" 73
+    profile_excludes=$(sed -n 's/^excludes = //p' "$profile_fragment")
+    printf '%s\n' "$profile_excludes" | grep -Eq '^\[\]$|^\["[^"\\]*"(, "[^"\\]*")*\]$' || api_error corrupt_config "profile excludes are malformed" 73
+    api_secret_boolean "$secret_root/$profile_name.password"; has_password=$secret_boolean
+    api_secret_boolean "$secret_root/$profile_name.totp"; has_totp=$secret_boolean
+    api_secret_boolean "$secret_root/$profile_name.remote-log-token"; has_remote_log_token=$secret_boolean
+    health_file=$health_dir/$profile_name.state
+    api_load_kv "$health_file" state unknown; health_state=$kv_value
+    api_load_kv "$health_file" checked_epoch 0; health_epoch=$kv_value
+    api_load_kv "$health_file" exit_code -1; health_exit=$kv_value
+    api_load_kv "$health_file" write_test false; health_write=$kv_value
+    case $health_state in unknown|succeeded|failed) ;; *) api_error corrupt_state "invalid cached health state" 73 ;; esac
+    case $health_epoch in ''|*[!0-9]*) api_error corrupt_state "invalid cached health epoch" 73 ;; esac
+    case $health_exit in -1|''|*[!0-9]*) [ "$health_exit" = -1 ] || api_error corrupt_state "invalid cached health exit" 73 ;; esac
+    case $health_write in true|false) ;; *) api_error corrupt_state "invalid cached health write flag" 73 ;; esac
+    [ "$profile_name" = "$profile_default" ] && is_default=true || is_default=false
+    if [ "$profile_max_rate" = 0 ]; then profile_max_rate_json=null; else profile_max_rate_json=$profile_max_rate; fi
+    printf '{"name":%s,"default":%s,"source":%s,"url":%s,"username":%s,"remote":%s,' \
+        "$(json_quote "$profile_name")" "$is_default" "$(json_quote "$profile_source")" "$(json_quote "$profile_url")" \
+        "$(json_quote "$profile_username")" "$(json_quote "$profile_remote")"
+    printf '"compare":%s,"jobs":%s,"delete":%s,"max_delete":%s,"allow_http":%s,' \
+        "$(json_quote "$profile_compare")" "$profile_jobs" "$profile_delete" "$profile_max_delete" "$profile_allow_http"
+    printf '"has_password":%s,"has_totp":%s,"has_remote_log_token":%s,' "$has_password" "$has_totp" "$has_remote_log_token"
+    printf '"excludes":%s,"allow_empty_source":%s,"retries":%s,"upload_timeout_seconds":%s,"connect_timeout_seconds":%s,' \
+        "$profile_excludes" "$profile_allow_empty" "$profile_retries" "$profile_timeout" "$profile_connect_timeout"
+    printf '"max_rate_bytes_per_second":%s,"ca_certificate":%s,"danger_accept_invalid_certs":%s,' \
+        "$profile_max_rate_json" "$(json_quote "$profile_ca_certificate")" "$profile_invalid_certs"
+    printf '"verbosity":%s,"quiet":%s,"log_level":%s,"log_format":%s,"log_file":%s,"progress":%s,"output":%s,' \
+        "$profile_verbose" "$profile_quiet" "$(json_quote "$profile_log_level")" "$(json_quote "$profile_log_format")" \
+        "$(json_quote "$profile_log_file")" "$(json_quote "$profile_progress")" "$(json_quote "$profile_output")"
+    printf '"remote_log_url":%s,"remote_log_mode":%s,' "$(json_quote "$profile_remote_log_url")" "$(json_quote "$profile_remote_log_mode")"
+    printf '"health":{"state":%s,"checked_epoch":%s,"exit_code":' "$(json_quote "$health_state")" "$health_epoch"
+    if [ "$health_exit" = -1 ]; then printf 'null'; else printf '%s' "$health_exit"; fi
+    printf ',"write_test":%s}}' "$health_write"
+}
+
+api_dependencies_json() {
+    dependency_value=$1
+    printf '['
+    dependency_first=true
+    old_ifs=$IFS; IFS=,
+    for dependency_item in $dependency_value; do
+        IFS=$old_ifs
+        [ -n "$dependency_item" ] || continue
+        valid_name "$dependency_item" || api_error corrupt_config "invalid routine dependency" 73
+        [ "$dependency_first" = true ] || printf ','
+        printf '%s' "$(json_quote "$dependency_item")"
+        dependency_first=false
+        IFS=,
+    done
+    IFS=$old_ifs
+    printf ']'
+}
+
+api_routine_json() {
+    routine_path=$1
+    if [ -L "$routine_path" ] || [ ! -f "$routine_path" ] || [ ! -r "$routine_path" ]; then api_error unsafe_state "unsafe routine config" 73; fi
+    routine_name=${routine_path##*/}; routine_name=${routine_name%.conf}
+    valid_name "$routine_name" && profile_exists "$routine_name" || api_error corrupt_config "routine references an unknown profile" 73
+    api_load_kv "$routine_path" enabled false; routine_enabled=$kv_value
+    api_load_kv "$routine_path" action sync; routine_action=$kv_value
+    api_load_kv "$routine_path" mode interval; routine_mode=$kv_value
+    api_load_kv "$routine_path" interval_seconds 3600; routine_interval=$kv_value
+    api_load_kv "$routine_path" weekdays 1,2,3,4,5,6,7; routine_weekdays=$kv_value
+    api_load_kv "$routine_path" time_window_start 00:00; routine_start=$kv_value
+    api_load_kv "$routine_path" time_window_end 23:59; routine_end=$kv_value
+    api_load_kv "$routine_path" debounce_seconds 5; routine_debounce=$kv_value
+    api_load_kv "$routine_path" retry_count 2; routine_retries=$kv_value
+    api_load_kv "$routine_path" retry_backoff_seconds 60; routine_backoff=$kv_value
+    api_load_kv "$routine_path" poll_seconds 30; routine_poll=$kv_value
+    api_load_kv "$routine_path" allow_delete false; routine_delete=$kv_value
+    api_load_kv "$routine_path" max_total_delete 100; routine_max_total=$kv_value
+    api_load_kv "$routine_path" depends_on ''; routine_dependencies=$kv_value
+    case $routine_enabled:$routine_delete in true:true|true:false|false:true|false:false) ;; *) api_error corrupt_config "invalid routine booleans" 73 ;; esac
+    case $routine_action in plan|sync) ;; *) api_error corrupt_config "invalid routine action" 73 ;; esac
+    case $routine_mode in interval|daily|realtime) ;; *) api_error corrupt_config "invalid routine mode" 73 ;; esac
+    case $routine_interval:$routine_debounce:$routine_retries:$routine_backoff:$routine_poll:$routine_max_total in *[!0-9:]*) api_error corrupt_config "invalid routine numeric value" 73 ;; esac
+    printf '%s\n' "$routine_weekdays" | grep -Eq '^[1-7](,[1-7])*$' || api_error corrupt_config "invalid routine weekdays" 73
+    case $routine_start in [0-1][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;; *) api_error corrupt_config "invalid routine start time" 73 ;; esac
+    case $routine_end in [0-1][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;; *) api_error corrupt_config "invalid routine end time" 73 ;; esac
+    routine_state_file=$routine_state_dir/$routine_name.state
+    api_load_kv "$routine_state_file" state never; routine_state=$kv_value
+    api_load_kv "$routine_state_file" next_run_epoch 0; routine_next=$kv_value
+    api_load_kv "$routine_state_file" last_success_epoch 0; routine_last_success=$kv_value
+    api_load_kv "$routine_state_file" backend none; routine_backend=$kv_value
+    case $routine_state in never|scheduled|running|succeeded|failed|deferred) ;; *) api_error corrupt_state "invalid routine state" 73 ;; esac
+    case $routine_backend in none|interval|daily|inotify|polling) ;; *) api_error corrupt_state "invalid routine backend" 73 ;; esac
+    case $routine_next:$routine_last_success in *[!0-9:]*) api_error corrupt_state "invalid routine epoch" 73 ;; esac
+    printf '{"profile":%s,"enabled":%s,"action":%s,"mode":%s,"interval_seconds":%s,' \
+        "$(json_quote "$routine_name")" "$routine_enabled" "$(json_quote "$routine_action")" "$(json_quote "$routine_mode")" "$routine_interval"
+    printf '"weekdays":[%s],"time_window_start":%s,"time_window_end":%s,"debounce_seconds":%s,' \
+        "$routine_weekdays" "$(json_quote "$routine_start")" "$(json_quote "$routine_end")" "$routine_debounce"
+    printf '"retry_count":%s,"retry_backoff_seconds":%s,"poll_seconds":%s,"allow_delete":%s,"max_total_delete":%s,"depends_on":' \
+        "$routine_retries" "$routine_backoff" "$routine_poll" "$routine_delete" "$routine_max_total"
+    api_dependencies_json "$routine_dependencies"
+    printf ',"backend":%s,"state":%s,"next_run_epoch":%s,"last_success_epoch":%s}' \
+        "$(json_quote "$routine_backend")" "$(json_quote "$routine_state")" "$routine_next" "$routine_last_success"
+}
+
+api_snapshot() {
+    [ "$#" -eq 0 ] || api_error invalid_request "snapshot accepts no arguments" 64
+    generated_epoch=$(epoch_now)
+    case $generated_epoch in ''|*[!0-9]*) api_error unavailable "system clock is unavailable" 69 ;; esac
+    service_pid=0 service_state=stopped
+    if [ -e "$controller_pid_file" ] || [ -L "$controller_pid_file" ]; then
+        [ ! -L "$controller_pid_file" ] && [ -f "$controller_pid_file" ] || api_error unsafe_state "unsafe controller PID file" 73
+        service_pid=$(read_pid "$controller_pid_file" 2>/dev/null || true)
+        [ -n "$service_pid" ] || api_error corrupt_state "controller PID file is malformed" 73
+        if pid_matches_command "$service_pid" "$controller"; then service_state=running
+        elif pid_is_live "$service_pid"; then service_state=untrusted
+        else service_pid=0; service_state=stopped
+        fi
+    fi
+    api_load_kv "$schedule_file" enabled false; schedule_enabled=$kv_value
+    api_load_kv "$schedule_file" interval_seconds 3600; schedule_interval=$kv_value
+    api_load_kv "$schedule_file" allow_delete false; schedule_delete=$kv_value
+    api_load_kv "$schedule_file" max_total_delete 100; schedule_max=$kv_value
+    case $schedule_enabled:$schedule_delete in true:true|true:false|false:true|false:false) ;; *) api_error corrupt_state "schedule has invalid booleans" 73 ;; esac
+    case $schedule_interval:$schedule_max in *[!0-9:]*) api_error corrupt_state "schedule has invalid numbers" 73 ;; esac
+    [ "$schedule_interval" -ge 60 ] && [ "$schedule_interval" -le 2592000 ] || api_error corrupt_state "schedule interval is out of range" 73
+    api_load_kv "$controller_state" state stopped; controller_status=$kv_value
+    api_load_kv "$controller_state" pid 0; controller_pid=$kv_value
+    api_load_kv "$controller_state" next_run_epoch 0; controller_next=$kv_value
+    api_load_kv "$controller_state" active_pid 0; controller_active=$kv_value
+    api_load_kv "$controller_state" updated_epoch 0; controller_updated=$kv_value
+    case $controller_status in running|stopped) ;; *) api_error corrupt_state "invalid controller state" 73 ;; esac
+    case $controller_pid:$controller_next:$controller_active:$controller_updated in *[!0-9:]*) api_error corrupt_state "invalid controller numeric state" 73 ;; esac
+    api_load_kv "$run_state" state never; run_status=$kv_value
+    api_load_kv "$run_state" started_epoch 0; run_started=$kv_value
+    api_load_kv "$run_state" finished_epoch 0; run_finished=$kv_value
+    api_load_kv "$run_state" exit_code -1; run_exit=$kv_value
+    api_load_kv "$run_state" scope none; run_scope=$kv_value
+    api_load_kv_optional "$run_state" operation none; run_operation=$kv_value
+    case $run_status in never|running|succeeded|failed) ;; *) api_error corrupt_state "invalid run state" 73 ;; esac
+    case $run_started:$run_finished in *[!0-9:]*) api_error corrupt_state "invalid run epoch" 73 ;; esac
+    case $run_exit in -1|*[!0-9]*) [ "$run_exit" = -1 ] || api_error corrupt_state "invalid run exit code" 73 ;; esac
+    case $run_scope in none|all) ;; *) valid_name "$run_scope" || api_error corrupt_state "invalid run scope" 73 ;; esac
+    case $run_operation in none|sync|plan) ;; *) api_error corrupt_state "invalid run operation" 73 ;; esac
+    profile_default=$(current_default 2>/dev/null || true)
+    if [ -n "$profile_default" ]; then valid_name "$profile_default" && profile_exists "$profile_default" || api_error corrupt_config "invalid default profile" 73; fi
+    api_load_kv "$alert_policy_file" enabled true; alert_enabled=$kv_value
+    api_load_kv "$alert_policy_file" on_success false; alert_success=$kv_value
+    api_load_kv "$alert_policy_file" on_failure true; alert_failure=$kv_value
+    api_load_kv "$alert_policy_file" failure_threshold 1; alert_threshold=$kv_value
+    api_load_kv "$alert_policy_file" cooldown_seconds 3600; alert_cooldown=$kv_value
+    case $alert_enabled:$alert_success:$alert_failure in
+        true:true:true|true:true:false|true:false:true|true:false:false|false:true:true|false:true:false|false:false:true|false:false:false) ;;
+        *) api_error corrupt_state "invalid alert policy" 73 ;;
+    esac
+    case $alert_threshold:$alert_cooldown in *[!0-9:]*) api_error corrupt_state "invalid alert policy numbers" 73 ;; esac
+    # Preflight every private entry before emitting the first JSON byte.
+    snapshot_profile_count=0
+    for preflight_profile in "$profiles_dir"/*.toml; do
+        [ -e "$preflight_profile" ] || [ -L "$preflight_profile" ] || continue
+        [ ! -L "$preflight_profile" ] && [ -f "$preflight_profile" ] && [ -r "$preflight_profile" ] || api_error unsafe_state "unsafe profile fragment" 73
+        snapshot_profile_count=$((snapshot_profile_count + 1))
+        [ "$snapshot_profile_count" -le 256 ] || api_error response_too_large "snapshot profile count exceeds its safe bound" 69
+    done
+    snapshot_routine_count=0
+    for preflight_routine in "$routines_dir"/*.conf; do
+        [ -e "$preflight_routine" ] || [ -L "$preflight_routine" ] || continue
+        [ ! -L "$preflight_routine" ] && [ -f "$preflight_routine" ] && [ -r "$preflight_routine" ] || api_error unsafe_state "unsafe routine config" 73
+        snapshot_routine_count=$((snapshot_routine_count + 1))
+        [ "$snapshot_routine_count" -le 256 ] || api_error response_too_large "snapshot routine count exceeds its safe bound" 69
+    done
+    snapshot_json=$state_root/.api.$$.snapshot
+    [ ! -L "$snapshot_json" ] || api_error unsafe_state "unsafe API snapshot path" 73
+    {
+    printf '{"schema":"sdsync.dsm-api.v1","generated_at_epoch":%s,' "$generated_epoch"
+    printf '"service":{"state":%s,"pid":%s},' "$(json_quote "$service_state")" "$service_pid"
+    printf '"schedule":{"enabled":%s,"interval_seconds":%s,"allow_delete":%s,"max_total_delete":%s},' \
+        "$schedule_enabled" "$schedule_interval" "$schedule_delete" "$schedule_max"
+    printf '"controller":{"state":%s,"pid":%s,"next_run_epoch":%s,"active_pid":%s,"updated_epoch":%s},' \
+        "$(json_quote "$controller_status")" "$controller_pid" "$controller_next" "$controller_active" "$controller_updated"
+    printf '"run":{"state":%s,"started_epoch":%s,"finished_epoch":%s,"exit_code":' \
+        "$(json_quote "$run_status")" "$run_started" "$run_finished"
+    if [ "$run_exit" = -1 ]; then printf 'null'; else printf '%s' "$run_exit"; fi
+    printf ',"scope":%s,"operation":%s},"profiles":[' "$(json_quote "$run_scope")" "$(json_quote "$run_operation")"
+    profile_first=true
+    sorted_fragments | while IFS= read -r snapshot_fragment; do
+        [ "$profile_first" = true ] || printf ','
+        api_profile_json "$snapshot_fragment" "$profile_default"
+        profile_first=false
+    done
+    printf '],"routines":['
+    routine_first=true
+    for snapshot_routine in "$routines_dir"/*.conf; do
+        [ -f "$snapshot_routine" ] || continue
+        [ "$routine_first" = true ] || printf ','
+        api_routine_json "$snapshot_routine"
+        routine_first=false
+    done
+    printf '],"alerts":{"enabled":%s,"on_success":%s,"on_failure":%s,"failure_threshold":%s,"cooldown_seconds":%s},' \
+        "$alert_enabled" "$alert_success" "$alert_failure" "$alert_threshold" "$alert_cooldown"
+    printf '"capabilities":{"mutations":false,"secrets":false,"write_test":false}}\n'
+    } > "$snapshot_json"
+    finish_private_file "$snapshot_json"
+    snapshot_size=$(wc -c < "$snapshot_json" | tr -d ' ')
+    case $snapshot_size in ''|*[!0-9]*) rm -f "$snapshot_json"; snapshot_json=; api_error unsafe_state "cannot measure snapshot response" 73 ;; esac
+    if [ "$snapshot_size" -gt 1048576 ]; then rm -f "$snapshot_json"; snapshot_json=; api_error response_too_large "snapshot response exceeds its safe bound" 69; fi
+    cat "$snapshot_json"
+    rm -f "$snapshot_json"
+    snapshot_json=
+}
+
+api_mutation_result() {
+    mutation_message=$1
+    append_activity configuration.changed all changed "$mutation_message" 2>/dev/null || true
+    api_result "$mutation_message"
+}
+
+api_set_secret() {
+    secret_profile= secret_kind= secret_mode=
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --profile) api_need_value "$@"; secret_profile=$2; shift 2 ;;
+            --kind) api_need_value "$@"; secret_kind=$2; shift 2 ;;
+            --mode) api_need_value "$@"; secret_mode=$2; shift 2 ;;
+            *) api_error invalid_request "unknown set-secret option" 64 ;;
+        esac
+    done
+    valid_name "$secret_profile" && profile_exists "$secret_profile" || api_error invalid_request "set-secret requires an existing profile" 64
+    case $secret_kind in password|totp|remote-log-token) ;; *) api_error invalid_request "invalid secret kind" 64 ;; esac
+    case $secret_mode in replace)
+        api_capture_or_error true "$manager" "set-$secret_kind" "$secret_profile"
+        ;;
+    clear)
+        api_capture_or_error false "$manager" "remove-$secret_kind" "$secret_profile"
+        ;;
+    *) api_error invalid_request "secret mode must be replace or clear" 64 ;;
+    esac
+    api_secret_boolean "$secret_root/$secret_profile.password"; result_password=$secret_boolean
+    api_secret_boolean "$secret_root/$secret_profile.totp"; result_totp=$secret_boolean
+    api_secret_boolean "$secret_root/$secret_profile.remote-log-token"; result_remote_token=$secret_boolean
+    printf '{"schema":"sdsync.dsm-result.v1","ok":true,"message":"secret state updated","has_password":%s,"has_totp":%s,"has_remote_log_token":%s}\n' \
+        "$result_password" "$result_totp" "$result_remote_token"
+}
+
+api_action() {
+    action_kind= action_scope= action_write=false action_delete=false action_max=100
+    action_write_seen=false action_delete_seen=false action_max_seen=false
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --kind) api_need_value "$@"; action_kind=$2; shift 2 ;;
+            --scope) api_need_value "$@"; action_scope=$2; shift 2 ;;
+            --write-test) api_need_value "$@"; action_write=$2; action_write_seen=true; shift 2 ;;
+            --allow-delete) api_need_value "$@"; action_delete=$2; action_delete_seen=true; shift 2 ;;
+            --max-total-delete) api_need_value "$@"; action_max=$2; action_max_seen=true; shift 2 ;;
+            *) api_error invalid_request "unknown action option" 64 ;;
+        esac
+    done
+    case $action_kind in doctor|plan|run) ;; *) api_error invalid_request "action kind must be doctor, plan, or run" 64 ;; esac
+    case $action_scope in all) ;; *) valid_name "$action_scope" && profile_exists "$action_scope" || api_error invalid_request "action scope must be all or an existing profile" 64 ;; esac
+    case $action_write:$action_delete in true:true|true:false|false:true|false:false) ;; *) api_error invalid_request "action booleans must be true or false" 64 ;; esac
+    case $action_max in ''|*[!0-9]*) api_error invalid_request "max-total-delete must be non-negative" 64 ;; esac
+    if [ "$action_kind" = doctor ]; then
+        [ "$action_delete_seen" = false ] && [ "$action_max_seen" = false ] || api_error invalid_request "delete options are not valid for doctor" 64
+        if [ "$action_scope" = all ]; then set -- "$manager" doctor --all; else set -- "$manager" doctor "$action_scope"; fi
+        [ "$action_write" = false ] || set -- "$@" --write-test
+    else
+        [ "$action_write_seen" = false ] || api_error invalid_request "write-test is only valid for doctor" 64
+        if [ "$action_scope" = all ]; then set -- "$manager" "$action_kind" --all; else set -- "$manager" "$action_kind" "$action_scope"; fi
+        [ "$action_delete" = false ] || set -- "$@" --allow-delete
+        if [ "$action_max_seen" = true ]; then
+            [ "$action_scope" = all ] || api_error invalid_request "max-total-delete requires scope all" 64
+            set -- "$@" --max-total-delete "$action_max"
+        fi
+    fi
+    api_capture false "$@"
+    if [ "$api_exit" -eq 0 ]; then
+        [ -n "$api_output" ] || api_output="$action_kind completed"
+        printf '{"schema":"sdsync.dsm-result.v1","ok":true,"message":%s,"status":"succeeded","exit_code":0,"scope":%s,"output":%s}\n' \
+            "$(json_quote "$action_kind completed")" "$(json_quote "$action_scope")" "$(json_quote "$api_output")"
+    else
+        api_map_exit_code "$api_exit"
+        [ -n "$api_output" ] || api_output="$action_kind failed"
+        printf '{"schema":"sdsync.dsm-result.v1","ok":false,"code":%s,"message":%s,"status":"failed","exit_code":%s,"scope":%s,"output":%s}\n' \
+            "$(json_quote "$api_mapped_code")" "$(json_quote "$action_kind failed")" "$api_exit" \
+            "$(json_quote "$action_scope")" "$(json_quote "$api_output")"
+        exit "$api_exit"
+    fi
+}
+
+api_command() {
+    exec 3>&1
+    api_error_fd3=true
+    trap cleanup_manager_lock 0
+    api_guard
+    api_operation=${1:-}
+    [ "$#" -eq 0 ] || shift
+    case $api_operation in
+        snapshot) api_snapshot "$@" ;;
+        logs) api_logs "$@" ;;
+        activity) api_activity "$@" ;;
+        configure-profile)
+            [ "$#" -gt 0 ] || api_error invalid_request "configure-profile needs options" 64
+            api_capture_or_error false "$manager" configure-profile "$@"
+            api_mutation_result "Profile configuration changed"
+            ;;
+        remove-profile)
+            [ "$#" -eq 1 ] || api_error invalid_request "remove-profile needs one profile" 64
+            api_capture_or_error false "$manager" remove-profile "$1"
+            api_mutation_result "Profile removed"
+            ;;
+        set-default)
+            [ "$#" -eq 1 ] || api_error invalid_request "set-default needs one profile" 64
+            api_capture_or_error false "$manager" set-default "$1"
+            api_mutation_result "Default profile changed"
+            ;;
+        set-secret) api_set_secret "$@" ;;
+        schedule)
+            [ "$#" -gt 0 ] || api_error invalid_request "schedule needs options" 64
+            api_capture_or_error false "$manager" set-schedule "$@"
+            api_mutation_result "Global schedule changed"
+            ;;
+        routine)
+            [ "$#" -gt 0 ] || api_error invalid_request "routine needs options" 64
+            api_capture_or_error false "$manager" configure-routine "$@"
+            api_mutation_result "Routine configuration changed"
+            ;;
+        remove-routine)
+            [ "$#" -eq 1 ] || api_error invalid_request "remove-routine needs one profile" 64
+            api_capture_or_error false "$manager" remove-routine "$1"
+            api_mutation_result "Routine removed"
+            ;;
+        alert-policy)
+            [ "$#" -gt 0 ] || api_error invalid_request "alert-policy needs options" 64
+            api_capture_or_error false "$manager" configure-alerts "$@"
+            api_mutation_result "Alert policy changed"
+            ;;
+        action) api_action "$@" ;;
+        '') api_error invalid_request "missing API operation" 64 ;;
+        *) api_error invalid_request "unknown API operation" 64 ;;
+    esac
+}
+
 command_name=${1:-help}
 [ "$#" -eq 0 ] || shift
 case $command_name in
     help|-h|--help) [ "$#" -eq 0 ] || die "help accepts no arguments"; usage ;;
+    api) api_command "$@" ;;
     configure-profile) begin_mutation; configure_profile "$@"; end_mutation ;;
+    configure-routine) begin_mutation; configure_routine "$@"; end_mutation ;;
+    remove-routine)
+        begin_mutation
+        [ "$#" -eq 1 ] && valid_name "$1" || die "remove-routine requires one profile name"
+        routine_target=$routines_dir/$1.conf
+        routine_state_target=$routine_state_dir/$1.state
+        [ ! -L "$routine_target" ] && [ ! -L "$routine_state_target" ] || die "refusing symlinked routine state"
+        rm -f "$routine_target" "$routine_state_target"
+        reload_controller_if_running
+        append_activity configuration.changed "$1" changed "Routine removed" 2>/dev/null || true
+        echo "removed routine for '$1'"
+        end_mutation
+        ;;
     list-profiles)
         require_package_identity || exit 77
         [ "$#" -eq 0 ] || die "list-profiles accepts no arguments"
@@ -532,6 +1620,14 @@ case $command_name in
         begin_mutation
         if [ "$#" -ne 1 ] || ! profile_exists "$1"; then die "remove-profile requires an existing profile"; fi
         remove_name=$1
+        for dependent_routine in "$routines_dir"/*.conf; do
+            [ -f "$dependent_routine" ] || continue
+            [ ! -L "$dependent_routine" ] || die "refusing symlinked routine config"
+            dependent_name=${dependent_routine##*/}; dependent_name=${dependent_name%.conf}
+            [ "$dependent_name" = "$remove_name" ] && continue
+            dependent_list=$(setting "$dependent_routine" depends_on '')
+            case ,$dependent_list, in *,$remove_name,*) die "cannot remove '$remove_name'; routine '$dependent_name' depends on it" ;; esac
+        done
         previous_default=$(current_default 2>/dev/null || true)
         remaining=$(sorted_fragments | while IFS= read -r fragment; do name=${fragment##*/}; name=${name%.toml}; [ "$name" = "$remove_name" ] || printf '%s\n' "$name"; done | sed -n '1p')
         if [ -n "$remaining" ]; then
@@ -545,29 +1641,48 @@ case $command_name in
             # Disable scheduling atomically before deleting the final runnable profile.
             write_disabled_schedule
         fi
-        rm -f "$profiles_dir/$remove_name.toml" "$secret_root/$remove_name.password" "$secret_root/$remove_name.totp"
+        rm -f "$profiles_dir/$remove_name.toml" "$secret_root/$remove_name.password" "$secret_root/$remove_name.totp" \
+            "$secret_root/$remove_name.remote-log-token" "$routines_dir/$remove_name.conf" \
+            "$routine_state_dir/$remove_name.state" "$profile_state_dir/$remove_name.state" "$health_dir/$remove_name.state"
         if [ -n "$remaining" ]; then mv -f "$candidate" "$config_file"; finish_private_file "$config_file"; write_default "$selected_default"; else rm -f "$config_file" "$default_profile_file"; fi
         echo "removed profile '$remove_name' and its package-owned credentials"
         end_mutation
         ;;
     set-password) begin_mutation; set_secret password "$@"; end_mutation ;;
     set-totp) begin_mutation; set_secret totp "$@"; end_mutation ;;
-    remove-totp)
+    set-remote-log-token) begin_mutation; set_secret remote-log-token "$@"; end_mutation ;;
+    remove-password|remove-totp|remove-remote-log-token)
         begin_mutation
-        if [ "$#" -ne 1 ] || ! profile_exists "$1"; then die "remove-totp requires an existing profile"; fi
-        [ ! -L "$secret_root/$1.totp" ] || die "refusing symlinked secret file"
-        rm -f "$secret_root/$1.totp"; echo "removed TOTP material for '$1'"
+        [ "$#" -eq 1 ] || die "$command_name requires an existing profile"
+        case $command_name in remove-password) remove_kind=password ;; remove-totp) remove_kind=totp ;; *) remove_kind=remote-log-token ;; esac
+        clear_secret "$remove_kind" "$1"
         end_mutation
         ;;
     doctor)
-        require_package_identity || exit 77
+        begin_mutation
         selection doctor "$@"
         if [ "$selected_scope" = all ]; then set -- --all-profiles; else set -- --profile "$selected_scope"; fi
+        doctor_exit=0
+        set +e
         "$binary" --config "$config_file" doctor "$@" source --hash
+        doctor_exit=$?
+        if [ "$doctor_exit" -eq 0 ]; then
         if [ "$write_test" = true ]; then
-            exec "$binary" --config "$config_file" doctor "$@" target --write-test
+                "$binary" --config "$config_file" doctor "$@" target --write-test
+            else
+                "$binary" --config "$config_file" doctor "$@" target
+            fi
+            doctor_exit=$?
         fi
-        exec "$binary" --config "$config_file" doctor "$@" target
+        set -e
+        if [ "$doctor_exit" -eq 0 ]; then doctor_status=succeeded; doctor_code=doctor.succeeded; else doctor_status=failed; doctor_code=doctor.failed; fi
+        write_health_cache "$selected_scope" "$doctor_status" "$doctor_exit" "$write_test"
+        append_activity "$doctor_code" "$selected_scope" "$doctor_status" "Target doctor completed" 2>/dev/null || true
+        if [ "$doctor_exit" -ne 0 ]; then
+            handle_doctor_alert "$selected_scope" "$doctor_exit" 2>/dev/null || true
+        fi
+        end_mutation
+        exit "$doctor_exit"
         ;;
     plan|run)
         require_package_identity || exit 77
@@ -602,6 +1717,16 @@ case $command_name in
         finish_private_file "$schedule_temp"; mv -f "$schedule_temp" "$schedule_file"
         reload_controller_if_running
         echo "scheduler enabled every $interval seconds (delete=$allow_schedule_delete); next run is not immediate"
+        end_mutation
+        ;;
+    set-schedule)
+        begin_mutation
+        configure_schedule "$@"
+        end_mutation
+        ;;
+    configure-alerts)
+        begin_mutation
+        configure_alert_policy "$@"
         end_mutation
         ;;
     disable)

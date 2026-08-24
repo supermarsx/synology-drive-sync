@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import binascii
+import functools
 import gzip
 import io
+import math
 import os
 import re
 import struct
@@ -19,6 +21,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[1]
 PACKAGE = "synology-drive-sync"
+UI_ICON_SIZES = (16, 24, 32, 48, 64, 72, 256)
 
 
 @dataclass(frozen=True)
@@ -99,6 +102,12 @@ def parse_arguments() -> argparse.Namespace:
         description="Build a DSM 7 SPK around a prebuilt static Linux binary."
     )
     parser.add_argument("--binary", required=True, type=Path)
+    parser.add_argument(
+        "--api-binary",
+        required=True,
+        type=Path,
+        help="prebuilt static sdsync-dsm-api ELF for the controller and CGI bridge",
+    )
     parser.add_argument("--arch", required=True, choices=sorted(ARCHITECTURES))
     parser.add_argument("--version", required=True)
     parser.add_argument("--output", required=True, type=Path)
@@ -249,6 +258,8 @@ def elf_contract(path: Path, arch: str) -> None:
 
 
 def tar_info(name: str, mode: int, size: int = 0, directory: bool = False) -> tarfile.TarInfo:
+    if mode & 0o6000:
+        raise PackageError(f"archive members must not carry setuid/setgid bits: {name}")
     info = tarfile.TarInfo(name)
     info.mode = mode
     info.size = size
@@ -266,24 +277,104 @@ def add_bytes(archive: tarfile.TarFile, name: str, payload: bytes, mode: int) ->
     archive.addfile(tar_info(name, mode, len(payload)), io.BytesIO(payload))
 
 
+def _rounded_square_distance(x: float, y: float) -> float:
+    half = 0.4375
+    radius = 0.19
+    qx = abs(x - 0.5) - (half - radius)
+    qy = abs(y - 0.5) - (half - radius)
+    return math.hypot(max(qx, 0.0), max(qy, 0.0)) + min(max(qx, qy), 0.0) - radius
+
+
+def _triangle_contains(
+    x: float,
+    y: float,
+    first: tuple[float, float],
+    second: tuple[float, float],
+    third: tuple[float, float],
+) -> bool:
+    def edge(
+        point_x: float,
+        point_y: float,
+        start: tuple[float, float],
+        end: tuple[float, float],
+    ) -> float:
+        return (point_x - end[0]) * (start[1] - end[1]) - (start[0] - end[0]) * (point_y - end[1])
+
+    first_edge = edge(x, y, first, second)
+    second_edge = edge(x, y, second, third)
+    third_edge = edge(x, y, third, first)
+    return not ((first_edge < 0 or second_edge < 0 or third_edge < 0) and (first_edge > 0 or second_edge > 0 or third_edge > 0))
+
+
+def _arrow_triangle(angle: float) -> tuple[tuple[float, float], ...]:
+    radius = 0.265
+    tip = (0.5 + radius * math.cos(angle), 0.5 + radius * math.sin(angle))
+    tangent = (-math.sin(angle), math.cos(angle))
+    radial = (math.cos(angle), math.sin(angle))
+    base = (tip[0] - tangent[0] * 0.105, tip[1] - tangent[1] * 0.105)
+    return (
+        tip,
+        (base[0] + radial[0] * 0.07, base[1] + radial[1] * 0.07),
+        (base[0] - radial[0] * 0.07, base[1] - radial[1] * 0.07),
+    )
+
+
+@functools.lru_cache(maxsize=len(UI_ICON_SIZES))
 def png_icon(size: int) -> bytes:
-    """Generate a deterministic dark-blue icon with a bright two-arrow sync mark."""
+    """Rasterize the authored sync mark deterministically with safe transparent bounds."""
+    if size not in UI_ICON_SIZES:
+        raise PackageError(f"unsupported UI icon size: {size}")
+    supersample = 4
+    arrow_one = _arrow_triangle(-0.10)
+    arrow_two = _arrow_triangle(3.02)
     rows: list[bytes] = []
-    center = size // 2
-    thickness = max(2, size // 18)
     for y in range(size):
         row = bytearray([0])
         for x in range(size):
-            edge = min(x, y, size - 1 - x, size - 1 - y)
-            background = (12 + min(edge, 8), 24 + min(edge, 8), 38 + min(edge, 10), 255)
-            upper = center - size // 7
-            lower = center + size // 7
-            rightward = upper - thickness <= y <= upper + thickness and size // 4 <= x <= 3 * size // 4
-            leftward = lower - thickness <= y <= lower + thickness and size // 4 <= x <= 3 * size // 4
-            arrow_right = x >= 3 * size // 4 - thickness * 2 and abs(y - upper) <= (x - (3 * size // 4 - thickness * 2))
-            arrow_left = x <= size // 4 + thickness * 2 and abs(y - lower) <= ((size // 4 + thickness * 2) - x)
-            pixel = (55, 210, 186, 255) if rightward or leftward or arrow_right or arrow_left else background
-            row.extend(pixel)
+            red = green = blue = alpha = 0.0
+            for sample_y in range(supersample):
+                normalized_y = (y + (sample_y + 0.5) / supersample) / size
+                for sample_x in range(supersample):
+                    normalized_x = (x + (sample_x + 0.5) / supersample) / size
+                    if _rounded_square_distance(normalized_x, normalized_y) > 0:
+                        continue
+                    delta_x = normalized_x - 0.5
+                    delta_y = normalized_y - 0.5
+                    radius = math.hypot(delta_x, delta_y)
+                    glow = max(0.0, 1.0 - radius / 0.62)
+                    pixel = (9 + 7 * glow, 18 + 13 * glow, 16 + 11 * glow)
+                    angle = math.atan2(delta_y, delta_x)
+                    on_arc = abs(radius - 0.265) <= 0.033 and (
+                        -2.82 <= angle <= -0.10 or 0.34 <= angle <= 3.02
+                    )
+                    on_arrow = _triangle_contains(
+                        normalized_x, normalized_y, *arrow_one
+                    ) or _triangle_contains(normalized_x, normalized_y, *arrow_two)
+                    on_center = radius <= 0.055
+                    on_orbit = abs(radius - 0.355) <= 0.004
+                    if on_arc or on_arrow:
+                        pixel = (98.0, 229.0, 197.0)
+                    elif on_center:
+                        pixel = (45.0, 182.0, 156.0)
+                    elif on_orbit:
+                        pixel = (37.0, 66.0, 58.0)
+                    red += pixel[0]
+                    green += pixel[1]
+                    blue += pixel[2]
+                    alpha += 255.0
+            samples = supersample * supersample
+            if alpha:
+                coverage = alpha / (255.0 * samples)
+                row.extend(
+                    (
+                        round(red / (samples * coverage)),
+                        round(green / (samples * coverage)),
+                        round(blue / (samples * coverage)),
+                        round(255 * coverage),
+                    )
+                )
+            else:
+                row.extend((0, 0, 0, 0))
         rows.append(bytes(row))
     raw = b"".join(rows)
 
@@ -303,7 +394,7 @@ def png_icon(size: int) -> bytes:
     )
 
 
-def payload_archive(binary: Path) -> tuple[bytes, int]:
+def payload_archive(binary: Path, api_binary: Path) -> tuple[bytes, int]:
     script_sources = (
         HERE / "package/bin/sdsync-dsm",
         HERE / "package/libexec/sdsync-common",
@@ -315,14 +406,44 @@ def payload_archive(binary: Path) -> tuple[bytes, int]:
         REPOSITORY / "THIRD_PARTY_LICENSES.html",
         HERE / "licenses/musl-COPYRIGHT",
     )
-    installed_size = binary.stat().st_size + sum(
-        path.stat().st_size for path in script_sources + notice_sources
+    ui_sources = (
+        (HERE / "package/ui/config", "ui/config"),
+        (HERE / "package/ui/index.html", "ui/index.html"),
+        (HERE / "package/ui/app.css", "ui/app.css"),
+        (HERE / "package/ui/app.js", "ui/app.js"),
+        (HERE / "package/ui/images/icon.svg", "ui/images/icon.svg"),
+        (HERE / "package/ui/texts/enu/strings", "ui/texts/enu/strings"),
+        (HERE / "package/ui/texts/enu/mails", "ui/texts/enu/mails"),
+    )
+    rendered_icons = {size: png_icon(size) for size in UI_ICON_SIZES}
+    installed_size = (
+        binary.stat().st_size
+        + 2 * api_binary.stat().st_size
+        + sum(path.stat().st_size for path in script_sources + notice_sources)
+        + sum(path.stat().st_size for path, _destination in ui_sources)
+        + sum(len(payload) for payload in rendered_icons.values())
     )
     tar_stream = io.BytesIO()
     with tarfile.open(fileobj=tar_stream, mode="w", format=tarfile.PAX_FORMAT) as archive:
-        for directory in ("bin", "libexec", "share", "share/licenses"):
+        for directory in (
+            "bin",
+            "libexec",
+            "share",
+            "share/licenses",
+            "ui",
+            "ui/images",
+            "ui/texts",
+            "ui/texts/enu",
+        ):
             archive.addfile(tar_info(directory, 0o755, directory=True))
         add_bytes(archive, "bin/synology-drive-sync", binary.read_bytes(), 0o755)
+        api_payload = api_binary.read_bytes()
+        add_bytes(archive, "bin/sdsync-dsm-api", api_payload, 0o755)
+        # Keep the distributable archive free of setuid/setgid entries. DSM applies
+        # the reviewed package-owned 4755 mode from conf/privilege during install;
+        # embedding that bit here makes pre-install scanners see a root-owned
+        # setuid member before DSM has assigned the package identity.
+        add_bytes(archive, "ui/api.cgi", api_payload, 0o755)
         for source, destination in (
             (HERE / "package/bin/sdsync-dsm", "bin/sdsync-dsm"),
             (HERE / "package/libexec/sdsync-common", "libexec/sdsync-common"),
@@ -348,6 +469,10 @@ def payload_archive(binary: Path) -> tuple[bytes, int]:
             (REPOSITORY / "THIRD_PARTY_LICENSES.html").read_bytes(),
             0o644,
         )
+        for source, destination in ui_sources:
+            add_bytes(archive, destination, source.read_bytes(), 0o644)
+        for size, icon in rendered_icons.items():
+            add_bytes(archive, f"ui/images/icon_{size}.png", icon, 0o644)
     compressed = io.BytesIO()
     with gzip.GzipFile(
         filename="", fileobj=compressed, mode="wb", mtime=SOURCE_DATE_EPOCH
@@ -368,8 +493,15 @@ def render_info(arch: str, dsm_version: str, extract_size: int) -> bytes:
     return rendered.encode("utf-8")
 
 
-def create_spk(binary: Path, arch: str, release: str, dsm_version: str, output: Path) -> Path:
-    payload, installed_size = payload_archive(binary)
+def create_spk(
+    binary: Path,
+    api_binary: Path,
+    arch: str,
+    release: str,
+    dsm_version: str,
+    output: Path,
+) -> Path:
+    payload, installed_size = payload_archive(binary, api_binary)
     info = render_info(arch, dsm_version, installed_size)
     output.mkdir(parents=True, exist_ok=True)
     destination = output / f"{PACKAGE}-{release}-{arch}.spk"
@@ -400,6 +532,7 @@ def create_spk(binary: Path, arch: str, release: str, dsm_version: str, output: 
             if source.is_file():
                 add_bytes(archive, f"scripts/{source.name}", source.read_bytes(), 0o755)
         add_bytes(archive, "conf/privilege", (HERE / "conf/privilege").read_bytes(), 0o644)
+        add_bytes(archive, "conf/resource", (HERE / "conf/resource").read_bytes(), 0o644)
     os.replace(temporary, destination)
     return destination
 
@@ -410,9 +543,12 @@ def main() -> int:
     # Check the caller-supplied path before resolving it; otherwise Path.resolve() erases the
     # symlink property that this package boundary promises to reject.
     elf_contract(arguments.binary, arguments.arch)
+    elf_contract(arguments.api_binary, arguments.arch)
     binary = arguments.binary.resolve()
+    api_binary = arguments.api_binary.resolve()
     destination = create_spk(
         binary,
+        api_binary,
         arguments.arch,
         release,
         dsm_version,

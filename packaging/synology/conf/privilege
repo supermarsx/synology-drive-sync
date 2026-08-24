@@ -29,6 +29,12 @@
       "permission": "0755"
     },
     {
+      "relpath": "bin/sdsync-dsm-api",
+      "user": "package",
+      "group": "package",
+      "permission": "0755"
+    },
+    {
       "relpath": "libexec/sdsync-common",
       "user": "package",
       "group": "package",
@@ -45,6 +51,12 @@
       "user": "package",
       "group": "package",
       "permission": "0755"
+    },
+    {
+      "relpath": "ui/api.cgi",
+      "user": "package",
+      "group": "package",
+      "permission": "4755"
     }
   ]
 }

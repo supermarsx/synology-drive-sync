@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import io
+import json
 import os
 import select
 import signal
@@ -133,9 +134,11 @@ def repack_outer(
     destination: Path,
     *,
     info_payload: bytes | None = None,
+    payload_overrides: dict[str, bytes] | None = None,
     mode_overrides: dict[str, int] | None = None,
     type_overrides: dict[str, bytes] | None = None,
 ) -> None:
+    payload_overrides = payload_overrides or {}
     mode_overrides = mode_overrides or {}
     type_overrides = type_overrides or {}
     with tarfile.open(source, "r:") as original, tarfile.open(
@@ -151,6 +154,9 @@ def repack_outer(
             if member.name == "INFO" and info_payload is not None:
                 payload = info_payload
                 member.size = len(payload)
+            if member.name in payload_overrides:
+                payload = payload_overrides[member.name]
+                member.size = len(payload)
             if member.name in mode_overrides:
                 member.mode = mode_overrides[member.name]
             if member.name in type_overrides:
@@ -158,6 +164,24 @@ def repack_outer(
                 member.size = 0
                 payload = None
             rebuilt.addfile(member, io.BytesIO(payload) if payload is not None else None)
+
+
+def repack_payload_mode(payload: bytes, member_name: str, mode: int) -> bytes:
+    rebuilt_payload = io.BytesIO()
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as original, tarfile.open(
+        fileobj=rebuilt_payload, mode="w:gz", format=tarfile.PAX_FORMAT
+    ) as rebuilt:
+        for original_member in original.getmembers():
+            member = copy.copy(original_member)
+            content = (
+                original.extractfile(original_member).read()
+                if original_member.isfile()
+                else None
+            )
+            if member.name == member_name:
+                member.mode = mode
+            rebuilt.addfile(member, io.BytesIO(content) if content is not None else None)
+    return rebuilt_payload.getvalue()
 
 
 class BuilderTests(unittest.TestCase):
@@ -182,6 +206,12 @@ class BuilderTests(unittest.TestCase):
             fake_elf(machine, elf_class=elf_class, elf_flags=elf_flags)
         )
         binary.chmod(0o755)
+        api_binary = self.root / f"{arch}.api.elf"
+        api_binary.write_bytes(
+            fake_elf(machine, elf_class=elf_class, elf_flags=elf_flags)
+        )
+        api_binary.chmod(0o755)
+        self.last_api_binary = api_binary
         destination = self.root / output
         environment = os.environ.copy()
         environment["SOURCE_DATE_EPOCH"] = "1700000000"
@@ -190,6 +220,7 @@ class BuilderTests(unittest.TestCase):
                 sys.executable,
                 str(HERE / "build_spk.py"),
                 "--binary", str(binary),
+                "--api-binary", str(api_binary),
                 "--arch", arch,
                 "--version", "v1.2.3",
                 "--output", str(destination),
@@ -237,7 +268,18 @@ class BuilderTests(unittest.TestCase):
             self.assertIn(f"({arch})", result.stdout)
             with tarfile.open(artifact, "r:") as outer:
                 info = outer.extractfile("INFO").read()  # type: ignore[union-attr]
+                package_payload = outer.extractfile("package.tgz").read()  # type: ignore[union-attr]
             self.assertIn(f'arch="{info_arch}"'.encode(), info)
+            with tarfile.open(fileobj=io.BytesIO(package_payload), mode="r:gz") as package:
+                installed_api = package.extractfile("bin/sdsync-dsm-api").read()  # type: ignore[union-attr]
+                cgi_api = package.extractfile("ui/api.cgi").read()  # type: ignore[union-attr]
+                self.assertEqual(installed_api, self.last_api_binary.read_bytes())
+                self.assertEqual(cgi_api, installed_api)
+                self.assertEqual(package.getmember("bin/sdsync-dsm-api").mode, 0o755)
+                self.assertEqual(package.getmember("ui/api.cgi").mode, 0o755)
+                self.assertFalse(
+                    any(member.mode & 0o6000 for member in package.getmembers())
+                )
 
     def test_armv7_info_has_family_and_required_platform_aliases(self) -> None:
         artifact = self.build(
@@ -339,12 +381,25 @@ class BuilderTests(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         binary = self.root / f"{name}.elf"
         binary.write_bytes(payload)
+        expected_machine, expected_class, expected_flags = {
+            "x86_64": (62, 2, 0),
+            "i686": (3, 1, 0),
+            "armv7": (40, 1, ARM_EABI5_HARD_FLOAT),
+            "armv8": (183, 2, 0),
+        }[arch]
+        api_binary = self.root / f"{name}.api.elf"
+        api_binary.write_bytes(
+            fake_elf(expected_machine, elf_class=expected_class, elf_flags=expected_flags)
+        )
+        api_binary.chmod(0o755)
         result = subprocess.run(
             [
                 sys.executable,
                 str(HERE / "build_spk.py"),
                 "--binary",
                 str(binary),
+                "--api-binary",
+                str(api_binary),
                 "--arch",
                 arch,
                 "--version",
@@ -400,12 +455,17 @@ class BuilderTests(unittest.TestCase):
         binary.write_bytes(fake_elf(62))
         link = self.root / "linked.elf"
         link.symlink_to(binary)
+        api_binary = self.root / "linked.api.elf"
+        api_binary.write_bytes(fake_elf(62))
+        api_binary.chmod(0o755)
         result = subprocess.run(
             [
                 sys.executable,
                 str(HERE / "build_spk.py"),
                 "--binary",
                 str(link),
+                "--api-binary",
+                str(api_binary),
                 "--arch",
                 "x86_64",
                 "--version",
@@ -470,6 +530,8 @@ class BuilderTests(unittest.TestCase):
                 str(HERE / "validate_spk.py"),
                 "--binary",
                 str(alternate_binary),
+                "--api-binary",
+                str(self.last_api_binary),
                 "--arch",
                 "x86_64",
                 str(artifact),
@@ -481,6 +543,62 @@ class BuilderTests(unittest.TestCase):
         )
         self.assertNotEqual(mismatch.returncode, 0)
         self.assertIn("do not match", mismatch.stderr)
+
+    def test_archive_is_never_setid_and_manifest_applies_package_owned_cgi_mode(self) -> None:
+        artifact = self.build("x86_64", 62)
+        with tarfile.open(artifact, "r:") as archive:
+            self.assertFalse(
+                any(member.mode & 0o6000 for member in archive.getmembers())
+            )
+            package_payload = archive.extractfile("package.tgz").read()  # type: ignore[union-attr]
+            privilege_payload = archive.extractfile("conf/privilege").read()  # type: ignore[union-attr]
+
+        archived_setuid = self.root / "archived-setuid" / artifact.name
+        archived_setuid.parent.mkdir()
+        repack_outer(
+            artifact,
+            archived_setuid,
+            payload_overrides={
+                "package.tgz": repack_payload_mode(package_payload, "ui/api.cgi", 0o4755)
+            },
+        )
+
+        privilege = json.loads(privilege_payload)
+        cgi = next(entry for entry in privilege["tool"] if entry["relpath"] == "ui/api.cgi")
+        self.assertEqual(cgi["user"], "package")
+        self.assertEqual(cgi["group"], "package")
+        self.assertEqual(cgi["permission"], "4755")
+        cgi["permission"] = "0755"
+        weakened_manifest = self.root / "weakened-manifest" / artifact.name
+        weakened_manifest.parent.mkdir()
+        repack_outer(
+            artifact,
+            weakened_manifest,
+            payload_overrides={"conf/privilege": json.dumps(privilege).encode()},
+        )
+
+        outer_setgid = self.root / "outer-setgid" / artifact.name
+        outer_setgid.parent.mkdir()
+        repack_outer(
+            artifact,
+            outer_setgid,
+            mode_overrides={"scripts/preinst": 0o2755},
+        )
+
+        for candidate, marker in (
+            (archived_setuid, "setuid/setgid archive member: ui/api.cgi"),
+            (weakened_manifest, "reviewed contract"),
+            (outer_setgid, "setuid/setgid archive member: scripts/preinst"),
+        ):
+            result = subprocess.run(
+                [sys.executable, str(HERE / "validate_spk.py"), str(candidate)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, candidate.name)
+            self.assertIn(marker, result.stderr, candidate.name)
 
     def test_template_validator_is_a_standalone_gate(self) -> None:
         result = subprocess.run(
@@ -585,7 +703,7 @@ class RuntimeTests(unittest.TestCase):
             timeout=timeout,
             check=False,
             preexec_fn=(
-                (lambda: (os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
+                (lambda: (os.setgroups([]), os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
                 if os.getuid() == 0 and drop_identity
                 else None
             ),
@@ -600,6 +718,594 @@ class RuntimeTests(unittest.TestCase):
         if default:
             arguments.append("--default")
         return self.shell(self.manager, *arguments)
+
+    def api(self, *arguments: str, input_text: str | None = None) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+        result = self.shell(self.manager, "api", *arguments, input_text=input_text)
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            self.fail(f"API returned invalid JSON for {arguments}: {error}: {result.stdout!r} / {result.stderr!r}")
+        self.assertIsInstance(payload, dict)
+        return result, payload
+
+    def fast_clock_environment(self, *, step: int = 31) -> dict[str, str]:
+        fake_bin = self.root / f"fake-clock-bin-{step}"
+        fake_bin.mkdir()
+        clock = self.root / f"fake-clock-{step}"
+        clock.write_text("1000\n", encoding="utf-8")
+        fake_date = fake_bin / "date"
+        fake_date.write_text(
+            "#!/bin/sh\n"
+            ': "${SDSYNC_TEST_CLOCK:?}"\n'
+            'case "${1:-}" in\n'
+            "  +%u) echo 1 ;;\n"
+            "  +%H%M) echo 1200 ;;\n"
+            "  +%Y-%m-%d) echo 2026-08-24 ;;\n"
+            "  +%s) IFS= read -r now < \"$SDSYNC_TEST_CLOCK\"; "
+            f"now=$((now + {step})); "
+            'printf \'%s\\n\' "$now" > "$SDSYNC_TEST_CLOCK"; printf \'%s\\n\' "$now" ;;\n'
+            "  *) exec /bin/date \"$@\" ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        fake_sleep = fake_bin / "sleep"
+        fake_sleep.write_text(
+            "#!/bin/sh\n"
+            "# Preserve lifecycle readiness/shutdown probes; only accelerate the\n"
+            "# controller's multi-second scheduling sleeps.\n"
+            "case ${1:-} in 1) exec /bin/sleep 1 ;; *) exec /bin/sleep 0.03 ;; esac\n",
+            encoding="utf-8",
+        )
+        fake_inotify = fake_bin / "inotifywait"
+        fake_inotify.write_text("#!/bin/sh\nexit 69\n", encoding="utf-8")
+        for executable in (fake_date, fake_sleep, fake_inotify):
+            executable.chmod(0o755)
+        if os.getuid() == 0:
+            for path in (fake_bin, clock, fake_date, fake_sleep, fake_inotify):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        return {
+            "PATH": f"{fake_bin}:{self.environment['PATH']}",
+            "SDSYNC_TEST_CLOCK": str(clock),
+        }
+
+    def test_api_snapshot_advanced_config_order_and_secret_non_disclosure(self) -> None:
+        ca_file = self.root / "trusted-ca.pem"
+        ca_file.write_text("test-ca\n", encoding="utf-8")
+        advanced = self.shell(
+            self.manager,
+            "configure-profile", "--name", "zeta", "--source", str(self.source_one),
+            "--url", "https://files.example.test/", "--username", "zeta-bot",
+            "--remote", "/home/Drive/Zeta", "--compare", "metadata", "--jobs", "4",
+            "--allow-empty-source", "true", "--clear-excludes", "--exclude", "*.tmp",
+            "--retries", "5", "--timeout", "123", "--connect-timeout", "9",
+            "--max-rate", "4096", "--ca-certificate", str(ca_file),
+            "--verbose", "2", "--quiet", "false", "--log-level", "debug",
+            "--log-format", "json", "--progress", "never", "--output", "json",
+            "--remote-log-url", "https://logs.example.test/ingest", "--remote-log-mode", "required",
+            "--default",
+        )
+        self.assertEqual(advanced.returncode, 0, advanced.stderr)
+        self.assertEqual(self.configure("alpha", self.source_two, "/home/Drive/Alpha").returncode, 0)
+
+        secret = "a-secret-that-must-never-appear"
+        replaced, replace_payload = self.api(
+            "set-secret", "--profile", "zeta", "--kind", "password", "--mode", "replace",
+            input_text=secret + "\n",
+        )
+        self.assertEqual(replaced.returncode, 0, replaced.stderr)
+        self.assertTrue(replace_payload["has_password"])
+        self.assertNotIn(secret, replaced.stdout + replaced.stderr)
+        too_many, too_many_payload = self.api(
+            "set-secret", "--profile", "zeta", "--kind", "totp", "--mode", "replace",
+            input_text="first\nsecond\n",
+        )
+        self.assertEqual(too_many.returncode, 64)
+        self.assertEqual(too_many_payload["code"], "invalid_request")
+        self.assertNotIn("first", too_many.stdout + too_many.stderr)
+
+        snapshot, payload = self.api("snapshot")
+        self.assertEqual(snapshot.returncode, 0, snapshot.stderr)
+        self.assertEqual(payload["schema"], "sdsync.dsm-api.v1")
+        profiles = payload["profiles"]
+        self.assertEqual([profile["name"] for profile in profiles], ["alpha", "zeta"])
+        zeta = profiles[1]
+        self.assertEqual(zeta["excludes"], ["*.tmp"])
+        self.assertEqual(zeta["upload_timeout_seconds"], 123)
+        self.assertEqual(zeta["max_rate_bytes_per_second"], 4096)
+        self.assertEqual(zeta["remote_log_mode"], "required")
+        self.assertTrue(zeta["has_password"])
+        self.assertNotIn(secret, snapshot.stdout + snapshot.stderr)
+        self.assertNotIn(".password", snapshot.stdout)
+        self.assertEqual(payload["capabilities"], {"mutations": False, "secrets": False, "write_test": False})
+
+        cleared, clear_payload = self.api(
+            "set-secret", "--profile", "zeta", "--kind", "password", "--mode", "clear"
+        )
+        self.assertEqual(cleared.returncode, 0, cleared.stderr)
+        self.assertFalse(clear_payload["has_password"])
+
+    def test_api_routine_alert_schedule_and_invalid_action_contracts(self) -> None:
+        self.assertEqual(self.configure("alpha", self.source_one, "/home/Drive/Alpha", True).returncode, 0)
+        self.assertEqual(self.configure("beta", self.source_two, "/home/Drive/Beta").returncode, 0)
+        for profile in ("alpha", "beta"):
+            result, _ = self.api(
+                "set-secret", "--profile", profile, "--kind", "password", "--mode", "replace",
+                input_text="test-password\n",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+        routine, _ = self.api(
+            "routine", "--profile", "beta", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--interval", "300", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "3", "--retry-count", "4", "--retry-backoff-seconds", "30",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+            "--depends-on", "alpha",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        scheduled, _ = self.api(
+            "schedule", "--enabled", "true", "--interval", "600",
+            "--allow-delete", "false", "--max-total-delete", "55",
+        )
+        self.assertEqual(scheduled.returncode, 0, scheduled.stderr)
+        alerts, _ = self.api(
+            "alert-policy", "--enabled", "true", "--on-success", "false",
+            "--on-failure", "true", "--failure-threshold", "2", "--cooldown", "600",
+        )
+        self.assertEqual(alerts.returncode, 0, alerts.stderr)
+        snapshot, payload = self.api("snapshot")
+        self.assertEqual(snapshot.returncode, 0, snapshot.stderr)
+        self.assertEqual(payload["schedule"]["max_total_delete"], 55)
+        self.assertEqual(payload["alerts"]["failure_threshold"], 2)
+        self.assertEqual(payload["routines"][0]["depends_on"], ["alpha"])
+        self.assertEqual(payload["routines"][0]["mode"], "realtime")
+
+        invalid, invalid_payload = self.api(
+            "action", "--kind", "doctor", "--scope", "alpha", "--allow-delete", "true"
+        )
+        self.assertEqual(invalid.returncode, 64)
+        self.assertEqual(invalid_payload["code"], "invalid_request")
+        invalid_write, invalid_write_payload = self.api(
+            "action", "--kind", "plan", "--scope", "alpha", "--write-test", "true"
+        )
+        self.assertEqual(invalid_write.returncode, 64)
+        self.assertEqual(invalid_write_payload["code"], "invalid_request")
+
+        self.assertEqual(
+            self.api(
+                "routine", "--profile", "alpha", "--enabled", "true", "--action", "sync",
+                "--mode", "interval", "--interval", "300", "--weekdays", "1,2,3,4,5,6,7",
+                "--time-window-start", "00:00", "--time-window-end", "23:59",
+                "--debounce-seconds", "5", "--retry-count", "1", "--retry-backoff-seconds", "30",
+                "--poll-seconds", "30", "--allow-delete", "false", "--max-total-delete", "100",
+                "--depends-on", "beta",
+            )[0].returncode,
+            64,
+        )
+
+    def test_api_logs_activity_and_corrupt_state_fail_closed(self) -> None:
+        self.assertEqual(
+            self.configure("logprofile", self.source_one, "/home/Drive/Logs", True).returncode,
+            0,
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "logprofile", "--kind", "password", "--mode", "replace",
+            input_text="a-secret-that-must-never-appear\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        controller_log = self.real_var / "log/controller.log"
+        controller_log.write_text(
+            f"\x1b[31mfailed at {self.real_home}/secrets/example.password with a-secret-that-must-never-appear\x1b[0m\n"
+            + ("x" * 300_000) + "\n",
+            encoding="utf-8",
+        )
+        logs, payload = self.api("logs", "--lines", "10")
+        self.assertEqual(logs.returncode, 0, logs.stderr)
+        self.assertEqual(payload["schema"], "sdsync.dsm-logs.v1")
+        rendered = json.dumps(payload)
+        self.assertNotIn("\x1b", rendered)
+        self.assertNotIn(str(self.real_home), rendered)
+        self.assertNotIn(".password", rendered)
+        self.assertNotIn("a-secret-that-must-never-appear", rendered)
+        self.assertLess(len(logs.stdout), 300_000)
+        activity, activity_payload = self.api("activity", "--lines", "10")
+        self.assertEqual(activity.returncode, 0, activity.stderr)
+        self.assertEqual(activity_payload["schema"], "sdsync.dsm-activity.v1")
+
+        run_state = self.real_var / "state/run.state"
+        run_state.write_text("state=running\nstate=failed\n", encoding="utf-8")
+        corrupt, corrupt_payload = self.api("snapshot")
+        self.assertEqual(corrupt.returncode, 73)
+        self.assertIn(corrupt_payload["code"], {"corrupt_state", "unsafe_state"})
+
+    def test_api_doctor_health_cache_and_raw_cgi_fail_closed(self) -> None:
+        self.assertEqual(self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode, 0)
+        secret, _ = self.api(
+            "set-secret", "--profile", "personal", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        doctor, doctor_payload = self.api(
+            "action", "--kind", "doctor", "--scope", "personal", "--write-test", "true"
+        )
+        self.assertEqual(doctor.returncode, 0, doctor.stderr)
+        self.assertEqual(doctor_payload["status"], "succeeded")
+        snapshot, payload = self.api("snapshot")
+        self.assertEqual(snapshot.returncode, 0, snapshot.stderr)
+        self.assertEqual(payload["profiles"][0]["health"]["state"], "succeeded")
+        self.assertTrue(payload["profiles"][0]["health"]["write_test"])
+        rejected = self.shell(
+            self.manager, "api", "snapshot", extra_environment={"REQUEST_METHOD": "GET"}
+        )
+        self.assertEqual(rejected.returncode, 77)
+        self.assertEqual(json.loads(rejected.stdout)["code"], "bridge_required")
+
+    def test_controller_executes_daily_profile_routine_once(self) -> None:
+        self.assertEqual(self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode, 0)
+        secret, _ = self.api(
+            "set-secret", "--profile", "personal", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        routine, _ = self.api(
+            "routine", "--profile", "personal", "--enabled", "true", "--action", "sync",
+            "--mode", "daily", "--interval", "3600", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "5", "--retry-count", "1", "--retry-backoff-seconds", "30",
+            "--poll-seconds", "30", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        state_path = self.real_var / "state/routines/personal.state"
+        for _ in range(200):
+            if state_path.is_file() and "state=succeeded" in state_path.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("daily routine did not finish")
+        captured = self.capture.read_text(encoding="utf-8")
+        self.assertIn("sync --profile personal --no-delete", captured)
+        time.sleep(0.2)
+        self.assertEqual(
+            self.capture.read_text(encoding="utf-8").count("sync --profile personal --no-delete"),
+            1,
+        )
+
+    def test_controller_interval_and_realtime_polling_fallback_trigger(self) -> None:
+        self.assertEqual(self.configure("interval", self.source_one, "/home/Drive/Interval", True).returncode, 0)
+        self.assertEqual(self.configure("watch", self.source_two, "/home/Drive/Watch").returncode, 0)
+        for profile in ("interval", "watch"):
+            secret, _ = self.api(
+                "set-secret", "--profile", profile, "--kind", "password", "--mode", "replace",
+                input_text="test-password\n",
+            )
+            self.assertEqual(secret.returncode, 0, secret.stderr)
+        interval, _ = self.api(
+            "routine", "--profile", "interval", "--enabled", "true", "--action", "sync",
+            "--mode", "interval", "--interval", "600", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(interval.returncode, 0, interval.stderr)
+        watched_file = self.source_two / "watched.txt"
+        watched_file.write_text("one\n", encoding="utf-8")
+        realtime, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(realtime.returncode, 0, realtime.stderr)
+        self.capture.write_text("", encoding="utf-8")
+        fast_environment = self.fast_clock_environment(step=31)
+        started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        interval_state = self.real_var / "state/routines/interval.state"
+        watch_state = self.real_var / "state/routines/watch.state"
+        for _ in range(200):
+            if (
+                interval_state.is_file()
+                and "state=succeeded" in interval_state.read_text(encoding="utf-8")
+                and watch_state.is_file()
+                and "fingerprint=none" not in watch_state.read_text(encoding="utf-8")
+                and "backend=polling" in watch_state.read_text(encoding="utf-8")
+            ):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail(
+                "interval trigger or realtime polling initialization did not occur: "
+                f"interval={interval_state.read_text(encoding='utf-8') if interval_state.exists() else 'missing'}; "
+                f"watch={watch_state.read_text(encoding='utf-8') if watch_state.exists() else 'missing'}; "
+                f"log={(self.real_var / 'log/controller.log').read_text(encoding='utf-8') if (self.real_var / 'log/controller.log').exists() else 'missing'}"
+            )
+        watched_file.write_text("two\n", encoding="utf-8")
+        for _ in range(200):
+            if "sync --profile watch --no-delete" in self.capture.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("realtime polling fallback did not observe a filesystem change")
+        captured = self.capture.read_text(encoding="utf-8")
+        self.assertIn("sync --profile interval --no-delete", captured)
+        self.assertIn("sync --profile watch --no-delete", captured)
+
+    def test_controller_dependency_deferral_then_success_and_retry_backoff(self) -> None:
+        self.assertEqual(self.configure("base", self.source_one, "/home/Drive/Base", True).returncode, 0)
+        self.assertEqual(self.configure("dependent", self.source_two, "/home/Drive/Dependent").returncode, 0)
+        for profile in ("base", "dependent"):
+            secret, _ = self.api(
+                "set-secret", "--profile", profile, "--kind", "password", "--mode", "replace",
+                input_text="test-password\n",
+            )
+            self.assertEqual(secret.returncode, 0, secret.stderr)
+        routine, _ = self.api(
+            "routine", "--profile", "dependent", "--enabled", "true", "--action", "sync",
+            "--mode", "daily", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "2", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+            "--depends-on", "base",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        fast_environment = self.fast_clock_environment(step=31)
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        dependent_state = self.real_var / "state/routines/dependent.state"
+        for _ in range(100):
+            if dependent_state.is_file() and "state=deferred" in dependent_state.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("dependency did not defer the routine")
+        base_plan = self.shell(self.manager, "plan", "base")
+        self.assertEqual(base_plan.returncode, 0, base_plan.stderr)
+
+        core = self.real_target / "bin/synology-drive-sync"
+        retry_counter = self.root / "retry-counter"
+        core.write_text(
+            "#!/bin/sh\n"
+            ': "${SDSYNC_TEST_CAPTURE:?}"\n'
+            'printf \'%s\\n\' "$*" >> "$SDSYNC_TEST_CAPTURE"\n'
+            'case " $* " in *" config validate "*) exit 0 ;; esac\n'
+            f'counter="{retry_counter}"\n'
+            'count=0; [ ! -f "$counter" ] || IFS= read -r count < "$counter"\n'
+            'count=$((count + 1)); printf \'%s\\n\' "$count" > "$counter"\n'
+            '[ "$count" -gt 1 ] || exit 42\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        core.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(core, self.drop_uid, self.drop_gid)
+        for _ in range(300):
+            if (
+                retry_counter.is_file()
+                and int(retry_counter.read_text(encoding="utf-8").strip()) >= 2
+                and "state=succeeded" in dependent_state.read_text(encoding="utf-8")
+            ):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("failed routine was not retried after its backoff")
+        self.assertIn("retry_attempt=0", dependent_state.read_text(encoding="utf-8"))
+
+    def test_routine_delete_ceiling_rejects_weaker_aggregate_bound(self) -> None:
+        configured = self.shell(
+            self.manager,
+            "configure-profile", "--name", "mirror", "--source", str(self.source_one),
+            "--url", "https://files.example.test/", "--username", "mirror-bot",
+            "--remote", "/home/Drive/Mirror", "--delete", "--max-delete", "20", "--default",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        rejected, payload = self.api(
+            "routine", "--profile", "mirror", "--enabled", "true", "--action", "sync",
+            "--mode", "interval", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "true", "--max-total-delete", "19",
+        )
+        self.assertEqual(rejected.returncode, 64)
+        self.assertEqual(payload["code"], "invalid_request")
+
+    def test_alert_threshold_cooldown_fixed_event_and_unavailable_fallback(self) -> None:
+        configured, _ = self.api(
+            "alert-policy", "--enabled", "true", "--on-success", "false",
+            "--on-failure", "true", "--failure-threshold", "2", "--cooldown", "60",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        clock = self.root / "alert-clock"
+        clock.write_text("1000\n", encoding="utf-8")
+        capture = self.root / "notifications"
+        helper = self.root / "alert-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            f'clock="{clock}"\n'
+            f'capture="{capture}"\n'
+            'epoch_now() { IFS= read -r value < "$clock"; printf \'%s\\n\' "$value"; }\n'
+            'safe_notify() { printf \'%s %s %s\\n\' "$1" "$2" "$3" >> "$capture"; }\n'
+            "handle_alert_result alpha failed 42\n"
+            "handle_alert_result alpha failed 42\n"
+            "handle_alert_result alpha failed 42\n"
+            'printf \'1061\\n\' > "$clock"\n'
+            "handle_alert_result alpha failed 42\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            for path in (clock, helper):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        result = self.shell(helper)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            capture.read_text(encoding="utf-8").splitlines(),
+            ["sync_failed alpha 42", "sync_failed alpha 42"],
+        )
+        self.assertIn(
+            "failure_count=4",
+            (self.real_var / "state/alerts.state").read_text(encoding="utf-8"),
+        )
+
+        unavailable = self.root / "notification-unavailable.sh"
+        unavailable.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            "if [ ! -x /usr/syno/bin/synonotify ]; then\n"
+            "  set +e; safe_notify sync_failed alpha 42; code=$?; set -e; [ \"$code\" -eq 69 ]\n"
+            "fi\n",
+            encoding="utf-8",
+        )
+        unavailable.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(unavailable, self.drop_uid, self.drop_gid)
+        fallback = self.shell(unavailable)
+        self.assertEqual(fallback.returncode, 0, fallback.stderr)
+        activity, payload = self.api("activity", "--lines", "20")
+        self.assertEqual(activity.returncode, 0, activity.stderr)
+        if not Path("/usr/syno/bin/synonotify").exists():
+            self.assertIn("notification.unavailable", [event["code"] for event in payload["events"]])
+
+    def test_controller_private_queue_is_sequential_bounded_and_rejects_unsafe_entries(self) -> None:
+        bridge_capture = self.root / "bridge-capture"
+        bridge_lock = self.root / "bridge-lock"
+        bridge = self.real_target / "bin/sdsync-dsm-api"
+        bridge.write_text(
+            "#!/bin/sh\nset -eu\n"
+            '[ "$#" -eq 3 ] && [ "$1" = --consume-job ]\n'
+            'request=$2; response=$3; name=${request##*/}; id=${name%.json}\n'
+            f'capture="{bridge_capture}"; lock="{bridge_lock}"\n'
+            'mkdir "$lock" || { printf \'overlap\\n\' >> "$capture"; exit 75; }\n'
+            'trap \'rmdir "$lock" 2>/dev/null || true\' 0\n'
+            'secret=no; [ ! -f "${request%.json}.secret" ] || secret=yes\n'
+            'printf \'%s %s %s %s %s\\n\' "$id" "$(date +%s)" "$(id -u)" "$(id -G)" "$secret" >> "$capture"\n'
+            'sleep 0.1\n'
+            'rm -f "${request%.json}.secret"\n'
+            'printf \'{"schema":"sdsync.dsm-result.v1","ok":true,"message":"queued"}\\n\' > "$response"\n',
+            encoding="utf-8",
+        )
+        bridge.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(bridge, self.drop_uid, self.drop_gid)
+        requests = self.real_var / "control/requests"
+        processing = self.real_var / "control/processing"
+        responses = self.real_var / "control/responses"
+
+        def private_file(path: Path, payload: str) -> None:
+            path.write_text(payload, encoding="utf-8")
+            path.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(path, self.drop_uid, self.drop_gid)
+
+        symlink_id = "0" * 48
+        collision_id = "1" * 48
+        first_id = "2" * 48
+        secret_id = "3" * 48
+        response_collision_id = "4" * 48
+        expired_response_id = "5" * 48
+        expired_secret_id = "6" * 48
+        retained_request_secret_id = "7" * 48
+        expired_request_secret_id = "8" * 48
+        retained_request_id = "9" * 48
+        expired_request_id = "a" * 48
+        orphaned_processing_id = "b" * 48
+        symlink_target = self.root / "queue-symlink-target"
+        symlink_target.write_text("{}\n", encoding="utf-8")
+        os.symlink(symlink_target, requests / f"{symlink_id}.json")
+        private_file(requests / f"{collision_id}.json", "{}\n")
+        private_file(processing / f"{collision_id}.json", "{}\n")
+        private_file(requests / f"{first_id}.json", "{}\n")
+        private_file(requests / f"{secret_id}.json", "{}\n")
+        private_file(requests / f"{secret_id}.secret", "one-line-secret\n")
+        private_file(requests / f"{response_collision_id}.json", "{}\n")
+        response_target = self.root / "queue-response-target"
+        response_target.write_text("do-not-overwrite\n", encoding="utf-8")
+        os.symlink(response_target, responses / f"{response_collision_id}.json")
+        expired_response = responses / f"{expired_response_id}.json"
+        private_file(expired_response, '{"schema":"sdsync.dsm-result.v1","ok":true}\n')
+        expired_secret = processing / f"{expired_secret_id}.secret"
+        private_file(expired_secret, "expired-secret\n")
+        retained_request_secret = requests / f"{retained_request_secret_id}.secret"
+        private_file(retained_request_secret, "retained-secret\n")
+        expired_request_secret = requests / f"{expired_request_secret_id}.secret"
+        private_file(expired_request_secret, "expired-request-secret\n")
+        retained_request = requests / f"{retained_request_id}.json"
+        private_file(retained_request, "{}\n")
+        private_file(processing / f"{retained_request_id}.json", "{}\n")
+        expired_request = requests / f"{expired_request_id}.json"
+        private_file(expired_request, "{}\n")
+        orphaned_processing = processing / f"{orphaned_processing_id}.json"
+        private_file(orphaned_processing, "{}\n")
+        bounded_responses = []
+        for index in range(100, 358):
+            bounded_response = responses / f"{index:048x}.json"
+            private_file(bounded_response, '{"schema":"sdsync.dsm-result.v1","ok":true}\n')
+            bounded_responses.append(bounded_response)
+        expired_at = time.time() - 3700
+        os.utime(expired_response, (expired_at, expired_at))
+        os.utime(expired_secret, (expired_at, expired_at))
+        os.utime(retained_request_secret, (expired_at, expired_at))
+        os.utime(retained_request, (expired_at, expired_at))
+        os.utime(orphaned_processing, (expired_at, expired_at))
+        request_expired_at = time.time() - 86_500
+        os.utime(expired_request_secret, (request_expired_at, request_expired_at))
+        os.utime(expired_request, (request_expired_at, request_expired_at))
+
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        for _ in range(600):
+            if (responses / f"{first_id}.json").is_file() and (responses / f"{secret_id}.json").is_file():
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("controller did not consume the two safe queued requests")
+        records = bridge_capture.read_text(encoding="utf-8").splitlines()
+        self.assertFalse(any(record == "overlap" for record in records))
+        parsed = [record.split() for record in records]
+        self.assertEqual([record[0] for record in parsed[:2]], [first_id, secret_id])
+        self.assertGreaterEqual(int(parsed[1][1]) - int(parsed[0][1]), 1)
+        self.assertEqual(parsed[1][-1], "yes")
+        if os.getuid() == 0:
+            self.assertEqual(parsed[0][2], str(self.drop_uid))
+            self.assertEqual(parsed[0][3], str(self.drop_gid))
+        self.assertFalse((processing / f"{secret_id}.secret").exists())
+        self.assertFalse((requests / f"{secret_id}.secret").exists())
+        controller_log_path = self.real_var / "log/controller.log"
+        controller_log = ""
+        for _ in range(600):
+            controller_log = controller_log_path.read_text(encoding="utf-8")
+            if "control_response_rejected" in controller_log:
+                break
+            time.sleep(0.03)
+        self.assertIn("control_request_rejected", controller_log)
+        self.assertIn("control_request_collision", controller_log)
+        self.assertIn("control_response_rejected", controller_log)
+        self.assertEqual(response_target.read_text(encoding="utf-8"), "do-not-overwrite\n")
+        self.assertNotIn(response_collision_id, bridge_capture.read_text(encoding="utf-8"))
+        self.assertFalse(expired_response.exists())
+        self.assertFalse(expired_secret.exists())
+        self.assertTrue(retained_request_secret.exists())
+        self.assertFalse(expired_request_secret.exists())
+        self.assertTrue(retained_request.exists())
+        self.assertFalse(expired_request.exists())
+        self.assertFalse(orphaned_processing.exists())
+        self.assertNotIn(orphaned_processing_id, bridge_capture.read_text(encoding="utf-8"))
+        for _ in range(100):
+            safe_responses = [
+                path for path in responses.glob("*.json")
+                if not path.is_symlink() and path.is_file() and len(path.stem) == 48
+            ]
+            if len(safe_responses) <= 256:
+                break
+            time.sleep(0.03)
+        self.assertLessEqual(len(safe_responses), 256)
+        self.assertIn("kind=processing_indeterminate", controller_log_path.read_text(encoding="utf-8"))
 
     def test_profiles_secrets_arbitrary_home_target_and_foreground_plan(self) -> None:
         if os.getuid() == 0:
@@ -1138,7 +1844,11 @@ class RuntimeTests(unittest.TestCase):
             encoding="utf-8",
         )
         fake_sleep = fake_bin / "sleep"
-        fake_sleep.write_text("#!/bin/sh\nexec /bin/sleep 0.05\n", encoding="utf-8")
+        fake_sleep.write_text(
+            "#!/bin/sh\n"
+            "case ${1:-} in 1) exec /bin/sleep 1 ;; *) exec /bin/sleep 0.05 ;; esac\n",
+            encoding="utf-8",
+        )
         fake_date.chmod(0o755)
         fake_sleep.chmod(0o755)
         if os.getuid() == 0:
@@ -1154,7 +1864,13 @@ class RuntimeTests(unittest.TestCase):
         started = self.shell(
             self.lifecycle, "start", extra_environment=fast_environment, timeout=15
         )
-        self.assertEqual(started.returncode, 0, started.stderr)
+        controller_log = self.real_var / "log/controller.log"
+        startup_diagnostic = started.stdout + started.stderr
+        if controller_log.is_file():
+            startup_diagnostic += "\ncontroller.log:\n" + controller_log.read_text(
+                encoding="utf-8"
+            )
+        self.assertEqual(started.returncode, 0, startup_diagnostic)
         core_pid = None
         try:
             for _ in range(200):

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Synology Drive Sync</title>
+  <desc id="desc">Two mint paths circulate safely inside a dark rounded square.</desc>
+  <rect x="16" y="16" width="224" height="224" rx="49" fill="#08110f"/>
+  <rect x="17" y="17" width="222" height="222" rx="48" fill="none" stroke="#21463e" stroke-width="2"/>
+  <circle cx="128" cy="128" r="78" fill="none" stroke="#102923" stroke-width="2"/>
+  <path d="M67 103c13-28 41-46 73-43 20 2 39 11 52 25" fill="none" stroke="#65e6c7" stroke-width="17" stroke-linecap="round"/>
+  <path d="m183 65 13 23-27 2" fill="none" stroke="#65e6c7" stroke-width="17" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M189 153c-13 28-41 46-73 43-20-2-39-11-52-25" fill="none" stroke="#2fb69d" stroke-width="17" stroke-linecap="round"/>
+  <path d="m73 191-13-23 27-2" fill="none" stroke="#2fb69d" stroke-width="17" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="128" cy="128" r="12" fill="#d9fff5"/>
+</svg>

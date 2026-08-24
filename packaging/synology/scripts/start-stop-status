@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 . "$(dirname "$0")/common"
+umask 077
 
 status_code() {
     saved_pid=$(script_pid "$controller_pid_file" 2>/dev/null || true)

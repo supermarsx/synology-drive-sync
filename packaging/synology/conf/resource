@@ -1,0 +1,11 @@
+{
+  "sysnotify": {
+    "texts_dir": "ui/texts",
+    "app_privileges": [
+      {
+        "app_id": "com.supermarsx.SynologyDriveSync",
+        "categories": ["Synology Drive Sync"]
+      }
+    ]
+  }
+}

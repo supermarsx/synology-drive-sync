@@ -37,11 +37,13 @@ ctrlc = { version = "3.5.2", features = ["termination"] }
 ignore = "0.4.31"
 keyring-core = "1.0.0"
 md-5 = { version = "0.11.0", default-features = false }
+hmac = "0.12.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "form", "multipart", "rustls"] }
 rpassword = "7.5.4"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 sha2 = "0.10.9"
+subtle = "2.6"
 thiserror = "2.0"
 toml = "0.9.8"
 totp-rs = { version = "5.7.2", default-features = false, features = ["zeroize"] }
@@ -54,6 +56,7 @@ windows-native-keyring-store = { version = "1.1.0", default-features = false }
 apple-native-keyring-store = { version = "1.0.1", default-features = false, features = ["keychain"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 zbus-secret-service-keyring-store = { version = "1.0.0", default-features = false, features = ["crypto-rust"] }
 
 [profile.release]

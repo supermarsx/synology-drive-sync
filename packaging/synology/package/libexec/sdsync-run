@@ -109,43 +109,51 @@ forward_term() {
 trap forward_term TERM INT HUP
 trap cleanup_run 0
 
+preflight_profile_runtime() {
+    runtime_fragment=$1
+    [ -f "$runtime_fragment" ] && [ ! -L "$runtime_fragment" ] && [ -r "$runtime_fragment" ] || {
+        echo "profile configuration is not a readable regular file: $runtime_fragment" >&2
+        return 66
+    }
+    runtime_profile=${runtime_fragment##*/}
+    runtime_profile=${runtime_profile%.toml}
+    profile_secret_exists "$runtime_profile" || {
+        echo "profile '$runtime_profile' has no protected password; use sdsync-dsm set-password" >&2
+        return 66
+    }
+    for runtime_secret in "$secret_root/$runtime_profile.totp" "$secret_root/$runtime_profile.remote-log-token"; do
+        if [ -e "$runtime_secret" ] || [ -L "$runtime_secret" ]; then
+            private_secret_file "$runtime_secret" || {
+                echo "optional secret material is not a package-owned 0600 regular file: $runtime_secret" >&2
+                return 66
+            }
+        fi
+    done
+    runtime_log_count=$(grep -c '^log-file = "' "$runtime_fragment" 2>/dev/null || true)
+    [ "$runtime_log_count" = 1 ] || { echo "profile '$runtime_profile' has an invalid log-file" >&2; return 66; }
+    runtime_log_file=$(sed -n 's/^log-file = "\(.*\)"$/\1/p' "$runtime_fragment")
+    case $runtime_log_file in "$log_root"/*) ;; *) echo "profile '$runtime_profile' log-file escaped package storage" >&2; return 66 ;; esac
+    if [ -e "$runtime_log_file" ] || [ -L "$runtime_log_file" ]; then
+        private_secret_file "$runtime_log_file" || {
+            echo "profile '$runtime_profile' log-file is not a package-owned 0600 regular file" >&2
+            return 66
+        }
+    fi
+}
+
 if [ "$run_scope" = all ]; then
     found_profile=false
     for fragment in "$profiles_dir"/*.toml; do
-        [ -f "$fragment" ] || continue
+        [ -e "$fragment" ] || [ -L "$fragment" ] || continue
         found_profile=true
-        profile_name=${fragment##*/}
-        profile_name=${profile_name%.toml}
-        if ! profile_secret_exists "$profile_name"; then
-            echo "profile '$profile_name' has no protected password; use sdsync-dsm set-password" >&2
-            exit 66
-        fi
+        preflight_profile_runtime "$fragment" || exit $?
     done
     [ "$found_profile" = true ] || {
         echo "no configured profiles" >&2
         exit 66
     }
 else
-    profile_secret_exists "$run_scope" || {
-        echo "profile '$run_scope' is missing or has no protected password" >&2
-        exit 66
-    }
-fi
-
-if [ "$run_scope" = all ]; then
-    for totp_path in "$secret_root"/*.totp; do
-        [ -e "$totp_path" ] || continue
-        private_secret_file "$totp_path" || {
-            echo "TOTP material is not a package-owned 0600 regular file: $totp_path" >&2
-            exit 66
-        }
-    done
-else
-    totp_path=$secret_root/$run_scope.totp
-    if [ -e "$totp_path" ] && ! private_secret_file "$totp_path"; then
-        echo "TOTP material is not a package-owned 0600 regular file: $totp_path" >&2
-        exit 66
-    fi
+    preflight_profile_runtime "$profiles_dir/$run_scope.toml" || exit $?
 fi
 
 "$binary" --config "$config_file" --quiet config validate
@@ -161,7 +169,8 @@ if [ "$allow_delete" != true ]; then
     set -- "$@" --no-delete
 fi
 
-write_run_state running "$started" 0 -1 "$run_label"
+write_run_state running "$started" 0 -1 "$run_label" "$run_mode"
+append_activity run.started "$run_label" running "Package action started" 2>/dev/null || true
 scheduled_log=$log_root/scheduler.log
 if [ "$run_output" = scheduled ]; then
     rotate_log "$scheduled_log" 10485760 5
@@ -202,7 +211,28 @@ if [ "$exit_code" -eq 0 ]; then
 else
     final_state=failed
 fi
-write_run_state "$final_state" "$started" "$finished" "$exit_code" "$run_label"
+write_run_state "$final_state" "$started" "$finished" "$exit_code" "$run_label" "$run_mode"
+write_profile_completion_state() {
+    profile_state_fragment=$1
+    [ -f "$profile_state_fragment" ] || return 0
+    profile_state_name=${profile_state_fragment##*/}; profile_state_name=${profile_state_name%.toml}
+    profile_state_temp=$profile_state_dir/.${profile_state_name}.state.$$
+    printf 'state=%s\nfinished_epoch=%s\nexit_code=%s\naction=%s\n' \
+        "$final_state" "$finished" "$exit_code" "$run_mode" > "$profile_state_temp"
+    finish_private_file "$profile_state_temp"
+    mv -f "$profile_state_temp" "$profile_state_dir/$profile_state_name.state"
+}
+if [ "$run_scope" = all ]; then
+    for profile_state_fragment in "$profiles_dir"/*.toml; do
+        [ -f "$profile_state_fragment" ] || continue
+        write_profile_completion_state "$profile_state_fragment"
+    done
+else
+    write_profile_completion_state "$profiles_dir/$run_scope.toml"
+fi
+if [ "$final_state" = succeeded ]; then activity_code=run.succeeded; else activity_code=run.failed; fi
+append_activity "$activity_code" "$run_label" "$final_state" "Package action completed" 2>/dev/null || true
+if [ "$run_mode" = sync ]; then handle_alert_result "$run_label" "$final_state" "$exit_code" 2>/dev/null || true; fi
 if [ "$run_output" = scheduled ]; then
     printf '%s\n' "run_finished epoch=$finished mode=$run_mode scope=$run_label exit=$exit_code" >> "$scheduled_log"
 fi

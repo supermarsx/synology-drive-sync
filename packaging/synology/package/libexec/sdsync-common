@@ -17,6 +17,7 @@ fi
 
 binary=$package_root/bin/synology-drive-sync
 manager=$package_root/bin/sdsync-dsm
+api_bridge=$package_root/bin/sdsync-dsm-api
 controller=$package_root/libexec/sdsync-controller
 runner=$package_root/libexec/sdsync-run
 config_root=$package_home/config
@@ -24,10 +25,24 @@ profiles_dir=$config_root/profiles.d
 config_file=$config_root/config.toml
 default_profile_file=$config_root/default-profile
 schedule_file=$config_root/schedule.conf
+routines_dir=$config_root/routines.d
+alert_policy_file=$config_root/alerts.conf
 secret_root=$package_home/secrets
 state_root=$package_var/state
+routine_state_dir=$state_root/routines
+profile_state_dir=$state_root/profiles
+health_dir=$state_root/health
 runtime_root=$package_var/run
+control_root=$package_var/control
+control_requests=$control_root/requests
+control_processing=$control_root/processing
+control_responses=$control_root/responses
 log_root=$package_var/log
+activity_log=$log_root/activity.log
+doctor_state=$state_root/doctor.state
+alert_state=$state_root/alerts.state
+package_home_real=$(CDPATH='' cd -- "$package_home" 2>/dev/null && pwd -P || printf '%s' "$package_home")
+package_var_real=$(CDPATH='' cd -- "$package_var" 2>/dev/null && pwd -P || printf '%s' "$package_var")
 controller_pid_file=$runtime_root/controller.pid
 controller_lock=$runtime_root/controller.lock
 controller_state=$state_root/controller.state
@@ -85,7 +100,9 @@ ensure_layout() {
         private_roots=$package_var
     fi
     for private_dir in $private_roots "$config_root" "$profiles_dir" \
-        "$secret_root" "$state_root" "$runtime_root" "$log_root"
+        "$routines_dir" "$secret_root" "$state_root" "$routine_state_dir" "$profile_state_dir" \
+        "$health_dir" "$runtime_root" "$control_root" "$control_requests" \
+        "$control_processing" "$control_responses" "$log_root"
     do
         if [ -L "$private_dir" ]; then
             echo "refusing symlinked package data directory: $private_dir" >&2
@@ -190,6 +207,7 @@ write_run_state() {
     run_finished=${3:-0}
     run_exit=${4:--1}
     run_scope=${5:-none}
+    run_operation=${6:-none}
     run_temp=$run_state.tmp.$$
     umask 077
     {
@@ -198,6 +216,7 @@ write_run_state() {
         printf 'finished_epoch=%s\n' "$run_finished"
         printf 'exit_code=%s\n' "$run_exit"
         printf 'scope=%s\n' "$run_scope"
+        printf 'operation=%s\n' "$run_operation"
     } > "$run_temp"
     finish_private_file "$run_temp"
     mv -f "$run_temp" "$run_state"
@@ -233,6 +252,150 @@ append_rotating_log() {
     append_line=$4
     rotate_log "$append_path" "$append_limit" "$append_keep"
     printf '%s\n' "$append_line" >> "$append_path"
+}
+
+json_quote() {
+    # All package-authored configuration rejects newlines and control bytes, but
+    # logs can still contain them.  Keep this encoder self-contained so the DSM
+    # package does not depend on Python, jq, or a particular BusyBox extension.
+    printf '%s' "${1:-}" | LC_ALL=C awk '
+        BEGIN { printf "\"" }
+        {
+            if (NR > 1) printf "\\n"
+            gsub(/\\/, "\\\\")
+            gsub(/\"/, "\\\"")
+            gsub(/\t/, "\\t")
+            gsub(/\r/, "\\r")
+            gsub(/[\001-\010\013\014\016-\037]/, "?")
+            printf "%s", $0
+        }
+        END { printf "\"" }
+    '
+}
+
+append_activity() {
+    activity_code=$1
+    activity_profile=${2:-none}
+    activity_state=$3
+    activity_message=$4
+    case $activity_code in
+        run.started|run.succeeded|run.failed|routine.deferred|routine.retry_scheduled|\
+        doctor.succeeded|doctor.failed|configuration.changed|notification.unavailable) ;;
+        *) return 64 ;;
+    esac
+    case $activity_profile in none|all|''|*[!A-Za-z0-9_-]*)
+        [ "$activity_profile" = none ] || [ "$activity_profile" = all ] || return 64
+        ;;
+    esac
+    case $activity_state in running|succeeded|failed|deferred|scheduled|changed|unavailable) ;;
+        *) return 64 ;;
+    esac
+    case $activity_message in
+        *'|'*|*'
+'*) return 64 ;;
+    esac
+    if printf '%s' "$activity_message" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
+        return 64
+    fi
+    append_rotating_log "$activity_log" 1048576 3 \
+        "$(epoch_now)|$activity_code|${activity_profile:-none}|$activity_state|$activity_message"
+    finish_private_file "$activity_log"
+}
+
+safe_notify() {
+    notify_key=$1
+    notify_profile=${2:-all}
+    notify_exit=${3:-0}
+    case $notify_key in sync_succeeded|sync_failed|doctor_failed) ;; *) return 64 ;; esac
+    case $notify_profile in all|*[!A-Za-z0-9_-]*)
+        [ "$notify_profile" = all ] || return 64
+        ;;
+    esac
+    case $notify_exit in ''|*[!0-9]*) return 64 ;; esac
+    if [ -x /usr/syno/bin/synonotify ] && [ ! -L /usr/syno/bin/synonotify ]; then
+        # Both the event key and the JSON variable names are package constants;
+        # profile and exit are validated above and are passed as one quoted argv.
+        /usr/syno/bin/synonotify "$notify_key" \
+            "{\"%PROFILE%\":\"$notify_profile\",\"%EXIT_CODE%\":$notify_exit}" \
+            >/dev/null 2>&1 || return $?
+        return 0
+    fi
+    append_activity notification.unavailable "$notify_profile" unavailable \
+        "DSM notification command unavailable" 2>/dev/null || true
+    return 69
+}
+
+handle_alert_result() {
+    alert_profile=$1
+    alert_result=$2
+    alert_exit=$3
+    case $alert_profile in all|*[!A-Za-z0-9_-]*) [ "$alert_profile" = all ] || return 64 ;; esac
+    case $alert_result in succeeded|failed) ;; *) return 64 ;; esac
+    case $alert_exit in ''|*[!0-9]*) return 64 ;; esac
+    [ ! -L "$alert_policy_file" ] && [ ! -L "$alert_state" ] || return 73
+    policy_enabled=$(setting "$alert_policy_file" enabled true)
+    policy_success=$(setting "$alert_policy_file" on_success false)
+    policy_failure=$(setting "$alert_policy_file" on_failure true)
+    policy_threshold=$(setting "$alert_policy_file" failure_threshold 1)
+    policy_cooldown=$(setting "$alert_policy_file" cooldown_seconds 3600)
+    case $policy_enabled:$policy_success:$policy_failure in
+        true:true:true|true:true:false|true:false:true|true:false:false|false:true:true|false:true:false|false:false:true|false:false:false) ;;
+        *) return 73 ;;
+    esac
+    case $policy_threshold:$policy_cooldown in *[!0-9:]*) return 73 ;; esac
+    [ "$policy_threshold" -ge 1 ] && [ "$policy_threshold" -le 100 ] || return 73
+    [ "$policy_cooldown" -ge 60 ] && [ "$policy_cooldown" -le 2592000 ] || return 73
+    failure_count=$(setting "$alert_state" failure_count 0)
+    last_notify=$(setting "$alert_state" last_notify_epoch 0)
+    case $failure_count:$last_notify in *[!0-9:]*) return 73 ;; esac
+    alert_now=$(epoch_now)
+    should_notify=false
+    notify_key=sync_failed
+    if [ "$alert_result" = succeeded ]; then
+        failure_count=0
+        if [ "$policy_enabled" = true ] && [ "$policy_success" = true ]; then should_notify=true; notify_key=sync_succeeded; fi
+    else
+        failure_count=$((failure_count + 1))
+        if [ "$policy_enabled" = true ] && [ "$policy_failure" = true ] && [ "$failure_count" -ge "$policy_threshold" ]; then should_notify=true; fi
+    fi
+    if [ "$should_notify" = true ] && [ "$last_notify" -gt 0 ] && [ $((alert_now - last_notify)) -lt "$policy_cooldown" ]; then
+        should_notify=false
+    fi
+    if [ "$should_notify" = true ]; then
+        if safe_notify "$notify_key" "$alert_profile" "$alert_exit"; then last_notify=$alert_now; fi
+    fi
+    alert_state_temp=$alert_state.tmp.$$
+    printf 'failure_count=%s\nlast_notify_epoch=%s\n' "$failure_count" "$last_notify" > "$alert_state_temp"
+    finish_private_file "$alert_state_temp"
+    mv -f "$alert_state_temp" "$alert_state"
+}
+
+handle_doctor_alert() {
+    doctor_profile=$1
+    doctor_exit=$2
+    case $doctor_profile in all|*[!A-Za-z0-9_-]*) [ "$doctor_profile" = all ] || return 64 ;; esac
+    case $doctor_exit in ''|*[!0-9]*) return 64 ;; esac
+    [ ! -L "$alert_policy_file" ] && [ ! -L "$doctor_state" ] || return 73
+    doctor_enabled=$(setting "$alert_policy_file" enabled true)
+    doctor_failure=$(setting "$alert_policy_file" on_failure true)
+    doctor_threshold=$(setting "$alert_policy_file" failure_threshold 1)
+    doctor_cooldown=$(setting "$alert_policy_file" cooldown_seconds 3600)
+    case $doctor_enabled:$doctor_failure in true:true|true:false|false:true|false:false) ;; *) return 73 ;; esac
+    case $doctor_threshold:$doctor_cooldown in *[!0-9:]*) return 73 ;; esac
+    doctor_failures=$(setting "$doctor_state" failure_count 0)
+    doctor_last_notify=$(setting "$doctor_state" last_notify_epoch 0)
+    case $doctor_failures:$doctor_last_notify in *[!0-9:]*) return 73 ;; esac
+    doctor_failures=$((doctor_failures + 1))
+    doctor_now=$(epoch_now)
+    if [ "$doctor_enabled" = true ] && [ "$doctor_failure" = true ] && [ "$doctor_failures" -ge "$doctor_threshold" ]; then
+        if [ "$doctor_last_notify" -eq 0 ] || [ $((doctor_now - doctor_last_notify)) -ge "$doctor_cooldown" ]; then
+            if safe_notify doctor_failed "$doctor_profile" "$doctor_exit"; then doctor_last_notify=$doctor_now; fi
+        fi
+    fi
+    doctor_temp=$doctor_state.tmp.$$
+    printf 'failure_count=%s\nlast_notify_epoch=%s\n' "$doctor_failures" "$doctor_last_notify" > "$doctor_temp"
+    finish_private_file "$doctor_temp"
+    mv -f "$doctor_temp" "$doctor_state"
 }
 
 profile_exists() {

@@ -938,6 +938,8 @@ def validate_synology_wrapper_argument_parsing() -> None:
                 "argparse-check",
                 "--remote",
                 "/argparse-check",
+                "--remote-log-url",
+                "https://logs.example.invalid/ingest",
                 "--default",
             ],
             env=environment,

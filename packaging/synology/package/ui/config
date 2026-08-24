@@ -1,0 +1,20 @@
+{
+  ".url": {
+    "com.supermarsx.SynologyDriveSync": {
+      "type": "url",
+      "icon": "images/icon_{0}.png",
+      "title": "Synology Drive Sync",
+      "desc": "Configure, diagnose, and monitor one-way File Station sync",
+      "url": "3rdparty/synology-drive-sync/index.html",
+      "allUsers": false,
+      "preloadTexts": [
+        "notifications:sync_succeeded_title",
+        "notifications:sync_succeeded_message",
+        "notifications:sync_failed_title",
+        "notifications:sync_failed_message",
+        "notifications:doctor_failed_title",
+        "notifications:doctor_failed_message"
+      ]
+    }
+  }
+}

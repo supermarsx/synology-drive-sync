@@ -229,7 +229,8 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: >-
           cargo build --release --locked
-          --package synology-drive-sync --bin synology-drive-sync
+          --package synology-drive-sync
+          --bin synology-drive-sync --bin sdsync-dsm-api
           --target "$RUST_TARGET"
       - name: Cross-build DSM-portable static binary
         if: matrix.cross_compile == true
@@ -238,9 +239,10 @@ jobs:
           RUST_TARGET: ${{ matrix.rust_target }}
         run: >-
           cargo zigbuild --release --locked
-          --package synology-drive-sync --bin synology-drive-sync
+          --package synology-drive-sync
+          --bin synology-drive-sync --bin sdsync-dsm-api
           --target "$RUST_TARGET"
-      - name: Verify DSM binary architecture and static linkage
+      - name: Verify DSM binaries, architecture and static linkage
         shell: bash
         env:
           ARM_HARD_FLOAT: ${{ matrix.arm_hard_float }}
@@ -252,31 +254,35 @@ jobs:
         run: |
           set -euo pipefail
           binary="target/$RUST_TARGET/release/synology-drive-sync"
-          class=$(readelf --file-header --wide "$binary" | awk -F: '/Class:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')
-          [[ "$class" == "$ELF_CLASS" ]] || {
-            echo "unexpected ELF class: $class (expected $ELF_CLASS)" >&2
-            exit 1
-          }
-          machine=$(readelf --file-header --wide "$binary" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')
-          [[ "$machine" == "$ELF_MACHINE" ]] || {
-            echo "unexpected ELF machine: $machine (expected $ELF_MACHINE)" >&2
-            exit 1
-          }
-          if readelf --program-headers --wide "$binary" | grep -q 'INTERP'; then
-            echo 'DSM binary must not require a host ELF interpreter' >&2
-            exit 1
-          fi
-          if readelf --dynamic --wide "$binary" 2>/dev/null | grep -q 'NEEDED'; then
-            echo 'DSM binary must not require host dynamic libraries' >&2
-            exit 1
-          fi
-          if [[ "$ARM_HARD_FLOAT" == true ]]; then
-            flags=$(readelf --file-header --wide "$binary" | awk -F: '/Flags:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')
-            [[ "$flags" == *'Version5 EABI'* && "$flags" == *'hard-float ABI'* ]] || {
-              echo "ARMv7 binary does not declare EABI5 hard-float: $flags" >&2
+          api_binary="target/$RUST_TARGET/release/sdsync-dsm-api"
+          for checked_binary in "$binary" "$api_binary"; do
+            label=$(basename "$checked_binary")
+            class=$(readelf --file-header --wide "$checked_binary" | awk -F: '/Class:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')
+            [[ "$class" == "$ELF_CLASS" ]] || {
+              echo "$label has unexpected ELF class: $class (expected $ELF_CLASS)" >&2
               exit 1
             }
-          fi
+            machine=$(readelf --file-header --wide "$checked_binary" | awk -F: '/Machine:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')
+            [[ "$machine" == "$ELF_MACHINE" ]] || {
+              echo "$label has unexpected ELF machine: $machine (expected $ELF_MACHINE)" >&2
+              exit 1
+            }
+            if readelf --program-headers --wide "$checked_binary" | grep -q 'INTERP'; then
+              echo "$label must not require a host ELF interpreter" >&2
+              exit 1
+            fi
+            if readelf --dynamic --wide "$checked_binary" 2>/dev/null | grep -q 'NEEDED'; then
+              echo "$label must not require host dynamic libraries" >&2
+              exit 1
+            fi
+            if [[ "$ARM_HARD_FLOAT" == true ]]; then
+              flags=$(readelf --file-header --wide "$checked_binary" | awk -F: '/Flags:/ { sub(/^[[:space:]]+/, "", $2); print $2 }')
+              [[ "$flags" == *'Version5 EABI'* && "$flags" == *'hard-float ABI'* ]] || {
+                echo "$label does not declare EABI5 hard-float: $flags" >&2
+                exit 1
+              }
+            fi
+          done
           if [[ -n "$QEMU_BINARY" ]]; then
             emulator="$RUNNER_TEMP/$QEMU_BINARY"
             [[ -x "$emulator" ]] || {
@@ -286,10 +292,22 @@ jobs:
             # This extracted tonistiigi binfmt QEMU treats the first post-binary
             # guest argument as argv[0], so supply it before the real arguments.
             reported=$(QEMU_CPU="$QEMU_CPU" "$emulator" "$binary" synology-drive-sync --version)
+            set +e
+            bridge_output=$(REQUEST_METHOD=GET QEMU_CPU="$QEMU_CPU" "$emulator" "$api_binary" sdsync-dsm-api 2>&1)
+            bridge_exit=$?
+            set -e
           else
             reported=$("$binary" --version)
+            set +e
+            bridge_output=$(REQUEST_METHOD=GET "$api_binary" 2>&1)
+            bridge_exit=$?
+            set -e
           fi
           [[ "$reported" == 'synology-drive-sync 0.0.0' ]]
+          [[ "$bridge_exit" -ne 0 ]]
+          grep -Fq 'Status: 400 Bad Request' <<<"$bridge_output"
+          grep -Fq 'Content-Type: application/json; charset=utf-8' <<<"$bridge_output"
+          grep -Fq '"schema":"sdsync.dsm-error.v1"' <<<"$bridge_output"
       - name: Assemble and validate installable SPK
         shell: bash
         env:
@@ -298,14 +316,17 @@ jobs:
         run: |
           set -euo pipefail
           binary="target/$RUST_TARGET/release/synology-drive-sync"
+          api_binary="target/$RUST_TARGET/release/sdsync-dsm-api"
           bash packaging/synology/build-spk.sh \
             --binary "$binary" \
+            --api-binary "$api_binary" \
             --arch "$SYNOLOGY_ARCH" \
             --version 0.0.0 \
             --output dist
           spk="dist/synology-drive-sync-0.0.0-$SYNOLOGY_ARCH.spk"
           python3 packaging/synology/validate_spk.py \
             --binary "$binary" \
+            --api-binary "$api_binary" \
             --arch "$SYNOLOGY_ARCH" \
             "$spk"
 

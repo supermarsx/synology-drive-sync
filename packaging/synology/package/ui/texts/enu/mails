@@ -1,0 +1,17 @@
+[sync_succeeded]
+Category: Synology Drive Sync
+Level: NOTIFICATION_INFO
+Title: Drive Sync completed
+Desktop: Profile %PROFILE% completed successfully on %HOSTNAME%.
+
+[sync_failed]
+Category: Synology Drive Sync
+Level: NOTIFICATION_ERROR
+Title: Drive Sync failed
+Desktop: Profile %PROFILE% failed with exit code %EXIT_CODE% on %HOSTNAME%.
+
+[doctor_failed]
+Category: Synology Drive Sync
+Level: NOTIFICATION_ERROR
+Title: Drive Sync doctor failed
+Desktop: The target doctor failed for profile %PROFILE% with exit code %EXIT_CODE% on %HOSTNAME%.
