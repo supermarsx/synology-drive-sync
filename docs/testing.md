@@ -32,8 +32,9 @@ or reverse-proxy release. A disposable target on the intended NAS must still pas
 
 ## Reproducible source coverage
 
-Coverage uses the exact Rust and `cargo-llvm-cov` versions in
-[`coverage.env`](../.config/coverage.env). Install those prerequisites before running a report:
+Coverage uses the exact Rust and `cargo-llvm-cov` versions in the tracked
+[`coverage.env`](https://github.com/supermarsx/synology-drive-sync/blob/main/.config/coverage.env).
+Install those prerequisites before running a report:
 
 ```bash
 rustup toolchain install 1.88.0 --component llvm-tools-preview

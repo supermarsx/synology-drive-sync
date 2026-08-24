@@ -1,0 +1,200 @@
+/* A restrained, dark-first layer over mdBook's maintained theme. */
+
+html.navy {
+    color-scheme: dark;
+    --bg: #090b0f;
+    --fg: #d9e1e8;
+    --sidebar-bg: #0d1015;
+    --sidebar-fg: #aeb9c4;
+    --sidebar-non-existant: #66717d;
+    --sidebar-active: #78e2bd;
+    --sidebar-spacer: #222831;
+    --scrollbar: #39424d;
+    --icons: #91a0ae;
+    --icons-hover: #e8eef3;
+    --links: #76d9ba;
+    --inline-code-color: #e9c77d;
+    --theme-popup-bg: #11161d;
+    --theme-popup-border: #2b3440;
+    --theme-hover: #1b232d;
+    --quote-bg: #10171b;
+    --quote-border: #54b899;
+    --table-border-color: #2c3540;
+    --table-header-bg: #11161d;
+    --table-alternate-bg: #0d1117;
+    --searchbar-border-color: #35414d;
+    --searchbar-bg: #0d1117;
+    --searchbar-fg: #eef3f7;
+    --searchresults-header-fg: #e7edf2;
+    --searchresults-border-color: #252d37;
+    --searchresults-li-bg: #10151c;
+    --search-mark-bg: #395f50;
+}
+
+html.navy body {
+    background: var(--bg);
+}
+
+.menu-title {
+    font-weight: 720;
+    letter-spacing: -0.02em;
+}
+
+.chapter li.part-title {
+    margin-top: 1.35rem;
+    color: #75818d;
+    font-size: 0.7rem;
+    font-weight: 760;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+}
+
+.sidebar .chapter li a {
+    border-left: 2px solid transparent;
+    border-radius: 0 0.35rem 0.35rem 0;
+}
+
+.sidebar .chapter li a.active {
+    border-left-color: #66d3ad;
+    background: rgba(102, 211, 173, 0.08);
+    font-weight: 650;
+}
+
+.content main {
+    max-width: 960px;
+}
+
+.hero {
+    margin: 0.5rem 0 2rem;
+    padding: 2rem 0 1.6rem;
+    border-top: 1px solid var(--table-border-color);
+    border-bottom: 1px solid var(--table-border-color);
+}
+
+.hero-kicker {
+    margin: 0 0 0.75rem;
+    color: #76d9ba;
+    font-size: 0.74rem;
+    font-weight: 760;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+}
+
+.hero h1 {
+    max-width: 18ch;
+    margin: 0;
+    font-size: clamp(2.1rem, 6vw, 4.4rem);
+    letter-spacing: -0.055em;
+    line-height: 0.98;
+}
+
+.hero-summary {
+    max-width: 68ch;
+    margin: 1.25rem 0 0;
+    color: var(--fg);
+    font-size: 1.06rem;
+}
+
+.doc-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.8rem;
+    margin: 1.25rem 0 2rem;
+}
+
+.doc-card {
+    display: block;
+    min-height: 7.2rem;
+    padding: 1rem 1.05rem;
+    border: 1px solid var(--table-border-color);
+    border-radius: 0.55rem;
+    background: #0d1117;
+    color: var(--fg) !important;
+    text-decoration: none !important;
+}
+
+.doc-card:hover,
+.doc-card:focus-visible {
+    border-color: #5fc39f;
+    background: #10171b;
+}
+
+.doc-card strong {
+    display: block;
+    margin-bottom: 0.45rem;
+    color: #eff5f8;
+    font-size: 1.02rem;
+}
+
+.doc-card span {
+    color: #aab5bf;
+    font-size: 0.9rem;
+    line-height: 1.45;
+}
+
+.contract-strip {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    margin: 1.3rem 0 2rem;
+    border: 1px solid var(--table-border-color);
+    border-radius: 0.55rem;
+    overflow: hidden;
+}
+
+.contract-strip > div {
+    padding: 0.9rem 1rem;
+    border-right: 1px solid var(--table-border-color);
+}
+
+.contract-strip > div:last-child {
+    border-right: 0;
+}
+
+.contract-strip strong,
+.contract-strip span {
+    display: block;
+}
+
+.contract-strip strong {
+    color: #78e2bd;
+    font-size: 0.78rem;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+}
+
+.contract-strip span {
+    margin-top: 0.25rem;
+    color: #bcc6cf;
+    font-size: 0.86rem;
+}
+
+table {
+    display: block;
+    overflow-x: auto;
+    white-space: normal;
+}
+
+code {
+    font-variant-ligatures: none;
+}
+
+:focus-visible {
+    outline: 2px solid #76d9ba;
+    outline-offset: 3px;
+}
+
+@media (max-width: 720px) {
+    .doc-grid,
+    .contract-strip {
+        grid-template-columns: 1fr;
+    }
+
+    .contract-strip > div {
+        border-right: 0;
+        border-bottom: 1px solid var(--table-border-color);
+    }
+
+    .contract-strip > div:last-child {
+        border-bottom: 0;
+    }
+}

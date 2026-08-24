@@ -4,7 +4,7 @@ Releases use calendar tags in strict `YY.N` form. `YY` is the two-digit UTC year
 
 An automatic release starts only after the repository's exact `CI` workflow completes successfully for a `push` to `main`. That CI run includes a hash-pinned `cargo-audit` 0.22.2 binary which updates the RustSec advisory database and rejects vulnerabilities, yanked crates, unsoundness, and unmaintained warnings. A separate daily workflow reruns the same gate so a new advisory is detected even when `Cargo.lock` has not changed. A maintainer can also dispatch a release manually against `main`, but the workflow refuses to continue unless that exact commit already has a completed, successful `CI` push run. Release jobs check out that approved commit, serialize version allocation, and compile the reported binary version from the allocated tag.
 
-Provenance shows what repository workflow and commit produced an artifact; it does not prove application correctness or live-NAS compatibility. The automated release remains subject to the no-live-NAS caveat in the [README](../README.md).
+Provenance shows what repository workflow and commit produced an artifact; it does not prove application correctness or live-NAS compatibility. The automated release remains subject to the no-live-NAS caveat on the [documentation home](index.md).
 
 ## Native archives
 
@@ -52,10 +52,40 @@ for a non-Synology package; these artifacts are not published or signed by Synol
 [Synology DSM package guide](synology-package.md) before granting source-share access or entering a
 target password/TOTP seed.
 
+## Rust and C SDK archives
+
+The Rust SDK is the version-matched source bundle:
+
+```text
+synology-drive-sync-YY.N-rust-sdk.tar.gz
+```
+
+Rust applications can alternatively pin the same release tag directly:
+
+```toml
+synology-drive-sync = { git = "https://github.com/supermarsx/synology-drive-sync", tag = "YY.N" }
+```
+
+The C SDK is published for every native OS/architecture pair:
+
+| OS | Architecture | Release asset |
+| --- | --- | --- |
+| Windows | x86-64 | `synology-drive-sync-YY.N-c-sdk-windows-x86_64.zip` |
+| Windows | ARM64 | `synology-drive-sync-YY.N-c-sdk-windows-aarch64.zip` |
+| Linux | x86-64 | `synology-drive-sync-YY.N-c-sdk-linux-x86_64.tar.gz` |
+| Linux | ARM64 | `synology-drive-sync-YY.N-c-sdk-linux-aarch64.tar.gz` |
+| macOS | Intel x86-64 | `synology-drive-sync-YY.N-c-sdk-macos-x86_64.tar.gz` |
+| macOS | Apple silicon ARM64 | `synology-drive-sync-YY.N-c-sdk-macos-aarch64.tar.gz` |
+
+Each C SDK contains `include/sdsync.h`, `examples/ffi/basic.c`, license/notices, and the matching
+`sdsync.dll`, `libsdsync.so`, or `libsdsync.dylib`. Every Windows C SDK also contains the
+`sdsync.lib` import library. See the [Rust library guide](sdk/index.md) and
+[C ABI guide](ffi/index.md) before integrating.
+
 The release also publishes:
 
-- `SHA256SUMS`, covering all six native archives, both DSM SPKs, both installer scripts, the SBOM,
-  and the notice bundle;
+- `SHA256SUMS`, covering all native archives, Rust/C SDKs, both DSM SPKs, both installer scripts, the
+  SBOM, and the notice bundle;
 - `synology-drive-sync-YY.N.cdx.json`, a CycloneDX JSON Rust dependency SBOM;
 - `THIRD_PARTY_LICENSES.html`, the generated dependency license and attribution bundle;
 - `install.sh` and `install.ps1` bootstrap installers.

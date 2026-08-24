@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/supermarsx/synology-drive-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/supermarsx/synology-drive-sync/actions/workflows/ci.yml)
 
+**Documentation:** [install, configure, schedule, integrate, and verify releases](https://supermarsx.github.io/synology-drive-sync/)
+
 A lean Rust CLI that pushes one local directory—or a deterministic batch of complete named profile jobs—to Synology Drive-backed folders through the documented File Station WebAPI and HTTPS reverse-proxy URLs.
 
 The sync engine is deliberately one-way and stateless. It is not a Synology Drive protocol client,
@@ -112,6 +114,27 @@ $env:SDSYNC_USERNAME = 'mirror-bot'
 synology-drive-sync.exe plan 'C:\Data\Project' '/team-folder/project'
 synology-drive-sync.exe sync 'C:\Data\Project' '/team-folder/project'
 ```
+
+## Rust SDK and C ABI
+
+Rust applications can embed the high-level synchronous `synology_drive_sync::sdk::Engine`. The
+package is not published to crates.io; pin the exact verified calendar release tag instead:
+
+```toml
+[dependencies]
+synology-drive-sync = { git = "https://github.com/supermarsx/synology-drive-sync", tag = "YY.N" }
+```
+
+The same release contains `synology-drive-sync-YY.N-rust-sdk.tar.gz` for vendored source review.
+See the [Rust SDK guide](https://supermarsx.github.io/synology-drive-sync/sdk/index.html) for the
+request builder, secret provider, immutable plan decision, progress, cancellation, and errors.
+
+Non-Rust programs use the versioned C ABI only through a matching release SDK named
+`synology-drive-sync-YY.N-c-sdk-{windows,linux,macos}-{x86_64,aarch64}` (`.zip` on Windows,
+`.tar.gz` elsewhere). Older releases without those assets do not acquire ABI support retroactively.
+Each SDK contains `include/sdsync.h`, `examples/ffi/basic.c`, licenses/notices, and the matching DLL,
+`.so`, or `.dylib`; Windows SDKs also contain `lib/sdsync.lib`. Compile against the header and
+library from the same verified release. See the [C ABI guide](https://supermarsx.github.io/synology-drive-sync/ffi/index.html).
 
 ## Reverse-proxy requirements
 
@@ -256,6 +279,10 @@ The removal kind is required; the CLI never assumes `all`.
 
 For DSM TOTP, import the manual Base32 key or original provisioning URI shown during DSM enrollment. The CLI does not enroll a new factor and cannot recover a seed DSM no longer displays. Supported provisioning data is SHA-1, six digits, and a 30-second period. Codes are generated only when DSM challenges for OTP, are refreshed once across a time-step boundary, and are never persisted.
 
+For non-interactive vault enrollment, `credentials set-totp --secret-stdin` reads the Base32 seed or
+`otpauth://` URI from the first line of standard input. Pipe it directly from a protected secret
+provider; do not place the value in a command argument or shell history.
+
 Effective password resolution is:
 
 1. `--password-stdin`, when selected;
@@ -348,7 +375,8 @@ Command results and diagnostics are independent streams:
 
 - `--output human|json|ndjson` controls result records on standard output;
 - `--log-format human|json` controls secret-free diagnostic events on standard error and optional sinks;
-- `-v` selects debug logging, `-vv` trace, while `--log-level` is explicit;
+- `-v` or `--verbose` selects debug logging; repeat it (`-vv` or `--verbose --verbose`) for trace,
+  while `--log-level` is explicit;
 - `--progress auto|always|never` controls progress for human result output; `auto` additionally requires a terminal and human-formatted logs, while machine result modes suppress progress;
 - `--quiet` suppresses non-error terminal diagnostics and progress without disabling configured file or remote logs;
 - `--log-file` appends local logs;
@@ -399,7 +427,7 @@ The native schedulers are preferred because their identity and credential-sessio
 
 ## Releases and supply-chain verification
 
-Calendar releases use `YY.N` tags and provide native Linux, Windows, and macOS archives for both x86-64 and ARM64, plus architecture-specific DSM 7 SPKs for `x86_64` and `armv8`. Each release also includes `SHA256SUMS`, a CycloneDX dependency SBOM, generated third-party license notices, installer scripts, and GitHub artifact provenance/SBOM attestations. CI audits the locked graph against current RustSec data and refuses stale notices. The GHCR image is published for `linux/amd64` and `linux/arm64` as both `YY.N` and `latest`.
+Calendar releases use `YY.N` tags and provide native Linux, Windows, and macOS archives for both x86-64 and ARM64, architecture-specific DSM 7 SPKs for `x86_64` and `armv8`, `synology-drive-sync-YY.N-rust-sdk.tar.gz`, and six platform/architecture C SDK archives. Each release also includes `SHA256SUMS`, a CycloneDX dependency SBOM, generated third-party license notices, installer scripts, and GitHub artifact provenance/SBOM attestations. CI audits the locked graph against current RustSec data and refuses stale notices. The GHCR image is published for `linux/amd64` and `linux/arm64` as both `YY.N` and `latest`.
 
 See [Release artifacts and verification](docs/releases.md) before deploying a binary or container in a sensitive environment. Pin a calendar version or container digest rather than relying on mutable `latest`.
 
@@ -437,10 +465,14 @@ Transient transport, busy, 408/429, and 502/503/504 failures use bounded retry. 
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-targets
-cargo build --release --locked
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-targets
+cargo build --release --locked -p synology-drive-sync
+cargo build --profile ffi-release --locked -p synology-drive-sync-ffi
 ```
+
+The CLI intentionally uses the ordinary release profile. Build the C ABI with `ffi-release` so
+Rust panics unwind into its containment boundary instead of aborting the embedding process.
 
 See [Testing and coverage](docs/testing.md), [CONTRIBUTING.md](CONTRIBUTING.md), and
 [SECURITY.md](SECURITY.md). Tests do not read or write the host OS credential vault.

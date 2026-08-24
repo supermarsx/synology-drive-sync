@@ -1,0 +1,50 @@
+[book]
+title = "synology-drive-sync documentation"
+authors = ["synology-drive-sync contributors"]
+description = "Installation, configuration, operations, Rust integration, and release verification for synology-drive-sync."
+src = "docs"
+language = "en"
+text-direction = "ltr"
+
+[build]
+build-dir = "target/site"
+create-missing = false
+
+[rust]
+edition = "2024"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+smart-punctuation = true
+definition-lists = true
+admonitions = true
+no-section-label = true
+site-url = "/synology-drive-sync/"
+input-404 = "404.md"
+sidebar-header-nav = true
+git-repository-url = "https://github.com/supermarsx/synology-drive-sync"
+git-repository-icon = "fab-github"
+edit-url-template = "https://github.com/supermarsx/synology-drive-sync/edit/main/{path}"
+additional-css = ["docs/theme/sdsync.css"]
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+limit-results = 50
+teaser-word-count = 32
+use-boolean-and = true
+boost-title = 3
+boost-hierarchy = 2
+boost-paragraph = 1
+expand = true
+heading-split-level = 2
+copy-js = true
+
+[output.html.playground]
+editable = false
+copyable = true
+runnable = false

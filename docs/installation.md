@@ -271,7 +271,7 @@ and partial-failure behavior.
 
 ### Linux systemd timer
 
-[The systemd assets](../packaging/systemd/README.md) provide a hardened `Type=oneshot` service and daily timer. The service runs as a dedicated `sdsync` account with no capabilities, a read-only filesystem namespace, socket creation limited to Unix/IPv4/IPv6 families, and a password supplied through `LoadCredential`. `RestrictAddressFamilies` does not filter by protocol or destination; use host/network firewall policy when egress must be limited to the reverse proxy.
+[The systemd deployment](operations/systemd.md) provides a hardened `Type=oneshot` service and daily timer. The service runs as a dedicated `sdsync` account with no capabilities, a read-only filesystem namespace, socket creation limited to Unix/IPv4/IPv6 families, and a password supplied through `LoadCredential`. `RestrictAddressFamilies` does not filter by protocol or destination; use host/network firewall policy when egress must be limited to the reverse proxy.
 
 For TOTP, install the documented `synology-drive-sync-totp.conf.example` drop-in. It adds a second `LoadCredential` mount and passes only its protected path to `--totp-secret-file`. Neither seed belongs in `sync.env`.
 
@@ -286,19 +286,19 @@ sudo systemctl enable --now synology-drive-sync.timer
 
 ### Cron fallback
 
-[The cron assets](../packaging/cron/README.md) use a mode-`0600` environment file containing only non-secret settings and protected secret-file paths. The wrapper forces `--no-vault`, supports an optional `SDSYNC_TOTP_SECRET_FILE`, and the sample crontab uses `flock` to reject overlap.
+[The cron deployment](operations/cron.md) uses a mode-`0600` environment file containing only non-secret settings and protected secret-file paths. The wrapper forces `--no-vault`, supports an optional `SDSYNC_TOTP_SECRET_FILE`, and the sample crontab uses `flock` to reject overlap.
 
 Prefer systemd on Linux. A cron session commonly lacks the D-Bus and unlocked Secret Service collection required for OS-vault access.
 
 ### macOS LaunchAgent
 
-[The LaunchAgent example](../packaging/launchd/README.md) runs in the logged-in user's GUI session so the same user's login Keychain is available. Enroll the password and optional TOTP seed first, replace every plist placeholder with a non-secret absolute value, validate with `plutil`, and bootstrap it with `launchctl`.
+[The LaunchAgent deployment](operations/launchd.md) runs in the logged-in user's GUI session so the same user's login Keychain is available. Enroll the password and optional TOTP seed first, replace every plist placeholder with a non-secret absolute value, validate with `plutil`, and bootstrap it with `launchctl`.
 
 The login Keychain generally must be unlocked. Do not place secret values in the plist.
 
 ### Windows Task Scheduler
 
-[The Task Scheduler installer](../packaging/windows/README.md) creates a current-user, interactive-token, limited-privilege daily task. It uses the same user's Windows Credential Manager entries, refuses to replace an existing task unless `-Force` is explicit, and configures Task Scheduler to ignore overlap.
+[The Task Scheduler installer](operations/windows.md) creates a current-user, interactive-token, limited-privilege daily task. It uses the same user's Windows Credential Manager entries, refuses to replace an existing task unless `-Force` is explicit, and configures Task Scheduler to ignore overlap.
 
 Its default executable is the release installer's per-user path, `%LOCALAPPDATA%\Programs\synology-drive-sync\synology-drive-sync.exe`; pass `-Executable` when the binary is installed elsewhere.
 

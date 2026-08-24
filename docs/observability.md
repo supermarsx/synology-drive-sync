@@ -18,7 +18,7 @@ in [Diagnostics and multi-profile batches](diagnostics-and-batch.md).
 
 | Setting | Default | Notes |
 | --- | --- | --- |
-| Log level | `info` | `debug` with `-v`, `trace` with `-vv` |
+| Log level | `info` | `debug` with `-v`/`--verbose`, trace when repeated |
 | Log format | `human` | `json` is one complete object per line |
 | Standard-error log sink | enabled | disabled by `--quiet` or `--log-level off` |
 | Log file | disabled | enabled with `--log-file FILE` |
@@ -53,7 +53,7 @@ The general value precedence is command line, `SDSYNC_*` environment variable, s
 then built-in default. Log-level resolution is deliberately more specific:
 
 1. `--log-level LEVEL` (or `SDSYNC_LOG_LEVEL` when the flag is absent);
-2. command-line `-vv` (`trace`) or `-v` (`debug`);
+2. repeated command-line `-v`/`--verbose` (`trace`) or one occurrence (`debug`);
 3. profile `log-level`;
 4. profile `verbose` (`2` means `trace`, `1` means `debug`);
 5. `info`.
@@ -83,6 +83,7 @@ never contain the token value itself.
 
 | CLI option | Environment setting | Profile field |
 | --- | --- | --- |
+| `-v`, `--verbose` | none | `verbose` |
 | `--quiet` | `SDSYNC_QUIET` | `quiet` |
 | `--log-level` | `SDSYNC_LOG_LEVEL` | `log-level` |
 | `--log-format` | `SDSYNC_LOG_FORMAT` | `log-format` |
