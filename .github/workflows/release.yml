@@ -1041,23 +1041,18 @@ jobs:
           release_id="$RELEASE_ID"
 
           if [[ -z "$release_id" ]]; then
-            # --generate-notes is kept alongside --notes-file: GitHub appends its
-            # contributor and compare block, and the "What's Changed" section
-            # fills itself in automatically if a PR-based history is adopted.
             if [[ "$TAG_MATCHES" == true ]]; then
               gh release create "$TAG" \
                 --draft \
                 --verify-tag \
                 --title "synology-drive-sync $TAG" \
-                --notes-file "$notes" \
-                --generate-notes
+                --notes-file "$notes"
             else
               gh release create "$TAG" \
                 --draft \
                 --target "$SHA" \
                 --title "synology-drive-sync $TAG" \
-                --notes-file "$notes" \
-                --generate-notes
+                --notes-file "$notes"
             fi
 
             # Re-resolve to learn the new id. Still list-and-filter: the release
@@ -1075,6 +1070,31 @@ jobs:
               exit 1
             }
             release_id=$(jq -r '.[0].id' "$created")
+          else
+            # A resumed draft may have been left by an older failed run or
+            # deliberately retargeted during recovery. Refresh every mutable
+            # identity field and the freshly rendered notes by immutable id so
+            # publication can never ship stale release metadata.
+            updated="$RUNNER_TEMP/sdsync-updated-draft.json"
+            gh api --method PATCH \
+              "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+              -f tag_name="$TAG" \
+              -f target_commitish="$SHA" \
+              -f name="synology-drive-sync $TAG" \
+              -F body=@"$notes" \
+              -F draft=true > "$updated"
+            jq -e \
+              --arg tag "$TAG" \
+              --arg sha "$SHA" \
+              --arg title "synology-drive-sync $TAG" '
+                .draft == true
+                and .tag_name == $tag
+                and .target_commitish == $sha
+                and .name == $title
+              ' "$updated" >/dev/null
+            remote_notes="$RUNNER_TEMP/sdsync-updated-draft-notes.md"
+            jq -r '.body' "$updated" > "$remote_notes"
+            diff -u "$notes" "$remote_notes"
           fi
 
           state="$RUNNER_TEMP/sdsync-draft-state.json"
