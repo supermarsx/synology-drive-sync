@@ -13,6 +13,11 @@ controller=$package_root/libexec/sdsync-controller
 runner=$package_root/libexec/sdsync-run
 common_runtime=$package_root/libexec/sdsync-common
 run_lock=$runtime_root/run.lock
+api_server=$package_root/bin/sdsync-dsm-api
+api_pid_file=$runtime_root/api.pid
+api_socket_dir=$package_root/ui
+api_socket=$api_socket_dir/api.sock
+api_log=$log_root/api.log
 
 package_message() {
     if [ -n "${SYNOPKG_TEMP_LOGFILE:-}" ]; then
@@ -53,6 +58,243 @@ script_pid_matches() {
     [ "$canonical_command" != "$expected_command" ] || return 1
     tr '\000' '\n' < "/proc/$checked_pid/cmdline" 2>/dev/null |
         grep -F -x "$canonical_command" >/dev/null 2>&1
+}
+
+api_pid_matches() {
+    checked_pid=$1
+    script_pid_live "$checked_pid" || return 1
+    expected_uid=$(stat -L -c '%u' "$package_home" 2>/dev/null || true)
+    [ -n "$expected_uid" ] || return 1
+    actual_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "/proc/$checked_pid/status" 2>/dev/null | sed -n '1p')
+    [ "$actual_uid" = "$expected_uid" ] || return 1
+    [ -r "/proc/$checked_pid/cmdline" ] || return 1
+    canonical_api_dir=$(CDPATH='' cd -- "$(dirname -- "$api_server")" 2>/dev/null && pwd -P) || return 1
+    canonical_api=$canonical_api_dir/$(basename -- "$api_server")
+    tr '\000' '\n' < "/proc/$checked_pid/cmdline" 2>/dev/null |
+        awk -v expected="$api_server" -v canonical="$canonical_api" '
+            { argument[NR] = $0 }
+            END {
+                if (NR == 2 &&
+                    (argument[1] == expected || argument[1] == canonical) &&
+                    argument[2] == "--serve") exit 0
+                # Test fixtures use a shebang interpreter; the shipped API is
+                # an ELF and therefore takes the two-argument branch above.
+                if (NR == 3 && argument[1] ~ /^\// &&
+                    (argument[2] == expected || argument[2] == canonical) &&
+                    argument[3] == "--serve") exit 0
+                exit 1
+            }
+        '
+}
+
+verified_service_pid_matches() {
+    verified_service_kind=$1
+    verified_service_pid=$2
+    case $verified_service_kind in
+        controller) script_pid_matches "$verified_service_pid" "$controller" ;;
+        runner) script_pid_matches "$verified_service_pid" "$runner" ;;
+        api) api_pid_matches "$verified_service_pid" ;;
+        *) return 1 ;;
+    esac
+}
+
+pid_slot_absent() {
+    checked_slot_pid=$1
+    script_pid_live "$checked_slot_pid" && return 1
+    [ ! -e "/proc/$checked_slot_pid" ]
+}
+
+signal_verified_service() {
+    signal_service_kind=$1
+    signal_service_pid=$2
+    signal_service_label=$3
+
+    if ! verified_service_pid_matches "$signal_service_kind" "$signal_service_pid"; then
+        if pid_slot_absent "$signal_service_pid"; then
+            return 0
+        fi
+        package_message "refusing to signal unverified $signal_service_label PID $signal_service_pid"
+        return 1
+    fi
+
+    if kill -TERM "$signal_service_pid" 2>/dev/null; then
+        return 0
+    fi
+
+    # A target can exit after the identity check but before kill(2). Accept
+    # that race only when a fresh identity/liveness check proves its PID slot
+    # is gone. A live exact target, reused PID, or uninspectable live process
+    # remains a hard failure.
+    if verified_service_pid_matches "$signal_service_kind" "$signal_service_pid"; then
+        package_message "failed to signal verified $signal_service_label PID $signal_service_pid; target remains live"
+        return 1
+    fi
+    if pid_slot_absent "$signal_service_pid"; then
+        return 0
+    fi
+    package_message "$signal_service_label PID $signal_service_pid changed identity or remained live after signal failure"
+    return 1
+}
+
+package_uid() {
+    stat -L -c '%u' "$package_home" 2>/dev/null
+}
+
+http_group_gid() {
+    api_http_gid=
+    if command -v getent >/dev/null 2>&1; then
+        api_http_gid=$(getent group http 2>/dev/null |
+            awk -F: '$1 == "http" && $3 ~ /^[0-9]+$/ { print $3; exit }' || true)
+    fi
+    if [ -z "$api_http_gid" ] && [ -r /etc/group ]; then
+        api_http_gid=$(awk -F: '$1 == "http" && $3 ~ /^[0-9]+$/ { print $3; exit }' /etc/group 2>/dev/null || true)
+    fi
+    case $api_http_gid in ''|*[!0-9]*) return 1 ;; esac
+    case " $(id -G 2>/dev/null || true) " in
+        *" $api_http_gid "*) ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$api_http_gid"
+}
+
+api_socket_parent_safe() {
+    [ -d "$api_socket_dir" ] && [ ! -L "$api_socket_dir" ] || {
+        package_message "API socket parent is not a real directory: $api_socket_dir"
+        return 1
+    }
+    api_expected_uid=$(package_uid 2>/dev/null || true)
+    api_parent_uid=$(stat -c '%u' "$api_socket_dir" 2>/dev/null || true)
+    api_parent_mode=$(stat -c '%a' "$api_socket_dir" 2>/dev/null || true)
+    case $api_parent_mode in ''|*[!0-7]*)
+        package_message "cannot verify API socket parent mode: $api_socket_dir"
+        return 1
+        ;;
+    esac
+    [ -n "$api_expected_uid" ] && [ "$api_parent_uid" = "$api_expected_uid" ] || {
+        package_message "API socket parent is not owned by the package identity: $api_socket_dir"
+        return 1
+    }
+    api_parent_bits=$((0$api_parent_mode))
+    [ $((api_parent_bits & 06000)) -eq 0 ] || {
+        package_message "API socket parent must not carry setuid/setgid bits: $api_socket_dir"
+        return 1
+    }
+    [ $((api_parent_bits & 0022)) -eq 0 ] || {
+        package_message "API socket parent must not be writable by group or other: $api_socket_dir"
+        return 1
+    }
+}
+
+api_socket_safe() {
+    api_socket_parent_safe || return 1
+    [ -S "$api_socket" ] && [ ! -L "$api_socket" ] || {
+        package_message "API socket path is not a real Unix socket: $api_socket"
+        return 1
+    }
+    api_expected_uid=$(package_uid 2>/dev/null || true)
+    api_expected_gid=$(http_group_gid 2>/dev/null || true)
+    api_socket_uid=$(stat -c '%u' "$api_socket" 2>/dev/null || true)
+    api_socket_gid=$(stat -c '%g' "$api_socket" 2>/dev/null || true)
+    api_socket_mode=$(stat -c '%a' "$api_socket" 2>/dev/null || true)
+    api_socket_links=$(stat -c '%h' "$api_socket" 2>/dev/null || true)
+    [ -n "$api_expected_uid" ] && [ -n "$api_expected_gid" ] && \
+        [ "$api_socket_uid" = "$api_expected_uid" ] && \
+        [ "$api_socket_gid" = "$api_expected_gid" ] && \
+        [ "$api_socket_mode" = 660 ] && [ "$api_socket_links" = 1 ] || {
+        package_message "API socket ownership or mode is outside the package:http 0660 contract"
+        return 1
+    }
+}
+
+api_stale_socket_safe() {
+    api_socket_parent_safe || return 1
+    [ -S "$api_socket" ] && [ ! -L "$api_socket" ] || {
+        package_message "API socket path is not a real Unix socket: $api_socket"
+        return 1
+    }
+    api_expected_uid=$(package_uid 2>/dev/null || true)
+    api_socket_uid=$(stat -c '%u' "$api_socket" 2>/dev/null || true)
+    api_socket_gid=$(stat -c '%g' "$api_socket" 2>/dev/null || true)
+    api_socket_mode=$(stat -c '%a' "$api_socket" 2>/dev/null || true)
+    api_socket_links=$(stat -c '%h' "$api_socket" 2>/dev/null || true)
+    [ -n "$api_expected_uid" ] && [ "$api_socket_uid" = "$api_expected_uid" ] && \
+        [ "$api_socket_links" = 1 ] || {
+        package_message "API socket is not exclusively owned by the package"
+        return 1
+    }
+    case $api_socket_mode in
+        600) ;;
+        660)
+            api_expected_gid=$(http_group_gid 2>/dev/null || true)
+            [ -n "$api_expected_gid" ] && [ "$api_socket_gid" = "$api_expected_gid" ] || {
+                package_message "API socket is outside the package:http 0660 contract"
+                return 1
+            }
+            ;;
+        *)
+            package_message "API socket is neither a restricted 0600 bind nor package:http 0660"
+            return 1
+            ;;
+    esac
+}
+
+api_pid_file_safe() {
+    [ -f "$api_pid_file" ] && [ ! -L "$api_pid_file" ] || return 1
+    api_expected_uid=$(package_uid 2>/dev/null || true)
+    api_pid_uid=$(stat -c '%u' "$api_pid_file" 2>/dev/null || true)
+    api_pid_mode=$(stat -c '%a' "$api_pid_file" 2>/dev/null || true)
+    api_pid_links=$(stat -c '%h' "$api_pid_file" 2>/dev/null || true)
+    [ -n "$api_expected_uid" ] && [ "$api_pid_uid" = "$api_expected_uid" ] && \
+        [ "$api_pid_mode" = 600 ] && [ "$api_pid_links" = 1 ]
+}
+
+api_pid() {
+    api_pid_file_safe || return 1
+    IFS= read -r api_found_pid < "$api_pid_file" || return 1
+    case $api_found_pid in ''|*[!0-9]*) return 1 ;; esac
+    [ "$api_found_pid" -gt 1 ] 2>/dev/null || return 1
+    printf '%s\n' "$api_found_pid"
+}
+
+api_path_exists() {
+    [ -e "$1" ] || [ -L "$1" ]
+}
+
+api_socket_identity() {
+    api_stale_socket_safe >/dev/null || return 1
+    api_socket_identity_value=$(stat -c '%d:%i' "$api_socket" 2>/dev/null || true)
+    case $api_socket_identity_value in ''|*[!0-9:]*|*:*:*) return 1 ;; esac
+    printf '%s\n' "$api_socket_identity_value"
+}
+
+remove_safe_api_socket() {
+    api_expected_identity=${1:-}
+    api_path_exists "$api_socket" || return 0
+    case $api_expected_identity in ''|*[!0-9:]*|*:*:*)
+        package_message "cannot remove API socket without a captured device/inode"
+        return 1
+        ;;
+    esac
+    api_current_identity=$(api_socket_identity 2>/dev/null || true)
+    [ "$api_current_identity" = "$api_expected_identity" ] || {
+        package_message "API socket changed after its verified service was identified"
+        return 1
+    }
+    api_rechecked_identity=$(api_socket_identity 2>/dev/null || true)
+    [ "$api_rechecked_identity" = "$api_expected_identity" ] || {
+        package_message "API socket changed immediately before removal"
+        return 1
+    }
+    rm -f "$api_socket"
+}
+
+remove_safe_api_pid_file() {
+    api_path_exists "$api_pid_file" || return 0
+    api_pid_file_safe || {
+        package_message "refusing unsafe API PID file: $api_pid_file"
+        return 1
+    }
+    rm -f "$api_pid_file"
 }
 
 refuse_active_run() {

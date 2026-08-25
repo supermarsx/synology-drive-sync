@@ -439,10 +439,10 @@ def payload_archive(binary: Path, api_binary: Path) -> tuple[bytes, int]:
         add_bytes(archive, "bin/synology-drive-sync", binary.read_bytes(), 0o755)
         api_payload = api_binary.read_bytes()
         add_bytes(archive, "bin/sdsync-dsm-api", api_payload, 0o755)
-        # Keep the distributable archive free of setuid/setgid entries. DSM applies
-        # the reviewed package-owned 4755 mode from conf/privilege during install;
-        # embedding that bit here makes pre-install scanners see a root-owned
-        # setuid member before DSM has assigned the package identity.
+        # The dashboard entry point is an ordinary, rootless socket client. Keep
+        # both the archive and the installed privilege contract free of
+        # setuid/setgid bits; the package-owned API service owns the private side
+        # of the fixed Unix socket instead of relying on an identity-changing CGI.
         add_bytes(archive, "ui/api.cgi", api_payload, 0o755)
         for source, destination in (
             (HERE / "package/bin/sdsync-dsm", "bin/sdsync-dsm"),

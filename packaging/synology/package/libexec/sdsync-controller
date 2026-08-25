@@ -126,6 +126,12 @@ process_control_queue() {
         }
         "$api_bridge" --consume-job "$processing_request" "$response_final" &
         active_pid=$!
+        # TERM can be delivered after the asynchronous launch but before the
+        # assignment above. Recheck the latched shutdown state so that window
+        # cannot strand an un-signalled consumer before it creates a run lock.
+        if [ "$shutdown" = true ] && pid_is_live "$active_pid"; then
+            kill -TERM "$active_pid" 2>/dev/null || true
+        fi
         write_controller_state running "$$" "$next_run" "$active_pid"
         wait_for_runner
         control_exit=$scheduled_exit
@@ -401,11 +407,18 @@ process_routines() {
             append_activity routine.deferred "$routine_profile" deferred "Routine dependency has not succeeded" 2>/dev/null || true
             continue
         fi
+        # Do not start new work after TERM/INT was latched while this routine
+        # was being evaluated. A signal after this check is covered again once
+        # the direct child PID has been assigned below.
+        [ "$shutdown" = false ] || break
         routine_state_value=running
         routine_last_attempt_value=$routine_now
         write_routine_state "$routine_profile"
         "$runner" "$routine_action" "$routine_profile" "$routine_delete" scheduled - &
         active_pid=$!
+        if [ "$shutdown" = true ] && pid_is_live "$active_pid"; then
+            kill -TERM "$active_pid" 2>/dev/null || true
+        fi
         write_controller_state running "$$" "$next_run" "$active_pid"
         wait_for_runner
         routine_finished=$(epoch_now)
@@ -509,9 +522,15 @@ while [ "$shutdown" = false ]; do
     elif [ "$next_run" -eq 0 ]; then
         next_run=$((now + interval))
     elif [ "$now" -ge "$next_run" ]; then
+        # Do not start a scheduled aggregate after TERM/INT was latched. The
+        # post-assignment check closes the asynchronous launch window.
+        [ "$shutdown" = false ] || break
         write_controller_state running "$$" "$next_run" 0
         "$runner" sync all "$allow_delete" scheduled "$maximum_total" &
         active_pid=$!
+        if [ "$shutdown" = true ] && pid_is_live "$active_pid"; then
+            kill -TERM "$active_pid" 2>/dev/null || true
+        fi
         write_controller_state running "$$" "$next_run" "$active_pid"
         previous_wait_status=
         while :; do

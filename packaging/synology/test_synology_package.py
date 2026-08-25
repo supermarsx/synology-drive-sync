@@ -10,6 +10,7 @@ import os
 import select
 import signal
 import shutil
+import socket
 import stat
 import struct
 import subprocess
@@ -137,15 +138,22 @@ def repack_outer(
     payload_overrides: dict[str, bytes] | None = None,
     mode_overrides: dict[str, int] | None = None,
     type_overrides: dict[str, bytes] | None = None,
+    pax_overrides: dict[str, dict[str, str]] | None = None,
+    global_pax_headers: dict[str, str] | None = None,
 ) -> None:
     payload_overrides = payload_overrides or {}
     mode_overrides = mode_overrides or {}
     type_overrides = type_overrides or {}
+    pax_overrides = pax_overrides or {}
     with tarfile.open(source, "r:") as original, tarfile.open(
-        destination, "w", format=tarfile.PAX_FORMAT
+        destination,
+        "w",
+        format=tarfile.PAX_FORMAT,
+        pax_headers=global_pax_headers,
     ) as rebuilt:
         for original_member in original.getmembers():
             member = copy.copy(original_member)
+            member.pax_headers = dict(original_member.pax_headers)
             payload = (
                 original.extractfile(original_member).read()
                 if original_member.isfile()
@@ -163,6 +171,8 @@ def repack_outer(
                 member.type = type_overrides[member.name]
                 member.size = 0
                 payload = None
+            if member.name in pax_overrides:
+                member.pax_headers.update(pax_overrides[member.name])
             rebuilt.addfile(member, io.BytesIO(payload) if payload is not None else None)
 
 
@@ -180,6 +190,34 @@ def repack_payload_mode(payload: bytes, member_name: str, mode: int) -> bytes:
             )
             if member.name == member_name:
                 member.mode = mode
+            rebuilt.addfile(member, io.BytesIO(content) if content is not None else None)
+    return rebuilt_payload.getvalue()
+
+
+def repack_payload_pax(
+    payload: bytes,
+    *,
+    pax_overrides: dict[str, dict[str, str]] | None = None,
+    global_pax_headers: dict[str, str] | None = None,
+) -> bytes:
+    pax_overrides = pax_overrides or {}
+    rebuilt_payload = io.BytesIO()
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as original, tarfile.open(
+        fileobj=rebuilt_payload,
+        mode="w:gz",
+        format=tarfile.PAX_FORMAT,
+        pax_headers=global_pax_headers,
+    ) as rebuilt:
+        for original_member in original.getmembers():
+            member = copy.copy(original_member)
+            member.pax_headers = dict(original_member.pax_headers)
+            content = (
+                original.extractfile(original_member).read()
+                if original_member.isfile()
+                else None
+            )
+            if member.name in pax_overrides:
+                member.pax_headers.update(pax_overrides[member.name])
             rebuilt.addfile(member, io.BytesIO(content) if content is not None else None)
     return rebuilt_payload.getvalue()
 
@@ -269,7 +307,15 @@ class BuilderTests(unittest.TestCase):
             with tarfile.open(artifact, "r:") as outer:
                 info = outer.extractfile("INFO").read()  # type: ignore[union-attr]
                 package_payload = outer.extractfile("package.tgz").read()  # type: ignore[union-attr]
+                privilege = json.loads(
+                    outer.extractfile("conf/privilege").read()  # type: ignore[union-attr]
+                )
             self.assertIn(f'arch="{info_arch}"'.encode(), info)
+            self.assertEqual(
+                privilege,
+                {"defaults": {"run-as": "package"}, "join-groupname": "http"},
+            )
+            self.assertNotIn("tool", privilege)
             with tarfile.open(fileobj=io.BytesIO(package_payload), mode="r:gz") as package:
                 installed_api = package.extractfile("bin/sdsync-dsm-api").read()  # type: ignore[union-attr]
                 cgi_api = package.extractfile("ui/api.cgi").read()  # type: ignore[union-attr]
@@ -544,7 +590,7 @@ class BuilderTests(unittest.TestCase):
         self.assertNotEqual(mismatch.returncode, 0)
         self.assertIn("do not match", mismatch.stderr)
 
-    def test_archive_is_never_setid_and_manifest_applies_package_owned_cgi_mode(self) -> None:
+    def test_archive_and_privilege_manifest_are_never_setid(self) -> None:
         artifact = self.build("x86_64", 62)
         with tarfile.open(artifact, "r:") as archive:
             self.assertFalse(
@@ -564,16 +610,21 @@ class BuilderTests(unittest.TestCase):
         )
 
         privilege = json.loads(privilege_payload)
-        cgi = next(entry for entry in privilege["tool"] if entry["relpath"] == "ui/api.cgi")
-        self.assertEqual(cgi["user"], "package")
-        self.assertEqual(cgi["group"], "package")
-        self.assertEqual(cgi["permission"], "4755")
-        cgi["permission"] = "0755"
-        weakened_manifest = self.root / "weakened-manifest" / artifact.name
-        weakened_manifest.parent.mkdir()
+        self.assertEqual(
+            privilege,
+            {"defaults": {"run-as": "package"}, "join-groupname": "http"},
+        )
+        privilege["tool"] = [{
+            "relpath": "ui/api.cgi",
+            "user": "package",
+            "group": "package",
+            "permission": "4755",
+        }]
+        setuid_manifest = self.root / "setuid-manifest" / artifact.name
+        setuid_manifest.parent.mkdir()
         repack_outer(
             artifact,
-            weakened_manifest,
+            setuid_manifest,
             payload_overrides={"conf/privilege": json.dumps(privilege).encode()},
         )
 
@@ -587,8 +638,81 @@ class BuilderTests(unittest.TestCase):
 
         for candidate, marker in (
             (archived_setuid, "setuid/setgid archive member: ui/api.cgi"),
-            (weakened_manifest, "reviewed contract"),
+            (setuid_manifest, "tool permission requests setuid/setgid"),
             (outer_setgid, "setuid/setgid archive member: scripts/preinst"),
+        ):
+            result = subprocess.run(
+                [sys.executable, str(HERE / "validate_spk.py"), str(candidate)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, candidate.name)
+            self.assertIn(marker, result.stderr, candidate.name)
+
+    def test_validator_rejects_outer_and_inner_pax_privilege_metadata(self) -> None:
+        artifact = self.build("x86_64", 62)
+        with tarfile.open(artifact, "r:") as archive:
+            package_payload = archive.extractfile("package.tgz").read()  # type: ignore[union-attr]
+
+        outer_member = self.root / "outer-member-pax" / artifact.name
+        outer_member.parent.mkdir()
+        repack_outer(
+            artifact,
+            outer_member,
+            pax_overrides={
+                "scripts/preinst": {
+                    "SCHILY.xattr.security.capability": "unexpected-capability"
+                }
+            },
+        )
+
+        outer_global = self.root / "outer-global-pax" / artifact.name
+        outer_global.parent.mkdir()
+        repack_outer(
+            artifact,
+            outer_global,
+            global_pax_headers={"SCHILY.acl.access": "unexpected-acl"},
+        )
+
+        inner_member = self.root / "inner-member-pax" / artifact.name
+        inner_member.parent.mkdir()
+        repack_outer(
+            artifact,
+            inner_member,
+            payload_overrides={
+                "package.tgz": repack_payload_pax(
+                    package_payload,
+                    pax_overrides={
+                        "bin/sdsync-dsm-api": {
+                            "SCHILY.acl.access": "unexpected-acl"
+                        }
+                    },
+                )
+            },
+        )
+
+        inner_global = self.root / "inner-global-pax" / artifact.name
+        inner_global.parent.mkdir()
+        repack_outer(
+            artifact,
+            inner_global,
+            payload_overrides={
+                "package.tgz": repack_payload_pax(
+                    package_payload,
+                    global_pax_headers={
+                        "SCHILY.xattr.security.capability": "unexpected-capability"
+                    },
+                )
+            },
+        )
+
+        for candidate, marker in (
+            (outer_member, "unsupported member PAX headers"),
+            (outer_global, "unsupported global PAX headers"),
+            (inner_member, "unsupported member PAX headers"),
+            (inner_global, "unsupported global PAX headers"),
         ):
             result = subprocess.run(
                 [sys.executable, str(HERE / "validate_spk.py"), str(candidate)],
@@ -618,6 +742,8 @@ class RuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="sdsync-dsm-runtime-")
         self.root = Path(self.temporary.name)
+        self.drop_uid = os.getuid() if os.getuid() != 0 else 65534
+        self.drop_gid = os.getgid() if os.getuid() != 0 else 65534
         self.real_home = self.root / "apphome"
         self.real_var = self.root / "appdata"
         self.real_target = self.root / "appstore"
@@ -629,6 +755,8 @@ class RuntimeTests(unittest.TestCase):
         shutil.copytree(HERE / "scripts", self.lifecycle_dir)
         for path in self.real_target.rglob("*"):
             if path.is_file():
+                path.chmod(0o755)
+            elif path.is_dir():
                 path.chmod(0o755)
         os.symlink(self.real_home, self.fhs / "home", target_is_directory=True)
         os.symlink(self.real_var, self.fhs / "var", target_is_directory=True)
@@ -649,6 +777,20 @@ class RuntimeTests(unittest.TestCase):
             encoding="utf-8",
         )
         core.chmod(0o755)
+        self.write_api_mock()
+        self.fake_system_bin = self.root / "fake-system-bin"
+        self.fake_system_bin.mkdir(mode=0o700)
+        fake_getent = self.fake_system_bin / "getent"
+        fake_getent.write_text(
+            "#!/bin/sh\n"
+            'if [ "$#" -eq 2 ] && [ "$1" = group ] && [ "$2" = http ]; then\n'
+            f"  printf 'http:x:{self.drop_gid}:\\n'\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 2\n",
+            encoding="utf-8",
+        )
+        fake_getent.chmod(0o755)
         self.source_one = self.root / "Source Folder"
         self.source_two = self.root / "Second Source"
         self.source_one.mkdir()
@@ -662,16 +804,14 @@ class RuntimeTests(unittest.TestCase):
                 "SYNOPKG_PKGNAME": "synology-drive-sync",
                 "SYNOPKG_DSM_VERSION_MAJOR": "7",
                 "SDSYNC_TEST_CAPTURE": str(self.capture),
+                "SDSYNC_TEST_API_SOCKET": str(self.real_target / "ui/api.sock"),
                 "SDSYNC_DSM_STOP_TIMEOUT": "10",
+                "PATH": f"{self.fake_system_bin}:{os.environ['PATH']}",
             }
         )
         self.manager = self.fhs / "target/bin/sdsync-dsm"
         self.lifecycle = self.lifecycle_dir / "start-stop-status"
-        self.drop_uid = os.getuid()
-        self.drop_gid = os.getgid()
         if os.getuid() == 0:
-            self.drop_uid = 65534
-            self.drop_gid = 65534
             for path in [self.root, *self.root.rglob("*")]:
                 # Model DSM: FHS links stay root-owned while their @apphome,
                 # @appdata, and @appstore targets belong to the package user.
@@ -679,6 +819,173 @@ class RuntimeTests(unittest.TestCase):
                     os.lchown(path, self.drop_uid, self.drop_gid)
         installed = self.shell(self.lifecycle_dir / "postinst")
         self.assertEqual(installed.returncode, 0, installed.stderr)
+
+    def write_api_mock(
+        self,
+        *,
+        queue_capture: Path | None = None,
+        queue_lock: Path | None = None,
+        consumer_tree_pid_file: Path | None = None,
+        consumer_tree_ready_file: Path | None = None,
+        consumer_tree_done_file: Path | None = None,
+    ) -> None:
+        bridge = self.real_target / "bin/sdsync-dsm-api"
+        consume = ""
+        if queue_capture is not None and queue_lock is not None:
+            consume = f'''\nif len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
+    request = Path(sys.argv[2])
+    response = Path(sys.argv[3])
+    job_id = request.stem
+    capture = Path({str(queue_capture)!r})
+    lock = Path({str(queue_lock)!r})
+    try:
+        lock.mkdir()
+    except FileExistsError:
+        with capture.open("a", encoding="utf-8") as stream:
+            stream.write("overlap\\n")
+        raise SystemExit(75)
+    try:
+        secret = request.with_suffix(".secret")
+        has_secret = "yes" if secret.is_file() else "no"
+        with capture.open("a", encoding="utf-8") as stream:
+            stream.write(f"{{job_id}} {{int(time.time())}} {{os.getuid()}} {{os.getgid()}} {{has_secret}}\\n")
+        time.sleep(0.1)
+        secret.unlink(missing_ok=True)
+        response.write_text('{{"schema":"sdsync.dsm-result.v1","ok":true,"message":"queued"}}\\n', encoding="utf-8")
+    finally:
+        lock.rmdir()
+    raise SystemExit(0)
+'''
+        consumer_tree = ""
+        if (
+            consumer_tree_pid_file is not None
+            and consumer_tree_ready_file is not None
+            and consumer_tree_done_file is not None
+        ):
+            consumer_tree = f'''
+if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
+    tree_environment = os.environ.copy()
+    tree_environment["SDSYNC_TEST_TREE_PID_FILE"] = {str(consumer_tree_pid_file)!r}
+    manager = None
+    stopping = False
+    def stop_consumer_tree(_signum, _frame):
+        global stopping
+        stopping = True
+    signal.signal(signal.SIGTERM, stop_consumer_tree)
+    signal.signal(signal.SIGINT, stop_consumer_tree)
+    signal.signal(signal.SIGHUP, stop_consumer_tree)
+    manager = subprocess.Popen(
+        [
+            "/bin/sh",
+            "-c",
+            "trap 'kill -TERM \\\"$worker\\\" 2>/dev/null || true; wait \\\"$worker\\\" 2>/dev/null || true; exit 143' TERM INT HUP; sleep 30 & worker=$!; printf '%s %s\\n' \\\"$$\\\" \\\"$worker\\\" > \\\"$SDSYNC_TEST_TREE_PID_FILE\\\"; wait \\\"$worker\\\"",
+        ],
+        env=tree_environment,
+        start_new_session=True,
+    )
+    Path({str(consumer_tree_ready_file)!r}).write_text("consumer-ready\\n", encoding="utf-8")
+    while manager.poll() is None:
+        if stopping:
+            try:
+                # The Rust regression covers cooperative TERM handling. This
+                # packaging fixture forcefully collapses its synthetic tree so
+                # the assertion isolates whether lifecycle waits for consumer
+                # cleanup before declaring the package stopped.
+                os.killpg(manager.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            manager.wait(timeout=5)
+            Path({str(consumer_tree_done_file)!r}).write_text("tree-terminal\\n", encoding="utf-8")
+            raise SystemExit(143)
+        time.sleep(0.02)
+    raise SystemExit(manager.returncode)
+'''
+        bridge.write_text(
+            f"#!{sys.executable}\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            "import signal\n"
+            "import socket\n"
+            "import stat\n"
+            "import subprocess\n"
+            "import sys\n"
+            "import time\n"
+            "\n"
+            f"{consumer_tree}"
+            "if len(sys.argv) == 4 and sys.argv[1] == '--consume-job' and "
+            "os.environ.get('SDSYNC_TEST_HOLD_CONSUMER') == 'true':\n"
+            "    running = True\n"
+            "    def stop_consumer(_signum, _frame):\n"
+            "        global running\n"
+            "        running = False\n"
+            "    signal.signal(signal.SIGTERM, stop_consumer)\n"
+            "    signal.signal(signal.SIGINT, stop_consumer)\n"
+            "    while running:\n"
+            "        time.sleep(0.1)\n"
+            "    raise SystemExit(0)\n"
+            "\n"
+            "if sys.argv[1:] == ['--serve']:\n"
+            "    socket_path = os.environ['SDSYNC_TEST_API_SOCKET']\n"
+            "    time.sleep(float(os.environ.get('SDSYNC_TEST_API_START_DELAY', '0')))\n"
+            "    socket_file = Path(socket_path)\n"
+            "    if socket_file.exists() or socket_file.is_symlink():\n"
+            "        before = os.lstat(socket_path)\n"
+            "        mode = stat.S_IMODE(before.st_mode)\n"
+            "        safe = (stat.S_ISSOCK(before.st_mode) and "
+            "before.st_uid == os.getuid() and before.st_nlink == 1 and "
+            "(mode == 0o600 or (mode == 0o660 and before.st_gid == os.getgid())))\n"
+            "        if not safe:\n"
+            "            raise SystemExit(73)\n"
+            "        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+            "        probe.settimeout(0.25)\n"
+            "        try:\n"
+            "            probe.connect(socket_path)\n"
+            "        except ConnectionRefusedError:\n"
+            "            probe.close()\n"
+            "            after = os.lstat(socket_path)\n"
+            "            if (before.st_dev, before.st_ino, before.st_uid, before.st_gid, "
+            "before.st_mode, before.st_nlink) != "
+            "(after.st_dev, after.st_ino, after.st_uid, after.st_gid, "
+            "after.st_mode, after.st_nlink):\n"
+            "                raise SystemExit(73)\n"
+            "            os.unlink(socket_path)\n"
+            "        except FileNotFoundError:\n"
+            "            probe.close()\n"
+            "        except OSError:\n"
+            "            probe.close()\n"
+            "            raise SystemExit(73)\n"
+            "        else:\n"
+            "            probe.close()\n"
+            "            raise SystemExit(75)\n"
+            "    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+            "    server.bind(socket_path)\n"
+            "    os.chmod(socket_path, 0o660)\n"
+            "    server.listen(4)\n"
+            "    server.settimeout(0.1)\n"
+            "    running = True\n"
+            "    def stop(_signum, _frame):\n"
+            "        global running\n"
+            "        running = False\n"
+            "    signal.signal(signal.SIGTERM, stop)\n"
+            "    signal.signal(signal.SIGINT, stop)\n"
+            "    while running:\n"
+            "        try:\n"
+            "            connection, _ = server.accept()\n"
+            "            connection.close()\n"
+            "        except socket.timeout:\n"
+            "            pass\n"
+            "        except OSError:\n"
+            "            if running:\n"
+            "                raise\n"
+            "    server.close()\n"
+            "    raise SystemExit(0)\n"
+            f"{consume}"
+            "raise SystemExit(64)\n",
+            encoding="utf-8",
+        )
+        bridge.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(bridge, self.drop_uid, self.drop_gid)
 
     def tearDown(self) -> None:
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
@@ -708,6 +1015,112 @@ class RuntimeTests(unittest.TestCase):
                 else None
             ),
         )
+
+    def shell_process(
+        self,
+        script: Path,
+        *arguments: str,
+        extra_environment: dict[str, str] | None = None,
+    ) -> subprocess.Popen[str]:
+        environment = self.environment.copy()
+        if extra_environment:
+            environment.update(extra_environment)
+        return subprocess.Popen(
+            ["/bin/sh", str(script), *arguments],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+            preexec_fn=(
+                (lambda: (os.setgroups([]), os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
+                if os.getuid() == 0
+                else None
+            ),
+        )
+
+    def instrument_launch_assignment_signal(
+        self,
+        script: Path,
+        launch_line: str,
+        assignment_line: str,
+        indentation: str,
+    ) -> None:
+        source = script.read_text(encoding="utf-8")
+        needle = f"{launch_line}\n{assignment_line}"
+        self.assertEqual(source.count(needle), 1, f"launch site changed in {script}")
+        replacement = (
+            f"{launch_line}\n"
+            f'{indentation}while [ ! -e "${{SDSYNC_TEST_LAUNCH_READY:?}}" ]; do '
+            "/bin/sleep 0.01; done\n"
+            f'{indentation}kill -TERM "$$"\n'
+            f"{assignment_line}"
+        )
+        script.write_text(source.replace(needle, replacement), encoding="utf-8")
+
+    def write_terminable_launch_child(self, path: Path, *, core: bool = False) -> None:
+        validate = 'case " $* " in *" config validate "*) exit 0 ;; esac\n' if core else ""
+        path.write_text(
+            "#!/bin/sh\n"
+            f"{validate}"
+            ': "${SDSYNC_TEST_LAUNCH_READY:?}"\n'
+            ': "${SDSYNC_TEST_LAUNCHED_PID:?}"\n'
+            ': "${SDSYNC_TEST_TERM_OBSERVED:?}"\n'
+            "trap ': > \"$SDSYNC_TEST_TERM_OBSERVED\"; exit 143' TERM INT HUP\n"
+            'printf \'%s\\n\' "$$" > "$SDSYNC_TEST_LAUNCHED_PID"\n'
+            ': > "$SDSYNC_TEST_LAUNCH_READY"\n'
+            "while :; do /bin/sleep 1; done\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(path, self.drop_uid, self.drop_gid)
+
+    def assert_injected_launch_is_reaped(
+        self,
+        script: Path,
+        arguments: tuple[str, ...],
+        environment: dict[str, str],
+        pid_file: Path,
+        ready_file: Path,
+        term_file: Path,
+        expected_exit: int,
+    ) -> None:
+        process = self.shell_process(script, *arguments, extra_environment=environment)
+        child_pid = None
+        try:
+            ready_deadline = time.monotonic() + 5
+            while not ready_file.is_file() and time.monotonic() < ready_deadline:
+                if process.poll() is not None:
+                    break
+                time.sleep(0.01)
+            if pid_file.is_file():
+                child_pid = int(pid_file.read_text(encoding="utf-8").strip())
+            self.assertTrue(ready_file.is_file(), "instrumented child did not reach launch window")
+            try:
+                exit_code = process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                process.wait(timeout=5)
+                self.fail("parent did not close the launch-assignment signal window")
+            stdout, stderr = process.communicate()
+            self.assertEqual(exit_code, expected_exit, stdout + stderr)
+            self.assertTrue(term_file.is_file(), "launched child did not observe forwarded TERM")
+            self.assertIsNotNone(child_pid)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)  # type: ignore[arg-type]
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def configure(self, name: str, source: Path, remote: str, default: bool = False) -> subprocess.CompletedProcess[str]:
         arguments = [
@@ -972,6 +1385,42 @@ class RuntimeTests(unittest.TestCase):
             1,
         )
 
+    def test_routine_runner_launch_signal_is_forwarded_after_pid_assignment(self) -> None:
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode,
+            0,
+        )
+        routine, _ = self.api(
+            "routine", "--profile", "personal", "--enabled", "true", "--action", "sync",
+            "--mode", "daily", "--interval", "3600", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "5", "--retry-count", "1", "--retry-backoff-seconds", "30",
+            "--poll-seconds", "30", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+
+        runner = self.real_target / "libexec/sdsync-run"
+        self.write_terminable_launch_child(runner)
+        controller = self.real_target / "libexec/sdsync-controller"
+        self.instrument_launch_assignment_signal(
+            controller,
+            '        "$runner" "$routine_action" "$routine_profile" "$routine_delete" scheduled - &',
+            "        active_pid=$!",
+            "        ",
+        )
+        ready = self.root / "routine-launch.ready"
+        pid_file = self.root / "routine-launch.pid"
+        terminated = self.root / "routine-launch.term"
+        environment = {
+            "SDSYNC_TEST_LAUNCH_READY": str(ready),
+            "SDSYNC_TEST_LAUNCHED_PID": str(pid_file),
+            "SDSYNC_TEST_TERM_OBSERVED": str(terminated),
+        }
+        self.assert_injected_launch_is_reaped(
+            controller, (), environment, pid_file, ready, terminated, 0
+        )
+        self.assertFalse((self.real_var / "run/controller.lock").exists())
+
     def test_controller_interval_and_realtime_polling_fallback_trigger(self) -> None:
         self.assertEqual(self.configure("interval", self.source_one, "/home/Drive/Interval", True).returncode, 0)
         self.assertEqual(self.configure("watch", self.source_two, "/home/Drive/Watch").returncode, 0)
@@ -1175,24 +1624,7 @@ class RuntimeTests(unittest.TestCase):
     def test_controller_private_queue_is_sequential_bounded_and_rejects_unsafe_entries(self) -> None:
         bridge_capture = self.root / "bridge-capture"
         bridge_lock = self.root / "bridge-lock"
-        bridge = self.real_target / "bin/sdsync-dsm-api"
-        bridge.write_text(
-            "#!/bin/sh\nset -eu\n"
-            '[ "$#" -eq 3 ] && [ "$1" = --consume-job ]\n'
-            'request=$2; response=$3; name=${request##*/}; id=${name%.json}\n'
-            f'capture="{bridge_capture}"; lock="{bridge_lock}"\n'
-            'mkdir "$lock" || { printf \'overlap\\n\' >> "$capture"; exit 75; }\n'
-            'trap \'rmdir "$lock" 2>/dev/null || true\' 0\n'
-            'secret=no; [ ! -f "${request%.json}.secret" ] || secret=yes\n'
-            'printf \'%s %s %s %s %s\\n\' "$id" "$(date +%s)" "$(id -u)" "$(id -G)" "$secret" >> "$capture"\n'
-            'sleep 0.1\n'
-            'rm -f "${request%.json}.secret"\n'
-            'printf \'{"schema":"sdsync.dsm-result.v1","ok":true,"message":"queued"}\\n\' > "$response"\n',
-            encoding="utf-8",
-        )
-        bridge.chmod(0o755)
-        if os.getuid() == 0:
-            os.chown(bridge, self.drop_uid, self.drop_gid)
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
         requests = self.real_var / "control/requests"
         processing = self.real_var / "control/processing"
         responses = self.real_var / "control/responses"
@@ -1306,6 +1738,77 @@ class RuntimeTests(unittest.TestCase):
             time.sleep(0.03)
         self.assertLessEqual(len(safe_responses), 256)
         self.assertIn("kind=processing_indeterminate", controller_log_path.read_text(encoding="utf-8"))
+
+    def test_lifecycle_stop_waits_for_queued_tree_before_any_run_lock(self) -> None:
+        tree_pid_file = self.root / "queued-tree.pids"
+        tree_ready_file = self.root / "queued-tree.ready"
+        tree_done_file = self.root / "queued-tree.done"
+        self.write_api_mock(
+            consumer_tree_pid_file=tree_pid_file,
+            consumer_tree_ready_file=tree_ready_file,
+            consumer_tree_done_file=tree_done_file,
+        )
+        job_id = "c" * 48
+        requests = self.real_var / "control/requests"
+        processing = self.real_var / "control/processing"
+        request = requests / f"{job_id}.json"
+        secret = requests / f"{job_id}.secret"
+        secret_literal = "queued-shutdown-secret-should-not-leak"
+        request.write_text("{}\n", encoding="utf-8")
+        secret.write_text(f"{secret_literal}\n", encoding="utf-8")
+        request.chmod(0o600)
+        secret.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(request, self.drop_uid, self.drop_gid)
+            os.chown(secret, self.drop_uid, self.drop_gid)
+
+        tree_pids: list[int] = []
+        try:
+            started = self.shell(self.lifecycle, "start", timeout=15)
+            self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+            for _ in range(300):
+                if tree_pid_file.is_file() and tree_ready_file.is_file():
+                    tree_pids = [
+                        int(value)
+                        for value in tree_pid_file.read_text(encoding="utf-8").split()
+                    ]
+                    if len(tree_pids) == 2:
+                        break
+                time.sleep(0.02)
+            self.assertEqual(len(tree_pids), 2, "queued consumer tree did not start")
+            self.assertFalse(
+                (self.real_var / "run/run.lock").exists(),
+                "fixture unexpectedly crossed into the runner-lock path",
+            )
+            self.assertTrue((processing / f"{job_id}.secret").is_file())
+
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+            controller_log = self.real_var / "log/controller.log"
+            self.assertTrue(
+                tree_done_file.is_file(),
+                controller_log.read_text(encoding="utf-8", errors="replace")
+                if controller_log.is_file()
+                else "controller log missing",
+            )
+            for tree_pid in tree_pids:
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(tree_pid, 0)
+            self.assertFalse((processing / f"{job_id}.json").exists())
+            self.assertFalse((processing / f"{job_id}.secret").exists())
+            self.assertFalse(request.exists())
+            self.assertFalse(secret.exists())
+            logs = "\n".join(
+                path.read_text(encoding="utf-8", errors="replace")
+                for path in (self.real_var / "log").glob("*.log")
+            )
+            self.assertNotIn(secret_literal, logs)
+        finally:
+            if tree_pids:
+                try:
+                    os.killpg(tree_pids[0], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_profiles_secrets_arbitrary_home_target_and_foreground_plan(self) -> None:
         if os.getuid() == 0:
@@ -1663,6 +2166,48 @@ class RuntimeTests(unittest.TestCase):
                 except ProcessLookupError:
                     pass
 
+    def test_scheduled_core_launch_signal_targets_and_reaps_the_execed_core(self) -> None:
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode,
+            0,
+        )
+        password = self.root / "launch-password"
+        password.write_text("test-password\n", encoding="utf-8")
+        self.assertEqual(
+            self.shell(
+                self.manager, "set-password", "personal", "--from-file", str(password)
+            ).returncode,
+            0,
+        )
+
+        core = self.real_target / "bin/synology-drive-sync"
+        self.write_terminable_launch_child(core, core=True)
+        runner = self.real_target / "libexec/sdsync-run"
+        self.instrument_launch_assignment_signal(
+            runner,
+            "fi",
+            "core_pid=$!",
+            "",
+        )
+        ready = self.root / "core-launch.ready"
+        pid_file = self.root / "core-launch.pid"
+        terminated = self.root / "core-launch.term"
+        environment = {
+            "SDSYNC_TEST_LAUNCH_READY": str(ready),
+            "SDSYNC_TEST_LAUNCHED_PID": str(pid_file),
+            "SDSYNC_TEST_TERM_OBSERVED": str(terminated),
+        }
+        self.assert_injected_launch_is_reaped(
+            runner,
+            ("sync", "personal", "false", "scheduled", "-"),
+            environment,
+            pid_file,
+            ready,
+            terminated,
+            143,
+        )
+        self.assertFalse((self.real_var / "run/run.lock").exists())
+
     def test_lifecycle_stop_rejects_forged_live_pid_without_signaling_it(self) -> None:
         sleeper = subprocess.Popen(
             ["/bin/sleep", "30"],
@@ -1690,6 +2235,117 @@ class RuntimeTests(unittest.TestCase):
             if run_lock.is_dir():
                 (run_lock / "pid").unlink(missing_ok=True)
                 run_lock.rmdir()
+
+    def test_verified_stop_signal_accepts_only_a_target_that_exited_during_kill(self) -> None:
+        fixture_source = (
+            "#!/bin/sh\n"
+            ': > "${SDSYNC_TEST_RACE_READY:?}"\n'
+            'while [ ! -e "${SDSYNC_TEST_RACE_RELEASE:?}" ]; do :; done\n'
+            "exit 0\n"
+        )
+        fixtures = {
+            "controller": self.real_target / "libexec/sdsync-controller",
+            "runner": self.real_target / "libexec/sdsync-run",
+            "api": self.real_target / "bin/sdsync-dsm-api",
+        }
+        for fixture in fixtures.values():
+            fixture.write_text(fixture_source, encoding="utf-8")
+            fixture.chmod(0o755)
+
+        harness = self.root / "verified-signal-race.sh"
+        harness.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            '. "$SDSYNC_TEST_COMMON"\n'
+            "race_service=$1\n"
+            "race_mode=$2\n"
+            "case $race_service in\n"
+            "  controller) race_command=$controller; race_argument= ;;\n"
+            "  runner) race_command=$runner; race_argument= ;;\n"
+            "  api) race_command=$api_server; race_argument=--serve ;;\n"
+            "  *) exit 64 ;;\n"
+            "esac\n"
+            "if [ -n \"$race_argument\" ]; then\n"
+            '  "$race_command" "$race_argument" &\n'
+            "else\n"
+            '  "$race_command" &\n'
+            "fi\n"
+            "race_pid=$!\n"
+            "race_wait=0\n"
+            'while [ ! -e "$SDSYNC_TEST_RACE_READY" ]; do\n'
+            '  command kill -0 "$race_pid" 2>/dev/null || exit 80\n'
+            '  [ "$race_wait" -lt 200 ] || exit 81\n'
+            "  sleep 0.01\n"
+            "  race_wait=$((race_wait + 1))\n"
+            "done\n"
+            "kill() {\n"
+            '  if [ "$1" = -TERM ] && [ "$2" = "$race_pid" ]; then\n'
+            '    if [ "$race_mode" = gone ]; then\n'
+            '      : > "$SDSYNC_TEST_RACE_RELEASE"\n'
+            '      wait "$race_pid"\n'
+            '      command kill "$@"\n'
+            "      return $?\n"
+            "    fi\n"
+            "    return 1\n"
+            "  fi\n"
+            '  command kill "$@"\n'
+            "}\n"
+            'if signal_verified_service "$race_service" "$race_pid" "$race_service"; then\n'
+            "  race_result=0\n"
+            "else\n"
+            "  race_result=$?\n"
+            "fi\n"
+            'if [ "$race_mode" = gone ]; then\n'
+            '  [ "$race_result" -eq 0 ] || exit 82\n'
+            '  pid_slot_absent "$race_pid" || exit 83\n'
+            "else\n"
+            '  [ "$race_result" -ne 0 ] || exit 84\n'
+            '  verified_service_pid_matches "$race_service" "$race_pid" || exit 85\n'
+            '  : > "$SDSYNC_TEST_RACE_RELEASE"\n'
+            '  wait "$race_pid"\n'
+            "fi\n",
+            encoding="utf-8",
+        )
+        harness.chmod(0o755)
+
+        lifecycle_source = self.lifecycle.read_text(encoding="utf-8")
+        self.assertIn(
+            'signal_verified_service controller "$saved_pid" controller',
+            lifecycle_source,
+        )
+        self.assertIn(
+            'signal_verified_service runner "$run_pid" plan/sync',
+            lifecycle_source,
+        )
+        self.assertIn(
+            'signal_verified_service api "$saved_api_pid" API',
+            lifecycle_source,
+        )
+
+        for service in fixtures:
+            for mode in ("gone", "live"):
+                with self.subTest(service=service, mode=mode):
+                    ready = self.root / f"{service}-{mode}.ready"
+                    release = self.root / f"{service}-{mode}.release"
+                    result = self.shell(
+                        harness,
+                        service,
+                        mode,
+                        extra_environment={
+                            "SDSYNC_TEST_COMMON": str(self.lifecycle_dir / "common"),
+                            "SDSYNC_TEST_RACE_READY": str(ready),
+                            "SDSYNC_TEST_RACE_RELEASE": str(release),
+                        },
+                        timeout=10,
+                    )
+                    self.assertEqual(
+                        result.returncode,
+                        0,
+                        (service, mode, result.stdout, result.stderr),
+                    )
+                    self.assertNotIn("No such process", result.stderr)
+                    if mode == "live":
+                        self.assertIn("target remains live", result.stdout)
 
     def test_package_stop_waits_for_a_manual_foreground_run(self) -> None:
         self.assertEqual(
@@ -1897,6 +2553,49 @@ class RuntimeTests(unittest.TestCase):
                 except ProcessLookupError:
                     pass
 
+    def test_aggregate_runner_launch_signal_is_forwarded_after_pid_assignment(self) -> None:
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode,
+            0,
+        )
+        password = self.root / "aggregate-launch-password"
+        password.write_text("test-password\n", encoding="utf-8")
+        self.assertEqual(
+            self.shell(
+                self.manager, "set-password", "personal", "--from-file", str(password)
+            ).returncode,
+            0,
+        )
+        self.assertEqual(
+            self.shell(self.manager, "enable", "--interval", "60").returncode,
+            0,
+        )
+
+        runner = self.real_target / "libexec/sdsync-run"
+        self.write_terminable_launch_child(runner)
+        controller = self.real_target / "libexec/sdsync-controller"
+        self.instrument_launch_assignment_signal(
+            controller,
+            '        "$runner" sync all "$allow_delete" scheduled "$maximum_total" &',
+            "        active_pid=$!",
+            "        ",
+        )
+        ready = self.root / "aggregate-launch.ready"
+        pid_file = self.root / "aggregate-launch.pid"
+        terminated = self.root / "aggregate-launch.term"
+        environment = self.fast_clock_environment(step=61)
+        environment.update(
+            {
+                "SDSYNC_TEST_LAUNCH_READY": str(ready),
+                "SDSYNC_TEST_LAUNCHED_PID": str(pid_file),
+                "SDSYNC_TEST_TERM_OBSERVED": str(terminated),
+            }
+        )
+        self.assert_injected_launch_is_reaped(
+            controller, (), environment, pid_file, ready, terminated, 0
+        )
+        self.assertFalse((self.real_var / "run/controller.lock").exists())
+
     def test_rotating_append_checks_size_before_every_controller_entry(self) -> None:
         helper = self.root / "append-log.sh"
         helper.write_text(
@@ -1984,12 +2683,43 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("outside", refused_log.stdout)
 
     def test_start_status_term_stop_and_upgrade_uninstall_run_guard(self) -> None:
+        api_socket = self.real_target / "ui/api.sock"
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(str(api_socket))
+        stale.close()
+        api_socket.chmod(0o600)
+        api_pid_file = self.real_var / "run/api.pid"
+        api_pid_file.write_text("2147483647\n", encoding="utf-8")
+        api_pid_file.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(api_socket, self.drop_uid, self.drop_gid)
+            os.chown(api_pid_file, self.drop_uid, self.drop_gid)
+
+        stale_status = self.shell(self.lifecycle, "status")
+        self.assertEqual(
+            stale_status.returncode,
+            1,
+            (
+                stale_status.stdout,
+                stale_status.stderr,
+                api_socket.lstat(),
+                api_pid_file.lstat(),
+                (self.real_target / "ui").stat(),
+            ),
+        )
         started = self.shell(self.lifecycle, "start", timeout=15)
-        self.assertEqual(started.returncode, 0, started.stderr)
+        self.assertEqual(started.returncode, 0, (started.stdout, started.stderr))
         self.assertEqual(self.shell(self.lifecycle, "status").returncode, 0)
+        self.assertTrue(stat.S_ISSOCK(api_socket.stat().st_mode))
+        self.assertEqual(api_socket.stat().st_mode & 0o7777, 0o660)
+        self.assertEqual(api_socket.stat().st_uid, self.drop_uid)
+        self.assertEqual(api_socket.stat().st_gid, self.drop_gid)
+        self.assertEqual(api_pid_file.stat().st_mode & 0o7777, 0o600)
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
         self.assertEqual(stopped.returncode, 0, stopped.stderr)
         self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
+        self.assertFalse(api_socket.exists())
+        self.assertFalse(api_pid_file.exists())
 
         run_lock = self.real_var / "run/run.lock"
         run_lock.mkdir(mode=0o700)
@@ -1998,6 +2728,203 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.shell(self.lifecycle_dir / "preuninst").returncode, 1)
         (run_lock / "pid").unlink()
         run_lock.rmdir()
+
+    def test_lifecycle_rejects_untracked_socket_and_unsafe_pid_artifacts(self) -> None:
+        api_socket = self.real_target / "ui/api.sock"
+        outside = self.root / "outside-api-marker"
+        outside.write_text("keep\n", encoding="utf-8")
+        api_socket.symlink_to(outside)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 2)
+        refused_socket = self.shell(self.lifecycle, "start")
+        self.assertEqual(refused_socket.returncode, 1, refused_socket.stderr)
+        self.assertIn("inconsistent lifecycle state", refused_socket.stdout)
+        self.assertTrue(api_socket.is_symlink())
+        self.assertEqual(outside.read_text(encoding="utf-8"), "keep\n")
+        api_socket.unlink()
+
+        api_pid_file = self.real_var / "run/api.pid"
+        api_pid_file.symlink_to(outside)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 2)
+        refused_pid = self.shell(self.lifecycle, "start")
+        self.assertEqual(refused_pid.returncode, 1, refused_pid.stderr)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "keep\n")
+        api_pid_file.unlink()
+
+        hardlink_source = self.real_var / "run/api-hardlink-source"
+        hardlink_source.write_text("2147483647\n", encoding="utf-8")
+        hardlink_source.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(hardlink_source, self.drop_uid, self.drop_gid)
+        os.link(hardlink_source, api_pid_file)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 2)
+        self.assertEqual(self.shell(self.lifecycle, "start").returncode, 1)
+        api_pid_file.unlink()
+        hardlink_source.unlink()
+
+        wrong_mode = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        wrong_mode.bind(str(api_socket))
+        wrong_mode.close()
+        api_socket.chmod(0o700)
+        if os.getuid() == 0:
+            os.chown(api_socket, self.drop_uid, self.drop_gid)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 2)
+        self.assertEqual(self.shell(self.lifecycle, "start").returncode, 1)
+        self.assertEqual(self.shell(self.lifecycle, "stop").returncode, 1)
+        self.assertTrue(stat.S_ISSOCK(api_socket.lstat().st_mode))
+        api_socket.unlink()
+
+        ui_directory = self.real_target / "ui"
+        ui_directory.chmod(0o2755)
+        try:
+            self.assertEqual(self.shell(self.lifecycle, "prestart").returncode, 150)
+            self.assertEqual(self.shell(self.lifecycle, "start").returncode, 1)
+        finally:
+            ui_directory.chmod(0o755)
+
+    def test_lifecycle_rejects_wrong_group_stale_socket(self) -> None:
+        if os.getuid() != 0:
+            self.skipTest("wrong socket group requires a privileged test runner")
+        api_socket = self.real_target / "ui/api.sock"
+        wrong_group = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        wrong_group.bind(str(api_socket))
+        wrong_group.close()
+        api_socket.chmod(0o660)
+        wrong_gid = 0 if self.drop_gid != 0 else 1
+        os.chown(api_socket, self.drop_uid, wrong_gid)
+        api_pid_file = self.real_var / "run/api.pid"
+        api_pid_file.write_text("2147483647\n", encoding="utf-8")
+        api_pid_file.chmod(0o600)
+        os.chown(api_pid_file, self.drop_uid, self.drop_gid)
+        try:
+            self.assertEqual(self.shell(self.lifecycle, "status").returncode, 2)
+            refused = self.shell(self.lifecycle, "start")
+            self.assertEqual(refused.returncode, 1, refused.stderr)
+            self.assertTrue(stat.S_ISSOCK(api_socket.lstat().st_mode))
+            self.assertEqual(self.shell(self.lifecycle, "stop").returncode, 1)
+            self.assertTrue(stat.S_ISSOCK(api_socket.lstat().st_mode))
+        finally:
+            api_socket.unlink(missing_ok=True)
+            api_pid_file.unlink(missing_ok=True)
+
+    def test_start_never_unlinks_a_live_listener_with_a_stale_pid(self) -> None:
+        api_socket = self.real_target / "ui/api.sock"
+        api_pid_file = self.real_var / "run/api.pid"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(api_socket))
+        listener.listen(4)
+        api_socket.chmod(0o660)
+        api_pid_file.write_text("2147483647\n", encoding="utf-8")
+        api_pid_file.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(api_socket, self.drop_uid, self.drop_gid)
+            os.chown(api_pid_file, self.drop_uid, self.drop_gid)
+        original = api_socket.lstat()
+        try:
+            self.assertEqual(self.shell(self.lifecycle, "status").returncode, 1)
+            refused = self.shell(self.lifecycle, "start", timeout=15)
+            self.assertEqual(refused.returncode, 1, (refused.stdout, refused.stderr))
+            self.assertIn("API service failed to start", refused.stdout)
+            current = api_socket.lstat()
+            self.assertEqual((current.st_dev, current.st_ino), (original.st_dev, original.st_ino))
+            self.assertFalse(api_pid_file.exists())
+            refused_stop = self.shell(self.lifecycle, "stop")
+            self.assertEqual(refused_stop.returncode, 1, refused_stop.stderr)
+            current = api_socket.lstat()
+            self.assertEqual((current.st_dev, current.st_ino), (original.st_dev, original.st_ino))
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(1)
+            client.connect(str(api_socket))
+            client.close()
+        finally:
+            listener.close()
+            api_socket.unlink(missing_ok=True)
+            api_pid_file.unlink(missing_ok=True)
+
+    def test_lifecycle_never_treats_same_binary_consumer_as_api_server(self) -> None:
+        request = self.root / "consumer-request.json"
+        response = self.root / "consumer-response.json"
+        request.write_text("{}\n", encoding="utf-8")
+        environment = self.environment.copy()
+        environment["SDSYNC_TEST_HOLD_CONSUMER"] = "true"
+        consumer = subprocess.Popen(
+            [str(self.real_target / "bin/sdsync-dsm-api"), "--consume-job", str(request), str(response)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            preexec_fn=(
+                (lambda: (os.setgroups([]), os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
+                if os.getuid() == 0
+                else None
+            ),
+        )
+        api_pid_file = self.real_var / "run/api.pid"
+        try:
+            time.sleep(0.1)
+            self.assertIsNone(consumer.poll(), "consumer fixture did not stay live")
+            api_pid_file.write_text(f"{consumer.pid}\n", encoding="utf-8")
+            api_pid_file.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(api_pid_file, self.drop_uid, self.drop_gid)
+            self.assertEqual(self.shell(self.lifecycle, "status").returncode, 2)
+            refused = self.shell(self.lifecycle, "stop")
+            self.assertEqual(refused.returncode, 1, refused.stderr)
+            self.assertIn("unverified API PID", refused.stdout)
+            self.assertIsNone(consumer.poll(), "non-serve same-binary process was signaled")
+        finally:
+            api_pid_file.unlink(missing_ok=True)
+            if consumer.poll() is None:
+                consumer.terminate()
+                consumer.wait(timeout=5)
+
+    def test_failed_controller_start_rolls_back_api_service(self) -> None:
+        controller = self.real_target / "libexec/sdsync-controller"
+        controller.chmod(0o644)
+        try:
+            failed = self.shell(self.lifecycle, "start", timeout=15)
+            self.assertEqual(failed.returncode, 1, failed.stderr)
+            self.assertIn("controller failed to start", failed.stdout)
+            self.assertFalse((self.real_var / "run/api.pid").exists())
+            self.assertFalse((self.real_target / "ui/api.sock").exists())
+            self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
+        finally:
+            controller.chmod(0o755)
+
+    def test_interrupted_start_cannot_leave_a_live_untracked_api(self) -> None:
+        environment = self.environment.copy()
+        environment["SDSYNC_TEST_API_START_DELAY"] = "1"
+        process = subprocess.Popen(
+            ["/bin/sh", str(self.lifecycle), "start"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+            preexec_fn=(
+                (lambda: (os.setgroups([]), os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
+                if os.getuid() == 0
+                else None
+            ),
+        )
+        api_pid_file = self.real_var / "run/api.pid"
+        try:
+            for _ in range(100):
+                if api_pid_file.is_file():
+                    break
+                if process.poll() is not None:
+                    break
+                time.sleep(0.02)
+            self.assertTrue(api_pid_file.is_file(), "API child never published its PID")
+            process.terminate()
+            stdout, stderr = process.communicate(timeout=15)
+            self.assertNotEqual(process.returncode, 0, (stdout, stderr))
+            self.assertFalse(api_pid_file.exists())
+            self.assertFalse((self.real_target / "ui/api.sock").exists())
+            self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
+            restarted = self.shell(self.lifecycle, "start", timeout=15)
+            self.assertEqual(restarted.returncode, 0, restarted.stderr)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
 
     def test_uninstall_cleanup_is_bounded_to_package_data(self) -> None:
         self.assertEqual(self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode, 0)

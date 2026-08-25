@@ -172,16 +172,26 @@ fi
 write_run_state running "$started" 0 -1 "$run_label" "$run_mode"
 append_activity run.started "$run_label" running "Package action started" 2>/dev/null || true
 scheduled_log=$log_root/scheduler.log
+# Do not start the core after TERM/INT/HUP was latched while preflight or state
+# publication was running. A signal after this check is covered again once the
+# direct child PID has been assigned below.
+[ "$termination_requested" = false ] || exit 143
 if [ "$run_output" = scheduled ]; then
     rotate_log "$scheduled_log" 10485760 5
     {
         printf '%s\n' "run_started epoch=$started mode=$run_mode scope=$run_label delete=$allow_delete"
-        "$@"
+        # Preserve the background child's PID as the core PID. POSIX does not
+        # require a shell to optimize the final command into an exec, and a
+        # wrapper PID would let TERM orphan the actual core process.
+        exec "$@"
     } >> "$scheduled_log" 2>&1 &
 else
     "$@" &
 fi
 core_pid=$!
+if [ "$termination_requested" = true ] && pid_is_live "$core_pid"; then
+    kill -TERM "$core_pid" 2>/dev/null || true
+fi
 # A trapped signal interrupts POSIX `wait` before a cooperatively shutting-down child necessarily
 # exits. Keep waiting so the run lock remains authoritative until the core process is actually
 # reaped. If the first wait already reaped it, a follow-up wait may return 127; retain the prior

@@ -22,7 +22,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "linux")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+};
+#[cfg(target_os = "linux")]
+use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -42,8 +49,10 @@ const PROCESSING_DIR: &str = "/var/packages/synology-drive-sync/var/control/proc
 const RESPONSES_DIR: &str = "/var/packages/synology-drive-sync/var/control/responses";
 const CSRF_KEY_PATH: &str = "/var/packages/synology-drive-sync/var/control/csrf.key";
 const ENQUEUE_LOCK_PATH: &str = "/var/packages/synology-drive-sync/var/control/enqueue.lock";
+const API_SOCKET_PATH: &str = "/var/packages/synology-drive-sync/target/ui/api.sock";
 const WEB_IDENTITY: &str = "http";
 const ADMINISTRATORS_GROUP: &str = "administrators";
+const RELAY_SCHEMA: &str = "sdsync.dsm-relay.v1";
 const CGI_ORIGIN_VARIABLES: &[&str] = &[
     "REQUEST_METHOD",
     "GATEWAY_INTERFACE",
@@ -53,10 +62,12 @@ const CGI_ORIGIN_VARIABLES: &[&str] = &[
     "HTTP_COOKIE",
     "HTTP_X_SYNO_TOKEN",
     "HTTP_X_SDSYNC_CSRF",
+    "HTTP_TRANSFER_ENCODING",
     "REMOTE_ADDR",
     "SERVER_ADDR",
     "SERVER_NAME",
     "SERVER_PORT",
+    "HTTPS",
     "SCRIPT_NAME",
     "SCRIPT_FILENAME",
     "DOCUMENT_ROOT",
@@ -77,6 +88,22 @@ const MAX_OUTSTANDING_JOBS: usize = 256;
 const CSRF_LIFETIME_SECONDS: u64 = 5 * 60;
 const CLOCK_SKEW_SECONDS: u64 = 30;
 const SERVER_JOB_ID_BYTES: usize = 24;
+const MAX_RELAY_REQUEST_BYTES: usize = 256 * 1024;
+const MAX_RELAY_RESPONSE_BYTES: usize = MAX_MANAGER_OUTPUT_BYTES + 2;
+#[cfg(target_os = "linux")]
+const RELAY_IO_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(target_os = "linux")]
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
+const AUTH_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
+const READ_MANAGER_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(target_os = "linux")]
+const MAX_HELPER_STDERR_BYTES: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
+const API_WORKER_COUNT: usize = 4;
+#[cfg(target_os = "linux")]
+const API_QUEUE_CAPACITY: usize = 16;
 
 type HmacSha256 = Hmac<Sha256>;
 type BridgeResult<T> = Result<T, BridgeError>;
@@ -162,6 +189,7 @@ struct IdentityState {
     executable_mode: u32,
 }
 
+#[derive(Clone)]
 struct CgiEnvironment {
     method: String,
     content_length: Option<String>,
@@ -228,6 +256,197 @@ struct AuthenticationInputs {
     server_name: Option<String>,
     server_port: Option<String>,
     https: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RelayRequestRef<'a> {
+    schema: &'static str,
+    method: &'a str,
+    content_length: Option<&'a str>,
+    content_type: Option<&'a str>,
+    query: &'a str,
+    cookie: &'a str,
+    synology_token_header: Option<&'a str>,
+    csrf_header: Option<&'a str>,
+    remote_address: Option<&'a str>,
+    server_address: Option<&'a str>,
+    server_name: Option<&'a str>,
+    server_port: Option<&'a str>,
+    https: Option<&'a str>,
+    transfer_encoding: Option<&'a str>,
+    body: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelayRequest {
+    schema: String,
+    method: String,
+    content_length: Option<String>,
+    content_type: Option<String>,
+    query: String,
+    cookie: String,
+    synology_token_header: Option<String>,
+    csrf_header: Option<String>,
+    remote_address: Option<String>,
+    server_address: Option<String>,
+    server_name: Option<String>,
+    server_port: Option<String>,
+    https: Option<String>,
+    transfer_encoding: Option<String>,
+    body: Option<String>,
+}
+
+impl RelayRequest {
+    fn environment(&self) -> CgiEnvironment {
+        CgiEnvironment {
+            method: self.method.clone(),
+            content_length: self.content_length.clone(),
+            content_type: self.content_type.clone(),
+            query: Zeroizing::new(self.query.clone()),
+            cookie: Zeroizing::new(self.cookie.clone()),
+            synology_token_header: self
+                .synology_token_header
+                .as_ref()
+                .map(|value| Zeroizing::new(value.clone())),
+            csrf_header: self
+                .csrf_header
+                .as_ref()
+                .map(|value| Zeroizing::new(value.clone())),
+            remote_address: self.remote_address.clone(),
+            server_address: self.server_address.clone(),
+            server_name: self.server_name.clone(),
+            server_port: self.server_port.clone(),
+            https: self.https.clone(),
+            transfer_encoding: self.transfer_encoding.clone(),
+        }
+    }
+
+    fn validate_fields(&self) -> BridgeResult<()> {
+        validate_environment_value(&self.method, 16)?;
+        validate_optional_environment_value(self.content_length.as_deref(), 32)?;
+        validate_optional_environment_value(self.content_type.as_deref(), 128)?;
+        validate_environment_value(&self.query, MAX_QUERY_BYTES)?;
+        validate_environment_value(&self.cookie, MAX_COOKIE_BYTES)?;
+        validate_optional_environment_value(
+            self.synology_token_header.as_deref(),
+            MAX_TOKEN_BYTES,
+        )?;
+        validate_optional_environment_value(self.csrf_header.as_deref(), MAX_CSRF_BYTES)?;
+        validate_optional_environment_value(self.remote_address.as_deref(), 128)?;
+        validate_optional_environment_value(self.server_address.as_deref(), 128)?;
+        validate_optional_environment_value(self.server_name.as_deref(), 255)?;
+        validate_optional_environment_value(self.server_port.as_deref(), 8)?;
+        validate_optional_environment_value(self.https.as_deref(), 16)?;
+        validate_optional_environment_value(self.transfer_encoding.as_deref(), 64)?;
+        if self
+            .body
+            .as_ref()
+            .is_some_and(|body| body.len() > MAX_POST_BODY_BYTES)
+        {
+            return Err(BridgeError::new(ErrorKind::PayloadTooLarge));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RelayRequest {
+    fn drop(&mut self) {
+        self.schema.zeroize();
+        self.method.zeroize();
+        self.content_length.zeroize();
+        self.content_type.zeroize();
+        self.query.zeroize();
+        self.cookie.zeroize();
+        self.synology_token_header.zeroize();
+        self.csrf_header.zeroize();
+        self.remote_address.zeroize();
+        self.server_address.zeroize();
+        self.server_name.zeroize();
+        self.server_port.zeroize();
+        self.https.zeroize();
+        self.transfer_encoding.zeroize();
+        self.body.zeroize();
+    }
+}
+
+impl fmt::Debug for RelayRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RelayRequest")
+            .field("schema", &self.schema)
+            .field("method", &self.method)
+            .field("content_length", &self.content_length)
+            .field("query", &"[redacted]")
+            .field("cookie", &"[redacted]")
+            .field("synology_token_header", &"[redacted]")
+            .field("csrf_header", &"[redacted]")
+            .field("body", &"[redacted]")
+            .finish()
+    }
+}
+
+fn encode_relay_request(
+    environment: &CgiEnvironment,
+    body: Option<&[u8]>,
+) -> BridgeResult<Zeroizing<Vec<u8>>> {
+    let body = body
+        .map(|bytes| std::str::from_utf8(bytes).map_err(|_| BridgeError::bad_request()))
+        .transpose()?;
+    let request = RelayRequestRef {
+        schema: RELAY_SCHEMA,
+        method: &environment.method,
+        content_length: environment.content_length.as_deref(),
+        content_type: environment.content_type.as_deref(),
+        query: &environment.query,
+        cookie: &environment.cookie,
+        synology_token_header: environment
+            .synology_token_header
+            .as_ref()
+            .map(|value| value.as_str()),
+        csrf_header: environment.csrf_header.as_ref().map(|value| value.as_str()),
+        remote_address: environment.remote_address.as_deref(),
+        server_address: environment.server_address.as_deref(),
+        server_name: environment.server_name.as_deref(),
+        server_port: environment.server_port.as_deref(),
+        https: environment.https.as_deref(),
+        transfer_encoding: environment.transfer_encoding.as_deref(),
+        body,
+    };
+    let encoded = serde_json::to_vec(&request).map_err(|_| BridgeError::internal())?;
+    if encoded.is_empty() || encoded.len() > MAX_RELAY_REQUEST_BYTES {
+        return Err(BridgeError::new(ErrorKind::PayloadTooLarge));
+    }
+    Ok(Zeroizing::new(encoded))
+}
+
+fn decode_relay_request(encoded: &[u8]) -> BridgeResult<RelayRequest> {
+    if encoded.is_empty() || encoded.len() > MAX_RELAY_REQUEST_BYTES {
+        return Err(BridgeError::new(ErrorKind::PayloadTooLarge));
+    }
+    let request =
+        serde_json::from_slice::<RelayRequest>(encoded).map_err(|_| BridgeError::bad_request())?;
+    if request.schema != RELAY_SCHEMA {
+        return Err(BridgeError::bad_request());
+    }
+    request.validate_fields()?;
+    Ok(request)
+}
+
+fn validate_relay_http_request(
+    relay: &RelayRequest,
+) -> BridgeResult<(ValidatedHttpRequest, Option<&[u8]>)> {
+    let request = validate_http_request(relay.environment())?;
+    let body = match (&request, relay.body.as_deref()) {
+        (ValidatedHttpRequest::Get { .. }, None) => None,
+        (ValidatedHttpRequest::Post { content_length, .. }, Some(body))
+            if body.len() == *content_length =>
+        {
+            Some(body.as_bytes())
+        }
+        _ => return Err(BridgeError::bad_request()),
+    };
+    Ok((request, body))
 }
 
 struct AuthenticatedSession {
@@ -674,6 +893,10 @@ fn validate_environment_value(value: &str, maximum: usize) -> BridgeResult<()> {
         return Err(BridgeError::bad_request());
     }
     Ok(())
+}
+
+fn validate_optional_environment_value(value: Option<&str>, maximum: usize) -> BridgeResult<()> {
+    value.map_or(Ok(()), |value| validate_environment_value(value, maximum))
 }
 
 fn validate_http_request(mut environment: CgiEnvironment) -> BridgeResult<ValidatedHttpRequest> {
@@ -1341,34 +1564,34 @@ fn valid_authenticated_username(value: &str) -> bool {
         })
 }
 
-fn validate_cgi_identity(state: &IdentityState, web_uid: u32) -> BridgeResult<()> {
+fn validate_cgi_identity(state: &IdentityState, web_uid: u32) -> BridgeResult<u32> {
+    let package_uid = state.executable_uid;
     let regular_file = state.executable_mode & 0o170_000 == 0o100_000;
-    if state.real_uid == 0
-        || state.effective_uid == 0
+    if web_uid == 0
+        || package_uid == 0
+        || web_uid == package_uid
         || state.real_uid != web_uid
-        || state.effective_uid == state.real_uid
-        || state.executable_uid != state.effective_uid
+        || state.effective_uid != web_uid
         || !regular_file
-        || state.executable_mode & 0o4000 == 0
-        || state.executable_mode & 0o022 != 0
+        || state.executable_mode & 0o7777 != 0o755
     {
         return Err(BridgeError::unsafe_runtime());
     }
-    Ok(())
+    Ok(package_uid)
 }
 
-fn validate_consumer_identity(state: &IdentityState) -> BridgeResult<()> {
+fn validate_package_identity(state: &IdentityState) -> BridgeResult<u32> {
+    let package_uid = state.executable_uid;
     let regular_file = state.executable_mode & 0o170_000 == 0o100_000;
-    if state.real_uid == 0
-        || state.real_uid != state.effective_uid
-        || state.executable_uid != state.effective_uid
+    if package_uid == 0
+        || state.real_uid != package_uid
+        || state.effective_uid != package_uid
         || !regular_file
-        || state.executable_mode & 0o6000 != 0
-        || state.executable_mode & 0o022 != 0
+        || state.executable_mode & 0o7777 != 0o755
     {
         return Err(BridgeError::unsafe_runtime());
     }
-    Ok(())
+    Ok(package_uid)
 }
 
 fn authorize_admin_membership(
@@ -1380,31 +1603,23 @@ fn authorize_admin_membership(
     if authenticated_uid == 0 {
         return Err(BridgeError::new(ErrorKind::Forbidden));
     }
-    if primary_gid != administrator_gid && !supplementary_groups.contains(&administrator_gid) {
+    if !identity_belongs_to_group(primary_gid, administrator_gid, supplementary_groups) {
         return Err(BridgeError::new(ErrorKind::Forbidden));
     }
     Ok(())
 }
 
-trait UidTransition {
-    fn set_all_uids(&self, uid: u32) -> io::Result<()>;
-    fn all_uids(&self) -> io::Result<(u32, u32, u32)>;
+fn identity_belongs_to_group(
+    primary_gid: u32,
+    required_gid: u32,
+    supplementary_groups: &[u32],
+) -> bool {
+    primary_gid == required_gid || supplementary_groups.contains(&required_gid)
 }
 
-fn permanently_drop_with(transition: &impl UidTransition, package_uid: u32) -> BridgeResult<()> {
-    if package_uid == 0 {
-        return Err(BridgeError::unsafe_runtime());
-    }
-    transition
-        .set_all_uids(package_uid)
-        .map_err(|_| BridgeError::unsafe_runtime())?;
-    let (real, effective, saved) = transition
-        .all_uids()
-        .map_err(|_| BridgeError::unsafe_runtime())?;
-    if real != package_uid || effective != package_uid || saved != package_uid {
-        return Err(BridgeError::unsafe_runtime());
-    }
-    Ok(())
+#[cfg(any(target_os = "linux", test))]
+fn trusted_executable_mode(mode: u32) -> bool {
+    mode & 0o170_000 == 0o100_000 && mode & 0o022 == 0 && mode & 0o6000 == 0 && mode & 0o111 != 0
 }
 
 fn parse_authentication_output(output: &[u8]) -> BridgeResult<String> {
@@ -1502,11 +1717,77 @@ fn update_length_prefixed(digest: &mut Sha256, value: &[u8]) {
     digest.update(value);
 }
 
+fn write_frame(writer: &mut impl Write, payload: &[u8], maximum: usize) -> BridgeResult<()> {
+    if payload.is_empty() || payload.len() > maximum || payload.len() > u32::MAX as usize {
+        return Err(BridgeError::new(ErrorKind::PayloadTooLarge));
+    }
+    writer
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .and_then(|()| writer.write_all(payload))
+        .and_then(|()| writer.flush())
+        .map_err(|_| BridgeError::new(ErrorKind::Unavailable))
+}
+
+fn read_single_frame(
+    reader: &mut impl Read,
+    maximum: usize,
+    malformed: ErrorKind,
+) -> BridgeResult<Zeroizing<Vec<u8>>> {
+    let mut header = [0_u8; 4];
+    reader
+        .read_exact(&mut header)
+        .map_err(|_| BridgeError::new(malformed))?;
+    let length = u32::from_be_bytes(header) as usize;
+    if length == 0 || length > maximum {
+        return Err(BridgeError::new(if length > maximum {
+            ErrorKind::PayloadTooLarge
+        } else {
+            malformed
+        }));
+    }
+    let mut payload = Zeroizing::new(vec![0_u8; length]);
+    reader
+        .read_exact(&mut payload)
+        .map_err(|_| BridgeError::new(malformed))?;
+    let mut trailing = [0_u8; 1];
+    match reader.read(&mut trailing) {
+        Ok(0) => Ok(payload),
+        Ok(_) | Err(_) => Err(BridgeError::new(malformed)),
+    }
+}
+
+fn encode_relay_response(response: &CgiResponse) -> BridgeResult<Zeroizing<Vec<u8>>> {
+    if response.body.is_empty() || response.body.len() > MAX_MANAGER_OUTPUT_BYTES {
+        return Err(BridgeError::new(ErrorKind::Unavailable));
+    }
+    let mut payload = Zeroizing::new(Vec::with_capacity(response.body.len() + 2));
+    payload.extend_from_slice(&response.status.to_be_bytes());
+    payload.extend_from_slice(&response.body);
+    Ok(payload)
+}
+
+fn decode_relay_response(payload: &[u8]) -> BridgeResult<CgiResponse> {
+    if payload.len() <= 2 || payload.len() > MAX_RELAY_RESPONSE_BYTES {
+        return Err(BridgeError::new(ErrorKind::Unavailable));
+    }
+    let status = u16::from_be_bytes([payload[0], payload[1]]);
+    if !matches!(
+        status,
+        200 | 202 | 400 | 401 | 403 | 405 | 409 | 410 | 413 | 415 | 500 | 503
+    ) || serde_json::from_slice::<Value>(&payload[2..]).is_err()
+    {
+        return Err(BridgeError::new(ErrorKind::Unavailable));
+    }
+    Ok(CgiResponse {
+        status,
+        body: payload[2..].to_vec(),
+    })
+}
+
 #[cfg(target_os = "linux")]
 mod linux_runtime {
     use super::*;
     use std::os::linux::fs::MetadataExt;
-    use std::os::unix::process::CommandExt;
     use std::ptr;
 
     pub(super) fn clear_environment() -> BridgeResult<()> {
@@ -1535,13 +1816,19 @@ mod linux_runtime {
         })
     }
 
-    pub(super) fn web_uid() -> BridgeResult<u32> {
-        lookup_user(WEB_IDENTITY).map(|entry| entry.0)
+    pub(super) fn web_identity() -> BridgeResult<(u32, u32)> {
+        let (web_uid, primary_gid) = lookup_user(WEB_IDENTITY)?;
+        let web_gid = lookup_group(WEB_IDENTITY)?;
+        let groups = lookup_groups(WEB_IDENTITY, primary_gid)?;
+        if web_uid == 0 || web_gid == 0 || !identity_belongs_to_group(primary_gid, web_gid, &groups)
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok((web_uid, web_gid))
     }
 
     pub(super) fn authenticate_and_authorize(
         inputs: &AuthenticationInputs,
-        state: &IdentityState,
     ) -> BridgeResult<AuthenticatedSession> {
         validate_trusted_executable(Path::new(AUTHENTICATE_PATH), 0)?;
         let mut command = Command::new(AUTHENTICATE_PATH);
@@ -1551,19 +1838,13 @@ mod linux_runtime {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let caller_uid = state.real_uid;
-        // SAFETY: pre_exec performs only the async-signal-safe setresuid call.
-        // The requested UID is the process's current real UID, so this is a
-        // permanent privilege drop in the authentication child.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::setresuid(caller_uid, caller_uid, caller_uid) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let output = capture_stdout(&mut command, MAX_AUTH_OUTPUT_BYTES)?;
+        let output = capture_bounded_command(
+            &mut command,
+            MAX_AUTH_OUTPUT_BYTES,
+            MAX_HELPER_STDERR_BYTES,
+            AUTH_HELPER_TIMEOUT,
+            None,
+        )?;
         if !output.status_success {
             return Err(BridgeError::new(ErrorKind::Unauthorized));
         }
@@ -1574,10 +1855,6 @@ mod linux_runtime {
         authorize_admin_membership(uid, primary_gid, administrator_gid, &groups)?;
         let binding = session_binding(&username, uid, &inputs.cookie, &inputs.synology_token);
         Ok(AuthenticatedSession { username, binding })
-    }
-
-    pub(super) fn permanently_drop_to_package_uid(package_uid: u32) -> BridgeResult<()> {
-        permanently_drop_with(&LibcUidTransition, package_uid)
     }
 
     pub(super) fn validate_package_manager() -> BridgeResult<()> {
@@ -1692,36 +1969,356 @@ mod linux_runtime {
 
     fn validate_trusted_executable(path: &Path, expected_uid: u32) -> BridgeResult<()> {
         let metadata = fs::symlink_metadata(path).map_err(|_| BridgeError::unsafe_runtime())?;
-        if !metadata.file_type().is_file()
-            || metadata.st_uid() != expected_uid
-            || metadata.st_mode() & 0o022 != 0
-            || metadata.st_mode() & 0o111 == 0
+        if metadata.st_uid() != expected_uid || !trusted_executable_mode(metadata.st_mode()) {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux_socket {
+    use super::*;
+    use std::mem;
+    use std::net::Shutdown;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::linux::fs::MetadataExt;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::Mutex;
+
+    static UMASK_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) struct PeerCredentials {
+        pub(super) pid: u32,
+        pub(super) uid: u32,
+        pub(super) gid: u32,
+    }
+
+    pub(super) fn peer_credentials(stream: &UnixStream) -> BridgeResult<PeerCredentials> {
+        // SAFETY: getsockopt writes at most the supplied ucred-sized buffer and
+        // receives a valid file descriptor owned by the live UnixStream.
+        unsafe {
+            let mut credentials = mem::zeroed::<libc::ucred>();
+            let mut length = mem::size_of::<libc::ucred>() as libc::socklen_t;
+            if libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut credentials as *mut libc::ucred).cast(),
+                &mut length,
+            ) != 0
+                || length as usize != mem::size_of::<libc::ucred>()
+            {
+                return Err(BridgeError::unsafe_runtime());
+            }
+            Ok(PeerCredentials {
+                pid: credentials
+                    .pid
+                    .try_into()
+                    .map_err(|_| BridgeError::unsafe_runtime())?,
+                uid: credentials.uid,
+                gid: credentials.gid,
+            })
+        }
+    }
+
+    pub(super) fn validate_peer_uid(actual: u32, expected: u32) -> BridgeResult<()> {
+        if actual == 0 || expected == 0 || actual != expected {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(())
+    }
+
+    pub(super) fn configure_stream(stream: &UnixStream) -> BridgeResult<()> {
+        stream
+            .set_read_timeout(Some(RELAY_IO_TIMEOUT))
+            .and_then(|()| stream.set_write_timeout(Some(RELAY_IO_TIMEOUT)))
+            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))
+    }
+
+    pub(super) fn connect(path: &Path, package_uid: u32, web_gid: u32) -> BridgeResult<UnixStream> {
+        let before = socket_metadata(path, package_uid, web_gid)?;
+        let stream = connect_with_timeout(path, RELAY_CONNECT_TIMEOUT)
+            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+        configure_stream(&stream)?;
+        let credentials = peer_credentials(&stream)?;
+        validate_peer_uid(credentials.uid, package_uid)?;
+        let after = socket_metadata(path, package_uid, web_gid)?;
+        if !same_object(&before, &after) {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(stream)
+    }
+
+    pub(super) fn bind(path: &Path, package_uid: u32, web_gid: u32) -> BridgeResult<UnixListener> {
+        validate_socket_parent(path, package_uid)?;
+        remove_stale_socket(path, package_uid, web_gid)?;
+        let listener = {
+            let _lock = UMASK_LOCK
+                .lock()
+                .map_err(|_| BridgeError::unsafe_runtime())?;
+            let _umask = UmaskGuard::replace(0o177);
+            UnixListener::bind(path).map_err(|_| BridgeError::new(ErrorKind::Unavailable))?
+        };
+        if let Err(error) = set_socket_contract(path, package_uid, web_gid) {
+            drop(listener);
+            remove_new_socket(path, package_uid);
+            return Err(error);
+        }
+        Ok(listener)
+    }
+
+    pub(super) fn shutdown_write(stream: &UnixStream) -> BridgeResult<()> {
+        stream
+            .shutdown(Shutdown::Write)
+            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))
+    }
+
+    fn validate_socket_parent(path: &Path, package_uid: u32) -> BridgeResult<()> {
+        let parent = path.parent().ok_or_else(BridgeError::unsafe_runtime)?;
+        let metadata = fs::symlink_metadata(parent).map_err(|_| BridgeError::unsafe_runtime())?;
+        if package_uid == 0
+            || !metadata.file_type().is_dir()
+            || metadata.st_uid() != package_uid
+            || metadata.st_mode() & 0o6022 != 0
         {
             return Err(BridgeError::unsafe_runtime());
         }
         Ok(())
     }
 
-    struct LibcUidTransition;
+    fn socket_metadata(path: &Path, package_uid: u32, web_gid: u32) -> BridgeResult<fs::Metadata> {
+        let metadata = fs::symlink_metadata(path).map_err(|_| BridgeError::unsafe_runtime())?;
+        if package_uid == 0
+            || web_gid == 0
+            || !metadata.file_type().is_socket()
+            || metadata.st_uid() != package_uid
+            || metadata.st_gid() != web_gid
+            || metadata.st_mode() & 0o7777 != 0o660
+            || metadata.st_nlink() != 1
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(metadata)
+    }
 
-    impl UidTransition for LibcUidTransition {
-        fn set_all_uids(&self, uid: u32) -> io::Result<()> {
-            // SAFETY: all requested IDs equal the current setuid effective or
-            // saved package UID; the kernel validates that invariant.
-            if unsafe { libc::setresuid(uid, uid, uid) } == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            }
+    fn remove_stale_socket(path: &Path, package_uid: u32, web_gid: u32) -> BridgeResult<()> {
+        let before = match fs::symlink_metadata(path) {
+            Ok(_) => stale_socket_metadata(path, package_uid, web_gid)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(BridgeError::unsafe_runtime()),
+        };
+        match connect_with_timeout(path, RELAY_CONNECT_TIMEOUT) {
+            Ok(_) => return Err(BridgeError::new(ErrorKind::Conflict)),
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(BridgeError::unsafe_runtime()),
+        }
+        let after = stale_socket_metadata(path, package_uid, web_gid)?;
+        if !same_object(&before, &after) {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        fs::remove_file(path).map_err(|_| BridgeError::unsafe_runtime())
+    }
+
+    fn connect_with_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+        let path_bytes = path.as_os_str().as_bytes();
+        // sockaddr_un paths are NUL-terminated. Abstract sockets are outside the
+        // fixed filesystem contract used by this bridge.
+        // SAFETY: zero is a valid initial representation for sockaddr_un.
+        let mut address = unsafe { mem::zeroed::<libc::sockaddr_un>() };
+        let address_capacity = address.sun_path.len();
+        if path_bytes.is_empty() || path_bytes.contains(&0) || path_bytes.len() >= address_capacity
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid Unix socket path",
+            ));
         }
 
-        fn all_uids(&self) -> io::Result<(u32, u32, u32)> {
-            let (mut real, mut effective, mut saved) = (0, 0, 0);
-            // SAFETY: getresuid writes to three valid local uid_t objects.
-            if unsafe { libc::getresuid(&mut real, &mut effective, &mut saved) } == 0 {
-                Ok((real, effective, saved))
+        // SAFETY: socket returns a new descriptor or a negative errno sentinel.
+        let descriptor = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: ownership of the newly-created descriptor moves to stream.
+        let stream = unsafe { UnixStream::from_raw_fd(descriptor) };
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (destination, source) in address.sun_path.iter_mut().zip(path_bytes) {
+            *destination = *source as libc::c_char;
+        }
+
+        // SAFETY: address is initialized, the descriptor is live, and the full
+        // Linux sockaddr_un size includes the terminating zero from initialization.
+        let connected = unsafe {
+            libc::connect(
+                stream.as_raw_fd(),
+                (&address as *const libc::sockaddr_un).cast(),
+                mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        if connected != 0 {
+            let error = io::Error::last_os_error();
+            if !matches!(
+                error.raw_os_error(),
+                Some(libc::EINPROGRESS | libc::EAGAIN | libc::EALREADY)
+            ) {
+                return Err(error);
+            }
+            wait_for_connect(&stream, timeout)?;
+        }
+        stream.set_nonblocking(false)?;
+        Ok(stream)
+    }
+
+    fn wait_for_connect(stream: &UnixStream, timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid timeout"))?;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Unix socket connect timed out",
+                ));
+            }
+            let remaining = deadline.duration_since(now);
+            let timeout_ms =
+                remaining.as_millis().max(1).min(libc::c_int::MAX as u128) as libc::c_int;
+            let mut descriptor = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: descriptor points to one initialized pollfd for this call.
+            let status = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+            if status == 0 {
+                continue;
+            }
+            if status < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            let mut socket_error: libc::c_int = 0;
+            let mut length = mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: getsockopt writes one c_int to the initialized output.
+            let status = unsafe {
+                libc::getsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    (&mut socket_error as *mut libc::c_int).cast(),
+                    &mut length,
+                )
+            };
+            if status != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if length as usize != mem::size_of::<libc::c_int>() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid SO_ERROR response",
+                ));
+            }
+            return if socket_error == 0 {
+                Ok(())
             } else {
-                Err(io::Error::last_os_error())
+                Err(io::Error::from_raw_os_error(socket_error))
+            };
+        }
+    }
+
+    fn set_socket_contract(path: &Path, package_uid: u32, web_gid: u32) -> BridgeResult<()> {
+        let path =
+            CString::new(path.as_os_str().as_bytes()).map_err(|_| BridgeError::unsafe_runtime())?;
+        // SAFETY: path is a live NUL-terminated path; uid_t::MAX means retain
+        // the current owner, while the package user may select its joined http
+        // supplementary group without elevated privilege.
+        if unsafe { libc::chown(path.as_ptr(), libc::uid_t::MAX, web_gid) } != 0 {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        fs::set_permissions(
+            Path::new(std::ffi::OsStr::from_bytes(path.as_bytes())),
+            fs::Permissions::from_mode(0o660),
+        )
+        .map_err(|_| BridgeError::unsafe_runtime())?;
+        socket_metadata(
+            Path::new(std::ffi::OsStr::from_bytes(path.as_bytes())),
+            package_uid,
+            web_gid,
+        )?;
+        Ok(())
+    }
+
+    fn remove_new_socket(path: &Path, package_uid: u32) {
+        if let Ok(metadata) = fs::symlink_metadata(path)
+            && metadata.file_type().is_socket()
+            && metadata.st_uid() == package_uid
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    fn stale_socket_metadata(
+        path: &Path,
+        package_uid: u32,
+        web_gid: u32,
+    ) -> BridgeResult<fs::Metadata> {
+        let metadata = fs::symlink_metadata(path).map_err(|_| BridgeError::unsafe_runtime())?;
+        let permission = metadata.st_mode() & 0o7777;
+        let is_restricted_bind = permission == 0o600;
+        let is_final_socket = permission == 0o660 && metadata.st_gid() == web_gid;
+        if package_uid == 0
+            || !metadata.file_type().is_socket()
+            || metadata.st_uid() != package_uid
+            || metadata.st_nlink() != 1
+            || (!is_restricted_bind && !is_final_socket)
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(metadata)
+    }
+
+    fn same_object(first: &fs::Metadata, second: &fs::Metadata) -> bool {
+        first.st_dev() == second.st_dev()
+            && first.st_ino() == second.st_ino()
+            && first.st_uid() == second.st_uid()
+            && first.st_gid() == second.st_gid()
+            && first.st_mode() == second.st_mode()
+            && first.st_nlink() == second.st_nlink()
+    }
+
+    struct UmaskGuard {
+        previous: libc::mode_t,
+    }
+
+    impl UmaskGuard {
+        fn replace(mode: libc::mode_t) -> Self {
+            // SAFETY: umask has no pointer arguments. The caller holds the
+            // module lock and production calls this before accepting clients.
+            let previous = unsafe { libc::umask(mode) };
+            Self { previous }
+        }
+    }
+
+    impl Drop for UmaskGuard {
+        fn drop(&mut self) {
+            // SAFETY: restoring the value returned by umask is always valid.
+            unsafe {
+                libc::umask(self.previous);
             }
         }
     }
@@ -1742,33 +2339,529 @@ mod linux_runtime {
 
 struct CapturedOutput {
     status_success: bool,
-    stdout: Vec<u8>,
+    stdout: Zeroizing<Vec<u8>>,
 }
 
-fn capture_stdout(command: &mut Command, maximum: usize) -> BridgeResult<CapturedOutput> {
-    let mut child = command
-        .spawn()
-        .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
-    let mut stdout = child.stdout.take().ok_or_else(BridgeError::internal)?;
-    let mut bytes = Vec::with_capacity(maximum.min(8192));
-    stdout
-        .by_ref()
-        .take((maximum + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
-    if bytes.len() > maximum {
+#[cfg(target_os = "linux")]
+fn capture_bounded_command(
+    command: &mut Command,
+    maximum_stdout: usize,
+    maximum_stderr: usize,
+    timeout: Duration,
+    input: Option<&[u8]>,
+) -> BridgeResult<CapturedOutput> {
+    linux_process::capture_bounded_command(command, maximum_stdout, maximum_stderr, timeout, input)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn capture_bounded_command(
+    _command: &mut Command,
+    _maximum_stdout: usize,
+    _maximum_stderr: usize,
+    _timeout: Duration,
+    _input: Option<&[u8]>,
+) -> BridgeResult<CapturedOutput> {
+    Err(BridgeError::unsafe_runtime())
+}
+
+#[cfg(target_os = "linux")]
+mod linux_process {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, ExitStatus};
+
+    const POLL_SLICE: Duration = Duration::from_millis(25);
+
+    pub(super) fn capture_bounded_command(
+        command: &mut Command,
+        maximum_stdout: usize,
+        maximum_stderr: usize,
+        timeout: Duration,
+        input: Option<&[u8]>,
+    ) -> BridgeResult<CapturedOutput> {
+        if maximum_stdout == 0
+            || maximum_stderr == 0
+            || timeout.is_zero()
+            || input.is_some_and(|value| value.len() > MAX_SECRET_BYTES)
+        {
+            return Err(BridgeError::new(ErrorKind::Unavailable));
+        }
+        command
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // SAFETY: setpgid is async-signal-safe and the callback performs no
+        // allocation or synchronization between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            });
+        }
+
+        let mut child = command
+            .spawn()
+            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+        match capture_child(&mut child, maximum_stdout, maximum_stderr, timeout, input) {
+            Ok(output) => Ok(output),
+            Err(error) => {
+                terminate_process_group(&mut child);
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) fn capture_queued_mutation_command(
+        command: &mut Command,
+        maximum_stdout: usize,
+        input: Option<&[u8]>,
+        termination_requested: &AtomicBool,
+    ) -> BridgeResult<CapturedOutput> {
+        if maximum_stdout == 0
+            || input.is_some_and(|value| value.len() > MAX_SECRET_BYTES)
+            || termination_requested.load(AtomicOrdering::Acquire)
+        {
+            return Err(BridgeError::new(ErrorKind::Unavailable));
+        }
+        command
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        // The manager and everything it starts remain in a dedicated process
+        // group. Normal queued work has no deadline, but consumer shutdown can
+        // therefore terminate the complete in-flight operation without relying
+        // on a runner lock that may not exist yet.
+        let consumer_pid = unsafe { libc::getpid() };
+        // SAFETY: setpgid, prctl, and getppid are async-signal-safe and the
+        // callback performs no allocation or synchronization between fork and
+        // exec. The parent comparison closes PR_SET_PDEATHSIG's setup race.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::getppid() != consumer_pid {
+                    return Err(io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
+
+        let mut child = command
+            .spawn()
+            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+        let process_group = match libc::pid_t::try_from(child.id()) {
+            Ok(process_group) => process_group,
+            Err(_) => {
+                terminate_process_group(&mut child);
+                return Err(BridgeError::new(ErrorKind::Unavailable));
+            }
+        };
+        match capture_queued_child(&mut child, maximum_stdout, input, termination_requested) {
+            Ok(output) => match process_group_exists(process_group) {
+                Ok(false) => Ok(output),
+                Ok(true) | Err(_) => {
+                    terminate_queued_process_group(&mut child, process_group, false);
+                    Err(BridgeError::new(ErrorKind::Unavailable))
+                }
+            },
+            Err(error) => {
+                let cooperative = termination_requested.load(AtomicOrdering::Acquire);
+                terminate_queued_process_group(&mut child, process_group, cooperative);
+                Err(error)
+            }
+        }
+    }
+
+    fn capture_queued_child(
+        child: &mut Child,
+        maximum_stdout: usize,
+        input: Option<&[u8]>,
+        termination_requested: &AtomicBool,
+    ) -> BridgeResult<CapturedOutput> {
+        let mut stdout = child.stdout.take().ok_or_else(BridgeError::internal)?;
+        let mut stdin = if input.is_some() {
+            Some(child.stdin.take().ok_or_else(BridgeError::internal)?)
+        } else {
+            None
+        };
+        set_nonblocking(stdout.as_raw_fd())?;
+        if let Some(writer) = &stdin {
+            set_nonblocking(writer.as_raw_fd())?;
+        }
+
+        let mut input_bytes = Zeroizing::new(Vec::new());
+        if let Some(input) = input {
+            input_bytes
+                .try_reserve_exact(input.len().saturating_add(1))
+                .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+            input_bytes.extend_from_slice(input);
+            input_bytes.push(b'\n');
+        }
+        let mut input_offset = 0_usize;
+        let mut stdout_bytes = Zeroizing::new(Vec::with_capacity(maximum_stdout.min(8192)));
+        let mut stdout_eof = false;
+
+        loop {
+            if termination_requested.load(AtomicOrdering::Acquire) {
+                return Err(BridgeError::new(ErrorKind::Unavailable));
+            }
+            stdout_eof |= drain_pipe(&mut stdout, &mut stdout_bytes, maximum_stdout)?;
+            write_input(&mut stdin, &input_bytes, &mut input_offset)?;
+
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?
+            {
+                stdout_eof |= drain_pipe(&mut stdout, &mut stdout_bytes, maximum_stdout)?;
+                if stdout_eof && input_offset == input_bytes.len() && stdin.is_none() {
+                    return completed_output(status, stdout_bytes);
+                }
+                return Err(BridgeError::new(ErrorKind::Unavailable));
+            }
+
+            poll_queued_io(&stdout, stdout_eof, stdin.as_ref())?;
+        }
+    }
+
+    fn capture_child(
+        child: &mut Child,
+        maximum_stdout: usize,
+        maximum_stderr: usize,
+        timeout: Duration,
+        input: Option<&[u8]>,
+    ) -> BridgeResult<CapturedOutput> {
+        let mut stdout = child.stdout.take().ok_or_else(BridgeError::internal)?;
+        let mut stderr = child.stderr.take().ok_or_else(BridgeError::internal)?;
+        let mut stdin = if input.is_some() {
+            Some(child.stdin.take().ok_or_else(BridgeError::internal)?)
+        } else {
+            None
+        };
+        set_nonblocking(stdout.as_raw_fd())?;
+        set_nonblocking(stderr.as_raw_fd())?;
+        if let Some(writer) = &stdin {
+            set_nonblocking(writer.as_raw_fd())?;
+        }
+
+        let mut input_bytes = Zeroizing::new(Vec::new());
+        if let Some(input) = input {
+            input_bytes
+                .try_reserve_exact(input.len().saturating_add(1))
+                .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+            input_bytes.extend_from_slice(input);
+            input_bytes.push(b'\n');
+        }
+        let mut input_offset = 0_usize;
+        let mut stdout_bytes = Zeroizing::new(Vec::with_capacity(maximum_stdout.min(8192)));
+        let mut stderr_bytes = Zeroizing::new(Vec::with_capacity(maximum_stderr.min(8192)));
+        let mut stdout_eof = false;
+        let mut stderr_eof = false;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+
+        loop {
+            stdout_eof |= drain_pipe(&mut stdout, &mut stdout_bytes, maximum_stdout)?;
+            stderr_eof |= drain_pipe(&mut stderr, &mut stderr_bytes, maximum_stderr)?;
+            write_input(&mut stdin, &input_bytes, &mut input_offset)?;
+
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?
+            {
+                // Recheck after observing exit so buffered bytes and ordinary
+                // pipe EOF cannot be mistaken for an inherited descriptor.
+                stdout_eof |= drain_pipe(&mut stdout, &mut stdout_bytes, maximum_stdout)?;
+                stderr_eof |= drain_pipe(&mut stderr, &mut stderr_bytes, maximum_stderr)?;
+                if stdout_eof && stderr_eof && input_offset == input_bytes.len() && stdin.is_none()
+                {
+                    return completed_output(status, stdout_bytes);
+                }
+                // A descendant retained a pipe, or the helper exited before it
+                // consumed the complete bounded input. Do not wait on either.
+                return Err(BridgeError::new(ErrorKind::Unavailable));
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(BridgeError::new(ErrorKind::Unavailable));
+            }
+            poll_child_io(
+                &stdout,
+                stdout_eof,
+                &stderr,
+                stderr_eof,
+                stdin.as_ref(),
+                deadline.duration_since(now).min(POLL_SLICE),
+            )?;
+        }
+    }
+
+    fn completed_output(
+        status: ExitStatus,
+        stdout: Zeroizing<Vec<u8>>,
+    ) -> BridgeResult<CapturedOutput> {
+        Ok(CapturedOutput {
+            status_success: status.success(),
+            stdout,
+        })
+    }
+
+    fn drain_pipe(
+        reader: &mut impl Read,
+        output: &mut Zeroizing<Vec<u8>>,
+        maximum: usize,
+    ) -> BridgeResult<bool> {
+        let mut chunk = Zeroizing::new([0_u8; 8192]);
+        loop {
+            match reader.read(&mut chunk[..]) {
+                Ok(0) => return Ok(true),
+                Ok(length) => {
+                    if length > maximum.saturating_sub(output.len()) {
+                        return Err(BridgeError::new(ErrorKind::Unavailable));
+                    }
+                    output.extend_from_slice(&chunk[..length]);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+                Err(_) => return Err(BridgeError::new(ErrorKind::Unavailable)),
+            }
+        }
+    }
+
+    fn write_input(
+        writer: &mut Option<ChildStdin>,
+        input: &[u8],
+        offset: &mut usize,
+    ) -> BridgeResult<()> {
+        while *offset < input.len() {
+            let Some(writer) = writer.as_mut() else {
+                return Err(BridgeError::new(ErrorKind::Unavailable));
+            };
+            match writer.write(&input[*offset..]) {
+                Ok(0) => return Err(BridgeError::new(ErrorKind::Unavailable)),
+                Ok(length) => *offset += length,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(_) => return Err(BridgeError::new(ErrorKind::Unavailable)),
+            }
+        }
+        if *offset == input.len() {
+            drop(writer.take());
+        }
+        Ok(())
+    }
+
+    fn poll_child_io(
+        stdout: &ChildStdout,
+        stdout_eof: bool,
+        stderr: &ChildStderr,
+        stderr_eof: bool,
+        stdin: Option<&ChildStdin>,
+        timeout: Duration,
+    ) -> BridgeResult<()> {
+        let mut descriptors = [
+            libc::pollfd {
+                fd: if stdout_eof { -1 } else { stdout.as_raw_fd() },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if stderr_eof { -1 } else { stderr.as_raw_fd() },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stdin.map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLOUT,
+                revents: 0,
+            },
+        ];
+        let timeout_ms = timeout.as_millis().max(1).min(libc::c_int::MAX as u128) as libc::c_int;
+        // SAFETY: descriptors is an initialized three-element pollfd array.
+        let status = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as libc::nfds_t,
+                timeout_ms,
+            )
+        };
+        if status < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(BridgeError::new(ErrorKind::Unavailable));
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_queued_io(
+        stdout: &ChildStdout,
+        stdout_eof: bool,
+        stdin: Option<&ChildStdin>,
+    ) -> BridgeResult<()> {
+        let mut descriptors = [
+            libc::pollfd {
+                fd: if stdout_eof { -1 } else { stdout.as_raw_fd() },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stdin.map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLOUT,
+                revents: 0,
+            },
+        ];
+        // There is deliberately no operation deadline. This short poll slice
+        // exists only so a controller signal is observed promptly.
+        let timeout_ms = POLL_SLICE.as_millis() as libc::c_int;
+        // SAFETY: descriptors is an initialized two-element pollfd array.
+        let status = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as libc::nfds_t,
+                timeout_ms,
+            )
+        };
+        if status < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(BridgeError::new(ErrorKind::Unavailable));
+            }
+        }
+        Ok(())
+    }
+
+    fn set_nonblocking(descriptor: libc::c_int) -> BridgeResult<()> {
+        // SAFETY: fcntl reads flags from a live pipe descriptor.
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(BridgeError::new(ErrorKind::Unavailable));
+        }
+        // SAFETY: fcntl updates flags on the same live descriptor.
+        if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(BridgeError::new(ErrorKind::Unavailable));
+        }
+        Ok(())
+    }
+
+    fn terminate_process_group(child: &mut Child) {
+        if let Ok(process_group) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: the child created this process group in pre_exec. SIGKILL
+            // is used only for the bounded helper and any pipe-holding children.
+            unsafe {
+                libc::kill(-process_group, libc::SIGKILL);
+            }
+        }
+        // Fall back to the direct child if the group disappeared or changed.
         let _ = child.kill();
         let _ = child.wait();
-        bytes.zeroize();
-        return Err(BridgeError::new(ErrorKind::Unavailable));
     }
-    let status = child
-        .wait()
-        .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
-    Ok(CapturedOutput {
-        status_success: status.success(),
-        stdout: bytes,
-    })
+
+    fn terminate_queued_process_group(
+        child: &mut Child,
+        process_group: libc::pid_t,
+        cooperative: bool,
+    ) {
+        let mut direct_reaped = matches!(child.try_wait(), Ok(Some(_)));
+        signal_process_group(
+            process_group,
+            if cooperative {
+                libc::SIGTERM
+            } else {
+                libc::SIGKILL
+            },
+        );
+
+        loop {
+            if !direct_reaped {
+                direct_reaped = matches!(child.try_wait(), Ok(Some(_)));
+            }
+            if direct_reaped {
+                reap_adopted_group_children(process_group);
+            }
+            if !process_group_exists(process_group).unwrap_or(true) {
+                if !direct_reaped {
+                    let _ = child.wait();
+                }
+                reap_adopted_group_children(process_group);
+                return;
+            }
+            if cooperative {
+                // Keep supervising without imposing an operation timeout or
+                // bypassing the manager's TERM cleanup. DSM's outer lifecycle
+                // timeout will fail closed if the group refuses to terminate.
+                signal_process_group(process_group, libc::SIGTERM);
+            } else {
+                signal_process_group(process_group, libc::SIGKILL);
+                let _ = child.kill();
+            }
+            std::thread::sleep(POLL_SLICE);
+        }
+    }
+
+    fn signal_process_group(process_group: libc::pid_t, signal: libc::c_int) {
+        // SAFETY: the queued child created this positive process group in
+        // pre_exec; a negative PID targets that complete group.
+        unsafe {
+            libc::kill(-process_group, signal);
+        }
+    }
+
+    fn process_group_exists(process_group: libc::pid_t) -> BridgeResult<bool> {
+        // SAFETY: signal zero performs a permission/liveness probe only.
+        if unsafe { libc::kill(-process_group, 0) } == 0 {
+            return Ok(true);
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Ok(false),
+            Some(libc::EPERM) => Ok(true),
+            _ => Err(BridgeError::new(ErrorKind::Unavailable)),
+        }
+    }
+
+    fn reap_adopted_group_children(process_group: libc::pid_t) {
+        loop {
+            let mut status = 0;
+            // SAFETY: the consumer is a child subreaper; negative waitpid
+            // reaps only adopted children from this manager process group.
+            let waited = unsafe { libc::waitpid(-process_group, &mut status, libc::WNOHANG) };
+            if waited <= 0 {
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn capture_queued_mutation_command(
+    command: &mut Command,
+    maximum_stdout: usize,
+    input: Option<&[u8]>,
+    termination_requested: &AtomicBool,
+) -> BridgeResult<CapturedOutput> {
+    linux_process::capture_queued_mutation_command(
+        command,
+        maximum_stdout,
+        input,
+        termination_requested,
+    )
 }
 
 fn issue_csrf_token(
@@ -2489,67 +3582,45 @@ fn generic_manager_result_value() -> Value {
     })
 }
 
-fn run_manager(
-    arguments: &[OsString],
-    mut secret: Option<&mut Zeroizing<Vec<u8>>>,
-) -> BridgeResult<CapturedOutput> {
-    #[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")]
+fn manager_command(arguments: &[OsString], has_secret_input: bool) -> BridgeResult<Command> {
     linux_runtime::validate_package_manager()?;
-    #[cfg(not(target_os = "linux"))]
-    return Err(BridgeError::unsafe_runtime());
-
     let mut command = Command::new(MANAGER_PATH);
     command
         .args(arguments)
         .env_clear()
-        .envs(manager_command_environment())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    if secret.is_some() {
-        command
-            .env("SDSYNC_DSM_EXACT_SECRET_INPUT", "true")
-            .stdin(Stdio::piped());
-    } else {
-        command.stdin(Stdio::null());
+        .envs(manager_command_environment());
+    if has_secret_input {
+        command.env("SDSYNC_DSM_EXACT_SECRET_INPUT", "true");
     }
+    Ok(command)
+}
 
-    let mut child = command
-        .spawn()
-        .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
-    if let Some(secret) = secret.as_mut() {
-        let mut stdin = child.stdin.take().ok_or_else(BridgeError::internal)?;
-        let write_result = stdin
-            .write_all(secret)
-            .and_then(|()| stdin.write_all(b"\n"))
-            .and_then(|()| stdin.flush());
-        drop(stdin);
-        if write_result.is_err() {
-            secret.zeroize();
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(BridgeError::new(ErrorKind::Unavailable));
-        }
-    }
-    let mut stdout = child.stdout.take().ok_or_else(BridgeError::internal)?;
-    let mut bytes = Vec::with_capacity(8192);
-    stdout
-        .by_ref()
-        .take((MAX_MANAGER_OUTPUT_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
-    if bytes.len() > MAX_MANAGER_OUTPUT_BYTES {
-        let _ = child.kill();
-        let _ = child.wait();
-        bytes.zeroize();
-        return Err(BridgeError::new(ErrorKind::Unavailable));
-    }
-    let status = child
-        .wait()
-        .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
-    Ok(CapturedOutput {
-        status_success: status.success(),
-        stdout: bytes,
-    })
+#[cfg(target_os = "linux")]
+fn run_read_manager(arguments: &[OsString]) -> BridgeResult<CapturedOutput> {
+    let mut command = manager_command(arguments, false)?;
+    capture_bounded_command(
+        &mut command,
+        MAX_MANAGER_OUTPUT_BYTES,
+        MAX_HELPER_STDERR_BYTES,
+        READ_MANAGER_TIMEOUT,
+        None,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn run_queued_mutation_manager(
+    arguments: &[OsString],
+    secret: Option<&[u8]>,
+    termination_requested: &AtomicBool,
+) -> BridgeResult<CapturedOutput> {
+    let mut command = manager_command(arguments, secret.is_some())?;
+    capture_queued_mutation_command(
+        &mut command,
+        MAX_MANAGER_OUTPUT_BYTES,
+        secret,
+        termination_requested,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -3117,6 +4188,11 @@ pub(crate) fn main_entry() -> ExitCode {
         } else {
             ExitCode::SUCCESS
         }
+    } else if arguments.len() == 1 && arguments[0] == "--serve" {
+        match run_server() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        }
     } else if arguments.len() == 3 && arguments[0] == "--consume-job" {
         let request = PathBuf::from(&arguments[1]);
         let response = PathBuf::from(&arguments[2]);
@@ -3141,83 +4217,238 @@ fn run_cgi() -> BridgeResult<CgiResponse> {
     {
         let environment = process_environment()?;
         let identity = linux_runtime::identity_state()?;
-        let web_uid = linux_runtime::web_uid()?;
-        validate_cgi_identity(&identity, web_uid)?;
-        let request = validate_http_request(environment)?;
-        linux_runtime::clear_environment()?;
-
-        let authentication = match &request {
-            ValidatedHttpRequest::Get { authentication, .. }
-            | ValidatedHttpRequest::Post { authentication, .. } => authentication,
+        let (web_uid, web_gid) = linux_runtime::web_identity()?;
+        let package_uid = validate_cgi_identity(&identity, web_uid)?;
+        let request = validate_http_request(environment.clone())?;
+        let body = match request {
+            ValidatedHttpRequest::Get { .. } => None,
+            ValidatedHttpRequest::Post { content_length, .. } => {
+                Some(read_exact_body(&mut io::stdin().lock(), content_length)?)
+            }
         };
-        let session = linux_runtime::authenticate_and_authorize(authentication, &identity)?;
-        // The parent CGI permanently adopts the package UID after DSM auth.
-        // Supplementary web groups cannot be cleared by a non-root setuid
-        // helper, so this process invokes only read-only manager API commands;
-        // every operation that can inspect a source is placed on the clean
-        // package controller's private queue instead.
-        linux_runtime::permanently_drop_to_package_uid(identity.effective_uid)?;
-        let now = current_epoch()?;
-        let control_paths = ControlPaths::production();
+        let encoded =
+            encode_relay_request(&environment, body.as_ref().map(|value| value.as_slice()))?;
+        linux_runtime::clear_environment()?;
+        let mut stream = linux_socket::connect(Path::new(API_SOCKET_PATH), package_uid, web_gid)?;
+        write_frame(&mut stream, &encoded, MAX_RELAY_REQUEST_BYTES)?;
+        linux_socket::shutdown_write(&stream)?;
+        let response = read_single_frame(
+            &mut stream,
+            MAX_RELAY_RESPONSE_BYTES,
+            ErrorKind::Unavailable,
+        )?;
+        decode_relay_response(&response)
+    }
+}
 
-        match request {
-            ValidatedHttpRequest::Get { action, .. } => match action {
-                ReadAction::Csrf => {
-                    let key = linux_files::load_or_create_csrf_key(
-                        &control_paths,
-                        identity.effective_uid,
-                    )?;
-                    let nonce = linux_files::random_nonce()?;
-                    let token = issue_csrf_token(&key[..], &session.binding, now, &nonce)?;
-                    let body = serde_json::to_vec(&json!({
-                        "schema": "sdsync.dsm-csrf.v1",
-                        "csrf_token": token,
-                        "expires_at_epoch": now + CSRF_LIFETIME_SECONDS,
-                    }))
-                    .map_err(|_| BridgeError::internal())?;
-                    Ok(CgiResponse::success(body))
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum DispatchError<T> {
+    Full(T),
+    Disconnected(T),
+}
+
+#[cfg(target_os = "linux")]
+struct BoundedWorkerPool<T> {
+    sender: Option<std::sync::mpsc::SyncSender<T>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl<T: Send + 'static> BoundedWorkerPool<T> {
+    fn start<F>(worker_count: usize, queue_capacity: usize, handler: F) -> BridgeResult<Self>
+    where
+        F: Fn(T) + Send + Sync + 'static,
+    {
+        if worker_count == 0 || queue_capacity == 0 {
+            return Err(BridgeError::new(ErrorKind::Unavailable));
+        }
+        let (sender, receiver) = std::sync::mpsc::sync_channel(queue_capacity);
+        let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
+        let handler = std::sync::Arc::new(handler);
+        let mut workers = Vec::with_capacity(worker_count);
+        for index in 0..worker_count {
+            let worker_receiver = std::sync::Arc::clone(&receiver);
+            let worker_handler = std::sync::Arc::clone(&handler);
+            let spawn_result = std::thread::Builder::new()
+                .name(format!("dsm-api-worker-{index}"))
+                .spawn(move || {
+                    loop {
+                        // Receiver is not Sync. The lock is held only while
+                        // selecting one bounded item, never while handling it.
+                        let item = match worker_receiver.lock() {
+                            Ok(receiver) => match receiver.recv() {
+                                Ok(item) => item,
+                                Err(_) => return,
+                            },
+                            Err(_) => return,
+                        };
+                        worker_handler(item);
+                    }
+                });
+            match spawn_result {
+                Ok(worker) => workers.push(worker),
+                Err(_) => {
+                    drop(sender);
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    return Err(BridgeError::new(ErrorKind::Unavailable));
                 }
-                ReadAction::Result { job_id } => execute_result_action(
-                    &control_paths,
-                    &job_id,
-                    &session.binding,
-                    identity.effective_uid,
-                    now,
-                ),
-                action => execute_read_action(&action),
-            },
-            ValidatedHttpRequest::Post {
-                content_length,
-                csrf_token,
-                ..
-            } => {
-                let key =
-                    linux_files::load_or_create_csrf_key(&control_paths, identity.effective_uid)?;
-                verify_csrf_token(&csrf_token, &key[..], &session.binding, now)?;
-                let body = read_exact_body(&mut io::stdin().lock(), content_length)?;
-                let parsed = parse_mutation_request(&body)?;
-                let job_id = linux_files::enqueue(
-                    &control_paths,
-                    EnqueueRequest {
-                        package_uid: identity.effective_uid,
-                        client_request_id: &parsed.request_id,
-                        requested_by: &session.username,
-                        session_binding: &session.binding,
-                        issued_at_epoch: now,
-                        mutation: &parsed.mutation,
-                        secret: parsed.secret.as_ref().map(|secret| secret.as_slice()),
-                    },
-                )?;
-                let response = serde_json::to_vec(&json!({
-                    "schema": "sdsync.dsm-queued.v1",
-                    "ok": true,
-                    "request_id": parsed.request_id,
-                    "job_id": job_id,
-                    "state": "queued",
+            }
+        }
+        Ok(Self {
+            sender: Some(sender),
+            workers,
+        })
+    }
+
+    fn try_dispatch(&self, item: T) -> Result<(), DispatchError<T>> {
+        let Some(sender) = &self.sender else {
+            return Err(DispatchError::Disconnected(item));
+        };
+        sender.try_send(item).map_err(|error| match error {
+            std::sync::mpsc::TrySendError::Full(item) => DispatchError::Full(item),
+            std::sync::mpsc::TrySendError::Disconnected(item) => DispatchError::Disconnected(item),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<T> Drop for BoundedWorkerPool<T> {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn run_server() -> BridgeResult<()> {
+    #[cfg(not(target_os = "linux"))]
+    return Err(BridgeError::unsafe_runtime());
+
+    #[cfg(target_os = "linux")]
+    {
+        if CGI_ORIGIN_VARIABLES
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let identity = linux_runtime::identity_state()?;
+        let package_uid = validate_package_identity(&identity)?;
+        let (web_uid, web_gid) = linux_runtime::web_identity()?;
+        if web_uid == 0 || web_uid == package_uid || web_gid == 0 {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        linux_runtime::clear_environment()?;
+        let listener = linux_socket::bind(Path::new(API_SOCKET_PATH), package_uid, web_gid)?;
+        let workers =
+            BoundedWorkerPool::start(API_WORKER_COUNT, API_QUEUE_CAPACITY, move |mut stream| {
+                let _ = serve_connection(&mut stream, package_uid, web_uid);
+            })?;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => match workers.try_dispatch(stream) {
+                    Ok(()) | Err(DispatchError::Full(_)) => {}
+                    Err(DispatchError::Disconnected(_)) => {
+                        return Err(BridgeError::new(ErrorKind::Unavailable));
+                    }
+                },
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return Err(BridgeError::new(ErrorKind::Unavailable)),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn serve_connection(
+    stream: &mut std::os::unix::net::UnixStream,
+    package_uid: u32,
+    web_uid: u32,
+) -> BridgeResult<()> {
+    linux_socket::configure_stream(stream)?;
+    let credentials = linux_socket::peer_credentials(stream)?;
+    linux_socket::validate_peer_uid(credentials.uid, web_uid)?;
+    let response = match read_single_frame(stream, MAX_RELAY_REQUEST_BYTES, ErrorKind::BadRequest) {
+        Ok(request) => {
+            handle_relay_request(&request, package_uid).unwrap_or_else(CgiResponse::error)
+        }
+        Err(error) => CgiResponse::error(error),
+    };
+    let encoded = encode_relay_response(&response)?;
+    write_frame(stream, &encoded, MAX_RELAY_RESPONSE_BYTES)?;
+    linux_socket::shutdown_write(stream)
+}
+
+#[cfg(target_os = "linux")]
+fn handle_relay_request(encoded: &[u8], package_uid: u32) -> BridgeResult<CgiResponse> {
+    let relay = decode_relay_request(encoded)?;
+    let (request, body) = validate_relay_http_request(&relay)?;
+    let authentication = match &request {
+        ValidatedHttpRequest::Get { authentication, .. }
+        | ValidatedHttpRequest::Post { authentication, .. } => authentication,
+    };
+    let session = linux_runtime::authenticate_and_authorize(authentication)?;
+    execute_authenticated_request(request, body, &session, package_uid, current_epoch()?)
+}
+
+#[cfg(target_os = "linux")]
+fn execute_authenticated_request(
+    request: ValidatedHttpRequest,
+    body: Option<&[u8]>,
+    session: &AuthenticatedSession,
+    package_uid: u32,
+    now: u64,
+) -> BridgeResult<CgiResponse> {
+    let control_paths = ControlPaths::production();
+    match request {
+        ValidatedHttpRequest::Get { action, .. } => match action {
+            ReadAction::Csrf => {
+                let key = linux_files::load_or_create_csrf_key(&control_paths, package_uid)?;
+                let nonce = linux_files::random_nonce()?;
+                let token = issue_csrf_token(&key[..], &session.binding, now, &nonce)?;
+                let body = serde_json::to_vec(&json!({
+                    "schema": "sdsync.dsm-csrf.v1",
+                    "csrf_token": token,
+                    "expires_at_epoch": now + CSRF_LIFETIME_SECONDS,
                 }))
                 .map_err(|_| BridgeError::internal())?;
-                Ok(CgiResponse::accepted(response))
+                Ok(CgiResponse::success(body))
             }
+            ReadAction::Result { job_id } => {
+                execute_result_action(&control_paths, &job_id, &session.binding, package_uid, now)
+            }
+            action => execute_read_action(&action),
+        },
+        ValidatedHttpRequest::Post { csrf_token, .. } => {
+            let key = linux_files::load_or_create_csrf_key(&control_paths, package_uid)?;
+            verify_csrf_token(&csrf_token, &key[..], &session.binding, now)?;
+            let body = body.ok_or_else(BridgeError::bad_request)?;
+            let parsed = parse_mutation_request(body)?;
+            let job_id = linux_files::enqueue(
+                &control_paths,
+                EnqueueRequest {
+                    package_uid,
+                    client_request_id: &parsed.request_id,
+                    requested_by: &session.username,
+                    session_binding: &session.binding,
+                    issued_at_epoch: now,
+                    mutation: &parsed.mutation,
+                    secret: parsed.secret.as_ref().map(|secret| secret.as_slice()),
+                },
+            )?;
+            let response = serde_json::to_vec(&json!({
+                "schema": "sdsync.dsm-queued.v1",
+                "ok": true,
+                "request_id": parsed.request_id,
+                "job_id": job_id,
+                "state": "queued",
+            }))
+            .map_err(|_| BridgeError::internal())?;
+            Ok(CgiResponse::accepted(response))
         }
     }
 }
@@ -3340,7 +4571,7 @@ fn queued_expired_response(job_id: &str) -> BridgeResult<CgiResponse> {
 #[cfg(target_os = "linux")]
 fn execute_read_action(action: &ReadAction) -> BridgeResult<CgiResponse> {
     let arguments = read_manager_arguments(action)?;
-    let output = run_manager(&arguments, None)?;
+    let output = run_read_manager(&arguments)?;
     if !output.status_success {
         return Err(BridgeError::new(ErrorKind::Unavailable));
     }
@@ -3361,21 +4592,30 @@ fn run_consumer(request: &Path, response: &Path) -> BridgeResult<()> {
             return Err(BridgeError::unsafe_runtime());
         }
         let identity = linux_runtime::identity_state()?;
-        validate_consumer_identity(&identity)?;
+        let package_uid = validate_package_identity(&identity)?;
         let request_id = validate_consumer_paths(request, response)?;
         linux_runtime::clear_environment()?;
+        enable_consumer_subreaper()?;
+        let termination_requested = install_consumer_termination_handler()?;
         let control_paths = ControlPaths::production();
 
         let response_result = (|| {
-            let job_bytes = linux_files::read_job(&control_paths, request, identity.effective_uid)?;
+            if termination_requested.load(AtomicOrdering::Acquire) {
+                return Err(BridgeError::new(ErrorKind::Unavailable));
+            }
+            let job_bytes = linux_files::read_job(&control_paths, request, package_uid)?;
             let job = parse_job(&job_bytes)?;
             let now = current_epoch()?;
             validate_job_freshness(job.issued_at_epoch, now)?;
             if job.request_id != request_id {
                 return Err(BridgeError::bad_request());
             }
-            let result = consume_job_inner(&control_paths, &job, identity.effective_uid)
-                .unwrap_or_else(|_| generic_manager_result_value());
+            let result =
+                consume_job_inner(&control_paths, &job, package_uid, &termination_requested)
+                    .unwrap_or_else(|_| generic_manager_result_value());
+            if termination_requested.load(AtomicOrdering::Acquire) {
+                return Err(BridgeError::new(ErrorKind::Unavailable));
+            }
             canonical_queued_response_bytes(&job, current_epoch()?, &result)
         })();
         linux_files::remove_claimed_secret(&control_paths, &request_id);
@@ -3384,10 +4624,36 @@ fn run_consumer(request: &Path, response: &Path) -> BridgeResult<()> {
             &control_paths,
             response,
             &request_id,
-            identity.effective_uid,
+            package_uid,
             &response_bytes,
         )
     }
+}
+
+#[cfg(target_os = "linux")]
+fn enable_consumer_subreaper() -> BridgeResult<()> {
+    // SAFETY: PR_SET_CHILD_SUBREAPER changes only this dedicated consumer
+    // process. It lets shutdown reap manager grandchildren before reporting
+    // the queued process group terminal.
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == 0 {
+        Ok(())
+    } else {
+        Err(BridgeError::new(ErrorKind::Unavailable))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_consumer_termination_handler() -> BridgeResult<Arc<AtomicBool>> {
+    let termination_requested = Arc::new(AtomicBool::new(false));
+    let handler_flag = Arc::clone(&termination_requested);
+    // A controller-spawned background process may inherit ignored terminal
+    // signals from its shell. This dedicated one-job process must own these
+    // dispositions so TERM/HUP/INT always become cooperative cancellation.
+    ctrlc::set_handler(move || {
+        handler_flag.store(true, AtomicOrdering::Release);
+    })
+    .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+    Ok(termination_requested)
 }
 
 #[cfg(target_os = "linux")]
@@ -3395,8 +4661,9 @@ fn consume_job_inner(
     paths: &ControlPaths<'_>,
     job: &ParsedJob,
     package_uid: u32,
+    termination_requested: &AtomicBool,
 ) -> BridgeResult<Value> {
-    let mut secret = match &job.mutation {
+    let secret = match &job.mutation {
         Mutation::SetSecret(arguments) if arguments.mode == SecretMode::Replace => {
             linux_files::read_claimed_secret(paths, &job.request_id, package_uid, true)?
         }
@@ -3410,7 +4677,11 @@ fn consume_job_inner(
         }
     };
     let arguments = mutation_manager_arguments(&job.mutation);
-    let output = run_manager(&arguments, secret.as_mut())?;
+    let output = run_queued_mutation_manager(
+        &arguments,
+        secret.as_ref().map(|value| value.as_slice()),
+        termination_requested,
+    )?;
     let result = parse_manager_result(
         &output.stdout,
         secret.as_ref().map(|secret| secret.as_slice()),
@@ -3459,8 +4730,9 @@ fn write_cgi_response(response: &CgiResponse) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
     use std::io::Cursor;
+    #[cfg(target_os = "linux")]
+    use std::os::linux::fs::MetadataExt;
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::{PermissionsExt, symlink};
     #[cfg(target_os = "linux")]
@@ -3646,6 +4918,366 @@ mod tests {
         assert_eq!(paths.responses, Path::new(RESPONSES_DIR));
         assert_eq!(paths.csrf_key, Path::new(CSRF_KEY_PATH));
         assert_eq!(paths.enqueue_lock, Path::new(ENQUEUE_LOCK_PATH));
+        assert_eq!(
+            Path::new(API_SOCKET_PATH),
+            Path::new(PACKAGE_ROOT).join("ui/api.sock")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unix_socket_peers_are_credential_checked_in_both_directions() {
+        use std::os::unix::net::UnixStream;
+
+        // SAFETY: these identity calls have no pointer arguments or preconditions.
+        let uid = unsafe { libc::geteuid() };
+        // SAFETY: these identity calls have no pointer arguments or preconditions.
+        let gid = unsafe { libc::getegid() };
+        if uid == 0 || gid == 0 {
+            return;
+        }
+        let (first, second) = UnixStream::pair().unwrap();
+        let first_peer = linux_socket::peer_credentials(&first).unwrap();
+        let second_peer = linux_socket::peer_credentials(&second).unwrap();
+        assert_eq!(first_peer.uid, uid);
+        assert_eq!(first_peer.gid, gid);
+        assert_eq!(second_peer.uid, uid);
+        linux_socket::validate_peer_uid(first_peer.uid, uid).unwrap();
+        let wrong_uid = uid.checked_add(1).unwrap_or(uid - 1);
+        assert!(linux_socket::validate_peer_uid(first_peer.uid, wrong_uid).is_err());
+
+        let fixture = TestControlFixture::new("socket-peer");
+        let socket = fixture.root.join("api.sock");
+        let listener = linux_socket::bind(&socket, uid, gid).unwrap();
+        let client = linux_socket::connect(&socket, uid, gid).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        assert_eq!(linux_socket::peer_credentials(&client).unwrap().uid, uid);
+        assert_eq!(linux_socket::peer_credentials(&server).unwrap().uid, uid);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_worker_pool_rejects_saturation_and_recovers() {
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+        let release_receiver = std::sync::Arc::new(std::sync::Mutex::new(release_receiver));
+        let worker_release = std::sync::Arc::clone(&release_receiver);
+        let workers = BoundedWorkerPool::start(1, 1, move |item| {
+            started_sender.send(item).unwrap();
+            worker_release.lock().unwrap().recv().unwrap();
+        })
+        .unwrap();
+
+        workers.try_dispatch(1_u8).unwrap();
+        assert_eq!(
+            started_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            1
+        );
+        workers.try_dispatch(2).unwrap();
+        assert!(matches!(
+            workers.try_dispatch(3),
+            Err(DispatchError::Full(3))
+        ));
+
+        release_sender.send(()).unwrap();
+        assert_eq!(
+            started_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            2
+        );
+        workers.try_dispatch(4).unwrap();
+        release_sender.send(()).unwrap();
+        assert_eq!(
+            started_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            4
+        );
+        release_sender.send(()).unwrap();
+        drop(workers);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_capture_bounds_input_output_and_stderr_without_leaking() {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "IFS= read -r value; printf '%s' \"$value\"; printf 'discarded' >&2",
+        ]);
+        let secret = Zeroizing::new(b"bounded-input".to_vec());
+        let output =
+            capture_bounded_command(&mut command, 64, 64, Duration::from_secs(2), Some(&secret))
+                .unwrap();
+        assert!(output.status_success);
+        assert_eq!(&output.stdout[..], b"bounded-input");
+
+        let oversized_input = Zeroizing::new(vec![b'x'; MAX_SECRET_BYTES + 1]);
+        let mut rejected_input = Command::new("/bin/true");
+        assert!(
+            capture_bounded_command(
+                &mut rejected_input,
+                64,
+                64,
+                Duration::from_secs(2),
+                Some(&oversized_input),
+            )
+            .is_err()
+        );
+
+        for script in ["printf 123456789", "printf 123456789 >&2"] {
+            let mut overflowing = Command::new("/bin/sh");
+            overflowing.args(["-c", script]);
+            let error =
+                match capture_bounded_command(&mut overflowing, 8, 8, Duration::from_secs(2), None)
+                {
+                    Err(error) => error,
+                    Ok(_) => panic!("oversized helper output was accepted"),
+                };
+            assert_eq!(error.kind, ErrorKind::Unavailable);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_capture_kills_hangs_and_pipe_holding_descendants_then_recovers() {
+        for script in ["sleep 5", "(sleep 5) & printf ok"] {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", script]);
+            let started = Instant::now();
+            let error = match capture_bounded_command(
+                &mut command,
+                64,
+                64,
+                Duration::from_millis(150),
+                None,
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("hung helper was accepted"),
+            };
+            assert_eq!(error.kind, ErrorKind::Unavailable);
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+
+        let mut recovery = Command::new("/bin/sh");
+        recovery.args(["-c", "printf recovered"]);
+        let output =
+            capture_bounded_command(&mut recovery, 64, 64, Duration::from_secs(2), None).unwrap();
+        assert!(output.status_success);
+        assert_eq!(&output.stdout[..], b"recovered");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn queued_mutation_capture_has_no_deadline_and_uses_an_isolated_group() {
+        // SAFETY: getpgrp has no pointer arguments or preconditions.
+        let existing_group = unsafe { libc::getpgrp() };
+        let termination_requested = AtomicBool::new(false);
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "IFS= read -r value; sleep 0.2; printf '%s|' \"$value\"; awk '{print $1, $5}' /proc/$$/stat",
+        ]);
+        let secret = Zeroizing::new(b"queued-secret".to_vec());
+        let started = Instant::now();
+        let output = capture_queued_mutation_command(
+            &mut command,
+            128,
+            Some(&secret),
+            &termination_requested,
+        )
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(output.status_success);
+        let text = std::str::from_utf8(&output.stdout).unwrap();
+        let (received_secret, identity) = text.split_once('|').unwrap();
+        assert_eq!(received_secret, "queued-secret");
+        let identity = identity
+            .split_ascii_whitespace()
+            .map(|value| value.parse::<libc::pid_t>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(identity.len(), 2);
+        assert_eq!(identity[0], identity[1]);
+        assert_ne!(identity[1], existing_group);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn queued_mutation_cancellation_kills_group_and_reaps_secret_helper() {
+        const CHILD_MODE: &str = "SDSYNC_TEST_QUEUED_SIGNAL_CHILD";
+        const PID_FILE: &str = "SDSYNC_TEST_QUEUED_SIGNAL_PIDS";
+        if std::env::var_os(CHILD_MODE).is_some() {
+            enable_consumer_subreaper().unwrap();
+            let termination_requested = install_consumer_termination_handler().unwrap();
+            let pid_file = PathBuf::from(std::env::var_os(PID_FILE).unwrap());
+            let mut command = Command::new("/bin/sh");
+            command.env("SDSYNC_TEST_PID_FILE", &pid_file).args([
+                "-c",
+                "trap 'wait \"$descendant\" 2>/dev/null || true; exit 143' TERM INT HUP; sleep 30 & descendant=$!; manager_group=$(awk '{print $5}' /proc/$$/stat); printf '%s %s %s\n' \"$$\" \"$manager_group\" \"$descendant\" > \"$SDSYNC_TEST_PID_FILE\"; wait \"$descendant\"",
+            ]);
+            // A maximum-sized secret plus the manager's newline exceeds a 4
+            // KiB pipe. TERM must remain observable even if this helper never
+            // reads the secret input.
+            let secret = Zeroizing::new(vec![b's'; MAX_SECRET_BYTES]);
+            let error = match capture_queued_mutation_command(
+                &mut command,
+                128,
+                Some(&secret),
+                termination_requested.as_ref(),
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("terminated queued helper was accepted"),
+            };
+            assert_eq!(error.kind, ErrorKind::Unavailable);
+            assert!(termination_requested.load(AtomicOrdering::Acquire));
+            let manager_pid = fs::read_to_string(&pid_file)
+                .unwrap()
+                .split_ascii_whitespace()
+                .next()
+                .unwrap()
+                .parse::<libc::pid_t>()
+                .unwrap();
+            let mut status = 0;
+            // SAFETY: the capture helper must already have reaped its direct
+            // manager before returning from cooperative cancellation.
+            assert_eq!(
+                unsafe { libc::waitpid(manager_pid, &mut status, libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+            return;
+        }
+
+        let fixture = TestControlFixture::new("queued-cancel");
+        let pid_file = fixture.root.join("manager-pids");
+        let test_binary = std::env::current_exe().unwrap();
+        let started = Instant::now();
+        let mut consumer = Command::new(test_binary)
+            .args([
+                "queued_mutation_cancellation_kills_group_and_reaps_secret_helper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_MODE, "true")
+            .env(PID_FILE, &pid_file)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let ready_deadline = Instant::now() + Duration::from_secs(3);
+        while !pid_file.is_file() && Instant::now() < ready_deadline {
+            assert!(
+                consumer.try_wait().unwrap().is_none(),
+                "consumer exited before ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(pid_file.is_file(), "queued manager did not become ready");
+
+        let identities = fs::read_to_string(&pid_file)
+            .unwrap()
+            .split_ascii_whitespace()
+            .map(|value| value.parse::<libc::pid_t>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(identities.len(), 3);
+        let manager_pid = identities[0];
+        let manager_group = identities[1];
+        let descendant_pid = identities[2];
+        assert_eq!(manager_pid, manager_group);
+
+        // SAFETY: the subprocess installed the production TERM/HUP/INT handler
+        // before publishing its manager PID file.
+        assert_eq!(
+            unsafe { libc::kill(consumer.id() as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+        let consumer_deadline = Instant::now() + Duration::from_secs(5);
+        let consumer_status = loop {
+            if let Some(status) = consumer.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < consumer_deadline,
+                "consumer did not finish cooperative process-group cleanup"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(consumer_status.success());
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let disappearance_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: signal zero only probes the recorded process identifiers.
+            let manager_gone = unsafe { libc::kill(manager_pid, 0) } == -1
+                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            // SAFETY: signal zero only probes the recorded process identifiers.
+            let descendant_gone = unsafe { libc::kill(descendant_pid, 0) } == -1
+                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            if manager_gone && descendant_gone {
+                break;
+            }
+            assert!(
+                Instant::now() < disappearance_deadline,
+                "queued manager process group survived cancellation"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unix_socket_bind_recovers_only_verified_stale_sockets_and_rejects_symlinks() {
+        // SAFETY: these identity calls have no pointer arguments or preconditions.
+        let uid = unsafe { libc::geteuid() };
+        // SAFETY: these identity calls have no pointer arguments or preconditions.
+        let gid = unsafe { libc::getegid() };
+        if uid == 0 || gid == 0 {
+            return;
+        }
+        let fixture = TestControlFixture::new("socket-stale");
+        let socket = fixture.root.join("api.sock");
+        let listener = linux_socket::bind(&socket, uid, gid).unwrap();
+        let metadata = fs::symlink_metadata(&socket).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o660);
+        assert_eq!(metadata.st_uid(), uid);
+        assert_eq!(metadata.st_gid(), gid);
+        assert_eq!(
+            linux_socket::bind(&socket, uid, gid).unwrap_err().kind,
+            ErrorKind::Conflict
+        );
+        drop(listener);
+
+        // This is the safe crash window after bind(2) under umask 0177 but
+        // before the final group/mode contract has been applied.
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        let recovered = linux_socket::bind(&socket, uid, gid).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&socket).unwrap().permissions().mode() & 0o7777,
+            0o660
+        );
+        drop(recovered);
+        fs::remove_file(&socket).unwrap();
+
+        let outside = fixture.root.join("outside");
+        fs::write(&outside, b"do not remove").unwrap();
+        symlink(&outside, &socket).unwrap();
+        assert_eq!(
+            linux_socket::bind(&socket, uid, gid).unwrap_err().kind,
+            ErrorKind::UnsafeRuntime
+        );
+        assert!(
+            fs::symlink_metadata(&socket)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"do not remove");
     }
 
     #[cfg(target_os = "linux")]
@@ -4148,6 +5780,131 @@ mod tests {
     }
 
     #[test]
+    fn relay_framing_is_length_prefixed_bounded_and_single_message() {
+        let payload = br#"{"schema":"sdsync.test.v1","secret":"socket-only"}"#;
+        let mut framed = Cursor::new(Vec::new());
+        write_frame(&mut framed, payload, payload.len()).unwrap();
+        assert_eq!(
+            &framed.get_ref()[..4],
+            &(payload.len() as u32).to_be_bytes()
+        );
+        framed.set_position(0);
+        assert_eq!(
+            read_single_frame(&mut framed, payload.len(), ErrorKind::BadRequest)
+                .unwrap()
+                .as_slice(),
+            payload
+        );
+
+        for malformed in [
+            vec![0, 0, 0],
+            vec![0, 0, 0, 4, b'a', b'b', b'c'],
+            vec![0, 0, 0, 1, b'a', b'b'],
+            vec![0, 0, 0, 0],
+        ] {
+            assert!(
+                read_single_frame(
+                    &mut Cursor::new(malformed),
+                    MAX_RELAY_REQUEST_BYTES,
+                    ErrorKind::BadRequest,
+                )
+                .is_err()
+            );
+        }
+        let oversized = ((MAX_RELAY_REQUEST_BYTES + 1) as u32)
+            .to_be_bytes()
+            .to_vec();
+        assert_eq!(
+            read_single_frame(
+                &mut Cursor::new(oversized),
+                MAX_RELAY_REQUEST_BYTES,
+                ErrorKind::BadRequest,
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::PayloadTooLarge
+        );
+        assert!(
+            write_frame(
+                &mut Cursor::new(Vec::new()),
+                &vec![0_u8; MAX_RELAY_REQUEST_BYTES + 1],
+                MAX_RELAY_REQUEST_BYTES,
+            )
+            .is_err()
+        );
+
+        let response = CgiResponse::accepted(br#"{"ok":true}"#.to_vec());
+        let encoded = encode_relay_response(&response).unwrap();
+        let decoded = decode_relay_response(&encoded).unwrap();
+        assert_eq!(decoded.status, 202);
+        assert_eq!(decoded.body, br#"{"ok":true}"#);
+        let mut invalid_status = encoded.to_vec();
+        invalid_status[..2].copy_from_slice(&201_u16.to_be_bytes());
+        assert!(decode_relay_response(&invalid_status).is_err());
+    }
+
+    #[test]
+    fn relay_reconstructs_and_revalidates_raw_http_fields_and_secret_body() {
+        let secret = "socket-secret-value";
+        let body = request(
+            "set-secret",
+            json!({"profile":"nightly","kind":"password","mode":"replace","value":secret}),
+        );
+        let environment = post_environment(body.len());
+        let encoded = encode_relay_request(&environment, Some(&body)).unwrap();
+        assert!(contains_bytes(&encoded, secret.as_bytes()));
+        let relay = decode_relay_request(&encoded).unwrap();
+        let debug = format!("{relay:?}");
+        for sensitive in [secret, "authenticated-session", "dsm-token", "csrf-token"] {
+            assert!(!debug.contains(sensitive));
+        }
+        let (validated, relayed_body) = validate_relay_http_request(&relay).unwrap();
+        assert!(matches!(validated, ValidatedHttpRequest::Post { .. }));
+        assert_eq!(relayed_body, Some(body.as_slice()));
+        let parsed = parse_mutation_request(relayed_body.unwrap()).unwrap();
+        assert_eq!(
+            parsed.secret.as_ref().map(|value| value.as_slice()),
+            Some(secret.as_bytes())
+        );
+
+        assert_eq!(
+            encode_relay_request(&post_environment(1), Some(&[0xff]))
+                .unwrap_err()
+                .kind,
+            ErrorKind::BadRequest
+        );
+
+        let mut oversized_field = decode_relay_request(&encoded).unwrap();
+        oversized_field.cookie = "x".repeat(MAX_COOKIE_BYTES + 1);
+        assert_eq!(
+            oversized_field.validate_fields().unwrap_err().kind,
+            ErrorKind::BadRequest
+        );
+        let mut control_field = decode_relay_request(&encoded).unwrap();
+        control_field.server_name = Some("nas\nforged".to_owned());
+        assert_eq!(
+            control_field.validate_fields().unwrap_err().kind,
+            ErrorKind::BadRequest
+        );
+        let mut length_mismatch = decode_relay_request(&encoded).unwrap();
+        length_mismatch.content_length = Some((body.len() + 1).to_string());
+        assert_eq!(
+            validate_relay_http_request(&length_mismatch)
+                .unwrap_err()
+                .kind,
+            ErrorKind::BadRequest
+        );
+
+        let mut unknown = serde_json::from_slice::<Value>(&encoded).unwrap();
+        unknown["unreviewed"] = json!(true);
+        let unknown = Zeroizing::new(serde_json::to_vec(&unknown).unwrap());
+        assert_eq!(
+            decode_relay_request(&unknown).unwrap_err().kind,
+            ErrorKind::BadRequest
+        );
+    }
+
+    #[test]
     fn url_decoder_rejects_duplicates_nul_and_malformed_escapes() {
         assert_eq!(percent_decode("a%2Fb+c").unwrap(), "a/b c");
         assert!(percent_decode("%0").is_err());
@@ -4182,22 +5939,39 @@ mod tests {
     }
 
     #[test]
-    fn cgi_identity_requires_non_root_http_real_uid_and_setuid_package_owner() {
+    fn named_group_membership_accepts_primary_or_supplementary_gid_only() {
+        assert!(identity_belongs_to_group(200, 200, &[]));
+        assert!(identity_belongs_to_group(100, 200, &[50, 200]));
+        assert!(!identity_belongs_to_group(100, 200, &[50, 300]));
+    }
+
+    #[test]
+    fn trusted_executable_mode_rejects_set_id_and_mutable_helpers() {
+        assert!(trusted_executable_mode(0o100_755));
+        for mode in [
+            0o100_4755, 0o100_2755, 0o100_6755, 0o100_775, 0o100_757, 0o040_755, 0o100_644,
+        ] {
+            assert!(!trusted_executable_mode(mode), "accepted mode {mode:o}");
+        }
+    }
+
+    #[test]
+    fn cgi_identity_derives_package_uid_from_plain_binary_owner() {
         let valid = IdentityState {
             real_uid: 1023,
-            effective_uid: 1060,
+            effective_uid: 1023,
             executable_uid: 1060,
-            executable_mode: 0o100_000 | 0o4755,
+            executable_mode: 0o100_000 | 0o755,
         };
-        assert!(validate_cgi_identity(&valid, 1023).is_ok());
+        assert_eq!(validate_cgi_identity(&valid, 1023).unwrap(), 1060);
         for invalid in [
             IdentityState {
                 real_uid: 0,
+                effective_uid: 0,
                 ..valid.clone()
             },
             IdentityState {
-                effective_uid: 0,
-                executable_uid: 0,
+                effective_uid: 1060,
                 ..valid.clone()
             },
             IdentityState {
@@ -4205,85 +5979,62 @@ mod tests {
                 ..valid.clone()
             },
             IdentityState {
-                executable_uid: 999,
+                executable_uid: 0,
                 ..valid.clone()
             },
             IdentityState {
-                executable_mode: 0o100_000 | 0o755,
+                executable_mode: 0o100_000 | 0o4755,
                 ..valid.clone()
             },
             IdentityState {
-                executable_mode: 0o100_000 | 0o4775,
+                executable_mode: 0o100_000 | 0o775,
                 ..valid.clone()
             },
         ] {
             assert!(validate_cgi_identity(&invalid, 1023).is_err());
         }
+        assert!(validate_cgi_identity(&valid, 1060).is_err());
     }
 
     #[test]
-    fn consumer_identity_requires_plain_package_owned_non_setuid_binary() {
+    fn server_and_consumer_derive_uid_from_plain_package_owned_binary() {
         let valid = IdentityState {
             real_uid: 1060,
             effective_uid: 1060,
             executable_uid: 1060,
             executable_mode: 0o100_000 | 0o755,
         };
-        assert!(validate_consumer_identity(&valid).is_ok());
+        assert_eq!(validate_package_identity(&valid).unwrap(), 1060);
         assert!(
-            validate_consumer_identity(&IdentityState {
+            validate_package_identity(&IdentityState {
                 executable_mode: 0o100_000 | 0o4755,
                 ..valid.clone()
             })
             .is_err()
         );
         assert!(
-            validate_consumer_identity(&IdentityState {
+            validate_package_identity(&IdentityState {
                 real_uid: 1023,
+                ..valid.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_package_identity(&IdentityState {
+                effective_uid: 1023,
+                ..valid.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_package_identity(&IdentityState {
+                real_uid: 0,
+                effective_uid: 0,
+                executable_uid: 0,
                 ..valid
             })
             .is_err()
         );
-    }
-
-    struct MockTransition {
-        requested: Cell<Option<u32>>,
-        reported: (u32, u32, u32),
-        fail_set: bool,
-    }
-
-    impl UidTransition for MockTransition {
-        fn set_all_uids(&self, uid: u32) -> io::Result<()> {
-            self.requested.set(Some(uid));
-            if self.fail_set {
-                Err(io::Error::new(io::ErrorKind::PermissionDenied, "mock"))
-            } else {
-                Ok(())
-            }
-        }
-
-        fn all_uids(&self) -> io::Result<(u32, u32, u32)> {
-            Ok(self.reported)
-        }
-    }
-
-    #[test]
-    fn privilege_drop_is_mockable_and_verifies_real_effective_and_saved_ids() {
-        let valid = MockTransition {
-            requested: Cell::new(None),
-            reported: (1060, 1060, 1060),
-            fail_set: false,
-        };
-        assert!(permanently_drop_with(&valid, 1060).is_ok());
-        assert_eq!(valid.requested.get(), Some(1060));
-
-        let incomplete = MockTransition {
-            requested: Cell::new(None),
-            reported: (1023, 1060, 1060),
-            fail_set: false,
-        };
-        assert!(permanently_drop_with(&incomplete, 1060).is_err());
-        assert!(permanently_drop_with(&valid, 0).is_err());
     }
 
     #[test]

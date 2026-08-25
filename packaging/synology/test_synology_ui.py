@@ -268,41 +268,69 @@ class DsmUiContractTests(unittest.TestCase):
                 script.replace(b"sdsync.dsm-result-status.v1", b"sdsync.dsm-unknown.v1"),
             )
         config = json.loads((UI / "config").read_text(encoding="utf-8"))
+        duplicate_all_users = json.dumps(config).encode().replace(
+            b'"allUsers": false',
+            b'"allUsers": true, "allUsers": false',
+            1,
+        )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "duplicate JSON key"):
+            validate_spk.validate_ui_config(duplicate_all_users)
         config[".url"]["com.supermarsx.SynologyDriveSync"]["allUsers"] = True
         with self.assertRaisesRegex(validate_spk.ValidationError, "allUsers"):
             validate_spk.validate_ui_config(json.dumps(config).encode())
         resource = json.loads((HERE / "conf/resource").read_text(encoding="utf-8"))
+        duplicate_resource = json.dumps(resource).encode().replace(
+            b'"texts_dir": "ui/texts"',
+            b'"texts_dir": "unsafe", "texts_dir": "ui/texts"',
+            1,
+        )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "duplicate JSON key"):
+            validate_spk.validate_resource(duplicate_resource)
         resource["sysnotify"]["app_privileges"][0]["categories"] = ["Unreviewed"]
         with self.assertRaisesRegex(validate_spk.ValidationError, "sysnotify"):
             validate_spk.validate_resource(json.dumps(resource).encode())
         privilege = json.loads((HERE / "conf/privilege").read_text(encoding="utf-8"))
-        cgi = next(entry for entry in privilege["tool"] if entry["relpath"] == "ui/api.cgi")
-        cgi["permission"] = "0755"
-        with self.assertRaisesRegex(validate_spk.ValidationError, "reviewed contract"):
-            validate_spk.validate_privilege(json.dumps(privilege).encode())
+        validate_spk.validate_privilege(json.dumps(privilege).encode())
+        duplicate_privilege = (
+            b'{"defaults":{"run-as":"root"},'
+            b'"defaults":{"run-as":"package"},"join-groupname":"http"}'
+        )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "duplicate JSON key"):
+            validate_spk.validate_privilege(duplicate_privilege)
 
         def privilege_model() -> dict[str, object]:
             return json.loads((HERE / "conf/privilege").read_text(encoding="utf-8"))
 
-        non_package = privilege_model()
-        non_package["ctrl-script"][0]["run-as"] = "nobody"  # type: ignore[index]
-        with self.assertRaisesRegex(validate_spk.ValidationError, "must run as package"):
-            validate_spk.validate_privilege(json.dumps(non_package).encode())
+        root_run = privilege_model()
+        root_run["defaults"] = {"run-as": "root"}
+        with self.assertRaisesRegex(validate_spk.ValidationError, "root identity"):
+            validate_spk.validate_privilege(json.dumps(root_run).encode())
 
-        duplicate = privilege_model()
-        duplicate["ctrl-script"].append(dict(duplicate["ctrl-script"][0]))  # type: ignore[index,union-attr]
-        with self.assertRaisesRegex(validate_spk.ValidationError, "duplicate lifecycle action"):
-            validate_spk.validate_privilege(json.dumps(duplicate).encode())
+        capabilities = privilege_model()
+        capabilities["capabilities"] = ["CAP_SETUID"]
+        with self.assertRaisesRegex(validate_spk.ValidationError, "Linux capabilities"):
+            validate_spk.validate_privilege(json.dumps(capabilities).encode())
 
-        extra_field = privilege_model()
-        extra_field["ctrl-script"][0]["user"] = "package"  # type: ignore[index]
-        with self.assertRaisesRegex(validate_spk.ValidationError, "only action and run-as"):
-            validate_spk.validate_privilege(json.dumps(extra_field).encode())
+        wrong_group = privilege_model()
+        wrong_group["join-groupname"] = "package"
+        with self.assertRaisesRegex(validate_spk.ValidationError, "rootless package/http"):
+            validate_spk.validate_privilege(json.dumps(wrong_group).encode())
 
-        missing_field = privilege_model()
-        del missing_field["ctrl-script"][0]["run-as"]  # type: ignore[index]
-        with self.assertRaisesRegex(validate_spk.ValidationError, "only action and run-as"):
-            validate_spk.validate_privilege(json.dumps(missing_field).encode())
+        setuid_tool = privilege_model()
+        setuid_tool["tool"] = [{
+            "relpath": "ui/api.cgi", "user": "package", "group": "package",
+            "permission": "4755",
+        }]
+        with self.assertRaisesRegex(validate_spk.ValidationError, "setuid/setgid"):
+            validate_spk.validate_privilege(json.dumps(setuid_tool).encode())
+
+        ordinary_tool = privilege_model()
+        ordinary_tool["tool"] = [{
+            "relpath": "ui/api.cgi", "user": "package", "group": "package",
+            "permission": "0755",
+        }]
+        with self.assertRaisesRegex(validate_spk.ValidationError, "rootless package/http"):
+            validate_spk.validate_privilege(json.dumps(ordinary_tool).encode())
 
     @staticmethod
     def _alpha_bounds(payload: bytes, size: int) -> tuple[int, int, int, int]:

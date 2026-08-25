@@ -88,8 +88,14 @@ def arguments() -> argparse.Namespace:
 
 
 def safe_members(archive: tarfile.TarFile, label: str) -> dict[str, tarfile.TarInfo]:
+    if archive.pax_headers:
+        raise ValidationError(f"{label} contains unsupported global PAX headers")
     members: dict[str, tarfile.TarInfo] = {}
     for member in archive.getmembers():
+        if member.pax_headers:
+            raise ValidationError(
+                f"{label} contains unsupported member PAX headers: {member.name}"
+            )
         path = PurePosixPath(member.name)
         if path.is_absolute() or ".." in path.parts or member.name in ("", "."):
             raise ValidationError(f"{label} contains unsafe path {member.name!r}")
@@ -105,6 +111,18 @@ def safe_members(archive: tarfile.TarFile, label: str) -> dict[str, tarfile.TarI
             raise ValidationError(f"{label} contains setuid/setgid archive member: {member.name}")
         members[member.name] = member
     return members
+
+
+def load_unique_json(payload: bytes, label: str) -> object:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValidationError(f"{label} contains duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    return json.loads(payload, object_pairs_hook=unique_object)
 
 
 def member_bytes(archive: tarfile.TarFile, member: tarfile.TarInfo) -> bytes:
@@ -167,7 +185,7 @@ def png_dimensions(payload: bytes) -> tuple[int, int]:
 
 
 def validate_resource(payload: bytes) -> None:
-    model = json.loads(payload)
+    model = load_unique_json(payload, "conf/resource")
     expected = {
         "sysnotify": {
             "texts_dir": "ui/texts",
@@ -184,7 +202,9 @@ def validate_resource(payload: bytes) -> None:
 
 
 def validate_ui_config(payload: bytes) -> None:
-    model = json.loads(payload)
+    model = load_unique_json(payload, "ui/config")
+    if not isinstance(model, dict):
+        raise ValidationError("ui/config must be a JSON object")
     applications = model.get(".url")
     if not isinstance(applications, dict) or set(applications) != {APP_ID}:
         raise ValidationError("ui/config must register exactly the DSM application id")
@@ -313,67 +333,47 @@ def validate_ui_static(index_payload: bytes, css_payload: bytes, script_payload:
 
 
 def validate_privilege(payload: bytes) -> None:
-    model = json.loads(payload)
-    if model.get("defaults", {}).get("run-as") != "package":
-        raise ValidationError("conf/privilege must default to run-as package")
-    forbidden = json.dumps(model)
-    if '"root"' in forbidden or "capabilities" in forbidden:
-        raise ValidationError("conf/privilege requests root or Linux capabilities")
+    model = load_unique_json(payload, "conf/privilege")
+    if not isinstance(model, dict):
+        raise ValidationError("conf/privilege must be a JSON object")
+
+    def reject_elevation(value: object) -> None:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if "capabilit" in str(key).lower():
+                    raise ValidationError("conf/privilege requests Linux capabilities")
+                reject_elevation(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                reject_elevation(nested)
+        elif isinstance(value, str) and value.lower() == "root":
+            raise ValidationError("conf/privilege requests the root identity")
+
+    reject_elevation(model)
+
+    # Fail a setid request with a specific error even though the rootless
+    # contract below does not allow a tool stanza at all. This keeps tampered
+    # manifests from being mistaken for harmless schema drift.
+    tools = model.get("tool", [])
+    if isinstance(tools, list):
+        for entry in tools:
+            if not isinstance(entry, dict):
+                continue
+            permission = entry.get("permission")
+            if isinstance(permission, str) and re.fullmatch(r"[0-7]{4}", permission):
+                if int(permission, 8) & 0o6000:
+                    raise ValidationError(
+                        "conf/privilege tool permission requests setuid/setgid bits"
+                    )
+
     expected = {
-        "preinst", "postinst", "preuninst", "postuninst", "preupgrade",
-        "postupgrade", "prestart", "start", "prestop", "stop", "status",
+        "defaults": {"run-as": "package"},
+        "join-groupname": "http",
     }
-    control_scripts = model.get("ctrl-script")
-    if not isinstance(control_scripts, list):
-        raise ValidationError("conf/privilege must declare lifecycle actions as a list")
-    actions: set[str] = set()
-    for entry in control_scripts:
-        if not isinstance(entry, dict) or set(entry) != {"action", "run-as"}:
-            raise ValidationError(
-                "conf/privilege lifecycle entries must use only action and run-as"
-            )
-        action = entry.get("action")
-        if not isinstance(action, str) or action not in expected:
-            raise ValidationError("conf/privilege contains an invalid lifecycle action")
-        if action in actions:
-            raise ValidationError("conf/privilege contains a duplicate lifecycle action")
-        if entry.get("run-as") != "package":
-            raise ValidationError("conf/privilege lifecycle actions must run as package")
-        actions.add(action)
-    if actions != expected:
-        raise ValidationError("conf/privilege does not explicitly cover every lifecycle action")
-    tools = model.get("tool")
-    if not isinstance(tools, list):
-        raise ValidationError("conf/privilege must declare package-owned tools")
-    tool_contract: dict[str, str] = {}
-    for entry in tools:
-        if not isinstance(entry, dict) or set(entry) != {"relpath", "user", "group", "permission"}:
-            raise ValidationError("conf/privilege tool entries must use the reviewed fields")
-        path = entry.get("relpath")
-        if not isinstance(path, str) or path in tool_contract:
-            raise ValidationError("conf/privilege contains an invalid or duplicate tool path")
-        if entry.get("user") != "package" or entry.get("group") != "package":
-            raise ValidationError("conf/privilege tools must remain package-owned")
-        permission = entry.get("permission")
-        if not isinstance(permission, str) or not re.fullmatch(r"[0-7]{4}", permission):
-            raise ValidationError("conf/privilege contains an invalid tool mode")
-        mode = int(permission, 8)
-        if mode & 0o022:
-            raise ValidationError("conf/privilege tool is group/world writable")
-        if mode & 0o6000 and path != "ui/api.cgi":
-            raise ValidationError("only the authenticated CGI bridge may be setuid/setgid")
-        tool_contract[path] = permission
-    expected_tools = {
-        "bin/synology-drive-sync": "0755",
-        "bin/sdsync-dsm": "0755",
-        "bin/sdsync-dsm-api": "0755",
-        "libexec/sdsync-common": "0755",
-        "libexec/sdsync-controller": "0755",
-        "libexec/sdsync-run": "0755",
-        "ui/api.cgi": "4755",
-    }
-    if tool_contract != expected_tools:
-        raise ValidationError("conf/privilege tool ownership/modes do not match the reviewed contract")
+    if model != expected:
+        raise ValidationError(
+            "conf/privilege must use the reviewed rootless package/http contract"
+        )
 
 
 def validate_source() -> None:
