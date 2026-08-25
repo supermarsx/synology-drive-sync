@@ -1,38 +1,55 @@
 # Dashboard security model
 
 The DSM page is an administrative control plane over a package identity that can read explicitly
-granted source shares and authenticate to remote NAS accounts. Its bridge is intentionally narrow:
-it authenticates every request, returns no stored secret, validates an exact schema, and sends
-mutations through a private controller queue rather than running sync work inside CGI.
+granted source shares and authenticate to remote NAS accounts. Its web entry point is intentionally
+narrow: an ordinary CGI relays one bounded request over a fixed Unix socket, while a package-user
+API service authenticates and authorizes the request, returns no stored secret, validates an exact
+schema, and sends mutations through a private controller queue instead of running sync work in CGI.
 
-## Installed privilege boundary
+## Installed privilege and socket boundary
 
-The package uses `run-as: package` for lifecycle scripts and ordinary tools. It requests no root
-execution and no Linux capabilities.
+The package requests no root execution, Linux capability, set-user-ID bit, or set-group-ID bit. Its
+entire `conf/privilege` contract is:
 
-| Installed path | Owner | Mode | Purpose |
+```json
+{
+  "defaults": {
+    "run-as": "package"
+  },
+  "join-groupname": "http"
+}
+```
+
+The default makes lifecycle scripts and services run as the actual DSM package identity. DSM may
+collision-rename its NSS username, so neither the security boundary nor the documentation assumes a
+literal account name. Joining DSM's `http` group lets that non-root service create the one socket
+shared with DSM's web identity. There is no `tool`, per-action root override, or capability declaration.
+
+| Installed path | Owner | Mode | Runtime identity and purpose |
 | --- | --- | ---: | --- |
-| `bin/synology-drive-sync` | package | `0755` | Static sync engine |
-| `bin/sdsync-dsm` | package | `0755` | Shell control-plane manager |
-| `bin/sdsync-dsm-api` | package | `0755` | Non-setuid private job consumer used by the controller |
-| `ui/api.cgi` | package | `4755` | Same compiled helper bytes, setuid only to the non-root package user |
+| `bin/synology-drive-sync` | package | `0755` | Package-user sync engine |
+| `bin/sdsync-dsm` | package | `0755` | Package-user shell control-plane manager |
+| `bin/sdsync-dsm-api` | package | `0755` | Package-user API service and private job consumer |
+| `ui/api.cgi` | package | `0755` | DSM `http` CGI process; bounded socket relay only |
+| `ui/api.sock` | package:`http` | `0660` | Fixed API-service Unix socket; never configurable |
 
-No other package file may be setuid/setgid or group/world-writable. The general CLI is never setuid.
-The CGI's setuid bit does not grant root; it changes the effective identity from DSM's web user to
-the non-root package user so private package state can be reached after authentication.
+The CGI and service are byte-identical copies of the compiled helper, but their arguments and
+runtime identities select different modes. The CGI must have real and effective UID `http`; it does
+not change identity and cannot read package-private state. The long-lived `--serve` process must have
+real and effective UID equal to the package executable's owner. The server creates `ui/api.sock` under a
+package-owned directory that is not group/other-writable, assigns the socket group `http`, and
+requires exact mode `0660` and one link.
 
-That table describes the installed state, not the distributable tar metadata. Every member of the
-outer SPK and inner `package.tgz`, including `ui/api.cgi`, is archived without setuid/setgid bits;
-the CGI enters `package.tgz` as ordinary `0755`. During installation DSM reads `conf/privilege`,
-assigns `ui/api.cgi` to user/group `package`, and only then applies `4755`. This prevents Package
-Center's pre-install scan from seeing a root-owned setuid archive entry while preserving the narrow
-installed web-user-to-package-user bridge. The manifest contains no root run-as request or Linux
-capability.
+Both peers authenticate the local transport. The CGI validates the socket owner/group/mode and the
+server's kernel-reported peer UID as the package user. The server accepts only a kernel-reported peer
+UID matching DSM `http`. A symlink, wrong owner/group/mode, additional hard link, wrong peer, unsafe
+parent, or missing socket fails closed.
 
 DSM's official [privilege configuration](https://help.synology.com/developer-guide/privilege/privilege_config.html)
-defines package ownership and four-digit tool modes. The SPK validator enforces the exact reviewed
-list, rejects any setuid/setgid archive member, requires the package-owned installed CGI declaration,
-and rejects mode, ownership, identity, or byte mismatches between the two helper copies.
+defines package ownership and joined groups. The builder stores every executable as ordinary `0755`.
+The validator enforces the exact two-key manifest above, rejects any archive set-user-ID/set-group-ID
+member or privilege-bearing tool/capability declaration, and rejects mode, ownership, identity, or
+byte mismatches between the two helper copies.
 
 ## Launch token and referrer handling
 
@@ -57,20 +74,23 @@ Every API request goes through these checks:
 
 1. CGI environment values, query, cookie, content length, content type, method, and headers are
    copied into bounded Rust-owned buffers.
-2. The executable verifies that it is a regular, package-owned setuid file, invoked with DSM's web
-   UID as the real user, not root, and not group/world-writable.
-3. A non-empty DSM session cookie and matching query/header SynoToken are required.
-4. The bridge executes DSM's root-owned
-   `/usr/syno/synoman/webman/modules/authenticate.cgi` in a child permanently dropped to the web UID,
-   forwarding only the bounded authentication environment DSM expects.
-5. The returned username is validated and looked up through DSM's account database.
-6. Root is rejected, and independent membership in the DSM `administrators` group is required even
+2. The CGI verifies that it is a regular package-owned file with exact mode `0755`, that both its
+   real and effective UID equal DSM `http`, and that neither web nor package UID is root.
+3. It clears its environment and sends one length-bounded frame to the fixed `package:http` `0660`
+   socket after validating the socket and server peer identity.
+4. The package-user server validates the CGI peer UID, decodes one strict relay schema, and repeats
+   method, query, header, body, cookie, and SynoToken validation.
+5. The server executes DSM's root-owned
+   `/usr/syno/synoman/webman/modules/authenticate.cgi` as the package user with only the bounded
+   authentication environment DSM expects.
+6. The returned username is validated and looked up through DSM's account database.
+7. Root is rejected, and independent membership in the DSM `administrators` group is required even
    though the desktop app is also registered with `allUsers: false`.
-7. The bridge clears its environment and permanently sets real, effective, and saved UIDs to the
-   non-root package UID before reading package state or accepting a mutation.
+8. The server reads package-private state or queues a mutation only after authentication,
+   authorization, and—on POST—independent package CSRF verification succeed.
 
-UI registration is not authorization. The independent administrator check remains mandatory when
-someone calls the CGI URL directly.
+UI registration and socket access are not authorization. The server repeats the HTTP validation and
+independent administrator check even when a caller reaches the CGI URL or socket path directly.
 
 ## Independent package CSRF
 
@@ -114,26 +134,27 @@ parameters. Its flat envelope is:
 }
 ```
 
-Operations and their exact argument keys are allowlisted by both browser and bridge:
+Operations and their exact argument keys are allowlisted by both browser and API service:
 `configure-profile`, `remove-profile`, `set-default`, `set-secret`, `schedule`, `routine`,
 `remove-routine`, `alert-policy`, and `action`. Unknown, missing, duplicate, out-of-range, nested, or
 operation-inapplicable fields fail closed.
 
 ## Why mutations use a private queue
 
-After DSM authentication, the CGI can permanently drop its UIDs but cannot safely clear
-supplementary web-process groups without root. It therefore executes only read-only manager API
-commands directly. Doctor, Plan, Run, source validation, and every mutation are published for a clean
-package-controller process.
+The package-user API service can return bounded read-only state after authentication. It does not
+perform Doctor, Plan, Run, source validation, or configuration changes in the HTTP request handler.
+Those operations are published for the controller so serialization, retention, asynchronous result
+tracking, and overlap rules do not depend on a CGI or browser connection remaining open.
 
 Queue behavior:
 
-- the bridge allocates a sortable 48-hex job ID under an exclusive private enqueue lock;
+- the authenticated API service allocates a sortable 48-hex job ID under an exclusive private
+  enqueue lock;
 - the client request ID remains separately recorded for correlation;
 - job JSON and any secret file are package-owned, bounded, non-symlink regular files;
 - publication uses private temporary files, hard-link/rename-style atomicity, directory sync, and
   no-follow checks;
-- the controller claims jobs in server-ID order and invokes the non-setuid consumer under the clean
+- the controller claims jobs in server-ID order and invokes the ordinary `0755` consumer under the
   package identity;
 - jobs older than the accepted window, malformed jobs, unexpected secret files, unsafe paths, and
   output containing sensitive material fail closed; and
@@ -155,7 +176,7 @@ normal run, Activity, and log evidence.
 
 ## Secret and response non-disclosure
 
-Snapshot reports only presence booleans. The bridge recursively redacts response keys that imply a
+Snapshot reports only presence booleans. The API service recursively redacts response keys that imply a
 password, secret, token, authorization value, or cookie, except reviewed `has_*` flags. It also
 redacts an exact submitted secret if a child unexpectedly echoes it. Unsafe output becomes a generic
 failure document.
@@ -167,15 +188,17 @@ input, and are removed after claim. See [Secrets and protected values](secrets.m
 
 The page uses a restrictive self-only Content Security Policy, no inline event handlers, no `eval`,
 no dynamic HTML injection, and no external fetch/WebSocket/EventSource URL. DOM output is assigned as
-text. Only the local API bridge is reachable under `connect-src 'self'`.
+text. Only the local CGI endpoint is reachable under `connect-src 'self'`; the Unix socket is never a
+browser endpoint.
 
 Local storage contains only theme/refresh/open-session-notification preferences. Cookies remain DSM's
 responsibility and are sent with same-origin credentials.
 
 ## Security acceptance limits
 
-Repository tests cover parsing, identity predicates, admin membership, UID drop, CSRF binding,
-schema rejection, queue paths/modes/order, redaction, response bounds, static CSP, and SPK privilege
-layout. They do not prove the actual web UID/group database, `authenticate.cgi` behavior, AppLaunch
+Repository tests cover parsing, CGI/service identity predicates, Unix-socket ownership/mode and peer
+checks, admin membership, CSRF binding, schema rejection, queue paths/modes/order, redaction,
+response bounds, static CSP, and SPK privilege layout. They do not prove the actual DSM `http`
+identity/group database, execution of `authenticate.cgi` from the package-user service, AppLaunch
 token delivery, or reverse-proxy/origin behavior of a physical DSM release. Validate those on every
 supported DSM branch before calling the dashboard production-ready.

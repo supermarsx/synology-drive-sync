@@ -129,9 +129,12 @@ touch local or remote data. Removing the final profile disables the legacy globa
 
 ## CLI example
 
+Resolve `$PACKAGE_USER` through the canonical
+[package-identity discovery](cli-parity.md#discover-the-actual-package-identity) first.
+
 ```bash
 MANAGER=/var/packages/synology-drive-sync/target/bin/sdsync-dsm
-sudo -u synology-drive-sync -- "$MANAGER" configure-profile \
+sudo -u "$PACKAGE_USER" -- "$MANAGER" configure-profile \
   --name archive \
   --source '/volume1/Documents' \
   --url 'https://files.archive.example/nas/' \

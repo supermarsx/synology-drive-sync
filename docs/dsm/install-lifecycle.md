@@ -29,13 +29,23 @@ not create DSM users, homes, shared folders, Team Folders, or ACLs.
 2. In DSM, open **Package Center > Manual Install**.
 3. Select the verified `.spk`, check its displayed name/version, and review the package information.
 4. Accept DSM's normal third-party-package warning only after confirming the repository, asset,
-   checksum, and optional attestation. The project does not bypass that warning.
+   checksum, and optional attestation. The project does not bypass that publisher-trust warning. A
+   refusal saying the package requires root or a lower privilege level is a different condition and
+   is not expected; preserve the artifact and collect the logs in
+   [Troubleshooting](troubleshooting.md#normal-third-party-warning-versus-a-root-privilege-rejection).
 5. Finish installation, then start **Synology Drive Sync** in Package Center.
 
-Installation creates the unprivileged system-internal identity `synology-drive-sync`, private FHS
-storage, a disabled global schedule, the package controller, the desktop application, fixed DSM
-notification resources, and deterministic icons. It does not grant access to a user share, create a
-profile, store a credential, contact a target, or start a sync.
+Installation creates an unprivileged system-internal package identity, private FHS storage, a
+disabled global schedule, the package controller, a package-user API service, the desktop
+application, fixed DSM notification resources, and deterministic icons. Its privilege manifest
+defaults everything to the package identity and joins that identity to DSM's `http` group; it
+requests no root execution, capability, or identity-changing file mode. It does not grant access to
+a user share, create a profile, store a credential, contact a target, or start a sync.
+
+DSM may collision-rename the package's NSS username. Use the account shown under **System internal
+user**, or resolve `$PACKAGE_USER` with the canonical
+[package-identity discovery](cli-parity.md#discover-the-actual-package-identity); do not assume a
+literal username.
 
 `silent_install=yes` and `silent_upgrade=yes` intentionally avoid a Package Center wizard that
 could place secrets or paths in installer variables. `silent_uninstall=no` is equally intentional:
@@ -45,8 +55,10 @@ uninstall permanently purges package-private operational state and requires conf
 
 Use the DSM desktop application menu or Package Center's **Open** action. The application is
 registered for administrators only. A healthy open sequence requires the DSM session cookie,
-administrator membership, and a `SynoToken` delivered with the launch URL. The package then issues
-its own short-lived, session-bound CSRF token.
+administrator membership, and a `SynoToken` delivered with the launch URL. An ordinary `0755` CGI
+running as DSM `http` relays the bounded request through the fixed package:`http` `0660` Unix socket.
+The package-user API service revalidates the request, invokes `authenticate.cgi`, independently
+checks administrator membership, and then issues its own short-lived, session-bound CSRF token.
 
 DSM 7 AppLaunch forwarding of that SynoToken has not yet been proven on physical hardware. If the
 page reports a missing launch token, do not paste a token into the URL, a bookmark, browser storage,
@@ -71,9 +83,9 @@ Test the real package identity from an administrator SSH shell:
 
 ```bash
 MANAGER=/var/packages/synology-drive-sync/target/bin/sdsync-dsm
-sudo -u synology-drive-sync -- "$MANAGER" paths
-sudo -u synology-drive-sync -- test -r /volume1/Source
-sudo -u synology-drive-sync -- test -x /volume1/Source
+sudo -u "$PACKAGE_USER" -- "$MANAGER" paths
+sudo -u "$PACKAGE_USER" -- test -r /volume1/Source
+sudo -u "$PACKAGE_USER" -- test -x /volume1/Source
 ```
 
 The manager canonicalizes sources and rejects `/`, symlink roots, unreadable/untraversable roots,
@@ -96,7 +108,7 @@ in a refreshed snapshot. Run non-writing Doctor and Plan only after that evidenc
 Equivalent SSH setup:
 
 ```bash
-sudo -u synology-drive-sync -- "$MANAGER" configure-profile \
+sudo -u "$PACKAGE_USER" -- "$MANAGER" configure-profile \
   --name personal \
   --source '/volume1/Photos' \
   --url 'https://files.remote.example' \
@@ -106,15 +118,16 @@ sudo -u synology-drive-sync -- "$MANAGER" configure-profile \
   --jobs 2 \
   --default
 
-sudo -u synology-drive-sync -- "$MANAGER" set-password personal
-sudo -u synology-drive-sync -- "$MANAGER" doctor personal
-sudo -u synology-drive-sync -- "$MANAGER" plan personal
+sudo -u "$PACKAGE_USER" -- "$MANAGER" set-password personal
+sudo -u "$PACKAGE_USER" -- "$MANAGER" doctor personal
+sudo -u "$PACKAGE_USER" -- "$MANAGER" plan personal
 ```
 
 ## Start, stop, and scheduling defaults
 
-Package Center start/stop controls one long-lived, unprivileged controller. Starting it does not
-enable a routine or contact a target. The legacy global interval schedule and every per-profile
+Package Center start/stop controls two long-lived, unprivileged package-user processes: the local API
+service for the DSM dashboard and the controller for routines and queued work. Starting them does
+not enable a routine or contact a target. The legacy global interval schedule and every per-profile
 routine are disabled until explicitly configured and enabled.
 
 ```bash
@@ -123,10 +136,10 @@ sudo synopkg start synology-drive-sync
 sudo synopkg stop synology-drive-sync
 ```
 
-Stop requests cooperative termination of the verified controller and any verified active runner.
-The lifecycle script waits for shutdown and refuses to signal an untrusted PID or force-kill after a
-timeout. Profile, secret, routine, and schedule mutations are serialized and refuse to race an active
-Plan or Run.
+Stop requests cooperative termination of the verified API service, controller, and any verified
+active runner. The lifecycle script validates recorded PIDs and the fixed socket before cleanup,
+waits for shutdown, and refuses to signal an untrusted PID or force-kill after a timeout. Profile,
+secret, routine, and schedule mutations are serialized and refuse to race an active Plan or Run.
 
 ## Upgrade, rollback, and uninstall
 
@@ -150,7 +163,7 @@ code; it cannot undo uploads, directory creation, copies, or deletions already c
 Before uninstalling:
 
 ```bash
-sudo -u synology-drive-sync -- "$MANAGER" disable
+sudo -u "$PACKAGE_USER" -- "$MANAGER" disable
 sudo synopkg stop synology-drive-sync
 ```
 
@@ -163,6 +176,8 @@ Deleted package credentials are not recoverable.
 ## Post-install acceptance evidence
 
 Record the model, DSM build, `uname -m`, exact SPK filename/version, checksum, optional attestation,
-Package Center install/start/open result, package-user ACL test, and first non-writing Doctor/Plan.
-Do not describe the installation as production-ready until the complete
+the exact Package Center warning/result, bounded install/package logs, CGI/API-service/socket
+identities and modes, install/start/open result, package-user ACL test, and first non-writing
+Doctor/Plan. Explicitly test `authenticate.cgi` from the package-user service; repository tests do
+not prove that DSM behavior. Do not describe the installation as production-ready until the complete
 [live-NAS acceptance](troubleshooting.md#live-nas-acceptance) passes.

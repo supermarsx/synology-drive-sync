@@ -1,8 +1,10 @@
 # Synology DSM package and dashboard
 
 The DSM 7 package installs the one-way sync engine on the NAS that owns the authoritative source
-folder. It reads only the local folders granted to the `synology-drive-sync` system-internal user
-and sends their contents over HTTPS to a chosen File Station logical path on another NAS.
+folder. It reads only the local folders granted to its actual DSM system-internal package identity
+and sends their contents over HTTPS to a chosen File Station logical path on another NAS. DSM may
+collision-rename that identity's NSS username; discover it from package-home ownership instead of
+assuming the package name is the account name.
 
 ```text
 source NAS                                                target NAS
@@ -16,6 +18,11 @@ Both surfaces operate the same package-owned profiles, credentials, routines, st
 dashboard is administrator-only; it never returns a stored password, TOTP seed, or remote logging
 token to the browser. The CLI remains the recovery and automation surface when the dashboard cannot
 open.
+
+The package requests no root execution, Linux capabilities, set-user-ID bit, or set-group-ID bit.
+Its ordinary `0755` DSM `http` CGI can only relay a bounded request over a fixed package:`http`
+`0660` Unix socket. The package-user API service reauthenticates the DSM session, independently
+requires administrator membership and package CSRF, and alone reaches private state or the queue.
 
 The package is not a Synology Drive protocol plug-in. It writes through File Station. Synology Drive
 can index the result only when the selected destination belongs to the remote account's Drive home
@@ -39,7 +46,7 @@ or an enabled Team Folder.
 | Password, TOTP, and remote-log-token keep/replace/clear behavior | [Secrets and protected values](dsm/secrets.md) |
 | Interval, daily, and realtime routines, dependencies, retries, and deletion approval | [Routines and scheduling](dsm/routines.md) |
 | Doctor, cached health, activity, logs, and DSM notifications | [Health, activity, logs, and notifications](dsm/operations.md) |
-| `authenticate.cgi`, administrator checks, SynoToken, CSRF, privilege drop, and private queue | [Dashboard security model](dsm/security.md) |
+| `authenticate.cgi`, administrator checks, SynoToken, CSRF, package/`http` socket boundary, and private queue | [Dashboard security model](dsm/security.md) |
 | Dashboard-to-`sdsync-dsm` command mapping and private paths | [CLI parity and private paths](dsm/cli-parity.md) |
 | Symptoms, recovery, acceptance evidence, and known unverified behavior | [Troubleshooting and live-NAS acceptance](dsm/troubleshooting.md) |
 | Reproducible package assembly, ELF contracts, icons, and validation | [Build and validate SPKs](dsm/package-development.md) |
@@ -54,7 +61,7 @@ status such as `77`, or a protocol term such as `X-SDSYNC-CSRF`.
    `uname -m` value. Do not choose an SPK from a marketing CPU label alone.
 2. Verify the selected SPK against the same release's `SHA256SUMS`, then install it through
    **Package Center > Manual Install**.
-3. Grant the `synology-drive-sync` system-internal user read-only access to the intended local source
+3. Grant the package's actual **System internal user** read-only access to the intended local source
    share. The package grants itself no share access.
 4. Start the package and open **Synology Drive Sync** from the DSM desktop or Package Center. If the
    browser reports that the DSM launch token is missing, stop there and use the CLI; do not copy a
@@ -75,11 +82,13 @@ job result before reporting success. Doctor, Plan, and Run intentionally return 
 snapshot or Activity before treating those operations as complete.
 
 The CLI can perform the same operational work and exposes recovery-oriented commands such as
-`paths`, `show-config`, and direct bounded log reads. Run it as the package identity:
+`paths`, `show-config`, and direct bounded log reads. First resolve `$PACKAGE_USER` with the
+canonical [package-identity discovery](dsm/cli-parity.md#discover-the-actual-package-identity), then
+run it as that identity:
 
 ```bash
 MANAGER=/var/packages/synology-drive-sync/target/bin/sdsync-dsm
-sudo -u synology-drive-sync -- "$MANAGER" status
+sudo -u "$PACKAGE_USER" -- "$MANAGER" status
 ```
 
 Profile, credential, routine, schedule, Doctor, Plan, and Run operations reject root and other

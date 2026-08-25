@@ -122,8 +122,11 @@ wait for a terminal private-queue result before reporting success.
 
 ## CLI parity
 
+Resolve `$PACKAGE_USER` through the canonical
+[package-identity discovery](cli-parity.md#discover-the-actual-package-identity) first.
+
 ```bash
-sudo -u synology-drive-sync -- "$MANAGER" configure-routine \
+sudo -u "$PACKAGE_USER" -- "$MANAGER" configure-routine \
   --profile personal \
   --enabled true \
   --action sync \
@@ -138,7 +141,7 @@ sudo -u synology-drive-sync -- "$MANAGER" configure-routine \
   --allow-delete false \
   --max-total-delete 100
 
-sudo -u synology-drive-sync -- "$MANAGER" remove-routine personal
+sudo -u "$PACKAGE_USER" -- "$MANAGER" remove-routine personal
 ```
 
 Multiple `--depends-on NAME` options build a dependency list. See [CLI parity](cli-parity.md) for
@@ -149,8 +152,8 @@ status and recovery commands.
 The manager retains a package-wide interval schedule for CLI compatibility:
 
 ```bash
-sudo -u synology-drive-sync -- "$MANAGER" enable --interval 3600
-sudo -u synology-drive-sync -- "$MANAGER" disable
+sudo -u "$PACKAGE_USER" -- "$MANAGER" enable --interval 3600
+sudo -u "$PACKAGE_USER" -- "$MANAGER" disable
 ```
 
 It runs all profiles sequentially after one interval, uses delay-after-completion, and has separate

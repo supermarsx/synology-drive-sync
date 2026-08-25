@@ -2,13 +2,16 @@
 
 Start with evidence from the exact NAS, package identity, and profile. Do not fix a dashboard error
 by broadening ACLs, disabling TLS, editing private files, or repeatedly resubmitting a mutation.
+Resolve `$PACKAGE_USER` with the canonical
+[package-identity discovery](cli-parity.md#discover-the-actual-package-identity) before using these
+SSH commands.
 
 ```bash
 MANAGER=/var/packages/synology-drive-sync/target/bin/sdsync-dsm
 sudo synopkg status synology-drive-sync
-sudo -u synology-drive-sync -- "$MANAGER" status
-sudo -u synology-drive-sync -- "$MANAGER" logs 200
-sudo -u synology-drive-sync -- "$MANAGER" paths
+sudo -u "$PACKAGE_USER" -- "$MANAGER" status
+sudo -u "$PACKAGE_USER" -- "$MANAGER" logs 200
+sudo -u "$PACKAGE_USER" -- "$MANAGER" paths
 ```
 
 ## “Package is not supported” or “incompatible DSM version”
@@ -26,17 +29,58 @@ Common causes are:
 Re-run the [release selector](../release-selector.md) with exact model, DSM minor/build, and
 `uname -m`. Do not modify `INFO` or rename an SPK/binary to force installation.
 
-## Package Center says the package uses root privileges
+## Normal third-party warning versus a root-privilege rejection
 
-Use a current release artifact. The SPK must contain no setuid/setgid archive member:
-`ui/api.cgi` is stored in `package.tgz` as ordinary `0755`, and `conf/privilege` separately tells DSM
-to install it as package/package `4755`. That installed setuid bit targets only the non-root package
-identity; lifecycle actions remain `run-as: package`, and no Linux capabilities are requested.
+DSM normally warns before installing a package that is not signed and distributed by Synology.
+That publisher-trust warning is expected for this project; accept it only after verifying the
+repository, exact release asset, checksum, and optional attestation. It is distinct from Package
+Center refusing installation because a package requires root or a lower privilege level.
 
-Do not repair an older or locally modified SPK with `chmod`, by deleting the privilege manifest, or
-by changing it to root. Rebuild it with the current assembler and run `validate_spk.py` against the
-exact output. The validator rejects both an archived `4755` entry and a manifest that fails to apply
-the reviewed package-owned CGI mode.
+> [!WARNING]
+> Do not install the immutable 26.5 SPK assets. Release 26.5 requested package-owned mode `4755` for
+> `ui/api.cgi`. That did not select UID 0, but it was still an identity-changing permission that DSM
+> classified and rejected as requiring privileges. It does not meet the zero-setid contract and
+> cannot be repaired in place. Use 26.6 or later only after that corrected release is published and
+> its asset/checksum have been verified.
+
+The corrected 26.6-and-later SPK contract requests no root run-as, Linux capabilities,
+set-user-ID bit, or set-group-ID bit. Every executable, including `ui/api.cgi`, is ordinary `0755`,
+and `conf/privilege` contains exactly:
+
+```json
+{
+  "defaults": {
+    "run-as": "package"
+  },
+  "join-groupname": "http"
+}
+```
+
+If Package Center reports a root-privilege rejection, do not accept it as the normal trust warning
+and do not repair the SPK with `chmod`, by deleting the privilege manifest, or by changing anything
+to root. Preserve the exact artifact and DSM build, validate the SPK on a workstation, and collect
+the install logs below. An old, locally modified, corrupted, or differently signed artifact is not
+evidence about the current package contract. Synology documents the two messages separately in its
+[DSM 7 system requirements](https://help.synology.com/developer-guide/getting_started/system_requirement.html)
+and [breaking changes](https://help.synology.com/developer-guide/breaking_changes.html).
+
+## Collect installation and dashboard evidence safely
+
+On the affected NAS, collect bounded tails rather than whole system logs:
+
+```bash
+sudo tail -n 200 /var/log/synopkg.log
+sudo tail -n 200 /var/log/messages
+sudo tail -n 200 /var/log/packages/synology-drive-sync.log
+sudo tail -n 200 /var/packages/synology-drive-sync/var/log/controller.log
+sudo tail -n 200 /var/packages/synology-drive-sync/var/log/api.log
+```
+
+The final two are package-private service logs and may not exist if installation or first start did
+not reach that stage. Inspect all output locally before sharing it. Never paste a DSM cookie,
+`SynoToken`, `X-SDSYNC-CSRF`, password, TOTP seed/current code, remote-log token, secret queue file,
+or token-bearing URL into an issue, chat, screenshot, or support archive. Redact sensitive host,
+account, and path values without removing timestamps, exit codes, DSM build, or package version.
 
 ## Dashboard does not open or says the launch token is missing
 
@@ -51,12 +95,14 @@ issue, screenshot, terminal, browser storage, or bookmark.
 
 ## Dashboard is read-only
 
-Read-only means the bridge snapshot did not grant the required capability and independent CSRF.
-Possible causes include authentication/admin rejection, missing/expired SynoToken, CSRF bootstrap
-failure, helper ownership/mode drift, stopped controller/private state, or an unsafe package path.
+Read-only means the authenticated API service snapshot did not grant the required capability and
+independent CSRF. Possible causes include authentication/admin rejection, missing/expired
+SynoToken, CSRF bootstrap failure, a stopped API service, wrong CGI/socket ownership or mode, a
+stopped controller/private state, or an unsafe package path.
 
-Use `status`, `paths`, the DSM package-control log, and Package Center restart. Do not chmod
-`ui/api.cgi`, make the general CLI setuid, add capabilities, or hand-create the CSRF key.
+Use `status`, `paths`, the bounded logs above, and Package Center restart. Do not chmod or chown the
+CGI/socket, add any identity-changing permission or capability, expose the socket, or hand-create
+the CSRF key.
 
 ## A configuration action remains pending or times out
 
@@ -182,7 +228,8 @@ the exact source NAS and record all of the following:
 - model, Package Arch, `uname -m`, DSM product/version/build;
 - selected SPK filename, version, SHA-256, optional GitHub attestation;
 - Package Center install, third-party warning, start, stop, restart, upgrade, rollback constraints,
-  and disposable uninstall;
+  and disposable uninstall; record a normal unsigned-publisher warning separately from any
+  lower-privilege/root rejection and retain the bounded log tails above;
 - dashboard icon/Open behavior and actual DSM iframe/window layout at narrow and wide sizes; and
 - whether DSM AppLaunch supplies SynoToken to a fresh administrator launch.
 
@@ -191,7 +238,13 @@ accessibility interaction, or AppLaunch token forwarding as already proven.
 
 ### Identity, ACL, and dashboard security
 
-- `synology-drive-sync` has read/traverse permission only to intended source shares;
+- the actual DSM package identity has read/traverse permission only to intended source shares;
+- `conf/privilege` is the exact package/`http` document above, all installed executables are `0755`,
+  and no package file carries an identity-changing permission bit or Linux capability;
+- `ui/api.cgi` is package-owned `0755` but executes with real/effective DSM `http` UID; the API
+  `--serve` process executes as the package user; and `ui/api.sock` is package:`http` `0660`;
+- the CGI and service reject a substituted socket, wrong owner/group/mode, wrong peer UID, symlink,
+  extra hard link, unsafe parent, oversized frame, or malformed relay schema;
 - another internal user/root cannot use manager mutations in place of the package identity;
 - non-administrator DSM users cannot launch or call the API;
 - stale cookie, absent/mismatched SynoToken, missing/expired CSRF, wrong methods/fields, and direct CGI
@@ -234,5 +287,8 @@ accessibility interaction, or AppLaunch token forwarding as already proven.
   NAS data trees.
 
 TOTP challenge behavior, DSM authentication, AppLaunch token delivery, Notification Center,
-File Station versions, reverse proxies, and Drive indexing vary across deployed systems. A complete
-record from the exact environment is the acceptance evidence.
+File Station versions, reverse proxies, and Drive indexing vary across deployed systems. In
+particular, Synology documents direct `authenticate.cgi` use by a custom CGI, but this root-free
+design invokes it from the package-user API service after an authenticated local socket relay. That
+execution behavior remains a live-DSM acceptance requirement. A complete record from the exact
+environment is the acceptance evidence.

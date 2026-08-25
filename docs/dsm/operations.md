@@ -6,7 +6,8 @@ Doctor and inspect its refreshed evidence.
 
 ## Health and Doctor
 
-Doctor supports one named profile or `all`.
+Doctor supports one named profile or `all`. SSH examples assume `$PACKAGE_USER` was resolved through
+the canonical [package-identity discovery](cli-parity.md#discover-the-actual-package-identity).
 
 The default diagnostic:
 
@@ -23,9 +24,9 @@ final verdict appears through run/activity/health state after the controller exe
 
 ### Disposable write test
 
-**Disposable write test** is a mutating diagnostic and is disabled unless the authenticated bridge
-grants `write_test`. It requires a separate checkbox and confirmation. It can create a unique probe,
-upload and verify it, exercise an optional same-target copy path, and remove the probe.
+**Disposable write test** is a mutating diagnostic and is disabled unless the authenticated API
+service grants `write_test`. It requires a separate checkbox and confirmation. It can create a
+unique probe, upload and verify it, exercise an optional same-target copy path, and remove the probe.
 
 Run it only against a prepared non-critical existing destination. After any timeout or failure,
 inspect both target folders for leftovers rather than assuming cleanup happened.
@@ -33,9 +34,9 @@ inspect both target folders for leftovers rather than assuming cleanup happened.
 CLI:
 
 ```bash
-sudo -u synology-drive-sync -- "$MANAGER" doctor personal
-sudo -u synology-drive-sync -- "$MANAGER" doctor personal --write-test
-sudo -u synology-drive-sync -- "$MANAGER" doctor --all
+sudo -u "$PACKAGE_USER" -- "$MANAGER" doctor personal
+sudo -u "$PACKAGE_USER" -- "$MANAGER" doctor personal --write-test
+sudo -u "$PACKAGE_USER" -- "$MANAGER" doctor --all
 ```
 
 ### Cached target-health table
@@ -102,8 +103,9 @@ The Activity page can pause refresh without changing package logging. Log refres
 10, or 30 seconds. For SSH recovery:
 
 ```bash
-sudo -u synology-drive-sync -- "$MANAGER" logs 200
+sudo -u "$PACKAGE_USER" -- "$MANAGER" logs 200
 sudo tail -n 200 /var/log/packages/synology-drive-sync.log
+sudo tail -n 200 /var/packages/synology-drive-sync/var/log/api.log
 ```
 
 ## DSM Notification Center policy
@@ -136,7 +138,7 @@ Successful sync resets the tracked sync failure count. Cooldown rate-limits deli
 CLI parity:
 
 ```bash
-sudo -u synology-drive-sync -- "$MANAGER" configure-alerts \
+sudo -u "$PACKAGE_USER" -- "$MANAGER" configure-alerts \
   --enabled true \
   --on-success false \
   --on-failure true \

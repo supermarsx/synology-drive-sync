@@ -18,7 +18,10 @@ logs, and notifications, plus the `sdsync-dsm` SSH recovery/automation manager. 
 destination is configurable: `/home/Drive/...` targets the remote account's Drive home, and any
 writable `/<shared-folder>/...` subdirectory can be selected instead. DSM must provision the remote
 user home or shared-folder root and its permissions first; the sync creates a missing chosen
-subdirectory and all descendants beneath an existing writable parent. See the
+subdirectory and all descendants beneath an existing writable parent. The SPK requests no root,
+Linux capability, or identity-changing file mode: an ordinary DSM `http` CGI relays over a fixed
+package:`http` `0660` Unix socket to a package-user API service that reauthenticates the session and
+enforces administrator membership plus package CSRF. See the
 [Synology DSM package and dashboard guide](docs/synology-package.md).
 
 > [!IMPORTANT]

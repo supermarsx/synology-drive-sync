@@ -15,9 +15,10 @@ loads no CDN scripts, fonts, images, analytics, or hosted search service.
 
 The footer distinguishes these states:
 
-- **Authenticated control bridge** means the current DSM session passed package authentication,
-  administrator membership, SynoToken, and CSRF bootstrap checks, and the snapshot explicitly
-  grants mutation capabilities.
+- **Authenticated control service** means the ordinary DSM `http` CGI reached the package-user API
+  service over its fixed private socket, the current session passed authentication, administrator
+  membership, SynoToken, and CSRF bootstrap checks, and the snapshot explicitly grants mutation
+  capabilities.
 - **Package status · read-only** means a snapshot was available but one or more mutation
   capabilities were not granted. Buttons that could change package state remain disabled.
 - **Status unavailable** means snapshot refresh failed. Existing values may be stale; the interface
@@ -27,7 +28,7 @@ Mutation controls require both a valid independent package CSRF token and
 `capabilities.mutations=true`. Secret controls additionally require `capabilities.secrets=true`,
 and **Disposable write test** requires `capabilities.write_test=true`. A direct package-user
 `sdsync-dsm api snapshot` intentionally reports those capabilities as false; only the authenticated
-bridge can elevate them after all checks pass.
+API service can grant them after every server-side check passes.
 
 ## Overview
 
@@ -141,7 +142,7 @@ contrast, zoom, and the exact DSM window sizes during [live acceptance](troubles
 ## Queue and completion evidence
 
 Every changing request receives a client request ID and is published into a private package queue.
-The bridge first returns HTTP `202` with state `queued`. The controller later claims and validates
+The API service first returns HTTP `202` with state `queued`. The controller later claims and validates
 the job, runs the package manager under a clean package identity, and writes a private response.
 Configuration/secret/routine/policy calls poll that response before their success toast. Operational
 Doctor/Plan/Run calls remain asynchronous. Therefore:

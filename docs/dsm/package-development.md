@@ -3,14 +3,28 @@
 The SPK assembler accepts two matching Linux executables:
 
 - `synology-drive-sync`, the core sync engine; and
-- `sdsync-dsm-api`, the compiled authenticated CGI/private-queue helper.
+- `sdsync-dsm-api`, the compiled CGI relay, package-user API service, and private-queue consumer.
 
 Both must be regular, non-symlink, fully static, little-endian ELF files for the selected DSM
 architecture. The helper is installed byte-for-byte at ordinary `bin/sdsync-dsm-api` mode `0755`
-and at `ui/api.cgi`. Both copies are stored in `package.tgz` as ordinary `0755` files. The reviewed
-`conf/privilege` declaration makes only the installed `ui/api.cgi` package-owned `4755`; no outer or
-inner archive member carries a setuid/setgid bit, and the package requests neither root run-as nor
-Linux capabilities.
+and at `ui/api.cgi` mode `0755`. The CGI executes as DSM `http` and relays one bounded request to the
+package-user `--serve` process through the fixed `ui/api.sock`, owned by the package user, grouped to
+`http`, and mode `0660`. No outer or inner archive member or installed executable carries a
+set-user-ID/set-group-ID bit. The package requests neither root run-as nor Linux capabilities.
+
+The complete reviewed `conf/privilege` document is deliberately minimal:
+
+```json
+{
+  "defaults": {
+    "run-as": "package"
+  },
+  "join-groupname": "http"
+}
+```
+
+The default covers lifecycle scripts; there is no redundant `ctrl-script` list, `tool` list, or
+capability declaration.
 
 ## Architecture contracts
 
@@ -110,12 +124,13 @@ claimed bit-for-bit reproducible across different compiler/linker/runner images.
 - filename/version/`INFO` architecture and DSM-bound consistency;
 - exact `conf/privilege`, `conf/resource`, application config, notification category/events/texts;
 - static core/helper ELF identity and equality of helper/CGI bytes;
-- no outer or inner archive member is setuid/setgid or group/world-writable, while
-  `conf/privilege` requires DSM to install only the package-owned CGI as `4755`;
+- no outer or inner archive member has a set-user-ID/set-group-ID bit or is group/world-writable,
+  while `conf/privilege` remains the exact root-free package/`http` contract;
 - authored SVG safe bounds and exact deterministic PNG bytes/dimensions;
 - CSP, no-referrer ordering, offline assets, no inline handlers/eval/HTML injection, exact bridge
   action/schema markers, and no secret local-storage path;
-- lifecycle scripts, private FHS behavior, icons, license texts, and installed size.
+- lifecycle scripts, the fixed `package:http` `0660` socket/service contract, private FHS behavior,
+  icons, license texts, and installed size.
 
 Source-only validation:
 
@@ -129,14 +144,15 @@ python3 packaging/synology/test_synology_package.py
 Run the package suite in a Linux/WSL environment that provides its expected shell/process semantics.
 Negative tests deliberately tamper with architecture, helper identity, symlinks, permissions,
 resources, UI security markers, icons, and archive fields. They specifically reject an archived
-`ui/api.cgi` mode `4755` and a privilege manifest that does not require package/package `4755`, so
-the gates do not merely accept the builder's happy path.
+privilege bit, a non-`0755` CGI, a privilege manifest beyond the exact two-key contract, and unsafe
+socket ownership/mode/peer assumptions, so the gates do not merely accept the builder's happy path.
 
 ## Acceptance boundary
 
 Builder/validator success proves the reviewed archive contract, not DSM installation, web launch,
-`authenticate.cgi`, administrator groups, Notification Center, source ACLs, reverse proxy, File
-Station, TOTP, Drive indexing, or sync behavior on a physical model. Complete
+the `http` CGI identity, package-user `authenticate.cgi` execution, socket group behavior,
+administrator groups, Notification Center, source ACLs, reverse proxy, File Station, TOTP, Drive
+indexing, or sync behavior on a physical model. Complete
 [live-NAS acceptance](troubleshooting.md#live-nas-acceptance) before publishing a support claim.
 
 Official framework references:

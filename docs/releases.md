@@ -34,6 +34,13 @@ Every archive has one versioned top-level directory and contains:
 
 Four DSM 7 packages are published separately from the GNU/Linux archives:
 
+> [!WARNING]
+> The immutable 26.5 SPKs requested package-owned mode `4755` for `ui/api.cgi`. Although that mode
+> did not select UID 0, DSM classified and rejected the identity-changing permission. Release 26.5
+> does not meet the zero-setid package contract and should not be installed. The corrected baseline
+> is 26.6 or later once published; verify that release's exact SPK and checksum rather than modifying
+> or repackaging a 26.5 asset.
+
 | SPK `INFO` arch | Official CPU-table Package Arch mapping | Rust target embedded in the SPK | Release asset |
 | --- | --- | --- | --- |
 | `x86_64` | Supported DSM 7 x86-64 families in the selector snapshot | `x86_64-unknown-linux-musl` | `synology-drive-sync-YY.N-x86_64.spk` |
@@ -41,10 +48,10 @@ Four DSM 7 packages are published separately from the GNU/Linux archives:
 | `armv7 armada370 armada375 armada38x armadaxp comcerto2k monaco` | `alpine`, `alpine4k`, `armada370`, `armada375`, `armada38x`, `armadaxp`, `comcerto2k`, `monaco` | `armv7-unknown-linux-musleabihf` | `synology-drive-sync-YY.N-armv7.spk` |
 | `i686` | `evansport` (DSM 7.0/7.1 only) | `i686-unknown-linux-musl` | `synology-drive-sync-YY.N-i686.spk` |
 
-Each SPK contains one matching static ELF32 or ELF64 sync executable, a native administrator DSM
-dashboard, the `sdsync-dsm` CLI manager, authenticated bridge, controller/runner helpers, DSM
-lifecycle scripts, a lower-privilege `conf/privilege`, icons,
-and license texts. The package requires DSM `7.0-40759` or newer, while platform availability remains
+Each corrected SPK contains one matching static ELF32 or ELF64 sync executable, a native
+administrator DSM dashboard, the `sdsync-dsm` CLI manager, ordinary CGI relay, package-user API
+service, controller/runner helpers, DSM lifecycle scripts, the minimal package/`http`
+`conf/privilege`, icons, and license texts. The package requires DSM `7.0-40759` or newer, while platform availability remains
 constrained by Synology's DSM-version table. It is not `noarch`; the four binary ABIs are never
 combined into one SPK. The ARMv7 INFO field combines the generic `armv7` family token used for
 Alpine/Alpine4k with the six compatible platform-specific aliases; every value selects the same

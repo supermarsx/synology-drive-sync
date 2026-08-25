@@ -38,11 +38,12 @@ NAS account; it changes only this package's protected copy.
 Dashboard and manager secret inputs are limited to one non-empty line and 4,096 bytes. Newlines,
 empty values, oversized inputs, unknown profile names, and unexpected request fields are rejected.
 
-CLI equivalents:
+CLI equivalents use `$PACKAGE_USER` from the canonical
+[package-identity discovery](cli-parity.md#discover-the-actual-package-identity):
 
 ```bash
-sudo -u synology-drive-sync -- "$MANAGER" set-password personal
-sudo -u synology-drive-sync -- "$MANAGER" remove-password personal
+sudo -u "$PACKAGE_USER" -- "$MANAGER" set-password personal
+sudo -u "$PACKAGE_USER" -- "$MANAGER" remove-password personal
 ```
 
 `set-password` uses a masked terminal prompt. `--from-file FILE` is available for controlled
@@ -61,8 +62,8 @@ places both factors inside the package account's security boundary; decide wheth
 for the target account.
 
 ```bash
-sudo -u synology-drive-sync -- "$MANAGER" set-totp personal
-sudo -u synology-drive-sync -- "$MANAGER" remove-totp personal
+sudo -u "$PACKAGE_USER" -- "$MANAGER" set-totp personal
+sudo -u "$PACKAGE_USER" -- "$MANAGER" remove-totp personal
 ```
 
 ## Remote logging token
@@ -71,19 +72,20 @@ Remote logging configuration contains a non-secret HTTPS collector URL and mode.
 stored separately and follows the same keep/replace/clear contract:
 
 ```bash
-sudo -u synology-drive-sync -- "$MANAGER" set-remote-log-token personal
-sudo -u synology-drive-sync -- "$MANAGER" remove-remote-log-token personal
+sudo -u "$PACKAGE_USER" -- "$MANAGER" set-remote-log-token personal
+sudo -u "$PACKAGE_USER" -- "$MANAGER" remove-remote-log-token personal
 ```
 
 Clearing the token while remote-log mode is `required` can make subsequent operations fail. Review
 the profile and collector behavior before clearing it.
 
-## Browser and bridge handling
+## Browser and service handling
 
 The page does not place secret values in URLs, local storage, session storage, DOM text, logs, or
 snapshot responses. A replacement travels in one bounded JSON POST over the current same-origin DSM
-session. The authenticated bridge validates the exact operation/field schema, publishes the job and
-a separate private secret file atomically, and returns only a queued identifier.
+session. The ordinary DSM `http` CGI relays it over the fixed private Unix socket. The package-user
+API service reauthenticates the session, validates the exact operation/field schema, publishes the
+job and a separate private secret file atomically, and returns only a queued identifier.
 
 The CGI process does not run the secret-changing manager action. The clean package controller claims
 the private job, reads the protected secret file without following symlinks, feeds it to the manager

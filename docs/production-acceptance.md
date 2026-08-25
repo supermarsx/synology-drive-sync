@@ -275,25 +275,27 @@ runtime inputs conflict. Verify that an SPK for the wrong architecture is not us
 **Package Center > Manual Install** and confirm scheduling is disabled before entering any target
 credentials.
 
-On the source NAS, grant the `synology-drive-sync` system-internal user read-only permission to one
-disposable source share and no access to unrelated shares. Confirm the physical source path is not a
-symlink and run every check as that identity:
+On the source NAS, grant the actual package **System internal user** read-only permission to one
+disposable source share and no access to unrelated shares. DSM may collision-rename its NSS
+username; resolve `$PACKAGE_USER` through the
+[canonical package-identity discovery](dsm/cli-parity.md#discover-the-actual-package-identity).
+Confirm the physical source path is not a symlink and run every check as that identity:
 
 ```bash
 MANAGER=/var/packages/synology-drive-sync/target/bin/sdsync-dsm
-sudo -u synology-drive-sync -- "$MANAGER" paths
-sudo -u synology-drive-sync -- "$MANAGER" configure-profile \
+sudo -u "$PACKAGE_USER" -- "$MANAGER" paths
+sudo -u "$PACKAGE_USER" -- "$MANAGER" configure-profile \
   --name acceptance-nas-b \
   --source '/volume1/sdsync-acceptance-source' \
   --url 'https://files-b.example.com' \
   --username 'acceptance-bot' \
   --remote '/home/Drive/sdsync-acceptance-UNIQUE' \
   --default
-sudo -u synology-drive-sync -- "$MANAGER" set-password acceptance-nas-b
-sudo -u synology-drive-sync -- "$MANAGER" set-totp acceptance-nas-b # when required
-sudo -u synology-drive-sync -- "$MANAGER" doctor acceptance-nas-b
-sudo -u synology-drive-sync -- "$MANAGER" plan acceptance-nas-b
-sudo -u synology-drive-sync -- "$MANAGER" run acceptance-nas-b
+sudo -u "$PACKAGE_USER" -- "$MANAGER" set-password acceptance-nas-b
+sudo -u "$PACKAGE_USER" -- "$MANAGER" set-totp acceptance-nas-b # when required
+sudo -u "$PACKAGE_USER" -- "$MANAGER" doctor acceptance-nas-b
+sudo -u "$PACKAGE_USER" -- "$MANAGER" plan acceptance-nas-b
+sudo -u "$PACKAGE_USER" -- "$MANAGER" run acceptance-nas-b
 ```
 
 Repeat with a Team Folder or shared-folder profile if that is the production destination type. Test
@@ -311,9 +313,9 @@ Add a second profile with a different target URL or destination and distinct pro
 Require these commands to preflight every target and run in deterministic profile-name order:
 
 ```bash
-sudo -u synology-drive-sync -- "$MANAGER" doctor --all
-sudo -u synology-drive-sync -- "$MANAGER" plan --all
-sudo -u synology-drive-sync -- "$MANAGER" run --all
+sudo -u "$PACKAGE_USER" -- "$MANAGER" doctor --all
+sudo -u "$PACKAGE_USER" -- "$MANAGER" plan --all
+sudo -u "$PACKAGE_USER" -- "$MANAGER" run --all
 ```
 
 When TOTP is used, prove a scheduled, non-interactive challenge with synchronized clocks and the
@@ -326,10 +328,10 @@ because they are not established by the mock suite.
 Exercise the built-in controller with deletion disabled:
 
 ```bash
-sudo -u synology-drive-sync -- "$MANAGER" enable --interval 60
+sudo -u "$PACKAGE_USER" -- "$MANAGER" enable --interval 60
 sudo synopkg start synology-drive-sync
-sudo -u synology-drive-sync -- "$MANAGER" status
-sudo -u synology-drive-sync -- "$MANAGER" logs 200
+sudo -u "$PACKAGE_USER" -- "$MANAGER" status
+sudo -u "$PACKAGE_USER" -- "$MANAGER" logs 200
 ```
 
 Require no immediate sync at enable time, one run after the interval, rejection of an overlapping

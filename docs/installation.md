@@ -46,28 +46,30 @@ The native DSM package installs the CLI manager here:
 /var/packages/synology-drive-sync/target/bin/sdsync-dsm
 ```
 
-The schedule is disabled at installation. Grant the `synology-drive-sync` system-internal user
+The schedule is disabled at installation. Grant the actual package **System internal user**
 read-only access to the intended local source share, then configure it from an administrator SSH
-session as the package identity. Mutating and sync/diagnostic manager commands refuse root or a
+session as that identity. DSM may collision-rename its NSS username. Resolve `$PACKAGE_USER` through
+the [canonical package-identity discovery](dsm/cli-parity.md#discover-the-actual-package-identity)
+rather than assuming a literal name. Mutating and sync/diagnostic manager commands refuse root or a
 different identity with exit `77`, preventing an administrator ACL from masking a missing package
 source permission. For example:
 
 ```bash
 MANAGER=/var/packages/synology-drive-sync/target/bin/sdsync-dsm
 
-sudo -u synology-drive-sync -- "$MANAGER" configure-profile \
+sudo -u "$PACKAGE_USER" -- "$MANAGER" configure-profile \
   --name nas-b \
   --source '/volume1/Source' \
   --url 'https://files-b.example.com' \
   --username 'mirror-bot' \
   --remote '/home/Drive/NAS-A Backup' \
   --default
-sudo -u synology-drive-sync -- "$MANAGER" set-password nas-b
-sudo -u synology-drive-sync -- "$MANAGER" set-totp nas-b # only for app TOTP
-sudo -u synology-drive-sync -- "$MANAGER" doctor nas-b
-sudo -u synology-drive-sync -- "$MANAGER" plan nas-b
-sudo -u synology-drive-sync -- "$MANAGER" run nas-b
-sudo -u synology-drive-sync -- "$MANAGER" enable --interval 3600
+sudo -u "$PACKAGE_USER" -- "$MANAGER" set-password nas-b
+sudo -u "$PACKAGE_USER" -- "$MANAGER" set-totp nas-b # only for app TOTP
+sudo -u "$PACKAGE_USER" -- "$MANAGER" doctor nas-b
+sudo -u "$PACKAGE_USER" -- "$MANAGER" plan nas-b
+sudo -u "$PACKAGE_USER" -- "$MANAGER" run nas-b
+sudo -u "$PACKAGE_USER" -- "$MANAGER" enable --interval 3600
 sudo synopkg start synology-drive-sync
 ```
 

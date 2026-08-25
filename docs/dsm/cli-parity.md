@@ -4,12 +4,22 @@ The DSM dashboard and `sdsync-dsm` operate the same package-owned control plane.
 normal graphical surface; the CLI is the authoritative SSH recovery, provisioning, and inspection
 surface.
 
-Run manager commands as the package identity:
+## Discover the actual package identity
+
+DSM normally bases the system-internal account name on the package name, but it may collision-rename
+that NSS account. Do not assume the literal username `synology-drive-sync`. Resolve the owner of the
+package home once in each administrator SSH session, then use that value for manager commands:
 
 ```bash
+PACKAGE_USER=$(stat -L -c '%U' /var/packages/synology-drive-sync/home)
+case "$PACKAGE_USER" in ''|root|UNKNOWN) echo 'unsafe package owner' >&2; exit 1 ;; esac
 MANAGER=/var/packages/synology-drive-sync/target/bin/sdsync-dsm
-sudo -u synology-drive-sync -- "$MANAGER" status
+sudo -u "$PACKAGE_USER" -- "$MANAGER" status
 ```
+
+The runtime authorization does not trust a fixed username. It derives the package UID from trusted
+executable or package-home ownership and compares real/effective process and socket-peer UIDs to that
+value.
 
 Profile, secret, routine, schedule, Doctor, Plan, and Run operations refuse root and other users with
 exit `77`. Do not use plain `sudo "$MANAGER" ...`; even if it were permitted, it would test an
@@ -48,13 +58,13 @@ rejected rather than ignored.
 ## Common recovery sequence
 
 ```bash
-sudo -u synology-drive-sync -- "$MANAGER" paths
-sudo -u synology-drive-sync -- "$MANAGER" list-profiles
-sudo -u synology-drive-sync -- "$MANAGER" show-config personal
-sudo -u synology-drive-sync -- "$MANAGER" status
-sudo -u synology-drive-sync -- "$MANAGER" logs 200
-sudo -u synology-drive-sync -- "$MANAGER" doctor personal
-sudo -u synology-drive-sync -- "$MANAGER" plan personal
+sudo -u "$PACKAGE_USER" -- "$MANAGER" paths
+sudo -u "$PACKAGE_USER" -- "$MANAGER" list-profiles
+sudo -u "$PACKAGE_USER" -- "$MANAGER" show-config personal
+sudo -u "$PACKAGE_USER" -- "$MANAGER" status
+sudo -u "$PACKAGE_USER" -- "$MANAGER" logs 200
+sudo -u "$PACKAGE_USER" -- "$MANAGER" doctor personal
+sudo -u "$PACKAGE_USER" -- "$MANAGER" plan personal
 ```
 
 `show-config` is non-secret. Never use direct `cat` on secret files for troubleshooting.
@@ -62,7 +72,8 @@ sudo -u synology-drive-sync -- "$MANAGER" plan personal
 ## Machine-readable manager API
 
 `sdsync-dsm api snapshot`, `api logs --lines N`, and `api activity --lines N` are strict JSON
-contracts used by the compiled bridge and tests. A direct package-user snapshot deliberately reports:
+contracts used by the package-user API service and tests. A direct package-user snapshot
+deliberately reports:
 
 ```json
 {
@@ -74,10 +85,16 @@ contracts used by the compiled bridge and tests. A direct package-user snapshot 
 }
 ```
 
-Only the authenticated CGI bridge replaces that object with true capabilities and
-`private_queue=true`. Do not call `ui/api.cgi` from SSH, forge a bridge marker, or write queue files
-manually. The non-setuid `sdsync-dsm-api --consume-job` form is controller-internal and validates its
-identity and exact private paths.
+Only the package-user API service returns true capabilities and `private_queue=true` after a DSM
+`http` CGI request has crossed the fixed authenticated socket and passed server-side DSM
+authentication, administrator authorization, SynoToken, and package CSRF checks. Do not call
+`ui/api.cgi` from SSH, connect to `api.sock`, forge relay data, or write queue files manually. The
+ordinary `0755` `sdsync-dsm-api --consume-job` form is controller-internal and validates its identity
+and exact private paths.
+
+The CLI does not require the CGI, socket, or API service. It is the recovery path when the dashboard
+cannot launch, but mutations still require the exact package identity and the same private-state and
+overlap validation.
 
 ## Private package paths
 
@@ -85,8 +102,9 @@ identity and exact private paths.
 | --- | --- |
 | Core binary | `/var/packages/synology-drive-sync/target/bin/synology-drive-sync` |
 | Manager | `/var/packages/synology-drive-sync/target/bin/sdsync-dsm` |
-| Private job consumer | `/var/packages/synology-drive-sync/target/bin/sdsync-dsm-api` |
-| DSM CGI bridge | `/var/packages/synology-drive-sync/target/ui/api.cgi` |
+| API service and private job consumer | `/var/packages/synology-drive-sync/target/bin/sdsync-dsm-api` |
+| Ordinary DSM `http` CGI relay | `/var/packages/synology-drive-sync/target/ui/api.cgi` |
+| Fixed package:`http` `0660` API socket | `/var/packages/synology-drive-sync/target/ui/api.sock` |
 | Dashboard assets | `/var/packages/synology-drive-sync/target/ui/` |
 | Generated config | `/var/packages/synology-drive-sync/home/config/config.toml` |
 | Profile fragments | `/var/packages/synology-drive-sync/home/config/profiles.d/` |
@@ -97,16 +115,19 @@ identity and exact private paths.
 | Password/TOTP/remote-log-token files | `/var/packages/synology-drive-sync/home/secrets/` |
 | Controller/run/routine/health state | `/var/packages/synology-drive-sync/var/state/` |
 | PID and overlap locks | `/var/packages/synology-drive-sync/var/run/` |
+| API-service PID file | `/var/packages/synology-drive-sync/var/run/api.pid` |
 | Private control queue/results/CSRF key | `/var/packages/synology-drive-sync/var/control/` |
 | Package logs and Activity | `/var/packages/synology-drive-sync/var/log/` |
+| API-service log | `/var/packages/synology-drive-sync/var/log/api.log` |
 | DSM package-control log | `/var/log/packages/synology-drive-sync.log` |
 
 Early DSM 7 builds without `SYNOPKG_PKGVAR` use a private package-home state fallback rather than a
 shared or world-writable path. Use `paths` to observe the actual resolved directories.
 
-Do not edit, chmod, chown, symlink, or enqueue files in these directories. The manager uses atomic
-replacement and validates owner, type, mode, and containment; manual edits can make the control plane
-fail closed.
+Do not edit, chmod, chown, symlink, enqueue, or connect to files in these directories. The manager
+uses atomic replacement and validates owner, type, mode, and containment; the CGI and API service
+also validate the fixed socket, parent, and kernel peer identities. Manual intervention can make the
+control plane fail closed.
 
 ## Exit statuses
 
@@ -127,7 +148,8 @@ Investigate every other nonzero result and obtain a fresh Plan before retrying a
 
 ## Package Center parity
 
-Package Center start/stop maps to the lifecycle controller. SSH parity is:
+Package Center start/stop controls both the dashboard API service and lifecycle controller. SSH
+parity is:
 
 ```bash
 sudo synopkg status synology-drive-sync
@@ -135,5 +157,5 @@ sudo synopkg start synology-drive-sync
 sudo synopkg stop synology-drive-sync
 ```
 
-Starting the controller does not enable a schedule. Stopping requests cooperative shutdown and does
-not silently discard an active job.
+Starting the package does not enable a schedule. Stopping requests cooperative shutdown of the API
+service, controller, and verified active runner and does not silently discard an active job.
