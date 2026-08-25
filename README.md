@@ -14,7 +14,7 @@ schedule isolated finite runs.
 
 An architecture-specific DSM 7 `.spk` can run the same engine directly on the source NAS. It includes
 a dark-first administrator dashboard for profiles, secrets, routines, Doctor, health, activity,
-logs, and notifications, plus the `sdsync-dsm` SSH recovery/automation manager. Its remote
+logs, and direct DSM desktop alerts, plus the `sdsync-dsm` SSH recovery/automation manager. Its remote
 destination is configurable: `/home/Drive/...` targets the remote account's Drive home, and any
 writable `/<shared-folder>/...` subdirectory can be selected instead. DSM must provision the remote
 user home or shared-folder root and its permissions first; the sync creates a missing chosen
@@ -23,6 +23,13 @@ Linux capability, or identity-changing file mode: an ordinary DSM `http` CGI rel
 package:`http` `0660` Unix socket to a package-user API service that reauthenticates the session and
 enforces administrator membership plus package CSRF. See the
 [Synology DSM package and dashboard guide](docs/synology-package.md).
+
+> [!WARNING]
+> Do not install the immutable 26.5 or 26.6 SPKs. Release 26.5 is setid/privilege-invalid; affected
+> DSM installs reject release 26.6's `conf/resource` `sysnotify` worker with
+> `pkgmgr_worker_violation`. Use 26.7 or later only when that release is published and its exact
+> SPK/checksum are verified. Published assets are not repaired in place, and repository validation
+> is not physical-DSM installation proof.
 
 > [!IMPORTANT]
 > The automated suite uses deterministic local and mock-HTTP tests; it does not log in to a live NAS. Before trusting a deployment, run the [source and target diagnostics](docs/diagnostics-and-batch.md), review `plan`, complete the [disposable live-NAS acceptance](docs/production-acceptance.md), and keep `--delete` disabled.
@@ -444,7 +451,8 @@ published separately for `linux/amd64` and `linux/arm64` as both `YY.N` and `lat
 Use the [release selector](docs/release-selector.md) to resolve an exact Synology model/DSM/runtime
 combination or desktop OS/CPU, then see [Release artifacts and verification](docs/releases.md) before
 deploying in a sensitive environment. Pin a calendar version or container digest rather than relying
-on mutable `latest`.
+on mutable `latest`. For DSM, reject 26.5 and 26.6 even if the selector matches their architecture;
+use a 26.7-or-later SPK only when that release is published.
 
 ## Failure clues
 

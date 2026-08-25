@@ -184,6 +184,25 @@ failure document.
 Secret replacements travel in a separate private queue file, enter the manager through standard
 input, and are removed after claim. See [Secrets and protected values](secrets.md).
 
+## Desktop alert boundary
+
+The package does not acquire DSM's `conf/resource` `sysnotify` worker and does not register
+Notification Center rules or email, SMS, mobile, or CMS channels. Its optional package alert policy
+invokes the documented `/usr/syno/bin/synodsmnotify -c` desktop path directly for logged-in DSM
+administrators.
+
+Each of the three accepted internal triggers maps to literal application, recipient, title-I18N, and
+message-I18N arguments. The command is an absolute path and is invoked directly—never through
+`eval`, `sh -c`, `xargs`, or a constructed command string. Profile names, exit codes, paths, URLs,
+account names, log/error text, cookies, CSRF/SynoToken values, passwords, TOTP material, and remote-log
+tokens never enter notifier arguments. The fixed desktop text tells the administrator to inspect
+package Activity and bounded logs for details.
+
+Repository validation rejects the legacy `synonotify` event/custom-variable path, a
+`conf/resource` member, sysnotify mail templates, dynamic notification placeholders, and drift from
+the exact fixed I18N argv. It does not prove that `synodsmnotify` accepts package-user calls or renders
+those keys on a particular DSM build; that remains live-NAS acceptance.
+
 ## Browser content policy
 
 The page uses a restrictive self-only Content Security Policy, no inline event handlers, no `eval`,
@@ -198,7 +217,8 @@ responsibility and are sent with same-origin credentials.
 
 Repository tests cover parsing, CGI/service identity predicates, Unix-socket ownership/mode and peer
 checks, admin membership, CSRF binding, schema rejection, queue paths/modes/order, redaction,
-response bounds, static CSP, and SPK privilege layout. They do not prove the actual DSM `http`
-identity/group database, execution of `authenticate.cgi` from the package-user service, AppLaunch
-token delivery, or reverse-proxy/origin behavior of a physical DSM release. Validate those on every
-supported DSM branch before calling the dashboard production-ready.
+response bounds, static CSP, direct fixed notifier arguments, and SPK privilege/resource layout.
+They do not prove the actual DSM `http` identity/group database, package-identity execution of
+`authenticate.cgi` or `synodsmnotify`, AppLaunch token delivery, or reverse-proxy/origin
+behavior of a physical DSM release. Validate those on every supported DSM branch before calling the
+dashboard production-ready.

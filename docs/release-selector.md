@@ -16,6 +16,15 @@ deterministic `YY.N` filename pattern and links to Releases; it never constructs
 download. A container tag is only correlated with the latest release and remains explicitly
 unverified until it is present in GHCR; deploy its immutable digest after verification.
 
+> **DSM package safety hold:** do not install `.spk` assets from releases `26.5` or `26.6`.
+> Release `26.5` contains identity-changing/set-ID privilege metadata that DSM rejects for a
+> third-party package; release `26.6` instead requests the Synology-only `sysnotify` resource worker.
+> The selector blocks those DSM assets even when GitHub reports one as the latest uploaded file and
+> links to [GitHub Releases](https://github.com/supermarsx/synology-drive-sync/releases) instead of
+> exposing a download. Release `26.7` or newer is eligible only when its exact canonical asset is
+> present. This hold does not block desktop, Rust SDK, C SDK, or container artifacts from the same
+> tags because those artifacts are not DSM packages.
+
 DSM compatibility follows SynologyOpenSource's
 [`pkgscripts-ng` platform mapping through DSM 7.4](https://github.com/SynologyOpenSource/pkgscripts-ng/blob/DSM7.4/include/pkg_util.sh).
 DSM 7.5 or a later major release therefore stops without a recommendation until this snapshot is

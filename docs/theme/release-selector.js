@@ -37,9 +37,16 @@
 
     const REPOSITORY = "supermarsx/synology-drive-sync";
     const RELEASES_URL = `https://github.com/${REPOSITORY}/releases/latest`;
+    const ALL_RELEASES_URL = `https://github.com/${REPOSITORY}/releases`;
     const RELEASE_API_URL = `https://api.github.com/repos/${REPOSITORY}/releases/latest`;
     const PACKAGE_URL = `https://github.com/${REPOSITORY}/pkgs/container/synology-drive-sync`;
     const FALLBACK_TAG = "YY.N";
+    const KNOWN_INVALID_DSM_SPK_RELEASES = Object.freeze({
+        "26.5":
+            "Release 26.5 SPKs contain identity-changing/set-ID privilege metadata that DSM rejects for a third-party package.",
+        "26.6":
+            "Release 26.6 SPKs request the Synology-only sysnotify resource worker, which DSM rejects for a third-party package.",
+    });
     const DSM_PACKAGE_MAXIMUM = Object.freeze({
         major: 7,
         minor: 4,
@@ -615,6 +622,7 @@
         return Object.freeze({
             ok: true,
             kind: "release-asset",
+            artifactType: "dsm-spk",
             purpose: "DSM dashboard package (SPK)",
             assetTemplate: `synology-drive-sync-{tag}-${assetArch}.spk`,
             detected: `${model.model} · Product line DSM · ${model.cpuArch} · Package Arch ${model.packageArch} · DSM ${versionDisplay} · Model ${dsmMinorRangeLabel(modelBounds)} · Toolkit ${dsmMinorRangeLabel(bounds)}`,
@@ -768,6 +776,26 @@
             });
         }
 
+        const invalidDsmSpkReason =
+            release && recommendation.artifactType === "dsm-spk"
+                ? KNOWN_INVALID_DSM_SPK_RELEASES[tag]
+                : null;
+
+        if (invalidDsmSpkReason) {
+            return Object.freeze({
+                ...recommendation,
+                ok: false,
+                code: "known_invalid_dsm_spk_release",
+                message: `Do not download or install DSM SPKs from release ${tag}.`,
+                details: `${invalidDsmSpkReason} Review GitHub Releases for a fixed release (26.7 or newer); the selector will verify its exact asset before offering a download.`,
+                tag,
+                exact: false,
+                releaseCorrelated: true,
+                downloadUrl: ALL_RELEASES_URL,
+                actionLabel: "Review GitHub Releases",
+            });
+        }
+
         const asset = release
             ? (Array.isArray(release.assets) ? release.assets : []).find(function findAsset(candidate) {
                   return (
@@ -861,12 +889,20 @@
         const heading = documentRef.createElement("h2");
         const summary = documentRef.createElement("p");
         const detail = documentRef.createElement("p");
+        const children = [heading, summary, detail];
 
         heading.textContent = "No safe recommendation";
         summary.className = "selector-result-summary";
         summary.textContent = recommendation.message;
         detail.textContent = recommendation.details;
-        result.replaceChildren(heading, summary, detail);
+        if (recommendation.downloadUrl) {
+            const link = documentRef.createElement("a");
+            link.className = "selector-download";
+            link.href = recommendation.downloadUrl;
+            link.textContent = recommendation.actionLabel || "Review GitHub Releases";
+            children.push(link);
+        }
+        result.replaceChildren(...children);
         result.dataset.state = "blocked";
         result.hidden = false;
         result.setAttribute("tabindex", "-1");
@@ -996,6 +1032,12 @@
 
             const latestRelease = await releasePromise;
             const recommendation = materializeRecommendation(resolved, latestRelease);
+            if (!recommendation.ok) {
+                renderFailure(container, recommendation);
+                status.textContent =
+                    "The current DSM package release is blocked; no download was recommended.";
+                return;
+            }
             renderSuccess(container, recommendation);
             status.textContent = recommendation.exact
                 ? "Exact current artifact found."

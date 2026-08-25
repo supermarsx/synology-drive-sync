@@ -29,23 +29,26 @@ Common causes are:
 Re-run the [release selector](../release-selector.md) with exact model, DSM minor/build, and
 `uname -m`. Do not modify `INFO` or rename an SPK/binary to force installation.
 
-## Normal third-party warning versus a root-privilege rejection
+## Normal third-party warning versus a DSM install-policy rejection
 
 DSM normally warns before installing a package that is not signed and distributed by Synology.
 That publisher-trust warning is expected for this project; accept it only after verifying the
 repository, exact release asset, checksum, and optional attestation. It is distinct from Package
-Center refusing installation because a package requires root or a lower privilege level.
+Center refusing installation because a package violates its lower-privilege or resource-worker
+policy.
 
 > [!WARNING]
-> Do not install the immutable 26.5 SPK assets. Release 26.5 requested package-owned mode `4755` for
-> `ui/api.cgi`. That did not select UID 0, but it was still an identity-changing permission that DSM
-> classified and rejected as requiring privileges. It does not meet the zero-setid contract and
-> cannot be repaired in place. Use 26.6 or later only after that corrected release is published and
-> its asset/checksum have been verified.
+> Do not install the immutable 26.5 or 26.6 SPK assets. Release 26.5 requested package-owned mode
+> `4755` for `ui/api.cgi`; although it did not select UID 0, DSM correctly treated the set-user-ID
+> permission as identity-changing/root-privilege-invalid. Release 26.6 removed setid, but affected DSM
+> installations then rejected its `conf/resource` `sysnotify` acquisition worker and recorded
+> `pkgmgr_worker_violation`. Published assets are not repaired or replaced in place. Use 26.7 or
+> later only when that release is published and its exact SPK/checksum are verified; repository
+> source or a draft artifact is not physical-DSM installation proof.
 
-The corrected 26.6-and-later SPK contract requests no root run-as, Linux capabilities,
-set-user-ID bit, or set-group-ID bit. Every executable, including `ui/api.cgi`, is ordinary `0755`,
-and `conf/privilege` contains exactly:
+The corrected 26.7-or-later source contract requests no root run-as, Linux capabilities, set-user-ID
+bit, or set-group-ID bit. Every executable, including `ui/api.cgi`, is ordinary `0755`, and
+`conf/privilege` contains exactly:
 
 ```json
 {
@@ -56,19 +59,27 @@ and `conf/privilege` contains exactly:
 }
 ```
 
-If Package Center reports a root-privilege rejection, do not accept it as the normal trust warning
-and do not repair the SPK with `chmod`, by deleting the privilege manifest, or by changing anything
-to root. Preserve the exact artifact and DSM build, validate the SPK on a workstation, and collect
-the install logs below. An old, locally modified, corrupted, or differently signed artifact is not
-evidence about the current package contract. Synology documents the two messages separately in its
+If Package Center reports a privilege/resource rejection, do not accept it as the normal trust
+warning and do not repair the SPK with `chmod`, by deleting a manifest, or by changing anything to
+root. Preserve the exact artifact and DSM build, validate the SPK on a workstation, and collect the
+install logs below. An old, locally modified, corrupted, or differently signed artifact is not
+evidence about the current source contract. Synology documents the messages separately in its
 [DSM 7 system requirements](https://help.synology.com/developer-guide/getting_started/system_requirement.html)
 and [breaking changes](https://help.synology.com/developer-guide/breaking_changes.html).
 
 ## Collect installation and dashboard evidence safely
 
-On the affected NAS, collect bounded tails rather than whole system logs:
+Record the exact Package Center failure time. On the affected NAS, collect the immutable device and
+artifact identity first, then bounded tails rather than whole system logs:
 
 ```bash
+date '+%Y-%m-%dT%H:%M:%S%z'
+uname -m
+cat /proc/sys/kernel/syno_hw_version
+cat /etc.defaults/VERSION
+sha256sum /path/to/synology-drive-sync-YY.N-ARCH.spk
+tar -xOf /path/to/synology-drive-sync-YY.N-ARCH.spk INFO
+tar -tf /path/to/synology-drive-sync-YY.N-ARCH.spk | grep -E '^(conf/|scripts/|INFO$)'
 sudo tail -n 200 /var/log/synopkg.log
 sudo tail -n 200 /var/log/messages
 sudo tail -n 200 /var/log/packages/synology-drive-sync.log
@@ -76,8 +87,11 @@ sudo tail -n 200 /var/packages/synology-drive-sync/var/log/controller.log
 sudo tail -n 200 /var/packages/synology-drive-sync/var/log/api.log
 ```
 
-The final two are package-private service logs and may not exist if installation or first start did
-not reach that stage. Inspect all output locally before sharing it. Never paste a DSM cookie,
+Replace the SPK path with the preserved file that Package Center actually received; do not extract,
+edit, or repack it. Keep any `pkgmgr_worker_violation`, resource name, package-manager phase, exit
+code, and nearby timestamp intact. The final two logs are package-private service logs and may not
+exist if installation or first start did not reach that stage. Inspect all output locally before
+sharing it. Never paste a DSM cookie,
 `SynoToken`, `X-SDSYNC-CSRF`, password, TOTP seed/current code, remote-log token, secret queue file,
 or token-bearing URL into an issue, chat, screenshot, or support archive. Redact sensitive host,
 account, and path values without removing timestamps, exit codes, DSM build, or package version.
@@ -190,9 +204,15 @@ at configuration time.
 
 ## DSM notification does not arrive
 
-Confirm the package alert policy, failure threshold, cooldown, and the administrator's DSM
-Notification Center channels. Look for `notification.unavailable` in Activity. The package registers
-only `sync_succeeded`, `sync_failed`, and `doctor_failed`; it does not send arbitrary log text.
+Confirm the package alert policy, failure threshold, cooldown, and that a DSM administrator is logged
+in to the desktop. Look for `notification.unavailable` in Activity, then inspect the bounded package
+logs. The package sends only fixed preloaded I18N title/message keys through
+`/usr/syno/bin/synodsmnotify -c`; it does not include a profile, exit code, path, URL, account, secret,
+or arbitrary log text in notifier arguments. Details remain in Activity and logs.
+
+This path is desktop-only. The package does not acquire `conf/resource` `sysnotify` and does not
+register Notification Center email, SMS, mobile, CMS, or rule/channel delivery. Checking those
+channels cannot repair a missing desktop alert.
 
 The browser fallback is not an unattended transport. It requires the dashboard to remain open and
 browser permission to be granted.
@@ -249,7 +269,7 @@ accessibility interaction, or AppLaunch token forwarding as already proven.
 - non-administrator DSM users cannot launch or call the API;
 - stale cookie, absent/mismatched SynoToken, missing/expired CSRF, wrong methods/fields, and direct CGI
   calls fail closed; and
-- no secret appears in URL history, Referer, browser storage, Activity, logs, Notification Center,
+- no secret appears in URL history, Referer, browser storage, Activity, logs, DSM desktop alerts,
   queue result, or support evidence.
 
 ### Profile, target, and Doctor
@@ -271,7 +291,8 @@ accessibility interaction, or AppLaunch token forwarding as already proven.
 - manual and scheduled actions do not overlap on the source NAS;
 - queued configuration terminal results and asynchronous Doctor/Plan/Run status are observable;
 - Activity/log bounds and rotation work through restart;
-- DSM success/failure/Doctor notifications obey threshold/cooldown and contain only fixed safe data;
+- direct DSM success/failure/Doctor desktop alerts obey threshold/cooldown, use only fixed I18N keys,
+  expose details only through Activity/logs, and do not register Notification Center channels;
   and
 - service restart after source-NAS reboot preserves configuration without triggering an unreviewed
   immediate mutation.
@@ -286,8 +307,9 @@ accessibility interaction, or AppLaunch token forwarding as already proven.
 - disposable uninstall removes package-private profiles/secrets/state/logs while preserving both
   NAS data trees.
 
-TOTP challenge behavior, DSM authentication, AppLaunch token delivery, Notification Center,
-File Station versions, reverse proxies, and Drive indexing vary across deployed systems. In
+TOTP challenge behavior, DSM authentication, AppLaunch token delivery, direct `synodsmnotify`
+desktop delivery, File Station versions, reverse proxies, and Drive indexing vary across deployed
+systems. In
 particular, Synology documents direct `authenticate.cgi` use by a custom CGI, but this root-free
 design invokes it from the package-user API service after an authenticated local socket relay. That
 execution behavior remains a live-DSM acceptance requirement. A complete record from the exact

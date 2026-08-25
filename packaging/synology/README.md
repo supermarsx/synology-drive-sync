@@ -11,7 +11,13 @@ The destination is not fixed or pre-provisioned in package code. Each profile ch
 - `/TeamShare/Backups` targets a shared folder or Drive Team Folder on the remote NAS. The DSM account must have File Station and write permission there.
 - Never use a remote physical path such as `/volume1/homes/alice/Drive/Backups`.
 
-The source is independently selectable for every profile and is a physical local path visible on the package NAS, such as `/volume1/Photos`. Grant the actual package identity shown under **Control Panel > Shared Folder > Edit > Permission > System internal user** read/traverse permission; DSM may collision-rename its NSS username. The package never requests root or capabilities. The dashboard covers profiles, protected-secret state, per-profile routines, Doctor, health, activity, bounded logs, DSM notifications, and non-secret display settings. See the [complete DSM package and dashboard guide](../../docs/synology-package.md).
+The source is independently selectable for every profile and is a physical local path visible on the package NAS, such as `/volume1/Photos`. Grant the actual package identity shown under **Control Panel > Shared Folder > Edit > Permission > System internal user** read/traverse permission; DSM may collision-rename its NSS username. The package never requests root or capabilities. The dashboard covers profiles, protected-secret state, per-profile routines, Doctor, health, activity, bounded logs, direct DSM desktop alerts, and non-secret display settings. See the [complete DSM package and dashboard guide](../../docs/synology-package.md).
+
+> [!WARNING]
+> Do not install the immutable 26.5 or 26.6 SPKs. Release 26.5 is setid/privilege-invalid. Release
+> 26.6 removed setid but affected DSM installs reject its `conf/resource` `sysnotify` acquisition
+> worker with `pkgmgr_worker_violation`. Use 26.7 or later only when that release is published and
+> its exact SPK/checksum are verified; a local build is not physical-DSM installation proof.
 
 ## Build and validate
 
@@ -65,6 +71,12 @@ package-user `sdsync-dsm-api --serve` process through fixed `target/ui/api.sock`
 user, grouped to `http`, and mode `0660`. Both peers verify socket metadata and kernel peer identity.
 The validator rejects any privilege-bearing archive member or broader privilege manifest.
 
+The corrected package contains no `conf/resource` acquisition worker or sysnotify mail templates.
+Optional alerts invoke `/usr/syno/bin/synodsmnotify -c` with only a fixed application ID,
+administrator recipient, and preloaded title/message I18N keys. They are DSM-desktop-only: profile,
+exit, path, account, log, and secret details remain in Activity and bounded logs, and no Notification
+Center email, SMS, mobile, CMS, or rule/channel delivery is registered.
+
 Linux reports a compatible 32-bit ARM NAS as `armv7l`, but `armv7l` is not a valid package-builder
 argument or DSM `INFO` family. Select the `armv7` artifact. Its `INFO` includes the unified `armv7`
 family used for Alpine platforms and the exact aliases which Synology's DSM 7 toolkit does not
@@ -76,11 +88,13 @@ The SPK contains the project license, generated third-party notices, and musl's 
 
 ## Install and initial configuration
 
-1. In DSM Package Center, choose **Manual Install** and select the SPK for the NAS architecture. DSM
+1. Use a verified 26.7-or-later SPK only when that release is published. In DSM Package Center, choose
+   **Manual Install** and select the SPK for the NAS architecture. DSM
    normally warns that this is a third-party package; that publisher-trust warning is expected for a
    package not distributed by Synology. A refusal saying root or lower privileges are required is a
-   different, unexpected result: preserve the asset and collect `/var/log/synopkg.log`,
-   `/var/log/messages`, and the package log as described in the troubleshooting guide.
+   different, unexpected result: preserve the asset and collect its SHA-256, `INFO`, member list,
+   `/var/log/synopkg.log`, `/var/log/messages`, and the package log exactly as described in the
+   troubleshooting guide. Preserve `pkgmgr_worker_violation`, resource names, phases, and timestamps.
 2. Start the package. The package-user API service and controller start safely with scheduling
    disabled.
 3. Open **Synology Drive Sync** from the DSM desktop or Package Center. A fresh administrator launch
@@ -196,8 +210,8 @@ assembly. Before relying on the package, test its exact NAS model and DSM versio
 source and target, including Package Center installation and exact warning, CGI `http` identity,
 package-user API service, package:`http` `0660` socket, rendered dashboard behavior, AppLaunch
 SynoToken forwarding, package-user `authenticate.cgi`, administrator/CSRF rejection cases,
-reverse-proxy upload limits, TLS trust, TOTP clock synchronization, routines, notifications, large
-files, Drive indexing, restart during a long transfer, upgrade, and uninstall. Rendered browser QA,
+reverse-proxy upload limits, TLS trust, TOTP clock synchronization, routines, direct DSM desktop
+alerts, large files, Drive indexing, restart during a long transfer, upgrade, and uninstall. Rendered browser QA,
 physical installation, and `authenticate.cgi` execution under the package user remain unverified. A
 manually built SPK is not automatically a Synology Package Center-approved release.
 

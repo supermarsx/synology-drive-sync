@@ -81,7 +81,7 @@ codes are:
 | `doctor.succeeded` | Doctor completed successfully |
 | `doctor.failed` | Doctor completed with a nonzero result |
 | `configuration.changed` | Profile, routine, alert, or schedule configuration changed |
-| `notification.unavailable` | The DSM notification command was unavailable |
+| `notification.unavailable` | The DSM desktop notification helper was unavailable or failed |
 
 Each event contains an epoch, fixed code, validated profile/`all`/`none` scope, fixed state, and
 bounded non-secret message. Activity rotates at 1 MiB with three backups. Browser clearing affects
@@ -108,32 +108,39 @@ sudo tail -n 200 /var/log/packages/synology-drive-sync.log
 sudo tail -n 200 /var/packages/synology-drive-sync/var/log/api.log
 ```
 
-## DSM Notification Center policy
+## DSM desktop alert policy
 
-The package registers one category, **Synology Drive Sync**, and three fixed events:
+The package recognizes three internal alert triggers and maps each one to a fixed title/message pair
+from `ui/texts/enu/strings`:
 
-| Event | Data passed |
+| Trigger | Desktop message |
 | --- | --- |
-| `sync_succeeded` | Validated profile identifier |
-| `sync_failed` | Validated profile identifier and numeric exit code |
-| `doctor_failed` | Validated profile identifier and numeric exit code |
+| `sync_succeeded` | Fixed completion title and message |
+| `sync_failed` | Fixed sync-failure title and message |
+| `doctor_failed` | Fixed Doctor-failure title and message |
 
-DSM supplies the hostname. The package never passes arbitrary core/log text, paths, URLs, account
-names, passwords, TOTP values, or tokens to Notification Center.
+The package invokes `/usr/syno/bin/synodsmnotify -c` directly with the fixed application ID,
+`@administrators`, and full package I18N keys. A profile name, exit code, path, URL, account name,
+core/log message, password, TOTP value, cookie, or token never enters notifier arguments. Operation
+details remain in Activity and bounded package logs.
+
+This is desktop-only delivery to logged-in DSM administrators. The SPK deliberately has no
+`conf/resource` `sysnotify` worker and does not register Notification Center rules or email, SMS,
+mobile, or CMS channels. Those channels cannot be enabled through this package alert policy.
 
 Policy fields:
 
 | Field | Dashboard range/meaning |
 | --- | --- |
-| Enable DSM notifications | Master enable |
+| Enable DSM desktop alerts | Master enable |
 | Notify on success | Emit `sync_succeeded`; off by default |
 | Notify on failure | Emit sync/Doctor failure events; on by default |
 | Failures before alert | `1..100`; default `1` |
 | Cooldown | Dashboard `60..604800` seconds; manager supports up to 30 days |
 
 Successful sync resets the tracked sync failure count. Cooldown rate-limits delivery. If
-`/usr/syno/bin/synonotify` is unavailable or fails, synchronization keeps its own result and records
-`notification.unavailable`; notification failure is not disguised as successful delivery.
+`/usr/syno/bin/synodsmnotify` is unavailable or fails, synchronization keeps its own result and
+records `notification.unavailable`; alert failure is not disguised as successful delivery.
 
 CLI parity:
 
@@ -156,6 +163,6 @@ failed run. This is a non-secret browser preference, not a background transport:
 - the first already-visible failure does not generate a duplicate alert; and
 - closing the page stops this fallback.
 
-Use DSM Notification Center or another externally monitored log/status path for unattended
-attention. Validate actual DSM notification delivery during
+Use an externally monitored log/status path when desktop-only delivery is insufficient for
+unattended attention. Validate actual DSM desktop delivery during
 [live-NAS acceptance](troubleshooting.md#live-nas-acceptance).

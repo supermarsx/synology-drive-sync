@@ -35,11 +35,13 @@ Every archive has one versioned top-level directory and contains:
 Four DSM 7 packages are published separately from the GNU/Linux archives:
 
 > [!WARNING]
-> The immutable 26.5 SPKs requested package-owned mode `4755` for `ui/api.cgi`. Although that mode
-> did not select UID 0, DSM classified and rejected the identity-changing permission. Release 26.5
-> does not meet the zero-setid package contract and should not be installed. The corrected baseline
-> is 26.6 or later once published; verify that release's exact SPK and checksum rather than modifying
-> or repackaging a 26.5 asset.
+> Do not install the immutable 26.5 or 26.6 SPKs. Release 26.5 requested package-owned mode `4755`
+> for `ui/api.cgi`; although it did not select UID 0, DSM classified the set-user-ID permission as
+> identity-changing/root-privilege-invalid. Release 26.6 removed setid, but affected DSM installs
+> rejected its `conf/resource` `sysnotify` acquisition worker with `pkgmgr_worker_violation`.
+> Published assets are not repaired or replaced in place. Use 26.7 or later only when that release is
+> published; verify that exact SPK and checksum rather than modifying or repackaging a 26.5/26.6
+> asset. Repository validation is not physical-DSM installation proof.
 
 | SPK `INFO` arch | Official CPU-table Package Arch mapping | Rust target embedded in the SPK | Release asset |
 | --- | --- | --- | --- |
@@ -48,12 +50,15 @@ Four DSM 7 packages are published separately from the GNU/Linux archives:
 | `armv7 armada370 armada375 armada38x armadaxp comcerto2k monaco` | `alpine`, `alpine4k`, `armada370`, `armada375`, `armada38x`, `armadaxp`, `comcerto2k`, `monaco` | `armv7-unknown-linux-musleabihf` | `synology-drive-sync-YY.N-armv7.spk` |
 | `i686` | `evansport` (DSM 7.0/7.1 only) | `i686-unknown-linux-musl` | `synology-drive-sync-YY.N-i686.spk` |
 
-Each corrected SPK contains one matching static ELF32 or ELF64 sync executable, a native
-administrator DSM dashboard, the `sdsync-dsm` CLI manager, ordinary CGI relay, package-user API
-service, controller/runner helpers, DSM lifecycle scripts, the minimal package/`http`
-`conf/privilege`, icons, and license texts. The package requires DSM `7.0-40759` or newer, while platform availability remains
-constrained by Synology's DSM-version table. It is not `noarch`; the four binary ABIs are never
-combined into one SPK. The ARMv7 INFO field combines the generic `armv7` family token used for
+Each corrected 26.7-or-later SPK, once published, contains one matching static ELF32 or ELF64 sync
+executable, a native administrator DSM dashboard, the `sdsync-dsm` CLI manager, ordinary CGI relay,
+package-user API service, controller/runner helpers, DSM lifecycle scripts, the minimal package/`http`
+`conf/privilege`, preloaded desktop-alert I18N text, icons, and license texts. It contains no
+`conf/resource` acquisition worker; fixed desktop alerts use direct `synodsmnotify -c` calls and do
+not register Notification Center channels. The package requires DSM `7.0-40759` or newer, while
+platform availability remains constrained by Synology's DSM-version table. It is not `noarch`; the
+four binary ABIs are never combined into one SPK. The ARMv7 INFO field combines the generic `armv7`
+family token used for
 Alpine/Alpine4k with the six compatible platform-specific aliases; every value selects the same
 ARMv7-A little-endian hard-float ABI.
 

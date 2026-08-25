@@ -110,7 +110,7 @@ normalizes member order, ownership, group, modes, and archive metadata. It inclu
 - core, manager, controller, runner, compiled helper/CGI, lifecycle scripts, and privilege policy;
 - DSM desktop app config, offline HTML/CSS/JavaScript, authored SVG mark, and deterministic
   16/24/32/48/64/72/256 PNG icons;
-- fixed Notification Center resources and English texts;
+- fixed, preloaded English desktop-alert I18N texts, with no `conf/resource` acquisition worker;
 - project license, generated notices, and musl copyright.
 
 Deterministic assembly reduces packaging variance. Independently compiled Rust binaries are not
@@ -122,13 +122,16 @@ claimed bit-for-bit reproducible across different compiler/linker/runner images.
 
 - safe outer/inner archive member names, types, modes, ordering, and required files;
 - filename/version/`INFO` architecture and DSM-bound consistency;
-- exact `conf/privilege`, `conf/resource`, application config, notification category/events/texts;
+- exact `conf/privilege` and application config, absence of `conf/resource` and legacy sysnotify mail
+  templates, and fixed desktop-alert I18N texts;
 - static core/helper ELF identity and equality of helper/CGI bytes;
 - no outer or inner archive member has a set-user-ID/set-group-ID bit or is group/world-writable,
   while `conf/privilege` remains the exact root-free package/`http` contract;
 - authored SVG safe bounds and exact deterministic PNG bytes/dimensions;
 - CSP, no-referrer ordering, offline assets, no inline handlers/eval/HTML injection, exact bridge
   action/schema markers, and no secret local-storage path;
+- the direct `synodsmnotify -c` contract: fixed application/administrator/I18N arguments only, no
+  legacy `synonotify` event/custom-variable path, and no dynamic profile, exit, log, or secret data;
 - lifecycle scripts, the fixed `package:http` `0660` socket/service contract, private FHS behavior,
   icons, license texts, and installed size.
 
@@ -143,16 +146,18 @@ python3 packaging/synology/test_synology_package.py
 
 Run the package suite in a Linux/WSL environment that provides its expected shell/process semantics.
 Negative tests deliberately tamper with architecture, helper identity, symlinks, permissions,
-resources, UI security markers, icons, and archive fields. They specifically reject an archived
-privilege bit, a non-`0755` CGI, a privilege manifest beyond the exact two-key contract, and unsafe
-socket ownership/mode/peer assumptions, so the gates do not merely accept the builder's happy path.
+reserved resources, notifier arguments, UI security markers, icons, and archive fields. They
+specifically reject `conf/resource`, legacy sysnotify mail templates, a dynamic notifier operand, an
+archived privilege bit, a non-`0755` CGI, a privilege manifest beyond the exact two-key contract, and
+unsafe socket ownership/mode/peer assumptions, so the gates do not merely accept the builder's happy
+path.
 
 ## Acceptance boundary
 
 Builder/validator success proves the reviewed archive contract, not DSM installation, web launch,
 the `http` CGI identity, package-user `authenticate.cgi` execution, socket group behavior,
-administrator groups, Notification Center, source ACLs, reverse proxy, File Station, TOTP, Drive
-indexing, or sync behavior on a physical model. Complete
+administrator groups, direct `synodsmnotify` desktop delivery, source ACLs, reverse proxy, File
+Station, TOTP, Drive indexing, or sync behavior on a physical model. Complete
 [live-NAS acceptance](troubleshooting.md#live-nas-acceptance) before publishing a support claim.
 
 Official framework references:

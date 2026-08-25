@@ -105,16 +105,19 @@ are in [Health, activity, logs, and notifications](operations.md).
 
 ## Notifications
 
-The package alert policy controls registered DSM Notification Center events. It is separate from
-the optional open-browser fallback:
+The package alert policy controls direct DSM desktop alerts. It is separate from the optional
+open-browser fallback:
 
-- DSM notifications can be enabled, triggered on success and/or failure, delayed until a bounded
-  consecutive failure threshold, and rate-limited by a cooldown.
+- DSM desktop alerts can be enabled, triggered on success and/or failure, delayed until a bounded
+  consecutive failure threshold, and rate-limited by a cooldown. They are sent directly to logged-in
+  DSM administrators through `synodsmnotify` with fixed, preloaded I18N keys.
 - Open-session notifications and the audible cue are local interface preferences. They operate only
   while this application is open and the browser grants permission.
 
-DSM event payloads contain only a validated profile identifier and, for failures, a numeric exit
-code. They never contain passwords, TOTP material, bearer tokens, or arbitrary log text.
+The desktop message never contains a profile name, exit code, path, URL, account name, password,
+TOTP material, bearer token, or arbitrary log text. Inspect Activity and bounded package logs for the
+specific operation and result. The package does not acquire the `sysnotify` resource or register
+Notification Center rules, email, SMS, mobile, or CMS delivery channels.
 
 ## Settings
 

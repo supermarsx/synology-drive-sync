@@ -29,6 +29,12 @@ can index the result only when the selected destination belongs to the remote ac
 or an enabled Team Folder.
 
 > [!IMPORTANT]
+> Do not install the immutable 26.5 or 26.6 SPKs. Release 26.5 is setid/privilege-invalid; release
+> 26.6 is rejected on affected DSM by its `conf/resource` `sysnotify` acquisition worker with
+> `pkgmgr_worker_violation`. Use 26.7 or later only when that release is published and its exact
+> SPK/checksum are verified. Published assets are not repaired in place.
+
+> [!NOTE]
 > Static packaging, bridge, manager, lifecycle, and mock File Station tests have passed. They do not
 > prove installation on a physical NAS or synchronization between two live NAS devices. DSM 7
 > AppLaunch forwarding of `SynoToken` to this third-party application is also not yet proven on
@@ -45,7 +51,7 @@ or an enabled Team Folder.
 | Every basic, deletion, TLS, retry, rate, output, and remote-log profile field | [Profiles and destinations](dsm/profiles.md) |
 | Password, TOTP, and remote-log-token keep/replace/clear behavior | [Secrets and protected values](dsm/secrets.md) |
 | Interval, daily, and realtime routines, dependencies, retries, and deletion approval | [Routines and scheduling](dsm/routines.md) |
-| Doctor, cached health, activity, logs, and DSM notifications | [Health, activity, logs, and notifications](dsm/operations.md) |
+| Doctor, cached health, activity, logs, and DSM desktop alerts | [Health, activity, logs, and notifications](dsm/operations.md) |
 | `authenticate.cgi`, administrator checks, SynoToken, CSRF, package/`http` socket boundary, and private queue | [Dashboard security model](dsm/security.md) |
 | Dashboard-to-`sdsync-dsm` command mapping and private paths | [CLI parity and private paths](dsm/cli-parity.md) |
 | Symptoms, recovery, acceptance evidence, and known unverified behavior | [Troubleshooting and live-NAS acceptance](dsm/troubleshooting.md) |
@@ -76,8 +82,8 @@ The complete procedure, including remote account preparation and source ACL chec
 ## Dashboard and CLI are one control plane
 
 The dashboard provides graphical profile editing, per-profile routines, status, cached health,
-Doctor, Plan, Run, bounded logs, structured activity, and DSM notification policy. Mutating requests
-are authenticated and queued. Configuration/secret/routine/policy saves poll a sanitized terminal
+Doctor, Plan, Run, bounded logs, structured activity, and a direct DSM desktop-alert policy.
+Mutating requests are authenticated and queued. Configuration/secret/routine/policy saves poll a sanitized terminal
 job result before reporting success. Doctor, Plan, and Run intentionally return `queued`; follow the
 snapshot or Activity before treating those operations as complete.
 
@@ -119,17 +125,20 @@ credentials, state, locks, and logs while leaving both NAS data trees untouched.
 
 ## Evidence boundary
 
-The native application, package resources, icons, permission contract, request schema, queue, and
-manager behavior are covered by repository tests. Rendered browser QA could not be completed because
+The native application, fixed desktop-alert I18N text, icons, permission contract, request schema,
+queue, and manager behavior are covered by repository tests. Rendered browser QA could not be completed because
 no browser runtime was available in the test environment. Treat layout on real DSM iframe/window
-sizes, DSM 7 AppLaunch `SynoToken` delivery, Package Center install/start/open behavior, Notification
-Center delivery, and the complete two-NAS data path as live acceptance work—not as proven behavior.
+sizes, DSM 7 AppLaunch `SynoToken` delivery, Package Center install/start/open behavior, DSM desktop
+delivery through `synodsmnotify`, and the complete two-NAS data path as live acceptance
+work—not as proven behavior. The SPK does not acquire `sysnotify` or register Notification Center
+email, SMS, mobile, CMS, or rule/channel delivery.
 
 Official framework references:
 
 - [DSM desktop application integration](https://help.synology.com/developer-guide/integrate_dsm/desktopapp.html)
 - [DSM application authentication](https://help.synology.com/developer-guide/integrate_dsm/web_authentication.html)
 - [DSM package privilege configuration](https://help.synology.com/developer-guide/privilege/privilege_config.html)
+- [DSM desktop notification command](https://help.synology.com/developer-guide/synology_package/show_massage.html)
 - [DSM package FHS](https://help.synology.com/developer-guide/integrate_dsm/fhs.html)
 - [Platform and `arch` mapping](https://help.synology.com/developer-guide/appendix/platarchs.html)
 - [Synology File Station API Guide](https://global.download.synology.com/download/Document/Software/DeveloperGuide/Package/FileStation/All/enu/Synology_File_Station_API_Guide.pdf)

@@ -53,6 +53,11 @@ test("selector form remains one raw HTML block for mdBook", () => {
     }
     assert.match(block[1], /Required for DSM 7\.0 and 7\.4/);
     assert.match(block[1], /optional for DSM 7\.1–7\.3/);
+    assert.match(source, /DSM package safety hold:[\s\S]*releases `26\.5` or `26\.6`/);
+    assert.match(
+        source,
+        /\[GitHub Releases\]\(https:\/\/github\.com\/supermarsx\/synology-drive-sync\/releases\)/,
+    );
 });
 
 test("captured official table has unique normalized model mappings", () => {
@@ -484,6 +489,121 @@ test("live GitHub asset must exist and be uploaded before an exact link is emitt
     assert.equal(absent.exact, false);
     assert.equal(absent.name, "synology-drive-sync-YY.N-armv7.spk");
     assert.equal(redirected.exact, false);
+});
+
+test("known-invalid 26.5 and 26.6 DSM SPKs are never recommended", () => {
+    const base = resolve({});
+    const expectedReasons = new Map([
+        ["26.5", /identity-changing\/set-ID privilege metadata/],
+        ["26.6", /Synology-only sysnotify resource worker/],
+    ]);
+
+    for (const [tag, expectedReason] of expectedReasons) {
+        const name = `synology-drive-sync-${tag}-armv7.spk`;
+        const result = selector.materializeRecommendation(base, {
+            tag_name: tag,
+            draft: false,
+            prerelease: false,
+            assets: [
+                {
+                    name,
+                    state: "uploaded",
+                    size: 42,
+                    browser_download_url: `https://github.com/supermarsx/synology-drive-sync/releases/download/${tag}/${name}`,
+                },
+            ],
+        });
+
+        assert.equal(result.ok, false, tag);
+        assert.equal(result.code, "known_invalid_dsm_spk_release", tag);
+        assert.equal(result.exact, false, tag);
+        assert.equal(result.downloadUrl, "https://github.com/supermarsx/synology-drive-sync/releases", tag);
+        assert.match(result.message, new RegExp(`release ${tag.replace(".", "\\.")}`), tag);
+        assert.match(result.details, expectedReason, tag);
+        assert.match(result.details, /26\.7 or newer/, tag);
+    }
+});
+
+test("26.7 DSM SPK is accepted only through its exact canonical asset URL", () => {
+    const base = resolve({});
+    const name = "synology-drive-sync-26.7-armv7.spk";
+    const result = selector.materializeRecommendation(base, {
+        tag_name: "26.7",
+        draft: false,
+        prerelease: false,
+        assets: [
+            {
+                name,
+                state: "uploaded",
+                size: 42,
+                browser_download_url: `https://github.com/supermarsx/synology-drive-sync/releases/download/26.7/${name}`,
+            },
+        ],
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.exact, true);
+    assert.equal(result.name, name);
+    assert.equal(
+        result.downloadUrl,
+        `https://github.com/supermarsx/synology-drive-sync/releases/download/26.7/${name}`,
+    );
+});
+
+test("26.5 and 26.6 safety hold is scoped to DSM SPKs", () => {
+    const selections = [
+        selector.resolveSelection({
+            purpose: "desktop-cli",
+            desktopOs: "linux",
+            desktopCpu: "x86_64",
+        }),
+        selector.resolveSelection({ purpose: "rust-sdk" }),
+        selector.resolveSelection({
+            purpose: "c-abi",
+            desktopOs: "macos",
+            desktopCpu: "aarch64",
+        }),
+    ];
+
+    for (const tag of ["26.5", "26.6"]) {
+        const releaseAssets = [
+            `synology-drive-sync-${tag}-linux-x86_64.tar.gz`,
+            `synology-drive-sync-${tag}-rust-sdk.tar.gz`,
+            `synology-drive-sync-${tag}-c-sdk-macos-aarch64.tar.gz`,
+        ].map(function asset(name) {
+            return {
+                name,
+                state: "uploaded",
+                size: 42,
+                browser_download_url: `https://github.com/supermarsx/synology-drive-sync/releases/download/${tag}/${name}`,
+            };
+        });
+        const release = {
+            tag_name: tag,
+            draft: false,
+            prerelease: false,
+            assets: releaseAssets,
+        };
+
+        for (const selection of selections) {
+            const result = selector.materializeRecommendation(selection, release);
+            assert.equal(result.ok, true, `${tag} ${selection.purpose}`);
+            assert.equal(result.exact, true, `${tag} ${selection.purpose}`);
+            assert.equal(result.tag, tag, `${tag} ${selection.purpose}`);
+        }
+
+        const container = selector.materializeRecommendation(
+            selector.resolveSelection({
+                purpose: "container",
+                desktopOs: "linux",
+                desktopCpu: "aarch64",
+            }),
+            release,
+        );
+        assert.equal(container.ok, true, tag);
+        assert.equal(container.releaseCorrelated, true, tag);
+        assert.equal(container.tag, tag);
+    }
 });
 
 test("live release tags and GitHub asset URLs must be canonical", () => {
