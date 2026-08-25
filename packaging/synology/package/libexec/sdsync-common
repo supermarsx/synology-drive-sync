@@ -312,17 +312,37 @@ safe_notify() {
         ;;
     esac
     case $notify_exit in ''|*[!0-9]*) return 64 ;; esac
-    if [ -x /usr/syno/bin/synonotify ] && [ ! -L /usr/syno/bin/synonotify ]; then
-        # Both the event key and the JSON variable names are package constants;
-        # profile and exit are validated above and are passed as one quoted argv.
-        /usr/syno/bin/synonotify "$notify_key" \
-            "{\"%PROFILE%\":\"$notify_profile\",\"%EXIT_CODE%\":$notify_exit}" \
-            >/dev/null 2>&1 || return $?
-        return 0
+    notify_status=69
+    if [ -x /usr/syno/bin/synodsmnotify ] && [ ! -L /usr/syno/bin/synodsmnotify ]; then
+        # DSM receives only reviewed application and I18N identifiers. Dynamic
+        # profile, exit, log, and secret material never enters notifier argv.
+        case $notify_key in
+            sync_succeeded)
+                if /usr/syno/bin/synodsmnotify -c com.supermarsx.SynologyDriveSync \
+                    @administrators \
+                    synology-drive-sync:notifications:sync_succeeded_title \
+                    synology-drive-sync:notifications:sync_succeeded_message \
+                    >/dev/null 2>&1; then return 0; else notify_status=$?; fi
+                ;;
+            sync_failed)
+                if /usr/syno/bin/synodsmnotify -c com.supermarsx.SynologyDriveSync \
+                    @administrators \
+                    synology-drive-sync:notifications:sync_failed_title \
+                    synology-drive-sync:notifications:sync_failed_message \
+                    >/dev/null 2>&1; then return 0; else notify_status=$?; fi
+                ;;
+            doctor_failed)
+                if /usr/syno/bin/synodsmnotify -c com.supermarsx.SynologyDriveSync \
+                    @administrators \
+                    synology-drive-sync:notifications:doctor_failed_title \
+                    synology-drive-sync:notifications:doctor_failed_message \
+                    >/dev/null 2>&1; then return 0; else notify_status=$?; fi
+                ;;
+        esac
     fi
     append_activity notification.unavailable "$notify_profile" unavailable \
-        "DSM notification command unavailable" 2>/dev/null || true
-    return 69
+        "DSM desktop notification delivery unavailable" 2>/dev/null || true
+    return "$notify_status"
 }
 
 handle_alert_result() {

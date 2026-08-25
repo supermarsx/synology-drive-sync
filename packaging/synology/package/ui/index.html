@@ -338,23 +338,23 @@
 
       <section class="page" data-page="notifications" aria-labelledby="notifications-title" hidden>
         <div class="section-heading">
-          <div><p class="eyebrow">Attention routing</p><h2 id="notifications-title">Notifications</h2><p>Choose how this open DSM session calls attention to routine failures.</p></div>
+          <div><p class="eyebrow">Attention routing</p><h2 id="notifications-title">Notifications</h2><p>Choose package-level DSM desktop alerts and optional signals for this open session.</p></div>
         </div>
         <div class="two-column">
           <form class="panel" data-alert-policy-form>
-            <div class="panel-heading"><div><p class="eyebrow">DSM Notification Center</p><h3>Package alert policy</h3></div><span class="status-pill neutral" data-alert-policy-state>Unavailable</span></div>
-            <label class="switch-row"><span><strong>Enable DSM notifications</strong><small>Uses package-registered, fixed notification events.</small></span><input name="enabled" type="checkbox" role="switch" disabled></label>
-            <label class="switch-row"><span><strong>Notify on success</strong><small>Reports the validated profile identifier only.</small></span><input name="on_success" type="checkbox" role="switch" disabled></label>
-            <label class="switch-row"><span><strong>Notify on failure</strong><small>Reports the profile identifier and numeric exit code, never log text.</small></span><input name="on_failure" type="checkbox" role="switch" checked disabled></label>
+            <div class="panel-heading"><div><p class="eyebrow">DSM desktop alerts</p><h3>Package alert policy</h3></div><span class="status-pill neutral" data-alert-policy-state>Unavailable</span></div>
+            <label class="switch-row"><span><strong>Enable DSM desktop alerts</strong><small>Sends fixed, preloaded I18N messages directly to logged-in DSM administrators.</small></span><input name="enabled" type="checkbox" role="switch" disabled></label>
+            <label class="switch-row"><span><strong>Notify on success</strong><small>Sends a fixed completion message; inspect Activity for the profile and result.</small></span><input name="on_success" type="checkbox" role="switch" disabled></label>
+            <label class="switch-row"><span><strong>Notify on failure</strong><small>Sends a fixed failure message; inspect Activity and logs for details.</small></span><input name="on_failure" type="checkbox" role="switch" checked disabled></label>
             <label><span>Failures before alert</span><input name="failure_threshold" type="number" min="1" max="100" value="1" inputmode="numeric" disabled></label>
             <label><span>Cooldown (seconds)</span><input name="cooldown_seconds" type="number" min="60" max="604800" value="3600" inputmode="numeric" disabled></label>
             <button class="button primary" type="submit" disabled>Save DSM alert policy</button>
           </form>
           <div class="stack">
             <article class="panel">
-              <p class="eyebrow">Registered events</p><h3>Fixed, non-secret payloads</h3>
-              <ul class="plain-list"><li><code>sync_succeeded</code> — profile identifier</li><li><code>sync_failed</code> — profile identifier and numeric exit code</li><li><code>doctor_failed</code> — profile identifier and numeric exit code</li></ul>
-              <p>Delivery follows the administrator's DSM Notification Center configuration. If DSM notification tools are unavailable, the package records a safe <code>notification.unavailable</code> activity event.</p>
+              <p class="eyebrow">Direct desktop delivery</p><h3>Fixed, non-secret messages</h3>
+              <ul class="plain-list"><li><code>sync_succeeded</code> — fixed completion message</li><li><code>sync_failed</code> — fixed sync failure message</li><li><code>doctor_failed</code> — fixed Doctor failure message</li></ul>
+              <p>The package does not register Notification Center rules, email, SMS, mobile, or CMS channels. Details stay in Activity and package logs. If DSM's desktop notification helper is unavailable, the package records <code>notification.unavailable</code>.</p>
             </article>
             <form class="panel" data-notification-form>
               <div class="panel-heading"><div><p class="eyebrow">Open-session signal</p><h3>Browser fallback</h3></div><span class="status-pill neutral" data-notification-permission>Not enabled</span></div>

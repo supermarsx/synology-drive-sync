@@ -7,6 +7,7 @@ import copy
 import io
 import json
 import os
+import re
 import select
 import signal
 import shutil
@@ -222,6 +223,31 @@ def repack_payload_pax(
     return rebuilt_payload.getvalue()
 
 
+def repack_payload_with_extra(
+    payload: bytes, member_name: str, member_payload: bytes
+) -> bytes:
+    rebuilt_payload = io.BytesIO()
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as original, tarfile.open(
+        fileobj=rebuilt_payload, mode="w:gz", format=tarfile.PAX_FORMAT
+    ) as rebuilt:
+        for original_member in original.getmembers():
+            member = copy.copy(original_member)
+            content = (
+                original.extractfile(original_member).read()
+                if original_member.isfile()
+                else None
+            )
+            rebuilt.addfile(member, io.BytesIO(content) if content is not None else None)
+        extra = tarfile.TarInfo(member_name)
+        extra.mode = 0o644
+        extra.size = len(member_payload)
+        extra.mtime = 1700000000
+        extra.uid = extra.gid = 0
+        extra.uname = extra.gname = "root"
+        rebuilt.addfile(extra, io.BytesIO(member_payload))
+    return rebuilt_payload.getvalue()
+
+
 class BuilderTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="sdsync-spk-test-")
@@ -305,11 +331,13 @@ class BuilderTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(f"({arch})", result.stdout)
             with tarfile.open(artifact, "r:") as outer:
+                outer_members = {member.name for member in outer.getmembers()}
                 info = outer.extractfile("INFO").read()  # type: ignore[union-attr]
                 package_payload = outer.extractfile("package.tgz").read()  # type: ignore[union-attr]
                 privilege = json.loads(
                     outer.extractfile("conf/privilege").read()  # type: ignore[union-attr]
                 )
+            self.assertNotIn("conf/resource", outer_members)
             self.assertIn(f'arch="{info_arch}"'.encode(), info)
             self.assertEqual(
                 privilege,
@@ -317,15 +345,99 @@ class BuilderTests(unittest.TestCase):
             )
             self.assertNotIn("tool", privilege)
             with tarfile.open(fileobj=io.BytesIO(package_payload), mode="r:gz") as package:
+                package_members = {member.name for member in package.getmembers()}
                 installed_api = package.extractfile("bin/sdsync-dsm-api").read()  # type: ignore[union-attr]
                 cgi_api = package.extractfile("ui/api.cgi").read()  # type: ignore[union-attr]
+                common = package.extractfile("libexec/sdsync-common").read()  # type: ignore[union-attr]
                 self.assertEqual(installed_api, self.last_api_binary.read_bytes())
                 self.assertEqual(cgi_api, installed_api)
+                self.assertNotIn(b"/usr/syno/bin/synonotify", common)
+                self.assertIn(b"/usr/syno/bin/synodsmnotify", common)
+                self.assertNotIn("ui/texts/enu/mails", package_members)
                 self.assertEqual(package.getmember("bin/sdsync-dsm-api").mode, 0o755)
                 self.assertEqual(package.getmember("ui/api.cgi").mode, 0o755)
                 self.assertFalse(
                     any(member.mode & 0o6000 for member in package.getmembers())
                 )
+
+    def test_builder_omits_and_validator_rejects_reserved_resource_manifest(self) -> None:
+        artifact = self.build("x86_64", 62)
+        with tarfile.open(artifact, "r:") as archive:
+            self.assertNotIn("conf/resource", {member.name for member in archive})
+
+        for index, resource_name in enumerate(
+            (
+                "conf/resource",
+                "conf/resource/unexpected.json",
+                "./conf/resource",
+            )
+        ):
+            tampered = self.root / f"reserved-resource-{index}" / artifact.name
+            tampered.parent.mkdir()
+            shutil.copyfile(artifact, tampered)
+            resource = b'{"sysnotify":{}}'
+            member = tarfile.TarInfo(resource_name)
+            member.mode = 0o644
+            member.size = len(resource)
+            member.mtime = 1700000000
+            member.uid = member.gid = 0
+            member.uname = member.gname = "root"
+            with tarfile.open(tampered, "a") as archive:
+                archive.addfile(member, io.BytesIO(resource))
+
+            result = subprocess.run(
+                [sys.executable, str(HERE / "validate_spk.py"), str(tampered)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("reserved conf/resource", result.stderr)
+
+    def test_validator_rejects_unreviewed_outer_and_inner_members(self) -> None:
+        artifact = self.build("x86_64", 62)
+        with tarfile.open(artifact, "r:") as archive:
+            package_payload = archive.extractfile("package.tgz").read()  # type: ignore[union-attr]
+
+        outer_extra = self.root / "outer-extra" / artifact.name
+        outer_extra.parent.mkdir()
+        shutil.copyfile(artifact, outer_extra)
+        payload = b"unreviewed\n"
+        member = tarfile.TarInfo("conf/unreviewed")
+        member.mode = 0o644
+        member.size = len(payload)
+        member.mtime = 1700000000
+        member.uid = member.gid = 0
+        member.uname = member.gname = "root"
+        with tarfile.open(outer_extra, "a") as archive:
+            archive.addfile(member, io.BytesIO(payload))
+
+        inner_extra = self.root / "inner-extra" / artifact.name
+        inner_extra.parent.mkdir()
+        repack_outer(
+            artifact,
+            inner_extra,
+            payload_overrides={
+                "package.tgz": repack_payload_with_extra(
+                    package_payload, "share/unreviewed", payload
+                )
+            },
+        )
+
+        for candidate, marker in (
+            (outer_extra, "unexpected outer members"),
+            (inner_extra, "unexpected inner members"),
+        ):
+            result = subprocess.run(
+                [sys.executable, str(HERE / "validate_spk.py"), str(candidate)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, candidate.parent.name)
+            self.assertIn(marker, result.stderr, candidate.parent.name)
 
     def test_armv7_info_has_family_and_required_platform_aliases(self) -> None:
         artifact = self.build(
@@ -468,10 +580,81 @@ class BuilderTests(unittest.TestCase):
         with tarfile.open(first, "r:") as outer:
             info = outer.extractfile("INFO").read().decode("utf-8")  # type: ignore[union-attr]
             compressed_size = outer.getmember("package.tgz").size
+            package_payload = outer.extractfile("package.tgz").read()  # type: ignore[union-attr]
         extract_line = next(line for line in info.splitlines() if line.startswith('extractsize="'))
         extract_kib = int(extract_line.split('"')[1])
+        with tarfile.open(fileobj=io.BytesIO(package_payload), mode="r:gz") as package:
+            payload_bytes = sum(
+                member.size for member in package.getmembers() if member.isfile()
+            )
+        self.assertEqual(extract_kib, (payload_bytes + 1023) // 1024)
         self.assertGreater(extract_kib * 1024, compressed_size)
         self.assertIn('version="1.2.3-1"', info)
+
+    def test_validator_rejects_malformed_zero_and_inexact_extractsize(self) -> None:
+        artifact = self.build("x86_64", 62)
+        with tarfile.open(artifact, "r:") as archive:
+            original_info = archive.extractfile("INFO").read()  # type: ignore[union-attr]
+        match = re.search(rb'(?m)^extractsize="([1-9][0-9]*)"$', original_info)
+        self.assertIsNotNone(match)
+        declared = int(match.group(1))  # type: ignore[union-attr]
+        original_line = f'extractsize="{declared}"'.encode()
+        cases = (
+            ("malformed", b'extractsize="12 KiB"', "canonical positive integer"),
+            ("zero", b'extractsize="0"', "canonical positive integer"),
+            (
+                "off-by-one",
+                f'extractsize="{declared + 1}"'.encode(),
+                "does not match package.tgz regular-file size",
+            ),
+        )
+        for name, replacement, marker in cases:
+            tampered = self.root / name / artifact.name
+            tampered.parent.mkdir()
+            repack_outer(
+                artifact,
+                tampered,
+                info_payload=original_info.replace(original_line, replacement, 1),
+            )
+            result = subprocess.run(
+                [sys.executable, str(HERE / "validate_spk.py"), str(tampered)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, name)
+            self.assertIn(marker, result.stderr, name)
+
+    def test_validator_requires_thirdparty_and_exact_info_schema(self) -> None:
+        artifact = self.build("x86_64", 62)
+        with tarfile.open(artifact, "r:") as archive:
+            original_info = archive.extractfile("INFO").read()  # type: ignore[union-attr]
+        cases = (
+            (
+                "not-third-party",
+                original_info.replace(b'thirdparty="yes"', b'thirdparty="no"', 1),
+                "fixed field 'thirdparty' must be 'yes'",
+            ),
+            (
+                "unknown-field",
+                original_info + b'unreviewed_metadata="yes"\n',
+                "unknown fields",
+            ),
+        )
+        for name, info_payload, marker in cases:
+            tampered = self.root / name / artifact.name
+            tampered.parent.mkdir()
+            repack_outer(artifact, tampered, info_payload=info_payload)
+            result = subprocess.run(
+                [sys.executable, str(HERE / "validate_spk.py"), str(tampered)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, name)
+            self.assertIn(marker, result.stderr, name)
 
     def test_rejects_wrong_machine_dynamic_interpreter_and_headerless_elf(self) -> None:
         cases = (
@@ -1606,7 +1789,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "#!/bin/sh\nset -eu\n"
             f'. "{self.real_target / "libexec/sdsync-common"}"\n'
             "ensure_layout\n"
-            "if [ ! -x /usr/syno/bin/synonotify ]; then\n"
+            "if [ ! -x /usr/syno/bin/synodsmnotify ]; then\n"
             "  set +e; safe_notify sync_failed alpha 42; code=$?; set -e; [ \"$code\" -eq 69 ]\n"
             "fi\n",
             encoding="utf-8",
@@ -1618,8 +1801,91 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(fallback.returncode, 0, fallback.stderr)
         activity, payload = self.api("activity", "--lines", "20")
         self.assertEqual(activity.returncode, 0, activity.stderr)
-        if not Path("/usr/syno/bin/synonotify").exists():
+        if not Path("/usr/syno/bin/synodsmnotify").exists():
             self.assertIn("notification.unavailable", [event["code"] for event in payload["events"]])
+
+    def test_direct_dsm_notifications_use_fixed_argv_and_record_failures(self) -> None:
+        common = self.real_target / "libexec/sdsync-common"
+        source = common.read_text(encoding="utf-8")
+        self.assertNotIn("/usr/syno/bin/synonotify", source)
+        notifier = self.root / "synodsmnotify"
+        capture = self.root / "synodsmnotify.args"
+        notifier.write_text(
+            "#!/bin/sh\n"
+            f'printf \'%s\\n\' --CALL-- "$@" >> "{capture}"\n'
+            "exit 23\n",
+            encoding="utf-8",
+        )
+        notifier.chmod(0o755)
+        common.write_text(
+            source.replace("/usr/syno/bin/synodsmnotify", str(notifier)),
+            encoding="utf-8",
+        )
+        profile = "A" * 62 + "-_"
+        helper = self.root / "direct-notification.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{common}"\n'
+            "ensure_layout\n"
+            f'profile="{profile}"\n'
+            "for event in sync_succeeded sync_failed doctor_failed; do\n"
+            "  set +e\n"
+            "  safe_notify \"$event\" \"$profile\" 4294967295\n"
+            "  code=$?\n"
+            "  set -e\n"
+            "  [ \"$code\" -eq 23 ]\n"
+            "done\n"
+            "for rejected in event profile exit; do\n"
+            "  set +e\n"
+            "  case $rejected in\n"
+            "    event) safe_notify unregistered \"$profile\" 42 ;;\n"
+            "    profile) safe_notify sync_failed 'bad/profile' 42 ;;\n"
+            "    exit) safe_notify sync_failed \"$profile\" 42x ;;\n"
+            "  esac\n"
+            "  code=$?\n"
+            "  set -e\n"
+            "  [ \"$code\" -eq 64 ]\n"
+            "done\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            for path in (notifier, common, helper):
+                os.chown(path, self.drop_uid, self.drop_gid)
+
+        result = self.shell(helper)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected: list[str] = []
+        for event in ("sync_succeeded", "sync_failed", "doctor_failed"):
+            expected.extend(
+                [
+                    "--CALL--",
+                    "-c",
+                    "com.supermarsx.SynologyDriveSync",
+                    "@administrators",
+                    f"synology-drive-sync:notifications:{event}_title",
+                    f"synology-drive-sync:notifications:{event}_message",
+                ]
+            )
+        captured = capture.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(captured, expected)
+        self.assertNotIn(profile, captured)
+        self.assertNotIn("4294967295", captured)
+        activity, payload = self.api("activity", "--lines", "20")
+        self.assertEqual(activity.returncode, 0, activity.stderr)
+        unavailable = [
+            event for event in payload["events"]
+            if event["code"] == "notification.unavailable"
+        ]
+        self.assertEqual(len(unavailable), 3)
+        self.assertTrue(all(event["profile"] == profile for event in unavailable))
+        self.assertTrue(
+            all(
+                event["message"]
+                == "DSM desktop notification delivery unavailable"
+                for event in unavailable
+            )
+        )
 
     def test_controller_private_queue_is_sequential_bounded_and_rejects_unsafe_entries(self) -> None:
         bridge_capture = self.root / "bridge-capture"

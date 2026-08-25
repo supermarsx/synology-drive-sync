@@ -1101,7 +1101,7 @@
     };
     try {
       await apiPost(ACTIONS.alertPolicy, payload);
-      toast("Alert policy saved", "The controller applied the DSM Notification Center policy.", false);
+      toast("Alert policy saved", "The controller applied the DSM desktop alert policy.", false);
       await refreshSnapshot(false);
     } catch (error) {
       toast("Alert policy not saved", boundedText(error.message, "The package rejected the policy."), true);

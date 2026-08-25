@@ -413,7 +413,6 @@ def payload_archive(binary: Path, api_binary: Path) -> tuple[bytes, int]:
         (HERE / "package/ui/app.js", "ui/app.js"),
         (HERE / "package/ui/images/icon.svg", "ui/images/icon.svg"),
         (HERE / "package/ui/texts/enu/strings", "ui/texts/enu/strings"),
-        (HERE / "package/ui/texts/enu/mails", "ui/texts/enu/mails"),
     )
     rendered_icons = {size: png_icon(size) for size in UI_ICON_SIZES}
     installed_size = (
@@ -532,7 +531,6 @@ def create_spk(
             if source.is_file():
                 add_bytes(archive, f"scripts/{source.name}", source.read_bytes(), 0o755)
         add_bytes(archive, "conf/privilege", (HERE / "conf/privilege").read_bytes(), 0o644)
-        add_bytes(archive, "conf/resource", (HERE / "conf/resource").read_bytes(), 0o644)
     os.replace(temporary, destination)
     return destination
 

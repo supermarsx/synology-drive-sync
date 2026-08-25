@@ -4,8 +4,8 @@ description="Configure, diagnose, and monitor one-way File Station sync"
 
 [notifications]
 sync_succeeded_title="Drive Sync completed"
-sync_succeeded_message="Profile %PROFILE% completed successfully."
+sync_succeeded_message="A configured Drive Sync profile completed successfully."
 sync_failed_title="Drive Sync failed"
-sync_failed_message="Profile %PROFILE% failed with exit code %EXIT_CODE%."
+sync_failed_message="A configured Drive Sync profile failed. Open the package dashboard for details."
 doctor_failed_title="Drive Sync doctor failed"
-doctor_failed_message="The target doctor failed for profile %PROFILE% with exit code %EXIT_CODE%."
+doctor_failed_message="A target doctor check failed. Open the package dashboard for details."

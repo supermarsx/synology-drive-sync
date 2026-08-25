@@ -352,6 +352,8 @@ jobs:
         run: bash .github/scripts/validate-packaging.sh
       - name: Validate Synology package templates
         run: python3 packaging/synology/validate_spk.py
+      - name: Test Synology DSM UI contract
+        run: python3 packaging/synology/test_synology_ui.py
       - name: Test Synology package builder and DSM lifecycle
         run: python3 packaging/synology/test_synology_package.py
       - name: Test calendar release contract

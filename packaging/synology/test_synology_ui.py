@@ -29,7 +29,7 @@ UI = HERE / "package/ui"
 
 
 class DsmUiContractTests(unittest.TestCase):
-    def test_source_validator_covers_ui_resource_and_dsm_bounds(self) -> None:
+    def test_source_validator_covers_rootless_ui_and_dsm_bounds(self) -> None:
         validate_spk.validate_source()
         info = (HERE / "INFO.template").read_text(encoding="utf-8")
         self.assertIn('os_min_ver="7.0-40759"', info)
@@ -37,16 +37,18 @@ class DsmUiContractTests(unittest.TestCase):
         self.assertIn('dsmuidir="ui"', info)
         self.assertIn('dsmappname="com.supermarsx.SynologyDriveSync"', info)
 
-    def test_dsm_application_and_notification_registration_match(self) -> None:
+    def test_dsm_application_and_direct_notification_contract_match(self) -> None:
         config = json.loads((UI / "config").read_text(encoding="utf-8"))
-        resource = json.loads((HERE / "conf/resource").read_text(encoding="utf-8"))
+        notifier = (HERE / "package/libexec/sdsync-common").read_bytes()
         app_id = "com.supermarsx.SynologyDriveSync"
         application = config[".url"][app_id]
         self.assertEqual(application["type"], "url")
         self.assertEqual(application["url"], "3rdparty/synology-drive-sync/index.html")
         self.assertIs(application["allUsers"], False)
-        self.assertEqual(resource["sysnotify"]["texts_dir"], "ui/texts")
-        self.assertEqual(resource["sysnotify"]["app_privileges"], [{"app_id": app_id, "categories": ["Synology Drive Sync"]}])
+        self.assertFalse((HERE / "conf/resource").exists())
+        self.assertFalse((UI / "texts/enu/mails").exists())
+        validate_spk.validate_notifier(notifier)
+        self.assertNotIn(b"/usr/syno/bin/synonotify", notifier)
         expected = {
             f"notifications:{event}_{suffix}"
             for event in ("sync_succeeded", "sync_failed", "doctor_failed")
@@ -243,8 +245,9 @@ class DsmUiContractTests(unittest.TestCase):
                 name = f"ui/images/icon_{size}.png"
                 self.assertIn(name, members)
                 self.assertEqual(validate_spk.png_dimensions(archive.extractfile(members[name]).read()), (size, size))
-            for name in ("ui/config", "ui/index.html", "ui/app.css", "ui/app.js", "ui/images/icon.svg", "ui/texts/enu/strings", "ui/texts/enu/mails"):
+            for name in ("ui/config", "ui/index.html", "ui/app.css", "ui/app.js", "ui/images/icon.svg", "ui/texts/enu/strings"):
                 self.assertIn(name, members)
+            self.assertNotIn("ui/texts/enu/mails", members)
             self.assertEqual(installed_size, sum(member.size for member in members.values() if member.isfile()))
 
     def test_builder_refuses_setid_archive_metadata(self) -> None:
@@ -278,17 +281,43 @@ class DsmUiContractTests(unittest.TestCase):
         config[".url"]["com.supermarsx.SynologyDriveSync"]["allUsers"] = True
         with self.assertRaisesRegex(validate_spk.ValidationError, "allUsers"):
             validate_spk.validate_ui_config(json.dumps(config).encode())
-        resource = json.loads((HERE / "conf/resource").read_text(encoding="utf-8"))
-        duplicate_resource = json.dumps(resource).encode().replace(
-            b'"texts_dir": "ui/texts"',
-            b'"texts_dir": "unsafe", "texts_dir": "ui/texts"',
-            1,
-        )
-        with self.assertRaisesRegex(validate_spk.ValidationError, "duplicate JSON key"):
-            validate_spk.validate_resource(duplicate_resource)
-        resource["sysnotify"]["app_privileges"][0]["categories"] = ["Unreviewed"]
-        with self.assertRaisesRegex(validate_spk.ValidationError, "sysnotify"):
-            validate_spk.validate_resource(json.dumps(resource).encode())
+        strings = (UI / "texts/enu/strings").read_bytes()
+        validate_spk.validate_ui_texts(strings)
+        with self.assertRaisesRegex(validate_spk.ValidationError, "fixed"):
+            validate_spk.validate_ui_texts(
+                strings.replace(
+                    b"A configured Drive Sync profile failed.",
+                    b"Profile %PROFILE% failed.",
+                    1,
+                )
+            )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "reviewed sections"):
+            validate_spk.validate_ui_texts(
+                strings + b'\n[unexpected]\nextra="value"\n'
+            )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "duplicate key"):
+            validate_spk.validate_ui_texts(
+                strings.replace(
+                    b'sync_failed_title="Drive Sync failed"',
+                    b'sync_failed_title="one"\nsync_failed_title="two"',
+                    1,
+                )
+            )
+        notifier = (HERE / "package/libexec/sdsync-common").read_bytes()
+        with self.assertRaisesRegex(validate_spk.ValidationError, "synonotify"):
+            validate_spk.validate_notifier(
+                notifier
+                + b'\n/usr/syno/bin/synonotify sync_failed '
+                + b"'{\"%PROFILE%\":\"$notify_profile\"}'\n"
+            )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "fixed reviewed argv"):
+            validate_spk.validate_notifier(
+                notifier.replace(
+                    b"synology-drive-sync:notifications:sync_failed_message",
+                    b'"$notify_profile"',
+                    1,
+                )
+            )
         privilege = json.loads((HERE / "conf/privilege").read_text(encoding="utf-8"))
         validate_spk.validate_privilege(json.dumps(privilege).encode())
         duplicate_privilege = (

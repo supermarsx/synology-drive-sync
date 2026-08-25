@@ -54,23 +54,33 @@ REQUIRED_PAYLOAD = {
     "ui/app.js",
     "ui/images/icon.svg",
     "ui/texts/enu/strings",
-    "ui/texts/enu/mails",
     *{f"ui/images/icon_{size}.png" for size in UI_ICON_SIZES},
-}
-REQUIRED_INFO = {
-    "package",
-    "version",
-    "os_min_ver",
-    "os_max_ver",
-    "description",
-    "arch",
-    "maintainer",
-    "dsmuidir",
-    "dsmappname",
 }
 APP_ID = "com.supermarsx.SynologyDriveSync"
 DSM_MINIMUM = "7.0-40759"
 DSM_MAXIMUM = "7.4-99999"
+FIXED_INFO = {
+    "package": PACKAGE,
+    "os_min_ver": DSM_MINIMUM,
+    "os_max_ver": DSM_MAXIMUM,
+    "displayname": "Synology Drive Sync",
+    "description": (
+        "One-way local-folder sync to configurable remote Synology File Station folders"
+    ),
+    "maintainer": "supermarsx",
+    "maintainer_url": "https://github.com/supermarsx/synology-drive-sync",
+    "helpurl": "https://github.com/supermarsx/synology-drive-sync/tree/main/packaging/synology",
+    "thirdparty": "yes",
+    "ctl_stop": "yes",
+    "ctl_uninstall": "yes",
+    "precheckstartstop": "yes",
+    "silent_install": "yes",
+    "silent_upgrade": "yes",
+    "silent_uninstall": "no",
+    "dsmuidir": "ui",
+    "dsmappname": APP_ID,
+}
+REQUIRED_INFO = set(FIXED_INFO) | {"version", "arch", "extractsize"}
 NOTIFICATION_KEYS = {"sync_succeeded", "sync_failed", "doctor_failed"}
 
 
@@ -175,6 +185,9 @@ def parse_info(payload: bytes) -> dict[str, str]:
     missing = REQUIRED_INFO - values.keys()
     if missing:
         raise ValidationError(f"INFO is missing fields: {sorted(missing)}")
+    unexpected = values.keys() - REQUIRED_INFO
+    if unexpected:
+        raise ValidationError(f"INFO contains unknown fields: {sorted(unexpected)}")
     return values
 
 
@@ -182,23 +195,6 @@ def png_dimensions(payload: bytes) -> tuple[int, int]:
     if len(payload) < 24 or payload[:8] != b"\x89PNG\r\n\x1a\n" or payload[12:16] != b"IHDR":
         raise ValidationError("package icon is not a PNG with an IHDR chunk")
     return struct.unpack_from(">II", payload, 16)
-
-
-def validate_resource(payload: bytes) -> None:
-    model = load_unique_json(payload, "conf/resource")
-    expected = {
-        "sysnotify": {
-            "texts_dir": "ui/texts",
-            "app_privileges": [
-                {
-                    "app_id": APP_ID,
-                    "categories": ["Synology Drive Sync"],
-                }
-            ],
-        }
-    }
-    if model != expected:
-        raise ValidationError("conf/resource must register only the fixed sysnotify contract")
 
 
 def validate_ui_config(payload: bytes) -> None:
@@ -228,26 +224,73 @@ def validate_ui_config(payload: bytes) -> None:
         for suffix in ("title", "message")
     }
     if set(application.get("preloadTexts", [])) != expected_preloads:
-        raise ValidationError("ui/config preloadTexts does not match sysnotify texts")
+        raise ValidationError("ui/config preloadTexts does not match notification texts")
     if set(application) != set(expected) | {"preloadTexts"}:
         raise ValidationError("ui/config contains an unreviewed DSM application property")
 
 
-def validate_ui_texts(strings_payload: bytes, mails_payload: bytes) -> None:
+def validate_ui_texts(strings_payload: bytes) -> None:
     strings = strings_payload.decode("utf-8")
-    mails = mails_payload.decode("utf-8")
+    sections: dict[str, dict[str, str]] = {}
+    current: dict[str, str] | None = None
+    for line_number, line in enumerate(strings.splitlines(), 1):
+        if not line:
+            continue
+        section = re.fullmatch(r"\[([a-z][a-z0-9_]*)\]", line)
+        if section:
+            name = section.group(1)
+            if name in sections:
+                raise ValidationError(f"ui notification strings duplicate section [{name}]")
+            current = {}
+            sections[name] = current
+            continue
+        entry = re.fullmatch(r'([a-z][a-z0-9_]*)="([^"\r\n]+)"', line)
+        if current is None or entry is None:
+            raise ValidationError(
+                f"ui notification strings contain malformed line {line_number}"
+            )
+        key, value = entry.groups()
+        if key in current:
+            raise ValidationError(f"ui notification strings duplicate key {key}")
+        current[key] = value
+    expected = {
+        "app": {"title", "description"},
+        "notifications": {
+            f"{event}_{suffix}"
+            for event in NOTIFICATION_KEYS
+            for suffix in ("title", "message")
+        },
+    }
+    if {section: set(values) for section, values in sections.items()} != expected:
+        raise ValidationError(
+            "ui notification strings must contain only the reviewed sections and keys"
+        )
+    if re.search(r"%[A-Z][A-Z0-9_]*%", strings):
+        raise ValidationError("ui notification text must be fixed and non-interpolating")
+
+
+def validate_notifier(payload: bytes) -> None:
+    source = payload.decode("utf-8")
+    legacy = "/usr/syno/bin/synonotify"
+    direct = "/usr/syno/bin/synodsmnotify"
+    if legacy in source:
+        raise ValidationError("DSM notifier must not depend on reserved synonotify events")
+    availability = f"if [ -x {direct} ] && [ ! -L {direct} ]; then"
+    if source.count(availability) != 1 or source.count(direct) != 5:
+        raise ValidationError("DSM notifier executable validation is not the reviewed contract")
+    normalized = re.sub(r"\\\r?\n[ \t]*", " ", source)
+    normalized = re.sub(r"[ \t]+", " ", normalized)
     for event in NOTIFICATION_KEYS:
-        for suffix in ("title", "message"):
-            if not re.search(rf"(?m)^{re.escape(event)}_{suffix}=\"[^\r\n]+\"$", strings):
-                raise ValidationError(f"ui notification strings are missing {event}_{suffix}")
-        if mails.count(f"[{event}]") != 1:
-            raise ValidationError(f"ui notification mails are missing [{event}]")
-    if set(re.findall(r"(?m)^\[([^\]]+)\]$", mails)) != NOTIFICATION_KEYS:
-        raise ValidationError("ui notification mails contain an unregistered event")
-    if "%PASSWORD%" in strings + mails or "%TOTP%" in strings + mails or "%TOKEN%" in strings + mails:
-        raise ValidationError("ui notification text must never interpolate secret material")
-    if re.search(r"(?m)^Category: (?!Synology Drive Sync$)", mails):
-        raise ValidationError("ui notification category does not match conf/resource")
+        command = (
+            f"if {direct} -c {APP_ID} @administrators "
+            f"{PACKAGE}:notifications:{event}_title "
+            f"{PACKAGE}:notifications:{event}_message "
+            ">/dev/null 2>&1; then return 0; else notify_status=$?; fi"
+        )
+        if normalized.count(command) != 1:
+            raise ValidationError(
+                f"DSM notifier must use only fixed reviewed argv for {event}"
+            )
 
 
 def validate_svg_icon(payload: bytes) -> None:
@@ -380,7 +423,6 @@ def validate_source() -> None:
     required_files = [
         HERE / "INFO.template",
         HERE / "conf/privilege",
-        HERE / "conf/resource",
         HERE / "licenses/musl-COPYRIGHT",
         HERE / "build-spk.sh",
         HERE / "build_spk.py",
@@ -394,18 +436,24 @@ def validate_source() -> None:
         HERE / "package/ui/app.js",
         HERE / "package/ui/images/icon.svg",
         HERE / "package/ui/texts/enu/strings",
-        HERE / "package/ui/texts/enu/mails",
     ] + [HERE / "scripts" / name for name in REQUIRED_SCRIPTS]
     missing = [str(path.relative_to(HERE)) for path in required_files if not path.is_file()]
     if missing:
         raise ValidationError(f"source package is missing files: {missing}")
-    validate_privilege((HERE / "conf/privilege").read_bytes())
-    validate_resource((HERE / "conf/resource").read_bytes())
-    validate_ui_config((HERE / "package/ui/config").read_bytes())
-    validate_ui_texts(
-        (HERE / "package/ui/texts/enu/strings").read_bytes(),
-        (HERE / "package/ui/texts/enu/mails").read_bytes(),
+    forbidden_resources = (
+        HERE / "conf/resource",
+        HERE / "package/ui/texts/enu/mails",
     )
+    for path in forbidden_resources:
+        if path.exists() or path.is_symlink():
+            raise ValidationError(
+                f"third-party source package must not acquire reserved resource: "
+                f"{path.relative_to(HERE)}"
+            )
+    validate_privilege((HERE / "conf/privilege").read_bytes())
+    validate_ui_config((HERE / "package/ui/config").read_bytes())
+    validate_ui_texts((HERE / "package/ui/texts/enu/strings").read_bytes())
+    validate_notifier((HERE / "package/libexec/sdsync-common").read_bytes())
     validate_svg_icon((HERE / "package/ui/images/icon.svg").read_bytes())
     validate_ui_static(
         (HERE / "package/ui/index.html").read_bytes(),
@@ -416,14 +464,15 @@ def validate_source() -> None:
     for token in ("@DSM_VERSION@", "@ARCH@", "@EXTRACT_SIZE_KIB@"):
         if template.count(token) != 1:
             raise ValidationError(f"INFO.template must contain {token} exactly once")
-    for line in (
-        f'os_min_ver="{DSM_MINIMUM}"',
-        f'os_max_ver="{DSM_MAXIMUM}"',
-        'dsmuidir="ui"',
-        f'dsmappname="{APP_ID}"',
-    ):
-        if template.count(line) != 1:
-            raise ValidationError(f"INFO.template must contain exactly {line}")
+    template_info = parse_info(template.encode("utf-8"))
+    expected_template = {
+        **FIXED_INFO,
+        "version": "@DSM_VERSION@",
+        "arch": "@ARCH@",
+        "extractsize": "@EXTRACT_SIZE_KIB@",
+    }
+    if template_info != expected_template:
+        raise ValidationError("INFO.template does not match the exact reviewed schema")
     manager = (HERE / "package/bin/sdsync-dsm").read_text(encoding="utf-8")
     for contract in (
         "configure-profile", "set-password", "set-totp", "doctor", "plan",
@@ -465,14 +514,27 @@ def validate_spk(
         raise ValidationError(f"SPK is not a non-symlink regular file: {path}")
     with tarfile.open(path, "r:*") as outer:
         members = safe_members(outer, path.name)
+        if any(
+            PurePosixPath(name).parts[:2] == ("conf", "resource")
+            for name in members
+        ):
+            raise ValidationError(
+                f"{path.name} must not acquire the reserved conf/resource interface"
+            )
         required_outer = {
             "INFO", "package.tgz", "PACKAGE_ICON.PNG", "PACKAGE_ICON_256.PNG",
             "LICENSE", "LICENSES/musl-COPYRIGHT",
-            "LICENSES/THIRD_PARTY_LICENSES.html", "conf/privilege", "conf/resource",
+            "LICENSES/THIRD_PARTY_LICENSES.html", "conf/privilege",
         } | {f"scripts/{name}" for name in REQUIRED_SCRIPTS}
         missing = required_outer - members.keys()
         if missing:
             raise ValidationError(f"{path.name} is missing members: {sorted(missing)}")
+        allowed_outer = required_outer | {"LICENSES", "scripts", "conf"}
+        unexpected = members.keys() - allowed_outer
+        if unexpected:
+            raise ValidationError(
+                f"{path.name} contains unexpected outer members: {sorted(unexpected)}"
+            )
         info = parse_info(member_bytes(outer, members["INFO"]))
         info_arch = info["arch"]
         matching_arches = [
@@ -483,18 +545,20 @@ def validate_spk(
         if len(matching_arches) != 1:
             raise ValidationError(f"unsupported INFO arch value: {info_arch}")
         arch = matching_arches[0]
+        declared_extract_kib = info["extractsize"]
+        if not re.fullmatch(r"[1-9][0-9]*", declared_extract_kib):
+            raise ValidationError(
+                "INFO extractsize must be a canonical positive integer in KiB"
+            )
         if requested_arch and requested_arch != arch:
             raise ValidationError(
                 f"INFO arch {info_arch} resolves to {arch}, not requested {requested_arch}"
             )
-        if (
-            info["package"] != PACKAGE
-            or info["os_min_ver"] != DSM_MINIMUM
-            or info["os_max_ver"] != DSM_MAXIMUM
-            or info["dsmuidir"] != "ui"
-            or info["dsmappname"] != APP_ID
-        ):
-            raise ValidationError("INFO package identity, DSM bounds, or UI registration is invalid")
+        for key, expected in FIXED_INFO.items():
+            if info[key] != expected:
+                raise ValidationError(
+                    f"INFO fixed field {key!r} must be {expected!r}"
+                )
         expected_info_version = filename_info_version(path, arch)
         if info["version"] != expected_info_version:
             raise ValidationError(
@@ -502,7 +566,6 @@ def validate_spk(
                 f"{expected_info_version!r}"
             )
         validate_privilege(member_bytes(outer, members["conf/privilege"]))
-        validate_resource(member_bytes(outer, members["conf/resource"]))
         for script in REQUIRED_SCRIPTS:
             require_regular_mode(members, f"scripts/{script}", 0o755, "lifecycle script")
         package_icon = member_bytes(outer, members["PACKAGE_ICON.PNG"])
@@ -516,9 +579,40 @@ def validate_spk(
         payload = member_bytes(outer, members["package.tgz"])
     with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as inner:
         inner_members = safe_members(inner, f"{path.name}:package.tgz")
+        if any(
+            PurePosixPath(name).parts[:4] == ("ui", "texts", "enu", "mails")
+            for name in inner_members
+        ):
+            raise ValidationError(
+                "package.tgz must not contain reserved sysnotify mail templates"
+            )
         missing = REQUIRED_PAYLOAD - inner_members.keys()
         if missing:
             raise ValidationError(f"package.tgz is missing members: {sorted(missing)}")
+        allowed_inner = REQUIRED_PAYLOAD | {
+            "bin",
+            "libexec",
+            "share",
+            "share/licenses",
+            "ui",
+            "ui/images",
+            "ui/texts",
+            "ui/texts/enu",
+        }
+        unexpected = inner_members.keys() - allowed_inner
+        if unexpected:
+            raise ValidationError(
+                f"package.tgz contains unexpected inner members: {sorted(unexpected)}"
+            )
+        payload_bytes = sum(
+            member.size for member in inner_members.values() if member.isfile()
+        )
+        expected_extract_kib = str((payload_bytes + 1023) // 1024)
+        if declared_extract_kib != expected_extract_kib:
+            raise ValidationError(
+                f"INFO extractsize {declared_extract_kib} does not match "
+                f"package.tgz regular-file size {expected_extract_kib} KiB"
+            )
         executables = (
             "bin/synology-drive-sync", "bin/sdsync-dsm", "libexec/sdsync-common",
             "bin/sdsync-dsm-api", "libexec/sdsync-controller", "libexec/sdsync-run",
@@ -544,10 +638,8 @@ def validate_spk(
         if expected_api_binary is not None and embedded_api != expected_api_binary:
             raise ValidationError("--api-binary bytes do not match the helper embedded in the SPK")
         validate_ui_config(member_bytes(inner, inner_members["ui/config"]))
-        validate_ui_texts(
-            member_bytes(inner, inner_members["ui/texts/enu/strings"]),
-            member_bytes(inner, inner_members["ui/texts/enu/mails"]),
-        )
+        validate_ui_texts(member_bytes(inner, inner_members["ui/texts/enu/strings"]))
+        validate_notifier(member_bytes(inner, inner_members["libexec/sdsync-common"]))
         validate_svg_icon(member_bytes(inner, inner_members["ui/images/icon.svg"]))
         validate_ui_static(
             member_bytes(inner, inner_members["ui/index.html"]),
