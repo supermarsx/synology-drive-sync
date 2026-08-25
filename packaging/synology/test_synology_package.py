@@ -29,6 +29,9 @@ if os.name == "posix":
 
 HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[1]
+sys.path.insert(0, str(HERE))
+
+import validate_spk  # noqa: E402
 
 
 ARM_EABI5_HARD_FLOAT = 0x05000400
@@ -349,8 +352,19 @@ class BuilderTests(unittest.TestCase):
                 installed_api = package.extractfile("bin/sdsync-dsm-api").read()  # type: ignore[union-attr]
                 cgi_api = package.extractfile("ui/api.cgi").read()  # type: ignore[union-attr]
                 common = package.extractfile("libexec/sdsync-common").read()  # type: ignore[union-attr]
+                ui_config_payload = package.extractfile("ui/config").read()  # type: ignore[union-attr]
+                ui_config = json.loads(ui_config_payload)
+                ui_entrypoint = validate_spk.validate_ui_config(ui_config_payload)
                 self.assertEqual(installed_api, self.last_api_binary.read_bytes())
                 self.assertEqual(cgi_api, installed_api)
+                self.assertEqual(
+                    ui_config[".url"]["com.supermarsx.SynologyDriveSync"]["url"],
+                    "/webman/3rdparty/synology-drive-sync/index.html",
+                )
+                self.assertEqual(ui_entrypoint, "ui/index.html")
+                self.assertIn(ui_entrypoint, package_members)
+                self.assertTrue(package.getmember(ui_entrypoint).isfile())
+                self.assertEqual(package.getmember(ui_entrypoint).mode, 0o644)
                 self.assertNotIn(b"/usr/syno/bin/synonotify", common)
                 self.assertIn(b"/usr/syno/bin/synodsmnotify", common)
                 self.assertNotIn("ui/texts/enu/mails", package_members)
@@ -359,6 +373,22 @@ class BuilderTests(unittest.TestCase):
                 self.assertFalse(
                     any(member.mode & 0o6000 for member in package.getmembers())
                 )
+
+    def test_validator_rejects_noncanonical_webman_routes(self) -> None:
+        source = json.loads((HERE / "package/ui/config").read_text(encoding="utf-8"))
+        cases = {
+            "legacy-relative": "3rdparty/synology-drive-sync/index.html",
+            "root-without-webman": "/3rdparty/synology-drive-sync/index.html",
+            "wrong-package": "/webman/3rdparty/another-package/index.html",
+            "traversal": "/webman/3rdparty/synology-drive-sync/../index.html",
+        }
+        for name, route in cases.items():
+            config = copy.deepcopy(source)
+            config[".url"]["com.supermarsx.SynologyDriveSync"]["url"] = route
+            with self.subTest(name=name), self.assertRaisesRegex(
+                validate_spk.ValidationError, "canonical DSM Webman entry point"
+            ):
+                validate_spk.validate_ui_config(json.dumps(config).encode("utf-8"))
 
     def test_builder_omits_and_validator_rejects_reserved_resource_manifest(self) -> None:
         artifact = self.build("x86_64", 62)

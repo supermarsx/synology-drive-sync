@@ -22,6 +22,24 @@ HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[1]
 PACKAGE = "synology-drive-sync"
 UI_ICON_SIZES = (16, 24, 32, 48, 64, 72, 256)
+ICON_ARROW_RADIUS = 0.265
+ICON_ARROW_HALF_THICKNESS = 0.033
+ICON_ARROW_HALF_WIDTH = 0.07
+ICON_ARROW_LENGTH = 0.105
+ICON_TOP_ARC = (-2.82, -0.42)
+ICON_BOTTOM_ARC = (0.34, 2.70)
+ICON_TOP_TIP_ANGLE = -0.10
+ICON_BOTTOM_TIP_ANGLE = 3.02
+ICON_BORDER_THICKNESS = 2.0 / 256.0
+ICON_ORBIT_RADIUS = 0.355
+ICON_ORBIT_HALF_THICKNESS = 0.004
+ICON_CENTER_RADIUS = 0.055
+ICON_BACKGROUND = (8.0, 17.0, 15.0)
+ICON_BORDER = (33.0, 70.0, 62.0)
+ICON_ORBIT = (37.0, 66.0, 58.0)
+ICON_TOP = (101.0, 230.0, 199.0)
+ICON_BOTTOM = (47.0, 182.0, 157.0)
+ICON_CENTER = (217.0, 255.0, 245.0)
 
 
 @dataclass(frozen=True)
@@ -307,15 +325,37 @@ def _triangle_contains(
 
 
 def _arrow_triangle(angle: float) -> tuple[tuple[float, float], ...]:
-    radius = 0.265
-    tip = (0.5 + radius * math.cos(angle), 0.5 + radius * math.sin(angle))
+    tip = (
+        0.5 + ICON_ARROW_RADIUS * math.cos(angle),
+        0.5 + ICON_ARROW_RADIUS * math.sin(angle),
+    )
     tangent = (-math.sin(angle), math.cos(angle))
     radial = (math.cos(angle), math.sin(angle))
-    base = (tip[0] - tangent[0] * 0.105, tip[1] - tangent[1] * 0.105)
+    base = (
+        tip[0] - tangent[0] * ICON_ARROW_LENGTH,
+        tip[1] - tangent[1] * ICON_ARROW_LENGTH,
+    )
     return (
         tip,
-        (base[0] + radial[0] * 0.07, base[1] + radial[1] * 0.07),
-        (base[0] - radial[0] * 0.07, base[1] - radial[1] * 0.07),
+        (
+            base[0] + radial[0] * ICON_ARROW_HALF_WIDTH,
+            base[1] + radial[1] * ICON_ARROW_HALF_WIDTH,
+        ),
+        (
+            base[0] - radial[0] * ICON_ARROW_HALF_WIDTH,
+            base[1] - radial[1] * ICON_ARROW_HALF_WIDTH,
+        ),
+    )
+
+
+def _arc_contains(x: float, y: float, start_angle: float, end_angle: float) -> bool:
+    delta_x = x - 0.5
+    delta_y = y - 0.5
+    radius = math.hypot(delta_x, delta_y)
+    angle = math.atan2(delta_y, delta_x)
+    return (
+        abs(radius - ICON_ARROW_RADIUS) <= ICON_ARROW_HALF_THICKNESS
+        and start_angle <= angle <= end_angle
     )
 
 
@@ -325,8 +365,8 @@ def png_icon(size: int) -> bytes:
     if size not in UI_ICON_SIZES:
         raise PackageError(f"unsupported UI icon size: {size}")
     supersample = 4
-    arrow_one = _arrow_triangle(-0.10)
-    arrow_two = _arrow_triangle(3.02)
+    top_arrow = _arrow_triangle(ICON_TOP_TIP_ANGLE)
+    bottom_arrow = _arrow_triangle(ICON_BOTTOM_TIP_ANGLE)
     rows: list[bytes] = []
     for y in range(size):
         row = bytearray([0])
@@ -336,28 +376,40 @@ def png_icon(size: int) -> bytes:
                 normalized_y = (y + (sample_y + 0.5) / supersample) / size
                 for sample_x in range(supersample):
                     normalized_x = (x + (sample_x + 0.5) / supersample) / size
-                    if _rounded_square_distance(normalized_x, normalized_y) > 0:
+                    square_distance = _rounded_square_distance(
+                        normalized_x, normalized_y
+                    )
+                    if square_distance > 0:
                         continue
                     delta_x = normalized_x - 0.5
                     delta_y = normalized_y - 0.5
                     radius = math.hypot(delta_x, delta_y)
-                    glow = max(0.0, 1.0 - radius / 0.62)
-                    pixel = (9 + 7 * glow, 18 + 13 * glow, 16 + 11 * glow)
-                    angle = math.atan2(delta_y, delta_x)
-                    on_arc = abs(radius - 0.265) <= 0.033 and (
-                        -2.82 <= angle <= -0.10 or 0.34 <= angle <= 3.02
+                    pixel = ICON_BACKGROUND
+                    if square_distance >= -ICON_BORDER_THICKNESS:
+                        pixel = ICON_BORDER
+                    if abs(radius - ICON_ORBIT_RADIUS) <= ICON_ORBIT_HALF_THICKNESS:
+                        pixel = ICON_ORBIT
+                    if radius <= ICON_CENTER_RADIUS:
+                        pixel = ICON_CENTER
+
+                    on_top_body = _arc_contains(
+                        normalized_x, normalized_y, *ICON_TOP_ARC
                     )
-                    on_arrow = _triangle_contains(
-                        normalized_x, normalized_y, *arrow_one
-                    ) or _triangle_contains(normalized_x, normalized_y, *arrow_two)
-                    on_center = radius <= 0.055
-                    on_orbit = abs(radius - 0.355) <= 0.004
-                    if on_arc or on_arrow:
-                        pixel = (98.0, 229.0, 197.0)
-                    elif on_center:
-                        pixel = (45.0, 182.0, 156.0)
-                    elif on_orbit:
-                        pixel = (37.0, 66.0, 58.0)
+                    on_bottom_body = _arc_contains(
+                        normalized_x, normalized_y, *ICON_BOTTOM_ARC
+                    )
+                    if on_top_body:
+                        pixel = ICON_TOP
+                    if on_bottom_body:
+                        pixel = ICON_BOTTOM
+
+                    # Filled heads are composited after the bodies. The shortened
+                    # body arcs overlap only the rear of each triangle, leaving
+                    # the forward apex visible at every packaged icon size.
+                    if _triangle_contains(normalized_x, normalized_y, *top_arrow):
+                        pixel = ICON_TOP
+                    if _triangle_contains(normalized_x, normalized_y, *bottom_arrow):
+                        pixel = ICON_BOTTOM
                     red += pixel[0]
                     green += pixel[1]
                     blue += pixel[2]

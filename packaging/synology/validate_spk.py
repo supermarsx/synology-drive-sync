@@ -80,6 +80,9 @@ FIXED_INFO = {
     "dsmuidir": "ui",
     "dsmappname": APP_ID,
 }
+WEBMAN_ROUTE_ROOT = PurePosixPath("/webman/3rdparty") / PACKAGE
+WEBMAN_ENTRYPOINT = (WEBMAN_ROUTE_ROOT / "index.html").as_posix()
+DSM_UI_ENTRYPOINT = PurePosixPath(FIXED_INFO["dsmuidir"]) / "index.html"
 REQUIRED_INFO = set(FIXED_INFO) | {"version", "arch", "extractsize"}
 NOTIFICATION_KEYS = {"sync_succeeded", "sync_failed", "doctor_failed"}
 
@@ -197,7 +200,22 @@ def png_dimensions(payload: bytes) -> tuple[int, int]:
     return struct.unpack_from(">II", payload, 16)
 
 
-def validate_ui_config(payload: bytes) -> None:
+def webman_payload_member(url: object) -> str:
+    if not isinstance(url, str) or url != WEBMAN_ENTRYPOINT:
+        raise ValidationError(
+            f"ui/config url must be the canonical DSM Webman entry point "
+            f"{WEBMAN_ENTRYPOINT!r}"
+        )
+    relative = PurePosixPath(url).relative_to(WEBMAN_ROUTE_ROOT)
+    member = PurePosixPath(FIXED_INFO["dsmuidir"]) / relative
+    if member != DSM_UI_ENTRYPOINT:
+        raise ValidationError(
+            "ui/config Webman route does not map to the packaged DSM UI entry point"
+        )
+    return member.as_posix()
+
+
+def validate_ui_config(payload: bytes) -> str:
     model = load_unique_json(payload, "ui/config")
     if not isinstance(model, dict):
         raise ValidationError("ui/config must be a JSON object")
@@ -207,12 +225,12 @@ def validate_ui_config(payload: bytes) -> None:
     application = applications[APP_ID]
     if not isinstance(application, dict):
         raise ValidationError("ui/config application entry must be an object")
+    entrypoint = webman_payload_member(application.get("url"))
     expected = {
         "type": "url",
         "icon": "images/icon_{0}.png",
         "title": "Synology Drive Sync",
         "desc": "Configure, diagnose, and monitor one-way File Station sync",
-        "url": "3rdparty/synology-drive-sync/index.html",
         "allUsers": False,
     }
     for key, value in expected.items():
@@ -225,8 +243,9 @@ def validate_ui_config(payload: bytes) -> None:
     }
     if set(application.get("preloadTexts", [])) != expected_preloads:
         raise ValidationError("ui/config preloadTexts does not match notification texts")
-    if set(application) != set(expected) | {"preloadTexts"}:
+    if set(application) != set(expected) | {"url", "preloadTexts"}:
         raise ValidationError("ui/config contains an unreviewed DSM application property")
+    return entrypoint
 
 
 def validate_ui_texts(strings_payload: bytes) -> None:
@@ -451,7 +470,12 @@ def validate_source() -> None:
                 f"{path.relative_to(HERE)}"
             )
     validate_privilege((HERE / "conf/privilege").read_bytes())
-    validate_ui_config((HERE / "package/ui/config").read_bytes())
+    ui_entrypoint = validate_ui_config((HERE / "package/ui/config").read_bytes())
+    source_entrypoint = HERE / "package" / ui_entrypoint
+    if source_entrypoint.is_symlink() or not source_entrypoint.is_file():
+        raise ValidationError(
+            "ui/config Webman route does not resolve to a regular source UI entry point"
+        )
     validate_ui_texts((HERE / "package/ui/texts/enu/strings").read_bytes())
     validate_notifier((HERE / "package/libexec/sdsync-common").read_bytes())
     validate_svg_icon((HERE / "package/ui/images/icon.svg").read_bytes())
@@ -637,7 +661,14 @@ def validate_spk(
             raise ValidationError("ui/api.cgi must exactly match bin/sdsync-dsm-api")
         if expected_api_binary is not None and embedded_api != expected_api_binary:
             raise ValidationError("--api-binary bytes do not match the helper embedded in the SPK")
-        validate_ui_config(member_bytes(inner, inner_members["ui/config"]))
+        ui_entrypoint = validate_ui_config(member_bytes(inner, inner_members["ui/config"]))
+        if ui_entrypoint not in inner_members:
+            raise ValidationError(
+                "ui/config Webman route does not resolve inside package.tgz"
+            )
+        require_regular_mode(
+            inner_members, ui_entrypoint, 0o644, "DSM Webman UI entry point"
+        )
         validate_ui_texts(member_bytes(inner, inner_members["ui/texts/enu/strings"]))
         validate_notifier(member_bytes(inner, inner_members["libexec/sdsync-common"]))
         validate_svg_icon(member_bytes(inner, inner_members["ui/images/icon.svg"]))

@@ -96,6 +96,58 @@ sharing it. Never paste a DSM cookie,
 or token-bearing URL into an issue, chat, screenshot, or support archive. Redact sensitive host,
 account, and path values without removing timestamps, exit codes, DSM build, or package version.
 
+## DSM says the page is not found when opening the app
+
+DSM's generic “Sorry, the page you are looking for is not found” response is a Webman routing
+failure, not a SynoToken, CGI-socket, or profile error. The corrected application registration uses
+the exact root-absolute route `/webman/3rdparty/synology-drive-sync/index.html`; it must map through
+DSM's framework-owned link to packaged `ui/index.html`.
+
+First click **Open** in Package Center or launch **Synology Drive Sync** from the DSM desktop. In the
+browser Network panel, record only the request path, status, and response type. Do not copy, save, or
+share the query string because it can contain `SynoToken`. The document request path, excluding any
+query or fragment, must be:
+
+```text
+/webman/3rdparty/synology-drive-sync/index.html
+```
+
+Then inspect the installed registration and mapping without changing them:
+
+```bash
+PACKAGE=synology-drive-sync
+PACKAGE_BASE=/var/packages/$PACKAGE
+WEBMAN_LINK=/usr/syno/synoman/webman/3rdparty/$PACKAGE
+UI_ROOT=$PACKAGE_BASE/target/ui
+
+grep -E '^(package|dsmuidir|dsmappname)=' "$PACKAGE_BASE/INFO"
+ls -ld "$WEBMAN_LINK" "$UI_ROOT"
+readlink "$WEBMAN_LINK"
+readlink -f "$WEBMAN_LINK"
+stat -Lc '%F %a %U:%G %n' \
+  "$WEBMAN_LINK" "$UI_ROOT" "$UI_ROOT/index.html" "$UI_ROOT/api.cgi"
+```
+
+The installed fields must be `package="synology-drive-sync"`, `dsmuidir="ui"`, and
+`dsmappname="com.supermarsx.SynologyDriveSync"`. The Webman link must resolve to that installation's
+`target/ui`; the directory must be traversable, `index.html` must be a regular `0644` file, and
+`api.cgi` must be a regular `0755` file. Interpret the evidence as follows:
+
+- A launch path beginning `/3rdparty/` or lacking the leading `/webman/` identifies an old or
+  noncanonical application config. Verify and install a corrected release; do not edit the installed
+  config in place.
+- A missing or broken Webman link with correct installed metadata is a DSM package-framework
+  registration failure. Preserve package-manager logs and reinstall the verified corrected SPK; do
+  not create the link manually.
+- A correct link and readable target with a `/webman/.../index.html` 404 requires the matching
+  timestamp from `/var/log/nginx/error.log`, `/var/log/synopkg.log`, and `/var/log/messages` for DSM
+  routing diagnosis.
+- If `index.html` and its static assets load but `api.cgi` fails, Webman launch succeeded. Continue
+  with the read-only/API-service checks below.
+
+These commands are diagnostic only. Never `ln`, `rm`, `chmod`, or `chown` anything under
+`/usr/syno/synoman/webman`, and never add root execution to the package to work around the route.
+
 ## Dashboard does not open or says the launch token is missing
 
 Open the application from the DSM desktop or Package Center, not a saved direct URL. Confirm the
@@ -251,6 +303,10 @@ the exact source NAS and record all of the following:
   and disposable uninstall; record a normal unsigned-publisher warning separately from any
   lower-privilege/root rejection and retain the bounded log tails above;
 - dashboard icon/Open behavior and actual DSM iframe/window layout at narrow and wide sizes; and
+- Package Center and desktop Open both request exactly
+  `/webman/3rdparty/synology-drive-sync/index.html` before any query, DSM's Webman link resolves to
+  the installed `target/ui`, `index.html` and its static assets return successfully, and `api.cgi`
+  is reached without a routing 404; and
 - whether DSM AppLaunch supplies SynoToken to a fresh administrator launch.
 
 Rendered browser QA was unavailable in the development environment. Do not mark layout,

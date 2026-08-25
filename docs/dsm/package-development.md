@@ -26,6 +26,22 @@ The complete reviewed `conf/privilege` document is deliberately minimal:
 The default covers lifecycle scripts; there is no redundant `ctrl-script` list, `tool` list, or
 capability declaration.
 
+## DSM Webman application contract
+
+`INFO` registers `dsmuidir="ui"` and
+`dsmappname="com.supermarsx.SynologyDriveSync"`. The matching `.url` application remains DSM's
+documented `type=url` native pop-up, but uses the unambiguous root-absolute entry point
+`/webman/3rdparty/synology-drive-sync/index.html`. The validator derives the installed payload member
+from that route and requires it to be the regular `ui/index.html` file at mode `0644`; the page's
+same-directory `./api.cgi` URL then maps to packaged `ui/api.cgi` at mode `0755`.
+
+DSM, not a lifecycle script, owns the
+`/usr/syno/synoman/webman/3rdparty/synology-drive-sync` link created from `dsmuidir`. The package must
+not create, replace, remove, chmod, or chown that link. Static validation proves that registration,
+route, and payload agree inside the SPK; only the
+[live-NAS acceptance](troubleshooting.md#live-nas-acceptance) can prove DSM created the link and that
+Package Center and desktop Open reach the route on an installed system.
+
 ## Architecture contracts
 
 | Builder `--arch` | Rust target | Required ELF |
@@ -124,6 +140,8 @@ claimed bit-for-bit reproducible across different compiler/linker/runner images.
 - filename/version/`INFO` architecture and DSM-bound consistency;
 - exact `conf/privilege` and application config, absence of `conf/resource` and legacy sysnotify mail
   templates, and fixed desktop-alert I18N texts;
+- the canonical root-absolute Webman route, its package-name boundary, and its exact mapping to the
+  regular packaged `ui/index.html` entry point;
 - static core/helper ELF identity and equality of helper/CGI bytes;
 - no outer or inner archive member has a set-user-ID/set-group-ID bit or is group/world-writable,
   while `conf/privilege` remains the exact root-free package/`http` contract;
@@ -149,8 +167,9 @@ Negative tests deliberately tamper with architecture, helper identity, symlinks,
 reserved resources, notifier arguments, UI security markers, icons, and archive fields. They
 specifically reject `conf/resource`, legacy sysnotify mail templates, a dynamic notifier operand, an
 archived privilege bit, a non-`0755` CGI, a privilege manifest beyond the exact two-key contract, and
-unsafe socket ownership/mode/peer assumptions, so the gates do not merely accept the builder's happy
-path.
+unsafe socket ownership/mode/peer assumptions. They also reject legacy `/3rdparty`/relative launch
+routes, a wrong package identifier, and traversal in the Webman route, so the gates do not merely
+accept the builder's happy path.
 
 ## Acceptance boundary
 

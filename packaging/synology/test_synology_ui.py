@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import re
 import shutil
 import struct
@@ -43,7 +44,10 @@ class DsmUiContractTests(unittest.TestCase):
         app_id = "com.supermarsx.SynologyDriveSync"
         application = config[".url"][app_id]
         self.assertEqual(application["type"], "url")
-        self.assertEqual(application["url"], "3rdparty/synology-drive-sync/index.html")
+        self.assertEqual(
+            application["url"],
+            "/webman/3rdparty/synology-drive-sync/index.html",
+        )
         self.assertIs(application["allUsers"], False)
         self.assertFalse((HERE / "conf/resource").exists())
         self.assertFalse((UI / "texts/enu/mails").exists())
@@ -203,13 +207,13 @@ class DsmUiContractTests(unittest.TestCase):
 
     def test_icon_family_is_deterministic_snapshotted_and_inside_safe_bounds(self) -> None:
         expected_hashes = {
-            16: "53b66efdee04cf34b84599568bc7eba241c55bfebe3f80e4ac08123e766a0c15",
-            24: "1da35a323aa6603100cf05fb7067d9679732a2dabe2336af96c29013f6baa12b",
-            32: "ad9229bedca146b48f6d8de0a88af921a77e8857ab9527a8dc7d71ac68fa6e32",
-            48: "81acf1abc7f703d7191623c00338dc224966f659c39b068c3a848fde08f4d08b",
-            64: "579a2d4bf06650dc72326eb12c3d500b153fcab66aa0dac23c3be40c202c39d0",
-            72: "cef7ba027c33e8bd66ad015590c24a3980255b2d149a2f4052f4b44ecb5e6edd",
-            256: "e2549bfe7b81a8650bb2ae17a297fcd9e0ceb50d1c67f8000bec8c9200c7733e",
+            16: "4cb3d5307d64639e723cd59dc0818c6e65a5c748e1355bcc1aed7e5eba4baef1",
+            24: "3c587033dd626d5caceb81606a20c16426e12c259a8afa6aca57c121acc4e493",
+            32: "20cfa35b7f756518707cdd14b0531aa63159d527a7adf6996cdf995fafca33f7",
+            48: "e2d05816e460035d5cfccf76c5c8c685f0d93e570d2e27aaa92e533bee1a0274",
+            64: "d2c7c9310adcd8c9612809ebef9704c38cb2056daf3dff17b682091e4030f3ec",
+            72: "f58f6096d5391b8e2748af9f669cfec48ff13a99a790496300fbfb40ab77b899",
+            256: "687b845fda755e11d55d6f96979c634ad650506d0bb2a905824178acf3f1ebad",
         }
         self.assertEqual(tuple(expected_hashes), build_spk.UI_ICON_SIZES)
         for size, expected_hash in expected_hashes.items():
@@ -222,6 +226,118 @@ class DsmUiContractTests(unittest.TestCase):
             self.assertLessEqual(maximum_x, size - 2)
             self.assertLessEqual(maximum_y, size - 2)
         validate_spk.validate_svg_icon((UI / "images/icon.svg").read_bytes())
+
+    def test_icon_arrow_apices_stay_ahead_of_bodies_at_every_size(self) -> None:
+        arrows = (
+            ("top", build_spk.ICON_TOP_ARC, build_spk.ICON_TOP_TIP_ANGLE),
+            ("bottom", build_spk.ICON_BOTTOM_ARC, build_spk.ICON_BOTTOM_TIP_ANGLE),
+        )
+        for name, body_angles, tip_angle in arrows:
+            triangle = build_spk._arrow_triangle(tip_angle)
+            apex = triangle[0]
+            with self.subTest(arrow=name, contract="apex"):
+                self.assertGreater(tip_angle, body_angles[1])
+                self.assertAlmostEqual(tip_angle - body_angles[1], 0.32)
+                self.assertTrue(build_spk._triangle_contains(*apex, *triangle))
+                self.assertFalse(build_spk._arc_contains(*apex, *body_angles))
+
+        supersample = 4
+        for size in build_spk.UI_ICON_SIZES:
+            resolution = size * supersample
+            for name, body_angles, tip_angle in arrows:
+                triangle = build_spk._arrow_triangle(tip_angle)
+                head_samples = 0
+                overlap_samples = 0
+                forward_head_pixels: set[tuple[int, int]] = set()
+                for sample_y in range(resolution):
+                    normalized_y = (sample_y + 0.5) / resolution
+                    for sample_x in range(resolution):
+                        normalized_x = (sample_x + 0.5) / resolution
+                        on_head = build_spk._triangle_contains(
+                            normalized_x, normalized_y, *triangle
+                        )
+                        if not on_head:
+                            continue
+                        head_samples += 1
+                        on_body = build_spk._arc_contains(
+                            normalized_x, normalized_y, *body_angles
+                        )
+                        if on_body:
+                            overlap_samples += 1
+                            continue
+                        angle = math.atan2(normalized_y - 0.5, normalized_x - 0.5)
+                        if angle > body_angles[1]:
+                            forward_head_pixels.add(
+                                (sample_x // supersample, sample_y // supersample)
+                            )
+                with self.subTest(size=size, arrow=name, contract="base-overlap"):
+                    overlap_ratio = overlap_samples / head_samples
+                    self.assertGreater(overlap_ratio, 0.10)
+                    self.assertLess(overlap_ratio, 0.30)
+                    self.assertTrue(forward_head_pixels)
+
+    def test_svg_icon_matches_raster_arrow_geometry_and_palette(self) -> None:
+        svg = (UI / "images/icon.svg").read_text(encoding="utf-8")
+
+        def scalar(value: float) -> str:
+            return f"{value:.3f}".rstrip("0").rstrip(".")
+
+        def point(angle: float) -> tuple[float, float]:
+            return (
+                256 * (0.5 + build_spk.ICON_ARROW_RADIUS * math.cos(angle)),
+                256 * (0.5 + build_spk.ICON_ARROW_RADIUS * math.sin(angle)),
+            )
+
+        radius = scalar(256 * build_spk.ICON_ARROW_RADIUS)
+        stroke_width = scalar(512 * build_spk.ICON_ARROW_HALF_THICKNESS)
+        for body_angles, color in (
+            (build_spk.ICON_TOP_ARC, build_spk.ICON_TOP),
+            (build_spk.ICON_BOTTOM_ARC, build_spk.ICON_BOTTOM),
+        ):
+            start = point(body_angles[0])
+            end = point(body_angles[1])
+            path = (
+                f'd="M{start[0]:.3f} {start[1]:.3f} A{radius} {radius} '
+                f'0 0 1 {end[0]:.3f} {end[1]:.3f}"'
+            )
+            color_hex = "#" + "".join(f"{round(channel):02x}" for channel in color)
+            self.assertIn(path, svg)
+            self.assertRegex(
+                svg,
+                re.escape(path) + rf'[^>]+stroke="{color_hex}"[^>]+stroke-width="{stroke_width}"',
+            )
+
+        for tip_angle, color in (
+            (build_spk.ICON_TOP_TIP_ANGLE, build_spk.ICON_TOP),
+            (build_spk.ICON_BOTTOM_TIP_ANGLE, build_spk.ICON_BOTTOM),
+        ):
+            points = " ".join(
+                f"{x * 256:.3f},{y * 256:.3f}"
+                for x, y in build_spk._arrow_triangle(tip_angle)
+            )
+            color_hex = "#" + "".join(f"{round(channel):02x}" for channel in color)
+            self.assertIn(f'<polygon points="{points}" fill="{color_hex}"/>', svg)
+
+        palette = (
+            build_spk.ICON_BACKGROUND,
+            build_spk.ICON_BORDER,
+            build_spk.ICON_ORBIT,
+            build_spk.ICON_TOP,
+            build_spk.ICON_BOTTOM,
+            build_spk.ICON_CENTER,
+        )
+        for color in palette:
+            color_hex = "#" + "".join(f"{round(channel):02x}" for channel in color)
+            self.assertIn(color_hex, svg)
+        self.assertIn(
+            f'r="{scalar(256 * build_spk.ICON_ORBIT_RADIUS)}"',
+            svg,
+        )
+        self.assertIn(
+            f'r="{scalar(256 * build_spk.ICON_CENTER_RADIUS)}"',
+            svg,
+        )
+        self.assertLess(svg.rindex("<path"), svg.index("<polygon"))
 
     def test_payload_contains_offline_ui_icons_and_identical_helper_modes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

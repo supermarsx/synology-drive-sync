@@ -5,7 +5,7 @@
       "icon": "images/icon_{0}.png",
       "title": "Synology Drive Sync",
       "desc": "Configure, diagnose, and monitor one-way File Station sync",
-      "url": "3rdparty/synology-drive-sync/index.html",
+      "url": "/webman/3rdparty/synology-drive-sync/index.html",
       "allUsers": false,
       "preloadTexts": [
         "notifications:sync_succeeded_title",

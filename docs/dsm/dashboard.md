@@ -4,6 +4,21 @@ The SPK registers **Synology Drive Sync** as an administrator-only DSM desktop a
 Center's **Open** action targets the same application. It is self-contained inside the SPK: the page
 loads no CDN scripts, fonts, images, analytics, or hosted search service.
 
+## DSM Webman launch route
+
+The application remains a native DSM `type=url` pop-up. Its registered entry point is the canonical,
+root-absolute path `/webman/3rdparty/synology-drive-sync/index.html`. `dsmuidir="ui"` tells DSM to
+create and own the corresponding
+`/usr/syno/synoman/webman/3rdparty/synology-drive-sync` link to the installed package's `ui`
+directory. The page then reaches its packaged CGI through the same-directory relative URL
+`./api.cgi`.
+
+Package lifecycle scripts never create, replace, or repair that `/usr/syno` link. Doing so would
+cross DSM's framework boundary and would require privileges the package deliberately does not have.
+If Package Center's **Open** action shows DSM's “page not found” response, use the read-only
+[Webman launch diagnostics](troubleshooting.md#dsm-says-the-page-is-not-found-when-opening-the-app)
+instead of hand-creating a link or changing ownership.
+
 > [!NOTE]
 > The first live request still depends on DSM launching the application with a valid `SynoToken`.
 > That forwarding behavior has not yet been observed on physical DSM 7 hardware. If the token is
