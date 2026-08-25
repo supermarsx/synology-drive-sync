@@ -1,30 +1,35 @@
 # Dashboard and navigation
 
-The SPK registers **Synology Drive Sync** as an administrator-only DSM desktop application. Package
-Center's **Open** action targets the same application. It is self-contained inside the SPK: the page
-loads no CDN scripts, fonts, images, analytics, or hosted search service.
+The SPK registers **Synology Drive Sync** as an administrator-only native DSM Vue AppWindow. Package
+Center's **Open** action targets the same application class. It is self-contained inside the SPK:
+the bundle loads no CDN scripts, fonts, images, analytics, or hosted search service.
 
-## DSM Webman launch route
+## Native DSM AppWindow contract
 
-The application is a packaged web application opened through DSM's documented `type=url` pop-up;
-it is not a native `type=app`/Vue `AppWindow`. Its registered entry point is the canonical,
-root-absolute path `/webman/3rdparty/synology-drive-sync/index.html`. `dsmuidir="ui"` tells DSM to
-create and own the corresponding
-`/usr/syno/synoman/webman/3rdparty/synology-drive-sync` link to the installed package's `ui`
-directory. The page then reaches its packaged CGI through the same-directory relative URL
-`./api.cgi`.
+`INFO` binds `dsmuidir="ui"` and
+`dsmappname="SYNO.SDS.App.SynologyDriveSync.Instance"`. The installed `ui/config` is keyed first by
+`SynologyDriveSync.js`, then by that exact application class. Its entry declares `type="app"` and
+the matching `appWindow`; it is not a `type=url` pop-up or an iframe around a standalone HTML page.
+The bundle registers the class through `SYNO.namespace` and `Vue.extend`, then renders the dashboard
+inside DSM's `v-app-instance` and `v-app-window` components. DSM loads the packaged
+`SynologyDriveSync.js` and `style.css` assets; there is no packaged `index.html` launch document.
+
+The AppWindow calls the canonical same-origin CGI endpoint
+`/webman/3rdparty/synology-drive-sync/api.cgi` directly. `dsmuidir="ui"` lets DSM expose that
+package-owned endpoint through its framework-managed third-party path while the rootless CGI/socket
+authentication boundary remains unchanged.
 
 Package lifecycle scripts never create, replace, or repair that `/usr/syno` link. Doing so would
 cross DSM's framework boundary and would require privileges the package deliberately does not have.
 If Package Center's **Open** action shows DSM's “page not found” response, use the read-only
-[Webman launch diagnostics](troubleshooting.md#dsm-says-the-page-is-not-found-when-opening-the-app)
+[AppWindow diagnostics](troubleshooting.md#dsm-says-the-page-is-not-found-when-opening-the-app)
 instead of hand-creating a link or changing ownership.
 
 > [!NOTE]
-> The first live request depends on the current DSM session cookie, which the browser sends only to
-> the same-origin packaged CGI. A launch `SynoToken` is an optional session-binding input: a valid
-> supplied value is scrubbed from the visible URL, kept only in memory, and forwarded; absence does not make
-> the dashboard read-only. Never manufacture, paste, bookmark, or persist one.
+> The native AppWindow authenticates through the current DSM session cookie, which the browser sends
+> only to the same-origin packaged CGI. It does not inspect or rewrite the DSM shell location and
+> does not derive or forward a `SynoToken`. Package mutation still requires the independently issued
+> package CSRF token.
 
 ## Connection and read-only states
 
@@ -77,9 +82,10 @@ and three secret-state editors. See:
 - [Secrets and protected values](secrets.md) for keep, replace, clear, non-disclosure, and ordering.
 
 The underlying save is queued, but the page polls its sanitized result and reports success only after
-the controller completes it. For a new profile with accompanying secret replacements, the page also
-waits until a refreshed snapshot shows the profile before it enqueues the secret jobs. This is
-defense in depth; the controller's private queue uses sortable identifiers and serial processing.
+the controller completes it. Configuration is applied first, followed by each requested secret
+operation in order. If a later stage fails or becomes outcome-unknown, the page reports the profile
+as partially applied when an earlier stage completed, closes the editor, refreshes the snapshot, and
+requires credential-presence inspection before any retry.
 
 ## Routines
 
@@ -100,8 +106,11 @@ nearest writable ancestor without changing target contents.
 
 **Disposable write test** is separately capability-gated and requires an explicit confirmation. It
 briefly creates, uploads, verifies, may exercise same-target copy, and removes a unique probe. Use it
-only in a prepared non-critical destination. The action is queued, so the immediate result is not a
-Doctor verdict; follow Activity and the refreshed cached health evidence.
+only in a prepared non-critical destination. The API initially queues the action, then the page polls
+its sanitized terminal result before reporting the Doctor verdict. Pending observations have no
+client deadline. An `expired_or_missing` result, an invalid result document, or five consecutive result
+observation failures yield outcome-unknown; inspect Activity and refreshed cached health evidence
+before retrying.
 
 The target-health table never fabricates evidence. Missing reachability, authentication,
 writability, latency, or timestamp data is shown as **Unavailable**. Free space is displayed only
@@ -146,30 +155,38 @@ Settings changes only non-secret interface preferences:
 | Open-session notification | Off/on, subject to browser permission |
 | Audible cue | Off/on, best effort |
 
-These preferences use the browser's local storage. SynoToken, package CSRF, DSM cookies, passwords,
+These preferences use the browser's local storage. Package CSRF, DSM cookies, passwords,
 TOTP seeds, and remote-log tokens are memory-only and are never included in that storage object.
 
 ## Accessibility and narrow windows
 
-The application provides labeled controls, a skip link, keyboard focus indicators, semantic tables
-and forms, polite live regions, a real confirmation dialog, and reduced-motion handling. Navigation
-collapses for DSM iframe and narrow-window widths. These contracts are covered by static tests, but
-rendered browser QA was unavailable in the development environment; verify keyboard flow, focus,
-contrast, zoom, and the exact DSM window sizes during [live acceptance](troubleshooting.md#live-nas-acceptance).
+The application provides labeled controls, keyboard focus indicators, semantic tables and forms,
+polite live regions, and confirmation overlays marked with `role=dialog` and `aria-modal`. A
+confirmation moves focus inside the dialog, traps Tab and Shift+Tab, cancels on Escape, and restores
+the prior focus when it closes. Reduced-motion handling is present and navigation collapses for
+narrow AppWindow widths. The application does not currently implement a skip link. Verify keyboard
+flow, focus behavior, contrast, zoom, and the exact DSM window sizes during
+[live acceptance](troubleshooting.md#live-nas-acceptance).
 
 ## Queue and completion evidence
 
 Every changing request receives a client request ID and is published into a private package queue.
 The API service first returns HTTP `202` with state `queued`. The controller later claims and validates
 the job, runs the package manager under a clean package identity, and writes a private response.
-Configuration/secret/routine/policy calls poll that response before their success toast. Operational
-Doctor/Plan/Run calls remain asynchronous. Therefore:
+Configuration/secret/routine/policy calls and Doctor poll that response before reporting a terminal
+result. Plan and Run remain asynchronous. Therefore:
 
 1. A configuration success toast proves a sanitized terminal manager result, but the refreshed
    snapshot remains the authoritative displayed state.
-2. A configuration timeout or `expired_or_missing` result leaves the outcome unknown; inspect state
-   before retrying.
-3. For Doctor, Plan, and Run, “queued” is not success; follow structured Activity, run state, and
-   bounded logs.
-4. Investigate a failed or stale job through the [CLI recovery path](cli-parity.md), not browser
+2. Pending result observations have no client deadline. They continue until a terminal or
+   `expired_or_missing` response, five consecutive observation failures, an invalid result document,
+   or AppWindow shutdown aborts observation.
+3. `expired_or_missing`, invalid result evidence, and repeated observation failures make the accepted
+   job outcome unknown; inspect the refreshed snapshot, structured Activity, and bounded logs before
+   retrying. Closing the AppWindow stops observation, not the queued server job.
+4. A multi-stage profile save can be partially applied when configuration or an earlier secret stage
+   completed before a later failure or outcome-unknown result. Inspect configuration and every
+   credential-presence marker before retrying.
+5. For Plan and Run, “queued” is not success; follow run state, Activity, and logs.
+6. Investigate a failed or stale job through the [CLI recovery path](cli-parity.md), not browser
    developer tools containing session material.

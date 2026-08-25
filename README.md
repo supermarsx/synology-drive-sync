@@ -12,9 +12,10 @@ underlying DSM folder through File Station; Synology Drive can index that folder
 My Drive or an enabled Team Folder. Service managers, including the DSM package controller, only
 schedule isolated finite runs.
 
-An architecture-specific DSM 7 `.spk` can run the same engine directly on the source NAS. It includes
-a dark-first administrator dashboard for profiles, secrets, routines, Doctor, health, activity,
-logs, and direct DSM desktop alerts, plus the `sdsync-dsm` SSH recovery/automation manager. Its remote
+The current architecture-specific DSM 7 `.spk` source, planned to first ship in release 26.10, can
+run the same engine directly on the source NAS. It includes a dark-first native DSM Vue AppWindow
+for profiles, secrets, routines, Doctor, health, activity, logs, and direct DSM desktop alerts, plus
+the `sdsync-dsm` SSH recovery/automation manager. Its remote
 destination is configurable: `/home/Drive/...` targets the remote account's Drive home, and any
 writable `/<shared-folder>/...` subdirectory can be selected instead. DSM must provision the remote
 user home or shared-folder root and its permissions first; the sync creates a missing chosen
@@ -428,7 +429,8 @@ profiles remain committed.
 See [Installation and deployment](docs/installation.md) for:
 
 - four manually installable DSM 7 SPKs for `x86_64`, `armv8`, ARMv7-A hard-float, and Evansport
-  `i686`, with a DSM-integrated administrator web dashboard, per-profile routines, and CLI manager;
+  `i686`; release 26.10 is the first planned to include the native administrator-only DSM AppWindow,
+  alongside per-profile routines and the CLI manager;
 - checksum-verifying Unix and Windows installers;
 - manual archive installation, completions, and manpage setup;
 - the non-root, read-only Docker/Compose job and optional TOTP secret overlay;

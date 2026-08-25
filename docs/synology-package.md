@@ -13,8 +13,8 @@ source NAS                                                target NAS
                          DSM admin dashboard          /TeamShare/Chosen Folder
 ```
 
-The SPK includes a dark-first packaged web application opened in a DSM-managed `type=url` pop-up and
-the `sdsync-dsm` SSH manager. It is not a native Vue `type=app`/`AppWindow`. Both surfaces operate the
+The current SPK source, planned to first ship in release 26.10, includes a dark-first
+administrator-only native DSM Vue `type=app` AppWindow and the `sdsync-dsm` SSH manager. Both surfaces operate the
 same package-owned profiles, credentials, routines, state, and logs. The dashboard is
 administrator-only; it never returns a stored password, TOTP seed, or remote logging token to the
 browser. The CLI remains the recovery and automation surface when the dashboard cannot open.
@@ -38,8 +38,8 @@ or an enabled Team Folder.
 > Static packaging, bridge, manager, lifecycle, and mock File Station tests have passed. They do not
 > prove installation on a physical NAS, execution of DSM's cookie authenticator from the
 > package-user service, DSM forwarding of `X-SDSYNC-Request: 1` as `HTTP_X_SDSYNC_REQUEST=1`, or
-> synchronization between two live NAS devices. AppLaunch may supply an optional session-binding
-> `SynoToken`, but its absence is supported. Complete the
+> synchronization between two live NAS devices. The native AppWindow uses cookie authentication
+> and does not inspect the DSM shell location for a token. Complete the
 > [live-NAS acceptance](dsm/troubleshooting.md#live-nas-acceptance) on disposable folders, and keep
 > deletion disabled until its separate destructive test passes.
 
@@ -54,7 +54,7 @@ or an enabled Team Folder.
 | Password, TOTP, and remote-log-token keep/replace/clear behavior | [Secrets and protected values](dsm/secrets.md) |
 | Interval, daily, and realtime routines, dependencies, retries, and deletion approval | [Routines and scheduling](dsm/routines.md) |
 | Doctor, cached health, activity, logs, and DSM desktop alerts | [Health, activity, logs, and notifications](dsm/operations.md) |
-| `authenticate.cgi`, administrator checks, optional session-binding `SynoToken`, CSRF, package/`http` socket boundary, and private queue | [Dashboard security model](dsm/security.md) |
+| `authenticate.cgi`, administrator checks, cookie authentication, CSRF, package/`http` socket boundary, and private queue | [Dashboard security model](dsm/security.md) |
 | Dashboard-to-`sdsync-dsm` command mapping and private paths | [CLI parity and private paths](dsm/cli-parity.md) |
 | Symptoms, recovery, acceptance evidence, and known unverified behavior | [Troubleshooting and live-NAS acceptance](dsm/troubleshooting.md) |
 | Reproducible package assembly, ELF contracts, icons, and validation | [Build and validate SPKs](dsm/package-development.md) |
@@ -67,18 +67,19 @@ status such as `77`, or a protocol term such as `X-SDSYNC-CSRF`.
 
 1. Use the [release selector](release-selector.md) with the exact NAS model, DSM branch/build, and
    `uname -m` value. Do not choose an SPK from a marketing CPU label alone.
-2. Verify the selected SPK against the same release's `SHA256SUMS`, then install it through
-   **Package Center > Manual Install**.
+2. For this native AppWindow flow, select a published 26.10-or-later SPK. Verify it against the same
+   release's `SHA256SUMS`, then install it through **Package Center > Manual Install**.
 3. Grant the package's actual **System internal user** read-only access to the intended local source
    share. The package grants itself no share access.
 4. Start the package and open **Synology Drive Sync** from the DSM desktop or Package Center. The
-   current DSM session cookie is authenticated server-side; a launch `SynoToken` is an optional
-   session-binding input. If session authentication or the control bridge fails, use the
-   troubleshooting checks and CLI. Do
-   not copy any supplied token into a bookmark, local storage, log, or support transcript.
+   current DSM session cookie is authenticated server-side. The native UI does not inspect or
+   rewrite the DSM shell location and sends no `SynoToken`. If session authentication or the control
+   bridge fails, use the troubleshooting checks and CLI; do not copy cookies or CSRF material into
+   a bookmark, local storage, log, or support transcript.
 5. Create one profile, store its password, run non-writing Doctor, and review Plan. Profile/secret
-   saves wait for a terminal controller result; Doctor and Plan remain asynchronous. Run remains
-   additive/update-only unless deletion is independently approved at every required layer.
+   saves and Doctor wait for a sanitized terminal controller result; Plan and Run remain
+   asynchronous. Run remains additive/update-only unless deletion is independently approved at every
+   required layer.
 
 The complete procedure, including remote account preparation and source ACL checks, is in
 [Install, ACLs, and lifecycle](dsm/install-lifecycle.md).
@@ -87,9 +88,11 @@ The complete procedure, including remote account preparation and source ACL chec
 
 The dashboard provides graphical profile editing, per-profile routines, status, cached health,
 Doctor, Plan, Run, bounded logs, structured activity, and a direct DSM desktop-alert policy.
-Mutating requests are authenticated and queued. Configuration/secret/routine/policy saves poll a sanitized terminal
-job result before reporting success. Doctor, Plan, and Run intentionally return `queued`; follow the
-snapshot or Activity before treating those operations as complete.
+Mutating requests are authenticated and queued. Configuration/secret/routine/policy saves and Doctor
+observe a sanitized terminal job result before reporting success, with no client pending-state
+deadline. Expired/missing or invalid evidence and five consecutive observation failures produce an
+outcome-unknown result; multi-stage profile saves can be partially applied. Plan and Run intentionally
+remain asynchronous; follow the snapshot or Activity before treating either operation as complete.
 
 The CLI can perform the same operational work and exposes recovery-oriented commands such as
 `paths`, `show-config`, and direct bounded log reads. First resolve `$PACKAGE_USER` with the
@@ -129,18 +132,19 @@ credentials, state, locks, and logs while leaving both NAS data trees untouched.
 
 ## Evidence boundary
 
-The packaged web application, fixed desktop-alert I18N text, icons, permission contract, request
+The native AppWindow bundle, fixed desktop-alert I18N text, icons, permission contract, request
 schema, queue, and manager behavior are covered by repository tests. Rendered browser QA could not
 be completed because no browser runtime was available in the test environment. Treat layout in real
-DSM pop-up sizes, package-user `authenticate.cgi` execution, request-marker CGI forwarding,
-optional AppLaunch-token behavior,
+DSM AppWindow sizes and supported DSM versions, package-user `authenticate.cgi` execution,
+`X-SDSYNC-Request: 1` to `HTTP_X_SDSYNC_REQUEST=1` forwarding,
 Package Center install/start/open behavior, DSM desktop delivery through `synodsmnotify`, and the
 complete two-NAS data path as live acceptance work—not as proven behavior. The SPK does not acquire
 `sysnotify` or register Notification Center email, SMS, mobile, CMS, or rule/channel delivery.
 
 Official framework references:
 
-- [DSM desktop application integration](https://help.synology.com/developer-guide/integrate_dsm/desktopapp.html)
+- [Native package app launch](https://help.synology.com/developer-guide/synology_package/package_tgz/launch_app.html)
+- [AppWindow UI framework](https://help.synology.com/developer-guide/appendix/ui_framework/application.html)
 - [DSM application authentication](https://help.synology.com/developer-guide/integrate_dsm/web_authentication.html)
 - [DSM package privilege configuration](https://help.synology.com/developer-guide/privilege/privilege_config.html)
 - [DSM desktop notification command](https://help.synology.com/developer-guide/synology_package/show_massage.html)

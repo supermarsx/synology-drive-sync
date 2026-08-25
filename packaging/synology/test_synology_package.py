@@ -357,14 +357,25 @@ class BuilderTests(unittest.TestCase):
                 ui_entrypoint = validate_spk.validate_ui_config(ui_config_payload)
                 self.assertEqual(installed_api, self.last_api_binary.read_bytes())
                 self.assertEqual(cgi_api, installed_api)
-                self.assertEqual(
-                    ui_config[".url"]["com.supermarsx.SynologyDriveSync"]["url"],
-                    "/webman/3rdparty/synology-drive-sync/index.html",
-                )
-                self.assertEqual(ui_entrypoint, "ui/index.html")
+                self.assertEqual(set(ui_config), {"SynologyDriveSync.js"})
+                native_applications = ui_config["SynologyDriveSync.js"]
+                self.assertEqual(set(native_applications), {validate_spk.APP_ID})
+                native_application = native_applications[validate_spk.APP_ID]
+                self.assertEqual(native_application["type"], "app")
+                self.assertEqual(native_application["appWindow"], validate_spk.APP_ID)
+                self.assertEqual(native_application["depend"], [])
+                self.assertNotIn("url", native_application)
+                self.assertEqual(ui_entrypoint, "ui/SynologyDriveSync.js")
                 self.assertIn(ui_entrypoint, package_members)
                 self.assertTrue(package.getmember(ui_entrypoint).isfile())
                 self.assertEqual(package.getmember(ui_entrypoint).mode, 0o644)
+                self.assertIn("ui/style.css", package_members)
+                self.assertEqual(package.getmember("ui/style.css").mode, 0o644)
+                for legacy in ("ui/index.html", "ui/app.js", "ui/app.css"):
+                    self.assertNotIn(legacy, package_members)
+                native_script = package.extractfile(ui_entrypoint).read()  # type: ignore[union-attr]
+                native_style = package.extractfile("ui/style.css").read()  # type: ignore[union-attr]
+                validate_spk.validate_native_bundle(native_script, native_style)
                 self.assertNotIn(b"/usr/syno/bin/synonotify", common)
                 self.assertIn(b"/usr/syno/bin/synodsmnotify", common)
                 self.assertNotIn("ui/texts/enu/mails", package_members)
@@ -374,19 +385,46 @@ class BuilderTests(unittest.TestCase):
                     any(member.mode & 0o6000 for member in package.getmembers())
                 )
 
-    def test_validator_rejects_noncanonical_webman_routes(self) -> None:
-        source = json.loads((HERE / "package/ui/config").read_text(encoding="utf-8"))
-        cases = {
-            "legacy-relative": "3rdparty/synology-drive-sync/index.html",
-            "root-without-webman": "/3rdparty/synology-drive-sync/index.html",
-            "wrong-package": "/webman/3rdparty/another-package/index.html",
-            "traversal": "/webman/3rdparty/synology-drive-sync/../index.html",
+    def test_validator_rejects_legacy_and_invalid_native_appwindow_configs(self) -> None:
+        source = json.loads((HERE / "ui-src/app.config").read_text(encoding="utf-8"))
+        application = copy.deepcopy(source[validate_spk.APP_ID])
+        application["depend"] = []
+        installed = {
+            "SynologyDriveSync.js": {validate_spk.APP_ID: application}
         }
-        for name, route in cases.items():
-            config = copy.deepcopy(source)
-            config[".url"]["com.supermarsx.SynologyDriveSync"]["url"] = route
+        validate_spk.validate_ui_config(json.dumps(installed).encode("utf-8"))
+
+        cases: list[tuple[str, dict[str, object], str]] = []
+        legacy = {".url": {"com.supermarsx.SynologyDriveSync": {"type": "url"}}}
+        cases.append(("legacy-url-wrapper", legacy, "one reviewed native"))
+
+        wrong_module = copy.deepcopy(installed)
+        wrong_module["app.js"] = wrong_module.pop("SynologyDriveSync.js")
+        cases.append(("legacy-module-name", wrong_module, "one reviewed native"))
+
+        wrong_class = copy.deepcopy(installed)
+        wrong_class["SynologyDriveSync.js"]["com.supermarsx.SynologyDriveSync"] = (
+            wrong_class["SynologyDriveSync.js"].pop(validate_spk.APP_ID)
+        )
+        cases.append(("legacy-class", wrong_class, "native AppWindow class"))
+
+        for name, key, value, pattern in (
+            ("url-type", "type", "url", "property 'type'"),
+            ("wrong-window", "appWindow", "Legacy.Window", "property 'appWindow'"),
+            ("legacy-url", "url", "index.html", "unreviewed DSM application property"),
+            ("nonempty-depend", "depend", ["unreviewed.js"], "dependency list"),
+        ):
+            config = copy.deepcopy(installed)
+            config["SynologyDriveSync.js"][validate_spk.APP_ID][key] = value
+            cases.append((name, config, pattern))
+
+        missing_depend = copy.deepcopy(installed)
+        del missing_depend["SynologyDriveSync.js"][validate_spk.APP_ID]["depend"]
+        cases.append(("missing-depend", missing_depend, "dependency list"))
+
+        for name, config, pattern in cases:
             with self.subTest(name=name), self.assertRaisesRegex(
-                validate_spk.ValidationError, "canonical DSM Webman entry point"
+                validate_spk.ValidationError, pattern
             ):
                 validate_spk.validate_ui_config(json.dumps(config).encode("utf-8"))
 
@@ -1891,7 +1929,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 [
                     "--CALL--",
                     "-c",
-                    "com.supermarsx.SynologyDriveSync",
+                    "SYNO.SDS.App.SynologyDriveSync.Instance",
                     "@administrators",
                     f"synology-drive-sync:notifications:{event}_title",
                     f"synology-drive-sync:notifications:{event}_message",

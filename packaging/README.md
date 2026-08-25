@@ -8,7 +8,7 @@ configuration, credentials, state, and logs after a confirmation.
 
 | Deployment | Identity and credentials | Non-overlap boundary | Authoritative diagnostics |
 | --- | --- | --- | --- |
-| DSM 7 SPK | actual DSM package identity discovered from package-home ownership; package-owned `0600` password/TOTP/token files | one package run lock across dashboard, manual, and scheduled jobs on that NAS | DSM-integrated web dashboard, `sdsync-dsm status`, bounded package logs, and exit status |
+| DSM 7 SPK | actual DSM package identity discovered from package-home ownership; package-owned `0600` password/TOTP/token files | one package run lock across dashboard, manual, and scheduled jobs on that NAS | native DSM AppWindow dashboard, `sdsync-dsm status`, bounded package logs, and exit status |
 | systemd | dedicated `sdsync` user; `LoadCredential` files | shared packaged `flock` path across related units on one host | journald plus exit status |
 | launchd | logged-in user; login Keychain | one launchd label only | rotating JSON file plus unified-log fallback |
 | Task Scheduler | current interactive user; Credential Manager | one task name (`IgnoreNew`) only | rotating JSON file plus `LastTaskResult` |
@@ -33,8 +33,10 @@ The per-manager directories provide exact install/upgrade/uninstall, enable/disa
 
 ## Synology DSM package lifecycle
 
-[`packaging/synology`](synology/) assembles a manually installable DSM 7 SPK around one validated
-static musl ELF. Releases contain four separate ABI packages: `x86_64`, `armv8`, ARMv7-A hard-float
+[`packaging/synology`](synology/) assembles a manually installable DSM 7 SPK around two validated
+static musl ELFs and the pinned native AppWindow bundle. This native package source is planned to
+first ship in release 26.10; published 26.7-26.9 assets retain their original UI. Releases contain
+four separate ABI packages: `x86_64`, `armv8`, ARMv7-A hard-float
 (`INFO` arch `armv7 armada370 armada375 armada38x armadaxp comcerto2k monaco`), and `i686` for
 Evansport on the DSM 7.0/7.1 line. Use the
 [release selector](../docs/release-selector.md) instead of guessing from a CPU label; ARMv5, PowerPC,
@@ -42,8 +44,8 @@ unknown, and conflicting inputs fail closed. The SPK runs without root, Linux ca
 set-user-ID/set-group-ID file. Its ordinary DSM `http` CGI relays bounded requests over a fixed
 package:`http` `0660` Unix socket to a package-user API service. That service reauthenticates the DSM
 session and enforces administrator membership and package CSRF before reaching private state. The
-package keeps scheduling disabled after installation, registers an administrator-only DSM
-dashboard, and supplies the CLI recovery/automation manager at:
+package keeps scheduling disabled after installation, registers the administrator-only native DSM
+AppWindow `SYNO.SDS.App.SynologyDriveSync.Instance`, and supplies the CLI recovery/automation manager at:
 
 ```text
 /var/packages/synology-drive-sync/target/bin/sdsync-dsm
@@ -76,8 +78,8 @@ The package controller provides per-profile interval/daily/realtime routines, na
 fallback, dependencies, bounded retry/backoff, a legacy global interval schedule, cooperative
 start/stop, one run lock, state, bounded logs, and fixed DSM notifications. Package Center lifecycle
 also controls the package-user API service. The dashboard uses DSM cookie authentication, an
-independent administrator check, an optional `SynoToken` session-binding input, mandatory package
-CSRF, and a private controller queue; stored secrets are never returned. Deletion requires profile and
+independent administrator check, mandatory package CSRF, and a private controller queue; the native
+UI does not inspect the DSM shell location or send a `SynoToken`, and stored secrets are never returned. Deletion requires profile and
 action-level approval. Upgrade retains
 private configuration and credentials and validates them; uninstall removes package-owned
 configuration, credentials, state, locks, socket, and logs while leaving both NAS data trees untouched.
@@ -86,7 +88,8 @@ See the [complete DSM package and dashboard guide](../docs/synology-package.md) 
 ACL, graphical configuration, secret, diagnostic, routine, security, CLI, upgrade, and acceptance
 behavior. The package has static/mock validation but no recorded physical installation or live
 two-NAS test. Package-user `authenticate.cgi` execution, browser request-marker forwarding to CGI
-`HTTP_X_SDSYNC_REQUEST=1`, and optional AppLaunch-token behavior also remain live acceptance checks;
+`HTTP_X_SDSYNC_REQUEST=1`, and AppWindow loading also remain live
+acceptance checks;
 token absence is supported.
 
 ## Verified binary installer lifecycle

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a deterministic, manually installable DSM 7 SPK from one static ELF."""
+"""Build a deterministic DSM 7 SPK from static ELFs and a native UI bundle."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import binascii
 import functools
 import gzip
 import io
+import json
 import math
 import os
 import re
@@ -21,6 +22,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[1]
 PACKAGE = "synology-drive-sync"
+DSM_APP_CLASS = "SYNO.SDS.App.SynologyDriveSync.Instance"
+UI_SOURCE = HERE / "ui-src"
 UI_ICON_SIZES = (16, 24, 32, 48, 64, 72, 256)
 ICON_ARROW_RADIUS = 0.265
 ICON_ARROW_HALF_THICKNESS = 0.033
@@ -117,7 +120,10 @@ class PackageError(ValueError):
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build a DSM 7 SPK around a prebuilt static Linux binary."
+        description=(
+            "Build a DSM 7 SPK around prebuilt static Linux binaries and the "
+            "prebuilt native DSM AppWindow bundle."
+        )
     )
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument(
@@ -295,6 +301,114 @@ def add_bytes(archive: tarfile.TarFile, name: str, payload: bytes, mode: int) ->
     archive.addfile(tar_info(name, mode, len(payload)), io.BytesIO(payload))
 
 
+def _json_object(path: Path) -> dict[str, object]:
+    if path.is_symlink() or not path.is_file():
+        raise PackageError(
+            f"native DSM UI input must be a non-symlink regular file: {path}"
+        )
+    payload = path.read_bytes()
+    if not payload:
+        raise PackageError(f"native DSM UI input must not be empty: {path}")
+    try:
+        parsed = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PackageError(f"native DSM UI JSON is invalid: {path}: {error}") from error
+    if not isinstance(parsed, dict):
+        raise PackageError(f"native DSM UI JSON must contain an object: {path}")
+    return parsed
+
+
+def _regular_file_bytes(path: Path) -> bytes:
+    if path.is_symlink() or not path.is_file():
+        raise PackageError(
+            "native DSM UI input must be a non-symlink regular file: "
+            f"{path}; run the pinned pnpm build in {UI_SOURCE} first"
+        )
+    payload = path.read_bytes()
+    if not payload:
+        raise PackageError(f"native DSM UI input must not be empty: {path}")
+    return payload
+
+
+def native_ui_payloads() -> tuple[tuple[bytes, str], ...]:
+    """Validate and render the fixed AppWindow payload staged in the SPK."""
+    app_config_path = UI_SOURCE / "app.config"
+    app_config = _json_object(app_config_path)
+    if set(app_config) != {DSM_APP_CLASS}:
+        raise PackageError(
+            f"app.config must define exactly the native DSM class {DSM_APP_CLASS}"
+        )
+    application = app_config[DSM_APP_CLASS]
+    expected_application = {
+        "type": "app",
+        "title": "app:title",
+        "desc": "app:description",
+        "appWindow": DSM_APP_CLASS,
+        "allUsers": False,
+        "allowMultiInstance": False,
+        "hidden": False,
+        "icon": "images/icon_{0}.png",
+        "preloadTexts": [
+            "notifications:sync_succeeded_title",
+            "notifications:sync_succeeded_message",
+            "notifications:sync_failed_title",
+            "notifications:sync_failed_message",
+            "notifications:doctor_failed_title",
+            "notifications:doctor_failed_message",
+        ],
+    }
+    if not isinstance(application, dict):
+        raise PackageError(f"app.config entry {DSM_APP_CLASS} must be an object")
+    if set(application) != set(expected_application):
+        raise PackageError(
+            f"app.config entry {DSM_APP_CLASS} must contain only the reviewed fields"
+        )
+    for key, expected in expected_application.items():
+        if application.get(key) != expected:
+            raise PackageError(
+                f"app.config entry {DSM_APP_CLASS}.{key} must equal {expected!r}"
+            )
+
+    config_define_path = UI_SOURCE / "config.define"
+    config_define = _json_object(config_define_path)
+    expected_define = {
+        "SynologyDriveSync.js": {
+            "JSfiles": ["dist/SynologyDriveSync.js"],
+            "params": "-s -c skip",
+        }
+    }
+    if config_define != expected_define:
+        raise PackageError(
+            "config.define must map SynologyDriveSync.js to the deterministic "
+            "dist/SynologyDriveSync.js bundle"
+        )
+
+    # parse_requires.py adds the dependency list and GenerateJSDepend.php
+    # combines app.config with config.define into this module-keyed installed
+    # form. Render the same wrapper deterministically so SPK construction never
+    # depends on an unpinned DSM toolkit installation.
+    installed_application = dict(application)
+    installed_application["depend"] = []
+    installed_config = (
+        json.dumps(
+            {"SynologyDriveSync.js": {DSM_APP_CLASS: installed_application}},
+            ensure_ascii=False,
+            indent=2,
+            separators=(",", ": "),
+        )
+        + "\n"
+    ).encode("utf-8")
+    sources = (
+        (UI_SOURCE / "dist/SynologyDriveSync.js", "ui/SynologyDriveSync.js"),
+        (UI_SOURCE / "dist/style.css", "ui/style.css"),
+        (HERE / "package/ui/images/icon.svg", "ui/images/icon.svg"),
+        (HERE / "package/ui/texts/enu/strings", "ui/texts/enu/strings"),
+    )
+    return ((installed_config, "ui/config"),) + tuple(
+        (_regular_file_bytes(source), destination) for source, destination in sources
+    )
+
+
 def _rounded_square_distance(x: float, y: float) -> float:
     half = 0.4375
     radius = 0.19
@@ -458,20 +572,13 @@ def payload_archive(binary: Path, api_binary: Path) -> tuple[bytes, int]:
         REPOSITORY / "THIRD_PARTY_LICENSES.html",
         HERE / "licenses/musl-COPYRIGHT",
     )
-    ui_sources = (
-        (HERE / "package/ui/config", "ui/config"),
-        (HERE / "package/ui/index.html", "ui/index.html"),
-        (HERE / "package/ui/app.css", "ui/app.css"),
-        (HERE / "package/ui/app.js", "ui/app.js"),
-        (HERE / "package/ui/images/icon.svg", "ui/images/icon.svg"),
-        (HERE / "package/ui/texts/enu/strings", "ui/texts/enu/strings"),
-    )
+    ui_payloads = native_ui_payloads()
     rendered_icons = {size: png_icon(size) for size in UI_ICON_SIZES}
     installed_size = (
         binary.stat().st_size
         + 2 * api_binary.stat().st_size
         + sum(path.stat().st_size for path in script_sources + notice_sources)
-        + sum(path.stat().st_size for path, _destination in ui_sources)
+        + sum(len(payload) for payload, _destination in ui_payloads)
         + sum(len(payload) for payload in rendered_icons.values())
     )
     tar_stream = io.BytesIO()
@@ -520,8 +627,8 @@ def payload_archive(binary: Path, api_binary: Path) -> tuple[bytes, int]:
             (REPOSITORY / "THIRD_PARTY_LICENSES.html").read_bytes(),
             0o644,
         )
-        for source, destination in ui_sources:
-            add_bytes(archive, destination, source.read_bytes(), 0o644)
+        for payload, destination in ui_payloads:
+            add_bytes(archive, destination, payload, 0o644)
         for size, icon in rendered_icons.items():
             add_bytes(archive, f"ui/images/icon_{size}.png", icon, 0o644)
     compressed = io.BytesIO()

@@ -17,7 +17,7 @@ Every graphical secret editor has an explicit mode:
 | Mode | Browser input | Package effect |
 | --- | --- | --- |
 | Keep existing | Hidden/disabled | No secret job is sent; existing protected file remains unchanged |
-| Replace securely | Required password-style input | Enqueues a dedicated secret replacement after profile configuration is observable |
+| Replace securely | Required password-style input | Enqueues a dedicated secret replacement after profile configuration returns terminal success |
 | Clear stored value | Hidden/disabled | Enqueues removal; JSON carries `null`, never an empty substitute secret |
 
 No mode is inferred from an empty text box. Cancelling a dangerous profile confirmation leaves the
@@ -25,9 +25,11 @@ entered replacement available for correction; once submission begins, secret inp
 They are also cleared on page exit and after an error.
 
 For a new profile, configuration must be applied before a secret can reference it. The dashboard
-therefore queues profile configuration, polls its sanitized terminal result, waits for snapshots to
-show the profile for up to a bounded deadline, and only then queues and polls secret operations. If
-the profile never appears, secret handoff stops instead of becoming an orphaned or misdirected job.
+therefore queues profile configuration, observes its sanitized terminal success, and only then queues
+and observes each requested secret operation in order. There is no client pending-state deadline. If
+configuration or an earlier secret stage completed before a later failure or outcome-unknown result,
+the page reports the profile as partially applied, refreshes the snapshot, and requires the operator
+to inspect every credential-presence marker before retrying.
 
 ## Password
 

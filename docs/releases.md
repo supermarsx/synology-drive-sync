@@ -50,8 +50,9 @@ Four DSM 7 packages are published separately from the GNU/Linux archives:
 | `armv7 armada370 armada375 armada38x armadaxp comcerto2k monaco` | `alpine`, `alpine4k`, `armada370`, `armada375`, `armada38x`, `armadaxp`, `comcerto2k`, `monaco` | `armv7-unknown-linux-musleabihf` | `synology-drive-sync-YY.N-armv7.spk` |
 | `i686` | `evansport` (DSM 7.0/7.1 only) | `i686-unknown-linux-musl` | `synology-drive-sync-YY.N-i686.spk` |
 
-Each corrected 26.7-or-later SPK, once published, contains one matching static ELF32 or ELF64 sync
-executable, a DSM-integrated administrator web dashboard opened by its `type=url` entry, the
+Release 26.10 is the first release planned to ship the administrator-only native DSM Vue AppWindow
+(`type=app`); published 26.7–26.9 assets do not acquire it retroactively. Once 26.10 is published,
+each 26.10-or-later SPK contains one matching static ELF32 or ELF64 sync executable, the AppWindow, the
 `sdsync-dsm` CLI manager, ordinary CGI relay,
 package-user API service, controller/runner helpers, DSM lifecycle scripts, the minimal package/`http`
 `conf/privilege`, preloaded desktop-alert I18N text, icons, and license texts. It contains no

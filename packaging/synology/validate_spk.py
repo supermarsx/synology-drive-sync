@@ -16,8 +16,10 @@ from pathlib import Path, PurePosixPath
 
 from build_spk import (
     ARCHITECTURES,
+    DSM_APP_CLASS,
     HERE,
     PackageError,
+    UI_SOURCE,
     UI_ICON_SIZES,
     elf_contract,
     elf_data_contract,
@@ -49,14 +51,18 @@ REQUIRED_PAYLOAD = {
     "share/licenses/THIRD_PARTY_LICENSES.html",
     "ui/api.cgi",
     "ui/config",
-    "ui/index.html",
-    "ui/app.css",
-    "ui/app.js",
+    "ui/SynologyDriveSync.js",
+    "ui/style.css",
     "ui/images/icon.svg",
     "ui/texts/enu/strings",
     *{f"ui/images/icon_{size}.png" for size in UI_ICON_SIZES},
 }
-APP_ID = "com.supermarsx.SynologyDriveSync"
+APP_ID = DSM_APP_CLASS
+APP_NAMESPACE = "SYNO.SDS.App.SynologyDriveSync"
+NATIVE_MODULE = "SynologyDriveSync.js"
+NATIVE_SCRIPT = "ui/SynologyDriveSync.js"
+NATIVE_STYLE = "ui/style.css"
+CANONICAL_API = "/webman/3rdparty/synology-drive-sync/api.cgi"
 DSM_MINIMUM = "7.0-40759"
 DSM_MAXIMUM = "7.4-99999"
 FIXED_INFO = {
@@ -80,9 +86,6 @@ FIXED_INFO = {
     "dsmuidir": "ui",
     "dsmappname": APP_ID,
 }
-WEBMAN_ROUTE_ROOT = PurePosixPath("/webman/3rdparty") / PACKAGE
-WEBMAN_ENTRYPOINT = (WEBMAN_ROUTE_ROOT / "index.html").as_posix()
-DSM_UI_ENTRYPOINT = PurePosixPath(FIXED_INFO["dsmuidir"]) / "index.html"
 REQUIRED_INFO = set(FIXED_INFO) | {"version", "arch", "extractsize"}
 NOTIFICATION_KEYS = {"sync_succeeded", "sync_failed", "doctor_failed"}
 
@@ -200,52 +203,66 @@ def png_dimensions(payload: bytes) -> tuple[int, int]:
     return struct.unpack_from(">II", payload, 16)
 
 
-def webman_payload_member(url: object) -> str:
-    if not isinstance(url, str) or url != WEBMAN_ENTRYPOINT:
-        raise ValidationError(
-            f"ui/config url must be the canonical DSM Webman entry point "
-            f"{WEBMAN_ENTRYPOINT!r}"
-        )
-    relative = PurePosixPath(url).relative_to(WEBMAN_ROUTE_ROOT)
-    member = PurePosixPath(FIXED_INFO["dsmuidir"]) / relative
-    if member != DSM_UI_ENTRYPOINT:
-        raise ValidationError(
-            "ui/config Webman route does not map to the packaged DSM UI entry point"
-        )
-    return member.as_posix()
-
-
-def validate_ui_config(payload: bytes) -> str:
-    model = load_unique_json(payload, "ui/config")
-    if not isinstance(model, dict):
-        raise ValidationError("ui/config must be a JSON object")
-    applications = model.get(".url")
-    if not isinstance(applications, dict) or set(applications) != {APP_ID}:
-        raise ValidationError("ui/config must register exactly the DSM application id")
-    application = applications[APP_ID]
+def validate_native_application(
+    application: object, label: str, *, generated: bool = False
+) -> None:
     if not isinstance(application, dict):
-        raise ValidationError("ui/config application entry must be an object")
-    entrypoint = webman_payload_member(application.get("url"))
+        raise ValidationError(f"{label} native AppWindow entry must be an object")
     expected = {
-        "type": "url",
+        "type": "app",
         "icon": "images/icon_{0}.png",
-        "title": "Synology Drive Sync",
-        "desc": "Configure, diagnose, and monitor one-way File Station sync",
+        "title": "app:title",
+        "desc": "app:description",
+        "appWindow": APP_ID,
         "allUsers": False,
+        "allowMultiInstance": False,
+        "hidden": False,
     }
     for key, value in expected.items():
         if application.get(key) != value:
-            raise ValidationError(f"ui/config has invalid {key!r}")
+            raise ValidationError(f"{label} has invalid native AppWindow property {key!r}")
     expected_preloads = {
         f"notifications:{event}_{suffix}"
         for event in NOTIFICATION_KEYS
         for suffix in ("title", "message")
     }
-    if set(application.get("preloadTexts", [])) != expected_preloads:
-        raise ValidationError("ui/config preloadTexts does not match notification texts")
-    if set(application) != set(expected) | {"url", "preloadTexts"}:
-        raise ValidationError("ui/config contains an unreviewed DSM application property")
-    return entrypoint
+    preload_texts = application.get("preloadTexts")
+    if (
+        not isinstance(preload_texts, list)
+        or any(not isinstance(value, str) for value in preload_texts)
+        or len(preload_texts) != len(set(preload_texts))
+        or set(preload_texts) != expected_preloads
+    ):
+        raise ValidationError(f"{label} preloadTexts does not match notification texts")
+    allowed = set(expected) | {"preloadTexts"}
+    if generated:
+        if application.get("depend") != []:
+            raise ValidationError(
+                f"{label} must contain the deterministic empty DSM dependency list"
+            )
+        allowed.add("depend")
+    if set(application) != allowed:
+        raise ValidationError(f"{label} contains an unreviewed DSM application property")
+
+
+def validate_source_app_config(payload: bytes) -> None:
+    model = load_unique_json(payload, "ui-src/app.config")
+    if not isinstance(model, dict) or set(model) != {APP_ID}:
+        raise ValidationError("ui-src/app.config must define exactly the native AppWindow class")
+    validate_native_application(model[APP_ID], "ui-src/app.config")
+
+
+def validate_ui_config(payload: bytes) -> str:
+    model = load_unique_json(payload, "ui/config")
+    if not isinstance(model, dict) or set(model) != {NATIVE_MODULE}:
+        raise ValidationError(
+            "ui/config must register exactly one reviewed native JavaScript module"
+        )
+    applications = model[NATIVE_MODULE]
+    if not isinstance(applications, dict) or set(applications) != {APP_ID}:
+        raise ValidationError("ui/config module must define exactly the native AppWindow class")
+    validate_native_application(applications[APP_ID], "ui/config", generated=True)
+    return NATIVE_SCRIPT
 
 
 def validate_ui_texts(strings_payload: bytes) -> None:
@@ -323,105 +340,373 @@ def validate_svg_icon(payload: bytes) -> None:
         raise ValidationError("authored icon source contains an external or executable construct")
 
 
-def validate_ui_static(index_payload: bytes, css_payload: bytes, script_payload: bytes) -> None:
-    index = index_payload.decode("utf-8")
-    css = css_payload.decode("utf-8")
-    script = script_payload.decode("utf-8")
-    required_routes = {
-        "overview", "profiles", "routines", "health", "activity",
-        "notifications", "settings",
-    }
-    if set(re.findall(r'data-route="([a-z]+)"', index)) != required_routes:
-        raise ValidationError("DSM UI navigation does not expose the required sections")
-    csp_match = re.search(
-        r'<meta\s+http-equiv="Content-Security-Policy"\s+content="([^"]+)"',
-        index,
-        re.IGNORECASE,
-    )
-    if not csp_match:
-        raise ValidationError("DSM UI must define a Content-Security-Policy")
-    csp = csp_match.group(1)
-    for directive in (
-        "default-src 'self'", "script-src 'self'", "style-src 'self'",
-        "connect-src 'self'", "object-src 'none'", "base-uri 'none'",
-        "form-action 'self'",
+def validate_native_api_source(payload: bytes) -> None:
+    source = payload.decode("utf-8")
+    endpoints = re.findall(r'["\']([^"\']*api\.cgi)["\']', source)
+    if endpoints != [CANONICAL_API]:
+        raise ValidationError("native DSM UI must use only the canonical absolute package CGI path")
+    for marker in (
+        'credentials: "same-origin"',
+        '"X-SDSYNC-CSRF": csrfToken',
+        "crypto.getRandomValues",
+        "request_id: id",
+        "operation: action",
+        "arguments: payload",
+        "signal: auth && auth.signal ? auth.signal : undefined",
+        "signal.addEventListener(\"abort\", cancel, { once: true })",
+        "signal.removeEventListener(\"abort\", cancel)",
+        "window.clearTimeout(timer)",
+        "const RESULT_POLL_INTERVAL_MS = 2000;",
+        "const RESULT_POLL_OBSERVATION_FAILURES = 5;",
+        "class QueuedOutcomeUnknownError extends Error",
+        "this.outcomeUnknown = true;",
     ):
-        if directive not in csp:
-            raise ValidationError(f"DSM UI CSP is missing {directive}")
-    if re.search(r"\son[a-z]+\s*=", index, re.IGNORECASE):
-        raise ValidationError("DSM UI contains an inline event handler")
-    referrer = '<meta name="referrer" content="no-referrer">'
-    first_subresource = min(position for position in (index.find("<link"), index.find("<script")) if position >= 0)
-    if index.find(referrer) < 0 or index.find(referrer) > first_subresource:
-        raise ValidationError("DSM UI must suppress referrers before loading subresources")
-    script_tags = re.findall(r"<script([^>]*)>(.*?)</script>", index, re.IGNORECASE | re.DOTALL)
-    if not script_tags or any("src=" not in attributes.lower() or body.strip() for attributes, body in script_tags):
-        raise ValidationError("DSM UI scripts must be external, local, and non-inline")
-    for attribute in re.findall(r'(?:src|href)="([^"]+)"', index, re.IGNORECASE):
-        if re.match(r"(?:[a-z]+:)?//", attribute, re.IGNORECASE):
-            raise ValidationError(f"DSM UI loads an external asset: {attribute}")
-    if re.search(r"url\(\s*['\"]?(?:https?:)?//", css, re.IGNORECASE):
-        raise ValidationError("DSM UI CSS loads an external asset")
-    if re.search(
-        r"(?:fetch\s*\(|new\s+(?:WebSocket|EventSource)\s*\()\s*['\"](?:https?:)?//",
-        script,
-        re.IGNORECASE,
+        if marker not in source:
+            raise ValidationError(f"native DSM API source is missing security contract {marker!r}")
+    if source.count('credentials: "same-origin"') != 2:
+        raise ValidationError("native DSM GET and POST must both use same-origin credentials")
+    if source.count("signal: auth && auth.signal ? auth.signal : undefined") != 2:
+        raise ValidationError("native DSM GET and POST must both support AppWindow cancellation")
+    for forbidden in (
+        r"consumeLaunchToken",
+        r"\bwindow\.location\b",
+        r"\bwindow\.history\b",
+        r"\bhistory\.replaceState\b",
+        r"X-SYNO-TOKEN",
+        r"SynoToken",
+        r"launch[- ]token",
     ):
-        raise ValidationError("DSM UI script contains an external network endpoint")
-    for forbidden in ("eval(", "new Function(", ".innerHTML", "insertAdjacentHTML", "document.write("):
-        if forbidden in script:
-            raise ValidationError(f"DSM UI script contains forbidden DOM construct {forbidden}")
-    headers_start = script.find("  function authenticatedHeaders(")
-    headers_end = script.find("\n  async function apiGet(", headers_start)
+        if re.search(forbidden, source, re.IGNORECASE):
+            raise ValidationError(
+                "native DSM API must use cookie-only AppWindow authentication without launch-token parsing"
+            )
+
+    headers_start = source.find("function authenticatedHeaders(")
+    headers_end = source.find("\nfunction exactKeys(", headers_start)
     if headers_start < 0 or headers_end < 0:
-        raise ValidationError("DSM UI script is missing the authenticated-header bridge")
-    authenticated_headers = script[headers_start:headers_end]
-    marker_names = re.findall(r'["\']X-SDSYNC-Request["\']', script)
+        raise ValidationError("native DSM API source is missing the authenticated-header bridge")
+    authenticated_headers = source[headers_start:headers_end]
+    if "function authenticatedHeaders(headers)" not in authenticated_headers:
+        raise ValidationError("native DSM headers must not accept browser launch-token authentication")
+    marker_names = re.findall(r'["\']X-SDSYNC-Request["\']', source)
     marker_values = re.findall(
-        r'const\s+authenticated\s*=\s*Object\.assign\(\s*\{\s*\}\s*,\s*headers\s*,\s*\{\s*'
+        r'return\s+Object\.assign\(\s*\{\s*\}\s*,\s*headers\s*,\s*\{\s*'
         r'["\']X-SDSYNC-Request["\']\s*:\s*["\']([^"\']*)["\']\s*\}\s*\)\s*;',
         authenticated_headers,
     )
     if (
         len(marker_names) != 1
         or marker_values != ["1"]
-        or authenticated_headers.count("return authenticated;") != 1
+        or authenticated_headers.count("return Object.assign(") != 1
     ):
-        raise ValidationError("DSM UI must emit exactly one X-SDSYNC-Request header with value 1")
+        raise ValidationError("native DSM UI must emit exactly one X-SDSYNC-Request header with value 1")
     for method, start_marker, end_marker in (
-        ("GET", "  async function apiGet(", "\n  function canMutate("),
-        ("POST", "  async function apiPost(", "\n  function setConnected("),
+        ("GET", "export async function apiGet(", "\nfunction delay("),
+        ("POST", "export async function apiPost(", None),
     ):
-        request_start = script.find(start_marker)
-        request_end = script.find(end_marker, request_start)
+        request_start = source.find(start_marker)
+        request_end = len(source) if end_marker is None else source.find(end_marker, request_start)
         if request_start < 0 or request_end < 0:
-            raise ValidationError(f"DSM UI script is missing the {method} request bridge")
-        request_source = script[request_start:request_end]
+            raise ValidationError(f"native DSM API source is missing the {method} request bridge")
+        request_source = source[request_start:request_end]
         if len(re.findall(r"\bheaders\s*:\s*authenticatedHeaders\s*\(", request_source)) != 1:
             raise ValidationError(
-                f"DSM UI {method} requests must emit X-SDSYNC-Request through authenticatedHeaders"
+                f"native DSM {method} requests must emit X-SDSYNC-Request through authenticatedHeaders"
             )
-    for required in (
-        "X-SYNO-TOKEN", "X-SDSYNC-CSRF", "crypto.getRandomValues",
-        "request_id", "operation: action", "arguments: payload",
-        "capabilities.mutations === true", 'hasCapability("secrets")',
-        "has_remote_log_token", "remote-log-token",
-        "sdsync.dsm-result-status.v1", 'result: Object.freeze(["job_id"])',
-        "pollJobResult(queued.job_id)", "awaitTerminal === false", "expired_or_missing",
+
+    poll_start = source.find("async function pollJobResult(")
+    poll_end = source.find("\nfunction requestId(", poll_start)
+    if poll_start < 0 or poll_end < 0:
+        raise ValidationError("native DSM API source is missing queued-result observation")
+    poll_source = source[poll_start:poll_end]
+    for marker in (
+        "pollIntervalMs = RESULT_POLL_INTERVAL_MS",
+        "let consecutiveObservationFailures = 0;",
+        "for (;;)",
+        "if (auth && auth.signal && auth.signal.aborted) throw error;",
+        "consecutiveObservationFailures += 1;",
+        "consecutiveObservationFailures >= RESULT_POLL_OBSERVATION_FAILURES",
+        "consecutiveObservationFailures = 0;",
+        "status.state === \"pending\"",
+        "status.state === \"expired_or_missing\"",
+        "status.result.ok === false",
+        "status.result.ok !== true && status.result.ok !== false",
+        "failure.resultOutput = boundedText(",
+        "status.result.output",
     ):
-        if required not in script:
-            raise ValidationError(f"DSM UI script is missing security contract {required!r}")
-    if not re.search(r'name="connect_timeout"[^>]*\bmin="1"[^>]*\bmax="600"', index):
-        raise ValidationError("DSM UI connect-timeout bounds drifted from the bridge")
-    if not re.search(r'name="cooldown_seconds"[^>]*\bmin="60"[^>]*\bmax="604800"', index):
-        raise ValidationError("DSM UI notification-cooldown bounds drifted from the bridge")
-    for secret_name in ("password", "totp", "remote_log_token"):
-        if re.search(rf"localStorage[^\n]*{secret_name}|{secret_name}[^\n]*localStorage", script, re.IGNORECASE):
-            raise ValidationError(f"DSM UI persists {secret_name} in localStorage")
-    if "prefers-reduced-motion" not in css or ":focus-visible" not in css:
-        raise ValidationError("DSM UI CSS is missing reduced-motion or focus treatment")
-    if "@media (max-width:" not in css:
-        raise ValidationError("DSM UI CSS is not responsive")
+        if marker not in poll_source:
+            raise ValidationError(
+                f"native DSM queued-result observer is missing {marker!r}"
+            )
+    if poll_source.count("await delay(interval, auth && auth.signal);") != 2:
+        raise ValidationError(
+            "native DSM queued-result observer must retry pending and transport observations"
+        )
+    if poll_source.count("throw new QueuedOutcomeUnknownError(") != 4:
+        raise ValidationError(
+            "native DSM queued-result observer must distinguish all outcome-unknown states"
+        )
+    for forbidden in (
+        "RESULT_POLL_ATTEMPTS",
+        "for (let attempt",
+        "within two minutes",
+        "poll deadline",
+        "poll timeout",
+    ):
+        if forbidden.lower() in poll_source.lower():
+            raise ValidationError(
+                "native DSM queued-result observer must not invent a client terminal horizon"
+            )
+
+    post_start = source.find("export async function apiPost(")
+    if post_start < 0 or (
+        "return awaitTerminal ? pollJobResult(auth, queued.job_id, pollIntervalMs) : queued;"
+        not in source[post_start:]
+    ):
+        raise ValidationError(
+            "native DSM POST must explicitly choose terminal observation or queued return"
+        )
+    if re.search(
+        r"(?:fetch\s*\(|new\s+(?:WebSocket|EventSource)\s*\()\s*['\"](?:https?:)?//",
+        source,
+        re.IGNORECASE,
+    ):
+        raise ValidationError("native DSM API source contains an external network endpoint")
+    for forbidden in (
+        "document.documentElement", "window.location.hash", "location.hash",
+        "hashchange", "eval(", "new Function(", ".innerHTML", "insertAdjacentHTML",
+    ):
+        if forbidden in source:
+            raise ValidationError(f"native DSM API source contains forbidden construct {forbidden}")
+
+
+def validate_native_build_contract(
+    main_payload: bytes,
+    app_payload: bytes,
+    api_payload: bytes,
+    css_payload: bytes,
+    webpack_payload: bytes,
+    config_define_payload: bytes,
+    package_payload: bytes,
+) -> None:
+    main = main_payload.decode("utf-8")
+    app = app_payload.decode("utf-8")
+    css = css_payload.decode("utf-8")
+    webpack = webpack_payload.decode("utf-8")
+
+    for marker in (
+        'import Vue from "vue";',
+        f'SYNO.namespace("{APP_NAMESPACE}");',
+        f"{APP_ID} = Vue.extend({{",
+        "components: { App }",
+        'template: "<App/>"',
+    ):
+        if marker not in main:
+            raise ValidationError(f"native DSM entry module is missing {marker!r}")
+    if main.count("Vue.extend(") != 1 or main.count(f"{APP_ID} =") != 1:
+        raise ValidationError("native DSM entry module must define exactly one reviewed Vue class")
+
+    structural_markers = (
+        f'<v-app-instance class-name="{APP_ID}">',
+        "<v-app-window",
+        'ref="appWindow"',
+        "</v-app-window>",
+        "</v-app-instance>",
+    )
+    try:
+        positions = [app.index(marker) for marker in structural_markers]
+    except ValueError as error:
+        raise ValidationError("native DSM component is missing its AppWindow structure") from error
+    if positions != sorted(positions):
+        raise ValidationError("native DSM AppWindow components are not correctly nested")
+    root_marker = '<div class="sdsync-app" :class="themeClass">'
+    toasts_marker = '<div class="sdsync-toasts" aria-live="polite"'
+    modal_marker = (
+        '<div v-if="confirmation.visible" class="sdsync-modal-backdrop" '
+        'role="presentation"'
+    )
+    if app.count(root_marker) != 1 or app.count(toasts_marker) != 1 or app.count(modal_marker) != 1:
+        raise ValidationError("native DSM AppWindow must own exactly one root, toast host, and modal host")
+    if not (
+        app.index(root_marker)
+        < app.index("<main class=\"sdsync-workspace\">")
+        < app.index("</main>")
+        < app.index(toasts_marker)
+        < app.index(modal_marker)
+        < app.index("</v-app-window>")
+    ):
+        raise ValidationError("native DSM toast and modal hosts must remain at the AppWindow root")
+    for marker in ("<v-button", "<v-form", "<v-form-item", "<v-single-select"):
+        if marker not in app:
+            raise ValidationError(f"native DSM component is missing DSM Vue control {marker}")
+    for marker in (
+        "beforeDestroy()", "this.stopTimers();",
+        'document.removeEventListener("visibilitychange", this.visibilityHandler)',
+        'this.mediaQuery.removeEventListener("change", this.mediaHandler)',
+        "window.clearTimeout(this.snapshotTimer)",
+        "window.clearTimeout(this.logTimer)",
+        "this.disposed = true;",
+        "this.abortController.abort();",
+        "this.toastTimers.forEach((timer) => window.clearTimeout(timer))",
+        "this.removeConfirmationKeyHandler();",
+        "this.confirmationPriorFocus = null;",
+        "this.clearSecrets();", 'this.csrfToken = "";',
+    ):
+        if marker not in app:
+            raise ValidationError(f"native DSM component is missing destruction cleanup {marker!r}")
+    if "window.setInterval" in app or "setInterval(" in app:
+        raise ValidationError("native DSM component must not retain unmanaged interval timers")
+
+    for marker in (
+        ':aria-label="item.title"',
+        ':title="item.title"',
+        'type="time" aria-label="Window starts"',
+        'type="time" aria-label="Window ends"',
+        'multiple size="4" aria-label="Wait for routines"',
+        'role="dialog" aria-modal="true"',
+        'aria-labelledby="sdsync-confirm-title"',
+        'aria-describedby="sdsync-confirm-message"',
+        'this.confirmationPriorFocus = document.activeElement;',
+        'document.addEventListener("keydown", this.confirmationKeyHandler, true);',
+        'document.removeEventListener("keydown", this.confirmationKeyHandler, true);',
+        'event.key === "Escape"',
+        'event.key !== "Tab"',
+        "priorFocus && priorFocus.isConnected && priorFocus.focus",
+        'if (this.route === "profiles" && route !== "profiles") this.closeProfile();',
+        "closeProfile() { this.clearSecrets();",
+    ):
+        if marker not in app:
+            raise ValidationError(
+                f"native DSM component is missing AppWindow interaction contract {marker!r}"
+            )
+
+    operation_guards = (
+        r"openProfile\(name\)\s*\{\s*if \(this\.operationBusy\) return;",
+        r"async saveProfile\(event\)\s*\{.{0,180}?if \(!this\.canMutate \|\| this\.operationBusy\) return;",
+        r"async removeProfile\(\)\s*\{\s*if \(!this\.canMutate \|\| !this\.selectedProfile \|\| this\.operationBusy\) return;",
+        r"selectRoutine\(profile\)\s*\{\s*if \(this\.operationBusy\) return;",
+        r"async saveRoutine\(event\)\s*\{.{0,180}?this\.operationBusy\) return;",
+        r"async removeRoutine\(\)\s*\{.{0,180}?this\.operationBusy\) return;",
+        r"async saveAlerts\(event\)\s*\{.{0,180}?this\.operationBusy\) return;",
+        r"async executeOperation\(kind, payload\)\s*\{\s*if \(!this\.canMutate \|\| this\.operationBusy \|\| this\.disposed\) return;",
+        r"async quickRun\(\)\s*\{\s*if \(!this\.canMutate \|\| this\.operationBusy\) return;",
+        r"async runDoctor\(event\)\s*\{.{0,180}?if \(!this\.canMutate \|\| this\.operationBusy\) return;",
+    )
+    for guard in operation_guards:
+        if not re.search(guard, app, re.DOTALL):
+            raise ValidationError("native DSM mutation surface is missing a global operationBusy guard")
+    for marker in (
+        'const awaitTerminal = kind === "doctor";',
+        "Object.assign({ kind }, payload),\n          awaitTerminal",
+        'quickPlan() { return this.executeOperation("plan"',
+        'return this.executeOperation("run"',
+        'return this.executeOperation("doctor"',
+    ):
+        if marker not in app:
+            raise ValidationError(
+                "native DSM Doctor must terminal-poll while plan and run return queued"
+            )
+    for forbidden in (
+        "<iframe", "createElement(\"iframe\")", "createElement('iframe')",
+        "<object", "<embed", "index.html", "document.documentElement",
+        "window.location", "window.history", "history.replaceState", "location.hash", "hashchange", "v-html",
+        ".innerHTML", "insertAdjacentHTML", "document.write(", "eval(", "new Function(",
+        "consumeLaunchToken", "X-SYNO-TOKEN", "SynoToken", "launch token",
+    ):
+        if forbidden.lower() in app.lower():
+            raise ValidationError(f"native DSM component contains forbidden launcher or DOM construct {forbidden}")
+
+    if ".sdsync-app" not in css or ".sdsync-app.is-light" not in css:
+        raise ValidationError("native DSM styles must scope dark/light themes to the AppWindow root")
+    if "@media (prefers-reduced-motion:" not in css or ":focus-visible" not in css:
+        raise ValidationError(
+            "native DSM styles must provide reduced-motion and keyboard-focus treatment"
+        )
+    if re.search(r"(^|[},])\s*(?::root|html\b|body\b)", css, re.IGNORECASE):
+        raise ValidationError("native DSM styles must not mutate DSM document-level selectors")
+    for line in css.splitlines():
+        selector = line.strip()
+        if selector.endswith("{") and not selector.startswith("@") and not selector.startswith(".sdsync-"):
+            raise ValidationError(f"native DSM stylesheet has an unscoped selector {selector!r}")
+    if re.search(r"url\(\s*['\"]?(?:https?:)?//", css, re.IGNORECASE):
+        raise ValidationError("native DSM stylesheet loads a remote asset")
+    if "sourceMappingURL" in css:
+        raise ValidationError("native DSM stylesheet must not reference a source map")
+
+    if not re.search(r"externals\s*:\s*\{\s*vue\s*:\s*['\"]Vue['\"]\s*\}", webpack):
+        raise ValidationError("native DSM webpack build must externalize Vue to the DSM global")
+    for marker in (
+        'filename: "SynologyDriveSync.js"',
+        'new MiniCssExtractPlugin({ filename: "style.css" })',
+        "splitChunks: false", "runtimeChunk: false", "devtool: false",
+    ):
+        if marker not in webpack:
+            raise ValidationError(f"native DSM webpack contract is missing {marker!r}")
+
+    config_define = load_unique_json(config_define_payload, "ui-src/config.define")
+    if config_define != {
+        NATIVE_MODULE: {
+            "JSfiles": [f"dist/{NATIVE_MODULE}"],
+            "params": "-s -c skip",
+        }
+    }:
+        raise ValidationError("ui-src/config.define does not bind the reviewed native module")
+    package = load_unique_json(package_payload, "ui-src/package.json")
+    if not isinstance(package, dict):
+        raise ValidationError("ui-src/package.json must be an object")
+    dependencies = package.get("dependencies", {})
+    dev_dependencies = package.get("devDependencies")
+    if dependencies not in ({}, None) or not isinstance(dev_dependencies, dict):
+        raise ValidationError("native DSM UI may only use pinned build-time dependencies")
+    if dev_dependencies.get("vue") != "2.7.14" or any(
+        not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version)
+        for version in dev_dependencies.values()
+    ):
+        raise ValidationError("native DSM UI build dependencies must be exact and use DSM Vue 2.7.14")
+
+    validate_native_api_source(api_payload)
+
+
+def validate_native_bundle(script_payload: bytes, style_payload: bytes) -> None:
+    script = script_payload.decode("utf-8")
+    style = style_payload.decode("utf-8")
+    for marker in (
+        APP_ID, "v-app-instance", "v-app-window", CANONICAL_API,
+        "X-SDSYNC-Request", "X-SDSYNC-CSRF", "same-origin", "beforeDestroy",
+    ):
+        if marker not in script:
+            raise ValidationError(f"native DSM bundle is missing reviewed contract {marker!r}")
+    if not re.search(r"\b(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*Vue\b", script):
+        raise ValidationError("native DSM bundle must consume Vue from the DSM global")
+    for forbidden in (
+        "<iframe", "createElement(\"iframe\")", "createElement('iframe')", "index.html",
+        "document.documentElement", "window.location", "window.history", "history.replaceState",
+        "location.hash", "hashchange",
+        "sourceMappingURL", "eval(", "new Function(", "__VUE_DEVTOOLS_GLOBAL_HOOK__",
+        "You are running Vue in development mode", 'version:"2.7.14"',
+        "consumeLaunchToken", "X-SYNO-TOKEN", "SynoToken", "launch token",
+    ):
+        if forbidden.lower() in script.lower():
+            raise ValidationError(f"native DSM bundle contains forbidden runtime {forbidden}")
+    if re.search(
+        r"(?:fetch\s*\(|new\s+(?:WebSocket|EventSource)\s*\()\s*['\"](?:https?:)?//",
+        script,
+        re.IGNORECASE,
+    ):
+        raise ValidationError("native DSM bundle contains an external network endpoint")
+    if "eval(" in style or "sourceMappingURL" in style:
+        raise ValidationError("native DSM style bundle contains executable or source-map content")
+    if re.search(r"url\(\s*['\"]?(?:https?:)?//", style, re.IGNORECASE):
+        raise ValidationError("native DSM style bundle loads a remote asset")
+    if (
+        ".sdsync-app" not in style
+        or "@media (prefers-reduced-motion:" not in style
+        or ":focus-visible" not in style
+        or re.search(
+            r"(^|[},])\s*(?::root|html\b|body\b)", style, re.IGNORECASE
+        )
+    ):
+        raise ValidationError("native DSM style bundle is not isolated to the AppWindow")
 
 
 def validate_privilege(payload: bytes) -> None:
@@ -479,12 +764,20 @@ def validate_source() -> None:
         HERE / "package/libexec/sdsync-common",
         HERE / "package/libexec/sdsync-controller",
         HERE / "package/libexec/sdsync-run",
-        HERE / "package/ui/config",
-        HERE / "package/ui/index.html",
-        HERE / "package/ui/app.css",
-        HERE / "package/ui/app.js",
         HERE / "package/ui/images/icon.svg",
         HERE / "package/ui/texts/enu/strings",
+        UI_SOURCE / "app.config",
+        UI_SOURCE / "config.define",
+        UI_SOURCE / "Makefile",
+        UI_SOURCE / "package.json",
+        UI_SOURCE / "pnpm-lock.yaml",
+        UI_SOURCE / "webpack.config.js",
+        UI_SOURCE / "src/main.js",
+        UI_SOURCE / "src/App.vue",
+        UI_SOURCE / "src/api.js",
+        UI_SOURCE / "src/styles/native.css",
+        UI_SOURCE / "dist/SynologyDriveSync.js",
+        UI_SOURCE / "dist/style.css",
     ] + [HERE / "scripts" / name for name in REQUIRED_SCRIPTS]
     missing = [str(path.relative_to(HERE)) for path in required_files if not path.is_file()]
     if missing:
@@ -499,21 +792,43 @@ def validate_source() -> None:
                 f"third-party source package must not acquire reserved resource: "
                 f"{path.relative_to(HERE)}"
             )
+    for path in (
+        HERE / "package/ui/config",
+        HERE / "package/ui/index.html",
+        HERE / "package/ui/app.js",
+        HERE / "package/ui/app.css",
+    ):
+        if path.exists() or path.is_symlink():
+            raise ValidationError(
+                "native DSM source must not contain a legacy standalone launcher: "
+                f"{path.relative_to(HERE)}"
+            )
     validate_privilege((HERE / "conf/privilege").read_bytes())
-    ui_entrypoint = validate_ui_config((HERE / "package/ui/config").read_bytes())
-    source_entrypoint = HERE / "package" / ui_entrypoint
-    if source_entrypoint.is_symlink() or not source_entrypoint.is_file():
+    validate_source_app_config((UI_SOURCE / "app.config").read_bytes())
+    dist_members = {
+        path.name
+        for path in (UI_SOURCE / "dist").iterdir()
+    }
+    if dist_members != {NATIVE_MODULE, "style.css"}:
         raise ValidationError(
-            "ui/config Webman route does not resolve to a regular source UI entry point"
+            "native DSM dist must contain only SynologyDriveSync.js and style.css"
         )
+    validate_native_build_contract(
+        (UI_SOURCE / "src/main.js").read_bytes(),
+        (UI_SOURCE / "src/App.vue").read_bytes(),
+        (UI_SOURCE / "src/api.js").read_bytes(),
+        (UI_SOURCE / "src/styles/native.css").read_bytes(),
+        (UI_SOURCE / "webpack.config.js").read_bytes(),
+        (UI_SOURCE / "config.define").read_bytes(),
+        (UI_SOURCE / "package.json").read_bytes(),
+    )
+    validate_native_bundle(
+        (UI_SOURCE / "dist/SynologyDriveSync.js").read_bytes(),
+        (UI_SOURCE / "dist/style.css").read_bytes(),
+    )
     validate_ui_texts((HERE / "package/ui/texts/enu/strings").read_bytes())
     validate_notifier((HERE / "package/libexec/sdsync-common").read_bytes())
     validate_svg_icon((HERE / "package/ui/images/icon.svg").read_bytes())
-    validate_ui_static(
-        (HERE / "package/ui/index.html").read_bytes(),
-        (HERE / "package/ui/app.css").read_bytes(),
-        (HERE / "package/ui/app.js").read_bytes(),
-    )
     template = (HERE / "INFO.template").read_text(encoding="utf-8")
     for token in ("@DSM_VERSION@", "@ARCH@", "@EXTRACT_SIZE_KIB@"):
         if template.count(token) != 1:
@@ -691,21 +1006,21 @@ def validate_spk(
             raise ValidationError("ui/api.cgi must exactly match bin/sdsync-dsm-api")
         if expected_api_binary is not None and embedded_api != expected_api_binary:
             raise ValidationError("--api-binary bytes do not match the helper embedded in the SPK")
-        ui_entrypoint = validate_ui_config(member_bytes(inner, inner_members["ui/config"]))
-        if ui_entrypoint not in inner_members:
+        ui_module = validate_ui_config(member_bytes(inner, inner_members["ui/config"]))
+        if ui_module not in inner_members:
             raise ValidationError(
-                "ui/config Webman route does not resolve inside package.tgz"
+                "ui/config native module does not resolve inside package.tgz"
             )
         require_regular_mode(
-            inner_members, ui_entrypoint, 0o644, "DSM Webman UI entry point"
+            inner_members, ui_module, 0o644, "DSM native AppWindow module"
         )
+        require_regular_mode(inner_members, NATIVE_STYLE, 0o644, "DSM native AppWindow style")
         validate_ui_texts(member_bytes(inner, inner_members["ui/texts/enu/strings"]))
         validate_notifier(member_bytes(inner, inner_members["libexec/sdsync-common"]))
         validate_svg_icon(member_bytes(inner, inner_members["ui/images/icon.svg"]))
-        validate_ui_static(
-            member_bytes(inner, inner_members["ui/index.html"]),
-            member_bytes(inner, inner_members["ui/app.css"]),
-            member_bytes(inner, inner_members["ui/app.js"]),
+        validate_native_bundle(
+            member_bytes(inner, inner_members[NATIVE_SCRIPT]),
+            member_bytes(inner, inner_members[NATIVE_STYLE]),
         )
         for size in UI_ICON_SIZES:
             icon_name = f"ui/images/icon_{size}.png"

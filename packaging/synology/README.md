@@ -1,7 +1,8 @@
 # DSM 7 package
 
-This directory builds a manually installable Synology DSM 7 package with a DSM-integrated
-administrator-only web dashboard and the `sdsync-dsm` SSH manager. Install it on the NAS that
+This directory builds the current manually installable Synology DSM 7 package source, planned to
+first ship its administrator-only native Vue AppWindow in release 26.10. It also includes the
+`sdsync-dsm` SSH manager. Install it on the NAS that
 owns the authoritative source directory; the package reads that directory locally and sends changes
 over HTTPS to a destination accepted by the remote NAS File Station WebAPI.
 
@@ -21,8 +22,9 @@ The source is independently selectable for every profile and is a physical local
 
 ## Build and validate
 
-Supply two fully static, little-endian Linux ELFs matching the selected release architecture: the
-core `synology-drive-sync` and compiled `sdsync-dsm-api` helper. The builder rejects the wrong ELF
+Build the pinned native DSM UI first, then supply two fully static, little-endian Linux ELFs matching
+the selected release architecture: the core `synology-drive-sync` and compiled `sdsync-dsm-api`
+helper. The builder rejects a missing or empty bundle, a mismatched AppWindow/config definition, the wrong ELF
 class or machine, a dynamic interpreter, `DT_NEEDED`, malformed program headers, or an ELF without
 an executable load segment. ARMv7 is additionally required to be EABI5 hard-float; an ARM
 soft-float binary cannot be made compatible by changing its filename.
@@ -35,6 +37,12 @@ soft-float binary cannot be made compatible by changing its filename.
 | `armv8` | `aarch64-unknown-linux-musl` | ELF64, `EM_AARCH64` | `armv8` |
 
 ```sh
+cd packaging/synology/ui-src
+pnpm install --frozen-lockfile --ignore-scripts
+pnpm run build
+cd ../../..
+git diff --exit-code -- packaging/synology/ui-src/dist
+
 bash packaging/synology/build-spk.sh \
   --binary dist/x86_64-unknown-linux-musl/synology-drive-sync \
   --api-binary dist/x86_64-unknown-linux-musl/sdsync-dsm-api \
@@ -61,7 +69,9 @@ python packaging/synology/test_synology_package.py
 Artifacts are named `synology-drive-sync-VERSION-ARCH.spk`, where `ARCH` is `x86_64`, `i686`,
 `armv7`, or `armv8`; a leading `v` is removed. A semantic version such as `0.1.0` is rendered as
 DSM version `0.1.0-1` in `INFO`. `SOURCE_DATE_EPOCH` controls every tar member and the inner gzip
-header for reproducible output.
+header for reproducible output. The builder validates `ui-src/app.config` and `config.define`, then
+deterministically renders the DSM toolkit-equivalent module wrapper under `ui/config` and packages
+`ui/SynologyDriveSync.js` plus `ui/style.css`; the old standalone HTML entry point is not shipped.
 
 Every executable, including `ui/api.cgi`, is ordinary `0755` in both the archive and installed
 package. Nothing carries a set-user-ID/set-group-ID bit. `conf/privilege` contains only
@@ -72,7 +82,8 @@ user, grouped to `http`, and mode `0660`. Both peers verify socket metadata and 
 The validator rejects any privilege-bearing archive member or broader privilege manifest.
 
 The corrected package contains no `conf/resource` acquisition worker or sysnotify mail templates.
-Optional alerts invoke `/usr/syno/bin/synodsmnotify -c` with only a fixed application ID,
+Optional alerts invoke `/usr/syno/bin/synodsmnotify -c` with only the fixed application ID
+`SYNO.SDS.App.SynologyDriveSync.Instance`,
 administrator recipient, and preloaded title/message I18N keys. They are DSM-desktop-only: profile,
 exit, path, account, log, and secret details remain in Activity and bounded logs, and no Notification
 Center email, SMS, mobile, CMS, or rule/channel delivery is registered.
@@ -88,7 +99,8 @@ The SPK contains the project license, generated third-party notices, and musl's 
 
 ## Install and initial configuration
 
-1. Use a verified 26.7-or-later SPK only when that release is published. In DSM Package Center, choose
+1. For the native AppWindow flow below, use a verified 26.10-or-later SPK only when that release is
+   published. Releases 26.7-26.9 retain their originally published UI. In DSM Package Center, choose
    **Manual Install** and select the SPK for the NAS architecture. DSM
    normally warns that this is a third-party package; that publisher-trust warning is expected for a
    package not distributed by Synology. A refusal saying root or lower privileges are required is a
@@ -97,10 +109,11 @@ The SPK contains the project license, generated third-party notices, and musl's 
    troubleshooting guide. Preserve `pkgmgr_worker_violation`, resource names, phases, and timestamps.
 2. Start the package. The package-user API service and controller start safely with scheduling
    disabled.
-3. Open **Synology Drive Sync** from the DSM desktop or Package Center. The server authenticates the
-   current DSM session cookie and independently requires administrator membership. A valid launch
-   `SynoToken` is accepted as an optional session-binding input, but absence is supported. If session
-   authentication or the bridge fails, use the CLI and record the physical-NAS evidence.
+3. Open the native **Synology Drive Sync** AppWindow from the DSM desktop or Package Center. The
+   server authenticates the current DSM session cookie and independently requires administrator
+   membership. The native UI does not inspect or rewrite the DSM shell location and sends no
+   `SynoToken`. If session authentication or the bridge fails, use the CLI and record the
+   physical-NAS evidence.
 4. Enable SSH temporarily for ACL verification and recovery. Resolve the actual package owner as
    shown in [CLI parity](../../docs/dsm/cli-parity.md#discover-the-actual-package-identity); the
    management entry point is:
@@ -209,12 +222,12 @@ Static validation proves archive structure, the root-free manifest, ordinary exe
 architecture, static linkage, dashboard/relay contracts, lifecycle behavior, and deterministic
 assembly. Before relying on the package, test its exact NAS model and DSM version with a disposable
 source and target, including Package Center installation and exact warning, CGI `http` identity,
-package-user API service, package:`http` `0660` socket, rendered dashboard behavior, browser
-`X-SDSYNC-Request: 1` to CGI `HTTP_X_SDSYNC_REQUEST=1` forwarding, AppLaunch optional-token
-behavior, package-user `authenticate.cgi`, administrator/CSRF rejection cases,
+package-user API service, package:`http` `0660` socket, native AppWindow loading/rendering, browser
+`X-SDSYNC-Request: 1` to CGI `HTTP_X_SDSYNC_REQUEST=1` forwarding, package-user
+`authenticate.cgi`, administrator/CSRF rejection cases,
 reverse-proxy upload limits, TLS trust, TOTP clock synchronization, routines, direct DSM desktop
 alerts, large files, Drive indexing, restart during a long transfer, upgrade, and uninstall. Rendered browser QA,
 physical installation, and `authenticate.cgi` execution under the package user remain unverified. A
 manually built SPK is not automatically a Synology Package Center-approved release.
 
-Official framework references: [package structure](https://help.synology.com/developer-guide/synology_package/introduction.html), [architecture mapping](https://help.synology.com/developer-guide/appendix/platarchs.html), [privilege configuration](https://help.synology.com/developer-guide/privilege/privilege_config.html), [FHS paths](https://help.synology.com/developer-guide/integrate_dsm/fhs.html), and [lifecycle status codes](https://help.synology.com/developer-guide/synology_package/scripts.html).
+Official framework references: [package structure](https://help.synology.com/developer-guide/synology_package/introduction.html), [native app launch](https://help.synology.com/developer-guide/synology_package/package_tgz/launch_app.html), [AppWindow framework](https://help.synology.com/developer-guide/appendix/ui_framework/application.html), [architecture mapping](https://help.synology.com/developer-guide/appendix/platarchs.html), [privilege configuration](https://help.synology.com/developer-guide/privilege/privilege_config.html), [FHS paths](https://help.synology.com/developer-guide/integrate_dsm/fhs.html), and [lifecycle status codes](https://help.synology.com/developer-guide/synology_package/scripts.html).

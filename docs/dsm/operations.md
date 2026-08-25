@@ -19,8 +19,11 @@ The default diagnostic:
    the selected descendant is missing; and
 6. reports success or a nonzero exit without changing target contents.
 
-The dashboard's **Run doctor** action is asynchronous. Its immediate HTTP result means queued; the
-final verdict appears through run/activity/health state after the controller executes it.
+The dashboard's **Run doctor** action is initially queued, then the page polls the controller's
+sanitized result to a terminal verdict without a client pending-state deadline. An
+`expired_or_missing` response, invalid result evidence, or five consecutive result observation
+failures make the accepted job outcome-unknown; inspect refreshed health, Activity, and logs before
+retrying. Closing the AppWindow aborts observation but does not cancel the queued job.
 
 ### Disposable write test
 
@@ -28,8 +31,9 @@ final verdict appears through run/activity/health state after the controller exe
 service grants `write_test`. It requires a separate checkbox and confirmation. It can create a
 unique probe, upload and verify it, exercise an optional same-target copy path, and remove the probe.
 
-Run it only against a prepared non-critical existing destination. After any timeout or failure,
-inspect both target folders for leftovers rather than assuming cleanup happened.
+Run it only against a prepared non-critical existing destination. After a core diagnostic request
+timeout, terminal failure, or outcome-unknown result, inspect both target folders for leftovers
+rather than assuming cleanup happened.
 
 CLI:
 
@@ -63,8 +67,8 @@ The snapshot reports:
 - start/finish epochs; and
 - numeric exit code when complete.
 
-Operational actions remain asynchronous in the dashboard. “Queued” is not completion. Follow the
-run state, Activity, and logs.
+Plan and Run remain asynchronous in the dashboard. “Queued” is not completion. Follow the run state,
+Activity, and logs.
 
 ## Structured Activity
 
@@ -119,8 +123,8 @@ from `ui/texts/enu/strings`:
 | `sync_failed` | Fixed sync-failure title and message |
 | `doctor_failed` | Fixed Doctor-failure title and message |
 
-The package invokes `/usr/syno/bin/synodsmnotify -c` directly with the fixed application ID,
-`@administrators`, and full package I18N keys. A profile name, exit code, path, URL, account name,
+The package invokes `/usr/syno/bin/synodsmnotify -c` directly with the fixed application ID
+`SYNO.SDS.App.SynologyDriveSync.Instance`, `@administrators`, and full package I18N keys. A profile name, exit code, path, URL, account name,
 core/log message, password, TOTP value, cookie, or token never enters notifier arguments. Operation
 details remain in Activity and bounded package logs.
 

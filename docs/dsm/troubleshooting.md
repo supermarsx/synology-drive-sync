@@ -98,19 +98,17 @@ account, and path values without removing timestamps, exit codes, DSM build, or 
 
 ## DSM says the page is not found when opening the app
 
-DSM's generic “Sorry, the page you are looking for is not found” response is a Webman routing
-failure, not a SynoToken, CGI-socket, or profile error. The corrected application registration uses
-the exact root-absolute route `/webman/3rdparty/synology-drive-sync/index.html`; it must map through
-DSM's framework-owned link to packaged `ui/index.html`.
+The current source, first planned for release 26.10, uses a native `type=app` AppWindow. It does not
+navigate to a packaged `index.html`. On a 26.10-or-later native artifact, DSM's generic “Sorry, the
+page you are looking for is not found” response during Open therefore usually identifies a stale
+URL-style registration/shortcut or a failed native asset/API request; it is not evidence that a
+`SynoToken` is required.
 
 First click **Open** in Package Center or launch **Synology Drive Sync** from the DSM desktop. In the
-browser Network panel, record only the request path, status, and response type. Do not copy, save, or
-share the query string because it can contain `SynoToken`. The document request path, excluding any
-query or fragment, must be:
-
-```text
-/webman/3rdparty/synology-drive-sync/index.html
-```
+browser Network panel, record only each failed request path, status, and response type. Do not copy,
+save, or share any query string because it can contain session material. A corrected launch must not
+request `/webman/3rdparty/synology-drive-sync/index.html`. The dashboard's API requests use the exact
+path `/webman/3rdparty/synology-drive-sync/api.cgi`.
 
 Then inspect the installed registration and mapping without changing them:
 
@@ -125,25 +123,33 @@ ls -ld "$WEBMAN_LINK" "$UI_ROOT"
 readlink "$WEBMAN_LINK"
 readlink -f "$WEBMAN_LINK"
 stat -Lc '%F %a %U:%G %n' \
-  "$WEBMAN_LINK" "$UI_ROOT" "$UI_ROOT/index.html" "$UI_ROOT/api.cgi"
+  "$WEBMAN_LINK" "$UI_ROOT" "$UI_ROOT/config" \
+  "$UI_ROOT/SynologyDriveSync.js" "$UI_ROOT/style.css" "$UI_ROOT/api.cgi"
+grep -F 'SYNO.SDS.App.SynologyDriveSync.Instance' "$UI_ROOT/config"
+grep -F '"type": "app"' "$UI_ROOT/config"
 ```
 
 The installed fields must be `package="synology-drive-sync"`, `dsmuidir="ui"`, and
-`dsmappname="com.supermarsx.SynologyDriveSync"`. The Webman link must resolve to that installation's
-`target/ui`; the directory must be traversable, `index.html` must be a regular `0644` file, and
-`api.cgi` must be a regular `0755` file. Interpret the evidence as follows:
+`dsmappname="SYNO.SDS.App.SynologyDriveSync.Instance"`. `config`, `SynologyDriveSync.js`, and
+`style.css` must be regular `0644` files; `config` must wrap that class beneath the
+`SynologyDriveSync.js` module and declare `type="app"` with the matching `appWindow`. `api.cgi` must
+be a regular `0755` file. The Webman link must resolve to that installation's `target/ui` for the
+CGI endpoint. Interpret the evidence as follows:
 
-- A launch path beginning `/3rdparty/` or lacking the leading `/webman/` identifies an old or
-  noncanonical application config. Verify and install a corrected release; do not edit the installed
-  config in place.
+- Any Open request for `index.html`, or an installed `.url`/`type=url` config, identifies an old
+  package or stale DSM registration. Verify and reinstall a published 26.10-or-later native artifact;
+  do not edit the installed config in place.
+- A missing class/module wrapper, bundle, or stylesheet is an invalid/stale SPK payload. Preserve its
+  checksum and member listing, then install a verified corrected artifact.
 - A missing or broken Webman link with correct installed metadata is a DSM package-framework
-  registration failure. Preserve package-manager logs and reinstall the verified corrected SPK; do
-  not create the link manually.
-- A correct link and readable target with a `/webman/.../index.html` 404 requires the matching
+  CGI-registration failure. Preserve package-manager logs and reinstall the verified corrected SPK;
+  do not create the link manually.
+- A correct link and readable target with an `/api.cgi` 404 requires the matching
   timestamp from `/var/log/nginx/error.log`, `/var/log/synopkg.log`, and `/var/log/messages` for DSM
   routing diagnosis.
-- If `index.html` and its static assets load but `api.cgi` fails, Webman launch succeeded. Continue
-  with the read-only/API-service checks below.
+- If the native bundle/style load but the AppWindow never instantiates, preserve the first browser
+  console error and matching DSM/package log timestamps. If only `api.cgi` fails, continue with the
+  read-only API-service checks below.
 
 These commands are diagnostic only. Never `ln`, `rm`, `chmod`, or `chown` anything under
 `/usr/syno/synoman/webman`, and never add root execution to the package to work around the route.
@@ -152,38 +158,43 @@ These commands are diagnostic only. Never `ln`, `rm`, `chmod`, or `chown` anythi
 
 Open the application from the DSM desktop or Package Center and confirm the user is a non-root DSM
 administrator with a current login session. The browser sends that same-origin cookie to the
-packaged CGI; a launch `SynoToken` is an optional session-binding input and its absence is not an
-error. If the exact message
-still says a launch token is required, the installed UI is from an older release—verify and install
-the current SPK instead of pasting a token into the URL.
+packaged CGI; that cookie is the active native authentication input. The AppWindow does not inspect
+or rewrite the DSM shell location and sends no `SynoToken`. If the exact message still says a launch
+token is required, the installed UI predates the 26.10 native contract. Do not paste anything into
+the URL; install a verified 26.10-or-later artifact once published, or use the CLI meanwhile.
 
 The application intentionally has no undocumented DSM-global or login-API fallback. If a fresh
 launch cannot authenticate, record the model, DSM build, package version, launch path, `api.cgi`
 status, and bounded package logs, then use [CLI parity](cli-parity.md) while diagnosing the service.
-Never paste a cookie or supplied token into an issue, screenshot, terminal, browser storage, or
+Never paste a cookie or package CSRF token into an issue, screenshot, terminal, browser storage, or
 bookmark.
 
 ## Dashboard is read-only
 
 Read-only means the authenticated API service snapshot did not grant the required capability and
-independent CSRF. Possible causes include authentication/admin rejection, an invalid supplied
-SynoToken, CSRF bootstrap failure, a stopped API service, wrong CGI/socket ownership or mode, a
-stopped controller/private state, or an unsafe package path. An absent SynoToken is supported.
+independent CSRF. Possible causes include cookie authentication/admin rejection, CSRF bootstrap
+failure, a stopped API service, wrong CGI/socket ownership or mode, a stopped controller/private
+state, or an unsafe package path.
 
 Use `status`, `paths`, the bounded logs above, and Package Center restart. Do not chmod or chown the
 CGI/socket, add any identity-changing permission or capability, expose the socket, or hand-create
 the CSRF key.
 
-## A configuration action remains pending or times out
+## A queued action remains pending or becomes outcome-unknown
 
-Configuration, secret, routine, and alert-policy saves poll a server job result for up to two
-minutes. A timeout means completion is unknown, not that the job was cancelled.
+Configuration, secret, routine, and alert-policy saves plus Doctor observe a server job result with
+no client pending-state deadline. A healthy pending response continues to be observed until the
+controller returns terminal or `expired_or_missing` evidence. Five consecutive result-observation
+failures or an invalid result document instead produce a typed outcome-unknown result. Closing the
+AppWindow aborts browser observation but does not cancel a job already accepted by the server.
 
 1. Refresh the dashboard snapshot.
 2. Inspect structured Activity and bounded logs.
 3. Check controller status and the host-local run/management lock.
 4. Confirm whether the intended profile/routine/policy is now visible.
-5. Resubmit only after deciding the first job did not apply.
+5. For a profile save, inspect configuration and every credential-presence marker: configuration and
+   earlier secret stages may have applied before a later stage failed or became outcome-unknown.
+6. Resubmit only after deciding the first job did not apply.
 
 The bridge caps the queue at 256 outstanding safe entries. Request/secret artifacts retain for up to
 24 hours; completed responses and unrecoverable processing-orphan artifacts retain for one hour,
@@ -194,8 +205,8 @@ After abrupt power loss, a job already claimed for processing is never replayed 
 outcome is deliberately indeterminate. Compare snapshot, Activity, health, target inventory, and the
 requested change before explicitly re-running it.
 
-Doctor, Plan, and Run are intentionally asynchronous and remain shown as queued until normal
-run/activity evidence changes.
+Doctor is initially queued, but the page polls its sanitized controller result to a terminal state.
+Plan and Run remain asynchronous and are shown as queued until normal run/activity evidence changes.
 
 ## Profile save is rejected
 
@@ -306,18 +317,18 @@ the exact source NAS and record all of the following:
 - Package Center install, third-party warning, start, stop, restart, upgrade, rollback constraints,
   and disposable uninstall; record a normal unsigned-publisher warning separately from any
   lower-privilege/root rejection and retain the bounded log tails above;
-- dashboard icon/Open behavior and actual DSM iframe/window layout at narrow and wide sizes; and
-- Package Center and desktop Open both request exactly
-  `/webman/3rdparty/synology-drive-sync/index.html` before any query, DSM's Webman link resolves to
-  the installed `target/ui`, `index.html` and its static assets return successfully, and `api.cgi`
-  is reached without a routing 404; and
-- whether DSM AppLaunch supplies a `SynoToken` session-binding input to a fresh administrator
-  launch; record its presence only, never its value, and verify that an absent token still reaches
-  cookie authentication.
+- dashboard icon/Open behavior and actual native DSM AppWindow layout at narrow and wide sizes;
+- the installed module-keyed config registers `SYNO.SDS.App.SynologyDriveSync.Instance` as
+  `type=app`, Package Center and desktop Open instantiate that class without any `index.html`
+  navigation, the bundle/style load, DSM's Webman link resolves to `target/ui`, and
+  `/webman/3rdparty/synology-drive-sync/api.cgi` is reached without a routing 404;
+- on every claimed DSM branch—and specifically DSM 7.0/7.1 where supported—the same AppWindow
+  launch, rendering, assets, and API path succeed on physical NAS hardware; and
+- a fresh native launch authenticates with the same-origin DSM cookie, does not inspect/rewrite the
+  DSM shell location, and sends no `X-SYNO-TOKEN` header.
 
 Rendered browser QA was unavailable in the development environment. Do not mark layout,
-accessibility interaction, browser-header-to-CGI forwarding, or optional AppLaunch-token behavior
-as already proven.
+accessibility interaction, or browser-header-to-CGI forwarding as already proven.
 
 ### Identity, ACL, and dashboard security
 
@@ -333,9 +344,9 @@ as already proven.
 - DSM maps a browser request containing exactly `X-SDSYNC-Request: 1` into the CGI environment as
   `HTTP_X_SDSYNC_REQUEST=1`, the bounded relay preserves that marker to the package-user service,
   and an omitted or wrong-value marker is rejected;
-- a stale cookie, malformed/mismatched supplied SynoToken, missing/expired CSRF, wrong
-  methods/fields, and direct CGI calls fail closed, while a truly absent SynoToken succeeds through
-  cookie authentication; and
+- a stale cookie, any malformed/mismatched optional compatibility token supplied directly to the
+  API parser, missing/expired CSRF, wrong methods/fields, and direct CGI calls fail closed, while the
+  token-free native UI succeeds through cookie authentication; and
 - no secret appears in URL history, Referer, browser storage, Activity, logs, DSM desktop alerts,
   queue result, or support evidence.
 
@@ -356,7 +367,8 @@ as already proven.
 - interval, daily, and realtime routines, weekdays/windows, debounce, native watcher or polling
   fallback, retries/backoff, and dependencies behave as documented;
 - manual and scheduled actions do not overlap on the source NAS;
-- queued configuration terminal results and asynchronous Doctor/Plan/Run status are observable;
+- queued configuration and Doctor terminal results, plus asynchronous Plan/Run status, are
+  observable;
 - Activity/log bounds and rotation work through restart;
 - direct DSM success/failure/Doctor desktop alerts obey threshold/cooldown, use only fixed I18N keys,
   expose details only through Activity/logs, and do not register Notification Center channels;
@@ -374,7 +386,7 @@ as already proven.
 - disposable uninstall removes package-private profiles/secrets/state/logs while preserving both
   NAS data trees.
 
-TOTP challenge behavior, DSM authentication, optional AppLaunch-token delivery, direct `synodsmnotify`
+TOTP challenge behavior, DSM cookie authentication, direct `synodsmnotify`
 desktop delivery, File Station versions, reverse proxies, and Drive indexing vary across deployed
 systems. In
 particular, Synology documents direct `authenticate.cgi` use by a custom CGI, but this root-free

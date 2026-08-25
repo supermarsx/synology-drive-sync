@@ -51,28 +51,23 @@ The validator enforces the exact two-key manifest above, rejects any archive set
 member or privilege-bearing tool/capability declaration, and rejects mode, ownership, identity, or
 byte mismatches between the two helper copies.
 
-## DSM session, optional launch token, and referrer handling
+## DSM cookie authentication and the native shell boundary
 
 The DSM session cookie is the authoritative browser authentication input. JavaScript never reads
 that cookie; `credentials: "same-origin"` lets the browser attach it to the packaged `api.cgi`
 request, and the server validates it with DSM's `authenticate.cgi` before authorizing any action.
 
-A `SynoToken` supplied by DSM is an optional session-binding input. DSM does not guarantee that a
-`type=url` launch will append one. If DSM supplies one in the launch URL, the application accepts a non-empty value up
-to 1,024 bytes with no ASCII whitespace or control characters, removes the parameter from the
-visible URL immediately, keeps it in memory, and sends it as `X-SYNO-TOKEN` on same-origin API
-requests. If it is absent, the header is omitted and cookie authentication continues. An explicitly
-supplied empty, malformed, or mismatched header/query token is rejected rather than downgraded.
-
-A `no-referrer` meta policy appears before icons, CSS, or scripts so the initial token-bearing URL is
-not sent as a Referer while the local application loads. The token is never written to local storage,
-logs, a bookmark, Activity, or a profile.
+The native AppWindow has no standalone HTML launch document and receives no package-owned launch
+URL. It does not inspect or rewrite `window.location`, does not try to extract a token from the DSM
+shell location, and sends no `X-SYNO-TOKEN` header. Cookie authentication is therefore the active
+native browser path. DSM owns the containing shell document and its document-level policies.
 
 Synology's DSM 7 [application authentication guide](https://help.synology.com/developer-guide/integrate_dsm/web_authentication.html)
 documents cookie validation through `authenticate.cgi`; it does not document a DSM 7 JavaScript API
-for retrieving SynoToken. This application therefore does not call an undocumented login endpoint
-or depend on DSM browser globals. Physical-NAS acceptance must still prove that the package-user API
-service can execute `authenticate.cgi` with the bounded relayed CGI environment.
+for retrieving a launch token. This application therefore does not call an undocumented login
+endpoint or depend on DSM browser globals for authentication. Physical-NAS acceptance must still
+prove that the package-user API service can execute `authenticate.cgi` with the bounded relayed CGI
+environment.
 
 ## Authentication and authorization sequence
 
@@ -85,8 +80,8 @@ Every API request goes through these checks:
 3. It clears its environment and sends one length-bounded frame to the fixed `package:http` `0660`
    socket after validating the socket and server peer identity.
 4. The package-user server validates the CGI peer UID, decodes one strict relay schema, and repeats
-   method, query, header, body, cookie, request-marker, and optional session-binding `SynoToken`
-   validation.
+   method, query, header, body, cookie, request marker, and optional compatibility-token validation.
+   The native UI leaves that optional field absent.
 5. The server executes DSM's root-owned
    `/usr/syno/synoman/webman/modules/authenticate.cgi` as the package user with only the bounded
    authentication environment DSM expects.
@@ -106,7 +101,7 @@ DSM cookie authentication is necessary but not sufficient for POST. An authentic
 
 - authenticated username and UID;
 - current DSM cookie;
-- the presence and value of the current optional session-binding `SynoToken`;
+- any optional compatibility token supplied directly to the API parser (absent for the native UI);
 - issue and expiry times; and
 - a random nonce.
 
@@ -126,8 +121,9 @@ Allowed authenticated GET actions are:
 | `activity` | `lines=1..1000` |
 | `result` | one 48-character lowercase hexadecimal server job ID |
 
-Every GET may additionally carry one validated optional session-binding `SynoToken`; the packaged
-browser uses the header form when one was supplied at launch. GET rejects a request body, content type, CSRF header,
+The server parser retains a bounded optional token field for compatibility and rejects a malformed or
+mismatched supplied value rather than silently downgrading it. The native AppWindow never populates
+that field. GET rejects a request body, content type, CSRF header,
 duplicate/unknown query key, invalid transfer encoding, or unsupported action. Every browser API
 request also requires the fixed custom marker `X-SDSYNC-Request: 1`; the package emits no CORS
 permission that would let a foreign origin manufacture that header.
@@ -180,9 +176,13 @@ that job on restart. Replaying a partially executed sync or configuration mutati
 dangerous than leaving its outcome indeterminate. Inspect snapshot, Activity, health, and target
 state, then explicitly repeat the operation only when it is safe.
 
-Configuration and secret saves poll terminal results before proceeding to dependent jobs. Long
-Doctor/Plan/Run actions remain asynchronous: the UI retains the job ID only in memory and follows
-normal run, Activity, and log evidence.
+Configuration and secret saves, routine/policy changes, and Doctor observe terminal results before
+the UI reports success. Pending observations have no client deadline: they continue until terminal
+or `expired_or_missing` evidence, five consecutive result-observation failures, invalid result
+evidence, or AppWindow shutdown. Repeated observation failures and invalid/expired evidence produce
+a typed outcome-unknown result because the accepted server job may still have applied. Plan and Run
+remain asynchronous: the UI retains their job IDs only in memory and follows normal run, Activity,
+and log evidence.
 
 ## Secret and response non-disclosure
 
@@ -204,9 +204,9 @@ administrators.
 Each of the three accepted internal triggers maps to literal application, recipient, title-I18N, and
 message-I18N arguments. The command is an absolute path and is invoked directly—never through
 `eval`, `sh -c`, `xargs`, or a constructed command string. Profile names, exit codes, paths, URLs,
-account names, log/error text, cookies, CSRF/SynoToken values, passwords, TOTP material, and remote-log
-tokens never enter notifier arguments. The fixed desktop text tells the administrator to inspect
-package Activity and bounded logs for details.
+account names, log/error text, cookies, CSRF or compatibility-token values, passwords, TOTP material,
+and remote-log tokens never enter notifier arguments. The fixed desktop text tells the administrator
+to inspect package Activity and bounded logs for details.
 
 Repository validation rejects the legacy `synonotify` event/custom-variable path, a
 `conf/resource` member, sysnotify mail templates, dynamic notification placeholders, and drift from
@@ -227,9 +227,9 @@ responsibility and are sent with same-origin credentials.
 
 Repository tests cover parsing, CGI/service identity predicates, Unix-socket ownership/mode and peer
 checks, admin membership, CSRF binding, schema rejection, queue paths/modes/order, redaction,
-response bounds, static CSP, direct fixed notifier arguments, and SPK privilege/resource layout.
+response bounds, native bundle/style isolation, direct fixed notifier arguments, and SPK privilege/resource layout.
 They do not prove the actual DSM `http` identity/group database, package-identity execution of
 `authenticate.cgi` or `synodsmnotify`, DSM forwarding of `X-SDSYNC-Request: 1` as
-`HTTP_X_SDSYNC_REQUEST=1`, optional AppLaunch-token behavior, or reverse-proxy/origin
+`HTTP_X_SDSYNC_REQUEST=1`, or reverse-proxy/origin
 behavior of a physical DSM release. Validate those on every supported DSM branch before calling the
 dashboard production-ready.

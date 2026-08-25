@@ -26,22 +26,27 @@ The complete reviewed `conf/privilege` document is deliberately minimal:
 The default covers lifecycle scripts; there is no redundant `ctrl-script` list, `tool` list, or
 capability declaration.
 
-## DSM Webman application contract
+## Native DSM AppWindow contract
 
-`INFO` registers `dsmuidir="ui"` and
-`dsmappname="com.supermarsx.SynologyDriveSync"`. The matching `.url` application remains DSM's
-documented `type=url` web pop-up—not a native `type=app`/Vue `AppWindow`—and uses the unambiguous
-root-absolute entry point
-`/webman/3rdparty/synology-drive-sync/index.html`. The validator derives the installed payload member
-from that route and requires it to be the regular `ui/index.html` file at mode `0644`; the page's
-same-directory `./api.cgi` URL then maps to packaged `ui/api.cgi` at mode `0755`.
+`INFO` registers `dsmuidir="ui"` and the exact class
+`dsmappname="SYNO.SDS.App.SynologyDriveSync.Instance"`. `ui-src/app.config` declares that class as
+`type="app"`, sets `appWindow` to the same value, and keeps `allUsers=false`. `config.define` binds
+the source bundle to `SynologyDriveSync.js`. The assembler deterministically reproduces the normal
+DSM toolkit merge: installed `ui/config` is keyed by `SynologyDriveSync.js`, contains the class
+entry plus `depend: []`, and is packaged with regular `ui/SynologyDriveSync.js` and `ui/style.css`
+files at mode `0644`.
+
+The bundle uses `SYNO.namespace` and `Vue.extend`; its root is `v-app-instance` containing
+`v-app-window`. It renders the dashboard directly rather than embedding a `type=url` page or iframe.
+It calls the regular packaged `ui/api.cgi` through the canonical same-origin endpoint
+`/webman/3rdparty/synology-drive-sync/api.cgi`.
 
 DSM, not a lifecycle script, owns the
 `/usr/syno/synoman/webman/3rdparty/synology-drive-sync` link created from `dsmuidir`. The package must
 not create, replace, remove, chmod, or chown that link. Static validation proves that registration,
-route, and payload agree inside the SPK; only the
-[live-NAS acceptance](troubleshooting.md#live-nas-acceptance) can prove DSM created the link and that
-Package Center and desktop Open reach the route on an installed system.
+module config, assets, and API path agree inside the SPK; only the
+[live-NAS acceptance](troubleshooting.md#live-nas-acceptance) can prove DSM registered and rendered
+the AppWindow and exposed the CGI path on an installed system.
 
 ## Architecture contracts
 
@@ -55,6 +60,26 @@ Package Center and desktop Open reach the route on an installed system.
 A matching filename is not sufficient. The builder rejects the wrong class, endianness, machine,
 ARM EABI/float ABI, malformed program headers, missing executable load segment, ELF interpreter, or
 `DT_NEEDED` dependency.
+
+## Build the native UI
+
+Use the exact pnpm version pinned by `ui-src/package.json` and the committed lockfile. The assembler
+does not install dependencies or build the UI: it checks that the generated files are present,
+nonempty, and satisfy the reviewed package contract, but it cannot prove that they are fresh from the
+current source. Every local caller must build and compare the generated output before assembly:
+
+```bash
+cd packaging/synology/ui-src
+pnpm install --frozen-lockfile --ignore-scripts
+pnpm run build
+cd ../../..
+```
+
+This produces only `ui-src/dist/SynologyDriveSync.js` and `ui-src/dist/style.css`. Run
+`git diff --exit-code -- packaging/synology/ui-src/dist` from the repository root; a difference means
+the committed generated files were stale and must be reviewed. Release and CI jobs pin Node and
+pnpm, use the frozen lockfile, rebuild, and reject a generated diff before package validation. The
+dedicated CI packaging gate also rebuilds twice and compares bundle hashes for determinism.
 
 ## Native x86-64 example
 
@@ -125,7 +150,7 @@ normalizes member order, ownership, group, modes, and archive metadata. It inclu
 
 - architecture-bound `INFO` with DSM `7.0-40759` through `7.4-99999`;
 - core, manager, controller, runner, compiled helper/CGI, lifecycle scripts, and privilege policy;
-- DSM desktop app config, offline HTML/CSS/JavaScript, authored SVG mark, and deterministic
+- module-keyed native AppWindow config, offline Vue JavaScript/CSS, authored SVG mark, and deterministic
   16/24/32/48/64/72/256 PNG icons;
 - fixed, preloaded English desktop-alert I18N texts, with no `conf/resource` acquisition worker;
 - project license, generated notices, and musl copyright.
@@ -139,17 +164,18 @@ claimed bit-for-bit reproducible across different compiler/linker/runner images.
 
 - safe outer/inner archive member names, types, modes, ordering, and required files;
 - filename/version/`INFO` architecture and DSM-bound consistency;
-- exact `conf/privilege` and application config, absence of `conf/resource` and legacy sysnotify mail
+- exact `conf/privilege` and module-keyed `type=app`/AppWindow config, absence of `conf/resource` and legacy sysnotify mail
   templates, and fixed desktop-alert I18N texts;
-- the canonical root-absolute Webman route, its package-name boundary, and its exact mapping to the
-  regular packaged `ui/index.html` entry point;
+- exact `INFO`/application-class identity, bundle/style members, and the canonical
+  `/webman/3rdparty/synology-drive-sync/api.cgi` boundary;
 - static core/helper ELF identity and equality of helper/CGI bytes;
 - no outer or inner archive member has a set-user-ID/set-group-ID bit or is group/world-writable,
   while `conf/privilege` remains the exact root-free package/`http` contract;
 - authored SVG safe bounds and exact deterministic PNG bytes/dimensions;
-- CSP, no-referrer ordering, offline assets, no inline handlers/eval/HTML injection, exact bridge
+- scoped AppWindow styles, offline assets, no iframe/eval/HTML injection or source maps, exact bridge
   action/schema markers, and no secret local-storage path;
-- the direct `synodsmnotify -c` contract: fixed application/administrator/I18N arguments only, no
+- the direct `synodsmnotify -c` contract: the exact native application class plus fixed
+  administrator/I18N arguments only, no
   legacy `synonotify` event/custom-variable path, and no dynamic profile, exit, log, or secret data;
 - lifecycle scripts, the fixed `package:http` `0660` socket/service contract, private FHS behavior,
   icons, license texts, and installed size.
@@ -157,8 +183,12 @@ claimed bit-for-bit reproducible across different compiler/linker/runner images.
 Source-only validation:
 
 ```bash
+cd packaging/synology/ui-src
+pnpm install --frozen-lockfile --ignore-scripts
+pnpm run check
+cd ../../..
+git diff --exit-code -- packaging/synology/ui-src/dist
 python3 packaging/synology/validate_spk.py
-node --check packaging/synology/package/ui/app.js
 python3 -m unittest packaging.synology.test_synology_ui -v
 python3 packaging/synology/test_synology_package.py
 ```
@@ -168,13 +198,13 @@ Negative tests deliberately tamper with architecture, helper identity, symlinks,
 reserved resources, notifier arguments, UI security markers, icons, and archive fields. They
 specifically reject `conf/resource`, legacy sysnotify mail templates, a dynamic notifier operand, an
 archived privilege bit, a non-`0755` CGI, a privilege manifest beyond the exact two-key contract, and
-unsafe socket ownership/mode/peer assumptions. They also reject legacy `/3rdparty`/relative launch
-routes, a wrong package identifier, and traversal in the Webman route, so the gates do not merely
-accept the builder's happy path.
+unsafe socket ownership/mode/peer assumptions. They also reject a wrong native application class,
+missing module wrapper or `depend` field, `type=url`, mismatched `appWindow`, missing bundle/style,
+and traversal in the API path, so the gates do not merely accept the builder's happy path.
 
 ## Acceptance boundary
 
-Builder/validator success proves the reviewed archive contract, not DSM installation, web launch,
+Builder/validator success proves the reviewed archive contract, not DSM installation, AppWindow launch,
 the `http` CGI identity, package-user `authenticate.cgi` execution, socket group behavior,
 administrator groups, direct `synodsmnotify` desktop delivery, source ACLs, reverse proxy, File
 Station, TOTP, Drive indexing, or sync behavior on a physical model. Complete
@@ -183,7 +213,8 @@ Station, TOTP, Drive indexing, or sync behavior on a physical model. Complete
 Official framework references:
 
 - [Package structure](https://help.synology.com/developer-guide/synology_package/introduction.html)
-- [Desktop application integration](https://help.synology.com/developer-guide/integrate_dsm/desktopapp.html)
+- [Native package app launch](https://help.synology.com/developer-guide/synology_package/package_tgz/launch_app.html)
+- [AppWindow UI framework](https://help.synology.com/developer-guide/appendix/ui_framework/application.html)
 - [Privilege configuration](https://help.synology.com/developer-guide/privilege/privilege_config.html)
 - [FHS paths](https://help.synology.com/developer-guide/integrate_dsm/fhs.html)
 - [Platform and `arch` values](https://help.synology.com/developer-guide/appendix/platarchs.html)

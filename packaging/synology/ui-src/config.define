@@ -1,0 +1,8 @@
+{
+  "SynologyDriveSync.js": {
+    "JSfiles": [
+      "dist/SynologyDriveSync.js"
+    ],
+    "params": "-s -c skip"
+  }
+}

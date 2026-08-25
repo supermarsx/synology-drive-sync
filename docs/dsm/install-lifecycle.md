@@ -25,6 +25,10 @@ not create DSM users, homes, shared folders, Team Folders, or ACLs.
 
 ## Verify and install
 
+The native AppWindow procedure below applies to a verified 26.10-or-later SPK once such a release is
+published. Releases 26.7-26.9 may satisfy the corrected rootless package contract, but they retain
+their originally published UI and do not gain the native AppWindow retroactively.
+
 1. Verify the asset as described in [Compatibility and release selection](compatibility.md#download-and-verify-one-exact-release).
 2. In DSM, open **Package Center > Manual Install**.
 3. Select the verified `.spk`, check its displayed name/version, and review the package information.
@@ -59,9 +63,9 @@ administrator membership, and a package CSRF token for mutation. An ordinary `07
 DSM `http` relays the bounded request through the fixed package:`http` `0660` Unix socket. The
 package-user API service revalidates the request, invokes `authenticate.cgi` against the DSM cookie,
 independently checks administrator membership, and then issues its own short-lived, session-bound
-CSRF token. A valid `SynoToken` delivered with the launch URL is validated and used as an optional
-session-binding input; its absence is supported. Never paste one into a URL, bookmark, browser storage,
-or support transcript.
+CSRF token. The native AppWindow does not parse or rewrite the DSM shell location and does not send
+a `SynoToken`; cookie authentication is the active native path. Never copy a DSM cookie or package
+CSRF token into a URL, bookmark, browser storage, or support transcript.
 
 ## Grant read-only access to each local source
 
@@ -97,9 +101,12 @@ In the dashboard, open **Profiles > New profile**. Supply a physical local sourc
 URL, target DSM username, and File Station logical destination. Keep **Mirror remote deletions**,
 **Allow an empty source**, **Allow plain HTTP**, and **Accept invalid TLS certificates** off.
 
-Choose **Replace securely** for Password and enter the value. Save polls the queued configuration
-and secret jobs to sanitized terminal results; then confirm the profile and password-presence marker
-in a refreshed snapshot. Run non-writing Doctor and Plan only after that evidence appears. See
+Choose **Replace securely** for Password and enter the value. Save observes the queued configuration
+and each secret job to a sanitized terminal result, without a client pending-state deadline; then
+confirm the profile and password-presence marker in a refreshed snapshot. If a later stage fails or
+becomes outcome-unknown after an earlier stage completed, the UI reports the profile as partially
+applied—inspect all configuration and credential-presence markers before retrying. Run non-writing
+Doctor and Plan only after that evidence appears. See
 [Profiles and destinations](profiles.md) and
 [Secrets and protected values](secrets.md).
 

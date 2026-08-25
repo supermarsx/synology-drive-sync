@@ -122,8 +122,10 @@ generated TOML, validated by the core, and atomically replaced. Existing protect
 retained unless their separate secret selector says replace or clear.
 
 Dashboard saves are published through the private queue and poll a sanitized terminal result before
-reporting success. Treat the subsequent snapshot as the authoritative displayed configuration; a
-timeout leaves the outcome unknown. Removing a profile also removes its package-owned password, TOTP,
+reporting success. Pending observations have no client deadline. An `expired_or_missing` response,
+invalid result evidence, or five consecutive observation failures make the accepted job
+outcome-unknown; treat the subsequent snapshot as authoritative and inspect it before retrying.
+Removing a profile also removes its package-owned password, TOTP,
 remote-log-token, routine, and cached state, then rebuilds the generated configuration. It does not
 touch local or remote data. Removing the final profile disables the legacy global schedule.
 

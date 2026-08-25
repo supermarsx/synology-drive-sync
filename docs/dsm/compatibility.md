@@ -18,6 +18,28 @@ reviewed against that package framework. Model availability is narrower where Sy
 model earlier or introduced it later. In particular, Evansport `i686` is restricted to DSM 7.0 and
 7.1 by the model/toolkit matrix.
 
+## Native UI and legacy policy
+
+The current source builds the same genuine Vue `type=app` AppWindow into all four architecture
+artifacts, first planned for release 26.10. There is no legacy `type=url` variant of that native
+package. Synology's current official Vue AppWindow example retains
+[`os_min_ver="7.0-40000"`](https://github.com/SynologyOpenSource/ExamplePackages/blob/main/ExamplePackage/INFO.sh);
+that is earlier than this package's existing `7.0-40759` floor, so
+the native UI does not by itself justify dropping DSM 7.0 or 7.1. The package therefore keeps one
+release matrix and its existing floor rather than creating UI variants that could drift.
+
+The package uses the long-supported `dsmappname` field for
+`SYNO.SDS.App.SynologyDriveSync.Instance`. It deliberately omits `dsmapplaunchname`: Synology marks
+that optional field as available only from DSM `7.0-40796`, which is newer than this package's
+declared floor. See Synology's [optional INFO fields](https://help.synology.com/developer-guide/synology_package/INFO_optional_fields.html).
+
+The currently published AppWindow guidance is from the modern DSM 7 toolkit, so metadata compatibility
+is not runtime proof for an older NAS. Physical DSM 7.0 and 7.1 acceptance must prove desktop and
+Package Center launch, bundle/style loading, rendering, and CGI access on each supported family,
+especially Evansport. If that evidence disproves compatibility, a future release must explicitly
+raise the floor or publish a separately named legacy design; it must not silently fall back to a URL
+page inside the same artifact.
+
 Use the interactive [release selector](../release-selector.md). It evaluates the captured official
 model catalog and fails closed on unknown models, DSM Enterprise, DSM 6 or older, unsupported
 branches, unreviewed future DSM versions, and contradictory model/architecture input.
@@ -92,9 +114,10 @@ program-header layout, static linkage, and executable load segments for both the
 The validator also binds the filename, `INFO` version/architecture, DSM floor/ceiling, privileges,
 dashboard resources, notification texts, deterministic icons, licenses, archive paths, and modes.
 
-These checks do not prove that Synology accepts the SPK on a particular physical model, that the
+For the current source and prospective 26.10-or-later artifacts, these checks do not prove that
+Synology accepts the SPK on a particular physical model, that the
 package-user service can execute DSM's cookie authenticator, that DSM forwards the browser request
-marker as `HTTP_X_SDSYNC_REQUEST=1`, or how the DSM pop-up renders on that release. Record those
+marker as `HTTP_X_SDSYNC_REQUEST=1`, or how the native AppWindow loads and renders on that release. Record those
 separately during
-[live-NAS acceptance](troubleshooting.md#live-nas-acceptance). AppLaunch may optionally supply a
-`SynoToken` as a session-binding input, but the dashboard does not require one.
+[live-NAS acceptance](troubleshooting.md#live-nas-acceptance). The native dashboard authenticates
+with the DSM session cookie and does not inspect or rewrite the DSM shell location for a token.

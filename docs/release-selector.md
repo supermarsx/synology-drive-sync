@@ -25,6 +25,9 @@ unverified until it is present in GHCR; deploy its immutable digest after verifi
 > present. This hold does not block desktop, Rust SDK, C SDK, or container artifacts from the same
 > tags because those artifacts are not DSM packages.
 
+The native DSM AppWindow is planned to begin with release `26.10`. Published `26.7`-`26.9` SPKs keep
+the UI they were released with; select `26.10` or later when the native AppWindow is required.
+
 DSM compatibility follows SynologyOpenSource's
 [`pkgscripts-ng` platform mapping through DSM 7.4](https://github.com/SynologyOpenSource/pkgscripts-ng/blob/DSM7.4/include/pkg_util.sh).
 DSM 7.5 or a later major release therefore stops without a recommendation until this snapshot is

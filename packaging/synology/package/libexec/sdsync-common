@@ -318,21 +318,21 @@ safe_notify() {
         # profile, exit, log, and secret material never enters notifier argv.
         case $notify_key in
             sync_succeeded)
-                if /usr/syno/bin/synodsmnotify -c com.supermarsx.SynologyDriveSync \
+                if /usr/syno/bin/synodsmnotify -c SYNO.SDS.App.SynologyDriveSync.Instance \
                     @administrators \
                     synology-drive-sync:notifications:sync_succeeded_title \
                     synology-drive-sync:notifications:sync_succeeded_message \
                     >/dev/null 2>&1; then return 0; else notify_status=$?; fi
                 ;;
             sync_failed)
-                if /usr/syno/bin/synodsmnotify -c com.supermarsx.SynologyDriveSync \
+                if /usr/syno/bin/synodsmnotify -c SYNO.SDS.App.SynologyDriveSync.Instance \
                     @administrators \
                     synology-drive-sync:notifications:sync_failed_title \
                     synology-drive-sync:notifications:sync_failed_message \
                     >/dev/null 2>&1; then return 0; else notify_status=$?; fi
                 ;;
             doctor_failed)
-                if /usr/syno/bin/synodsmnotify -c com.supermarsx.SynologyDriveSync \
+                if /usr/syno/bin/synodsmnotify -c SYNO.SDS.App.SynologyDriveSync.Instance \
                     @administrators \
                     synology-drive-sync:notifications:doctor_failed_title \
                     synology-drive-sync:notifications:doctor_failed_message \

@@ -27,6 +27,7 @@ import validate_spk  # noqa: E402
 
 
 UI = HERE / "package/ui"
+UI_SOURCE = HERE / "ui-src"
 
 
 class DsmUiContractTests(unittest.TestCase):
@@ -36,19 +37,35 @@ class DsmUiContractTests(unittest.TestCase):
         self.assertIn('os_min_ver="7.0-40759"', info)
         self.assertIn('os_max_ver="7.4-99999"', info)
         self.assertIn('dsmuidir="ui"', info)
-        self.assertIn('dsmappname="com.supermarsx.SynologyDriveSync"', info)
+        self.assertIn('dsmappname="SYNO.SDS.App.SynologyDriveSync.Instance"', info)
+        self.assertFalse(hasattr(validate_spk, "validate_ui_static"))
+        for legacy in ("config", "index.html", "app.js", "app.css"):
+            self.assertFalse(UI.joinpath(legacy).exists())
 
-    def test_dsm_application_and_direct_notification_contract_match(self) -> None:
-        config = json.loads((UI / "config").read_text(encoding="utf-8"))
+    def test_native_dsm_application_and_direct_notification_contract_match(self) -> None:
+        config = json.loads((UI_SOURCE / "app.config").read_text(encoding="utf-8"))
         notifier = (HERE / "package/libexec/sdsync-common").read_bytes()
-        app_id = "com.supermarsx.SynologyDriveSync"
-        application = config[".url"][app_id]
-        self.assertEqual(application["type"], "url")
-        self.assertEqual(
-            application["url"],
-            "/webman/3rdparty/synology-drive-sync/index.html",
-        )
+        app_id = "SYNO.SDS.App.SynologyDriveSync.Instance"
+        application = config[app_id]
+        self.assertEqual(set(config), {app_id})
+        self.assertEqual(application["type"], "app")
+        self.assertEqual(application["appWindow"], app_id)
+        self.assertNotIn("url", application)
+        self.assertNotIn(".url", config)
         self.assertIs(application["allUsers"], False)
+        self.assertIs(application["allowMultiInstance"], False)
+        self.assertIs(application["hidden"], False)
+        installed_config = json.loads(build_spk.native_ui_payloads()[0][0])
+        expected_installed_application = dict(application)
+        expected_installed_application["depend"] = []
+        self.assertEqual(
+            installed_config,
+            {"SynologyDriveSync.js": {app_id: expected_installed_application}},
+        )
+        self.assertEqual(
+            validate_spk.validate_ui_config(json.dumps(installed_config).encode()),
+            "ui/SynologyDriveSync.js",
+        )
         self.assertFalse((HERE / "conf/resource").exists())
         self.assertFalse((UI / "texts/enu/mails").exists())
         validate_spk.validate_notifier(notifier)
@@ -60,273 +77,212 @@ class DsmUiContractTests(unittest.TestCase):
         }
         self.assertEqual(set(application["preloadTexts"]), expected)
 
-    def test_ui_is_dark_first_accessible_responsive_and_offline(self) -> None:
-        index = (UI / "index.html").read_text(encoding="utf-8")
-        css = (UI / "app.css").read_text(encoding="utf-8")
-        script = (UI / "app.js").read_text(encoding="utf-8")
-        self.assertIn('<html lang="en" data-theme="dark">', index)
-        self.assertLess(index.index('<meta name="referrer" content="no-referrer">'), index.index("<link"))
-        for route in ("overview", "profiles", "routines", "health", "activity", "notifications", "settings"):
-            self.assertEqual(index.count(f'data-route="{route}"'), 1)
-            self.assertEqual(index.count(f'data-page="{route}"'), 1)
-        for marker in (
-            'aria-live="polite"', 'aria-labelledby="health-title"', 'data-confirm-dialog',
-            'data-target-health', 'data-routine-form', 'data-alert-policy-form',
-            'data-invalid-cert-warning', 'data-remote-log-token-input',
+    def test_native_appwindow_is_dark_first_accessible_responsive_and_isolated(self) -> None:
+        main = (UI_SOURCE / "src/main.js").read_bytes()
+        app = (UI_SOURCE / "src/App.vue").read_bytes()
+        api = (UI_SOURCE / "src/api.js").read_bytes()
+        css = (UI_SOURCE / "src/styles/native.css").read_bytes()
+        validate_spk.validate_native_build_contract(
+            main,
+            app,
+            api,
+            css,
+            (UI_SOURCE / "webpack.config.js").read_bytes(),
+            (UI_SOURCE / "config.define").read_bytes(),
+            (UI_SOURCE / "package.json").read_bytes(),
+        )
+        app_text = app.decode()
+        css_text = css.decode()
+        self.assertLess(
+            app_text.index('<v-app-instance class-name="SYNO.SDS.App.SynologyDriveSync.Instance">'),
+            app_text.index("<v-app-window"),
+        )
+        self.assertLess(app_text.index("<v-app-window"), app_text.index("</v-app-window>"))
+        self.assertLess(
+            app_text.index("</main>"),
+            app_text.index('<div class="sdsync-toasts"'),
+        )
+        self.assertLess(
+            app_text.index('<div class="sdsync-toasts"'),
+            app_text.index('<div v-if="confirmation.visible" class="sdsync-modal-backdrop"'),
+        )
+        self.assertLess(
+            app_text.index('<div v-if="confirmation.visible" class="sdsync-modal-backdrop"'),
+            app_text.index("</v-app-window>"),
+        )
+        for route in (
+            "Overview", "Profiles", "Routines", "Health / Doctor",
+            "Activity / Logs", "Notifications", "Settings",
         ):
-            self.assertIn(marker, index)
-        self.assertIn("@media (max-width: 840px)", css)
-        self.assertIn("@media (prefers-reduced-motion: reduce)", css)
-        self.assertIn(":focus-visible", css)
-        self.assertNotRegex(index, r"\son[a-z]+\s*=")
-        self.assertNotIn(".innerHTML", script)
-        self.assertNotIn("eval(", script)
-        validate_spk.validate_ui_static(index.encode(), css.encode(), script.encode())
+            self.assertIn(f'title: "{route}"', app_text)
+        for marker in (
+            'aria-live="polite"', 'aria-labelledby="sdsync-health-title"',
+            "<v-button", "<v-form", "<v-form-item", "<v-single-select",
+            "beforeDestroy()", "this.stopTimers();",
+            "this.disposed = true;", "this.abortController.abort();",
+            "this.toastTimers.forEach((timer) => window.clearTimeout(timer))",
+            'document.removeEventListener("visibilitychange", this.visibilityHandler)',
+            'this.mediaQuery.removeEventListener("change", this.mediaHandler)',
+            ':aria-label="item.title"', ':title="item.title"',
+            'type="time" aria-label="Window starts"',
+            'type="time" aria-label="Window ends"',
+            'multiple size="4" aria-label="Wait for routines"',
+            'role="dialog" aria-modal="true"',
+            'document.addEventListener("keydown", this.confirmationKeyHandler, true)',
+            'document.removeEventListener("keydown", this.confirmationKeyHandler, true)',
+            'if (this.route === "profiles" && route !== "profiles") this.closeProfile();',
+            'const awaitTerminal = kind === "doctor";',
+        ):
+            self.assertIn(marker, app_text)
+        for forbidden in (
+            "<iframe", "index.html", "document.documentElement",
+            "window.location.hash", "hashchange", "v-html", ".innerHTML", "eval(",
+        ):
+            self.assertNotIn(forbidden, app_text)
+        self.assertTrue(css_text.startswith(".sdsync-app {"))
+        self.assertIn(".sdsync-app.is-light", css_text)
+        self.assertGreaterEqual(
+            len(re.findall(r"@media \(max-width: [1-9][0-9]*px\)", css_text)),
+            2,
+        )
+        self.assertIn("@media (prefers-reduced-motion: reduce)", css_text)
+        self.assertIn(":focus-visible", css_text)
+        self.assertNotRegex(css_text, r"(^|[},])\s*(?::root|html\b|body\b)")
 
-    def test_settings_save_action_has_responsive_panel_spacing(self) -> None:
-        index = (UI / "index.html").read_text(encoding="utf-8")
-        css = (UI / "app.css").read_text(encoding="utf-8")
-        settings = re.search(
-            r'<form class="panel" data-settings-form>(.*?)</form>',
-            index,
-            re.DOTALL,
-        )
-        self.assertIsNotNone(settings)
-        self.assertRegex(
-            settings.group(1),  # type: ignore[union-attr]
-            r'<div class="form-actions settings-actions">\s*'
-            r'<button class="button primary" type="submit">'
-            r'Save interface settings</button>\s*</div>',
-        )
-        self.assertRegex(
-            css,
-            r"\.form-actions\s*\{[^}]*margin-top:\s*20px;[^}]*\}",
-        )
-        self.assertRegex(
-            css,
-            r"\.settings-actions\s*\{[^}]*justify-content:\s*flex-end;[^}]*\}",
-        )
-        self.assertIn("  .form-actions { flex-wrap: wrap; }", css)
-
-    def test_advanced_profile_and_secret_semantics_are_explicit(self) -> None:
-        index = (UI / "index.html").read_text(encoding="utf-8")
-        script = (UI / "app.js").read_text(encoding="utf-8")
+    def test_native_profile_routine_health_notification_and_settings_surfaces_are_complete(self) -> None:
+        app = (UI_SOURCE / "src/App.vue").read_text(encoding="utf-8")
+        api = (UI_SOURCE / "src/api.js").read_text(encoding="utf-8")
         manager = (HERE / "package/bin/sdsync-dsm").read_text(encoding="utf-8")
         for field in (
-            "excludes", "allow_empty_source", "retries", "timeout", "connect_timeout",
-            "max_rate", "ca_certificate", "danger_invalid_certs", "verbosity", "quiet",
-            "log_level", "log_format", "log_file", "progress", "output",
-            "remote_log_url", "remote_log_mode", "remote_log_token_mode",
+            "allow_empty_source", "ca_certificate", "connect_timeout",
+            "danger_invalid_certs", "excludes", "max_rate", "remote_log_mode",
+            "remote_log_token", "retry_backoff_seconds", "retry_count",
+            "time_window_end", "time_window_start", "weekdays",
         ):
-            self.assertIn(f'name="{field}"', index)
-        for secret in ("password", "totp", "remote_log_token"):
-            self.assertRegex(index, rf'name="{secret}_mode"[^>]*>.*?value="keep".*?value="replace".*?value="clear"')
-        for managed in ("log_format", "log_file", "progress", "output"):
-            self.assertRegex(index, rf'name="{managed}"[^>]*data-managed[^>]*disabled')
-        self.assertRegex(index, r'name="connect_timeout"[^>]*min="1"[^>]*max="600"')
-        self.assertIn("form.elements.name.readOnly = Boolean(profile)", script)
-        self.assertLess(script.index("if (risky && !await confirmAction"), script.index("clearSecretInputs();", script.index("async function saveProfile")))
-        self.assertNotRegex(script, r"localStorage[^\n]*(?:password|totp|remote_log_token)")
-        quiet_guard = script.index("if (form.elements.quiet.checked && Number(form.elements.verbosity.value) !== 0)")
-        self.assertLess(quiet_guard, script.index("const profile = collectProfile(form);", quiet_guard))
-        self.assertIn("Quiet terminal output cannot be combined with verbose output", script)
+            self.assertIn(field, app)
+        for marker in (
+            "keep", "replace", "clear", "interval", "daily", "realtime",
+            "Reachable", "Writable", "Latency", "Last success", "Free space",
+            "failure_threshold", "cooldown_seconds", "Save interface settings",
+            "sdsync-settings-actions",
+        ):
+            self.assertIn(marker, app)
+        for operation in (
+            "configure-profile", "remove-profile", "set-default", "set-secret",
+            "schedule", "routine", "remove-routine", "alert-policy", "action",
+        ):
+            self.assertIn(f'"{operation}"', api)
+        self.assertNotRegex(app, r"localStorage[^\n]*(?:password|totp|remote_log_token)")
         self.assertIn("set-remote-log-token NAME [--from-file FILE]", manager)
         self.assertIn("remove-password NAME | remove-totp NAME | remove-remote-log-token NAME", manager)
-        self.assertIn("--kind password|totp|remote-log-token --mode replace|clear", manager)
 
-    def test_routine_health_and_notification_surfaces_are_complete(self) -> None:
-        index = (UI / "index.html").read_text(encoding="utf-8")
-        for field in (
-            "profile", "enabled", "action", "mode", "interval_seconds", "window_start",
-            "window_end", "debounce_seconds", "poll_seconds", "retry_count",
-            "retry_backoff_seconds", "depends_on", "allow_delete", "max_total_delete",
-        ):
-            self.assertIn(f'name="{field}"', index)
-        for value in ("interval", "daily", "realtime"):
-            self.assertIn(f'value="{value}"', index)
-        for column in ("Reachable", "Auth", "Writable", "Latency", "Last success", "Doctor", "Free space"):
-            self.assertIn(f">{column}<", index)
-        self.assertIn("Free space is shown only when the backend proves it", index)
-        for field in ("on_success", "on_failure", "failure_threshold", "cooldown_seconds"):
-            self.assertIn(f'name="{field}"', index)
-        self.assertRegex(index, r'name="cooldown_seconds"[^>]*min="60"[^>]*max="604800"')
-        for event in ("sync_succeeded", "sync_failed", "doctor_failed"):
-            self.assertIn(f"<code>{event}</code>", index)
-
-    def test_browser_bridge_actions_and_argument_keys_are_exact(self) -> None:
-        script = (UI / "app.js").read_text(encoding="utf-8")
-        get_match = re.search(r'const GET_ACTIONS = Object\.freeze\((\[[^;]+\])\);', script)
-        self.assertIsNotNone(get_match)
-        self.assertEqual(json.loads(get_match.group(1)), ["csrf", "snapshot", "logs", "activity", "result"])
-        expected = {
-            "configure-profile": ["allow_empty_source", "allow_http", "ca_certificate", "compare", "connect_timeout_seconds", "danger_accept_invalid_certs", "delete", "excludes", "jobs", "log_level", "make_default", "max_delete", "max_rate_bytes_per_second", "name", "quiet", "remote", "remote_log_mode", "remote_log_url", "retries", "source", "timeout_seconds", "url", "username", "verbosity"],
-            "remove-profile": ["name"],
-            "set-default": ["name"],
-            "set-secret": ["kind", "mode", "profile", "value"],
-            "schedule": ["allow_delete", "enabled", "interval_seconds", "max_total_delete"],
-            "routine": ["action", "allow_delete", "debounce_seconds", "depends_on", "enabled", "interval_seconds", "max_total_delete", "mode", "poll_seconds", "profile", "retry_backoff_seconds", "retry_count", "time_window_end", "time_window_start", "weekdays"],
-            "remove-routine": ["name"],
-            "alert-policy": ["cooldown_seconds", "enabled", "failure_threshold", "on_failure", "on_success"],
-            "action": ["allow_delete", "kind", "max_total_delete", "scope", "write_test"],
-        }
-        actual = {}
-        for operation, values in re.findall(r'^    "([a-z-]+)": Object\.freeze\((\[[^\n]+\])\)', script, re.MULTILINE):
-            actual[operation] = json.loads(values)
-        self.assertEqual(actual, expected)
-        for marker in (
-            "crypto.getRandomValues(random)", "request_id: requestId", "operation: action",
-            "arguments: payload", 'authenticated["X-SYNO-TOKEN"] = state.synoToken',
-            '"X-SDSYNC-CSRF": state.csrfToken', "token.length > 1024",
-            'result: Object.freeze(["job_id"])', 'const RESULT_STATUS_SCHEMA = "sdsync.dsm-result-status.v1"',
-            "pollJobResult(queued.job_id)", "awaitTerminal === false",
-            'apiGet("result", { job_id: jobId })', "/^[0-9a-f]{48}$/",
-            'response.status === 410', 'status.state === "expired_or_missing"',
-            'status.result.code !== "expired_or_missing"',
-        ):
-            self.assertIn(marker, script)
-        self.assertRegex(script, r'apiPost\(ACTIONS\.execute,[\s\S]*?, false\)')
-
-    def test_launch_token_is_optional_for_same_origin_cookie_authentication(self) -> None:
-        script = (UI / "app.js").read_text(encoding="utf-8")
-        headers_function = script[
-            script.index("  function authenticatedHeaders(") : script.index(
-                "\n  async function apiGet("
-            )
-        ]
-        self.assertIn('{ "X-SDSYNC-Request": "1" }', headers_function)
-        self.assertLess(
-            headers_function.index("if (state.launchTokenInvalid)"),
-            headers_function.index('Object.assign({}, headers'),
+    def test_native_api_source_is_canonical_and_appwindow_safe(self) -> None:
+        api = (UI_SOURCE / "src/api.js").read_text(encoding="utf-8")
+        app = (UI_SOURCE / "src/App.vue").read_text(encoding="utf-8")
+        validate_spk.validate_native_api_source(api.encode())
+        self.assertEqual(
+            re.findall(r'["\']([^"\']*api\.cgi)["\']', api),
+            ["/webman/3rdparty/synology-drive-sync/api.cgi"],
         )
-        self.assertIn("if (state.synoToken)", headers_function)
-        self.assertIn('authenticated["X-SYNO-TOKEN"] = state.synoToken', headers_function)
-        self.assertNotIn("login.cgi", script)
-        self.assertNotIn("DSM launch token is unavailable", script)
-        self.assertNotIn('toast("Read-only launch"', script)
-        self.assertEqual(script.count('credentials: "same-origin"'), 2)
-        self.assertEqual(script.count("headers: authenticatedHeaders("), 2)
-        self.assertLess(
-            script.index("names.forEach(function (name) { url.searchParams.delete(name); })"),
-            script.index("headers: authenticatedHeaders("),
-        )
+        self.assertEqual(api.count('credentials: "same-origin"'), 2)
+        self.assertEqual(api.count('"X-SDSYNC-Request"'), 1)
+        self.assertIn("function authenticatedHeaders(headers)", api)
+        self.assertIn('auth: { signal: undefined }', app)
+        for source in (api, app):
+            for forbidden in (
+                "login.cgi", "consumeLaunchToken", "window.location", "window.history",
+                "history.replaceState", "X-SYNO-TOKEN", "SynoToken", "synotoken",
+                "launch token", "hashchange",
+            ):
+                self.assertNotIn(forbidden, source)
 
-    def test_browser_authentication_behavior_and_request_headers(self) -> None:
+    def test_native_api_authentication_and_headers_behave_in_appwindow_context(self) -> None:
         node = shutil.which("node")
         if not node:
             self.skipTest("node is not available")
 
-        script = (UI / "app.js").read_text(encoding="utf-8")
-
-        def source_between(start: str, end: str) -> str:
-            return script[script.index(start) : script.index(end, script.index(start))]
-
-        token_function = source_between("  function consumeLaunchToken()", "\n  function one(")
-        headers_function = source_between("  function authenticatedHeaders(", "\n  async function apiGet(")
-        get_function = source_between("  async function apiGet(", "\n  function canMutate(")
-        post_function = source_between("  async function apiPost(", "\n  function setConnected(")
+        api_source = (UI_SOURCE / "src/api.js").read_text(encoding="utf-8")
+        executable_source = re.sub(r"^export\s+", "", api_source, flags=re.MULTILINE)
         harness = "\n".join(
             (
                 '"use strict";',
-                token_function,
-                r'''
-function tokenCase(href) {
-  const replacements = [];
-  global.window = {
-    location: { href: href },
-    history: {
-      replaceState: function (_state, _title, value) { replacements.push(value); }
-    }
-  };
-  return { authentication: consumeLaunchToken(), replacements: replacements };
-}
-
-const base = "https://nas.example/webman/3rdparty/synology-drive-sync/index.html";
-const tokenCases = {
-  absent: tokenCase(base + "?keep=1#route"),
-  validUpper: tokenCase(base + "?SynoToken=abc123&keep=1#route"),
-  validLower: tokenCase(base + "?synotoken=abc123"),
-  duplicate: tokenCase(base + "?SynoToken=one&SynoToken=two"),
-  mixedCase: tokenCase(base + "?SynoToken=one&synotoken=one"),
-  incorrectCase: tokenCase(base + "?SYNOTOKEN=one"),
-  empty: tokenCase(base + "?SynoToken="),
-  malformedWhitespace: tokenCase(base + "?SynoToken=bad%20token"),
-  malformedControl: tokenCase(base + "?SynoToken=bad%00token"),
-  malformedOversized: tokenCase(base + "?SynoToken=" + "a".repeat(1025))
-};
-
-const state = { synoToken: "", launchTokenInvalid: false, csrfToken: "csrf-token" };
-''',
-                headers_function,
+                'const assert = require("node:assert/strict");',
+                executable_source,
                 r'''
 const requests = [];
-const GET_ACTIONS = Object.freeze(["snapshot"]);
-const GET_ARGUMENT_KEYS = Object.freeze({ snapshot: Object.freeze([]) });
-const ARGUMENT_KEYS = Object.freeze({ action: Object.freeze([]) });
-const REQUEST_SCHEMA = "test-request.v1";
-const QUEUED_SCHEMA = "test-queued.v1";
-const API_URL = "https://nas.example/webman/3rdparty/synology-drive-sync/api.cgi";
-
-function endpoint(action) { return API_URL + "?action=" + encodeURIComponent(action); }
-function canMutate() { return true; }
-function pollJobResult() { throw new Error("unexpected terminal polling"); }
-async function responseJson(response) { return response.payload; }
-
-global.fetch = async function (url, options) {
-  requests.push({ url: url, options: options });
-  if (options.method === "POST") {
-    const request = JSON.parse(options.body);
-    return {
-      payload: {
-        schema: QUEUED_SCHEMA,
-        state: "queued",
-        request_id: request.request_id,
-        job_id: "0".repeat(48)
-      }
-    };
-  }
-  return { payload: { ok: true } };
-};
 global.window = {
   crypto: {
     getRandomValues: function (values) { values.fill(1); return values; }
-  }
+  },
+  setTimeout: setTimeout,
+  clearTimeout: clearTimeout
 };
-''',
-                get_function,
-                post_function,
-                r'''
+global.fetch = async function (url, options) {
+  requests.push({ url: url, options: options });
+  let payload = { ok: true };
+  if (options.method === "POST") {
+    const request = JSON.parse(options.body);
+    payload = {
+      schema: QUEUED_SCHEMA,
+      state: "queued",
+      request_id: request.request_id,
+      job_id: "0".repeat(48)
+    };
+  }
+  return {
+    redirected: false,
+    ok: true,
+    status: 200,
+    headers: { get: function () { return "application/json; charset=utf-8"; } },
+    text: async function () { return JSON.stringify(payload); }
+  };
+};
+
 (async function () {
-  state.synoToken = "";
-  await apiGet("snapshot");
-  const getAbsent = requests[requests.length - 1];
+  const cookieOnly = {};
+  const signalMarker = { aborted: false };
+  const adversarialFields = { token: "must-be-ignored", invalid: true, signal: signalMarker };
 
-  state.synoToken = "abc123";
-  await apiGet("snapshot");
-  const getToken = requests[requests.length - 1];
+  await apiGet(cookieOnly, "snapshot");
+  const getCookieOnly = requests[requests.length - 1];
+  await apiGet(adversarialFields, "snapshot");
+  const getAdversarial = requests[requests.length - 1];
+  await apiPost(cookieOnly, "csrf-token", "set-default", { name: "profile" }, false);
+  const postCookieOnly = requests[requests.length - 1];
+  await apiPost(adversarialFields, "csrf-token", "set-default", { name: "profile" }, false);
+  const postAdversarial = requests[requests.length - 1];
 
-  state.synoToken = "";
-  await apiPost("action", {}, false);
-  const postAbsent = requests[requests.length - 1];
+  assert.equal(
+    getCookieOnly.url,
+    "/webman/3rdparty/synology-drive-sync/api.cgi?action=snapshot"
+  );
+  assert.equal(postCookieOnly.url, "/webman/3rdparty/synology-drive-sync/api.cgi");
+  for (const request of [getCookieOnly, getAdversarial]) {
+    assert.equal(request.options.method, "GET");
+    assert.equal(request.options.credentials, "same-origin");
+    assert.deepEqual(request.options.headers, {
+      Accept: "application/json",
+      "X-SDSYNC-Request": "1"
+    });
+  }
+  assert.equal(getAdversarial.options.signal, signalMarker);
 
-  state.synoToken = "abc123";
-  await apiPost("action", {}, false);
-  const postToken = requests[requests.length - 1];
+  for (const request of [postCookieOnly, postAdversarial]) {
+    assert.equal(request.options.method, "POST");
+    assert.equal(request.options.credentials, "same-origin");
+    assert.deepEqual(request.options.headers, {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "X-SDSYNC-CSRF": "csrf-token",
+      "X-SDSYNC-Request": "1"
+    });
+  }
+  assert.equal(postAdversarial.options.signal, signalMarker);
 
-  const beforeInvalid = requests.length;
-  state.launchTokenInvalid = true;
-  const invalidErrors = [];
-  try { await apiGet("snapshot"); } catch (error) { invalidErrors.push(error.message); }
-  try { await apiPost("action", {}, false); } catch (error) { invalidErrors.push(error.message); }
-
-  process.stdout.write(JSON.stringify({
-    tokenCases: tokenCases,
-    getAbsent: getAbsent,
-    getToken: getToken,
-    postAbsent: postAbsent,
-    postToken: postToken,
-    invalidErrors: invalidErrors,
-    invalidFetches: requests.length - beforeInvalid
-  }));
+  const cancellation = new AbortController();
+  const pendingDelay = delay(60000, cancellation.signal);
+  cancellation.abort();
+  await assert.rejects(pendingDelay, /DSM UI request was cancelled/);
 })().catch(function (error) {
   process.stderr.write(String(error && error.stack ? error.stack : error));
   process.exitCode = 1;
@@ -343,111 +299,452 @@ global.window = {
             check=False,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        result = json.loads(completed.stdout)
 
-        self.assertEqual(
-            result["tokenCases"]["absent"],
-            {
-                "authentication": {"token": "", "invalid": False},
-                "replacements": [],
-            },
-        )
-        for case in ("validUpper", "validLower"):
-            self.assertEqual(
-                result["tokenCases"][case]["authentication"],
-                {"token": "abc123", "invalid": False},
+    def test_native_queued_result_semantics_are_behavioral(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not available")
+
+        api_source = (UI_SOURCE / "src/api.js").read_text(encoding="utf-8")
+        executable_source = re.sub(r"^export\s+", "", api_source, flags=re.MULTILINE)
+        harness = "\n".join(
+            (
+                '"use strict";',
+                'const assert = require("node:assert/strict");',
+                executable_source,
+                r'''
+const jobId = "a".repeat(48);
+const pending = () => ({
+  schema: RESULT_STATUS_SCHEMA,
+  job_id: jobId,
+  state: "pending"
+});
+const complete = (result) => ({
+  schema: RESULT_STATUS_SCHEMA,
+  job_id: jobId,
+  state: "complete",
+  result: result
+});
+const result = (ok, message, output) => ({
+  schema: RESULT_SCHEMA,
+  ok: ok,
+  message: message,
+  output: output
+});
+const jsonResponse = (payload, status = 200) => ({
+  redirected: false,
+  ok: status >= 200 && status < 300,
+  status: status,
+  headers: { get: () => "application/json; charset=utf-8" },
+  text: async () => JSON.stringify(payload)
+});
+
+const scenarios = [];
+let observations = [];
+let observationCount = 0;
+global.window = {
+  location: {
+    origin: "https://nas.example",
+    href: "https://nas.example/webman/index.cgi"
+  },
+  history: { replaceState: function () {} },
+  crypto: {
+    getRandomValues: function (values) { values.fill(2); return values; }
+  },
+  setTimeout: setTimeout,
+  clearTimeout: clearTimeout
+};
+global.fetch = async function (_url, options) {
+  if (options.method === "POST") {
+    observations = scenarios.shift().slice();
+    const request = JSON.parse(options.body);
+    return jsonResponse({
+      schema: QUEUED_SCHEMA,
+      state: "queued",
+      request_id: request.request_id,
+      job_id: jobId
+    });
+  }
+  observationCount += 1;
+  const next = observations.shift();
+  if (next instanceof Error) throw next;
+  if (!next) throw new Error("test exhausted queued-result observations");
+  return jsonResponse(next.payload || next, next.status || 200);
+};
+
+async function capture(promise) {
+  try {
+    await promise;
+  } catch (error) {
+    return error;
+  }
+  throw new Error("expected promise to reject");
+}
+
+(async function () {
+  const auth = { token: "", invalid: false };
+  const action = "set-default";
+  const payload = { name: "profile" };
+
+  scenarios.push([
+    ...Array.from({ length: 70 }, pending),
+    complete(result(true, "done", "terminal output"))
+  ]);
+  observationCount = 0;
+  const beyondOldHorizon = await apiPost(
+    auth, "csrf", action, payload, true, 0
+  );
+  assert.equal(beyondOldHorizon.ok, true);
+  assert.equal(beyondOldHorizon.output, "terminal output");
+  assert.equal(observationCount, 71);
+
+  scenarios.push([
+    new Error("temporary transport loss"),
+    new Error("temporary authentication observation loss"),
+    pending(),
+    complete(result(true, "observed", "recovered output"))
+  ]);
+  const recovered = await apiPost(auth, "csrf", action, payload, true, 0);
+  assert.equal(recovered.output, "recovered output");
+
+  scenarios.push(Array.from(
+    { length: 5 },
+    () => new Error("result observation unavailable")
+  ));
+  const unobservable = await capture(apiPost(auth, "csrf", action, payload, true, 0));
+  assert.equal(unobservable instanceof QueuedOutcomeUnknownError, true);
+  assert.equal(unobservable.outcomeUnknown, true);
+  assert.equal(unobservable.jobId, jobId);
+  assert.match(unobservable.message, /accepted the operation/i);
+  assert.match(unobservable.message, /do not retry/i);
+
+  scenarios.push([{ schema: "invalid", job_id: jobId, state: "pending" }]);
+  const malformed = await capture(apiPost(auth, "csrf", action, payload, true, 0));
+  assert.equal(malformed instanceof QueuedOutcomeUnknownError, true);
+  assert.equal(malformed.outcomeUnknown, true);
+  assert.equal(malformed.jobId, jobId);
+
+  scenarios.push([{
+    schema: RESULT_STATUS_SCHEMA,
+    job_id: jobId,
+    state: "expired_or_missing",
+    result: { message: "retention elapsed" }
+  }]);
+  const expired = await capture(apiPost(auth, "csrf", action, payload, true, 0));
+  assert.equal(expired instanceof QueuedOutcomeUnknownError, true);
+  assert.match(expired.message, /retention elapsed/);
+
+  scenarios.push([complete(result(false, "doctor failed", "doctor raw output"))]);
+  const terminalFailure = await capture(
+    apiPost(auth, "csrf", action, payload, true, 0)
+  );
+  assert.equal(terminalFailure instanceof QueuedOutcomeUnknownError, false);
+  assert.equal(terminalFailure.outcomeUnknown, undefined);
+  assert.equal(terminalFailure.message, "doctor failed");
+  assert.equal(terminalFailure.resultOutput, "doctor raw output");
+})().catch(function (error) {
+  process.stderr.write(String(error && error.stack ? error.stack : error));
+  process.exitCode = 1;
+});
+''',
             )
-        for case in (
-            "duplicate",
-            "mixedCase",
-            "incorrectCase",
-            "empty",
-            "malformedWhitespace",
-            "malformedControl",
-            "malformedOversized",
-        ):
-            self.assertEqual(
-                result["tokenCases"][case]["authentication"],
-                {"token": "", "invalid": True},
+        )
+        completed = subprocess.run(
+            [node, "-"],
+            input=harness,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_native_appwindow_interactions_and_operation_modes_are_behavioral(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not available")
+
+        app = (UI_SOURCE / "src/App.vue").read_text(encoding="utf-8")
+        script_match = re.search(r"<script>\s*(.*?)\s*</script>", app, re.DOTALL)
+        self.assertIsNotNone(script_match)
+        executable = re.sub(
+            r'import\s*\{.*?\}\s*from\s*"\./api";\s*',
+            "",
+            script_match.group(1),  # type: ignore[union-attr]
+            count=1,
+            flags=re.DOTALL,
+        )
+        executable = executable.replace("export default {", "const AppComponent = {", 1)
+        executable = executable.replace("apiPost(", "apiPostSpy(")
+        harness = "\n".join(
+            (
+                '"use strict";',
+                'const assert = require("node:assert/strict");',
+                r'''
+const ACTIONS = { execute: "action" };
+const boundedText = (value, fallback = "") =>
+  String(typeof value === "string" && value ? value : fallback).slice(0, 65536);
+const formatBytes = (value) => String(value);
+const formatDate = (value) => String(value);
+const formatDuration = (value) => String(value);
+const postCalls = [];
+let postFailure = null;
+async function apiPostSpy(_auth, _csrf, action, payload, awaitTerminal) {
+  postCalls.push({ action, payload, awaitTerminal });
+  if (postFailure) throw postFailure;
+  return awaitTerminal
+    ? { output: "doctor terminal output" }
+    : { state: "queued", job_id: "b".repeat(48) };
+}
+global.window = { clearTimeout: function () {} };
+''',
+                executable,
+                r'''
+const methods = AppComponent.methods;
+
+function operationContext() {
+  const context = {
+    canMutate: true,
+    operationBusy: false,
+    disposed: false,
+    auth: {},
+    csrfToken: "csrf",
+    diagnostic: {},
+    toasts: [],
+    toast: function (title, message, error) {
+      this.toasts.push({ title, message, error });
+    },
+    refreshSnapshot: async function () {},
+    reportMutationError: function (...args) {
+      return methods.reportMutationError.apply(this, args);
+    }
+  };
+  return context;
+}
+
+function bind(context, names) {
+  names.forEach((name) => {
+    context[name] = (...args) => methods[name].apply(context, args);
+  });
+}
+
+(async function () {
+  const operation = operationContext();
+  await methods.executeOperation.call(operation, "doctor", {
+    scope: "all", write_test: false, allow_delete: null, max_total_delete: null
+  });
+  await methods.executeOperation.call(operation, "plan", {
+    scope: "all", write_test: null, allow_delete: false, max_total_delete: 0
+  });
+  await methods.executeOperation.call(operation, "run", {
+    scope: "all", write_test: null, allow_delete: false, max_total_delete: 0
+  });
+  assert.deepEqual(postCalls.map((call) => call.awaitTerminal), [true, false, false]);
+  assert.deepEqual(
+    operation.toasts.map((toast) => toast.title),
+    ["Doctor completed", "Plan queued", "Run queued"]
+  );
+  assert.deepEqual(operation.diagnostic, {
+    title: "Doctor completed",
+    output: "doctor terminal output"
+  });
+
+  postFailure = new Error("doctor failed");
+  postFailure.resultOutput = "doctor preserved raw output";
+  await methods.executeOperation.call(operation, "doctor", {
+    scope: "all", write_test: false, allow_delete: null, max_total_delete: null
+  });
+  assert.deepEqual(operation.diagnostic, {
+    title: "Doctor failed",
+    output: "doctor preserved raw output"
+  });
+  postFailure = null;
+
+  const beforeBusy = postCalls.length;
+  operation.operationBusy = true;
+  await methods.executeOperation.call(operation, "doctor", {
+    scope: "all", write_test: false, allow_delete: null, max_total_delete: null
+  });
+  assert.equal(postCalls.length, beforeBusy);
+
+  const routeContext = {
+    routes: [{ id: "profiles" }, { id: "overview" }],
+    route: "profiles",
+    logTimer: 0,
+    profileEditorOpen: true,
+    selectedProfile: "private",
+    secretModes: {
+      password: "replace", totp: "replace", remote_log_token: "replace"
+    },
+    secretValues: {
+      password: "password", totp: "totp", remote_log_token: "token"
+    },
+    refreshLogs: function () {}
+  };
+  bind(routeContext, ["clearSecrets", "closeProfile"]);
+  methods.navigate.call(routeContext, "overview");
+  assert.deepEqual(routeContext.secretValues, {
+    password: "", totp: "", remote_log_token: ""
+  });
+  assert.deepEqual(routeContext.secretModes, {
+    password: "keep", totp: "keep", remote_log_token: "keep"
+  });
+  assert.equal(routeContext.profileEditorOpen, false);
+  assert.equal(routeContext.selectedProfile, "");
+
+  const focusLog = [];
+  const listeners = [];
+  function focusable(name) {
+    return {
+      name,
+      disabled: false,
+      isConnected: true,
+      matches: () => true,
+      getAttribute: () => null,
+      focus: function () {
+        global.document.activeElement = this;
+        focusLog.push(name);
+      }
+    };
+  }
+  const prior = focusable("prior");
+  const cancel = focusable("cancel");
+  const accept = focusable("accept");
+  const dialog = {
+    matches: () => true,
+    focus: () => focusLog.push("dialog"),
+    contains: (element) => element === cancel || element === accept,
+    querySelectorAll: () => [cancel, accept]
+  };
+  global.document = {
+    activeElement: prior,
+    addEventListener: function (type, handler, capture) {
+      listeners.push({ action: "add", type, handler, capture });
+    },
+    removeEventListener: function (type, handler, capture) {
+      listeners.push({ action: "remove", type, handler, capture });
+    }
+  };
+  const dialogContext = {
+    confirmation: {
+      visible: false, title: "", message: "", button: "Confirm", resolve: null
+    },
+    confirmationPriorFocus: null,
+    confirmationKeyHandler: null,
+    disposed: false,
+    $refs: {
+      confirmationDialog: dialog,
+      confirmationCancel: cancel,
+      confirmationAccept: accept
+    },
+    $nextTick: (callback) => callback()
+  };
+  bind(dialogContext, [
+    "confirmationElement",
+    "confirmationFocusables",
+    "handleConfirmationKeydown",
+    "removeConfirmationKeyHandler",
+    "settleConfirmation"
+  ]);
+  const confirmation = methods.confirmAction.call(
+    dialogContext, "Danger", "Confirm the action", "Continue"
+  );
+  assert.equal(dialogContext.confirmation.visible, true);
+  assert.equal(focusLog[focusLog.length - 1], "cancel");
+  assert.deepEqual(
+    listeners.map((entry) => [entry.action, entry.type, entry.capture]),
+    [["add", "keydown", true]]
+  );
+
+  global.document.activeElement = accept;
+  const forwardTab = {
+    key: "Tab", shiftKey: false, prevented: false,
+    preventDefault: function () { this.prevented = true; },
+    stopPropagation: function () {}
+  };
+  methods.handleConfirmationKeydown.call(dialogContext, forwardTab);
+  assert.equal(forwardTab.prevented, true);
+  assert.equal(global.document.activeElement, cancel);
+
+  global.document.activeElement = cancel;
+  const reverseTab = {
+    key: "Tab", shiftKey: true, prevented: false,
+    preventDefault: function () { this.prevented = true; },
+    stopPropagation: function () {}
+  };
+  methods.handleConfirmationKeydown.call(dialogContext, reverseTab);
+  assert.equal(reverseTab.prevented, true);
+  assert.equal(global.document.activeElement, accept);
+
+  const escape = {
+    key: "Escape", prevented: false, stopped: false,
+    preventDefault: function () { this.prevented = true; },
+    stopPropagation: function () { this.stopped = true; }
+  };
+  methods.handleConfirmationKeydown.call(dialogContext, escape);
+  assert.equal(await confirmation, false);
+  assert.equal(escape.prevented, true);
+  assert.equal(escape.stopped, true);
+  assert.equal(dialogContext.confirmation.visible, false);
+  assert.equal(global.document.activeElement, prior);
+  assert.deepEqual(
+    listeners.map((entry) => [entry.action, entry.type, entry.capture]),
+    [["add", "keydown", true], ["remove", "keydown", true]]
+  );
+})().catch(function (error) {
+  process.stderr.write(String(error && error.stack ? error.stack : error));
+  process.exitCode = 1;
+});
+''',
             )
-        for case, model in result["tokenCases"].items():
-            if case == "absent":
-                continue
-            self.assertEqual(len(model["replacements"]), 1)
-            self.assertNotIn("synotoken", model["replacements"][0].lower())
-        self.assertEqual(
-            result["tokenCases"]["validUpper"]["replacements"],
-            ["/webman/3rdparty/synology-drive-sync/index.html?keep=1#route"],
         )
-
-        for request in (result["getAbsent"], result["getToken"]):
-            self.assertEqual(request["options"]["method"], "GET")
-            self.assertEqual(request["options"]["credentials"], "same-origin")
-            self.assertEqual(request["options"]["headers"]["X-SDSYNC-Request"], "1")
-            self.assertEqual(request["options"]["headers"]["Accept"], "application/json")
-        self.assertNotIn("X-SYNO-TOKEN", result["getAbsent"]["options"]["headers"])
-        self.assertEqual(result["getToken"]["options"]["headers"]["X-SYNO-TOKEN"], "abc123")
-
-        for request in (result["postAbsent"], result["postToken"]):
-            self.assertEqual(request["options"]["method"], "POST")
-            self.assertEqual(request["options"]["credentials"], "same-origin")
-            self.assertEqual(request["options"]["headers"]["X-SDSYNC-Request"], "1")
-            self.assertEqual(request["options"]["headers"]["X-SDSYNC-CSRF"], "csrf-token")
-            self.assertEqual(request["options"]["headers"]["Content-Type"], "application/json")
-        self.assertNotIn("X-SYNO-TOKEN", result["postAbsent"]["options"]["headers"])
-        self.assertEqual(result["postToken"]["options"]["headers"]["X-SYNO-TOKEN"], "abc123")
-        self.assertEqual(result["invalidFetches"], 0)
-        self.assertEqual(len(result["invalidErrors"]), 2)
-        self.assertTrue(
-            all("invalid launch token" in message for message in result["invalidErrors"])
+        completed = subprocess.run(
+            [node, "-"],
+            input=harness,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
         )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
-    def test_launch_token_run_details_and_zero_routine_values_are_preserved(self) -> None:
-        index = (UI / "index.html").read_text(encoding="utf-8")
-        script = (UI / "app.js").read_text(encoding="utf-8")
+    def test_native_run_details_and_zero_routine_values_are_preserved(self) -> None:
+        app = (UI_SOURCE / "src/App.vue").read_text(encoding="utf-8")
+        api = (UI_SOURCE / "src/api.js").read_text(encoding="utf-8")
 
-        token_function = script[
-            script.index("  function consumeLaunchToken()") : script.index("\n  function one(")
-        ]
-        validation = token_function.index("if (entries.length !== 1")
-        self.assertLess(token_function.index("url.searchParams.delete(name)"), validation)
-        self.assertLess(token_function.index("window.history.replaceState"), validation)
-        self.assertIn('name.toLowerCase() === "synotoken"', token_function)
-        self.assertIn('entry.name === "SynoToken" || entry.name === "synotoken"', token_function)
-        self.assertIn('return { token: "", invalid: false }', token_function)
-        self.assertIn('return { token: "", invalid: true }', token_function)
-
-        details = re.search(r'<dl class="definition-grid" data-run-details>(.*?)</dl>', index, re.DOTALL)
+        details = re.search(
+            r'<dl class="sdsync-definition-grid">(.*?)</dl>', app, re.DOTALL
+        )
         self.assertIsNotNone(details)
         self.assertEqual(
             re.findall(r"<dt>([^<]+)</dt>", details.group(1)),
             ["Operation", "State", "Scope", "Started", "Finished"],
         )
-        self.assertIn(
-            'const values = [boundedText(run.operation, "Unavailable"), status, scope, '
-            "formatDate(run.started_epoch), formatDate(run.finished_epoch)];",
-            script,
-        )
-
-        self.assertIn(
-            'setFormValue(form, "retry_count", definedOr(pick(routine, "retry_count"), 2));',
-            script,
-        )
-        self.assertIn(
-            'setFormValue(form, "max_total_delete", definedOr(pick(routine, "max_total_delete"), 100));',
-            script,
-        )
-        self.assertIn(
-            "return value === undefined || value === null ? fallback : value;",
-            script,
-        )
+        for marker in (
+            "runOperation() { return boundedText(this.run.operation, \"Unavailable\"); }",
+            "runScope() { return boundedText(this.run.scope, \"Unavailable\"); }",
+            "numberOr(routine.retry_count, 2)",
+            "numberOr(routine.max_total_delete, 100)",
+        ):
+            self.assertIn(marker, app)
+        self.assertIn("return Number.isFinite(parsed) ? parsed : fallback;", api)
 
     def test_javascript_parses_when_node_is_available(self) -> None:
         node = shutil.which("node")
         if not node:
             self.skipTest("node is not installed")
-        result = subprocess.run([node, "--check", str(UI / "app.js")], capture_output=True, text=True, timeout=20)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        for source in (
+            UI_SOURCE / "src/main.js",
+            UI_SOURCE / "src/api.js",
+            UI_SOURCE / "dist/SynologyDriveSync.js",
+        ):
+            result = subprocess.run(
+                [node, "--check", str(source)],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(result.returncode, 0, f"{source.name}: {result.stderr}")
 
     def test_icon_family_is_deterministic_snapshotted_and_inside_safe_bounds(self) -> None:
         expected_hashes = {
@@ -605,8 +902,25 @@ global.window = {
                 name = f"ui/images/icon_{size}.png"
                 self.assertIn(name, members)
                 self.assertEqual(validate_spk.png_dimensions(archive.extractfile(members[name]).read()), (size, size))
-            for name in ("ui/config", "ui/index.html", "ui/app.css", "ui/app.js", "ui/images/icon.svg", "ui/texts/enu/strings"):
+            for name in (
+                "ui/config",
+                "ui/SynologyDriveSync.js",
+                "ui/style.css",
+                "ui/images/icon.svg",
+                "ui/texts/enu/strings",
+            ):
                 self.assertIn(name, members)
+            for name in ("ui/index.html", "ui/app.js", "ui/app.css"):
+                self.assertNotIn(name, members)
+            ui_config = archive.extractfile(members["ui/config"]).read()
+            self.assertEqual(
+                validate_spk.validate_ui_config(ui_config),
+                "ui/SynologyDriveSync.js",
+            )
+            validate_spk.validate_native_bundle(
+                archive.extractfile(members["ui/SynologyDriveSync.js"]).read(),
+                archive.extractfile(members["ui/style.css"]).read(),
+            )
             self.assertNotIn("ui/texts/enu/mails", members)
             self.assertEqual(installed_size, sum(member.size for member in members.values() if member.isfile()))
 
@@ -615,54 +929,232 @@ global.window = {
             build_spk.tar_info("ui/api.cgi", 0o4755, 1)
 
     def test_static_validators_reject_security_and_registration_tampering(self) -> None:
-        index = (UI / "index.html").read_bytes()
-        css = (UI / "app.css").read_bytes()
-        script = (UI / "app.js").read_bytes()
-        with self.assertRaisesRegex(validate_spk.ValidationError, "inline event"):
-            validate_spk.validate_ui_static(index.replace(b"<body>", b'<body onload="steal()">'), css, script)
-        with self.assertRaisesRegex(validate_spk.ValidationError, "external network endpoint"):
-            validate_spk.validate_ui_static(index, css, script + b'\nfetch("https://evil.invalid/");\n')
-        with self.assertRaisesRegex(validate_spk.ValidationError, "persists password"):
-            validate_spk.validate_ui_static(index, css, script + b'\nlocalStorage.setItem("password", "bad");\n')
+        source = {
+            "main": (UI_SOURCE / "src/main.js").read_bytes(),
+            "app": (UI_SOURCE / "src/App.vue").read_bytes(),
+            "api": (UI_SOURCE / "src/api.js").read_bytes(),
+            "css": (UI_SOURCE / "src/styles/native.css").read_bytes(),
+            "webpack": (UI_SOURCE / "webpack.config.js").read_bytes(),
+            "config_define": (UI_SOURCE / "config.define").read_bytes(),
+            "package": (UI_SOURCE / "package.json").read_bytes(),
+        }
+
+        def validate_build(**overrides: bytes) -> None:
+            payloads = dict(source)
+            payloads.update(overrides)
+            validate_spk.validate_native_build_contract(
+                payloads["main"],
+                payloads["app"],
+                payloads["api"],
+                payloads["css"],
+                payloads["webpack"],
+                payloads["config_define"],
+                payloads["package"],
+            )
+
+        with self.assertRaisesRegex(validate_spk.ValidationError, "AppWindow structure"):
+            validate_build(app=source["app"].replace(b"<v-app-window", b"<section", 1))
+        for name, marker in (
+            ("iframe", b"<iframe"),
+            ("legacy launcher", b"index.html"),
+            ("global theme", b"document.documentElement"),
+            ("hash router", b"window.location.hash"),
+        ):
+            with self.subTest(name=name), self.assertRaisesRegex(
+                validate_spk.ValidationError, "forbidden launcher or DOM construct"
+            ):
+                validate_build(app=source["app"] + b"\n" + marker)
+        with self.assertRaisesRegex(validate_spk.ValidationError, "destruction cleanup"):
+            validate_build(
+                app=source["app"].replace(b"beforeDestroy()", b"destroyed()", 1)
+            )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "destruction cleanup"):
+            validate_build(
+                app=source["app"].replace(b"this.abortController.abort();", b"", 1)
+            )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "canonical absolute"):
+            validate_build(
+                api=source["api"].replace(
+                    b'"/webman/3rdparty/synology-drive-sync/api.cgi"',
+                    b'"./api.cgi"',
+                    1,
+                )
+            )
         with self.assertRaisesRegex(validate_spk.ValidationError, "X-SDSYNC-Request"):
-            validate_spk.validate_ui_static(
-                index,
-                css,
-                script.replace(b'"X-SDSYNC-Request": "1"', b'"X-SDSYNC-Request": "0"', 1),
+            validate_build(
+                api=source["api"].replace(
+                    b'"X-SDSYNC-Request": "1"',
+                    b'"X-SDSYNC-Request": "0"',
+                    1,
+                )
             )
         with self.assertRaisesRegex(validate_spk.ValidationError, "GET requests"):
-            validate_spk.validate_ui_static(
-                index,
-                css,
-                script.replace(b"headers: authenticatedHeaders({", b"headers: ({", 1),
+            validate_build(
+                api=source["api"].replace(
+                    b"headers: authenticatedHeaders({ Accept:",
+                    b"headers: ({ Accept:",
+                    1,
+                )
             )
-        post_call = script.rfind(b"headers: authenticatedHeaders({")
+        post_call = source["api"].rfind(b"headers: authenticatedHeaders(")
         self.assertGreater(post_call, -1)
         with self.assertRaisesRegex(validate_spk.ValidationError, "POST requests"):
-            validate_spk.validate_ui_static(
-                index,
-                css,
-                script[:post_call] + script[post_call:].replace(
-                    b"headers: authenticatedHeaders({", b"headers: ({", 1
-                ),
+            validate_build(
+                api=source["api"][:post_call]
+                + source["api"][post_call:].replace(
+                    b"headers: authenticatedHeaders(", b"headers: (", 1
+                )
             )
-        with self.assertRaisesRegex(validate_spk.ValidationError, "result-status"):
-            validate_spk.validate_ui_static(
-                index,
-                css,
-                script.replace(b"sdsync.dsm-result-status.v1", b"sdsync.dsm-unknown.v1"),
+        with self.assertRaisesRegex(validate_spk.ValidationError, "launch-token authentication"):
+            validate_build(
+                api=source["api"].replace(
+                    b"function authenticatedHeaders(headers)",
+                    b"function authenticatedHeaders(auth, headers)",
+                    1,
+                )
             )
-        config = json.loads((UI / "config").read_text(encoding="utf-8"))
-        duplicate_all_users = json.dumps(config).encode().replace(
+        for name, marker in (
+            ("token parser", b"\nfunction consumeLaunchToken() {}\n"),
+            ("shell location", b"\nwindow.location.href;\n"),
+            ("shell history", b"\nwindow.history.replaceState(null, '', '/');\n"),
+            ("Synology token header", b'\nheaders["X-SYNO-TOKEN"] = "value";\n'),
+            ("Synology token parameter", b'\nconst tokenName = "SynoToken";\n'),
+        ):
+            with self.subTest(name=name), self.assertRaisesRegex(
+                validate_spk.ValidationError, "cookie-only AppWindow authentication"
+            ):
+                validate_build(api=source["api"] + marker)
+        with self.assertRaisesRegex(validate_spk.ValidationError, "external network endpoint"):
+            validate_build(api=source["api"] + b'\nfetch("https://evil.invalid/");\n')
+        with self.assertRaisesRegex(validate_spk.ValidationError, "AppWindow cancellation"):
+            validate_build(
+                api=source["api"].replace(
+                    b"signal: auth && auth.signal ? auth.signal : undefined,",
+                    b"signal: undefined,",
+                    1,
+                )
+            )
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError, "queued-result observer|terminal horizon"
+        ):
+            validate_build(
+                api=source["api"].replace(
+                    b"for (;;)",
+                    b"for (let attempt = 0; attempt < 60; attempt += 1)",
+                    1,
+                )
+            )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "retry pending and transport"):
+            validate_build(
+                api=source["api"].replace(
+                    b"await delay(interval, auth && auth.signal);",
+                    b"await Promise.resolve();",
+                    1,
+                )
+            )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "outcome-unknown"):
+            validate_build(
+                api=source["api"].replace(
+                    b"throw new QueuedOutcomeUnknownError(",
+                    b"throw new Error(",
+                    1,
+                )
+            )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "resultOutput"):
+            validate_build(
+                api=source["api"].replace(
+                    b"failure.resultOutput = boundedText(",
+                    b"failure.resultText = boundedText(",
+                    1,
+                )
+            )
+        for name, original, replacement, pattern in (
+            (
+                "toast root",
+                b'<div class="sdsync-toasts"',
+                b'<div class="detached-toasts"',
+                "root, toast host, and modal host",
+            ),
+            (
+                "narrow navigation label",
+                b':aria-label="item.title"',
+                b':data-label="item.title"',
+                "interaction contract",
+            ),
+            (
+                "dialog listener cleanup",
+                b'document.removeEventListener("keydown", this.confirmationKeyHandler, true);',
+                b'document.removeEventListener("keydown", this.confirmationKeyHandler);',
+                "interaction contract",
+            ),
+            (
+                "secret route cleanup",
+                b'if (this.route === "profiles" && route !== "profiles") this.closeProfile();',
+                b'if (false) this.closeProfile();',
+                "interaction contract",
+            ),
+            (
+                "global mutation guard",
+                b"openProfile(name) {\n      if (this.operationBusy) return;",
+                b"openProfile(name) {",
+                "operationBusy guard",
+            ),
+            (
+                "Doctor terminal observation",
+                b'const awaitTerminal = kind === "doctor";',
+                b"const awaitTerminal = false;",
+                "Doctor must terminal-poll",
+            ),
+        ):
+            self.assertIn(original, source["app"], name)
+            with self.subTest(name=name), self.assertRaisesRegex(
+                validate_spk.ValidationError, pattern
+            ):
+                validate_build(app=source["app"].replace(original, replacement, 1))
+        with self.assertRaisesRegex(validate_spk.ValidationError, "externalize Vue"):
+            validate_build(
+                webpack=source["webpack"].replace(b'vue: "Vue"', b'vue: "BundledVue"', 1)
+            )
+
+        script = (UI_SOURCE / "dist/SynologyDriveSync.js").read_bytes()
+        style = (UI_SOURCE / "dist/style.css").read_bytes()
+        for name, suffix, pattern in (
+            ("eval", b"\neval('bad')", "forbidden runtime"),
+            ("source map", b"\n//# sourceMappingURL=bad.map", "forbidden runtime"),
+            ("bundled Vue", b'\nversion:"2.7.14"', "forbidden runtime"),
+            ("remote endpoint", b'\nfetch("https://evil.invalid/")', "external network endpoint"),
+        ):
+            with self.subTest(name=name), self.assertRaisesRegex(
+                validate_spk.ValidationError, pattern
+            ):
+                validate_spk.validate_native_bundle(script + suffix, style)
+        with self.assertRaisesRegex(validate_spk.ValidationError, "not isolated"):
+            validate_spk.validate_native_bundle(script, b":root { color: red; }\n" + style)
+        with self.assertRaisesRegex(validate_spk.ValidationError, "remote asset"):
+            validate_spk.validate_native_bundle(
+                script, style + b'\n.sdsync-app { background: url("https://evil.invalid/x"); }'
+            )
+
+        installed_payload = build_spk.native_ui_payloads()[0][0]
+        config = json.loads(installed_payload)
+        duplicate_all_users = installed_payload.replace(
             b'"allUsers": false',
             b'"allUsers": true, "allUsers": false',
             1,
         )
         with self.assertRaisesRegex(validate_spk.ValidationError, "duplicate JSON key"):
             validate_spk.validate_ui_config(duplicate_all_users)
-        config[".url"]["com.supermarsx.SynologyDriveSync"]["allUsers"] = True
+        config["SynologyDriveSync.js"][validate_spk.APP_ID]["allUsers"] = True
         with self.assertRaisesRegex(validate_spk.ValidationError, "allUsers"):
             validate_spk.validate_ui_config(json.dumps(config).encode())
+        config = json.loads(installed_payload)
+        del config["SynologyDriveSync.js"][validate_spk.APP_ID]["depend"]
+        with self.assertRaisesRegex(validate_spk.ValidationError, "dependency list"):
+            validate_spk.validate_ui_config(json.dumps(config).encode())
+        with self.assertRaisesRegex(validate_spk.ValidationError, "one reviewed native"):
+            validate_spk.validate_ui_config(
+                json.dumps({".url": {validate_spk.APP_ID: {"type": "url"}}}).encode()
+            )
         strings = (UI / "texts/enu/strings").read_bytes()
         validate_spk.validate_ui_texts(strings)
         with self.assertRaisesRegex(validate_spk.ValidationError, "fixed"):
