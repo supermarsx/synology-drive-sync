@@ -13,11 +13,11 @@ source NAS                                                target NAS
                          DSM admin dashboard          /TeamShare/Chosen Folder
 ```
 
-The SPK includes a dark-first native DSM desktop application and the `sdsync-dsm` SSH manager.
-Both surfaces operate the same package-owned profiles, credentials, routines, state, and logs. The
-dashboard is administrator-only; it never returns a stored password, TOTP seed, or remote logging
-token to the browser. The CLI remains the recovery and automation surface when the dashboard cannot
-open.
+The SPK includes a dark-first packaged web application opened in a DSM-managed `type=url` pop-up and
+the `sdsync-dsm` SSH manager. It is not a native Vue `type=app`/`AppWindow`. Both surfaces operate the
+same package-owned profiles, credentials, routines, state, and logs. The dashboard is
+administrator-only; it never returns a stored password, TOTP seed, or remote logging token to the
+browser. The CLI remains the recovery and automation surface when the dashboard cannot open.
 
 The package requests no root execution, Linux capabilities, set-user-ID bit, or set-group-ID bit.
 Its ordinary `0755` DSM `http` CGI can only relay a bounded request over a fixed package:`http`
@@ -36,10 +36,12 @@ or an enabled Team Folder.
 
 > [!NOTE]
 > Static packaging, bridge, manager, lifecycle, and mock File Station tests have passed. They do not
-> prove installation on a physical NAS or synchronization between two live NAS devices. DSM 7
-> AppLaunch forwarding of `SynoToken` to this third-party application is also not yet proven on
-> hardware. Complete the [live-NAS acceptance](dsm/troubleshooting.md#live-nas-acceptance) on
-> disposable folders, and keep deletion disabled until its separate destructive test passes.
+> prove installation on a physical NAS, execution of DSM's cookie authenticator from the
+> package-user service, DSM forwarding of `X-SDSYNC-Request: 1` as `HTTP_X_SDSYNC_REQUEST=1`, or
+> synchronization between two live NAS devices. AppLaunch may supply an optional session-binding
+> `SynoToken`, but its absence is supported. Complete the
+> [live-NAS acceptance](dsm/troubleshooting.md#live-nas-acceptance) on disposable folders, and keep
+> deletion disabled until its separate destructive test passes.
 
 ## Choose the exact DSM topic
 
@@ -52,7 +54,7 @@ or an enabled Team Folder.
 | Password, TOTP, and remote-log-token keep/replace/clear behavior | [Secrets and protected values](dsm/secrets.md) |
 | Interval, daily, and realtime routines, dependencies, retries, and deletion approval | [Routines and scheduling](dsm/routines.md) |
 | Doctor, cached health, activity, logs, and DSM desktop alerts | [Health, activity, logs, and notifications](dsm/operations.md) |
-| `authenticate.cgi`, administrator checks, SynoToken, CSRF, package/`http` socket boundary, and private queue | [Dashboard security model](dsm/security.md) |
+| `authenticate.cgi`, administrator checks, optional session-binding `SynoToken`, CSRF, package/`http` socket boundary, and private queue | [Dashboard security model](dsm/security.md) |
 | Dashboard-to-`sdsync-dsm` command mapping and private paths | [CLI parity and private paths](dsm/cli-parity.md) |
 | Symptoms, recovery, acceptance evidence, and known unverified behavior | [Troubleshooting and live-NAS acceptance](dsm/troubleshooting.md) |
 | Reproducible package assembly, ELF contracts, icons, and validation | [Build and validate SPKs](dsm/package-development.md) |
@@ -69,9 +71,11 @@ status such as `77`, or a protocol term such as `X-SDSYNC-CSRF`.
    **Package Center > Manual Install**.
 3. Grant the package's actual **System internal user** read-only access to the intended local source
    share. The package grants itself no share access.
-4. Start the package and open **Synology Drive Sync** from the DSM desktop or Package Center. If the
-   browser reports that the DSM launch token is missing, stop there and use the CLI; do not copy a
-   token into a bookmark, local storage, or log.
+4. Start the package and open **Synology Drive Sync** from the DSM desktop or Package Center. The
+   current DSM session cookie is authenticated server-side; a launch `SynoToken` is an optional
+   session-binding input. If session authentication or the control bridge fails, use the
+   troubleshooting checks and CLI. Do
+   not copy any supplied token into a bookmark, local storage, log, or support transcript.
 5. Create one profile, store its password, run non-writing Doctor, and review Plan. Profile/secret
    saves wait for a terminal controller result; Doctor and Plan remain asynchronous. Run remains
    additive/update-only unless deletion is independently approved at every required layer.
@@ -125,13 +129,14 @@ credentials, state, locks, and logs while leaving both NAS data trees untouched.
 
 ## Evidence boundary
 
-The native application, fixed desktop-alert I18N text, icons, permission contract, request schema,
-queue, and manager behavior are covered by repository tests. Rendered browser QA could not be completed because
-no browser runtime was available in the test environment. Treat layout on real DSM iframe/window
-sizes, DSM 7 AppLaunch `SynoToken` delivery, Package Center install/start/open behavior, DSM desktop
-delivery through `synodsmnotify`, and the complete two-NAS data path as live acceptance
-work—not as proven behavior. The SPK does not acquire `sysnotify` or register Notification Center
-email, SMS, mobile, CMS, or rule/channel delivery.
+The packaged web application, fixed desktop-alert I18N text, icons, permission contract, request
+schema, queue, and manager behavior are covered by repository tests. Rendered browser QA could not
+be completed because no browser runtime was available in the test environment. Treat layout in real
+DSM pop-up sizes, package-user `authenticate.cgi` execution, request-marker CGI forwarding,
+optional AppLaunch-token behavior,
+Package Center install/start/open behavior, DSM desktop delivery through `synodsmnotify`, and the
+complete two-NAS data path as live acceptance work—not as proven behavior. The SPK does not acquire
+`sysnotify` or register Notification Center email, SMS, mobile, CMS, or rule/channel delivery.
 
 Official framework references:
 

@@ -185,6 +185,7 @@ legend { padding: 0 7px; color: var(--text); font-size: 12px; font-weight: 760; 
 .credential-state { color: var(--faint); font-size: 10px; }
 .field-note { margin: 0; color: var(--muted); font-size: 11px; }
 .form-actions { display: flex; align-items: center; gap: 9px; margin-top: 20px; }
+.settings-actions { justify-content: flex-end; }
 .action-spacer { flex: 1; }
 .advanced-panel { margin: 20px 0; border: 1px solid var(--border); border-radius: 12px; background: color-mix(in srgb, var(--surface-soft) 58%, transparent); }
 .advanced-panel summary { padding: 15px 16px; cursor: pointer; color: var(--text); }

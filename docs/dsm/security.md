@@ -51,22 +51,28 @@ The validator enforces the exact two-key manifest above, rejects any archive set
 member or privilege-bearing tool/capability declaration, and rejects mode, ownership, identity, or
 byte mismatches between the two helper copies.
 
-## Launch token and referrer handling
+## DSM session, optional launch token, and referrer handling
 
-The application reads `SynoToken` only from its DSM launch URL. It accepts a non-empty value up to
-1,024 bytes with no ASCII whitespace or control characters, removes the parameter from the visible
-URL immediately, keeps it in memory, and sends it as `X-SYNO-TOKEN` on same-origin API requests.
+The DSM session cookie is the authoritative browser authentication input. JavaScript never reads
+that cookie; `credentials: "same-origin"` lets the browser attach it to the packaged `api.cgi`
+request, and the server validates it with DSM's `authenticate.cgi` before authorizing any action.
+
+A `SynoToken` supplied by DSM is an optional session-binding input. DSM does not guarantee that a
+`type=url` launch will append one. If DSM supplies one in the launch URL, the application accepts a non-empty value up
+to 1,024 bytes with no ASCII whitespace or control characters, removes the parameter from the
+visible URL immediately, keeps it in memory, and sends it as `X-SYNO-TOKEN` on same-origin API
+requests. If it is absent, the header is omitted and cookie authentication continues. An explicitly
+supplied empty, malformed, or mismatched header/query token is rejected rather than downgraded.
 
 A `no-referrer` meta policy appears before icons, CSS, or scripts so the initial token-bearing URL is
 not sent as a Referer while the local application loads. The token is never written to local storage,
 logs, a bookmark, Activity, or a profile.
 
 Synology's DSM 7 [application authentication guide](https://help.synology.com/developer-guide/integrate_dsm/web_authentication.html)
-documents the DSM cookie and `authenticate.cgi`, but it does not document a DSM 7 JavaScript API for
-retrieving SynoToken. This application does not call a login endpoint or depend on undocumented
-browser globals. It fails closed when AppLaunch does not provide the token. Whether current DSM 7
-AppLaunch supplies it to this third-party `dsmuidir` application remains a physical-NAS acceptance
-gap.
+documents cookie validation through `authenticate.cgi`; it does not document a DSM 7 JavaScript API
+for retrieving SynoToken. This application therefore does not call an undocumented login endpoint
+or depend on DSM browser globals. Physical-NAS acceptance must still prove that the package-user API
+service can execute `authenticate.cgi` with the bounded relayed CGI environment.
 
 ## Authentication and authorization sequence
 
@@ -79,7 +85,8 @@ Every API request goes through these checks:
 3. It clears its environment and sends one length-bounded frame to the fixed `package:http` `0660`
    socket after validating the socket and server peer identity.
 4. The package-user server validates the CGI peer UID, decodes one strict relay schema, and repeats
-   method, query, header, body, cookie, and SynoToken validation.
+   method, query, header, body, cookie, request-marker, and optional session-binding `SynoToken`
+   validation.
 5. The server executes DSM's root-owned
    `/usr/syno/synoman/webman/modules/authenticate.cgi` as the package user with only the bounded
    authentication environment DSM expects.
@@ -94,12 +101,12 @@ independent administrator check even when a caller reaches the CGI URL or socket
 
 ## Independent package CSRF
 
-DSM authentication and SynoToken are necessary but not sufficient for POST. An authenticated GET
-to `action=csrf` returns a five-minute HMAC-SHA256 token bound to:
+DSM cookie authentication is necessary but not sufficient for POST. An authenticated GET to
+`action=csrf` returns a five-minute HMAC-SHA256 token bound to:
 
 - authenticated username and UID;
 - current DSM cookie;
-- current SynoToken;
+- the presence and value of the current optional session-binding `SynoToken`;
 - issue and expiry times; and
 - a random nonce.
 
@@ -113,14 +120,17 @@ Allowed authenticated GET actions are:
 
 | Action | Exact query fields |
 | --- | --- |
-| `csrf` | none beyond action/SynoToken |
-| `snapshot` | none beyond action/SynoToken |
+| `csrf` | none beyond `action` |
+| `snapshot` | none beyond `action` |
 | `logs` | `lines=1..1000`, optional fixed source `all`, `controller`, `scheduler`, or `sync` |
 | `activity` | `lines=1..1000` |
 | `result` | one 48-character lowercase hexadecimal server job ID |
 
-GET rejects a request body, content type, CSRF header, duplicate/unknown query key, invalid transfer
-encoding, or unsupported action.
+Every GET may additionally carry one validated optional session-binding `SynoToken`; the packaged
+browser uses the header form when one was supplied at launch. GET rejects a request body, content type, CSRF header,
+duplicate/unknown query key, invalid transfer encoding, or unsupported action. Every browser API
+request also requires the fixed custom marker `X-SDSYNC-Request: 1`; the package emits no CORS
+permission that would let a foreign origin manufacture that header.
 
 POST accepts only `application/json` with a canonical content length up to 64 KiB and no query
 parameters. Its flat envelope is:
@@ -219,6 +229,7 @@ Repository tests cover parsing, CGI/service identity predicates, Unix-socket own
 checks, admin membership, CSRF binding, schema rejection, queue paths/modes/order, redaction,
 response bounds, static CSP, direct fixed notifier arguments, and SPK privilege/resource layout.
 They do not prove the actual DSM `http` identity/group database, package-identity execution of
-`authenticate.cgi` or `synodsmnotify`, AppLaunch token delivery, or reverse-proxy/origin
+`authenticate.cgi` or `synodsmnotify`, DSM forwarding of `X-SDSYNC-Request: 1` as
+`HTTP_X_SDSYNC_REQUEST=1`, optional AppLaunch-token behavior, or reverse-proxy/origin
 behavior of a physical DSM release. Validate those on every supported DSM branch before calling the
 dashboard production-ready.

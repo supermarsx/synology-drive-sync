@@ -30,7 +30,8 @@ capability declaration.
 
 `INFO` registers `dsmuidir="ui"` and
 `dsmappname="com.supermarsx.SynologyDriveSync"`. The matching `.url` application remains DSM's
-documented `type=url` native pop-up, but uses the unambiguous root-absolute entry point
+documented `type=url` web pop-up—not a native `type=app`/Vue `AppWindow`—and uses the unambiguous
+root-absolute entry point
 `/webman/3rdparty/synology-drive-sync/index.html`. The validator derives the installed payload member
 from that route and requires it to be the regular `ui/index.html` file at mode `0644`; the page's
 same-directory `./api.cgi` URL then maps to packaged `ui/api.cgi` at mode `0755`.

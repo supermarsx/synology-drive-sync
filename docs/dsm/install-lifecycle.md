@@ -55,15 +55,13 @@ uninstall permanently purges package-private operational state and requires conf
 
 Use the DSM desktop application menu or Package Center's **Open** action. The application is
 registered for administrators only. A healthy open sequence requires the DSM session cookie,
-administrator membership, and a `SynoToken` delivered with the launch URL. An ordinary `0755` CGI
-running as DSM `http` relays the bounded request through the fixed package:`http` `0660` Unix socket.
-The package-user API service revalidates the request, invokes `authenticate.cgi`, independently
-checks administrator membership, and then issues its own short-lived, session-bound CSRF token.
-
-DSM 7 AppLaunch forwarding of that SynoToken has not yet been proven on physical hardware. If the
-page reports a missing launch token, do not paste a token into the URL, a bookmark, browser storage,
-or a support transcript. Continue through the [CLI path](cli-parity.md) and record the behavior as a
-live acceptance failure.
+administrator membership, and a package CSRF token for mutation. An ordinary `0755` CGI running as
+DSM `http` relays the bounded request through the fixed package:`http` `0660` Unix socket. The
+package-user API service revalidates the request, invokes `authenticate.cgi` against the DSM cookie,
+independently checks administrator membership, and then issues its own short-lived, session-bound
+CSRF token. A valid `SynoToken` delivered with the launch URL is validated and used as an optional
+session-binding input; its absence is supported. Never paste one into a URL, bookmark, browser storage,
+or support transcript.
 
 ## Grant read-only access to each local source
 

@@ -51,7 +51,8 @@ Four DSM 7 packages are published separately from the GNU/Linux archives:
 | `i686` | `evansport` (DSM 7.0/7.1 only) | `i686-unknown-linux-musl` | `synology-drive-sync-YY.N-i686.spk` |
 
 Each corrected 26.7-or-later SPK, once published, contains one matching static ELF32 or ELF64 sync
-executable, a native administrator DSM dashboard, the `sdsync-dsm` CLI manager, ordinary CGI relay,
+executable, a DSM-integrated administrator web dashboard opened by its `type=url` entry, the
+`sdsync-dsm` CLI manager, ordinary CGI relay,
 package-user API service, controller/runner helpers, DSM lifecycle scripts, the minimal package/`http`
 `conf/privilege`, preloaded desktop-alert I18N text, icons, and license texts. It contains no
 `conf/resource` acquisition worker; fixed desktop alerts use direct `synodsmnotify -c` calls and do

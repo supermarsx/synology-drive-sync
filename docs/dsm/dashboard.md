@@ -6,7 +6,8 @@ loads no CDN scripts, fonts, images, analytics, or hosted search service.
 
 ## DSM Webman launch route
 
-The application remains a native DSM `type=url` pop-up. Its registered entry point is the canonical,
+The application is a packaged web application opened through DSM's documented `type=url` pop-up;
+it is not a native `type=app`/Vue `AppWindow`. Its registered entry point is the canonical,
 root-absolute path `/webman/3rdparty/synology-drive-sync/index.html`. `dsmuidir="ui"` tells DSM to
 create and own the corresponding
 `/usr/syno/synoman/webman/3rdparty/synology-drive-sync` link to the installed package's `ui`
@@ -20,11 +21,10 @@ If Package Center's **Open** action shows DSM's “page not found” response, u
 instead of hand-creating a link or changing ownership.
 
 > [!NOTE]
-> The first live request still depends on DSM launching the application with a valid `SynoToken`.
-> That forwarding behavior has not yet been observed on physical DSM 7 hardware. If the token is
-> absent, malformed, contains whitespace, or exceeds 1,024 bytes, the application removes any token
-> text from the visible URL, disables mutations, and reports a compatibility error. Use
-> [`sdsync-dsm`](cli-parity.md) instead of trying to manufacture or persist a token.
+> The first live request depends on the current DSM session cookie, which the browser sends only to
+> the same-origin packaged CGI. A launch `SynoToken` is an optional session-binding input: a valid
+> supplied value is scrubbed from the visible URL, kept only in memory, and forwarded; absence does not make
+> the dashboard read-only. Never manufacture, paste, bookmark, or persist one.
 
 ## Connection and read-only states
 
@@ -32,8 +32,8 @@ The footer distinguishes these states:
 
 - **Authenticated control service** means the ordinary DSM `http` CGI reached the package-user API
   service over its fixed private socket, the current session passed authentication, administrator
-  membership, SynoToken, and CSRF bootstrap checks, and the snapshot explicitly grants mutation
-  capabilities.
+  membership, optional-token validation when applicable, and CSRF bootstrap checks, and the
+  snapshot explicitly grants mutation capabilities.
 - **Package status · read-only** means a snapshot was available but one or more mutation
   capabilities were not granted. Buttons that could change package state remain disabled.
 - **Status unavailable** means snapshot refresh failed. Existing values may be stale; the interface

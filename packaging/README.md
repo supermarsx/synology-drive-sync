@@ -8,7 +8,7 @@ configuration, credentials, state, and logs after a confirmation.
 
 | Deployment | Identity and credentials | Non-overlap boundary | Authoritative diagnostics |
 | --- | --- | --- | --- |
-| DSM 7 SPK | actual DSM package identity discovered from package-home ownership; package-owned `0600` password/TOTP/token files | one package run lock across dashboard, manual, and scheduled jobs on that NAS | native dashboard, `sdsync-dsm status`, bounded package logs, and exit status |
+| DSM 7 SPK | actual DSM package identity discovered from package-home ownership; package-owned `0600` password/TOTP/token files | one package run lock across dashboard, manual, and scheduled jobs on that NAS | DSM-integrated web dashboard, `sdsync-dsm status`, bounded package logs, and exit status |
 | systemd | dedicated `sdsync` user; `LoadCredential` files | shared packaged `flock` path across related units on one host | journald plus exit status |
 | launchd | logged-in user; login Keychain | one launchd label only | rotating JSON file plus unified-log fallback |
 | Task Scheduler | current interactive user; Credential Manager | one task name (`IgnoreNew`) only | rotating JSON file plus `LastTaskResult` |
@@ -76,16 +76,18 @@ The package controller provides per-profile interval/daily/realtime routines, na
 fallback, dependencies, bounded retry/backoff, a legacy global interval schedule, cooperative
 start/stop, one run lock, state, bounded logs, and fixed DSM notifications. Package Center lifecycle
 also controls the package-user API service. The dashboard uses DSM cookie authentication, an
-independent administrator check, SynoToken, package CSRF, and a private controller queue; stored
-secrets are never returned. Deletion requires profile and action-level approval. Upgrade retains
+independent administrator check, an optional `SynoToken` session-binding input, mandatory package
+CSRF, and a private controller queue; stored secrets are never returned. Deletion requires profile and
+action-level approval. Upgrade retains
 private configuration and credentials and validates them; uninstall removes package-owned
 configuration, credentials, state, locks, socket, and logs while leaving both NAS data trees untouched.
 
 See the [complete DSM package and dashboard guide](../docs/synology-package.md) for exact install,
 ACL, graphical configuration, secret, diagnostic, routine, security, CLI, upgrade, and acceptance
 behavior. The package has static/mock validation but no recorded physical installation or live
-two-NAS test. DSM 7 AppLaunch SynoToken forwarding and `authenticate.cgi` execution from the
-package-user API service also remain live acceptance gaps.
+two-NAS test. Package-user `authenticate.cgi` execution, browser request-marker forwarding to CGI
+`HTTP_X_SDSYNC_REQUEST=1`, and optional AppLaunch-token behavior also remain live acceptance checks;
+token absence is supported.
 
 ## Verified binary installer lifecycle
 

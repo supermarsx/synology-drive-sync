@@ -60,6 +60,7 @@ const CGI_ORIGIN_VARIABLES: &[&str] = &[
     "CONTENT_LENGTH",
     "CONTENT_TYPE",
     "HTTP_COOKIE",
+    "HTTP_X_SDSYNC_REQUEST",
     "HTTP_X_SYNO_TOKEN",
     "HTTP_X_SDSYNC_CSRF",
     "HTTP_TRANSFER_ENCODING",
@@ -196,6 +197,7 @@ struct CgiEnvironment {
     content_type: Option<String>,
     query: Zeroizing<String>,
     cookie: Zeroizing<String>,
+    request_marker: Option<String>,
     synology_token_header: Option<Zeroizing<String>>,
     csrf_header: Option<Zeroizing<String>>,
     remote_address: Option<String>,
@@ -250,7 +252,7 @@ struct AuthenticationInputs {
     method: String,
     query: Zeroizing<String>,
     cookie: Zeroizing<String>,
-    synology_token: Zeroizing<String>,
+    synology_token: Option<Zeroizing<String>>,
     remote_address: Option<String>,
     server_address: Option<String>,
     server_name: Option<String>,
@@ -266,6 +268,7 @@ struct RelayRequestRef<'a> {
     content_type: Option<&'a str>,
     query: &'a str,
     cookie: &'a str,
+    request_marker: Option<&'a str>,
     synology_token_header: Option<&'a str>,
     csrf_header: Option<&'a str>,
     remote_address: Option<&'a str>,
@@ -286,6 +289,7 @@ struct RelayRequest {
     content_type: Option<String>,
     query: String,
     cookie: String,
+    request_marker: Option<String>,
     synology_token_header: Option<String>,
     csrf_header: Option<String>,
     remote_address: Option<String>,
@@ -305,6 +309,7 @@ impl RelayRequest {
             content_type: self.content_type.clone(),
             query: Zeroizing::new(self.query.clone()),
             cookie: Zeroizing::new(self.cookie.clone()),
+            request_marker: self.request_marker.clone(),
             synology_token_header: self
                 .synology_token_header
                 .as_ref()
@@ -328,6 +333,7 @@ impl RelayRequest {
         validate_optional_environment_value(self.content_type.as_deref(), 128)?;
         validate_environment_value(&self.query, MAX_QUERY_BYTES)?;
         validate_environment_value(&self.cookie, MAX_COOKIE_BYTES)?;
+        validate_optional_environment_value(self.request_marker.as_deref(), 8)?;
         validate_optional_environment_value(
             self.synology_token_header.as_deref(),
             MAX_TOKEN_BYTES,
@@ -358,6 +364,7 @@ impl Drop for RelayRequest {
         self.content_type.zeroize();
         self.query.zeroize();
         self.cookie.zeroize();
+        self.request_marker.zeroize();
         self.synology_token_header.zeroize();
         self.csrf_header.zeroize();
         self.remote_address.zeroize();
@@ -400,6 +407,7 @@ fn encode_relay_request(
         content_type: environment.content_type.as_deref(),
         query: &environment.query,
         cookie: &environment.cookie,
+        request_marker: environment.request_marker.as_deref(),
         synology_token_header: environment
             .synology_token_header
             .as_ref()
@@ -873,6 +881,7 @@ fn process_environment() -> BridgeResult<CgiEnvironment> {
         content_type: optional("CONTENT_TYPE", 128)?,
         query: Zeroizing::new(optional("QUERY_STRING", MAX_QUERY_BYTES)?.unwrap_or_default()),
         cookie: Zeroizing::new(required("HTTP_COOKIE", MAX_COOKIE_BYTES)?),
+        request_marker: optional("HTTP_X_SDSYNC_REQUEST", 8)?,
         synology_token_header: optional("HTTP_X_SYNO_TOKEN", MAX_TOKEN_BYTES)?.map(Zeroizing::new),
         csrf_header: optional("HTTP_X_SDSYNC_CSRF", MAX_CSRF_BYTES)?.map(Zeroizing::new),
         remote_address: optional("REMOTE_ADDR", 128)?,
@@ -902,6 +911,9 @@ fn validate_optional_environment_value(value: Option<&str>, maximum: usize) -> B
 fn validate_http_request(mut environment: CgiEnvironment) -> BridgeResult<ValidatedHttpRequest> {
     if environment.transfer_encoding.is_some() {
         return Err(BridgeError::bad_request());
+    }
+    if environment.request_marker.as_deref() != Some("1") {
+        return Err(BridgeError::new(ErrorKind::Forbidden));
     }
     if environment.cookie.is_empty() {
         return Err(BridgeError::new(ErrorKind::Unauthorized));
@@ -966,7 +978,7 @@ fn validate_http_request(mut environment: CgiEnvironment) -> BridgeResult<Valida
 fn choose_synology_token(
     header: Option<Zeroizing<String>>,
     query: Option<Zeroizing<String>>,
-) -> BridgeResult<Zeroizing<String>> {
+) -> BridgeResult<Option<Zeroizing<String>>> {
     let selected = match (header, query) {
         (Some(header), Some(query)) => {
             if !constant_time_equal(header.as_bytes(), query.as_bytes()) {
@@ -976,7 +988,7 @@ fn choose_synology_token(
         }
         (Some(header), None) => header,
         (None, Some(query)) => query,
-        (None, None) => return Err(BridgeError::new(ErrorKind::Forbidden)),
+        (None, None) => return Ok(None),
     };
     if selected.is_empty()
         || selected.len() > MAX_TOKEN_BYTES
@@ -986,7 +998,7 @@ fn choose_synology_token(
     {
         return Err(BridgeError::new(ErrorKind::Forbidden));
     }
-    Ok(selected)
+    Ok(Some(selected))
 }
 
 fn parse_content_length(value: Option<&str>) -> BridgeResult<usize> {
@@ -1659,11 +1671,13 @@ fn authentication_command_environment(inputs: &AuthenticationInputs) -> Vec<(OsS
             OsString::from("HTTP_COOKIE"),
             OsString::from(inputs.cookie.as_str()),
         ),
-        (
-            OsString::from("HTTP_X_SYNO_TOKEN"),
-            OsString::from(inputs.synology_token.as_str()),
-        ),
     ];
+    if let Some(synology_token) = &inputs.synology_token {
+        variables.push((
+            OsString::from("HTTP_X_SYNO_TOKEN"),
+            OsString::from(synology_token.as_str()),
+        ));
+    }
     for (name, value) in [
         ("REMOTE_ADDR", inputs.remote_address.as_ref()),
         ("SERVER_ADDR", inputs.server_address.as_ref()),
@@ -1702,13 +1716,21 @@ fn manager_command_environment() -> Vec<(OsString, OsString)> {
     ]
 }
 
-fn session_binding(username: &str, uid: u32, cookie: &str, synology_token: &str) -> [u8; 32] {
+fn session_binding(
+    username: &str,
+    uid: u32,
+    cookie: &str,
+    synology_token: Option<&str>,
+) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"sdsync-dsm-session-v1\0");
     update_length_prefixed(&mut digest, username.as_bytes());
     digest.update(uid.to_be_bytes());
     update_length_prefixed(&mut digest, cookie.as_bytes());
-    update_length_prefixed(&mut digest, synology_token.as_bytes());
+    // An absent launch token occupies the otherwise-invalid empty-token slot.
+    // This preserves the v1 binding for every previously valid non-empty token
+    // while keeping cookie-only and token-authenticated sessions distinct.
+    update_length_prefixed(&mut digest, synology_token.unwrap_or_default().as_bytes());
     digest.finalize().into()
 }
 
@@ -1853,7 +1875,12 @@ mod linux_runtime {
         let administrator_gid = lookup_group(ADMINISTRATORS_GROUP)?;
         let groups = lookup_groups(&username, primary_gid)?;
         authorize_admin_membership(uid, primary_gid, administrator_gid, &groups)?;
-        let binding = session_binding(&username, uid, &inputs.cookie, &inputs.synology_token);
+        let binding = session_binding(
+            &username,
+            uid,
+            &inputs.cookie,
+            inputs.synology_token.as_ref().map(|value| value.as_str()),
+        );
         Ok(AuthenticatedSession { username, binding })
     }
 
@@ -4748,6 +4775,7 @@ mod tests {
             content_type: None,
             query: Zeroizing::new(query.to_owned()),
             cookie: Zeroizing::new("id=authenticated-session".to_owned()),
+            request_marker: Some("1".to_owned()),
             synology_token_header: None,
             csrf_header: None,
             remote_address: Some("192.0.2.8".to_owned()),
@@ -5698,13 +5726,19 @@ mod tests {
     }
 
     #[test]
-    fn synology_token_is_required_and_duplicate_sources_must_match() {
-        assert_eq!(
-            validate_http_request(environment("GET", "action=snapshot"))
-                .unwrap_err()
-                .kind,
-            ErrorKind::Forbidden
-        );
+    fn synology_token_is_optional_but_present_sources_remain_strict() {
+        let cookie_only = validate_http_request(environment("GET", "action=snapshot")).unwrap();
+        assert!(matches!(
+            cookie_only,
+            ValidatedHttpRequest::Get {
+                authentication: AuthenticationInputs {
+                    synology_token: None,
+                    ..
+                },
+                ..
+            }
+        ));
+
         let mut matching = environment("GET", "action=snapshot&SynoToken=token");
         matching.synology_token_header = Some(Zeroizing::new("token".to_owned()));
         assert!(validate_http_request(matching).is_ok());
@@ -5713,6 +5747,42 @@ mod tests {
         mismatch.synology_token_header = Some(Zeroizing::new("token-b".to_owned()));
         assert_eq!(
             validate_http_request(mismatch).unwrap_err().kind,
+            ErrorKind::Forbidden
+        );
+
+        for invalid in ["", "contains space", "line\nbreak"] {
+            let mut request = environment("GET", "action=snapshot");
+            request.synology_token_header = Some(Zeroizing::new(invalid.to_owned()));
+            assert_eq!(
+                validate_http_request(request).unwrap_err().kind,
+                ErrorKind::Forbidden
+            );
+        }
+        assert_eq!(
+            validate_http_request(environment("GET", "action=snapshot&SynoToken="))
+                .unwrap_err()
+                .kind,
+            ErrorKind::Forbidden
+        );
+    }
+
+    #[test]
+    fn browser_request_marker_is_required_exact_and_revalidated_after_relay() {
+        for marker in [None, Some(""), Some("0"), Some("true"), Some("1 ")] {
+            let mut request = environment("GET", "action=snapshot");
+            request.request_marker = marker.map(str::to_owned);
+            assert_eq!(
+                validate_http_request(request).unwrap_err().kind,
+                ErrorKind::Forbidden
+            );
+        }
+
+        let environment = environment("GET", "action=snapshot");
+        let encoded = encode_relay_request(&environment, None).unwrap();
+        let mut relay = decode_relay_request(&encoded).unwrap();
+        relay.request_marker = Some("0".to_owned());
+        assert_eq!(
+            validate_relay_http_request(&relay).unwrap_err().kind,
             ErrorKind::Forbidden
         );
     }
@@ -6039,21 +6109,37 @@ mod tests {
 
     #[test]
     fn child_environments_are_allowlists_without_request_secrets_for_manager() {
-        let request =
-            validate_http_request(environment("GET", "action=snapshot&SynoToken=dsm-token"))
-                .unwrap();
-        let authentication = match request {
+        let cookie_request = validate_http_request(environment("GET", "action=snapshot")).unwrap();
+        let cookie_authentication = match cookie_request {
             ValidatedHttpRequest::Get { authentication, .. } => authentication,
             _ => unreachable!(),
         };
-        let auth_names = authentication_command_environment(&authentication)
+        let cookie_auth_names = authentication_command_environment(&cookie_authentication)
             .into_iter()
             .map(|(name, _)| name.into_string().unwrap())
             .collect::<BTreeSet<_>>();
-        assert!(auth_names.contains("HTTP_COOKIE"));
-        assert!(auth_names.contains("HTTP_X_SYNO_TOKEN"));
-        assert!(!auth_names.contains("LD_PRELOAD"));
-        assert!(!auth_names.contains("HTTP_X_SDSYNC_CSRF"));
+        assert!(cookie_auth_names.contains("HTTP_COOKIE"));
+        assert!(!cookie_auth_names.contains("HTTP_X_SYNO_TOKEN"));
+        assert!(!cookie_auth_names.contains("HTTP_X_SDSYNC_REQUEST"));
+        assert!(!cookie_auth_names.contains("LD_PRELOAD"));
+        assert!(!cookie_auth_names.contains("HTTP_X_SDSYNC_CSRF"));
+
+        let token_request =
+            validate_http_request(environment("GET", "action=snapshot&SynoToken=dsm-token"))
+                .unwrap();
+        let token_authentication = match token_request {
+            ValidatedHttpRequest::Get { authentication, .. } => authentication,
+            _ => unreachable!(),
+        };
+        let token_auth_names = authentication_command_environment(&token_authentication)
+            .into_iter()
+            .map(|(name, _)| name.into_string().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert!(token_auth_names.contains("HTTP_COOKIE"));
+        assert!(token_auth_names.contains("HTTP_X_SYNO_TOKEN"));
+        assert!(!token_auth_names.contains("HTTP_X_SDSYNC_REQUEST"));
+        assert!(!token_auth_names.contains("LD_PRELOAD"));
+        assert!(!token_auth_names.contains("HTTP_X_SDSYNC_CSRF"));
 
         let manager_names = manager_command_environment()
             .into_iter()
@@ -6068,8 +6154,22 @@ mod tests {
     #[test]
     fn csrf_is_session_bound_short_lived_and_tamper_evident() {
         let key = [7_u8; 32];
-        let first = session_binding("admin", 1000, "id=session-a", "token-a");
-        let second = session_binding("admin", 1000, "id=session-b", "token-a");
+        let first = session_binding("admin", 1000, "id=session-a", Some("token-a"));
+        let second = session_binding("admin", 1000, "id=session-b", Some("token-a"));
+        let cookie_only = session_binding("admin", 1000, "id=session-a", None);
+        assert_ne!(first, cookie_only);
+        assert_eq!(
+            hex_encode(&first),
+            "3f4ccb5350a9e97bcd1cf2decc083b780c7518f1b1fa8e2426b859bc2233937b"
+        );
+        let cookie_token = issue_csrf_token(&key, &cookie_only, 10_000, &[8_u8; 16]).unwrap();
+        assert!(verify_csrf_token(&cookie_token, &key, &cookie_only, 10_001).is_ok());
+        assert_eq!(
+            verify_csrf_token(&cookie_token, &key, &first, 10_001)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Forbidden
+        );
         let token = issue_csrf_token(&key, &first, 10_000, &[9_u8; 16]).unwrap();
         assert!(verify_csrf_token(&token, &key, &first, 10_001).is_ok());
         assert_eq!(

@@ -92,6 +92,9 @@ program-header layout, static linkage, and executable load segments for both the
 The validator also binds the filename, `INFO` version/architecture, DSM floor/ceiling, privileges,
 dashboard resources, notification texts, deterministic icons, licenses, archive paths, and modes.
 
-These checks do not prove that Synology accepts the SPK on a particular physical model or that DSM
-AppLaunch supplies the token required by the dashboard. Record those separately during
-[live-NAS acceptance](troubleshooting.md#live-nas-acceptance).
+These checks do not prove that Synology accepts the SPK on a particular physical model, that the
+package-user service can execute DSM's cookie authenticator, that DSM forwards the browser request
+marker as `HTTP_X_SDSYNC_REQUEST=1`, or how the DSM pop-up renders on that release. Record those
+separately during
+[live-NAS acceptance](troubleshooting.md#live-nas-acceptance). AppLaunch may optionally supply a
+`SynoToken` as a session-binding input, but the dashboard does not require one.

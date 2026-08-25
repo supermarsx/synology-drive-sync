@@ -51,9 +51,11 @@
     "action": Object.freeze(["allow_delete", "kind", "max_total_delete", "scope", "write_test"])
   });
 
+  const launchToken = consumeLaunchToken();
   const state = {
     snapshot: null,
-    synoToken: consumeLaunchToken(),
+    synoToken: launchToken.token,
+    launchTokenInvalid: launchToken.invalid,
     csrfToken: "",
     connected: false,
     selectedProfile: "",
@@ -71,13 +73,24 @@
 
   function consumeLaunchToken() {
     const url = new URL(window.location.href);
-    const hadTokenParameter = url.searchParams.has("SynoToken") || url.searchParams.has("synotoken");
-    const token = url.searchParams.get("SynoToken") || url.searchParams.get("synotoken") || "";
-    url.searchParams.delete("SynoToken");
-    url.searchParams.delete("synotoken");
-    if (hadTokenParameter) window.history.replaceState(null, "", url.pathname + (url.search ? url.search : "") + (url.hash ? url.hash : ""));
-    if (!token || token.length > 1024 || /\s|[\u0000-\u001f\u007f]/.test(token)) return "";
-    return token;
+    const entries = [];
+    const names = [];
+    url.searchParams.forEach(function (value, name) {
+      if (name.toLowerCase() === "synotoken") {
+        entries.push({ name: name, value: value });
+        if (!names.includes(name)) names.push(name);
+      }
+    });
+    names.forEach(function (name) { url.searchParams.delete(name); });
+    if (entries.length) window.history.replaceState(null, "", url.pathname + (url.search ? url.search : "") + (url.hash ? url.hash : ""));
+    if (!entries.length) return { token: "", invalid: false };
+    const entry = entries[0];
+    const supportedName = entry.name === "SynoToken" || entry.name === "synotoken";
+    const token = entry.value;
+    if (entries.length !== 1 || !supportedName || !token || token.length > 1024 || /\s|[\u0000-\u001f\u007f]/.test(token)) {
+      return { token: "", invalid: true };
+    }
+    return { token: token, invalid: false };
   }
 
   function one(selector, root) {
@@ -275,6 +288,13 @@
     return url.href;
   }
 
+  function authenticatedHeaders(headers) {
+    if (state.launchTokenInvalid) throw new Error("DSM supplied an invalid launch token; reopen the app from the DSM desktop");
+    const authenticated = Object.assign({}, headers, { "X-SDSYNC-Request": "1" });
+    if (state.synoToken) authenticated["X-SYNO-TOKEN"] = state.synoToken;
+    return authenticated;
+  }
+
   async function apiGet(action, parameters) {
     if (!GET_ACTIONS.includes(action)) throw new Error("Unsupported API read action");
     const expectedKeys = GET_ARGUMENT_KEYS[action];
@@ -282,13 +302,12 @@
     if (!expectedKeys || actualKeys.length !== expectedKeys.length || actualKeys.some(function (key, index) { return key !== expectedKeys[index]; })) {
       throw new Error("Read arguments do not match the reviewed bridge contract");
     }
-    if (!state.synoToken) throw new Error("DSM launch token is unavailable; reopen the app from the DSM desktop");
     const response = await fetch(endpoint(action, parameters), {
       method: "GET",
       credentials: "same-origin",
       cache: "no-store",
       redirect: "error",
-      headers: { "Accept": "application/json", "X-SDSYNC-Request": "1", "X-SYNO-TOKEN": state.synoToken }
+      headers: authenticatedHeaders({ "Accept": "application/json" })
     });
     return responseJson(response, action === "result");
   }
@@ -346,13 +365,11 @@
       credentials: "same-origin",
       cache: "no-store",
       redirect: "error",
-      headers: {
+      headers: authenticatedHeaders({
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "X-SDSYNC-Request": "1",
-        "X-SYNO-TOKEN": state.synoToken,
         "X-SDSYNC-CSRF": state.csrfToken
-      },
+      }),
       body: request
     });
     const queued = await responseJson(response);
@@ -1286,8 +1303,8 @@
     try {
       await refreshCsrf();
     } catch (error) {
-      setConnected(false, "DSM launch authentication unavailable");
-      toast("Read-only launch", boundedText(error.message, "Reopen this app from the DSM desktop."), true);
+      setConnected(false, "DSM session authentication unavailable");
+      toast("Control bridge unavailable", boundedText(error.message, "Sign in to DSM again, then reopen this app."), true);
     }
     refreshSnapshot(false);
   }

@@ -371,6 +371,36 @@ def validate_ui_static(index_payload: bytes, css_payload: bytes, script_payload:
     for forbidden in ("eval(", "new Function(", ".innerHTML", "insertAdjacentHTML", "document.write("):
         if forbidden in script:
             raise ValidationError(f"DSM UI script contains forbidden DOM construct {forbidden}")
+    headers_start = script.find("  function authenticatedHeaders(")
+    headers_end = script.find("\n  async function apiGet(", headers_start)
+    if headers_start < 0 or headers_end < 0:
+        raise ValidationError("DSM UI script is missing the authenticated-header bridge")
+    authenticated_headers = script[headers_start:headers_end]
+    marker_names = re.findall(r'["\']X-SDSYNC-Request["\']', script)
+    marker_values = re.findall(
+        r'const\s+authenticated\s*=\s*Object\.assign\(\s*\{\s*\}\s*,\s*headers\s*,\s*\{\s*'
+        r'["\']X-SDSYNC-Request["\']\s*:\s*["\']([^"\']*)["\']\s*\}\s*\)\s*;',
+        authenticated_headers,
+    )
+    if (
+        len(marker_names) != 1
+        or marker_values != ["1"]
+        or authenticated_headers.count("return authenticated;") != 1
+    ):
+        raise ValidationError("DSM UI must emit exactly one X-SDSYNC-Request header with value 1")
+    for method, start_marker, end_marker in (
+        ("GET", "  async function apiGet(", "\n  function canMutate("),
+        ("POST", "  async function apiPost(", "\n  function setConnected("),
+    ):
+        request_start = script.find(start_marker)
+        request_end = script.find(end_marker, request_start)
+        if request_start < 0 or request_end < 0:
+            raise ValidationError(f"DSM UI script is missing the {method} request bridge")
+        request_source = script[request_start:request_end]
+        if len(re.findall(r"\bheaders\s*:\s*authenticatedHeaders\s*\(", request_source)) != 1:
+            raise ValidationError(
+                f"DSM UI {method} requests must emit X-SDSYNC-Request through authenticatedHeaders"
+            )
     for required in (
         "X-SYNO-TOKEN", "X-SDSYNC-CSRF", "crypto.getRandomValues",
         "request_id", "operation: action", "arguments: payload",

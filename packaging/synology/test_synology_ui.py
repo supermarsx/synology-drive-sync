@@ -83,6 +83,31 @@ class DsmUiContractTests(unittest.TestCase):
         self.assertNotIn("eval(", script)
         validate_spk.validate_ui_static(index.encode(), css.encode(), script.encode())
 
+    def test_settings_save_action_has_responsive_panel_spacing(self) -> None:
+        index = (UI / "index.html").read_text(encoding="utf-8")
+        css = (UI / "app.css").read_text(encoding="utf-8")
+        settings = re.search(
+            r'<form class="panel" data-settings-form>(.*?)</form>',
+            index,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(settings)
+        self.assertRegex(
+            settings.group(1),  # type: ignore[union-attr]
+            r'<div class="form-actions settings-actions">\s*'
+            r'<button class="button primary" type="submit">'
+            r'Save interface settings</button>\s*</div>',
+        )
+        self.assertRegex(
+            css,
+            r"\.form-actions\s*\{[^}]*margin-top:\s*20px;[^}]*\}",
+        )
+        self.assertRegex(
+            css,
+            r"\.settings-actions\s*\{[^}]*justify-content:\s*flex-end;[^}]*\}",
+        )
+        self.assertIn("  .form-actions { flex-wrap: wrap; }", css)
+
     def test_advanced_profile_and_secret_semantics_are_explicit(self) -> None:
         index = (UI / "index.html").read_text(encoding="utf-8")
         script = (UI / "app.js").read_text(encoding="utf-8")
@@ -150,7 +175,7 @@ class DsmUiContractTests(unittest.TestCase):
         self.assertEqual(actual, expected)
         for marker in (
             "crypto.getRandomValues(random)", "request_id: requestId", "operation: action",
-            "arguments: payload", '"X-SYNO-TOKEN": state.synoToken',
+            "arguments: payload", 'authenticated["X-SYNO-TOKEN"] = state.synoToken',
             '"X-SDSYNC-CSRF": state.csrfToken', "token.length > 1024",
             'result: Object.freeze(["job_id"])', 'const RESULT_STATUS_SCHEMA = "sdsync.dsm-result-status.v1"',
             "pollJobResult(queued.job_id)", "awaitTerminal === false",
@@ -161,6 +186,222 @@ class DsmUiContractTests(unittest.TestCase):
             self.assertIn(marker, script)
         self.assertRegex(script, r'apiPost\(ACTIONS\.execute,[\s\S]*?, false\)')
 
+    def test_launch_token_is_optional_for_same_origin_cookie_authentication(self) -> None:
+        script = (UI / "app.js").read_text(encoding="utf-8")
+        headers_function = script[
+            script.index("  function authenticatedHeaders(") : script.index(
+                "\n  async function apiGet("
+            )
+        ]
+        self.assertIn('{ "X-SDSYNC-Request": "1" }', headers_function)
+        self.assertLess(
+            headers_function.index("if (state.launchTokenInvalid)"),
+            headers_function.index('Object.assign({}, headers'),
+        )
+        self.assertIn("if (state.synoToken)", headers_function)
+        self.assertIn('authenticated["X-SYNO-TOKEN"] = state.synoToken', headers_function)
+        self.assertNotIn("login.cgi", script)
+        self.assertNotIn("DSM launch token is unavailable", script)
+        self.assertNotIn('toast("Read-only launch"', script)
+        self.assertEqual(script.count('credentials: "same-origin"'), 2)
+        self.assertEqual(script.count("headers: authenticatedHeaders("), 2)
+        self.assertLess(
+            script.index("names.forEach(function (name) { url.searchParams.delete(name); })"),
+            script.index("headers: authenticatedHeaders("),
+        )
+
+    def test_browser_authentication_behavior_and_request_headers(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not available")
+
+        script = (UI / "app.js").read_text(encoding="utf-8")
+
+        def source_between(start: str, end: str) -> str:
+            return script[script.index(start) : script.index(end, script.index(start))]
+
+        token_function = source_between("  function consumeLaunchToken()", "\n  function one(")
+        headers_function = source_between("  function authenticatedHeaders(", "\n  async function apiGet(")
+        get_function = source_between("  async function apiGet(", "\n  function canMutate(")
+        post_function = source_between("  async function apiPost(", "\n  function setConnected(")
+        harness = "\n".join(
+            (
+                '"use strict";',
+                token_function,
+                r'''
+function tokenCase(href) {
+  const replacements = [];
+  global.window = {
+    location: { href: href },
+    history: {
+      replaceState: function (_state, _title, value) { replacements.push(value); }
+    }
+  };
+  return { authentication: consumeLaunchToken(), replacements: replacements };
+}
+
+const base = "https://nas.example/webman/3rdparty/synology-drive-sync/index.html";
+const tokenCases = {
+  absent: tokenCase(base + "?keep=1#route"),
+  validUpper: tokenCase(base + "?SynoToken=abc123&keep=1#route"),
+  validLower: tokenCase(base + "?synotoken=abc123"),
+  duplicate: tokenCase(base + "?SynoToken=one&SynoToken=two"),
+  mixedCase: tokenCase(base + "?SynoToken=one&synotoken=one"),
+  incorrectCase: tokenCase(base + "?SYNOTOKEN=one"),
+  empty: tokenCase(base + "?SynoToken="),
+  malformedWhitespace: tokenCase(base + "?SynoToken=bad%20token"),
+  malformedControl: tokenCase(base + "?SynoToken=bad%00token"),
+  malformedOversized: tokenCase(base + "?SynoToken=" + "a".repeat(1025))
+};
+
+const state = { synoToken: "", launchTokenInvalid: false, csrfToken: "csrf-token" };
+''',
+                headers_function,
+                r'''
+const requests = [];
+const GET_ACTIONS = Object.freeze(["snapshot"]);
+const GET_ARGUMENT_KEYS = Object.freeze({ snapshot: Object.freeze([]) });
+const ARGUMENT_KEYS = Object.freeze({ action: Object.freeze([]) });
+const REQUEST_SCHEMA = "test-request.v1";
+const QUEUED_SCHEMA = "test-queued.v1";
+const API_URL = "https://nas.example/webman/3rdparty/synology-drive-sync/api.cgi";
+
+function endpoint(action) { return API_URL + "?action=" + encodeURIComponent(action); }
+function canMutate() { return true; }
+function pollJobResult() { throw new Error("unexpected terminal polling"); }
+async function responseJson(response) { return response.payload; }
+
+global.fetch = async function (url, options) {
+  requests.push({ url: url, options: options });
+  if (options.method === "POST") {
+    const request = JSON.parse(options.body);
+    return {
+      payload: {
+        schema: QUEUED_SCHEMA,
+        state: "queued",
+        request_id: request.request_id,
+        job_id: "0".repeat(48)
+      }
+    };
+  }
+  return { payload: { ok: true } };
+};
+global.window = {
+  crypto: {
+    getRandomValues: function (values) { values.fill(1); return values; }
+  }
+};
+''',
+                get_function,
+                post_function,
+                r'''
+(async function () {
+  state.synoToken = "";
+  await apiGet("snapshot");
+  const getAbsent = requests[requests.length - 1];
+
+  state.synoToken = "abc123";
+  await apiGet("snapshot");
+  const getToken = requests[requests.length - 1];
+
+  state.synoToken = "";
+  await apiPost("action", {}, false);
+  const postAbsent = requests[requests.length - 1];
+
+  state.synoToken = "abc123";
+  await apiPost("action", {}, false);
+  const postToken = requests[requests.length - 1];
+
+  const beforeInvalid = requests.length;
+  state.launchTokenInvalid = true;
+  const invalidErrors = [];
+  try { await apiGet("snapshot"); } catch (error) { invalidErrors.push(error.message); }
+  try { await apiPost("action", {}, false); } catch (error) { invalidErrors.push(error.message); }
+
+  process.stdout.write(JSON.stringify({
+    tokenCases: tokenCases,
+    getAbsent: getAbsent,
+    getToken: getToken,
+    postAbsent: postAbsent,
+    postToken: postToken,
+    invalidErrors: invalidErrors,
+    invalidFetches: requests.length - beforeInvalid
+  }));
+})().catch(function (error) {
+  process.stderr.write(String(error && error.stack ? error.stack : error));
+  process.exitCode = 1;
+});
+''',
+            )
+        )
+        completed = subprocess.run(
+            [node, "-"],
+            input=harness,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+
+        self.assertEqual(
+            result["tokenCases"]["absent"],
+            {
+                "authentication": {"token": "", "invalid": False},
+                "replacements": [],
+            },
+        )
+        for case in ("validUpper", "validLower"):
+            self.assertEqual(
+                result["tokenCases"][case]["authentication"],
+                {"token": "abc123", "invalid": False},
+            )
+        for case in (
+            "duplicate",
+            "mixedCase",
+            "incorrectCase",
+            "empty",
+            "malformedWhitespace",
+            "malformedControl",
+            "malformedOversized",
+        ):
+            self.assertEqual(
+                result["tokenCases"][case]["authentication"],
+                {"token": "", "invalid": True},
+            )
+        for case, model in result["tokenCases"].items():
+            if case == "absent":
+                continue
+            self.assertEqual(len(model["replacements"]), 1)
+            self.assertNotIn("synotoken", model["replacements"][0].lower())
+        self.assertEqual(
+            result["tokenCases"]["validUpper"]["replacements"],
+            ["/webman/3rdparty/synology-drive-sync/index.html?keep=1#route"],
+        )
+
+        for request in (result["getAbsent"], result["getToken"]):
+            self.assertEqual(request["options"]["method"], "GET")
+            self.assertEqual(request["options"]["credentials"], "same-origin")
+            self.assertEqual(request["options"]["headers"]["X-SDSYNC-Request"], "1")
+            self.assertEqual(request["options"]["headers"]["Accept"], "application/json")
+        self.assertNotIn("X-SYNO-TOKEN", result["getAbsent"]["options"]["headers"])
+        self.assertEqual(result["getToken"]["options"]["headers"]["X-SYNO-TOKEN"], "abc123")
+
+        for request in (result["postAbsent"], result["postToken"]):
+            self.assertEqual(request["options"]["method"], "POST")
+            self.assertEqual(request["options"]["credentials"], "same-origin")
+            self.assertEqual(request["options"]["headers"]["X-SDSYNC-Request"], "1")
+            self.assertEqual(request["options"]["headers"]["X-SDSYNC-CSRF"], "csrf-token")
+            self.assertEqual(request["options"]["headers"]["Content-Type"], "application/json")
+        self.assertNotIn("X-SYNO-TOKEN", result["postAbsent"]["options"]["headers"])
+        self.assertEqual(result["postToken"]["options"]["headers"]["X-SYNO-TOKEN"], "abc123")
+        self.assertEqual(result["invalidFetches"], 0)
+        self.assertEqual(len(result["invalidErrors"]), 2)
+        self.assertTrue(
+            all("invalid launch token" in message for message in result["invalidErrors"])
+        )
+
     def test_launch_token_run_details_and_zero_routine_values_are_preserved(self) -> None:
         index = (UI / "index.html").read_text(encoding="utf-8")
         script = (UI / "app.js").read_text(encoding="utf-8")
@@ -168,10 +409,13 @@ class DsmUiContractTests(unittest.TestCase):
         token_function = script[
             script.index("  function consumeLaunchToken()") : script.index("\n  function one(")
         ]
-        validation = token_function.index("if (!token || token.length > 1024")
-        self.assertLess(token_function.index('url.searchParams.delete("SynoToken")'), validation)
-        self.assertLess(token_function.index('url.searchParams.delete("synotoken")'), validation)
+        validation = token_function.index("if (entries.length !== 1")
+        self.assertLess(token_function.index("url.searchParams.delete(name)"), validation)
         self.assertLess(token_function.index("window.history.replaceState"), validation)
+        self.assertIn('name.toLowerCase() === "synotoken"', token_function)
+        self.assertIn('entry.name === "SynoToken" || entry.name === "synotoken"', token_function)
+        self.assertIn('return { token: "", invalid: false }', token_function)
+        self.assertIn('return { token: "", invalid: true }', token_function)
 
         details = re.search(r'<dl class="definition-grid" data-run-details>(.*?)</dl>', index, re.DOTALL)
         self.assertIsNotNone(details)
@@ -380,6 +624,28 @@ class DsmUiContractTests(unittest.TestCase):
             validate_spk.validate_ui_static(index, css, script + b'\nfetch("https://evil.invalid/");\n')
         with self.assertRaisesRegex(validate_spk.ValidationError, "persists password"):
             validate_spk.validate_ui_static(index, css, script + b'\nlocalStorage.setItem("password", "bad");\n')
+        with self.assertRaisesRegex(validate_spk.ValidationError, "X-SDSYNC-Request"):
+            validate_spk.validate_ui_static(
+                index,
+                css,
+                script.replace(b'"X-SDSYNC-Request": "1"', b'"X-SDSYNC-Request": "0"', 1),
+            )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "GET requests"):
+            validate_spk.validate_ui_static(
+                index,
+                css,
+                script.replace(b"headers: authenticatedHeaders({", b"headers: ({", 1),
+            )
+        post_call = script.rfind(b"headers: authenticatedHeaders({")
+        self.assertGreater(post_call, -1)
+        with self.assertRaisesRegex(validate_spk.ValidationError, "POST requests"):
+            validate_spk.validate_ui_static(
+                index,
+                css,
+                script[:post_call] + script[post_call:].replace(
+                    b"headers: authenticatedHeaders({", b"headers: ({", 1
+                ),
+            )
         with self.assertRaisesRegex(validate_spk.ValidationError, "result-status"):
             validate_spk.validate_ui_static(
                 index,

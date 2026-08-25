@@ -1,7 +1,7 @@
 # DSM 7 package
 
-This directory builds a manually installable Synology DSM 7 package with a native
-administrator-only desktop application and the `sdsync-dsm` SSH manager. Install it on the NAS that
+This directory builds a manually installable Synology DSM 7 package with a DSM-integrated
+administrator-only web dashboard and the `sdsync-dsm` SSH manager. Install it on the NAS that
 owns the authoritative source directory; the package reads that directory locally and sends changes
 over HTTPS to a destination accepted by the remote NAS File Station WebAPI.
 
@@ -97,9 +97,10 @@ The SPK contains the project license, generated third-party notices, and musl's 
    troubleshooting guide. Preserve `pkgmgr_worker_violation`, resource names, phases, and timestamps.
 2. Start the package. The package-user API service and controller start safely with scheduling
    disabled.
-3. Open **Synology Drive Sync** from the DSM desktop or Package Center. A fresh administrator launch
-   must supply DSM SynoToken; if the dashboard fails closed, use the CLI and record this physical-NAS
-   acceptance gap.
+3. Open **Synology Drive Sync** from the DSM desktop or Package Center. The server authenticates the
+   current DSM session cookie and independently requires administrator membership. A valid launch
+   `SynoToken` is accepted as an optional session-binding input, but absence is supported. If session
+   authentication or the bridge fails, use the CLI and record the physical-NAS evidence.
 4. Enable SSH temporarily for ACL verification and recovery. Resolve the actual package owner as
    shown in [CLI parity](../../docs/dsm/cli-parity.md#discover-the-actual-package-identity); the
    management entry point is:
@@ -208,8 +209,9 @@ Static validation proves archive structure, the root-free manifest, ordinary exe
 architecture, static linkage, dashboard/relay contracts, lifecycle behavior, and deterministic
 assembly. Before relying on the package, test its exact NAS model and DSM version with a disposable
 source and target, including Package Center installation and exact warning, CGI `http` identity,
-package-user API service, package:`http` `0660` socket, rendered dashboard behavior, AppLaunch
-SynoToken forwarding, package-user `authenticate.cgi`, administrator/CSRF rejection cases,
+package-user API service, package:`http` `0660` socket, rendered dashboard behavior, browser
+`X-SDSYNC-Request: 1` to CGI `HTTP_X_SDSYNC_REQUEST=1` forwarding, AppLaunch optional-token
+behavior, package-user `authenticate.cgi`, administrator/CSRF rejection cases,
 reverse-proxy upload limits, TLS trust, TOTP clock synchronization, routines, direct DSM desktop
 alerts, large files, Drive indexing, restart during a long transfer, upgrade, and uninstall. Rendered browser QA,
 physical installation, and `authenticate.cgi` execution under the package user remain unverified. A

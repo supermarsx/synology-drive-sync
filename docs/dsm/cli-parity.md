@@ -87,7 +87,8 @@ deliberately reports:
 
 Only the package-user API service returns true capabilities and `private_queue=true` after a DSM
 `http` CGI request has crossed the fixed authenticated socket and passed server-side DSM
-authentication, administrator authorization, SynoToken, and package CSRF checks. Do not call
+cookie authentication, administrator authorization, optional-token validation when supplied, and
+package CSRF checks. Do not call
 `ui/api.cgi` from SSH, connect to `api.sock`, forge relay data, or write queue files manually. The
 ordinary `0755` `sdsync-dsm-api --consume-job` form is controller-internal and validates its identity
 and exact private paths.

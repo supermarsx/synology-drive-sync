@@ -428,7 +428,7 @@ profiles remain committed.
 See [Installation and deployment](docs/installation.md) for:
 
 - four manually installable DSM 7 SPKs for `x86_64`, `armv8`, ARMv7-A hard-float, and Evansport
-  `i686`, with a native administrator dashboard, per-profile routines, and CLI manager;
+  `i686`, with a DSM-integrated administrator web dashboard, per-profile routines, and CLI manager;
 - checksum-verifying Unix and Windows installers;
 - manual archive installation, completions, and manpage setup;
 - the non-root, read-only Docker/Compose job and optional TOTP secret overlay;

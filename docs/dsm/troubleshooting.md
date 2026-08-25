@@ -148,23 +148,27 @@ The installed fields must be `package="synology-drive-sync"`, `dsmuidir="ui"`, a
 These commands are diagnostic only. Never `ln`, `rm`, `chmod`, or `chown` anything under
 `/usr/syno/synoman/webman`, and never add root execution to the package to work around the route.
 
-## Dashboard does not open or says the launch token is missing
+## Dashboard reports DSM session authentication or control bridge unavailable
 
-Open the application from the DSM desktop or Package Center, not a saved direct URL. Confirm the
-user is a non-root DSM administrator with a valid login session. Reloading an old token-bearing URL
-is not a recovery method.
+Open the application from the DSM desktop or Package Center and confirm the user is a non-root DSM
+administrator with a current login session. The browser sends that same-origin cookie to the
+packaged CGI; a launch `SynoToken` is an optional session-binding input and its absence is not an
+error. If the exact message
+still says a launch token is required, the installed UI is from an older release—verify and install
+the current SPK instead of pasting a token into the URL.
 
-The application intentionally has no undocumented DSM-global or login API fallback. Physical DSM 7
-AppLaunch delivery of SynoToken has not yet been proven. If the fresh launch still omits it, record
-the model/build/launch path and use [CLI parity](cli-parity.md). Never paste session tokens into an
-issue, screenshot, terminal, browser storage, or bookmark.
+The application intentionally has no undocumented DSM-global or login-API fallback. If a fresh
+launch cannot authenticate, record the model, DSM build, package version, launch path, `api.cgi`
+status, and bounded package logs, then use [CLI parity](cli-parity.md) while diagnosing the service.
+Never paste a cookie or supplied token into an issue, screenshot, terminal, browser storage, or
+bookmark.
 
 ## Dashboard is read-only
 
 Read-only means the authenticated API service snapshot did not grant the required capability and
-independent CSRF. Possible causes include authentication/admin rejection, missing/expired
+independent CSRF. Possible causes include authentication/admin rejection, an invalid supplied
 SynoToken, CSRF bootstrap failure, a stopped API service, wrong CGI/socket ownership or mode, a
-stopped controller/private state, or an unsafe package path.
+stopped controller/private state, or an unsafe package path. An absent SynoToken is supported.
 
 Use `status`, `paths`, the bounded logs above, and Package Center restart. Do not chmod or chown the
 CGI/socket, add any identity-changing permission or capability, expose the socket, or hand-create
@@ -307,10 +311,13 @@ the exact source NAS and record all of the following:
   `/webman/3rdparty/synology-drive-sync/index.html` before any query, DSM's Webman link resolves to
   the installed `target/ui`, `index.html` and its static assets return successfully, and `api.cgi`
   is reached without a routing 404; and
-- whether DSM AppLaunch supplies SynoToken to a fresh administrator launch.
+- whether DSM AppLaunch supplies a `SynoToken` session-binding input to a fresh administrator
+  launch; record its presence only, never its value, and verify that an absent token still reaches
+  cookie authentication.
 
 Rendered browser QA was unavailable in the development environment. Do not mark layout,
-accessibility interaction, or AppLaunch token forwarding as already proven.
+accessibility interaction, browser-header-to-CGI forwarding, or optional AppLaunch-token behavior
+as already proven.
 
 ### Identity, ACL, and dashboard security
 
@@ -323,8 +330,12 @@ accessibility interaction, or AppLaunch token forwarding as already proven.
   extra hard link, unsafe parent, oversized frame, or malformed relay schema;
 - another internal user/root cannot use manager mutations in place of the package identity;
 - non-administrator DSM users cannot launch or call the API;
-- stale cookie, absent/mismatched SynoToken, missing/expired CSRF, wrong methods/fields, and direct CGI
-  calls fail closed; and
+- DSM maps a browser request containing exactly `X-SDSYNC-Request: 1` into the CGI environment as
+  `HTTP_X_SDSYNC_REQUEST=1`, the bounded relay preserves that marker to the package-user service,
+  and an omitted or wrong-value marker is rejected;
+- a stale cookie, malformed/mismatched supplied SynoToken, missing/expired CSRF, wrong
+  methods/fields, and direct CGI calls fail closed, while a truly absent SynoToken succeeds through
+  cookie authentication; and
 - no secret appears in URL history, Referer, browser storage, Activity, logs, DSM desktop alerts,
   queue result, or support evidence.
 
@@ -363,7 +374,7 @@ accessibility interaction, or AppLaunch token forwarding as already proven.
 - disposable uninstall removes package-private profiles/secrets/state/logs while preserving both
   NAS data trees.
 
-TOTP challenge behavior, DSM authentication, AppLaunch token delivery, direct `synodsmnotify`
+TOTP challenge behavior, DSM authentication, optional AppLaunch-token delivery, direct `synodsmnotify`
 desktop delivery, File Station versions, reverse proxies, and Drive indexing vary across deployed
 systems. In
 particular, Synology documents direct `authenticate.cgi` use by a custom CGI, but this root-free
