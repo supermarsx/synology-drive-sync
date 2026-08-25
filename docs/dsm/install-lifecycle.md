@@ -30,14 +30,14 @@ not create DSM users, homes, shared folders, Team Folders, or ACLs.
 3. Select the verified `.spk`, check its displayed name/version, and review the package information.
 4. Accept DSM's normal third-party-package warning only after confirming the repository, asset,
    checksum, and optional attestation. The project does not bypass that publisher-trust warning. A
-   refusal saying the package requires root or a lower privilege level is a different condition and
-   is not expected; preserve the artifact and collect the logs in
-   [Troubleshooting](troubleshooting.md#normal-third-party-warning-versus-a-root-privilege-rejection).
+   refusal reporting a lower-privilege or resource-worker policy violation is a different condition
+   and is not expected from a corrected release; preserve the artifact and collect the logs in
+   [Troubleshooting](troubleshooting.md#normal-third-party-warning-versus-a-dsm-install-policy-rejection).
 5. Finish installation, then start **Synology Drive Sync** in Package Center.
 
 Installation creates an unprivileged system-internal package identity, private FHS storage, a
 disabled global schedule, the package controller, a package-user API service, the desktop
-application, fixed DSM notification resources, and deterministic icons. Its privilege manifest
+application, fixed preloaded desktop-alert I18N text, and deterministic icons. Its privilege manifest
 defaults everything to the package identity and joins that identity to DSM's `http` group; it
 requests no root execution, capability, or identity-changing file mode. It does not grant access to
 a user share, create a profile, store a credential, contact a target, or start a sync.
