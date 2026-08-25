@@ -21,14 +21,23 @@ on:
 # so overlapping runs would allocate the same YY.N.
 #
 # Known and accepted behaviour (audit H5): GitHub keeps at most ONE pending run
-# per concurrency group. A burst of merges to main during a ~60 minute release
-# run leaves N queued runs of which N-1 are cancelled. That is correct for a
-# rolling release -- the surviving run ships a superset of the dropped commits --
-# but it means individual commits do not each get their own release, and the
-# released commit can lag main. The freshness guard in the `version` job below
-# bounds how stale that can get.
+# per concurrency group. Eligible automatic releases and manual dispatches share
+# the serial group, preserving rolling-release behaviour during a burst of main
+# pushes. Ineligible workflow completions use their own run-ID group so they
+# cannot displace an eligible pending release before the `version` job evaluates
+# its matching guard below.
 concurrency:
-  group: calendar-release
+  group: >-
+    ${{
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository))
+      && 'calendar-release'
+      || format('calendar-release-ineligible-{0}', github.run_id)
+    }}
   cancel-in-progress: false
 
 permissions:

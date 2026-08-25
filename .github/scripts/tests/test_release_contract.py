@@ -605,7 +605,6 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("github.event.workflow_run.event == 'push'", workflow)
         self.assertIn("github.event.workflow_run.head_branch == 'main'", workflow)
         self.assertIn("github.event.workflow_run.head_repository.full_name == github.repository", workflow)
-        self.assertIn("group: calendar-release", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
         publish_release = workflow.index("\n  publish-release:")
         publish_image = workflow.index("\n  publish-image:")
@@ -625,6 +624,33 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("release-contract.py verify-remote-assets", workflow)
         self.assertGreaterEqual(workflow.count("verify-remote-assets"), 2)
         self.assertIn("name: staged-release-contract", workflow)
+
+    def test_release_concurrency_isolates_ineligible_workflow_completions(self):
+        workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        concurrency = workflow[
+            workflow.index("concurrency:\n") : workflow.index("\npermissions:")
+        ]
+
+        self.assertIn("github.event_name == 'workflow_dispatch'", concurrency)
+        self.assertIn("github.event_name == 'workflow_run'", concurrency)
+        self.assertIn(
+            "github.event.workflow_run.conclusion == 'success'", concurrency
+        )
+        self.assertIn("github.event.workflow_run.event == 'push'", concurrency)
+        self.assertIn("github.event.workflow_run.head_branch == 'main'", concurrency)
+        self.assertIn(
+            "github.event.workflow_run.head_repository.full_name == github.repository",
+            concurrency,
+        )
+        self.assertIn("&& 'calendar-release'", concurrency)
+        self.assertIn(
+            "|| format('calendar-release-ineligible-{0}', github.run_id)",
+            concurrency,
+        )
+        self.assertIn("cancel-in-progress: false", concurrency)
+        self.assertNotIn("group: calendar-release", concurrency)
 
     def test_stage_retries_eventually_consistent_listing_by_immutable_id(self):
         workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
