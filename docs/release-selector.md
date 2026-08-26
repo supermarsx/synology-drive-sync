@@ -7,14 +7,28 @@ required on DSM 7.0 to prove the package minimum and on DSM 7.4 to prove the pac
 optional on DSM 7.1–7.3. DSM 7.4 must not exceed the SPK manifest maximum of `7.4-99999`. A missing
 boundary build or mismatch stops the selector instead of guessing.
 
-The 231-model catalog is a factual snapshot of Synology's
-[CPU and Package Arch table](https://kb.synology.com/en-us/DSM/tutorial/What_kind_of_CPU_does_my_NAS_have),
-captured on **2026-08-24**. That is this catalog's extraction date, not a claim about the source
-page's locale-dependent last-updated metadata. For downloadable assets, the selector checks GitHub's
-public latest-release API for an exact current file. If that lookup is unavailable, it shows the
-deterministic `YY.N` filename pattern and links to Releases; it never constructs an unverified
-download. A container tag is only correlated with the latest release and remains explicitly
-unverified until it is present in GHCR; deploy its immutable digest after verification.
+The 233-model physical catalog is a factual snapshot captured on **2026-08-26**. It contains all
+231 records in Synology's
+[CPU and Package Arch table](https://kb.synology.com/en-us/DSM/tutorial/What_kind_of_CPU_does_my_NAS_have)
+plus `DVA7400` and `RS11626xs+`. Synology's official
+[DSM 7.4.1-90080 PAT index](https://archive.synology.com/download/Os/DSM/7.4.1-90080) proves those two
+physical models exist at that build, while its
+[model-qualified package index](https://archive.synology.com/download/Package/SynoOnlinePack_v2/1071)
+maps them to Package Arch `v1000nk` and `epyc7003`, respectively. The capture date is not a claim
+about any source page's locale-dependent last-updated metadata. `VirtualDSM`, historical products
+without current CPU/Package Arch evidence, and model-less toolkit targets are not guessed into the
+physical catalog. For downloadable assets, the selector checks GitHub's public latest-release API
+for an exact current file. If that lookup is unavailable, it shows the deterministic `YY.N`
+filename pattern and links to Releases; it never constructs an unverified download. A container tag
+is only correlated with the latest release and remains explicitly unverified until it is present in
+GHCR; deploy its immutable digest after verification.
+
+The model picker is a native, visibly populated select rather than a browser-dependent suggestion
+list. It loads all 233 exact model names, and every option shows the captured processor family,
+Synology Package Arch, and explicit SPK asset correspondence. Models whose CPU family or product
+lifecycle has no published DSM 7 package say **manual review / no SPK**. A separate manual-review
+option preserves that same fail-closed path for a model added after the snapshot; the selector never
+chooses a nearest-looking model.
 
 > **DSM package safety hold:** do not install `.spk` assets from releases `26.5` or `26.6`.
 > Release `26.5` contains identity-changing/set-ID privilege metadata that DSM rejects for a
@@ -60,8 +74,11 @@ reviewed and updated.
 <div class="selector-grid">
 <div class="selector-field">
 <label for="synology-model">Exact Synology model</label>
-<input id="synology-model" name="model" list="synology-models" autocomplete="off" placeholder="DS419slim" aria-describedby="model-fact">
-<datalist id="synology-models" data-model-list></datalist>
+<select id="synology-model" name="model" data-model-select required aria-describedby="model-catalog-status model-fact">
+<option value="" selected disabled>Choose an exact Synology model</option>
+<option value="__unknown__">My model is not listed — manual review / no SPK</option>
+</select>
+<small id="model-catalog-status"><span data-model-count>Loading the exact model catalog…</span>. Every model option shows its processor, Package Arch, and corresponding SPK asset or manual-review status.</small>
 <small id="model-fact" data-model-fact aria-live="polite"></small>
 </div>
 <div class="selector-field">
@@ -122,7 +139,7 @@ reviewed and updated.
 </div>
 </fieldset>
 <div class="selector-actions">
-<button type="submit">Find my release</button>
+<button type="submit"><svg class="selector-action-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true" focusable="false"><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2"></path><rect x="5" y="5" width="6" height="6"></rect><path d="M8 6.5v3M6.5 8h3"></path></svg> Find my release</button>
 <span class="selector-status" role="status" aria-live="polite" data-selector-status>Ready to check.</span>
 </div>
 </form>
@@ -152,19 +169,19 @@ reviewed and updated.
 
 ### DSM toolkit intervals
 
-The selector has two independent compatibility layers. First, every one of the 231 models in the
-CPU-table snapshot has an explicit OS product and model-specific DSM interval. Second, the model's
+The selector has two independent compatibility layers. First, every one of the 233 models in the
+physical catalog has an explicit OS product and model-specific DSM interval. Second, the model's
 Package Arch must exist in Synology's toolkit branch. Passing only one layer is not enough.
 
-Model lifecycle data was reconciled on **2026-08-24** against Synology's official
+Model lifecycle data was reconciled on **2026-08-26** against Synology's official
 [last-upgradable software version table](https://kb.synology.com/en-us/DSM/tutorial/What_is_the_last_upgradable_software_version_for_my_Synology_product)
 and the official model-specific PAT indexes for
 [DSM 7.0](https://archive.synology.com/download/Os/DSM/7.0.1-42218),
 [DSM 7.1](https://archive.synology.com/download/Os/DSM/7.1-42661-1),
 [DSM 7.2](https://archive.synology.com/download/Os/DSM/7.2.2-72806),
 [DSM 7.3](https://archive.synology.com/download/Os/DSM/7.3-81180), and
-[DSM 7.4](https://archive.synology.com/download/Os/DSM/7.4-90075). The catalog partitions all
-231 records exactly once:
+[DSM 7.4](https://archive.synology.com/download/Os/DSM/7.4.1-90080). The catalog partitions all
+233 records exactly once:
 
 | Product/model lifecycle | Models | Selector behavior |
 | --- | ---: | --- |
@@ -174,17 +191,20 @@ and the official model-specific PAT indexes for
 | DSM 7.0–7.4 | 92 | Exact model and branch must agree |
 | DSM 7.1–7.4 | 7 | Reject DSM 7.0 |
 | DSM 7.2–7.4 | 22 | Reject DSM 7.0/7.1 |
-| DSM 7.4 only | 16 | Reject every earlier branch |
+| DSM 7.4 only | 18 | Reject every earlier branch; six require `7.4.1-90080` or later |
 | DSM Enterprise 1.0 | 1 (`PAS7700`) | Informational; no ordinary DSM SPK |
 
 Synology's lifecycle article intentionally omits models whose final version is not yet fixed and
 directs users to Download Center. For those models, the catalog uses the earliest official DSM 7
 branch that publishes that exact model and caps recommendations at the latest reviewed DSM 7.4
-branch. The four Japanese-market `neo+` models in Synology's official
-[2026 product announcement](https://www.synology.com/ja-jp/company/news/article/dsneoplus), published
-after the base DSM 7.4 archive, are explicit DSM 7.4-only records; they are never
-backfilled onto an older branch. A future model or DSM 7.5+ remains unknown until the source
-snapshot is refreshed.
+branch. Six physical models are absent from the `7.4-90075` PAT index and first appear at
+`7.4.1-90080`: `DS1525neo+`, `DS1825neo+`, `DS725neo+`, `DS925neo+`, `DVA7400`, and
+`RS11626xs+`. The PAT indexes establish this exact build boundary; the package index independently
+establishes Package Arch `v1000nk` for `DVA7400` and `epyc7003` for `RS11626xs+`. The selector
+therefore requires at least `7.4.1-90080` for all six and never backfills them onto an older image.
+The four `neo+` records are also corroborated by Synology's official
+[2026 product announcement](https://www.synology.com/ja-jp/company/news/article/dsneoplus). A future
+model or DSM 7.5+ remains unknown until the source snapshot is refreshed.
 
 The selector requires the model's official Package Arch to appear in the entered DSM minor branch.
 The intervals below are derived from `AllPlatformOptionNames` in SynologyOpenSource's official
@@ -204,9 +224,9 @@ branches:
 | 7.3–7.4 | `epyc7003`, `icelaked` |
 
 This enforces both ends of the interval: a newly introduced platform is not guessed onto an older
-DSM branch, and a removed platform is not guessed onto a newer one. Toolkit-only values without a
-model in the captured CPU table, including `kvmx64`, `kvmcloud`, and `epyc7003ntb`, cannot bypass the
-exact-model check.
+DSM branch, and a removed platform is not guessed onto a newer one. Toolkit-only values without an
+exact physical model in the provenance-complete catalog, including `kvmx64`, `kvmcloud`, and
+`epyc7003ntb`, cannot bypass the exact-model check.
 
 `PAS7700` deliberately remains in the factual CPU/Package Arch snapshot, but it never produces a
 DSM SPK recommendation. Synology's official [PAS7700 Download Center](https://www.synology.com/en-us/support/download/PAS7700)

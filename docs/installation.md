@@ -25,14 +25,19 @@ All four packages embed one fully static musl ELF (ELF32 or ELF64) and require D
 newer. Availability is the intersection of the exact model's DSM lifecycle and the DSM 7.0–7.4
 `pkgscripts-ng` interval for its Package Arch. A platform can remain in a toolkit after an older
 model on that platform stops receiving DSM, and a new model can require a later DSM even when its
-CPU family already existed. Use the [release selector](release-selector.md) with the searchable
-model, explicit OS product/version, and reported architecture. The exact build is optional for DSM
+CPU family already existed. Use the [release selector](release-selector.md) with the exact model,
+explicit OS product/version, and reported architecture. The exact build is optional for DSM
 7.1–7.3 but mandatory for DSM 7.0 and 7.4 so the `7.0-40759` floor and `7.4-99999` ceiling can be
-proven. The selector covers all 231 models in the captured official CPU table, including
-informational DSM 5.2/6.2 systems that
-receive no asset. It rejects model/branch conflicts, pre-introduction and post-removal toolkit
-branches, unknown or contradictory runtime inputs, and `PAS7700`, whose product line is DSM
-Enterprise 1.0 rather than ordinary DSM. For an unsupported NAS, run the desktop CLI or container
+proven. Its 233-model physical catalog contains all 231 entries in the captured official
+[CPU and Package Arch table](https://kb.synology.com/en-us/DSM/tutorial/What_kind_of_CPU_does_my_NAS_have)
+plus `DVA7400` and `RS11626xs+`. Those two supplemental records are sourced from Synology's official
+[DSM 7.4.1-90080 PAT index](https://archive.synology.com/download/Os/DSM/7.4.1-90080) and
+[model-qualified package index](https://archive.synology.com/download/Package/SynoOnlinePack_v2/1071),
+and cannot be selected below their first observed build, `7.4.1-90080`. Informational DSM 5.2/6.2
+systems receive no asset. The selector rejects model/branch conflicts, pre-introduction and
+post-removal toolkit branches, unknown or contradictory runtime inputs, and `PAS7700`, whose product
+line is DSM Enterprise 1.0 rather than ordinary DSM. `VirtualDSM` and model-less toolkit platforms
+are not physical-model records and remain fail-closed. For an unsupported NAS, run the desktop CLI or container
 on a supported workstation that can read the source over an intentionally configured share; do not
 relabel an SPK. Download the selected SPK and `SHA256SUMS`,
 verify the file as described in [Release artifacts and verification](releases.md), then use **Package

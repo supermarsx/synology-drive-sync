@@ -40,9 +40,17 @@ especially Evansport. If that evidence disproves compatibility, a future release
 raise the floor or publish a separately named legacy design; it must not silently fall back to a URL
 page inside the same artifact.
 
-Use the interactive [release selector](../release-selector.md). It evaluates the captured official
-model catalog and fails closed on unknown models, DSM Enterprise, DSM 6 or older, unsupported
-branches, unreviewed future DSM versions, and contradictory model/architecture input.
+Use the interactive [release selector](../release-selector.md). It evaluates a 233-model physical
+catalog: 231 records from Synology's official
+[CPU and Package Arch table](https://kb.synology.com/en-us/DSM/tutorial/What_kind_of_CPU_does_my_NAS_have),
+plus `DVA7400` and `RS11626xs+` from the official
+[DSM 7.4.1-90080 PAT index](https://archive.synology.com/download/Os/DSM/7.4.1-90080) and
+[model-qualified package index](https://archive.synology.com/download/Package/SynoOnlinePack_v2/1071).
+The supplemental models are not backfilled before their first observed build, `7.4.1-90080`.
+`VirtualDSM`, `kvmx64`, `kvmcloud`, and other toolkit-only or non-physical targets are not NAS model
+records and remain fail-closed. The selector also fails closed on unknown models, DSM Enterprise,
+DSM 6 or older, unsupported branches, unreviewed future DSM versions, and contradictory
+model/architecture input.
 
 ## Four release SPKs
 

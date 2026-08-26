@@ -67,9 +67,16 @@ ARMv7-A little-endian hard-float ABI.
 
 An ABI match alone is insufficient. The [release selector's model lifecycle and DSM toolkit intervals](release-selector.md#dsm-toolkit-intervals)
 require both the exact model and its Package Arch to exist in the selected official DSM 7.0–7.4
-branch. The captured 231-model catalog includes model-specific introduction floors and retirement
-ceilings as well as toolkit-level changes. DSM 5.2/6.2 and DSM Enterprise entries remain
-searchable for an explicit no-asset result; they are never mapped to one of these four DSM 7 SPKs.
+branch. The captured 233-model physical catalog consists of 231 records from Synology's official
+[CPU and Package Arch table](https://kb.synology.com/en-us/DSM/tutorial/What_kind_of_CPU_does_my_NAS_have)
+plus `DVA7400` and `RS11626xs+`, whose model presence and Package Arch are independently recorded in
+Synology's official [DSM 7.4.1-90080 PAT index](https://archive.synology.com/download/Os/DSM/7.4.1-90080)
+and [model-qualified package index](https://archive.synology.com/download/Package/SynoOnlinePack_v2/1071).
+It includes model-specific introduction floors and retirement ceilings as well as toolkit-level
+changes; the two supplemental models first appear at `7.4.1-90080`. DSM 5.2/6.2 and DSM Enterprise
+entries remain available for an explicit no-asset result. `VirtualDSM` and model-less toolkit
+targets are kept separate from physical models and fail closed; none of these non-eligible records
+is mapped to one of the four DSM 7 SPKs.
 
 Release CI rejects an embedded ELF with the wrong machine type, a dynamic program interpreter, or
 a required dynamic library. It validates the SPK INFO, archive member safety and modes, package

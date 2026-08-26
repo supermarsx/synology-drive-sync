@@ -30,7 +30,8 @@
     if (
         !data ||
         !Array.isArray(data.modelGroups) ||
-        !Array.isArray(data.compatibilityGroups)
+        !Array.isArray(data.compatibilityGroups) ||
+        !Array.isArray(data.supplementalModelSources)
     ) {
         throw new Error("release selector model data is unavailable");
     }
@@ -54,40 +55,13 @@
         display: "7.4-99999",
     });
 
-    const ARMV7_PACKAGES = new Set([
-        "alpine",
-        "alpine4k",
-        "armada370",
-        "armada375",
-        "armada38x",
-        "armadaxp",
-        "comcerto2k",
-        "monaco",
-    ]);
-    const ARMV8_PACKAGES = new Set(["armada37xx", "rtd1296", "rtd1619b"]);
-    const X86_64_PACKAGES = new Set([
-        "apollolake",
-        "avoton",
-        "braswell",
-        "broadwell",
-        "broadwellnk",
-        "broadwellnkv2",
-        "broadwellntbap",
-        "bromolow",
-        "cedarview",
-        "denverton",
-        "epyc7002",
-        "epyc7003",
-        "geminilake",
-        "geminilakenk",
-        "grantley",
-        "icelaked",
-        "purley",
-        "r1000",
-        "r1000nk",
-        "v1000",
-        "v1000nk",
-    ]);
+    const DSM_ASSET_ARCHES = new Set(["armv7", "armv8", "i686", "x86_64"]);
+    const DSM_ASSET_CPU_ARCH = Object.freeze({
+        armv7: "armv7",
+        armv8: "armv8",
+        i686: "i686",
+        x86_64: "x86_64",
+    });
     // Exact contiguous intervals derived from AllPlatformOptionNames in SynologyOpenSource's
     // official DSM7.0 through DSM7.4 pkgscripts-ng branches. Model-less toolkit platforms such as
     // kvmx64, kvmcloud, and epyc7003ntb are intentionally absent from this model-driven selector.
@@ -141,19 +115,45 @@
         const index = new Map();
 
         for (const group of modelGroups) {
+            if (
+                !group ||
+                typeof group !== "object" ||
+                !Array.isArray(group.models) ||
+                !Object.prototype.hasOwnProperty.call(group, "assetArch")
+            ) {
+                throw new Error("invalid Synology model snapshot group");
+            }
+            const cpuArch = String(group.cpuArch || "").toLowerCase();
+            const packageArch = String(group.packageArch || "").toLowerCase();
+            const assetArch = group.assetArch === null
+                ? null
+                : String(group.assetArch || "").toLowerCase();
+
+            if (
+                !cpuArch ||
+                !packageArch ||
+                !group.models.length ||
+                (assetArch !== null && !DSM_ASSET_ARCHES.has(assetArch)) ||
+                (assetArch !== null && normalizeCpuArch(cpuArch) !== DSM_ASSET_CPU_ARCH[assetArch])
+            ) {
+                throw new Error(`invalid Synology model snapshot mapping: ${packageArch || "unknown"}`);
+            }
+
             for (const model of group.models) {
                 const key = normalizedModel(model);
                 const record = Object.freeze({
                     model,
-                    cpuArch: String(group.cpuArch).toLowerCase(),
-                    packageArch: String(group.packageArch).toLowerCase(),
+                    cpuArch,
+                    packageArch,
+                    assetArch,
                 });
                 const existing = index.get(key);
 
                 if (
                     existing &&
                     (existing.cpuArch !== record.cpuArch ||
-                        existing.packageArch !== record.packageArch)
+                        existing.packageArch !== record.packageArch ||
+                        existing.assetArch !== record.assetArch)
                 ) {
                     throw new Error(`conflicting Synology model snapshot entry: ${model}`);
                 }
@@ -167,10 +167,39 @@
 
     const MODEL_INDEX = buildModelIndex(data.modelGroups);
 
+    function buildPackageAssetIndex(modelGroups) {
+        const index = new Map();
+
+        for (const group of modelGroups) {
+            if (group.assetArch === null) {
+                continue;
+            }
+            const packageArch = String(group.packageArch).toLowerCase();
+            const assetArch = String(group.assetArch).toLowerCase();
+            const existing = index.get(packageArch);
+
+            if (existing && existing !== assetArch) {
+                throw new Error(`conflicting DSM package asset mapping: ${packageArch}`);
+            }
+            index.set(packageArch, assetArch);
+        }
+
+        return index;
+    }
+
+    const PACKAGE_ASSET_INDEX = buildPackageAssetIndex(data.modelGroups);
+
     function buildCompatibilityIndex(groups) {
         const index = new Map();
 
         for (const group of groups) {
+            const minPatch = Number.isInteger(group.minPatch) ? group.minPatch : null;
+            const minBuild = Number.isInteger(group.minBuild) ? group.minBuild : null;
+
+            if ((minPatch === null) !== (minBuild === null)) {
+                throw new Error("incomplete Synology model minimum-build mapping");
+            }
+
             for (const model of group.models) {
                 const key = normalizedModel(model);
 
@@ -185,6 +214,8 @@
                         status: group.status,
                         minMinor: Number.isInteger(group.minMinor) ? group.minMinor : null,
                         maxMinor: Number.isInteger(group.maxMinor) ? group.maxMinor : null,
+                        minPatch,
+                        minBuild,
                         lastVersion: group.lastVersion || null,
                     }),
                 );
@@ -360,20 +391,7 @@
     }
 
     function packageAssetArch(packageArch) {
-        if (ARMV7_PACKAGES.has(packageArch)) {
-            return "armv7";
-        }
-        if (ARMV8_PACKAGES.has(packageArch)) {
-            return "armv8";
-        }
-        if (X86_64_PACKAGES.has(packageArch)) {
-            return "x86_64";
-        }
-        if (packageArch === "evansport") {
-            return "i686";
-        }
-
-        return null;
+        return PACKAGE_ASSET_INDEX.get(String(packageArch || "").toLowerCase()) || null;
     }
 
     function dsmMinorBounds(packageArch) {
@@ -393,6 +411,9 @@
         if (compatibility.status === "legacy") {
             return `last upgradable DSM ${compatibility.lastVersion} · no published SPK`;
         }
+        if (compatibility.minBuild !== null) {
+            return `DSM 7.${compatibility.minMinor}.${compatibility.minPatch}-${compatibility.minBuild} or newer on DSM 7.${compatibility.maxMinor}`;
+        }
 
         return dsmMinorRangeLabel({
             min: compatibility.minMinor,
@@ -400,12 +421,20 @@
         });
     }
 
-    const DSM_ASSET_PACKAGES = new Set([
-        ...ARMV7_PACKAGES,
-        ...ARMV8_PACKAGES,
-        ...X86_64_PACKAGES,
-        "evansport",
-    ]);
+    function modelAssetLabel(model, compatibility) {
+        if (
+            !model ||
+            !compatibility ||
+            compatibility.status !== "supported" ||
+            !model.assetArch
+        ) {
+            return "manual review / no SPK";
+        }
+
+        return `synology-drive-sync-YY.N-${model.assetArch}.spk`;
+    }
+
+    const DSM_ASSET_PACKAGES = new Set(PACKAGE_ASSET_INDEX.keys());
 
     if (
         Object.keys(DSM_PLATFORM_MINOR_BOUNDS).length !== DSM_ASSET_PACKAGES.size ||
@@ -414,6 +443,10 @@
         }) ||
         Object.keys(DSM_PLATFORM_MINOR_BOUNDS).some(function missingAsset(packageArch) {
             return !DSM_ASSET_PACKAGES.has(packageArch);
+        }) ||
+        [...MODEL_INDEX.values()].some(function inconsistentModelAsset(model) {
+            return model.assetArch !== null &&
+                packageAssetArch(model.packageArch) !== model.assetArch;
         })
     ) {
         throw new Error("DSM asset families and official toolkit intervals are out of sync");
@@ -424,8 +457,8 @@
         if (!catalogModel) {
             return failure(
                 "unknown_model",
-                "That model is not in the captured Synology CPU-table snapshot.",
-                `Check Synology's live Package Arch table (snapshot captured ${data.snapshotCapturedDate}) and report the exact model, DSM build, and Package Arch. The selector will not guess from a model year or marketing name.`,
+                "That model is not in the captured physical Synology model catalog.",
+                `Check Synology's live CPU/Package Arch table and model-specific archives (snapshot captured ${data.snapshotCapturedDate}), then report the exact model, DSM build, and Package Arch. The selector will not guess from a model year or marketing name.`,
             );
         }
 
@@ -536,11 +569,30 @@
                 "Recheck Control Panel > Info Center. The branch selector and exact build, when supplied, must describe the same installed OS.",
             );
         }
-        if (version && version.build < 40759) {
+        if (
+            version &&
+            version.major === 7 &&
+            version.minor === 0 &&
+            version.patch === 0 &&
+            version.build < 40759
+        ) {
             return failure(
                 "dsm_too_old",
                 "This package requires DSM 7.0-40759 or newer.",
                 "An older build requires a separately designed package; changing the INFO label would not make this DSM 7 package compatible.",
+            );
+        }
+        if (
+            version &&
+            compatibility.minBuild !== null &&
+            (version.patch < compatibility.minPatch ||
+                (version.patch === compatibility.minPatch &&
+                    version.build < compatibility.minBuild))
+        ) {
+            return failure(
+                "model_build_too_old",
+                `${catalogModel.model} first appears in the captured DSM 7.${compatibility.minMinor}.${compatibility.minPatch}-${compatibility.minBuild} model index.`,
+                "Choose the exact installed model and build. The selector will not backfill a newly introduced model onto an older DSM image.",
             );
         }
         if (
@@ -582,13 +634,20 @@
                 "Recheck the model and runtime output. A package is not recommended when those two independent inputs conflict.",
             );
         }
-        const assetArch = packageAssetArch(model.packageArch);
+        const assetArch = model.assetArch;
 
         if (!assetArch) {
             return failure(
                 "unsupported_package_arch",
-                `No verified DSM artifact maps to Package Arch ${model.packageArch}.`,
+                `No verified DSM artifact is assigned to ${model.model} (${model.cpuArch}/${model.packageArch}).`,
                 "Use the exact official Package Arch to request a new verified build; do not install a relabeled binary.",
+            );
+        }
+        if (packageAssetArch(model.packageArch) !== assetArch) {
+            return failure(
+                "asset_mapping_conflict",
+                `The captured ${model.model} model-to-asset mapping is inconsistent.`,
+                "Refresh and validate the canonical Synology model catalog before recommending an SPK.",
             );
         }
 
@@ -625,7 +684,7 @@
             artifactType: "dsm-spk",
             purpose: "DSM dashboard package (SPK)",
             assetTemplate: `synology-drive-sync-{tag}-${assetArch}.spk`,
-            detected: `${model.model} · Product line DSM · ${model.cpuArch} · Package Arch ${model.packageArch} · DSM ${versionDisplay} · Model ${dsmMinorRangeLabel(modelBounds)} · Toolkit ${dsmMinorRangeLabel(bounds)}`,
+            detected: `${model.model} · Product line DSM · Processor ${model.cpuArch} · Package Arch ${model.packageArch} · Release asset ${assetArch} · DSM ${versionDisplay} · Model ${compatibilityLabel(compatibility)} · Toolkit ${dsmMinorRangeLabel(bounds)}`,
             rationale:
                 assetArch === "armv7"
                     ? "The ARMv7 SPK carries one little-endian EABI5 hard-float binary and explicitly lists every verified DSM 7 ARMv7 family in INFO."
@@ -980,8 +1039,8 @@
 
         const form = container.querySelector("form");
         const purpose = form.querySelector("[name=purpose]");
-        const modelInput = form.querySelector("[name=model]");
-        const modelList = container.querySelector("[data-model-list]");
+        const modelInput = form.querySelector("[data-model-select]");
+        const modelCount = container.querySelector("[data-model-count]");
         const modelFact = container.querySelector("[data-model-fact]");
         const status = container.querySelector("[data-selector-status]");
         const documentRef = container.ownerDocument;
@@ -989,26 +1048,34 @@
             return null;
         });
 
-        if (modelList) {
+        if (modelInput) {
             const fragment = documentRef.createDocumentFragment();
+            const models = listModels();
 
-            for (const model of listModels()) {
+            for (const model of models) {
                 const option = documentRef.createElement("option");
                 const compatibility = modelCompatibility(model);
                 option.value = model.model;
-                option.label = `${model.cpuArch} · ${model.packageArch} · ${compatibilityLabel(compatibility)}`;
+                option.textContent = `${model.model} — processor ${model.cpuArch} — Package Arch ${model.packageArch} — ${modelAssetLabel(model, compatibility)} — ${compatibilityLabel(compatibility)}`;
                 fragment.append(option);
             }
 
-            modelList.append(fragment);
+            modelInput.append(fragment);
+            if (modelCount) {
+                modelCount.textContent = `${models.length} exact models loaded`;
+            }
         }
 
         function updateModelFact() {
             const model = lookupModel(modelInput.value);
             const compatibility = modelCompatibility(model);
-            modelFact.textContent = model
-                ? `Official snapshot: ${model.cpuArch} · Package Arch ${model.packageArch} · Product line ${compatibility.productLine} · ${compatibilityLabel(compatibility)}`
-                : "Choose an exact model from the captured official table.";
+            if (model) {
+                modelFact.textContent = `Official snapshot: processor ${model.cpuArch} · Package Arch ${model.packageArch} · Release ${modelAssetLabel(model, compatibility)} · Product line ${compatibility.productLine} · ${compatibilityLabel(compatibility)}`;
+            } else if (modelInput.value === "__unknown__") {
+                modelFact.textContent = `This model is outside the ${data.snapshotCapturedDate} physical catalog. No SPK is recommended; use Synology's live CPU table and model-specific archives for manual review.`;
+            } else {
+                modelFact.textContent = `Choose one of the ${data.modelCount} exact models in the captured physical catalog.`;
+            }
         }
 
         purpose.addEventListener("change", function purposeChanged() {
