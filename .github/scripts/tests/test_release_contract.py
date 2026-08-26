@@ -758,7 +758,7 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertNotIn("jq -er '.already_published'", workflow)
         self.assertNotIn("jq -er '.tag_matches'", workflow)
 
-    def test_native_ci_and_coverage_keep_workspace_scope_and_threshold(self):
+    def test_native_ci_and_coverage_keep_workspace_scope_and_split_thresholds(self):
         ci = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("cargo clippy --locked --workspace --all-targets", ci)
         self.assertIn("cargo test --locked --workspace --all-targets", ci)
@@ -769,12 +769,66 @@ class WorkflowWiringTests(unittest.TestCase):
             ci,
         )
         self.assertNotIn("cargo build --release --locked --workspace", ci)
+        self.assertIn("Coverage (90% non-DSM / 74% DSM line gates)", ci)
+        self.assertIn("Enforce split repository line coverage", ci)
+        self.assertIn("Test release and coverage policy contracts", ci)
+        self.assertIn("-p 'test_*.py' -v", ci)
         coverage = (REPOSITORY_ROOT / "scripts/coverage.sh").read_text(encoding="utf-8")
         self.assertIn("llvm-cov --locked --workspace --all-targets --no-report", coverage)
+        self.assertIn('python3 "$repo_root/scripts/coverage_policy.py"', coverage)
+        self.assertIn('--minimum-general "$minimum_lines"', coverage)
+        self.assertIn('--minimum-dsm "$dsm_minimum_lines"', coverage)
+        self.assertIn("enforcement_arguments=(--enforce)", coverage)
+        self.assertIn("validate_coverage_summary true", coverage)
+        self.assertIn("Duplicate coverage setting: $key", coverage)
+        self.assertNotIn("--ignore-filename-regex", coverage)
+        self.assertNotIn("--fail-under-lines", coverage)
+        powershell_coverage = (REPOSITORY_ROOT / "scripts/coverage.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("'coverage_policy.py'", powershell_coverage)
+        self.assertIn("'--minimum-general', $GeneralMinimum", powershell_coverage)
+        self.assertIn("'--minimum-dsm', $DsmMinimum", powershell_coverage)
+        self.assertIn("$arguments += '--enforce'", powershell_coverage)
+        self.assertIn("-EnforceThresholds $true", powershell_coverage)
+        self.assertIn("Duplicate coverage setting: $($Matches[1])", powershell_coverage)
+        self.assertNotIn("--ignore-filename-regex", powershell_coverage)
+        self.assertNotIn("--fail-under-lines", powershell_coverage)
+        policy = (REPOSITORY_ROOT / "scripts/coverage_policy.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('Path("src/dsm_api.rs")', policy)
+        self.assertIn('Path("src/bin/sdsync-dsm-api.rs")', policy)
+        self.assertIn("seen_dsm_paths != expected_dsm_paths", policy)
+        self.assertIn("total_count != dsm_count + general_count", policy)
+        self.assertIn("total_covered != dsm_covered + general_covered", policy)
+        self.assertIn(
+            "metrics.general_covered * 100 < general_minimum * metrics.general_count",
+            policy,
+        )
+        self.assertIn(
+            "metrics.dsm_covered * 100 < dsm_minimum * metrics.dsm_count",
+            policy,
+        )
         coverage_env = (REPOSITORY_ROOT / ".config/coverage.env").read_text(
             encoding="utf-8"
         )
-        self.assertIn("COVERAGE_MIN_LINES=90", coverage_env.splitlines())
+        self.assertEqual(
+            coverage_env.splitlines(),
+            [
+                "RUST_TOOLCHAIN=1.88.0",
+                "CARGO_LLVM_COV_VERSION=0.8.7",
+                "COVERAGE_MIN_LINES=90",
+                "COVERAGE_DSM_MIN_LINES=74",
+            ],
+        )
+        coverage_docs = (REPOSITORY_ROOT / "docs/testing.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("**90% minimum**", coverage_docs)
+        self.assertIn("**74% minimum**", coverage_docs)
+        self.assertIn("src/dsm_api.rs", coverage_docs)
+        self.assertIn("src/bin/sdsync-dsm-api.rs", coverage_docs)
 
 
 if __name__ == "__main__":

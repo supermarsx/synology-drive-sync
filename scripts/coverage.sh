@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage: bash scripts/coverage.sh [check|report|html]
 
-  check   Run all test targets and enforce the configured line threshold (default).
+  check   Run all test targets and enforce the configured split line thresholds (default).
   report  Run all test targets and print the full repository coverage baseline.
   html    Run all test targets and write an HTML report under target/llvm-cov/html.
 
@@ -37,14 +37,24 @@ config_path="$repo_root/.config/coverage.env"
 rust_toolchain=""
 tool_version=""
 minimum_lines=""
+dsm_minimum_lines=""
+seen_settings=$'\n'
 while IFS='=' read -r key value; do
   key="${key%$'\r'}"
   value="${value%$'\r'}"
   case "$key" in
+    ''|'#'*) continue ;;
+  esac
+  if [[ "$seen_settings" == *$'\n'"$key"$'\n'* ]]; then
+    echo "Duplicate coverage setting: $key" >&2
+    exit 2
+  fi
+  seen_settings+="$key"$'\n'
+  case "$key" in
     RUST_TOOLCHAIN) rust_toolchain="$value" ;;
     CARGO_LLVM_COV_VERSION) tool_version="$value" ;;
     COVERAGE_MIN_LINES) minimum_lines="$value" ;;
-    ''|'#'*) ;;
+    COVERAGE_DSM_MIN_LINES) dsm_minimum_lines="$value" ;;
     *)
       echo "Unknown coverage setting: $key" >&2
       exit 2
@@ -54,8 +64,14 @@ done < "$config_path"
 
 if [[ ! "$rust_toolchain" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
    [[ ! "$tool_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
-   [[ ! "$minimum_lines" =~ ^([1-9][0-9]?|100)$ ]]; then
+   [[ ! "$minimum_lines" =~ ^([1-9][0-9]?|100)$ ]] ||
+   [[ ! "$dsm_minimum_lines" =~ ^([1-9][0-9]?|100)$ ]]; then
   echo "Invalid coverage configuration in $config_path" >&2
+  exit 2
+fi
+if ! command -v python3 >/dev/null 2>&1 ||
+   ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)'; then
+  echo "Python 3.8 or newer is required to validate the split coverage policy." >&2
   exit 2
 fi
 
@@ -85,6 +101,25 @@ fi
 output_dir="$repo_root/target/llvm-cov"
 summary_path="$output_dir/coverage-summary.json"
 
+validate_coverage_summary() {
+  local enforce_thresholds="$1"
+  local enforcement_arguments=()
+
+  if [[ "$enforce_thresholds" == "true" ]]; then
+    enforcement_arguments=(--enforce)
+  elif [[ "$enforce_thresholds" != "false" ]]; then
+    echo "Invalid coverage enforcement mode: $enforce_thresholds" >&2
+    return 2
+  fi
+
+  python3 "$repo_root/scripts/coverage_policy.py" \
+    --summary "$summary_path" \
+    --repository "$repo_root" \
+    --minimum-general "$minimum_lines" \
+    --minimum-dsm "$dsm_minimum_lines" \
+    "${enforcement_arguments[@]}"
+}
+
 cargo "+$rust_toolchain" llvm-cov clean --workspace
 cargo "+$rust_toolchain" llvm-cov --locked --workspace --all-targets --no-report
 mkdir -p "$output_dir"
@@ -95,13 +130,16 @@ cargo "+$rust_toolchain" llvm-cov report \
 
 case "$mode" in
   check)
-    cargo "+$rust_toolchain" llvm-cov report --fail-under-lines "$minimum_lines"
+    cargo "+$rust_toolchain" llvm-cov report
+    validate_coverage_summary true
     ;;
   report)
     cargo "+$rust_toolchain" llvm-cov report
+    validate_coverage_summary false
     ;;
   html)
     cargo "+$rust_toolchain" llvm-cov report --html --output-dir "$output_dir/html"
+    validate_coverage_summary false
     echo "HTML coverage report: $output_dir/html/index.html"
     ;;
 esac

@@ -128,7 +128,7 @@ jobs:
           }
 
   coverage:
-    name: Coverage (90% line gate)
+    name: Coverage (90% non-DSM / 74% DSM line gates)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -148,7 +148,7 @@ jobs:
           cargo "+$RUST_TOOLCHAIN" install cargo-llvm-cov \
             --version "$CARGO_LLVM_COV_VERSION" \
             --locked
-      - name: Enforce repository line coverage
+      - name: Enforce split repository line coverage
         run: bash scripts/coverage.sh check
       - name: Preserve coverage summary
         if: always()
@@ -433,10 +433,10 @@ jobs:
         run: python3 packaging/synology/test_synology_ui.py
       - name: Test Synology package builder and DSM lifecycle
         run: python3 packaging/synology/test_synology_package.py
-      - name: Test calendar release contract
+      - name: Test release and coverage policy contracts
         run: >-
           python3 -m unittest discover -s .github/scripts/tests
-          -p 'test_release_contract.py' -v
+          -p 'test_*.py' -v
       - name: Parse PowerShell packaging scripts
         shell: pwsh
         run: ./.github/scripts/validate-powershell.ps1

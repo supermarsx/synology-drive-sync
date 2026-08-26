@@ -15,8 +15,9 @@ git diff --exit-code -- THIRD_PARTY_LICENSES.html
 ```
 
 Run the reproducible full-source coverage report described in
-[Testing and coverage](docs/testing.md). The CI coverage job enforces the repository's unfiltered
-90% total line threshold with the pinned toolchain and `cargo-llvm-cov` version.
+[Testing and coverage](docs/testing.md). The CI coverage job preserves the unfiltered report while
+enforcing a 90% non-DSM line floor and a 74% floor across the exact DSM bridge boundary, using the
+pinned toolchain and `cargo-llvm-cov` version.
 
 The two supply-chain helpers use SHA-256-pinned official tool archives. The RustSec helper updates
 the advisory database before checking `Cargo.lock`; the notice helper fetches checksum-locked
