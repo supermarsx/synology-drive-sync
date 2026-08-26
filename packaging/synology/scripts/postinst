@@ -8,6 +8,7 @@ set -eu
 require_package_identity
 ensure_layout
 postinst_lifecycle_lock=false
+postinst_policy_lock=false
 postinst_lock=false
 postinst_audit_pending=false
 postinst_commit_started=false
@@ -23,6 +24,10 @@ cleanup_postinst() {
         release_private_process_lock "$management_lock" >/dev/null 2>&1 || true
         postinst_lock=false
     fi
+    if [ "$postinst_policy_lock" = true ]; then
+        release_private_process_lock "$policy_execution_lock" >/dev/null 2>&1 || true
+        postinst_policy_lock=false
+    fi
     if [ "$postinst_lifecycle_lock" = true ]; then
         release_private_process_lock "$lifecycle_lock" >/dev/null 2>&1 || true
         postinst_lifecycle_lock=false
@@ -35,15 +40,20 @@ acquire_private_process_lock "$lifecycle_lock" || {
     exit 1
 }
 postinst_lifecycle_lock=true
-"$api_bridge" --service-admission close || {
-    package_message "could not initialize closed service admission"
+acquire_private_process_lock "$policy_execution_lock" || {
+    package_message "another policy-sensitive operation is active"
     exit 1
 }
+postinst_policy_lock=true
 acquire_private_process_lock "$management_lock" || {
     package_message "another package-management operation is active"
     exit 1
 }
 postinst_lock=true
+"$api_bridge" --service-admission close || {
+    package_message "could not initialize closed service admission"
+    exit 1
+}
 
 postinst_initial_transition=$(package_transition_status) || {
     package_message "cannot validate package transition during installation"
@@ -160,6 +170,8 @@ case ${SYNOPKG_PKG_STATUS:-INSTALL}:$postinst_transition_state in
 esac
 release_private_process_lock "$management_lock"
 postinst_lock=false
+release_private_process_lock "$policy_execution_lock"
+postinst_policy_lock=false
 release_private_process_lock "$lifecycle_lock"
 postinst_lifecycle_lock=false
 trap - 0 HUP INT TERM

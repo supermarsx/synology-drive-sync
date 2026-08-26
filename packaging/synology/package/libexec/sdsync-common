@@ -266,15 +266,13 @@ EOF
 
 require_verified_controller_parent() {
     controller_parent=${PPID:-0}
-    controller_lock_status=0
-    private_process_lock_is_live "$controller_lock" || controller_lock_status=$?
-    case $controller_lock_status in
+    controller_parent_status=0
+    controller_persisted_identity_status "$controller_parent" || controller_parent_status=$?
+    case $controller_parent_status in
         0) ;;
         1) return 77 ;;
         *) return 73 ;;
     esac
-    [ "$lock_owner_pid" = "$controller_parent" ] || return 77
-    pid_matches_command "$controller_parent" "$controller" || return 77
     [ -f "$controller" ] && [ ! -L "$controller" ] || return 73
     controller_owner=$(stat -L -c '%u' "$controller" 2>/dev/null || true)
     controller_mode=$(stat -L -c '%a' "$controller" 2>/dev/null || true)
@@ -337,25 +335,68 @@ read_controller_ready_identity() {
     valid_boot_identity "$controller_ready_boot" || return 73
 }
 
+# Long-lived controller authorization is based on three independently
+# published exact identities rather than vendor-shell-specific cmdline text:
+# the PID file, readiness record, and live private lock must all name the same
+# PID/start/boot tuple owned by this package. Recheck the complete chain to
+# reject replacement during inspection.
+controller_persisted_identity_status() {
+    expected_controller_pid=${1:-}
+    [ -f "$controller" ] && [ ! -L "$controller" ] || return 73
+    persisted_controller_executable=$(stat -L -c '%u:%a:%h' "$controller" 2>/dev/null || true)
+    [ "$persisted_controller_executable" = "$path_owner:755:1" ] || return 73
+    controller_pid_file_safe || return $?
+    persisted_controller_pid=$controller_pid_value
+    read_controller_ready_identity || return $?
+    persisted_controller_ready_pid=$controller_ready_pid
+    persisted_controller_start=$controller_ready_start
+    persisted_controller_boot=$controller_ready_boot
+    persisted_controller_lock_status=0
+    private_process_lock_is_live "$controller_lock" || persisted_controller_lock_status=$?
+    [ "$persisted_controller_lock_status" -eq 0 ] || return "$persisted_controller_lock_status"
+    [ "${lock_owner_legacy:-true}" = false ] \
+        && [ "$persisted_controller_pid" = "$persisted_controller_ready_pid" ] \
+        && [ "$lock_owner_pid" = "$persisted_controller_pid" ] \
+        && [ "$lock_owner_start" = "$persisted_controller_start" ] \
+        && [ "$lock_owner_boot" = "$persisted_controller_boot" ] || return 73
+    [ -z "$expected_controller_pid" ] \
+        || [ "$persisted_controller_pid" = "$expected_controller_pid" ] || return 1
+
+    controller_pid_file_safe || return 73
+    [ "$controller_pid_value" = "$persisted_controller_pid" ] || return 73
+    read_controller_ready_identity || return 73
+    [ "$controller_ready_pid" = "$persisted_controller_pid" ] \
+        && [ "$controller_ready_start" = "$persisted_controller_start" ] \
+        && [ "$controller_ready_boot" = "$persisted_controller_boot" ] || return 73
+    persisted_controller_lock_status=0
+    private_process_lock_is_live "$controller_lock" || persisted_controller_lock_status=$?
+    [ "$persisted_controller_lock_status" -eq 0 ] \
+        && [ "${lock_owner_legacy:-true}" = false ] \
+        && [ "$lock_owner_pid" = "$persisted_controller_pid" ] \
+        && [ "$lock_owner_start" = "$persisted_controller_start" ] \
+        && [ "$lock_owner_boot" = "$persisted_controller_boot" ] || return 73
+}
+
 # Return 0 only for a live, exact controller readiness identity; 1 means an
 # absent or verifiably stale record, and 73 means an unsafe/malformed record.
 controller_ready_status() {
     [ -e "$controller_ready_file" ] || [ -L "$controller_ready_file" ] || return 1
-    read_controller_ready_identity || return $?
-    controller_ready_live_status=0
-    process_identity_is_live "$controller_ready_pid" "$controller_ready_start" \
-        "$controller_ready_boot" || controller_ready_live_status=$?
-    case $controller_ready_live_status in
-        0) pid_matches_command "$controller_ready_pid" "$controller" || return 73; return 0 ;;
-        1) return 1 ;;
-        *) return 73 ;;
-    esac
+    controller_persisted_identity_status
 }
 
 controller_ready_matches() {
     expected_ready_pid=$1
     controller_ready_status || return $?
     [ "$controller_ready_pid" = "$expected_ready_pid" ] || return 73
+}
+
+# A controller verifies the exact package-owned script named by its own $0
+# before it publishes readiness. This avoids depending on how a particular DSM
+# shell exposes its interpreter argv through procfs while retaining the same
+# inode, owner, mode, and single-link contract.
+controller_self_executable_matches() {
+    [ "${PPID:-0}" = "${SDSYNC_DSM_CONTROLLER_START_PARENT_PID:-}" ] || return 73
+    same_private_executable "$controller" "$0" "$path_owner"
 }
 
 runtime_api_ready_status() {
@@ -582,21 +623,49 @@ remove_stale_controller_start_lease() {
 
 remove_stale_controller_ready() {
     [ -e "$controller_ready_file" ] || [ -L "$controller_ready_file" ] || return 0
-    stale_ready_status=0
-    controller_ready_status || stale_ready_status=$?
-    case $stale_ready_status in
+    # The caller owns controller.lock here. That means a dead controller's
+    # readiness tuple cannot satisfy controller_persisted_identity_status:
+    # the lock now truthfully names this cleanup process. Validate the private
+    # readiness record directly, prove its exact PID/start/boot identity is no
+    # longer live, then pin and recheck both the tuple and inode before removal.
+    stale_ready_lock_status=0
+    private_process_lock_is_live "$controller_lock" || stale_ready_lock_status=$?
+    [ "$stale_ready_lock_status" -eq 0 ] \
+        && [ "${lock_owner_legacy:-true}" = false ] \
+        && [ "$lock_owner_pid" = "$$" ] || return 73
+    stale_ready_owner_start=$(process_start_time "$$" 2>/dev/null || true)
+    stale_ready_owner_boot=$(boot_identity) || return 73
+    [ "$lock_owner_start" = "$stale_ready_owner_start" ] \
+        && [ "$lock_owner_boot" = "$stale_ready_owner_boot" ] || return 73
+    read_controller_ready_identity || return 73
+    stale_ready_pid=$controller_ready_pid
+    stale_ready_start=$controller_ready_start
+    stale_ready_boot=$controller_ready_boot
+    stale_ready_identity=$(stat -c '%d:%i' "$controller_ready_file" 2>/dev/null || true)
+    [ -n "$stale_ready_identity" ] || return 73
+    stale_ready_process_status=0
+    process_identity_is_live "$stale_ready_pid" "$stale_ready_start" \
+        "$stale_ready_boot" || stale_ready_process_status=$?
+    case $stale_ready_process_status in
         0) return 75 ;;
         1) ;;
         *) return 73 ;;
     esac
-    # Re-validate the exact inode immediately before removal. A disappearance
-    # is benign; a replacement is unsafe.
     read_controller_ready_identity || {
         [ -e "$controller_ready_file" ] || [ -L "$controller_ready_file" ] || return 0
         return 73
     }
-    stale_ready_identity=$(stat -c '%d:%i' "$controller_ready_file" 2>/dev/null || true)
-    [ -n "$stale_ready_identity" ] || return 73
+    [ "$controller_ready_pid" = "$stale_ready_pid" ] \
+        && [ "$controller_ready_start" = "$stale_ready_start" ] \
+        && [ "$controller_ready_boot" = "$stale_ready_boot" ] || return 73
+    stale_ready_process_status=0
+    process_identity_is_live "$stale_ready_pid" "$stale_ready_start" \
+        "$stale_ready_boot" || stale_ready_process_status=$?
+    case $stale_ready_process_status in
+        0) return 75 ;;
+        1) ;;
+        *) return 73 ;;
+    esac
     stale_ready_recheck=$(stat -c '%d:%i' "$controller_ready_file" 2>/dev/null || true)
     [ "$stale_ready_recheck" = "$stale_ready_identity" ] || return 73
     rm -f "$controller_ready_file"
@@ -607,6 +676,7 @@ publish_controller_ready() {
     published_ready_start=$(process_start_time "$$" 2>/dev/null || true)
     case $published_ready_start in ''|*[!0-9]*|0) return 73 ;; esac
     published_ready_boot=$(boot_identity) || return 73
+    controller_self_executable_matches || return 73
     published_ready_temp=$controller_ready_file.tmp.$$
     [ ! -e "$published_ready_temp" ] && [ ! -L "$published_ready_temp" ] || return 73
     {
@@ -620,7 +690,10 @@ publish_controller_ready() {
         return 73
     }
     mv "$published_ready_temp" "$controller_ready_file" || { rm -f "$published_ready_temp"; return 73; }
-    controller_ready_matches "$$"
+    read_controller_ready_identity || return 73
+    [ "$controller_ready_pid" = "$$" ] \
+        && [ "$controller_ready_start" = "$published_ready_start" ] \
+        && [ "$controller_ready_boot" = "$published_ready_boot" ]
 }
 
 remove_own_controller_ready() {

@@ -480,10 +480,18 @@ reload_controller_if_running() {
     running_pid=$(read_pid "$controller_pid_file" 2>/dev/null || true)
     [ -n "$running_pid" ] || return 0
     pid_is_live "$running_pid" || return 0
-    if ! pid_matches_command "$running_pid" "$controller"; then
+    if ! controller_persisted_identity_status "$running_pid"; then
         echo "refusing to signal unverified controller PID $running_pid" >&2
         return 73
     fi
+    reload_controller_start=$persisted_controller_start
+    reload_controller_boot=$persisted_controller_boot
+    controller_persisted_identity_status "$running_pid" \
+        && [ "$persisted_controller_start" = "$reload_controller_start" ] \
+        && [ "$persisted_controller_boot" = "$reload_controller_boot" ] || {
+        echo "controller identity changed immediately before reload" >&2
+        return 73
+    }
     kill -HUP "$running_pid"
 }
 
@@ -1889,7 +1897,7 @@ api_snapshot() {
         [ ! -L "$controller_pid_file" ] && [ -f "$controller_pid_file" ] || api_error unsafe_state "unsafe controller PID file" 73
         service_pid=$(read_pid "$controller_pid_file" 2>/dev/null || true)
         [ -n "$service_pid" ] || api_error corrupt_state "controller PID file is malformed" 73
-        if pid_matches_command "$service_pid" "$controller"; then service_state=running
+        if controller_persisted_identity_status "$service_pid"; then service_state=running
         elif pid_is_live "$service_pid"; then service_state=untrusted
         else service_pid=0; service_state=stopped
         fi
@@ -2449,7 +2457,7 @@ case $command_name in
         require_package_identity || exit 77
         [ "$#" -eq 0 ] || die "status accepts no arguments"
         pid=$(read_pid "$controller_pid_file" 2>/dev/null || true)
-        if [ -n "$pid" ] && pid_matches_command "$pid" "$controller"; then
+        if [ -n "$pid" ] && controller_persisted_identity_status "$pid"; then
             service=running
         elif [ -n "$pid" ] && pid_is_live "$pid"; then
             service=untrusted

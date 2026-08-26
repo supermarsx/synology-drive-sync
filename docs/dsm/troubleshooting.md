@@ -120,19 +120,41 @@ the [release instructions](../releases.md#synology-dsm-packages), then install i
 **Package Center > Manual Install**. GitHub Releases are the update channel for this package; the
 26.11 asset remains immutable.
 
+## `api.cgi?action=csrf` returns HTTP 503
+
+An authenticated 503 response with code `service_unavailable` means the fixed private package API
+socket was not ready for a verified connection. A request that overlaps normal startup retries only
+the missing, connection-refused, or private pre-commit socket state for a short bounded window. Retry
+once after Package Center reports the package running. Repeated 503 responses mean the service did
+not become ready; restart **Synology Drive Sync** in Package Center and inspect the package startup
+result rather than repeatedly refreshing the dashboard. A later Synology `synowebrtc` message such
+as `Peer connection closed` is downstream noise after the HTTP request failed, not the root cause.
+
+Failed startup now emits one fixed-value line beginning `startup diagnostic:`. Collect that complete
+line from the Package Center start details or package log, together with the bounded
+`controller.log` and `api.log` tails listed above. Its fields report only states such as
+`exact`, `missing`, `absent`, `mismatch`, `prepared`, `unverified`, or `unsafe` for the controller
+PID/child/lock and API PID/bound/socket checks; they contain no request query, cookie, token, secret,
+or filesystem path.
+Do not hand-create readiness files, remove locks, broaden socket permissions, or run either service
+as root. Those changes erase the evidence and bypass the package's fail-closed identity checks.
+
 ## DSM says the page is not found when opening the app
 
-The current source uses the native `type=app` AppWindow introduced in release 26.10. It does not
-navigate to a packaged `index.html`. On a 26.10-or-later native artifact, DSM's generic “Sorry, the
-page you are looking for is not found” response during Open therefore usually identifies a stale
-URL-style registration/shortcut or a failed native asset/API request; it is not evidence that a
-`SynoToken` is required.
+The current source uses the native `type=app` AppWindow introduced in release 26.10. The package's
+directory Open route now resolves through a byte-pinned `index.html` that has no script, external
+asset, token handling, or dashboard implementation. It redirects on the same origin to
+`/webman/index.cgi?launchApp=SYNO.SDS.App.SynologyDriveSync.Instance`, while desktop and Package
+Center launches still instantiate that same native class. DSM's generic “Sorry, the page you are
+looking for is not found” response therefore identifies a missing/stale launcher payload or a
+broken Webman mapping; it is not evidence that a `SynoToken` is required.
 
 First click **Open** in Package Center or launch **Synology Drive Sync** from the DSM desktop. In the
 browser Network panel, record only each failed request path, status, and response type. Do not copy,
-save, or share any query string because it can contain session material. A corrected launch must not
-request `/webman/3rdparty/synology-drive-sync/index.html`. The dashboard's API requests use the exact
-path `/webman/3rdparty/synology-drive-sync/api.cgi`.
+save, or share arbitrary query strings because they can contain session material. A corrected direct
+launch may request either `/webman/3rdparty/synology-drive-sync/` or its explicit `index.html`, then
+must navigate to the fixed token-free `launchApp` target above. The dashboard's API requests use the
+exact path `/webman/3rdparty/synology-drive-sync/api.cgi`.
 
 Then inspect the installed registration and mapping without changing them:
 
@@ -147,22 +169,24 @@ ls -ld "$WEBMAN_LINK" "$UI_ROOT"
 readlink "$WEBMAN_LINK"
 readlink -f "$WEBMAN_LINK"
 stat -Lc '%F %a %U:%G %n' \
-  "$WEBMAN_LINK" "$UI_ROOT" "$UI_ROOT/config" \
+  "$WEBMAN_LINK" "$UI_ROOT" "$UI_ROOT/config" "$UI_ROOT/index.html" \
   "$UI_ROOT/SynologyDriveSync.js" "$UI_ROOT/style.css" "$UI_ROOT/api.cgi"
 grep -F 'SYNO.SDS.App.SynologyDriveSync.Instance' "$UI_ROOT/config"
 grep -F '"type": "app"' "$UI_ROOT/config"
 ```
 
 The installed fields must be `package="synology-drive-sync"`, `dsmuidir="ui"`, and
-`dsmappname="SYNO.SDS.App.SynologyDriveSync.Instance"`. `config`, `SynologyDriveSync.js`, and
-`style.css` must be regular `0644` files; `config` must wrap that class beneath the
+`dsmappname="SYNO.SDS.App.SynologyDriveSync.Instance"`. `config`, `index.html`,
+`SynologyDriveSync.js`, and `style.css` must be regular `0644` files; `config` must wrap that class
+beneath the
 `SynologyDriveSync.js` module and declare `type="app"` with the matching `appWindow`. `api.cgi` must
 be a regular `0755` file. The Webman link must resolve to that installation's `target/ui` for the
 CGI endpoint. Interpret the evidence as follows:
 
-- Any Open request for `index.html`, or an installed `.url`/`type=url` config, identifies an old
-  package or stale DSM registration. Verify and reinstall a published 26.10-or-later native artifact;
-  do not edit the installed config in place.
+- An Open request for the package root or `index.html` is expected only when it returns the exact
+  same-origin redirect to the native `launchApp` class. A missing/tampered index, an external target,
+  or an installed `.url`/`type=url` config identifies an invalid package or stale DSM registration.
+  Verify and reinstall a corrected published native artifact; do not edit the installed files.
 - A missing class/module wrapper, bundle, or stylesheet is an invalid/stale SPK payload. Preserve its
   checksum and member listing, then install a verified corrected artifact.
 - A missing or broken Webman link with correct installed metadata is a DSM package-framework
@@ -343,8 +367,9 @@ the exact source NAS and record all of the following:
   lower-privilege/root rejection and retain the bounded log tails above;
 - dashboard icon/Open behavior and actual native DSM AppWindow layout at narrow and wide sizes;
 - the installed module-keyed config registers `SYNO.SDS.App.SynologyDriveSync.Instance` as
-  `type=app`, Package Center and desktop Open instantiate that class without any `index.html`
-  navigation, the bundle/style load, DSM's Webman link resolves to `target/ui`, and
+  `type=app`, Package Center and desktop Open instantiate that class, the package root and explicit
+  `index.html` routes redirect only to that same native class, the bundle/style load, DSM's Webman
+  link resolves to `target/ui`, and
   `/webman/3rdparty/synology-drive-sync/api.cgi` is reached without a routing 404;
 - on every claimed DSM branch—and specifically DSM 7.0/7.1 where supported—the same AppWindow
   launch, rendering, assets, and API path succeed on physical NAS hardware; and

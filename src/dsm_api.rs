@@ -156,6 +156,10 @@ const RELAY_IO_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(target_os = "linux")]
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "linux")]
+const CGI_SERVICE_CONNECT_WINDOW: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
+const CGI_SERVICE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(target_os = "linux")]
 const AUTH_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
 const READ_MANAGER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -182,6 +186,8 @@ struct ControlPaths<'a> {
     enqueue_sequence: &'a Path,
     audit_outbox_directory: &'a Path,
     audit_outbox_lock: &'a Path,
+    package_transition: &'a Path,
+    service_closed: &'a Path,
 }
 
 #[cfg(target_os = "linux")]
@@ -335,6 +341,8 @@ impl ControlPaths<'static> {
             enqueue_sequence: Path::new(ENQUEUE_SEQUENCE_PATH),
             audit_outbox_directory: Path::new(AUDIT_OUTBOX_DIR),
             audit_outbox_lock: Path::new(AUDIT_OUTBOX_LOCK_PATH),
+            package_transition: Path::new(PACKAGE_TRANSITION_PATH),
+            service_closed: Path::new(SERVICE_CLOSED_PATH),
         }
     }
 }
@@ -2784,6 +2792,11 @@ mod linux_socket {
 
     static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
+    enum ConnectAttemptError {
+        Retryable,
+        Terminal(BridgeError),
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(super) struct PeerCredentials {
         pub(super) uid: u32,
@@ -2828,21 +2841,97 @@ mod linux_socket {
             .map_err(|_| BridgeError::new(ErrorKind::Unavailable))
     }
 
+    #[cfg(test)]
     pub(super) fn connect(path: &Path, package_uid: u32, web_gid: u32) -> BridgeResult<UnixStream> {
-        let before = socket_metadata(path, package_uid, web_gid)?;
-        let stream = connect_with_timeout(path, RELAY_CONNECT_TIMEOUT)
-            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
-        configure_stream(&stream)?;
-        let credentials = peer_credentials(&stream)?;
-        validate_peer_uid(credentials.uid, package_uid)?;
-        let after = socket_metadata(path, package_uid, web_gid)?;
+        connect_attempt(path, package_uid, web_gid).map_err(|error| match error {
+            ConnectAttemptError::Retryable => BridgeError::new(ErrorKind::Unavailable),
+            ConnectAttemptError::Terminal(error) => error,
+        })
+    }
+
+    pub(super) fn connect_for_cgi(
+        path: &Path,
+        package_uid: u32,
+        web_gid: u32,
+        window: Duration,
+    ) -> BridgeResult<UnixStream> {
+        let deadline = Instant::now()
+            .checked_add(window)
+            .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+        loop {
+            match connect_attempt(path, package_uid, web_gid) {
+                Ok(stream) => return Ok(stream),
+                Err(ConnectAttemptError::Terminal(error)) => return Err(error),
+                Err(ConnectAttemptError::Retryable) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(BridgeError::new(ErrorKind::Unavailable));
+                    }
+                    std::thread::sleep(
+                        deadline.duration_since(now).min(CGI_SERVICE_RETRY_INTERVAL),
+                    );
+                }
+            }
+        }
+    }
+
+    fn connect_attempt(
+        path: &Path,
+        package_uid: u32,
+        web_gid: u32,
+    ) -> Result<UnixStream, ConnectAttemptError> {
+        let before = match connectable_socket_metadata(path, package_uid, web_gid) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind == ErrorKind::Unavailable => {
+                return Err(ConnectAttemptError::Retryable);
+            }
+            Err(error) => return Err(ConnectAttemptError::Terminal(error)),
+        };
+        let stream = match connect_with_timeout(path, RELAY_CONNECT_TIMEOUT) {
+            Ok(stream) => stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return Err(ConnectAttemptError::Retryable);
+            }
+            Err(_) => {
+                return Err(ConnectAttemptError::Terminal(BridgeError::new(
+                    ErrorKind::Unavailable,
+                )));
+            }
+        };
+        configure_stream(&stream).map_err(ConnectAttemptError::Terminal)?;
+        let credentials = peer_credentials(&stream).map_err(ConnectAttemptError::Terminal)?;
+        validate_peer_uid(credentials.uid, package_uid).map_err(ConnectAttemptError::Terminal)?;
+        // Once a verified peer accepted the connection, disappearance or
+        // replacement of the filesystem name is a security failure, never a
+        // readiness retry. This preserves the before/after inode contract.
+        let after = socket_metadata(path, package_uid, web_gid)
+            .map_err(|_| ConnectAttemptError::Terminal(BridgeError::unsafe_runtime()))?;
         if !same_object(&before, &after) {
-            return Err(BridgeError::unsafe_runtime());
+            return Err(ConnectAttemptError::Terminal(BridgeError::unsafe_runtime()));
         }
         Ok(stream)
     }
 
     pub(super) fn bind(path: &Path, package_uid: u32, web_gid: u32) -> BridgeResult<UnixListener> {
+        let (listener, identity) = bind_prepared(path, package_uid, web_gid)?;
+        if let Err(error) = activate_prepared(path, package_uid, web_gid, &identity) {
+            drop(listener);
+            remove_new_socket(path, package_uid);
+            return Err(error);
+        }
+        Ok(listener)
+    }
+
+    pub(super) fn bind_prepared(
+        path: &Path,
+        package_uid: u32,
+        web_gid: u32,
+    ) -> BridgeResult<(UnixListener, fs::Metadata)> {
         validate_socket_parent(path, package_uid)?;
         remove_stale_socket(path, package_uid, web_gid)?;
         let listener = {
@@ -2852,12 +2941,33 @@ mod linux_socket {
             let _umask = UmaskGuard::replace(0o177);
             UnixListener::bind(path).map_err(|_| BridgeError::new(ErrorKind::Unavailable))?
         };
-        if let Err(error) = set_socket_contract(path, package_uid, web_gid) {
-            drop(listener);
-            remove_new_socket(path, package_uid);
-            return Err(error);
+        let identity = match prepared_socket_metadata(path, package_uid) {
+            Ok(identity) => identity,
+            Err(error) => {
+                drop(listener);
+                remove_new_socket(path, package_uid);
+                return Err(error);
+            }
+        };
+        Ok((listener, identity))
+    }
+
+    pub(super) fn activate_prepared(
+        path: &Path,
+        package_uid: u32,
+        web_gid: u32,
+        expected: &fs::Metadata,
+    ) -> BridgeResult<()> {
+        let before = prepared_socket_metadata(path, package_uid)?;
+        if !same_inode(expected, &before) {
+            return Err(BridgeError::unsafe_runtime());
         }
-        Ok(listener)
+        set_socket_contract(path, package_uid, web_gid)?;
+        let after = socket_metadata(path, package_uid, web_gid)?;
+        if !same_inode(expected, &after) {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(())
     }
 
     pub(super) fn cleanup_stale_service_socket(
@@ -2963,13 +3073,53 @@ mod linux_socket {
     }
 
     fn socket_metadata(path: &Path, package_uid: u32, web_gid: u32) -> BridgeResult<fs::Metadata> {
-        let metadata = fs::symlink_metadata(path).map_err(|_| BridgeError::unsafe_runtime())?;
+        let metadata = fs::symlink_metadata(path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                BridgeError::new(ErrorKind::Unavailable)
+            } else {
+                BridgeError::unsafe_runtime()
+            }
+        })?;
         if package_uid == 0
             || web_gid == 0
             || !metadata.file_type().is_socket()
             || metadata.st_uid() != package_uid
             || metadata.st_gid() != web_gid
             || metadata.st_mode() & 0o7777 != 0o660
+            || metadata.st_nlink() != 1
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(metadata)
+    }
+
+    fn connectable_socket_metadata(
+        path: &Path,
+        package_uid: u32,
+        web_gid: u32,
+    ) -> BridgeResult<fs::Metadata> {
+        match socket_metadata(path, package_uid, web_gid) {
+            Ok(metadata) => Ok(metadata),
+            Err(error) if error.kind == ErrorKind::Unavailable => Err(error),
+            Err(error) => match prepared_socket_metadata(path, package_uid) {
+                Ok(_) => Err(BridgeError::new(ErrorKind::Unavailable)),
+                Err(_) => Err(error),
+            },
+        }
+    }
+
+    fn prepared_socket_metadata(path: &Path, package_uid: u32) -> BridgeResult<fs::Metadata> {
+        let metadata = fs::symlink_metadata(path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                BridgeError::new(ErrorKind::Unavailable)
+            } else {
+                BridgeError::unsafe_runtime()
+            }
+        })?;
+        if package_uid == 0
+            || !metadata.file_type().is_socket()
+            || metadata.st_uid() != package_uid
+            || metadata.st_mode() & 0o7777 != 0o600
             || metadata.st_nlink() != 1
         {
             return Err(BridgeError::unsafe_runtime());
@@ -3171,6 +3321,10 @@ mod linux_socket {
             && first.st_gid() == second.st_gid()
             && first.st_mode() == second.st_mode()
             && first.st_nlink() == second.st_nlink()
+    }
+
+    fn same_inode(first: &fs::Metadata, second: &fs::Metadata) -> bool {
+        first.st_dev() == second.st_dev() && first.st_ino() == second.st_ino()
     }
 
     struct UmaskGuard {
@@ -5551,10 +5705,30 @@ mod linux_files {
         paths: &ControlPaths<'_>,
         request: EnqueueRequest<'_>,
         maximum_outstanding_jobs: usize,
-        mut record_audit: F,
+        record_audit: F,
     ) -> BridgeResult<EnqueueOutcome>
     where
         F: FnMut(&AuditOutboxRecord, &str) -> BridgeResult<()>,
+    {
+        enqueue_with_admission_hook(
+            paths,
+            request,
+            maximum_outstanding_jobs,
+            record_audit,
+            || {},
+        )
+    }
+
+    pub(super) fn enqueue_with_admission_hook<F, H>(
+        paths: &ControlPaths<'_>,
+        request: EnqueueRequest<'_>,
+        maximum_outstanding_jobs: usize,
+        mut record_audit: F,
+        after_admission: H,
+    ) -> BridgeResult<EnqueueOutcome>
+    where
+        F: FnMut(&AuditOutboxRecord, &str) -> BridgeResult<()>,
+        H: FnOnce(),
     {
         let EnqueueRequest {
             package_uid,
@@ -5574,6 +5748,12 @@ mod linux_files {
         validate_private_directory(paths.responses, package_uid)?;
         validate_private_directory(paths.staging, package_uid)?;
         let _enqueue_lock = open_enqueue_lock(paths, package_uid)?;
+        // This check is authoritative because lifecycle/upgrade marker writes
+        // take the same enqueue flock. Either publication wins before the
+        // close fence, or the closed/transition state is observed before any
+        // audit or queue artifact is staged.
+        require_open_runtime_admission(paths, package_uid)?;
+        after_admission();
         let audit_paths = paths.audit_outbox();
         reconcile_audit_transactions(&audit_paths, package_uid, &mut record_audit)?;
         recover_legacy_queue_temps(paths, package_uid)?;
@@ -6730,8 +6910,11 @@ mod linux_files {
         remove_own_service_identity(path, package_uid, actual.as_slice())
     }
 
-    pub(super) fn package_transition_state(package_uid: u32) -> BridgeResult<&'static str> {
-        let path = Path::new(PACKAGE_TRANSITION_PATH);
+    pub(super) fn package_transition_state(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+    ) -> BridgeResult<&'static str> {
+        let path = paths.package_transition;
         let bytes = match fs::symlink_metadata(path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok("open"),
             Ok(_) => read_exact_single_link_private_file(path, package_uid, 16)?,
@@ -6744,25 +6927,64 @@ mod linux_files {
         }
     }
 
-    pub(super) fn prepare_package_transition(package_uid: u32, kind: &str) -> BridgeResult<()> {
+    pub(super) fn prepare_package_transition(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+        kind: &str,
+    ) -> BridgeResult<()> {
+        prepare_package_transition_with_hook(paths, package_uid, kind, || {})
+    }
+
+    pub(super) fn prepare_package_transition_with_hook<H>(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+        kind: &str,
+        after_lock: H,
+    ) -> BridgeResult<()>
+    where
+        H: FnOnce(),
+    {
         let expected: &[u8] = match kind {
             "upgrade" => b"upgrade\n",
             "uninstall" => b"uninstall\n",
             _ => return Err(BridgeError::bad_request()),
         };
-        publish_idempotent_private_marker(Path::new(PACKAGE_TRANSITION_PATH), package_uid, expected)
+        validate_private_directory(paths.root, package_uid)?;
+        let _enqueue_lock = open_enqueue_lock(paths, package_uid)?;
+        after_lock();
+        publish_idempotent_private_marker(paths.package_transition, package_uid, expected)
     }
 
-    pub(super) fn clear_package_transition(package_uid: u32) -> BridgeResult<()> {
+    pub(super) fn clear_package_transition(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+    ) -> BridgeResult<()> {
+        clear_package_transition_with_hook(paths, package_uid, || {})
+    }
+
+    fn clear_package_transition_with_hook<H>(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+        after_lock: H,
+    ) -> BridgeResult<()>
+    where
+        H: FnOnce(),
+    {
+        validate_private_directory(paths.root, package_uid)?;
+        let _enqueue_lock = open_enqueue_lock(paths, package_uid)?;
+        after_lock();
         remove_allowed_private_marker(
-            Path::new(PACKAGE_TRANSITION_PATH),
+            paths.package_transition,
             package_uid,
             &[b"upgrade\n", b"uninstall\n"],
         )
     }
 
-    pub(super) fn service_admission_state(package_uid: u32) -> BridgeResult<&'static str> {
-        let path = Path::new(SERVICE_CLOSED_PATH);
+    pub(super) fn service_admission_state(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+    ) -> BridgeResult<&'static str> {
+        let path = paths.service_closed;
         match fs::symlink_metadata(path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok("open"),
             Ok(_) => {
@@ -6777,12 +6999,58 @@ mod linux_files {
         }
     }
 
-    pub(super) fn close_service_admission(package_uid: u32) -> BridgeResult<()> {
-        publish_idempotent_private_marker(Path::new(SERVICE_CLOSED_PATH), package_uid, b"closed\n")
+    pub(super) fn close_service_admission(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+    ) -> BridgeResult<()> {
+        close_service_admission_with_hook(paths, package_uid, || {})
     }
 
-    pub(super) fn open_service_admission(package_uid: u32) -> BridgeResult<()> {
-        remove_allowed_private_marker(Path::new(SERVICE_CLOSED_PATH), package_uid, &[b"closed\n"])
+    pub(super) fn close_service_admission_with_hook<H>(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+        after_lock: H,
+    ) -> BridgeResult<()>
+    where
+        H: FnOnce(),
+    {
+        validate_private_directory(paths.root, package_uid)?;
+        let _enqueue_lock = open_enqueue_lock(paths, package_uid)?;
+        after_lock();
+        publish_idempotent_private_marker(paths.service_closed, package_uid, b"closed\n")
+    }
+
+    pub(super) fn open_service_admission(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+    ) -> BridgeResult<()> {
+        open_service_admission_with_hook(paths, package_uid, || {})
+    }
+
+    pub(super) fn open_service_admission_with_hook<H>(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+        after_lock: H,
+    ) -> BridgeResult<()>
+    where
+        H: FnOnce(),
+    {
+        validate_private_directory(paths.root, package_uid)?;
+        let _enqueue_lock = open_enqueue_lock(paths, package_uid)?;
+        after_lock();
+        remove_allowed_private_marker(paths.service_closed, package_uid, &[b"closed\n"])
+    }
+
+    pub(super) fn require_open_runtime_admission(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+    ) -> BridgeResult<()> {
+        if package_transition_state(paths, package_uid)? != "open"
+            || service_admission_state(paths, package_uid)? != "open"
+        {
+            return Err(BridgeError::new(ErrorKind::Unavailable));
+        }
+        Ok(())
     }
 
     fn failed_start_child_path(kind: &str) -> BridgeResult<&'static Path> {
@@ -7751,6 +8019,11 @@ impl CgiResponse {
         Self { status: 410, body }
     }
 
+    fn service_unavailable() -> Self {
+        let body = br#"{"schema":"sdsync.dsm-error.v1","ok":false,"code":"service_unavailable","message":"The package service is not ready. Retry shortly. If this persists, restart Synology Drive Sync in Package Center and inspect its controller log."}"#.to_vec();
+        Self { status: 503, body }
+    }
+
     fn error(error: BridgeError) -> Self {
         let (status, code) = match error.kind {
             ErrorKind::BadRequest => (400, "invalid_request"),
@@ -8021,21 +8294,34 @@ fn run_runtime_marker_cli(arguments: &[OsString]) -> BridgeResult<()> {
             .ok_or_else(BridgeError::bad_request)
     };
     linux_runtime::clear_environment()?;
+    let control_paths = ControlPaths::production();
     match (text(0)?, text(1)?, arguments.len()) {
         ("--package-transition", "status", 2) => {
-            println!("{}", linux_files::package_transition_state(package_uid)?);
+            println!(
+                "{}",
+                linux_files::package_transition_state(&control_paths, package_uid)?
+            );
             Ok(())
         }
         ("--package-transition", "prepare", 3) => {
-            linux_files::prepare_package_transition(package_uid, text(2)?)
+            linux_files::prepare_package_transition(&control_paths, package_uid, text(2)?)
         }
-        ("--package-transition", "clear", 2) => linux_files::clear_package_transition(package_uid),
+        ("--package-transition", "clear", 2) => {
+            linux_files::clear_package_transition(&control_paths, package_uid)
+        }
         ("--service-admission", "status", 2) => {
-            println!("{}", linux_files::service_admission_state(package_uid)?);
+            println!(
+                "{}",
+                linux_files::service_admission_state(&control_paths, package_uid)?
+            );
             Ok(())
         }
-        ("--service-admission", "close", 2) => linux_files::close_service_admission(package_uid),
-        ("--service-admission", "open", 2) => linux_files::open_service_admission(package_uid),
+        ("--service-admission", "close", 2) => {
+            linux_files::close_service_admission(&control_paths, package_uid)
+        }
+        ("--service-admission", "open", 2) => {
+            linux_files::open_service_admission(&control_paths, package_uid)
+        }
         ("--failed-start-child", "status", 3) => {
             match linux_files::failed_start_child_state(package_uid, text(2)?)? {
                 Some((pid, start, boot)) => println!("present {pid} {start} {boot}"),
@@ -8293,7 +8579,21 @@ fn run_cgi() -> BridgeResult<CgiResponse> {
             &session,
         )?;
         linux_runtime::clear_environment()?;
-        let mut stream = linux_socket::connect(Path::new(API_SOCKET_PATH), package_uid, web_gid)?;
+        let mut stream = match linux_socket::connect_for_cgi(
+            Path::new(API_SOCKET_PATH),
+            package_uid,
+            web_gid,
+            CGI_SERVICE_CONNECT_WINDOW,
+        ) {
+            Ok(stream) => stream,
+            Err(error) if error.kind == ErrorKind::Unavailable => {
+                eprintln!(
+                    "sdsync-dsm-api: authenticated relay could not reach the verified package API service"
+                );
+                return Ok(CgiResponse::service_unavailable());
+            }
+            Err(error) => return Err(error),
+        };
         write_frame(&mut stream, &encoded, MAX_RELAY_REQUEST_BYTES)?;
         linux_socket::shutdown_write(&stream)?;
         let response = read_single_frame(
@@ -8576,7 +8876,16 @@ fn run_server_loop(
     web_gid: u32,
     supervisor: Option<(&SupervisedParent, u64, &str)>,
 ) -> BridgeResult<()> {
-    let listener = linux_socket::bind(Path::new(API_SOCKET_PATH), package_uid, web_gid)?;
+    let (listener, prepared_socket_identity) = if supervisor.is_some() {
+        let (listener, identity) =
+            linux_socket::bind_prepared(Path::new(API_SOCKET_PATH), package_uid, web_gid)?;
+        (listener, Some(identity))
+    } else {
+        (
+            linux_socket::bind(Path::new(API_SOCKET_PATH), package_uid, web_gid)?,
+            None,
+        )
+    };
     if let Some((parent, start, boot)) = supervisor {
         // PID + socket + this private bound identity form the pre-commit
         // topology. Keep the parent-death signal armed until the lifecycle
@@ -8628,6 +8937,18 @@ fn run_server_loop(
         BoundedWorkerPool::start(API_WORKER_COUNT, API_QUEUE_CAPACITY, move |mut stream| {
             let _ = serve_connection(&mut stream, package_uid, web_uid);
         })?;
+    if let Some(identity) = prepared_socket_identity.as_ref() {
+        // The pre-commit listener is deliberately package-only 0600. Publish
+        // the worker pool and exact readiness identity first, then activate the
+        // socket for DSM's http group. A CGI can therefore never connect to a
+        // listener whose accept loop does not exist yet.
+        linux_socket::activate_prepared(
+            Path::new(API_SOCKET_PATH),
+            package_uid,
+            web_gid,
+            identity,
+        )?;
+    }
     loop {
         match listener.accept() {
             Ok((stream, _)) => match workers.try_dispatch(stream) {
@@ -8679,6 +9000,8 @@ fn handle_relay_request(encoded: &[u8], package_uid: u32) -> BridgeResult<CgiRes
     // cross-UID /proc lookup that rootless package processes cannot perform.
     let session = linux_runtime::authenticate_and_authorize(authentication, AUTH_HELPER_TIMEOUT)?;
     validate_relay_authenticated_session(&relay, &session)?;
+    let control_paths = ControlPaths::production();
+    linux_files::require_open_runtime_admission(&control_paths, package_uid)?;
     let policy = linux_files::load_security_policy(package_uid)?;
     let is_post = matches!(request, ValidatedHttpRequest::Post { .. });
     let result = if policy.require_https && !is_https_request(authentication.https.as_deref()) {
@@ -9405,6 +9728,8 @@ mod tests {
         enqueue_sequence: PathBuf,
         audit_outbox_directory: PathBuf,
         audit_outbox_lock: PathBuf,
+        package_transition: PathBuf,
+        service_closed: PathBuf,
     }
 
     #[cfg(target_os = "linux")]
@@ -9437,6 +9762,8 @@ mod tests {
                 enqueue_sequence: root.join("enqueue.sequence"),
                 audit_outbox_directory,
                 audit_outbox_lock: root.join("audit-outbox.flock"),
+                package_transition: root.join("package.transition"),
+                service_closed: root.join("service.closed"),
                 root,
                 requests,
                 processing,
@@ -9457,6 +9784,8 @@ mod tests {
                 enqueue_sequence: &self.enqueue_sequence,
                 audit_outbox_directory: &self.audit_outbox_directory,
                 audit_outbox_lock: &self.audit_outbox_lock,
+                package_transition: &self.package_transition,
+                service_closed: &self.service_closed,
             }
         }
 
@@ -9534,6 +9863,385 @@ mod tests {
         let (server, _) = listener.accept().unwrap();
         assert_eq!(linux_socket::peer_credentials(&client).unwrap().uid, uid);
         assert_eq!(linux_socket::peer_credentials(&server).unwrap().uid, uid);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_admission_markers_linearize_with_enqueue_publication() {
+        let fixture = TestControlFixture::new("runtime-admission-fence");
+        let paths = fixture.paths();
+        let package_uid = TestControlFixture::package_uid();
+        if package_uid == 0 {
+            return;
+        }
+        let session = [11_u8; 32];
+        let mutation = Mutation::RemoveProfile(NameArgs {
+            name: "archive".to_owned(),
+        });
+        let fingerprint = "11".repeat(32);
+
+        let (admitted_sender, admitted_receiver) = std::sync::mpsc::sync_channel(0);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+        let (closed_sender, closed_receiver) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let enqueue_paths = paths;
+            let enqueue_session = &session;
+            let enqueue_fingerprint = &fingerprint;
+            let enqueue_mutation = &mutation;
+            let enqueue = scope.spawn(move || {
+                linux_files::enqueue_with_admission_hook(
+                    &enqueue_paths,
+                    EnqueueRequest {
+                        package_uid,
+                        client_request_id: REQUEST_ID,
+                        requested_by: "admin",
+                        requested_uid: 1000,
+                        session_binding: enqueue_session,
+                        audit_transaction: JOB_ID,
+                        request_fingerprint: enqueue_fingerprint,
+                        issued_at_epoch: 10_000,
+                        mutation: enqueue_mutation,
+                        secret: None,
+                    },
+                    MAX_OUTSTANDING_JOBS,
+                    |_, _| Ok(()),
+                    || {
+                        admitted_sender.send(()).unwrap();
+                        release_receiver.recv().unwrap();
+                    },
+                )
+            });
+            admitted_receiver.recv().unwrap();
+            let close_paths = paths;
+            let close = scope.spawn(move || {
+                let result = linux_files::close_service_admission(&close_paths, package_uid);
+                closed_sender.send(()).unwrap();
+                result
+            });
+            assert!(
+                closed_receiver
+                    .recv_timeout(Duration::from_millis(100))
+                    .is_err()
+            );
+            release_sender.send(()).unwrap();
+            assert!(enqueue.join().unwrap().is_ok());
+            assert!(close.join().unwrap().is_ok());
+            closed_receiver.recv().unwrap();
+        });
+        assert_eq!(fs::read_dir(&fixture.requests).unwrap().count(), 1);
+        assert_eq!(
+            fs::read_dir(&fixture.audit_outbox_directory)
+                .unwrap()
+                .count(),
+            1
+        );
+
+        let denied_mutation = Mutation::RemoveRoutine(NameArgs {
+            name: "nightly".to_owned(),
+        });
+        let denied_fingerprint = "22".repeat(32);
+        let denied = linux_files::enqueue(
+            &paths,
+            EnqueueRequest {
+                package_uid,
+                client_request_id: "11111111111111111111111111111111",
+                requested_by: "admin",
+                requested_uid: 1000,
+                session_binding: &session,
+                audit_transaction: "11160f5e12345678fedcba98765432100123456789abcdef",
+                request_fingerprint: &denied_fingerprint,
+                issued_at_epoch: 10_001,
+                mutation: &denied_mutation,
+                secret: None,
+            },
+            MAX_OUTSTANDING_JOBS,
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(denied.kind, ErrorKind::Unavailable);
+        assert_eq!(fs::read_dir(&fixture.requests).unwrap().count(), 1);
+        assert_eq!(
+            fs::read_dir(&fixture.audit_outbox_directory)
+                .unwrap()
+                .count(),
+            1
+        );
+        assert!(
+            !fs::read_dir(&fixture.staging)
+                .unwrap()
+                .any(|entry| entry.is_ok())
+        );
+
+        let (open_locked_sender, open_locked_receiver) = std::sync::mpsc::sync_channel(0);
+        let (open_release_sender, open_release_receiver) = std::sync::mpsc::sync_channel(0);
+        let (enqueue_done_sender, enqueue_done_receiver) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let open_paths = paths;
+            let open = scope.spawn(move || {
+                linux_files::open_service_admission_with_hook(&open_paths, package_uid, || {
+                    open_locked_sender.send(()).unwrap();
+                    open_release_receiver.recv().unwrap();
+                })
+            });
+            open_locked_receiver.recv().unwrap();
+            let enqueue_paths = paths;
+            let enqueue_session = &session;
+            let enqueue_fingerprint = &denied_fingerprint;
+            let enqueue_mutation = &denied_mutation;
+            let enqueue = scope.spawn(move || {
+                let result = linux_files::enqueue(
+                    &enqueue_paths,
+                    EnqueueRequest {
+                        package_uid,
+                        client_request_id: "22222222222222222222222222222222",
+                        requested_by: "admin",
+                        requested_uid: 1000,
+                        session_binding: enqueue_session,
+                        audit_transaction: "22260f5e12345678fedcba98765432100123456789abcdef",
+                        request_fingerprint: enqueue_fingerprint,
+                        issued_at_epoch: 10_002,
+                        mutation: enqueue_mutation,
+                        secret: None,
+                    },
+                    MAX_OUTSTANDING_JOBS,
+                    |_, _| Ok(()),
+                );
+                enqueue_done_sender.send(()).unwrap();
+                result
+            });
+            assert!(
+                enqueue_done_receiver
+                    .recv_timeout(Duration::from_millis(100))
+                    .is_err()
+            );
+            open_release_sender.send(()).unwrap();
+            assert!(open.join().unwrap().is_ok());
+            assert!(enqueue.join().unwrap().is_ok());
+            enqueue_done_receiver.recv().unwrap();
+        });
+        assert_eq!(fs::read_dir(&fixture.requests).unwrap().count(), 2);
+
+        let (close_locked_sender, close_locked_receiver) = std::sync::mpsc::sync_channel(0);
+        let (close_release_sender, close_release_receiver) = std::sync::mpsc::sync_channel(0);
+        let (close_enqueue_sender, close_enqueue_receiver) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let close_paths = paths;
+            let close = scope.spawn(move || {
+                linux_files::close_service_admission_with_hook(&close_paths, package_uid, || {
+                    close_locked_sender.send(()).unwrap();
+                    close_release_receiver.recv().unwrap();
+                })
+            });
+            close_locked_receiver.recv().unwrap();
+            let enqueue_paths = paths;
+            let enqueue_session = &session;
+            let enqueue_fingerprint = &fingerprint;
+            let enqueue_mutation = &mutation;
+            let enqueue = scope.spawn(move || {
+                let result = linux_files::enqueue(
+                    &enqueue_paths,
+                    EnqueueRequest {
+                        package_uid,
+                        client_request_id: "44444444444444444444444444444444",
+                        requested_by: "admin",
+                        requested_uid: 1000,
+                        session_binding: enqueue_session,
+                        audit_transaction: "44460f5e12345678fedcba98765432100123456789abcdef",
+                        request_fingerprint: enqueue_fingerprint,
+                        issued_at_epoch: 10_004,
+                        mutation: enqueue_mutation,
+                        secret: None,
+                    },
+                    MAX_OUTSTANDING_JOBS,
+                    |_, _| Ok(()),
+                );
+                close_enqueue_sender.send(()).unwrap();
+                result
+            });
+            assert!(
+                close_enqueue_receiver
+                    .recv_timeout(Duration::from_millis(100))
+                    .is_err()
+            );
+            close_release_sender.send(()).unwrap();
+            assert!(close.join().unwrap().is_ok());
+            let denied = enqueue.join().unwrap().unwrap_err();
+            assert_eq!(denied.kind, ErrorKind::Unavailable);
+            close_enqueue_receiver.recv().unwrap();
+        });
+        assert_eq!(fs::read_dir(&fixture.requests).unwrap().count(), 2);
+        assert_eq!(
+            fs::read_dir(&fixture.audit_outbox_directory)
+                .unwrap()
+                .count(),
+            2
+        );
+        linux_files::open_service_admission(&paths, package_uid).unwrap();
+
+        let (transition_locked_sender, transition_locked_receiver) =
+            std::sync::mpsc::sync_channel(0);
+        let (transition_release_sender, transition_release_receiver) =
+            std::sync::mpsc::sync_channel(0);
+        let (transition_enqueue_sender, transition_enqueue_receiver) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let transition_paths = paths;
+            let transition = scope.spawn(move || {
+                linux_files::prepare_package_transition_with_hook(
+                    &transition_paths,
+                    package_uid,
+                    "upgrade",
+                    || {
+                        transition_locked_sender.send(()).unwrap();
+                        transition_release_receiver.recv().unwrap();
+                    },
+                )
+            });
+            transition_locked_receiver.recv().unwrap();
+            let enqueue_paths = paths;
+            let enqueue_session = &session;
+            let enqueue_fingerprint = &fingerprint;
+            let enqueue_mutation = &mutation;
+            let enqueue = scope.spawn(move || {
+                let result = linux_files::enqueue(
+                    &enqueue_paths,
+                    EnqueueRequest {
+                        package_uid,
+                        client_request_id: "33333333333333333333333333333333",
+                        requested_by: "admin",
+                        requested_uid: 1000,
+                        session_binding: enqueue_session,
+                        audit_transaction: "33360f5e12345678fedcba98765432100123456789abcdef",
+                        request_fingerprint: enqueue_fingerprint,
+                        issued_at_epoch: 10_003,
+                        mutation: enqueue_mutation,
+                        secret: None,
+                    },
+                    MAX_OUTSTANDING_JOBS,
+                    |_, _| Ok(()),
+                );
+                transition_enqueue_sender.send(()).unwrap();
+                result
+            });
+            assert!(
+                transition_enqueue_receiver
+                    .recv_timeout(Duration::from_millis(100))
+                    .is_err()
+            );
+            transition_release_sender.send(()).unwrap();
+            assert!(transition.join().unwrap().is_ok());
+            let denied = enqueue.join().unwrap().unwrap_err();
+            assert_eq!(denied.kind, ErrorKind::Unavailable);
+            transition_enqueue_receiver.recv().unwrap();
+        });
+        assert_eq!(fs::read_dir(&fixture.requests).unwrap().count(), 2);
+        assert_eq!(
+            fs::read_dir(&fixture.audit_outbox_directory)
+                .unwrap()
+                .count(),
+            2
+        );
+        linux_files::clear_package_transition(&paths, package_uid).unwrap();
+        linux_files::require_open_runtime_admission(&paths, package_uid).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgi_socket_retry_is_bounded_and_never_retries_unsafe_metadata() {
+        // SAFETY: these identity calls have no pointer arguments or preconditions.
+        let uid = unsafe { libc::geteuid() };
+        // SAFETY: these identity calls have no pointer arguments or preconditions.
+        let gid = unsafe { libc::getegid() };
+        if uid == 0 || gid == 0 {
+            return;
+        }
+        let fixture = TestControlFixture::new("cgi-socket-retry");
+        let socket = fixture.root.join("api.sock");
+        let delayed_socket = socket.clone();
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let listener = linux_socket::bind(&delayed_socket, uid, gid).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            assert_eq!(linux_socket::peer_credentials(&stream).unwrap().uid, uid);
+        });
+        let started = Instant::now();
+        let client =
+            linux_socket::connect_for_cgi(&socket, uid, gid, Duration::from_secs(1)).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(75));
+        drop(client);
+        server.join().unwrap();
+        fs::remove_file(&socket).unwrap();
+
+        let (prepared, prepared_identity) = linux_socket::bind_prepared(&socket, uid, gid).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&socket).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        let prepared_started = Instant::now();
+        assert_eq!(
+            linux_socket::connect_for_cgi(&socket, uid, gid, Duration::from_millis(125),)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Unavailable
+        );
+        assert!(prepared_started.elapsed() >= Duration::from_millis(100));
+        prepared.set_nonblocking(true).unwrap();
+        assert_eq!(
+            prepared.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "a pre-commit CGI reached the prepared listener"
+        );
+        prepared.set_nonblocking(false).unwrap();
+        linux_socket::activate_prepared(&socket, uid, gid, &prepared_identity).unwrap();
+        let active =
+            linux_socket::connect_for_cgi(&socket, uid, gid, Duration::from_millis(125)).unwrap();
+        let (accepted, _) = prepared.accept().unwrap();
+        drop(active);
+        drop(accepted);
+        drop(prepared);
+        fs::remove_file(&socket).unwrap();
+
+        let (original, original_identity) = linux_socket::bind_prepared(&socket, uid, gid).unwrap();
+        fs::remove_file(&socket).unwrap();
+        let replacement = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            linux_socket::activate_prepared(&socket, uid, gid, &original_identity)
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnsafeRuntime
+        );
+        drop(original);
+        drop(replacement);
+        fs::remove_file(&socket).unwrap();
+
+        let missing_started = Instant::now();
+        assert_eq!(
+            linux_socket::connect_for_cgi(&socket, uid, gid, Duration::from_millis(125),)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Unavailable
+        );
+        assert!(missing_started.elapsed() >= Duration::from_millis(100));
+        assert!(missing_started.elapsed() < Duration::from_secs(1));
+
+        let outside = fixture.root.join("outside");
+        fs::write(&outside, b"preserve").unwrap();
+        symlink(&outside, &socket).unwrap();
+        let unsafe_started = Instant::now();
+        assert_eq!(
+            linux_socket::connect_for_cgi(&socket, uid, gid, Duration::from_secs(1),)
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnsafeRuntime
+        );
+        assert!(unsafe_started.elapsed() < Duration::from_millis(250));
+        assert!(
+            fs::symlink_metadata(&socket)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"preserve");
     }
 
     #[cfg(target_os = "linux")]
@@ -12896,6 +13604,15 @@ mod tests {
                 .unwrap()
                 .contains("not-in-job")
         );
+
+        let service = CgiResponse::service_unavailable();
+        let service_text = String::from_utf8(service.body).unwrap();
+        assert_eq!(service.status, 503);
+        assert!(service_text.contains("service_unavailable"));
+        assert!(service_text.contains("Package Center"));
+        assert!(service_text.contains("controller log"));
+        assert!(!service_text.contains(API_SOCKET_PATH));
+        assert!(!service_text.contains(PACKAGE_HOME));
     }
 
     #[cfg(not(target_os = "linux"))]

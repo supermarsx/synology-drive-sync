@@ -36,6 +36,7 @@ import validate_spk  # noqa: E402
 
 
 ARM_EABI5_HARD_FLOAT = 0x05000400
+PACKAGE_TOOL_TIMEOUT_SECONDS = 120
 
 
 def fake_elf(
@@ -342,7 +343,7 @@ class BuilderTests(unittest.TestCase):
             capture_output=True,
             text=True,
             env=environment,
-            timeout=30,
+            timeout=PACKAGE_TOOL_TIMEOUT_SECONDS,
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -375,7 +376,7 @@ class BuilderTests(unittest.TestCase):
                 [sys.executable, str(HERE / "validate_spk.py"), "--arch", arch, str(artifact)],
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=PACKAGE_TOOL_TIMEOUT_SECONDS,
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -419,7 +420,17 @@ class BuilderTests(unittest.TestCase):
                 self.assertEqual(package.getmember(ui_entrypoint).mode, 0o644)
                 self.assertIn("ui/style.css", package_members)
                 self.assertEqual(package.getmember("ui/style.css").mode, 0o644)
-                for legacy in ("ui/index.html", "ui/app.js", "ui/app.css"):
+                self.assertIn("ui/index.html", package_members)
+                direct_launcher_member = package.getmember("ui/index.html")
+                self.assertTrue(direct_launcher_member.isfile())
+                self.assertEqual(direct_launcher_member.mode, 0o644)
+                direct_launcher = package.extractfile(direct_launcher_member).read()  # type: ignore[union-attr]
+                self.assertEqual(
+                    direct_launcher,
+                    (HERE / "package/ui/index.html").read_bytes(),
+                )
+                validate_spk.validate_direct_launcher(direct_launcher)
+                for legacy in ("ui/app.js", "ui/app.css"):
                     self.assertNotIn(legacy, package_members)
                 native_script = package.extractfile(ui_entrypoint).read()  # type: ignore[union-attr]
                 native_style = package.extractfile("ui/style.css").read()  # type: ignore[union-attr]
@@ -505,7 +516,7 @@ class BuilderTests(unittest.TestCase):
                 [sys.executable, str(HERE / "validate_spk.py"), str(tampered)],
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=PACKAGE_TOOL_TIMEOUT_SECONDS,
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0)
@@ -549,7 +560,7 @@ class BuilderTests(unittest.TestCase):
                 [sys.executable, str(HERE / "validate_spk.py"), str(candidate)],
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=PACKAGE_TOOL_TIMEOUT_SECONDS,
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0, candidate.parent.name)
@@ -614,7 +625,7 @@ class BuilderTests(unittest.TestCase):
                 [sys.executable, str(HERE / "validate_spk.py"), str(candidate)],
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=PACKAGE_TOOL_TIMEOUT_SECONDS,
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0, candidate.parent.name)
@@ -646,7 +657,7 @@ class BuilderTests(unittest.TestCase):
             [sys.executable, str(HERE / "validate_spk.py"), str(incomplete)],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=PACKAGE_TOOL_TIMEOUT_SECONDS,
             check=False,
         )
         self.assertNotEqual(result.returncode, 0)
@@ -748,7 +759,7 @@ class BuilderTests(unittest.TestCase):
             ],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=PACKAGE_TOOL_TIMEOUT_SECONDS,
             check=False,
         )
         self.assertNotEqual(result.returncode, 0)
@@ -801,7 +812,7 @@ class BuilderTests(unittest.TestCase):
                 [sys.executable, str(HERE / "validate_spk.py"), str(tampered)],
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=PACKAGE_TOOL_TIMEOUT_SECONDS,
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0, name)
@@ -843,7 +854,7 @@ class BuilderTests(unittest.TestCase):
                 [sys.executable, str(HERE / "validate_spk.py"), str(tampered)],
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=PACKAGE_TOOL_TIMEOUT_SECONDS,
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0, name)
@@ -897,7 +908,7 @@ class BuilderTests(unittest.TestCase):
             ],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=PACKAGE_TOOL_TIMEOUT_SECONDS,
             check=False,
         )
         self.assertNotEqual(result.returncode, 0)
@@ -936,7 +947,7 @@ class BuilderTests(unittest.TestCase):
                 [sys.executable, str(HERE / "validate_spk.py"), str(candidate)],
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=PACKAGE_TOOL_TIMEOUT_SECONDS,
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0, candidate.name)
@@ -960,7 +971,7 @@ class BuilderTests(unittest.TestCase):
             ],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=PACKAGE_TOOL_TIMEOUT_SECONDS,
             check=False,
         )
         self.assertNotEqual(mismatch.returncode, 0)
@@ -1021,7 +1032,7 @@ class BuilderTests(unittest.TestCase):
                 [sys.executable, str(HERE / "validate_spk.py"), str(candidate)],
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=PACKAGE_TOOL_TIMEOUT_SECONDS,
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0, candidate.name)
@@ -1094,7 +1105,7 @@ class BuilderTests(unittest.TestCase):
                 [sys.executable, str(HERE / "validate_spk.py"), str(candidate)],
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=PACKAGE_TOOL_TIMEOUT_SECONDS,
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0, candidate.name)
@@ -1106,7 +1117,7 @@ class BuilderTests(unittest.TestCase):
             cwd=REPOSITORY,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=PACKAGE_TOOL_TIMEOUT_SECONDS,
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1186,7 +1197,7 @@ class BuilderTests(unittest.TestCase):
                 [sys.executable, str(HERE / "validate_spk.py"), str(candidate)],
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=PACKAGE_TOOL_TIMEOUT_SECONDS,
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0, name)
@@ -1950,7 +1961,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "            raise SystemExit(75)\n"
             "    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
             "    server.bind(socket_path)\n"
-            "    os.chmod(socket_path, 0o660)\n"
+            "    os.chmod(socket_path, 0o600 if serve_supervised else 0o660)\n"
             "    server.listen(4)\n"
             "    server.settimeout(0.1)\n"
             "    if serve_supervised:\n"
@@ -2001,6 +2012,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "        ready_path = Path(os.environ['SYNOPKG_PKGVAR']) / 'run/api.ready'\n"
             "        ready_path.write_text(identity, encoding='ascii')\n"
             "        ready_path.chmod(0o600)\n"
+            "        os.chmod(socket_path, 0o660)\n"
             "    running = True\n"
             "    def stop(_signum, _frame):\n"
             "        global running\n"
@@ -4358,6 +4370,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         watch_state = self.real_var / "state/routines/watch.state"
         if watch_state.exists():
             self.assertIn("fingerprint=none", watch_state.read_text(encoding="utf-8"))
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
         self.assertFalse(list((self.real_var / "run").glob("fingerprint.*")))
 
     def test_controller_dependency_deferral_then_success_and_retry_backoff(self) -> None:
@@ -5229,6 +5243,156 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             result = self.shell(self.manager, *arguments)
             self.assertEqual(result.returncode, 64, arguments)
 
+    def test_upgrade_stop_fence_waits_for_admitted_direct_mutation(self) -> None:
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        manager_source = self.manager.read_text(encoding="utf-8")
+        barrier_needle = '    if [ "${command_name:-}" != configure-security-policy ]; then\n'
+        self.assertEqual(manager_source.count(barrier_needle), 1)
+        self.manager.write_text(
+            manager_source.replace(
+                barrier_needle,
+                '    if [ -n "${SDSYNC_TEST_MUTATION_ADMITTED_READY:-}" ]; then\n'
+                '        : > "$SDSYNC_TEST_MUTATION_ADMITTED_READY"\n'
+                '        while [ ! -e "$SDSYNC_TEST_MUTATION_ADMITTED_RELEASE" ]; do /bin/sleep 0.01; done\n'
+                '    fi\n'
+                + barrier_needle,
+            ),
+            encoding="utf-8",
+        )
+        admitted_ready = self.root / "direct-mutation.admitted"
+        admitted_release = self.root / "direct-mutation.release"
+        mutation = self.shell_process(
+            self.manager,
+            "configure-profile",
+            "--name",
+            "fence-winner",
+            "--source",
+            str(self.source_one),
+            "--url",
+            "https://files.example.test/",
+            "--username",
+            "fence-user",
+            "--remote",
+            "/home/Drive/Fence",
+            extra_environment={
+                "SDSYNC_TEST_MUTATION_ADMITTED_READY": str(admitted_ready),
+                "SDSYNC_TEST_MUTATION_ADMITTED_RELEASE": str(admitted_release),
+            },
+        )
+        stop: subprocess.Popen[str] | None = None
+        try:
+            deadline = time.monotonic() + 10
+            while not admitted_ready.is_file() and mutation.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(admitted_ready.is_file(), "direct mutation did not pass its admission check")
+            stop = self.shell_process(
+                self.lifecycle,
+                "stop",
+                extra_environment={"SYNOPKG_PKG_STATUS": "UPGRADE"},
+            )
+            time.sleep(0.2)
+            self.assertIsNone(stop.poll(), "upgrade stop did not wait for the admitted manager")
+            self.assertFalse(
+                (self.real_var / "run/service.closed").exists(),
+                "stop published its close fence before the admitted manager completed",
+            )
+            admitted_release.touch()
+            mutation_stdout, mutation_stderr = mutation.communicate(timeout=15)
+            self.assertEqual(mutation.returncode, 0, mutation_stdout + mutation_stderr)
+            stop_stdout, stop_stderr = stop.communicate(timeout=20)
+            self.assertEqual(stop.returncode, 0, stop_stdout + stop_stderr)
+            self.assertTrue((self.real_home / "config/profiles.d/fence-winner.toml").is_file())
+            self.assertEqual(
+                (self.real_var / "run/package.transition").read_text(encoding="ascii"),
+                "upgrade\n",
+            )
+            audit_log = self.real_var / "log/audit.log"
+            before = audit_log.read_text(encoding="utf-8").splitlines()
+            denied = self.configure(
+                "fence-loser", self.source_two, "/home/Drive/FenceLoser"
+            )
+            self.assertEqual(denied.returncode, 75, denied.stderr)
+            after = audit_log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(after, before, "denied direct mutation emitted a mutation audit")
+            self.assertFalse((self.real_home / "config/profiles.d/fence-loser.toml").exists())
+        finally:
+            admitted_release.touch(exist_ok=True)
+            if mutation.poll() is None:
+                mutation.kill()
+                mutation.communicate(timeout=5)
+            if stop is not None and stop.poll() is None:
+                stop.kill()
+                stop.communicate(timeout=5)
+            self.manager.write_text(manager_source, encoding="utf-8")
+            self.manager.chmod(0o755)
+            bridge = self.real_target / "bin/sdsync-dsm-api"
+            self.executable(bridge, "--package-transition", "clear")
+
+    def test_start_signal_before_admission_open_and_open_failure_cleanup_are_truthful(self) -> None:
+        lifecycle_source = self.lifecycle.read_text(encoding="utf-8")
+        final_open = (
+            "                trap '' HUP INT TERM\n"
+            "                run_runtime_marker_fenced --service-admission open || {\n"
+        )
+        self.assertEqual(lifecycle_source.count(final_open), 1)
+        ready = self.root / "start-before-open.ready"
+        release = self.root / "start-before-open.release"
+        self.lifecycle.write_text(
+            lifecycle_source.replace(
+                final_open,
+                "                trap '' HUP INT TERM\n"
+                f"                : > {shlex.quote(str(ready))}\n"
+                f"                while [ ! -e {shlex.quote(str(release))} ]; do /bin/sleep 0.01; done\n"
+                "                run_runtime_marker_fenced --service-admission open || {\n",
+            ),
+            encoding="utf-8",
+        )
+        start = self.shell_process(self.lifecycle, "start")
+        try:
+            deadline = time.monotonic() + 15
+            while not ready.is_file() and start.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(ready.is_file(), "start did not reach its admission-open commit point")
+            start.terminate()
+            release.touch()
+            stdout, stderr = start.communicate(timeout=15)
+            self.assertEqual(start.returncode, 0, stdout + stderr)
+            self.assertEqual(self.shell(self.lifecycle, "status").returncode, 0)
+        finally:
+            release.touch(exist_ok=True)
+            if start.poll() is None:
+                start.kill()
+                start.communicate(timeout=5)
+
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        ready.unlink(missing_ok=True)
+        release.unlink(missing_ok=True)
+        self.lifecycle.write_text(
+            lifecycle_source.replace(
+                final_open,
+                "                trap '' HUP INT TERM\n"
+                "                run_runtime_marker_fenced --service-admission open && false || {\n",
+            ),
+            encoding="utf-8",
+        )
+        failed = self.shell(self.lifecycle, "start", timeout=20)
+        self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+        self.assertTrue((self.real_var / "run/service.closed").is_file())
+        for path in (
+            self.real_var / "run/controller.pid",
+            self.real_var / "run/controller.ready",
+            self.real_var / "run/controller.lock",
+            self.real_var / "run/api.pid",
+            self.real_var / "run/api.ready",
+            self.real_var / "run/api.bound",
+            self.real_target / "ui/api.sock",
+        ):
+            self.assertFalse(path.exists(), path)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
+        self.lifecycle.write_text(lifecycle_source, encoding="utf-8")
+
     def test_schedule_mutation_lock_stale_recovery_and_run_refusal(self) -> None:
         self.assertEqual(self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode, 0)
         password = self.root / "password"
@@ -5872,10 +6036,18 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         pid_file = self.root / "core-launch.pid"
         terminated = self.root / "core-launch.term"
         environment = {
+            # publish_controller_ready calls controller_self_executable_matches;
+            # this synthetic controller is launched directly by this Python process.
+            "SDSYNC_DSM_CONTROLLER_START_PARENT_PID": str(os.getpid()),
             "SDSYNC_TEST_LAUNCH_READY": str(ready),
             "SDSYNC_TEST_LAUNCHED_PID": str(pid_file),
             "SDSYNC_TEST_TERM_OBSERVED": str(terminated),
         }
+        self.assertEqual(
+            int(environment["SDSYNC_DSM_CONTROLLER_START_PARENT_PID"]),
+            os.getpid(),
+            "controller_self_executable_matches fixture parent must be the Python launcher",
+        )
         try:
             for _ in range(200):
                 if api_socket.exists():
@@ -5966,11 +6138,26 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             fixture.write_text(fixture_source, encoding="utf-8")
             fixture.chmod(0o755)
 
+        lifecycle_source = self.lifecycle.read_text(encoding="utf-8")
+        exact_helper_start_marker = "signal_exact_controller_identity() {\n"
+        exact_helper_end_marker = "\n}\n\nread_failed_start_child_marker() {"
+        self.assertEqual(lifecycle_source.count(exact_helper_start_marker), 1)
+        exact_helper_start = lifecycle_source.index(exact_helper_start_marker)
+        exact_helper_end = lifecycle_source.index(
+            exact_helper_end_marker, exact_helper_start
+        ) + len("\n}\n")
+        exact_controller_signal_source = lifecycle_source[
+            exact_helper_start:exact_helper_end
+        ]
+
         harness = self.root / "verified-signal-race.sh"
         harness.write_text(
             "#!/bin/sh\n"
             "set -eu\n"
             '. "$SDSYNC_TEST_COMMON"\n'
+            '. "$SDSYNC_TEST_RUNTIME_COMMON"\n'
+            + exact_controller_signal_source
+            + "\n"
             "race_service=$1\n"
             "race_mode=$2\n"
             "case $race_service in\n"
@@ -5992,6 +6179,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "  sleep 0.01\n"
             "  race_wait=$((race_wait + 1))\n"
             "done\n"
+            'race_start=$(process_start_time "$race_pid" 2>/dev/null || true)\n'
+            'case $race_start in \'\'|*[!0-9]*|0) exit 87 ;; esac\n'
+            "race_boot=$(boot_identity) || exit 88\n"
             "kill() {\n"
             '  if [ "$1" = -TERM ] && [ "$2" = "$race_pid" ]; then\n'
             '    if [ "$race_mode" = gone ]; then\n'
@@ -6010,16 +6200,25 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "        sleep 0.01\n"
             "        zombie_wait=$((zombie_wait + 1))\n"
             "      done\n"
+            '      [ "$race_service" != controller ] || return 0\n'
             "      return 1\n"
             "    fi\n"
             "    return 1\n"
             "  fi\n"
             '  command kill "$@"\n'
             "}\n"
-            'if signal_verified_service "$race_service" "$race_pid" "$race_service"; then\n'
-            "  race_result=0\n"
+            'if [ "$race_service" = controller ]; then\n'
+            '  if signal_exact_controller_identity "$race_pid" "$race_start" "$race_boot"; then\n'
+            "    race_result=0\n"
+            "  else\n"
+            "    race_result=$?\n"
+            "  fi\n"
             "else\n"
-            "  race_result=$?\n"
+            '  if signal_verified_service "$race_service" "$race_pid" "$race_service"; then\n'
+            "    race_result=0\n"
+            "  else\n"
+            "    race_result=$?\n"
+            "  fi\n"
             "fi\n"
             'if [ "$race_mode" = gone ] || [ "$race_mode" = zombie ]; then\n'
             '  [ "$race_result" -eq 0 ] || exit 82\n'
@@ -6027,7 +6226,11 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             '  [ "$race_mode" != zombie ] || wait "$race_pid"\n'
             "else\n"
             '  [ "$race_result" -ne 0 ] || exit 84\n'
-            '  verified_service_pid_matches "$race_service" "$race_pid" || exit 85\n'
+            '  if [ "$race_service" = controller ]; then\n'
+            '    process_identity_is_live "$race_pid" "$race_start" "$race_boot" || exit 85\n'
+            "  else\n"
+            '    verified_service_pid_matches "$race_service" "$race_pid" || exit 85\n'
+            "  fi\n"
             '  : > "$SDSYNC_TEST_RACE_RELEASE"\n'
             '  wait "$race_pid"\n'
             "fi\n",
@@ -6035,9 +6238,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         )
         harness.chmod(0o755)
 
-        lifecycle_source = self.lifecycle.read_text(encoding="utf-8")
         self.assertIn(
-            'signal_verified_service controller "$saved_pid" controller',
+            'signal_exact_controller_identity "$saved_pid" "$saved_controller_start" \\\n'
+            '                "$saved_controller_boot"',
             lifecycle_source,
         )
         self.assertIn(
@@ -6060,6 +6263,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                         mode,
                         extra_environment={
                             "SDSYNC_TEST_COMMON": str(self.lifecycle_dir / "common"),
+                            "SDSYNC_TEST_RUNTIME_COMMON": str(
+                                self.real_target / "libexec/sdsync-common"
+                            ),
                             "SDSYNC_TEST_RACE_READY": str(ready),
                             "SDSYNC_TEST_RACE_RELEASE": str(release),
                         },
@@ -6072,7 +6278,16 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                     )
                     self.assertNotIn("No such process", result.stderr)
                     if mode == "live":
-                        self.assertIn("target remains live", result.stdout)
+                        if service == "controller":
+                            self.assertIn(
+                                "failed to signal exact controller identity",
+                                result.stdout,
+                            )
+                        else:
+                            self.assertIn("target remains live", result.stdout)
+
+        # tearDown exercises lifecycle stop, so restore its marker-capable API mock.
+        self.write_api_mock()
 
     def test_package_stop_waits_for_a_manual_foreground_run(self) -> None:
         self.assertEqual(
@@ -8032,6 +8247,20 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             failed = self.shell(self.lifecycle, "start", timeout=15)
             self.assertEqual(failed.returncode, 1, failed.stderr)
             self.assertIn("controller failed before startup commit", failed.stdout)
+            diagnostics = [
+                line for line in failed.stdout.splitlines()
+                if line.startswith("startup diagnostic: ")
+            ]
+            self.assertEqual(len(diagnostics), 1, failed.stdout)
+            self.assertRegex(
+                diagnostics[0],
+                r"^startup diagnostic: controller_pid=(missing|exact|mismatch|unsafe) "
+                r"controller_child=(missing|exact|absent|unsafe) "
+                r"controller_lock=(missing|exact|mismatch|unsafe) "
+                r"api_pid=(missing|exact|unverified) "
+                r"api_bound=(missing|exact|unsafe) api_socket=(missing|prepared|unsafe)$",
+            )
+            self.assertNotIn(str(self.root), diagnostics[0])
             self.assertFalse((self.real_var / "run/api.pid").exists())
             self.assertFalse((self.real_var / "run/controller.ready").exists())
             self.assertFalse((self.real_target / "ui/api.sock").exists())
@@ -8071,6 +8300,24 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
     def test_physical_package_destination_accepts_framework_controller_exec_alias(self) -> None:
         framework_controller = self.fhs / "target/libexec/sdsync-controller"
         physical_controller = self.real_target / "libexec/sdsync-controller"
+        runtime_common = self.real_target / "libexec/sdsync-common"
+        runtime_common_source = runtime_common.read_text(encoding="utf-8")
+        matcher_definition = "\npid_matches_command() {\n"
+        self.assertEqual(runtime_common_source.count(matcher_definition), 1)
+        runtime_common.write_text(
+            runtime_common_source.replace(
+                matcher_definition,
+                "\npid_matches_command_original() {\n",
+                1,
+            )
+            + "\n# Test oracle: controller authorization must not fall back to proc cmdline.\n"
+            + "pid_matches_command() {\n"
+            + '    [ "${2:-}" != "$controller" ] || return 1\n'
+            + '    pid_matches_command_original "$@"\n'
+            + "}\n",
+            encoding="utf-8",
+        )
+        runtime_common.chmod(0o755)
         runtime_identity_result = self.root / "runtime-controller-alias.accepted"
         identity_probe = self.root / "controller-alias-identity-probe"
         identity_probe.write_text(
@@ -8079,11 +8326,14 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "case $1 in\n"
             "  lifecycle)\n"
             '    . "${SDSYNC_TEST_LIFECYCLE_COMMON:?}"\n'
-            '    controller_pid_matches "$2"\n'
+            '    . "$common_runtime"\n'
+            "    require_package_identity\n"
+            '    controller_persisted_identity_status "$2"\n'
             "    ;;\n"
             "  runtime)\n"
             '    . "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
-            '    pid_matches_command "$2" "$controller"\n'
+            "    require_package_identity\n"
+            '    controller_persisted_identity_status "$2"\n'
             "    ;;\n"
             "  runtime-ready)\n"
             '    . "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
@@ -8112,7 +8362,10 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
 
         controller_source = physical_controller.read_text(encoding="utf-8")
         ready_call = "publish_controller_ready\n"
+        reload_call = "request_reload() {\n    reload_requested=true\n"
         self.assertEqual(controller_source.count(ready_call), 1)
+        self.assertEqual(controller_source.count(reload_call), 1)
+        reload_observed = self.root / "physical-controller-reload.observed"
         physical_controller.write_text(
             controller_source.replace(
                 ready_call,
@@ -8120,6 +8373,11 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 + 'if [ -n "${SDSYNC_TEST_RUNTIME_CONTROLLER_IDENTITY_PROBE:-}" ]; then\n'
                 + '    /bin/sh "$SDSYNC_TEST_RUNTIME_CONTROLLER_IDENTITY_PROBE" runtime-parent "$$"\n'
                 + "fi\n",
+            ).replace(
+                reload_call,
+                reload_call
+                + '    [ -z "${SDSYNC_TEST_CONTROLLER_RELOAD_OBSERVED:-}" ] || '
+                + ': > "$SDSYNC_TEST_CONTROLLER_RELOAD_OBSERVED"\n',
             ),
             encoding="utf-8",
         )
@@ -8131,6 +8389,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "SDSYNC_TEST_CONTROLLER_EXEC_PATH": str(framework_controller),
             "SDSYNC_TEST_RUNTIME_CONTROLLER_IDENTITY_PROBE": str(identity_probe),
             "SDSYNC_TEST_RUNTIME_CONTROLLER_IDENTITY_RESULT": str(runtime_identity_result),
+            "SDSYNC_TEST_CONTROLLER_RELOAD_OBSERVED": str(reload_observed),
         }
         started = self.shell(
             self.lifecycle,
@@ -8142,6 +8401,11 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
 
         controller_pid = int(
             (self.real_var / "run/controller.pid").read_text(encoding="ascii").strip()
+        )
+        api_pid = int((self.real_var / "run/api.pid").read_text(encoding="ascii").strip())
+        self.assertIn(
+            f"API service and controller started as PIDs {api_pid} and {controller_pid}",
+            started.stdout,
         )
         probe_environment = {
             **physical_environment,
@@ -8165,6 +8429,55 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 0,
                 (identity_layer, accepted.stdout, accepted.stderr),
             )
+
+        manager_status = self.shell(
+            self.manager, "status", extra_environment=physical_environment
+        )
+        self.assertEqual(manager_status.returncode, 0, manager_status.stderr)
+        self.assertIn("service=running", manager_status.stdout)
+        snapshot, snapshot_payload = self.api("snapshot")
+        self.assertEqual(snapshot.returncode, 0, snapshot.stderr)
+        self.assertEqual(snapshot_payload["service"]["state"], "running")
+        configured = self.shell(
+            self.manager,
+            "configure-profile",
+            "--name",
+            "physical-alias",
+            "--source",
+            str(self.source_one),
+            "--url",
+            "https://files.example.test/",
+            "--username",
+            "physical-alias-bot",
+            "--remote",
+            "/home/Drive/PhysicalAlias",
+            extra_environment=physical_environment,
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        self.assertNotIn("could not be reloaded", configured.stderr)
+        password_saved = self.shell(
+            self.manager,
+            "set-password",
+            "physical-alias",
+            input_text="physical-alias-secret\n",
+            extra_environment=physical_environment,
+        )
+        self.assertEqual(password_saved.returncode, 0, password_saved.stderr)
+        reload_observed.unlink(missing_ok=True)
+        enabled = self.shell(
+            self.manager,
+            "enable",
+            "--interval",
+            "3600",
+            extra_environment=physical_environment,
+        )
+        self.assertEqual(enabled.returncode, 0, enabled.stderr)
+        self.assertNotIn("could not be reloaded", enabled.stderr)
+        for _ in range(100):
+            if reload_observed.is_file():
+                break
+            time.sleep(0.02)
+        self.assertTrue(reload_observed.is_file(), "saved mutation did not HUP the exact controller")
 
         unrelated = subprocess.Popen(
             [

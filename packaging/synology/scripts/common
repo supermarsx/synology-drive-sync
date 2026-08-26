@@ -106,32 +106,6 @@ same_private_executable() {
         && [ "$candidate_executable_recheck" = "$expected_executable_identity" ]
 }
 
-# The controller is a no-argument package script. Lock ownership is not enough
-# to authorize a signal: require the complete argv shape as well as the package
-# UID and executable inode so another package-owned process cannot become a
-# lifecycle target merely by mentioning the controller path in an unrelated
-# command line. DSM may use its physical SYNOPKG_PKGDEST as the lifecycle path
-# while the Rust supervisor execs the equivalent /var/packages target alias.
-controller_pid_matches() {
-    checked_pid=$1
-    script_pid_live "$checked_pid" || return 1
-    expected_uid=$(stat -L -c '%u' "$package_home" 2>/dev/null || true)
-    [ -n "$expected_uid" ] || return 1
-    actual_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "/proc/$checked_pid/status" 2>/dev/null | sed -n '1p')
-    [ "$actual_uid" = "$expected_uid" ] || return 1
-    [ -r "/proc/$checked_pid/cmdline" ] || return 1
-    controller_argument=$(tr '\000' '\n' 2>/dev/null < "/proc/$checked_pid/cmdline" |
-        awk '
-            { argument[NR] = $0 }
-            END {
-                if (NR == 1) { print argument[1]; exit 0 }
-                if (NR == 2 && argument[1] ~ /^\//) { print argument[2]; exit 0 }
-                exit 1
-            }
-        ') || return 1
-    same_private_executable "$controller" "$controller_argument" "$expected_uid"
-}
-
 api_pid_matches() {
     checked_pid=$1
     script_pid_live "$checked_pid" || return 1
@@ -198,13 +172,46 @@ controller_supervisor_pid_matches() {
         '
 }
 
+controller_lock_identity_matches() {
+    expected_controller_lock_pid=$1
+    expected_controller_lock_start=$2
+    expected_controller_lock_boot=$3
+    [ -f "$controller" ] && [ ! -L "$controller" ] || return 73
+    controller_lock_executable=$(stat -L -c '%u:%a:%h' "$controller" 2>/dev/null || true)
+    [ "$controller_lock_executable" = "$path_owner:755:1" ] || return 73
+    controller_lock_match_status=0
+    private_process_lock_is_live "$controller_lock" || controller_lock_match_status=$?
+    [ "$controller_lock_match_status" -eq 0 ] \
+        && [ "${lock_owner_legacy:-true}" = false ] \
+        && [ "$lock_owner_pid" = "$expected_controller_lock_pid" ] \
+        && [ "$lock_owner_start" = "$expected_controller_lock_start" ] \
+        && [ "$lock_owner_boot" = "$expected_controller_lock_boot" ] || return 73
+    if api_path_exists "$controller_pid_file"; then
+        controller_pid_file_safe || return 73
+        [ "$controller_pid_value" = "$expected_controller_lock_pid" ] || return 73
+    fi
+    if api_path_exists "$controller_ready_file"; then
+        controller_persisted_identity_status "$expected_controller_lock_pid" || return 73
+    fi
+    controller_lock_match_status=0
+    private_process_lock_is_live "$controller_lock" || controller_lock_match_status=$?
+    [ "$controller_lock_match_status" -eq 0 ] \
+        && [ "${lock_owner_legacy:-true}" = false ] \
+        && [ "$lock_owner_pid" = "$expected_controller_lock_pid" ] \
+        && [ "$lock_owner_start" = "$expected_controller_lock_start" ] \
+        && [ "$lock_owner_boot" = "$expected_controller_lock_boot" ]
+}
+
 failed_start_child_command_matches() {
     failed_child_kind=$1
     failed_child_pid=$2
+    failed_child_start=$3
+    failed_child_boot=$4
     case $failed_child_kind in
         api) api_pid_matches_supervised "$failed_child_pid" ;;
         controller)
-            controller_pid_matches "$failed_child_pid" ||
+            controller_lock_identity_matches "$failed_child_pid" \
+                "$failed_child_start" "$failed_child_boot" ||
                 controller_supervisor_pid_matches "$failed_child_pid"
             ;;
         *) return 1 ;;
@@ -215,7 +222,7 @@ verified_service_pid_matches() {
     verified_service_kind=$1
     verified_service_pid=$2
     case $verified_service_kind in
-        controller) controller_pid_matches "$verified_service_pid" ;;
+        controller) controller_persisted_identity_status "$verified_service_pid" ;;
         runner) script_pid_matches "$verified_service_pid" "$runner" ;;
         api) api_pid_matches "$verified_service_pid" ;;
         *) return 1 ;;
@@ -327,6 +334,46 @@ api_socket_safe() {
         package_message "API socket ownership or mode is outside the package:http 0660 contract"
         return 1
     }
+}
+
+# Before the lifecycle parent commits startup, the API listener must be a real,
+# single-link, package-owned 0600 socket. DSM's http tier cannot connect to this
+# prepared topology. The API changes it to the final package:http 0660 contract
+# only after readiness and worker-pool publication.
+api_prepared_socket_safe() {
+    api_socket_parent_safe || return 1
+    [ -S "$api_socket" ] && [ ! -L "$api_socket" ] || {
+        package_message "prepared API socket path is not a real Unix socket: $api_socket"
+        return 1
+    }
+    api_expected_uid=$(package_uid 2>/dev/null || true)
+    api_socket_uid=$(stat -c '%u' "$api_socket" 2>/dev/null || true)
+    api_socket_mode=$(stat -c '%a' "$api_socket" 2>/dev/null || true)
+    api_socket_links=$(stat -c '%h' "$api_socket" 2>/dev/null || true)
+    [ -n "$api_expected_uid" ] \
+        && [ "$api_socket_uid" = "$api_expected_uid" ] \
+        && [ "$api_socket_mode" = 600 ] \
+        && [ "$api_socket_links" = 1 ] || {
+        package_message "prepared API socket is outside the package-owned 0600 contract"
+        return 1
+    }
+}
+
+capture_api_prepared_socket_identity() {
+    api_prepared_socket_safe || return 1
+    prepared_socket_identity=$(stat -c '%d:%i' "$api_socket" 2>/dev/null || true)
+    case $prepared_socket_identity in ''|*[!0-9:]*|*:*:*) return 1 ;; esac
+    api_prepared_socket_safe || return 1
+    prepared_socket_identity_recheck=$(stat -c '%d:%i' "$api_socket" 2>/dev/null || true)
+    [ "$prepared_socket_identity_recheck" = "$prepared_socket_identity" ] || return 1
+    printf '%s\n' "$prepared_socket_identity"
+}
+
+api_prepared_socket_matches_identity() {
+    expected_prepared_socket_identity=${1:-}
+    case $expected_prepared_socket_identity in ''|*[!0-9:]*|*:*:*) return 1 ;; esac
+    current_prepared_socket_identity=$(capture_api_prepared_socket_identity 2>/dev/null || true)
+    [ "$current_prepared_socket_identity" = "$expected_prepared_socket_identity" ]
 }
 
 api_stale_socket_safe() {

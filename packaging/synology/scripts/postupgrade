@@ -48,10 +48,6 @@ acquire_private_process_lock "$lifecycle_lock" || {
     exit 1
 }
 upgrade_lifecycle_lock=true
-"$api_bridge" --service-admission close || {
-    package_message "could not keep service admission closed during upgrade"
-    exit 1
-}
 acquire_private_process_lock "$policy_execution_lock" || {
     package_message "another policy-sensitive operation is active"
     exit 1
@@ -62,6 +58,10 @@ acquire_private_process_lock "$management_lock" || {
     exit 1
 }
 upgrade_management_lock=true
+"$api_bridge" --service-admission close || {
+    package_message "could not keep service admission closed during upgrade"
+    exit 1
+}
 upgrade_transition_state=$(package_transition_status) || {
     package_message "cannot validate the package upgrade marker"
     exit 1
