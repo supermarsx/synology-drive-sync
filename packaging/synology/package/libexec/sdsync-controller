@@ -1,5 +1,10 @@
 #!/bin/sh
 set -eu
+# Rust's exec supervisor arms SIGUSR1 as the lifecycle-parent death signal.
+# Keep it fatal until controller lock/PID ownership makes a later parent death
+# visible and recoverable by lifecycle stop.
+trap 'exit 73' USR1
+umask 077
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 # shellcheck source=sdsync-common
@@ -7,33 +12,16 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 
 require_package_identity
 ensure_layout
-controller_log=$log_root/controller.log
 [ ! -L "$controller_log" ] || { echo "refusing symlinked controller log: $controller_log" >&2; exit 73; }
 rotate_log "$controller_log" 10485760 5
 [ ! -f "$controller_log" ] || finish_private_file "$controller_log"
 
+controller_log_event() {
+    append_controller_log_event "$@"
+}
+
 acquire_controller_lock() {
-    if mkdir "$controller_lock" 2>/dev/null; then
-        chmod 0700 "$controller_lock"
-        set_private_owner "$controller_lock"
-        return 0
-    fi
-    if [ -L "$controller_lock" ] || [ ! -d "$controller_lock" ]; then
-        echo "controller lock is not a private directory: $controller_lock" >&2
-        return 73
-    fi
-    existing_pid=$(read_pid "$controller_pid_file" 2>/dev/null || true)
-    if [ -n "$existing_pid" ] && pid_is_live "$existing_pid"; then
-        echo "controller already runs as PID $existing_pid" >&2
-        return 75
-    fi
-    rmdir "$controller_lock" 2>/dev/null || {
-        echo "cannot recover stale controller lock safely: $controller_lock" >&2
-        return 73
-    }
-    mkdir "$controller_lock"
-    chmod 0700 "$controller_lock"
-    set_private_owner "$controller_lock"
+    acquire_private_process_lock "$controller_lock"
 }
 
 valid_request_id() {
@@ -61,13 +49,14 @@ control_file_expired() {
 }
 
 prune_expired_control_files() {
+    load_security_policy_runtime
     prune_now=$(epoch_now)
     case $prune_now in ''|*[!0-9]*) return 0 ;; esac
     for prune_dir in "$control_requests" "$control_processing" "$control_responses"; do
         case $prune_dir in
             "$control_requests") prune_max_age=86400; prune_kind=request ;;
             "$control_processing") prune_max_age=3600; prune_kind=processing_indeterminate ;;
-            *) prune_max_age=3600; prune_kind=response ;;
+            *) prune_max_age=$security_runtime_result_retention; prune_kind=response ;;
         esac
         for prune_path in "$prune_dir"/*.json "$prune_dir"/*.secret; do
             [ -e "$prune_path" ] || [ -L "$prune_path" ] || continue
@@ -76,13 +65,17 @@ prune_expired_control_files() {
             valid_request_id "$prune_id" || continue
             if control_file_expired "$prune_path" "$prune_now" "$prune_max_age"; then
                 rm -f "$prune_path"
-                append_rotating_log "$controller_log" 10485760 5 "control_file_expired id=$prune_id kind=$prune_kind"
+                controller_log_event debug control_file_expired "id=$prune_id kind=$prune_kind"
             fi
         done
     done
 }
 
 process_control_queue() {
+    reconcile_audit_outbox || {
+        controller_log_event error audit_reconcile_failed "phase=queue_turn" controller true >/dev/null 2>&1 || true
+        return 73
+    }
     prune_expired_control_files
     [ -x "$api_bridge" ] && [ ! -L "$api_bridge" ] || return 0
     # The authenticated bridge generates lexically sortable server job IDs with
@@ -93,18 +86,18 @@ process_control_queue() {
         queued_name=${queued_request##*/}
         queued_id=${queued_name%.json}
         if ! valid_request_id "$queued_id" || ! private_control_file "$queued_request"; then
-            append_rotating_log "$controller_log" 10485760 5 "control_request_rejected file=$queued_name"
+            controller_log_event warn control_request_rejected "file=$queued_name"
             continue
         fi
         queued_size=$(wc -c < "$queued_request" | tr -d ' ')
         case $queued_size in ''|*[!0-9]*) queued_size=65537 ;; esac
         if [ "$queued_size" -gt 65536 ]; then
-            append_rotating_log "$controller_log" 10485760 5 "control_request_rejected id=$queued_id reason=size"
+            controller_log_event warn control_request_rejected "id=$queued_id reason=size"
             continue
         fi
         processing_request=$control_processing/$queued_name
         [ ! -e "$processing_request" ] && [ ! -L "$processing_request" ] || {
-            append_rotating_log "$controller_log" 10485760 5 "control_request_collision id=$queued_id"
+            controller_log_event warn control_request_collision "id=$queued_id"
             continue
         }
         mv "$queued_request" "$processing_request" || continue
@@ -114,16 +107,17 @@ process_control_queue() {
             if private_control_file "$queued_secret" && [ ! -e "$processing_secret" ] && [ ! -L "$processing_secret" ]; then
                 mv "$queued_secret" "$processing_secret" || true
             else
-                append_rotating_log "$controller_log" 10485760 5 "control_secret_rejected id=$queued_id"
+                controller_log_event error control_secret_rejected "id=$queued_id"
             fi
         fi
         response_final=$control_responses/$queued_id.json
         [ ! -e "$response_final" ] && [ ! -L "$response_final" ] || {
-            append_rotating_log "$controller_log" 10485760 5 "control_response_rejected id=$queued_id"
+            controller_log_event error control_response_rejected "id=$queued_id"
             rm -f "$processing_request"
             [ ! -L "$processing_secret" ] && rm -f "$processing_secret" 2>/dev/null || true
             continue
         }
+        controller_log_event trace control_request_dispatched "id=$queued_id"
         "$api_bridge" --consume-job "$processing_request" "$response_final" &
         active_pid=$!
         # TERM can be delivered after the asynchronous launch but before the
@@ -141,7 +135,9 @@ process_control_queue() {
         fi
         case $response_size in ''|*[!0-9]*) response_size=1048577 ;; esac
         if [ "$control_exit" -ne 0 ] || ! private_control_file "$response_final" || [ "$response_size" -gt 1048576 ]; then
-            append_rotating_log "$controller_log" 10485760 5 "control_consumer_failed id=$queued_id exit=$control_exit"
+            controller_log_event error control_consumer_failed "id=$queued_id exit=$control_exit"
+        else
+            controller_log_event debug control_consumer_completed "id=$queued_id"
         fi
         rm -f "$processing_request"
         if [ -e "$processing_secret" ] && [ ! -L "$processing_secret" ]; then rm -f "$processing_secret"; fi
@@ -149,6 +145,10 @@ process_control_queue() {
         # shutdown signals cannot be starved by a dashboard client.
         break
     done
+    reconcile_audit_outbox || {
+        controller_log_event error audit_reconcile_failed "phase=before_response_prune" controller true >/dev/null 2>&1 || true
+        return 73
+    }
     response_count=0
     for old_response in "$control_responses"/*.json; do
         [ -e "$old_response" ] || [ -L "$old_response" ] || continue
@@ -157,7 +157,7 @@ process_control_queue() {
         private_control_file "$old_response" || continue
         response_count=$((response_count + 1))
     done
-    responses_to_remove=$((response_count - 256))
+    responses_to_remove=$((response_count - security_runtime_max_outstanding))
     [ "$responses_to_remove" -gt 0 ] || return 0
     for old_response in "$control_responses"/*.json; do
         [ "$responses_to_remove" -gt 0 ] || break
@@ -223,14 +223,72 @@ ensure_realtime_watcher() {
     realtime_backend=inotify
 }
 
-source_fingerprint() {
+source_fingerprint() (
     fingerprint_source=$1
-    if ! command -v find >/dev/null 2>&1 || ! command -v cksum >/dev/null 2>&1 || ! command -v stat >/dev/null 2>&1; then
+    if ! command -v find >/dev/null 2>&1 || ! command -v sort >/dev/null 2>&1 ||
+        ! command -v cksum >/dev/null 2>&1 || ! command -v awk >/dev/null 2>&1 ||
+        ! command -v stat >/dev/null 2>&1; then
         return 69
     fi
-    find "$fingerprint_source" -type f -exec stat -c '%n|%s|%Y' {} \; 2>/dev/null |
-        LC_ALL=C sort | cksum | awk '{ print $1 ":" $2 }'
-}
+
+    # BusyBox ash has no pipefail. Keep each stage in a private file and check
+    # its status before the next stage so a failed find/stat/sort/cksum cannot
+    # be mistaken for a valid fingerprint of partial input.
+    fingerprint_attempt=0
+    fingerprint_temp_dir=
+    while [ "$fingerprint_attempt" -lt 32 ]; do
+        fingerprint_candidate=$runtime_root/fingerprint.$$.$fingerprint_attempt
+        if mkdir "$fingerprint_candidate" 2>/dev/null; then
+            fingerprint_temp_dir=$fingerprint_candidate
+            break
+        fi
+        fingerprint_attempt=$((fingerprint_attempt + 1))
+    done
+    [ -n "$fingerprint_temp_dir" ] || return 73
+    chmod 700 "$fingerprint_temp_dir" || return 73
+    fingerprint_metadata=$fingerprint_temp_dir/metadata
+    fingerprint_stat_failure=$fingerprint_temp_dir/stat-failure
+    fingerprint_sorted=$fingerprint_temp_dir/sorted
+    fingerprint_checksum=$fingerprint_temp_dir/checksum
+    fingerprint_cleanup() {
+        rm -f "$fingerprint_metadata" "$fingerprint_stat_failure" \
+            "$fingerprint_sorted" "$fingerprint_checksum" 2>/dev/null || true
+        rmdir "$fingerprint_temp_dir" 2>/dev/null || true
+    }
+    trap fingerprint_cleanup 0 HUP INT TERM
+
+    : > "$fingerprint_metadata" || return 73
+    : > "$fingerprint_stat_failure" || return 73
+    finish_private_file "$fingerprint_metadata" || return 73
+    finish_private_file "$fingerprint_stat_failure" || return 73
+    if ! find "$fingerprint_source" -type f -exec sh -c '
+        metadata_output=$1
+        metadata_failure=$2
+        shift 2
+        for metadata_path do
+            if ! stat -c "%n|%s|%Y" "$metadata_path" >> "$metadata_output" 2>/dev/null; then
+                printf "failed\n" > "$metadata_failure" || exit 73
+                exit 69
+            fi
+        done
+    ' sh "$fingerprint_metadata" "$fingerprint_stat_failure" {} + 2>/dev/null; then
+        return 69
+    fi
+    [ ! -s "$fingerprint_stat_failure" ] || return 69
+
+    : > "$fingerprint_sorted" || return 73
+    finish_private_file "$fingerprint_sorted" || return 73
+    LC_ALL=C sort "$fingerprint_metadata" > "$fingerprint_sorted" || return 69
+
+    : > "$fingerprint_checksum" || return 73
+    finish_private_file "$fingerprint_checksum" || return 73
+    cksum < "$fingerprint_sorted" > "$fingerprint_checksum" || return 69
+    awk '
+        NR != 1 || NF != 2 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ { exit 1 }
+        { fingerprint = $1 ":" $2 }
+        END { if (NR != 1) exit 1; print fingerprint }
+    ' "$fingerprint_checksum"
+)
 
 time_window_allows() {
     allowed_weekdays=$1
@@ -299,12 +357,12 @@ process_routines() {
     for routine_config in "$routines_dir"/*.conf; do
         [ -e "$routine_config" ] || [ -L "$routine_config" ] || continue
         if [ -L "$routine_config" ] || [ ! -f "$routine_config" ] || [ ! -r "$routine_config" ]; then
-            append_rotating_log "$controller_log" 10485760 5 "routine_config_rejected"
+            controller_log_event warn routine_config_rejected
             continue
         fi
         routine_profile=${routine_config##*/}; routine_profile=${routine_profile%.conf}
-        case $routine_profile in ''|*[!A-Za-z0-9_-]*) append_rotating_log "$controller_log" 10485760 5 "routine_name_rejected"; continue ;; esac
-        profile_exists "$routine_profile" || { append_rotating_log "$controller_log" 10485760 5 "routine_profile_missing profile=$routine_profile"; continue; }
+        case $routine_profile in ''|*[!A-Za-z0-9_-]*) controller_log_event warn routine_name_rejected; continue ;; esac
+        profile_exists "$routine_profile" || { controller_log_event warn routine_profile_missing "profile=$routine_profile"; continue; }
         routine_enabled=$(setting "$routine_config" enabled false)
         routine_action=$(setting "$routine_config" action sync)
         routine_mode=$(setting "$routine_config" mode interval)
@@ -319,11 +377,11 @@ process_routines() {
         routine_delete=$(setting "$routine_config" allow_delete false)
         routine_max_total=$(setting "$routine_config" max_total_delete 100)
         routine_dependencies=$(setting "$routine_config" depends_on '')
-        case $routine_enabled:$routine_delete in true:true|true:false|false:true|false:false) ;; *) append_rotating_log "$controller_log" 10485760 5 "routine_invalid profile=$routine_profile field=boolean"; continue ;; esac
+        case $routine_enabled:$routine_delete in true:true|true:false|false:true|false:false) ;; *) controller_log_event warn routine_invalid "profile=$routine_profile field=boolean"; continue ;; esac
         [ "$routine_enabled" = true ] || continue
-        case $routine_action in plan|sync) ;; *) append_rotating_log "$controller_log" 10485760 5 "routine_invalid profile=$routine_profile field=action"; continue ;; esac
-        case $routine_mode in interval|daily|realtime) ;; *) append_rotating_log "$controller_log" 10485760 5 "routine_invalid profile=$routine_profile field=mode"; continue ;; esac
-        case $routine_interval:$routine_debounce:$routine_retries:$routine_backoff:$routine_poll:$routine_max_total in *[!0-9:]*) append_rotating_log "$controller_log" 10485760 5 "routine_invalid profile=$routine_profile field=number"; continue ;; esac
+        case $routine_action in plan|sync) ;; *) controller_log_event warn routine_invalid "profile=$routine_profile field=action"; continue ;; esac
+        case $routine_mode in interval|daily|realtime) ;; *) controller_log_event warn routine_invalid "profile=$routine_profile field=mode"; continue ;; esac
+        case $routine_interval:$routine_debounce:$routine_retries:$routine_backoff:$routine_poll:$routine_max_total in *[!0-9:]*) controller_log_event warn routine_invalid "profile=$routine_profile field=number"; continue ;; esac
         [ "$routine_interval" -ge 60 ] && [ "$routine_interval" -le 2592000 ] || continue
         [ "$routine_debounce" -ge 1 ] && [ "$routine_debounce" -le 3600 ] || continue
         [ "$routine_retries" -le 5 ] || continue
@@ -335,11 +393,11 @@ process_routines() {
         routine_profile_max=$(sed -n 's/^max-delete = //p' "$profiles_dir/$routine_profile.toml" | sed -n '1p')
         case $routine_profile_max in ''|*[!0-9]*) continue ;; esac
         if [ "$routine_delete" = true ] && [ "$routine_max_total" -lt "$routine_profile_max" ]; then
-            append_rotating_log "$controller_log" 10485760 5 "routine_deferred profile=$routine_profile reason=delete_bound"
+            controller_log_event warn routine_deferred "profile=$routine_profile reason=delete_bound" scheduler
             continue
         fi
         routine_state_path=$routine_state_dir/$routine_profile.state
-        if [ -L "$routine_state_path" ]; then append_rotating_log "$controller_log" 10485760 5 "routine_state_rejected profile=$routine_profile"; continue; fi
+        if [ -L "$routine_state_path" ]; then controller_log_event error routine_state_rejected "profile=$routine_profile"; continue; fi
         routine_state_value=$(setting "$routine_state_path" state never)
         routine_next_value=$(setting "$routine_state_path" next_run_epoch 0)
         routine_last_success_value=$(setting "$routine_state_path" last_success_epoch 0)
@@ -349,8 +407,8 @@ process_routines() {
         routine_last_poll_value=$(setting "$routine_state_path" last_poll_epoch 0)
         routine_fingerprint_value=$(setting "$routine_state_path" fingerprint none)
         routine_backend_value=$(setting "$routine_state_path" backend none)
-        case $routine_state_value in never|scheduled|running|succeeded|failed|deferred) ;; *) append_rotating_log "$controller_log" 10485760 5 "routine_state_invalid profile=$routine_profile"; continue ;; esac
-        case $routine_next_value:$routine_last_success_value:$routine_last_attempt_value:$routine_retry_value:$routine_last_poll_value in *[!0-9:]*) append_rotating_log "$controller_log" 10485760 5 "routine_state_invalid profile=$routine_profile"; continue ;; esac
+        case $routine_state_value in never|scheduled|running|succeeded|failed|deferred) ;; *) controller_log_event warn routine_state_invalid "profile=$routine_profile"; continue ;; esac
+        case $routine_next_value:$routine_last_success_value:$routine_last_attempt_value:$routine_retry_value:$routine_last_poll_value in *[!0-9:]*) controller_log_event warn routine_state_invalid "profile=$routine_profile"; continue ;; esac
         due=false
         if [ "$routine_retry_value" -gt 0 ] && [ "$routine_next_value" -gt 0 ] && [ "$routine_now" -ge "$routine_next_value" ]; then
             due=true
@@ -358,7 +416,7 @@ process_routines() {
             routine_state_value=deferred
             routine_backend_value=$routine_mode
             write_routine_state "$routine_profile"
-            append_activity routine.deferred "$routine_profile" deferred "Routine outside configured window" 2>/dev/null || true
+            append_activity routine.deferred "$routine_profile" deferred "Routine outside configured window" routines warn 2>/dev/null || true
             continue
         else
             case $routine_mode in
@@ -383,8 +441,11 @@ process_routines() {
                     if [ "$routine_backend_value" = inotify ] && [ -s "$watcher_event_path" ] && [ $((routine_now - routine_last_attempt_value)) -ge "$routine_debounce" ]; then
                         : > "$watcher_event_path"; finish_private_file "$watcher_event_path"; due=true
                     elif [ $((routine_now - routine_last_poll_value)) -ge "$routine_poll" ]; then
-                        current_fingerprint=$(source_fingerprint "$profile_source" 2>/dev/null || true)
-                        [ -n "$current_fingerprint" ] || { append_rotating_log "$controller_log" 10485760 5 "routine_poll_unavailable profile=$routine_profile"; continue; }
+                        if ! current_fingerprint=$(source_fingerprint "$profile_source" 2>/dev/null); then
+                            controller_log_event warn routine_poll_unavailable "profile=$routine_profile reason=fingerprint"
+                            continue
+                        fi
+                        [ -n "$current_fingerprint" ] || { controller_log_event warn routine_poll_unavailable "profile=$routine_profile reason=empty"; continue; }
                         routine_last_poll_value=$routine_now
                         if [ "$routine_fingerprint_value" = none ]; then
                             routine_fingerprint_value=$current_fingerprint
@@ -404,7 +465,7 @@ process_routines() {
             routine_state_value=deferred
             routine_next_value=$((routine_now + 30))
             write_routine_state "$routine_profile"
-            append_activity routine.deferred "$routine_profile" deferred "Routine dependency has not succeeded" 2>/dev/null || true
+            append_activity routine.deferred "$routine_profile" deferred "Routine dependency has not succeeded" routines warn 2>/dev/null || true
             continue
         fi
         # Do not start new work after TERM/INT was latched while this routine
@@ -435,27 +496,20 @@ process_routines() {
                 retry_index=1
                 while [ "$retry_index" -lt "$routine_retry_value" ]; do retry_delay=$((retry_delay * 2)); [ "$retry_delay" -le 2592000 ] || { retry_delay=2592000; break; }; retry_index=$((retry_index + 1)); done
                 routine_next_value=$((routine_finished + retry_delay))
-                append_activity routine.retry_scheduled "$routine_profile" scheduled "Routine retry scheduled" 2>/dev/null || true
+                append_activity routine.retry_scheduled "$routine_profile" scheduled "Routine retry scheduled" routines info 2>/dev/null || true
             else
                 routine_retry_value=0
                 case $routine_mode in interval) routine_next_value=$((routine_finished + routine_interval)) ;; daily) routine_last_day_value=$(date +%Y-%m-%d); routine_next_value=0 ;; realtime) routine_next_value=0 ;; esac
             fi
         fi
         write_routine_state "$routine_profile"
-        append_rotating_log "$controller_log" 10485760 5 \
-            "routine_run profile=$routine_profile action=$routine_action exit=$scheduled_exit next=$routine_next_value backend=$routine_backend_value"
+        if [ "$scheduled_exit" -eq 0 ]; then routine_log_level=info; else routine_log_level=error; fi
+        controller_log_event "$routine_log_level" routine_run \
+            "profile=$routine_profile action=$routine_action exit=$scheduled_exit next=$routine_next_value backend=$routine_backend_value" scheduler
         # One routine per turn keeps control-plane latency and shutdown bounded.
         break
     done
 }
-
-acquire_controller_lock
-inotify_command=$(command -v inotifywait 2>/dev/null || true)
-umask 077
-controller_pid_temp=$controller_pid_file.tmp.$$
-printf '%s\n' "$$" > "$controller_pid_temp"
-finish_private_file "$controller_pid_temp"
-mv -f "$controller_pid_temp" "$controller_pid_file"
 
 shutdown=false
 active_pid=
@@ -467,11 +521,12 @@ reload_requested=false
 cleanup_controller() {
     stop_realtime_watchers 2>/dev/null || true
     write_controller_state stopped 0 0 0 2>/dev/null || true
+    remove_own_controller_ready 2>/dev/null || true
     current_pid=$(read_pid "$controller_pid_file" 2>/dev/null || true)
     if [ "$current_pid" = "$$" ]; then
         rm -f "$controller_pid_file"
-        rmdir "$controller_lock" 2>/dev/null || true
     fi
+    release_private_process_lock "$controller_lock" 2>/dev/null || true
 }
 request_shutdown() {
     shutdown=true
@@ -494,7 +549,47 @@ trap request_shutdown TERM INT
 trap request_reload HUP
 trap cleanup_controller 0
 
+controller_start_lease_matches_parent || {
+    echo "controller startup lease is absent, stale, or not owned by the lifecycle parent" >&2
+    exit 73
+}
+acquire_controller_lock
+controller_start_lease_matches_parent || {
+    echo "controller startup lease was cancelled before lock ownership" >&2
+    exit 73
+}
+reconcile_audit_outbox || {
+    controller_log_event error audit_reconcile_failed "phase=startup" controller true >/dev/null 2>&1 || true
+    echo "pending mandatory audit records could not be reconciled" >&2
+    exit 73
+}
+# Read and validate the complete policy, then inspect/prune the private queue
+# before publishing readiness. A controller PID alone is deliberately not a
+# readiness signal: any failure here must make lifecycle start fail cleanly.
+prune_expired_control_files
+inotify_command=$(command -v inotifywait 2>/dev/null || true)
+umask 077
+controller_pid_temp=$controller_pid_file.tmp.$$
+printf '%s\n' "$$" > "$controller_pid_temp"
+finish_private_file "$controller_pid_temp"
+mv -f "$controller_pid_temp" "$controller_pid_file"
 write_controller_state running "$$" 0 0
+# Keep the inherited parent-death signal fatal after all preflight and PID
+# publication until the lifecycle parent commits the shared startup lease.
+# After commit, a parent crash is recoverable from the exact PID/lock/socket
+# topology, so the long-lived controller may safely ignore SIGUSR1.
+wait_for_controller_start_commit || {
+    echo "controller lifecycle parent did not commit startup" >&2
+    exit 73
+}
+trap '' USR1
+controller_start_lease_committed_matches_parent || {
+    echo "controller startup commit changed before readiness" >&2
+    exit 73
+}
+publish_controller_ready
+unset SDSYNC_DSM_CONTROLLER_START_PARENT_PID SDSYNC_DSM_CONTROLLER_START_PARENT_TICKS \
+    SDSYNC_DSM_CONTROLLER_START_PARENT_BOOT
 while [ "$shutdown" = false ]; do
     if [ "$reload_requested" = true ]; then
         # Rebase the next deadline on the newly persisted cadence. This is what makes
@@ -554,8 +649,8 @@ while [ "$shutdown" = false ]; do
         now=$(epoch_now)
         next_run=$((now + interval))
         # Failure is recorded by sdsync-run and does not trigger an immediate retry.
-        append_rotating_log "$controller_log" 10485760 5 \
-            "scheduled_run exit=$run_exit next=$next_run"
+        if [ "$run_exit" -eq 0 ]; then scheduled_log_level=info; else scheduled_log_level=error; fi
+        controller_log_event "$scheduled_log_level" scheduled_run "exit=$run_exit next=$next_run" scheduler
     fi
 
     [ "$shutdown" = false ] || break
@@ -566,8 +661,16 @@ while [ "$shutdown" = false ]; do
 
     write_controller_state running "$$" "$next_run" 0
     sleep_for=30
-    if [ -n "$(find "$routines_dir" -type f -name '*.conf' -print -quit 2>/dev/null)" ]; then sleep_for=5; fi
-    if [ -n "$(find "$control_requests" -type f -name '*.json' -print -quit 2>/dev/null)" ]; then sleep_for=1; fi
+    for wake_routine in "$routines_dir"/*.conf; do
+        [ -e "$wake_routine" ] || [ -L "$wake_routine" ] || continue
+        sleep_for=5
+        break
+    done
+    for wake_request in "$control_requests"/*.json; do
+        [ -e "$wake_request" ] || [ -L "$wake_request" ] || continue
+        sleep_for=1
+        break
+    done
     if [ "$enabled" = true ] && [ "$next_run" -gt "$now" ]; then
         remaining=$((next_run - now))
         if [ "$remaining" -lt "$sleep_for" ]; then

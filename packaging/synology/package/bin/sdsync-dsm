@@ -6,6 +6,7 @@ package_root=$(CDPATH='' cd -- "$self_dir/.." && pwd -P)
 # shellcheck source=../libexec/sdsync-common
 . "$package_root/libexec/sdsync-common"
 umask 077
+clear_core_cli_environment
 
 usage() {
     cat <<'EOF'
@@ -28,6 +29,7 @@ Usage:
   sdsync-dsm api configure-profile ... | remove-profile NAME | set-default NAME
   sdsync-dsm api set-secret --profile NAME --kind password|totp|remote-log-token --mode replace|clear
   sdsync-dsm api schedule ... | routine ... | alert-policy ... | action ...
+  sdsync-dsm api security-policy ...
 
 configure-profile options:
   --compare content|metadata|size-only   (default: content)
@@ -62,10 +64,17 @@ need_value() {
 }
 
 valid_name() {
-    case ${1:-} in ''|all|*[!A-Za-z0-9_-]*) return 1 ;; *) return 0 ;; esac
+    case ${1:-} in ''|all|*[!A-Za-z0-9_-]*) return 1 ;; esac
+    [ "${#1}" -le 255 ]
+}
+
+valid_new_name() {
+    valid_name "${1:-}" && [ "${#1}" -le 64 ]
 }
 
 manager_lock_acquired=false
+policy_execution_lock_acquired=false
+mutation_commit_started=false
 tty_active=false
 saved_tty=
 restore_tty() {
@@ -79,18 +88,39 @@ cleanup_manager_lock() {
     restore_tty
     for cleanup_path in "${fragment_temp:-}" "${secret_temp:-}" "${candidate:-}" \
         "${schedule_temp:-}" "${routine_temp:-}" "${routine_graph_temp:-}" "${alert_temp:-}" \
+        "${security_temp:-}" \
         "${api_stdout:-}" "${api_stderr:-}" "${snapshot_json:-}" "${activity_json:-}"; do
         [ -n "$cleanup_path" ] || continue
         case $cleanup_path in "$package_home"/*) [ -L "$cleanup_path" ] || rm -f "$cleanup_path" 2>/dev/null || true ;; esac
     done
-    if [ "$manager_lock_acquired" = true ] && [ -d "$management_lock" ] && [ ! -L "$management_lock" ]; then
-        lock_pid=$(read_pid "$management_lock/pid" 2>/dev/null || true)
-        if [ "$lock_pid" = "$$" ]; then
-            rm -f "$management_lock/pid"
-            rmdir "$management_lock" 2>/dev/null || true
-        fi
+    if [ "$manager_lock_acquired" = true ]; then
+        release_private_process_lock "$management_lock" 2>/dev/null || true
     fi
     manager_lock_acquired=false
+    if [ "$policy_execution_lock_acquired" = true ]; then
+        release_private_process_lock "$policy_execution_lock" 2>/dev/null || true
+    fi
+    policy_execution_lock_acquired=false
+    if [ "${direct_audit_pending:-false}" = true ]; then
+        direct_audit_pending=false
+        cleanup_audit_state=failed
+        [ "${mutation_commit_started:-false}" != true ] || cleanup_audit_state=outcome_unknown
+        audit_outbox_complete "$SDSYNC_DSM_AUDIT_TRANSACTION" "$cleanup_audit_state" >/dev/null 2>&1 || true
+    fi
+}
+
+mark_mutation_commit_started() {
+    [ "${direct_audit_pending:-false}" = true ] || return 73
+    if [ "${mutation_commit_started:-false}" != true ]; then
+        audit_outbox_execute "$SDSYNC_DSM_AUDIT_TRANSACTION" || return $?
+        mutation_commit_started=true
+    fi
+}
+
+acquire_policy_execution_lock() {
+    [ "$policy_execution_lock_acquired" != true ] || return 0
+    acquire_private_process_lock "$policy_execution_lock" || return $?
+    policy_execution_lock_acquired=true
 }
 
 manager_signal() {
@@ -99,41 +129,349 @@ manager_signal() {
     exit 130
 }
 
+authorize_direct_policy_context() {
+    # Every invocation is checked from its actual parsed command line. Queued
+    # job validation is supplemental and can never turn this check off. Only
+    # a complete security-policy replacement remains as the recovery path.
+    [ "${command_name:-}" != configure-security-policy ] || return 0
+    case ${command_name:-} in
+        configure-profile|remove-profile|set-default)
+            [ "$security_runtime_allow_profile_changes" = true ] || return 77
+            ;;
+        set-password|set-totp|remove-password|remove-totp|remove-remote-log-token)
+            [ "$security_runtime_allow_secret_changes" = true ] || return 77
+            ;;
+        set-remote-log-token)
+            [ "$security_runtime_allow_secret_changes" = true ] \
+                && [ "$security_runtime_allow_remote_logging" = true ] || return 77
+            ;;
+        configure-routine|remove-routine|enable|disable|set-schedule)
+            [ "$security_runtime_allow_routine_changes" = true ] || return 77
+            ;;
+        configure-alerts)
+            [ "$security_runtime_allow_notification_changes" = true ] || return 77
+            ;;
+        doctor)
+            [ "$security_runtime_allow_operational_actions" = true ] || return 77
+            ;;
+    esac
+}
+
+policy_denied() {
+    echo "$*" >&2
+    exit 77
+}
+
+doctor_audit_scope() {
+    doctor_scope=
+    doctor_scope_seen=false
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --all)
+                [ "$doctor_scope_seen" = false ] || return 1
+                doctor_scope=all
+                doctor_scope_seen=true
+                ;;
+            --write-test) ;;
+            --*) return 1 ;;
+            *)
+                valid_name "$1" || return 1
+                [ "$doctor_scope_seen" = false ] || return 1
+                doctor_scope=$1
+                doctor_scope_seen=true
+                ;;
+        esac
+        shift
+    done
+    if [ "$doctor_scope_seen" = false ]; then
+        doctor_scope=$(current_default 2>/dev/null) || return 1
+        valid_name "$doctor_scope" || return 1
+    fi
+    printf '%s\n' "$doctor_scope"
+}
+
+configure_profile_audit_target() {
+    audit_target=
+    audit_singletons=,
+    while [ "$#" -gt 0 ]; do
+        audit_option=$1
+        case $audit_option in
+            --exclude)
+                [ "$#" -ge 2 ] || return 64
+                shift 2
+                continue
+                ;;
+            --delete|--allow-http|--default)
+                case $audit_singletons in *,$audit_option,*) return 64 ;; esac
+                audit_singletons=$audit_singletons$audit_option,
+                if [ "$#" -ge 2 ]; then
+                    case $2 in true|false) shift 2; continue ;; esac
+                fi
+                shift
+                continue
+                ;;
+            --clear-excludes)
+                case $audit_singletons in *,$audit_option,*) return 64 ;; esac
+                audit_singletons=$audit_singletons$audit_option,
+                shift
+                continue
+                ;;
+            --name|--source|--remote|--url|--username|--compare|--jobs|--max-delete|\
+            --allow-empty-source|--retries|--timeout|--connect-timeout|--max-rate|\
+            --ca-certificate|--danger-accept-invalid-certs|--verbose|--quiet|--log-level|\
+            --log-format|--log-file|--progress|--output|--remote-log-url|--remote-log-mode)
+                [ "$#" -ge 2 ] || return 64
+                case $audit_singletons in *,$audit_option,*) return 64 ;; esac
+                audit_singletons=$audit_singletons$audit_option,
+                [ "$audit_option" != --name ] || audit_target=$2
+                shift 2
+                continue
+                ;;
+            *) return 64 ;;
+        esac
+    done
+    valid_new_name "$audit_target" || return 64
+    printf '%s\n' "$audit_target"
+}
+
+configure_routine_audit_target() {
+    audit_target=
+    audit_singletons=,
+    while [ "$#" -gt 0 ]; do
+        audit_option=$1
+        case $audit_option in
+            --depends-on)
+                [ "$#" -ge 2 ] || return 64
+                shift 2
+                continue
+                ;;
+            --window-start|--time-window-start) audit_canonical=window-start ;;
+            --window-end|--time-window-end) audit_canonical=window-end ;;
+            --retry-attempts|--retry-count) audit_canonical=retry-count ;;
+            --retry-backoff|--retry-backoff-seconds) audit_canonical=retry-backoff ;;
+            --profile|--enabled|--action|--mode|--interval|--weekdays|--debounce-seconds|\
+            --poll-seconds|--allow-delete|--max-total-delete)
+                audit_canonical=$audit_option
+                ;;
+            *) return 64 ;;
+        esac
+        [ "$#" -ge 2 ] || return 64
+        case $audit_singletons in *,$audit_canonical,*) return 64 ;; esac
+        audit_singletons=$audit_singletons$audit_canonical,
+        [ "$audit_option" != --profile ] || audit_target=$2
+        shift 2
+    done
+    valid_name "$audit_target" || return 64
+    printf '%s\n' "$audit_target"
+}
+
+# Validate the complete recovery document before allowing the one mutation
+# that is safe while service admission is closed. Keep this parser
+# side-effect-free: the authoritative writer validates the same fields again
+# after mandatory audit intent has been prepared.
+complete_security_policy_arguments() {
+    recovery_seen=,
+    recovery_count=0
+    while [ "$#" -gt 0 ]; do
+        recovery_option=$1
+        [ "$#" -ge 2 ] || return 1
+        recovery_value=$2
+        case $recovery_option in
+            --require-https|--allow-interface-changes|--allow-profile-changes|\
+            --allow-secret-changes|--allow-routine-changes|--allow-notification-changes|\
+            --allow-operational-actions|--allow-http-targets|--allow-invalid-tls|\
+            --allow-destructive-sync|--allow-doctor-write-test|--allow-remote-logging|\
+            --allow-empty-source)
+                recovery_kind=boolean
+                ;;
+            --csrf-lifetime) recovery_kind=csrf ;;
+            --result-retention) recovery_kind=retention ;;
+            --max-outstanding-jobs) recovery_kind=outstanding ;;
+            --audit-log-level|--bridge-log-level|--authentication-log-level|\
+            --security-log-level|--configuration-log-level|--secrets-log-level|\
+            --routines-log-level|--operations-log-level|--notifications-log-level|\
+            --sync-log-level|--controller-log-level|--scheduler-log-level)
+                recovery_kind=level
+                ;;
+            *) return 1 ;;
+        esac
+        case $recovery_seen in *,$recovery_option,*) return 1 ;; esac
+        recovery_seen=$recovery_seen$recovery_option,
+        recovery_count=$((recovery_count + 1))
+        case $recovery_kind in
+            boolean) case $recovery_value in true|false) ;; *) return 1 ;; esac ;;
+            level) case $recovery_value in off|trace|debug|info|warn|error) ;; *) return 1 ;; esac ;;
+            *)
+                case $recovery_value in ''|*[!0-9]*|0[0-9]*) return 1 ;; esac
+                case $recovery_kind in
+                    csrf) [ "$recovery_value" -ge 60 ] && [ "$recovery_value" -le 900 ] || return 1 ;;
+                    retention) [ "$recovery_value" -ge 300 ] && [ "$recovery_value" -le 86400 ] || return 1 ;;
+                    outstanding) [ "$recovery_value" -ge 1 ] && [ "$recovery_value" -le 256 ] || return 1 ;;
+                esac
+                ;;
+        esac
+        shift 2
+    done
+    [ "$recovery_count" -eq 28 ]
+}
+
 begin_mutation() {
     require_package_identity || {
         echo "retry with: sudo -u synology-drive-sync -- $manager ..." >&2
         exit 77
     }
     ensure_layout
-    if ! mkdir "$management_lock" 2>/dev/null; then
-        if [ ! -d "$management_lock" ] || [ -L "$management_lock" ]; then
-            echo "unsafe package-manager lock" >&2
-            exit 73
-        fi
-        existing_manager=$(read_pid "$management_lock/pid" 2>/dev/null || true)
-        if [ -n "$existing_manager" ] && pid_is_live "$existing_manager"; then
+    resolved_direct_audit_profile=
+    case ${command_name:-} in
+        configure-profile)
+            resolved_direct_audit_profile=$(configure_profile_audit_target "$@") || {
+                echo "configure-profile contains a missing, unknown, or duplicate singleton option" >&2
+                exit 64
+            }
+            ;;
+        configure-routine)
+            resolved_direct_audit_profile=$(configure_routine_audit_target "$@") || {
+                echo "configure-routine contains a missing, unknown, or duplicate singleton option" >&2
+                exit 64
+            }
+            ;;
+    esac
+    acquire_private_process_lock "$management_lock" || {
+        manager_lock_status=$?
+        if [ "$manager_lock_status" -eq 75 ]; then
             echo "another package-management operation is active" >&2
-            exit 75
+        else
+            echo "cannot acquire the private package-manager lock" >&2
         fi
-        [ ! -f "$management_lock/pid" ] || rm -f "$management_lock/pid"
-        rmdir "$management_lock" 2>/dev/null || { echo "cannot recover stale package-manager lock" >&2; exit 73; }
-        mkdir "$management_lock"
-    fi
-    chmod 0700 "$management_lock"; set_private_owner "$management_lock"
-    printf '%s\n' "$$" > "$management_lock/pid"; finish_private_file "$management_lock/pid"
+        exit "$manager_lock_status"
+    }
     manager_lock_acquired=true
     trap cleanup_manager_lock 0
     trap manager_signal HUP INT TERM
-    if [ -d "$run_lock" ] && [ ! -L "$run_lock" ]; then
-        active_run=$(read_pid "$run_lock/pid" 2>/dev/null || true)
-        if [ -n "$active_run" ] && pid_is_live "$active_run"; then
-            echo "cannot change profiles, credentials, or schedule while PID $active_run is planning/syncing" >&2
+    direct_transition_state=$(package_transition_status) || {
+        echo "cannot validate the package transition state" >&2
+        exit 73
+    }
+    if [ "$direct_transition_state" != open ]; then
+        echo "package $direct_transition_state is in progress; configuration changes are closed" >&2
+        exit 75
+    fi
+    direct_service_state=$(service_admission_status) || {
+        echo "cannot validate package service admission" >&2
+        exit 73
+    }
+    if [ "$direct_service_state" != open ]; then
+        if [ "${command_name:-}" = configure-security-policy ] \
+            && [ "$direct_transition_state" = open ]; then
+            complete_security_policy_arguments "$@" || {
+                echo "stopped-service security-policy recovery requires the complete valid 28-field document" >&2
+                exit 64
+            }
+        else
+            echo "package service is stopped; configuration changes are closed" >&2
             exit 75
         fi
     fi
+    if [ "${command_name:-}" != configure-security-policy ]; then
+        reconcile_audit_outbox || {
+            echo "pending mandatory audit records could not be reconciled" >&2
+            exit 73
+        }
+        load_security_policy_runtime || {
+            echo "security policy is not a private complete document" >&2
+            exit 73
+        }
+    fi
+    # The underlying manager execution is itself an action. Always give it a
+    # fresh, fixed service attribution so caller-controlled bridge variables
+    # cannot suppress or forge its mandatory records.
+    unset SDSYNC_DSM_AUDIT_TRANSACTION SDSYNC_DSM_AUDIT_ACTOR \
+        SDSYNC_DSM_AUDIT_ACTOR_UID SDSYNC_DSM_AUDIT_ORIGIN SDSYNC_DSM_CLIENT_REQUEST_ID
+    SDSYNC_DSM_AUDIT_ACTOR=package-manager
+    SDSYNC_DSM_AUDIT_ACTOR_UID=$path_owner
+    SDSYNC_DSM_AUDIT_ORIGIN=manager
+    export SDSYNC_DSM_AUDIT_ACTOR SDSYNC_DSM_AUDIT_ACTOR_UID SDSYNC_DSM_AUDIT_ORIGIN
+    mutation_commit_started=false
+    case ${command_name:-} in
+            configure-profile|remove-profile|set-default|configure-routine|remove-routine|\
+            set-password|set-totp|set-remote-log-token|remove-password|remove-totp|\
+            remove-remote-log-token|enable|disable|set-schedule|configure-alerts|\
+            configure-security-policy|doctor)
+                case $command_name in
+                    configure-routine) direct_audit_operation=routine ;;
+                    set-schedule|enable|disable) direct_audit_operation=schedule ;;
+                    configure-alerts) direct_audit_operation=alert-policy ;;
+                    configure-security-policy)
+                        direct_audit_operation=security-policy
+                        ;;
+                    *) direct_audit_operation=$command_name ;;
+                esac
+                direct_audit_profile=all
+                case $command_name in
+                    configure-profile)
+                        direct_audit_profile=$resolved_direct_audit_profile
+                        ;;
+                    configure-routine)
+                        direct_audit_profile=$resolved_direct_audit_profile
+                        ;;
+                    remove-profile|remove-routine|set-default|set-password|set-totp|set-remote-log-token|\
+                    remove-password|remove-totp|remove-remote-log-token)
+                        valid_name "${1:-}" && direct_audit_profile=$1
+                        ;;
+                    doctor)
+                        resolved_doctor_audit_scope=$(doctor_audit_scope "$@" 2>/dev/null || true)
+                        case $resolved_doctor_audit_scope in
+                            all) direct_audit_profile=all ;;
+                            *) valid_name "$resolved_doctor_audit_scope" && direct_audit_profile=$resolved_doctor_audit_scope ;;
+                        esac
+                        ;;
+                esac
+                ensure_audit_transaction || {
+                    echo "mandatory audit transaction could not be created" >&2
+                    exit 73
+                }
+                audit_outbox_begin "$direct_audit_operation" "$direct_audit_profile" \
+                    "$SDSYNC_DSM_AUDIT_ACTOR" "$SDSYNC_DSM_AUDIT_ACTOR_UID" \
+                    "$SDSYNC_DSM_AUDIT_ORIGIN" \
+                    "$SDSYNC_DSM_AUDIT_TRANSACTION" || {
+                    echo "mandatory audit outbox could not be prepared" >&2
+                    exit 73
+                }
+                direct_audit_pending=true
+                ;;
+    esac
+    # Authorization denials are themselves module actions. The canonical
+    # requested record and private outbox therefore exist before the policy
+    # verdict; cleanup terminalizes the denied attempt as failed while no
+    # mutation has begun.
+    direct_policy_status=0
+    authorize_direct_policy_context || direct_policy_status=$?
+    case $direct_policy_status in
+        0) ;;
+        73) echo "security policy is not a private complete document" >&2; exit 73 ;;
+        *) echo "operation is disabled by the current security policy" >&2; exit 77 ;;
+    esac
+    opposing_run_status=0
+    private_process_lock_is_live "$run_lock" || opposing_run_status=$?
+    if [ "$opposing_run_status" -eq 0 ]; then
+            active_run=$lock_owner_pid
+            echo "cannot change profiles, credentials, or schedule while PID $active_run is planning/syncing" >&2
+            exit 75
+    fi
+    [ "$opposing_run_status" -eq 1 ] || {
+        echo "cannot validate the private run lock" >&2
+        exit 73
+    }
 }
 
 end_mutation() {
+    direct_audit_result=${1:-succeeded}
+    case $direct_audit_result in succeeded|failed|outcome_unknown) ;; *) return 64 ;; esac
+    if [ "${direct_audit_pending:-false}" = true ]; then
+        audit_outbox_complete "$SDSYNC_DSM_AUDIT_TRANSACTION" "$direct_audit_result" >/dev/null 2>&1 || \
+            echo "warning: operation completed; terminal audit is pending durable reconciliation" >&2
+        direct_audit_pending=false
+    fi
     cleanup_manager_lock
     trap - 0 HUP INT TERM
 }
@@ -157,9 +495,10 @@ write_disabled_schedule() {
             "$(setting "$schedule_file" max_total_delete 100)"
     } > "$schedule_temp"
     finish_private_file "$schedule_temp"
+    mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
     mv -f "$schedule_temp" "$schedule_file"
     schedule_temp=
-    reload_controller_if_running
+    reload_controller_if_running || echo "warning: configuration was saved but the controller could not be reloaded" >&2
 }
 
 validate_toml_text() {
@@ -414,7 +753,7 @@ configure_profile() {
             *) die "unknown configure-profile option: $1" ;;
         esac
     done
-    valid_name "$profile_name" || die "profile name may contain only letters, digits, '_' and '-'"
+    valid_new_name "$profile_name" || die "profile name must be 1..64 letters, digits, '_' or '-'"
     validate_source "$source_path"
     source_path=$canonical_source
     validate_remote "$remote_path"
@@ -446,7 +785,8 @@ configure_profile() {
     [ "$verbosity" -le 2 ] || die "verbose must be 0, 1, or 2"
     [ "$quiet" != true ] || [ "$verbosity" = 0 ] || die "quiet and verbose cannot both be enabled"
     validate_toml_text log-file "$log_file"
-    case $log_file in "$log_root"/*) ;; *) die "DSM log-file must remain inside the private package log directory" ;; esac
+    [ "$log_file" = "$log_root/sync.log" ] || \
+        die "DSM log-file must be the package-managed sync.log path"
     [ ! -L "$log_file" ] || die "log-file must not be a symlink"
     case $remote_log_mode in best-effort|required) ;; *) die "invalid remote-log-mode" ;; esac
     if [ -n "$remote_log_url" ]; then
@@ -459,6 +799,16 @@ configure_profile() {
         case $ca_certificate in /*) ;; *) die "ca-certificate must be an absolute path" ;; esac
         [ -f "$ca_certificate" ] && [ ! -L "$ca_certificate" ] && [ -r "$ca_certificate" ] || die "ca-certificate must be a readable non-symlink file"
     fi
+    [ "$security_runtime_allow_http_targets" = true ] || [ "$allow_http" != true ] || \
+        policy_denied "security policy blocks HTTP targets"
+    [ "$security_runtime_allow_invalid_tls" = true ] || [ "$danger_invalid" != true ] || \
+        policy_denied "security policy blocks invalid TLS certificates"
+    [ "$security_runtime_allow_destructive_sync" = true ] || [ "$delete" != true ] || \
+        policy_denied "security policy blocks destructive sync"
+    [ "$security_runtime_allow_remote_logging" = true ] || [ -z "$remote_log_url" ] || \
+        policy_denied "security policy blocks remote logging"
+    [ "$security_runtime_allow_empty_source" = true ] || [ "$allow_empty_source" != true ] || \
+        policy_denied "security policy blocks empty-source synchronization"
     ensure_layout
     fragment_temp=$profiles_dir/.${profile_name}.toml.$$
     umask 077
@@ -491,6 +841,7 @@ configure_profile() {
         selected_default=$(current_default 2>/dev/null || printf '%s\n' "$profile_name")
     fi
     candidate=$(render_candidate "$selected_default" "$profile_name" "$fragment_temp")
+    mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
     mv -f "$fragment_temp" "$profiles_dir/$profile_name.toml"
     finish_private_file "$profiles_dir/$profile_name.toml"
     mv -f "$candidate" "$config_file"
@@ -540,6 +891,7 @@ clear_secret() {
     case $secret_kind in password|totp|remote-log-token) ;; *) die "invalid secret kind" ;; esac
     target=$secret_root/$profile_name.$secret_kind
     [ ! -L "$target" ] || die "refusing symlinked secret file: $target"
+    mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
     if [ -e "$target" ]; then
         [ -f "$target" ] || die "secret target is not a regular file"
         rm -f "$target"
@@ -625,6 +977,8 @@ configure_routine() {
         case $profile_delete_bound in ''|*[!0-9]*) die "profile has an invalid deletion bound" ;; esac
         [ "$routine_max_total" -ge "$profile_delete_bound" ] || die "routine max-total-delete cannot be lower than the profile max-delete bound"
     fi
+    [ "$security_runtime_allow_destructive_sync" = true ] || [ "$routine_allow_delete" != true ] || \
+        policy_denied "security policy blocks destructive routines"
     seen_dependencies=,
     if [ -n "$routine_dependencies" ]; then
         old_ifs=$IFS; IFS=,
@@ -675,10 +1029,10 @@ configure_routine() {
         die "routine dependencies contain a cycle"
     fi
     rm -f "$routine_graph_temp"; routine_graph_temp=
+    mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
     mv -f "$routine_temp" "$routines_dir/$routine_profile.conf"
     routine_temp=
-    reload_controller_if_running
-    append_activity configuration.changed "$routine_profile" changed "Routine configuration changed" 2>/dev/null || true
+    reload_controller_if_running || echo "warning: configuration was saved but the controller could not be reloaded" >&2
     echo "configured $routine_mode routine for '$routine_profile'"
 }
 
@@ -709,11 +1063,145 @@ configure_alert_policy() {
         printf 'failure_threshold=%s\ncooldown_seconds=%s\n' "$alerts_threshold" "$alerts_cooldown"
     } > "$alert_temp"
     finish_private_file "$alert_temp"
+    mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
     mv -f "$alert_temp" "$alert_policy_file"
     alert_temp=
-    reload_controller_if_running
-    append_activity configuration.changed all changed "Alert policy changed" 2>/dev/null || true
+    reload_controller_if_running || echo "warning: configuration was saved but the controller could not be reloaded" >&2
     echo "updated DSM alert policy"
+}
+
+configure_security_policy() {
+    security_seen=,
+    security_seen_count=0
+    security_mark_seen() {
+        security_option_name=$1
+        case $security_seen in *,$security_option_name,*) die "duplicate security-policy option: --$security_option_name" ;; esac
+        security_seen=$security_seen$security_option_name,
+        security_seen_count=$((security_seen_count + 1))
+    }
+    security_require_https=false
+    security_allow_interface_changes=true
+    security_allow_profile_changes=true
+    security_allow_secret_changes=true
+    security_allow_routine_changes=true
+    security_allow_notification_changes=true
+    security_allow_operational_actions=true
+    security_allow_http_targets=true
+    security_allow_invalid_tls=true
+    security_allow_destructive_sync=true
+    security_allow_doctor_write_test=true
+    security_allow_remote_logging=true
+    security_allow_empty_source=true
+    security_csrf_lifetime=300
+    security_result_retention=3600
+    security_max_outstanding=256
+    security_audit_level=info
+    security_bridge_level=info
+    security_authentication_level=warn
+    security_security_level=warn
+    security_configuration_level=info
+    security_secrets_level=info
+    security_routines_level=info
+    security_operations_level=info
+    security_notifications_level=warn
+    security_sync_level=info
+    security_controller_level=info
+    security_scheduler_level=info
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --require-https) need_value "$@"; security_mark_seen require-https; security_require_https=$2; shift 2 ;;
+            --allow-interface-changes) need_value "$@"; security_mark_seen allow-interface-changes; security_allow_interface_changes=$2; shift 2 ;;
+            --allow-profile-changes) need_value "$@"; security_mark_seen allow-profile-changes; security_allow_profile_changes=$2; shift 2 ;;
+            --allow-secret-changes) need_value "$@"; security_mark_seen allow-secret-changes; security_allow_secret_changes=$2; shift 2 ;;
+            --allow-routine-changes) need_value "$@"; security_mark_seen allow-routine-changes; security_allow_routine_changes=$2; shift 2 ;;
+            --allow-notification-changes) need_value "$@"; security_mark_seen allow-notification-changes; security_allow_notification_changes=$2; shift 2 ;;
+            --allow-operational-actions) need_value "$@"; security_mark_seen allow-operational-actions; security_allow_operational_actions=$2; shift 2 ;;
+            --allow-http-targets) need_value "$@"; security_mark_seen allow-http-targets; security_allow_http_targets=$2; shift 2 ;;
+            --allow-invalid-tls) need_value "$@"; security_mark_seen allow-invalid-tls; security_allow_invalid_tls=$2; shift 2 ;;
+            --allow-destructive-sync) need_value "$@"; security_mark_seen allow-destructive-sync; security_allow_destructive_sync=$2; shift 2 ;;
+            --allow-doctor-write-test) need_value "$@"; security_mark_seen allow-doctor-write-test; security_allow_doctor_write_test=$2; shift 2 ;;
+            --allow-remote-logging) need_value "$@"; security_mark_seen allow-remote-logging; security_allow_remote_logging=$2; shift 2 ;;
+            --allow-empty-source) need_value "$@"; security_mark_seen allow-empty-source; security_allow_empty_source=$2; shift 2 ;;
+            --csrf-lifetime) need_value "$@"; security_mark_seen csrf-lifetime; security_csrf_lifetime=$2; shift 2 ;;
+            --result-retention) need_value "$@"; security_mark_seen result-retention; security_result_retention=$2; shift 2 ;;
+            --max-outstanding-jobs) need_value "$@"; security_mark_seen max-outstanding-jobs; security_max_outstanding=$2; shift 2 ;;
+            --audit-log-level) need_value "$@"; security_mark_seen audit-log-level; security_audit_level=$2; shift 2 ;;
+            --bridge-log-level) need_value "$@"; security_mark_seen bridge-log-level; security_bridge_level=$2; shift 2 ;;
+            --authentication-log-level) need_value "$@"; security_mark_seen authentication-log-level; security_authentication_level=$2; shift 2 ;;
+            --security-log-level) need_value "$@"; security_mark_seen security-log-level; security_security_level=$2; shift 2 ;;
+            --configuration-log-level) need_value "$@"; security_mark_seen configuration-log-level; security_configuration_level=$2; shift 2 ;;
+            --secrets-log-level) need_value "$@"; security_mark_seen secrets-log-level; security_secrets_level=$2; shift 2 ;;
+            --routines-log-level) need_value "$@"; security_mark_seen routines-log-level; security_routines_level=$2; shift 2 ;;
+            --operations-log-level) need_value "$@"; security_mark_seen operations-log-level; security_operations_level=$2; shift 2 ;;
+            --notifications-log-level) need_value "$@"; security_mark_seen notifications-log-level; security_notifications_level=$2; shift 2 ;;
+            --sync-log-level) need_value "$@"; security_mark_seen sync-log-level; security_sync_level=$2; shift 2 ;;
+            --controller-log-level) need_value "$@"; security_mark_seen controller-log-level; security_controller_level=$2; shift 2 ;;
+            --scheduler-log-level) need_value "$@"; security_mark_seen scheduler-log-level; security_scheduler_level=$2; shift 2 ;;
+            *) die "unknown security-policy option: $1" ;;
+        esac
+    done
+    [ "$security_seen_count" -eq 28 ] || die "configure-security-policy requires the complete 28-field policy document"
+    for security_boolean in "$security_require_https" "$security_allow_interface_changes" "$security_allow_profile_changes" \
+        "$security_allow_secret_changes" "$security_allow_routine_changes" \
+        "$security_allow_notification_changes" "$security_allow_operational_actions" \
+        "$security_allow_http_targets" "$security_allow_invalid_tls" \
+        "$security_allow_destructive_sync" "$security_allow_doctor_write_test" \
+        "$security_allow_remote_logging" "$security_allow_empty_source"; do
+        case $security_boolean in true|false) ;; *) die "security-policy booleans must be true or false" ;; esac
+    done
+    for security_number in "$security_csrf_lifetime" "$security_result_retention" "$security_max_outstanding"; do
+        case $security_number in
+            ''|*[!0-9]*|0[0-9]*) die "security-policy timing and capacity values must be canonical integers" ;;
+        esac
+    done
+    [ "$security_csrf_lifetime" -ge 60 ] && [ "$security_csrf_lifetime" -le 900 ] || die "csrf-lifetime must be 60..900 seconds"
+    [ "$security_result_retention" -ge 300 ] && [ "$security_result_retention" -le 86400 ] || die "result-retention must be 300..86400 seconds"
+    [ "$security_max_outstanding" -ge 1 ] && [ "$security_max_outstanding" -le 256 ] || die "max-outstanding-jobs must be 1..256"
+    for security_level in "$security_audit_level" "$security_bridge_level" "$security_authentication_level" \
+        "$security_security_level" "$security_configuration_level" "$security_secrets_level" \
+        "$security_routines_level" "$security_operations_level" "$security_notifications_level" \
+        "$security_sync_level" "$security_controller_level" "$security_scheduler_level"; do
+        case $security_level in off|trace|debug|info|warn|error) ;; *) die "security-policy log levels must be off, trace, debug, info, warn, or error" ;; esac
+    done
+    security_temp=$security_policy_file.tmp.$$
+    {
+        printf 'policy_version=1\n'
+        printf 'require_https=%s\n' "$security_require_https"
+        printf 'allow_interface_changes=%s\n' "$security_allow_interface_changes"
+        printf 'allow_profile_changes=%s\nallow_secret_changes=%s\nallow_routine_changes=%s\n' \
+            "$security_allow_profile_changes" "$security_allow_secret_changes" "$security_allow_routine_changes"
+        printf 'allow_notification_changes=%s\nallow_operational_actions=%s\n' \
+            "$security_allow_notification_changes" "$security_allow_operational_actions"
+        printf 'allow_http_targets=%s\nallow_invalid_tls=%s\nallow_destructive_sync=%s\n' \
+            "$security_allow_http_targets" "$security_allow_invalid_tls" "$security_allow_destructive_sync"
+        printf 'allow_doctor_write_test=%s\nallow_remote_logging=%s\n' \
+            "$security_allow_doctor_write_test" "$security_allow_remote_logging"
+        printf 'allow_empty_source=%s\n' "$security_allow_empty_source"
+        printf 'csrf_lifetime_seconds=%s\nresult_retention_seconds=%s\nmax_outstanding_jobs=%s\n' \
+            "$security_csrf_lifetime" "$security_result_retention" "$security_max_outstanding"
+        printf 'audit_log_level=%s\nbridge_log_level=%s\nauthentication_log_level=%s\nsecurity_log_level=%s\nconfiguration_log_level=%s\n' \
+            "$security_audit_level" "$security_bridge_level" "$security_authentication_level" "$security_security_level" "$security_configuration_level"
+        printf 'secrets_log_level=%s\nroutines_log_level=%s\noperations_log_level=%s\nnotifications_log_level=%s\n' \
+            "$security_secrets_level" "$security_routines_level" "$security_operations_level" "$security_notifications_level"
+        printf 'sync_log_level=%s\ncontroller_log_level=%s\nscheduler_log_level=%s\n' \
+            "$security_sync_level" "$security_controller_level" "$security_scheduler_level"
+    } > "$security_temp"
+    finish_private_file "$security_temp"
+    mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
+    mv -f "$security_temp" "$security_policy_file"
+    security_temp=
+    append_activity security.policy_changed all changed \
+        "DSM dashboard security policy changed" security warn false \
+        "$path_owner" package-manager >/dev/null 2>&1 || \
+        echo "warning: security-policy detail could not be added to Activity" >&2
+    # A complete policy replacement is the sole recovery path when the prior
+    # document is corrupt or unsafe. Unrelated outbox records are deliberately
+    # retained until after this atomic publish so their category metadata can
+    # be reconstructed from the repaired policy. A post-commit audit outage is
+    # reported as pending rather than falsely undoing or failing the repair.
+    reconcile_audit_outbox || \
+        echo "warning: security policy was repaired; prior mandatory audit records remain pending" >&2
+    echo "updated DSM dashboard security policy"
 }
 
 configure_schedule() {
@@ -743,14 +1231,16 @@ configure_schedule() {
     else
         schedule_allow_delete=false
     fi
+    [ "$security_runtime_allow_destructive_sync" = true ] || [ "$schedule_allow_delete" != true ] || \
+        policy_denied "security policy blocks destructive schedules"
     schedule_temp=$schedule_file.tmp.$$
     printf 'enabled=%s\ninterval_seconds=%s\nallow_delete=%s\nmax_total_delete=%s\n' \
         "$schedule_enabled" "$schedule_interval" "$schedule_allow_delete" "$schedule_max_total" > "$schedule_temp"
     finish_private_file "$schedule_temp"
+    mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
     mv -f "$schedule_temp" "$schedule_file"
     schedule_temp=
-    reload_controller_if_running
-    append_activity configuration.changed all changed "Global schedule changed" 2>/dev/null || true
+    reload_controller_if_running || echo "warning: configuration was saved but the controller could not be reloaded" >&2
     echo "updated global schedule (enabled=$schedule_enabled interval=$schedule_interval)"
 }
 
@@ -800,6 +1290,7 @@ set_secret() {
     secret_temp=$target.tmp.$$
     read_secret "$label" "$from_file" > "$secret_temp"
     finish_private_file "$secret_temp"
+    mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
     mv -f "$secret_temp" "$target"
     finish_private_file "$target"
     echo "stored protected $secret_kind material for '$profile_name'"
@@ -861,6 +1352,13 @@ api_error() {
             "$(json_quote "$api_code")" "$(json_quote "$api_message")"
     fi
     exit "$api_status"
+}
+
+api_append_terminal_audit() {
+    terminal_operation=$1
+    terminal_state=$2
+    terminal_profile=${3:-all}
+    append_audit_event "$terminal_operation" "$terminal_state" "$terminal_profile"
 }
 
 api_result() {
@@ -1054,13 +1552,34 @@ api_secret_boolean() {
 api_json_log_lines() {
     json_log_path=$1
     json_log_lines=$2
+    json_log_source=$3
+    json_log_threshold=$4
     [ -e "$json_log_path" ] || { printf '[]'; return; }
     if [ -L "$json_log_path" ] || [ ! -f "$json_log_path" ] || [ ! -r "$json_log_path" ]; then
         api_error unsafe_state "unsafe package log file" 73
     fi
     LC_ALL=C awk -v home="$package_home" -v var="$package_var" \
         -v real_home="$package_home_real" -v real_var="$package_var_real" \
-        -v requested="$json_log_lines" -v byte_limit=262144 -v line_limit=8192 '
+        -v requested="$json_log_lines" -v byte_limit=262144 -v line_limit=8192 \
+        -v source="$json_log_source" -v threshold="$json_log_threshold" '
+        function level_rank(level) {
+            if (level == "trace") return 0
+            if (level == "debug") return 1
+            if (level == "info") return 2
+            if (level == "warn") return 3
+            if (level == "error") return 4
+            return -1
+        }
+        function structured_level(text, marker, rest, ending, level) {
+            if (source != "controller" && source != "scheduler" && source != "sync") return "info"
+            marker = index(text, "\"level\":\"")
+            if (marker == 0) return "info"
+            rest = substr(text, marker + 9)
+            ending = index(rest, "\"")
+            if (ending == 0) return "invalid"
+            level = substr(rest, 1, ending - 1)
+            return level_rank(level) >= 0 ? level : "invalid"
+        }
         function replace_literal(text, needle, replacement, at) {
             if (needle == "") return text
             while ((at = index(text, needle)) != 0)
@@ -1074,7 +1593,7 @@ api_json_log_lines() {
             text = replace_literal(text, real_home, "[package-home]")
             text = replace_literal(text, real_var, "[package-var]")
             gsub(/\[package-home\]\/secrets\/[^ ]+/, "[secret]", text)
-            gsub(/\\/, "\\\\", text); gsub(/\"/, "\\\"", text)
+            gsub(/\\/, "\\\\", text); gsub(/"/, "\\\"", text)
             gsub(/\t/, "\\t", text); gsub(/\r/, "\\r", text)
             gsub(/[\001-\010\013\014\016-\037]/, "?", text)
             return "\"" text "\""
@@ -1089,6 +1608,11 @@ api_json_log_lines() {
         }
         {
             line = $0
+            if (source != "audit") {
+                if (threshold == "off") next
+                event_level = structured_level(line)
+                if (event_level == "invalid" || level_rank(event_level) < level_rank(threshold)) next
+            }
             for (needle_index = 1; needle_index <= needle_count; needle_index++)
                 line = replace_literal(line, needles[needle_index], "[redacted]")
             line = replace_literal(line, home, "[package-home]")
@@ -1129,16 +1653,18 @@ api_logs() {
     done
     case $log_lines in ''|*[!0-9]*) api_error invalid_request "lines must be an integer" 64 ;; esac
     [ "$log_lines" -ge 1 ] && [ "$log_lines" -le 1000 ] || api_error invalid_request "lines must be 1..1000" 64
-    for log_preflight in "$log_root/controller.log" "$log_root/scheduler.log" "$log_root/sync.log"; do
+    load_security_policy_runtime || api_error unsafe_state "security policy is unavailable" 73
+    for log_preflight in "$log_root/controller.log" "$log_root/scheduler.log" "$log_root/sync.log" "$audit_log"; do
         if [ -e "$log_preflight" ] || [ -L "$log_preflight" ]; then
             [ ! -L "$log_preflight" ] && [ -f "$log_preflight" ] && [ -r "$log_preflight" ] || api_error unsafe_state "unsafe package log file" 73
         fi
     done
     api_preflight_secret_material
     printf '{"schema":"sdsync.dsm-logs.v1","logs":['
-    printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/controller.log" "$log_lines"; printf '},'
-    printf '{"source":"scheduler","lines":'; api_json_log_lines "$log_root/scheduler.log" "$log_lines"; printf '},'
-    printf '{"source":"sync","lines":'; api_json_log_lines "$log_root/sync.log" "$log_lines"; printf '}]}\n'
+    printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/controller.log" "$log_lines" controller "$security_runtime_controller_level"; printf '},'
+    printf '{"source":"scheduler","lines":'; api_json_log_lines "$log_root/scheduler.log" "$log_lines" scheduler "$security_runtime_scheduler_level"; printf '},'
+    printf '{"source":"sync","lines":'; api_json_log_lines "$log_root/sync.log" "$log_lines" sync "$security_runtime_sync_level"; printf '},'
+    printf '{"source":"audit","lines":'; api_json_log_lines "$audit_log" "$log_lines" audit trace; printf '}]}\n'
 }
 
 api_activity() {
@@ -1157,18 +1683,35 @@ api_activity() {
     set +e
     tail -n "$activity_lines" "$activity_log" | LC_ALL=C awk -F'|' '
         function quote(text) {
-            gsub(/\\/, "\\\\", text); gsub(/\"/, "\\\"", text)
+            gsub(/\\/, "\\\\", text); gsub(/"/, "\\\"", text)
             return "\"" text "\""
         }
         BEGIN { printf "{\"schema\":\"sdsync.dsm-activity.v1\",\"events\":[" }
         {
-            if (NF != 5 || $1 !~ /^[0-9]+$/ || $2 !~ /^[a-z_]+\.[a-z_]+$/ ||
+            if ((NF != 5 && NF != 7 && NF != 9) || $1 !~ /^[0-9]+$/ || $2 !~ /^[a-z_]+\.[a-z_]+$/ ||
                 $3 !~ /^(none|all|[A-Za-z0-9_-]+)$/ ||
-                $4 !~ /^(running|succeeded|failed|deferred|scheduled|changed|unavailable)$/ ||
-                length($5) > 4096 || $5 ~ /[\001-\037]/) exit 73
+                $4 !~ /^(running|succeeded|failed|deferred|scheduled|changed|unavailable|requested)$/ ||
+                (NF >= 7 && ($5 !~ /^(audit|bridge|authentication|security|configuration|secrets|routines|operations|notifications|sync|controller|scheduler)$/ ||
+                    $6 !~ /^(trace|debug|info|warn|error)$/)) ||
+                (NF == 9 && ($7 !~ /^[1-9][0-9]*$/ || $7 > 4294967295 ||
+                    length($8) < 1 || length($8) > 256 || $8 ~ /[\001-\037\177]/)) ||
+                length($(NF)) > 4096 || $(NF) ~ /[\001-\037\177]/) exit 73
             if (seen++) printf ","
-            printf "{\"epoch\":%s,\"code\":%s,\"profile\":%s,\"state\":%s,\"message\":%s}",
-                $1, quote($2), quote($3), quote($4), quote($5)
+            category = NF >= 7 ? $5 : "operations"
+            level = NF >= 7 ? $6 : "info"
+            message = NF == 9 ? $9 : (NF == 7 ? $7 : $5)
+            actor_uid = NF == 9 ? $7 : "null"
+            actor = NF == 9 ? quote($8) : "null"
+            client_request_id = "null"
+            request_marker = " request_id="
+            request_offset = index(message, request_marker)
+            if (request_offset > 0) {
+                request_value = substr(message, request_offset + length(request_marker))
+                if (length(request_value) != 32 || request_value ~ /[^0-9a-f]/) exit 73
+                client_request_id = quote(request_value)
+            }
+            printf "{\"epoch\":%s,\"code\":%s,\"profile\":%s,\"state\":%s,\"category\":%s,\"level\":%s,\"actor_uid\":%s,\"actor\":%s,\"client_request_id\":%s,\"message\":%s}",
+                $1, quote($2), quote($3), quote($4), quote(category), quote(level), actor_uid, actor, client_request_id, quote(message)
         }
         END { printf "]}\n" }
     ' > "$activity_json"
@@ -1231,7 +1774,8 @@ api_profile_json() {
     case $profile_progress in auto|always|never) ;; *) api_error corrupt_config "invalid profile progress mode" 73 ;; esac
     case $profile_output in human|json) ;; *) api_error corrupt_config "invalid profile output mode" 73 ;; esac
     case $profile_remote_log_mode in best-effort|required) ;; *) api_error corrupt_config "invalid remote log mode" 73 ;; esac
-    case $profile_log_file in "$log_root"/*) ;; *) api_error corrupt_config "profile log file escaped package storage" 73 ;; esac
+    [ "$profile_log_file" = "$log_root/sync.log" ] || \
+        api_error corrupt_config "profile log file is outside the fixed package-managed path" 73
     if [ -n "$profile_remote_log_url" ]; then case $profile_remote_log_url in https://*) ;; *) api_error corrupt_config "remote log URL is not HTTPS" 73 ;; esac; fi
     api_toml_string "$profile_fragment" ca-certificate '' false; profile_ca_certificate=$toml_value
     api_toml_scalar "$profile_fragment" max-rate 0 number; profile_max_rate=$toml_value
@@ -1337,6 +1881,7 @@ api_routine_json() {
 
 api_snapshot() {
     [ "$#" -eq 0 ] || api_error invalid_request "snapshot accepts no arguments" 64
+    load_security_policy_runtime || api_error corrupt_state "security policy is not a private complete document" 73
     generated_epoch=$(epoch_now)
     case $generated_epoch in ''|*[!0-9]*) api_error unavailable "system clock is unavailable" 69 ;; esac
     service_pid=0 service_state=stopped
@@ -1386,6 +1931,53 @@ api_snapshot() {
         *) api_error corrupt_state "invalid alert policy" 73 ;;
     esac
     case $alert_threshold:$alert_cooldown in *[!0-9:]*) api_error corrupt_state "invalid alert policy numbers" 73 ;; esac
+    api_load_kv "$security_policy_file" require_https false; security_require_https=$kv_value
+    api_load_kv "$security_policy_file" allow_interface_changes true; security_allow_interface_changes=$kv_value
+    api_load_kv "$security_policy_file" allow_profile_changes true; security_allow_profile_changes=$kv_value
+    api_load_kv "$security_policy_file" allow_secret_changes true; security_allow_secret_changes=$kv_value
+    api_load_kv "$security_policy_file" allow_routine_changes true; security_allow_routine_changes=$kv_value
+    api_load_kv "$security_policy_file" allow_notification_changes true; security_allow_notification_changes=$kv_value
+    api_load_kv "$security_policy_file" allow_operational_actions true; security_allow_operational_actions=$kv_value
+    api_load_kv "$security_policy_file" allow_http_targets true; security_allow_http_targets=$kv_value
+    api_load_kv "$security_policy_file" allow_invalid_tls true; security_allow_invalid_tls=$kv_value
+    api_load_kv "$security_policy_file" allow_destructive_sync true; security_allow_destructive_sync=$kv_value
+    api_load_kv "$security_policy_file" allow_doctor_write_test true; security_allow_doctor_write_test=$kv_value
+    api_load_kv "$security_policy_file" allow_remote_logging true; security_allow_remote_logging=$kv_value
+    api_load_kv "$security_policy_file" allow_empty_source true; security_allow_empty_source=$kv_value
+    for security_boolean in "$security_require_https" "$security_allow_interface_changes" "$security_allow_profile_changes" \
+        "$security_allow_secret_changes" "$security_allow_routine_changes" \
+        "$security_allow_notification_changes" "$security_allow_operational_actions" \
+        "$security_allow_http_targets" "$security_allow_invalid_tls" "$security_allow_destructive_sync" \
+        "$security_allow_doctor_write_test" "$security_allow_remote_logging" "$security_allow_empty_source"; do
+        case $security_boolean in true|false) ;; *) api_error corrupt_state "invalid security policy boolean" 73 ;; esac
+    done
+    api_load_kv "$security_policy_file" csrf_lifetime_seconds 300; security_csrf_lifetime=$kv_value
+    api_load_kv "$security_policy_file" result_retention_seconds 3600; security_result_retention=$kv_value
+    api_load_kv "$security_policy_file" max_outstanding_jobs 256; security_max_outstanding=$kv_value
+    case $security_csrf_lifetime:$security_result_retention:$security_max_outstanding in
+        *[!0-9:]*) api_error corrupt_state "invalid security policy timing or capacity" 73 ;;
+    esac
+    [ "$security_csrf_lifetime" -ge 60 ] && [ "$security_csrf_lifetime" -le 900 ] || api_error corrupt_state "security CSRF lifetime is out of range" 73
+    [ "$security_result_retention" -ge 300 ] && [ "$security_result_retention" -le 86400 ] || api_error corrupt_state "security result retention is out of range" 73
+    [ "$security_max_outstanding" -ge 1 ] && [ "$security_max_outstanding" -le 256 ] || api_error corrupt_state "security queue capacity is out of range" 73
+    for security_category in audit bridge authentication security configuration secrets routines operations notifications sync controller scheduler; do
+        api_load_kv "$security_policy_file" "${security_category}_log_level" "$(security_category_level "$security_category" 2>/dev/null || printf 'info')"
+        case $kv_value in off|trace|debug|info|warn|error) ;; *) api_error corrupt_state "invalid security log level" 73 ;; esac
+        case $security_category in
+            audit) security_audit_level=$kv_value ;;
+            bridge) security_bridge_level=$kv_value ;;
+            authentication) security_authentication_level=$kv_value ;;
+            security) security_security_level=$kv_value ;;
+            configuration) security_configuration_level=$kv_value ;;
+            secrets) security_secrets_level=$kv_value ;;
+            routines) security_routines_level=$kv_value ;;
+            operations) security_operations_level=$kv_value ;;
+            notifications) security_notifications_level=$kv_value ;;
+            sync) security_sync_level=$kv_value ;;
+            controller) security_controller_level=$kv_value ;;
+            scheduler) security_scheduler_level=$kv_value ;;
+        esac
+    done
     # Preflight every private entry before emitting the first JSON byte.
     snapshot_profile_count=0
     for preflight_profile in "$profiles_dir"/*.toml; do
@@ -1430,6 +2022,28 @@ api_snapshot() {
     done
     printf '],"alerts":{"enabled":%s,"on_success":%s,"on_failure":%s,"failure_threshold":%s,"cooldown_seconds":%s},' \
         "$alert_enabled" "$alert_success" "$alert_failure" "$alert_threshold" "$alert_cooldown"
+    printf '"security_policy":{"schema":"sdsync.dsm-security-policy.v1","policy_version":1,"require_https":%s,' "$security_require_https"
+    printf '"allow_interface_changes":%s,' "$security_allow_interface_changes"
+    printf '"allow_profile_changes":%s,"allow_secret_changes":%s,"allow_routine_changes":%s,' \
+        "$security_allow_profile_changes" "$security_allow_secret_changes" "$security_allow_routine_changes"
+    printf '"allow_notification_changes":%s,"allow_operational_actions":%s,' \
+        "$security_allow_notification_changes" "$security_allow_operational_actions"
+    printf '"allow_http_targets":%s,"allow_invalid_tls":%s,"allow_destructive_sync":%s,' \
+        "$security_allow_http_targets" "$security_allow_invalid_tls" "$security_allow_destructive_sync"
+    printf '"allow_doctor_write_test":%s,"allow_remote_logging":%s,' \
+        "$security_allow_doctor_write_test" "$security_allow_remote_logging"
+    printf '"allow_empty_source":%s,' "$security_allow_empty_source"
+    printf '"csrf_lifetime_seconds":%s,"result_retention_seconds":%s,"max_outstanding_jobs":%s,' \
+        "$security_csrf_lifetime" "$security_result_retention" "$security_max_outstanding"
+    printf '"log_levels":{"audit":%s,"bridge":%s,"authentication":%s,"security":%s,' \
+        "$(json_quote "$security_audit_level")" "$(json_quote "$security_bridge_level")" \
+        "$(json_quote "$security_authentication_level")" "$(json_quote "$security_security_level")"
+    printf '"configuration":%s,"secrets":%s,"routines":%s,"operations":%s,' \
+        "$(json_quote "$security_configuration_level")" "$(json_quote "$security_secrets_level")" \
+        "$(json_quote "$security_routines_level")" "$(json_quote "$security_operations_level")"
+    printf '"notifications":%s,"sync":%s,"controller":%s,"scheduler":%s}},' \
+        "$(json_quote "$security_notifications_level")" "$(json_quote "$security_sync_level")" \
+        "$(json_quote "$security_controller_level")" "$(json_quote "$security_scheduler_level")"
     printf '"capabilities":{"mutations":false,"secrets":false,"write_test":false}}\n'
     } > "$snapshot_json"
     finish_private_file "$snapshot_json"
@@ -1443,7 +2057,6 @@ api_snapshot() {
 
 api_mutation_result() {
     mutation_message=$1
-    append_activity configuration.changed all changed "$mutation_message" 2>/dev/null || true
     api_result "$mutation_message"
 }
 
@@ -1472,6 +2085,49 @@ api_set_secret() {
     api_secret_boolean "$secret_root/$secret_profile.remote-log-token"; result_remote_token=$secret_boolean
     printf '{"schema":"sdsync.dsm-result.v1","ok":true,"message":"secret state updated","has_password":%s,"has_totp":%s,"has_remote_log_token":%s}\n' \
         "$result_password" "$result_totp" "$result_remote_token"
+}
+
+api_client_event() {
+    client_event=
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --event) api_need_value "$@"; client_event=$2; shift 2 ;;
+            *) api_error invalid_request "unknown client-event option" 64 ;;
+        esac
+    done
+    case $client_event in interface-settings|session-notifications) ;; *) api_error invalid_request "invalid client event" 64 ;; esac
+    acquire_policy_execution_lock || api_error busy "another policy-sensitive operation is active" 75
+    load_security_policy_runtime || api_error unsafe_state "security policy is not a private complete document" 73
+    case $client_event in
+        interface-settings) [ "$security_runtime_allow_interface_changes" = true ] ;;
+        session-notifications) [ "$security_runtime_allow_notification_changes" = true ] ;;
+    esac || api_error forbidden "client preference changes are disabled by the current security policy" 77
+    append_audit_event "$client_event" requested all >/dev/null 2>&1 || api_error audit_unavailable "mandatory audit record could not be written" 73
+    api_append_terminal_audit "$client_event" succeeded all >/dev/null 2>&1 || api_error audit_unavailable "mandatory audit record could not be written" 73
+    api_result "Client preference change audited"
+}
+
+api_audit_event() {
+    audit_event_operation= audit_event_state= audit_event_profile=
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --operation) api_need_value "$@"; audit_event_operation=$2; shift 2 ;;
+            --state) api_need_value "$@"; audit_event_state=$2; shift 2 ;;
+            --profile) api_need_value "$@"; audit_event_profile=$2; shift 2 ;;
+            *) api_error invalid_request "unknown audit-event option" 64 ;;
+        esac
+    done
+    case $audit_event_operation in
+        configure-profile|remove-profile|set-default|set-secret|set-password|remove-password|set-totp|remove-totp|\
+        set-remote-log-token|remove-remote-log-token|schedule|routine|remove-routine|alert-policy|security-policy|\
+        interface-settings|session-notifications|doctor|plan|run) ;;
+        *) api_error invalid_request "invalid audit-event operation" 64 ;;
+    esac
+    case $audit_event_state in requested|succeeded|failed|outcome_unknown) ;; *) api_error invalid_request "invalid audit-event state" 64 ;; esac
+    case $audit_event_profile in all|none) ;; *) valid_name "$audit_event_profile" || api_error invalid_request "invalid audit-event profile" 64 ;; esac
+    if [ "$audit_event_operation" = security-policy ]; then audit_event_policy_mode=recovery; else audit_event_policy_mode=strict; fi
+    append_audit_event "$audit_event_operation" "$audit_event_state" "$audit_event_profile" "$audit_event_policy_mode" >/dev/null 2>&1 || api_error audit_unavailable "mandatory audit record could not be written" 73
+    api_result "Audit event recorded"
 }
 
 api_action() {
@@ -1527,9 +2183,37 @@ api_command() {
     api_operation=${1:-}
     [ "$#" -eq 0 ] || shift
     case $api_operation in
+        audit-event|audit-rejected)
+            # These bounded sinks are internal package interfaces. The package
+            # UID owns the audit state and is therefore the integrity boundary;
+            # normal public CLI entrypoints still discard caller attribution.
+            require_internal_api_bridge_parent || api_error forbidden "private bridge audit endpoint" 77
+            ;;
+        *)
+            # Public/API mutation entry never trusts caller-reserved context.
+            # Queued work is deliberately launched through this same direct
+            # path, so actual argv policy checks and mandatory manager audit
+            # can never be disabled by environment spoofing.
+            unset SDSYNC_DSM_AUDIT_ACTOR SDSYNC_DSM_AUDIT_ACTOR_UID SDSYNC_DSM_AUDIT_ORIGIN \
+                SDSYNC_DSM_AUDIT_TRANSACTION SDSYNC_DSM_AUDIT_PROFILE \
+                SDSYNC_DSM_AUDIT_REQUESTED SDSYNC_DSM_TERMINAL_AUDIT_OWNER \
+                SDSYNC_DSM_POLICY_JOB_PATH SDSYNC_DSM_AUDIT_WRAPPED SDSYNC_DSM_CLIENT_REQUEST_ID
+            SDSYNC_DSM_AUDIT_ACTOR=package-manager
+            SDSYNC_DSM_AUDIT_ACTOR_UID=$path_owner
+            SDSYNC_DSM_AUDIT_ORIGIN=manager
+            export SDSYNC_DSM_AUDIT_ACTOR SDSYNC_DSM_AUDIT_ACTOR_UID SDSYNC_DSM_AUDIT_ORIGIN
+            ;;
+    esac
+    case $api_operation in
         snapshot) api_snapshot "$@" ;;
         logs) api_logs "$@" ;;
         activity) api_activity "$@" ;;
+        audit-rejected)
+            [ "$#" -eq 0 ] || api_error invalid_request "audit-rejected accepts no arguments" 64
+            append_audit_event rejected-post failed all >/dev/null 2>&1 || api_error audit_unavailable "mandatory audit record could not be written" 73
+            api_result "Rejected dashboard mutation audited"
+            ;;
+        audit-event) api_audit_event "$@" ;;
         configure-profile)
             [ "$#" -gt 0 ] || api_error invalid_request "configure-profile needs options" 64
             api_capture_or_error false "$manager" configure-profile "$@"
@@ -1566,6 +2250,12 @@ api_command() {
             api_capture_or_error false "$manager" configure-alerts "$@"
             api_mutation_result "Alert policy changed"
             ;;
+        security-policy)
+            [ "$#" -gt 0 ] || api_error invalid_request "security-policy needs options" 64
+            api_capture_or_error false "$manager" configure-security-policy "$@"
+            api_mutation_result "Dashboard security policy changed"
+            ;;
+        client-event) api_client_event "$@" ;;
         action) api_action "$@" ;;
         '') api_error invalid_request "missing API operation" 64 ;;
         *) api_error invalid_request "unknown API operation" 64 ;;
@@ -1577,17 +2267,17 @@ command_name=${1:-help}
 case $command_name in
     help|-h|--help) [ "$#" -eq 0 ] || die "help accepts no arguments"; usage ;;
     api) api_command "$@" ;;
-    configure-profile) begin_mutation; configure_profile "$@"; end_mutation ;;
-    configure-routine) begin_mutation; configure_routine "$@"; end_mutation ;;
+    configure-profile) begin_mutation "$@"; configure_profile "$@"; end_mutation ;;
+    configure-routine) begin_mutation "$@"; configure_routine "$@"; end_mutation ;;
     remove-routine)
-        begin_mutation
+        begin_mutation "$@"
         [ "$#" -eq 1 ] && valid_name "$1" || die "remove-routine requires one profile name"
         routine_target=$routines_dir/$1.conf
         routine_state_target=$routine_state_dir/$1.state
         [ ! -L "$routine_target" ] && [ ! -L "$routine_state_target" ] || die "refusing symlinked routine state"
+        mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
         rm -f "$routine_target" "$routine_state_target"
-        reload_controller_if_running
-        append_activity configuration.changed "$1" changed "Routine removed" 2>/dev/null || true
+        reload_controller_if_running || echo "warning: configuration was saved but the controller could not be reloaded" >&2
         echo "removed routine for '$1'"
         end_mutation
         ;;
@@ -1602,9 +2292,10 @@ case $command_name in
         done
         ;;
     set-default)
-        begin_mutation
+        begin_mutation "$@"
         if [ "$#" -ne 1 ] || ! profile_exists "$1"; then die "set-default requires an existing profile"; fi
         candidate=$(render_candidate "$1")
+        mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
         mv -f "$candidate" "$config_file"; finish_private_file "$config_file"; write_default "$1"
         echo "default profile is now '$1'"
         end_mutation
@@ -1617,7 +2308,7 @@ case $command_name in
         exec "$binary" --config "$config_file" config show "$@"
         ;;
     remove-profile)
-        begin_mutation
+        begin_mutation "$@"
         if [ "$#" -ne 1 ] || ! profile_exists "$1"; then die "remove-profile requires an existing profile"; fi
         remove_name=$1
         for dependent_routine in "$routines_dir"/*.conf; do
@@ -1639,8 +2330,10 @@ case $command_name in
             candidate=$(render_candidate "$selected_default" '' '' "$remove_name")
         else
             # Disable scheduling atomically before deleting the final runnable profile.
-            write_disabled_schedule
+            :
         fi
+        mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
+        [ -n "$remaining" ] || write_disabled_schedule
         rm -f "$profiles_dir/$remove_name.toml" "$secret_root/$remove_name.password" "$secret_root/$remove_name.totp" \
             "$secret_root/$remove_name.remote-log-token" "$routines_dir/$remove_name.conf" \
             "$routine_state_dir/$remove_name.state" "$profile_state_dir/$remove_name.state" "$health_dir/$remove_name.state"
@@ -1648,21 +2341,26 @@ case $command_name in
         echo "removed profile '$remove_name' and its package-owned credentials"
         end_mutation
         ;;
-    set-password) begin_mutation; set_secret password "$@"; end_mutation ;;
-    set-totp) begin_mutation; set_secret totp "$@"; end_mutation ;;
-    set-remote-log-token) begin_mutation; set_secret remote-log-token "$@"; end_mutation ;;
+    set-password) begin_mutation "$@"; set_secret password "$@"; end_mutation ;;
+    set-totp) begin_mutation "$@"; set_secret totp "$@"; end_mutation ;;
+    set-remote-log-token) begin_mutation "$@"; set_secret remote-log-token "$@"; end_mutation ;;
     remove-password|remove-totp|remove-remote-log-token)
-        begin_mutation
+        begin_mutation "$@"
         [ "$#" -eq 1 ] || die "$command_name requires an existing profile"
         case $command_name in remove-password) remove_kind=password ;; remove-totp) remove_kind=totp ;; *) remove_kind=remote-log-token ;; esac
         clear_secret "$remove_kind" "$1"
         end_mutation
         ;;
     doctor)
-        begin_mutation
+        begin_mutation "$@"
         selection doctor "$@"
+        load_security_policy_runtime || die "security policy is not a private complete document"
+        if [ "$write_test" = true ] && [ "$security_runtime_allow_doctor_write_test" != true ]; then
+            die "security policy blocks target doctor write tests"
+        fi
         if [ "$selected_scope" = all ]; then set -- --all-profiles; else set -- --profile "$selected_scope"; fi
         doctor_exit=0
+        mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
         set +e
         "$binary" --config "$config_file" doctor "$@" source --hash
         doctor_exit=$?
@@ -1677,11 +2375,12 @@ case $command_name in
         set -e
         if [ "$doctor_exit" -eq 0 ]; then doctor_status=succeeded; doctor_code=doctor.succeeded; else doctor_status=failed; doctor_code=doctor.failed; fi
         write_health_cache "$selected_scope" "$doctor_status" "$doctor_exit" "$write_test"
-        append_activity "$doctor_code" "$selected_scope" "$doctor_status" "Target doctor completed" 2>/dev/null || true
+        if [ "$doctor_status" = failed ]; then doctor_level=error; else doctor_level=info; fi
+        append_activity "$doctor_code" "$selected_scope" "$doctor_status" "Target doctor completed" operations "$doctor_level" 2>/dev/null || true
         if [ "$doctor_exit" -ne 0 ]; then
             handle_doctor_alert "$selected_scope" "$doctor_exit" 2>/dev/null || true
         fi
-        end_mutation
+        end_mutation "$doctor_status"
         exit "$doctor_exit"
         ;;
     plan|run)
@@ -1696,7 +2395,7 @@ case $command_name in
         exec "$runner" "$run_mode" "$selected_scope" "$allow_selected_delete" foreground "$runner_max_total"
         ;;
     enable)
-        begin_mutation
+        begin_mutation "$@"
         interval=3600; allow_schedule_delete=false; maximum_total=100
         while [ "$#" -gt 0 ]; do
             case $1 in
@@ -1709,28 +2408,38 @@ case $command_name in
         case $interval in ''|*[!0-9]*) die "interval must be an integer" ;; esac
         if [ "$interval" -lt 60 ] || [ "$interval" -gt 2592000 ]; then die "interval must be 60..2592000 seconds"; fi
         case $maximum_total in ''|*[!0-9]*) die "max-total-delete must be non-negative" ;; esac
+        [ "$security_runtime_allow_destructive_sync" = true ] || [ "$allow_schedule_delete" != true ] || \
+            policy_denied "security policy blocks destructive schedules"
         found=false; for fragment in "$profiles_dir"/*.toml; do [ -f "$fragment" ] || continue; found=true; name=${fragment##*/}; name=${name%.toml}; profile_secret_exists "$name" || die "profile '$name' has no password"; done
         [ "$found" = true ] || die "configure at least one profile first"
         "$binary" --config "$config_file" --quiet config validate
         schedule_temp=$schedule_file.tmp.$$
         { printf 'enabled=true\ninterval_seconds=%s\nallow_delete=%s\nmax_total_delete=%s\n' "$interval" "$allow_schedule_delete" "$maximum_total"; } > "$schedule_temp"
-        finish_private_file "$schedule_temp"; mv -f "$schedule_temp" "$schedule_file"
-        reload_controller_if_running
+        finish_private_file "$schedule_temp"
+        mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
+        mv -f "$schedule_temp" "$schedule_file"
+        reload_controller_if_running || echo "warning: configuration was saved but the controller could not be reloaded" >&2
         echo "scheduler enabled every $interval seconds (delete=$allow_schedule_delete); next run is not immediate"
         end_mutation
         ;;
     set-schedule)
-        begin_mutation
+        begin_mutation "$@"
         configure_schedule "$@"
         end_mutation
         ;;
     configure-alerts)
-        begin_mutation
+        begin_mutation "$@"
         configure_alert_policy "$@"
         end_mutation
         ;;
+    configure-security-policy)
+        acquire_policy_execution_lock || die "another policy-sensitive operation is active"
+        begin_mutation "$@"
+        configure_security_policy "$@"
+        end_mutation
+        ;;
     disable)
-        begin_mutation
+        begin_mutation "$@"
         [ "$#" -eq 0 ] || die "disable accepts no arguments"
         write_disabled_schedule
         echo "scheduler disabled; an active sync is not interrupted"

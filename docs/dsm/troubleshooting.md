@@ -98,7 +98,7 @@ account, and path values without removing timestamps, exit codes, DSM build, or 
 
 ## DSM says the page is not found when opening the app
 
-The current source, first planned for release 26.10, uses a native `type=app` AppWindow. It does not
+The current source uses the native `type=app` AppWindow introduced in release 26.10. It does not
 navigate to a packaged `index.html`. On a 26.10-or-later native artifact, DSM's generic “Sorry, the
 page you are looking for is not found” response during Open therefore usually identifies a stale
 URL-style registration/shortcut or a failed native asset/API request; it is not evidence that a

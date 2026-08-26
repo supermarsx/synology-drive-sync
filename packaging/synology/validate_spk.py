@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import re
@@ -20,6 +21,7 @@ from build_spk import (
     HERE,
     PackageError,
     UI_SOURCE,
+    UI_HELP_PAGES,
     UI_ICON_SIZES,
     elf_contract,
     elf_data_contract,
@@ -49,12 +51,15 @@ REQUIRED_PAYLOAD = {
     "share/licenses/synology-drive-sync-LICENSE",
     "share/licenses/musl-COPYRIGHT",
     "share/licenses/THIRD_PARTY_LICENSES.html",
+    "share/licenses/DSM_UI_THIRD_PARTY_LICENSES.txt",
     "ui/api.cgi",
     "ui/config",
     "ui/SynologyDriveSync.js",
     "ui/style.css",
     "ui/images/icon.svg",
+    "ui/helptoc.conf",
     "ui/texts/enu/strings",
+    *{f"ui/help/enu/{page}.html" for page in UI_HELP_PAGES},
     *{f"ui/images/icon_{size}.png" for size in UI_ICON_SIZES},
 }
 APP_ID = DSM_APP_CLASS
@@ -83,10 +88,11 @@ FIXED_INFO = {
     "silent_install": "yes",
     "silent_upgrade": "yes",
     "silent_uninstall": "no",
+    "auto_upgrade_from": "26.7-1",
     "dsmuidir": "ui",
     "dsmappname": APP_ID,
 }
-REQUIRED_INFO = set(FIXED_INFO) | {"version", "arch", "extractsize"}
+REQUIRED_INFO = set(FIXED_INFO) | {"version", "arch", "extractsize", "checksum"}
 NOTIFICATION_KEYS = {"sync_succeeded", "sync_failed", "doctor_failed"}
 
 
@@ -211,7 +217,7 @@ def validate_native_application(
     expected = {
         "type": "app",
         "icon": "images/icon_{0}.png",
-        "title": "app:title",
+        "title": "Synology Drive Sync",
         "desc": "app:description",
         "appWindow": APP_ID,
         "allUsers": False,
@@ -291,6 +297,7 @@ def validate_ui_texts(strings_payload: bytes) -> None:
         current[key] = value
     expected = {
         "app": {"title", "description"},
+        "help": set(UI_HELP_PAGES),
         "notifications": {
             f"{event}_{suffix}"
             for event in NOTIFICATION_KEYS
@@ -303,6 +310,63 @@ def validate_ui_texts(strings_payload: bytes) -> None:
         )
     if re.search(r"%[A-Z][A-Z0-9_]*%", strings):
         raise ValidationError("ui notification text must be fixed and non-interpolating")
+
+
+def validate_external_links(document: str, label: str) -> None:
+    anchors = re.findall(r"<a\b[^>]*>", document, re.IGNORECASE)
+    for anchor in anchors:
+        if not re.search(r'\btarget=["\']_blank["\']', anchor, re.IGNORECASE):
+            raise ValidationError(f"{label} external links must open in a new context")
+        relation = re.search(r'\brel=["\']([^"\']+)["\']', anchor, re.IGNORECASE)
+        relation_tokens = set(relation.group(1).lower().split()) if relation else set()
+        if not {"noopener", "noreferrer"}.issubset(relation_tokens):
+            raise ValidationError(f"{label} external links must prevent opener and referrer access")
+    for tag in re.findall(r"<[^>]+>", document):
+        if not re.search(r'\b(?:href|src)=["\'](?:https?:)?//', tag, re.IGNORECASE):
+            continue
+        if not re.match(r"<a\b", tag, re.IGNORECASE):
+            raise ValidationError(f"{label} contains a remote asset")
+        if not re.search(r'\bhref=["\']https://', tag, re.IGNORECASE):
+            raise ValidationError(f"{label} external links must use HTTPS")
+
+
+def validate_dsm_help(
+    toc_payload: bytes,
+    documents: dict[str, bytes],
+) -> None:
+    expected_toc = {
+        "app": APP_ID,
+        "title": "app:title",
+        "content": "overview.html",
+        "toc": [
+            {"title": f"help:{page}", "content": f"{page}.html"}
+            for page in UI_HELP_PAGES
+        ],
+    }
+    if load_unique_json(toc_payload, "ui/helptoc.conf") != expected_toc:
+        raise ValidationError(
+            "ui/helptoc.conf must bind every reviewed dashboard section to the native AppWindow"
+        )
+    if set(documents) != set(UI_HELP_PAGES):
+        raise ValidationError("DSM Help document set does not match the reviewed dashboard sections")
+    for page, payload in documents.items():
+        try:
+            document = payload.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValidationError(f"DSM Help document {page}.html is not UTF-8") from error
+        for marker in (
+            '<html class="img-no-display">',
+            '../../../../help/help.css',
+            '../../../../help/scrollbar/flexcroll.css',
+            '../../../../help/scrollbar/flexcroll.js',
+            '../../../../help/scrollbar/initFlexcroll.js',
+            "<h1>",
+        ):
+            if marker not in document:
+                raise ValidationError(
+                    f"DSM Help document {page}.html is missing {marker!r}"
+                )
+        validate_external_links(document, f"DSM Help document {page}.html")
 
 
 def validate_notifier(payload: bytes) -> None:
@@ -460,7 +524,7 @@ def validate_native_api_source(payload: bytes) -> None:
 
     post_start = source.find("export async function apiPost(")
     if post_start < 0 or (
-        "return awaitTerminal ? pollJobResult(auth, queued.job_id, pollIntervalMs) : queued;"
+        "return awaitTerminal ? pollJobResult(auth, queued.job_id, pollIntervalMs, id) : queued;"
         not in source[post_start:]
     ):
         raise ValidationError(
@@ -519,6 +583,8 @@ def validate_native_build_contract(
         raise ValidationError("native DSM component is missing its AppWindow structure") from error
     if positions != sorted(positions):
         raise ValidationError("native DSM AppWindow components are not correctly nested")
+    if app.count('title="Synology Drive Sync"') != 1 or ':title="windowTitle"' in app:
+        raise ValidationError("native DSM AppWindow title must be the literal package display name")
     root_marker = '<div class="sdsync-app" :class="themeClass">'
     toasts_marker = '<div class="sdsync-toasts" aria-live="polite"'
     modal_marker = (
@@ -574,6 +640,12 @@ def validate_native_build_contract(
         "priorFocus && priorFocus.isConnected && priorFocus.focus",
         'if (this.route === "profiles" && route !== "profiles") this.closeProfile();',
         "closeProfile() { this.clearSecrets();",
+        '{ id: "about", title: "About", icon: "ⓘ" }',
+        'about: "about.html"',
+        'this.snapshot && this.snapshot.package && this.snapshot.package.version',
+        'https://github.com/supermarsx/synology-drive-sync/releases',
+        'https://supermarsx.github.io/synology-drive-sync/release-selector.html',
+        'target="_blank" rel="noopener noreferrer"',
     ):
         if marker not in app:
             raise ValidationError(
@@ -582,15 +654,16 @@ def validate_native_build_contract(
 
     operation_guards = (
         r"openProfile\(name\)\s*\{\s*if \(this\.operationBusy\) return;",
-        r"async saveProfile\(event\)\s*\{.{0,180}?if \(!this\.canMutate \|\| this\.operationBusy\) return;",
-        r"async removeProfile\(\)\s*\{\s*if \(!this\.canMutate \|\| !this\.selectedProfile \|\| this\.operationBusy\) return;",
+        r"async saveProfile\(event\)\s*\{.{0,180}?if \(!this\.canChangeProfiles \|\| this\.operationBusy\) return;",
+        r"async removeProfile\(\)\s*\{\s*if \(!this\.canChangeProfiles \|\| !this\.selectedProfile \|\| this\.operationBusy\) return;",
         r"selectRoutine\(profile\)\s*\{\s*if \(this\.operationBusy\) return;",
         r"async saveRoutine\(event\)\s*\{.{0,180}?this\.operationBusy\) return;",
         r"async removeRoutine\(\)\s*\{.{0,180}?this\.operationBusy\) return;",
         r"async saveAlerts\(event\)\s*\{.{0,180}?this\.operationBusy\) return;",
-        r"async executeOperation\(kind, payload\)\s*\{\s*if \(!this\.canMutate \|\| this\.operationBusy \|\| this\.disposed\) return;",
-        r"async quickRun\(\)\s*\{\s*if \(!this\.canMutate \|\| this\.operationBusy\) return;",
-        r"async runDoctor\(event\)\s*\{.{0,180}?if \(!this\.canMutate \|\| this\.operationBusy\) return;",
+        r"async saveSecurityPolicy\(event\)\s*\{.{0,180}?if \(!this\.canMutate \|\| !this\.securityDirty \|\| this\.operationBusy\) return;",
+        r"async executeOperation\(kind, payload\)\s*\{\s*if \(!this\.canRunOperations \|\| this\.operationBusy \|\| this\.disposed\) return;",
+        r"async quickRun\(\)\s*\{\s*if \(!this\.canRunOperations \|\| this\.operationBusy\) return;",
+        r"async runDoctor\(event\)\s*\{.{0,180}?if \(!this\.canRunOperations \|\| this\.operationBusy\) return;",
     )
     for guard in operation_guards:
         if not re.search(guard, app, re.DOTALL):
@@ -615,6 +688,14 @@ def validate_native_build_contract(
     ):
         if forbidden.lower() in app.lower():
             raise ValidationError(f"native DSM component contains forbidden launcher or DOM construct {forbidden}")
+    validate_external_links(app, "native DSM component")
+    for forbidden in (
+        "Your sync estate, at a glance.", "sdsync-hero", "sdsync-check-grid",
+        "sdsync-editor-placeholder", "Select a profile or create one",
+        "Fixed, non-secret messages", "sdsync-section-heading",
+    ):
+        if forbidden in app:
+            raise ValidationError("native DSM component contains marketing or Help-only filler")
 
     if ".sdsync-app" not in css or ".sdsync-app.is-light" not in css:
         raise ValidationError("native DSM styles must scope dark/light themes to the AppWindow root")
@@ -673,6 +754,9 @@ def validate_native_bundle(script_payload: bytes, style_payload: bytes) -> None:
     for marker in (
         APP_ID, "v-app-instance", "v-app-window", CANONICAL_API,
         "X-SDSYNC-Request", "X-SDSYNC-CSRF", "same-origin", "beforeDestroy",
+        "https://github.com/supermarsx/synology-drive-sync/releases",
+        "https://supermarsx.github.io/synology-drive-sync/release-selector.html",
+        "noopener noreferrer",
     ):
         if marker not in script:
             raise ValidationError(f"native DSM bundle is missing reviewed contract {marker!r}")
@@ -758,6 +842,7 @@ def validate_source() -> None:
         HERE / "INFO.template",
         HERE / "conf/privilege",
         HERE / "licenses/musl-COPYRIGHT",
+        HERE / "licenses/DSM_UI_THIRD_PARTY_LICENSES.txt",
         HERE / "build-spk.sh",
         HERE / "build_spk.py",
         HERE / "package/bin/sdsync-dsm",
@@ -765,6 +850,7 @@ def validate_source() -> None:
         HERE / "package/libexec/sdsync-controller",
         HERE / "package/libexec/sdsync-run",
         HERE / "package/ui/images/icon.svg",
+        HERE / "package/ui/helptoc.conf",
         HERE / "package/ui/texts/enu/strings",
         UI_SOURCE / "app.config",
         UI_SOURCE / "config.define",
@@ -778,7 +864,9 @@ def validate_source() -> None:
         UI_SOURCE / "src/styles/native.css",
         UI_SOURCE / "dist/SynologyDriveSync.js",
         UI_SOURCE / "dist/style.css",
-    ] + [HERE / "scripts" / name for name in REQUIRED_SCRIPTS]
+    ] + [HERE / "scripts" / name for name in REQUIRED_SCRIPTS] + [
+        HERE / f"package/ui/help/enu/{page}.html" for page in UI_HELP_PAGES
+    ]
     missing = [str(path.relative_to(HERE)) for path in required_files if not path.is_file()]
     if missing:
         raise ValidationError(f"source package is missing files: {missing}")
@@ -827,10 +915,22 @@ def validate_source() -> None:
         (UI_SOURCE / "dist/style.css").read_bytes(),
     )
     validate_ui_texts((HERE / "package/ui/texts/enu/strings").read_bytes())
+    validate_dsm_help(
+        (HERE / "package/ui/helptoc.conf").read_bytes(),
+        {
+            page: (HERE / f"package/ui/help/enu/{page}.html").read_bytes()
+            for page in UI_HELP_PAGES
+        },
+    )
     validate_notifier((HERE / "package/libexec/sdsync-common").read_bytes())
     validate_svg_icon((HERE / "package/ui/images/icon.svg").read_bytes())
     template = (HERE / "INFO.template").read_text(encoding="utf-8")
-    for token in ("@DSM_VERSION@", "@ARCH@", "@EXTRACT_SIZE_KIB@"):
+    for token in (
+        "@DSM_VERSION@",
+        "@ARCH@",
+        "@EXTRACT_SIZE_KIB@",
+        "@PACKAGE_TGZ_MD5@",
+    ):
         if template.count(token) != 1:
             raise ValidationError(f"INFO.template must contain {token} exactly once")
     template_info = parse_info(template.encode("utf-8"))
@@ -839,6 +939,7 @@ def validate_source() -> None:
         "version": "@DSM_VERSION@",
         "arch": "@ARCH@",
         "extractsize": "@EXTRACT_SIZE_KIB@",
+        "checksum": "@PACKAGE_TGZ_MD5@",
     }
     if template_info != expected_template:
         raise ValidationError("INFO.template does not match the exact reviewed schema")
@@ -893,7 +994,8 @@ def validate_spk(
         required_outer = {
             "INFO", "package.tgz", "PACKAGE_ICON.PNG", "PACKAGE_ICON_256.PNG",
             "LICENSE", "LICENSES/musl-COPYRIGHT",
-            "LICENSES/THIRD_PARTY_LICENSES.html", "conf/privilege",
+            "LICENSES/THIRD_PARTY_LICENSES.html",
+            "LICENSES/DSM_UI_THIRD_PARTY_LICENSES.txt", "conf/privilege",
         } | {f"scripts/{name}" for name in REQUIRED_SCRIPTS}
         missing = required_outer - members.keys()
         if missing:
@@ -903,6 +1005,15 @@ def validate_spk(
         if unexpected:
             raise ValidationError(
                 f"{path.name} contains unexpected outer members: {sorted(unexpected)}"
+            )
+        expected_ui_notice = (
+            HERE / "licenses/DSM_UI_THIRD_PARTY_LICENSES.txt"
+        ).read_bytes()
+        if member_bytes(
+            outer, members["LICENSES/DSM_UI_THIRD_PARTY_LICENSES.txt"]
+        ) != expected_ui_notice:
+            raise ValidationError(
+                f"{path.name} outer DSM UI third-party notices do not match the reviewed source"
             )
         info = parse_info(member_bytes(outer, members["INFO"]))
         info_arch = info["arch"]
@@ -918,6 +1029,11 @@ def validate_spk(
         if not re.fullmatch(r"[1-9][0-9]*", declared_extract_kib):
             raise ValidationError(
                 "INFO extractsize must be a canonical positive integer in KiB"
+            )
+        declared_checksum = info["checksum"]
+        if not re.fullmatch(r"[0-9a-f]{32}", declared_checksum):
+            raise ValidationError(
+                "INFO checksum must be exactly 32 lowercase hexadecimal MD5 characters"
             )
         if requested_arch and requested_arch != arch:
             raise ValidationError(
@@ -964,6 +1080,8 @@ def validate_spk(
             "share",
             "share/licenses",
             "ui",
+            "ui/help",
+            "ui/help/enu",
             "ui/images",
             "ui/texts",
             "ui/texts/enu",
@@ -972,6 +1090,13 @@ def validate_spk(
         if unexpected:
             raise ValidationError(
                 f"package.tgz contains unexpected inner members: {sorted(unexpected)}"
+            )
+        if member_bytes(
+            inner,
+            inner_members["share/licenses/DSM_UI_THIRD_PARTY_LICENSES.txt"],
+        ) != expected_ui_notice:
+            raise ValidationError(
+                "package.tgz DSM UI third-party notices do not match the reviewed source"
             )
         payload_bytes = sum(
             member.size for member in inner_members.values() if member.isfile()
@@ -1016,6 +1141,15 @@ def validate_spk(
         )
         require_regular_mode(inner_members, NATIVE_STYLE, 0o644, "DSM native AppWindow style")
         validate_ui_texts(member_bytes(inner, inner_members["ui/texts/enu/strings"]))
+        validate_dsm_help(
+            member_bytes(inner, inner_members["ui/helptoc.conf"]),
+            {
+                page: member_bytes(
+                    inner, inner_members[f"ui/help/enu/{page}.html"]
+                )
+                for page in UI_HELP_PAGES
+            },
+        )
         validate_notifier(member_bytes(inner, inner_members["libexec/sdsync-common"]))
         validate_svg_icon(member_bytes(inner, inner_members["ui/images/icon.svg"]))
         validate_native_bundle(
@@ -1029,6 +1163,12 @@ def validate_spk(
                 raise ValidationError(f"{icon_name} must be {size}x{size}")
             if icon_payload != png_icon(size):
                 raise ValidationError(f"{icon_name} does not match the deterministic source mark")
+    actual_checksum = hashlib.md5(payload, usedforsecurity=False).hexdigest()
+    if declared_checksum != actual_checksum:
+        raise ValidationError(
+            f"INFO checksum {declared_checksum} does not match exact package.tgz MD5 "
+            f"{actual_checksum}"
+        )
     return arch
 
 

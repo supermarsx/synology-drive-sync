@@ -2,7 +2,7 @@
 //!
 //! This module intentionally belongs only to the dedicated `sdsync-dsm-api`
 //! binary.  It is not exported by the library and is never selected through
-//! the main CLI's argv[0] or command dispatch.
+//! the main CLI's `argv[0]` or command dispatch.
 
 #![cfg_attr(
     not(target_os = "linux"),
@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 #[cfg(target_os = "linux")]
@@ -42,14 +42,35 @@ const PACKAGE_ROOT: &str = "/var/packages/synology-drive-sync/target";
 const PACKAGE_HOME: &str = "/var/packages/synology-drive-sync/home";
 const PACKAGE_VAR: &str = "/var/packages/synology-drive-sync/var";
 const MANAGER_PATH: &str = "/var/packages/synology-drive-sync/target/bin/sdsync-dsm";
+const BINARY_PATH: &str = "/var/packages/synology-drive-sync/target/bin/synology-drive-sync";
+const CONTROLLER_PATH: &str = "/var/packages/synology-drive-sync/target/libexec/sdsync-controller";
 const AUTHENTICATE_PATH: &str = "/usr/syno/synoman/webman/modules/authenticate.cgi";
 const CONTROL_ROOT: &str = "/var/packages/synology-drive-sync/var/control";
 const REQUESTS_DIR: &str = "/var/packages/synology-drive-sync/var/control/requests";
 const PROCESSING_DIR: &str = "/var/packages/synology-drive-sync/var/control/processing";
 const RESPONSES_DIR: &str = "/var/packages/synology-drive-sync/var/control/responses";
+const STAGING_DIR: &str = "/var/packages/synology-drive-sync/var/control/staging";
 const CSRF_KEY_PATH: &str = "/var/packages/synology-drive-sync/var/control/csrf.key";
+const SECURITY_POLICY_PATH: &str = "/var/packages/synology-drive-sync/home/config/security.conf";
 const ENQUEUE_LOCK_PATH: &str = "/var/packages/synology-drive-sync/var/control/enqueue.lock";
+const ENQUEUE_SEQUENCE_PATH: &str =
+    "/var/packages/synology-drive-sync/var/control/enqueue.sequence";
+const AUDIT_OUTBOX_DIR: &str = "/var/packages/synology-drive-sync/var/state/audit-outbox";
+const AUDIT_OUTBOX_LOCK_PATH: &str = "/var/packages/synology-drive-sync/var/run/audit-outbox.flock";
+const LOG_ROOT: &str = "/var/packages/synology-drive-sync/var/log";
+const AUDIT_LOG_PATH: &str = "/var/packages/synology-drive-sync/var/log/audit.log";
+const ACTIVITY_LOG_PATH: &str = "/var/packages/synology-drive-sync/var/log/activity.log";
 const API_SOCKET_PATH: &str = "/var/packages/synology-drive-sync/target/ui/api.sock";
+const API_PID_PATH: &str = "/var/packages/synology-drive-sync/var/run/api.pid";
+const API_BOUND_PATH: &str = "/var/packages/synology-drive-sync/var/run/api.bound";
+const API_READY_PATH: &str = "/var/packages/synology-drive-sync/var/run/api.ready";
+const CONTROLLER_START_PATH: &str = "/var/packages/synology-drive-sync/var/run/controller.starting";
+const PACKAGE_TRANSITION_PATH: &str =
+    "/var/packages/synology-drive-sync/var/run/package.transition";
+const SERVICE_CLOSED_PATH: &str = "/var/packages/synology-drive-sync/var/run/service.closed";
+const FAILED_API_CHILD_PATH: &str = "/var/packages/synology-drive-sync/var/run/failed-start.api";
+const FAILED_CONTROLLER_CHILD_PATH: &str =
+    "/var/packages/synology-drive-sync/var/run/failed-start.controller";
 const WEB_IDENTITY: &str = "http";
 const ADMINISTRATORS_GROUP: &str = "administrators";
 const RELAY_SCHEMA: &str = "sdsync.dsm-relay.v1";
@@ -73,6 +94,43 @@ const CGI_ORIGIN_VARIABLES: &[&str] = &[
     "SCRIPT_FILENAME",
     "DOCUMENT_ROOT",
 ];
+const CORE_CLI_ENVIRONMENT_VARIABLES: &[&str] = &[
+    "SDSYNC_CONFIG",
+    "SDSYNC_PROFILE",
+    "SDSYNC_MAX_TOTAL_DELETE",
+    "SDSYNC_URL",
+    "SDSYNC_USERNAME",
+    "SDSYNC_PASSWORD",
+    "SDSYNC_OTP",
+    "SDSYNC_REMOTE_LOG_TOKEN",
+    "SDSYNC_PASSWORD_STDIN",
+    "SDSYNC_PASSWORD_FILE",
+    "SDSYNC_TOTP_SECRET_FILE",
+    "SDSYNC_NO_VAULT",
+    "SDSYNC_COMPARE",
+    "SDSYNC_JOBS",
+    "SDSYNC_DELETE",
+    "SDSYNC_ALLOW_EMPTY_SOURCE",
+    "SDSYNC_MAX_DELETE",
+    "SDSYNC_RETRIES",
+    "SDSYNC_TIMEOUT",
+    "SDSYNC_MAX_RATE",
+    "SDSYNC_CONNECT_TIMEOUT",
+    "SDSYNC_CA_CERTIFICATE",
+    "SDSYNC_ALLOW_HTTP",
+    "SDSYNC_DANGER_ACCEPT_INVALID_CERTS",
+    "SDSYNC_QUIET",
+    "SDSYNC_LOG_LEVEL",
+    "SDSYNC_LOG_FORMAT",
+    "SDSYNC_LOG_FILE",
+    "SDSYNC_REMOTE_LOG_URL",
+    "SDSYNC_REMOTE_LOG_TOKEN_FILE",
+    "SDSYNC_REMOTE_LOG_TOKEN_ENV",
+    "SDSYNC_REMOTE_LOG_MODE",
+    "SDSYNC_PROGRESS",
+    "SDSYNC_OUTPUT",
+    "SDSYNC_REMOTE",
+];
 
 const MAX_QUERY_BYTES: usize = 4 * 1024;
 const MAX_COOKIE_BYTES: usize = 16 * 1024;
@@ -80,8 +138,10 @@ const MAX_TOKEN_BYTES: usize = 1024;
 const MAX_CSRF_BYTES: usize = 256;
 const MAX_POST_BODY_BYTES: usize = 64 * 1024;
 const MAX_JOB_BYTES: usize = 64 * 1024;
+const MAX_AUDIT_OUTBOX_BYTES: usize = 4 * 1024;
 const MAX_MANAGER_OUTPUT_BYTES: usize = 1024 * 1024;
-const MAX_AUTH_OUTPUT_BYTES: usize = 512;
+const MAX_AUTHENTICATED_USERNAME_BYTES: usize = 256;
+const MAX_AUTH_OUTPUT_BYTES: usize = MAX_AUTHENTICATED_USERNAME_BYTES + 2;
 const MAX_SECRET_BYTES: usize = 4096;
 const MAX_JOB_AGE_SECONDS: u64 = 24 * 60 * 60;
 const RESULT_RETENTION_SECONDS: u64 = 60 * 60;
@@ -116,8 +176,12 @@ struct ControlPaths<'a> {
     requests: &'a Path,
     processing: &'a Path,
     responses: &'a Path,
+    staging: &'a Path,
     csrf_key: &'a Path,
     enqueue_lock: &'a Path,
+    enqueue_sequence: &'a Path,
+    audit_outbox_directory: &'a Path,
+    audit_outbox_lock: &'a Path,
 }
 
 #[cfg(target_os = "linux")]
@@ -125,10 +189,136 @@ struct EnqueueRequest<'a> {
     package_uid: u32,
     client_request_id: &'a str,
     requested_by: &'a str,
+    requested_uid: u32,
     session_binding: &'a [u8; 32],
+    audit_transaction: &'a str,
+    request_fingerprint: &'a str,
     issued_at_epoch: u64,
     mutation: &'a Mutation,
     secret: Option<&'a [u8]>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct AuditOutboxPaths<'a> {
+    directory: &'a Path,
+    lock: &'a Path,
+    requests: Option<&'a Path>,
+    processing: Option<&'a Path>,
+    responses: Option<&'a Path>,
+}
+
+#[cfg(target_os = "linux")]
+impl AuditOutboxPaths<'static> {
+    fn production() -> Self {
+        Self {
+            directory: Path::new(AUDIT_OUTBOX_DIR),
+            lock: Path::new(AUDIT_OUTBOX_LOCK_PATH),
+            requests: Some(Path::new(REQUESTS_DIR)),
+            processing: Some(Path::new(PROCESSING_DIR)),
+            responses: Some(Path::new(RESPONSES_DIR)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AuditOutboxPhase {
+    Prepared,
+    Publishing,
+    Queued,
+    Executing,
+    Succeeded,
+    Failed,
+    OutcomeUnknown,
+}
+
+impl AuditOutboxPhase {
+    fn terminal_state(self) -> Option<&'static str> {
+        match self {
+            Self::Succeeded => Some("succeeded"),
+            Self::Failed => Some("failed"),
+            Self::OutcomeUnknown => Some("outcome_unknown"),
+            Self::Prepared | Self::Publishing | Self::Queued | Self::Executing => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuditOutboxRecord {
+    schema: String,
+    transaction: String,
+    operation: String,
+    profile: String,
+    actor: String,
+    actor_uid: u32,
+    origin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_request_id: Option<String>,
+    job_id: Option<String>,
+    owner_pid: u32,
+    owner_start: u64,
+    owner_boot: String,
+    phase: AuditOutboxPhase,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditLogRecord<'a> {
+    epoch: u64,
+    level: &'a str,
+    configured_level: &'a str,
+    subject_level: &'a str,
+    mandatory: bool,
+    category: &'a str,
+    subject_category: &'a str,
+    operation: &'a str,
+    state: &'a str,
+    transaction: &'a str,
+    origin: &'a str,
+    actor: &'a str,
+    actor_uid: Option<u32>,
+    profile: &'a str,
+    #[serde(default)]
+    client_request_id: Option<&'a str>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Eq, PartialEq)]
+enum EnqueueOutcome {
+    Existing(String),
+    Published {
+        job_id: String,
+        durability_uncertain: bool,
+    },
+}
+
+#[cfg(target_os = "linux")]
+impl EnqueueOutcome {
+    fn job_id(&self) -> &str {
+        match self {
+            Self::Existing(job_id) | Self::Published { job_id, .. } => job_id,
+        }
+    }
+
+    fn response_state(&self) -> &'static str {
+        "queued"
+    }
+
+    fn replayed(&self) -> bool {
+        matches!(self, Self::Existing(_))
+    }
+
+    fn durability_warning(&self) -> bool {
+        matches!(
+            self,
+            Self::Published {
+                durability_uncertain: true,
+                ..
+            }
+        )
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -139,8 +329,25 @@ impl ControlPaths<'static> {
             requests: Path::new(REQUESTS_DIR),
             processing: Path::new(PROCESSING_DIR),
             responses: Path::new(RESPONSES_DIR),
+            staging: Path::new(STAGING_DIR),
             csrf_key: Path::new(CSRF_KEY_PATH),
             enqueue_lock: Path::new(ENQUEUE_LOCK_PATH),
+            enqueue_sequence: Path::new(ENQUEUE_SEQUENCE_PATH),
+            audit_outbox_directory: Path::new(AUDIT_OUTBOX_DIR),
+            audit_outbox_lock: Path::new(AUDIT_OUTBOX_LOCK_PATH),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ControlPaths<'_> {
+    fn audit_outbox(&self) -> AuditOutboxPaths<'_> {
+        AuditOutboxPaths {
+            directory: self.audit_outbox_directory,
+            lock: self.audit_outbox_lock,
+            requests: Some(self.requests),
+            processing: Some(self.processing),
+            responses: Some(self.responses),
         }
     }
 }
@@ -150,6 +357,7 @@ enum ErrorKind {
     BadRequest,
     Unauthorized,
     Forbidden,
+    CsrfRejected,
     MethodNotAllowed,
     UnsupportedMediaType,
     PayloadTooLarge,
@@ -223,6 +431,7 @@ enum LogSource {
     Controller,
     Scheduler,
     Sync,
+    Audit,
 }
 
 impl LogSource {
@@ -232,6 +441,7 @@ impl LogSource {
             Self::Controller => "controller",
             Self::Scheduler => "scheduler",
             Self::Sync => "sync",
+            Self::Audit => "audit",
         }
     }
 }
@@ -249,8 +459,6 @@ enum ValidatedHttpRequest {
 }
 
 struct AuthenticationInputs {
-    method: String,
-    query: Zeroizing<String>,
     cookie: Zeroizing<String>,
     synology_token: Option<Zeroizing<String>>,
     remote_address: Option<String>,
@@ -277,6 +485,9 @@ struct RelayRequestRef<'a> {
     server_port: Option<&'a str>,
     https: Option<&'a str>,
     transfer_encoding: Option<&'a str>,
+    authenticated_username: &'a str,
+    authenticated_uid: u32,
+    session_binding: &'a str,
     body: Option<&'a str>,
 }
 
@@ -298,6 +509,9 @@ struct RelayRequest {
     server_port: Option<String>,
     https: Option<String>,
     transfer_encoding: Option<String>,
+    authenticated_username: String,
+    authenticated_uid: u32,
+    session_binding: String,
     body: Option<String>,
 }
 
@@ -345,6 +559,12 @@ impl RelayRequest {
         validate_optional_environment_value(self.server_port.as_deref(), 8)?;
         validate_optional_environment_value(self.https.as_deref(), 16)?;
         validate_optional_environment_value(self.transfer_encoding.as_deref(), 64)?;
+        if !valid_authenticated_username(&self.authenticated_username)
+            || self.authenticated_uid == 0
+            || hex_decode_exact::<32>(&self.session_binding).is_none()
+        {
+            return Err(BridgeError::bad_request());
+        }
         if self
             .body
             .as_ref()
@@ -373,6 +593,8 @@ impl Drop for RelayRequest {
         self.server_port.zeroize();
         self.https.zeroize();
         self.transfer_encoding.zeroize();
+        self.authenticated_username.zeroize();
+        self.session_binding.zeroize();
         self.body.zeroize();
     }
 }
@@ -396,10 +618,12 @@ impl fmt::Debug for RelayRequest {
 fn encode_relay_request(
     environment: &CgiEnvironment,
     body: Option<&[u8]>,
+    session: &AuthenticatedSession,
 ) -> BridgeResult<Zeroizing<Vec<u8>>> {
     let body = body
         .map(|bytes| std::str::from_utf8(bytes).map_err(|_| BridgeError::bad_request()))
         .transpose()?;
+    let session_binding = hex_encode(&session.binding);
     let request = RelayRequestRef {
         schema: RELAY_SCHEMA,
         method: &environment.method,
@@ -419,6 +643,9 @@ fn encode_relay_request(
         server_port: environment.server_port.as_deref(),
         https: environment.https.as_deref(),
         transfer_encoding: environment.transfer_encoding.as_deref(),
+        authenticated_username: &session.username,
+        authenticated_uid: session.uid,
+        session_binding: &session_binding,
         body,
     };
     let encoded = serde_json::to_vec(&request).map_err(|_| BridgeError::internal())?;
@@ -457,8 +684,24 @@ fn validate_relay_http_request(
     Ok((request, body))
 }
 
+fn validate_relay_authenticated_session(
+    relay: &RelayRequest,
+    independently_authenticated: &AuthenticatedSession,
+) -> BridgeResult<()> {
+    let binding = hex_decode_exact::<32>(&relay.session_binding)
+        .ok_or_else(|| BridgeError::new(ErrorKind::Unauthorized))?;
+    if relay.authenticated_username != independently_authenticated.username
+        || relay.authenticated_uid != independently_authenticated.uid
+        || !session_binding_matches(&binding, &independently_authenticated.binding)
+    {
+        return Err(BridgeError::new(ErrorKind::Unauthorized));
+    }
+    Ok(())
+}
+
 struct AuthenticatedSession {
     username: String,
+    uid: u32,
     binding: [u8; 32],
 }
 
@@ -485,7 +728,10 @@ struct RawJob<'a> {
     request_id: &'a str,
     client_request_id: &'a str,
     requested_by: &'a str,
+    requested_uid: u32,
     session_binding: &'a str,
+    audit_transaction: &'a str,
+    request_fingerprint: &'a str,
     issued_at_epoch: u64,
     operation: &'a str,
     #[serde(borrow)]
@@ -496,7 +742,10 @@ struct ParsedJob {
     request_id: String,
     client_request_id: String,
     requested_by: String,
+    requested_uid: u32,
     session_binding: [u8; 32],
+    audit_transaction: String,
+    request_fingerprint: String,
     issued_at_epoch: u64,
     mutation: Mutation,
 }
@@ -514,7 +763,12 @@ struct RawQueuedResponse<'a> {
     job_id: &'a str,
     client_request_id: &'a str,
     requested_by: &'a str,
+    requested_uid: u32,
     session_binding: &'a str,
+    request_fingerprint: &'a str,
+    audit_transaction: &'a str,
+    audit_pending: bool,
+    audit_terminal_state: &'a str,
     issued_at_epoch: u64,
     completed_at_epoch: u64,
     #[serde(borrow)]
@@ -522,7 +776,14 @@ struct RawQueuedResponse<'a> {
 }
 
 struct ParsedQueuedResponse {
+    client_request_id: String,
+    requested_by: String,
+    requested_uid: u32,
     session_binding: [u8; 32],
+    request_fingerprint: String,
+    audit_transaction: String,
+    audit_pending: bool,
+    audit_terminal_state: String,
     completed_at_epoch: u64,
     result: Value,
 }
@@ -761,6 +1022,149 @@ struct AlertPolicyArgs {
     cooldown_seconds: u32,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum PolicyLogLevel {
+    Off,
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl PolicyLogLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "trace" => Some(Self::Trace),
+            "debug" => Some(Self::Debug),
+            "info" => Some(Self::Info),
+            "warn" => Some(Self::Warn),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+
+    fn allows(self, event: Self) -> bool {
+        fn rank(level: PolicyLogLevel) -> Option<u8> {
+            match level {
+                PolicyLogLevel::Off => None,
+                PolicyLogLevel::Trace => Some(0),
+                PolicyLogLevel::Debug => Some(1),
+                PolicyLogLevel::Info => Some(2),
+                PolicyLogLevel::Warn => Some(3),
+                PolicyLogLevel::Error => Some(4),
+            }
+        }
+        match (rank(self), rank(event)) {
+            (Some(threshold), Some(severity)) => severity >= threshold,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct SecurityPolicyArgs {
+    require_https: bool,
+    allow_interface_changes: bool,
+    allow_profile_changes: bool,
+    allow_secret_changes: bool,
+    allow_routine_changes: bool,
+    allow_notification_changes: bool,
+    allow_operational_actions: bool,
+    allow_http_targets: bool,
+    allow_invalid_tls: bool,
+    allow_destructive_sync: bool,
+    allow_doctor_write_test: bool,
+    allow_remote_logging: bool,
+    allow_empty_source: bool,
+    csrf_lifetime_seconds: u64,
+    result_retention_seconds: u64,
+    max_outstanding_jobs: usize,
+    audit_log_level: PolicyLogLevel,
+    bridge_log_level: PolicyLogLevel,
+    authentication_log_level: PolicyLogLevel,
+    security_log_level: PolicyLogLevel,
+    configuration_log_level: PolicyLogLevel,
+    secrets_log_level: PolicyLogLevel,
+    routines_log_level: PolicyLogLevel,
+    operations_log_level: PolicyLogLevel,
+    notifications_log_level: PolicyLogLevel,
+    sync_log_level: PolicyLogLevel,
+    controller_log_level: PolicyLogLevel,
+    scheduler_log_level: PolicyLogLevel,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum ClientEventKind {
+    InterfaceSettings,
+    SessionNotifications,
+}
+
+impl ClientEventKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InterfaceSettings => "interface-settings",
+            Self::SessionNotifications => "session-notifications",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ClientEventArgs {
+    event: ClientEventKind,
+}
+
+impl Default for SecurityPolicyArgs {
+    fn default() -> Self {
+        Self {
+            require_https: false,
+            allow_interface_changes: true,
+            allow_profile_changes: true,
+            allow_secret_changes: true,
+            allow_routine_changes: true,
+            allow_notification_changes: true,
+            allow_operational_actions: true,
+            allow_http_targets: true,
+            allow_invalid_tls: true,
+            allow_destructive_sync: true,
+            allow_doctor_write_test: true,
+            allow_remote_logging: true,
+            allow_empty_source: true,
+            csrf_lifetime_seconds: CSRF_LIFETIME_SECONDS,
+            result_retention_seconds: RESULT_RETENTION_SECONDS,
+            max_outstanding_jobs: MAX_OUTSTANDING_JOBS,
+            audit_log_level: PolicyLogLevel::Info,
+            bridge_log_level: PolicyLogLevel::Info,
+            authentication_log_level: PolicyLogLevel::Warn,
+            security_log_level: PolicyLogLevel::Warn,
+            configuration_log_level: PolicyLogLevel::Info,
+            secrets_log_level: PolicyLogLevel::Info,
+            routines_log_level: PolicyLogLevel::Info,
+            operations_log_level: PolicyLogLevel::Info,
+            notifications_log_level: PolicyLogLevel::Warn,
+            sync_log_level: PolicyLogLevel::Info,
+            controller_log_level: PolicyLogLevel::Info,
+            scheduler_log_level: PolicyLogLevel::Info,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct OperationalActionArgs {
@@ -799,6 +1203,8 @@ enum Mutation {
     Routine(RoutineArgs),
     RemoveRoutine(NameArgs),
     AlertPolicy(AlertPolicyArgs),
+    SecurityPolicy(SecurityPolicyArgs),
+    ClientEvent(ClientEventArgs),
     Action(OperationalActionArgs),
 }
 
@@ -837,6 +1243,8 @@ impl Mutation {
             Self::Routine(_) => "routine",
             Self::RemoveRoutine(_) => "remove-routine",
             Self::AlertPolicy(_) => "alert-policy",
+            Self::SecurityPolicy(_) => "security-policy",
+            Self::ClientEvent(_) => "client-event",
             Self::Action(_) => "action",
         }
     }
@@ -851,6 +1259,8 @@ impl Mutation {
             Self::Schedule(value) => serde_json::to_value(value),
             Self::Routine(value) => serde_json::to_value(value),
             Self::AlertPolicy(value) => serde_json::to_value(value),
+            Self::SecurityPolicy(value) => serde_json::to_value(value),
+            Self::ClientEvent(value) => serde_json::to_value(value),
             Self::Action(value) => serde_json::to_value(value),
         };
         result.map_err(|_| BridgeError::internal())
@@ -894,11 +1304,7 @@ fn process_environment() -> BridgeResult<CgiEnvironment> {
 }
 
 fn validate_environment_value(value: &str, maximum: usize) -> BridgeResult<()> {
-    if value.len() > maximum
-        || value
-            .bytes()
-            .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
-    {
+    if value.len() > maximum || value.bytes().any(|byte| byte.is_ascii_control()) {
         return Err(BridgeError::bad_request());
     }
     Ok(())
@@ -919,15 +1325,12 @@ fn validate_http_request(mut environment: CgiEnvironment) -> BridgeResult<Valida
         return Err(BridgeError::new(ErrorKind::Unauthorized));
     }
 
-    let original_query = Zeroizing::new(environment.query.to_string());
     let mut query = parse_urlencoded(&environment.query)?;
     let query_token = query.remove("SynoToken").map(Zeroizing::new);
     let synology_token =
         choose_synology_token(environment.synology_token_header.take(), query_token)?;
 
     let authentication = AuthenticationInputs {
-        method: environment.method.clone(),
-        query: original_query,
         cookie: environment.cookie,
         synology_token,
         remote_address: environment.remote_address,
@@ -1107,6 +1510,7 @@ fn parse_read_action(mut query: BTreeMap<String, String>) -> BridgeResult<ReadAc
                 "controller" => LogSource::Controller,
                 "scheduler" => LogSource::Scheduler,
                 "sync" => LogSource::Sync,
+                "audit" => LogSource::Audit,
                 _ => return Err(BridgeError::bad_request()),
             };
             require_empty_query(&query)?;
@@ -1193,7 +1597,7 @@ fn read_exact_body(
 fn parse_mutation_request(body: &[u8]) -> BridgeResult<ParsedMutation> {
     let request: RawMutationRequest<'_> =
         serde_json::from_slice(body).map_err(|_| BridgeError::bad_request())?;
-    if request.schema != "sdsync.dsm-request.v1" || !valid_request_id(request.request_id) {
+    if request.schema != "sdsync.dsm-request.v1" || !valid_client_request_id(request.request_id) {
         return Err(BridgeError::bad_request());
     }
 
@@ -1205,17 +1609,17 @@ fn parse_mutation_request(body: &[u8]) -> BridgeResult<ParsedMutation> {
         }
         "remove-profile" => {
             let arguments: NameArgs = parse_arguments(request.arguments)?;
-            validate_name(&arguments.name)?;
+            validate_existing_name(&arguments.name)?;
             (Mutation::RemoveProfile(arguments), None)
         }
         "set-default" => {
             let arguments: NameArgs = parse_arguments(request.arguments)?;
-            validate_name(&arguments.name)?;
+            validate_existing_name(&arguments.name)?;
             (Mutation::SetDefault(arguments), None)
         }
         "set-secret" => {
             let mut arguments: SecretRequestArgs = parse_arguments(request.arguments)?;
-            validate_name(&arguments.profile)?;
+            validate_existing_name(&arguments.profile)?;
             let secret = match arguments.mode {
                 SecretMode::Replace => {
                     let value = arguments
@@ -1254,13 +1658,22 @@ fn parse_mutation_request(body: &[u8]) -> BridgeResult<ParsedMutation> {
         }
         "remove-routine" => {
             let arguments: NameArgs = parse_arguments(request.arguments)?;
-            validate_name(&arguments.name)?;
+            validate_existing_name(&arguments.name)?;
             (Mutation::RemoveRoutine(arguments), None)
         }
         "alert-policy" => {
             let arguments: AlertPolicyArgs = parse_arguments(request.arguments)?;
             validate_alert_policy(&arguments)?;
             (Mutation::AlertPolicy(arguments), None)
+        }
+        "security-policy" => {
+            let arguments: SecurityPolicyArgs = parse_arguments(request.arguments)?;
+            validate_security_policy(&arguments)?;
+            (Mutation::SecurityPolicy(arguments), None)
+        }
+        "client-event" => {
+            let arguments: ClientEventArgs = parse_arguments(request.arguments)?;
+            (Mutation::ClientEvent(arguments), None)
         }
         "action" => {
             let arguments: OperationalActionArgs = parse_arguments(request.arguments)?;
@@ -1288,8 +1701,11 @@ fn parse_job(body: &[u8]) -> BridgeResult<ParsedJob> {
     let job: RawJob<'_> = serde_json::from_slice(body).map_err(|_| BridgeError::bad_request())?;
     if job.schema != "sdsync.dsm-job.v1"
         || !valid_server_job_id(job.request_id)
-        || !valid_request_id(job.client_request_id)
+        || !valid_client_request_id(job.client_request_id)
         || !valid_authenticated_username(job.requested_by)
+        || job.requested_uid == 0
+        || !valid_server_job_id(job.audit_transaction)
+        || !valid_request_fingerprint(job.request_fingerprint)
     {
         return Err(BridgeError::bad_request());
     }
@@ -1304,17 +1720,17 @@ fn parse_job(body: &[u8]) -> BridgeResult<ParsedJob> {
         }
         "remove-profile" => {
             let value: NameArgs = parse_arguments(job.arguments)?;
-            validate_name(&value.name)?;
+            validate_existing_name(&value.name)?;
             Mutation::RemoveProfile(value)
         }
         "set-default" => {
             let value: NameArgs = parse_arguments(job.arguments)?;
-            validate_name(&value.name)?;
+            validate_existing_name(&value.name)?;
             Mutation::SetDefault(value)
         }
         "set-secret" => {
             let value: SecretJobArgs = parse_arguments(job.arguments)?;
-            validate_name(&value.profile)?;
+            validate_existing_name(&value.profile)?;
             Mutation::SetSecret(value)
         }
         "schedule" => {
@@ -1329,13 +1745,22 @@ fn parse_job(body: &[u8]) -> BridgeResult<ParsedJob> {
         }
         "remove-routine" => {
             let value: NameArgs = parse_arguments(job.arguments)?;
-            validate_name(&value.name)?;
+            validate_existing_name(&value.name)?;
             Mutation::RemoveRoutine(value)
         }
         "alert-policy" => {
             let value: AlertPolicyArgs = parse_arguments(job.arguments)?;
             validate_alert_policy(&value)?;
             Mutation::AlertPolicy(value)
+        }
+        "security-policy" => {
+            let value: SecurityPolicyArgs = parse_arguments(job.arguments)?;
+            validate_security_policy(&value)?;
+            Mutation::SecurityPolicy(value)
+        }
+        "client-event" => {
+            let value: ClientEventArgs = parse_arguments(job.arguments)?;
+            Mutation::ClientEvent(value)
         }
         "action" => {
             let value: OperationalActionArgs = parse_arguments(job.arguments)?;
@@ -1348,14 +1773,17 @@ fn parse_job(body: &[u8]) -> BridgeResult<ParsedJob> {
         request_id: job.request_id.to_owned(),
         client_request_id: job.client_request_id.to_owned(),
         requested_by: job.requested_by.to_owned(),
+        requested_uid: job.requested_uid,
         session_binding,
+        audit_transaction: job.audit_transaction.to_owned(),
+        request_fingerprint: job.request_fingerprint.to_owned(),
         issued_at_epoch: job.issued_at_epoch,
         mutation,
     })
 }
 
-fn valid_request_id(value: &str) -> bool {
-    (32..=64).contains(&value.len())
+fn valid_client_request_id(value: &str) -> bool {
+    value.len() == 32
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -1363,6 +1791,13 @@ fn valid_request_id(value: &str) -> bool {
 
 fn valid_server_job_id(value: &str) -> bool {
     value.len() == SERVER_JOB_ID_BYTES * 2
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_request_fingerprint(value: &str) -> bool {
+    value.len() == 64
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -1380,6 +1815,23 @@ fn validate_job_freshness(issued_at_epoch: u64, now: u64) -> BridgeResult<()> {
 fn validate_name(value: &str) -> BridgeResult<()> {
     if value.is_empty()
         || value.len() > 64
+        || value == "all"
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(BridgeError::bad_request());
+    }
+    Ok(())
+}
+
+fn validate_existing_name(value: &str) -> BridgeResult<()> {
+    // Released package revisions accepted filesystem-safe profile identifiers
+    // up to the platform component limit. Keep that compatibility for reads,
+    // actions, secrets, and removal while retaining the tighter 64-byte limit
+    // for newly configured profiles.
+    if value.is_empty()
+        || value.len() > 255
         || value == "all"
         || !value
             .bytes()
@@ -1484,7 +1936,7 @@ fn validate_schedule(value: &ScheduleArgs) -> BridgeResult<()> {
 }
 
 fn validate_routine(value: &RoutineArgs) -> BridgeResult<()> {
-    validate_name(&value.profile)?;
+    validate_existing_name(&value.profile)?;
     if !(60..=2_592_000).contains(&value.interval_seconds)
         || !(1..=3600).contains(&value.debounce_seconds)
         || value.retry_count > 5
@@ -1508,7 +1960,7 @@ fn validate_routine(value: &RoutineArgs) -> BridgeResult<()> {
     }
     let mut dependencies = BTreeSet::new();
     for dependency in &value.depends_on {
-        validate_name(dependency)?;
+        validate_existing_name(dependency)?;
         if dependency == &value.profile || !dependencies.insert(dependency) {
             return Err(BridgeError::bad_request());
         }
@@ -1541,9 +1993,234 @@ fn validate_alert_policy(value: &AlertPolicyArgs) -> BridgeResult<()> {
     Ok(())
 }
 
+fn validate_security_policy(value: &SecurityPolicyArgs) -> BridgeResult<()> {
+    if !(60..=900).contains(&value.csrf_lifetime_seconds)
+        || !(300..=86_400).contains(&value.result_retention_seconds)
+        || !(1..=MAX_OUTSTANDING_JOBS).contains(&value.max_outstanding_jobs)
+    {
+        return Err(BridgeError::bad_request());
+    }
+    Ok(())
+}
+
+fn policy_level_for_category(
+    policy: &SecurityPolicyArgs,
+    category: &str,
+) -> Option<PolicyLogLevel> {
+    match category {
+        "audit" => Some(policy.audit_log_level),
+        "bridge" => Some(policy.bridge_log_level),
+        "authentication" => Some(policy.authentication_log_level),
+        "security" => Some(policy.security_log_level),
+        "configuration" => Some(policy.configuration_log_level),
+        "secrets" => Some(policy.secrets_log_level),
+        "routines" => Some(policy.routines_log_level),
+        "operations" => Some(policy.operations_log_level),
+        "notifications" => Some(policy.notifications_log_level),
+        "sync" => Some(policy.sync_log_level),
+        "controller" => Some(policy.controller_log_level),
+        "scheduler" => Some(policy.scheduler_log_level),
+        _ => None,
+    }
+}
+
+fn policy_level_for_log_source(
+    policy: &SecurityPolicyArgs,
+    source: &str,
+) -> Option<PolicyLogLevel> {
+    match source {
+        "audit" => Some(policy.audit_log_level),
+        "controller" => Some(policy.controller_log_level),
+        "scheduler" => Some(policy.scheduler_log_level),
+        "sync" => Some(policy.sync_log_level),
+        _ => None,
+    }
+}
+
+fn event_visible_at_threshold(
+    policy: &SecurityPolicyArgs,
+    category: &str,
+    level: &str,
+    mandatory: bool,
+) -> bool {
+    if mandatory && category == "audit" {
+        return true;
+    }
+    let Some(threshold) = policy_level_for_category(policy, category) else {
+        return false;
+    };
+    let Some(event_level) = PolicyLogLevel::parse(level) else {
+        return false;
+    };
+    threshold.allows(event_level)
+}
+
+fn log_line_visible_at_threshold(policy: &SecurityPolicyArgs, source: &str, line: &str) -> bool {
+    if source == "audit" {
+        // The audit file contains only the non-disableable minimal records.
+        return true;
+    }
+    let Some(threshold) = policy_level_for_log_source(policy, source) else {
+        return false;
+    };
+    let event_level = serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("level")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .and_then(|value| PolicyLogLevel::parse(&value))
+        // Opaque legacy/core output has no trustworthy severity contract.
+        // Treat it deterministically as Info; package-owned controller and
+        // scheduler lifecycle records are structured at the writer.
+        .unwrap_or(PolicyLogLevel::Info);
+    threshold.allows(event_level)
+}
+
+fn parse_security_policy_file(bytes: &[u8]) -> BridgeResult<SecurityPolicyArgs> {
+    // The persisted policy is a canonical LF-terminated document. `str::lines`
+    // otherwise normalizes CRLF by stripping CR, while the POSIX shell parser
+    // deliberately treats that CR as an invalid value and fails closed.
+    if !bytes.ends_with(b"\n") || bytes.contains(&b'\r') {
+        return Err(BridgeError::unsafe_runtime());
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| BridgeError::unsafe_runtime())?;
+    let mut fields = BTreeMap::new();
+    for line in text.lines() {
+        if line.is_empty() || line.bytes().any(|byte| byte.is_ascii_control()) {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(BridgeError::unsafe_runtime)?;
+        if key.is_empty()
+            || value.is_empty()
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            || fields.insert(key, value).is_some()
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+    }
+
+    fn take_bool(fields: &mut BTreeMap<&str, &str>, key: &str) -> BridgeResult<bool> {
+        match fields.remove(key) {
+            Some("true") => Ok(true),
+            Some("false") => Ok(false),
+            _ => Err(BridgeError::unsafe_runtime()),
+        }
+    }
+    fn take_u64(fields: &mut BTreeMap<&str, &str>, key: &str) -> BridgeResult<u64> {
+        let value = fields.remove(key).ok_or_else(BridgeError::unsafe_runtime)?;
+        parse_canonical_u64(value).map_err(|_| BridgeError::unsafe_runtime())
+    }
+    fn take_level(fields: &mut BTreeMap<&str, &str>, key: &str) -> BridgeResult<PolicyLogLevel> {
+        match fields.remove(key) {
+            Some("off") => Ok(PolicyLogLevel::Off),
+            Some("trace") => Ok(PolicyLogLevel::Trace),
+            Some("debug") => Ok(PolicyLogLevel::Debug),
+            Some("info") => Ok(PolicyLogLevel::Info),
+            Some("warn") => Ok(PolicyLogLevel::Warn),
+            Some("error") => Ok(PolicyLogLevel::Error),
+            _ => Err(BridgeError::unsafe_runtime()),
+        }
+    }
+
+    if take_u64(&mut fields, "policy_version")? != 1 {
+        return Err(BridgeError::unsafe_runtime());
+    }
+
+    let value = SecurityPolicyArgs {
+        require_https: take_bool(&mut fields, "require_https")?,
+        allow_interface_changes: take_bool(&mut fields, "allow_interface_changes")?,
+        allow_profile_changes: take_bool(&mut fields, "allow_profile_changes")?,
+        allow_secret_changes: take_bool(&mut fields, "allow_secret_changes")?,
+        allow_routine_changes: take_bool(&mut fields, "allow_routine_changes")?,
+        allow_notification_changes: take_bool(&mut fields, "allow_notification_changes")?,
+        allow_operational_actions: take_bool(&mut fields, "allow_operational_actions")?,
+        allow_http_targets: take_bool(&mut fields, "allow_http_targets")?,
+        allow_invalid_tls: take_bool(&mut fields, "allow_invalid_tls")?,
+        allow_destructive_sync: take_bool(&mut fields, "allow_destructive_sync")?,
+        allow_doctor_write_test: take_bool(&mut fields, "allow_doctor_write_test")?,
+        allow_remote_logging: take_bool(&mut fields, "allow_remote_logging")?,
+        allow_empty_source: take_bool(&mut fields, "allow_empty_source")?,
+        csrf_lifetime_seconds: take_u64(&mut fields, "csrf_lifetime_seconds")?,
+        result_retention_seconds: take_u64(&mut fields, "result_retention_seconds")?,
+        max_outstanding_jobs: take_u64(&mut fields, "max_outstanding_jobs")?
+            .try_into()
+            .map_err(|_| BridgeError::unsafe_runtime())?,
+        audit_log_level: take_level(&mut fields, "audit_log_level")?,
+        bridge_log_level: take_level(&mut fields, "bridge_log_level")?,
+        authentication_log_level: take_level(&mut fields, "authentication_log_level")?,
+        security_log_level: take_level(&mut fields, "security_log_level")?,
+        configuration_log_level: take_level(&mut fields, "configuration_log_level")?,
+        secrets_log_level: take_level(&mut fields, "secrets_log_level")?,
+        routines_log_level: take_level(&mut fields, "routines_log_level")?,
+        operations_log_level: take_level(&mut fields, "operations_log_level")?,
+        notifications_log_level: take_level(&mut fields, "notifications_log_level")?,
+        sync_log_level: take_level(&mut fields, "sync_log_level")?,
+        controller_log_level: take_level(&mut fields, "controller_log_level")?,
+        scheduler_log_level: take_level(&mut fields, "scheduler_log_level")?,
+    };
+    if !fields.is_empty() {
+        return Err(BridgeError::unsafe_runtime());
+    }
+    validate_security_policy(&value).map_err(|_| BridgeError::unsafe_runtime())?;
+    Ok(value)
+}
+
+fn validate_mutation_against_security_policy(
+    mutation: &Mutation,
+    policy: &SecurityPolicyArgs,
+) -> BridgeResult<()> {
+    let allowed = match mutation {
+        Mutation::ConfigureProfile(value) => {
+            policy.allow_profile_changes
+                && (policy.allow_http_targets || !value.allow_http)
+                && (policy.allow_invalid_tls || !value.danger_accept_invalid_certs)
+                && (policy.allow_destructive_sync || !value.delete)
+                && (policy.allow_remote_logging || value.remote_log_url.is_none())
+                && (policy.allow_empty_source || !value.allow_empty_source)
+        }
+        Mutation::RemoveProfile(_) | Mutation::SetDefault(_) => policy.allow_profile_changes,
+        Mutation::SetSecret(value) => {
+            policy.allow_secret_changes
+                && (policy.allow_remote_logging
+                    || value.kind != SecretKind::RemoteLogToken
+                    || value.mode == SecretMode::Clear)
+        }
+        Mutation::Schedule(value) => {
+            policy.allow_routine_changes && (policy.allow_destructive_sync || !value.allow_delete)
+        }
+        Mutation::Routine(value) => {
+            policy.allow_routine_changes && (policy.allow_destructive_sync || !value.allow_delete)
+        }
+        Mutation::RemoveRoutine(_) => policy.allow_routine_changes,
+        Mutation::AlertPolicy(_) => policy.allow_notification_changes,
+        Mutation::SecurityPolicy(_) => true,
+        Mutation::ClientEvent(value) => match value.event {
+            ClientEventKind::InterfaceSettings => policy.allow_interface_changes,
+            ClientEventKind::SessionNotifications => policy.allow_notification_changes,
+        },
+        Mutation::Action(value) => {
+            policy.allow_operational_actions
+                && (policy.allow_doctor_write_test || value.write_test != Some(true))
+                && (policy.allow_destructive_sync || value.allow_delete != Some(true))
+        }
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(BridgeError::new(ErrorKind::Forbidden))
+    }
+}
+
 fn validate_operational_action(value: &OperationalActionArgs) -> BridgeResult<()> {
     if value.scope != "all" {
-        validate_name(&value.scope)?;
+        validate_existing_name(&value.scope)?;
     }
     match value.kind {
         OperationalActionKind::Doctor => {
@@ -1570,9 +2247,19 @@ fn validate_operational_action(value: &OperationalActionArgs) -> BridgeResult<()
 
 fn valid_authenticated_username(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= 256
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'@' | b'\\')
+        && value.len() <= MAX_AUTHENTICATED_USERNAME_BYTES
+        && value.chars().all(|character| {
+            !character.is_control()
+                && character != '|'
+                && !matches!(
+                    character,
+                    '\u{061c}'
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2060}'..='\u{206f}'
+                        | '\u{feff}'
+                        | '\u{fff9}'..='\u{fffb}'
+                )
         })
 }
 
@@ -1631,7 +2318,10 @@ fn identity_belongs_to_group(
 
 #[cfg(any(target_os = "linux", test))]
 fn trusted_executable_mode(mode: u32) -> bool {
-    mode & 0o170_000 == 0o100_000 && mode & 0o022 == 0 && mode & 0o6000 == 0 && mode & 0o111 != 0
+    // This predicate is used only for Synology's fixed, root-owned system
+    // authenticate.cgi. DSM may ship that system helper with set-id bits;
+    // package files remain independently required to be ordinary 0755 files.
+    mode & 0o170_000 == 0o100_000 && mode & 0o022 == 0 && mode & 0o111 != 0
 }
 
 fn parse_authentication_output(output: &[u8]) -> BridgeResult<String> {
@@ -1652,6 +2342,12 @@ fn parse_authentication_output(output: &[u8]) -> BridgeResult<String> {
 }
 
 fn authentication_command_environment(inputs: &AuthenticationInputs) -> Vec<(OsString, OsString)> {
+    let authentication_query = inputs
+        .synology_token
+        .as_ref()
+        .map_or_else(String::new, |token| {
+            format!("SynoToken={}", percent_encode_query_value(token.as_bytes()))
+        });
     let mut variables = vec![
         (
             OsString::from("PATH"),
@@ -1661,11 +2357,14 @@ fn authentication_command_environment(inputs: &AuthenticationInputs) -> Vec<(OsS
         (OsString::from("LC_ALL"), OsString::from("C")),
         (
             OsString::from("REQUEST_METHOD"),
-            OsString::from(&inputs.method),
+            // authenticate.cgi is an authentication probe, not the original
+            // application action.  Passing POST or the app's action query can
+            // make DSM parse a body/query that belongs only to this package.
+            OsString::from("GET"),
         ),
         (
             OsString::from("QUERY_STRING"),
-            OsString::from(inputs.query.as_str()),
+            OsString::from(authentication_query),
         ),
         (
             OsString::from("HTTP_COOKIE"),
@@ -1690,6 +2389,21 @@ fn authentication_command_environment(inputs: &AuthenticationInputs) -> Vec<(OsS
         }
     }
     variables
+}
+
+fn percent_encode_query_value(value: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for &byte in value {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    encoded
 }
 
 fn manager_command_environment() -> Vec<(OsString, OsString)> {
@@ -1732,6 +2446,46 @@ fn session_binding(
     // while keeping cookie-only and token-authenticated sessions distinct.
     update_length_prefixed(&mut digest, synology_token.unwrap_or_default().as_bytes());
     digest.finalize().into()
+}
+
+fn audit_transaction_id(
+    session_binding: &[u8; 32],
+    client_request_id: &str,
+    issued_at_epoch: u64,
+    server_nonce: &[u8; 16],
+) -> BridgeResult<String> {
+    if !valid_client_request_id(client_request_id) {
+        return Err(BridgeError::bad_request());
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"sdsync.dsm-audit-transaction.v1\0");
+    digest.update(session_binding);
+    digest.update(client_request_id.as_bytes());
+    digest.update(issued_at_epoch.to_be_bytes());
+    digest.update(server_nonce);
+    Ok(hex_encode(&digest.finalize())[..48].to_owned())
+}
+
+fn mutation_request_fingerprint(
+    idempotency_key: &[u8],
+    mutation: &Mutation,
+    secret: Option<&[u8]>,
+) -> BridgeResult<String> {
+    let arguments =
+        serde_json::to_vec(&mutation.arguments_value()?).map_err(|_| BridgeError::internal())?;
+    let mut mac = HmacSha256::new_from_slice(idempotency_key)
+        .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+    mac.update(b"sdsync.dsm-idempotency.v1\0");
+    update_mac_length_prefixed(&mut mac, mutation.operation_id().as_bytes());
+    update_mac_length_prefixed(&mut mac, &arguments);
+    mac.update(&[u8::from(secret.is_some())]);
+    update_mac_length_prefixed(&mut mac, secret.unwrap_or_default());
+    Ok(hex_encode(&mac.finalize().into_bytes()))
+}
+
+fn update_mac_length_prefixed(mac: &mut HmacSha256, value: &[u8]) {
+    mac.update(&(value.len() as u64).to_be_bytes());
+    mac.update(value);
 }
 
 fn update_length_prefixed(digest: &mut Sha256, value: &[u8]) {
@@ -1851,6 +2605,7 @@ mod linux_runtime {
 
     pub(super) fn authenticate_and_authorize(
         inputs: &AuthenticationInputs,
+        timeout: Duration,
     ) -> BridgeResult<AuthenticatedSession> {
         validate_trusted_executable(Path::new(AUTHENTICATE_PATH), 0)?;
         let mut command = Command::new(AUTHENTICATE_PATH);
@@ -1864,24 +2619,36 @@ mod linux_runtime {
             &mut command,
             MAX_AUTH_OUTPUT_BYTES,
             MAX_HELPER_STDERR_BYTES,
-            AUTH_HELPER_TIMEOUT,
+            timeout,
             None,
         )?;
         if !output.status_success {
             return Err(BridgeError::new(ErrorKind::Unauthorized));
         }
         let username = parse_authentication_output(&output.stdout)?;
-        let (uid, primary_gid) = lookup_user(&username)?;
-        let administrator_gid = lookup_group(ADMINISTRATORS_GROUP)?;
-        let groups = lookup_groups(&username, primary_gid)?;
-        authorize_admin_membership(uid, primary_gid, administrator_gid, &groups)?;
+        let uid = authorize_relayed_username(&username)?;
         let binding = session_binding(
             &username,
             uid,
             &inputs.cookie,
             inputs.synology_token.as_ref().map(|value| value.as_str()),
         );
-        Ok(AuthenticatedSession { username, binding })
+        Ok(AuthenticatedSession {
+            username,
+            uid,
+            binding,
+        })
+    }
+
+    pub(super) fn authorize_relayed_username(username: &str) -> BridgeResult<u32> {
+        if !valid_authenticated_username(username) {
+            return Err(BridgeError::new(ErrorKind::Forbidden));
+        }
+        let (uid, primary_gid) = lookup_user(username)?;
+        let administrator_gid = lookup_group(ADMINISTRATORS_GROUP)?;
+        let groups = lookup_groups(username, primary_gid)?;
+        authorize_admin_membership(uid, primary_gid, administrator_gid, &groups)?;
+        Ok(uid)
     }
 
     pub(super) fn validate_package_manager() -> BridgeResult<()> {
@@ -2011,7 +2778,7 @@ mod linux_socket {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::linux::fs::MetadataExt;
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::Mutex;
 
@@ -2019,7 +2786,6 @@ mod linux_socket {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(super) struct PeerCredentials {
-        pub(super) pid: u32,
         pub(super) uid: u32,
         pub(super) gid: u32,
     }
@@ -2042,10 +2808,6 @@ mod linux_socket {
                 return Err(BridgeError::unsafe_runtime());
             }
             Ok(PeerCredentials {
-                pid: credentials
-                    .pid
-                    .try_into()
-                    .map_err(|_| BridgeError::unsafe_runtime())?,
                 uid: credentials.uid,
                 gid: credentials.gid,
             })
@@ -2096,6 +2858,89 @@ mod linux_socket {
             return Err(error);
         }
         Ok(listener)
+    }
+
+    pub(super) fn cleanup_stale_service_socket(
+        socket_path: &Path,
+        pid_path: &Path,
+        package_uid: u32,
+        web_gid: u32,
+    ) -> BridgeResult<()> {
+        validate_socket_parent(socket_path, package_uid)?;
+        let pid_metadata = match fs::symlink_metadata(pid_path) {
+            Ok(before) => {
+                let parent = pid_path.parent().ok_or_else(BridgeError::unsafe_runtime)?;
+                let parent_metadata =
+                    fs::symlink_metadata(parent).map_err(|_| BridgeError::unsafe_runtime())?;
+                if !parent_metadata.file_type().is_dir()
+                    || parent_metadata.st_uid() != package_uid
+                    || parent_metadata.st_mode() & 0o7777 != 0o700
+                {
+                    return Err(BridgeError::unsafe_runtime());
+                }
+                let mut options = OpenOptions::new();
+                options
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+                let mut file = options
+                    .open(pid_path)
+                    .map_err(|_| BridgeError::unsafe_runtime())?;
+                let opened = file.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
+                if !opened.file_type().is_file()
+                    || opened.st_uid() != package_uid
+                    || opened.st_mode() & 0o7777 != 0o600
+                    || opened.st_nlink() != 1
+                    || opened.len() > 32
+                    || !same_object(&before, &opened)
+                {
+                    return Err(BridgeError::unsafe_runtime());
+                }
+                let mut bytes = Vec::with_capacity(opened.len() as usize);
+                Read::by_ref(&mut file)
+                    .take(33)
+                    .read_to_end(&mut bytes)
+                    .map_err(|_| BridgeError::unsafe_runtime())?;
+                let after_read = file.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
+                if bytes.len() as u64 != opened.len() || !same_object(&opened, &after_read) {
+                    return Err(BridgeError::unsafe_runtime());
+                }
+                let text =
+                    std::str::from_utf8(&bytes).map_err(|_| BridgeError::unsafe_runtime())?;
+                let pid = text
+                    .strip_suffix('\n')
+                    .filter(|value| {
+                        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .filter(|value| *value > 1)
+                    .ok_or_else(BridgeError::unsafe_runtime)?;
+                // SAFETY: signal zero performs only a liveness/permission probe.
+                if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+                    return Err(BridgeError::new(ErrorKind::Conflict));
+                }
+                if io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                    return Err(BridgeError::unsafe_runtime());
+                }
+                Some(opened)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(_) => return Err(BridgeError::unsafe_runtime()),
+        };
+
+        remove_stale_socket(socket_path, package_uid, web_gid)?;
+        if let Some(before) = pid_metadata {
+            let after =
+                fs::symlink_metadata(pid_path).map_err(|_| BridgeError::unsafe_runtime())?;
+            if !same_object(&before, &after) {
+                return Err(BridgeError::unsafe_runtime());
+            }
+            fs::remove_file(pid_path).map_err(|_| BridgeError::unsafe_runtime())?;
+            let parent = pid_path.parent().ok_or_else(BridgeError::unsafe_runtime)?;
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|_| BridgeError::unsafe_runtime())?;
+        }
+        Ok(())
     }
 
     pub(super) fn shutdown_write(stream: &UnixStream) -> BridgeResult<()> {
@@ -2896,12 +3741,13 @@ fn issue_csrf_token(
     session_binding: &[u8; 32],
     now: u64,
     nonce: &[u8; 16],
+    lifetime_seconds: u64,
 ) -> BridgeResult<String> {
-    if key.len() != 32 {
+    if key.len() != 32 || !(60..=900).contains(&lifetime_seconds) {
         return Err(BridgeError::unsafe_runtime());
     }
     let expires = now
-        .checked_add(CSRF_LIFETIME_SECONDS)
+        .checked_add(lifetime_seconds)
         .ok_or_else(BridgeError::internal)?;
     let nonce_hex = hex_encode(nonce);
     let message = csrf_message(now, expires, &nonce_hex, session_binding);
@@ -2919,36 +3765,37 @@ fn verify_csrf_token(
     key: &[u8],
     session_binding: &[u8; 32],
     now: u64,
+    lifetime_seconds: u64,
 ) -> BridgeResult<()> {
-    if token.len() > MAX_CSRF_BYTES || key.len() != 32 {
-        return Err(BridgeError::new(ErrorKind::Forbidden));
+    if token.len() > MAX_CSRF_BYTES || key.len() != 32 || !(60..=900).contains(&lifetime_seconds) {
+        return Err(BridgeError::new(ErrorKind::CsrfRejected));
     }
     let components: Vec<&str> = token.split('.').collect();
     if components.len() != 5 || components[0] != "v1" {
-        return Err(BridgeError::new(ErrorKind::Forbidden));
+        return Err(BridgeError::new(ErrorKind::CsrfRejected));
     }
-    let issued =
-        parse_canonical_u64(components[1]).map_err(|_| BridgeError::new(ErrorKind::Forbidden))?;
-    let expires =
-        parse_canonical_u64(components[2]).map_err(|_| BridgeError::new(ErrorKind::Forbidden))?;
-    if expires.checked_sub(issued) != Some(CSRF_LIFETIME_SECONDS)
+    let issued = parse_canonical_u64(components[1])
+        .map_err(|_| BridgeError::new(ErrorKind::CsrfRejected))?;
+    let expires = parse_canonical_u64(components[2])
+        .map_err(|_| BridgeError::new(ErrorKind::CsrfRejected))?;
+    if expires.checked_sub(issued) != Some(lifetime_seconds)
         || issued > now.saturating_add(CLOCK_SKEW_SECONDS)
         || expires <= now
     {
-        return Err(BridgeError::new(ErrorKind::Forbidden));
+        return Err(BridgeError::new(ErrorKind::CsrfRejected));
     }
     let nonce = hex_decode_exact::<16>(components[3])
-        .ok_or_else(|| BridgeError::new(ErrorKind::Forbidden))?;
+        .ok_or_else(|| BridgeError::new(ErrorKind::CsrfRejected))?;
     let supplied_signature = hex_decode_exact::<32>(components[4])
-        .ok_or_else(|| BridgeError::new(ErrorKind::Forbidden))?;
+        .ok_or_else(|| BridgeError::new(ErrorKind::CsrfRejected))?;
     let nonce_hex = hex_encode(&nonce);
     let message = csrf_message(issued, expires, &nonce_hex, session_binding);
     let mut mac =
-        HmacSha256::new_from_slice(key).map_err(|_| BridgeError::new(ErrorKind::Forbidden))?;
+        HmacSha256::new_from_slice(key).map_err(|_| BridgeError::new(ErrorKind::CsrfRejected))?;
     mac.update(message.as_bytes());
     let expected = mac.finalize().into_bytes();
     if !constant_time_equal(&expected, &supplied_signature) {
-        return Err(BridgeError::new(ErrorKind::Forbidden));
+        return Err(BridgeError::new(ErrorKind::CsrfRejected));
     }
     Ok(())
 }
@@ -2998,12 +3845,18 @@ fn hex_decode_exact<const N: usize>(value: &str) -> Option<[u8; N]> {
 fn read_manager_arguments(action: &ReadAction) -> BridgeResult<Vec<OsString>> {
     let arguments = match action {
         ReadAction::Snapshot => vec!["api".into(), "snapshot".into()],
-        ReadAction::Logs { lines, .. } => vec![
-            "api".into(),
-            "logs".into(),
-            "--lines".into(),
-            lines.to_string().into(),
-        ],
+        ReadAction::Logs { lines, .. } => {
+            let scan_lines = lines
+                .saturating_mul(16)
+                .max(lines.saturating_add(128))
+                .min(1000);
+            vec![
+                "api".into(),
+                "logs".into(),
+                "--lines".into(),
+                scan_lines.to_string().into(),
+            ]
+        }
         ReadAction::Activity { lines } => vec![
             "api".into(),
             "activity".into(),
@@ -3192,6 +4045,67 @@ fn mutation_manager_arguments(mutation: &Mutation) -> Vec<OsString> {
                 &value.cooldown_seconds.to_string(),
             );
         }
+        Mutation::SecurityPolicy(value) => {
+            arguments.push("security-policy".into());
+            for (name, enabled) in [
+                ("--require-https", value.require_https),
+                ("--allow-interface-changes", value.allow_interface_changes),
+                ("--allow-profile-changes", value.allow_profile_changes),
+                ("--allow-secret-changes", value.allow_secret_changes),
+                ("--allow-routine-changes", value.allow_routine_changes),
+                (
+                    "--allow-notification-changes",
+                    value.allow_notification_changes,
+                ),
+                (
+                    "--allow-operational-actions",
+                    value.allow_operational_actions,
+                ),
+                ("--allow-http-targets", value.allow_http_targets),
+                ("--allow-invalid-tls", value.allow_invalid_tls),
+                ("--allow-destructive-sync", value.allow_destructive_sync),
+                ("--allow-doctor-write-test", value.allow_doctor_write_test),
+                ("--allow-remote-logging", value.allow_remote_logging),
+                ("--allow-empty-source", value.allow_empty_source),
+            ] {
+                push_pair(&mut arguments, name, bool_text(enabled));
+            }
+            push_pair(
+                &mut arguments,
+                "--csrf-lifetime",
+                &value.csrf_lifetime_seconds.to_string(),
+            );
+            push_pair(
+                &mut arguments,
+                "--result-retention",
+                &value.result_retention_seconds.to_string(),
+            );
+            push_pair(
+                &mut arguments,
+                "--max-outstanding-jobs",
+                &value.max_outstanding_jobs.to_string(),
+            );
+            for (name, level) in [
+                ("--audit-log-level", value.audit_log_level),
+                ("--bridge-log-level", value.bridge_log_level),
+                ("--authentication-log-level", value.authentication_log_level),
+                ("--security-log-level", value.security_log_level),
+                ("--configuration-log-level", value.configuration_log_level),
+                ("--secrets-log-level", value.secrets_log_level),
+                ("--routines-log-level", value.routines_log_level),
+                ("--operations-log-level", value.operations_log_level),
+                ("--notifications-log-level", value.notifications_log_level),
+                ("--sync-log-level", value.sync_log_level),
+                ("--controller-log-level", value.controller_log_level),
+                ("--scheduler-log-level", value.scheduler_log_level),
+            ] {
+                push_pair(&mut arguments, name, level.as_str());
+            }
+        }
+        Mutation::ClientEvent(value) => {
+            arguments.push("client-event".into());
+            push_pair(&mut arguments, "--event", value.event.as_str());
+        }
         Mutation::Action(value) => {
             arguments.push("action".into());
             push_pair(&mut arguments, "--kind", value.kind.as_str());
@@ -3231,6 +4145,7 @@ fn parse_and_sanitize_manager_json(
     bytes: &[u8],
     action: &ReadAction,
     exact_secret: Option<&[u8]>,
+    runtime_policy: Option<&SecurityPolicyArgs>,
 ) -> BridgeResult<Vec<u8>> {
     let mut value: Value =
         serde_json::from_slice(bytes).map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
@@ -3252,6 +4167,12 @@ fn parse_and_sanitize_manager_json(
             let root = value
                 .as_object_mut()
                 .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+            // This value is embedded by build.rs and cannot be influenced by
+            // the package INFO file or any mutable DSM runtime state.
+            root.insert(
+                "package".to_owned(),
+                json!({ "version": env!("SDSYNC_VERSION") }),
+            );
             root.insert(
                 "capabilities".to_owned(),
                 json!({
@@ -3261,22 +4182,128 @@ fn parse_and_sanitize_manager_json(
                     "private_queue": true,
                 }),
             );
+            if let Some(policy) = runtime_policy {
+                root.insert(
+                    "security_policy".to_owned(),
+                    security_policy_snapshot_value(policy),
+                );
+            }
         }
-        ReadAction::Logs { source, .. } if *source != LogSource::All => {
+        ReadAction::Logs {
+            source,
+            lines: requested,
+        } => {
             let logs = value
                 .get_mut("logs")
                 .and_then(Value::as_array_mut)
                 .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
-            logs.retain(|entry| {
-                entry.get("source").and_then(Value::as_str) == Some(source.as_str())
-            });
+            if *source != LogSource::All {
+                logs.retain(|entry| {
+                    entry.get("source").and_then(Value::as_str) == Some(source.as_str())
+                });
+            }
+            if let Some(policy) = runtime_policy {
+                for entry in logs {
+                    let source = entry
+                        .get("source")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?
+                        .to_owned();
+                    let lines = entry
+                        .get_mut("lines")
+                        .and_then(Value::as_array_mut)
+                        .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+                    lines.retain(|line| {
+                        line.as_str().is_some_and(|line| {
+                            log_line_visible_at_threshold(policy, &source, line)
+                        })
+                    });
+                    let requested = usize::from(*requested);
+                    if lines.len() > requested {
+                        lines.drain(..lines.len() - requested);
+                    }
+                }
+            }
         }
-        ReadAction::Logs { .. }
-        | ReadAction::Activity { .. }
-        | ReadAction::Csrf
-        | ReadAction::Result { .. } => {}
+        ReadAction::Activity { .. } => {
+            if let Some(policy) = runtime_policy {
+                let events = value
+                    .get_mut("events")
+                    .and_then(Value::as_array_mut)
+                    .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+                events.retain(|event| {
+                    let Some(category) = event.get("category").and_then(Value::as_str) else {
+                        return false;
+                    };
+                    let Some(level) = event.get("level").and_then(Value::as_str) else {
+                        return false;
+                    };
+                    let mandatory = event
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .is_some_and(|code| code.starts_with("audit."));
+                    event_visible_at_threshold(policy, category, level, mandatory)
+                });
+            }
+        }
+        ReadAction::Csrf | ReadAction::Result { .. } => {}
     }
     serde_json::to_vec(&value).map_err(|_| BridgeError::internal())
+}
+
+fn security_policy_snapshot_value(policy: &SecurityPolicyArgs) -> Value {
+    json!({
+        "schema": "sdsync.dsm-security-policy.v1",
+        "policy_version": 1,
+        "require_https": policy.require_https,
+        "allow_interface_changes": policy.allow_interface_changes,
+        "allow_profile_changes": policy.allow_profile_changes,
+        "allow_secret_changes": policy.allow_secret_changes,
+        "allow_routine_changes": policy.allow_routine_changes,
+        "allow_notification_changes": policy.allow_notification_changes,
+        "allow_operational_actions": policy.allow_operational_actions,
+        "allow_http_targets": policy.allow_http_targets,
+        "allow_invalid_tls": policy.allow_invalid_tls,
+        "allow_destructive_sync": policy.allow_destructive_sync,
+        "allow_doctor_write_test": policy.allow_doctor_write_test,
+        "allow_remote_logging": policy.allow_remote_logging,
+        "allow_empty_source": policy.allow_empty_source,
+        "csrf_lifetime_seconds": policy.csrf_lifetime_seconds,
+        "result_retention_seconds": policy.result_retention_seconds,
+        "max_outstanding_jobs": policy.max_outstanding_jobs,
+        "queue_limits": {
+            "active_request_and_processing_jobs": policy.max_outstanding_jobs,
+            "retained_terminal_responses": policy.max_outstanding_jobs,
+            "worst_case_total_job_records": policy.max_outstanding_jobs * 2,
+        },
+        "log_levels": {
+            "audit": policy.audit_log_level.as_str(),
+            "bridge": policy.bridge_log_level.as_str(),
+            "authentication": policy.authentication_log_level.as_str(),
+            "security": policy.security_log_level.as_str(),
+            "configuration": policy.configuration_log_level.as_str(),
+            "secrets": policy.secrets_log_level.as_str(),
+            "routines": policy.routines_log_level.as_str(),
+            "operations": policy.operations_log_level.as_str(),
+            "notifications": policy.notifications_log_level.as_str(),
+            "sync": policy.sync_log_level.as_str(),
+            "controller": policy.controller_log_level.as_str(),
+            "scheduler": policy.scheduler_log_level.as_str(),
+        },
+        "immutable": {
+            "administrator_only": true,
+            "same_origin_cookie_authentication": true,
+            "csrf_required_for_mutations": true,
+            "session_bound_results": true,
+            "secret_values_never_returned": true,
+            "private_fixed_paths": true,
+            "unix_peer_credentials_verified": true,
+            "root_privileges": false,
+            "setuid_or_capabilities": false,
+            "fail_closed": true,
+            "mandatory_minimal_audit": true,
+        }
+    })
 }
 
 fn redact_secret_fields(value: &mut Value, exact_secret: Option<&[u8]>) {
@@ -3315,20 +4342,36 @@ fn redact_secret_fields(value: &mut Value, exact_secret: Option<&[u8]>) {
     }
 }
 
+// Keep every immutable queue identity field explicit at the one serialization
+// boundary; grouping them into a loosely validated map would make schema drift
+// and secret-bearing fingerprint mistakes easier to miss.
+#[allow(clippy::too_many_arguments)]
 fn canonical_job_bytes(
     request_id: &str,
     client_request_id: &str,
     requested_by: &str,
+    requested_uid: u32,
     session_binding: &[u8; 32],
+    audit_transaction: &str,
+    request_fingerprint: &str,
     issued_at_epoch: u64,
     mutation: &Mutation,
 ) -> BridgeResult<Vec<u8>> {
+    if requested_uid == 0
+        || !valid_server_job_id(audit_transaction)
+        || !valid_request_fingerprint(request_fingerprint)
+    {
+        return Err(BridgeError::bad_request());
+    }
     let value = json!({
         "schema": "sdsync.dsm-job.v1",
         "request_id": request_id,
         "client_request_id": client_request_id,
         "requested_by": requested_by,
+        "requested_uid": requested_uid,
         "session_binding": hex_encode(session_binding),
+        "audit_transaction": audit_transaction,
+        "request_fingerprint": request_fingerprint,
         "issued_at_epoch": issued_at_epoch,
         "operation": mutation.operation_id(),
         "arguments": mutation.arguments_value()?,
@@ -3340,10 +4383,27 @@ fn canonical_job_bytes(
     Ok(bytes)
 }
 
+fn validate_processing_job_path(request: &Path) -> BridgeResult<String> {
+    if request.parent() != Some(Path::new(PROCESSING_DIR)) {
+        return Err(BridgeError::bad_request());
+    }
+    let request_name = request
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(BridgeError::bad_request)?;
+    if !request_name.ends_with(".json") {
+        return Err(BridgeError::bad_request());
+    }
+    let request_id = &request_name[..request_name.len() - ".json".len()];
+    if !valid_server_job_id(request_id) {
+        return Err(BridgeError::bad_request());
+    }
+    Ok(request_id.to_owned())
+}
+
 fn validate_consumer_paths(request: &Path, response: &Path) -> BridgeResult<String> {
-    if request.parent() != Some(Path::new(PROCESSING_DIR))
-        || response.parent() != Some(Path::new(RESPONSES_DIR))
-    {
+    let request_id = validate_processing_job_path(request)?;
+    if response.parent() != Some(Path::new(RESPONSES_DIR)) {
         return Err(BridgeError::bad_request());
     }
     let request_name = request
@@ -3357,18 +4417,11 @@ fn validate_consumer_paths(request: &Path, response: &Path) -> BridgeResult<Stri
     if request_name != response_name || !request_name.ends_with(".json") {
         return Err(BridgeError::bad_request());
     }
-    let request_id = &request_name[..request_name.len() - ".json".len()];
-    if !valid_server_job_id(request_id) {
-        return Err(BridgeError::bad_request());
-    }
-    Ok(request_id.to_owned())
+    Ok(request_id)
 }
 
 fn parse_manager_result(bytes: &[u8], exact_secret: Option<&[u8]>) -> BridgeResult<Value> {
-    if bytes.is_empty()
-        || bytes.len() > MAX_MANAGER_OUTPUT_BYTES
-        || exact_secret.is_some_and(|secret| contains_bytes(bytes, secret))
-    {
+    if bytes.is_empty() || bytes.len() > MAX_MANAGER_OUTPUT_BYTES {
         return Err(BridgeError::new(ErrorKind::Unavailable));
     }
     let value: Value =
@@ -3459,7 +4512,7 @@ fn parse_manager_result(bytes: &[u8], exact_secret: Option<&[u8]>) -> BridgeResu
             .get("scope")
             .and_then(Value::as_str)
             .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
-        if scope != "all" && validate_name(scope).is_err() {
+        if scope != "all" && validate_existing_name(scope).is_err() {
             return Err(BridgeError::new(ErrorKind::Unavailable));
         }
         let output = root
@@ -3492,6 +4545,32 @@ fn parse_manager_result(bytes: &[u8], exact_secret: Option<&[u8]>) -> BridgeResu
     Ok(value)
 }
 
+fn validate_set_secret_manager_result(value: &Value) -> BridgeResult<()> {
+    let root = value
+        .as_object()
+        .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+    const EXACT_FIELDS: &[&str] = &[
+        "schema",
+        "ok",
+        "message",
+        "has_password",
+        "has_totp",
+        "has_remote_log_token",
+    ];
+    if root.len() != EXACT_FIELDS.len()
+        || root.keys().any(|key| !EXACT_FIELDS.contains(&key.as_str()))
+        || root.get("schema").and_then(Value::as_str) != Some("sdsync.dsm-result.v1")
+        || root.get("ok").and_then(Value::as_bool) != Some(true)
+        || root.get("message").and_then(Value::as_str) != Some("secret state updated")
+        || ["has_password", "has_totp", "has_remote_log_token"]
+            .iter()
+            .any(|field| root.get(*field).and_then(Value::as_bool).is_none())
+    {
+        return Err(BridgeError::new(ErrorKind::Unavailable));
+    }
+    Ok(())
+}
+
 fn validate_result_text(value: &str, maximum: usize) -> BridgeResult<()> {
     if value.len() > maximum || value.contains('\0') {
         return Err(BridgeError::new(ErrorKind::Unavailable));
@@ -3503,16 +4582,27 @@ fn canonical_queued_response_bytes(
     job: &ParsedJob,
     completed_at_epoch: u64,
     result: &Value,
+    audit_pending: bool,
 ) -> BridgeResult<Vec<u8>> {
     if completed_at_epoch < job.issued_at_epoch {
         return Err(BridgeError::new(ErrorKind::Unavailable));
     }
+    let audit_terminal_state = if result.get("ok").and_then(Value::as_bool) == Some(true) {
+        "succeeded"
+    } else {
+        "failed"
+    };
     let bytes = serde_json::to_vec(&json!({
         "schema": "sdsync.dsm-queued-response.v1",
         "job_id": job.request_id,
         "client_request_id": job.client_request_id,
         "requested_by": job.requested_by,
+        "requested_uid": job.requested_uid,
         "session_binding": hex_encode(&job.session_binding),
+        "request_fingerprint": job.request_fingerprint,
+        "audit_transaction": job.audit_transaction,
+        "audit_pending": audit_pending,
+        "audit_terminal_state": audit_terminal_state,
         "issued_at_epoch": job.issued_at_epoch,
         "completed_at_epoch": completed_at_epoch,
         "result": result,
@@ -3533,8 +4623,12 @@ fn parse_queued_response(
     if response.schema != "sdsync.dsm-queued-response.v1"
         || response.job_id != expected_job_id
         || !valid_server_job_id(response.job_id)
-        || !valid_request_id(response.client_request_id)
+        || !valid_client_request_id(response.client_request_id)
         || !valid_authenticated_username(response.requested_by)
+        || response.requested_uid == 0
+        || !valid_request_fingerprint(response.request_fingerprint)
+        || !valid_audit_transaction(response.audit_transaction)
+        || !matches!(response.audit_terminal_state, "succeeded" | "failed")
         || response.completed_at_epoch < response.issued_at_epoch
     {
         return Err(BridgeError::new(ErrorKind::Unavailable));
@@ -3542,8 +4636,23 @@ fn parse_queued_response(
     let session_binding = hex_decode_exact::<32>(response.session_binding)
         .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
     let result = parse_manager_result(response.result.get().as_bytes(), None)?;
+    let expected_terminal = if result.get("ok").and_then(Value::as_bool) == Some(true) {
+        "succeeded"
+    } else {
+        "failed"
+    };
+    if response.audit_terminal_state != expected_terminal {
+        return Err(BridgeError::new(ErrorKind::Unavailable));
+    }
     Ok(ParsedQueuedResponse {
+        client_request_id: response.client_request_id.to_owned(),
+        requested_by: response.requested_by.to_owned(),
+        requested_uid: response.requested_uid,
         session_binding,
+        request_fingerprint: response.request_fingerprint.to_owned(),
+        audit_transaction: response.audit_transaction.to_owned(),
+        audit_pending: response.audit_pending,
+        audit_terminal_state: response.audit_terminal_state.to_owned(),
         completed_at_epoch: response.completed_at_epoch,
         result,
     })
@@ -3573,6 +4682,7 @@ fn json_contains_sensitive_value(value: &Value, exact_secret: Option<&[u8]>) -> 
     }
 }
 
+#[cfg(test)]
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && haystack.len() >= needle.len()
@@ -3609,6 +4719,39 @@ fn generic_manager_result_value() -> Value {
     })
 }
 
+struct TerminalizedConsumeResult {
+    value: Value,
+    #[cfg_attr(not(test), allow(dead_code))]
+    state: &'static str,
+    audit_pending: bool,
+}
+
+fn terminalize_consume_result<F>(
+    result: BridgeResult<Value>,
+    mut record_terminal: F,
+) -> TerminalizedConsumeResult
+where
+    F: FnMut(&str) -> BridgeResult<bool>,
+{
+    let (value, state) = match result {
+        Ok(value) => {
+            let state = if value.get("ok").and_then(Value::as_bool) == Some(true) {
+                "succeeded"
+            } else {
+                "failed"
+            };
+            (value, state)
+        }
+        Err(_) => (generic_manager_result_value(), "failed"),
+    };
+    let audit_pending = record_terminal(state).unwrap_or(true);
+    TerminalizedConsumeResult {
+        value,
+        state,
+        audit_pending,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn manager_command(arguments: &[OsString], has_secret_input: bool) -> BridgeResult<Command> {
     linux_runtime::validate_package_manager()?;
@@ -3636,6 +4779,205 @@ fn run_read_manager(arguments: &[OsString]) -> BridgeResult<CapturedOutput> {
 }
 
 #[cfg(target_os = "linux")]
+fn record_rejected_post(audit_actor: &str, audit_actor_uid: u32) -> BridgeResult<()> {
+    record_rejected_operation(audit_actor, audit_actor_uid, "bridge")
+}
+
+#[cfg(target_os = "linux")]
+fn record_rejected_operation(
+    audit_actor: &str,
+    audit_actor_uid: u32,
+    origin: &str,
+) -> BridgeResult<()> {
+    if !valid_authenticated_username(audit_actor) || audit_actor_uid == 0 {
+        return Err(BridgeError::new(ErrorKind::Forbidden));
+    }
+    if !matches!(origin, "bridge" | "controller") {
+        return Err(BridgeError::new(ErrorKind::Forbidden));
+    }
+    let mut command = manager_command(&["api".into(), "audit-rejected".into()], false)?;
+    command.env("SDSYNC_DSM_AUDIT_ACTOR", audit_actor);
+    command.env("SDSYNC_DSM_AUDIT_ACTOR_UID", audit_actor_uid.to_string());
+    command.env("SDSYNC_DSM_AUDIT_ORIGIN", origin);
+    let output = capture_bounded_command(
+        &mut command,
+        MAX_MANAGER_OUTPUT_BYTES,
+        MAX_HELPER_STDERR_BYTES,
+        READ_MANAGER_TIMEOUT,
+        None,
+    )?;
+    if output.status_success {
+        Ok(())
+    } else {
+        Err(BridgeError::new(ErrorKind::Unavailable))
+    }
+}
+
+fn mutation_audit_operation(mutation: &Mutation) -> &'static str {
+    match mutation {
+        Mutation::SetSecret(value) => match (value.kind, value.mode) {
+            (SecretKind::Password, SecretMode::Replace) => "set-password",
+            (SecretKind::Password, SecretMode::Clear) => "remove-password",
+            (SecretKind::Totp, SecretMode::Replace) => "set-totp",
+            (SecretKind::Totp, SecretMode::Clear) => "remove-totp",
+            (SecretKind::RemoteLogToken, SecretMode::Replace) => "set-remote-log-token",
+            (SecretKind::RemoteLogToken, SecretMode::Clear) => "remove-remote-log-token",
+        },
+        Mutation::ClientEvent(value) => value.event.as_str(),
+        Mutation::Action(value) => value.kind.as_str(),
+        _ => mutation.operation_id(),
+    }
+}
+
+fn mutation_audit_profile(mutation: &Mutation) -> &str {
+    match mutation {
+        Mutation::ConfigureProfile(value) => &value.name,
+        Mutation::RemoveProfile(value) | Mutation::SetDefault(value) => &value.name,
+        Mutation::SetSecret(value) => &value.profile,
+        Mutation::Routine(value) => &value.profile,
+        Mutation::RemoveRoutine(value) => &value.name,
+        Mutation::Action(value) => &value.scope,
+        Mutation::Schedule(_)
+        | Mutation::AlertPolicy(_)
+        | Mutation::SecurityPolicy(_)
+        | Mutation::ClientEvent(_) => "all",
+    }
+}
+
+fn valid_audit_transaction(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 96
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn valid_audit_operation(value: &str) -> bool {
+    matches!(
+        value,
+        "configure-profile"
+            | "remove-profile"
+            | "set-default"
+            | "set-secret"
+            | "set-password"
+            | "remove-password"
+            | "set-totp"
+            | "remove-totp"
+            | "set-remote-log-token"
+            | "remove-remote-log-token"
+            | "schedule"
+            | "routine"
+            | "remove-routine"
+            | "alert-policy"
+            | "security-policy"
+            | "interface-settings"
+            | "session-notifications"
+            | "rejected-post"
+            | "doctor"
+            | "plan"
+            | "run"
+    )
+}
+
+fn valid_audit_profile(value: &str) -> bool {
+    matches!(value, "all" | "none") || validate_existing_name(value).is_ok()
+}
+
+fn valid_audit_origin(value: &str) -> bool {
+    matches!(
+        value,
+        "bridge" | "cli" | "manager" | "scheduler" | "controller"
+    )
+}
+
+fn validate_audit_identity(record: &AuditOutboxRecord) -> BridgeResult<()> {
+    if record.schema != "sdsync.dsm-audit-outbox.v1"
+        || !valid_audit_transaction(&record.transaction)
+        || !valid_audit_operation(&record.operation)
+        || !valid_audit_profile(&record.profile)
+        || !valid_authenticated_username(&record.actor)
+        || record.actor_uid == 0
+        || !valid_audit_origin(&record.origin)
+        || record
+            .client_request_id
+            .as_deref()
+            .is_some_and(|value| !valid_client_request_id(value))
+    {
+        return Err(BridgeError::unsafe_runtime());
+    }
+    Ok(())
+}
+
+fn validate_audit_outbox_record(record: &AuditOutboxRecord) -> BridgeResult<()> {
+    validate_audit_identity(record)?;
+    if record
+        .job_id
+        .as_deref()
+        .is_some_and(|value| !valid_server_job_id(value))
+        || (record.origin == "bridge") != record.job_id.is_some()
+        || (record.origin == "bridge") != record.client_request_id.is_some()
+        || record.owner_pid <= 1
+        || record.owner_start == 0
+        || !valid_boot_id(&record.owner_boot)
+    {
+        return Err(BridgeError::unsafe_runtime());
+    }
+    Ok(())
+}
+
+fn valid_boot_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+            }
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn record_audit_event(record: &AuditOutboxRecord, state: &str) -> BridgeResult<()> {
+    validate_audit_outbox_record(record)?;
+    if !matches!(
+        state,
+        "requested" | "succeeded" | "failed" | "outcome_unknown"
+    ) {
+        return Err(BridgeError::new(ErrorKind::Forbidden));
+    }
+    let arguments = [
+        "api".into(),
+        "audit-event".into(),
+        "--operation".into(),
+        record.operation.clone().into(),
+        "--state".into(),
+        state.into(),
+        "--profile".into(),
+        record.profile.clone().into(),
+    ];
+    let mut command = manager_command(&arguments, false)?;
+    command.env("SDSYNC_DSM_AUDIT_ACTOR", &record.actor);
+    command.env("SDSYNC_DSM_AUDIT_ACTOR_UID", record.actor_uid.to_string());
+    command.env("SDSYNC_DSM_AUDIT_ORIGIN", &record.origin);
+    command.env("SDSYNC_DSM_AUDIT_TRANSACTION", &record.transaction);
+    if let Some(client_request_id) = record.client_request_id.as_deref() {
+        command.env("SDSYNC_DSM_CLIENT_REQUEST_ID", client_request_id);
+    }
+    let output = capture_bounded_command(
+        &mut command,
+        MAX_MANAGER_OUTPUT_BYTES,
+        MAX_HELPER_STDERR_BYTES,
+        READ_MANAGER_TIMEOUT,
+        None,
+    )?;
+    if output.status_success {
+        Ok(())
+    } else {
+        Err(BridgeError::new(ErrorKind::Unavailable))
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn run_queued_mutation_manager(
     arguments: &[OsString],
     secret: Option<&[u8]>,
@@ -3653,12 +4995,528 @@ fn run_queued_mutation_manager(
 #[cfg(target_os = "linux")]
 mod linux_files {
     use super::*;
-    use std::io::{Seek, SeekFrom};
     use std::os::fd::AsRawFd;
     use std::os::linux::fs::MetadataExt;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 
     const NOFOLLOW_CLOEXEC: i32 = libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(test)]
+    thread_local! {
+        static FAIL_AUDIT_READY_WRITE_ONCE: std::cell::Cell<bool> = const {
+            std::cell::Cell::new(false)
+        };
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_audit_ready_write() {
+        FAIL_AUDIT_READY_WRITE_ONCE.with(|flag| flag.set(true));
+    }
+
+    pub(super) fn durably_verify_audit_event(
+        expected: &AuditOutboxRecord,
+        expected_state: &str,
+        package_uid: u32,
+    ) -> BridgeResult<()> {
+        durably_verify_audit_event_at(
+            expected,
+            expected_state,
+            package_uid,
+            Path::new(LOG_ROOT),
+            Path::new(AUDIT_LOG_PATH),
+            Path::new(ACTIVITY_LOG_PATH),
+        )
+    }
+
+    pub(super) fn durably_verify_audit_event_at(
+        expected: &AuditOutboxRecord,
+        expected_state: &str,
+        package_uid: u32,
+        log_root: &Path,
+        audit_log: &Path,
+        activity_log: &Path,
+    ) -> BridgeResult<()> {
+        // Durable log verification binds the immutable audit identity. It is
+        // intentionally independent from queue topology: the private verify
+        // helper receives no job path, including for authenticated bridge
+        // events, while the lifecycle outbox validator still requires a
+        // bridge record to carry its exact job id.
+        validate_audit_identity(expected)?;
+        if !matches!(
+            expected_state,
+            "requested" | "succeeded" | "failed" | "outcome_unknown"
+        ) {
+            return Err(BridgeError::bad_request());
+        }
+        validate_private_directory(log_root, package_uid)?;
+
+        let mut audit_found = false;
+        for path in rotating_log_paths(audit_log, 5) {
+            let Some((file, bytes)) = open_private_log_file(&path, package_uid, 11 * 1024 * 1024)?
+            else {
+                continue;
+            };
+            validate_canonical_log_records(&bytes, |line| {
+                validate_audit_log_line(line).map(|_| ())
+            })?;
+            for line in bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+            {
+                let parsed = validate_audit_log_line(line)?;
+                if parsed.transaction == expected.transaction && parsed.state == expected_state {
+                    if parsed.operation != expected.operation
+                        || parsed.profile != expected.profile
+                        || parsed.actor != expected.actor
+                        || parsed.actor_uid != Some(expected.actor_uid)
+                        || parsed.origin != expected.origin
+                        || parsed.client_request_id != expected.client_request_id.as_deref()
+                    {
+                        return Err(BridgeError::unsafe_runtime());
+                    }
+                    audit_found = true;
+                    file.sync_all().map_err(|_| BridgeError::unsafe_runtime())?;
+                }
+            }
+        }
+
+        let expected_code = format!("audit.{expected_state}");
+        let expected_activity_state = if expected_state == "outcome_unknown" {
+            "unavailable"
+        } else {
+            expected_state
+        };
+        let mut expected_message = format!(
+            "Module {} {} [{}]",
+            expected.operation, expected_state, expected.transaction
+        );
+        if let Some(client_request_id) = expected.client_request_id.as_deref() {
+            expected_message.push_str(" request_id=");
+            expected_message.push_str(client_request_id);
+        }
+        let mut activity_found = false;
+        for path in rotating_log_paths(activity_log, 3) {
+            let Some((file, bytes)) = open_private_log_file(&path, package_uid, 2 * 1024 * 1024)?
+            else {
+                continue;
+            };
+            validate_canonical_log_records(&bytes, |line| {
+                validate_activity_log_line(line).map(|_| ())
+            })?;
+            for line in bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+            {
+                let text = validate_activity_log_line(line)?;
+                let fields: Vec<&str> = text.split('|').collect();
+                match fields.len() {
+                    // Released builds wrote five-field activity records. They
+                    // remain readable history, but cannot satisfy a new audit
+                    // transaction's exact durable-record proof.
+                    5 => {
+                        if fields[1] == expected_code && fields[4].contains(&expected.transaction) {
+                            return Err(BridgeError::unsafe_runtime());
+                        }
+                    }
+                    // The immediately preceding package format had category
+                    // and level but no stable actor identity. It remains valid
+                    // unrelated history, but cannot prove a new transaction.
+                    7 => {
+                        if fields[1] == expected_code && fields[6].contains(&expected.transaction) {
+                            return Err(BridgeError::unsafe_runtime());
+                        }
+                    }
+                    9 => {
+                        let actor_uid = fields[6]
+                            .parse::<u32>()
+                            .ok()
+                            .filter(|value| *value != 0)
+                            .ok_or_else(BridgeError::unsafe_runtime)?;
+                        if !valid_authenticated_username(fields[7]) {
+                            return Err(BridgeError::unsafe_runtime());
+                        }
+                        if fields[1] == expected_code && fields[8].contains(&expected.transaction) {
+                            if fields[2] != expected.profile
+                                || fields[3] != expected_activity_state
+                                || fields[4] != "audit"
+                                || actor_uid != expected.actor_uid
+                                || fields[7] != expected.actor
+                                || fields[8] != expected_message
+                            {
+                                return Err(BridgeError::unsafe_runtime());
+                            }
+                            activity_found = true;
+                            file.sync_all().map_err(|_| BridgeError::unsafe_runtime())?;
+                        }
+                    }
+                    _ => return Err(BridgeError::unsafe_runtime()),
+                }
+            }
+        }
+        if !audit_found || !activity_found {
+            return Err(BridgeError::new(ErrorKind::Unavailable));
+        }
+        sync_directory(log_root)
+    }
+
+    fn require_canonical_log_termination(bytes: &[u8]) -> BridgeResult<()> {
+        if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(())
+    }
+
+    fn validate_canonical_log_records<T>(
+        bytes: &[u8],
+        validate_line: impl Fn(&[u8]) -> BridgeResult<T>,
+    ) -> BridgeResult<()> {
+        require_canonical_log_termination(bytes)?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let records = &bytes[..bytes.len() - 1];
+        if records.is_empty() {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        for line in records.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                return Err(BridgeError::unsafe_runtime());
+            }
+            validate_line(line)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_audit_log_line(line: &[u8]) -> BridgeResult<AuditLogRecord<'_>> {
+        let parsed: AuditLogRecord<'_> =
+            serde_json::from_slice(line).map_err(|_| BridgeError::unsafe_runtime())?;
+        let expected_category = match parsed.operation {
+            "configure-profile" | "remove-profile" | "set-default" | "schedule"
+            | "alert-policy" | "interface-settings" => "configuration",
+            "set-secret"
+            | "set-password"
+            | "remove-password"
+            | "set-totp"
+            | "remove-totp"
+            | "set-remote-log-token"
+            | "remove-remote-log-token" => "secrets",
+            "routine" | "remove-routine" => "routines",
+            "security-policy" => "security",
+            "rejected-post" => "bridge",
+            "session-notifications" => "notifications",
+            "doctor" | "plan" | "run" => "operations",
+            _ => return Err(BridgeError::unsafe_runtime()),
+        };
+        let expected_level = match parsed.state {
+            "requested" | "succeeded" => "info",
+            "failed" => "error",
+            "outcome_unknown" => "warn",
+            _ => return Err(BridgeError::unsafe_runtime()),
+        };
+        if parsed.epoch == 0
+            || PolicyLogLevel::parse(parsed.level).is_none()
+            || PolicyLogLevel::parse(parsed.configured_level).is_none()
+            || PolicyLogLevel::parse(parsed.subject_level).is_none()
+            || !parsed.mandatory
+            || parsed.category != "audit"
+            || parsed.subject_category != expected_category
+            || parsed.level != expected_level
+            || !valid_audit_transaction(parsed.transaction)
+            || !valid_audit_operation(parsed.operation)
+            || !valid_audit_profile(parsed.profile)
+            || !valid_authenticated_username(parsed.actor)
+            || parsed.actor_uid.is_none_or(|value| value == 0)
+            || !valid_audit_origin(parsed.origin)
+            || parsed
+                .client_request_id
+                .is_some_and(|value| !valid_client_request_id(value))
+            || if parsed.operation == "rejected-post" {
+                !matches!(parsed.origin, "bridge" | "controller")
+                    || parsed.client_request_id.is_some()
+            } else {
+                (parsed.origin == "bridge") != parsed.client_request_id.is_some()
+            }
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(parsed)
+    }
+
+    pub(super) fn valid_activity_code(value: &str) -> bool {
+        let Some((namespace, event)) = value.split_once('.') else {
+            return false;
+        };
+        let valid_segment = |segment: &str| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        };
+        valid_segment(namespace) && valid_segment(event) && !event.contains('.')
+    }
+
+    pub(super) fn validate_activity_log_line(line: &[u8]) -> BridgeResult<&str> {
+        let text = std::str::from_utf8(line).map_err(|_| BridgeError::unsafe_runtime())?;
+        let fields: Vec<&str> = text.split('|').collect();
+        if !matches!(fields.len(), 5 | 7 | 9)
+            || fields[0].parse::<u64>().is_err()
+            || !valid_activity_code(fields[1])
+            || !valid_audit_profile(fields[2])
+            || !matches!(
+                fields[3],
+                "running"
+                    | "succeeded"
+                    | "failed"
+                    | "deferred"
+                    | "scheduled"
+                    | "changed"
+                    | "unavailable"
+                    | "requested"
+            )
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        if fields.len() >= 7
+            && (policy_level_for_category(&SecurityPolicyArgs::default(), fields[4]).is_none()
+                || !matches!(fields[5], "trace" | "debug" | "info" | "warn" | "error"))
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        if fields.len() == 9
+            && (fields[6]
+                .parse::<u32>()
+                .ok()
+                .filter(|value| *value != 0)
+                .is_none()
+                || !valid_authenticated_username(fields[7]))
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let message = fields[fields.len() - 1];
+        if message.len() > 4096
+            || message
+                .chars()
+                .any(|character| character.is_control() || character == '\u{7f}')
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(text)
+    }
+
+    pub(super) fn repair_durable_log_tail(kind: &str, package_uid: u32) -> BridgeResult<bool> {
+        match kind {
+            "audit" => repair_durable_log_tail_at(
+                Path::new(LOG_ROOT),
+                Path::new(AUDIT_LOG_PATH),
+                package_uid,
+                5,
+                11 * 1024 * 1024,
+                |line| validate_audit_log_line(line).map(|_| ()),
+            ),
+            "activity" => repair_durable_log_tail_at(
+                Path::new(LOG_ROOT),
+                Path::new(ACTIVITY_LOG_PATH),
+                package_uid,
+                3,
+                2 * 1024 * 1024,
+                |line| validate_activity_log_line(line).map(|_| ()),
+            ),
+            _ => Err(BridgeError::bad_request()),
+        }
+    }
+
+    pub(super) fn repair_durable_log_tail_at<T>(
+        log_root: &Path,
+        active_log: &Path,
+        package_uid: u32,
+        keep: usize,
+        maximum: usize,
+        validate_line: impl Fn(&[u8]) -> BridgeResult<T>,
+    ) -> BridgeResult<bool> {
+        validate_private_directory(log_root, package_uid)?;
+        let mut repaired = false;
+        for (index, path) in rotating_log_paths(active_log, keep).into_iter().enumerate() {
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .write(index == 0)
+                .custom_flags(NOFOLLOW_CLOEXEC);
+            let mut file = match options.open(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(BridgeError::unsafe_runtime()),
+            };
+            let metadata = file.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
+            if !metadata.file_type().is_file()
+                || metadata.st_uid() != package_uid
+                || metadata.st_mode() & 0o7777 != 0o600
+                || metadata.st_nlink() != 1
+                || metadata.len() > maximum as u64
+            {
+                return Err(BridgeError::unsafe_runtime());
+            }
+            let mut bytes = Vec::with_capacity(metadata.len() as usize + 1);
+            Read::by_ref(&mut file)
+                .take((maximum + 1) as u64)
+                .read_to_end(&mut bytes)
+                .map_err(|_| BridgeError::unsafe_runtime())?;
+            if bytes.len() > maximum || bytes.len() as u64 != metadata.len() {
+                return Err(BridgeError::unsafe_runtime());
+            }
+
+            if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+                if index != 0 {
+                    return Err(BridgeError::unsafe_runtime());
+                }
+                let tail_start = bytes
+                    .iter()
+                    .rposition(|byte| *byte == b'\n')
+                    .map_or(0, |position| position + 1);
+                validate_canonical_log_records(&bytes[..tail_start], &validate_line)?;
+                if validate_line(&bytes[tail_start..]).is_ok() {
+                    if bytes.len() == maximum {
+                        return Err(BridgeError::unsafe_runtime());
+                    }
+                    file.seek(SeekFrom::End(0))
+                        .and_then(|_| file.write_all(b"\n"))
+                        .map_err(|_| BridgeError::unsafe_runtime())?;
+                    bytes.push(b'\n');
+                } else {
+                    file.set_len(tail_start as u64)
+                        .map_err(|_| BridgeError::unsafe_runtime())?;
+                    bytes.truncate(tail_start);
+                }
+                file.sync_all().map_err(|_| BridgeError::unsafe_runtime())?;
+                repaired = true;
+            }
+            validate_canonical_log_records(&bytes, &validate_line)?;
+        }
+        if repaired {
+            sync_directory(log_root)?;
+        }
+        Ok(repaired)
+    }
+
+    fn rotating_log_paths(base: &Path, keep: usize) -> Vec<PathBuf> {
+        let mut paths = Vec::with_capacity(keep + 1);
+        paths.push(base.to_owned());
+        for index in 1..=keep {
+            let mut rotated = base.as_os_str().to_os_string();
+            rotated.push(format!(".{index}"));
+            paths.push(PathBuf::from(rotated));
+        }
+        paths
+    }
+
+    fn open_private_log_file(
+        path: &Path,
+        package_uid: u32,
+        maximum: usize,
+    ) -> BridgeResult<Option<(File, Vec<u8>)>> {
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(NOFOLLOW_CLOEXEC);
+        let mut file = match options.open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(BridgeError::unsafe_runtime()),
+        };
+        let metadata = file.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
+        if !metadata.file_type().is_file()
+            || metadata.st_uid() != package_uid
+            || metadata.st_mode() & 0o7777 != 0o600
+            || metadata.st_nlink() != 1
+            || metadata.len() > maximum as u64
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        Read::by_ref(&mut file)
+            .take((maximum + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        if bytes.len() > maximum || bytes.len() as u64 != metadata.len() {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(Some((file, bytes)))
+    }
+
+    pub(super) fn load_security_policy(package_uid: u32) -> BridgeResult<SecurityPolicyArgs> {
+        load_security_policy_at(Path::new(SECURITY_POLICY_PATH), package_uid)
+    }
+
+    pub(super) fn load_security_policy_at(
+        path: &Path,
+        package_uid: u32,
+    ) -> BridgeResult<SecurityPolicyArgs> {
+        let parent = path.parent().ok_or_else(BridgeError::unsafe_runtime)?;
+        validate_private_directory(parent, package_uid)?;
+        match read_optional_single_link_private_file(path, package_uid, 8 * 1024)? {
+            Some(bytes) => parse_security_policy_file(&bytes),
+            None => Ok(SecurityPolicyArgs::default()),
+        }
+    }
+
+    pub(super) fn migrate_security_policy(package_uid: u32) -> BridgeResult<bool> {
+        migrate_security_policy_at(Path::new(SECURITY_POLICY_PATH), package_uid)
+    }
+
+    pub(super) fn security_policy_migration_required(package_uid: u32) -> BridgeResult<bool> {
+        security_policy_migration_required_at(Path::new(SECURITY_POLICY_PATH), package_uid)
+    }
+
+    fn migrated_security_policy(existing: &[u8]) -> BridgeResult<Option<Vec<u8>>> {
+        if parse_security_policy_file(existing).is_ok() {
+            return Ok(None);
+        }
+        let text = std::str::from_utf8(existing).map_err(|_| BridgeError::unsafe_runtime())?;
+        if text.lines().any(|line| line.starts_with("policy_version=")) {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let mut migrated = Vec::with_capacity(existing.len() + 17);
+        migrated.extend_from_slice(b"policy_version=1\n");
+        migrated.extend_from_slice(existing);
+        parse_security_policy_file(&migrated)?;
+        Ok(Some(migrated))
+    }
+
+    pub(super) fn security_policy_migration_required_at(
+        path: &Path,
+        package_uid: u32,
+    ) -> BridgeResult<bool> {
+        let parent = path.parent().ok_or_else(BridgeError::unsafe_runtime)?;
+        validate_private_directory(parent, package_uid)?;
+        let Some(existing) = read_optional_single_link_private_file(path, package_uid, 8 * 1024)?
+        else {
+            return Ok(false);
+        };
+        Ok(migrated_security_policy(&existing)?.is_some())
+    }
+
+    pub(super) fn migrate_security_policy_at(path: &Path, package_uid: u32) -> BridgeResult<bool> {
+        let parent = path.parent().ok_or_else(BridgeError::unsafe_runtime)?;
+        validate_private_directory(parent, package_uid)?;
+        let Some(existing) = read_optional_single_link_private_file(path, package_uid, 8 * 1024)?
+        else {
+            return Ok(false);
+        };
+        let Some(migrated) = migrated_security_policy(&existing)? else {
+            return Ok(false);
+        };
+
+        let temporary = parent.join(".security.conf.policy-v1.tmp");
+        match fs::symlink_metadata(&temporary) {
+            Ok(_) => {
+                let _ = read_exact_single_link_private_file(&temporary, package_uid, 8 * 1024)?;
+                fs::remove_file(&temporary).map_err(|_| BridgeError::unsafe_runtime())?;
+                sync_directory(parent)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(BridgeError::unsafe_runtime()),
+        }
+        create_private_file(&temporary, package_uid, &migrated)?;
+        fs::rename(&temporary, path).map_err(|_| BridgeError::unsafe_runtime())?;
+        sync_directory(parent)?;
+        Ok(true)
+    }
 
     pub(super) fn load_or_create_csrf_key(
         paths: &ControlPaths<'_>,
@@ -3689,29 +5547,59 @@ mod linux_files {
         Ok(nonce)
     }
 
-    pub(super) fn enqueue(
+    pub(super) fn enqueue<F>(
         paths: &ControlPaths<'_>,
         request: EnqueueRequest<'_>,
-    ) -> BridgeResult<String> {
+        maximum_outstanding_jobs: usize,
+        mut record_audit: F,
+    ) -> BridgeResult<EnqueueOutcome>
+    where
+        F: FnMut(&AuditOutboxRecord, &str) -> BridgeResult<()>,
+    {
         let EnqueueRequest {
             package_uid,
             client_request_id,
             requested_by,
+            requested_uid,
             session_binding,
+            audit_transaction,
+            request_fingerprint,
             issued_at_epoch,
             mutation,
             secret,
         } = request;
         validate_private_directory(paths.root, package_uid)?;
         validate_private_directory(paths.requests, package_uid)?;
-        let mut enqueue_lock = open_enqueue_lock(paths, package_uid)?;
-        validate_outstanding_queue_capacity(paths, package_uid)?;
-        let request_id = next_job_id(&mut enqueue_lock)?;
+        validate_private_directory(paths.processing, package_uid)?;
+        validate_private_directory(paths.responses, package_uid)?;
+        validate_private_directory(paths.staging, package_uid)?;
+        let _enqueue_lock = open_enqueue_lock(paths, package_uid)?;
+        let audit_paths = paths.audit_outbox();
+        reconcile_audit_transactions(&audit_paths, package_uid, &mut record_audit)?;
+        recover_legacy_queue_temps(paths, package_uid)?;
+        recover_staging_files(paths, package_uid, issued_at_epoch)?;
+        recover_orphan_canonical_secrets(paths, package_uid)?;
+        if let Some(existing) = find_idempotent_job(
+            paths,
+            package_uid,
+            client_request_id,
+            requested_by,
+            requested_uid,
+            session_binding,
+            request_fingerprint,
+        )? {
+            return Ok(EnqueueOutcome::Existing(existing));
+        }
+        validate_outstanding_queue_capacity(paths, package_uid, maximum_outstanding_jobs)?;
+        let request_id = next_job_id(paths, package_uid)?;
         let job = canonical_job_bytes(
             &request_id,
             client_request_id,
             requested_by,
+            requested_uid,
             session_binding,
+            audit_transaction,
+            request_fingerprint,
             issued_at_epoch,
             mutation,
         )?;
@@ -3719,38 +5607,107 @@ mod linux_files {
             return Err(BridgeError::bad_request());
         }
         let final_job = paths.requests.join(format!("{request_id}.json"));
-        let temporary_job = paths
-            .requests
-            .join(format!(".{request_id}.{}.job", std::process::id()));
+        let temporary_job = paths.staging.join(format!("{request_id}.job.tmp"));
         let secret_path = paths.requests.join(format!("{request_id}.secret"));
+        let temporary_secret = paths.staging.join(format!("{request_id}.secret.tmp"));
         if final_job.exists() || secret_path.exists() {
             return Err(BridgeError::new(ErrorKind::Conflict));
         }
+        if secret.is_some_and(|value| value.is_empty() || value.len() > MAX_SECRET_BYTES) {
+            return Err(BridgeError::bad_request());
+        }
+        create_private_file(&temporary_job, package_uid, &job)?;
+        let (owner_pid, owner_start, owner_boot) = current_process_identity()?;
+        let audit_record = AuditOutboxRecord {
+            schema: "sdsync.dsm-audit-outbox.v1".to_owned(),
+            transaction: audit_transaction.to_owned(),
+            operation: mutation_audit_operation(mutation).to_owned(),
+            profile: mutation_audit_profile(mutation).to_owned(),
+            actor: requested_by.to_owned(),
+            actor_uid: requested_uid,
+            origin: "bridge".to_owned(),
+            client_request_id: Some(client_request_id.to_owned()),
+            job_id: Some(request_id.clone()),
+            owner_pid,
+            owner_start,
+            owner_boot,
+            phase: AuditOutboxPhase::Prepared,
+        };
+        if let Err(error) = audit_transaction_begin(
+            &audit_paths,
+            package_uid,
+            audit_record,
+            AuditOutboxPhase::Publishing,
+            &mut record_audit,
+        ) {
+            let _ = fs::remove_file(&temporary_job);
+            return Err(error);
+        }
 
         if let Some(secret) = secret {
-            if secret.is_empty() || secret.len() > MAX_SECRET_BYTES {
-                return Err(BridgeError::bad_request());
-            }
             let mut secret_line = Zeroizing::new(Vec::with_capacity(secret.len() + 1));
             secret_line.extend_from_slice(secret);
             secret_line.push(b'\n');
-            create_private_file(&secret_path, package_uid, &secret_line)?;
-        }
-
-        let publish_result = (|| {
-            create_private_file(&temporary_job, package_uid, &job)?;
-            fs::hard_link(&temporary_job, &final_job).map_err(|error| map_create_error(&error))?;
-            fs::remove_file(&temporary_job).map_err(|_| BridgeError::unsafe_runtime())?;
-            sync_directory(paths.requests)
-        })();
-        if publish_result.is_err() {
-            let _ = fs::remove_file(&temporary_job);
-            if secret.is_some() {
+            if let Err(error) = create_private_file(&temporary_secret, package_uid, &secret_line)
+                .and_then(|()| {
+                    fs::hard_link(&temporary_secret, &secret_path)
+                        .map_err(|error| map_create_error(&error))
+                })
+            {
+                let _ = fs::remove_file(&temporary_job);
+                let _ = fs::remove_file(&temporary_secret);
                 let _ = fs::remove_file(&secret_path);
+                audit_transaction_complete(
+                    &audit_paths,
+                    package_uid,
+                    audit_transaction,
+                    AuditOutboxPhase::Failed,
+                    &mut record_audit,
+                )?;
+                return Err(error);
             }
         }
-        publish_result?;
-        Ok(request_id)
+        if let Err(error) =
+            fs::hard_link(&temporary_job, &final_job).map_err(|error| map_create_error(&error))
+        {
+            let _ = fs::remove_file(&temporary_job);
+            let _ = fs::remove_file(&temporary_secret);
+            let _ = fs::remove_file(&secret_path);
+            audit_transaction_complete(
+                &audit_paths,
+                package_uid,
+                audit_transaction,
+                AuditOutboxPhase::Failed,
+                &mut record_audit,
+            )?;
+            return Err(error);
+        }
+
+        // Once the canonical job name is visible, never report an ordinary
+        // enqueue failure or remove its secret: the controller may execute it
+        // immediately. Cleanup/durability failures are an accepted but
+        // outcome-unknown state tied to the same server job ID.
+        let mut durability_uncertain = mark_audit_transaction_queued(
+            &audit_paths,
+            package_uid,
+            audit_transaction,
+            &request_id,
+        )
+        .is_err();
+        for temporary in [&temporary_job, &temporary_secret] {
+            if (temporary.exists() || fs::symlink_metadata(temporary).is_ok())
+                && fs::remove_file(temporary).is_err()
+            {
+                durability_uncertain = true;
+            }
+        }
+        if sync_directory(paths.requests).is_err() || sync_directory(paths.staging).is_err() {
+            durability_uncertain = true;
+        }
+        Ok(EnqueueOutcome::Published {
+            job_id: request_id,
+            durability_uncertain,
+        })
     }
 
     pub(super) fn read_job(
@@ -3882,22 +5839,33 @@ mod linux_files {
         if response.is_empty() || response.len() > MAX_MANAGER_OUTPUT_BYTES {
             return Err(BridgeError::new(ErrorKind::Unavailable));
         }
-        let temporary = paths
-            .responses
-            .join(format!(".{request_id}.{}.response", std::process::id()));
+        let temporary = paths.staging.join(format!("{request_id}.response.tmp"));
         if path.exists() {
             return Err(BridgeError::new(ErrorKind::Conflict));
         }
-        let result = (|| {
-            create_private_file(&temporary, package_uid, response)?;
-            fs::hard_link(&temporary, path).map_err(|error| map_create_error(&error))?;
-            fs::remove_file(&temporary).map_err(|_| BridgeError::unsafe_runtime())?;
-            sync_directory(paths.responses)
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
+        if temporary.exists() || fs::symlink_metadata(&temporary).is_ok() {
+            let companions = vec![path.to_path_buf()];
+            remove_private_staging_file(
+                &temporary,
+                package_uid,
+                MAX_MANAGER_OUTPUT_BYTES,
+                &companions,
+            )?;
         }
-        result
+        create_private_file(&temporary, package_uid, response)?;
+        if let Err(error) =
+            fs::hard_link(&temporary, path).map_err(|error| map_create_error(&error))
+        {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        // As with request publication, a visible canonical response is the
+        // authoritative outcome. Never convert post-publication cleanup or
+        // fsync trouble into a false consumer failure.
+        let _ = fs::remove_file(&temporary);
+        let _ = sync_directory(paths.responses);
+        let _ = sync_directory(paths.staging);
+        Ok(())
     }
 
     fn key_from_bytes(bytes: Zeroizing<Vec<u8>>) -> BridgeResult<Zeroizing<[u8; 32]>> {
@@ -3935,11 +5903,549 @@ mod linux_files {
         Ok(file)
     }
 
-    fn validate_outstanding_queue_capacity(
+    pub(super) fn private_file_metadata_with_companion(
+        path: &Path,
+        package_uid: u32,
+        maximum: usize,
+        published_companions: &[PathBuf],
+    ) -> BridgeResult<fs::Metadata> {
+        let metadata = fs::symlink_metadata(path).map_err(|_| BridgeError::unsafe_runtime())?;
+        if !metadata.file_type().is_file()
+            || metadata.st_uid() != package_uid
+            || metadata.st_mode() & 0o777 != 0o600
+            || !matches!(metadata.st_nlink(), 1 | 2)
+            || metadata.len() > maximum as u64
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        match metadata.st_nlink() {
+            1 => {}
+            2 => {
+                let mut matching_companions = 0_u8;
+                for companion in published_companions {
+                    let companion_metadata = match fs::symlink_metadata(companion) {
+                        Ok(metadata) => metadata,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                        Err(_) => return Err(BridgeError::unsafe_runtime()),
+                    };
+                    if companion_metadata.file_type().is_file()
+                        && companion_metadata.st_uid() == package_uid
+                        && companion_metadata.st_mode() & 0o777 == 0o600
+                        && companion_metadata.st_nlink() == 2
+                        && companion_metadata.st_dev() == metadata.st_dev()
+                        && companion_metadata.st_ino() == metadata.st_ino()
+                    {
+                        matching_companions = matching_companions.saturating_add(1);
+                    }
+                }
+                if matching_companions != 1 {
+                    return Err(BridgeError::unsafe_runtime());
+                }
+            }
+            _ => return Err(BridgeError::unsafe_runtime()),
+        }
+        Ok(metadata)
+    }
+
+    fn private_file_metadata(
+        path: &Path,
+        package_uid: u32,
+        maximum: usize,
+    ) -> BridgeResult<fs::Metadata> {
+        private_file_metadata_with_companion(path, package_uid, maximum, &[])
+    }
+
+    fn remove_private_staging_file(
+        path: &Path,
+        package_uid: u32,
+        maximum: usize,
+        published_companions: &[PathBuf],
+    ) -> BridgeResult<()> {
+        let _ =
+            private_file_metadata_with_companion(path, package_uid, maximum, published_companions)?;
+        fs::remove_file(path).map_err(|_| BridgeError::unsafe_runtime())
+    }
+
+    fn legacy_temporary_name(name: &str, suffix: &str) -> bool {
+        let Some(value) = name
+            .strip_prefix('.')
+            .and_then(|value| value.strip_suffix(suffix))
+        else {
+            return false;
+        };
+        let Some((request_id, pid)) = value.rsplit_once('.') else {
+            return false;
+        };
+        valid_server_job_id(request_id)
+            && !pid.is_empty()
+            && !pid.starts_with('0')
+            && pid.bytes().all(|byte| byte.is_ascii_digit())
+    }
+
+    pub(super) fn recover_legacy_queue_temps(
         paths: &ControlPaths<'_>,
         package_uid: u32,
     ) -> BridgeResult<()> {
-        let mut jobs = 0_usize;
+        for (directory, suffix, maximum) in [
+            (paths.requests, ".job", MAX_JOB_BYTES),
+            (paths.responses, ".response", MAX_MANAGER_OUTPUT_BYTES),
+        ] {
+            for entry in fs::read_dir(directory).map_err(|_| BridgeError::unsafe_runtime())? {
+                let entry = entry.map_err(|_| BridgeError::unsafe_runtime())?;
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| BridgeError::unsafe_runtime())?;
+                if !name.starts_with('.') {
+                    continue;
+                }
+                if directory == paths.responses
+                    && response_audit_reconcile_temp_job_id(&name).is_some()
+                {
+                    validate_response_audit_reconcile_temp(&entry.path(), package_uid)?;
+                    continue;
+                }
+                if !legacy_temporary_name(&name, suffix) {
+                    return Err(BridgeError::unsafe_runtime());
+                }
+                let path = entry.path();
+                let value = name
+                    .strip_prefix('.')
+                    .and_then(|value| value.strip_suffix(suffix))
+                    .ok_or_else(BridgeError::unsafe_runtime)?;
+                let (request_id, _) = value
+                    .rsplit_once('.')
+                    .ok_or_else(BridgeError::unsafe_runtime)?;
+                let mut companions = vec![directory.join(format!("{request_id}.json"))];
+                if directory == paths.requests {
+                    companions.push(paths.processing.join(format!("{request_id}.json")));
+                }
+                remove_private_staging_file(&path, package_uid, maximum, &companions)?;
+            }
+            sync_directory(directory)?;
+        }
+        Ok(())
+    }
+
+    fn staging_entry_maximum(name: &str) -> Option<usize> {
+        if name == "enqueue.sequence.tmp" {
+            return Some(16);
+        }
+        let (request_id, maximum) = if let Some(request_id) = name.strip_suffix(".job.tmp") {
+            (request_id, MAX_JOB_BYTES)
+        } else if let Some(request_id) = name.strip_suffix(".secret.tmp") {
+            (request_id, MAX_SECRET_BYTES + 1)
+        } else if let Some(request_id) = name.strip_suffix(".response.tmp") {
+            (request_id, MAX_MANAGER_OUTPUT_BYTES)
+        } else {
+            return None;
+        };
+        valid_server_job_id(request_id).then_some(maximum)
+    }
+
+    fn staging_published_companions(paths: &ControlPaths<'_>, name: &str) -> Vec<PathBuf> {
+        if let Some(request_id) = name.strip_suffix(".job.tmp") {
+            if valid_server_job_id(request_id) {
+                vec![
+                    paths.requests.join(format!("{request_id}.json")),
+                    paths.processing.join(format!("{request_id}.json")),
+                ]
+            } else {
+                Vec::new()
+            }
+        } else if let Some(request_id) = name.strip_suffix(".secret.tmp") {
+            if valid_server_job_id(request_id) {
+                vec![
+                    paths.requests.join(format!("{request_id}.secret")),
+                    paths.processing.join(format!("{request_id}.secret")),
+                ]
+            } else {
+                Vec::new()
+            }
+        } else if let Some(request_id) = name.strip_suffix(".response.tmp") {
+            if valid_server_job_id(request_id) {
+                vec![paths.responses.join(format!("{request_id}.json"))]
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn recover_staging_files(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+        now: u64,
+    ) -> BridgeResult<()> {
+        for entry in fs::read_dir(paths.staging).map_err(|_| BridgeError::unsafe_runtime())? {
+            let entry = entry.map_err(|_| BridgeError::unsafe_runtime())?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| BridgeError::unsafe_runtime())?;
+            let maximum = staging_entry_maximum(&name).ok_or_else(BridgeError::unsafe_runtime)?;
+            let path = entry.path();
+            let companions = staging_published_companions(paths, &name);
+            let metadata =
+                private_file_metadata_with_companion(&path, package_uid, maximum, &companions)?;
+            let modified = metadata
+                .modified()
+                .map_err(|_| BridgeError::unsafe_runtime())?
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| BridgeError::unsafe_runtime())?
+                .as_secs();
+            if modified > now.saturating_add(CLOCK_SKEW_SECONDS) {
+                return Err(BridgeError::unsafe_runtime());
+            }
+            let serialized_enqueue_staging = name == "enqueue.sequence.tmp"
+                || name.ends_with(".job.tmp")
+                || name.ends_with(".secret.tmp");
+            if metadata.st_nlink() == 2
+                || serialized_enqueue_staging
+                || now.saturating_sub(modified) > MAX_JOB_AGE_SECONDS
+            {
+                fs::remove_file(&path).map_err(|_| BridgeError::unsafe_runtime())?;
+            }
+        }
+        sync_directory(paths.staging)
+    }
+
+    fn canonical_job_is_present(
+        paths: &ControlPaths<'_>,
+        request_id: &str,
+        package_uid: u32,
+    ) -> BridgeResult<bool> {
+        // Check the queued name before the processing name. A controller move
+        // is atomic within this filesystem, so that order cannot miss a job
+        // moving requests -> processing.
+        for directory in [paths.requests, paths.processing] {
+            let job = directory.join(format!("{request_id}.json"));
+            let metadata = match fs::symlink_metadata(&job) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(BridgeError::unsafe_runtime()),
+            };
+            if !metadata.file_type().is_file()
+                || metadata.st_uid() != package_uid
+                || metadata.st_mode() & 0o777 != 0o600
+                || metadata.st_nlink() != 1
+                || metadata.len() > MAX_JOB_BYTES as u64
+            {
+                return Err(BridgeError::unsafe_runtime());
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub(super) fn recover_orphan_canonical_secrets(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+    ) -> BridgeResult<()> {
+        for directory in [paths.requests, paths.processing] {
+            validate_private_directory(directory, package_uid)?;
+            for entry in fs::read_dir(directory).map_err(|_| BridgeError::unsafe_runtime())? {
+                let entry = entry.map_err(|_| BridgeError::unsafe_runtime())?;
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| BridgeError::unsafe_runtime())?;
+                let Some(request_id) = name.strip_suffix(".secret") else {
+                    continue;
+                };
+                if !valid_server_job_id(request_id) {
+                    return Err(BridgeError::unsafe_runtime());
+                }
+                let secret_path = entry.path();
+                let before = match fs::symlink_metadata(&secret_path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(_) => return Err(BridgeError::unsafe_runtime()),
+                };
+                if !before.file_type().is_file()
+                    || before.st_uid() != package_uid
+                    || before.st_mode() & 0o777 != 0o600
+                    || before.st_nlink() != 1
+                    || before.len() > (MAX_SECRET_BYTES + 1) as u64
+                {
+                    return Err(BridgeError::unsafe_runtime());
+                }
+                if canonical_job_is_present(paths, request_id, package_uid)? {
+                    continue;
+                }
+
+                // Re-observe both the name and queue topology before deleting.
+                // A vanished/moved candidate is a controller race and is left
+                // alone; an existing replacement or malformed artifact is an
+                // unsafe state. Only the exact stable inode with no executable
+                // job is an orphan from a pre-publication crash.
+                std::thread::yield_now();
+                if canonical_job_is_present(paths, request_id, package_uid)? {
+                    continue;
+                }
+                let current = match fs::symlink_metadata(&secret_path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(_) => return Err(BridgeError::unsafe_runtime()),
+                };
+                if !current.file_type().is_file()
+                    || current.st_uid() != package_uid
+                    || current.st_mode() & 0o777 != 0o600
+                    || current.st_nlink() != 1
+                    || current.len() > (MAX_SECRET_BYTES + 1) as u64
+                    || current.st_dev() != before.st_dev()
+                    || current.st_ino() != before.st_ino()
+                {
+                    return Err(BridgeError::unsafe_runtime());
+                }
+                match fs::remove_file(&secret_path) {
+                    Ok(()) => sync_directory(directory)?,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(_) => return Err(BridgeError::unsafe_runtime()),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // These are the two complete immutable identities being compared. Keeping
+    // every field explicit makes omission of actor, session, or fingerprint
+    // material visible at this security boundary.
+    #[allow(clippy::too_many_arguments)]
+    fn matching_idempotency_key(
+        client_request_id: &str,
+        requested_by: &str,
+        requested_uid: u32,
+        session_binding: &[u8; 32],
+        request_fingerprint: &str,
+        existing_client_request_id: &str,
+        existing_requested_by: &str,
+        existing_requested_uid: u32,
+        existing_session_binding: &[u8; 32],
+        existing_request_fingerprint: &str,
+    ) -> BridgeResult<bool> {
+        if existing_client_request_id != client_request_id
+            || !session_binding_matches(existing_session_binding, session_binding)
+        {
+            return Ok(false);
+        }
+        if existing_requested_by != requested_by || existing_requested_uid != requested_uid {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        if !constant_time_equal(
+            existing_request_fingerprint.as_bytes(),
+            request_fingerprint.as_bytes(),
+        ) {
+            return Err(BridgeError::new(ErrorKind::Conflict));
+        }
+        Ok(true)
+    }
+
+    fn response_audit_reconcile_temp_job_id(name: &str) -> Option<&str> {
+        name.strip_prefix('.')
+            .and_then(|value| value.strip_suffix(".audit-reconciled.tmp"))
+            .filter(|value| valid_server_job_id(value))
+    }
+
+    fn validate_response_audit_reconcile_temp(path: &Path, package_uid: u32) -> BridgeResult<()> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(BridgeError::unsafe_runtime()),
+        };
+        if !metadata.file_type().is_file()
+            || metadata.st_uid() != package_uid
+            || metadata.st_mode() & 0o777 != 0o600
+            || metadata.st_nlink() != 1
+            || metadata.len() > MAX_MANAGER_OUTPUT_BYTES as u64
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(())
+    }
+
+    pub(super) fn collect_json_job_ids(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+    ) -> BridgeResult<BTreeSet<String>> {
+        let mut ids = BTreeSet::new();
+        for directory in [paths.requests, paths.processing, paths.responses] {
+            for entry in fs::read_dir(directory).map_err(|_| BridgeError::unsafe_runtime())? {
+                let entry = entry.map_err(|_| BridgeError::unsafe_runtime())?;
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| BridgeError::unsafe_runtime())?;
+                if directory == paths.responses
+                    && response_audit_reconcile_temp_job_id(&name).is_some()
+                {
+                    // Audit reconciliation atomically replaces a terminal
+                    // response while holding the outbox lock. Enqueue uses a
+                    // separate lock, so its stable idempotency scan may see
+                    // this bounded private staging name. It is not a queue
+                    // object and must not make a valid enqueue fail. Existing
+                    // malformed lookalikes still fail closed.
+                    validate_response_audit_reconcile_temp(&entry.path(), package_uid)?;
+                    continue;
+                }
+                if name.ends_with(".secret")
+                    && (directory == paths.requests || directory == paths.processing)
+                {
+                    continue;
+                }
+                let Some(request_id) = name.strip_suffix(".json") else {
+                    return Err(BridgeError::unsafe_runtime());
+                };
+                if !valid_server_job_id(request_id) {
+                    return Err(BridgeError::unsafe_runtime());
+                }
+                ids.insert(request_id.to_owned());
+            }
+        }
+        Ok(ids)
+    }
+
+    fn read_transient_optional_private_file(
+        path: &Path,
+        package_uid: u32,
+        maximum: usize,
+    ) -> BridgeResult<Option<Zeroizing<Vec<u8>>>> {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(BridgeError::unsafe_runtime()),
+            Ok(_) => match read_exact_private_file(path, package_uid, maximum) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error)
+                    if error.kind == ErrorKind::Unavailable
+                        && fs::symlink_metadata(path).is_err_and(|follow_up| {
+                            follow_up.kind() == io::ErrorKind::NotFound
+                        }) =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            },
+        }
+    }
+
+    type IdempotencyRecord = (String, String, u32, [u8; 32], String);
+
+    fn read_any_idempotency_record(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+        request_id: &str,
+    ) -> BridgeResult<Option<IdempotencyRecord>> {
+        for (directory, response) in [
+            (paths.requests, false),
+            (paths.processing, false),
+            (paths.responses, true),
+        ] {
+            let path = directory.join(format!("{request_id}.json"));
+            let maximum = if response {
+                MAX_MANAGER_OUTPUT_BYTES
+            } else {
+                MAX_JOB_BYTES
+            };
+            let Some(bytes) = read_transient_optional_private_file(&path, package_uid, maximum)?
+            else {
+                continue;
+            };
+            if response {
+                let parsed = parse_queued_response(&bytes, request_id)?;
+                return Ok(Some((
+                    parsed.client_request_id.clone(),
+                    parsed.requested_by.clone(),
+                    parsed.requested_uid,
+                    parsed.session_binding,
+                    parsed.request_fingerprint.clone(),
+                )));
+            }
+            let parsed = parse_job(&bytes)?;
+            return Ok(Some((
+                parsed.client_request_id.clone(),
+                parsed.requested_by.clone(),
+                parsed.requested_uid,
+                parsed.session_binding,
+                parsed.request_fingerprint.clone(),
+            )));
+        }
+        Ok(None)
+    }
+
+    fn find_idempotent_job(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+        client_request_id: &str,
+        requested_by: &str,
+        requested_uid: u32,
+        session_binding: &[u8; 32],
+        request_fingerprint: &str,
+    ) -> BridgeResult<Option<String>> {
+        for _ in 0..4 {
+            let before = collect_json_job_ids(paths, package_uid)?;
+            let mut found: Option<String> = None;
+            let mut conflict = false;
+            let mut vanished = false;
+            for request_id in &before {
+                let Some((
+                    existing_client,
+                    existing_actor,
+                    existing_actor_uid,
+                    existing_binding,
+                    existing_fingerprint,
+                )) = read_any_idempotency_record(paths, package_uid, request_id)?
+                else {
+                    vanished = true;
+                    continue;
+                };
+                match matching_idempotency_key(
+                    client_request_id,
+                    requested_by,
+                    requested_uid,
+                    session_binding,
+                    request_fingerprint,
+                    &existing_client,
+                    &existing_actor,
+                    existing_actor_uid,
+                    &existing_binding,
+                    &existing_fingerprint,
+                ) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        if found
+                            .as_deref()
+                            .is_some_and(|existing| existing != request_id)
+                        {
+                            return Err(BridgeError::unsafe_runtime());
+                        }
+                        found = Some(request_id.to_owned());
+                    }
+                    Err(error) if error.kind == ErrorKind::Conflict => conflict = true,
+                    Err(error) => return Err(error),
+                }
+            }
+            let after = collect_json_job_ids(paths, package_uid)?;
+            if !vanished && before == after {
+                if conflict {
+                    return Err(BridgeError::new(ErrorKind::Conflict));
+                }
+                return Ok(found);
+            }
+            std::thread::yield_now();
+        }
+        Err(BridgeError::new(ErrorKind::Unavailable))
+    }
+
+    fn validate_outstanding_queue_capacity(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+        maximum_outstanding_jobs: usize,
+    ) -> BridgeResult<()> {
+        if !(1..=MAX_OUTSTANDING_JOBS).contains(&maximum_outstanding_jobs) {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let mut jobs = BTreeSet::new();
         for directory in [paths.requests, paths.processing] {
             validate_private_directory(directory, package_uid)?;
             for entry in fs::read_dir(directory).map_err(|_| BridgeError::unsafe_runtime())? {
@@ -3973,52 +6479,1033 @@ mod linux_files {
                     return Err(BridgeError::unsafe_runtime());
                 }
                 if is_job {
-                    jobs = jobs
-                        .checked_add(1)
-                        .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+                    jobs.insert(request_id.to_owned());
                 }
             }
         }
-        if jobs >= MAX_OUTSTANDING_JOBS {
+        if jobs.len() >= maximum_outstanding_jobs {
             return Err(BridgeError::new(ErrorKind::Conflict));
         }
         Ok(())
     }
 
-    fn next_job_id(lock: &mut File) -> BridgeResult<String> {
-        lock.seek(SeekFrom::Start(0))
-            .map_err(|_| BridgeError::unsafe_runtime())?;
-        let mut previous_text = String::new();
-        Read::by_ref(lock)
-            .take(17)
-            .read_to_string(&mut previous_text)
-            .map_err(|_| BridgeError::unsafe_runtime())?;
-        let previous = if previous_text.is_empty() {
-            0
-        } else if previous_text.len() == 16
-            && previous_text
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    fn parse_sequence(bytes: &[u8]) -> Option<u64> {
+        if bytes.len() != 16
+            || !bytes
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
         {
-            u64::from_str_radix(&previous_text, 16).map_err(|_| BridgeError::unsafe_runtime())?
-        } else {
-            return Err(BridgeError::unsafe_runtime());
+            return None;
+        }
+        std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|value| u64::from_str_radix(value, 16).ok())
+    }
+
+    fn maximum_published_sequence(paths: &ControlPaths<'_>, package_uid: u32) -> BridgeResult<u64> {
+        let mut maximum = 0_u64;
+        for directory in [paths.requests, paths.processing, paths.responses] {
+            for entry in fs::read_dir(directory).map_err(|_| BridgeError::unsafe_runtime())? {
+                let entry = entry.map_err(|_| BridgeError::unsafe_runtime())?;
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| BridgeError::unsafe_runtime())?;
+                let Some(request_id) = name.strip_suffix(".json") else {
+                    continue;
+                };
+                if !valid_server_job_id(request_id) {
+                    return Err(BridgeError::unsafe_runtime());
+                }
+                let maximum_size = if directory == paths.responses {
+                    MAX_MANAGER_OUTPUT_BYTES
+                } else {
+                    MAX_JOB_BYTES
+                };
+                let _ = private_file_metadata(&entry.path(), package_uid, maximum_size)?;
+                let prefix = u64::from_str_radix(&request_id[..16], 16)
+                    .map_err(|_| BridgeError::unsafe_runtime())?;
+                maximum = maximum.max(prefix);
+            }
+        }
+        Ok(maximum)
+    }
+
+    fn publish_enqueue_sequence(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+        encoded: &[u8; 16],
+    ) -> BridgeResult<()> {
+        let temporary = paths.staging.join("enqueue.sequence.tmp");
+        if temporary.exists() || fs::symlink_metadata(&temporary).is_ok() {
+            remove_private_staging_file(&temporary, package_uid, 16, &[])?;
+        }
+        if paths.enqueue_sequence.exists() || fs::symlink_metadata(paths.enqueue_sequence).is_ok() {
+            let _ = private_file_metadata(paths.enqueue_sequence, package_uid, 16)?;
+        }
+        create_private_file(&temporary, package_uid, encoded)?;
+        fs::rename(&temporary, paths.enqueue_sequence)
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        sync_directory(paths.root)?;
+        sync_directory(paths.staging)
+    }
+
+    pub(super) fn next_job_id(paths: &ControlPaths<'_>, package_uid: u32) -> BridgeResult<String> {
+        let saved = match fs::symlink_metadata(paths.enqueue_sequence) {
+            Ok(_) => {
+                let _ = private_file_metadata(paths.enqueue_sequence, package_uid, 16)?;
+                let bytes = read_exact_private_file(paths.enqueue_sequence, package_uid, 16)?;
+                parse_sequence(&bytes).unwrap_or(0)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+            Err(_) => return Err(BridgeError::unsafe_runtime()),
         };
+        let previous = saved.max(maximum_published_sequence(paths, package_uid)?);
         let elapsed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
         let wall_clock = u64::try_from(elapsed.as_micros())
             .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
         let sequence = next_enqueue_sequence(previous, wall_clock)?;
-        let encoded_sequence = format!("{sequence:016x}");
-        lock.seek(SeekFrom::Start(0))
-            .and_then(|_| lock.set_len(0))
-            .and_then(|_| lock.write_all(encoded_sequence.as_bytes()))
-            .and_then(|_| lock.sync_all())
-            .map_err(|_| BridgeError::unsafe_runtime())?;
         let mut random = [0_u8; 16];
         fill_random(&mut random)?;
+        let encoded_sequence: [u8; 16] = format!("{sequence:016x}")
+            .into_bytes()
+            .try_into()
+            .map_err(|_| BridgeError::internal())?;
+        publish_enqueue_sequence(paths, package_uid, &encoded_sequence)?;
         Ok(sortable_job_id(sequence, &random))
+    }
+
+    pub(super) fn parent_process_identity() -> BridgeResult<(u32, u64, String)> {
+        // SAFETY: getppid has no pointer arguments or preconditions.
+        let parent = unsafe { libc::getppid() };
+        let pid = u32::try_from(parent).map_err(|_| BridgeError::unsafe_runtime())?;
+        if pid <= 1 {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok((pid, process_start(pid)?, current_boot_id()?))
+    }
+
+    pub(super) fn current_process_identity() -> BridgeResult<(u32, u64, String)> {
+        let pid = std::process::id();
+        if pid <= 1 {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok((pid, process_start(pid)?, current_boot_id()?))
+    }
+
+    pub(super) fn validate_live_process_identity(
+        pid: u32,
+        start: u64,
+        boot: &str,
+        expected_uid: u32,
+    ) -> BridgeResult<()> {
+        if pid <= 1
+            || start == 0
+            || expected_uid == 0
+            || !valid_boot_id(boot)
+            || !process_identity_is_live(pid, start, boot)?
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let status = fs::read_to_string(format!("/proc/{pid}/status"))
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        let actual_uid = status
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Uid:")
+                    .and_then(|tail| tail.split_ascii_whitespace().next())
+                    .and_then(|value| value.parse::<u32>().ok())
+            })
+            .ok_or_else(BridgeError::unsafe_runtime)?;
+        if actual_uid != expected_uid {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(())
+    }
+
+    pub(super) fn publish_service_identity(
+        path: &Path,
+        package_uid: u32,
+        bytes: &[u8],
+    ) -> BridgeResult<()> {
+        if bytes.is_empty() || bytes.len() > 96 {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let parent = path.parent().ok_or_else(BridgeError::unsafe_runtime)?;
+        let parent_metadata =
+            fs::symlink_metadata(parent).map_err(|_| BridgeError::unsafe_runtime())?;
+        if !parent_metadata.file_type().is_dir()
+            || parent_metadata.st_uid() != package_uid
+            || parent_metadata.st_mode() & 0o7777 != 0o700
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            _ => return Err(BridgeError::unsafe_runtime()),
+        }
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(BridgeError::unsafe_runtime)?;
+        let temporary = parent.join(format!(".{name}.{}.tmp", std::process::id()));
+        match fs::symlink_metadata(&temporary) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            _ => return Err(BridgeError::unsafe_runtime()),
+        }
+        create_private_file(&temporary, package_uid, bytes)?;
+        if fs::rename(&temporary, path).is_err() {
+            let _ = fs::remove_file(&temporary);
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let published = read_exact_single_link_private_file(path, package_uid, 96)?;
+        if published.as_slice() != bytes {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        sync_directory(parent)
+    }
+
+    pub(super) fn service_start_is_committed(
+        path: &Path,
+        package_uid: u32,
+        parent_pid: u32,
+        parent_start: u64,
+        parent_boot: &str,
+    ) -> BridgeResult<bool> {
+        if parent_pid <= 1 || parent_start == 0 || !valid_boot_id(parent_boot) {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let bytes = read_exact_single_link_private_file(path, package_uid, 112)?;
+        let prepared = format!("{parent_pid}\n{parent_start}\n{parent_boot}\n");
+        let committed = format!("{prepared}committed\n");
+        let is_committed = if bytes.as_slice() == committed.as_bytes() {
+            true
+        } else if bytes.as_slice() == prepared.as_bytes() {
+            false
+        } else {
+            return Err(BridgeError::unsafe_runtime());
+        };
+        validate_live_process_identity(parent_pid, parent_start, parent_boot, package_uid)?;
+        Ok(is_committed)
+    }
+
+    fn publish_idempotent_private_marker(
+        path: &Path,
+        package_uid: u32,
+        expected: &[u8],
+    ) -> BridgeResult<()> {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                publish_service_identity(path, package_uid, expected)
+            }
+            Ok(_) => {
+                let actual = read_exact_single_link_private_file(path, package_uid, 112)?;
+                if actual.as_slice() == expected {
+                    Ok(())
+                } else {
+                    Err(BridgeError::unsafe_runtime())
+                }
+            }
+            Err(_) => Err(BridgeError::unsafe_runtime()),
+        }
+    }
+
+    fn remove_allowed_private_marker(
+        path: &Path,
+        package_uid: u32,
+        allowed: &[&[u8]],
+    ) -> BridgeResult<()> {
+        let actual = match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Ok(_) => read_exact_single_link_private_file(path, package_uid, 112)?,
+            Err(_) => return Err(BridgeError::unsafe_runtime()),
+        };
+        if !allowed
+            .iter()
+            .any(|expected| actual.as_slice() == *expected)
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        remove_own_service_identity(path, package_uid, actual.as_slice())
+    }
+
+    pub(super) fn package_transition_state(package_uid: u32) -> BridgeResult<&'static str> {
+        let path = Path::new(PACKAGE_TRANSITION_PATH);
+        let bytes = match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok("open"),
+            Ok(_) => read_exact_single_link_private_file(path, package_uid, 16)?,
+            Err(_) => return Err(BridgeError::unsafe_runtime()),
+        };
+        match bytes.as_slice() {
+            b"upgrade\n" => Ok("upgrade"),
+            b"uninstall\n" => Ok("uninstall"),
+            _ => Err(BridgeError::unsafe_runtime()),
+        }
+    }
+
+    pub(super) fn prepare_package_transition(package_uid: u32, kind: &str) -> BridgeResult<()> {
+        let expected: &[u8] = match kind {
+            "upgrade" => b"upgrade\n",
+            "uninstall" => b"uninstall\n",
+            _ => return Err(BridgeError::bad_request()),
+        };
+        publish_idempotent_private_marker(Path::new(PACKAGE_TRANSITION_PATH), package_uid, expected)
+    }
+
+    pub(super) fn clear_package_transition(package_uid: u32) -> BridgeResult<()> {
+        remove_allowed_private_marker(
+            Path::new(PACKAGE_TRANSITION_PATH),
+            package_uid,
+            &[b"upgrade\n", b"uninstall\n"],
+        )
+    }
+
+    pub(super) fn service_admission_state(package_uid: u32) -> BridgeResult<&'static str> {
+        let path = Path::new(SERVICE_CLOSED_PATH);
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok("open"),
+            Ok(_) => {
+                let bytes = read_exact_single_link_private_file(path, package_uid, 16)?;
+                if bytes.as_slice() == b"closed\n" {
+                    Ok("closed")
+                } else {
+                    Err(BridgeError::unsafe_runtime())
+                }
+            }
+            Err(_) => Err(BridgeError::unsafe_runtime()),
+        }
+    }
+
+    pub(super) fn close_service_admission(package_uid: u32) -> BridgeResult<()> {
+        publish_idempotent_private_marker(Path::new(SERVICE_CLOSED_PATH), package_uid, b"closed\n")
+    }
+
+    pub(super) fn open_service_admission(package_uid: u32) -> BridgeResult<()> {
+        remove_allowed_private_marker(Path::new(SERVICE_CLOSED_PATH), package_uid, &[b"closed\n"])
+    }
+
+    fn failed_start_child_path(kind: &str) -> BridgeResult<&'static Path> {
+        match kind {
+            "api" => Ok(Path::new(FAILED_API_CHILD_PATH)),
+            "controller" => Ok(Path::new(FAILED_CONTROLLER_CHILD_PATH)),
+            _ => Err(BridgeError::bad_request()),
+        }
+    }
+
+    fn failed_start_child_bytes(
+        kind: &str,
+        pid: u32,
+        start: u64,
+        boot: &str,
+    ) -> BridgeResult<Vec<u8>> {
+        if pid <= 1 || start == 0 || !valid_boot_id(boot) {
+            return Err(BridgeError::bad_request());
+        }
+        let bytes = format!("{kind}\n{pid}\n{start}\n{boot}\n").into_bytes();
+        if bytes.len() > 96 {
+            return Err(BridgeError::bad_request());
+        }
+        Ok(bytes)
+    }
+
+    pub(super) fn record_failed_start_child(
+        package_uid: u32,
+        kind: &str,
+        pid: u32,
+        start: u64,
+        boot: &str,
+    ) -> BridgeResult<()> {
+        let path = failed_start_child_path(kind)?;
+        let bytes = failed_start_child_bytes(kind, pid, start, boot)?;
+        publish_idempotent_private_marker(path, package_uid, &bytes)
+    }
+
+    pub(super) fn failed_start_child_state(
+        package_uid: u32,
+        kind: &str,
+    ) -> BridgeResult<Option<(u32, u64, String)>> {
+        let path = failed_start_child_path(kind)?;
+        let bytes = match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Ok(_) => read_exact_single_link_private_file(path, package_uid, 96)?,
+            Err(_) => return Err(BridgeError::unsafe_runtime()),
+        };
+        let text = std::str::from_utf8(&bytes).map_err(|_| BridgeError::unsafe_runtime())?;
+        let fields = text.split('\n').collect::<Vec<_>>();
+        if fields.len() != 5 || !fields[4].is_empty() || fields[0] != kind {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let pid = fields[1]
+            .parse::<u32>()
+            .ok()
+            .filter(|value| *value > 1)
+            .ok_or_else(BridgeError::unsafe_runtime)?;
+        let start = fields[2]
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(BridgeError::unsafe_runtime)?;
+        if !valid_boot_id(fields[3]) {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(Some((pid, start, fields[3].to_owned())))
+    }
+
+    pub(super) fn clear_failed_start_child(
+        package_uid: u32,
+        kind: &str,
+        pid: u32,
+        start: u64,
+        boot: &str,
+    ) -> BridgeResult<()> {
+        let path = failed_start_child_path(kind)?;
+        let bytes = failed_start_child_bytes(kind, pid, start, boot)?;
+        remove_allowed_private_marker(path, package_uid, &[bytes.as_slice()])
+    }
+
+    pub(super) fn remove_own_service_identity(
+        path: &Path,
+        package_uid: u32,
+        expected: &[u8],
+    ) -> BridgeResult<()> {
+        let before = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(BridgeError::unsafe_runtime()),
+        };
+        let bytes = read_exact_single_link_private_file(path, package_uid, 96)?;
+        if bytes.as_slice() != expected {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let current = fs::symlink_metadata(path).map_err(|_| BridgeError::unsafe_runtime())?;
+        if before.st_dev() != current.st_dev()
+            || before.st_ino() != current.st_ino()
+            || before.st_uid() != current.st_uid()
+            || before.st_mode() != current.st_mode()
+            || before.st_nlink() != current.st_nlink()
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        fs::remove_file(path).map_err(|_| BridgeError::unsafe_runtime())?;
+        let parent = path.parent().ok_or_else(BridgeError::unsafe_runtime)?;
+        sync_directory(parent)
+    }
+
+    pub(super) fn audit_transaction_begin<F>(
+        paths: &AuditOutboxPaths<'_>,
+        package_uid: u32,
+        mut record: AuditOutboxRecord,
+        ready_phase: AuditOutboxPhase,
+        mut append: F,
+    ) -> BridgeResult<()>
+    where
+        F: FnMut(&AuditOutboxRecord, &str) -> BridgeResult<()>,
+    {
+        validate_audit_outbox_record(&record)?;
+        if record.phase != AuditOutboxPhase::Prepared
+            || !matches!(
+                ready_phase,
+                AuditOutboxPhase::Prepared
+                    | AuditOutboxPhase::Publishing
+                    | AuditOutboxPhase::Executing
+            )
+            || (ready_phase == AuditOutboxPhase::Publishing) != record.job_id.is_some()
+        {
+            return Err(BridgeError::bad_request());
+        }
+        let _lock = open_audit_outbox_lock(paths, package_uid)?;
+        recover_audit_outbox_temps(paths, package_uid)?;
+        let target = audit_outbox_path(paths, &record.transaction)?;
+        if fs::symlink_metadata(&target).is_ok() {
+            return Err(BridgeError::new(ErrorKind::Conflict));
+        }
+        write_audit_outbox_record(paths, package_uid, &record)?;
+        if let Err(error) = append(&record, "requested") {
+            record.phase = AuditOutboxPhase::Failed;
+            write_audit_outbox_record(paths, package_uid, &record)?;
+            if append(&record, "requested").is_ok() && append(&record, "failed").is_ok() {
+                remove_audit_outbox_record(paths, package_uid, &record.transaction)?;
+            }
+            return Err(error);
+        }
+        record.phase = ready_phase;
+        #[cfg(test)]
+        let ready_write_result = if FAIL_AUDIT_READY_WRITE_ONCE.with(|flag| flag.replace(false)) {
+            Err(BridgeError::unsafe_runtime())
+        } else {
+            write_audit_outbox_record(paths, package_uid, &record)
+        };
+        #[cfg(not(test))]
+        let ready_write_result = write_audit_outbox_record(paths, package_uid, &record);
+        if let Err(error) = ready_write_result {
+            // The durable Prepared record and requested event already exist.
+            // Terminalize the known pre-publication failure while this lock is
+            // still held; otherwise a long-lived API owner would make
+            // reconciliation defer the unterminated request indefinitely.
+            record.phase = AuditOutboxPhase::Failed;
+            if write_audit_outbox_record(paths, package_uid, &record).is_ok()
+                && append(&record, "requested").is_ok()
+                && append(&record, "failed").is_ok()
+            {
+                let _ = remove_audit_outbox_record(paths, package_uid, &record.transaction);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(super) fn audit_transaction_complete<F>(
+        paths: &AuditOutboxPaths<'_>,
+        package_uid: u32,
+        transaction: &str,
+        terminal: AuditOutboxPhase,
+        mut append: F,
+    ) -> BridgeResult<bool>
+    where
+        F: FnMut(&AuditOutboxRecord, &str) -> BridgeResult<()>,
+    {
+        if terminal.terminal_state().is_none() || !valid_audit_transaction(transaction) {
+            return Err(BridgeError::bad_request());
+        }
+        let _lock = open_audit_outbox_lock(paths, package_uid)?;
+        recover_audit_outbox_temps(paths, package_uid)?;
+        let mut record = read_audit_outbox_record(paths, package_uid, transaction)?;
+        match record.phase {
+            AuditOutboxPhase::Executing => {
+                record.phase = terminal;
+                write_audit_outbox_record(paths, package_uid, &record)?;
+            }
+            AuditOutboxPhase::Prepared if terminal == AuditOutboxPhase::Failed => {
+                record.phase = terminal;
+                write_audit_outbox_record(paths, package_uid, &record)?;
+            }
+            AuditOutboxPhase::Publishing if terminal == AuditOutboxPhase::Failed => {
+                let (owner_pid, owner_start, owner_boot) = current_process_identity()?;
+                if record.owner_pid != owner_pid
+                    || record.owner_start != owner_start
+                    || record.owner_boot != owner_boot
+                    || bridge_job_state(paths, package_uid, &record)? != BridgeJobState::Missing
+                {
+                    return Err(BridgeError::unsafe_runtime());
+                }
+                record.phase = terminal;
+                write_audit_outbox_record(paths, package_uid, &record)?;
+            }
+            phase if phase == terminal => {}
+            _ => return Err(BridgeError::unsafe_runtime()),
+        }
+        let state = record
+            .phase
+            .terminal_state()
+            .ok_or_else(BridgeError::unsafe_runtime)?;
+        if append(&record, "requested").is_ok() && append(&record, state).is_ok() {
+            mark_response_audit_reconciled(paths, package_uid, &record)?;
+            remove_audit_outbox_record(paths, package_uid, transaction)?;
+            Ok(false)
+        } else {
+            Ok(true)
+        }
+    }
+
+    pub(super) fn mark_audit_transaction_executing(
+        paths: &AuditOutboxPaths<'_>,
+        package_uid: u32,
+        transaction: &str,
+    ) -> BridgeResult<()> {
+        if !valid_audit_transaction(transaction) {
+            return Err(BridgeError::bad_request());
+        }
+        let _lock = open_audit_outbox_lock(paths, package_uid)?;
+        recover_audit_outbox_temps(paths, package_uid)?;
+        let mut record = read_audit_outbox_record(paths, package_uid, transaction)?;
+        let (owner_pid, owner_start, owner_boot) = parent_process_identity()?;
+        if record.phase != AuditOutboxPhase::Prepared
+            || record.job_id.is_some()
+            || record.owner_pid != owner_pid
+            || record.owner_start != owner_start
+            || record.owner_boot != owner_boot
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        record.phase = AuditOutboxPhase::Executing;
+        write_audit_outbox_record(paths, package_uid, &record)
+    }
+
+    pub(super) fn claim_queued_audit_transaction(
+        paths: &AuditOutboxPaths<'_>,
+        package_uid: u32,
+        transaction: &str,
+        expected_job_id: &str,
+    ) -> BridgeResult<()> {
+        if !valid_server_job_id(expected_job_id) {
+            return Err(BridgeError::bad_request());
+        }
+        let _lock = open_audit_outbox_lock(paths, package_uid)?;
+        recover_audit_outbox_temps(paths, package_uid)?;
+        let mut record = read_audit_outbox_record(paths, package_uid, transaction)?;
+        if !matches!(
+            record.phase,
+            AuditOutboxPhase::Publishing | AuditOutboxPhase::Queued
+        ) || record.job_id.as_deref() != Some(expected_job_id)
+            || bridge_job_state(paths, package_uid, &record)? != BridgeJobState::Active
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let (owner_pid, owner_start, owner_boot) = current_process_identity()?;
+        record.owner_pid = owner_pid;
+        record.owner_start = owner_start;
+        record.owner_boot = owner_boot;
+        record.phase = AuditOutboxPhase::Executing;
+        write_audit_outbox_record(paths, package_uid, &record)
+    }
+
+    pub(super) fn mark_audit_transaction_queued(
+        paths: &AuditOutboxPaths<'_>,
+        package_uid: u32,
+        transaction: &str,
+        expected_job_id: &str,
+    ) -> BridgeResult<()> {
+        let _lock = open_audit_outbox_lock(paths, package_uid)?;
+        recover_audit_outbox_temps(paths, package_uid)?;
+        let mut record = read_audit_outbox_record(paths, package_uid, transaction)?;
+        if record.phase != AuditOutboxPhase::Publishing
+            || record.job_id.as_deref() != Some(expected_job_id)
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        match bridge_job_state(paths, package_uid, &record)? {
+            BridgeJobState::Active => {
+                record.phase = AuditOutboxPhase::Queued;
+                write_audit_outbox_record(paths, package_uid, &record)
+            }
+            BridgeJobState::Complete(_) | BridgeJobState::Missing => {
+                Err(BridgeError::unsafe_runtime())
+            }
+        }
+    }
+
+    pub(super) fn reconcile_audit_transactions<F>(
+        paths: &AuditOutboxPaths<'_>,
+        package_uid: u32,
+        mut append: F,
+    ) -> BridgeResult<usize>
+    where
+        F: FnMut(&AuditOutboxRecord, &str) -> BridgeResult<()>,
+    {
+        let _lock = open_audit_outbox_lock(paths, package_uid)?;
+        recover_audit_outbox_temps(paths, package_uid)?;
+        let mut names = Vec::new();
+        for entry in fs::read_dir(paths.directory).map_err(|_| BridgeError::unsafe_runtime())? {
+            let entry = entry.map_err(|_| BridgeError::unsafe_runtime())?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| BridgeError::unsafe_runtime())?;
+            if name.starts_with('.') {
+                return Err(BridgeError::unsafe_runtime());
+            }
+            let transaction = name
+                .strip_suffix(".event")
+                .filter(|value| valid_audit_transaction(value))
+                .ok_or_else(BridgeError::unsafe_runtime)?;
+            names.push(transaction.to_owned());
+        }
+        names.sort();
+        let mut reconciled = 0;
+        for transaction in names {
+            let mut record = read_audit_outbox_record(paths, package_uid, &transaction)?;
+            match record.phase {
+                AuditOutboxPhase::Prepared => {
+                    if process_identity_is_live(
+                        record.owner_pid,
+                        record.owner_start,
+                        &record.owner_boot,
+                    )? {
+                        continue;
+                    }
+                    record.phase = AuditOutboxPhase::Failed;
+                    write_audit_outbox_record(paths, package_uid, &record)?;
+                }
+                AuditOutboxPhase::Publishing => {
+                    match bridge_job_state(paths, package_uid, &record)? {
+                        BridgeJobState::Active => {
+                            record.phase = AuditOutboxPhase::Queued;
+                            write_audit_outbox_record(paths, package_uid, &record)?;
+                            continue;
+                        }
+                        BridgeJobState::Complete(succeeded) => {
+                            record.phase = if succeeded {
+                                AuditOutboxPhase::Succeeded
+                            } else {
+                                AuditOutboxPhase::Failed
+                            };
+                            write_audit_outbox_record(paths, package_uid, &record)?;
+                        }
+                        BridgeJobState::Missing => {
+                            if process_identity_is_live(
+                                record.owner_pid,
+                                record.owner_start,
+                                &record.owner_boot,
+                            )? {
+                                continue;
+                            }
+                            record.phase = AuditOutboxPhase::Failed;
+                            write_audit_outbox_record(paths, package_uid, &record)?;
+                        }
+                    }
+                }
+                AuditOutboxPhase::Queued => match bridge_job_state(paths, package_uid, &record)? {
+                    BridgeJobState::Active => continue,
+                    BridgeJobState::Complete(succeeded) => {
+                        record.phase = if succeeded {
+                            AuditOutboxPhase::Succeeded
+                        } else {
+                            AuditOutboxPhase::Failed
+                        };
+                        write_audit_outbox_record(paths, package_uid, &record)?;
+                    }
+                    BridgeJobState::Missing => {
+                        record.phase = AuditOutboxPhase::Failed;
+                        write_audit_outbox_record(paths, package_uid, &record)?;
+                    }
+                },
+                AuditOutboxPhase::Executing => {
+                    match bridge_job_state(paths, package_uid, &record)? {
+                        BridgeJobState::Complete(succeeded) => {
+                            record.phase = if succeeded {
+                                AuditOutboxPhase::Succeeded
+                            } else {
+                                AuditOutboxPhase::Failed
+                            };
+                            write_audit_outbox_record(paths, package_uid, &record)?;
+                        }
+                        BridgeJobState::Active | BridgeJobState::Missing => {}
+                    }
+                    if record.phase != AuditOutboxPhase::Executing {
+                        // A canonical response proves the terminal result even
+                        // if the original consumer disappeared before logging.
+                    } else if process_identity_is_live(
+                        record.owner_pid,
+                        record.owner_start,
+                        &record.owner_boot,
+                    )? {
+                        continue;
+                    } else {
+                        record.phase = AuditOutboxPhase::OutcomeUnknown;
+                        write_audit_outbox_record(paths, package_uid, &record)?;
+                    }
+                }
+                AuditOutboxPhase::Succeeded
+                | AuditOutboxPhase::Failed
+                | AuditOutboxPhase::OutcomeUnknown => {}
+            }
+            let state = record
+                .phase
+                .terminal_state()
+                .ok_or_else(BridgeError::unsafe_runtime)?;
+            append(&record, "requested")?;
+            append(&record, state)?;
+            mark_response_audit_reconciled(paths, package_uid, &record)?;
+            remove_audit_outbox_record(paths, package_uid, &transaction)?;
+            reconciled += 1;
+        }
+        Ok(reconciled)
+    }
+
+    fn mark_response_audit_reconciled(
+        paths: &AuditOutboxPaths<'_>,
+        package_uid: u32,
+        record: &AuditOutboxRecord,
+    ) -> BridgeResult<()> {
+        let (Some(responses), Some(job_id)) = (paths.responses, record.job_id.as_deref()) else {
+            return Ok(());
+        };
+        let response_path = responses.join(format!("{job_id}.json"));
+        let before = match fs::symlink_metadata(&response_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(BridgeError::unsafe_runtime()),
+        };
+        let bytes = read_exact_private_file(&response_path, package_uid, MAX_MANAGER_OUTPUT_BYTES)?;
+        let parsed = parse_queued_response(&bytes, job_id)?;
+        if parsed.audit_transaction != record.transaction {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        if !parsed.audit_pending {
+            return Ok(());
+        }
+        let mut value: Value =
+            serde_json::from_slice(&bytes).map_err(|_| BridgeError::unsafe_runtime())?;
+        value["audit_pending"] = Value::Bool(false);
+        let rewritten = serde_json::to_vec(&value).map_err(|_| BridgeError::internal())?;
+        if rewritten.len() > MAX_MANAGER_OUTPUT_BYTES {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let temporary = responses.join(format!(".{job_id}.audit-reconciled.tmp"));
+        if fs::symlink_metadata(&temporary).is_ok() {
+            let _ = read_exact_private_file(&temporary, package_uid, MAX_MANAGER_OUTPUT_BYTES)?;
+            fs::remove_file(&temporary).map_err(|_| BridgeError::unsafe_runtime())?;
+            sync_directory(responses)?;
+        }
+        create_private_file(&temporary, package_uid, &rewritten)?;
+        let current =
+            fs::symlink_metadata(&response_path).map_err(|_| BridgeError::unsafe_runtime())?;
+        if before.st_dev() != current.st_dev()
+            || before.st_ino() != current.st_ino()
+            || current.st_uid() != package_uid
+            || current.st_mode() & 0o777 != 0o600
+            || current.st_nlink() != 1
+        {
+            let _ = fs::remove_file(&temporary);
+            return Err(BridgeError::unsafe_runtime());
+        }
+        fs::rename(&temporary, &response_path).map_err(|_| BridgeError::unsafe_runtime())?;
+        sync_directory(responses)
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum BridgeJobState {
+        Active,
+        Complete(bool),
+        Missing,
+    }
+
+    fn bridge_job_state(
+        paths: &AuditOutboxPaths<'_>,
+        package_uid: u32,
+        record: &AuditOutboxRecord,
+    ) -> BridgeResult<BridgeJobState> {
+        let Some(job_id) = record.job_id.as_deref() else {
+            return Ok(BridgeJobState::Missing);
+        };
+        let (Some(requests), Some(processing), Some(responses)) =
+            (paths.requests, paths.processing, paths.responses)
+        else {
+            return Err(BridgeError::unsafe_runtime());
+        };
+        for directory in [requests, processing, responses] {
+            validate_private_directory(directory, package_uid)?;
+        }
+        for directory in [requests, processing] {
+            let job_path = directory.join(format!("{job_id}.json"));
+            if let Some(bytes) =
+                read_transient_optional_private_file(&job_path, package_uid, MAX_JOB_BYTES)?
+            {
+                let job = parse_job(&bytes)?;
+                if job.request_id != job_id || job.audit_transaction != record.transaction {
+                    return Err(BridgeError::unsafe_runtime());
+                }
+                return Ok(BridgeJobState::Active);
+            }
+        }
+        // The controller publishes the response before removing the processing
+        // job. Observing active paths first and the response last closes the
+        // normal publish/remove transition without a false Missing result.
+        let response_path = responses.join(format!("{job_id}.json"));
+        if let Some(bytes) = read_transient_optional_private_file(
+            &response_path,
+            package_uid,
+            MAX_MANAGER_OUTPUT_BYTES,
+        )? {
+            let response = parse_queued_response(&bytes, job_id)?;
+            if response.audit_transaction != record.transaction {
+                return Err(BridgeError::unsafe_runtime());
+            }
+            return Ok(BridgeJobState::Complete(
+                response.audit_terminal_state == "succeeded",
+            ));
+        }
+        Ok(BridgeJobState::Missing)
+    }
+
+    fn open_audit_outbox_lock(
+        paths: &AuditOutboxPaths<'_>,
+        package_uid: u32,
+    ) -> BridgeResult<File> {
+        validate_private_directory(paths.directory, package_uid)?;
+        let parent = paths
+            .lock
+            .parent()
+            .ok_or_else(BridgeError::unsafe_runtime)?;
+        validate_private_directory(parent, package_uid)?;
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(NOFOLLOW_CLOEXEC);
+        let file = options
+            .open(paths.lock)
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        let metadata = file.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
+        if !metadata.file_type().is_file()
+            || metadata.st_uid() != package_uid
+            || metadata.st_mode() & 0o777 != 0o600
+            || metadata.st_nlink() != 1
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        // SAFETY: flock receives a valid descriptor and a fixed operation.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(file)
+    }
+
+    fn audit_outbox_path(paths: &AuditOutboxPaths<'_>, transaction: &str) -> BridgeResult<PathBuf> {
+        if !valid_audit_transaction(transaction) {
+            return Err(BridgeError::bad_request());
+        }
+        Ok(paths.directory.join(format!("{transaction}.event")))
+    }
+
+    fn read_audit_outbox_record(
+        paths: &AuditOutboxPaths<'_>,
+        package_uid: u32,
+        transaction: &str,
+    ) -> BridgeResult<AuditOutboxRecord> {
+        let path = audit_outbox_path(paths, transaction)?;
+        let bytes = read_exact_private_file(&path, package_uid, MAX_AUDIT_OUTBOX_BYTES)?;
+        let record: AuditOutboxRecord =
+            serde_json::from_slice(&bytes).map_err(|_| BridgeError::unsafe_runtime())?;
+        validate_audit_outbox_record(&record)?;
+        if record.transaction != transaction {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(record)
+    }
+
+    fn write_audit_outbox_record(
+        paths: &AuditOutboxPaths<'_>,
+        package_uid: u32,
+        record: &AuditOutboxRecord,
+    ) -> BridgeResult<()> {
+        validate_audit_outbox_record(record)?;
+        let target = audit_outbox_path(paths, &record.transaction)?;
+        if fs::symlink_metadata(&target).is_ok() {
+            let _ = private_file_metadata(&target, package_uid, MAX_AUDIT_OUTBOX_BYTES)?;
+        }
+        let temporary = paths.directory.join(format!(
+            ".{}.{}.tmp",
+            record.transaction,
+            std::process::id()
+        ));
+        match fs::symlink_metadata(&temporary) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                let _ = private_file_metadata(&temporary, package_uid, MAX_AUDIT_OUTBOX_BYTES)?;
+                fs::remove_file(&temporary).map_err(|_| BridgeError::unsafe_runtime())?;
+            }
+            Err(_) => return Err(BridgeError::unsafe_runtime()),
+        }
+        let bytes = serde_json::to_vec(record).map_err(|_| BridgeError::internal())?;
+        if bytes.is_empty() || bytes.len() > MAX_AUDIT_OUTBOX_BYTES {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        create_private_file(&temporary, package_uid, &bytes)?;
+        fs::rename(&temporary, &target).map_err(|_| BridgeError::unsafe_runtime())?;
+        sync_directory(paths.directory)
+    }
+
+    fn remove_audit_outbox_record(
+        paths: &AuditOutboxPaths<'_>,
+        package_uid: u32,
+        transaction: &str,
+    ) -> BridgeResult<()> {
+        let path = audit_outbox_path(paths, transaction)?;
+        let _ = private_file_metadata(&path, package_uid, MAX_AUDIT_OUTBOX_BYTES)?;
+        fs::remove_file(path).map_err(|_| BridgeError::unsafe_runtime())?;
+        sync_directory(paths.directory)
+    }
+
+    fn recover_audit_outbox_temps(
+        paths: &AuditOutboxPaths<'_>,
+        package_uid: u32,
+    ) -> BridgeResult<()> {
+        for entry in fs::read_dir(paths.directory).map_err(|_| BridgeError::unsafe_runtime())? {
+            let entry = entry.map_err(|_| BridgeError::unsafe_runtime())?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| BridgeError::unsafe_runtime())?;
+            if !name.starts_with('.') {
+                continue;
+            }
+            let Some(stem) = name
+                .strip_prefix('.')
+                .and_then(|value| value.strip_suffix(".tmp"))
+            else {
+                return Err(BridgeError::unsafe_runtime());
+            };
+            let Some((transaction, pid)) = stem.rsplit_once('.') else {
+                return Err(BridgeError::unsafe_runtime());
+            };
+            if !valid_audit_transaction(transaction)
+                || pid.parse::<u32>().ok().is_none_or(|value| value <= 1)
+            {
+                return Err(BridgeError::unsafe_runtime());
+            }
+            let _ = private_file_metadata(&entry.path(), package_uid, MAX_AUDIT_OUTBOX_BYTES)?;
+            fs::remove_file(entry.path()).map_err(|_| BridgeError::unsafe_runtime())?;
+        }
+        sync_directory(paths.directory)
+    }
+
+    fn current_boot_id() -> BridgeResult<String> {
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(NOFOLLOW_CLOEXEC);
+        let file = options
+            .open("/proc/sys/kernel/random/boot_id")
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        let metadata = file.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
+        if !metadata.file_type().is_file() || metadata.st_uid() != 0 || metadata.len() > 64 {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let mut value = String::new();
+        file.take(65)
+            .read_to_string(&mut value)
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        let value = value.trim_end_matches('\n').to_owned();
+        if !valid_boot_id(&value) {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(value)
+    }
+
+    fn process_start(pid: u32) -> BridgeResult<u64> {
+        let value = fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        let tail = value
+            .rsplit_once(") ")
+            .map(|(_, tail)| tail)
+            .ok_or_else(BridgeError::unsafe_runtime)?;
+        tail.split_ascii_whitespace()
+            .nth(19)
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value != 0)
+            .ok_or_else(BridgeError::unsafe_runtime)
+    }
+
+    fn process_identity_is_live(pid: u32, start: u64, boot: &str) -> BridgeResult<bool> {
+        if current_boot_id()? != boot {
+            return Ok(false);
+        }
+        // SAFETY: kill with signal zero performs a permission/liveness probe.
+        let status = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if status != 0 {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ESRCH) => Ok(false),
+                _ => Err(BridgeError::unsafe_runtime()),
+            };
+        }
+        match process_start(pid) {
+            Ok(actual) => Ok(actual == start),
+            Err(_) => Ok(false),
+        }
     }
 
     fn validate_private_directory(path: &Path, package_uid: u32) -> BridgeResult<()> {
@@ -4032,10 +7519,39 @@ mod linux_files {
         Ok(())
     }
 
+    pub(super) fn validate_private_executable(path: &Path, package_uid: u32) -> BridgeResult<()> {
+        let metadata = fs::symlink_metadata(path).map_err(|_| BridgeError::unsafe_runtime())?;
+        if !metadata.file_type().is_file()
+            || metadata.st_uid() != package_uid
+            || metadata.st_mode() & 0o7777 != 0o755
+            || metadata.st_nlink() != 1
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(())
+    }
+
     fn read_exact_private_file(
         path: &Path,
         package_uid: u32,
         maximum: usize,
+    ) -> BridgeResult<Zeroizing<Vec<u8>>> {
+        read_private_file_with_link_contract(path, package_uid, maximum, false)
+    }
+
+    fn read_exact_single_link_private_file(
+        path: &Path,
+        package_uid: u32,
+        maximum: usize,
+    ) -> BridgeResult<Zeroizing<Vec<u8>>> {
+        read_private_file_with_link_contract(path, package_uid, maximum, true)
+    }
+
+    fn read_private_file_with_link_contract(
+        path: &Path,
+        package_uid: u32,
+        maximum: usize,
+        require_single_link: bool,
     ) -> BridgeResult<Zeroizing<Vec<u8>>> {
         let mut options = OpenOptions::new();
         options.read(true).custom_flags(NOFOLLOW_CLOEXEC);
@@ -4049,7 +7565,8 @@ mod linux_files {
         let metadata = file.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
         if !metadata.file_type().is_file()
             || metadata.st_uid() != package_uid
-            || metadata.st_mode() & 0o777 != 0o600
+            || metadata.st_mode() & 0o7777 != 0o600
+            || (require_single_link && metadata.st_nlink() != 1)
             || metadata.len() > maximum as u64
         {
             return Err(BridgeError::unsafe_runtime());
@@ -4072,6 +7589,18 @@ mod linux_files {
     ) -> BridgeResult<Option<Zeroizing<Vec<u8>>>> {
         match fs::symlink_metadata(path) {
             Ok(_) => read_exact_private_file(path, package_uid, maximum).map(Some),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(BridgeError::unsafe_runtime()),
+        }
+    }
+
+    fn read_optional_single_link_private_file(
+        path: &Path,
+        package_uid: u32,
+        maximum: usize,
+    ) -> BridgeResult<Option<Zeroizing<Vec<u8>>>> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => read_exact_single_link_private_file(path, package_uid, maximum).map(Some),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(_) => Err(BridgeError::unsafe_runtime()),
         }
@@ -4107,29 +7636,76 @@ mod linux_files {
     }
 
     fn fill_random(output: &mut [u8]) -> BridgeResult<()> {
+        fill_random_with(output, |chunk| {
+            // SAFETY: the pointer targets a valid mutable slice and the slice
+            // length is supplied exactly.
+            let result = unsafe { libc::getrandom(chunk.as_mut_ptr().cast(), chunk.len(), 0) };
+            if result >= 0 {
+                Ok(result as usize)
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        })
+    }
+
+    pub(super) fn fill_random_with(
+        output: &mut [u8],
+        mut getrandom_chunk: impl FnMut(&mut [u8]) -> io::Result<usize>,
+    ) -> BridgeResult<()> {
         let mut written = 0;
         while written < output.len() {
-            // SAFETY: the pointer targets the unwritten portion of a valid
-            // mutable slice and its remaining length is supplied exactly.
-            let result = unsafe {
-                libc::getrandom(
-                    output[written..].as_mut_ptr().cast(),
-                    output.len() - written,
-                    0,
-                )
-            };
-            if result > 0 {
-                written += result as usize;
-            } else if result == -1
-                && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
-            {
-                continue;
-            } else {
-                output.zeroize();
-                return Err(BridgeError::new(ErrorKind::Unavailable));
+            match getrandom_chunk(&mut output[written..]) {
+                Ok(0) => break,
+                Ok(count) if count <= output.len() - written => written += count,
+                Ok(_) => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {
+                    // Linux getrandom(2) postdates the 3.2 kernel shipped on
+                    // some DSM 7.1 models. Replace the whole buffer from the
+                    // kernel random character device rather than combining a
+                    // possibly partial syscall result with the fallback.
+                    output.zeroize();
+                    return fill_random_from_device(output, Path::new("/dev/urandom"));
+                }
+                Err(_) => break,
             }
         }
-        Ok(())
+        if written == output.len() {
+            Ok(())
+        } else {
+            output.zeroize();
+            Err(BridgeError::new(ErrorKind::Unavailable))
+        }
+    }
+
+    fn fill_random_from_device(output: &mut [u8], path: &Path) -> BridgeResult<()> {
+        let result = (|| {
+            let mut options = OpenOptions::new();
+            options.read(true).custom_flags(NOFOLLOW_CLOEXEC);
+            let mut source = options
+                .open(path)
+                .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+            let metadata = source
+                .metadata()
+                .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+            if !metadata.file_type().is_char_device() || metadata.st_uid() != 0 {
+                return Err(BridgeError::new(ErrorKind::Unavailable));
+            }
+            let mut read = 0;
+            while read < output.len() {
+                match source.read(&mut output[read..]) {
+                    Ok(0) => return Err(BridgeError::new(ErrorKind::Unavailable)),
+                    Ok(count) => read += count,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => return Err(BridgeError::new(ErrorKind::Unavailable)),
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            output.zeroize();
+        }
+        result
     }
 
     fn sync_directory(path: &Path) -> BridgeResult<()> {
@@ -4181,6 +7757,7 @@ impl CgiResponse {
             ErrorKind::BadRequest => (400, "invalid_request"),
             ErrorKind::Unauthorized => (401, "unauthorized"),
             ErrorKind::Forbidden => (403, "forbidden"),
+            ErrorKind::CsrfRejected => (403, "csrf_rejected"),
             ErrorKind::MethodNotAllowed => (405, "method_not_allowed"),
             ErrorKind::UnsupportedMediaType => (415, "unsupported_media_type"),
             ErrorKind::PayloadTooLarge => (413, "payload_too_large"),
@@ -4220,12 +7797,210 @@ pub(crate) fn main_entry() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => ExitCode::FAILURE,
         }
+    } else if arguments.len() == 4 && arguments[0] == "--serve-supervised" {
+        #[cfg(target_os = "linux")]
+        {
+            let result = (|| {
+                let parent_pid = arguments[1]
+                    .to_str()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .filter(|value| *value > 1)
+                    .ok_or_else(BridgeError::bad_request)?;
+                let parent_start = arguments[2]
+                    .to_str()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(BridgeError::bad_request)?;
+                let parent_boot = arguments[3]
+                    .to_str()
+                    .filter(|value| valid_boot_id(value))
+                    .ok_or_else(BridgeError::bad_request)?
+                    .to_owned();
+                run_supervised_server(SupervisedParent {
+                    pid: parent_pid,
+                    start: parent_start,
+                    boot: parent_boot,
+                })
+            })();
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(_) => ExitCode::FAILURE,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            ExitCode::FAILURE
+        }
+    } else if arguments.len() == 4 && arguments[0] == "--exec-supervised-controller" {
+        #[cfg(target_os = "linux")]
+        {
+            let result = (|| {
+                let parent_pid = arguments[1]
+                    .to_str()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .filter(|value| *value > 1)
+                    .ok_or_else(BridgeError::bad_request)?;
+                let parent_start = arguments[2]
+                    .to_str()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(BridgeError::bad_request)?;
+                let parent_boot = arguments[3]
+                    .to_str()
+                    .filter(|value| valid_boot_id(value))
+                    .ok_or_else(BridgeError::bad_request)?
+                    .to_owned();
+                exec_supervised_controller(SupervisedParent {
+                    pid: parent_pid,
+                    start: parent_start,
+                    boot: parent_boot,
+                })
+            })();
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(_) => ExitCode::FAILURE,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            ExitCode::FAILURE
+        }
+    } else if arguments.len() >= 6
+        && arguments[0] == "--exec-supervised-core"
+        && arguments[4] == "--"
+    {
+        #[cfg(target_os = "linux")]
+        {
+            let result = (|| {
+                let parent_pid = arguments[1]
+                    .to_str()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .filter(|value| *value > 1)
+                    .ok_or_else(BridgeError::bad_request)?;
+                let parent_start = arguments[2]
+                    .to_str()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(BridgeError::bad_request)?;
+                let parent_boot = arguments[3]
+                    .to_str()
+                    .filter(|value| valid_boot_id(value))
+                    .ok_or_else(BridgeError::bad_request)?
+                    .to_owned();
+                if arguments[5] != BINARY_PATH {
+                    return Err(BridgeError::bad_request());
+                }
+                exec_supervised_core(
+                    SupervisedParent {
+                        pid: parent_pid,
+                        start: parent_start,
+                        boot: parent_boot,
+                    },
+                    &arguments[6..],
+                )
+            })();
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(_) => ExitCode::FAILURE,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            ExitCode::FAILURE
+        }
     } else if arguments.len() == 3 && arguments[0] == "--consume-job" {
         let request = PathBuf::from(&arguments[1]);
         let response = PathBuf::from(&arguments[2]);
         match run_consumer(&request, &response) {
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => ExitCode::FAILURE,
+        }
+    } else if arguments.len() == 1 && arguments[0] == "--cleanup-stale-api-socket" {
+        #[cfg(target_os = "linux")]
+        {
+            let result = (|| {
+                let identity = linux_runtime::identity_state()?;
+                let package_uid = validate_package_identity(&identity)?;
+                let (_, web_gid) = linux_runtime::web_identity()?;
+                linux_runtime::clear_environment()?;
+                linux_socket::cleanup_stale_service_socket(
+                    Path::new(API_SOCKET_PATH),
+                    Path::new(API_PID_PATH),
+                    package_uid,
+                    web_gid,
+                )
+            })();
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) if error.kind == ErrorKind::Conflict => ExitCode::from(75),
+                Err(_) => ExitCode::from(73),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            ExitCode::from(73)
+        }
+    } else if arguments.len() == 1
+        && (arguments[0] == "--migrate-security-policy"
+            || arguments[0] == "--security-policy-migration-status")
+    {
+        #[cfg(target_os = "linux")]
+        {
+            let migration_requested = arguments[0] == "--migrate-security-policy";
+            let result = (|| {
+                let identity = linux_runtime::identity_state()?;
+                let package_uid = validate_package_identity(&identity)?;
+                linux_runtime::clear_environment()?;
+                if migration_requested {
+                    linux_files::migrate_security_policy(package_uid)
+                } else {
+                    linux_files::security_policy_migration_required(package_uid)
+                }
+            })();
+            match result {
+                Ok(changed_or_required) => {
+                    println!(
+                        "{}",
+                        if changed_or_required {
+                            if migration_requested {
+                                "migrated"
+                            } else {
+                                "required"
+                            }
+                        } else {
+                            "unchanged"
+                        }
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(_) => ExitCode::from(73),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            ExitCode::from(73)
+        }
+    } else if arguments.first().is_some_and(|value| {
+        value == "--package-transition"
+            || value == "--service-admission"
+            || value == "--failed-start-child"
+    }) {
+        match run_runtime_marker_cli(&arguments) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) if error.kind == ErrorKind::BadRequest => ExitCode::from(64),
+            Err(error) if error.kind == ErrorKind::Forbidden => ExitCode::from(77),
+            Err(_) => ExitCode::from(73),
+        }
+    } else if arguments
+        .first()
+        .is_some_and(|value| value == "--audit-transaction")
+    {
+        match run_audit_transaction_cli(&arguments[1..]) {
+            Ok(false) => ExitCode::SUCCESS,
+            Ok(true) => ExitCode::from(75),
+            Err(error) if error.kind == ErrorKind::BadRequest => ExitCode::from(64),
+            Err(error) if error.kind == ErrorKind::Forbidden => ExitCode::from(77),
+            Err(_) => ExitCode::from(73),
         }
     } else if std::env::var_os("REQUEST_METHOD").is_some() {
         let response = CgiResponse::error(BridgeError::bad_request());
@@ -4234,6 +8009,258 @@ pub(crate) fn main_entry() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+#[cfg(target_os = "linux")]
+fn run_runtime_marker_cli(arguments: &[OsString]) -> BridgeResult<()> {
+    let identity = linux_runtime::identity_state()?;
+    let package_uid = validate_package_identity(&identity)?;
+    let text = |index: usize| -> BridgeResult<&str> {
+        arguments
+            .get(index)
+            .and_then(|value| value.to_str())
+            .ok_or_else(BridgeError::bad_request)
+    };
+    linux_runtime::clear_environment()?;
+    match (text(0)?, text(1)?, arguments.len()) {
+        ("--package-transition", "status", 2) => {
+            println!("{}", linux_files::package_transition_state(package_uid)?);
+            Ok(())
+        }
+        ("--package-transition", "prepare", 3) => {
+            linux_files::prepare_package_transition(package_uid, text(2)?)
+        }
+        ("--package-transition", "clear", 2) => linux_files::clear_package_transition(package_uid),
+        ("--service-admission", "status", 2) => {
+            println!("{}", linux_files::service_admission_state(package_uid)?);
+            Ok(())
+        }
+        ("--service-admission", "close", 2) => linux_files::close_service_admission(package_uid),
+        ("--service-admission", "open", 2) => linux_files::open_service_admission(package_uid),
+        ("--failed-start-child", "status", 3) => {
+            match linux_files::failed_start_child_state(package_uid, text(2)?)? {
+                Some((pid, start, boot)) => println!("present {pid} {start} {boot}"),
+                None => println!("absent"),
+            }
+            Ok(())
+        }
+        ("--failed-start-child", action @ ("record" | "clear"), 6) => {
+            let kind = text(2)?;
+            let pid = text(3)?
+                .parse::<u32>()
+                .ok()
+                .filter(|value| *value > 1)
+                .ok_or_else(BridgeError::bad_request)?;
+            let start = text(4)?
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(BridgeError::bad_request)?;
+            let boot = text(5)?;
+            if action == "record" {
+                linux_files::record_failed_start_child(package_uid, kind, pid, start, boot)
+            } else {
+                linux_files::clear_failed_start_child(package_uid, kind, pid, start, boot)
+            }
+        }
+        _ => Err(BridgeError::bad_request()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_runtime_marker_cli(_arguments: &[OsString]) -> BridgeResult<()> {
+    Err(BridgeError::unsafe_runtime())
+}
+
+#[cfg(target_os = "linux")]
+fn run_audit_transaction_cli(arguments: &[OsString]) -> BridgeResult<bool> {
+    let identity = linux_runtime::identity_state()?;
+    let package_uid = validate_package_identity(&identity)?;
+    let paths = AuditOutboxPaths::production();
+    if arguments.len() == 2
+        && arguments
+            .first()
+            .is_some_and(|value| value == "repair-log-tail")
+    {
+        let kind = arguments[1].to_str().ok_or_else(BridgeError::bad_request)?;
+        linux_runtime::clear_environment()?;
+        let repaired = linux_files::repair_durable_log_tail(kind, package_uid)?;
+        println!("{}", if repaired { "repaired" } else { "clean" });
+        return Ok(false);
+    }
+    let client_request_id = std::env::var_os("SDSYNC_DSM_CLIENT_REQUEST_ID")
+        .map(|value| {
+            value
+                .into_string()
+                .ok()
+                .filter(|value| valid_client_request_id(value))
+                .ok_or_else(BridgeError::bad_request)
+        })
+        .transpose()?;
+    let text = |index: usize| -> BridgeResult<String> {
+        arguments
+            .get(index)
+            .and_then(|value| value.to_str())
+            .map(ToOwned::to_owned)
+            .ok_or_else(BridgeError::bad_request)
+    };
+    match arguments.first().and_then(|value| value.to_str()) {
+        Some("create") if arguments.len() == 2 => {
+            let origin = text(1)?;
+            if !valid_audit_origin(&origin) {
+                return Err(BridgeError::bad_request());
+            }
+            let (owner_pid, owner_start, owner_boot) = linux_files::parent_process_identity()?;
+            let nonce = linux_files::random_nonce()?;
+            let mut digest = Sha256::new();
+            digest.update(b"sdsync.dsm-audit-transaction.v1\0");
+            digest.update(origin.as_bytes());
+            digest.update(owner_pid.to_be_bytes());
+            digest.update(owner_start.to_be_bytes());
+            digest.update(owner_boot.as_bytes());
+            digest.update(nonce);
+            let transaction = format!("{origin}-{}", hex_encode(&digest.finalize()));
+            if !valid_audit_transaction(&transaction) {
+                return Err(BridgeError::internal());
+            }
+            println!("{transaction}");
+            Ok(false)
+        }
+        Some("reconcile") if arguments.len() == 1 => {
+            linux_runtime::clear_environment()?;
+            linux_files::reconcile_audit_transactions(&paths, package_uid, record_audit_event)?;
+            Ok(false)
+        }
+        Some("begin") if arguments.len() == 7 => {
+            let operation = text(1)?;
+            let profile = text(2)?;
+            let actor = text(3)?;
+            let actor_uid = text(4)?
+                .parse::<u32>()
+                .ok()
+                .filter(|value| *value != 0)
+                .ok_or_else(BridgeError::bad_request)?;
+            let origin = text(5)?;
+            let transaction = text(6)?;
+            let (owner_pid, owner_start, owner_boot) = linux_files::parent_process_identity()?;
+            let record = AuditOutboxRecord {
+                schema: "sdsync.dsm-audit-outbox.v1".to_owned(),
+                transaction,
+                operation,
+                profile,
+                actor,
+                actor_uid,
+                origin,
+                client_request_id: client_request_id.clone(),
+                job_id: None,
+                owner_pid,
+                owner_start,
+                owner_boot,
+                phase: AuditOutboxPhase::Prepared,
+            };
+            linux_runtime::clear_environment()?;
+            linux_files::audit_transaction_begin(
+                &paths,
+                package_uid,
+                record,
+                AuditOutboxPhase::Prepared,
+                record_audit_event,
+            )?;
+            Ok(false)
+        }
+        Some("execute") if arguments.len() == 2 => {
+            let transaction = text(1)?;
+            linux_runtime::clear_environment()?;
+            linux_files::mark_audit_transaction_executing(&paths, package_uid, &transaction)?;
+            Ok(false)
+        }
+        Some("complete") if arguments.len() == 3 => {
+            let transaction = text(1)?;
+            let terminal = match arguments.get(2).and_then(|value| value.to_str()) {
+                Some("succeeded") => AuditOutboxPhase::Succeeded,
+                Some("failed") => AuditOutboxPhase::Failed,
+                Some("outcome_unknown") => AuditOutboxPhase::OutcomeUnknown,
+                _ => return Err(BridgeError::bad_request()),
+            };
+            linux_runtime::clear_environment()?;
+            linux_files::audit_transaction_complete(
+                &paths,
+                package_uid,
+                &transaction,
+                terminal,
+                record_audit_event,
+            )
+        }
+        Some("verify") if arguments.len() == 8 => {
+            let operation = text(1)?;
+            let profile = text(2)?;
+            let actor = text(3)?;
+            let actor_uid = text(4)?
+                .parse::<u32>()
+                .ok()
+                .filter(|value| *value != 0)
+                .ok_or_else(BridgeError::bad_request)?;
+            let origin = text(5)?;
+            let transaction = text(6)?;
+            let state = text(7)?;
+            let (owner_pid, owner_start, owner_boot) = linux_files::parent_process_identity()?;
+            let record = AuditOutboxRecord {
+                schema: "sdsync.dsm-audit-outbox.v1".to_owned(),
+                transaction,
+                operation,
+                profile,
+                actor,
+                actor_uid,
+                origin,
+                client_request_id: client_request_id.clone(),
+                job_id: None,
+                owner_pid,
+                owner_start,
+                owner_boot,
+                phase: AuditOutboxPhase::Prepared,
+            };
+            linux_runtime::clear_environment()?;
+            linux_files::durably_verify_audit_event(&record, &state, package_uid)?;
+            Ok(false)
+        }
+        Some("validate") if arguments.len() == 7 => {
+            let operation = text(1)?;
+            let profile = text(2)?;
+            let actor = text(3)?;
+            let actor_uid = text(4)?
+                .parse::<u32>()
+                .ok()
+                .filter(|value| *value != 0)
+                .ok_or_else(BridgeError::bad_request)?;
+            let origin = text(5)?;
+            let transaction = text(6)?;
+            let (owner_pid, owner_start, owner_boot) = linux_files::parent_process_identity()?;
+            let record = AuditOutboxRecord {
+                schema: "sdsync.dsm-audit-outbox.v1".to_owned(),
+                transaction,
+                operation,
+                profile,
+                actor,
+                actor_uid,
+                origin,
+                client_request_id,
+                job_id: None,
+                owner_pid,
+                owner_start,
+                owner_boot,
+                phase: AuditOutboxPhase::Prepared,
+            };
+            linux_runtime::clear_environment()?;
+            validate_audit_identity(&record)?;
+            Ok(false)
+        }
+        _ => Err(BridgeError::bad_request()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_audit_transaction_cli(_arguments: &[OsString]) -> BridgeResult<bool> {
+    Err(BridgeError::unsafe_runtime())
 }
 
 fn run_cgi() -> BridgeResult<CgiResponse> {
@@ -4247,14 +8274,25 @@ fn run_cgi() -> BridgeResult<CgiResponse> {
         let (web_uid, web_gid) = linux_runtime::web_identity()?;
         let package_uid = validate_cgi_identity(&identity, web_uid)?;
         let request = validate_http_request(environment.clone())?;
+        let authentication = match &request {
+            ValidatedHttpRequest::Get { authentication, .. }
+            | ValidatedHttpRequest::Post { authentication, .. } => authentication,
+        };
+        // Synology documents authenticate.cgi being invoked from the custom
+        // CGI, where DSM's native request environment is still authoritative.
+        let session =
+            linux_runtime::authenticate_and_authorize(authentication, AUTH_HELPER_TIMEOUT)?;
         let body = match request {
             ValidatedHttpRequest::Get { .. } => None,
             ValidatedHttpRequest::Post { content_length, .. } => {
                 Some(read_exact_body(&mut io::stdin().lock(), content_length)?)
             }
         };
-        let encoded =
-            encode_relay_request(&environment, body.as_ref().map(|value| value.as_slice()))?;
+        let encoded = encode_relay_request(
+            &environment,
+            body.as_ref().map(|value| value.as_slice()),
+            &session,
+        )?;
         linux_runtime::clear_environment()?;
         let mut stream = linux_socket::connect(Path::new(API_SOCKET_PATH), package_uid, web_gid)?;
         write_frame(&mut stream, &encoded, MAX_RELAY_REQUEST_BYTES)?;
@@ -4351,41 +8389,256 @@ impl<T> Drop for BoundedWorkerPool<T> {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct SupervisedParent {
+    pid: u32,
+    start: u64,
+    boot: String,
+}
+
+#[cfg(target_os = "linux")]
+struct SupervisedServerFiles {
+    package_uid: u32,
+    pid: u32,
+    start: u64,
+    boot: String,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SupervisedServerFiles {
+    fn drop(&mut self) {
+        let ready = format!("{}\n{}\n{}\n", self.pid, self.start, self.boot);
+        let pid = format!("{}\n", self.pid);
+        let _ = linux_files::remove_own_service_identity(
+            Path::new(API_READY_PATH),
+            self.package_uid,
+            ready.as_bytes(),
+        );
+        let _ = linux_files::remove_own_service_identity(
+            Path::new(API_BOUND_PATH),
+            self.package_uid,
+            ready.as_bytes(),
+        );
+        let _ = linux_files::remove_own_service_identity(
+            Path::new(API_PID_PATH),
+            self.package_uid,
+            pid.as_bytes(),
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_parent_death_signal(signal: libc::c_int) -> BridgeResult<()> {
+    // SAFETY: PR_SET_PDEATHSIG changes only the calling process and receives a
+    // plain signal number. Failure is fail-closed even on an unexpected old
+    // vendor kernel because otherwise the API could outlive its lifecycle
+    // publisher before a PID/readiness identity exists.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, signal, 0, 0, 0) } != 0 {
+        return Err(BridgeError::unsafe_runtime());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn exact_parent_is_live(parent: &SupervisedParent, package_uid: u32) -> BridgeResult<()> {
+    // SAFETY: getppid has no pointer arguments or preconditions.
+    let actual = unsafe { libc::getppid() };
+    if u32::try_from(actual).ok() != Some(parent.pid) {
+        return Err(BridgeError::unsafe_runtime());
+    }
+    linux_files::validate_live_process_identity(parent.pid, parent.start, &parent.boot, package_uid)
+}
+
+#[cfg(target_os = "linux")]
+fn server_identities() -> BridgeResult<(u32, u32, u32)> {
+    if CGI_ORIGIN_VARIABLES
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+    {
+        return Err(BridgeError::unsafe_runtime());
+    }
+    let identity = linux_runtime::identity_state()?;
+    let package_uid = validate_package_identity(&identity)?;
+    let (web_uid, web_gid) = linux_runtime::web_identity()?;
+    if web_uid == 0 || web_uid == package_uid || web_gid == 0 {
+        return Err(BridgeError::unsafe_runtime());
+    }
+    Ok((package_uid, web_uid, web_gid))
+}
+
+#[cfg(target_os = "linux")]
+fn run_supervised_server(parent: SupervisedParent) -> BridgeResult<()> {
+    // Arm the kernel handshake before identity/layout work. The immediate
+    // parent comparison closes the race where the lifecycle publisher died
+    // immediately before PR_SET_PDEATHSIG was installed.
+    set_parent_death_signal(libc::SIGKILL)?;
+    // SAFETY: getppid has no pointer arguments or preconditions.
+    if u32::try_from(unsafe { libc::getppid() }).ok() != Some(parent.pid) {
+        return Err(BridgeError::unsafe_runtime());
+    }
+    let (package_uid, web_uid, web_gid) = server_identities()?;
+    exact_parent_is_live(&parent, package_uid)?;
+    let (pid, start, boot) = linux_files::current_process_identity()?;
+    let pid_record = format!("{pid}\n");
+    linux_files::publish_service_identity(
+        Path::new(API_PID_PATH),
+        package_uid,
+        pid_record.as_bytes(),
+    )?;
+    let _files = SupervisedServerFiles {
+        package_uid,
+        pid,
+        start,
+        boot: boot.clone(),
+    };
+    linux_runtime::clear_environment()?;
+    run_server_loop(package_uid, web_uid, web_gid, Some((&parent, start, &boot)))
+}
+
+#[cfg(target_os = "linux")]
+fn exec_supervised_controller(parent: SupervisedParent) -> BridgeResult<()> {
+    use std::os::unix::process::CommandExt;
+
+    // SIGUSR1 is fatal by default and remains armed across exec(2). The shell
+    // controller installs an explicit fatal handler immediately, then changes
+    // it to ignored only immediately before publishing controller.ready. Thus
+    // a lifecycle-parent death cannot strand a controller before its lock/PID
+    // becomes discoverable, while the normal parent exit after readiness does
+    // not terminate the long-lived controller.
+    set_parent_death_signal(libc::SIGUSR1)?;
+    // SAFETY: getppid has no pointer arguments or preconditions.
+    if u32::try_from(unsafe { libc::getppid() }).ok() != Some(parent.pid) {
+        return Err(BridgeError::unsafe_runtime());
+    }
+    if CGI_ORIGIN_VARIABLES
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+    {
+        return Err(BridgeError::unsafe_runtime());
+    }
+    let identity = linux_runtime::identity_state()?;
+    let package_uid = validate_package_identity(&identity)?;
+    exact_parent_is_live(&parent, package_uid)?;
+    linux_files::validate_private_executable(Path::new(CONTROLLER_PATH), package_uid)?;
+    let error = Command::new(CONTROLLER_PATH).exec();
+    Err(if error.raw_os_error().is_some() {
+        BridgeError::new(ErrorKind::Unavailable)
+    } else {
+        BridgeError::unsafe_runtime()
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn exec_supervised_core(parent: SupervisedParent, arguments: &[OsString]) -> BridgeResult<()> {
+    use std::os::unix::process::CommandExt;
+
+    // The runner owns run.lock and remains the sole process lifecycle parent.
+    // Keep SIGKILL armed across exec so SIGKILL/OOM of that shell cannot strand
+    // a sync core after the authoritative lock owner disappears.
+    set_parent_death_signal(libc::SIGKILL)?;
+    // SAFETY: getppid has no pointer arguments or preconditions.
+    if u32::try_from(unsafe { libc::getppid() }).ok() != Some(parent.pid) {
+        return Err(BridgeError::unsafe_runtime());
+    }
+    let identity = linux_runtime::identity_state()?;
+    let package_uid = validate_package_identity(&identity)?;
+    exact_parent_is_live(&parent, package_uid)?;
+    linux_files::validate_private_executable(Path::new(BINARY_PATH), package_uid)?;
+    let mut command = Command::new(BINARY_PATH);
+    command.args(arguments);
+    for name in CORE_CLI_ENVIRONMENT_VARIABLES {
+        command.env_remove(name);
+    }
+    let error = command.exec();
+    Err(if error.raw_os_error().is_some() {
+        BridgeError::new(ErrorKind::Unavailable)
+    } else {
+        BridgeError::unsafe_runtime()
+    })
+}
+
 fn run_server() -> BridgeResult<()> {
     #[cfg(not(target_os = "linux"))]
     return Err(BridgeError::unsafe_runtime());
 
     #[cfg(target_os = "linux")]
     {
-        if CGI_ORIGIN_VARIABLES
-            .iter()
-            .any(|name| std::env::var_os(name).is_some())
-        {
-            return Err(BridgeError::unsafe_runtime());
-        }
-        let identity = linux_runtime::identity_state()?;
-        let package_uid = validate_package_identity(&identity)?;
-        let (web_uid, web_gid) = linux_runtime::web_identity()?;
-        if web_uid == 0 || web_uid == package_uid || web_gid == 0 {
-            return Err(BridgeError::unsafe_runtime());
-        }
+        let (package_uid, web_uid, web_gid) = server_identities()?;
         linux_runtime::clear_environment()?;
-        let listener = linux_socket::bind(Path::new(API_SOCKET_PATH), package_uid, web_gid)?;
-        let workers =
-            BoundedWorkerPool::start(API_WORKER_COUNT, API_QUEUE_CAPACITY, move |mut stream| {
-                let _ = serve_connection(&mut stream, package_uid, web_uid);
-            })?;
+        run_server_loop(package_uid, web_uid, web_gid, None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_server_loop(
+    package_uid: u32,
+    web_uid: u32,
+    web_gid: u32,
+    supervisor: Option<(&SupervisedParent, u64, &str)>,
+) -> BridgeResult<()> {
+    let listener = linux_socket::bind(Path::new(API_SOCKET_PATH), package_uid, web_gid)?;
+    if let Some((parent, start, boot)) = supervisor {
+        // PID + socket + this private bound identity form the pre-commit
+        // topology. Keep the parent-death signal armed until the lifecycle
+        // parent has observed both services and atomically committed its
+        // startup lease. A failed/timed-out start therefore cannot strand a
+        // child that publishes during cleanup.
+        let ready = format!("{}\n{}\n{}\n", std::process::id(), start, boot);
+        linux_files::publish_service_identity(
+            Path::new(API_BOUND_PATH),
+            package_uid,
+            ready.as_bytes(),
+        )?;
         loop {
-            match listener.accept() {
-                Ok((stream, _)) => match workers.try_dispatch(stream) {
-                    Ok(()) | Err(DispatchError::Full(_)) => {}
-                    Err(DispatchError::Disconnected(_)) => {
-                        return Err(BridgeError::new(ErrorKind::Unavailable));
-                    }
-                },
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => return Err(BridgeError::new(ErrorKind::Unavailable)),
+            exact_parent_is_live(parent, package_uid)?;
+            if linux_files::service_start_is_committed(
+                Path::new(CONTROLLER_START_PATH),
+                package_uid,
+                parent.pid,
+                parent.start,
+                &parent.boot,
+            )? {
+                break;
             }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        set_parent_death_signal(0)?;
+        exact_parent_is_live(parent, package_uid)?;
+        if !linux_files::service_start_is_committed(
+            Path::new(CONTROLLER_START_PATH),
+            package_uid,
+            parent.pid,
+            parent.start,
+            &parent.boot,
+        )? {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        linux_files::remove_own_service_identity(
+            Path::new(API_BOUND_PATH),
+            package_uid,
+            ready.as_bytes(),
+        )?;
+        linux_files::publish_service_identity(
+            Path::new(API_READY_PATH),
+            package_uid,
+            ready.as_bytes(),
+        )?;
+    }
+    let workers =
+        BoundedWorkerPool::start(API_WORKER_COUNT, API_QUEUE_CAPACITY, move |mut stream| {
+            let _ = serve_connection(&mut stream, package_uid, web_uid);
+        })?;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => match workers.try_dispatch(stream) {
+                Ok(()) | Err(DispatchError::Full(_)) => {}
+                Err(DispatchError::Disconnected(_)) => {
+                    return Err(BridgeError::new(ErrorKind::Unavailable));
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(BridgeError::new(ErrorKind::Unavailable)),
         }
     }
 }
@@ -4418,8 +8671,39 @@ fn handle_relay_request(encoded: &[u8], package_uid: u32) -> BridgeResult<CgiRes
         ValidatedHttpRequest::Get { authentication, .. }
         | ValidatedHttpRequest::Post { authentication, .. } => authentication,
     };
-    let session = linux_runtime::authenticate_and_authorize(authentication)?;
-    execute_authenticated_request(request, body, &session, package_uid, current_epoch()?)
+    // The CGI performs the documented DSM check early, while the native
+    // request environment is intact. The package daemon repeats that same
+    // root-owned helper check using only the bounded relayed environment and
+    // independently resolves administrator membership. The socket admits only
+    // DSM's exact non-root web UID via SO_PEERCRED; request authority still
+    // comes exclusively from the repeated DSM authentication, never from a
+    // cross-UID /proc lookup that rootless package processes cannot perform.
+    let session = linux_runtime::authenticate_and_authorize(authentication, AUTH_HELPER_TIMEOUT)?;
+    validate_relay_authenticated_session(&relay, &session)?;
+    let policy = linux_files::load_security_policy(package_uid)?;
+    let is_post = matches!(request, ValidatedHttpRequest::Post { .. });
+    let result = if policy.require_https && !is_https_request(authentication.https.as_deref()) {
+        Err(BridgeError::new(ErrorKind::Forbidden))
+    } else {
+        execute_authenticated_request(
+            request,
+            body,
+            &session,
+            package_uid,
+            current_epoch()?,
+            &policy,
+        )
+    };
+    if is_post && result.is_err() {
+        let _ = record_rejected_post(&session.username, session.uid);
+    }
+    result
+}
+
+fn is_https_request(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true") || value == "1"
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -4429,6 +8713,7 @@ fn execute_authenticated_request(
     session: &AuthenticatedSession,
     package_uid: u32,
     now: u64,
+    policy: &SecurityPolicyArgs,
 ) -> BridgeResult<CgiResponse> {
     let control_paths = ControlPaths::production();
     match request {
@@ -4436,43 +8721,81 @@ fn execute_authenticated_request(
             ReadAction::Csrf => {
                 let key = linux_files::load_or_create_csrf_key(&control_paths, package_uid)?;
                 let nonce = linux_files::random_nonce()?;
-                let token = issue_csrf_token(&key[..], &session.binding, now, &nonce)?;
+                let token = issue_csrf_token(
+                    &key[..],
+                    &session.binding,
+                    now,
+                    &nonce,
+                    policy.csrf_lifetime_seconds,
+                )?;
                 let body = serde_json::to_vec(&json!({
                     "schema": "sdsync.dsm-csrf.v1",
                     "csrf_token": token,
-                    "expires_at_epoch": now + CSRF_LIFETIME_SECONDS,
+                    "expires_at_epoch": now + policy.csrf_lifetime_seconds,
                 }))
                 .map_err(|_| BridgeError::internal())?;
                 Ok(CgiResponse::success(body))
             }
-            ReadAction::Result { job_id } => {
-                execute_result_action(&control_paths, &job_id, &session.binding, package_uid, now)
-            }
-            action => execute_read_action(&action),
+            ReadAction::Result { job_id } => execute_result_action(
+                &control_paths,
+                &job_id,
+                &session.binding,
+                session.uid,
+                package_uid,
+                now,
+                policy.result_retention_seconds,
+            ),
+            action => execute_read_action(&action, policy),
         },
         ValidatedHttpRequest::Post { csrf_token, .. } => {
             let key = linux_files::load_or_create_csrf_key(&control_paths, package_uid)?;
-            verify_csrf_token(&csrf_token, &key[..], &session.binding, now)?;
+            verify_csrf_token(
+                &csrf_token,
+                &key[..],
+                &session.binding,
+                now,
+                policy.csrf_lifetime_seconds,
+            )?;
             let body = body.ok_or_else(BridgeError::bad_request)?;
             let parsed = parse_mutation_request(body)?;
-            let job_id = linux_files::enqueue(
+            validate_mutation_against_security_policy(&parsed.mutation, policy)?;
+            let request_fingerprint = mutation_request_fingerprint(
+                &key[..],
+                &parsed.mutation,
+                parsed.secret.as_ref().map(|secret| secret.as_slice()),
+            )?;
+            let audit_nonce = linux_files::random_nonce()?;
+            let audit_transaction =
+                audit_transaction_id(&session.binding, &parsed.request_id, now, &audit_nonce)?;
+            let enqueue_outcome = linux_files::enqueue(
                 &control_paths,
                 EnqueueRequest {
                     package_uid,
                     client_request_id: &parsed.request_id,
                     requested_by: &session.username,
+                    requested_uid: session.uid,
                     session_binding: &session.binding,
+                    audit_transaction: &audit_transaction,
+                    request_fingerprint: &request_fingerprint,
                     issued_at_epoch: now,
                     mutation: &parsed.mutation,
                     secret: parsed.secret.as_ref().map(|secret| secret.as_slice()),
                 },
+                policy.max_outstanding_jobs,
+                record_audit_event,
             )?;
+            let job_id = enqueue_outcome.job_id().to_owned();
+            let state = enqueue_outcome.response_state();
+            let replayed = enqueue_outcome.replayed();
+            let durability_warning = enqueue_outcome.durability_warning();
             let response = serde_json::to_vec(&json!({
                 "schema": "sdsync.dsm-queued.v1",
                 "ok": true,
                 "request_id": parsed.request_id,
                 "job_id": job_id,
-                "state": "queued",
+                "state": state,
+                "replayed": replayed,
+                "durability_warning": durability_warning,
             }))
             .map_err(|_| BridgeError::internal())?;
             Ok(CgiResponse::accepted(response))
@@ -4485,15 +8808,23 @@ fn execute_result_action(
     paths: &ControlPaths<'_>,
     job_id: &str,
     session_binding: &[u8; 32],
+    authenticated_uid: u32,
     package_uid: u32,
     now: u64,
+    result_retention_seconds: u64,
 ) -> BridgeResult<CgiResponse> {
     if !valid_server_job_id(job_id) {
         return Err(BridgeError::bad_request());
     }
-    if let Some(response) =
-        completed_result_response(paths, job_id, session_binding, package_uid, now)?
-    {
+    if let Some(response) = completed_result_response(
+        paths,
+        job_id,
+        session_binding,
+        authenticated_uid,
+        package_uid,
+        now,
+        result_retention_seconds,
+    )? {
         return Ok(response);
     }
 
@@ -4509,7 +8840,9 @@ fn execute_result_action(
         if job.request_id != job_id {
             return Err(BridgeError::new(ErrorKind::Unavailable));
         }
-        if !session_binding_matches(&job.session_binding, session_binding) {
+        if job.requested_uid != authenticated_uid
+            || !session_binding_matches(&job.session_binding, session_binding)
+        {
             return queued_pending_response(job_id);
         }
         if job.issued_at_epoch > now.saturating_add(CLOCK_SKEW_SECONDS) {
@@ -4522,9 +8855,15 @@ fn execute_result_action(
     }
     // Close the processing -> response publish/removal race before declaring
     // the server-generated identifier gone.
-    if let Some(response) =
-        completed_result_response(paths, job_id, session_binding, package_uid, now)?
-    {
+    if let Some(response) = completed_result_response(
+        paths,
+        job_id,
+        session_binding,
+        authenticated_uid,
+        package_uid,
+        now,
+        result_retention_seconds,
+    )? {
         return Ok(response);
     }
     queued_expired_response(job_id)
@@ -4535,24 +8874,53 @@ fn completed_result_response(
     paths: &ControlPaths<'_>,
     job_id: &str,
     session_binding: &[u8; 32],
+    authenticated_uid: u32,
     package_uid: u32,
     now: u64,
+    result_retention_seconds: u64,
 ) -> BridgeResult<Option<CgiResponse>> {
     let Some(bytes) = linux_files::read_optional_response(paths, job_id, package_uid)? else {
         return Ok(None);
     };
-    let response = parse_queued_response(&bytes, job_id)?;
-    if !session_binding_matches(&response.session_binding, session_binding) {
+    let mut response = parse_queued_response(&bytes, job_id)?;
+    if response.requested_uid != authenticated_uid
+        || !session_binding_matches(&response.session_binding, session_binding)
+    {
         return queued_pending_response(job_id).map(Some);
     }
     if response.completed_at_epoch > now.saturating_add(CLOCK_SKEW_SECONDS) {
         return Err(BridgeError::new(ErrorKind::Unavailable));
     }
-    if now.saturating_sub(response.completed_at_epoch) > RESULT_RETENTION_SECONDS {
+    if response.audit_pending {
+        // Polling is also a bounded reconciliation opportunity, but an audit
+        // sink outage must never hide or delete a known terminal result. The
+        // controller provides autonomous retry; GET keeps serving the truthful
+        // result with audit_pending until the durable record is confirmed.
+        let audit_paths = paths.audit_outbox();
+        if linux_files::reconcile_audit_transactions(&audit_paths, package_uid, record_audit_event)
+            .is_ok()
+        {
+            let Some(refreshed) = linux_files::read_optional_response(paths, job_id, package_uid)?
+            else {
+                return queued_expired_response(job_id).map(Some);
+            };
+            response = parse_queued_response(&refreshed, job_id)?;
+        }
+    }
+    if !response.audit_pending
+        && now.saturating_sub(response.completed_at_epoch) > result_retention_seconds
+    {
         linux_files::remove_expired_response(paths, job_id, package_uid)?;
         return queued_expired_response(job_id).map(Some);
     }
-    queued_complete_response(job_id, &response.result).map(Some)
+    queued_complete_response(
+        job_id,
+        &response.client_request_id,
+        response.requested_uid,
+        &response.result,
+        response.audit_pending,
+    )
+    .map(Some)
 }
 
 fn queued_pending_response(job_id: &str) -> BridgeResult<CgiResponse> {
@@ -4565,11 +8933,20 @@ fn queued_pending_response(job_id: &str) -> BridgeResult<CgiResponse> {
     Ok(CgiResponse::accepted(body))
 }
 
-fn queued_complete_response(job_id: &str, result: &Value) -> BridgeResult<CgiResponse> {
+fn queued_complete_response(
+    job_id: &str,
+    client_request_id: &str,
+    actor_uid: u32,
+    result: &Value,
+    audit_pending: bool,
+) -> BridgeResult<CgiResponse> {
     let body = serde_json::to_vec(&json!({
         "schema": "sdsync.dsm-result-status.v1",
         "job_id": job_id,
+        "client_request_id": client_request_id,
+        "actor_uid": actor_uid,
         "state": "complete",
+        "audit_pending": audit_pending,
         "result": result,
     }))
     .map_err(|_| BridgeError::internal())?;
@@ -4596,13 +8973,16 @@ fn queued_expired_response(job_id: &str) -> BridgeResult<CgiResponse> {
 }
 
 #[cfg(target_os = "linux")]
-fn execute_read_action(action: &ReadAction) -> BridgeResult<CgiResponse> {
+fn execute_read_action(
+    action: &ReadAction,
+    policy: &SecurityPolicyArgs,
+) -> BridgeResult<CgiResponse> {
     let arguments = read_manager_arguments(action)?;
     let output = run_read_manager(&arguments)?;
     if !output.status_success {
         return Err(BridgeError::new(ErrorKind::Unavailable));
     }
-    let body = parse_and_sanitize_manager_json(&output.stdout, action, None)?;
+    let body = parse_and_sanitize_manager_json(&output.stdout, action, None, Some(policy))?;
     Ok(CgiResponse::success(body))
 }
 
@@ -4622,28 +9002,66 @@ fn run_consumer(request: &Path, response: &Path) -> BridgeResult<()> {
         let package_uid = validate_package_identity(&identity)?;
         let request_id = validate_consumer_paths(request, response)?;
         linux_runtime::clear_environment()?;
-        enable_consumer_subreaper()?;
-        let termination_requested = install_consumer_termination_handler()?;
         let control_paths = ControlPaths::production();
 
         let response_result = (|| {
-            if termination_requested.load(AtomicOrdering::Acquire) {
-                return Err(BridgeError::new(ErrorKind::Unavailable));
-            }
-            let job_bytes = linux_files::read_job(&control_paths, request, package_uid)?;
-            let job = parse_job(&job_bytes)?;
-            let now = current_epoch()?;
-            validate_job_freshness(job.issued_at_epoch, now)?;
-            if job.request_id != request_id {
-                return Err(BridgeError::bad_request());
-            }
-            let result =
-                consume_job_inner(&control_paths, &job, package_uid, &termination_requested)
-                    .unwrap_or_else(|_| generic_manager_result_value());
-            if termination_requested.load(AtomicOrdering::Acquire) {
-                return Err(BridgeError::new(ErrorKind::Unavailable));
-            }
-            canonical_queued_response_bytes(&job, current_epoch()?, &result)
+            let job = match linux_files::read_job(&control_paths, request, package_uid)
+                .and_then(|bytes| parse_job(&bytes))
+            {
+                Ok(job) => job,
+                Err(error) => {
+                    // No untrusted field is attributable until the strict job
+                    // document parses. Preserve a durable, bounded controller
+                    // rejection record before the controller quarantines it.
+                    record_rejected_operation("package-controller", package_uid, "controller")?;
+                    return Err(error);
+                }
+            };
+            let audit_transaction = job.audit_transaction.clone();
+            let mut termination_requested = None;
+            let execution_result = (|| {
+                // Unsupported subreaper mode on DSM's older Linux 3.2 kernels
+                // is safe here: every manager is still isolated in a process
+                // group, and cancellation waits until that entire group has
+                // disappeared. Subreaping only improves local waitpid cleanup.
+                let _subreaper_enabled = enable_consumer_subreaper()?;
+                let flag = install_consumer_termination_handler()?;
+                termination_requested = Some(flag);
+                let termination_requested = termination_requested
+                    .as_ref()
+                    .ok_or_else(BridgeError::internal)?;
+                validate_job_freshness(job.issued_at_epoch, current_epoch()?)?;
+                if job.request_id != request_id {
+                    return Err(BridgeError::bad_request());
+                }
+                linux_files::claim_queued_audit_transaction(
+                    &control_paths.audit_outbox(),
+                    package_uid,
+                    &audit_transaction,
+                    &request_id,
+                )?;
+                consume_job_inner(&control_paths, &job, package_uid, termination_requested)
+            })();
+            let result = terminalize_consume_result(execution_result, |state| {
+                let phase = if state == "succeeded" {
+                    AuditOutboxPhase::Succeeded
+                } else {
+                    AuditOutboxPhase::Failed
+                };
+                linux_files::audit_transaction_complete(
+                    &control_paths.audit_outbox(),
+                    package_uid,
+                    &audit_transaction,
+                    phase,
+                    record_audit_event,
+                )
+            });
+            canonical_queued_response_bytes(
+                &job,
+                current_epoch()?,
+                &result.value,
+                result.audit_pending,
+            )
         })();
         linux_files::remove_claimed_secret(&control_paths, &request_id);
         let response_bytes = response_result?;
@@ -4658,15 +9076,29 @@ fn run_consumer(request: &Path, response: &Path) -> BridgeResult<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn enable_consumer_subreaper() -> BridgeResult<()> {
+fn classify_consumer_subreaper_result(result: i32, errno: Option<i32>) -> BridgeResult<bool> {
+    if result == 0 {
+        return Ok(true);
+    }
+    match errno {
+        // DSM 7.1 still supports families whose vendor kernel predates
+        // PR_SET_CHILD_SUBREAPER. EINVAL is also the documented response when
+        // this prctl operation is unknown to an older kernel.
+        Some(libc::ENOSYS) | Some(libc::EINVAL) => Ok(false),
+        _ => Err(BridgeError::new(ErrorKind::Unavailable)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn enable_consumer_subreaper() -> BridgeResult<bool> {
     // SAFETY: PR_SET_CHILD_SUBREAPER changes only this dedicated consumer
     // process. It lets shutdown reap manager grandchildren before reporting
     // the queued process group terminal.
-    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == 0 {
-        Ok(())
-    } else {
-        Err(BridgeError::new(ErrorKind::Unavailable))
-    }
+    let result = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+    let errno = (result != 0)
+        .then(|| std::io::Error::last_os_error().raw_os_error())
+        .flatten();
+    classify_consumer_subreaper_result(result, errno)
 }
 
 #[cfg(target_os = "linux")]
@@ -4690,6 +9122,11 @@ fn consume_job_inner(
     package_uid: u32,
     termination_requested: &AtomicBool,
 ) -> BridgeResult<Value> {
+    // Policy is deliberately reloaded immediately before execution. A queued
+    // destructive/TLS/remote-log/operational action is revoked if an
+    // administrator tightened policy after it was accepted.
+    let current_policy = linux_files::load_security_policy(package_uid)?;
+    validate_mutation_against_security_policy(&job.mutation, &current_policy)?;
     let secret = match &job.mutation {
         Mutation::SetSecret(arguments) if arguments.mode == SecretMode::Replace => {
             linux_files::read_claimed_secret(paths, &job.request_id, package_uid, true)?
@@ -4713,6 +9150,9 @@ fn consume_job_inner(
         &output.stdout,
         secret.as_ref().map(|secret| secret.as_slice()),
     )?;
+    if matches!(&job.mutation, Mutation::SetSecret(_)) {
+        validate_set_secret_manager_result(&result)?;
+    }
     if result.get("ok").and_then(Value::as_bool) != Some(output.status_success) {
         return Err(BridgeError::new(ErrorKind::Unavailable));
     }
@@ -4787,6 +9227,38 @@ mod tests {
         }
     }
 
+    fn authenticated_session() -> AuthenticatedSession {
+        AuthenticatedSession {
+            username: "admin".to_owned(),
+            uid: 1000,
+            binding: [7_u8; 32],
+        }
+    }
+
+    fn bound_authenticated_session(
+        environment: &CgiEnvironment,
+        authenticated_uid: u32,
+    ) -> AuthenticatedSession {
+        let request = validate_http_request(environment.clone()).unwrap();
+        let authentication = match &request {
+            ValidatedHttpRequest::Get { authentication, .. }
+            | ValidatedHttpRequest::Post { authentication, .. } => authentication,
+        };
+        AuthenticatedSession {
+            username: "admin".to_owned(),
+            uid: authenticated_uid,
+            binding: session_binding(
+                "admin",
+                authenticated_uid,
+                &authentication.cookie,
+                authentication
+                    .synology_token
+                    .as_ref()
+                    .map(|value| value.as_str()),
+            ),
+        }
+    }
+
     fn post_environment(body_length: usize) -> CgiEnvironment {
         let mut environment = environment("POST", "");
         environment.content_length = Some(body_length.to_string());
@@ -4855,6 +9327,63 @@ mod tests {
         })
     }
 
+    fn security_policy_arguments() -> Value {
+        serde_json::to_value(SecurityPolicyArgs::default()).unwrap()
+    }
+
+    fn security_policy_document() -> String {
+        concat!(
+            "policy_version=1\n",
+            "require_https=false\n",
+            "allow_interface_changes=true\n",
+            "allow_profile_changes=true\n",
+            "allow_secret_changes=true\n",
+            "allow_routine_changes=true\n",
+            "allow_notification_changes=true\n",
+            "allow_operational_actions=true\n",
+            "allow_http_targets=true\n",
+            "allow_invalid_tls=true\n",
+            "allow_destructive_sync=true\n",
+            "allow_doctor_write_test=true\n",
+            "allow_remote_logging=true\n",
+            "allow_empty_source=true\n",
+            "csrf_lifetime_seconds=300\n",
+            "result_retention_seconds=3600\n",
+            "max_outstanding_jobs=256\n",
+            "audit_log_level=info\n",
+            "bridge_log_level=info\n",
+            "authentication_log_level=warn\n",
+            "security_log_level=warn\n",
+            "configuration_log_level=info\n",
+            "secrets_log_level=info\n",
+            "routines_log_level=info\n",
+            "operations_log_level=info\n",
+            "notifications_log_level=warn\n",
+            "sync_log_level=info\n",
+            "controller_log_level=info\n",
+            "scheduler_log_level=info\n",
+        )
+        .to_owned()
+    }
+
+    fn set_category_level(policy: &mut SecurityPolicyArgs, category: &str, level: PolicyLogLevel) {
+        match category {
+            "audit" => policy.audit_log_level = level,
+            "bridge" => policy.bridge_log_level = level,
+            "authentication" => policy.authentication_log_level = level,
+            "security" => policy.security_log_level = level,
+            "configuration" => policy.configuration_log_level = level,
+            "secrets" => policy.secrets_log_level = level,
+            "routines" => policy.routines_log_level = level,
+            "operations" => policy.operations_log_level = level,
+            "notifications" => policy.notifications_log_level = level,
+            "sync" => policy.sync_log_level = level,
+            "controller" => policy.controller_log_level = level,
+            "scheduler" => policy.scheduler_log_level = level,
+            _ => panic!("unknown test category: {category}"),
+        }
+    }
+
     fn argument_strings(mutation: &Mutation) -> Vec<String> {
         mutation_manager_arguments(mutation)
             .into_iter()
@@ -4871,8 +9400,12 @@ mod tests {
         requests: PathBuf,
         processing: PathBuf,
         responses: PathBuf,
+        staging: PathBuf,
         csrf_key: PathBuf,
         enqueue_lock: PathBuf,
+        enqueue_sequence: PathBuf,
+        audit_outbox_directory: PathBuf,
+        audit_outbox_lock: PathBuf,
     }
 
     #[cfg(target_os = "linux")]
@@ -4886,17 +9419,30 @@ mod tests {
             let requests = root.join("requests");
             let processing = root.join("processing");
             let responses = root.join("responses");
-            for directory in [&root, &requests, &processing, &responses] {
+            let staging = root.join("staging");
+            let audit_outbox_directory = root.join("audit-outbox");
+            for directory in [
+                &root,
+                &requests,
+                &processing,
+                &responses,
+                &staging,
+                &audit_outbox_directory,
+            ] {
                 fs::create_dir(directory).unwrap();
                 fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
             }
             Self {
                 csrf_key: root.join("csrf.key"),
                 enqueue_lock: root.join("enqueue.lock"),
+                enqueue_sequence: root.join("enqueue.sequence"),
+                audit_outbox_directory,
+                audit_outbox_lock: root.join("audit-outbox.flock"),
                 root,
                 requests,
                 processing,
                 responses,
+                staging,
             }
         }
 
@@ -4906,8 +9452,12 @@ mod tests {
                 requests: &self.requests,
                 processing: &self.processing,
                 responses: &self.responses,
+                staging: &self.staging,
                 csrf_key: &self.csrf_key,
                 enqueue_lock: &self.enqueue_lock,
+                enqueue_sequence: &self.enqueue_sequence,
+                audit_outbox_directory: &self.audit_outbox_directory,
+                audit_outbox_lock: &self.audit_outbox_lock,
             }
         }
 
@@ -4944,8 +9494,12 @@ mod tests {
         assert_eq!(paths.requests, Path::new(REQUESTS_DIR));
         assert_eq!(paths.processing, Path::new(PROCESSING_DIR));
         assert_eq!(paths.responses, Path::new(RESPONSES_DIR));
+        assert_eq!(paths.staging, Path::new(STAGING_DIR));
         assert_eq!(paths.csrf_key, Path::new(CSRF_KEY_PATH));
         assert_eq!(paths.enqueue_lock, Path::new(ENQUEUE_LOCK_PATH));
+        assert_eq!(paths.enqueue_sequence, Path::new(ENQUEUE_SEQUENCE_PATH));
+        assert_eq!(paths.audit_outbox_directory, Path::new(AUDIT_OUTBOX_DIR));
+        assert_eq!(paths.audit_outbox_lock, Path::new(AUDIT_OUTBOX_LOCK_PATH));
         assert_eq!(
             Path::new(API_SOCKET_PATH),
             Path::new(PACKAGE_ROOT).join("ui/api.sock")
@@ -5134,11 +9688,11 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn queued_mutation_cancellation_kills_group_and_reaps_secret_helper() {
+    fn queued_mutation_cancellation_is_group_safe_without_subreaper() {
         const CHILD_MODE: &str = "SDSYNC_TEST_QUEUED_SIGNAL_CHILD";
         const PID_FILE: &str = "SDSYNC_TEST_QUEUED_SIGNAL_PIDS";
         if std::env::var_os(CHILD_MODE).is_some() {
-            enable_consumer_subreaper().unwrap();
+            assert!(!classify_consumer_subreaper_result(-1, Some(libc::EINVAL)).unwrap());
             let termination_requested = install_consumer_termination_handler().unwrap();
             let pid_file = PathBuf::from(std::env::var_os(PID_FILE).unwrap());
             let mut command = Command::new("/bin/sh");
@@ -5188,7 +9742,7 @@ mod tests {
         let started = Instant::now();
         let mut consumer = Command::new(test_binary)
             .args([
-                "queued_mutation_cancellation_kills_group_and_reaps_secret_helper",
+                "queued_mutation_cancellation_is_group_safe_without_subreaper",
                 "--nocapture",
                 "--test-threads=1",
             ])
@@ -5270,6 +9824,7 @@ mod tests {
         }
         let fixture = TestControlFixture::new("socket-stale");
         let socket = fixture.root.join("api.sock");
+        let pid_file = fixture.root.join("api.pid");
         let listener = linux_socket::bind(&socket, uid, gid).unwrap();
         let metadata = fs::symlink_metadata(&socket).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o7777, 0o660);
@@ -5279,17 +9834,41 @@ mod tests {
             linux_socket::bind(&socket, uid, gid).unwrap_err().kind,
             ErrorKind::Conflict
         );
+        let (conflict_probe, _) = listener.accept().unwrap();
+        drop(conflict_probe);
+        // Other parallel tests fork helpers. CLOEXEC closes an inherited
+        // listener only after exec, so disable the shared socket description
+        // before dropping our descriptor and constructing the stale fixture.
+        // SAFETY: the listener descriptor is live and owned by this test.
+        let shutdown_status =
+            unsafe { libc::shutdown(std::os::fd::AsRawFd::as_raw_fd(&listener), libc::SHUT_RDWR) };
+        assert_eq!(shutdown_status, 0);
         drop(listener);
 
         // This is the safe crash window after bind(2) under umask 0177 but
         // before the final group/mode contract has been applied.
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        fixture.write_private(&pid_file, b"2147483647\n");
+        linux_socket::cleanup_stale_service_socket(&socket, &pid_file, uid, gid).unwrap();
+        assert!(!socket.exists());
+        assert!(!pid_file.exists());
+
         let recovered = linux_socket::bind(&socket, uid, gid).unwrap();
         assert_eq!(
             fs::symlink_metadata(&socket).unwrap().permissions().mode() & 0o7777,
             0o660
         );
         drop(recovered);
+        fixture.write_private(&pid_file, format!("{}\n", std::process::id()).as_bytes());
+        assert_eq!(
+            linux_socket::cleanup_stale_service_socket(&socket, &pid_file, uid, gid)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Conflict
+        );
+        assert!(socket.exists());
+        assert!(pid_file.exists());
+        fs::remove_file(&pid_file).unwrap();
         fs::remove_file(&socket).unwrap();
 
         let outside = fixture.root.join("outside");
@@ -5335,35 +9914,54 @@ mod tests {
             kind: SecretKind::Password,
             mode: SecretMode::Replace,
         });
+        let secret_fingerprint =
+            mutation_request_fingerprint(&first_key[..], &secret_mutation, Some(b"queue-secret"))
+                .unwrap();
         let first_id = linux_files::enqueue(
             &paths,
             EnqueueRequest {
                 package_uid,
                 client_request_id: REQUEST_ID,
                 requested_by: "admin",
+                requested_uid: 1000,
                 session_binding: &session,
+                audit_transaction: "10060f5e12345678fedcba98765432100123456789abcdef",
+                request_fingerprint: &secret_fingerprint,
                 issued_at_epoch: 10_000,
                 mutation: &secret_mutation,
                 secret: Some(b"queue-secret"),
             },
+            MAX_OUTSTANDING_JOBS,
+            |_, _| Ok(()),
         )
-        .unwrap();
+        .unwrap()
+        .job_id()
+        .to_owned();
         let plain_mutation = Mutation::RemoveProfile(NameArgs {
             name: "archive".to_owned(),
         });
+        let plain_fingerprint =
+            mutation_request_fingerprint(&first_key[..], &plain_mutation, None).unwrap();
         let second_id = linux_files::enqueue(
             &paths,
             EnqueueRequest {
                 package_uid,
                 client_request_id: "11111111111111111111111111111111",
                 requested_by: "admin",
+                requested_uid: 1000,
                 session_binding: &session,
+                audit_transaction: JOB_ID,
+                request_fingerprint: &plain_fingerprint,
                 issued_at_epoch: 10_001,
                 mutation: &plain_mutation,
                 secret: None,
             },
+            MAX_OUTSTANDING_JOBS,
+            |_, _| Ok(()),
         )
-        .unwrap();
+        .unwrap()
+        .job_id()
+        .to_owned();
         assert!(valid_server_job_id(&first_id));
         assert!(first_id < second_id);
 
@@ -5416,7 +10014,7 @@ mod tests {
         )
         .unwrap();
         let response_bytes =
-            canonical_queued_response_bytes(&parsed_job, 10_005, &manager_result).unwrap();
+            canonical_queued_response_bytes(&parsed_job, 10_005, &manager_result, false).unwrap();
         let response_path = fixture.responses.join(format!("{first_id}.json"));
         linux_files::write_response(
             &paths,
@@ -5448,38 +10046,103 @@ mod tests {
             ErrorKind::Conflict
         );
 
-        let concealed =
-            completed_result_response(&paths, &first_id, &[8_u8; 32], package_uid, 10_006)
-                .unwrap()
-                .unwrap();
+        let concealed = completed_result_response(
+            &paths,
+            &first_id,
+            &[8_u8; 32],
+            1000,
+            package_uid,
+            10_006,
+            RESULT_RETENTION_SECONDS,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(concealed.status, 202);
-        let completed = completed_result_response(&paths, &first_id, &session, package_uid, 10_006)
-            .unwrap()
-            .unwrap();
+        let completed = completed_result_response(
+            &paths,
+            &first_id,
+            &session,
+            1000,
+            package_uid,
+            10_006,
+            RESULT_RETENTION_SECONDS,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(completed.status, 200);
         assert_eq!(
             serde_json::from_slice::<Value>(&completed.body).unwrap()["state"],
             "complete"
         );
 
-        let pending =
-            execute_result_action(&paths, &second_id, &session, package_uid, 10_002).unwrap();
+        let pending = execute_result_action(
+            &paths,
+            &second_id,
+            &session,
+            1000,
+            package_uid,
+            10_002,
+            RESULT_RETENTION_SECONDS,
+        )
+        .unwrap();
         assert_eq!(pending.status, 202);
         let expired_pending = execute_result_action(
             &paths,
             &second_id,
             &session,
+            1000,
             package_uid,
             10_001 + MAX_JOB_AGE_SECONDS + 1,
+            RESULT_RETENTION_SECONDS,
         )
         .unwrap();
         assert_eq!(expired_pending.status, 410);
+        fs::remove_file(&response_path).unwrap();
+        let audit_pending_bytes =
+            canonical_queued_response_bytes(&parsed_job, 10_005, &manager_result, true).unwrap();
+        linux_files::write_response(
+            &paths,
+            &response_path,
+            &first_id,
+            package_uid,
+            &audit_pending_bytes,
+        )
+        .unwrap();
+        let retained_pending_audit = completed_result_response(
+            &paths,
+            &first_id,
+            &session,
+            1000,
+            package_uid,
+            10_005 + RESULT_RETENTION_SECONDS + 1,
+            RESULT_RETENTION_SECONDS,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(retained_pending_audit.status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&retained_pending_audit.body).unwrap()["audit_pending"],
+            true
+        );
+        assert!(response_path.is_file());
+
+        fs::remove_file(&response_path).unwrap();
+        linux_files::write_response(
+            &paths,
+            &response_path,
+            &first_id,
+            package_uid,
+            &response_bytes,
+        )
+        .unwrap();
         let expired_response = completed_result_response(
             &paths,
             &first_id,
             &session,
+            1000,
             package_uid,
             10_005 + RESULT_RETENTION_SECONDS + 1,
+            RESULT_RETENTION_SECONDS,
         )
         .unwrap()
         .unwrap();
@@ -5487,8 +10150,16 @@ mod tests {
         assert!(!response_path.exists());
 
         let missing_id = "ffffffffffffffffffffffffffffffffffffffffffffffff";
-        let missing =
-            execute_result_action(&paths, missing_id, &session, package_uid, 10_000).unwrap();
+        let missing = execute_result_action(
+            &paths,
+            missing_id,
+            &session,
+            1000,
+            package_uid,
+            10_000,
+            RESULT_RETENTION_SECONDS,
+        )
+        .unwrap();
         assert_eq!(missing.status, 410);
     }
 
@@ -5572,6 +10243,8 @@ mod tests {
         let mutation = Mutation::RemoveProfile(NameArgs {
             name: "archive".to_owned(),
         });
+        let request_fingerprint =
+            mutation_request_fingerprint(&[3_u8; 32], &mutation, None).unwrap();
         let unknown_entry = fixture.requests.join("unreviewed-entry");
         fixture.write_private(&unknown_entry, b"");
         assert_eq!(
@@ -5581,11 +10254,16 @@ mod tests {
                     package_uid,
                     client_request_id: REQUEST_ID,
                     requested_by: "admin",
+                    requested_uid: 1000,
                     session_binding: &[7_u8; 32],
+                    audit_transaction: JOB_ID,
+                    request_fingerprint: &request_fingerprint,
                     issued_at_epoch: 10_000,
                     mutation: &mutation,
                     secret: None,
                 },
+                MAX_OUTSTANDING_JOBS,
+                |_, _| Ok(()),
             )
             .unwrap_err()
             .kind,
@@ -5603,11 +10281,16 @@ mod tests {
                     package_uid,
                     client_request_id: REQUEST_ID,
                     requested_by: "admin",
+                    requested_uid: 1000,
                     session_binding: &[7_u8; 32],
+                    audit_transaction: JOB_ID,
+                    request_fingerprint: &request_fingerprint,
                     issued_at_epoch: 10_000,
                     mutation: &mutation,
                     secret: None,
                 },
+                MAX_OUTSTANDING_JOBS,
+                |_, _| Ok(()),
             )
             .unwrap_err()
             .kind,
@@ -5616,8 +10299,22 @@ mod tests {
         fs::remove_file(&wrong_mode_job).unwrap();
 
         for index in 0..MAX_OUTSTANDING_JOBS {
-            let path = fixture.requests.join(format!("{index:048x}.json"));
-            fixture.write_private(&path, b"");
+            let request_id = format!("{index:048x}");
+            let client_request_id = format!("{index:032x}");
+            let job = canonical_job_bytes(
+                &request_id,
+                &client_request_id,
+                "admin",
+                1000,
+                &[8_u8; 32],
+                JOB_ID,
+                &request_fingerprint,
+                10_000,
+                &mutation,
+            )
+            .unwrap();
+            let path = fixture.requests.join(format!("{request_id}.json"));
+            fixture.write_private(&path, &job);
         }
         assert_eq!(
             linux_files::enqueue(
@@ -5626,11 +10323,16 @@ mod tests {
                     package_uid,
                     client_request_id: REQUEST_ID,
                     requested_by: "admin",
+                    requested_uid: 1000,
                     session_binding: &[7_u8; 32],
+                    audit_transaction: JOB_ID,
+                    request_fingerprint: &request_fingerprint,
                     issued_at_epoch: 10_000,
                     mutation: &mutation,
                     secret: None,
                 },
+                MAX_OUTSTANDING_JOBS,
+                |_, _| Ok(()),
             )
             .unwrap_err()
             .kind,
@@ -5663,6 +10365,466 @@ mod tests {
                 .unwrap_err()
                 .kind,
             ErrorKind::UnsafeRuntime
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enqueue_recovery_removes_a_consumed_secret_staging_link_immediately() {
+        let fixture = TestControlFixture::new("consumed-secret-staging");
+        let paths = fixture.paths();
+        let package_uid = TestControlFixture::package_uid();
+        let stale_staging = fixture.staging.join(format!("{JOB_ID}.secret.tmp"));
+        let claimed_secret = fixture.processing.join(format!("{JOB_ID}.secret"));
+        fixture.write_private(&stale_staging, b"must-not-linger\n");
+        fs::hard_link(&stale_staging, &claimed_secret).unwrap();
+        fs::remove_file(&claimed_secret).unwrap();
+        assert_eq!(fs::metadata(&stale_staging).unwrap().st_nlink(), 1);
+
+        let mutation = Mutation::RemoveProfile(NameArgs {
+            name: "archive".to_owned(),
+        });
+        let request_fingerprint =
+            mutation_request_fingerprint(&[3_u8; 32], &mutation, None).unwrap();
+        let now = current_epoch().unwrap();
+        let outcome = linux_files::enqueue(
+            &paths,
+            EnqueueRequest {
+                package_uid,
+                client_request_id: REQUEST_ID,
+                requested_by: "admin",
+                requested_uid: 1000,
+                session_binding: &[7_u8; 32],
+                audit_transaction: JOB_ID,
+                request_fingerprint: &request_fingerprint,
+                issued_at_epoch: now,
+                mutation: &mutation,
+                secret: None,
+            },
+            MAX_OUTSTANDING_JOBS,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert!(matches!(outcome, EnqueueOutcome::Published { .. }));
+        assert!(!stale_staging.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn queue_recovery_removes_only_stable_orphan_canonical_secrets() {
+        let fixture = TestControlFixture::new("orphan-canonical-secret");
+        let paths = fixture.paths();
+        let package_uid = TestControlFixture::package_uid();
+        let orphan = fixture.requests.join(format!("{JOB_ID}.secret"));
+        fixture.write_private(&orphan, b"orphaned-before-job-publication\n");
+
+        linux_files::recover_orphan_canonical_secrets(&paths, package_uid).unwrap();
+        assert!(!orphan.exists());
+
+        let mutation = Mutation::SetSecret(SecretJobArgs {
+            profile: "nightly".to_owned(),
+            kind: SecretKind::Password,
+            mode: SecretMode::Replace,
+        });
+        let fingerprint =
+            mutation_request_fingerprint(&[3_u8; 32], &mutation, Some(b"claimed")).unwrap();
+        let job = canonical_job_bytes(
+            JOB_ID,
+            REQUEST_ID,
+            "admin",
+            1000,
+            &[7_u8; 32],
+            "10060f5e12345678fedcba98765432100123456789abcdef",
+            &fingerprint,
+            current_epoch().unwrap(),
+            &mutation,
+        )
+        .unwrap();
+        let active_job = fixture.processing.join(format!("{JOB_ID}.json"));
+        let active_secret = fixture.processing.join(format!("{JOB_ID}.secret"));
+        fixture.write_private(&active_job, &job);
+        fixture.write_private(&active_secret, b"claimed\n");
+        linux_files::recover_orphan_canonical_secrets(&paths, package_uid).unwrap();
+        assert!(active_secret.is_file());
+
+        fs::remove_file(&active_job).unwrap();
+        let hostile_link = fixture.root.join("hostile-secret-link");
+        fs::hard_link(&active_secret, &hostile_link).unwrap();
+        assert_eq!(
+            linux_files::recover_orphan_canonical_secrets(&paths, package_uid)
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnsafeRuntime
+        );
+        assert!(active_secret.is_file());
+        assert!(hostile_link.is_file());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn response_audit_rewrite_temp_does_not_break_concurrent_queue_scans() {
+        let fixture = TestControlFixture::new("response-audit-rewrite");
+        let paths = fixture.paths();
+        let package_uid = TestControlFixture::package_uid();
+        let temporary = fixture
+            .responses
+            .join(format!(".{JOB_ID}.audit-reconciled.tmp"));
+        fixture.write_private(&temporary, br#"{"audit_pending":false}"#);
+
+        assert!(
+            linux_files::collect_json_job_ids(&paths, package_uid)
+                .unwrap()
+                .is_empty()
+        );
+        // The legacy-temp recovery pass runs immediately before the stable
+        // idempotency scan and must tolerate the same live private name.
+        linux_files::recover_legacy_queue_temps(&paths, package_uid).unwrap();
+        assert!(temporary.is_file());
+
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o640)).unwrap();
+        assert_eq!(
+            linux_files::collect_json_job_ids(&paths, package_uid)
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnsafeRuntime
+        );
+        assert_eq!(
+            linux_files::recover_legacy_queue_temps(&paths, package_uid)
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnsafeRuntime
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staging_recovery_accepts_only_one_exact_published_hard_link() {
+        let fixture = TestControlFixture::new("published-staging-links");
+        let package_uid = TestControlFixture::package_uid();
+        let cases = [
+            (
+                format!("{JOB_ID}.job.tmp"),
+                fixture.requests.join(format!("{JOB_ID}.json")),
+                MAX_JOB_BYTES,
+            ),
+            (
+                format!("{JOB_ID}.secret.tmp"),
+                fixture.processing.join(format!("{JOB_ID}.secret")),
+                MAX_SECRET_BYTES + 1,
+            ),
+            (
+                format!("{JOB_ID}.response.tmp"),
+                fixture.responses.join(format!("{JOB_ID}.json")),
+                MAX_MANAGER_OUTPUT_BYTES,
+            ),
+        ];
+        for (name, companion, maximum) in cases {
+            let staging = fixture.staging.join(name);
+            fixture.write_private(&staging, b"private-staging\n");
+            fs::hard_link(&staging, &companion).unwrap();
+            let metadata = linux_files::private_file_metadata_with_companion(
+                &staging,
+                package_uid,
+                maximum,
+                std::slice::from_ref(&companion),
+            )
+            .unwrap();
+            assert_eq!(metadata.st_nlink(), 2);
+            fs::remove_file(&staging).unwrap();
+            assert_eq!(fs::metadata(&companion).unwrap().st_nlink(), 1);
+            fs::remove_file(companion).unwrap();
+        }
+
+        let hostile_staging = fixture.staging.join(format!("{JOB_ID}.job.tmp"));
+        let expected = fixture.requests.join(format!("{JOB_ID}.json"));
+        let unrelated = fixture.root.join("unrelated-hard-link");
+        fixture.write_private(&hostile_staging, b"hostile\n");
+        fs::hard_link(&hostile_staging, &unrelated).unwrap();
+        assert_eq!(
+            linux_files::private_file_metadata_with_companion(
+                &hostile_staging,
+                package_uid,
+                MAX_JOB_BYTES,
+                &[expected.clone()],
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::UnsafeRuntime
+        );
+        fs::remove_file(&unrelated).unwrap();
+        fs::hard_link(&hostile_staging, &expected).unwrap();
+        let extra = fixture.root.join("third-hard-link");
+        fs::hard_link(&hostile_staging, &extra).unwrap();
+        assert_eq!(
+            linux_files::private_file_metadata_with_companion(
+                &hostile_staging,
+                package_uid,
+                MAX_JOB_BYTES,
+                &[expected],
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::UnsafeRuntime
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unpublished_bridge_job_can_terminalize_failed_while_publisher_is_live() {
+        let fixture = TestControlFixture::new("publishing-terminal-failure");
+        let control_paths = fixture.paths();
+        let paths = control_paths.audit_outbox();
+        let package_uid = TestControlFixture::package_uid();
+        let (owner_pid, owner_start, owner_boot) = linux_files::current_process_identity().unwrap();
+        let record = AuditOutboxRecord {
+            schema: "sdsync.dsm-audit-outbox.v1".to_owned(),
+            transaction: format!("bridge-{JOB_ID}"),
+            operation: "set-password".to_owned(),
+            profile: "archive".to_owned(),
+            actor: "admin".to_owned(),
+            actor_uid: package_uid.max(1),
+            origin: "bridge".to_owned(),
+            client_request_id: Some(REQUEST_ID.to_owned()),
+            job_id: Some(JOB_ID.to_owned()),
+            owner_pid,
+            owner_start,
+            owner_boot,
+            phase: AuditOutboxPhase::Prepared,
+        };
+        let states = std::cell::RefCell::new(Vec::new());
+        linux_files::audit_transaction_begin(
+            &paths,
+            package_uid,
+            record,
+            AuditOutboxPhase::Publishing,
+            |_, state| {
+                states.borrow_mut().push(state.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap();
+        let pending = fixture
+            .audit_outbox_directory
+            .join(format!("bridge-{JOB_ID}.event"));
+        assert!(pending.is_file());
+        assert!(
+            !linux_files::audit_transaction_complete(
+                &paths,
+                package_uid,
+                &format!("bridge-{JOB_ID}"),
+                AuditOutboxPhase::Failed,
+                |_, state| {
+                    states.borrow_mut().push(state.to_owned());
+                    Ok(())
+                },
+            )
+            .unwrap()
+        );
+        assert!(!pending.exists());
+        assert_eq!(states.into_inner(), ["requested", "requested", "failed"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enqueue_terminalizes_failed_when_requested_audit_cannot_advance_to_publishing() {
+        let fixture = TestControlFixture::new("enqueue-audit-ready-write-failure");
+        let paths = fixture.paths();
+        let package_uid = TestControlFixture::package_uid();
+        let session = [7_u8; 32];
+        let mutation = Mutation::RemoveProfile(NameArgs {
+            name: "archive".to_owned(),
+        });
+        let fingerprint = mutation_request_fingerprint(&[9_u8; 32], &mutation, None).unwrap();
+        let states = std::cell::RefCell::new(Vec::new());
+        linux_files::fail_next_audit_ready_write();
+        let error = linux_files::enqueue(
+            &paths,
+            EnqueueRequest {
+                package_uid,
+                client_request_id: REQUEST_ID,
+                requested_by: "admin",
+                requested_uid: package_uid.max(1),
+                session_binding: &session,
+                audit_transaction: JOB_ID,
+                request_fingerprint: &fingerprint,
+                issued_at_epoch: current_epoch().unwrap(),
+                mutation: &mutation,
+                secret: None,
+            },
+            1,
+            |_, state| {
+                states.borrow_mut().push(state.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::UnsafeRuntime);
+        assert_eq!(states.into_inner(), ["requested", "requested", "failed"]);
+        for directory in [
+            &fixture.requests,
+            &fixture.processing,
+            &fixture.responses,
+            &fixture.staging,
+            &fixture.audit_outbox_directory,
+        ] {
+            assert_eq!(fs::read_dir(directory).unwrap().count(), 0, "{directory:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lost_202_replay_returns_original_job_and_keeps_audit_client_correlation() {
+        let fixture = TestControlFixture::new("idempotent-replay");
+        let paths = fixture.paths();
+        let package_uid = TestControlFixture::package_uid();
+        let session = [7_u8; 32];
+        let mutation = Mutation::RemoveProfile(NameArgs {
+            name: "archive".to_owned(),
+        });
+        let fingerprint = mutation_request_fingerprint(&[9_u8; 32], &mutation, None).unwrap();
+        let audit_calls = std::cell::Cell::new(0_u32);
+        let audit_events = std::cell::RefCell::new(Vec::new());
+        let enqueue_request = || EnqueueRequest {
+            package_uid,
+            client_request_id: REQUEST_ID,
+            requested_by: "admin",
+            requested_uid: 1000,
+            session_binding: &session,
+            audit_transaction: JOB_ID,
+            request_fingerprint: &fingerprint,
+            issued_at_epoch: current_epoch().unwrap(),
+            mutation: &mutation,
+            secret: None,
+        };
+        let first = linux_files::enqueue(&paths, enqueue_request(), 1, |record, state| {
+            audit_calls.set(audit_calls.get() + 1);
+            audit_events
+                .borrow_mut()
+                .push((state.to_owned(), record.clone()));
+            Ok(())
+        })
+        .unwrap();
+        let first_id = first.job_id().to_owned();
+        assert_eq!(audit_calls.get(), 1);
+        assert_eq!(
+            audit_events.borrow()[0].1.client_request_id.as_deref(),
+            Some(REQUEST_ID)
+        );
+
+        let replay = linux_files::enqueue(&paths, enqueue_request(), 1, |record, state| {
+            audit_calls.set(audit_calls.get() + 1);
+            audit_events
+                .borrow_mut()
+                .push((state.to_owned(), record.clone()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(replay, EnqueueOutcome::Existing(first_id.clone()));
+        assert_eq!(audit_calls.get(), 1);
+
+        let conflicting_mutation = Mutation::SetDefault(NameArgs {
+            name: "archive".to_owned(),
+        });
+        let conflicting_fingerprint =
+            mutation_request_fingerprint(&[9_u8; 32], &conflicting_mutation, None).unwrap();
+        let conflict = linux_files::enqueue(
+            &paths,
+            EnqueueRequest {
+                request_fingerprint: &conflicting_fingerprint,
+                mutation: &conflicting_mutation,
+                ..enqueue_request()
+            },
+            1,
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(conflict.kind, ErrorKind::Conflict);
+
+        let queued_path = fixture.requests.join(format!("{first_id}.json"));
+        let processing_path = fixture.processing.join(format!("{first_id}.json"));
+        fs::rename(&queued_path, &processing_path).unwrap();
+        let job = parse_job(&fs::read(&processing_path).unwrap()).unwrap();
+        let result = json!({
+            "schema": "sdsync.dsm-result.v1",
+            "ok": true,
+            "message": "completed",
+        });
+        let response_bytes = canonical_queued_response_bytes(
+            &job,
+            job.issued_at_epoch.saturating_add(1),
+            &result,
+            false,
+        )
+        .unwrap();
+        let response_path = fixture.responses.join(format!("{first_id}.json"));
+        linux_files::write_response(
+            &paths,
+            &response_path,
+            &first_id,
+            package_uid,
+            &response_bytes,
+        )
+        .unwrap();
+        fs::remove_file(&processing_path).unwrap();
+
+        let completed_replay =
+            linux_files::enqueue(&paths, enqueue_request(), 1, |record, state| {
+                audit_calls.set(audit_calls.get() + 1);
+                audit_events
+                    .borrow_mut()
+                    .push((state.to_owned(), record.clone()));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(completed_replay, EnqueueOutcome::Existing(first_id.clone()));
+        // Reconciliation replays the exact requested/terminal pair through an
+        // idempotent sink before the completed idempotency lookup. It never
+        // creates a second job or a second audit transaction.
+        assert_eq!(audit_calls.get(), 3);
+        assert!(audit_events.borrow().iter().all(|(_, record)| {
+            record.client_request_id.as_deref() == Some(REQUEST_ID)
+                && record.job_id.as_deref() == Some(first_id.as_str())
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enqueue_sequence_recovers_private_partial_state_from_published_maximum() {
+        let fixture = TestControlFixture::new("sequence-recovery");
+        let paths = fixture.paths();
+        let package_uid = TestControlFixture::package_uid();
+        let mutation = Mutation::RemoveProfile(NameArgs {
+            name: "archive".to_owned(),
+        });
+        let fingerprint = mutation_request_fingerprint(&[4_u8; 32], &mutation, None).unwrap();
+        let published_prefix = 0xffff_ffff_ffff_ff00_u64;
+        let published_id = format!("{published_prefix:016x}{}", "1".repeat(32));
+        let published_job = canonical_job_bytes(
+            &published_id,
+            REQUEST_ID,
+            "admin",
+            1000,
+            &[7_u8; 32],
+            JOB_ID,
+            &fingerprint,
+            current_epoch().unwrap(),
+            &mutation,
+        )
+        .unwrap();
+        fixture.write_private(
+            &fixture.requests.join(format!("{published_id}.json")),
+            &published_job,
+        );
+        fixture.write_private(&fixture.enqueue_sequence, b"partial");
+
+        let next_id = linux_files::next_job_id(&paths, package_uid).unwrap();
+        assert_eq!(
+            u64::from_str_radix(&next_id[..16], 16).unwrap(),
+            published_prefix + 1
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.enqueue_sequence).unwrap(),
+            format!("{:016x}", published_prefix + 1)
         );
     }
 
@@ -5778,7 +10940,7 @@ mod tests {
         }
 
         let environment = environment("GET", "action=snapshot");
-        let encoded = encode_relay_request(&environment, None).unwrap();
+        let encoded = encode_relay_request(&environment, None, &authenticated_session()).unwrap();
         let mut relay = decode_relay_request(&encoded).unwrap();
         relay.request_marker = Some("0".to_owned());
         assert_eq!(
@@ -5921,7 +11083,8 @@ mod tests {
             json!({"profile":"nightly","kind":"password","mode":"replace","value":secret}),
         );
         let environment = post_environment(body.len());
-        let encoded = encode_relay_request(&environment, Some(&body)).unwrap();
+        let encoded =
+            encode_relay_request(&environment, Some(&body), &authenticated_session()).unwrap();
         assert!(contains_bytes(&encoded, secret.as_bytes()));
         let relay = decode_relay_request(&encoded).unwrap();
         let debug = format!("{relay:?}");
@@ -5938,9 +11101,13 @@ mod tests {
         );
 
         assert_eq!(
-            encode_relay_request(&post_environment(1), Some(&[0xff]))
-                .unwrap_err()
-                .kind,
+            encode_relay_request(
+                &post_environment(1),
+                Some(&[0xff]),
+                &authenticated_session(),
+            )
+            .unwrap_err()
+            .kind,
             ErrorKind::BadRequest
         );
 
@@ -5950,12 +11117,14 @@ mod tests {
             oversized_field.validate_fields().unwrap_err().kind,
             ErrorKind::BadRequest
         );
-        let mut control_field = decode_relay_request(&encoded).unwrap();
-        control_field.server_name = Some("nas\nforged".to_owned());
-        assert_eq!(
-            control_field.validate_fields().unwrap_err().kind,
-            ErrorKind::BadRequest
-        );
+        for control in ['\n', '\t', '\u{001b}', '\u{007f}'] {
+            let mut control_field = decode_relay_request(&encoded).unwrap();
+            control_field.server_name = Some(format!("nas{control}forged"));
+            assert_eq!(
+                control_field.validate_fields().unwrap_err().kind,
+                ErrorKind::BadRequest
+            );
+        }
         let mut length_mismatch = decode_relay_request(&encoded).unwrap();
         length_mismatch.content_length = Some((body.len() + 1).to_string());
         assert_eq!(
@@ -5970,6 +11139,108 @@ mod tests {
         let unknown = Zeroizing::new(serde_json::to_vec(&unknown).unwrap());
         assert_eq!(
             decode_relay_request(&unknown).unwrap_err().kind,
+            ErrorKind::BadRequest
+        );
+    }
+
+    #[test]
+    fn relayed_assertion_must_match_an_independently_authenticated_dsm_session() {
+        const AUTHENTICATED_UID: u32 = 2000;
+        let environment = environment("GET", "action=snapshot&SynoToken=dsm-token");
+        let session = bound_authenticated_session(&environment, AUTHENTICATED_UID);
+        let encoded = encode_relay_request(&environment, None, &session).unwrap();
+        let relay = decode_relay_request(&encoded).unwrap();
+        validate_relay_authenticated_session(&relay, &session).unwrap();
+
+        let mut swapped_username = decode_relay_request(&encoded).unwrap();
+        swapped_username.authenticated_username = "other-admin".to_owned();
+        assert_eq!(
+            validate_relay_authenticated_session(&swapped_username, &session)
+                .err()
+                .unwrap()
+                .kind,
+            ErrorKind::Unauthorized
+        );
+
+        // A same-UID process can calculate the public digest used as a relay
+        // consistency binding. It still cannot substitute that for the
+        // daemon's independent authenticate.cgi result.
+        let mut forged = decode_relay_request(&encoded).unwrap();
+        forged.authenticated_username = "other-admin".to_owned();
+        forged.session_binding = hex_encode(&session_binding(
+            "other-admin",
+            AUTHENTICATED_UID + 1,
+            &environment.cookie,
+            environment
+                .synology_token_header
+                .as_ref()
+                .map(|value| value.as_str()),
+        ));
+        assert_eq!(
+            validate_relay_authenticated_session(&forged, &session)
+                .err()
+                .unwrap()
+                .kind,
+            ErrorKind::Unauthorized
+        );
+
+        let mut changed_binding = decode_relay_request(&encoded).unwrap();
+        changed_binding.session_binding.replace_range(..1, "0");
+        if changed_binding.session_binding == relay.session_binding {
+            changed_binding.session_binding.replace_range(..1, "1");
+        }
+        assert_eq!(
+            validate_relay_authenticated_session(&changed_binding, &session)
+                .err()
+                .unwrap()
+                .kind,
+            ErrorKind::Unauthorized
+        );
+
+        let mut changed_cookie = decode_relay_request(&encoded).unwrap();
+        changed_cookie.cookie = "id=different-session".to_owned();
+        let changed_environment = changed_cookie.environment();
+        let changed_session = bound_authenticated_session(&changed_environment, AUTHENTICATED_UID);
+        assert_eq!(
+            validate_relay_authenticated_session(&changed_cookie, &changed_session)
+                .err()
+                .unwrap()
+                .kind,
+            ErrorKind::Unauthorized
+        );
+    }
+
+    #[test]
+    fn relay_rejects_invalid_assertion_username_and_binding_shapes() {
+        const AUTHENTICATED_UID: u32 = 2000;
+        let environment = environment("GET", "action=snapshot");
+        let session = bound_authenticated_session(&environment, AUTHENTICATED_UID);
+        let encoded = encode_relay_request(&environment, None, &session).unwrap();
+
+        let mut invalid_username = serde_json::from_slice::<Value>(&encoded).unwrap();
+        invalid_username["authenticated_username"] = json!("x".repeat(257));
+        assert_eq!(
+            decode_relay_request(&serde_json::to_vec(&invalid_username).unwrap())
+                .unwrap_err()
+                .kind,
+            ErrorKind::BadRequest
+        );
+
+        let mut short_binding = serde_json::from_slice::<Value>(&encoded).unwrap();
+        short_binding["session_binding"] = json!("00");
+        assert_eq!(
+            decode_relay_request(&serde_json::to_vec(&short_binding).unwrap())
+                .unwrap_err()
+                .kind,
+            ErrorKind::BadRequest
+        );
+
+        let mut non_hex_binding = serde_json::from_slice::<Value>(&encoded).unwrap();
+        non_hex_binding["session_binding"] = json!("z".repeat(64));
+        assert_eq!(
+            decode_relay_request(&serde_json::to_vec(&non_hex_binding).unwrap())
+                .unwrap_err()
+                .kind,
             ErrorKind::BadRequest
         );
     }
@@ -5990,9 +11261,35 @@ mod tests {
             parse_authentication_output(b"DOMAIN\\operator\r\n").unwrap(),
             "DOMAIN\\operator"
         );
-        for invalid in [b"".as_slice(), b"admin\nother\n", b"bad user\n", b"root:\n"] {
+        assert_eq!(
+            parse_authentication_output("María Silva\n".as_bytes()).unwrap(),
+            "María Silva"
+        );
+        let long_directory_identity = format!("DOMAIN\\{}@directory.example.test", "a".repeat(96));
+        assert!(long_directory_identity.len() > 64);
+        assert!(valid_authenticated_username(&long_directory_identity));
+        let four_byte_identity = "𐐀".repeat(64);
+        assert_eq!(four_byte_identity.len(), 256);
+        assert!(valid_authenticated_username(&four_byte_identity));
+        assert!(!valid_authenticated_username(&(four_byte_identity + "a")));
+        assert!(valid_authenticated_username("مدير التخزين"));
+        for spoofing_control in ['\u{061c}', '\u{200e}', '\u{202e}', '\u{2066}', '\u{feff}'] {
+            assert!(!valid_authenticated_username(&format!(
+                "admin{spoofing_control}root"
+            )));
+        }
+        for invalid in [
+            b"".as_slice(),
+            b"admin\nother\n",
+            b"bad\0user\n",
+            b"tab\tuser\n",
+            b"carriage\ruser\n",
+        ] {
             assert!(parse_authentication_output(invalid).is_err());
         }
+        assert!(parse_authentication_output(&[0xff, b'\n']).is_err());
+        assert!(!valid_authenticated_username("DOMAIN|administrator"));
+        assert!(!valid_authenticated_username(&"x".repeat(257)));
     }
 
     #[test]
@@ -6016,11 +11313,11 @@ mod tests {
     }
 
     #[test]
-    fn trusted_executable_mode_rejects_set_id_and_mutable_helpers() {
+    fn trusted_system_helper_mode_allows_root_set_id_but_rejects_mutable_files() {
         assert!(trusted_executable_mode(0o100_755));
-        for mode in [
-            0o100_4755, 0o100_2755, 0o100_6755, 0o100_775, 0o100_757, 0o040_755, 0o100_644,
-        ] {
+        assert!(trusted_executable_mode(0o104_755));
+        assert!(trusted_executable_mode(0o102_755));
+        for mode in [0o100_775, 0o100_757, 0o040_755, 0o100_644] {
             assert!(!trusted_executable_mode(mode), "accepted mode {mode:o}");
         }
     }
@@ -6064,6 +11361,17 @@ mod tests {
             assert!(validate_cgi_identity(&invalid, 1023).is_err());
         }
         assert!(validate_cgi_identity(&valid, 1060).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rootless_daemon_socket_gate_requires_the_exact_nonroot_web_uid() {
+        let web_uid = 1023;
+        let package_uid = 1060;
+        assert!(linux_socket::validate_peer_uid(web_uid, web_uid).is_ok());
+        assert!(linux_socket::validate_peer_uid(package_uid, web_uid).is_err());
+        assert!(linux_socket::validate_peer_uid(0, web_uid).is_err());
+        assert!(linux_socket::validate_peer_uid(web_uid, 0).is_err());
     }
 
     #[test]
@@ -6162,26 +11470,54 @@ mod tests {
             hex_encode(&first),
             "3f4ccb5350a9e97bcd1cf2decc083b780c7518f1b1fa8e2426b859bc2233937b"
         );
-        let cookie_token = issue_csrf_token(&key, &cookie_only, 10_000, &[8_u8; 16]).unwrap();
-        assert!(verify_csrf_token(&cookie_token, &key, &cookie_only, 10_001).is_ok());
+        let cookie_token = issue_csrf_token(
+            &key,
+            &cookie_only,
+            10_000,
+            &[8_u8; 16],
+            CSRF_LIFETIME_SECONDS,
+        )
+        .unwrap();
+        assert!(
+            verify_csrf_token(
+                &cookie_token,
+                &key,
+                &cookie_only,
+                10_001,
+                CSRF_LIFETIME_SECONDS,
+            )
+            .is_ok()
+        );
         assert_eq!(
-            verify_csrf_token(&cookie_token, &key, &first, 10_001)
+            verify_csrf_token(&cookie_token, &key, &first, 10_001, CSRF_LIFETIME_SECONDS,)
                 .unwrap_err()
                 .kind,
-            ErrorKind::Forbidden
+            ErrorKind::CsrfRejected
         );
-        let token = issue_csrf_token(&key, &first, 10_000, &[9_u8; 16]).unwrap();
-        assert!(verify_csrf_token(&token, &key, &first, 10_001).is_ok());
+        let token =
+            issue_csrf_token(&key, &first, 10_000, &[9_u8; 16], CSRF_LIFETIME_SECONDS).unwrap();
+        assert!(verify_csrf_token(&token, &key, &first, 10_001, CSRF_LIFETIME_SECONDS).is_ok());
         assert_eq!(
-            verify_csrf_token(&token, &key, &second, 10_001)
+            verify_csrf_token(&token, &key, &second, 10_001, CSRF_LIFETIME_SECONDS)
                 .unwrap_err()
                 .kind,
-            ErrorKind::Forbidden
+            ErrorKind::CsrfRejected
         );
-        assert!(verify_csrf_token(&token, &[8_u8; 32], &first, 10_001).is_err());
-        assert!(verify_csrf_token(&token, &key, &first, 10_300).is_err());
+        assert!(
+            verify_csrf_token(&token, &[8_u8; 32], &first, 10_001, CSRF_LIFETIME_SECONDS,).is_err()
+        );
+        assert!(verify_csrf_token(&token, &key, &first, 10_300, CSRF_LIFETIME_SECONDS).is_err());
         let tampered = token.replacen("v1.", "v2.", 1);
-        assert!(verify_csrf_token(&tampered, &key, &first, 10_001).is_err());
+        let csrf_error =
+            verify_csrf_token(&tampered, &key, &first, 10_001, CSRF_LIFETIME_SECONDS).unwrap_err();
+        assert_eq!(csrf_error.kind, ErrorKind::CsrfRejected);
+        let response = CgiResponse::error(csrf_error);
+        assert_eq!(response.status, 403);
+        let payload: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(payload["code"], "csrf_rejected");
+        let forbidden = CgiResponse::error(BridgeError::new(ErrorKind::Forbidden));
+        let forbidden_payload: Value = serde_json::from_slice(&forbidden.body).unwrap();
+        assert_eq!(forbidden_payload["code"], "forbidden");
     }
 
     #[test]
@@ -6189,6 +11525,784 @@ mod tests {
         assert!(constant_time_equal(&[1, 2, 3], &[1, 2, 3]));
         assert!(!constant_time_equal(&[1, 2, 3], &[1, 2, 4]));
         assert!(!constant_time_equal(&[1, 2, 3], &[1, 2]));
+    }
+
+    #[test]
+    fn security_policy_file_requires_version_and_all_28_editable_canonical_fields() {
+        let document = security_policy_document();
+        assert_eq!(
+            parse_security_policy_file(document.as_bytes()).unwrap(),
+            SecurityPolicyArgs::default()
+        );
+
+        let malformed = [
+            document.replace("policy_version=1\n", ""),
+            document.replace("policy_version=1", "policy_version=2"),
+            document.replace('\n', "\r\n"),
+            document.replace("allow_empty_source=true", "allow_empty_source=tr\rue"),
+            document.replace("allow_empty_source=true", "allow_empty_source=true\0"),
+            document.trim_end_matches('\n').to_owned(),
+            document.replace("allow_empty_source=true\n", ""),
+            format!("{document}allow_empty_source=true\n"),
+            format!("{document}unreviewed_key=true\n"),
+            document.replace("csrf_lifetime_seconds=300", "csrf_lifetime_seconds=0300"),
+            document.replace(
+                "result_retention_seconds=3600",
+                "result_retention_seconds=299",
+            ),
+            document.replace("max_outstanding_jobs=256", "max_outstanding_jobs=257"),
+            document.replace("audit_log_level=info", "audit_log_level=verbose"),
+            document.replace("allow_profile_changes=true", "allow_profile_changes=1"),
+        ];
+        for candidate in malformed {
+            assert_eq!(
+                parse_security_policy_file(candidate.as_bytes())
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::UnsafeRuntime
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn policy_v1_migration_is_atomic_idempotent_and_fail_closed() {
+        let fixture = TestControlFixture::new("policy-v1-migration");
+        let package_uid = TestControlFixture::package_uid();
+        let policy_path = fixture.root.join("security.conf");
+        let versioned = security_policy_document();
+        let legacy = versioned.strip_prefix("policy_version=1\n").unwrap();
+        fixture.write_private(&policy_path, legacy.as_bytes());
+
+        assert!(
+            linux_files::security_policy_migration_required_at(&policy_path, package_uid).unwrap()
+        );
+        assert!(linux_files::migrate_security_policy_at(&policy_path, package_uid).unwrap());
+        assert_eq!(fs::read_to_string(&policy_path).unwrap(), versioned);
+        assert!(
+            !linux_files::security_policy_migration_required_at(&policy_path, package_uid).unwrap()
+        );
+        assert!(!linux_files::migrate_security_policy_at(&policy_path, package_uid).unwrap());
+
+        let policy_link = fixture.root.join("security-policy-hardlink");
+        fs::hard_link(&policy_path, &policy_link).unwrap();
+        for result in [
+            linux_files::load_security_policy_at(&policy_path, package_uid),
+            linux_files::migrate_security_policy_at(&policy_path, package_uid)
+                .map(|_| SecurityPolicyArgs::default()),
+        ] {
+            assert_eq!(result.unwrap_err().kind, ErrorKind::UnsafeRuntime);
+        }
+        fs::remove_file(&policy_link).unwrap();
+
+        for unsafe_mode in [0o1600, 0o2600, 0o4600] {
+            fs::set_permissions(&policy_path, fs::Permissions::from_mode(unsafe_mode)).unwrap();
+            assert_eq!(
+                linux_files::load_security_policy_at(&policy_path, package_uid)
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::UnsafeRuntime
+            );
+            assert_eq!(
+                linux_files::migrate_security_policy_at(&policy_path, package_uid)
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::UnsafeRuntime
+            );
+        }
+        fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let invalid_documents = [
+            "broken\n".to_owned(),
+            versioned.replace("policy_version=1", "policy_version=2"),
+        ];
+        for invalid in invalid_documents {
+            fixture.write_private(&policy_path, invalid.as_bytes());
+            assert_eq!(
+                linux_files::migrate_security_policy_at(&policy_path, package_uid)
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::UnsafeRuntime
+            );
+            assert_eq!(fs::read_to_string(&policy_path).unwrap(), invalid);
+        }
+
+        fs::remove_file(&policy_path).unwrap();
+        std::os::unix::fs::symlink("missing-policy", &policy_path).unwrap();
+        assert_eq!(
+            linux_files::migrate_security_policy_at(&policy_path, package_uid)
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnsafeRuntime
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_audit_verification_accepts_legacy_history_and_binds_exact_identity() {
+        let fixture = TestControlFixture::new("durable-audit-history");
+        let package_uid = TestControlFixture::package_uid();
+        let log_root = fixture.root.join("logs");
+        fs::create_dir(&log_root).unwrap();
+        fs::set_permissions(&log_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let audit_log = log_root.join("audit.log");
+        let activity_log = log_root.join("activity.log");
+        let (owner_pid, owner_start, owner_boot) = linux_files::current_process_identity().unwrap();
+        let record = AuditOutboxRecord {
+            schema: "sdsync.dsm-audit-outbox.v1".to_owned(),
+            transaction: JOB_ID.to_owned(),
+            operation: "remove-profile".to_owned(),
+            profile: "archive".to_owned(),
+            actor: "مدير التخزين".to_owned(),
+            actor_uid: package_uid.max(1),
+            origin: "manager".to_owned(),
+            client_request_id: None,
+            job_id: None,
+            owner_pid,
+            owner_start,
+            owner_boot,
+            phase: AuditOutboxPhase::Succeeded,
+        };
+        let audit = serde_json::to_string(&json!({
+            "epoch": 10_000,
+            "level": "info",
+            "configured_level": "info",
+            "subject_level": "info",
+            "mandatory": true,
+            "category": "audit",
+            "subject_category": "configuration",
+            "operation": record.operation,
+            "state": "succeeded",
+            "transaction": record.transaction,
+            "origin": record.origin,
+            "actor": record.actor,
+            "actor_uid": record.actor_uid,
+            "profile": record.profile,
+        }))
+        .unwrap();
+        fixture.write_private(&audit_log, format!("{audit}\n").as_bytes());
+        fixture.write_private(
+            &activity_log,
+            format!(
+                "9000|run.succeeded|legacy|succeeded|Released history\n10000|audit.succeeded|archive|succeeded|audit|info|{}|{}|Module remove-profile succeeded [{JOB_ID}]\n",
+                record.actor_uid, record.actor
+            )
+            .as_bytes(),
+        );
+        linux_files::durably_verify_audit_event_at(
+            &record,
+            "succeeded",
+            package_uid,
+            &log_root,
+            &audit_log,
+            &activity_log,
+        )
+        .unwrap();
+
+        let mut wrong_uid = record.clone();
+        wrong_uid.actor_uid = record.actor_uid.saturating_add(1);
+        assert_eq!(
+            linux_files::durably_verify_audit_event_at(
+                &wrong_uid,
+                "succeeded",
+                package_uid,
+                &log_root,
+                &audit_log,
+                &activity_log,
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::UnsafeRuntime
+        );
+
+        let mut bridge_expectation = record.clone();
+        bridge_expectation.origin = "bridge".to_owned();
+        bridge_expectation.transaction = format!("bridge-{JOB_ID}");
+        bridge_expectation.client_request_id = Some(REQUEST_ID.to_owned());
+        bridge_expectation.job_id = None;
+        let bridge_audit = serde_json::to_string(&json!({
+            "epoch": 10_001,
+            "level": "info",
+            "configured_level": "info",
+            "subject_level": "info",
+            "mandatory": true,
+            "category": "audit",
+            "subject_category": "configuration",
+            "operation": bridge_expectation.operation,
+            "state": "requested",
+            "transaction": bridge_expectation.transaction,
+            "origin": bridge_expectation.origin,
+            "actor": bridge_expectation.actor,
+            "actor_uid": bridge_expectation.actor_uid,
+            "profile": bridge_expectation.profile,
+            "client_request_id": bridge_expectation.client_request_id.as_deref(),
+        }))
+        .unwrap();
+        fixture.write_private(&audit_log, format!("{bridge_audit}\n").as_bytes());
+        fixture.write_private(
+            &activity_log,
+            format!(
+                "10001|audit.requested|archive|requested|audit|info|{}|{}|Module remove-profile requested [{}] request_id={}\n",
+                bridge_expectation.actor_uid,
+                bridge_expectation.actor,
+                bridge_expectation.transaction,
+                REQUEST_ID,
+            )
+            .as_bytes(),
+        );
+        linux_files::durably_verify_audit_event_at(
+            &bridge_expectation,
+            "requested",
+            package_uid,
+            &log_root,
+            &audit_log,
+            &activity_log,
+        )
+        .unwrap();
+
+        let mut wrong_client_request = bridge_expectation.clone();
+        wrong_client_request.client_request_id = Some("f".repeat(32));
+        assert_eq!(
+            linux_files::durably_verify_audit_event_at(
+                &wrong_client_request,
+                "requested",
+                package_uid,
+                &log_root,
+                &audit_log,
+                &activity_log,
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::UnsafeRuntime
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_log_tail_recovery_is_exact_bounded_and_fail_closed() {
+        let fixture = TestControlFixture::new("durable-log-tail-recovery");
+        let package_uid = TestControlFixture::package_uid();
+        let log_root = fixture.root.join("logs");
+        fs::create_dir(&log_root).unwrap();
+        fs::set_permissions(&log_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let audit_log = log_root.join("audit.log");
+        let activity_log = log_root.join("activity.log");
+        let audit = serde_json::to_string(&json!({
+            "epoch": 10_000,
+            "level": "info",
+            "configured_level": "info",
+            "subject_level": "info",
+            "mandatory": true,
+            "category": "audit",
+            "subject_category": "configuration",
+            "operation": "remove-profile",
+            "state": "succeeded",
+            "transaction": JOB_ID,
+            "origin": "manager",
+            "actor": "DSM Administrator",
+            "actor_uid": package_uid.max(1),
+            "profile": "archive",
+        }))
+        .unwrap();
+        let activity = format!(
+            "10000|audit.succeeded|archive|succeeded|audit|info|{}|DSM Administrator|Module remove-profile succeeded [{JOB_ID}]",
+            package_uid.max(1)
+        );
+
+        fixture.write_private(&audit_log, format!("{audit}\n{{\"partial\"").as_bytes());
+        assert!(
+            linux_files::repair_durable_log_tail_at(
+                &log_root,
+                &audit_log,
+                package_uid,
+                5,
+                11 * 1024 * 1024,
+                |line| linux_files::validate_audit_log_line(line).map(|_| ()),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(&audit_log).unwrap(),
+            format!("{audit}\n")
+        );
+
+        fixture.write_private(&activity_log, activity.as_bytes());
+        assert!(
+            linux_files::repair_durable_log_tail_at(
+                &log_root,
+                &activity_log,
+                package_uid,
+                3,
+                2 * 1024 * 1024,
+                |line| linux_files::validate_activity_log_line(line).map(|_| ()),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(&activity_log).unwrap(),
+            format!("{activity}\n")
+        );
+
+        fixture.write_private(&audit_log, format!("{audit}\n\n").as_bytes());
+        assert_eq!(
+            linux_files::repair_durable_log_tail_at(
+                &log_root,
+                &audit_log,
+                package_uid,
+                5,
+                11 * 1024 * 1024,
+                |line| linux_files::validate_audit_log_line(line).map(|_| ()),
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::UnsafeRuntime
+        );
+
+        fixture.write_private(&audit_log, format!("{audit}\n").as_bytes());
+        let rotated = log_root.join("audit.log.1");
+        fixture.write_private(&rotated, b"{\"partial\"");
+        assert_eq!(
+            linux_files::repair_durable_log_tail_at(
+                &log_root,
+                &audit_log,
+                package_uid,
+                5,
+                11 * 1024 * 1024,
+                |line| linux_files::validate_audit_log_line(line).map(|_| ()),
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::UnsafeRuntime
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_log_validators_reject_malformed_identity_and_activity_codes() {
+        for code in [
+            "audit.requested",
+            "security.log_tail_recovered",
+            "routine.retry_scheduled",
+        ] {
+            assert!(linux_files::valid_activity_code(code));
+        }
+        for code in [
+            "audit",
+            ".requested",
+            "audit.",
+            "audit..requested",
+            "Audit.requested",
+        ] {
+            assert!(!linux_files::valid_activity_code(code));
+        }
+
+        let package_uid = TestControlFixture::package_uid().max(1);
+        let base = json!({
+            "epoch": 10_000,
+            "level": "info",
+            "configured_level": "info",
+            "subject_level": "info",
+            "mandatory": true,
+            "category": "audit",
+            "subject_category": "configuration",
+            "operation": "remove-profile",
+            "state": "succeeded",
+            "transaction": JOB_ID,
+            "origin": "manager",
+            "actor": "DSM Administrator",
+            "actor_uid": package_uid,
+            "profile": "archive",
+        });
+        let mut malformed = Vec::new();
+        for (field, value) in [
+            ("operation", json!("unknown")),
+            ("state", json!("complete")),
+            ("transaction", json!("bad transaction")),
+            ("origin", json!("browser")),
+            ("profile", json!("../escape")),
+            ("actor", json!("spoof\u{202e}")),
+            ("actor_uid", json!(0)),
+            ("subject_category", json!("secrets")),
+            ("level", json!("debug")),
+            ("client_request_id", json!("short")),
+        ] {
+            let mut candidate = base.clone();
+            candidate[field] = value;
+            malformed.push(candidate);
+        }
+        for candidate in malformed {
+            let encoded = serde_json::to_vec(&candidate).unwrap();
+            assert_eq!(
+                linux_files::validate_audit_log_line(&encoded)
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::UnsafeRuntime
+            );
+        }
+
+        let mut rejected = base.clone();
+        rejected["operation"] = json!("rejected-post");
+        rejected["subject_category"] = json!("bridge");
+        rejected["state"] = json!("failed");
+        rejected["level"] = json!("error");
+        rejected["origin"] = json!("bridge");
+        assert!(
+            linux_files::validate_audit_log_line(&serde_json::to_vec(&rejected).unwrap()).is_ok()
+        );
+        rejected["client_request_id"] = json!(REQUEST_ID);
+        assert!(
+            linux_files::validate_audit_log_line(&serde_json::to_vec(&rejected).unwrap()).is_err()
+        );
+
+        let mut uncorrelated_bridge = base;
+        uncorrelated_bridge["origin"] = json!("bridge");
+        assert!(
+            linux_files::validate_audit_log_line(
+                &serde_json::to_vec(&uncorrelated_bridge).unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_existing_profile_names_remain_removable_but_new_names_stay_bounded() {
+        let legacy = "p".repeat(255);
+        assert!(validate_existing_name(&legacy).is_ok());
+        assert!(valid_audit_profile(&legacy));
+        assert!(validate_name(&legacy).is_err());
+        assert!(validate_existing_name(&"p".repeat(256)).is_err());
+
+        assert!(
+            parse_mutation_request(&request("remove-profile", json!({ "name": legacy }),)).is_ok()
+        );
+        let mut configure = configure_arguments();
+        configure["name"] = json!("p".repeat(65));
+        assert!(parse_mutation_request(&request("configure-profile", configure)).is_err());
+    }
+
+    #[test]
+    fn tightened_policy_revokes_every_risky_queued_mutation_before_execution() {
+        fn parsed(operation: &str, arguments: Value) -> Mutation {
+            parse_mutation_request(&request(operation, arguments))
+                .unwrap()
+                .mutation
+        }
+        fn rejected(mutation: &Mutation, policy: &SecurityPolicyArgs) {
+            assert_eq!(
+                validate_mutation_against_security_policy(mutation, policy)
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::Forbidden
+            );
+        }
+
+        let configure = parsed("configure-profile", configure_arguments());
+        assert!(
+            validate_mutation_against_security_policy(&configure, &SecurityPolicyArgs::default())
+                .is_ok()
+        );
+        let mut policy = SecurityPolicyArgs {
+            allow_profile_changes: false,
+            ..SecurityPolicyArgs::default()
+        };
+        rejected(&configure, &policy);
+
+        let mut http_arguments = configure_arguments();
+        http_arguments["url"] = json!("http://nas.example.invalid");
+        http_arguments["allow_http"] = json!(true);
+        policy = SecurityPolicyArgs {
+            allow_http_targets: false,
+            ..SecurityPolicyArgs::default()
+        };
+        rejected(&parsed("configure-profile", http_arguments), &policy);
+
+        let mut invalid_tls_arguments = configure_arguments();
+        invalid_tls_arguments["danger_accept_invalid_certs"] = json!(true);
+        policy = SecurityPolicyArgs {
+            allow_invalid_tls: false,
+            ..SecurityPolicyArgs::default()
+        };
+        rejected(&parsed("configure-profile", invalid_tls_arguments), &policy);
+
+        let mut destructive_arguments = configure_arguments();
+        destructive_arguments["delete"] = json!(true);
+        policy = SecurityPolicyArgs {
+            allow_destructive_sync: false,
+            ..SecurityPolicyArgs::default()
+        };
+        rejected(&parsed("configure-profile", destructive_arguments), &policy);
+
+        let mut empty_source_arguments = configure_arguments();
+        empty_source_arguments["allow_empty_source"] = json!(true);
+        policy = SecurityPolicyArgs {
+            allow_empty_source: false,
+            ..SecurityPolicyArgs::default()
+        };
+        rejected(
+            &parsed("configure-profile", empty_source_arguments),
+            &policy,
+        );
+
+        let mut remote_log_arguments = configure_arguments();
+        remote_log_arguments["remote_log_url"] = json!("https://logs.example.invalid");
+        policy = SecurityPolicyArgs {
+            allow_remote_logging: false,
+            ..SecurityPolicyArgs::default()
+        };
+        rejected(&parsed("configure-profile", remote_log_arguments), &policy);
+
+        let replace_remote_token = parsed(
+            "set-secret",
+            json!({"profile":"nightly","kind":"remote-log-token","mode":"replace","value":"token"}),
+        );
+        rejected(&replace_remote_token, &policy);
+        let clear_remote_token = parsed(
+            "set-secret",
+            json!({"profile":"nightly","kind":"remote-log-token","mode":"clear","value":null}),
+        );
+        assert!(validate_mutation_against_security_policy(&clear_remote_token, &policy).is_ok());
+        policy.allow_secret_changes = false;
+        rejected(&clear_remote_token, &policy);
+
+        policy = SecurityPolicyArgs {
+            allow_routine_changes: false,
+            ..SecurityPolicyArgs::default()
+        };
+        rejected(&parsed("routine", routine_arguments()), &policy);
+        policy = SecurityPolicyArgs {
+            allow_notification_changes: false,
+            ..SecurityPolicyArgs::default()
+        };
+        rejected(
+            &parsed(
+                "alert-policy",
+                json!({"enabled":true,"on_success":false,"on_failure":true,"failure_threshold":2,"cooldown_seconds":3600}),
+            ),
+            &policy,
+        );
+        rejected(
+            &parsed("client-event", json!({"event":"session-notifications"})),
+            &policy,
+        );
+        policy = SecurityPolicyArgs {
+            allow_interface_changes: false,
+            ..SecurityPolicyArgs::default()
+        };
+        rejected(
+            &parsed("client-event", json!({"event":"interface-settings"})),
+            &policy,
+        );
+        policy = SecurityPolicyArgs {
+            allow_operational_actions: false,
+            ..SecurityPolicyArgs::default()
+        };
+        rejected(
+            &parsed(
+                "action",
+                json!({"kind":"plan","scope":"all","write_test":null,"allow_delete":false,"max_total_delete":100}),
+            ),
+            &policy,
+        );
+        policy = SecurityPolicyArgs {
+            allow_doctor_write_test: false,
+            ..SecurityPolicyArgs::default()
+        };
+        rejected(
+            &parsed(
+                "action",
+                json!({"kind":"doctor","scope":"nightly","write_test":true,"allow_delete":null,"max_total_delete":null}),
+            ),
+            &policy,
+        );
+
+        // The policy document itself remains a recovery path even after every
+        // configurable mutation ceiling has been disabled.
+        let locked_down = SecurityPolicyArgs {
+            allow_interface_changes: false,
+            allow_profile_changes: false,
+            allow_secret_changes: false,
+            allow_routine_changes: false,
+            allow_notification_changes: false,
+            allow_operational_actions: false,
+            ..SecurityPolicyArgs::default()
+        };
+        assert!(
+            validate_mutation_against_security_policy(
+                &parsed("security-policy", security_policy_arguments()),
+                &locked_down,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn every_category_threshold_and_off_state_governs_real_optional_events() {
+        const CATEGORIES: [&str; 12] = [
+            "audit",
+            "bridge",
+            "authentication",
+            "security",
+            "configuration",
+            "secrets",
+            "routines",
+            "operations",
+            "notifications",
+            "sync",
+            "controller",
+            "scheduler",
+        ];
+        let mut policy = SecurityPolicyArgs::default();
+        for category in CATEGORIES {
+            set_category_level(&mut policy, category, PolicyLogLevel::Off);
+            assert!(!event_visible_at_threshold(
+                &policy, category, "error", false
+            ));
+            set_category_level(&mut policy, category, PolicyLogLevel::Warn);
+            assert!(event_visible_at_threshold(
+                &policy, category, "error", false
+            ));
+            assert!(event_visible_at_threshold(&policy, category, "warn", false));
+            assert!(!event_visible_at_threshold(
+                &policy, category, "info", false
+            ));
+        }
+        policy.audit_log_level = PolicyLogLevel::Off;
+        assert!(event_visible_at_threshold(&policy, "audit", "info", true));
+
+        policy.controller_log_level = PolicyLogLevel::Error;
+        assert!(log_line_visible_at_threshold(
+            &policy,
+            "controller",
+            r#"{"level":"error","event":"control_consumer_failed"}"#,
+        ));
+        assert!(!log_line_visible_at_threshold(
+            &policy,
+            "controller",
+            r#"{"level":"info","event":"scheduled_run"}"#,
+        ));
+        policy.scheduler_log_level = PolicyLogLevel::Error;
+        assert!(log_line_visible_at_threshold(
+            &policy,
+            "scheduler",
+            r#"{"level":"error","event":"run_finished","exit":1}"#,
+        ));
+        policy.sync_log_level = PolicyLogLevel::Warn;
+        assert!(log_line_visible_at_threshold(
+            &policy,
+            "sync",
+            r#"{"level":"error","message":"failed"}"#,
+        ));
+        assert!(log_line_visible_at_threshold(
+            &policy,
+            "audit",
+            r#"{"mandatory":true,"level":"info"}"#,
+        ));
+    }
+
+    #[test]
+    fn consume_results_preserve_truthful_outcome_while_terminal_audit_is_pending() {
+        let mut calls = 0;
+        let result =
+            terminalize_consume_result(Err(BridgeError::new(ErrorKind::Unavailable)), |state| {
+                calls += 1;
+                assert_eq!(state, "failed");
+                Ok(false)
+            });
+        assert_eq!(calls, 1);
+        assert_eq!(result.value["ok"], false);
+        assert_eq!(result.value["code"], "operation_failed");
+        assert_eq!(result.state, "failed");
+        assert!(!result.audit_pending);
+
+        let pending =
+            terminalize_consume_result(Err(BridgeError::new(ErrorKind::BadRequest)), |state| {
+                assert_eq!(state, "failed");
+                Err(BridgeError::new(ErrorKind::Unavailable))
+            });
+        assert_eq!(pending.value["ok"], false);
+        assert_eq!(pending.state, "failed");
+        assert!(pending.audit_pending);
+
+        let success = json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"done"});
+        let mut success_calls = 0;
+        let untouched = terminalize_consume_result(Ok(success.clone()), |state| {
+            success_calls += 1;
+            assert_eq!(state, "succeeded");
+            Ok(false)
+        });
+        assert_eq!(success_calls, 1);
+        assert_eq!(untouched.value, success);
+        assert_eq!(untouched.state, "succeeded");
+        assert!(!untouched.audit_pending);
+
+        let operation_failure = json!({
+            "schema":"sdsync.dsm-result.v1",
+            "ok":false,
+            "code":"operation_failed",
+            "message":"failed",
+            "status":"failed",
+            "exit_code":12,
+            "scope":"nightly",
+            "output":"diagnostic"
+        });
+        let terminal = terminalize_consume_result(Ok(operation_failure.clone()), |state| {
+            assert_eq!(state, "failed");
+            Ok(true)
+        });
+        assert_eq!(terminal.value, operation_failure);
+        assert_eq!(terminal.state, "failed");
+        assert!(terminal.audit_pending);
+    }
+
+    #[test]
+    fn audit_attribution_uses_exact_allowlisted_operation_and_target() {
+        let profile = parse_mutation_request(&request("configure-profile", configure_arguments()))
+            .unwrap()
+            .mutation;
+        assert_eq!(mutation_audit_operation(&profile), "configure-profile");
+        assert_eq!(mutation_audit_profile(&profile), "nightly");
+
+        let doctor = parse_mutation_request(&request(
+            "action",
+            json!({"kind":"doctor","scope":"nightly","write_test":false,"allow_delete":null,"max_total_delete":null}),
+        ))
+        .unwrap()
+        .mutation;
+        assert_eq!(mutation_audit_operation(&doctor), "doctor");
+        assert_eq!(mutation_audit_profile(&doctor), "nightly");
+
+        let client = parse_mutation_request(&request(
+            "client-event",
+            json!({"event":"interface-settings"}),
+        ))
+        .unwrap()
+        .mutation;
+        assert_eq!(mutation_audit_operation(&client), "interface-settings");
+        assert_eq!(mutation_audit_profile(&client), "all");
+
+        for (kind, mode, expected) in [
+            ("password", "replace", "set-password"),
+            ("password", "clear", "remove-password"),
+            ("totp", "replace", "set-totp"),
+            ("totp", "clear", "remove-totp"),
+            ("remote-log-token", "replace", "set-remote-log-token"),
+            ("remote-log-token", "clear", "remove-remote-log-token"),
+        ] {
+            let mut arguments = json!({
+                "profile":"nightly",
+                "kind":kind,
+                "mode":mode,
+                "value":null
+            });
+            if mode == "replace" {
+                arguments["value"] = json!("safe-test-value");
+            }
+            let mutation = parse_mutation_request(&request("set-secret", arguments))
+                .unwrap()
+                .mutation;
+            assert_eq!(mutation_audit_operation(&mutation), expected);
+            assert_eq!(mutation_audit_profile(&mutation), "nightly");
+        }
     }
 
     #[test]
@@ -6245,6 +12359,16 @@ mod tests {
                 "alert-policy",
             ),
             (
+                "security-policy",
+                security_policy_arguments(),
+                "security-policy",
+            ),
+            (
+                "client-event",
+                json!({"event":"interface-settings"}),
+                "client-event",
+            ),
+            (
                 "action",
                 json!({"kind":"doctor","scope":"nightly","write_test":true,"allow_delete":null,"max_total_delete":null}),
                 "action",
@@ -6283,7 +12407,10 @@ mod tests {
             JOB_ID,
             &parsed.request_id,
             "admin",
+            1000,
             &[7_u8; 32],
+            JOB_ID,
+            &"a".repeat(64),
             10_000,
             &parsed.mutation,
         )
@@ -6385,7 +12512,10 @@ mod tests {
             JOB_ID,
             REQUEST_ID,
             "admin",
+            1000,
             &[7_u8; 32],
+            JOB_ID,
+            &"a".repeat(64),
             10_000,
             &parsed.mutation,
         )
@@ -6469,6 +12599,27 @@ mod tests {
             )
             .is_err()
         );
+
+        let constant_secret_result = br#"{"schema":"sdsync.dsm-result.v1","ok":true,"message":"secret state updated","has_password":true,"has_totp":false,"has_remote_log_token":false}"#;
+        for short_secret in [b"a".as_slice(), b"true".as_slice(), b"schema".as_slice()] {
+            let parsed = parse_manager_result(constant_secret_result, Some(short_secret)).unwrap();
+            validate_set_secret_manager_result(&parsed).unwrap();
+        }
+        for invalid in [
+            json!({
+                "schema":"sdsync.dsm-result.v1", "ok":true,
+                "message":"secret a stored", "has_password":true,
+                "has_totp":false, "has_remote_log_token":false
+            }),
+            json!({
+                "schema":"sdsync.dsm-result.v1", "ok":true,
+                "message":"secret state updated", "has_password":true,
+                "has_totp":false, "has_remote_log_token":false,
+                "profile":"nightly"
+            }),
+        ] {
+            assert!(validate_set_secret_manager_result(&invalid).is_err());
+        }
     }
 
     #[test]
@@ -6479,7 +12630,10 @@ mod tests {
             JOB_ID,
             REQUEST_ID,
             "admin",
+            1000,
             &[9_u8; 32],
+            JOB_ID,
+            &"a".repeat(64),
             10_000,
             &mutation.mutation,
         )
@@ -6490,7 +12644,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let response = canonical_queued_response_bytes(&job, 10_005, &result).unwrap();
+        let response = canonical_queued_response_bytes(&job, 10_005, &result, false).unwrap();
         let parsed = parse_queued_response(&response, JOB_ID).unwrap();
         assert_eq!(parsed.session_binding, [9_u8; 32]);
         assert!(session_binding_matches(
@@ -6529,7 +12683,14 @@ mod tests {
         assert_eq!(pending_json["state"], "pending");
         assert!(pending_json.get("result").is_none());
 
-        let complete = queued_complete_response(JOB_ID, &generic_manager_result_value()).unwrap();
+        let complete = queued_complete_response(
+            JOB_ID,
+            REQUEST_ID,
+            1000,
+            &generic_manager_result_value(),
+            false,
+        )
+        .unwrap();
         assert_eq!(complete.status, 200);
         let complete_json: Value = serde_json::from_slice(&complete.body).unwrap();
         assert_eq!(complete_json["state"], "complete");
@@ -6550,6 +12711,7 @@ mod tests {
             output,
             &ReadAction::Activity { lines: 10 },
             Some(b"exact-secret"),
+            None,
         )
         .unwrap();
         let value: Value = serde_json::from_slice(&sanitized).unwrap();
@@ -6570,6 +12732,7 @@ mod tests {
                 source: LogSource::Sync,
             },
             None,
+            None,
         )
         .unwrap();
         let value: Value = serde_json::from_slice(&filtered).unwrap();
@@ -6580,11 +12743,21 @@ mod tests {
             br#"{"schema":"sdsync.dsm-api.v1","capabilities":{"mutations":false}}"#,
             &ReadAction::Snapshot,
             None,
+            Some(&SecurityPolicyArgs::default()),
         )
         .unwrap();
         let value: Value = serde_json::from_slice(&snapshot).unwrap();
+        assert_eq!(value["package"]["version"], env!("SDSYNC_VERSION"));
         assert_eq!(value["capabilities"]["mutations"], true);
         assert_eq!(value["capabilities"]["private_queue"], true);
+        assert_eq!(
+            value["security_policy"]["queue_limits"],
+            json!({
+                "active_request_and_processing_jobs": MAX_OUTSTANDING_JOBS,
+                "retained_terminal_responses": MAX_OUTSTANDING_JOBS,
+                "worst_case_total_job_records": MAX_OUTSTANDING_JOBS * 2,
+            })
+        );
     }
 
     #[test]
@@ -6629,9 +12802,86 @@ mod tests {
         let first_id = sortable_job_id(first, &[0xaa; 16]);
         let second_id = sortable_job_id(second, &[0x00; 16]);
         assert_eq!(first_id.len(), 48);
-        assert!(valid_request_id(&first_id));
+        assert!(valid_server_job_id(&first_id));
         assert!(first_id < second_id);
         assert!(next_enqueue_sequence(u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn client_and_server_request_identifiers_have_distinct_exact_bounds() {
+        assert!(!valid_client_request_id(&"a".repeat(31)));
+        assert!(valid_client_request_id(&"a".repeat(32)));
+        assert!(!valid_client_request_id(&"a".repeat(33)));
+        assert!(!valid_client_request_id(&"A".repeat(32)));
+
+        assert!(!valid_server_job_id(&"b".repeat(47)));
+        assert!(valid_server_job_id(&"b".repeat(48)));
+        assert!(!valid_server_job_id(&"b".repeat(49)));
+        assert!(!valid_server_job_id(&"B".repeat(48)));
+    }
+
+    #[test]
+    fn audit_transactions_are_server_nonce_unique_and_job_bound() {
+        let binding = [7_u8; 32];
+        let first = audit_transaction_id(&binding, REQUEST_ID, 10_000, &[1_u8; 16]).unwrap();
+        let second = audit_transaction_id(&binding, REQUEST_ID, 10_000, &[2_u8; 16]).unwrap();
+        assert_ne!(first, second);
+        assert!(valid_server_job_id(&first));
+        assert!(valid_server_job_id(&second));
+
+        let mutation =
+            parse_mutation_request(&request("remove-profile", json!({"name":"nightly"}))).unwrap();
+        let job_bytes = canonical_job_bytes(
+            JOB_ID,
+            REQUEST_ID,
+            "admin",
+            1000,
+            &binding,
+            &first,
+            &"a".repeat(64),
+            10_000,
+            &mutation.mutation,
+        )
+        .unwrap();
+        assert_eq!(parse_job(&job_bytes).unwrap().audit_transaction, first);
+
+        let mut tampered: Value = serde_json::from_slice(&job_bytes).unwrap();
+        tampered["audit_transaction"] = json!("client-selected");
+        assert!(parse_job(&serde_json::to_vec(&tampered).unwrap()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn consumer_subreaper_supports_old_kernel_fallback_only() {
+        assert!(classify_consumer_subreaper_result(0, None).unwrap());
+        assert!(!classify_consumer_subreaper_result(-1, Some(libc::ENOSYS)).unwrap());
+        assert!(!classify_consumer_subreaper_result(-1, Some(libc::EINVAL)).unwrap());
+        assert_eq!(
+            classify_consumer_subreaper_result(-1, Some(libc::EPERM))
+                .unwrap_err()
+                .kind,
+            ErrorKind::Unavailable
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn random_nonce_uses_validated_urandom_when_getrandom_is_unavailable() {
+        let mut output = [0_u8; 32];
+        linux_files::fill_random_with(&mut output, |_| {
+            Err(io::Error::from_raw_os_error(libc::ENOSYS))
+        })
+        .unwrap();
+        assert_ne!(output, [0_u8; 32]);
+
+        let mut failed = [7_u8; 32];
+        assert!(
+            linux_files::fill_random_with(&mut failed, |_| {
+                Err(io::Error::from_raw_os_error(libc::EPERM))
+            })
+            .is_err()
+        );
+        assert_eq!(failed, [0_u8; 32]);
     }
 
     #[test]

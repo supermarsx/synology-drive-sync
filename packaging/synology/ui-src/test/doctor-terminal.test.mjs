@@ -231,7 +231,7 @@ test("AppWindow overlays, focus behavior, labels, secrets, and mutation guards r
   assert.match(source, /clearSecrets\(\) \{ this\.secretValues = \{ password: "", totp: "", remote_log_token: "" \}; \}/);
   assert.match(source, /removeProfile\(\)[\s\S]*?this\.operationBusy\) return/);
   assert.match(source, /removeRoutine\(\)[\s\S]*?this\.operationBusy\) return/);
-  assert.match(source, /:disabled="!canMutate \|\| !profiles\.length \|\| operationBusy"/);
+  assert.match(source, /:disabled="!canRunOperations \|\| !profiles\.length \|\| operationBusy"/);
   assert.match(source, /let configurationApplied = false;\s*let secretsApplied = 0;/);
   assert.match(source, /ACTIONS\.configureProfile, payload\);\s*configurationApplied = true;/);
   assert.match(source, /ACTIONS\.setSecret, secret\);\s*secretsApplied \+= 1;/);

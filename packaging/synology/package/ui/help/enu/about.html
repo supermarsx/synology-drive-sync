@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html class="img-no-display">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <link href="../../../../help/help.css" rel="stylesheet" type="text/css">
+  <link href="../../../../help/scrollbar/flexcroll.css" rel="stylesheet" type="text/css">
+  <script type="text/javascript" src="../../../../help/scrollbar/flexcroll.js"></script>
+  <script type="text/javascript" src="../../../../help/scrollbar/initFlexcroll.js"></script>
+  <title>About Synology Drive Sync</title>
+</head>
+<body>
+  <h1>About Synology Drive Sync</h1>
+
+  <h2>Project identity</h2>
+  <dl>
+    <dt>Project</dt><dd><code>synology-drive-sync</code></dd>
+    <dt>Author</dt><dd><a href="https://github.com/supermarsx" target="_blank" rel="noopener noreferrer">Mariana</a></dd>
+    <dt>Maintainer</dt><dd><a href="https://github.com/supermarsx/synology-drive-sync" target="_blank" rel="noopener noreferrer">supermarsx</a></dd>
+    <dt>Repository</dt><dd><a href="https://github.com/supermarsx/synology-drive-sync" target="_blank" rel="noopener noreferrer">github.com/supermarsx/synology-drive-sync</a></dd>
+    <dt>License</dt><dd><a href="https://github.com/supermarsx/synology-drive-sync/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">MIT</a></dd>
+    <dt>Installed package version</dt><dd>The AppWindow displays the immutable compile-time package version reported by the authenticated snapshot API.</dd>
+    <dt>Core source version</dt><dd><code>0.1.0</code> from <code>Cargo.toml</code></dd>
+    <dt>DSM UI build version</dt><dd><code>1.0.0</code> from <code>ui-src/package.json</code></dd>
+    <dt>API schema</dt><dd><code>sdsync.dsm-api.v1</code></dd>
+  </dl>
+
+  <h2>Updates</h2>
+  <p><a href="https://github.com/supermarsx/synology-drive-sync/releases" target="_blank" rel="noopener noreferrer">GitHub Releases</a> contains published release assets. Use the <a href="https://supermarsx.github.io/synology-drive-sync/release-selector.html" target="_blank" rel="noopener noreferrer">compatible release selector</a> to select the exact SPK for the NAS model, DSM version, and CPU architecture. Verify the asset checksum, then upgrade with <strong>Package Center &gt; Manual Install</strong>.</p>
+  <p>Package lifecycle scripts retain configuration and protected secrets during an upgrade. The AppWindow does not fetch or install updates and does not configure Package Source discovery.</p>
+
+  <h2>Direct Rust dependencies</h2>
+  <ul>
+    <li data-package="clap" data-version="4.6.5" data-scope="All platforms"><a href="https://crates.io/crates/clap" target="_blank" rel="noopener noreferrer">clap</a> — All platforms — <code>4.6.5</code></li>
+    <li data-package="clap_complete" data-version="4.6.8" data-scope="All platforms"><a href="https://crates.io/crates/clap_complete" target="_blank" rel="noopener noreferrer">clap_complete</a> — All platforms — <code>4.6.8</code></li>
+    <li data-package="clap_mangen" data-version="0.3.0" data-scope="All platforms"><a href="https://crates.io/crates/clap_mangen" target="_blank" rel="noopener noreferrer">clap_mangen</a> — All platforms — <code>0.3.0</code></li>
+    <li data-package="ctrlc" data-version="3.5.2" data-scope="All platforms"><a href="https://crates.io/crates/ctrlc" target="_blank" rel="noopener noreferrer">ctrlc</a> — All platforms — <code>3.5.2</code></li>
+    <li data-package="ignore" data-version="0.4.31" data-scope="All platforms"><a href="https://crates.io/crates/ignore" target="_blank" rel="noopener noreferrer">ignore</a> — All platforms — <code>0.4.31</code></li>
+    <li data-package="keyring-core" data-version="1.0.0" data-scope="All platforms"><a href="https://crates.io/crates/keyring-core" target="_blank" rel="noopener noreferrer">keyring-core</a> — All platforms — <code>1.0.0</code></li>
+    <li data-package="md-5" data-version="0.11.0" data-scope="All platforms"><a href="https://crates.io/crates/md-5" target="_blank" rel="noopener noreferrer">md-5</a> — All platforms — <code>0.11.0</code></li>
+    <li data-package="hmac" data-version="0.12.1" data-scope="All platforms"><a href="https://crates.io/crates/hmac" target="_blank" rel="noopener noreferrer">hmac</a> — All platforms — <code>0.12.1</code></li>
+    <li data-package="reqwest" data-version="0.13.4" data-scope="All platforms"><a href="https://crates.io/crates/reqwest" target="_blank" rel="noopener noreferrer">reqwest</a> — All platforms — <code>0.13.4</code></li>
+    <li data-package="rpassword" data-version="7.5.4" data-scope="All platforms"><a href="https://crates.io/crates/rpassword" target="_blank" rel="noopener noreferrer">rpassword</a> — All platforms — <code>7.5.4</code></li>
+    <li data-package="serde" data-version="1.0.229" data-scope="All platforms"><a href="https://crates.io/crates/serde" target="_blank" rel="noopener noreferrer">serde</a> — All platforms — <code>1.0.229</code></li>
+    <li data-package="serde_json" data-version="1.0.151" data-scope="All platforms"><a href="https://crates.io/crates/serde_json" target="_blank" rel="noopener noreferrer">serde_json</a> — All platforms — <code>1.0.151</code></li>
+    <li data-package="sha2" data-version="0.10.9" data-scope="All platforms"><a href="https://crates.io/crates/sha2" target="_blank" rel="noopener noreferrer">sha2</a> — All platforms — <code>0.10.9</code></li>
+    <li data-package="subtle" data-version="2.6.1" data-scope="All platforms"><a href="https://crates.io/crates/subtle" target="_blank" rel="noopener noreferrer">subtle</a> — All platforms — <code>2.6.1</code></li>
+    <li data-package="thiserror" data-version="2.0.19" data-scope="All platforms"><a href="https://crates.io/crates/thiserror" target="_blank" rel="noopener noreferrer">thiserror</a> — All platforms — <code>2.0.19</code></li>
+    <li data-package="toml" data-version="0.9.12+spec-1.1.0" data-scope="All platforms"><a href="https://crates.io/crates/toml" target="_blank" rel="noopener noreferrer">toml</a> — All platforms — <code>0.9.12+spec-1.1.0</code></li>
+    <li data-package="totp-rs" data-version="5.7.2" data-scope="All platforms"><a href="https://crates.io/crates/totp-rs" target="_blank" rel="noopener noreferrer">totp-rs</a> — All platforms — <code>5.7.2</code></li>
+    <li data-package="zeroize" data-version="1.9.0" data-scope="All platforms"><a href="https://crates.io/crates/zeroize" target="_blank" rel="noopener noreferrer">zeroize</a> — All platforms — <code>1.9.0</code></li>
+    <li data-package="windows-native-keyring-store" data-version="1.1.0" data-scope="Windows"><a href="https://crates.io/crates/windows-native-keyring-store" target="_blank" rel="noopener noreferrer">windows-native-keyring-store</a> — Windows — <code>1.1.0</code></li>
+    <li data-package="apple-native-keyring-store" data-version="1.0.1" data-scope="macOS"><a href="https://crates.io/crates/apple-native-keyring-store" target="_blank" rel="noopener noreferrer">apple-native-keyring-store</a> — macOS — <code>1.0.1</code></li>
+    <li data-package="libc" data-version="0.2.189" data-scope="Linux"><a href="https://crates.io/crates/libc" target="_blank" rel="noopener noreferrer">libc</a> — Linux — <code>0.2.189</code></li>
+    <li data-package="zbus-secret-service-keyring-store" data-version="1.0.0" data-scope="Linux"><a href="https://crates.io/crates/zbus-secret-service-keyring-store" target="_blank" rel="noopener noreferrer">zbus-secret-service-keyring-store</a> — Linux — <code>1.0.0</code></li>
+  </ul>
+
+  <h2>DSM UI build dependencies</h2>
+  <ul>
+    <li data-package="@babel/core" data-version="7.18.6" data-scope="devDependency"><a href="https://www.npmjs.com/package/@babel/core" target="_blank" rel="noopener noreferrer">@babel/core</a> — devDependency — <code>7.18.6</code></li>
+    <li data-package="@babel/preset-env" data-version="7.18.6" data-scope="devDependency"><a href="https://www.npmjs.com/package/@babel/preset-env" target="_blank" rel="noopener noreferrer">@babel/preset-env</a> — devDependency — <code>7.18.6</code></li>
+    <li data-package="babel-loader" data-version="8.0.6" data-scope="devDependency"><a href="https://www.npmjs.com/package/babel-loader" target="_blank" rel="noopener noreferrer">babel-loader</a> — devDependency — <code>8.0.6</code></li>
+    <li data-package="css-loader" data-version="3.5.3" data-scope="devDependency"><a href="https://www.npmjs.com/package/css-loader" target="_blank" rel="noopener noreferrer">css-loader</a> — devDependency — <code>3.5.3</code></li>
+    <li data-package="mini-css-extract-plugin" data-version="0.12.0" data-scope="devDependency"><a href="https://www.npmjs.com/package/mini-css-extract-plugin" target="_blank" rel="noopener noreferrer">mini-css-extract-plugin</a> — devDependency — <code>0.12.0</code></li>
+    <li data-package="vue" data-version="2.7.14" data-scope="devDependency"><a href="https://www.npmjs.com/package/vue" target="_blank" rel="noopener noreferrer">vue</a> — devDependency — <code>2.7.14</code></li>
+    <li data-package="vue-loader" data-version="15.10.1" data-scope="devDependency"><a href="https://www.npmjs.com/package/vue-loader" target="_blank" rel="noopener noreferrer">vue-loader</a> — devDependency — <code>15.10.1</code></li>
+    <li data-package="vue-template-compiler" data-version="2.7.14" data-scope="devDependency"><a href="https://www.npmjs.com/package/vue-template-compiler" target="_blank" rel="noopener noreferrer">vue-template-compiler</a> — devDependency — <code>2.7.14</code></li>
+    <li data-package="webpack" data-version="5.91.0" data-scope="devDependency"><a href="https://www.npmjs.com/package/webpack" target="_blank" rel="noopener noreferrer">webpack</a> — devDependency — <code>5.91.0</code></li>
+    <li data-package="webpack-cli" data-version="5.1.4" data-scope="devDependency"><a href="https://www.npmjs.com/package/webpack-cli" target="_blank" rel="noopener noreferrer">webpack-cli</a> — devDependency — <code>5.1.4</code></li>
+    <li data-package="pnpm" data-version="pnpm@8.15.9" data-scope="packageManager"><a href="https://pnpm.io/" target="_blank" rel="noopener noreferrer">pnpm</a> — packageManager — <code>pnpm@8.15.9</code></li>
+  </ul>
+
+  <p>The Rust list shows every direct dependency selected by the root <code>Cargo.toml</code>, with its exact version resolved by the frozen <code>Cargo.lock</code>, including target-specific packages. The DSM UI list mirrors the exact versions in <code>package.json</code> and the pinned package manager. <code>THIRD_PARTY_LICENSES.html</code> contains the complete transitive Rust release-dependency license inventory. Notices for runtime code embedded in the AppWindow bundle ship separately as <code>DSM_UI_THIRD_PARTY_LICENSES.txt</code>. Vue is supplied by DSM and is not bundled; other pnpm packages whose code is not named in that notice are used only during the build.</p>
+</body>
+</html>

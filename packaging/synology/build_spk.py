@@ -7,6 +7,7 @@ import argparse
 import binascii
 import functools
 import gzip
+import hashlib
 import io
 import json
 import math
@@ -25,24 +26,50 @@ PACKAGE = "synology-drive-sync"
 DSM_APP_CLASS = "SYNO.SDS.App.SynologyDriveSync.Instance"
 UI_SOURCE = HERE / "ui-src"
 UI_ICON_SIZES = (16, 24, 32, 48, 64, 72, 256)
-ICON_ARROW_RADIUS = 0.265
-ICON_ARROW_HALF_THICKNESS = 0.033
-ICON_ARROW_HALF_WIDTH = 0.07
-ICON_ARROW_LENGTH = 0.105
-ICON_TOP_ARC = (-2.82, -0.42)
-ICON_BOTTOM_ARC = (0.34, 2.70)
-ICON_TOP_TIP_ANGLE = -0.10
-ICON_BOTTOM_TIP_ANGLE = 3.02
+UI_HELP_PAGES = (
+    "overview",
+    "profiles",
+    "routines",
+    "health",
+    "activity",
+    "notifications",
+    "security",
+    "settings",
+    "about",
+)
+ICON_ARROW_HALF_THICKNESS = 0.032
+ICON_ARROW_HALF_WIDTH = 0.075
+ICON_TOP_BODY = (
+    (0.245, 0.455),
+    (0.275, 0.350),
+    (0.360, 0.270),
+    (0.500, 0.240),
+    (0.640, 0.270),
+    (0.710, 0.350),
+)
+ICON_TOP_TIP = (0.790, 0.445)
+ICON_BOTTOM_BODY = tuple((1.0 - x, 1.0 - y) for x, y in ICON_TOP_BODY)
+ICON_BOTTOM_TIP = (1.0 - ICON_TOP_TIP[0], 1.0 - ICON_TOP_TIP[1])
 ICON_BORDER_THICKNESS = 2.0 / 256.0
-ICON_ORBIT_RADIUS = 0.355
-ICON_ORBIT_HALF_THICKNESS = 0.004
+ICON_ORBIT_HALF_THICKNESS = 0.005
+ICON_ORBIT_POINTS = (
+    (0.285, 0.155),
+    (0.715, 0.155),
+    (0.845, 0.285),
+    (0.845, 0.715),
+    (0.715, 0.845),
+    (0.285, 0.845),
+    (0.155, 0.715),
+    (0.155, 0.285),
+    (0.285, 0.155),
+)
 ICON_CENTER_RADIUS = 0.055
-ICON_BACKGROUND = (8.0, 17.0, 15.0)
-ICON_BORDER = (33.0, 70.0, 62.0)
-ICON_ORBIT = (37.0, 66.0, 58.0)
-ICON_TOP = (101.0, 230.0, 199.0)
-ICON_BOTTOM = (47.0, 182.0, 157.0)
-ICON_CENTER = (217.0, 255.0, 245.0)
+ICON_BACKGROUND = (11.0, 7.0, 6.0)
+ICON_BORDER = (74.0, 27.0, 16.0)
+ICON_ORBIT = (107.0, 39.0, 24.0)
+ICON_TOP = (255.0, 106.0, 26.0)
+ICON_BOTTOM = (215.0, 46.0, 22.0)
+ICON_CENTER = (255.0, 210.0, 163.0)
 
 
 @dataclass(frozen=True)
@@ -330,6 +357,26 @@ def _regular_file_bytes(path: Path) -> bytes:
     return payload
 
 
+def _validate_external_links(document: str, label: str) -> None:
+    """Allow inert HTTPS anchors while rejecting remote assets and opener access."""
+    for tag in re.findall(r"<[^>]+>", document):
+        remote_reference = re.search(
+            r'\b(?:href|src)=["\'](?:https?:)?//', tag, re.IGNORECASE
+        )
+        if remote_reference is None:
+            continue
+        if not re.match(r"<a\b", tag, re.IGNORECASE):
+            raise PackageError(f"{label} contains a remote asset")
+        if not re.search(r'\bhref=["\']https://', tag, re.IGNORECASE):
+            raise PackageError(f"{label} external links must use HTTPS")
+        if not re.search(r'\btarget=["\']_blank["\']', tag, re.IGNORECASE):
+            raise PackageError(f"{label} external links must open in a new context")
+        relation = re.search(r'\brel=["\']([^"\']+)["\']', tag, re.IGNORECASE)
+        relation_tokens = set(relation.group(1).lower().split()) if relation else set()
+        if not {"noopener", "noreferrer"}.issubset(relation_tokens):
+            raise PackageError(f"{label} external links must prevent opener and referrer access")
+
+
 def native_ui_payloads() -> tuple[tuple[bytes, str], ...]:
     """Validate and render the fixed AppWindow payload staged in the SPK."""
     app_config_path = UI_SOURCE / "app.config"
@@ -341,7 +388,7 @@ def native_ui_payloads() -> tuple[tuple[bytes, str], ...]:
     application = app_config[DSM_APP_CLASS]
     expected_application = {
         "type": "app",
-        "title": "app:title",
+        "title": "Synology Drive Sync",
         "desc": "app:description",
         "appWindow": DSM_APP_CLASS,
         "allUsers": False,
@@ -398,11 +445,59 @@ def native_ui_payloads() -> tuple[tuple[bytes, str], ...]:
         )
         + "\n"
     ).encode("utf-8")
+    help_toc_path = HERE / "package/ui/helptoc.conf"
+    help_toc = _json_object(help_toc_path)
+    expected_help_toc = {
+        "app": DSM_APP_CLASS,
+        "title": "app:title",
+        "content": "overview.html",
+        "toc": [
+            {
+                "title": f"help:{page}",
+                "content": f"{page}.html",
+            }
+            for page in UI_HELP_PAGES
+        ],
+    }
+    if help_toc != expected_help_toc:
+        raise PackageError(
+            "helptoc.conf must bind every reviewed dashboard section to the native DSM AppWindow"
+        )
+
+    help_sources: list[tuple[Path, str]] = []
+    for page in UI_HELP_PAGES:
+        source = HERE / f"package/ui/help/enu/{page}.html"
+        payload = _regular_file_bytes(source)
+        try:
+            document = payload.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise PackageError(f"DSM Help document is not UTF-8: {source}") from error
+        for marker in (
+            '<html class="img-no-display">',
+            '../../../../help/help.css',
+            '../../../../help/scrollbar/flexcroll.css',
+            '../../../../help/scrollbar/flexcroll.js',
+            '../../../../help/scrollbar/initFlexcroll.js',
+            "<h1>",
+        ):
+            if marker not in document:
+                raise PackageError(f"DSM Help document {source.name} is missing {marker!r}")
+        _validate_external_links(document, f"DSM Help document {source.name}")
+        help_sources.append((source, f"ui/help/enu/{page}.html"))
+
+    strings_path = HERE / "package/ui/texts/enu/strings"
+    strings = _regular_file_bytes(strings_path)
+    strings_text = strings.decode("utf-8")
+    for page in UI_HELP_PAGES:
+        if not re.search(rf'^{re.escape(page)}="[^"\r\n]+"$', strings_text, re.MULTILINE):
+            raise PackageError(f"DSM Help text key is missing: help:{page}")
     sources = (
         (UI_SOURCE / "dist/SynologyDriveSync.js", "ui/SynologyDriveSync.js"),
         (UI_SOURCE / "dist/style.css", "ui/style.css"),
         (HERE / "package/ui/images/icon.svg", "ui/images/icon.svg"),
-        (HERE / "package/ui/texts/enu/strings", "ui/texts/enu/strings"),
+        (strings_path, "ui/texts/enu/strings"),
+        (help_toc_path, "ui/helptoc.conf"),
+        *help_sources,
     )
     return ((installed_config, "ui/config"),) + tuple(
         (_regular_file_bytes(source), destination) for source, destination in sources
@@ -438,38 +533,82 @@ def _triangle_contains(
     return not ((first_edge < 0 or second_edge < 0 or third_edge < 0) and (first_edge > 0 or second_edge > 0 or third_edge > 0))
 
 
-def _arrow_triangle(angle: float) -> tuple[tuple[float, float], ...]:
-    tip = (
-        0.5 + ICON_ARROW_RADIUS * math.cos(angle),
-        0.5 + ICON_ARROW_RADIUS * math.sin(angle),
-    )
-    tangent = (-math.sin(angle), math.cos(angle))
-    radial = (math.cos(angle), math.sin(angle))
-    base = (
-        tip[0] - tangent[0] * ICON_ARROW_LENGTH,
-        tip[1] - tangent[1] * ICON_ARROW_LENGTH,
-    )
+def _arrow_triangle(
+    body: tuple[tuple[float, float], ...],
+    tip: tuple[float, float],
+) -> tuple[tuple[float, float], ...]:
+    """Return a head whose rear edge is exactly the body endpoint.
+
+    The head is rasterized after the trace body, but the body also terminates at
+    this base rather than continuing beneath the head. That keeps the arrowhead
+    visibly forward at DSM's 16px icon size instead of looking tucked behind the
+    stroke.
+    """
+    base = body[-1]
+    delta_x = tip[0] - base[0]
+    delta_y = tip[1] - base[1]
+    length = math.hypot(delta_x, delta_y)
+    if length <= 0:
+        raise PackageError("icon arrow tip must be ahead of its trace body")
+    perpendicular = (-delta_y / length, delta_x / length)
     return (
         tip,
         (
-            base[0] + radial[0] * ICON_ARROW_HALF_WIDTH,
-            base[1] + radial[1] * ICON_ARROW_HALF_WIDTH,
+            base[0] + perpendicular[0] * ICON_ARROW_HALF_WIDTH,
+            base[1] + perpendicular[1] * ICON_ARROW_HALF_WIDTH,
         ),
         (
-            base[0] - radial[0] * ICON_ARROW_HALF_WIDTH,
-            base[1] - radial[1] * ICON_ARROW_HALF_WIDTH,
+            base[0] - perpendicular[0] * ICON_ARROW_HALF_WIDTH,
+            base[1] - perpendicular[1] * ICON_ARROW_HALF_WIDTH,
         ),
     )
 
 
-def _arc_contains(x: float, y: float, start_angle: float, end_angle: float) -> bool:
-    delta_x = x - 0.5
-    delta_y = y - 0.5
-    radius = math.hypot(delta_x, delta_y)
-    angle = math.atan2(delta_y, delta_x)
-    return (
-        abs(radius - ICON_ARROW_RADIUS) <= ICON_ARROW_HALF_THICKNESS
-        and start_angle <= angle <= end_angle
+def _segment_contains(
+    x: float,
+    y: float,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    half_width: float,
+    *,
+    extend_start: bool,
+    extend_end: bool,
+) -> bool:
+    delta_x = end[0] - start[0]
+    delta_y = end[1] - start[1]
+    length = math.hypot(delta_x, delta_y)
+    if length <= 0:
+        return False
+    projection = ((x - start[0]) * delta_x + (y - start[1]) * delta_y) / (
+        length * length
+    )
+    extension = half_width / length
+    minimum = -extension if extend_start else 0.0
+    maximum = 1.0 + extension if extend_end else 1.0
+    distance = abs((x - start[0]) * delta_y - (y - start[1]) * delta_x) / length
+    return minimum <= projection <= maximum and distance <= half_width
+
+
+def _trace_contains(
+    x: float,
+    y: float,
+    points: tuple[tuple[float, float], ...],
+    half_width: float,
+    *,
+    stop_at_final_base: bool = False,
+) -> bool:
+    last_segment = len(points) - 2
+    return any(
+        _segment_contains(
+            x,
+            y,
+            points[index],
+            points[index + 1],
+            half_width,
+            extend_start=True,
+            extend_end=not (stop_at_final_base and index == last_segment),
+        )
+        for index in range(len(points) - 1)
     )
 
 
@@ -479,8 +618,8 @@ def png_icon(size: int) -> bytes:
     if size not in UI_ICON_SIZES:
         raise PackageError(f"unsupported UI icon size: {size}")
     supersample = 4
-    top_arrow = _arrow_triangle(ICON_TOP_TIP_ANGLE)
-    bottom_arrow = _arrow_triangle(ICON_BOTTOM_TIP_ANGLE)
+    top_arrow = _arrow_triangle(ICON_TOP_BODY, ICON_TOP_TIP)
+    bottom_arrow = _arrow_triangle(ICON_BOTTOM_BODY, ICON_BOTTOM_TIP)
     rows: list[bytes] = []
     for y in range(size):
         row = bytearray([0])
@@ -495,31 +634,43 @@ def png_icon(size: int) -> bytes:
                     )
                     if square_distance > 0:
                         continue
-                    delta_x = normalized_x - 0.5
-                    delta_y = normalized_y - 0.5
-                    radius = math.hypot(delta_x, delta_y)
                     pixel = ICON_BACKGROUND
                     if square_distance >= -ICON_BORDER_THICKNESS:
                         pixel = ICON_BORDER
-                    if abs(radius - ICON_ORBIT_RADIUS) <= ICON_ORBIT_HALF_THICKNESS:
+                    if _trace_contains(
+                        normalized_x,
+                        normalized_y,
+                        ICON_ORBIT_POINTS,
+                        ICON_ORBIT_HALF_THICKNESS,
+                    ):
                         pixel = ICON_ORBIT
-                    if radius <= ICON_CENTER_RADIUS:
+                    if (
+                        abs(normalized_x - 0.5) + abs(normalized_y - 0.5)
+                        <= ICON_CENTER_RADIUS
+                    ):
                         pixel = ICON_CENTER
 
-                    on_top_body = _arc_contains(
-                        normalized_x, normalized_y, *ICON_TOP_ARC
+                    on_top_body = _trace_contains(
+                        normalized_x,
+                        normalized_y,
+                        ICON_TOP_BODY,
+                        ICON_ARROW_HALF_THICKNESS,
+                        stop_at_final_base=True,
                     )
-                    on_bottom_body = _arc_contains(
-                        normalized_x, normalized_y, *ICON_BOTTOM_ARC
+                    on_bottom_body = _trace_contains(
+                        normalized_x,
+                        normalized_y,
+                        ICON_BOTTOM_BODY,
+                        ICON_ARROW_HALF_THICKNESS,
+                        stop_at_final_base=True,
                     )
                     if on_top_body:
                         pixel = ICON_TOP
                     if on_bottom_body:
                         pixel = ICON_BOTTOM
 
-                    # Filled heads are composited after the bodies. The shortened
-                    # body arcs overlap only the rear of each triangle, leaving
-                    # the forward apex visible at every packaged icon size.
+                    # Heads are composited last and the trace bodies stop exactly
+                    # at their rear edges, so no body stroke can cover an apex.
                     if _triangle_contains(normalized_x, normalized_y, *top_arrow):
                         pixel = ICON_TOP
                     if _triangle_contains(normalized_x, normalized_y, *bottom_arrow):
@@ -571,6 +722,7 @@ def payload_archive(binary: Path, api_binary: Path) -> tuple[bytes, int]:
         REPOSITORY / "LICENSE",
         REPOSITORY / "THIRD_PARTY_LICENSES.html",
         HERE / "licenses/musl-COPYRIGHT",
+        HERE / "licenses/DSM_UI_THIRD_PARTY_LICENSES.txt",
     )
     ui_payloads = native_ui_payloads()
     rendered_icons = {size: png_icon(size) for size in UI_ICON_SIZES}
@@ -590,6 +742,8 @@ def payload_archive(binary: Path, api_binary: Path) -> tuple[bytes, int]:
             "share/licenses",
             "ui",
             "ui/images",
+            "ui/help",
+            "ui/help/enu",
             "ui/texts",
             "ui/texts/enu",
         ):
@@ -627,6 +781,12 @@ def payload_archive(binary: Path, api_binary: Path) -> tuple[bytes, int]:
             (REPOSITORY / "THIRD_PARTY_LICENSES.html").read_bytes(),
             0o644,
         )
+        add_bytes(
+            archive,
+            "share/licenses/DSM_UI_THIRD_PARTY_LICENSES.txt",
+            (HERE / "licenses/DSM_UI_THIRD_PARTY_LICENSES.txt").read_bytes(),
+            0o644,
+        )
         for payload, destination in ui_payloads:
             add_bytes(archive, destination, payload, 0o644)
         for size, icon in rendered_icons.items():
@@ -639,12 +799,15 @@ def payload_archive(binary: Path, api_binary: Path) -> tuple[bytes, int]:
     return compressed.getvalue(), installed_size
 
 
-def render_info(arch: str, dsm_version: str, extract_size: int) -> bytes:
+def render_info(
+    arch: str, dsm_version: str, extract_size: int, package_checksum: str
+) -> bytes:
     template = (HERE / "INFO.template").read_text(encoding="utf-8")
     rendered = (
         template.replace("@ARCH@", ARCHITECTURES[arch].info_value)
         .replace("@DSM_VERSION@", dsm_version)
         .replace("@EXTRACT_SIZE_KIB@", str((extract_size + 1023) // 1024))
+        .replace("@PACKAGE_TGZ_MD5@", package_checksum)
     )
     if "@" in rendered:
         raise PackageError("INFO.template contains an unresolved placeholder")
@@ -660,7 +823,11 @@ def create_spk(
     output: Path,
 ) -> Path:
     payload, installed_size = payload_archive(binary, api_binary)
-    info = render_info(arch, dsm_version, installed_size)
+    # Synology's INFO checksum is specifically the lowercase MD5 of the exact
+    # compressed package.tgz member, not a replacement for release SHA-256 or
+    # provenance attestations.
+    package_checksum = hashlib.md5(payload, usedforsecurity=False).hexdigest()
+    info = render_info(arch, dsm_version, installed_size, package_checksum)
     output.mkdir(parents=True, exist_ok=True)
     destination = output / f"{PACKAGE}-{release}-{arch}.spk"
     temporary = output / f".{destination.name}.tmp-{os.getpid()}"
@@ -681,6 +848,12 @@ def create_spk(
             archive,
             "LICENSES/THIRD_PARTY_LICENSES.html",
             (REPOSITORY / "THIRD_PARTY_LICENSES.html").read_bytes(),
+            0o644,
+        )
+        add_bytes(
+            archive,
+            "LICENSES/DSM_UI_THIRD_PARTY_LICENSES.txt",
+            (HERE / "licenses/DSM_UI_THIRD_PARTY_LICENSES.txt").read_bytes(),
             0o644,
         )
         add_bytes(archive, "package.tgz", payload, 0o644)

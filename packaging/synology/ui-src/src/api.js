@@ -8,13 +8,47 @@ export const MAX_RESPONSE_BYTES = 1024 * 1024;
 
 const RESULT_POLL_INTERVAL_MS = 2000;
 const RESULT_POLL_OBSERVATION_FAILURES = 5;
+const CLIENT_REQUEST_ID_PATTERN = /^[0-9a-f]{32}$/;
+const JOB_ID_PATTERN = /^[0-9a-f]{48}$/;
+
+function validClientRequestId(value) {
+  return typeof value === "string" && CLIENT_REQUEST_ID_PATTERN.test(value) ? value : "";
+}
+
+function validJobId(value) {
+  return typeof value === "string" && JOB_ID_PATTERN.test(value) ? value : "";
+}
 
 export class QueuedOutcomeUnknownError extends Error {
-  constructor(jobId, message) {
+  constructor(jobId, message, requestId = "") {
     super(message);
     this.name = "QueuedOutcomeUnknownError";
-    this.jobId = jobId;
+    this.jobId = validJobId(jobId);
+    this.requestId = validClientRequestId(requestId);
+    this.trustedJobId = Boolean(this.jobId);
+    this.trustedRequestId = Boolean(this.requestId);
     this.outcomeUnknown = true;
+    this.accepted = true;
+  }
+}
+
+export class MutationOutcomeUnknownError extends Error {
+  constructor(requestId, message) {
+    super(message);
+    this.name = "MutationOutcomeUnknownError";
+    this.requestId = validClientRequestId(requestId);
+    this.trustedRequestId = Boolean(this.requestId);
+    this.outcomeUnknown = true;
+    this.acceptanceUnknown = true;
+  }
+}
+
+export class DsmApiError extends Error {
+  constructor(message, status = 0, code = "api_error") {
+    super(message);
+    this.name = "DsmApiError";
+    this.status = Number.isInteger(Number(status)) ? Number(status) : 0;
+    this.code = boundedText(code, "api_error").slice(0, 128);
   }
 }
 
@@ -27,6 +61,8 @@ export const ACTIONS = Object.freeze({
   routine: "routine",
   removeRoutine: "remove-routine",
   alertPolicy: "alert-policy",
+  securityPolicy: "security-policy",
+  clientEvent: "client-event",
   execute: "action"
 });
 
@@ -62,6 +98,18 @@ export const ARGUMENT_KEYS = Object.freeze({
   "alert-policy": Object.freeze([
     "cooldown_seconds", "enabled", "failure_threshold", "on_failure", "on_success"
   ]),
+  "security-policy": Object.freeze([
+    "allow_destructive_sync", "allow_doctor_write_test", "allow_empty_source", "allow_http_targets",
+    "allow_interface_changes", "allow_invalid_tls", "allow_notification_changes",
+    "allow_operational_actions", "allow_profile_changes", "allow_remote_logging",
+    "allow_routine_changes", "allow_secret_changes", "audit_log_level",
+    "authentication_log_level", "bridge_log_level", "configuration_log_level",
+    "controller_log_level", "csrf_lifetime_seconds", "max_outstanding_jobs",
+    "notifications_log_level", "operations_log_level", "require_https",
+    "result_retention_seconds", "routines_log_level", "scheduler_log_level",
+    "secrets_log_level", "security_log_level", "sync_log_level"
+  ]),
+  "client-event": Object.freeze(["event"]),
   action: Object.freeze(["allow_delete", "kind", "max_total_delete", "scope", "write_test"])
 });
 
@@ -141,31 +189,44 @@ function assertNoReturnedSecrets(model) {
 }
 
 async function responseJson(response, allowGoneResult = false) {
-  if (response.redirected) throw new Error("DSM authentication redirected the API request");
+  if (response.redirected) {
+    throw new DsmApiError("DSM authentication redirected the API request", response.status, "authentication_redirect");
+  }
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.toLowerCase().includes("application/json")) {
-    throw new Error("API did not return JSON");
+    throw new DsmApiError("API did not return JSON", response.status, "non_json_response");
   }
   const body = await response.text();
   const bodyBytes = typeof window.TextEncoder === "function"
     ? new window.TextEncoder().encode(body).byteLength
     : body.length * 2;
   if (bodyBytes > MAX_RESPONSE_BYTES) {
-    throw new Error("API response exceeded the client limit");
+    throw new DsmApiError("API response exceeded the client limit", response.status, "response_too_large");
   }
   let model;
   try {
     model = JSON.parse(body);
   } catch (_error) {
-    throw new Error("API returned malformed JSON");
+    throw new DsmApiError("API returned malformed JSON", response.status, "malformed_json");
   }
   if (!model || typeof model !== "object" || Array.isArray(model)) {
-    throw new Error("API returned an invalid document");
+    throw new DsmApiError("API returned an invalid document", response.status, "invalid_document");
   }
   assertNoReturnedSecrets(model);
   const allowedGone = allowGoneResult && response.status === 410;
   if ((!response.ok && !allowedGone) || (model.ok === false && !allowedGone)) {
-    throw new Error(boundedText(model.message, "API request failed"));
+    const error = new DsmApiError(
+      boundedText(model.message, "API request failed"),
+      response.status,
+      boundedText(model.code, `http_${response.status || 0}`)
+    );
+    error.trustedRejection = response.status >= 400
+      && response.status < 600
+      && model.schema === "sdsync.dsm-error.v1"
+      && model.ok === false
+      && typeof model.code === "string"
+      && typeof model.message === "string";
+    throw error;
   }
   return model;
 }
@@ -220,7 +281,7 @@ function delay(milliseconds, signal) {
   });
 }
 
-async function pollJobResult(auth, jobId, pollIntervalMs = RESULT_POLL_INTERVAL_MS) {
+async function pollJobResult(auth, jobId, pollIntervalMs = RESULT_POLL_INTERVAL_MS, requestId = "") {
   if (!/^[0-9a-f]{48}$/.test(jobId)) {
     throw new Error("API returned an invalid queued job identifier");
   }
@@ -241,7 +302,8 @@ async function pollJobResult(auth, jobId, pollIntervalMs = RESULT_POLL_INTERVAL_
       if (consecutiveObservationFailures >= RESULT_POLL_OBSERVATION_FAILURES) {
         throw new QueuedOutcomeUnknownError(
           jobId,
-          "DSM accepted the operation, but its result cannot currently be observed. Do not retry it; inspect Activity and Logs."
+          "DSM accepted the operation, but its result cannot currently be observed. Do not retry it; inspect Activity and Logs.",
+          requestId
         );
       }
       await delay(interval, auth && auth.signal);
@@ -251,7 +313,8 @@ async function pollJobResult(auth, jobId, pollIntervalMs = RESULT_POLL_INTERVAL_
     if (status.schema !== RESULT_STATUS_SCHEMA || status.job_id !== jobId) {
       throw new QueuedOutcomeUnknownError(
         jobId,
-        "The queued operation is still outcome-unknown because DSM returned an invalid result document. Do not retry it; inspect Activity and Logs."
+        "The queued operation is still outcome-unknown because DSM returned an invalid result document. Do not retry it; inspect Activity and Logs.",
+        requestId
       );
     }
     if (status.state === "pending") {
@@ -264,7 +327,8 @@ async function pollJobResult(auth, jobId, pollIntervalMs = RESULT_POLL_INTERVAL_
         boundedText(
           status.result && status.result.message,
           "The queued result is no longer available. Do not retry it; inspect Activity and Logs."
-        )
+        ),
+        requestId
       );
     }
     if (status.state !== "complete"
@@ -275,15 +339,25 @@ async function pollJobResult(auth, jobId, pollIntervalMs = RESULT_POLL_INTERVAL_
       || (status.result.ok !== true && status.result.ok !== false)) {
       throw new QueuedOutcomeUnknownError(
         jobId,
-        "The queued operation is outcome-unknown because DSM returned an invalid terminal result. Do not retry it; inspect Activity and Logs."
+        "The queued operation is outcome-unknown because DSM returned an invalid terminal result. Do not retry it; inspect Activity and Logs.",
+        requestId
       );
     }
     if (status.result.ok === false) {
-      const failure = new Error(boundedText(status.result.message, "Package operation failed"));
+      const failure = new DsmApiError(
+        boundedText(status.result.message, "Package operation failed"),
+        200,
+        boundedText(status.result.code, "operation_failed")
+      );
       failure.resultOutput = boundedText(
         status.result.output,
         failure.message
       );
+      failure.jobId = jobId;
+      failure.requestId = validClientRequestId(requestId);
+      failure.trustedJobId = true;
+      failure.trustedRequestId = Boolean(failure.requestId);
+      failure.accepted = true;
       throw failure;
     }
     return status.result;
@@ -299,6 +373,23 @@ function requestId() {
   return Array.from(random)
     .map((value) => value.toString(16).padStart(2, "0"))
     .join("");
+}
+
+function isExplicitCsrfRejection(error) {
+  if (!(error instanceof DsmApiError) || error.status !== 403 || error.trustedRejection !== true) {
+    return false;
+  }
+  const code = String(error.code || "").toLowerCase().replace(/-/g, "_");
+  const message = String(error.message || "").toLowerCase();
+  return ["csrf_rejected", "csrf_expired", "csrf_invalid", "invalid_csrf"].includes(code)
+    || /\bcsrf\b|cross[- ]site request forgery|mutation token/.test(message);
+}
+
+function dispatchedOutcomeUnknown(id) {
+  return new MutationOutcomeUnknownError(
+    id,
+    `DSM may have accepted client request ${id}, but no trustworthy rejection or queue acknowledgement was received. Do not retry it automatically; inspect Activity and Logs using this request ID.`
+  );
 }
 
 export async function apiPost(
@@ -321,25 +412,43 @@ export async function apiPost(
     operation: action,
     arguments: payload
   });
-  const response = await fetch(API_URL, {
-    method: "POST",
-    credentials: "same-origin",
-    cache: "no-store",
-    redirect: "error",
-    signal: auth && auth.signal ? auth.signal : undefined,
-    headers: authenticatedHeaders({
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      "X-SDSYNC-CSRF": csrfToken
-    }),
-    body: request
-  });
-  const queued = await responseJson(response);
+  let response;
+  try {
+    response = await fetch(API_URL, {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      redirect: "error",
+      signal: auth && auth.signal ? auth.signal : undefined,
+      headers: authenticatedHeaders({
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "X-SDSYNC-CSRF": csrfToken
+      }),
+      body: request
+    });
+  } catch (_error) {
+    throw dispatchedOutcomeUnknown(id);
+  }
+
+  let queued;
+  try {
+    queued = await responseJson(response);
+  } catch (error) {
+    if (error instanceof DsmApiError && error.trustedRejection === true) {
+      error.preAcceptance = true;
+      error.requestId = id;
+      error.trustedRequestId = true;
+      if (isExplicitCsrfRejection(error)) error.csrfRejected = true;
+      throw error;
+    }
+    throw dispatchedOutcomeUnknown(id);
+  }
   if (queued.schema !== QUEUED_SCHEMA
     || queued.state !== "queued"
     || queued.request_id !== id
     || !/^[0-9a-f]{48}$/.test(String(queued.job_id || ""))) {
-    throw new Error("API returned an invalid queued-operation document");
+    throw dispatchedOutcomeUnknown(id);
   }
-  return awaitTerminal ? pollJobResult(auth, queued.job_id, pollIntervalMs) : queued;
+  return awaitTerminal ? pollJobResult(auth, queued.job_id, pollIntervalMs, id) : queued;
 }

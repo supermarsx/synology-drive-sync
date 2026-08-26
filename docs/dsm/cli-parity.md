@@ -122,8 +122,9 @@ overlap validation.
 | API-service log | `/var/packages/synology-drive-sync/var/log/api.log` |
 | DSM package-control log | `/var/log/packages/synology-drive-sync.log` |
 
-Early DSM 7 builds without `SYNOPKG_PKGVAR` use a private package-home state fallback rather than a
-shared or world-writable path. Use `paths` to observe the actual resolved directories.
+DSM must provide the package-private `var` root (through `SYNOPKG_PKGVAR` or the canonical
+`/var/packages/synology-drive-sync/var` FHS link). The package fails closed when that root is absent rather than
+falling back to a shared or mismatched state path. Use `paths` to observe the actual resolved directories.
 
 Do not edit, chmod, chown, symlink, enqueue, or connect to files in these directories. The manager
 uses atomic replacement and validates owner, type, mode, and containment; the CGI and API service

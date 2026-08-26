@@ -6,14 +6,7 @@ package_base=/var/packages/$package_name
 package_root=${SYNOPKG_PKGDEST:-$package_base/target}
 package_home=${SYNOPKG_PKGHOME:-$package_base/home}
 package_var_candidate=${SYNOPKG_PKGVAR:-$package_base/var}
-
-if [ -d "$package_var_candidate" ]; then
-    package_var=$package_var_candidate
-else
-    # SYNOPKG_PKGVAR was introduced during DSM 7.0. Keep early DSM 7 builds
-    # functional without ever falling back to a shared or world-writable path.
-    package_var=$package_home/state
-fi
+package_var=$package_var_candidate
 
 binary=$package_root/bin/synology-drive-sync
 manager=$package_root/bin/sdsync-dsm
@@ -27,28 +20,48 @@ default_profile_file=$config_root/default-profile
 schedule_file=$config_root/schedule.conf
 routines_dir=$config_root/routines.d
 alert_policy_file=$config_root/alerts.conf
+security_policy_file=$config_root/security.conf
 secret_root=$package_home/secrets
 state_root=$package_var/state
 routine_state_dir=$state_root/routines
 profile_state_dir=$state_root/profiles
 health_dir=$state_root/health
+audit_outbox_dir=$state_root/audit-outbox
 runtime_root=$package_var/run
 control_root=$package_var/control
 control_requests=$control_root/requests
 control_processing=$control_root/processing
 control_responses=$control_root/responses
+control_staging=$control_root/staging
 log_root=$package_var/log
+controller_log=$log_root/controller.log
 activity_log=$log_root/activity.log
+audit_log=$log_root/audit.log
 doctor_state=$state_root/doctor.state
 alert_state=$state_root/alerts.state
 package_home_real=$(CDPATH='' cd -- "$package_home" 2>/dev/null && pwd -P || printf '%s' "$package_home")
 package_var_real=$(CDPATH='' cd -- "$package_var" 2>/dev/null && pwd -P || printf '%s' "$package_var")
 controller_pid_file=$runtime_root/controller.pid
+controller_ready_file=$runtime_root/controller.ready
+controller_start_file=$runtime_root/controller.starting
+api_pid_file=$runtime_root/api.pid
+api_bound_file=$runtime_root/api.bound
+api_ready_file=$runtime_root/api.ready
 controller_lock=$runtime_root/controller.lock
 controller_state=$state_root/controller.state
+service_stop_marker=$state_root/service-stopped.marker
 run_lock=$runtime_root/run.lock
 run_state=$state_root/run.state
 management_lock=$runtime_root/management.lock
+policy_execution_lock=$runtime_root/policy-execution.lock
+lifecycle_lock=$runtime_root/lifecycle.lock
+package_transition_file=$runtime_root/package.transition
+service_closed_file=$runtime_root/service.closed
+failed_start_api_file=$runtime_root/failed-start.api
+failed_start_controller_file=$runtime_root/failed-start.controller
+event_log_lock=$runtime_root/event-log.lock
+event_log_lock_held=false
+boot_identity_path=/proc/sys/kernel/random/boot_id
 
 path_owner=
 path_group=
@@ -64,6 +77,22 @@ set_private_owner() {
     if [ "$(id -u)" = 0 ] && [ -n "$path_owner" ] && [ -n "$path_group" ]; then
         chown "$path_owner:$path_group" "$private_path"
     fi
+}
+
+# DSM configuration is persisted in private package files. Never let an
+# invoking shell, task environment, or package hook override those values via
+# the core CLI's public SDSYNC_* environment surface.
+clear_core_cli_environment() {
+    unset SDSYNC_CONFIG SDSYNC_PROFILE SDSYNC_MAX_TOTAL_DELETE SDSYNC_URL \
+        SDSYNC_USERNAME SDSYNC_PASSWORD SDSYNC_OTP SDSYNC_REMOTE_LOG_TOKEN \
+        SDSYNC_PASSWORD_STDIN SDSYNC_PASSWORD_FILE SDSYNC_TOTP_SECRET_FILE \
+        SDSYNC_NO_VAULT SDSYNC_COMPARE SDSYNC_JOBS SDSYNC_DELETE \
+        SDSYNC_ALLOW_EMPTY_SOURCE SDSYNC_MAX_DELETE SDSYNC_RETRIES SDSYNC_TIMEOUT \
+        SDSYNC_MAX_RATE SDSYNC_CONNECT_TIMEOUT SDSYNC_CA_CERTIFICATE SDSYNC_ALLOW_HTTP \
+        SDSYNC_DANGER_ACCEPT_INVALID_CERTS SDSYNC_QUIET SDSYNC_LOG_LEVEL \
+        SDSYNC_LOG_FORMAT SDSYNC_LOG_FILE SDSYNC_REMOTE_LOG_URL \
+        SDSYNC_REMOTE_LOG_TOKEN_FILE SDSYNC_REMOTE_LOG_TOKEN_ENV \
+        SDSYNC_REMOTE_LOG_MODE SDSYNC_PROGRESS SDSYNC_OUTPUT SDSYNC_REMOTE
 }
 
 require_package_identity() {
@@ -101,8 +130,8 @@ ensure_layout() {
     fi
     for private_dir in $private_roots "$config_root" "$profiles_dir" \
         "$routines_dir" "$secret_root" "$state_root" "$routine_state_dir" "$profile_state_dir" \
-        "$health_dir" "$runtime_root" "$control_root" "$control_requests" \
-        "$control_processing" "$control_responses" "$log_root"
+        "$health_dir" "$audit_outbox_dir" "$runtime_root" "$control_root" "$control_requests" \
+        "$control_processing" "$control_responses" "$control_staging" "$log_root"
     do
         if [ -L "$private_dir" ]; then
             echo "refusing symlinked package data directory: $private_dir" >&2
@@ -143,14 +172,57 @@ pid_matches_command() {
     [ -r "/proc/$checked_pid/cmdline" ] || return 1
     canonical_command_dir=$(CDPATH='' cd -- "$(dirname -- "$expected_command")" 2>/dev/null && pwd -P) || return 1
     canonical_command=$canonical_command_dir/$(basename -- "$expected_command")
-    if tr '\000' '\n' < "/proc/$checked_pid/cmdline" 2>/dev/null |
+    if tr '\000' '\n' 2>/dev/null < "/proc/$checked_pid/cmdline" |
         grep -F -x "$expected_command" >/dev/null 2>&1
     then
         return 0
     fi
     [ "$canonical_command" != "$expected_command" ] || return 1
-    tr '\000' '\n' < "/proc/$checked_pid/cmdline" 2>/dev/null |
+    tr '\000' '\n' 2>/dev/null < "/proc/$checked_pid/cmdline" |
         grep -F -x "$canonical_command" >/dev/null 2>&1
+}
+
+require_internal_api_bridge_parent() {
+    internal_parent=${PPID:-0}
+    pid_matches_command "$internal_parent" "$api_bridge" || return 77
+    [ -f "$api_bridge" ] && [ ! -L "$api_bridge" ] || return 73
+    expected_bridge_identity=$(stat -L -c '%d:%i:%u:%a:%h' "$api_bridge" 2>/dev/null || true)
+    parent_bridge_identity=$(stat -L -c '%d:%i:%u:%a:%h' "/proc/$internal_parent/exe" 2>/dev/null || true)
+    expected_bridge_owner=$(stat -L -c '%u' "$api_bridge" 2>/dev/null || true)
+    case $expected_bridge_identity:$expected_bridge_owner in
+        *:755:1:"$path_owner") ;;
+        *) return 73 ;;
+    esac
+    [ "$parent_bridge_identity" = "$expected_bridge_identity" ] || return 77
+    parent_bridge_mode=false
+    while IFS= read -r internal_parent_argument; do
+        case $internal_parent_argument in
+            --serve|--consume-job|--audit-transaction) parent_bridge_mode=true ;;
+        esac
+    done <<EOF
+$(tr '\000' '\n' 2>/dev/null < "/proc/$internal_parent/cmdline" || true)
+EOF
+    [ "$parent_bridge_mode" = true ] || return 77
+}
+
+require_verified_controller_parent() {
+    controller_parent=${PPID:-0}
+    controller_lock_status=0
+    private_process_lock_is_live "$controller_lock" || controller_lock_status=$?
+    case $controller_lock_status in
+        0) ;;
+        1) return 77 ;;
+        *) return 73 ;;
+    esac
+    [ "$lock_owner_pid" = "$controller_parent" ] || return 77
+    pid_matches_command "$controller_parent" "$controller" || return 77
+    [ -f "$controller" ] && [ ! -L "$controller" ] || return 73
+    controller_owner=$(stat -L -c '%u' "$controller" 2>/dev/null || true)
+    controller_mode=$(stat -L -c '%a' "$controller" 2>/dev/null || true)
+    controller_links=$(stat -L -c '%h' "$controller" 2>/dev/null || true)
+    [ "$controller_owner" = "$path_owner" ] \
+        && [ "$controller_mode" = 755 ] \
+        && [ "$controller_links" = 1 ] || return 73
 }
 
 read_pid() {
@@ -161,6 +233,927 @@ read_pid() {
     IFS= read -r saved_pid < "$pid_path" || return 1
     is_pid "$saved_pid" || return 1
     printf '%s\n' "$saved_pid"
+}
+
+controller_pid_file_safe() {
+    [ -e "$controller_pid_file" ] || [ -L "$controller_pid_file" ] || return 1
+    [ -f "$controller_pid_file" ] && [ ! -L "$controller_pid_file" ] || return 73
+    [ -n "$path_owner" ] || return 73
+    controller_pid_metadata=$(stat -c '%u:%a:%h' "$controller_pid_file" 2>/dev/null || true)
+    [ "$controller_pid_metadata" = "$path_owner:600:1" ] || return 73
+    controller_pid_lines=$(awk 'END { print NR }' "$controller_pid_file" 2>/dev/null || true)
+    [ "$controller_pid_lines" = 1 ] || return 73
+    controller_pid_value=$(read_pid "$controller_pid_file" 2>/dev/null || true)
+    [ -n "$controller_pid_value" ] || return 73
+}
+
+remove_stale_controller_pid_file() {
+    [ -e "$controller_pid_file" ] || [ -L "$controller_pid_file" ] || return 0
+    controller_pid_file_safe || return $?
+    pid_is_live "$controller_pid_value" && return 75
+    stale_controller_pid_identity=$(stat -c '%d:%i' "$controller_pid_file" 2>/dev/null || true)
+    [ -n "$stale_controller_pid_identity" ] || return 73
+    controller_pid_file_safe || return 73
+    stale_controller_pid_recheck=$(stat -c '%d:%i' "$controller_pid_file" 2>/dev/null || true)
+    [ "$stale_controller_pid_recheck" = "$stale_controller_pid_identity" ] || return 73
+    rm -f "$controller_pid_file"
+}
+
+read_controller_ready_identity() {
+    [ -e "$controller_ready_file" ] || [ -L "$controller_ready_file" ] || return 1
+    [ -f "$controller_ready_file" ] && [ ! -L "$controller_ready_file" ] || return 73
+    [ -n "$path_owner" ] || return 73
+    controller_ready_metadata=$(stat -c '%u:%a:%h' "$controller_ready_file" 2>/dev/null || true)
+    [ "$controller_ready_metadata" = "$path_owner:600:1" ] || return 73
+    controller_ready_size=$(wc -c 2>/dev/null < "$controller_ready_file" | tr -d ' ')
+    case $controller_ready_size in ''|*[!0-9]*) return 73 ;; esac
+    [ "$controller_ready_size" -le 96 ] || return 73
+    controller_ready_lines=$(awk 'END { print NR }' "$controller_ready_file" 2>/dev/null || true)
+    [ "$controller_ready_lines" = 3 ] || return 73
+    controller_ready_pid=$(sed -n '1p' "$controller_ready_file" 2>/dev/null || true)
+    controller_ready_start=$(sed -n '2p' "$controller_ready_file" 2>/dev/null || true)
+    controller_ready_boot=$(sed -n '3p' "$controller_ready_file" 2>/dev/null || true)
+    is_pid "$controller_ready_pid" || return 73
+    case $controller_ready_start in ''|*[!0-9]*|0) return 73 ;; esac
+    valid_boot_identity "$controller_ready_boot" || return 73
+}
+
+# Return 0 only for a live, exact controller readiness identity; 1 means an
+# absent or verifiably stale record, and 73 means an unsafe/malformed record.
+controller_ready_status() {
+    [ -e "$controller_ready_file" ] || [ -L "$controller_ready_file" ] || return 1
+    read_controller_ready_identity || return $?
+    controller_ready_live_status=0
+    process_identity_is_live "$controller_ready_pid" "$controller_ready_start" \
+        "$controller_ready_boot" || controller_ready_live_status=$?
+    case $controller_ready_live_status in
+        0) pid_matches_command "$controller_ready_pid" "$controller" || return 73; return 0 ;;
+        1) return 1 ;;
+        *) return 73 ;;
+    esac
+}
+
+controller_ready_matches() {
+    expected_ready_pid=$1
+    controller_ready_status || return $?
+    [ "$controller_ready_pid" = "$expected_ready_pid" ] || return 73
+}
+
+runtime_api_ready_status() {
+    [ -e "$api_ready_file" ] || [ -L "$api_ready_file" ] || return 1
+    [ -f "$api_ready_file" ] && [ ! -L "$api_ready_file" ] || return 73
+    [ -n "$path_owner" ] || return 73
+    runtime_api_ready_metadata=$(stat -c '%u:%a:%h' "$api_ready_file" 2>/dev/null || true)
+    [ "$runtime_api_ready_metadata" = "$path_owner:600:1" ] || return 73
+    runtime_api_ready_lines=$(awk 'END { print NR }' "$api_ready_file" 2>/dev/null || true)
+    [ "$runtime_api_ready_lines" = 3 ] || return 73
+    runtime_api_ready_pid=$(sed -n '1p' "$api_ready_file" 2>/dev/null || true)
+    runtime_api_ready_start=$(sed -n '2p' "$api_ready_file" 2>/dev/null || true)
+    runtime_api_ready_boot=$(sed -n '3p' "$api_ready_file" 2>/dev/null || true)
+    is_pid "$runtime_api_ready_pid" || return 73
+    case $runtime_api_ready_start in ''|*[!0-9]*|0) return 73 ;; esac
+    valid_boot_identity "$runtime_api_ready_boot" || return 73
+    [ -f "$api_pid_file" ] && [ ! -L "$api_pid_file" ] || return 73
+    runtime_api_pid_metadata=$(stat -c '%u:%a:%h' "$api_pid_file" 2>/dev/null || true)
+    [ "$runtime_api_pid_metadata" = "$path_owner:600:1" ] || return 73
+    runtime_api_pid_lines=$(awk 'END { print NR }' "$api_pid_file" 2>/dev/null || true)
+    [ "$runtime_api_pid_lines" = 1 ] || return 73
+    runtime_api_saved_pid=$(sed -n '1p' "$api_pid_file" 2>/dev/null || true)
+    [ "$runtime_api_saved_pid" = "$runtime_api_ready_pid" ] || return 73
+    runtime_api_live_status=0
+    process_identity_is_live "$runtime_api_ready_pid" "$runtime_api_ready_start" \
+        "$runtime_api_ready_boot" || runtime_api_live_status=$?
+    case $runtime_api_live_status in
+        0) pid_matches_command "$runtime_api_ready_pid" "$api_bridge" || return 73; return 0 ;;
+        1) return 1 ;;
+        *) return 73 ;;
+    esac
+}
+
+service_runtime_ready() {
+    controller_ready_status || return $?
+    runtime_api_ready_status
+}
+
+package_transition_status() {
+    [ -x "$api_bridge" ] && [ ! -L "$api_bridge" ] || return 73
+    package_transition_value=$("$api_bridge" --package-transition status) || return $?
+    case $package_transition_value in open|upgrade|uninstall) ;;
+        *) return 73 ;;
+    esac
+    printf '%s\n' "$package_transition_value"
+}
+
+service_admission_status() {
+    [ -x "$api_bridge" ] && [ ! -L "$api_bridge" ] || return 73
+    service_admission_value=$("$api_bridge" --service-admission status) || return $?
+    case $service_admission_value in open|closed) ;;
+        *) return 73 ;;
+    esac
+    printf '%s\n' "$service_admission_value"
+}
+
+read_controller_start_lease() {
+    [ -e "$controller_start_file" ] || [ -L "$controller_start_file" ] || return 1
+    [ -f "$controller_start_file" ] && [ ! -L "$controller_start_file" ] || return 73
+    [ -n "$path_owner" ] || return 73
+    controller_start_metadata=$(stat -c '%u:%a:%h' "$controller_start_file" 2>/dev/null || true)
+    [ "$controller_start_metadata" = "$path_owner:600:1" ] || return 73
+    controller_start_size=$(wc -c 2>/dev/null < "$controller_start_file" | tr -d ' ')
+    case $controller_start_size in ''|*[!0-9]*) return 73 ;; esac
+    [ "$controller_start_size" -le 112 ] || return 73
+    controller_start_lines=$(awk 'END { print NR }' "$controller_start_file" 2>/dev/null || true)
+    case $controller_start_lines in
+        3) controller_start_phase=prepared ;;
+        4)
+            controller_start_phase=$(sed -n '4p' "$controller_start_file" 2>/dev/null || true)
+            [ "$controller_start_phase" = committed ] || return 73
+            ;;
+        *) return 73 ;;
+    esac
+    controller_start_pid=$(sed -n '1p' "$controller_start_file" 2>/dev/null || true)
+    controller_start_ticks=$(sed -n '2p' "$controller_start_file" 2>/dev/null || true)
+    controller_start_boot=$(sed -n '3p' "$controller_start_file" 2>/dev/null || true)
+    is_pid "$controller_start_pid" || return 73
+    case $controller_start_ticks in ''|*[!0-9]*|0) return 73 ;; esac
+    valid_boot_identity "$controller_start_boot" || return 73
+}
+
+controller_start_lease_status() {
+    read_controller_start_lease || return $?
+    controller_start_live_status=0
+    process_identity_is_live "$controller_start_pid" "$controller_start_ticks" \
+        "$controller_start_boot" || controller_start_live_status=$?
+    case $controller_start_live_status in
+        0) return 0 ;;
+        1) return 1 ;;
+        *) return 73 ;;
+    esac
+}
+
+publish_controller_start_lease() {
+    [ ! -e "$controller_start_file" ] && [ ! -L "$controller_start_file" ] || return 73
+    controller_start_parent_ticks=$(process_start_time "$$" 2>/dev/null || true)
+    case $controller_start_parent_ticks in ''|*[!0-9]*|0) return 73 ;; esac
+    controller_start_parent_boot=$(boot_identity) || return 73
+    controller_start_temp=$controller_start_file.tmp.$$
+    [ ! -e "$controller_start_temp" ] && [ ! -L "$controller_start_temp" ] || return 73
+    {
+        printf '%s\n' "$$"
+        printf '%s\n' "$controller_start_parent_ticks"
+        printf '%s\n' "$controller_start_parent_boot"
+    } > "$controller_start_temp" || { rm -f "$controller_start_temp"; return 73; }
+    finish_private_file "$controller_start_temp" || { rm -f "$controller_start_temp"; return 73; }
+    mv -f "$controller_start_temp" "$controller_start_file" || {
+        rm -f "$controller_start_temp"
+        return 73
+    }
+    SDSYNC_DSM_CONTROLLER_START_PARENT_PID=$$
+    SDSYNC_DSM_CONTROLLER_START_PARENT_TICKS=$controller_start_parent_ticks
+    SDSYNC_DSM_CONTROLLER_START_PARENT_BOOT=$controller_start_parent_boot
+    export SDSYNC_DSM_CONTROLLER_START_PARENT_PID \
+        SDSYNC_DSM_CONTROLLER_START_PARENT_TICKS SDSYNC_DSM_CONTROLLER_START_PARENT_BOOT
+}
+
+controller_start_lease_identity_matches_parent() {
+    expected_start_parent=${SDSYNC_DSM_CONTROLLER_START_PARENT_PID:-}
+    expected_start_ticks=${SDSYNC_DSM_CONTROLLER_START_PARENT_TICKS:-}
+    expected_start_boot=${SDSYNC_DSM_CONTROLLER_START_PARENT_BOOT:-}
+    is_pid "$expected_start_parent" || return 73
+    case $expected_start_ticks in ''|*[!0-9]*|0) return 73 ;; esac
+    valid_boot_identity "$expected_start_boot" || return 73
+    [ "${PPID:-0}" = "$expected_start_parent" ] || return 73
+    [ "$controller_start_pid" = "$expected_start_parent" ] \
+        && [ "$controller_start_ticks" = "$expected_start_ticks" ] \
+        && [ "$controller_start_boot" = "$expected_start_boot" ] || return 73
+    process_identity_is_live "$controller_start_pid" "$controller_start_ticks" \
+        "$controller_start_boot" || return 73
+}
+
+controller_start_lease_matches_parent() {
+    read_controller_start_lease || return 73
+    [ "$controller_start_phase" = prepared ] || return 73
+    controller_start_lease_identity_matches_parent
+}
+
+controller_start_lease_committed_matches_parent() {
+    read_controller_start_lease || return 73
+    [ "$controller_start_phase" = committed ] || return 73
+    controller_start_lease_identity_matches_parent
+}
+
+wait_for_controller_start_commit() {
+    while :; do
+        read_controller_start_lease || return 73
+        controller_start_lease_identity_matches_parent || return 73
+        case $controller_start_phase in
+            committed) return 0 ;;
+            prepared) sleep 1 ;;
+            *) return 73 ;;
+        esac
+    done
+}
+
+commit_controller_start_lease() {
+    read_controller_start_lease || return 73
+    [ "$controller_start_phase" = prepared ] || return 73
+    own_start_ticks=$(process_start_time "$$" 2>/dev/null || true)
+    own_start_boot=$(boot_identity) || return 73
+    [ "$controller_start_pid" = "$$" ] && [ "$controller_start_ticks" = "$own_start_ticks" ] \
+        && [ "$controller_start_boot" = "$own_start_boot" ] || return 73
+    controller_commit_temp=$controller_start_file.commit.$$
+    [ ! -e "$controller_commit_temp" ] && [ ! -L "$controller_commit_temp" ] || return 73
+    {
+        printf '%s\n' "$$"
+        printf '%s\n' "$own_start_ticks"
+        printf '%s\n' "$own_start_boot"
+        printf 'committed\n'
+    } > "$controller_commit_temp" || { rm -f "$controller_commit_temp"; return 73; }
+    finish_private_file "$controller_commit_temp" || { rm -f "$controller_commit_temp"; return 73; }
+    mv -f "$controller_commit_temp" "$controller_start_file" || {
+        rm -f "$controller_commit_temp"
+        return 73
+    }
+    read_controller_start_lease || return 73
+    [ "$controller_start_phase" = committed ] || return 73
+    [ "$controller_start_pid" = "$$" ] && [ "$controller_start_ticks" = "$own_start_ticks" ] \
+        && [ "$controller_start_boot" = "$own_start_boot" ] || return 73
+}
+
+remove_controller_start_lease() {
+    read_controller_start_lease || return $?
+    [ "$controller_start_pid" = "${SDSYNC_DSM_CONTROLLER_START_PARENT_PID:-}" ] \
+        && [ "$controller_start_ticks" = "${SDSYNC_DSM_CONTROLLER_START_PARENT_TICKS:-}" ] \
+        && [ "$controller_start_boot" = "${SDSYNC_DSM_CONTROLLER_START_PARENT_BOOT:-}" ] || return 73
+    controller_start_identity=$(stat -c '%d:%i' "$controller_start_file" 2>/dev/null || true)
+    [ -n "$controller_start_identity" ] || return 73
+    read_controller_start_lease || return 73
+    controller_start_recheck=$(stat -c '%d:%i' "$controller_start_file" 2>/dev/null || true)
+    [ "$controller_start_recheck" = "$controller_start_identity" ] || return 73
+    rm -f "$controller_start_file"
+}
+
+remove_own_controller_start_lease() {
+    [ -e "$controller_start_file" ] || [ -L "$controller_start_file" ] || return 0
+    read_controller_start_lease || return 73
+    own_start_ticks=$(process_start_time "$$" 2>/dev/null || true)
+    own_start_boot=$(boot_identity) || return 73
+    [ "$controller_start_pid" = "$$" ] && [ "$controller_start_ticks" = "$own_start_ticks" ] \
+        && [ "$controller_start_boot" = "$own_start_boot" ] || return 73
+    rm -f "$controller_start_file"
+}
+
+remove_stale_controller_start_lease() {
+    [ -e "$controller_start_file" ] || [ -L "$controller_start_file" ] || return 0
+    stale_start_status=0
+    controller_start_lease_status || stale_start_status=$?
+    case $stale_start_status in
+        0) return 75 ;;
+        1) ;;
+        *) return 73 ;;
+    esac
+    read_controller_start_lease || return 73
+    stale_start_identity=$(stat -c '%d:%i' "$controller_start_file" 2>/dev/null || true)
+    [ -n "$stale_start_identity" ] || return 73
+    read_controller_start_lease || return 73
+    stale_start_recheck=$(stat -c '%d:%i' "$controller_start_file" 2>/dev/null || true)
+    [ "$stale_start_recheck" = "$stale_start_identity" ] || return 73
+    rm -f "$controller_start_file"
+}
+
+remove_stale_controller_ready() {
+    [ -e "$controller_ready_file" ] || [ -L "$controller_ready_file" ] || return 0
+    stale_ready_status=0
+    controller_ready_status || stale_ready_status=$?
+    case $stale_ready_status in
+        0) return 75 ;;
+        1) ;;
+        *) return 73 ;;
+    esac
+    # Re-validate the exact inode immediately before removal. A disappearance
+    # is benign; a replacement is unsafe.
+    read_controller_ready_identity || {
+        [ -e "$controller_ready_file" ] || [ -L "$controller_ready_file" ] || return 0
+        return 73
+    }
+    stale_ready_identity=$(stat -c '%d:%i' "$controller_ready_file" 2>/dev/null || true)
+    [ -n "$stale_ready_identity" ] || return 73
+    stale_ready_recheck=$(stat -c '%d:%i' "$controller_ready_file" 2>/dev/null || true)
+    [ "$stale_ready_recheck" = "$stale_ready_identity" ] || return 73
+    rm -f "$controller_ready_file"
+}
+
+publish_controller_ready() {
+    remove_stale_controller_ready || return $?
+    published_ready_start=$(process_start_time "$$" 2>/dev/null || true)
+    case $published_ready_start in ''|*[!0-9]*|0) return 73 ;; esac
+    published_ready_boot=$(boot_identity) || return 73
+    published_ready_temp=$controller_ready_file.tmp.$$
+    [ ! -e "$published_ready_temp" ] && [ ! -L "$published_ready_temp" ] || return 73
+    {
+        printf '%s\n' "$$"
+        printf '%s\n' "$published_ready_start"
+        printf '%s\n' "$published_ready_boot"
+    } > "$published_ready_temp" || { rm -f "$published_ready_temp"; return 73; }
+    finish_private_file "$published_ready_temp" || { rm -f "$published_ready_temp"; return 73; }
+    [ ! -e "$controller_ready_file" ] && [ ! -L "$controller_ready_file" ] || {
+        rm -f "$published_ready_temp"
+        return 73
+    }
+    mv "$published_ready_temp" "$controller_ready_file" || { rm -f "$published_ready_temp"; return 73; }
+    controller_ready_matches "$$"
+}
+
+remove_own_controller_ready() {
+    [ -e "$controller_ready_file" ] || [ -L "$controller_ready_file" ] || return 0
+    read_controller_ready_identity || return 73
+    own_ready_start=$(process_start_time "$$" 2>/dev/null || true)
+    own_ready_boot=$(boot_identity) || return 73
+    [ "$controller_ready_pid" = "$$" ] \
+        && [ "$controller_ready_start" = "$own_ready_start" ] \
+        && [ "$controller_ready_boot" = "$own_ready_boot" ] || return 73
+    own_ready_identity=$(stat -c '%d:%i' "$controller_ready_file" 2>/dev/null || true)
+    [ -n "$own_ready_identity" ] || return 73
+    own_ready_recheck=$(stat -c '%d:%i' "$controller_ready_file" 2>/dev/null || true)
+    [ "$own_ready_recheck" = "$own_ready_identity" ] || return 73
+    rm -f "$controller_ready_file"
+}
+
+private_event_lock_directory() {
+    checked_event_dir=$1
+    [ -d "$checked_event_dir" ] && [ ! -L "$checked_event_dir" ] || return 1
+    [ -n "$path_owner" ] || return 1
+    checked_event_mode=$(stat -c '%a' "$checked_event_dir" 2>/dev/null || true)
+    checked_event_owner=$(stat -c '%u' "$checked_event_dir" 2>/dev/null || true)
+    [ "$checked_event_mode" = 700 ] && [ "$checked_event_owner" = "$path_owner" ] || return 1
+    for checked_event_entry in "$checked_event_dir"/* "$checked_event_dir"/.[!.]* "$checked_event_dir"/..?*; do
+        [ -e "$checked_event_entry" ] || [ -L "$checked_event_entry" ] || continue
+        [ "${checked_event_entry##*/}" = pid ] || return 1
+        [ -f "$checked_event_entry" ] && [ ! -L "$checked_event_entry" ] || return 1
+        checked_event_entry_mode=$(stat -c '%a' "$checked_event_entry" 2>/dev/null || true)
+        checked_event_entry_owner=$(stat -c '%u' "$checked_event_entry" 2>/dev/null || true)
+        [ "$checked_event_entry_mode" = 600 ] && [ "$checked_event_entry_owner" = "$path_owner" ] || return 1
+    done
+}
+
+process_start_time() {
+    process_start_pid=$1
+    is_pid "$process_start_pid" || return 1
+    process_start_value=$(awk '{ print $22 }' "/proc/$process_start_pid/stat" 2>/dev/null || true)
+    case $process_start_value in ''|*[!0-9]*|0) return 1 ;; esac
+    printf '%s\n' "$process_start_value"
+}
+
+valid_boot_identity() {
+    case ${1:-} in ????????-????-????-????-????????????) ;; *) return 1 ;; esac
+    boot_identity_compact=$(printf '%s' "$1" | tr -d '-')
+    [ "${#boot_identity_compact}" -eq 32 ] || return 1
+    case $boot_identity_compact in *[!0-9a-f]*) return 1 ;; esac
+}
+
+boot_identity() {
+    [ -f "$boot_identity_path" ] && [ ! -L "$boot_identity_path" ] && [ -r "$boot_identity_path" ] || return 73
+    boot_identity_mode=$(stat -c '%a' "$boot_identity_path" 2>/dev/null || true)
+    boot_identity_owner=$(stat -c '%u' "$boot_identity_path" 2>/dev/null || true)
+    [ "$boot_identity_mode" = 444 ] && [ "$boot_identity_owner" = 0 ] || return 73
+    boot_identity_lines=$(awk 'END { print NR }' "$boot_identity_path" 2>/dev/null || true)
+    [ "$boot_identity_lines" = 1 ] || return 73
+    IFS= read -r boot_identity_value < "$boot_identity_path" || return 73
+    valid_boot_identity "$boot_identity_value" || return 73
+    printf '%s\n' "$boot_identity_value"
+}
+
+process_identity_is_live() {
+    process_identity_pid=$1
+    process_identity_start=$2
+    process_identity_boot=$3
+    process_identity_current_boot=$(boot_identity) || return 73
+    [ "$process_identity_current_boot" = "$process_identity_boot" ] || return 1
+    pid_is_live "$process_identity_pid" || return 1
+    process_identity_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "/proc/$process_identity_pid/status" 2>/dev/null | sed -n '1p')
+    [ "$process_identity_uid" = "$path_owner" ] || return 1
+    process_identity_actual_start=$(process_start_time "$process_identity_pid" 2>/dev/null || true)
+    [ "$process_identity_actual_start" = "$process_identity_start" ]
+}
+
+read_private_lock_owner() {
+    lock_owner_path=$1
+    [ -f "$lock_owner_path" ] && [ ! -L "$lock_owner_path" ] || return 1
+    [ -n "$path_owner" ] || return 1
+    lock_owner_mode=$(stat -c '%a' "$lock_owner_path" 2>/dev/null || true)
+    lock_owner_uid=$(stat -c '%u' "$lock_owner_path" 2>/dev/null || true)
+    lock_owner_size=$(wc -c 2>/dev/null < "$lock_owner_path" | tr -d ' ')
+    [ "$lock_owner_mode" = 600 ] && [ "$lock_owner_uid" = "$path_owner" ] || return 1
+    case $lock_owner_size in ''|*[!0-9]*) return 1 ;; esac
+    [ "$lock_owner_size" -le 96 ] || return 1
+    lock_owner_lines=$(awk 'END { print NR }' "$lock_owner_path" 2>/dev/null || true)
+    lock_owner_pid=$(sed -n '1p' "$lock_owner_path" 2>/dev/null || true)
+    is_pid "$lock_owner_pid" || return 1
+    case $lock_owner_lines in
+        1)
+            lock_owner_start=
+            lock_owner_boot=
+            lock_owner_legacy=true
+            ;;
+        3)
+            lock_owner_start=$(sed -n '2p' "$lock_owner_path" 2>/dev/null || true)
+            lock_owner_boot=$(sed -n '3p' "$lock_owner_path" 2>/dev/null || true)
+            case $lock_owner_start in ''|*[!0-9]*|0) return 1 ;; esac
+            valid_boot_identity "$lock_owner_boot" || return 1
+            lock_owner_legacy=false
+            ;;
+        *) return 1 ;;
+    esac
+    lock_owner_links=$(stat -c '%h' "$lock_owner_path" 2>/dev/null || true)
+    case $lock_owner_links in
+        1) ;;
+        2)
+            [ "$lock_owner_legacy" = false ] || return 1
+            lock_owner_identity=$(stat -c '%d:%i' "$lock_owner_path" 2>/dev/null || true)
+            [ -n "$lock_owner_identity" ] || return 1
+            lock_owner_topology_valid=false
+            for lock_owner_companion in \
+                "$event_log_lock.claim.$lock_owner_pid.$lock_owner_start.$lock_owner_boot" \
+                "$event_log_lock.pending.$lock_owner_pid.$lock_owner_start.$lock_owner_boot" \
+                "$event_log_lock/pid"; do
+                [ "$lock_owner_companion" != "$lock_owner_path" ] || continue
+                companion_identity=$(stat -c '%d:%i' "$lock_owner_companion" 2>/dev/null || true)
+                if [ -n "$companion_identity" ] && [ "$companion_identity" = "$lock_owner_identity" ]; then
+                    lock_owner_topology_valid=true
+                    break
+                fi
+            done
+            if [ "$lock_owner_topology_valid" != true ]; then
+                lock_owner_current_identity=$(stat -c '%d:%i' "$lock_owner_path" 2>/dev/null || true)
+                lock_owner_current_links=$(stat -c '%h' "$lock_owner_path" 2>/dev/null || true)
+                if [ "$lock_owner_current_identity" = "$lock_owner_identity" ] && [ "$lock_owner_current_links" = 1 ]; then
+                    lock_owner_topology_valid=true
+                fi
+            fi
+            [ "$lock_owner_topology_valid" = true ] || return 1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+loaded_lock_owner_is_live() {
+    if [ "$lock_owner_legacy" = true ]; then
+        # A PID-only legacy owner cannot be distinguished from PID reuse and
+        # therefore cannot remain a live exclusion after package upgrade.
+        return 1
+    else
+        process_identity_is_live "$lock_owner_pid" "$lock_owner_start" "$lock_owner_boot"
+    fi
+}
+
+event_recovery_owner_is_live() {
+    checked_recovery_path=$1
+    checked_recovery_suffix=${checked_recovery_path#"$event_log_lock".recover.}
+    checked_recovery_pid=${checked_recovery_suffix%%.*}
+    checked_recovery_remainder=${checked_recovery_suffix#*.}
+    [ "$checked_recovery_remainder" != "$checked_recovery_suffix" ] || return 73
+    checked_recovery_start=${checked_recovery_remainder%%.*}
+    checked_recovery_boot=${checked_recovery_remainder#*.}
+    [ "$checked_recovery_boot" != "$checked_recovery_remainder" ] || return 73
+    case $checked_recovery_boot in *.*) return 73 ;; esac
+    case $checked_recovery_start in ''|*[!0-9]*|0) return 73 ;; esac
+    valid_boot_identity "$checked_recovery_boot" || return 73
+    is_pid "$checked_recovery_pid" || return 73
+    read_private_lock_owner "$checked_recovery_path" || return 73
+    process_identity_is_live "$checked_recovery_pid" "$checked_recovery_start" "$checked_recovery_boot"
+}
+
+private_claim_artifact() {
+    checked_claim_path=$1
+    checked_claim_prefix=$2
+    checked_claim_suffix=${checked_claim_path#"$checked_claim_prefix"}
+    [ "$checked_claim_suffix" != "$checked_claim_path" ] || return 1
+    checked_claim_pid=${checked_claim_suffix%%.*}
+    checked_claim_remainder=${checked_claim_suffix#*.}
+    [ "$checked_claim_remainder" != "$checked_claim_suffix" ] || return 1
+    checked_claim_start=${checked_claim_remainder%%.*}
+    checked_claim_boot=${checked_claim_remainder#*.}
+    [ "$checked_claim_boot" != "$checked_claim_remainder" ] || return 1
+    case $checked_claim_boot in *.*) return 1 ;; esac
+    case $checked_claim_start in ''|*[!0-9]*|0) return 1 ;; esac
+    valid_boot_identity "$checked_claim_boot" || return 1
+    is_pid "$checked_claim_pid" || return 1
+    [ -f "$checked_claim_path" ] && [ ! -L "$checked_claim_path" ] || return 1
+    [ -n "$path_owner" ] || return 1
+    checked_claim_mode=$(stat -c '%a' "$checked_claim_path" 2>/dev/null || true)
+    checked_claim_uid=$(stat -c '%u' "$checked_claim_path" 2>/dev/null || true)
+    checked_claim_links=$(stat -c '%h' "$checked_claim_path" 2>/dev/null || true)
+    checked_claim_size=$(wc -c 2>/dev/null < "$checked_claim_path" | tr -d ' ')
+    [ "$checked_claim_mode" = 600 ] && [ "$checked_claim_uid" = "$path_owner" ] || return 1
+    case $checked_claim_size in ''|*[!0-9]*) return 1 ;; esac
+    [ "$checked_claim_size" -le 96 ] || return 1
+    case $checked_claim_links in
+        1) ;;
+        2)
+            checked_claim_identity=$(stat -c '%d:%i' "$checked_claim_path" 2>/dev/null || true)
+            [ -n "$checked_claim_identity" ] || return 1
+            checked_claim_topology_valid=false
+            for checked_claim_companion in \
+                "$event_log_lock.claim.$checked_claim_pid.$checked_claim_start.$checked_claim_boot" \
+                "$event_log_lock.pending.$checked_claim_pid.$checked_claim_start.$checked_claim_boot" \
+                "$event_log_lock/pid"; do
+                [ "$checked_claim_companion" != "$checked_claim_path" ] || continue
+                companion_identity=$(stat -c '%d:%i' "$checked_claim_companion" 2>/dev/null || true)
+                if [ -n "$companion_identity" ] && [ "$companion_identity" = "$checked_claim_identity" ]; then
+                    checked_claim_topology_valid=true
+                    break
+                fi
+            done
+            if [ "$checked_claim_topology_valid" != true ]; then
+                checked_claim_current_identity=$(stat -c '%d:%i' "$checked_claim_path" 2>/dev/null || true)
+                checked_claim_current_links=$(stat -c '%h' "$checked_claim_path" 2>/dev/null || true)
+                if [ "$checked_claim_current_identity" = "$checked_claim_identity" ] && [ "$checked_claim_current_links" = 1 ]; then
+                    checked_claim_topology_valid=true
+                fi
+            fi
+            [ "$checked_claim_topology_valid" = true ] || return 1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+prune_orphan_claim_quarantines() {
+    quarantine_prefix=$event_log_lock.claim-quarantine.
+    for quarantine_path in "$quarantine_prefix"*; do
+        [ -e "$quarantine_path" ] || [ -L "$quarantine_path" ] || continue
+        quarantine_suffix=${quarantine_path#"$quarantine_prefix"}
+        quarantine_pid=${quarantine_suffix%%.*}
+        quarantine_remainder=${quarantine_suffix#*.}
+        quarantine_start=${quarantine_remainder%%.*}
+        quarantine_remainder=${quarantine_remainder#*.}
+        quarantine_boot=${quarantine_remainder%%.*}
+        quarantine_remainder=${quarantine_remainder#*.}
+        quarantine_owner_pid=${quarantine_remainder%%.*}
+        quarantine_remainder=${quarantine_remainder#*.}
+        quarantine_owner_start=${quarantine_remainder%%.*}
+        quarantine_owner_boot=${quarantine_remainder#*.}
+        [ "$quarantine_owner_boot" != "$quarantine_remainder" ] || return 73
+        case $quarantine_owner_boot in *.*) return 73 ;; esac
+        case $quarantine_start in ''|*[!0-9]*|0) return 73 ;; esac
+        case $quarantine_owner_start in ''|*[!0-9]*|0) return 73 ;; esac
+        valid_boot_identity "$quarantine_boot" || return 73
+        valid_boot_identity "$quarantine_owner_boot" || return 73
+        is_pid "$quarantine_pid" || return 73
+        is_pid "$quarantine_owner_pid" || return 73
+        if ! private_claim_artifact "$quarantine_path" "$quarantine_prefix$quarantine_pid.$quarantine_start.$quarantine_boot."; then
+            [ ! -e "$quarantine_path" ] && [ ! -L "$quarantine_path" ] && continue
+            return 73
+        fi
+        quarantine_live_status=0
+        process_identity_is_live "$quarantine_pid" "$quarantine_start" "$quarantine_boot" || quarantine_live_status=$?
+        case $quarantine_live_status in 0) return 75 ;; 1) ;; *) return 73 ;; esac
+        if ! rm -f "$quarantine_path"; then
+            [ ! -e "$quarantine_path" ] && [ ! -L "$quarantine_path" ] || return 73
+        fi
+    done
+}
+
+prune_orphan_event_claims() {
+    current_claim_path=$1
+    prune_orphan_claim_quarantines || return $?
+    for checked_claim_prefix in "$event_log_lock".claim. "$event_log_lock".pending.; do
+        for checked_claim_path in "$checked_claim_prefix"*; do
+            [ -e "$checked_claim_path" ] || [ -L "$checked_claim_path" ] || continue
+            [ "$checked_claim_path" = "$current_claim_path" ] && continue
+            if ! private_claim_artifact "$checked_claim_path" "$checked_claim_prefix"; then
+                [ ! -e "$checked_claim_path" ] && [ ! -L "$checked_claim_path" ] && continue
+                return 73
+            fi
+            checked_artifact_pid=$checked_claim_pid
+            checked_artifact_start=$checked_claim_start
+            checked_artifact_boot=$checked_claim_boot
+            checked_artifact_live_status=0
+            process_identity_is_live "$checked_artifact_pid" "$checked_artifact_start" "$checked_artifact_boot" || checked_artifact_live_status=$?
+            if [ "$checked_artifact_live_status" -eq 0 ]; then
+                # A contender can still be filling its private pending file.
+                # It is not ownership until the complete inode is hard-linked
+                # under the claim name, so never parse a live artifact here.
+                continue
+            fi
+            [ "$checked_artifact_live_status" -eq 1 ] || return 73
+            checked_artifact_identity=$(stat -c '%d:%i' "$checked_claim_path" 2>/dev/null || true)
+            [ -n "$checked_artifact_identity" ] || continue
+            quarantine_path=$event_log_lock.claim-quarantine.$$.$event_claim_start.$event_claim_boot.$checked_artifact_pid.$checked_artifact_start.$checked_artifact_boot
+            [ ! -e "$quarantine_path" ] && [ ! -L "$quarantine_path" ] || return 73
+            mv "$checked_claim_path" "$quarantine_path" 2>/dev/null || continue
+            quarantine_identity=$(stat -c '%d:%i' "$quarantine_path" 2>/dev/null || true)
+            [ "$quarantine_identity" = "$checked_artifact_identity" ] || return 73
+            if ! rm -f "$quarantine_path"; then
+                [ ! -e "$quarantine_path" ] && [ ! -L "$quarantine_path" ] || return 73
+            fi
+        done
+    done
+}
+
+remove_orphan_event_recovery() {
+    orphan_recovery_path=$1
+    read_private_lock_owner "$orphan_recovery_path" || return 73
+    orphan_lock_pid=$lock_owner_pid
+    orphan_lock_start=$lock_owner_start
+    orphan_lock_boot=$lock_owner_boot
+    orphan_lock_legacy=$lock_owner_legacy
+    orphan_reaper_status=0
+    event_recovery_owner_is_live "$orphan_recovery_path" || orphan_reaper_status=$?
+    case $orphan_reaper_status in 0) return 75 ;; 1) ;; *) return 73 ;; esac
+    lock_owner_pid=$orphan_lock_pid
+    lock_owner_start=$orphan_lock_start
+    lock_owner_boot=$orphan_lock_boot
+    lock_owner_legacy=$orphan_lock_legacy
+    orphan_owner_status=0
+    loaded_lock_owner_is_live || orphan_owner_status=$?
+    if [ "$orphan_owner_status" -eq 0 ]; then
+        # A recovery process can die after moving a newly-published live owner.
+        # Restore that exact owner if no replacement exists; never discard it.
+        [ ! -e "$event_log_lock/pid" ] && [ ! -L "$event_log_lock/pid" ] || return 75
+        mv "$orphan_recovery_path" "$event_log_lock/pid" 2>/dev/null || return 73
+        return 75
+    fi
+    [ "$orphan_owner_status" -eq 1 ] || return 73
+    rm -f "$orphan_recovery_path"
+}
+
+create_event_log_lock_directory() {
+    if [ ! -e "$event_log_lock" ] && [ ! -L "$event_log_lock" ]; then
+        (umask 077; mkdir "$event_log_lock") 2>/dev/null || true
+    fi
+    private_event_lock_directory "$event_log_lock" || return 1
+}
+
+acquire_event_log_lock() {
+    [ "$event_log_lock_held" != true ] || return 0
+    create_event_log_lock_directory || return 73
+    event_claim_start=$(process_start_time "$$" 2>/dev/null || true)
+    event_claim_boot=$(boot_identity) || return 73
+    [ -n "$event_claim_start" ] || return 73
+    event_claim_path=$event_log_lock.claim.$$.$event_claim_start.$event_claim_boot
+    event_pending_path=$event_log_lock.pending.$$.$event_claim_start.$event_claim_boot
+    [ ! -e "$event_claim_path" ] && [ ! -L "$event_claim_path" ] || return 73
+    [ ! -e "$event_pending_path" ] && [ ! -L "$event_pending_path" ] || return 73
+    (umask 077; printf '%s\n%s\n%s\n' "$$" "$event_claim_start" "$event_claim_boot" > "$event_pending_path") || {
+        [ -L "$event_pending_path" ] || rm -f "$event_pending_path" 2>/dev/null || true
+        return 73
+    }
+    finish_private_file "$event_pending_path" || { rm -f "$event_pending_path"; return 73; }
+    ln "$event_pending_path" "$event_claim_path" 2>/dev/null || { rm -f "$event_pending_path"; return 73; }
+    rm -f "$event_pending_path" || { rm -f "$event_claim_path"; return 73; }
+    event_claim_identity=$(stat -c '%d:%i' "$event_claim_path" 2>/dev/null || true)
+    [ -n "$event_claim_identity" ] || { rm -f "$event_claim_path"; return 73; }
+    event_lock_attempt=0
+    event_stale_identity=
+    event_stale_observations=0
+    while :; do
+        claim_prune_status=0
+        prune_orphan_event_claims "$event_claim_path" || claim_prune_status=$?
+        case $claim_prune_status in
+            0) ;;
+            75)
+                event_lock_attempt=$((event_lock_attempt + 1))
+                [ "$event_lock_attempt" -lt 10 ] || { rm -f "$event_claim_path"; return 75; }
+                sleep 1
+                continue
+                ;;
+            *) rm -f "$event_claim_path"; return 73 ;;
+        esac
+        event_recovery_active=false
+        event_recovery_removed=false
+        for event_recovery_path in "$event_log_lock".recover.*; do
+            [ -e "$event_recovery_path" ] || [ -L "$event_recovery_path" ] || continue
+            recovery_owner_status=0
+            event_recovery_owner_is_live "$event_recovery_path" || recovery_owner_status=$?
+            case $recovery_owner_status in
+                0) event_recovery_active=true; break ;;
+                1) ;;
+                *)
+                    [ ! -e "$event_recovery_path" ] && [ ! -L "$event_recovery_path" ] && continue
+                    rm -f "$event_claim_path"
+                    return 73
+                    ;;
+            esac
+            recovery_cleanup_status=0
+            remove_orphan_event_recovery "$event_recovery_path" || recovery_cleanup_status=$?
+            case $recovery_cleanup_status in
+                0) event_recovery_removed=true ;;
+                75) event_recovery_active=true; break ;;
+                *)
+                    if [ ! -e "$event_recovery_path" ] && [ ! -L "$event_recovery_path" ]; then
+                        event_recovery_removed=true
+                    else
+                        rm -f "$event_claim_path"
+                        return 73
+                    fi
+                    ;;
+            esac
+        done
+        if [ "$event_recovery_active" = true ]; then
+            event_lock_attempt=$((event_lock_attempt + 1))
+            [ "$event_lock_attempt" -lt 10 ] || { rm -f "$event_claim_path"; return 75; }
+            sleep 1
+            continue
+        fi
+        [ "$event_recovery_removed" != true ] || continue
+        if ln "$event_claim_path" "$event_log_lock/pid" 2>/dev/null; then
+            published_identity=$(stat -c '%d:%i' "$event_log_lock/pid" 2>/dev/null || true)
+            [ "$published_identity" = "$event_claim_identity" ] || { rm -f "$event_claim_path"; return 73; }
+            # A stale-owner recovery can begin between the pre-check and the
+            # atomic link. Do not enter the critical section until it settles.
+            event_recovery_active=false
+            for event_recovery_path in "$event_log_lock".recover.*; do
+                [ -e "$event_recovery_path" ] || [ -L "$event_recovery_path" ] || continue
+                recovery_owner_status=0
+                event_recovery_owner_is_live "$event_recovery_path" || recovery_owner_status=$?
+                case $recovery_owner_status in
+                    0) event_recovery_active=true; break ;;
+                    1) ;;
+                    *)
+                        [ ! -e "$event_recovery_path" ] && [ ! -L "$event_recovery_path" ] && continue
+                        rm -f "$event_claim_path"
+                        return 73
+                        ;;
+                esac
+                recovery_cleanup_status=0
+                remove_orphan_event_recovery "$event_recovery_path" || recovery_cleanup_status=$?
+                case $recovery_cleanup_status in
+                    0) ;;
+                    75) event_recovery_active=true; break ;;
+                    *)
+                        [ ! -e "$event_recovery_path" ] && [ ! -L "$event_recovery_path" ] && continue
+                        rm -f "$event_claim_path"
+                        return 73
+                        ;;
+                esac
+            done
+            if [ "$event_recovery_active" = true ]; then
+                current_published_identity=$(stat -c '%d:%i' "$event_log_lock/pid" 2>/dev/null || true)
+                if [ "$current_published_identity" = "$event_claim_identity" ]; then
+                    rm -f "$event_log_lock/pid" || { rm -f "$event_claim_path"; return 73; }
+                fi
+                event_lock_attempt=$((event_lock_attempt + 1))
+                [ "$event_lock_attempt" -lt 10 ] || { rm -f "$event_claim_path"; return 75; }
+                sleep 1
+                continue
+            fi
+            rm -f "$event_claim_path" || return 73
+            event_log_lock_held=true
+            break
+        fi
+        if ! private_event_lock_directory "$event_log_lock"; then
+            # A previous owner can release and remove the verified empty lock
+            # directory while this waiter sleeps. Recreate only an absent path;
+            # an existing path that fails validation remains a hard failure.
+            if create_event_log_lock_directory; then
+                continue
+            fi
+            rm -f "$event_claim_path"
+            return 73
+        fi
+        event_observed_owner_identity=$(stat -c '%d:%i' "$event_log_lock/pid" 2>/dev/null || true)
+        if ! read_private_lock_owner "$event_log_lock/pid"; then
+            event_current_owner_identity=$(stat -c '%d:%i' "$event_log_lock/pid" 2>/dev/null || true)
+            if [ -z "$event_current_owner_identity" ] || [ "$event_current_owner_identity" != "$event_observed_owner_identity" ]; then
+                event_lock_attempt=$((event_lock_attempt + 1))
+                [ "$event_lock_attempt" -lt 10 ] || { rm -f "$event_claim_path"; return 75; }
+                if ! create_event_log_lock_directory; then
+                    if [ -e "$event_log_lock" ] || [ -L "$event_log_lock" ]; then
+                        private_event_lock_directory "$event_log_lock" || { rm -f "$event_claim_path"; return 73; }
+                    fi
+                fi
+                continue
+            fi
+            rm -f "$event_claim_path"
+            return 73
+        fi
+        event_lock_pid=$lock_owner_pid
+        event_lock_start=$lock_owner_start
+        event_lock_boot=$lock_owner_boot
+        event_lock_legacy=$lock_owner_legacy
+        event_owner_status=0
+        loaded_lock_owner_is_live || event_owner_status=$?
+        if [ "$event_owner_status" -eq 0 ]; then
+            event_lock_attempt=$((event_lock_attempt + 1))
+            [ "$event_lock_attempt" -lt 10 ] || { rm -f "$event_claim_path"; return 75; }
+            sleep 1
+            continue
+        fi
+        [ "$event_owner_status" -eq 1 ] || { rm -f "$event_claim_path"; return 73; }
+        event_lock_identity=$(stat -c '%d:%i' "$event_log_lock/pid" 2>/dev/null || true)
+        if [ -z "$event_lock_identity" ]; then
+            if [ ! -e "$event_log_lock/pid" ] && [ ! -L "$event_log_lock/pid" ]; then
+                event_lock_attempt=$((event_lock_attempt + 1))
+                [ "$event_lock_attempt" -lt 10 ] || { rm -f "$event_claim_path"; return 75; }
+                create_event_log_lock_directory || {
+                    [ ! -e "$event_log_lock" ] && [ ! -L "$event_log_lock" ] || { rm -f "$event_claim_path"; return 73; }
+                }
+                continue
+            fi
+            rm -f "$event_claim_path"
+            return 73
+        fi
+        if [ "$event_stale_identity" = "$event_lock_identity" ]; then
+            event_stale_observations=$((event_stale_observations + 1))
+        else
+            event_stale_identity=$event_lock_identity
+            event_stale_observations=1
+        fi
+        if [ "$event_stale_observations" -lt 2 ]; then
+            sleep 1
+            continue
+        fi
+        event_recovery_path=$event_log_lock.recover.$$.$event_claim_start.$event_claim_boot
+        [ ! -e "$event_recovery_path" ] && [ ! -L "$event_recovery_path" ] || { rm -f "$event_claim_path"; return 73; }
+        mv "$event_log_lock/pid" "$event_recovery_path" 2>/dev/null || continue
+        recovered_identity=$(stat -c '%d:%i' "$event_recovery_path" 2>/dev/null || true)
+        read_private_lock_owner "$event_recovery_path" || { rm -f "$event_claim_path"; return 73; }
+        recovered_pid=$lock_owner_pid
+        recovered_start=$lock_owner_start
+        recovered_boot=$lock_owner_boot
+        recovered_legacy=$lock_owner_legacy
+        recovered_owner_status=0
+        loaded_lock_owner_is_live || recovered_owner_status=$?
+        [ "$recovered_owner_status" -ne 73 ] || { rm -f "$event_claim_path"; return 73; }
+        if [ "$recovered_identity" != "$event_lock_identity" ] || [ "$recovered_owner_status" -eq 0 ]; then
+            if [ ! -e "$event_log_lock/pid" ] && [ ! -L "$event_log_lock/pid" ]; then
+                mv "$event_recovery_path" "$event_log_lock/pid" 2>/dev/null || true
+            fi
+            sleep 1
+            continue
+        fi
+        rm -f "$event_recovery_path" || { rm -f "$event_claim_path"; return 73; }
+        event_stale_identity=
+        event_stale_observations=0
+    done
+}
+
+release_event_log_lock() {
+    [ "$event_log_lock_held" = true ] || return 0
+    read_private_lock_owner "$event_log_lock/pid" || return 73
+    event_release_start=$(process_start_time "$$" 2>/dev/null || true)
+    event_release_boot=$(boot_identity) || return 73
+    [ "$lock_owner_pid" = "$$" ] && [ "$lock_owner_start" = "$event_release_start" ] \
+        && [ "$lock_owner_boot" = "$event_release_boot" ] || return 73
+    rm -f "$event_log_lock/pid" || return 73
+    rmdir "$event_log_lock" 2>/dev/null || true
+    event_log_lock_held=false
+}
+
+# Reuse the atomic hard-link owner publication protocol for the longer-lived
+# manager, policy, controller, and run locks. The caller owns normal release;
+# the event-log lock globals are restored before any package work runs.
+acquire_private_process_lock() {
+    process_lock_path=$1
+    saved_event_log_lock=$event_log_lock
+    saved_event_log_lock_held=$event_log_lock_held
+    [ "$saved_event_log_lock_held" != true ] || return 73
+    event_log_lock=$process_lock_path
+    event_log_lock_held=false
+    process_lock_status=0
+    acquire_event_log_lock || process_lock_status=$?
+    event_log_lock=$saved_event_log_lock
+    event_log_lock_held=$saved_event_log_lock_held
+    return "$process_lock_status"
+}
+
+private_process_lock_is_live() {
+    checked_process_lock=$1
+    saved_event_log_lock=$event_log_lock
+    event_log_lock=$checked_process_lock
+    if ! private_event_lock_directory "$checked_process_lock"; then
+        if [ ! -e "$checked_process_lock" ] && [ ! -L "$checked_process_lock" ]; then
+            event_log_lock=$saved_event_log_lock
+            return 1
+        fi
+        event_log_lock=$saved_event_log_lock
+        return 73
+    fi
+    if [ ! -e "$checked_process_lock/pid" ] && [ ! -L "$checked_process_lock/pid" ]; then
+        event_log_lock=$saved_event_log_lock
+        return 1
+    fi
+    if ! read_private_lock_owner "$checked_process_lock/pid"; then
+        event_log_lock=$saved_event_log_lock
+        return 73
+    fi
+    process_lock_live_status=0
+    loaded_lock_owner_is_live || process_lock_live_status=$?
+    event_log_lock=$saved_event_log_lock
+    return "$process_lock_live_status"
+}
+
+release_private_process_lock() {
+    released_process_lock=$1
+    saved_event_log_lock=$event_log_lock
+    saved_event_log_lock_held=$event_log_lock_held
+    event_log_lock=$released_process_lock
+    event_log_lock_held=true
+    release_process_status=0
+    release_event_log_lock || release_process_status=$?
+    event_log_lock=$saved_event_log_lock
+    event_log_lock_held=$saved_event_log_lock_held
+    return "$release_process_status"
 }
 
 setting() {
@@ -177,6 +1170,128 @@ setting() {
     else
         printf '%s\n' "$setting_default"
     fi
+}
+
+load_security_policy_runtime() {
+    security_runtime_policy_version=1
+    security_runtime_require_https=false
+    security_runtime_allow_interface_changes=true
+    security_runtime_allow_profile_changes=true
+    security_runtime_allow_secret_changes=true
+    security_runtime_allow_routine_changes=true
+    security_runtime_allow_notification_changes=true
+    security_runtime_allow_operational_actions=true
+    security_runtime_allow_http_targets=true
+    security_runtime_allow_invalid_tls=true
+    security_runtime_allow_destructive_sync=true
+    security_runtime_allow_doctor_write_test=true
+    security_runtime_allow_remote_logging=true
+    security_runtime_allow_empty_source=true
+    security_runtime_result_retention=3600
+    security_runtime_max_outstanding=256
+    security_runtime_audit_level=info
+    security_runtime_bridge_level=info
+    security_runtime_authentication_level=warn
+    security_runtime_security_level=warn
+    security_runtime_configuration_level=info
+    security_runtime_secrets_level=info
+    security_runtime_routines_level=info
+    security_runtime_operations_level=info
+    security_runtime_notifications_level=warn
+    security_runtime_sync_level=info
+    security_runtime_controller_level=info
+    security_runtime_scheduler_level=info
+    [ ! -L "$security_policy_file" ] || return 73
+    [ -e "$security_policy_file" ] || return 0
+    private_secret_file "$security_policy_file" || return 73
+    security_runtime_size=$(wc -c < "$security_policy_file" | tr -d ' ')
+    case $security_runtime_size in ''|*[!0-9]*) return 73 ;; esac
+    [ "$security_runtime_size" -ge 1 ] && [ "$security_runtime_size" -le 8192 ] || return 73
+    # POSIX shell variables cannot preserve NUL. Strip every forbidden raw
+    # non-LF control byte before assignment and require the resulting byte
+    # length (minus the one canonical trailing LF removed by command
+    # substitution) to equal the original. The tr stage status is checked
+    # directly, without a pipeline whose earlier failure could be hidden.
+    security_runtime_sanitized=$(LC_ALL=C tr -d '\000-\011\013-\037\177' < "$security_policy_file") || return 73
+    [ "${#security_runtime_sanitized}" -eq $((security_runtime_size - 1)) ] || return 73
+    # The canonical v1 document has exactly 29 LF-terminated records. Counting
+    # newline bytes keeps an otherwise complete unterminated last record from
+    # drifting away from the Rust parser's exact-format contract.
+    security_runtime_newline_count=$(wc -l < "$security_policy_file" | tr -d ' ')
+    case $security_runtime_newline_count in ''|*[!0-9]*) return 73 ;; esac
+    [ "$security_runtime_newline_count" -eq 29 ] || return 73
+    security_runtime_seen=,
+    security_runtime_count=0
+    while IFS= read -r security_runtime_line || [ -n "$security_runtime_line" ]; do
+        case $security_runtime_line in ''|*=*=*) return 73 ;; esac
+        security_runtime_key=${security_runtime_line%%=*}
+        security_runtime_value=${security_runtime_line#*=}
+        [ "$security_runtime_key" != "$security_runtime_line" ] && [ -n "$security_runtime_value" ] || return 73
+        case $security_runtime_seen in *,$security_runtime_key,*) return 73 ;; esac
+        security_runtime_seen=$security_runtime_seen$security_runtime_key,
+        security_runtime_count=$((security_runtime_count + 1))
+        case $security_runtime_key in
+            policy_version)
+                [ "$security_runtime_value" = 1 ] || return 73
+                security_runtime_policy_version=1
+                ;;
+            require_https|allow_interface_changes|allow_profile_changes|allow_secret_changes|allow_routine_changes|\
+            allow_notification_changes|allow_operational_actions|allow_http_targets|allow_invalid_tls|\
+            allow_destructive_sync|allow_doctor_write_test|allow_remote_logging|allow_empty_source)
+                case $security_runtime_value in true|false) ;; *) return 73 ;; esac
+                case $security_runtime_key in
+                    require_https) security_runtime_require_https=$security_runtime_value ;;
+                    allow_interface_changes) security_runtime_allow_interface_changes=$security_runtime_value ;;
+                    allow_profile_changes) security_runtime_allow_profile_changes=$security_runtime_value ;;
+                    allow_secret_changes) security_runtime_allow_secret_changes=$security_runtime_value ;;
+                    allow_routine_changes) security_runtime_allow_routine_changes=$security_runtime_value ;;
+                    allow_notification_changes) security_runtime_allow_notification_changes=$security_runtime_value ;;
+                    allow_operational_actions) security_runtime_allow_operational_actions=$security_runtime_value ;;
+                    allow_http_targets) security_runtime_allow_http_targets=$security_runtime_value ;;
+                    allow_invalid_tls) security_runtime_allow_invalid_tls=$security_runtime_value ;;
+                    allow_destructive_sync) security_runtime_allow_destructive_sync=$security_runtime_value ;;
+                    allow_doctor_write_test) security_runtime_allow_doctor_write_test=$security_runtime_value ;;
+                    allow_remote_logging) security_runtime_allow_remote_logging=$security_runtime_value ;;
+                    allow_empty_source) security_runtime_allow_empty_source=$security_runtime_value ;;
+                esac
+                ;;
+            csrf_lifetime_seconds)
+                case $security_runtime_value in ''|*[!0-9]*|0[0-9]*) return 73 ;; esac
+                [ "$security_runtime_value" -ge 60 ] && [ "$security_runtime_value" -le 900 ] || return 73
+                ;;
+            result_retention_seconds)
+                case $security_runtime_value in ''|*[!0-9]*|0[0-9]*) return 73 ;; esac
+                [ "$security_runtime_value" -ge 300 ] && [ "$security_runtime_value" -le 86400 ] || return 73
+                security_runtime_result_retention=$security_runtime_value
+                ;;
+            max_outstanding_jobs)
+                case $security_runtime_value in ''|*[!0-9]*|0[0-9]*) return 73 ;; esac
+                [ "$security_runtime_value" -ge 1 ] && [ "$security_runtime_value" -le 256 ] || return 73
+                security_runtime_max_outstanding=$security_runtime_value
+                ;;
+            audit_log_level|bridge_log_level|authentication_log_level|security_log_level|\
+            configuration_log_level|secrets_log_level|routines_log_level|operations_log_level|\
+            notifications_log_level|sync_log_level|controller_log_level|scheduler_log_level)
+                case $security_runtime_value in off|trace|debug|info|warn|error) ;; *) return 73 ;; esac
+                case $security_runtime_key in
+                    audit_log_level) security_runtime_audit_level=$security_runtime_value ;;
+                    bridge_log_level) security_runtime_bridge_level=$security_runtime_value ;;
+                    authentication_log_level) security_runtime_authentication_level=$security_runtime_value ;;
+                    security_log_level) security_runtime_security_level=$security_runtime_value ;;
+                    configuration_log_level) security_runtime_configuration_level=$security_runtime_value ;;
+                    secrets_log_level) security_runtime_secrets_level=$security_runtime_value ;;
+                    routines_log_level) security_runtime_routines_level=$security_runtime_value ;;
+                    operations_log_level) security_runtime_operations_level=$security_runtime_value ;;
+                    notifications_log_level) security_runtime_notifications_level=$security_runtime_value ;;
+                    sync_log_level) security_runtime_sync_level=$security_runtime_value ;;
+                    controller_log_level) security_runtime_controller_level=$security_runtime_value ;;
+                    scheduler_log_level) security_runtime_scheduler_level=$security_runtime_value ;;
+                esac
+                ;;
+            *) return 73 ;;
+        esac
+    done < "$security_policy_file"
+    [ "$security_runtime_count" -eq 29 ] || return 73
 }
 
 epoch_now() {
@@ -250,8 +1365,18 @@ append_rotating_log() {
     append_limit=$2
     append_keep=$3
     append_line=$4
-    rotate_log "$append_path" "$append_limit" "$append_keep"
-    printf '%s\n' "$append_line" >> "$append_path"
+    append_old_umask=$(umask)
+    umask 077
+    append_status=0
+    rotate_log "$append_path" "$append_limit" "$append_keep" || append_status=$?
+    if [ "$append_status" -eq 0 ]; then
+        printf '%s\n' "$append_line" >> "$append_path" || append_status=$?
+    fi
+    if [ "$append_status" -eq 0 ]; then
+        finish_private_file "$append_path" || append_status=$?
+    fi
+    umask "$append_old_umask"
+    return "$append_status"
 }
 
 json_quote() {
@@ -263,7 +1388,7 @@ json_quote() {
         {
             if (NR > 1) printf "\\n"
             gsub(/\\/, "\\\\")
-            gsub(/\"/, "\\\"")
+            gsub(/"/, "\\\"")
             gsub(/\t/, "\\t")
             gsub(/\r/, "\\r")
             gsub(/[\001-\010\013\014\016-\037]/, "?")
@@ -278,18 +1403,44 @@ append_activity() {
     activity_profile=${2:-none}
     activity_state=$3
     activity_message=$4
+    activity_category=${5:-operations}
+    activity_level=${6:-info}
+    activity_mandatory=${7:-false}
+    activity_actor_uid=${8:-}
+    activity_actor=${9:-}
     case $activity_code in
         run.started|run.succeeded|run.failed|routine.deferred|routine.retry_scheduled|\
-        doctor.succeeded|doctor.failed|configuration.changed|notification.unavailable) ;;
+        doctor.succeeded|doctor.failed|configuration.changed|notification.unavailable|\
+        audit.requested|audit.succeeded|audit.failed|audit.outcome_unknown|\
+        module.requested|module.succeeded|module.failed|module.outcome_unknown|\
+        security.policy_changed|security.log_tail_recovered|\
+        service.started|service.stopped|service.restarted|service.start_failed) ;;
         *) return 64 ;;
     esac
     case $activity_profile in none|all|''|*[!A-Za-z0-9_-]*)
         [ "$activity_profile" = none ] || [ "$activity_profile" = all ] || return 64
         ;;
     esac
-    case $activity_state in running|succeeded|failed|deferred|scheduled|changed|unavailable) ;;
+    case $activity_state in running|succeeded|failed|deferred|scheduled|changed|unavailable|requested) ;;
         *) return 64 ;;
     esac
+    case $activity_category in
+        audit|bridge|authentication|security|configuration|secrets|routines|operations|notifications|sync|controller|scheduler) ;;
+        *) return 64 ;;
+    esac
+    case $activity_level in trace|debug|info|warn|error) ;; *) return 64 ;; esac
+    case $activity_mandatory in true|false) ;; *) return 64 ;; esac
+    if [ -n "$activity_actor_uid" ] || [ -n "$activity_actor" ]; then
+        case $activity_actor_uid in ''|*[!0-9]*|0|0[0-9]*) return 64 ;; esac
+        [ "$activity_actor_uid" -le 4294967295 ] 2>/dev/null || return 64
+        case $activity_actor in ''|*'|'*) return 64 ;; esac
+        if ! printf '%s\n' "$activity_actor" | LC_ALL=C awk '
+            NR != 1 { invalid = 1 }
+            NR == 1 && length($0) >= 1 && length($0) <= 256 && $0 !~ /[[:cntrl:]]/ { valid = 1 }
+            NR == 1 && !valid { invalid = 1 }
+            END { exit NR == 1 && valid && !invalid ? 0 : 1 }
+        '; then return 64; fi
+    fi
     case $activity_message in
         *'|'*|*'
 '*) return 64 ;;
@@ -297,9 +1448,480 @@ append_activity() {
     if printf '%s' "$activity_message" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
         return 64
     fi
-    append_rotating_log "$activity_log" 1048576 3 \
-        "$(epoch_now)|$activity_code|${activity_profile:-none}|$activity_state|$activity_message"
-    finish_private_file "$activity_log"
+    if [ "$activity_mandatory" != true ]; then
+        activity_configured_level=$(security_category_level "$activity_category") || return $?
+        [ "$activity_configured_level" != off ] || return 0
+        case $activity_configured_level in trace) activity_threshold=0 ;; debug) activity_threshold=1 ;; info) activity_threshold=2 ;; warn) activity_threshold=3 ;; error) activity_threshold=4 ;; esac
+        case $activity_level in trace) activity_severity=0 ;; debug) activity_severity=1 ;; info) activity_severity=2 ;; warn) activity_severity=3 ;; error) activity_severity=4 ;; esac
+        [ "$activity_severity" -ge "$activity_threshold" ] || return 0
+    fi
+    activity_owns_event_lock=false
+    if [ "$event_log_lock_held" != true ]; then
+        acquire_event_log_lock || return $?
+        activity_owns_event_lock=true
+    fi
+    activity_append_status=0
+    activity_tail_state=$(repair_durable_log_tail activity) || activity_append_status=$?
+    if [ "$activity_append_status" -eq 0 ]; then
+        case $activity_tail_state in clean|repaired) ;; *) activity_append_status=73 ;; esac
+    fi
+    if [ "$activity_append_status" -eq 0 ]; then
+        if [ -n "$activity_actor_uid" ]; then
+            activity_record="$(epoch_now)|$activity_code|${activity_profile:-none}|$activity_state|$activity_category|$activity_level|$activity_actor_uid|$activity_actor|$activity_message"
+        else
+            activity_record="$(epoch_now)|$activity_code|${activity_profile:-none}|$activity_state|$activity_category|$activity_level|$activity_message"
+        fi
+        append_rotating_log "$activity_log" 1048576 3 "$activity_record" || activity_append_status=$?
+    fi
+    if [ "$activity_append_status" -eq 0 ]; then
+        finish_private_file "$activity_log" || activity_append_status=$?
+    fi
+    if [ "$activity_owns_event_lock" = true ]; then
+        release_event_log_lock || activity_append_status=$?
+    fi
+    return "$activity_append_status"
+}
+
+security_category_level() {
+    security_category=$1
+    load_security_policy_runtime || return $?
+    case $security_category in
+        audit) security_level=$security_runtime_audit_level ;;
+        bridge) security_level=$security_runtime_bridge_level ;;
+        authentication) security_level=$security_runtime_authentication_level ;;
+        security) security_level=$security_runtime_security_level ;;
+        configuration) security_level=$security_runtime_configuration_level ;;
+        secrets) security_level=$security_runtime_secrets_level ;;
+        routines) security_level=$security_runtime_routines_level ;;
+        operations) security_level=$security_runtime_operations_level ;;
+        notifications) security_level=$security_runtime_notifications_level ;;
+        sync) security_level=$security_runtime_sync_level ;;
+        controller) security_level=$security_runtime_controller_level ;;
+        scheduler) security_level=$security_runtime_scheduler_level ;;
+        *) return 64 ;;
+    esac
+    printf '%s\n' "$security_level"
+}
+
+# Exit 0 when an optional event meets its persisted category threshold, 1 when
+# it is intentionally suppressed, and preserve strict policy/runtime failures.
+security_event_enabled() {
+    security_event_category=$1
+    security_event_level=$2
+    security_event_mandatory=${3:-false}
+    case $security_event_level in trace) security_event_rank=0 ;; debug) security_event_rank=1 ;; info) security_event_rank=2 ;; warn) security_event_rank=3 ;; error) security_event_rank=4 ;; *) return 64 ;; esac
+    case $security_event_mandatory in true) return 0 ;; false) ;; *) return 64 ;; esac
+    security_event_threshold=$(security_category_level "$security_event_category") || return $?
+    case $security_event_threshold in
+        off) return 1 ;;
+        trace) security_threshold_rank=0 ;;
+        debug) security_threshold_rank=1 ;;
+        info) security_threshold_rank=2 ;;
+        warn) security_threshold_rank=3 ;;
+        error) security_threshold_rank=4 ;;
+        *) return 73 ;;
+    esac
+    [ "$security_event_rank" -ge "$security_threshold_rank" ]
+}
+
+append_controller_log_event() {
+    controller_event_level=$1
+    controller_event_name=$2
+    controller_event_detail=${3:-}
+    controller_event_category=${4:-controller}
+    controller_event_mandatory=${5:-false}
+    controller_event_actor_uid=${6:-}
+    controller_event_actor=${7:-}
+    case $controller_event_level in trace|debug|info|warn|error) ;; *) return 64 ;; esac
+    case $controller_event_name in ''|*[!a-z0-9_]*) return 64 ;; esac
+    case $controller_event_category in controller|scheduler) ;; *) return 64 ;; esac
+    case $controller_event_mandatory in true|false) ;; *) return 64 ;; esac
+    case $controller_event_detail in *'
+'*) return 64 ;; esac
+    if printf '%s' "$controller_event_detail" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
+        return 64
+    fi
+    controller_event_actor_fields=
+    if [ -n "$controller_event_actor_uid" ] || [ -n "$controller_event_actor" ]; then
+        case $controller_event_actor_uid in ''|*[!0-9]*|0|0[0-9]*) return 64 ;; esac
+        [ "$controller_event_actor_uid" -le 4294967295 ] 2>/dev/null || return 64
+        case $controller_event_actor in ''|*'|'*) return 64 ;; esac
+        if ! printf '%s\n' "$controller_event_actor" | LC_ALL=C awk '
+            NR != 1 { invalid = 1 }
+            NR == 1 && length($0) >= 1 && length($0) <= 256 && $0 !~ /[[:cntrl:]]/ { valid = 1 }
+            NR == 1 && !valid { invalid = 1 }
+            END { exit NR == 1 && valid && !invalid ? 0 : 1 }
+        '; then return 64; fi
+        controller_event_actor_fields=",\"actor_uid\":$controller_event_actor_uid,\"actor\":$(json_quote "$controller_event_actor")"
+    fi
+    controller_event_enabled_status=0
+    security_event_enabled "$controller_event_category" "$controller_event_level" \
+        "$controller_event_mandatory" || controller_event_enabled_status=$?
+    case $controller_event_enabled_status in
+        0) ;;
+        1) return 0 ;;
+        *) return "$controller_event_enabled_status" ;;
+    esac
+    controller_event_epoch=$(epoch_now)
+    case $controller_event_epoch in ''|*[!0-9]*) return 69 ;; esac
+    controller_event_json=$(printf '{"epoch":%s,"level":%s,"category":%s,"event":%s,"detail":%s%s}' \
+        "$controller_event_epoch" "$(json_quote "$controller_event_level")" \
+        "$(json_quote "$controller_event_category")" \
+        "$(json_quote "$controller_event_name")" "$(json_quote "$controller_event_detail")" \
+        "$controller_event_actor_fields")
+    controller_event_owns_lock=false
+    if [ "$event_log_lock_held" != true ]; then
+        acquire_event_log_lock || return $?
+        controller_event_owns_lock=true
+    fi
+    controller_event_status=0
+    append_rotating_log "$controller_log" 10485760 5 "$controller_event_json" \
+        || controller_event_status=$?
+    if [ "$controller_event_owns_lock" = true ]; then
+        release_event_log_lock || controller_event_status=$?
+    fi
+    return "$controller_event_status"
+}
+
+append_lifecycle_event() {
+    lifecycle_event=$1
+    case $lifecycle_event in
+        started)
+            lifecycle_code=service.started
+            lifecycle_state=succeeded
+            lifecycle_level=info
+            lifecycle_message="Package service started"
+            ;;
+        stopped)
+            lifecycle_code=service.stopped
+            lifecycle_state=succeeded
+            lifecycle_level=info
+            lifecycle_message="Package service stopped"
+            ;;
+        restarted)
+            lifecycle_code=service.restarted
+            lifecycle_state=succeeded
+            lifecycle_level=info
+            lifecycle_message="Package service restarted"
+            ;;
+        start_failed)
+            lifecycle_code=service.start_failed
+            lifecycle_state=failed
+            lifecycle_level=error
+            lifecycle_message="Package service failed to start"
+            ;;
+        *) return 64 ;;
+    esac
+    lifecycle_event_status=0
+    append_controller_log_event "$lifecycle_level" "service_$lifecycle_event" \
+        "service=synology-drive-sync state=$lifecycle_state" controller false \
+        "$path_owner" package-service || lifecycle_event_status=$?
+    append_activity "$lifecycle_code" none "$lifecycle_state" "$lifecycle_message" \
+        controller "$lifecycle_level" false "$path_owner" package-service \
+        || lifecycle_event_status=$?
+    return "$lifecycle_event_status"
+}
+
+write_service_stop_marker() {
+    stop_marker_temp=$service_stop_marker.tmp.$$
+    [ ! -e "$stop_marker_temp" ] && [ ! -L "$stop_marker_temp" ] || return 73
+    printf 'stopped\n' > "$stop_marker_temp" || { rm -f "$stop_marker_temp"; return 73; }
+    finish_private_file "$stop_marker_temp" || { rm -f "$stop_marker_temp"; return 73; }
+    if [ -e "$service_stop_marker" ] || [ -L "$service_stop_marker" ]; then
+        private_secret_file "$service_stop_marker" || { rm -f "$stop_marker_temp"; return 73; }
+        [ "$(wc -c 2>/dev/null < "$service_stop_marker" | tr -d ' ')" = 8 ] \
+            || { rm -f "$stop_marker_temp"; return 73; }
+        [ "$(sed -n '1p' "$service_stop_marker" 2>/dev/null || true)" = stopped ] \
+            || { rm -f "$stop_marker_temp"; return 73; }
+    fi
+    mv -f "$stop_marker_temp" "$service_stop_marker" || { rm -f "$stop_marker_temp"; return 73; }
+}
+
+service_restart_pending() {
+    [ -e "$service_stop_marker" ] || [ -L "$service_stop_marker" ] || return 1
+    private_secret_file "$service_stop_marker" || return 73
+    [ "$(wc -c 2>/dev/null < "$service_stop_marker" | tr -d ' ')" = 8 ] || return 73
+    [ "$(sed -n '1p' "$service_stop_marker" 2>/dev/null || true)" = stopped ] || return 73
+}
+
+consume_service_stop_marker() {
+    service_restart_pending || return $?
+    stop_marker_identity=$(stat -c '%d:%i' "$service_stop_marker" 2>/dev/null || true)
+    [ -n "$stop_marker_identity" ] || return 73
+    service_restart_pending || return 73
+    stop_marker_recheck=$(stat -c '%d:%i' "$service_stop_marker" 2>/dev/null || true)
+    [ "$stop_marker_recheck" = "$stop_marker_identity" ] || return 73
+    rm -f "$service_stop_marker"
+}
+
+verify_durable_audit_event() {
+    [ -x "$api_bridge" ] && [ ! -L "$api_bridge" ] || return 73
+    "$api_bridge" --audit-transaction verify "$1" "$2" "$3" "$4" "$5" "$6" "$7"
+}
+
+repair_durable_log_tail() {
+    repair_log_kind=$1
+    case $repair_log_kind in audit|activity) ;; *) return 64 ;; esac
+    [ -x "$api_bridge" ] && [ ! -L "$api_bridge" ] || return 73
+    "$api_bridge" --audit-transaction repair-log-tail "$repair_log_kind"
+}
+
+validate_audit_identity() {
+    [ -x "$api_bridge" ] && [ ! -L "$api_bridge" ] || return 73
+    "$api_bridge" --audit-transaction validate "$1" "$2" "$3" "$4" "$5" "$6"
+}
+
+append_audit_event() {
+    audit_operation=$1
+    audit_state=$2
+    audit_profile=${3:-all}
+    audit_policy_mode=${4:-strict}
+    audit_actor=${SDSYNC_DSM_AUDIT_ACTOR:-dsm-administrator}
+    audit_actor_uid=${SDSYNC_DSM_AUDIT_ACTOR_UID:-$path_owner}
+    audit_origin=${SDSYNC_DSM_AUDIT_ORIGIN:-cli}
+    audit_client_request_id=${SDSYNC_DSM_CLIENT_REQUEST_ID:-}
+    case $audit_origin in bridge|cli|manager|scheduler|controller) ;; *) return 64 ;; esac
+    case $audit_client_request_id in
+        '') ;;
+        *[!0-9a-f]*) return 64 ;;
+    esac
+    if [ -n "$audit_client_request_id" ]; then
+        [ "${#audit_client_request_id}" -eq 32 ] || return 64
+    fi
+    ensure_audit_transaction || return $?
+    audit_transaction=$SDSYNC_DSM_AUDIT_TRANSACTION
+    case $audit_transaction in ''|*[!A-Za-z0-9_-]*) return 64 ;; esac
+    [ "${#audit_transaction}" -le 96 ] || return 64
+    case $audit_operation in
+        configure-profile|remove-profile|set-default|schedule|alert-policy|enable|disable) audit_category=configuration ;;
+        set-secret|set-password|set-totp|set-remote-log-token|remove-password|remove-totp|remove-remote-log-token) audit_category=secrets ;;
+        routine|configure-routine|remove-routine) audit_category=routines ;;
+        security-policy) audit_category=security ;;
+        rejected-post) audit_category=bridge ;;
+        interface-settings) audit_category=configuration ;;
+        session-notifications) audit_category=notifications ;;
+        action|doctor|plan|run) audit_category=operations ;;
+        *) return 64 ;;
+    esac
+    case $audit_state in requested|succeeded|failed|outcome_unknown) ;; *) return 64 ;; esac
+    case $audit_policy_mode in
+        strict) ;;
+        recovery) [ "$audit_operation" = security-policy ] || return 64 ;;
+        *) return 64 ;;
+    esac
+    case $audit_profile in all|none|''|*[!A-Za-z0-9_-]*)
+        [ "$audit_profile" = all ] || [ "$audit_profile" = none ] || return 64
+        ;;
+    esac
+    # The authenticated DSM account is used only as a JSON value. Keep actor
+    # validation separate from profile/path identifiers so documented UTF-8
+    # local or directory identities (including spaces) remain attributable without ever
+    # becoming a delimiter, command, or filesystem component.
+    case $audit_actor in ''|*'|'*) return 64 ;; esac
+    if ! printf '%s\n' "$audit_actor" | LC_ALL=C awk '
+        NR != 1 { invalid = 1 }
+        NR == 1 && length($0) >= 1 && length($0) <= 256 && $0 !~ /[[:cntrl:]]/ { valid = 1 }
+        NR == 1 && !valid { invalid = 1 }
+        END { exit NR == 1 && valid && !invalid ? 0 : 1 }
+    '; then return 64; fi
+    case $audit_actor_uid in ''|*[!0-9]*|0|0[0-9]*) return 64 ;; esac
+    [ "$audit_actor_uid" -le 4294967295 ] 2>/dev/null || return 64
+    validate_audit_identity "$audit_operation" "${audit_profile:-none}" "$audit_actor" \
+        "$audit_actor_uid" "$audit_origin" "$audit_transaction" || return $?
+    if [ "$audit_policy_mode" = recovery ]; then
+        # Repairing an incomplete/corrupt/dangling security policy must remain
+        # auditable without trusting that broken document. Mandatory records
+        # use fixed conservative metadata until the replacement is installed.
+        audit_configured_level=warn
+        audit_subject_level=warn
+    else
+        audit_configured_level=$(security_category_level audit) || return $?
+        audit_subject_level=$(security_category_level "$audit_category") || return $?
+    fi
+    # Accountability is non-disableable. "off" disables optional category
+    # detail, but each mutation still receives this minimal audit record.
+    case $audit_state in failed) audit_level=error ;; outcome_unknown) audit_level=warn ;; *) audit_level=info ;; esac
+    audit_epoch=$(epoch_now)
+    case $audit_epoch in ''|*[!0-9]*) return 69 ;; esac
+    audit_operation_json=$(json_quote "$audit_operation") || return $?
+    audit_state_json=$(json_quote "$audit_state") || return $?
+    audit_transaction_json=$(json_quote "$audit_transaction") || return $?
+    audit_origin_json=$(json_quote "$audit_origin") || return $?
+    audit_actor_json=$(json_quote "$audit_actor") || return $?
+    audit_profile_json=$(json_quote "${audit_profile:-none}") || return $?
+    audit_client_request_field=
+    audit_activity_message="Module $audit_operation $audit_state [$audit_transaction]"
+    if [ -n "$audit_client_request_id" ]; then
+        audit_client_request_json=$(json_quote "$audit_client_request_id") || return $?
+        audit_client_request_field=",\"client_request_id\":$audit_client_request_json"
+        audit_activity_message="$audit_activity_message request_id=$audit_client_request_id"
+    fi
+    case $audit_state in
+        requested) audit_code=audit.requested; audit_activity_state=requested ;;
+        succeeded) audit_code=audit.succeeded; audit_activity_state=succeeded ;;
+        failed) audit_code=audit.failed; audit_activity_state=failed ;;
+        outcome_unknown) audit_code=audit.outcome_unknown; audit_activity_state=unavailable ;;
+    esac
+    acquire_event_log_lock || return $?
+    audit_append_status=0
+    audit_record_exists=false
+    activity_record_exists=false
+    audit_tail_state=$(repair_durable_log_tail audit) || audit_append_status=$?
+    if [ "$audit_append_status" -eq 0 ]; then
+        activity_tail_state=$(repair_durable_log_tail activity) || audit_append_status=$?
+    fi
+    if [ "$audit_append_status" -eq 0 ]; then
+        case $audit_tail_state:$activity_tail_state in
+            clean:clean|clean:repaired|repaired:clean|repaired:repaired) ;;
+            *) audit_append_status=73 ;;
+        esac
+    fi
+    if [ "$audit_append_status" -eq 0 ] \
+        && { [ "$audit_tail_state" = repaired ] || [ "$activity_tail_state" = repaired ]; }; then
+        case $audit_tail_state:$activity_tail_state in
+            repaired:clean) audit_recovery_message="Recovered incomplete active audit log tail" ;;
+            clean:repaired) audit_recovery_message="Recovered incomplete active activity log tail" ;;
+            repaired:repaired) audit_recovery_message="Recovered incomplete active audit and activity log tails" ;;
+        esac
+        append_activity security.log_tail_recovered none changed \
+            "$audit_recovery_message" security warn true \
+            || audit_append_status=$?
+    fi
+    if [ "$audit_append_status" -eq 0 ]; then
+        for audit_existing in "$audit_log" "$audit_log.1" "$audit_log.2" "$audit_log.3" "$audit_log.4" "$audit_log.5"; do
+            [ -e "$audit_existing" ] || [ -L "$audit_existing" ] || continue
+            [ -f "$audit_existing" ] && [ ! -L "$audit_existing" ] \
+                && [ "$(stat -c '%u:%a:%h' "$audit_existing" 2>/dev/null || true)" = "$path_owner:600:1" ] || { audit_append_status=73; break; }
+            audit_match_count=$(grep -F "\"transaction\":$audit_transaction_json" "$audit_existing" 2>/dev/null |
+                grep -F "\"state\":$audit_state_json" | wc -l | tr -d ' ')
+            if [ -n "$audit_client_request_id" ]; then
+                audit_exact_count=$(grep -F "\"transaction\":$audit_transaction_json" "$audit_existing" 2>/dev/null |
+                    grep -F "\"state\":$audit_state_json" |
+                    grep -F "\"operation\":$audit_operation_json" |
+                    grep -F "\"origin\":$audit_origin_json" |
+                    grep -F "\"actor\":$audit_actor_json" |
+                    grep -F "\"actor_uid\":$audit_actor_uid" |
+                    grep -F "\"profile\":$audit_profile_json" |
+                    grep -F "\"client_request_id\":$audit_client_request_json" | wc -l | tr -d ' ')
+            else
+                audit_exact_count=$(grep -F "\"transaction\":$audit_transaction_json" "$audit_existing" 2>/dev/null |
+                    grep -F "\"state\":$audit_state_json" |
+                    grep -F "\"operation\":$audit_operation_json" |
+                    grep -F "\"origin\":$audit_origin_json" |
+                    grep -F "\"actor\":$audit_actor_json" |
+                    grep -F "\"actor_uid\":$audit_actor_uid" |
+                    grep -F "\"profile\":$audit_profile_json" | wc -l | tr -d ' ')
+            fi
+            case $audit_match_count:$audit_exact_count in *[!0-9:]*) audit_append_status=73; break ;; esac
+            [ "$audit_match_count" -eq "$audit_exact_count" ] || { audit_append_status=73; break; }
+            [ "$audit_exact_count" -eq 0 ] || audit_record_exists=true
+        done
+    fi
+    if [ "$audit_append_status" -eq 0 ]; then
+        for activity_existing in "$activity_log" "$activity_log.1" "$activity_log.2" "$activity_log.3"; do
+            [ -e "$activity_existing" ] || [ -L "$activity_existing" ] || continue
+            [ -f "$activity_existing" ] && [ ! -L "$activity_existing" ] \
+                && [ "$(stat -c '%u:%a:%h' "$activity_existing" 2>/dev/null || true)" = "$path_owner:600:1" ] || { audit_append_status=73; break; }
+            activity_match_count=$(grep -F "|$audit_code|" "$activity_existing" 2>/dev/null |
+                grep -F "[$audit_transaction]" | wc -l | tr -d ' ')
+            activity_exact_count=$(grep -F "|$audit_code|${audit_profile:-none}|$audit_activity_state|audit|$audit_level|$audit_actor_uid|$audit_actor|$audit_activity_message" "$activity_existing" 2>/dev/null |
+                wc -l | tr -d ' ')
+            case $activity_match_count:$activity_exact_count in *[!0-9:]*) audit_append_status=73; break ;; esac
+            [ "$activity_match_count" -eq "$activity_exact_count" ] || { audit_append_status=73; break; }
+            [ "$activity_exact_count" -eq 0 ] || activity_record_exists=true
+        done
+    fi
+    if [ "$audit_append_status" -eq 0 ] && [ "$activity_record_exists" = true ] && [ "$audit_record_exists" != true ]; then
+        audit_append_status=73
+    fi
+    if [ "$audit_append_status" -eq 0 ] && [ "$activity_record_exists" = true ] && [ "$audit_record_exists" = true ]; then
+        if [ "$audit_append_status" -eq 0 ]; then
+            verify_durable_audit_event "$audit_operation" "${audit_profile:-none}" "$audit_actor" \
+                "$audit_actor_uid" "$audit_origin" "$audit_transaction" "$audit_state" || audit_append_status=$?
+        fi
+        release_event_log_lock || audit_append_status=$?
+        return "$audit_append_status"
+    fi
+    if [ "$audit_append_status" -eq 0 ] && [ "$audit_record_exists" != true ]; then
+        append_rotating_log "$audit_log" 10485760 5 \
+            "{\"epoch\":$audit_epoch,\"level\":$(json_quote "$audit_level"),\"configured_level\":$(json_quote "$audit_configured_level"),\"subject_level\":$(json_quote "$audit_subject_level"),\"mandatory\":true,\"category\":\"audit\",\"subject_category\":$(json_quote "$audit_category"),\"operation\":$audit_operation_json,\"state\":$audit_state_json,\"transaction\":$audit_transaction_json,\"origin\":$audit_origin_json,\"actor\":$audit_actor_json,\"actor_uid\":$audit_actor_uid,\"profile\":$audit_profile_json$audit_client_request_field}" || audit_append_status=$?
+        if [ "$audit_append_status" -eq 0 ]; then
+            finish_private_file "$audit_log" || audit_append_status=$?
+        fi
+    fi
+    if [ "$audit_append_status" -eq 0 ] && [ "$activity_record_exists" != true ]; then
+        append_activity "$audit_code" "${audit_profile:-none}" "$audit_activity_state" \
+            "$audit_activity_message" audit "$audit_level" true \
+            "$audit_actor_uid" "$audit_actor" || audit_append_status=$?
+    fi
+    if [ "$audit_append_status" -eq 0 ] && [ "$audit_policy_mode" = recovery ]; then
+        if [ "$audit_append_status" -eq 0 ]; then
+            verify_durable_audit_event "$audit_operation" "${audit_profile:-none}" "$audit_actor" \
+                "$audit_actor_uid" "$audit_origin" "$audit_transaction" "$audit_state" || audit_append_status=$?
+        fi
+        release_event_log_lock || audit_append_status=$?
+        return "$audit_append_status"
+    fi
+    if [ "$audit_append_status" -eq 0 ]; then
+        case $audit_state in
+            requested) audit_subject_code=module.requested; audit_subject_event_level=debug ;;
+            succeeded) audit_subject_code=module.succeeded; audit_subject_event_level=info ;;
+            failed) audit_subject_code=module.failed; audit_subject_event_level=error ;;
+            outcome_unknown) audit_subject_code=module.outcome_unknown; audit_subject_event_level=warn ;;
+        esac
+        append_activity "$audit_subject_code" "${audit_profile:-none}" "$audit_activity_state" \
+            "$audit_activity_message" "$audit_category" "$audit_subject_event_level" false >/dev/null 2>&1 || true
+    fi
+    if [ "$audit_append_status" -eq 0 ] && [ "$audit_state" = requested ] && [ "$audit_origin" = bridge ]; then
+        append_activity module.requested "${audit_profile:-none}" requested \
+            "DSM administrator authentication accepted" authentication debug false >/dev/null 2>&1 || true
+    fi
+    if [ "$audit_append_status" -eq 0 ] && [ "$audit_state" = requested ] && [ "$audit_origin" = bridge ]; then
+        append_activity module.requested "${audit_profile:-none}" requested \
+            "Authenticated bridge mutation accepted" bridge trace false >/dev/null 2>&1 || true
+    fi
+    if [ "$audit_append_status" -eq 0 ]; then
+        append_activity "$audit_subject_code" "${audit_profile:-none}" "$audit_activity_state" \
+            "Mandatory audit transaction recorded" audit debug false >/dev/null 2>&1 || true
+    fi
+    if [ "$audit_append_status" -eq 0 ]; then
+        verify_durable_audit_event "$audit_operation" "${audit_profile:-none}" "$audit_actor" \
+            "$audit_actor_uid" "$audit_origin" "$audit_transaction" "$audit_state" || audit_append_status=$?
+    fi
+    release_event_log_lock || audit_append_status=$?
+    return "$audit_append_status"
+}
+
+ensure_audit_transaction() {
+    ensured_audit_origin=${SDSYNC_DSM_AUDIT_ORIGIN:-cli}
+    case $ensured_audit_origin in bridge|cli|manager|scheduler|controller) ;; *) return 64 ;; esac
+    if [ -z "${SDSYNC_DSM_AUDIT_TRANSACTION:-}" ]; then
+        [ -x "$api_bridge" ] && [ ! -L "$api_bridge" ] || return 73
+        SDSYNC_DSM_AUDIT_TRANSACTION=$("$api_bridge" --audit-transaction create "$ensured_audit_origin") || return $?
+        export SDSYNC_DSM_AUDIT_TRANSACTION
+    fi
+    case $SDSYNC_DSM_AUDIT_TRANSACTION in ''|*[!A-Za-z0-9_-]*) return 64 ;; esac
+    [ "${#SDSYNC_DSM_AUDIT_TRANSACTION}" -le 96 ] || return 64
+}
+
+audit_outbox_begin() {
+    [ -x "$api_bridge" ] && [ ! -L "$api_bridge" ] || return 73
+    "$api_bridge" --audit-transaction begin "$1" "$2" "$3" "$4" "$5" "$6"
+}
+
+audit_outbox_complete() {
+    [ -x "$api_bridge" ] && [ ! -L "$api_bridge" ] || return 73
+    "$api_bridge" --audit-transaction complete "$1" "$2"
+}
+
+audit_outbox_execute() {
+    [ -x "$api_bridge" ] && [ ! -L "$api_bridge" ] || return 73
+    "$api_bridge" --audit-transaction execute "$1"
+}
+
+reconcile_audit_outbox() {
+    [ -x "$api_bridge" ] && [ ! -L "$api_bridge" ] || return 73
+    "$api_bridge" --audit-transaction reconcile
 }
 
 safe_notify() {
@@ -341,7 +1963,7 @@ safe_notify() {
         esac
     fi
     append_activity notification.unavailable "$notify_profile" unavailable \
-        "DSM desktop notification delivery unavailable" 2>/dev/null || true
+        "DSM desktop notification delivery unavailable" notifications warn 2>/dev/null || true
     return "$notify_status"
 }
 
@@ -436,5 +2058,7 @@ private_secret_file() {
     [ -f "$secret_path" ] && [ ! -L "$secret_path" ] && [ -r "$secret_path" ] || return 1
     secret_mode=$(stat -c '%a' "$secret_path" 2>/dev/null || true)
     secret_owner=$(stat -c '%u' "$secret_path" 2>/dev/null || true)
-    [ "$secret_mode" = 600 ] && [ -n "$path_owner" ] && [ "$secret_owner" = "$path_owner" ]
+    secret_links=$(stat -c '%h' "$secret_path" 2>/dev/null || true)
+    [ "$secret_mode" = 600 ] && [ -n "$path_owner" ] && [ "$secret_owner" = "$path_owner" ] \
+        && [ "$secret_links" = 1 ]
 }

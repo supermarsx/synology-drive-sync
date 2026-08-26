@@ -2,6 +2,17 @@
 title="Synology Drive Sync"
 description="Configure, diagnose, and monitor one-way File Station sync"
 
+[help]
+overview="Overview"
+profiles="Profiles and credentials"
+routines="Routines and realtime hooks"
+health="Health and Target Doctor"
+activity="Activity and logs"
+notifications="Notifications"
+security="Security posture"
+settings="Interface settings"
+about="About and updates"
+
 [notifications]
 sync_succeeded_title="Drive Sync completed"
 sync_succeeded_message="A configured Drive Sync profile completed successfully."

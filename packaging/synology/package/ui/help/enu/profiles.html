@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html class="img-no-display">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <link href="../../../../help/help.css" rel="stylesheet" type="text/css">
+  <link href="../../../../help/scrollbar/flexcroll.css" rel="stylesheet" type="text/css">
+  <script type="text/javascript" src="../../../../help/scrollbar/flexcroll.js"></script>
+  <script type="text/javascript" src="../../../../help/scrollbar/initFlexcroll.js"></script>
+  <title>Profiles and credentials</title>
+</head>
+<body>
+  <h1>Profiles and credentials</h1>
+  <p>A profile binds one local source to one File Station origin, DSM account, and logical destination path. Names use letters, digits, underscores, or hyphens and cannot be renamed after creation.</p>
+
+  <h2>Required fields</h2>
+  <dl>
+    <dt>Local source</dt><dd>An absolute folder on this NAS, such as <code>/volume1/Source</code>.</dd>
+    <dt>File Station URL</dt><dd>The HTTPS origin of the destination NAS. Plain HTTP requires the explicit controlled-LAN override.</dd>
+    <dt>DSM username</dt><dd>The least-privileged destination account required to reach the configured path.</dd>
+    <dt>Remote logical path</dt><dd>A File Station path such as <code>/home/Drive/NAS Backup</code>, not a local filesystem mount.</dd>
+    <dt>Comparison</dt><dd>Content compares size, MD5, and modification time; metadata compares size and time; size-only is the weakest evidence.</dd>
+    <dt>Concurrent uploads</dt><dd>One through sixteen workers. Start low on memory-constrained NAS models.</dd>
+  </dl>
+
+  <h2>Deletion and empty-source guards</h2>
+  <p>Remote deletion requires approval in the saved profile and again for the operation or routine. The maximum-deletion value is a hard ceiling. An unexpectedly empty source fails closed unless <em>Allow an empty source</em> is enabled both by the global Security ceiling and by this profile. Review a plan after every exclusion or source-path change.</p>
+
+  <h2>Network and retry controls</h2>
+  <p>Retries cover transient failures. Upload and connection timeouts are bounded. Maximum rate uses bytes per second; zero means unlimited. A CA certificate path should reference a package-readable PEM bundle. Accepting invalid certificates disables identity verification and requires a separate interception-risk acknowledgement.</p>
+
+  <h2>Exclusions and logging</h2>
+  <p>Enter one exclusion pattern per line. Package output remains structured JSON with progress disabled. Verbosity and quiet mode cannot be enabled together. Remote logging requires HTTPS; <em>required</em> mode can fail the operation when delivery fails, while <em>best effort</em> records the delivery problem without failing the sync.</p>
+
+  <h2>Protected credentials</h2>
+  <p>Password, TOTP seed, and remote-log token have three independent operations: keep, replace, or clear. Replacement fields are write-only. Saving first applies profile configuration and then applies requested secret operations; if a later stage fails, inspect the refreshed credential-presence flags before retrying.</p>
+
+  <h2>Remove a profile</h2>
+  <p>Deleting a profile removes package-owned configuration and protected credentials. It does not delete local source files or already synchronized destination files.</p>
+</body>
+</html>

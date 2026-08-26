@@ -4,6 +4,7 @@ set -eu
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 # shellcheck source=sdsync-common
 . "$script_dir/sdsync-common"
+clear_core_cli_environment
 
 usage() {
     echo "usage: sdsync-run sync|plan PROFILE|all true|false foreground|scheduled MAX_TOTAL_DELETE|-" >&2
@@ -28,6 +29,63 @@ else
 fi
 
 ensure_layout
+reconcile_audit_outbox || {
+    echo "pending mandatory audit records could not be reconciled" >&2
+    exit 73
+}
+unset SDSYNC_DSM_AUDIT_WRAPPED SDSYNC_DSM_AUDIT_TRANSACTION \
+    SDSYNC_DSM_AUDIT_ACTOR SDSYNC_DSM_AUDIT_ACTOR_UID SDSYNC_DSM_AUDIT_ORIGIN \
+    SDSYNC_DSM_CLIENT_REQUEST_ID
+SDSYNC_DSM_AUDIT_ACTOR=package-runner
+SDSYNC_DSM_AUDIT_ACTOR_UID=$path_owner
+SDSYNC_DSM_AUDIT_ORIGIN=manager
+export SDSYNC_DSM_AUDIT_ACTOR SDSYNC_DSM_AUDIT_ACTOR_UID SDSYNC_DSM_AUDIT_ORIGIN
+if [ "$run_mode" = plan ]; then run_audit_operation=plan; else run_audit_operation=run; fi
+if [ "$run_output" = scheduled ]; then
+    scheduled_parent_status=0
+    require_verified_controller_parent || scheduled_parent_status=$?
+    if [ "$scheduled_parent_status" -ne 0 ]; then
+        ensure_audit_transaction || exit 73
+        audit_outbox_begin "$run_audit_operation" "$run_scope" "$SDSYNC_DSM_AUDIT_ACTOR" \
+            "$SDSYNC_DSM_AUDIT_ACTOR_UID" "$SDSYNC_DSM_AUDIT_ORIGIN" \
+            "$SDSYNC_DSM_AUDIT_TRANSACTION" || exit 73
+        audit_outbox_complete "$SDSYNC_DSM_AUDIT_TRANSACTION" failed >/dev/null 2>&1 || exit 73
+        echo "scheduled runner mode is private to the verified DSM controller" >&2
+        exit "$scheduled_parent_status"
+    fi
+    SDSYNC_DSM_AUDIT_ACTOR=package-scheduler
+    SDSYNC_DSM_AUDIT_ORIGIN=scheduler
+    export SDSYNC_DSM_AUDIT_ACTOR SDSYNC_DSM_AUDIT_ORIGIN
+fi
+run_audit_pending=false
+run_commit_started=false
+runner_lifecycle_lock_held=false
+release_runner_lifecycle_lock() {
+    [ "$runner_lifecycle_lock_held" = true ] || return 0
+    release_private_process_lock "$lifecycle_lock" 2>/dev/null || return 73
+    runner_lifecycle_lock_held=false
+}
+audit_run_cleanup() {
+    release_runner_lifecycle_lock >/dev/null 2>&1 || true
+    if [ "$run_audit_pending" = true ]; then
+        run_audit_pending=false
+        run_cleanup_state=failed
+        [ "$run_commit_started" != true ] || run_cleanup_state=outcome_unknown
+        audit_outbox_complete "$SDSYNC_DSM_AUDIT_TRANSACTION" "$run_cleanup_state" >/dev/null 2>&1 || true
+    fi
+}
+trap audit_run_cleanup 0
+ensure_audit_transaction || {
+    echo "mandatory audit transaction could not be created" >&2
+    exit 73
+}
+audit_outbox_begin "$run_audit_operation" "$run_scope" "$SDSYNC_DSM_AUDIT_ACTOR" \
+    "$SDSYNC_DSM_AUDIT_ACTOR_UID" "$SDSYNC_DSM_AUDIT_ORIGIN" \
+    "$SDSYNC_DSM_AUDIT_TRANSACTION" || {
+    echo "mandatory audit outbox could not be prepared" >&2
+    exit 73
+}
+run_audit_pending=true
 if [ ! -x "$binary" ] || [ -L "$binary" ]; then
     echo "installed sync binary is missing, symlinked, or not executable: $binary" >&2
     exit 69
@@ -37,52 +95,123 @@ if [ -L "$config_file" ] || [ ! -f "$config_file" ] || [ ! -r "$config_file" ]; 
     exit 66
 fi
 
-management_is_active() {
-    [ -d "$management_lock" ] && [ ! -L "$management_lock" ] || return 1
-    management_pid=$(read_pid "$management_lock/pid" 2>/dev/null || true)
-    [ -n "$management_pid" ] && pid_is_live "$management_pid"
+# Preserve exact policy-denial/error reporting without admitting any work.
+# The policy is loaded again after the serialized run-lock publication so a
+# concurrent configuration change cannot make this precheck authoritative.
+load_security_policy_runtime || {
+    echo "security policy is not a private complete document" >&2
+    exit 73
 }
-if management_is_active; then
-    echo "package configuration is being changed; retry the plan/sync later" >&2
-    exit 75
+if [ "$run_output" = foreground ] && [ "$security_runtime_allow_operational_actions" != true ]; then
+    echo "security policy blocks interactive doctor, plan, and run actions" >&2
+    exit 77
 fi
 
+management_lock_status() {
+    management_status=0
+    private_process_lock_is_live "$management_lock" || management_status=$?
+    return "$management_status"
+}
+admission_state_status() {
+    admission_transition=$(package_transition_status) || return 73
+    [ "$admission_transition" = open ] || return 75
+    admission_service=$(service_admission_status) || return 73
+    [ "$admission_service" = open ] || return 75
+    admission_ready_status=0
+    service_runtime_ready || admission_ready_status=$?
+    case $admission_ready_status in
+        0) return 0 ;;
+        1) return 75 ;;
+        *) return 73 ;;
+    esac
+}
+
+runner_lifecycle_status=0
+acquire_private_process_lock "$lifecycle_lock" || runner_lifecycle_status=$?
+case $runner_lifecycle_status in
+    0) runner_lifecycle_lock_held=true ;;
+    75) echo "package lifecycle is changing; retry the plan/sync later" >&2; exit 75 ;;
+    *) echo "cannot validate package lifecycle admission" >&2; exit 73 ;;
+esac
+runner_admission_status=0
+admission_state_status || runner_admission_status=$?
+case $runner_admission_status in
+    0) ;;
+    75)
+        release_runner_lifecycle_lock >/dev/null 2>&1 || true
+        echo "package service is stopped or transitioning; run admission is closed" >&2
+        exit 75
+        ;;
+    *)
+        release_runner_lifecycle_lock >/dev/null 2>&1 || true
+        echo "cannot validate package service admission" >&2
+        exit 73
+        ;;
+esac
+management_status=0
+management_lock_status || management_status=$?
+case $management_status in
+    0)
+        release_runner_lifecycle_lock >/dev/null 2>&1 || true
+        echo "package configuration is being changed; retry the plan/sync later" >&2
+        exit 75
+        ;;
+    1) ;;
+    *)
+        release_runner_lifecycle_lock >/dev/null 2>&1 || true
+        echo "cannot validate the private package-management lock" >&2
+        exit 73
+        ;;
+esac
+
 acquire_run_lock() {
-    if mkdir "$run_lock" 2>/dev/null; then
-        chmod 0700 "$run_lock"
-        set_private_owner "$run_lock"
-        return 0
-    fi
-    if [ -L "$run_lock" ] || [ ! -d "$run_lock" ]; then
-        echo "run lock is not a private directory: $run_lock" >&2
-        return 73
-    fi
-    stale_pid=$(read_pid "$run_lock/pid" 2>/dev/null || true)
-    if [ -n "$stale_pid" ] && pid_is_live "$stale_pid"; then
-        echo "another package plan/sync is running as PID $stale_pid" >&2
-        return 75
-    fi
-    if [ -f "$run_lock/pid" ] && [ ! -L "$run_lock/pid" ]; then
-        rm -f "$run_lock/pid"
-    fi
-    rmdir "$run_lock" 2>/dev/null || {
-        echo "cannot recover the stale run lock safely: $run_lock" >&2
-        return 73
-    }
-    mkdir "$run_lock"
-    chmod 0700 "$run_lock"
-    set_private_owner "$run_lock"
+    acquire_private_process_lock "$run_lock"
 }
 
 acquire_run_lock
-umask 077
-printf '%s\n' "$$" > "$run_lock/pid"
-finish_private_file "$run_lock/pid"
-if management_is_active; then
-    rm -f "$run_lock/pid"
-    rmdir "$run_lock" 2>/dev/null || true
-    echo "package configuration began changing; retry the plan/sync later" >&2
-    exit 75
+runner_admission_status=0
+admission_state_status || runner_admission_status=$?
+if [ "$runner_admission_status" -ne 0 ]; then
+    release_private_process_lock "$run_lock" 2>/dev/null || true
+    release_runner_lifecycle_lock >/dev/null 2>&1 || true
+    if [ "$runner_admission_status" -eq 75 ]; then
+        echo "package service closed while admitting the run; retry later" >&2
+        exit 75
+    fi
+    echo "cannot revalidate package service admission" >&2
+    exit 73
+fi
+management_status=0
+management_lock_status || management_status=$?
+case $management_status in
+    0)
+        release_private_process_lock "$run_lock" 2>/dev/null || true
+        release_runner_lifecycle_lock >/dev/null 2>&1 || true
+        echo "package configuration began changing; retry the plan/sync later" >&2
+        exit 75
+        ;;
+    1) ;;
+    *)
+        release_private_process_lock "$run_lock" 2>/dev/null || true
+        release_runner_lifecycle_lock >/dev/null 2>&1 || true
+        echo "cannot validate the private package-management lock" >&2
+        exit 73
+        ;;
+esac
+release_runner_lifecycle_lock || {
+    release_private_process_lock "$run_lock" 2>/dev/null || true
+    echo "cannot release package lifecycle admission lock" >&2
+    exit 73
+}
+load_security_policy_runtime || {
+    release_private_process_lock "$run_lock" 2>/dev/null || true
+    echo "security policy is not a private complete document" >&2
+    exit 73
+}
+if [ "$run_output" = foreground ] && [ "$security_runtime_allow_operational_actions" != true ]; then
+    release_private_process_lock "$run_lock" 2>/dev/null || true
+    echo "security policy blocks interactive doctor, plan, and run actions" >&2
+    exit 77
 fi
 
 core_pid=
@@ -91,13 +220,8 @@ wait_interrupted=false
 started=$(epoch_now)
 run_label=$run_scope
 cleanup_run() {
-    if [ -f "$run_lock/pid" ] && [ ! -L "$run_lock/pid" ]; then
-        lock_pid=$(read_pid "$run_lock/pid" 2>/dev/null || true)
-        if [ "$lock_pid" = "$$" ]; then
-            rm -f "$run_lock/pid"
-            rmdir "$run_lock" 2>/dev/null || true
-        fi
-    fi
+    release_private_process_lock "$run_lock" 2>/dev/null || true
+    audit_run_cleanup
 }
 forward_term() {
     termination_requested=true
@@ -117,6 +241,47 @@ preflight_profile_runtime() {
     }
     runtime_profile=${runtime_fragment##*/}
     runtime_profile=${runtime_profile%.toml}
+    for runtime_required_key in source url delete allow-empty-source danger-accept-invalid-certs; do
+        runtime_required_count=$(grep -c "^${runtime_required_key} = " "$runtime_fragment" 2>/dev/null || true)
+        [ "$runtime_required_count" = 1 ] || {
+            echo "profile '$runtime_profile' is missing a unique $runtime_required_key policy field" >&2
+            return 73
+        }
+    done
+    runtime_url=$(sed -n 's/^url = "\(.*\)"$/\1/p' "$runtime_fragment")
+    runtime_delete=$(sed -n 's/^delete = \(true\|false\)$/\1/p' "$runtime_fragment")
+    runtime_allow_empty=$(sed -n 's/^allow-empty-source = \(true\|false\)$/\1/p' "$runtime_fragment")
+    runtime_invalid_tls=$(sed -n 's/^danger-accept-invalid-certs = \(true\|false\)$/\1/p' "$runtime_fragment")
+    runtime_remote_log_count=$(grep -c '^remote-log-url = "' "$runtime_fragment" 2>/dev/null || true)
+    [ "$runtime_remote_log_count" -le 1 ] || {
+        echo "profile '$runtime_profile' has duplicate remote logging configuration" >&2
+        return 73
+    }
+    case $runtime_url in http://*) runtime_uses_http=true ;; https://*) runtime_uses_http=false ;; *) return 73 ;; esac
+    case $runtime_delete:$runtime_allow_empty:$runtime_invalid_tls in
+        true:true:true|true:true:false|true:false:true|true:false:false|false:true:true|false:true:false|false:false:true|false:false:false) ;;
+        *) return 73 ;;
+    esac
+    if [ "$security_runtime_allow_destructive_sync" != true ] && { [ "$runtime_delete" = true ] || [ "$allow_delete" = true ]; }; then
+        echo "security policy blocks destructive sync for profile '$runtime_profile'" >&2
+        return 77
+    fi
+    if [ "$security_runtime_allow_http_targets" != true ] && [ "$runtime_uses_http" = true ]; then
+        echo "security policy blocks HTTP targets for profile '$runtime_profile'" >&2
+        return 77
+    fi
+    if [ "$security_runtime_allow_invalid_tls" != true ] && [ "$runtime_invalid_tls" = true ]; then
+        echo "security policy blocks invalid TLS certificates for profile '$runtime_profile'" >&2
+        return 77
+    fi
+    if [ "$security_runtime_allow_remote_logging" != true ] && [ "$runtime_remote_log_count" -ne 0 ]; then
+        echo "security policy blocks remote logging for profile '$runtime_profile'" >&2
+        return 77
+    fi
+    if [ "$security_runtime_allow_empty_source" != true ] && [ "$runtime_allow_empty" = true ]; then
+        echo "security policy blocks empty-source synchronization for profile '$runtime_profile'" >&2
+        return 77
+    fi
     profile_secret_exists "$runtime_profile" || {
         echo "profile '$runtime_profile' has no protected password; use sdsync-dsm set-password" >&2
         return 66
@@ -132,7 +297,10 @@ preflight_profile_runtime() {
     runtime_log_count=$(grep -c '^log-file = "' "$runtime_fragment" 2>/dev/null || true)
     [ "$runtime_log_count" = 1 ] || { echo "profile '$runtime_profile' has an invalid log-file" >&2; return 66; }
     runtime_log_file=$(sed -n 's/^log-file = "\(.*\)"$/\1/p' "$runtime_fragment")
-    case $runtime_log_file in "$log_root"/*) ;; *) echo "profile '$runtime_profile' log-file escaped package storage" >&2; return 66 ;; esac
+    [ "$runtime_log_file" = "$log_root/sync.log" ] || {
+        echo "profile '$runtime_profile' log-file is outside the fixed package-managed path" >&2
+        return 66
+    }
     if [ -e "$runtime_log_file" ] || [ -L "$runtime_log_file" ]; then
         private_secret_file "$runtime_log_file" || {
             echo "profile '$runtime_profile' log-file is not a package-owned 0600 regular file" >&2
@@ -168,23 +336,44 @@ fi
 if [ "$allow_delete" != true ]; then
     set -- "$@" --no-delete
 fi
+runner_supervisor_start=$(process_start_time "$$" 2>/dev/null || true)
+case $runner_supervisor_start in ''|*[!0-9]*|0)
+    echo "cannot capture runner identity before core launch" >&2
+    exit 73
+    ;;
+esac
+runner_supervisor_boot=$(boot_identity) || {
+    echo "cannot capture runner boot identity before core launch" >&2
+    exit 73
+}
+set -- "$api_bridge" --exec-supervised-core "$$" "$runner_supervisor_start" \
+    "$runner_supervisor_boot" -- "$@"
 
+audit_outbox_execute "$SDSYNC_DSM_AUDIT_TRANSACTION" || {
+    echo "mandatory audit execution phase could not be recorded" >&2
+    exit 73
+}
+run_commit_started=true
 write_run_state running "$started" 0 -1 "$run_label" "$run_mode"
-append_activity run.started "$run_label" running "Package action started" 2>/dev/null || true
+if [ "$run_mode" = sync ]; then run_activity_category=sync; else run_activity_category=operations; fi
+append_activity run.started "$run_label" running "Package action started" "$run_activity_category" info 2>/dev/null || true
 scheduled_log=$log_root/scheduler.log
 # Do not start the core after TERM/INT/HUP was latched while preflight or state
 # publication was running. A signal after this check is covered again once the
 # direct child PID has been assigned below.
 [ "$termination_requested" = false ] || exit 143
 if [ "$run_output" = scheduled ]; then
-    rotate_log "$scheduled_log" 10485760 5
-    {
-        printf '%s\n' "run_started epoch=$started mode=$run_mode scope=$run_label delete=$allow_delete"
-        # Preserve the background child's PID as the core PID. POSIX does not
-        # require a shell to optimize the final command into an exec, and a
-        # wrapper PID would let TERM orphan the actual core process.
-        exec "$@"
-    } >> "$scheduled_log" 2>&1 &
+    scheduled_event_enabled=0
+    security_event_enabled scheduler info false || scheduled_event_enabled=$?
+    case $scheduled_event_enabled in
+        0) append_rotating_log "$scheduled_log" 10485760 5 \
+            "{\"epoch\":$started,\"level\":\"info\",\"category\":\"scheduler\",\"event\":\"run_started\",\"mode\":$(json_quote "$run_mode"),\"scope\":$(json_quote "$run_label"),\"delete\":$allow_delete}" ;;
+        1) ;;
+        *) exit "$scheduled_event_enabled" ;;
+    esac
+    # The core writes its own bounded per-profile log files. Keep the scheduler
+    # stream machine-readable and free of opaque/user-influenced lines.
+    "$@" >/dev/null 2>&1 &
 else
     "$@" &
 fi
@@ -240,10 +429,23 @@ if [ "$run_scope" = all ]; then
 else
     write_profile_completion_state "$profiles_dir/$run_scope.toml"
 fi
-if [ "$final_state" = succeeded ]; then activity_code=run.succeeded; else activity_code=run.failed; fi
-append_activity "$activity_code" "$run_label" "$final_state" "Package action completed" 2>/dev/null || true
+if [ "$final_state" = succeeded ]; then activity_code=run.succeeded; activity_level=info; else activity_code=run.failed; activity_level=error; fi
+append_activity "$activity_code" "$run_label" "$final_state" "Package action completed" "$run_activity_category" "$activity_level" 2>/dev/null || true
 if [ "$run_mode" = sync ]; then handle_alert_result "$run_label" "$final_state" "$exit_code" 2>/dev/null || true; fi
 if [ "$run_output" = scheduled ]; then
-    printf '%s\n' "run_finished epoch=$finished mode=$run_mode scope=$run_label exit=$exit_code" >> "$scheduled_log"
+    if [ "$exit_code" -eq 0 ]; then scheduled_level=info; else scheduled_level=error; fi
+    scheduled_event_enabled=0
+    security_event_enabled scheduler "$scheduled_level" false || scheduled_event_enabled=$?
+    case $scheduled_event_enabled in
+        0) append_rotating_log "$scheduled_log" 10485760 5 \
+            "{\"epoch\":$finished,\"level\":$(json_quote "$scheduled_level"),\"category\":\"scheduler\",\"event\":\"run_finished\",\"mode\":$(json_quote "$run_mode"),\"scope\":$(json_quote "$run_label"),\"exit\":$exit_code}" ;;
+        1) ;;
+        *) echo "warning: scheduler log policy could not be evaluated" >&2 ;;
+    esac
+fi
+if [ "$run_audit_pending" = true ]; then
+    audit_outbox_complete "$SDSYNC_DSM_AUDIT_TRANSACTION" "$final_state" >/dev/null 2>&1 || \
+        echo "warning: operation completed; terminal audit is pending durable reconciliation" >&2
+    run_audit_pending=false
 fi
 exit "$exit_code"

@@ -458,6 +458,15 @@ def validate_installers_and_docs() -> None:
             ],
             label,
         )
+    require(
+        powershell_installer,
+        [
+            "New-Item -ItemType Directory -Path $tempDir -WhatIf:$false",
+            "New-Item -ItemType Directory -Path $candidateDir -WhatIf:$false",
+            "Remove-Item -LiteralPath $resolvedTemp -Recurse -Force -WhatIf:$false",
+        ],
+        "PowerShell installer internal WhatIf isolation",
+    )
 
     for directory in ["systemd", "launchd", "windows", "cron", "docker"]:
         documentation = read(f"packaging/{directory}/README.md").lower()
@@ -903,9 +912,46 @@ def validate_synology_wrapper_argument_parsing() -> None:
         for path in (package_home, package_var):
             path.mkdir(mode=0o700)
         (package_target / "bin").mkdir(parents=True, mode=0o700)
+        (package_target / "libexec").mkdir(mode=0o700)
         fixture_binary = package_target / "bin/synology-drive-sync"
         shutil.copy2(binary, fixture_binary)
         fixture_binary.chmod(0o755)
+
+        # The production manager and runner now fail closed unless their
+        # package transition/service marker helper exists, and the runner also
+        # requires exact live controller/API readiness. Keep this validator on
+        # the real wrappers and real core by supplying the smallest faithful
+        # package-owned service fixture rather than bypassing those checks.
+        fixture_api = package_target / "bin/sdsync-dsm-api"
+        fixture_api.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "case ${1:-} in\n"
+            "  --package-transition) [ \"${2:-}\" = status ] || exit 64; echo open ;;\n"
+            "  --service-admission) [ \"${2:-}\" = status ] || exit 64; echo open ;;\n"
+            "  --audit-transaction)\n"
+            "    case ${2:-} in\n"
+            "      create) printf 'fixture-%s-%s\\n' \"$(date +%s)\" \"$$\" ;;\n"
+            "      begin|complete|execute|reconcile|repair-log-tail|validate|verify) exit 0 ;;\n"
+            "      *) exit 64 ;;\n"
+            "    esac\n"
+            "    ;;\n"
+            "  --exec-supervised-core) shift 5; exec \"$@\" ;;\n"
+            "  --serve) trap 'exit 0' TERM INT HUP; while :; do sleep 1; done ;;\n"
+            "  *) exit 64 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        fixture_api.chmod(0o755)
+        fixture_controller = package_target / "libexec/sdsync-controller"
+        fixture_controller.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "trap 'exit 0' TERM INT HUP\n"
+            "while :; do sleep 1; done\n",
+            encoding="utf-8",
+        )
+        fixture_controller.chmod(0o755)
 
         source = temporary / "source"
         source.mkdir(mode=0o700)
@@ -923,74 +969,138 @@ def validate_synology_wrapper_argument_parsing() -> None:
             }
         )
 
-        configured = subprocess.run(
-            [
-                "/bin/sh",
-                str(manager),
-                "configure-profile",
-                "--name",
-                "argparse-check",
-                "--source",
-                str(source),
-                "--url",
-                "https://files.example.invalid",
-                "--username",
-                "argparse-check",
-                "--remote",
-                "/argparse-check",
-                "--remote-log-url",
-                "https://logs.example.invalid/ingest",
-                "--default",
-            ],
+        runtime = package_var / "run"
+        runtime.mkdir(mode=0o700)
+        api_process = subprocess.Popen(
+            [str(fixture_api), "--serve"],
             env=environment,
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        if configured.returncode != 0:
-            raise AssertionError(
-                "could not build a Synology package fixture profile for argument-parsing "
-                f"validation: stdout={configured.stdout!r} stderr={configured.stderr!r}"
+        controller_process = subprocess.Popen(
+            [str(fixture_controller)],
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        def process_start(pid: int) -> str:
+            return (
+                Path(f"/proc/{pid}/stat")
+                .read_text(encoding="ascii")
+                .rsplit(") ", 1)[1]
+                .split()[19]
             )
 
-        password_input = temporary / "password.input"
-        password_input.write_text("test-only-secret\n", encoding="utf-8")
-        stored = subprocess.run(
-            [
-                "/bin/sh",
-                str(manager),
-                "set-password",
-                "argparse-check",
-                "--from-file",
-                str(password_input),
-            ],
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-        if stored.returncode != 0:
-            raise AssertionError(
-                "could not store a Synology package fixture password for argument-parsing "
-                f"validation: stdout={stored.stdout!r} stderr={stored.stderr!r}"
-            )
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
 
-        for delete_value in ("false", "true"):
-            run_environment = dict(environment)
-            run_environment["SDSYNC_DELETE"] = delete_value
-            result = subprocess.run(
-                ["/bin/sh", str(runner), "sync", "argparse-check", "false", "foreground", "-"],
-                env=run_environment,
+        def write_private(path: Path, value: str) -> None:
+            path.write_text(value, encoding="ascii")
+            path.chmod(0o600)
+
+        controller_lock = runtime / "controller.lock"
+        controller_lock.mkdir(mode=0o700)
+        write_private(
+            controller_lock / "pid",
+            f"{controller_process.pid}\n{process_start(controller_process.pid)}\n{boot}\n",
+        )
+        write_private(runtime / "controller.pid", f"{controller_process.pid}\n")
+        write_private(
+            runtime / "controller.ready",
+            f"{controller_process.pid}\n{process_start(controller_process.pid)}\n{boot}\n",
+        )
+        write_private(runtime / "api.pid", f"{api_process.pid}\n")
+        write_private(
+            runtime / "api.ready",
+            f"{api_process.pid}\n{process_start(api_process.pid)}\n{boot}\n",
+        )
+
+        try:
+            configured = subprocess.run(
+                [
+                    "/bin/sh",
+                    str(manager),
+                    "configure-profile",
+                    "--name",
+                    "argparse-check",
+                    "--source",
+                    str(source),
+                    "--url",
+                    "https://files.example.invalid",
+                    "--username",
+                    "argparse-check",
+                    "--remote",
+                    "/argparse-check",
+                    "--remote-log-url",
+                    "https://logs.example.invalid/ingest",
+                    "--default",
+                ],
+                env=environment,
                 capture_output=True,
                 text=True,
-                timeout=20,
+                timeout=15,
                 check=False,
             )
-            _assert_no_clap_conflict(
-                result, f"sdsync-run with an ambient SDSYNC_DELETE={delete_value}"
+            if configured.returncode != 0:
+                raise AssertionError(
+                    "could not build a Synology package fixture profile for argument-parsing "
+                    f"validation: stdout={configured.stdout!r} stderr={configured.stderr!r}"
+                )
+
+            password_input = temporary / "password.input"
+            password_input.write_text("test-only-secret\n", encoding="utf-8")
+            stored = subprocess.run(
+                [
+                    "/bin/sh",
+                    str(manager),
+                    "set-password",
+                    "argparse-check",
+                    "--from-file",
+                    str(password_input),
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
             )
+            if stored.returncode != 0:
+                raise AssertionError(
+                    "could not store a Synology package fixture password for argument-parsing "
+                    f"validation: stdout={stored.stdout!r} stderr={stored.stderr!r}"
+                )
+
+            for delete_value in ("false", "true"):
+                run_environment = dict(environment)
+                run_environment["SDSYNC_DELETE"] = delete_value
+                result = subprocess.run(
+                    [
+                        "/bin/sh",
+                        str(runner),
+                        "sync",
+                        "argparse-check",
+                        "false",
+                        "foreground",
+                        "-",
+                    ],
+                    env=run_environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                )
+                _assert_no_clap_conflict(
+                    result, f"sdsync-run with an ambient SDSYNC_DELETE={delete_value}"
+                )
+        finally:
+            for process in (controller_process, api_process):
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
 
 
 SYSTEMD_BINARY_PATH = Path("/usr/local/bin/synology-drive-sync")

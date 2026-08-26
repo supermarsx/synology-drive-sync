@@ -1,7 +1,7 @@
 # DSM 7 package
 
-This directory builds the current manually installable Synology DSM 7 package source, planned to
-first ship its administrator-only native Vue AppWindow in release 26.10. It also includes the
+This directory builds the current manually installable Synology DSM 7 package source. Release 26.10
+introduced its administrator-only native Vue AppWindow. The package also includes the
 `sdsync-dsm` SSH manager. Install it on the NAS that
 owns the authoritative source directory; the package reads that directory locally and sends changes
 over HTTPS to a destination accepted by the remote NAS File Station WebAPI.
@@ -95,12 +95,15 @@ unify. The package has no kernel module, so all aliases use the same validated u
 ARMv5/88f628x and PowerPC devices are not part of this DSM 7 package: their official toolchains and
 supported DSM generations require a separate legacy package design.
 
-The SPK contains the project license, generated third-party notices, and musl's upstream `COPYRIGHT` both in the outer package and under the installed `share/licenses` directory.
+The SPK contains the project license, generated Rust dependency notices, DSM AppWindow bundled-code
+notices, and musl's upstream `COPYRIGHT` both in the outer package and under the installed
+`share/licenses` directory. Vue is externalized to DSM; UI packages used only during the build are
+not presented as shipped runtime dependencies.
 
 ## Install and initial configuration
 
-1. For the native AppWindow flow below, use a verified 26.10-or-later SPK only when that release is
-   published. Releases 26.7-26.9 retain their originally published UI. In DSM Package Center, choose
+1. For the native AppWindow flow below, use a verified 26.10-or-later SPK. Releases 26.7-26.9 retain
+   their originally published UI. In DSM Package Center, choose
    **Manual Install** and select the SPK for the NAS architecture. DSM
    normally warns that this is a third-party package; that publisher-trust warning is expected for a
    package not distributed by Synology. A refusal saying root or lower privileges are required is a
@@ -212,7 +215,18 @@ sudo tail -n 200 /var/packages/synology-drive-sync/var/log/api.log
 
 ## Upgrade and uninstall
 
-DSM stops a started package before upgrade. The lifecycle scripts additionally refuse upgrade or uninstall while either the controller or a foreground run PID is live. Configuration and credentials are retained across upgrade and validated against the new binary before service restart.
+DSM stops a started package before upgrade. The manifest declares `auto_upgrade_from="26.7-1"`;
+26.7-1 through 26.10-1 share the reviewed markerless lifecycle generation, while 26.5/26.6 are not
+direct-upgrade eligible. Read-only pre-upgrade checks reject a live runner or exact orphaned package
+core, and the new post-install hook safely adopts only a strictly validated stale legacy run lock.
+Configuration and credentials are retained across upgrade and validated against the new binary
+before service restart. GitHub Releases are a Manual Install channel, not a private Package Center
+feed or self-updater.
+
+Because Synology's `preupgrade` hook is read-only, this markerless compatibility path cannot publish
+a new exclusion lock. Do not run `sdsync-dsm` or other package-private commands concurrently with
+the Package Center upgrade; the path assumes DSM serializes the package transaction and that the
+package service UID remains trusted.
 
 On a real uninstall (`SYNOPKG_PKG_STATUS=UNINSTALL`), the post-uninstall script removes only this package's configuration, credentials, runtime state, and logs under `/var/packages/synology-drive-sync/{home,var}`. It does not touch any source directory or remote NAS data. This purge is permanent.
 

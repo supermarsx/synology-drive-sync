@@ -1,12 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
   <title id="title">Synology Drive Sync</title>
-  <desc id="desc">Two mint paths circulate safely inside a dark rounded square.</desc>
-  <rect x="16" y="16" width="224" height="224" rx="49" fill="#08110f"/>
-  <rect x="17" y="17" width="222" height="222" rx="48" fill="none" stroke="#21463e" stroke-width="2"/>
-  <circle cx="128" cy="128" r="90.88" fill="none" stroke="#25423a" stroke-width="2.048"/>
-  <path d="M63.638 106.557 A67.84 67.84 0 0 1 189.944 100.338" fill="none" stroke="#65e6c7" stroke-width="16.896" stroke-linecap="butt"/>
-  <path d="M191.956 150.624 A67.84 67.84 0 0 1 66.668 156.993" fill="none" stroke="#2fb69d" stroke-width="16.896" stroke-linecap="butt"/>
-  <polygon points="195.501,121.227 210.648,92.693 174.987,96.271" fill="#65e6c7"/>
-  <polygon points="60.661,136.229 46.134,165.084 81.709,160.736" fill="#2fb69d"/>
-  <circle cx="128" cy="128" r="14.08" fill="#d9fff5"/>
+  <desc id="desc">Two clean ember trace arrows circulate above a soot-black eight-bit circuit mark.</desc>
+  <rect x="16" y="16" width="224" height="224" rx="49" fill="#0b0706"/>
+  <rect x="17" y="17" width="222" height="222" rx="48" fill="none" stroke="#4a1b10" stroke-width="2"/>
+  <polyline points="72.960,39.680 183.040,39.680 216.320,72.960 216.320,183.040 183.040,216.320 72.960,216.320 39.680,183.040 39.680,72.960 72.960,39.680" fill="none" stroke="#6b2718" stroke-width="2.560" stroke-linecap="square" stroke-linejoin="miter"/>
+  <polygon points="128.000,113.920 142.080,128.000 128.000,142.080 113.920,128.000" fill="#ffd2a3"/>
+  <polyline points="62.720,116.480 70.400,89.600 92.160,69.120 128.000,61.440 163.840,69.120 181.760,89.600" fill="none" stroke="#ff6a1a" stroke-width="16.384" stroke-linecap="butt" stroke-linejoin="miter"/>
+  <polyline points="193.280,139.520 185.600,166.400 163.840,186.880 128.000,194.560 92.160,186.880 74.240,166.400" fill="none" stroke="#d72e16" stroke-width="16.384" stroke-linecap="butt" stroke-linejoin="miter"/>
+  <polygon points="202.240,113.920 167.074,101.967 196.446,77.233" fill="#ff6a1a"/>
+  <polygon points="53.760,142.080 88.926,154.033 59.554,178.767" fill="#d72e16"/>
 </svg>

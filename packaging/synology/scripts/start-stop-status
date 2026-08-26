@@ -2,14 +2,316 @@
 set -eu
 . "$(dirname "$0")/common"
 umask 077
+status_allow_closed_admission=false
+
+lifecycle_lock_held=false
+lifecycle_lock=
+
+acquire_lifecycle_serialization() {
+    lifecycle_lock=$runtime_root/lifecycle.lock
+    lifecycle_acquire_status=0
+    acquire_private_process_lock "$lifecycle_lock" || lifecycle_acquire_status=$?
+    if [ "$lifecycle_acquire_status" -ne 0 ]; then
+        package_message "cannot serialize package lifecycle state (lock status $lifecycle_acquire_status)"
+        return 1
+    fi
+    lifecycle_lock_held=true
+}
+
+release_lifecycle_serialization() {
+    [ "$lifecycle_lock_held" = true ] || return 0
+    release_private_process_lock "$lifecycle_lock" || return 1
+    lifecycle_lock_held=false
+}
+
+capture_direct_child_start() {
+    captured_child_pid=$1
+    case $captured_child_pid in ''|*[!0-9]*) return 73 ;; esac
+    [ "$captured_child_pid" -gt 1 ] 2>/dev/null || return 73
+    captured_child_expected_uid=$(package_uid 2>/dev/null || true)
+    case $captured_child_expected_uid in ''|*[!0-9]*) return 73 ;; esac
+    captured_child_start=$(process_start_time "$captured_child_pid" 2>/dev/null || true)
+    captured_child_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "/proc/$captured_child_pid/status" 2>/dev/null | sed -n '1p')
+    captured_child_parent=$(sed -n 's/^PPid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "/proc/$captured_child_pid/status" 2>/dev/null | sed -n '1p')
+    case $captured_child_start in ''|*[!0-9]*|0) return 73 ;; esac
+    [ "$captured_child_uid" = "$captured_child_expected_uid" ] \
+        && [ "$captured_child_parent" = "$$" ] || return 73
+    captured_child_start_recheck=$(process_start_time "$captured_child_pid" 2>/dev/null || true)
+    captured_child_uid_recheck=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "/proc/$captured_child_pid/status" 2>/dev/null | sed -n '1p')
+    captured_child_parent_recheck=$(sed -n 's/^PPid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "/proc/$captured_child_pid/status" 2>/dev/null | sed -n '1p')
+    [ "$captured_child_start_recheck" = "$captured_child_start" ] \
+        && [ "$captured_child_uid_recheck" = "$captured_child_expected_uid" ] \
+        && [ "$captured_child_parent_recheck" = "$$" ] || return 73
+    printf '%s\n' "$captured_child_start"
+}
+
+# Return 0 only for the exact still-running direct child, 1 only after exact
+# absence or a verified zombie, and 73 for replacement/uninspectable state.
+# The PPid check is retained across the permitted Rust-to-controller exec.
+launched_child_identity_status() {
+    launched_identity_pid=$1
+    launched_identity_start=$2
+    launched_identity_boot=$3
+    launched_identity_current_boot=$(boot_identity) || return 73
+    [ "$launched_identity_current_boot" = "$launched_identity_boot" ] || return 73
+    [ -e "/proc/$launched_identity_pid" ] || return 1
+    launched_identity_state=$(sed -n 's/^.*) \([^ ]\).*/\1/p' \
+        "/proc/$launched_identity_pid/stat" 2>/dev/null || true)
+    launched_identity_actual_start=$(process_start_time "$launched_identity_pid" 2>/dev/null || true)
+    launched_identity_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "/proc/$launched_identity_pid/status" 2>/dev/null | sed -n '1p')
+    launched_identity_parent=$(sed -n 's/^PPid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "/proc/$launched_identity_pid/status" 2>/dev/null | sed -n '1p')
+    if [ -z "$launched_identity_state" ] || [ -z "$launched_identity_actual_start" ] \
+        || [ -z "$launched_identity_uid" ] || [ -z "$launched_identity_parent" ]; then
+        [ -e "/proc/$launched_identity_pid" ] && return 73
+        return 1
+    fi
+    [ "$launched_identity_actual_start" = "$launched_identity_start" ] \
+        && [ "$launched_identity_uid" = "$path_owner" ] \
+        && [ "$launched_identity_parent" = "$$" ] || return 73
+    [ "$launched_identity_state" != Z ] || return 1
+    pid_is_live "$launched_identity_pid" || {
+        [ -e "/proc/$launched_identity_pid" ] && return 73
+        return 1
+    }
+    launched_identity_start_recheck=$(process_start_time "$launched_identity_pid" 2>/dev/null || true)
+    launched_identity_uid_recheck=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "/proc/$launched_identity_pid/status" 2>/dev/null | sed -n '1p')
+    launched_identity_parent_recheck=$(sed -n 's/^PPid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "/proc/$launched_identity_pid/status" 2>/dev/null | sed -n '1p')
+    [ "$launched_identity_start_recheck" = "$launched_identity_start" ] \
+        && [ "$launched_identity_uid_recheck" = "$path_owner" ] \
+        && [ "$launched_identity_parent_recheck" = "$$" ] || return 73
+}
+
+hard_stop_exact_launched_child() {
+    hard_stop_pid=$1
+    hard_stop_start=$2
+    hard_stop_boot=$3
+    hard_stop_status=0
+    launched_child_identity_status "$hard_stop_pid" "$hard_stop_start" "$hard_stop_boot" || \
+        hard_stop_status=$?
+    case $hard_stop_status in
+        0) ;;
+        1) wait "$hard_stop_pid" 2>/dev/null || true; return 0 ;;
+        *) return 73 ;;
+    esac
+    kill -KILL "$hard_stop_pid" 2>/dev/null || true
+    hard_stop_count=0
+    while [ "$hard_stop_count" -lt 3 ]; do
+        hard_stop_status=0
+        launched_child_identity_status "$hard_stop_pid" "$hard_stop_start" "$hard_stop_boot" || \
+            hard_stop_status=$?
+        case $hard_stop_status in
+            0) ;;
+            1) wait "$hard_stop_pid" 2>/dev/null || true; return 0 ;;
+            *) return 73 ;;
+        esac
+        sleep 1
+        hard_stop_count=$((hard_stop_count + 1))
+    done
+    return 75
+}
+
+read_failed_start_child_marker() {
+    failed_marker_kind=$1
+    failed_marker_output=$("$api_server" --failed-start-child status "$failed_marker_kind") || return $?
+    if [ "$failed_marker_output" = absent ]; then
+        return 1
+    fi
+    set -- $failed_marker_output
+    [ "$#" -eq 4 ] && [ "$1" = present ] || return 73
+    failed_marker_pid=$2
+    failed_marker_start=$3
+    failed_marker_boot=$4
+    case $failed_marker_pid:$failed_marker_start in
+        *[!0-9:]*|:*|*:0) return 73 ;;
+    esac
+    [ "$failed_marker_pid" -gt 1 ] 2>/dev/null || return 73
+    valid_boot_identity "$failed_marker_boot" || return 73
+}
+
+# Return 0 for the exact live marked child, 1 only when that recorded process
+# is provably absent/replaced/zombie, and 73 when procfs cannot prove either.
+failed_start_child_identity_status() {
+    failed_identity_pid=$1
+    failed_identity_start=$2
+    failed_identity_boot=$3
+    failed_identity_current_boot=$(boot_identity) || return 73
+    [ "$failed_identity_current_boot" = "$failed_identity_boot" ] || return 1
+    [ -e "/proc/$failed_identity_pid" ] || return 1
+    failed_identity_state=$(sed -n 's/^.*) \([^ ]\).*/\1/p' \
+        "/proc/$failed_identity_pid/stat" 2>/dev/null || true)
+    failed_identity_actual_start=$(process_start_time "$failed_identity_pid" 2>/dev/null || true)
+    failed_identity_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "/proc/$failed_identity_pid/status" 2>/dev/null | sed -n '1p')
+    if [ -z "$failed_identity_state" ] || [ -z "$failed_identity_actual_start" ] \
+        || [ -z "$failed_identity_uid" ]; then
+        [ -e "/proc/$failed_identity_pid" ] && return 73
+        return 1
+    fi
+    [ "$failed_identity_actual_start" = "$failed_identity_start" ] || return 1
+    [ "$failed_identity_uid" = "$path_owner" ] || return 73
+    [ "$failed_identity_state" != Z ] || return 1
+    script_pid_live "$failed_identity_pid" || {
+        [ -e "/proc/$failed_identity_pid" ] && return 73
+        return 1
+    }
+    failed_identity_start_recheck=$(process_start_time "$failed_identity_pid" 2>/dev/null || true)
+    failed_identity_uid_recheck=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "/proc/$failed_identity_pid/status" 2>/dev/null | sed -n '1p')
+    [ "$failed_identity_start_recheck" = "$failed_identity_start" ] \
+        && [ "$failed_identity_uid_recheck" = "$path_owner" ] || return 73
+}
+
+failed_start_markers_status() {
+    failed_markers_stale=false
+    for failed_status_kind in api controller; do
+        failed_status_read=0
+        read_failed_start_child_marker "$failed_status_kind" || failed_status_read=$?
+        case $failed_status_read in
+            0)
+                failed_status_identity=0
+                failed_start_child_identity_status "$failed_marker_pid" "$failed_marker_start" \
+                    "$failed_marker_boot" || failed_status_identity=$?
+                case $failed_status_identity in
+                    0)
+                        failed_start_child_command_matches "$failed_status_kind" \
+                            "$failed_marker_pid" || return 73
+                        return 0
+                        ;;
+                    1) failed_markers_stale=true ;;
+                    *) return 73 ;;
+                esac
+                ;;
+            1) ;;
+            *) return 73 ;;
+        esac
+    done
+    [ "$failed_markers_stale" = true ] && return 1
+    return 2
+}
+
+clear_stale_failed_start_markers() {
+    for failed_clear_kind in api controller; do
+        failed_clear_read=0
+        read_failed_start_child_marker "$failed_clear_kind" || failed_clear_read=$?
+        case $failed_clear_read in
+            0)
+                failed_clear_identity=0
+                failed_start_child_identity_status "$failed_marker_pid" "$failed_marker_start" \
+                    "$failed_marker_boot" || failed_clear_identity=$?
+                case $failed_clear_identity in
+                    0) return 75 ;;
+                    1)
+                        "$api_server" --failed-start-child clear "$failed_clear_kind" \
+                            "$failed_marker_pid" "$failed_marker_start" "$failed_marker_boot" || return $?
+                        ;;
+                    *) return 73 ;;
+                esac
+                ;;
+            1) ;;
+            *) return 73 ;;
+        esac
+    done
+}
+
+stop_failed_start_children() {
+    for failed_stop_kind in api controller; do
+        failed_stop_read=0
+        read_failed_start_child_marker "$failed_stop_kind" || failed_stop_read=$?
+        case $failed_stop_read in
+            1) continue ;;
+            0) ;;
+            *) return 73 ;;
+        esac
+        failed_stop_pid=$failed_marker_pid
+        failed_stop_start=$failed_marker_start
+        failed_stop_boot=$failed_marker_boot
+        failed_stop_identity=0
+        failed_start_child_identity_status "$failed_stop_pid" "$failed_stop_start" \
+            "$failed_stop_boot" || failed_stop_identity=$?
+        case $failed_stop_identity in
+            0)
+                failed_start_child_command_matches "$failed_stop_kind" "$failed_stop_pid" || return 73
+                kill -TERM "$failed_stop_pid" 2>/dev/null || true
+                ;;
+            1)
+                "$api_server" --failed-start-child clear "$failed_stop_kind" \
+                    "$failed_stop_pid" "$failed_stop_start" "$failed_stop_boot" || return $?
+                continue
+                ;;
+            *) return 73 ;;
+        esac
+        failed_stop_count=0
+        while [ "$failed_stop_count" -lt 3 ]; do
+            failed_stop_identity=0
+            failed_start_child_identity_status "$failed_stop_pid" "$failed_stop_start" \
+                "$failed_stop_boot" || failed_stop_identity=$?
+            [ "$failed_stop_identity" -ne 0 ] && break
+            sleep 1
+            failed_stop_count=$((failed_stop_count + 1))
+        done
+        if [ "$failed_stop_identity" -eq 0 ]; then
+            failed_start_child_command_matches "$failed_stop_kind" "$failed_stop_pid" || return 73
+            kill -KILL "$failed_stop_pid" 2>/dev/null || true
+            failed_stop_count=0
+            while [ "$failed_stop_count" -lt 3 ]; do
+                failed_stop_identity=0
+                failed_start_child_identity_status "$failed_stop_pid" "$failed_stop_start" \
+                    "$failed_stop_boot" || failed_stop_identity=$?
+                [ "$failed_stop_identity" -ne 0 ] && break
+                sleep 1
+                failed_stop_count=$((failed_stop_count + 1))
+            done
+        fi
+        case $failed_stop_identity in
+            1)
+                "$api_server" --failed-start-child clear "$failed_stop_kind" \
+                    "$failed_stop_pid" "$failed_stop_start" "$failed_stop_boot" || return $?
+                ;;
+            0) return 75 ;;
+            *) return 73 ;;
+        esac
+    done
+}
 
 status_code() {
+    failed_child_topology=0
+    failed_start_markers_status || failed_child_topology=$?
+    case $failed_child_topology in
+        0) return 2 ;;
+        1) failed_child_stale=true ;;
+        2) failed_child_stale=false ;;
+        *) return 2 ;;
+    esac
+    run_topology_live=false
+    run_topology_stale=false
+    if [ -e "$run_lock" ] || [ -L "$run_lock" ]; then
+        run_topology_status=0
+        private_process_lock_is_live "$run_lock" || run_topology_status=$?
+        case $run_topology_status in
+            0) run_topology_live=true ;;
+            1) run_topology_stale=true ;;
+            *) return 2 ;;
+        esac
+    fi
     controller_active=false
     controller_stale=false
-    saved_pid=$(script_pid "$controller_pid_file" 2>/dev/null || true)
+    saved_pid=
     if api_path_exists "$controller_pid_file"; then
+        controller_pid_file_safe || return 2
+        saved_pid=$controller_pid_value
         [ -n "$saved_pid" ] || return 2
-        if script_pid_matches "$saved_pid" "$controller"; then
+        if controller_pid_matches "$saved_pid"; then
+            controller_ready_check=0
+            controller_ready_matches "$saved_pid" || controller_ready_check=$?
+            [ "$controller_ready_check" -eq 0 ] || return 2
             controller_active=true
         elif script_pid_live "$saved_pid"; then
             return 2
@@ -17,12 +319,31 @@ status_code() {
             controller_stale=true
         fi
     fi
+    if [ -e "$controller_ready_file" ] || [ -L "$controller_ready_file" ]; then
+        controller_ready_check=0
+        controller_ready_status || controller_ready_check=$?
+        case $controller_ready_check in
+            0) [ "$controller_active" = true ] || return 2 ;;
+            1) controller_stale=true ;;
+            *) return 2 ;;
+        esac
+    fi
     if api_path_exists "$controller_lock"; then
         [ -d "$controller_lock" ] && [ ! -L "$controller_lock" ] || return 2
         [ "$controller_active" = true ] || controller_stale=true
     fi
+    if api_path_exists "$controller_start_file"; then
+        controller_start_check=0
+        controller_start_lease_status || controller_start_check=$?
+        case $controller_start_check in
+            0) return 2 ;;
+            1) controller_stale=true ;;
+            *) return 2 ;;
+        esac
+    fi
 
     api_active=false
+    api_process_live=false
     api_stale=false
     saved_api_pid=
     if api_path_exists "$api_pid_file"; then
@@ -31,6 +352,8 @@ status_code() {
         [ -n "$saved_api_pid" ] || return 2
         if script_pid_live "$saved_api_pid"; then
             api_pid_matches "$saved_api_pid" || return 2
+            api_process_live=true
+            api_ready_matches "$saved_api_pid" || return 2
             api_socket_safe >/dev/null 2>&1 || return 2
             api_active=true
         else
@@ -48,21 +371,77 @@ status_code() {
             api_stale=true
         fi
     fi
+    if api_path_exists "$api_ready_file"; then
+        api_ready_check=0
+        api_ready_status || api_ready_check=$?
+        case $api_ready_check in
+            0) [ "$api_active" = true ] || return 2 ;;
+            1) api_stale=true ;;
+            *) return 2 ;;
+        esac
+    fi
+    if api_path_exists "$api_bound_file"; then
+        api_bound_check=0
+        api_bound_status || api_bound_check=$?
+        case $api_bound_check in
+            0) return 2 ;;
+            1) api_stale=true ;;
+            *) return 2 ;;
+        esac
+    fi
 
     if [ "$controller_active" = true ] && [ "$api_active" = true ]; then
+        [ "$failed_child_stale" = false ] && [ "$run_topology_stale" = false ] || return 2
+        status_transition_state=$(package_transition_status 2>/dev/null) || return 2
+        [ "$status_transition_state" = open ] || return 2
+        status_service_state=$(service_admission_status 2>/dev/null) || return 2
+        if [ "$status_service_state" != open ]; then
+            [ "${status_allow_closed_admission:-false}" = true ] \
+                && [ "$status_service_state" = closed ] || return 2
+        fi
         return 0
     fi
-    if [ "$controller_active" = true ] || [ "$api_active" = true ]; then
+    if [ "$controller_active" = true ] || [ "$api_active" = true ] || \
+        [ "$api_process_live" = true ] || [ "$run_topology_live" = true ]; then
         return 2
     fi
     if [ "$controller_stale" = true ] || [ "$api_stale" = true ]; then
         return 1
     fi
+    [ "$failed_child_stale" = false ] && [ "$run_topology_stale" = false ] || return 1
     return 3
 }
 
 prepare_api_start() {
     api_socket_parent_safe || return 1
+
+    api_bound_cleanup_status=0
+    remove_stale_api_bound || api_bound_cleanup_status=$?
+    case $api_bound_cleanup_status in
+        0) ;;
+        75)
+            package_message "refusing to replace a live pre-commit API identity"
+            return 1
+            ;;
+        *)
+            package_message "refusing unsafe stale pre-commit API state"
+            return 1
+            ;;
+    esac
+
+    api_ready_cleanup_status=0
+    remove_stale_api_ready || api_ready_cleanup_status=$?
+    case $api_ready_cleanup_status in
+        0) ;;
+        75)
+            package_message "refusing to replace a live API readiness identity"
+            return 1
+            ;;
+        *)
+            package_message "refusing unsafe stale API readiness state"
+            return 1
+            ;;
+    esac
 
     if api_path_exists "$api_pid_file"; then
         api_pid_file_safe || {
@@ -96,65 +475,124 @@ prepare_api_start() {
 cleanup_failed_start() {
     [ "${start_committed:-false}" = false ] || return 0
     set +e
-    if [ -n "${launched_controller_pid:-}" ] && \
-        script_pid_matches "$launched_controller_pid" "$controller"; then
-        kill -TERM "$launched_controller_pid" 2>/dev/null
-    fi
-    cleanup_api_owned=false
-    cleanup_api_signaled=false
+    # Removing the uncommitted lease makes both children fail closed. Keep
+    # signalling the direct, unreaped child PIDs while they transition from
+    # their Rust supervisors into published service identities; no final-check
+    # window can escape because parent-death supervision remains armed until a
+    # commit that this failure path never writes.
+    remove_own_controller_start_lease >/dev/null 2>&1 || true
     cleanup_api_socket_identity=${launched_api_socket_identity:-}
-    if [ -n "${launched_api_pid:-}" ]; then
-        # The PID is the direct child returned by this shell. Give its wrapper
-        # a bounded chance to publish the same PID and exec the exact --serve
-        # argv before deciding whether it is safe to signal.
-        cleanup_transition_count=0
-        while script_pid_live "$launched_api_pid" && \
-            ! api_pid_matches "$launched_api_pid" && \
-            [ "$cleanup_transition_count" -lt 3 ]; do
-            sleep 1
-            cleanup_transition_count=$((cleanup_transition_count + 1))
-        done
-        cleanup_saved_api_pid=$(api_pid 2>/dev/null || true)
-        if [ "$cleanup_saved_api_pid" = "$launched_api_pid" ]; then
-            cleanup_api_owned=true
-        fi
-        if [ "$cleanup_api_owned" = true ] && api_pid_matches "$launched_api_pid"; then
-            if [ -z "$cleanup_api_socket_identity" ] && api_path_exists "$api_socket"; then
-                cleanup_api_socket_identity=$(api_socket_identity 2>/dev/null || true)
-            fi
-            kill -TERM "$launched_api_pid" 2>/dev/null
-            cleanup_api_signaled=true
-        fi
-    fi
     cleanup_count=0
     while [ "$cleanup_count" -lt 10 ]; do
         cleanup_live=false
         if [ -n "${launched_controller_pid:-}" ] && \
-            script_pid_matches "$launched_controller_pid" "$controller"; then
-            cleanup_live=true
+            [ -n "${launched_controller_start:-}" ]; then
+            cleanup_controller_identity=0
+            launched_child_identity_status "$launched_controller_pid" "$launched_controller_start" \
+                "$launched_controller_boot" || cleanup_controller_identity=$?
+            if [ "$cleanup_controller_identity" -eq 0 ]; then
+                cleanup_live=true
+                kill -TERM "$launched_controller_pid" 2>/dev/null || true
+            fi
         fi
-        if [ -n "${launched_api_pid:-}" ] && \
-            api_pid_matches "$launched_api_pid"; then
-            cleanup_live=true
+        if [ -n "${launched_api_pid:-}" ] && [ -n "${launched_api_start:-}" ]; then
+            cleanup_api_identity=0
+            launched_child_identity_status "$launched_api_pid" "$launched_api_start" \
+                "$launched_api_boot" || cleanup_api_identity=$?
+            if [ "$cleanup_api_identity" -eq 0 ]; then
+                cleanup_live=true
+                if [ -z "$cleanup_api_socket_identity" ] && \
+                    api_pid_matches "$launched_api_pid" && api_path_exists "$api_socket"; then
+                    cleanup_api_socket_identity=$(api_socket_identity 2>/dev/null || true)
+                fi
+                kill -TERM "$launched_api_pid" 2>/dev/null || true
+            fi
         fi
         [ "$cleanup_live" = true ] || break
         sleep 1
         cleanup_count=$((cleanup_count + 1))
     done
-    if [ "$cleanup_api_signaled" = true ] && ! script_pid_live "$launched_api_pid"; then
-        wait "$launched_api_pid" 2>/dev/null
+    cleanup_controller_identity=1
+    if [ -n "${launched_controller_pid:-}" ] && \
+        [ -n "${launched_controller_start:-}" ]; then
+        cleanup_controller_identity=0
+        launched_child_identity_status "$launched_controller_pid" "$launched_controller_start" \
+            "$launched_controller_boot" || cleanup_controller_identity=$?
+        if [ "$cleanup_controller_identity" -eq 0 ]; then
+            cleanup_controller_hard_stop=0
+            hard_stop_exact_launched_child "$launched_controller_pid" \
+                "$launched_controller_start" "$launched_controller_boot" || \
+                cleanup_controller_hard_stop=$?
+            [ "$cleanup_controller_hard_stop" -eq 0 ] && cleanup_controller_identity=1
+        fi
     fi
-    if [ "$cleanup_api_owned" = true ] && \
-        ! script_pid_live "$launched_api_pid"; then
-        if [ "$cleanup_api_signaled" = true ] && \
-            [ -n "$cleanup_api_socket_identity" ]; then
-            remove_safe_api_socket "$cleanup_api_socket_identity" >/dev/null 2>&1
+    cleanup_api_identity=1
+    if [ -n "${launched_api_pid:-}" ] && [ -n "${launched_api_start:-}" ]; then
+        cleanup_api_identity=0
+        launched_child_identity_status "$launched_api_pid" "$launched_api_start" \
+            "$launched_api_boot" || cleanup_api_identity=$?
+        if [ "$cleanup_api_identity" -eq 0 ]; then
+            cleanup_api_hard_stop=0
+            hard_stop_exact_launched_child "$launched_api_pid" "$launched_api_start" \
+                "$launched_api_boot" || cleanup_api_hard_stop=$?
+            [ "$cleanup_api_hard_stop" -eq 0 ] && cleanup_api_identity=1
+        fi
+    fi
+    if [ "$cleanup_controller_identity" -ne 1 ] || [ "$cleanup_api_identity" -ne 1 ]; then
+        package_message "failed startup left a launched child live or uninspectable"
+    fi
+    if [ -n "$launched_controller_pid" ] && [ "$cleanup_controller_identity" -ne 1 ]; then
+        "$api_server" --failed-start-child record controller "$launched_controller_pid" \
+            "$launched_controller_start" "$launched_controller_boot" || \
+            package_message "failed controller child identity could not be persisted"
+    fi
+    if [ -n "$launched_api_pid" ] && [ "$cleanup_api_identity" -ne 1 ]; then
+        "$api_server" --failed-start-child record api "$launched_api_pid" \
+            "$launched_api_start" "$launched_api_boot" || \
+            package_message "failed API child identity could not be persisted"
+    fi
+    if [ -n "${launched_controller_pid:-}" ] && \
+        [ "$cleanup_controller_identity" -eq 1 ]; then
+        wait "$launched_controller_pid" 2>/dev/null || true
+    fi
+    if [ -n "${launched_api_pid:-}" ] && [ "$cleanup_api_identity" -eq 1 ]; then
+        wait "$launched_api_pid" 2>/dev/null || true
+        if [ -n "$cleanup_api_socket_identity" ]; then
+            remove_safe_api_socket "$cleanup_api_socket_identity" >/dev/null 2>&1 || true
+        elif api_path_exists "$api_socket"; then
+            "$api_server" --cleanup-stale-api-socket >/dev/null 2>&1 || true
         fi
         cleanup_saved_api_pid=$(api_pid 2>/dev/null || true)
         if [ -n "$cleanup_saved_api_pid" ] && [ "$cleanup_saved_api_pid" = "$launched_api_pid" ]; then
             remove_safe_api_pid_file >/dev/null 2>&1
         fi
+        remove_stale_api_bound >/dev/null 2>&1 || true
+        remove_stale_api_ready >/dev/null 2>&1 || true
     fi
+    if [ -n "${launched_controller_pid:-}" ] && \
+        [ "$cleanup_controller_identity" -eq 1 ]; then
+        cleanup_controller_lock_status=0
+        acquire_private_process_lock "$controller_lock" || cleanup_controller_lock_status=$?
+        if [ "$cleanup_controller_lock_status" -eq 0 ]; then
+            remove_stale_controller_ready >/dev/null 2>&1 || true
+            remove_stale_controller_pid_file >/dev/null 2>&1 || true
+            release_private_process_lock "$controller_lock" >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+finish_start() {
+    # EXIT cleanup is the only remaining owner of the startup topology. A
+    # second DSM signal must not re-enter exit and skip exact child cleanup
+    # or durable failed-start marker publication.
+    trap '' HUP INT TERM
+    cleanup_failed_start
+    if [ "${start_event_pending:-false}" = true ]; then
+        append_lifecycle_event start_failed >/dev/null 2>&1 || \
+            package_message "warning: failed start could not be recorded in package Activity"
+        start_event_pending=false
+    fi
+    release_lifecycle_serialization >/dev/null 2>&1 || true
 }
 
 case ${1:-} in
@@ -167,60 +605,157 @@ case ${1:-} in
         exit 0
         ;;
     start)
+        lifecycle_controller=$controller
+        . "$common_runtime"
+        require_package_identity
+        ensure_layout
+        start_committed=false
+        launched_api_pid=
+        launched_api_start=
+        launched_api_boot=
+        launched_api_socket_identity=
+        launched_controller_pid=
+        launched_controller_start=
+        launched_controller_boot=
+        start_event_pending=false
+        restart_event_pending=false
+        startup_timeout=${SDSYNC_DSM_START_TIMEOUT:-120}
+        case $startup_timeout in ''|*[!0-9]*)
+            package_message "invalid service startup timeout"
+            exit 1
+            ;;
+        esac
+        if [ "$startup_timeout" -lt 1 ] || [ "$startup_timeout" -gt 600 ]; then
+            package_message "service startup timeout must be between 1 and 600 seconds"
+            exit 1
+        fi
+        trap finish_start 0
+        trap 'exit 1' HUP INT TERM
+        acquire_lifecycle_serialization || exit 1
+        start_transition_state=$(package_transition_status) || {
+            package_message "cannot validate package transition state"
+            exit 1
+        }
+        [ "$start_transition_state" = open ] || {
+            package_message "cannot start while package $start_transition_state is in progress"
+            exit 1
+        }
         set +e
         status_code
         current_status=$?
         set -e
         case $current_status in
-            0) exit 0 ;;
+            0)
+                "$api_server" --service-admission open || {
+                    package_message "running service admission state is unsafe"
+                    exit 1
+                }
+                exit 0
+                ;;
             2)
+                # A signal/crash after stop closed admission but before it
+                # signalled either exact service leaves a fully ready pair
+                # intentionally fenced. Validate the complete topology while
+                # still holding lifecycle.lock, then reopen only that state.
+                status_allow_closed_admission=true
+                set +e
+                status_code
+                repairable_closed_status=$?
+                set -e
+                status_allow_closed_admission=false
+                if [ "$repairable_closed_status" -eq 0 ]; then
+                    "$api_server" --service-admission open || {
+                        package_message "ready service admission state could not be repaired"
+                        exit 1
+                    }
+                    release_lifecycle_serialization || exit 1
+                    trap - 0 HUP INT TERM
+                    package_message "API service and controller admission restored"
+                    exit 0
+                fi
                 package_message "refusing to start from an inconsistent lifecycle state"
                 exit 1
                 ;;
         esac
-        lifecycle_controller=$controller
-        . "$common_runtime"
-        require_package_identity
-        ensure_layout
+        clear_failed_start_status=0
+        clear_stale_failed_start_markers || clear_failed_start_status=$?
+        case $clear_failed_start_status in
+            0) ;;
+            75)
+                package_message "refusing to start while a failed-start child remains live"
+                exit 1
+                ;;
+            *)
+                package_message "refusing unsafe failed-start child state"
+                exit 1
+                ;;
+        esac
+        "$api_server" --service-admission close || {
+            package_message "service admission could not be closed for startup"
+            exit 1
+        }
+        restart_marker_status=0
+        service_restart_pending || restart_marker_status=$?
+        case $restart_marker_status in
+            0) restart_event_pending=true ;;
+            1) ;;
+            *)
+                package_message "warning: unsafe package restart marker will not affect service startup"
+                ;;
+        esac
+        start_event_pending=true
         prepare_api_start
-        start_committed=false
-        launched_api_pid=
-        launched_api_socket_identity=
-        launched_controller_pid=
-        trap cleanup_failed_start 0
-        trap 'exit 1' HUP INT TERM
 
         [ ! -L "$api_log" ] || {
             package_message "refusing symlinked API log: $api_log"
             exit 1
         }
         rotate_log "$api_log" 10485760 5
-        # The child owns PID publication: it creates the 0600 file with
-        # noclobber before exec, so killing this lifecycle shell cannot strand
-        # a live API server without its PID record.
-        /bin/sh -c '
-            set -eu
-            umask 077
-            api_child_pid_file=$1
-            api_child_server=$2
-            set -C
-            printf "%s\n" "$$" > "$api_child_pid_file"
-            set +C
-            chmod 0600 "$api_child_pid_file"
-            exec "$api_child_server" --serve
-        ' sdsync-api-wrapper "$api_pid_file" "$api_server" \
+        rotate_log "$log_root/controller.log" 10485760 5
+        stale_controller_start_status=0
+        remove_stale_controller_start_lease || stale_controller_start_status=$?
+        case $stale_controller_start_status in
+            0) ;;
+            75)
+                package_message "refusing to replace a live service startup lease"
+                exit 1
+                ;;
+            *)
+                package_message "refusing unsafe service startup lease state"
+                exit 1
+                ;;
+        esac
+        # Publish the shared prepared lease before either child exists. Rust
+        # keeps each child's parent-death signal armed through PID/socket or
+        # controller-PID publication; neither child publishes final readiness
+        # until this parent commits the same exact lease.
+        publish_controller_start_lease || {
+            package_message "service startup lease could not be published"
+            exit 1
+        }
+        api_supervisor_start=$SDSYNC_DSM_CONTROLLER_START_PARENT_TICKS
+        api_supervisor_boot=$SDSYNC_DSM_CONTROLLER_START_PARENT_BOOT
+        "$api_server" --serve-supervised "$$" "$api_supervisor_start" "$api_supervisor_boot" \
             >> "$api_log" 2>&1 </dev/null &
         launched_api_pid=$!
-        api_ready=false
+        launched_api_start=$(capture_direct_child_start "$launched_api_pid" 2>/dev/null || true)
+        case $launched_api_start in ''|*[!0-9]*|0)
+            package_message "cannot capture supervised API launch identity"
+            exit 1
+            ;;
+        esac
+        launched_api_boot=$api_supervisor_boot
+        api_prepared=false
         count=0
-        while [ "$count" -lt 10 ]; do
+        while [ "$count" -lt "$startup_timeout" ]; do
             saved_api_pid=$(api_pid 2>/dev/null || true)
             if [ "$saved_api_pid" = "$launched_api_pid" ] && \
                 api_pid_matches "$launched_api_pid" && \
+                api_bound_matches "$launched_api_pid" && \
                 api_socket_safe >/dev/null 2>&1; then
                 launched_api_socket_identity=$(api_socket_identity 2>/dev/null || true)
                 if [ -n "$launched_api_socket_identity" ]; then
-                    api_ready=true
+                    api_prepared=true
                     break
                 fi
             fi
@@ -228,37 +763,155 @@ case ${1:-} in
             sleep 1
             count=$((count + 1))
         done
-        if [ "$api_ready" != true ]; then
-            package_message "API service failed to start; inspect $api_log"
+        if [ "$api_prepared" != true ]; then
+            package_message "API service failed before startup commit; inspect $api_log"
             exit 1
         fi
 
-        rotate_log "$log_root/controller.log" 10485760 5
         # The controller deliberately owns SIGHUP as its schedule-reload signal.
         # stdin is detached and DSM supervises the package, so do not mask HUP with nohup.
-        "$lifecycle_controller" >> "$log_root/controller.log" 2>&1 </dev/null &
+        "$api_server" --exec-supervised-controller "$$" "$api_supervisor_start" \
+            "$api_supervisor_boot" >> "$log_root/controller.log" 2>&1 </dev/null &
         launched_controller_pid=$!
+        launched_controller_start=$(capture_direct_child_start "$launched_controller_pid" 2>/dev/null || true)
+        case $launched_controller_start in ''|*[!0-9]*|0)
+            package_message "cannot capture supervised controller launch identity"
+            exit 1
+            ;;
+        esac
+        launched_controller_boot=$api_supervisor_boot
+        services_prepared=false
         count=0
-        while [ "$count" -lt 10 ]; do
+        while [ "$count" -lt "$startup_timeout" ]; do
             saved_pid=$(script_pid "$controller_pid_file" 2>/dev/null || true)
-            if [ -n "$saved_pid" ] && script_pid_matches "$saved_pid" "$lifecycle_controller"; then
+            if [ "$saved_pid" = "$launched_controller_pid" ] \
+                && controller_pid_matches "$saved_pid" \
+                && api_pid_matches "$launched_api_pid" \
+                && api_bound_matches "$launched_api_pid" \
+                && api_socket_safe >/dev/null 2>&1; then
+                services_prepared=true
+                break
+            fi
+            script_pid_live "$launched_controller_pid" || break
+            script_pid_live "$launched_api_pid" || break
+            sleep 1
+            count=$((count + 1))
+        done
+        if [ "$services_prepared" != true ]; then
+            package_message "controller failed before startup commit; inspect $log_root/controller.log"
+            exit 1
+        fi
+        commit_controller_start_lease || {
+            package_message "prepared services could not be committed"
+            exit 1
+        }
+        services_ready=false
+        count=0
+        while [ "$count" -lt "$startup_timeout" ]; do
+            current_controller_pid=$(script_pid "$controller_pid_file" 2>/dev/null || true)
+            current_api_pid=$(api_pid 2>/dev/null || true)
+            if [ "$current_controller_pid" = "$launched_controller_pid" ] \
+                && [ "$current_api_pid" = "$launched_api_pid" ] \
+                && controller_pid_matches "$launched_controller_pid" \
+                && controller_ready_matches "$launched_controller_pid" \
+                && api_pid_matches "$launched_api_pid" \
+                && api_ready_matches "$launched_api_pid" \
+                && api_socket_safe >/dev/null 2>&1 \
+                && ! api_path_exists "$api_bound_file"; then
+                remove_own_controller_start_lease || {
+                    package_message "committed startup lease could not be retired"
+                    exit 1
+                }
+                "$api_server" --service-admission open || {
+                    package_message "ready services could not open run admission"
+                    exit 1
+                }
+                # Final readiness is the lifecycle commit point. Ignore
+                # terminal lifecycle signals until serialized event/marker
+                # bookkeeping and lock release finish so DSM cannot receive a
+                # false start failure while both services remain running.
+                trap '' HUP INT TERM
                 start_committed=true
+                start_event_pending=false
+                append_lifecycle_event started >/dev/null 2>&1 || \
+                    package_message "warning: successful start could not be recorded in package Activity"
+                if [ "$restart_event_pending" = true ]; then
+                    if consume_service_stop_marker; then
+                        append_lifecycle_event restarted >/dev/null 2>&1 || \
+                            package_message "warning: successful restart could not be recorded in package Activity"
+                    else
+                        package_message "warning: successful restart marker could not be retired"
+                    fi
+                fi
+                # Keep event order and restart-marker ownership serialized
+                # with stop/status. A concurrent stop must not overtake the
+                # successful-start record or have its new marker consumed by
+                # this start operation.
+                release_lifecycle_serialization || {
+                    package_message "controller started but lifecycle serialization could not be released"
+                    exit 1
+                }
                 trap - 0 HUP INT TERM
                 package_message "API service and controller started as PIDs $launched_api_pid and $saved_pid"
                 exit 0
             fi
             script_pid_live "$launched_controller_pid" || break
+            script_pid_live "$launched_api_pid" || break
             sleep 1
             count=$((count + 1))
         done
-        package_message "controller failed to start; inspect $log_root/controller.log"
+        package_message "committed services failed to publish final readiness"
         exit 1
         ;;
     prestop) exit 0 ;;
     stop)
         . "$common_runtime"
         require_package_identity
-        saved_pid=$(script_pid "$controller_pid_file" 2>/dev/null || true)
+        ensure_layout
+        trap 'release_lifecycle_serialization >/dev/null 2>&1 || true' 0
+        trap 'exit 1' HUP INT TERM
+        acquire_lifecycle_serialization || exit 1
+        "$api_server" --service-admission close || {
+            package_message "service admission could not be closed before stop"
+            exit 1
+        }
+        failed_stop_status=0
+        stop_failed_start_children || failed_stop_status=$?
+        case $failed_stop_status in
+            0) ;;
+            75)
+                package_message "failed-start child did not terminate; lifecycle remains inconsistent"
+                exit 1
+                ;;
+            *)
+                package_message "refusing unsafe failed-start child identity"
+                exit 1
+                ;;
+        esac
+        controller_start_cancelled=false
+        if api_path_exists "$controller_start_file"; then
+            controller_start_cancel_status=0
+            remove_stale_controller_start_lease || controller_start_cancel_status=$?
+            case $controller_start_cancel_status in
+                0) controller_start_cancelled=true ;;
+                75)
+                    package_message "refusing to cancel a controller startup lease whose lifecycle owner is live"
+                    exit 1
+                    ;;
+                *)
+                    package_message "refusing unsafe controller startup lease state"
+                    exit 1
+                    ;;
+            esac
+        fi
+        saved_pid=
+        if api_path_exists "$controller_pid_file"; then
+            controller_pid_file_safe || {
+                package_message "refusing unsafe controller PID file: $controller_pid_file"
+                exit 1
+            }
+            saved_pid=$controller_pid_value
+        fi
         run_pid=$(script_pid "$run_lock/pid" 2>/dev/null || true)
         saved_api_pid=
         controller_active=false
@@ -266,19 +919,81 @@ case ${1:-} in
         api_active=false
         api_stale_artifacts=false
         api_socket_before_stop=
+        stop_transitioned=false
         if [ -n "$saved_pid" ] && script_pid_live "$saved_pid"; then
-            if ! script_pid_matches "$saved_pid" "$controller"; then
-                package_message "refusing to signal unverified controller PID $saved_pid"
-                exit 1
+            if ! controller_pid_matches "$saved_pid"; then
+                if ! script_pid_absent_or_zombie "$saved_pid"; then
+                    package_message "refusing to signal unverified controller PID $saved_pid"
+                    exit 1
+                fi
+            else
+                controller_active=true
+                stop_transitioned=true
             fi
-            controller_active=true
+        fi
+        if [ "$controller_active" != true ] && api_path_exists "$controller_lock"; then
+            controller_lock_live_status=0
+            private_process_lock_is_live "$controller_lock" || controller_lock_live_status=$?
+            case $controller_lock_live_status in
+                0)
+                    discovered_controller_pid=$lock_owner_pid
+                    if ! controller_pid_matches "$discovered_controller_pid"; then
+                        package_message "refusing to signal unverified controller lock owner $discovered_controller_pid"
+                        exit 1
+                    fi
+                    saved_pid=$discovered_controller_pid
+                    controller_active=true
+                    stop_transitioned=true
+                    ;;
+                1) ;;
+                *)
+                    package_message "refusing unsafe controller lock owner state"
+                    exit 1
+                    ;;
+            esac
+        fi
+        if [ "$controller_active" != true ] && [ "$controller_start_cancelled" = true ]; then
+            # A child that passed its first lease check immediately before the
+            # cancellation can still be scheduled into controller.lock. Its
+            # mandatory second check makes it exit without publishing PID or
+            # readiness; this bounded observation catches and signals only an
+            # exact controller owner if it reaches the lock during that race.
+            cancelled_wait=0
+            while [ "$cancelled_wait" -lt 3 ]; do
+                cancelled_lock_status=0
+                private_process_lock_is_live "$controller_lock" || cancelled_lock_status=$?
+                case $cancelled_lock_status in
+                    0)
+                        discovered_controller_pid=$lock_owner_pid
+                        controller_pid_matches "$discovered_controller_pid" || {
+                            package_message "refusing unverified controller owner after startup cancellation"
+                            exit 1
+                        }
+                        saved_pid=$discovered_controller_pid
+                        controller_active=true
+                        stop_transitioned=true
+                        break
+                        ;;
+                    1) ;;
+                    *)
+                        package_message "refusing unsafe controller lock after startup cancellation"
+                        exit 1
+                        ;;
+                esac
+                sleep 1
+                cancelled_wait=$((cancelled_wait + 1))
+            done
         fi
         if [ -n "$run_pid" ] && script_pid_live "$run_pid"; then
             if ! script_pid_matches "$run_pid" "$runner"; then
-                package_message "refusing to signal unverified plan/sync PID $run_pid"
-                exit 1
+                if ! script_pid_absent_or_zombie "$run_pid"; then
+                    package_message "refusing to signal unverified plan/sync PID $run_pid"
+                    exit 1
+                fi
+            else
+                run_active=true
+                stop_transitioned=true
             fi
-            run_active=true
         fi
         if api_path_exists "$api_pid_file"; then
             api_pid_file_safe || {
@@ -292,16 +1007,54 @@ case ${1:-} in
             }
             if script_pid_live "$saved_api_pid"; then
                 if ! api_pid_matches "$saved_api_pid"; then
-                    package_message "refusing to signal unverified API PID $saved_api_pid"
-                    exit 1
+                    if ! script_pid_absent_or_zombie "$saved_api_pid"; then
+                        package_message "refusing to signal unverified API PID $saved_api_pid"
+                        exit 1
+                    fi
+                    api_stale_artifacts=true
+                    if api_path_exists "$api_socket"; then
+                        api_stale_socket_safe || exit 1
+                    fi
+                else
+                    if api_path_exists "$api_ready_file"; then
+                        api_ready_matches "$saved_api_pid" || {
+                            package_message "refusing unsafe or mismatched API readiness state"
+                            exit 1
+                        }
+                        api_path_exists "$api_bound_file" && {
+                            package_message "refusing final API readiness with a live pre-commit identity"
+                            exit 1
+                        }
+                        api_socket_safe || exit 1
+                        api_socket_before_stop=$(api_socket_identity 2>/dev/null || true)
+                        [ -n "$api_socket_before_stop" ] || {
+                            package_message "cannot capture API socket identity before stop"
+                            exit 1
+                        }
+                    else
+                        # Only Rust's parent-death-supervised argv can represent a
+                        # legitimate live API before readiness. A public --serve
+                        # process or unrelated package process is never inferred
+                        # to be lifecycle-owned from a PID file alone.
+                        api_pid_matches_supervised "$saved_api_pid" || {
+                            package_message "refusing unready API PID without supervised startup identity"
+                            exit 1
+                        }
+                        if api_path_exists "$api_bound_file"; then
+                            api_bound_matches "$saved_api_pid" || {
+                                package_message "refusing unsafe or mismatched pre-commit API identity"
+                                exit 1
+                            }
+                        fi
+                        if api_path_exists "$api_socket"; then
+                            api_socket_safe || exit 1
+                            api_socket_before_stop=$(api_socket_identity 2>/dev/null || true)
+                            [ -n "$api_socket_before_stop" ] || exit 1
+                        fi
+                    fi
+                    api_active=true
+                    stop_transitioned=true
                 fi
-                api_socket_safe || exit 1
-                api_socket_before_stop=$(api_socket_identity 2>/dev/null || true)
-                [ -n "$api_socket_before_stop" ] || {
-                    package_message "cannot capture API socket identity before stop"
-                    exit 1
-                }
-                api_active=true
             else
                 api_stale_artifacts=true
                 if api_path_exists "$api_socket"; then
@@ -309,6 +1062,28 @@ case ${1:-} in
                 fi
             fi
         else
+            if api_path_exists "$api_bound_file"; then
+                stale_bound_status=0
+                api_bound_status || stale_bound_status=$?
+                case $stale_bound_status in
+                    1) api_stale_artifacts=true ;;
+                    *)
+                        package_message "refusing unsafe untracked pre-commit API state"
+                        exit 1
+                        ;;
+                esac
+            fi
+            if api_path_exists "$api_ready_file"; then
+                stale_ready_status=0
+                api_ready_status || stale_ready_status=$?
+                case $stale_ready_status in
+                    1) api_stale_artifacts=true ;;
+                    *)
+                        package_message "refusing unsafe untracked API readiness state"
+                        exit 1
+                        ;;
+                esac
+            fi
             if api_path_exists "$api_socket"; then
                 api_stale_socket_safe || {
                     package_message "refusing unsafe untracked API socket: $api_socket"
@@ -334,7 +1109,7 @@ case ${1:-} in
             controller_still_active=false
             run_still_active=false
             api_still_active=false
-            if [ "$controller_active" = true ] && script_pid_matches "$saved_pid" "$controller"; then
+            if [ "$controller_active" = true ] && controller_pid_matches "$saved_pid"; then
                 controller_still_active=true
             fi
             if [ "$run_active" = true ] && script_pid_matches "$run_pid" "$runner"; then
@@ -352,28 +1127,148 @@ case ${1:-} in
             sleep 1
             elapsed=$((elapsed + 1))
         done
+        stale_run_lock_status=0
+        acquire_private_process_lock "$run_lock" || stale_run_lock_status=$?
+        case $stale_run_lock_status in
+            0)
+                release_private_process_lock "$run_lock" || {
+                    package_message "stale run state was cleaned but its lock could not be released"
+                    exit 1
+                }
+                ;;
+            75)
+                package_message "refusing to report stop while an exact plan/sync owner remains live"
+                exit 1
+                ;;
+            *)
+                package_message "refusing unsafe stale plan/sync lock state"
+                exit 1
+                ;;
+        esac
         if [ "$api_active" = true ]; then
-            if script_pid_live "$saved_api_pid"; then
+            if ! script_pid_absent_or_zombie "$saved_api_pid"; then
                 package_message "API PID $saved_api_pid changed identity or remained live after stop"
                 exit 1
             fi
-            remove_safe_api_socket "$api_socket_before_stop"
+            "$api_server" --cleanup-stale-api-socket || {
+                package_message "refusing to remove API crash artifacts after verified shutdown"
+                exit 1
+            }
+            remove_stale_api_ready || {
+                package_message "refusing unsafe stale API readiness state after stop"
+                exit 1
+            }
+            remove_stale_api_bound || {
+                package_message "refusing unsafe stale pre-commit API state after stop"
+                exit 1
+            }
+        elif [ "$api_stale_artifacts" = true ]; then
+            "$api_server" --cleanup-stale-api-socket || {
+                package_message "refusing to remove an unsafe or live stale API socket"
+                exit 1
+            }
+            remove_stale_api_ready || {
+                package_message "refusing unsafe stale API readiness state"
+                exit 1
+            }
+            remove_stale_api_bound || {
+                package_message "refusing unsafe stale pre-commit API state"
+                exit 1
+            }
         fi
-        if api_path_exists "$api_pid_file"; then
-            remove_safe_api_pid_file
-        fi
-        if [ "$api_stale_artifacts" = true ] && api_path_exists "$api_socket"; then
-            package_message "leaving an untracked API socket for the Rust start-time liveness check"
+        # A SIGKILL/power loss can leave an exact dead controller PID,
+        # readiness record, and process lock. Serialize against any live
+        # controller, reap only the reviewed stale topology, and leave unsafe
+        # or live/reused identities untouched.
+        stale_controller_lock_status=0
+        acquire_private_process_lock "$controller_lock" || stale_controller_lock_status=$?
+        case $stale_controller_lock_status in
+            0) ;;
+            75)
+                package_message "refusing to clean controller state while a verified lock owner is live"
+                exit 1
+                ;;
+            *)
+                package_message "refusing unsafe stale controller lock state"
+                exit 1
+                ;;
+        esac
+        remove_stale_controller_ready || {
+            package_message "refusing unsafe stale controller readiness state"
+            release_private_process_lock "$controller_lock" >/dev/null 2>&1 || true
+            exit 1
+        }
+        remove_stale_controller_pid_file || {
+            package_message "refusing unsafe stale controller PID state"
+            release_private_process_lock "$controller_lock" >/dev/null 2>&1 || true
+            exit 1
+        }
+        release_private_process_lock "$controller_lock" || {
+            package_message "stale controller state was cleaned but its serialization lock could not be released"
+            exit 1
+        }
+        set +e
+        status_code
+        stopped_status=$?
+        set -e
+        if [ "$stopped_status" -ne 3 ]; then
+            package_message "refusing to report a successful stop while lifecycle state is $stopped_status"
             exit 1
         fi
+        case ${SYNOPKG_PKG_STATUS:-} in
+            UPGRADE|UNINSTALL)
+                lifecycle_transition_kind=$(printf '%s' "$SYNOPKG_PKG_STATUS" |
+                    tr '[:upper:]' '[:lower:]')
+                lifecycle_transition_state=$(package_transition_status) || {
+                    package_message "services stopped but package transition state is unsafe"
+                    exit 1
+                }
+                case $lifecycle_transition_state in
+                    open)
+                        "$api_server" --package-transition prepare "$lifecycle_transition_kind" || {
+                            package_message "services stopped but package transition could not be prepared"
+                            exit 1
+                        }
+                        ;;
+                    "$lifecycle_transition_kind") ;;
+                    *)
+                        package_message "services stopped under conflicting package transition $lifecycle_transition_state"
+                        exit 1
+                        ;;
+                esac
+                ;;
+        esac
+        # All verified service processes are now absent. Complete serialized
+        # stop bookkeeping despite a late lifecycle signal so DSM cannot be
+        # told the stop failed after the service is already down.
+        trap '' HUP INT TERM
+        if [ "$stop_transitioned" = true ]; then
+            write_service_stop_marker || \
+                package_message "warning: services stopped but restart telemetry could not be armed"
+            append_lifecycle_event stopped >/dev/null 2>&1 || \
+                package_message "warning: successful stop could not be recorded in package Activity"
+        fi
+        release_lifecycle_serialization || {
+            package_message "services stopped but lifecycle serialization could not be released"
+            exit 1
+        }
+        trap - 0 HUP INT TERM
         package_message "API service, controller, and active plan/sync stopped gracefully"
         exit 0
         ;;
     status)
+        . "$common_runtime"
+        require_package_identity >/dev/null 2>&1 || exit 2
+        ensure_layout >/dev/null 2>&1 || exit 2
+        trap 'release_lifecycle_serialization >/dev/null 2>&1 || true' 0
+        trap 'exit 2' HUP INT TERM
+        acquire_lifecycle_serialization >/dev/null 2>&1 || exit 2
         set +e
         status_code
         result=$?
         set -e
+        release_lifecycle_serialization || result=2
+        trap - 0 HUP INT TERM
         exit "$result"
         ;;
     *) echo "usage: $0 prestart|start|prestop|stop|status" >&2; exit 64 ;;

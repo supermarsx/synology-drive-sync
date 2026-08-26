@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html class="img-no-display">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <link href="../../../../help/help.css" rel="stylesheet" type="text/css">
+  <link href="../../../../help/scrollbar/flexcroll.css" rel="stylesheet" type="text/css">
+  <script type="text/javascript" src="../../../../help/scrollbar/flexcroll.js"></script>
+  <script type="text/javascript" src="../../../../help/scrollbar/initFlexcroll.js"></script>
+  <title>Interface settings</title>
+</head>
+<body>
+  <h1>Interface settings</h1>
+  <p>Interface settings affect this browser's native DSM AppWindow. They do not alter profile, routine, credential, or package security policy.</p>
+
+  <h2>Theme</h2>
+  <p>The default is the dark-first ember theme, with soot-black surfaces, high-contrast text, orange/red state accents, and keyboard-visible focus. <strong>Follow system</strong> tracks DSM/browser color preference. Light mode remains available for accessibility or environment needs.</p>
+
+  <h2>Refresh cadence</h2>
+  <dl>
+    <dt>Status refresh</dt><dd>Controls periodic authenticated snapshot requests while DSM is visible.</dd>
+    <dt>Log refresh</dt><dd>Controls periodic Activity log requests while that page is visible and not paused.</dd>
+  </dl>
+  <p>Faster refresh improves freshness but increases browser and NAS request frequency. Hiding the DSM document or destroying the AppWindow stops scheduled refreshes and aborts active browser requests.</p>
+
+  <h2>Storage and privacy</h2>
+  <p>Theme, refresh cadence, and optional open-session notification preferences use browser local storage. The AppWindow writes the candidate browser preference first and submits the fixed package audit event only after that write succeeds. If browser storage rejects the write, no audit event is submitted. A trustworthy pre-acceptance audit rejection restores the exact prior browser value and applied settings. Once DSM may have accepted the audit event, the saved candidate is retained and the AppWindow shows its validated client request and queued job correlation instead of risking a misleading rollback. Profile configuration and protected secrets remain in DSM package-private storage. Secret editor values are never written to browser storage.</p>
+
+  <h2>Field help</h2>
+  <p>Configuration controls expose a keyboard-focusable question-mark affordance. Focus or hover it to read the concise field description; press Escape or move focus away to dismiss it. Use the Help button in the AppWindow header to open the complete Synology Drive Sync tree in DSM Help.</p>
+</body>
+</html>

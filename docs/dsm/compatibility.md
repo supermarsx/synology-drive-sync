@@ -21,7 +21,7 @@ model earlier or introduced it later. In particular, Evansport `i686` is restric
 ## Native UI and legacy policy
 
 The current source builds the same genuine Vue `type=app` AppWindow into all four architecture
-artifacts, first planned for release 26.10. There is no legacy `type=url` variant of that native
+artifacts; release 26.10 introduced that AppWindow. There is no legacy `type=url` variant of the native
 package. Synology's current official Vue AppWindow example retains
 [`os_min_ver="7.0-40000"`](https://github.com/SynologyOpenSource/ExamplePackages/blob/main/ExamplePackage/INFO.sh);
 that is earlier than this package's existing `7.0-40759` floor, so

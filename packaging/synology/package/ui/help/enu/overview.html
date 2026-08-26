@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html class="img-no-display">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <link href="../../../../help/help.css" rel="stylesheet" type="text/css">
+  <link href="../../../../help/scrollbar/flexcroll.css" rel="stylesheet" type="text/css">
+  <script type="text/javascript" src="../../../../help/scrollbar/flexcroll.js"></script>
+  <script type="text/javascript" src="../../../../help/scrollbar/initFlexcroll.js"></script>
+  <title>Synology Drive Sync overview</title>
+</head>
+<body>
+  <h1>Synology Drive Sync</h1>
+  <p>Synology Drive Sync copies files in one direction from a local NAS folder to a configurable Synology File Station destination. The native AppWindow lets DSM administrators configure profiles, plan or run work, schedule routines, inspect health evidence, and review bounded logs.</p>
+
+  <h2>Start safely</h2>
+  <ol>
+    <li>Create a profile and store its destination credentials.</li>
+    <li>Open Health / Doctor and verify the source, File Station route, authentication, and destination.</li>
+    <li>Run a plan before the first real sync.</li>
+    <li>Run a sync with deletion disabled, inspect Activity, and only then consider a bounded deletion policy.</li>
+    <li>Add an automation routine after manual acceptance succeeds.</li>
+  </ol>
+
+  <h2>Overview indicators</h2>
+  <dl>
+    <dt>Profiles</dt><dd>Configured destinations and whether protected password material is present.</dd>
+    <dt>Next routine</dt><dd>The earliest controller-reported execution time among enabled routines.</dd>
+    <dt>Last result</dt><dd>The latest observed terminal operation state and completion time.</dd>
+    <dt>Active scope</dt><dd>The profile or all-profile scope currently using the host-local operation lock.</dd>
+    <dt>Realtime</dt><dd>Enabled realtime policies and whether the controller reports a polling fallback.</dd>
+  </dl>
+
+  <h2>Package bridge status</h2>
+  <p><strong>Authenticated package bridge</strong> means the same-origin DSM session passed package authentication and the AppWindow holds a current CSRF token. <strong>Package status - read-only</strong> means status is visible but mutation capabilities are not granted. When a request fails, the banner distinguishes an expired DSM session, denied administrator access, a missing package route, an unavailable package service, and a UI/package schema mismatch. The last successful snapshot remains visible as stale evidence; use <strong>Retry</strong> after completing the banner's recovery instruction.</p>
+
+  <h2>Safety defaults</h2>
+  <ul>
+    <li>Sync direction is local source to remote File Station destination.</li>
+    <li>Deletion is disabled unless independently approved by profile, operation, and routine policy.</li>
+    <li>Secret values are write-only and are never returned to the browser.</li>
+    <li>Manual work and routines share one host-local lock so sync operations cannot overlap.</li>
+    <li>Closing the AppWindow stops browser observation; it does not cancel a job already accepted by the package.</li>
+  </ul>
+</body>
+</html>

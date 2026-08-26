@@ -25,8 +25,15 @@ unverified until it is present in GHCR; deploy its immutable digest after verifi
 > present. This hold does not block desktop, Rust SDK, C SDK, or container artifacts from the same
 > tags because those artifacts are not DSM packages.
 
-The native DSM AppWindow is planned to begin with release `26.10`. Published `26.7`-`26.9` SPKs keep
+Release `26.10` introduced the native DSM AppWindow. Published `26.7`-`26.9` SPKs keep
 the UI they were released with; select `26.10` or later when the native AppWindow is required.
+New SPKs declare `auto_upgrade_from="26.7-1"`: Package Center may offer a direct upgrade only from
+the reviewed lifecycle-equivalent 26.7-26.10 generation or newer. Its only relevant source drift is
+the fixed DSM notification application ID in 26.10; runner, lock, and lifecycle behavior is unchanged.
+Installations on 26.5 or
+26.6 must not be upgraded in place; use **Package Center > Manual Install** to move first to a
+verified 26.7-or-later intermediate SPK, then install the current release. This repository does not
+provide a private update feed or self-updater.
 
 DSM compatibility follows SynologyOpenSource's
 [`pkgscripts-ng` platform mapping through DSM 7.4](https://github.com/SynologyOpenSource/pkgscripts-ng/blob/DSM7.4/include/pkg_util.sh).

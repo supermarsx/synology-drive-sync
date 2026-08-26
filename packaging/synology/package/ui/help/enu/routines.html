@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html class="img-no-display">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <link href="../../../../help/help.css" rel="stylesheet" type="text/css">
+  <link href="../../../../help/scrollbar/flexcroll.css" rel="stylesheet" type="text/css">
+  <script type="text/javascript" src="../../../../help/scrollbar/flexcroll.js"></script>
+  <script type="text/javascript" src="../../../../help/scrollbar/initFlexcroll.js"></script>
+  <title>Routines and realtime hooks</title>
+</head>
+<body>
+  <h1>Routines and realtime hooks</h1>
+  <p>Each profile can have one package-controller routine. A routine remains inert until it is saved and enabled. Choose <strong>Sync</strong> for a real transfer or <strong>Plan only</strong> for read-only comparison.</p>
+
+  <h2>Execution modes</h2>
+  <dl>
+    <dt>Interval</dt><dd>Runs after the configured number of seconds, subject to enabled weekdays and the operation lock.</dd>
+    <dt>Daily window</dt><dd>Runs only between the start and end times in DSM local time.</dd>
+    <dt>Realtime</dt><dd>Observes source changes, waits for the debounce period, performs preflight, and starts a run. When a native change hook is unavailable, the package reports and uses the configured polling fallback.</dd>
+  </dl>
+
+  <h2>Timing model</h2>
+  <p>Realtime work follows four stages: observe, debounce, preflight, run. Debounce coalesces bursts of changes. Fallback poll controls how often the source is checked without native hooks. Retry attempts and backoff apply after an execution fails; they do not permit overlapping operations.</p>
+
+  <h2>Dependencies and weekdays</h2>
+  <p>Wait-for dependencies require selected profile routines to finish first. Avoid dependency cycles. At least one active weekday is required. The controller evaluates daily-window times and weekdays using the NAS clock, so keep DSM time synchronization healthy.</p>
+
+  <h2>Deletion policy</h2>
+  <p>A routine cannot independently enable deletion. It can only permit deletion already allowed by the profile, and its deletion approval ceiling adds another limit. Use a plan to review proposed removals before enabling either layer.</p>
+
+  <h2>One host-local lock</h2>
+  <p>Manual plans, manual syncs, Doctor operations, and scheduled routines coordinate through package state. A long-running sync cannot pile up concurrent sync processes; subsequent routine work waits or records the controller decision.</p>
+
+  <h2>Removing a routine</h2>
+  <p>Removing a routine stops package automation for the profile. The profile, credentials, and synchronized files remain intact.</p>
+</body>
+</html>

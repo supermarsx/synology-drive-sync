@@ -5,13 +5,163 @@ set -eu
 [ -x "$package_root/bin/synology-drive-sync" ] || { package_message "installed binary is not executable"; exit 1; }
 [ -r "$common_runtime" ] || { package_message "installed runtime helper is missing"; exit 1; }
 . "$common_runtime"
+require_package_identity
 ensure_layout
-if [ ! -f "$schedule_file" ]; then
+postinst_lifecycle_lock=false
+postinst_lock=false
+postinst_audit_pending=false
+postinst_commit_started=false
+cleanup_postinst() {
+    if [ "$postinst_audit_pending" = true ]; then
+        postinst_terminal=failed
+        [ "$postinst_commit_started" != true ] || postinst_terminal=outcome_unknown
+        audit_outbox_complete "$SDSYNC_DSM_AUDIT_TRANSACTION" "$postinst_terminal" \
+            >/dev/null 2>&1 || true
+        postinst_audit_pending=false
+    fi
+    if [ "$postinst_lock" = true ]; then
+        release_private_process_lock "$management_lock" >/dev/null 2>&1 || true
+        postinst_lock=false
+    fi
+    if [ "$postinst_lifecycle_lock" = true ]; then
+        release_private_process_lock "$lifecycle_lock" >/dev/null 2>&1 || true
+        postinst_lifecycle_lock=false
+    fi
+}
+trap cleanup_postinst 0
+trap 'exit 1' HUP INT TERM
+acquire_private_process_lock "$lifecycle_lock" || {
+    package_message "package lifecycle is still changing"
+    exit 1
+}
+postinst_lifecycle_lock=true
+"$api_bridge" --service-admission close || {
+    package_message "could not initialize closed service admission"
+    exit 1
+}
+acquire_private_process_lock "$management_lock" || {
+    package_message "another package-management operation is active"
+    exit 1
+}
+postinst_lock=true
+
+postinst_initial_transition=$(package_transition_status) || {
+    package_message "cannot validate package transition during installation"
+    exit 1
+}
+if [ "${SYNOPKG_PKG_STATUS:-INSTALL}" = UPGRADE ]; then
+    case $postinst_initial_transition in
+        open) "$api_bridge" --package-transition prepare upgrade ;;
+        upgrade) ;;
+        *) package_message "upgrade postinst found conflicting transition $postinst_initial_transition"; exit 1 ;;
+    esac
+fi
+
+# Supported markerless upgrade sources (26.7-1 through 26.10-1) used a one-line
+# runner lock and could leave it behind after a cleanly absent runner. The new
+# read-only preupgrade proves both that topology and the absence of an exact
+# package core. Recheck after replacement while lifecycle/management are
+# serialized, then let the current strict lock protocol retire only that
+# reviewed legacy lock.
+if [ "${SYNOPKG_PKG_STATUS:-INSTALL}" = UPGRADE ] \
+    && legacy_upgrade_source_supported; then
+    legacy_postinst_lock_status=0
+    legacy_stale_run_lock_status || legacy_postinst_lock_status=$?
+    case $legacy_postinst_lock_status in
+        0) ;;
+        75) package_message "legacy plan/sync owner became active during upgrade"; exit 1 ;;
+        *) package_message "legacy run lock changed or became unsafe during upgrade"; exit 1 ;;
+    esac
+    legacy_postinst_core_status=0
+    legacy_package_core_status || legacy_postinst_core_status=$?
+    case $legacy_postinst_core_status in
+        0) ;;
+        75) package_message "legacy package core became active during upgrade"; exit 1 ;;
+        *) package_message "legacy package core identity became unsafe during upgrade"; exit 1 ;;
+    esac
+    if [ "$legacy_run_lock_present" = true ]; then
+        legacy_postinst_reap_status=0
+        acquire_private_process_lock "$run_lock" || legacy_postinst_reap_status=$?
+        [ "$legacy_postinst_reap_status" -eq 0 ] || {
+            package_message "legacy run lock could not be adopted safely"
+            exit 1
+        }
+        release_private_process_lock "$run_lock" || {
+            package_message "adopted legacy run lock could not be retired"
+            exit 1
+        }
+    fi
+fi
+
+if [ ! -e "$schedule_file" ] && [ ! -L "$schedule_file" ]; then
+    postinst_audit_actor=package-install
+    postinst_schedule_message="Package installed with scheduling disabled"
+    if [ "${SYNOPKG_PKG_STATUS:-INSTALL}" = UPGRADE ]; then
+        postinst_audit_actor=package-upgrade
+        postinst_schedule_message="Package upgrade initialized missing scheduling state as disabled"
+    fi
+    unset SDSYNC_DSM_AUDIT_TRANSACTION SDSYNC_DSM_AUDIT_ACTOR \
+        SDSYNC_DSM_AUDIT_ACTOR_UID SDSYNC_DSM_AUDIT_ORIGIN SDSYNC_DSM_CLIENT_REQUEST_ID
+    SDSYNC_DSM_AUDIT_ACTOR=$postinst_audit_actor
+    SDSYNC_DSM_AUDIT_ACTOR_UID=$path_owner
+    SDSYNC_DSM_AUDIT_ORIGIN=controller
+    export SDSYNC_DSM_AUDIT_ACTOR SDSYNC_DSM_AUDIT_ACTOR_UID SDSYNC_DSM_AUDIT_ORIGIN
+    ensure_audit_transaction || {
+        package_message "initial schedule audit transaction could not be created"
+        exit 1
+    }
+    audit_outbox_begin schedule all "$SDSYNC_DSM_AUDIT_ACTOR" \
+        "$SDSYNC_DSM_AUDIT_ACTOR_UID" "$SDSYNC_DSM_AUDIT_ORIGIN" \
+        "$SDSYNC_DSM_AUDIT_TRANSACTION" || {
+        package_message "initial schedule audit outbox could not be prepared"
+        exit 1
+    }
+    postinst_audit_pending=true
     schedule_temp=$schedule_file.tmp.$$
     umask 077
     printf 'enabled=false\ninterval_seconds=3600\nallow_delete=false\nmax_total_delete=100\n' > "$schedule_temp"
     finish_private_file "$schedule_temp"
+    audit_outbox_execute "$SDSYNC_DSM_AUDIT_TRANSACTION" || {
+        package_message "initial schedule audit execution phase could not be recorded"
+        exit 1
+    }
+    postinst_commit_started=true
     mv -f "$schedule_temp" "$schedule_file"
+    audit_outbox_complete "$SDSYNC_DSM_AUDIT_TRANSACTION" succeeded >/dev/null 2>&1 || \
+        package_message "warning: initial schedule terminal audit remains pending"
+    postinst_audit_pending=false
+    append_activity configuration.changed all changed \
+        "$postinst_schedule_message" configuration info false \
+        "$path_owner" "$postinst_audit_actor" >/dev/null 2>&1 || \
+        package_message "warning: initial schedule detail could not be added to Activity"
+elif [ -L "$schedule_file" ] || [ ! -f "$schedule_file" ]; then
+    package_message "refusing unsafe existing schedule configuration"
+    exit 1
 fi
+postinst_transition_state=$(package_transition_status) || {
+    package_message "installation completed but its transition marker is unsafe"
+    exit 1
+}
+case ${SYNOPKG_PKG_STATUS:-INSTALL}:$postinst_transition_state in
+    UPGRADE:upgrade)
+        # DSM runs the new postinst before the new postupgrade. Keep the
+        # closing marker until migration and upgraded-binary validation finish.
+        ;;
+    INSTALL:open|INSTALL:uninstall|INSTALL:upgrade)
+        "$api_bridge" --package-transition clear || {
+            package_message "installation completed but its transition marker could not be retired"
+            exit 1
+        }
+        ;;
+    *)
+        package_message "package install phase does not match its transition state"
+        exit 1
+        ;;
+esac
+release_private_process_lock "$management_lock"
+postinst_lock=false
+release_private_process_lock "$lifecycle_lock"
+postinst_lifecycle_lock=false
+trap - 0 HUP INT TERM
 package_message "Installed safely with scheduling disabled. Configure profiles with $manager"
 exit 0

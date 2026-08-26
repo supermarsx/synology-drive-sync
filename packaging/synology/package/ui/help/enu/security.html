@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html class="img-no-display">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <link href="../../../../help/help.css" rel="stylesheet" type="text/css">
+  <link href="../../../../help/scrollbar/flexcroll.css" rel="stylesheet" type="text/css">
+  <script type="text/javascript" src="../../../../help/scrollbar/flexcroll.js"></script>
+  <script type="text/javascript" src="../../../../help/scrollbar/initFlexcroll.js"></script>
+  <title>Security posture</title>
+</head>
+<body>
+  <h1>Security posture</h1>
+  <p>The Security page configures package policy within fixed fail-closed boundaries. A saved posture may narrow behavior or require stronger evidence; it cannot turn the native AppWindow into a public endpoint, return secrets, remove DSM authentication, or grant root execution.</p>
+
+  <h2>Identity and request protections</h2>
+  <ul>
+    <li>The SPK runs as its DSM package identity and joins only the reviewed internal web-service group.</li>
+    <li>The AppWindow uses the current same-origin DSM session cookie; it does not accept launch tokens from URLs, fragments, history, or local storage.</li>
+    <li>Mutations require authenticated POST, a package CSRF token, a fixed request marker, a strict action schema, and bounded bodies.</li>
+    <li>The control socket remains package-private and requests are handled by the package-owned service.</li>
+  </ul>
+
+  <h2>Configurable policy</h2>
+  <p>The dashboard always submits one complete policy document. Invalid, incomplete, duplicate, or unsupported values are rejected rather than silently weakened.</p>
+  <dl>
+    <dt>Require HTTPS</dt><dd>Rejects dashboard requests unless DSM reports an HTTPS connection.</dd>
+    <dt>Interface changes</dt><dd>Allows audited browser theme and refresh-cadence persistence.</dd>
+    <dt>Profile and secret changes</dt><dd>Separately controls ordinary profile fields and write-only password, TOTP, or collector-token operations.</dd>
+    <dt>Routine changes</dt><dd>Controls interval, daily-window, realtime, dependency, retry, and routine-deletion policy.</dd>
+    <dt>Notification changes</dt><dd>Controls package alert policy and audited open-session notification preferences.</dd>
+    <dt>Operational actions</dt><dd>Controls manual plan, run, and Target Doctor requests.</dd>
+  </dl>
+
+  <h2>Risk ceilings</h2>
+  <dl>
+    <dt>HTTP targets</dt><dd>When off, a profile cannot enable unencrypted HTTP.</dd>
+    <dt>Empty source</dt><dd>When off, a profile cannot disable the empty-source deletion guard.</dd>
+    <dt>Invalid TLS</dt><dd>When off, a profile cannot bypass destination certificate validation.</dd>
+    <dt>Destructive sync</dt><dd>When off, profiles, routines, and operations cannot enable destination deletion.</dd>
+    <dt>Doctor write test</dt><dd>When off, Target Doctor remains read-only even if the package reports write-test capability.</dd>
+    <dt>Remote logging</dt><dd>When off, profiles cannot configure an HTTPS collector or change its write-only token.</dd>
+  </dl>
+
+  <h2>Request and result bounds</h2>
+  <dl>
+    <dt>CSRF lifetime</dt><dd>60 through 900 seconds for a session-bound mutation token.</dd>
+    <dt>Result retention</dt><dd>300 through 86400 seconds for completed queued results.</dd>
+    <dt>Maximum outstanding jobs</dt><dd>N is 1 through 256 and caps queued plus processing jobs. Retained terminal responses are capped separately at the same N, so the worst case is 2N private job records.</dd>
+  </dl>
+
+  <h2>Secrets</h2>
+  <p>Protected values are accepted only through dedicated write operations. Status reports presence flags, never values. Navigating away, hiding DSM, closing an editor, or destroying the AppWindow clears browser-held secret fields. Avoid copying secrets into profile names, paths, URLs, alerts, or logs.</p>
+
+  <h2>Deletion defense</h2>
+  <p>Remote deletion requires explicit agreement across each applicable layer: profile policy, manual operation or routine policy, and numeric ceilings. Empty-source protection remains independent. A configurable policy should strengthen these gates, not bypass them.</p>
+
+  <h2>Audit and log categories</h2>
+  <p>Each of audit, bridge, authentication, security, configuration, secrets, routines, operations, notifications, sync, controller, and scheduler accepts <code>off</code>, <code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code>, or <code>error</code>. Enable only the detail needed for operations and incident response. Mandatory minimal action audit records remain at info even when optional audit verbosity is off. Sensitive request bodies and credential material remain excluded regardless of category selection.</p>
+
+  <h2>Applying changes</h2>
+  <p>Policy changes take effect only after validation and an authenticated save. If the queued result cannot be observed, treat the outcome as unknown, inspect Activity and logs, and avoid blindly resubmitting the same change.</p>
+</body>
+</html>

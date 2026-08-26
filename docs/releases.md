@@ -50,12 +50,13 @@ Four DSM 7 packages are published separately from the GNU/Linux archives:
 | `armv7 armada370 armada375 armada38x armadaxp comcerto2k monaco` | `alpine`, `alpine4k`, `armada370`, `armada375`, `armada38x`, `armadaxp`, `comcerto2k`, `monaco` | `armv7-unknown-linux-musleabihf` | `synology-drive-sync-YY.N-armv7.spk` |
 | `i686` | `evansport` (DSM 7.0/7.1 only) | `i686-unknown-linux-musl` | `synology-drive-sync-YY.N-i686.spk` |
 
-Release 26.10 is the first release planned to ship the administrator-only native DSM Vue AppWindow
-(`type=app`); published 26.7–26.9 assets do not acquire it retroactively. Once 26.10 is published,
-each 26.10-or-later SPK contains one matching static ELF32 or ELF64 sync executable, the AppWindow, the
+Release 26.10 introduced the administrator-only native DSM Vue AppWindow (`type=app`); published
+26.7–26.9 assets do not acquire it retroactively. Each 26.10-or-later SPK contains one matching
+static ELF32 or ELF64 sync executable, the AppWindow, the
 `sdsync-dsm` CLI manager, ordinary CGI relay,
 package-user API service, controller/runner helpers, DSM lifecycle scripts, the minimal package/`http`
-`conf/privilege`, preloaded desktop-alert I18N text, icons, and license texts. It contains no
+`conf/privilege`, preloaded desktop-alert I18N text, icons, generated Rust dependency notices,
+DSM AppWindow bundled-code notices, and musl copyright. It contains no
 `conf/resource` acquisition worker; fixed desktop alerts use direct `synodsmnotify -c` calls and do
 not register Notification Center channels. The package requires DSM `7.0-40759` or newer, while
 platform availability remains constrained by Synology's DSM-version table. It is not `noarch`; the
@@ -72,7 +73,8 @@ searchable for an explicit no-asset result; they are never mapped to one of thes
 
 Release CI rejects an embedded ELF with the wrong machine type, a dynamic program interpreter, or
 a required dynamic library. It validates the SPK INFO, archive member safety and modes, package
-icons, licenses, lifecycle/privilege policy, and embedded binary again before staging the release.
+icons, exact license/notice contents, lifecycle/privilege policy, and embedded binary again before
+staging the release.
 Static validation is not proof of installation or File Station behavior on a live NAS.
 
 Install a verified SPK through **Package Center > Manual Install**. DSM 7 displays its normal alert
@@ -84,6 +86,14 @@ entering a target password/TOTP seed. Unsupported historical models, DSM Enterpr
 PowerPC, unknown models,
 and conflicting inputs fail closed. Their safe released alternatives are the desktop CLI or
 container on a supported host, not a relabeled SPK.
+
+The SPK manifest declares `auto_upgrade_from="26.7-1"`. Direct lifecycle adoption is tested for
+26.7-1 through 26.10-1. Their runner, lock, and lifecycle behavior is equivalent; 26.10 changes only
+the fixed DSM notification application ID in the relevant runtime helper. Releases 26.5 and 26.6
+are deliberately below the upgrade floor. If an older installation must be retained, manually
+install a verified eligible intermediate SPK before the current one. GitHub Releases remain a
+manual-download channel; unattended updates require an eventual accepted Synology Package Center
+submission, not an undocumented feed or package self-updater.
 
 ## Rust and C SDK archives
 
@@ -120,7 +130,7 @@ SDK, and one Rust SDK), four auxiliary payloads, and the checksum manifest. The 
 are:
 
 - `synology-drive-sync-YY.N.cdx.json`, a CycloneDX JSON Rust dependency SBOM;
-- `THIRD_PARTY_LICENSES.html`, the generated dependency license and attribution bundle;
+- `THIRD_PARTY_LICENSES.html`, the generated Rust dependency license and attribution bundle;
 - `install.sh` and `install.ps1` bootstrap installers.
 
 `SHA256SUMS` contains exactly 21 entries, covering every payload above and every archive; the
@@ -210,6 +220,13 @@ offline after Cargo fetches checksum-pinned crates, uses explicit accepted-licen
 policy and known upstream clarifications, and fails on an unreadable or
 unclassified license. CI regenerates the file and requires a byte-for-byte match,
 so a dependency change cannot silently leave the checked-in notice bundle stale.
+
+The four DSM SPKs additionally contain `DSM_UI_THIRD_PARTY_LICENSES.txt` in their outer archive and
+installed `share/licenses` directory. It records the pinned vue-loader and webpack runtime code
+incorporated into the generated AppWindow JavaScript. Vue is externalized to DSM rather than bundled,
+and other pnpm packages whose code is not named in that notice are used only during the build. The
+SPK validator requires both copies to match the reviewed source byte for byte. This SPK-internal
+notice is not an additional public release asset, so the 22-asset release contract remains unchanged.
 
 ## GHCR multi-architecture image
 

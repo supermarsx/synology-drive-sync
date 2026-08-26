@@ -153,7 +153,8 @@ normalizes member order, ownership, group, modes, and archive metadata. It inclu
 - module-keyed native AppWindow config, offline Vue JavaScript/CSS, authored SVG mark, and deterministic
   16/24/32/48/64/72/256 PNG icons;
 - fixed, preloaded English desktop-alert I18N texts, with no `conf/resource` acquisition worker;
-- project license, generated notices, and musl copyright.
+- project license, generated Rust dependency notices, DSM AppWindow bundled-code notices, and musl
+  copyright.
 
 Deterministic assembly reduces packaging variance. Independently compiled Rust binaries are not
 claimed bit-for-bit reproducible across different compiler/linker/runner images.
@@ -178,7 +179,7 @@ claimed bit-for-bit reproducible across different compiler/linker/runner images.
   administrator/I18N arguments only, no
   legacy `synonotify` event/custom-variable path, and no dynamic profile, exit, log, or secret data;
 - lifecycle scripts, the fixed `package:http` `0660` socket/service contract, private FHS behavior,
-  icons, license texts, and installed size.
+  icons, exact outer/installed license texts, and installed size.
 
 Source-only validation:
 

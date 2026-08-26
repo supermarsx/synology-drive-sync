@@ -8,6 +8,7 @@ package_var=${SYNOPKG_PKGVAR:-$package_base/var}
 runtime_root=$package_var/run
 log_root=$package_var/log
 controller_pid_file=$runtime_root/controller.pid
+controller_ready_file=$runtime_root/controller.ready
 controller_lock=$runtime_root/controller.lock
 controller=$package_root/libexec/sdsync-controller
 runner=$package_root/libexec/sdsync-run
@@ -15,6 +16,8 @@ common_runtime=$package_root/libexec/sdsync-common
 run_lock=$runtime_root/run.lock
 api_server=$package_root/bin/sdsync-dsm-api
 api_pid_file=$runtime_root/api.pid
+api_bound_file=$runtime_root/api.bound
+api_ready_file=$runtime_root/api.ready
 api_socket_dir=$package_root/ui
 api_socket=$api_socket_dir/api.sock
 api_log=$log_root/api.log
@@ -39,6 +42,24 @@ script_pid_live() {
     kill -0 "$1" 2>/dev/null
 }
 
+# Return success only when procfs proves that a sampled PID is now absent or in
+# a terminal zombie/dead state. An unreadable/malformed live entry is not terminal: callers must
+# preserve package topology and fail closed rather than infer identity loss.
+script_pid_absent_or_zombie() {
+    terminal_pid=$1
+    [ ! -e "/proc/$terminal_pid" ] && return 0
+    terminal_state=$(sed -n 's/^.*) \([^ ]\).*/\1/p' \
+        2>/dev/null < "/proc/$terminal_pid/stat" || true)
+    if [ -z "$terminal_state" ]; then
+        [ ! -e "/proc/$terminal_pid" ] && return 0
+        return 1
+    fi
+    case $terminal_state in
+        Z|X|x) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 script_pid_matches() {
     checked_pid=$1
     expected_command=$2
@@ -50,14 +71,40 @@ script_pid_matches() {
     [ -r "/proc/$checked_pid/cmdline" ] || return 1
     canonical_command_dir=$(CDPATH='' cd -- "$(dirname -- "$expected_command")" 2>/dev/null && pwd -P) || return 1
     canonical_command=$canonical_command_dir/$(basename -- "$expected_command")
-    if tr '\000' '\n' < "/proc/$checked_pid/cmdline" 2>/dev/null |
+    if tr '\000' '\n' 2>/dev/null < "/proc/$checked_pid/cmdline" |
         grep -F -x "$expected_command" >/dev/null 2>&1
     then
         return 0
     fi
     [ "$canonical_command" != "$expected_command" ] || return 1
-    tr '\000' '\n' < "/proc/$checked_pid/cmdline" 2>/dev/null |
+    tr '\000' '\n' 2>/dev/null < "/proc/$checked_pid/cmdline" |
         grep -F -x "$canonical_command" >/dev/null 2>&1
+}
+
+# The controller is a no-argument package script. Lock ownership is not enough
+# to authorize a signal: require the complete argv shape as well as the package
+# UID so another package-owned process cannot become a lifecycle target merely
+# by mentioning the controller path in an unrelated command line.
+controller_pid_matches() {
+    checked_pid=$1
+    script_pid_live "$checked_pid" || return 1
+    expected_uid=$(stat -L -c '%u' "$package_home" 2>/dev/null || true)
+    [ -n "$expected_uid" ] || return 1
+    actual_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "/proc/$checked_pid/status" 2>/dev/null | sed -n '1p')
+    [ "$actual_uid" = "$expected_uid" ] || return 1
+    [ -r "/proc/$checked_pid/cmdline" ] || return 1
+    canonical_controller_dir=$(CDPATH='' cd -- "$(dirname -- "$controller")" 2>/dev/null && pwd -P) || return 1
+    canonical_controller=$canonical_controller_dir/$(basename -- "$controller")
+    tr '\000' '\n' 2>/dev/null < "/proc/$checked_pid/cmdline" |
+        awk -v expected="$controller" -v canonical="$canonical_controller" '
+            { argument[NR] = $0 }
+            END {
+                if (NR == 1 && (argument[1] == expected || argument[1] == canonical)) exit 0
+                if (NR == 2 && argument[1] ~ /^\// &&
+                    (argument[2] == expected || argument[2] == canonical)) exit 0
+                exit 1
+            }
+        '
 }
 
 api_pid_matches() {
@@ -70,28 +117,80 @@ api_pid_matches() {
     [ -r "/proc/$checked_pid/cmdline" ] || return 1
     canonical_api_dir=$(CDPATH='' cd -- "$(dirname -- "$api_server")" 2>/dev/null && pwd -P) || return 1
     canonical_api=$canonical_api_dir/$(basename -- "$api_server")
-    tr '\000' '\n' < "/proc/$checked_pid/cmdline" 2>/dev/null |
+    tr '\000' '\n' 2>/dev/null < "/proc/$checked_pid/cmdline" |
         awk -v expected="$api_server" -v canonical="$canonical_api" '
             { argument[NR] = $0 }
             END {
-                if (NR == 2 &&
-                    (argument[1] == expected || argument[1] == canonical) &&
-                    argument[2] == "--serve") exit 0
-                # Test fixtures use a shebang interpreter; the shipped API is
-                # an ELF and therefore takes the two-argument branch above.
-                if (NR == 3 && argument[1] ~ /^\// &&
-                    (argument[2] == expected || argument[2] == canonical) &&
-                    argument[3] == "--serve") exit 0
+                base = 0
+                if (argument[1] == expected || argument[1] == canonical) base = 1
+                else if (argument[1] ~ /^\// &&
+                    (argument[2] == expected || argument[2] == canonical)) base = 2
+                if (base == 0) exit 1
+                remaining = NR - base
+                if (remaining == 1 && argument[base + 1] == "--serve") exit 0
+                if (remaining == 4 && argument[base + 1] == "--serve-supervised" &&
+                    argument[base + 2] ~ /^[0-9]+$/ && argument[base + 2] + 0 > 1 &&
+                    argument[base + 3] ~ /^[0-9]+$/ && argument[base + 3] + 0 > 0 &&
+                    length(argument[base + 4]) == 36 &&
+                    argument[base + 4] ~ /^[0-9a-f-]+$/) exit 0
                 exit 1
             }
         '
+}
+
+api_pid_matches_supervised() {
+    checked_pid=$1
+    api_pid_matches "$checked_pid" || return 1
+    tr '\000' '\n' 2>/dev/null < "/proc/$checked_pid/cmdline" |
+        grep -F -x -- '--serve-supervised' >/dev/null 2>&1
+}
+
+controller_supervisor_pid_matches() {
+    checked_pid=$1
+    script_pid_live "$checked_pid" || return 1
+    expected_uid=$(stat -L -c '%u' "$package_home" 2>/dev/null || true)
+    actual_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "/proc/$checked_pid/status" 2>/dev/null | sed -n '1p')
+    [ -n "$expected_uid" ] && [ "$actual_uid" = "$expected_uid" ] || return 1
+    canonical_api_dir=$(CDPATH='' cd -- "$(dirname -- "$api_server")" 2>/dev/null && pwd -P) || return 1
+    canonical_api=$canonical_api_dir/$(basename -- "$api_server")
+    tr '\000' '\n' 2>/dev/null < "/proc/$checked_pid/cmdline" |
+        awk -v expected="$api_server" -v canonical="$canonical_api" '
+            { argument[NR] = $0 }
+            END {
+                base = 0
+                if (argument[1] == expected || argument[1] == canonical) base = 1
+                else if (argument[1] ~ /^\// &&
+                    (argument[2] == expected || argument[2] == canonical)) base = 2
+                if (base == 0 || NR - base != 4 ||
+                    argument[base + 1] != "--exec-supervised-controller") exit 1
+                if (argument[base + 2] !~ /^[0-9]+$/ || argument[base + 2] + 0 <= 1 ||
+                    argument[base + 3] !~ /^[0-9]+$/ || argument[base + 3] + 0 <= 0 ||
+                    length(argument[base + 4]) != 36 ||
+                    argument[base + 4] !~ /^[0-9a-f-]+$/) exit 1
+                exit 0
+            }
+        '
+}
+
+failed_start_child_command_matches() {
+    failed_child_kind=$1
+    failed_child_pid=$2
+    case $failed_child_kind in
+        api) api_pid_matches_supervised "$failed_child_pid" ;;
+        controller)
+            controller_pid_matches "$failed_child_pid" ||
+                controller_supervisor_pid_matches "$failed_child_pid"
+            ;;
+        *) return 1 ;;
+    esac
 }
 
 verified_service_pid_matches() {
     verified_service_kind=$1
     verified_service_pid=$2
     case $verified_service_kind in
-        controller) script_pid_matches "$verified_service_pid" "$controller" ;;
+        controller) controller_pid_matches "$verified_service_pid" ;;
         runner) script_pid_matches "$verified_service_pid" "$runner" ;;
         api) api_pid_matches "$verified_service_pid" ;;
         *) return 1 ;;
@@ -100,8 +199,7 @@ verified_service_pid_matches() {
 
 pid_slot_absent() {
     checked_slot_pid=$1
-    script_pid_live "$checked_slot_pid" && return 1
-    [ ! -e "/proc/$checked_slot_pid" ]
+    script_pid_absent_or_zombie "$checked_slot_pid"
 }
 
 signal_verified_service() {
@@ -122,8 +220,8 @@ signal_verified_service() {
     fi
 
     # A target can exit after the identity check but before kill(2). Accept
-    # that race only when a fresh identity/liveness check proves its PID slot
-    # is gone. A live exact target, reused PID, or uninspectable live process
+    # that race only when a fresh procfs check proves its PID slot absent or
+    # robustly parses it as a zombie. A live exact target, reused live PID, or uninspectable process
     # remains a hard failure.
     if verified_service_pid_matches "$signal_service_kind" "$signal_service_pid"; then
         package_message "failed to signal verified $signal_service_label PID $signal_service_pid; target remains live"
@@ -256,6 +354,130 @@ api_pid() {
     printf '%s\n' "$api_found_pid"
 }
 
+read_api_bound_identity() {
+    api_path_exists "$api_bound_file" || return 1
+    [ -f "$api_bound_file" ] && [ ! -L "$api_bound_file" ] || return 73
+    api_expected_uid=$(package_uid 2>/dev/null || true)
+    api_bound_metadata=$(stat -c '%u:%a:%h' "$api_bound_file" 2>/dev/null || true)
+    [ -n "$api_expected_uid" ] && [ "$api_bound_metadata" = "$api_expected_uid:600:1" ] || return 73
+    api_bound_size=$(wc -c 2>/dev/null < "$api_bound_file" | tr -d ' ')
+    case $api_bound_size in ''|*[!0-9]*) return 73 ;; esac
+    [ "$api_bound_size" -le 96 ] || return 73
+    api_bound_lines=$(awk 'END { print NR }' "$api_bound_file" 2>/dev/null || true)
+    [ "$api_bound_lines" = 3 ] || return 73
+    api_bound_pid=$(sed -n '1p' "$api_bound_file" 2>/dev/null || true)
+    api_bound_start=$(sed -n '2p' "$api_bound_file" 2>/dev/null || true)
+    api_bound_boot=$(sed -n '3p' "$api_bound_file" 2>/dev/null || true)
+    case $api_bound_pid in ''|*[!0-9]*) return 73 ;; esac
+    [ "$api_bound_pid" -gt 1 ] 2>/dev/null || return 73
+    case $api_bound_start in ''|*[!0-9]*|0) return 73 ;; esac
+    valid_boot_identity "$api_bound_boot" || return 73
+}
+
+# Return 0 for the live exact pre-commit API identity, 1 for absent/stale, and
+# 73 for an unsafe or malformed record.
+api_bound_status() {
+    api_path_exists "$api_bound_file" || return 1
+    read_api_bound_identity || return $?
+    api_bound_live_status=0
+    process_identity_is_live "$api_bound_pid" "$api_bound_start" "$api_bound_boot" || \
+        api_bound_live_status=$?
+    case $api_bound_live_status in
+        0) api_pid_matches_supervised "$api_bound_pid" || return 73; return 0 ;;
+        1) return 1 ;;
+        *) return 73 ;;
+    esac
+}
+
+api_bound_matches() {
+    expected_api_bound_pid=$1
+    api_bound_status || return $?
+    [ "$api_bound_pid" = "$expected_api_bound_pid" ] || return 73
+}
+
+remove_stale_api_bound() {
+    api_path_exists "$api_bound_file" || return 0
+    stale_api_bound_status=0
+    api_bound_status || stale_api_bound_status=$?
+    case $stale_api_bound_status in
+        0) return 75 ;;
+        1) ;;
+        *) return 73 ;;
+    esac
+    read_api_bound_identity || {
+        api_path_exists "$api_bound_file" || return 0
+        return 73
+    }
+    stale_api_bound_identity=$(stat -c '%d:%i' "$api_bound_file" 2>/dev/null || true)
+    [ -n "$stale_api_bound_identity" ] || return 73
+    read_api_bound_identity || return 73
+    stale_api_bound_recheck=$(stat -c '%d:%i' "$api_bound_file" 2>/dev/null || true)
+    [ "$stale_api_bound_recheck" = "$stale_api_bound_identity" ] || return 73
+    rm -f "$api_bound_file"
+}
+
+read_api_ready_identity() {
+    api_path_exists "$api_ready_file" || return 1
+    [ -f "$api_ready_file" ] && [ ! -L "$api_ready_file" ] || return 73
+    api_expected_uid=$(package_uid 2>/dev/null || true)
+    api_ready_metadata=$(stat -c '%u:%a:%h' "$api_ready_file" 2>/dev/null || true)
+    [ -n "$api_expected_uid" ] && [ "$api_ready_metadata" = "$api_expected_uid:600:1" ] || return 73
+    api_ready_size=$(wc -c 2>/dev/null < "$api_ready_file" | tr -d ' ')
+    case $api_ready_size in ''|*[!0-9]*) return 73 ;; esac
+    [ "$api_ready_size" -le 96 ] || return 73
+    api_ready_lines=$(awk 'END { print NR }' "$api_ready_file" 2>/dev/null || true)
+    [ "$api_ready_lines" = 3 ] || return 73
+    api_ready_pid=$(sed -n '1p' "$api_ready_file" 2>/dev/null || true)
+    api_ready_start=$(sed -n '2p' "$api_ready_file" 2>/dev/null || true)
+    api_ready_boot=$(sed -n '3p' "$api_ready_file" 2>/dev/null || true)
+    case $api_ready_pid in ''|*[!0-9]*) return 73 ;; esac
+    [ "$api_ready_pid" -gt 1 ] 2>/dev/null || return 73
+    case $api_ready_start in ''|*[!0-9]*|0) return 73 ;; esac
+    valid_boot_identity "$api_ready_boot" || return 73
+}
+
+# Return 0 for the live exact supervised API identity, 1 for absent/stale, and
+# 73 for an unsafe or malformed readiness record.
+api_ready_status() {
+    api_path_exists "$api_ready_file" || return 1
+    read_api_ready_identity || return $?
+    api_ready_live_status=0
+    process_identity_is_live "$api_ready_pid" "$api_ready_start" "$api_ready_boot" || \
+        api_ready_live_status=$?
+    case $api_ready_live_status in
+        0) api_pid_matches_supervised "$api_ready_pid" || return 73; return 0 ;;
+        1) return 1 ;;
+        *) return 73 ;;
+    esac
+}
+
+api_ready_matches() {
+    expected_api_ready_pid=$1
+    api_ready_status || return $?
+    [ "$api_ready_pid" = "$expected_api_ready_pid" ] || return 73
+}
+
+remove_stale_api_ready() {
+    api_path_exists "$api_ready_file" || return 0
+    stale_api_ready_status=0
+    api_ready_status || stale_api_ready_status=$?
+    case $stale_api_ready_status in
+        0) return 75 ;;
+        1) ;;
+        *) return 73 ;;
+    esac
+    read_api_ready_identity || {
+        api_path_exists "$api_ready_file" || return 0
+        return 73
+    }
+    stale_api_ready_identity=$(stat -c '%d:%i' "$api_ready_file" 2>/dev/null || true)
+    [ -n "$stale_api_ready_identity" ] || return 73
+    read_api_ready_identity || return 73
+    stale_api_ready_recheck=$(stat -c '%d:%i' "$api_ready_file" 2>/dev/null || true)
+    [ "$stale_api_ready_recheck" = "$stale_api_ready_identity" ] || return 73
+    rm -f "$api_ready_file"
+}
+
 api_path_exists() {
     [ -e "$1" ] || [ -L "$1" ]
 }
@@ -307,4 +529,123 @@ refuse_active_run() {
         fi
         return 1
     fi
+}
+
+legacy_upgrade_source_supported() {
+    case ${SYNOPKG_OLD_PKGVER:-} in
+        26.7-1|26.8-1|26.9-1|26.10-1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# The released 26.7 through 26.10 runners stored only their shell PID. SIGKILL could leave an
+# exact core process alive behind a stale one-line run lock. These read-only
+# checks are used by the next package's preupgrade before target replacement;
+# never infer identity from a name/substring match.
+legacy_package_core_status() {
+    legacy_core_binary=$package_root/bin/synology-drive-sync
+    legacy_core_config=$package_home/config/config.toml
+    [ -x "$legacy_core_binary" ] && [ ! -L "$legacy_core_binary" ] || return 73
+    command -v readlink >/dev/null 2>&1 || return 73
+    legacy_core_dir=$(CDPATH='' cd -- "$(dirname -- "$legacy_core_binary")" 2>/dev/null && pwd -P) \
+        || return 73
+    legacy_core_canonical=$legacy_core_dir/$(basename -- "$legacy_core_binary")
+    legacy_core_uid=$(package_uid 2>/dev/null || true)
+    case $legacy_core_uid in ''|*[!0-9]*) return 73 ;; esac
+    for legacy_proc in /proc/[0-9]*; do
+        [ -d "$legacy_proc" ] || continue
+        legacy_proc_uid=$(stat -c '%u' "$legacy_proc" 2>/dev/null || true)
+        if [ -z "$legacy_proc_uid" ]; then
+            [ -e "$legacy_proc" ] && return 73
+            continue
+        fi
+        [ "$legacy_proc_uid" = "$legacy_core_uid" ] || continue
+        legacy_proc_state=$(sed -n 's/^.*) \([^ ]\).*/\1/p' \
+            "$legacy_proc/stat" 2>/dev/null || true)
+        [ "$legacy_proc_state" != Z ] || continue
+        legacy_proc_exe=$(readlink "$legacy_proc/exe" 2>/dev/null || true)
+        if [ -z "$legacy_proc_exe" ]; then
+            legacy_proc_arg0=$(tr '\000' '\n' 2>/dev/null < "$legacy_proc/cmdline" |
+                sed -n '1p' || true)
+            case $legacy_proc_arg0 in
+                "$legacy_core_binary"|"$legacy_core_canonical") return 73 ;;
+            esac
+            continue
+        fi
+        case $legacy_proc_exe in
+            "$legacy_core_canonical"|"$legacy_core_canonical (deleted)") ;;
+            *) continue ;;
+        esac
+        [ -r "$legacy_proc/cmdline" ] || return 73
+        if tr '\000' '\n' 2>/dev/null < "$legacy_proc/cmdline" |
+            awk -v expected="$legacy_core_binary" -v canonical="$legacy_core_canonical" \
+                -v config="$legacy_core_config" '
+                { argument[NR] = $0 }
+                END {
+                    if (NR < 6 || NR > 8) exit 1
+                    if (argument[1] != expected && argument[1] != canonical) exit 1
+                    if (argument[2] != "--config" || argument[3] != config) exit 1
+                    if (argument[4] != "sync" && argument[4] != "plan") exit 1
+                    if (argument[5] == "--profile") {
+                        if (argument[6] !~ /^[A-Za-z0-9_-]+$/) exit 1
+                        if (NR == 7 && argument[7] != "--no-delete") exit 1
+                        if (NR != 6 && NR != 7) exit 1
+                        exit 0
+                    }
+                    if (argument[5] == "--all-profiles") {
+                        if (argument[6] != "--max-total-delete" ||
+                            argument[7] !~ /^[0-9]+$/) exit 1
+                        if (NR == 8 && argument[8] != "--no-delete") exit 1
+                        if (NR != 7 && NR != 8) exit 1
+                        exit 0
+                    }
+                    exit 1
+                }
+            '
+        then
+            package_message "legacy package core PID ${legacy_proc##*/} is still active"
+            return 75
+        fi
+        # The executable identity is exact but argv could not be proven to be
+        # the released runner contract. Treat it as unsafe, never as absent.
+        [ -e "$legacy_proc" ] || continue
+        package_message "legacy package core PID ${legacy_proc##*/} has unsafe arguments"
+        return 73
+    done
+    return 0
+}
+
+legacy_stale_run_lock_status() {
+    legacy_run_lock_present=false
+    [ -e "$run_lock" ] || [ -L "$run_lock" ] || return 0
+    legacy_run_lock_present=true
+    [ -d "$run_lock" ] && [ ! -L "$run_lock" ] || return 73
+    legacy_lock_uid=$(package_uid 2>/dev/null || true)
+    legacy_lock_metadata=$(stat -c '%u:%a' "$run_lock" 2>/dev/null || true)
+    [ -n "$legacy_lock_uid" ] && [ "$legacy_lock_metadata" = "$legacy_lock_uid:700" ] \
+        || return 73
+    for legacy_lock_entry in "$run_lock"/* "$run_lock"/.[!.]* "$run_lock"/..?*; do
+        [ -e "$legacy_lock_entry" ] || [ -L "$legacy_lock_entry" ] || continue
+        [ "${legacy_lock_entry##*/}" = pid ] || return 73
+    done
+    legacy_lock_pid_file=$run_lock/pid
+    [ -f "$legacy_lock_pid_file" ] && [ ! -L "$legacy_lock_pid_file" ] || return 73
+    legacy_pid_metadata=$(stat -c '%u:%a:%h' "$legacy_lock_pid_file" 2>/dev/null || true)
+    [ "$legacy_pid_metadata" = "$legacy_lock_uid:600:1" ] || return 73
+    legacy_pid=$(sed -n '1p' "$legacy_lock_pid_file" 2>/dev/null || true)
+    case $legacy_pid in ''|*[!0-9]*) return 73 ;; esac
+    [ "$legacy_pid" -gt 1 ] 2>/dev/null || return 73
+    legacy_pid_size=$(wc -c 2>/dev/null < "$legacy_lock_pid_file" | tr -d ' ')
+    case $legacy_pid_size in ''|*[!0-9]*) return 73 ;; esac
+    [ "$legacy_pid_size" -eq $((${#legacy_pid} + 1)) ] || return 73
+    if script_pid_live "$legacy_pid"; then
+        package_message "legacy plan/sync owner PID $legacy_pid is still active"
+        return 75
+    fi
+    if [ -e "/proc/$legacy_pid" ]; then
+        legacy_reused_uid=$(stat -c '%u' "/proc/$legacy_pid" 2>/dev/null || true)
+        [ -n "$legacy_reused_uid" ] || return 73
+        [ "$legacy_reused_uid" != "$legacy_lock_uid" ] || return 73
+    fi
+    return 0
 }

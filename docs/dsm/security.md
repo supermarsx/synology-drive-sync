@@ -45,6 +45,14 @@ server's kernel-reported peer UID as the package user. The server accepts only a
 UID matching DSM `http`. A symlink, wrong owner/group/mode, additional hard link, wrong peer, unsafe
 parent, or missing socket fails closed.
 
+`SO_PEERCRED` identifies the shared DSM web tier, not unique package provenance. A co-resident DSM
+web/CGI package may also execute as the same `http` UID, so DSM's CGI routing/registration and that
+shared web tier are part of the trusted computing and confused-deputy boundary. The package does
+not claim that peer credentials alone isolate a hostile same-UID CGI; cookie authentication,
+administrator authorization, strict relay parsing, and package CSRF remain mandatory above the
+local transport check. Physical-NAS acceptance must exercise this boundary with the installed DSM
+web stack.
+
 DSM's official [privilege configuration](https://help.synology.com/developer-guide/privilege/privilege_config.html)
 defines package ownership and joined groups. The builder stores every executable as ordinary `0755`.
 The validator enforces the exact two-key manifest above, rejects any archive set-user-ID/set-group-ID
@@ -55,7 +63,9 @@ byte mismatches between the two helper copies.
 
 The DSM session cookie is the authoritative browser authentication input. JavaScript never reads
 that cookie; `credentials: "same-origin"` lets the browser attach it to the packaged `api.cgi`
-request, and the server validates it with DSM's `authenticate.cgi` before authorizing any action.
+request. The CGI validates it with DSM's `authenticate.cgi` and resolves administrator membership
+before relay. The package daemon independently repeats both checks against the bounded reconstructed
+environment before authorizing any action.
 
 The native AppWindow has no standalone HTML launch document and receives no package-owned launch
 URL. It does not inspect or rewrite `window.location`, does not try to extract a token from the DSM
@@ -67,7 +77,12 @@ documents cookie validation through `authenticate.cgi`; it does not document a D
 for retrieving a launch token. This application therefore does not call an undocumented login
 endpoint or depend on DSM browser globals for authentication. Physical-NAS acceptance must still
 prove that the package-user API service can execute `authenticate.cgi` with the bounded relayed CGI
-environment.
+environment. The authenticated identity transport accepts exact valid UTF-8 names from 1 through
+256 bytes, including spaces, `DOMAIN\\Username`, and `Username@LDAP_FQDN`; control, bidi-format, and
+activity-delimiter characters are rejected. The static package binary cannot directly load
+DSM/glibc NSS modules (though an available NSCD path may serve lookups), so local, LDAP, and AD
+administrator/non-administrator accounts—including qualified, Unicode, nested-group, and
+name-collision cases—remain a required physical-DSM acceptance matrix.
 
 ## Authentication and authorization sequence
 
@@ -77,18 +92,23 @@ Every API request goes through these checks:
    copied into bounded Rust-owned buffers.
 2. The CGI verifies that it is a regular package-owned file with exact mode `0755`, that both its
    real and effective UID equal DSM `http`, and that neither web nor package UID is root.
-3. It clears its environment and sends one length-bounded frame to the fixed `package:http` `0660`
-   socket after validating the socket and server peer identity.
-4. The package-user server validates the CGI peer UID, decodes one strict relay schema, and repeats
+3. The CGI invokes DSM's root-owned `authenticate.cgi` with the original bounded native request
+   environment, validates one safe returned identity, rejects root, and independently requires DSM
+   `administrators` membership.
+4. It clears its environment and sends one length-bounded frame containing that exact authenticated
+   username, numeric UID, and session binding to the fixed `package:http` `0660` socket after
+   validating the socket and server peer identity.
+5. The package-user server validates the CGI peer UID, decodes one strict relay schema, and repeats
    method, query, header, body, cookie, request marker, and optional compatibility-token validation.
    The native UI leaves that optional field absent.
-5. The server executes DSM's root-owned
+6. The server independently executes DSM's root-owned
    `/usr/syno/synoman/webman/modules/authenticate.cgi` as the package user with only the bounded
    authentication environment DSM expects.
-6. The returned username is validated and looked up through DSM's account database.
-7. Root is rejected, and independent membership in the DSM `administrators` group is required even
+7. The returned username and numeric UID must exactly match the CGI assertion, then the account is
+   independently looked up through DSM's account database.
+8. Root is rejected, and independent membership in the DSM `administrators` group is required even
    though the desktop app is also registered with `allUsers: false`.
-8. The server reads package-private state or queues a mutation only after authentication,
+9. The server reads package-private state or queues a mutation only after authentication,
    authorization, and—on POST—independent package CSRF verification succeed.
 
 UI registration and socket access are not authorization. The server repeats the HTTP validation and
@@ -107,7 +127,8 @@ DSM cookie authentication is necessary but not sufficient for POST. An authentic
 
 The signing key is a package-owned private file. Mutation POSTs require the token in
 `X-SDSYNC-CSRF`; expired, malformed, replayed in another session, or incorrectly signed values are
-rejected. The UI holds it only in memory.
+rejected with the stable pre-acceptance code `csrf_rejected`. The UI holds it only in memory and
+never automatically retries an outcome-uncertain POST.
 
 ## Exact HTTP surface
 
@@ -142,8 +163,17 @@ parameters. Its flat envelope is:
 
 Operations and their exact argument keys are allowlisted by both browser and API service:
 `configure-profile`, `remove-profile`, `set-default`, `set-secret`, `schedule`, `routine`,
-`remove-routine`, `alert-policy`, and `action`. Unknown, missing, duplicate, out-of-range, nested, or
-operation-inapplicable fields fail closed.
+`remove-routine`, `alert-policy`, `security-policy`, `client-event`, and `action`. Unknown, missing,
+duplicate, out-of-range, nested, or operation-inapplicable fields fail closed. `security-policy`
+accepts exactly 28 editable fields; the persisted complete document additionally carries immutable
+`policy_version=1`. Upgrade migrates only the exact private pre-version 28-key shape, while corrupt,
+symlinked, hard-linked, incomplete, or unknown-version policy state remains fail closed and can be
+repaired only by supplying a complete replacement through the recovery command. That command emits
+its fixed conservative recovery intent without parsing the broken document, atomically installs the
+complete replacement, and only then reconciles unrelated pending audit records under the repaired
+policy. New profile identifiers are limited to 64 safe ASCII bytes. A released pre-limit profile
+identifier of 65 through 255 safe ASCII bytes remains observable, auditable, actionable, and
+removable for upgrade recovery, but cannot be newly created.
 
 ## Why mutations use a private queue
 
@@ -156,7 +186,8 @@ Queue behavior:
 
 - the authenticated API service allocates a sortable 48-hex job ID under an exclusive private
   enqueue lock;
-- the client request ID remains separately recorded for correlation;
+- the exact 32-hex client request ID is durably mapped to the authenticated session and request
+  fingerprint for idempotent replay, and appears in mandatory bridge audit/activity correlation;
 - job JSON and any secret file are package-owned, bounded, non-symlink regular files;
 - publication uses private temporary files, hard-link/rename-style atomicity, directory sync, and
   no-follow checks;
@@ -166,10 +197,14 @@ Queue behavior:
   output containing sensitive material fail closed; and
 - the result endpoint returns only pending or a sanitized terminal manager result.
 
-The queue accepts at most 256 safe outstanding entries. Published requests and their separate secret
-files have a 24-hour retention ceiling. Completed responses and unrecoverable processing-orphan
-artifacts are retained for one hour, with at most 256 response entries. A result lookup after removal
-returns terminal `expired_or_missing`; it does not remain pending forever.
+The configurable `max_outstanding_jobs` value `N` is in `1..256` and applies as two separate caps:
+at most `N` active request-plus-processing jobs and, independently, at most `N` retained terminal
+responses (worst case `2N` JSON job/result artifacts). Published requests and their separate secret
+files have a 24-hour stale ceiling; processing orphans have a one-hour ceiling. Completed response
+retention is separately configurable from 300 through 86400 seconds. A response marked
+`audit_pending` is pinned until its known terminal audit is durably reconciled; only then can normal
+retention remove it. A result lookup after removal returns terminal `expired_or_missing`; it does not
+remain pending forever.
 
 If power is lost after a job is claimed into processing, the controller deliberately does not replay
 that job on restart. Replaying a partially executed sync or configuration mutation could be more
@@ -180,9 +215,35 @@ Configuration and secret saves, routine/policy changes, and Doctor observe termi
 the UI reports success. Pending observations have no client deadline: they continue until terminal
 or `expired_or_missing` evidence, five consecutive result-observation failures, invalid result
 evidence, or AppWindow shutdown. Repeated observation failures and invalid/expired evidence produce
-a typed outcome-unknown result because the accepted server job may still have applied. Plan and Run
+a typed outcome-unknown result that carries the client request ID because the accepted server job
+may still have applied. Replaying the exact same authenticated request ID and payload returns the
+original job ID; reusing it for a different payload is a conflict. Plan and Run
 remain asynchronous: the UI retains their job IDs only in memory and follows normal run, Activity,
 and log evidence.
+
+## Mandatory audit and log policy
+
+Every accepted mutation first creates a private, fsynced audit-outbox intent and mandatory requested
+record before entering an executing or queued phase. Terminal success, failure, or unknown outcome is
+recorded in the outbox before log delivery; if the log sink is unavailable, the truthful operation
+result is preserved with `audit_pending=true` and the controller retries reconciliation before queue
+work and pruning. Exact immutable identity, file and directory sync, and the event-log lock are part
+of successful delivery. The package UID owns both mutation and audit state and is therefore the audit
+integrity trust boundary; the public CLI still clears caller-supplied attribution variables.
+
+Audit and Activity files are canonical newline-delimited records. Before deduplication or append,
+the active file and rotated history are validated while the event-log lock remains held. A complete
+active final record missing only its newline is durably terminated; an incomplete active final
+record is durably truncated to the last verified newline and a bounded recovery Activity event is
+written. Interior blank or malformed records, malformed newline-terminated active history, and any
+malformed rotated history remain fail closed. Exact record verification and file/directory sync
+complete before the outbox record can be retired.
+
+Category thresholds suppress optional Activity/controller/scheduler records below the configured
+level before persistence. Log reads scan the bounded rotated file and return up to the requested
+number of matching records, so newer trace/debug noise cannot hide an older allowed error. Minimal
+mutation accountability records are mandatory and remain visible even when the optional `audit`
+category level is `off`.
 
 ## Secret and response non-disclosure
 

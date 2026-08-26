@@ -13,7 +13,8 @@ if [ "${SYNOPKG_PKG_STATUS:-}" = UNINSTALL ]; then
     done
     for private_child in \
         "$package_home/config" "$package_home/secrets" "$package_home/state" \
-        "$package_var/run" "$package_var/state" "$package_var/log"
+        "$package_var/run" "$package_var/state" "$package_var/log" \
+        "$package_var/control"
     do
         case $private_child in
             "$package_home"/*|"$package_var"/*) rm -rf "$private_child" ;;

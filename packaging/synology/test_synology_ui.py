@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 import unittest
 import zlib
 from pathlib import Path
@@ -49,6 +50,7 @@ class DsmUiContractTests(unittest.TestCase):
         application = config[app_id]
         self.assertEqual(set(config), {app_id})
         self.assertEqual(application["type"], "app")
+        self.assertEqual(application["title"], "Synology Drive Sync")
         self.assertEqual(application["appWindow"], app_id)
         self.assertNotIn("url", application)
         self.assertNotIn(".url", config)
@@ -76,6 +78,171 @@ class DsmUiContractTests(unittest.TestCase):
             for suffix in ("title", "message")
         }
         self.assertEqual(set(application["preloadTexts"]), expected)
+
+    def test_about_metadata_dependencies_updates_and_safe_links_match_sources(self) -> None:
+        cargo = tomllib.loads((HERE.parents[1] / "Cargo.toml").read_text(encoding="utf-8"))
+        cargo_lock = tomllib.loads(
+            (HERE.parents[1] / "Cargo.lock").read_text(encoding="utf-8")
+        )
+        ui_package = json.loads((UI_SOURCE / "package.json").read_text(encoding="utf-8"))
+        info = validate_spk.parse_info((HERE / "INFO.template").read_bytes())
+        app = (UI_SOURCE / "src/App.vue").read_text(encoding="utf-8")
+        about_help = (UI / "help/enu/about.html").read_text(encoding="utf-8")
+        package = cargo["package"]
+        expected_metadata = {
+            "project": package["name"],
+            "author": "Mariana",
+            "authorUrl": "https://github.com/supermarsx",
+            "maintainer": info["maintainer"],
+            "maintainerUrl": info["maintainer_url"],
+            "repository": package["repository"],
+            "license": package["license"],
+            "coreVersion": package["version"],
+            "uiVersion": ui_package["version"],
+        }
+        for field, value in expected_metadata.items():
+            self.assertIn(f'{field}: "{value}"', app)
+        self.assertIn("apiSchema: SNAPSHOT_SCHEMA", app)
+        self.assertIn(
+            "this.snapshot && this.snapshot.package && this.snapshot.package.version",
+            app,
+        )
+        self.assertIn(">Mariana</a>", about_help)
+
+        locked_versions: dict[str, list[str]] = {}
+        for resolved_package in cargo_lock["package"]:
+            locked_versions.setdefault(resolved_package["name"], []).append(
+                resolved_package["version"]
+            )
+
+        def locked_version(name: str) -> str:
+            versions = locked_versions.get(name, [])
+            self.assertEqual(
+                len(versions),
+                1,
+                f"direct Rust dependency {name} must have one Cargo.lock resolution",
+            )
+            return versions[0]
+
+        rust_dependencies = {
+            name: (
+                locked_version(name),
+                "All platforms",
+                f"https://crates.io/crates/{name}",
+            )
+            for name in cargo["dependencies"]
+        }
+        target_scopes = {
+            'cfg(target_os = "windows")': "Windows",
+            'cfg(target_os = "macos")': "macOS",
+            'cfg(target_os = "linux")': "Linux",
+        }
+        self.assertEqual(set(cargo["target"]), set(target_scopes))
+        for target, target_values in cargo["target"].items():
+            for name in target_values["dependencies"]:
+                self.assertNotIn(name, rust_dependencies)
+                rust_dependencies[name] = (
+                    locked_version(name),
+                    target_scopes[target],
+                    f"https://crates.io/crates/{name}",
+                )
+
+        ui_dependencies = {
+            name: (
+                version,
+                "devDependency",
+                f"https://www.npmjs.com/package/{name}",
+            )
+            for name, version in ui_package["devDependencies"].items()
+        }
+        package_manager = ui_package["packageManager"]
+        package_manager_name = package_manager.split("@", 1)[0]
+        ui_dependencies[package_manager_name] = (
+            package_manager,
+            "packageManager",
+            "https://pnpm.io/",
+        )
+
+        def app_catalog(constant: str) -> dict[str, tuple[str, str, str]]:
+            block = re.search(
+                rf"const {constant} = Object\.freeze\(\[([\s\S]*?)\]\);",
+                app,
+            )
+            self.assertIsNotNone(block)
+            entries = re.findall(
+                r'\{ name: "([^"]+)", pin: "([^"]+)", scope: "([^"]+)", url: "([^"]+)" \}',
+                block.group(1),
+            )
+            self.assertEqual(len(entries), len({name for name, *_ in entries}))
+            return {name: (pin, scope, url) for name, pin, scope, url in entries}
+
+        self.assertEqual(app_catalog("ABOUT_RUST_DEPENDENCIES"), rust_dependencies)
+        self.assertEqual(app_catalog("ABOUT_UI_DEPENDENCIES"), ui_dependencies)
+        self.assertIn(
+            "Exact direct versions resolved by the frozen <code>Cargo.lock</code>",
+            app,
+        )
+
+        help_entries = re.findall(
+            r'<li data-package="([^"]+)" data-version="([^"]+)" '
+            r'data-scope="([^"]+)"><a href="([^"]+)"[^>]*>([^<]+)</a> '
+            r'— ([^<]+) — <code>([^<]+)</code></li>',
+            about_help,
+        )
+        self.assertEqual(len(help_entries), len({name for name, *_ in help_entries}))
+        for (
+            name,
+            version,
+            scope,
+            _url,
+            visible_name,
+            visible_scope,
+            visible_version,
+        ) in help_entries:
+            self.assertEqual(
+                (visible_name, visible_scope, visible_version),
+                (name, scope, version),
+            )
+        self.assertEqual(
+            {
+                name: (version, scope, url)
+                for name, version, scope, url, *_visible in help_entries
+            },
+            rust_dependencies | ui_dependencies,
+        )
+        self.assertIn(
+            "exact version resolved by the frozen <code>Cargo.lock</code>",
+            about_help,
+        )
+        for document in (app, about_help):
+            self.assertIn(
+                "complete transitive Rust release-dependency license inventory",
+                document,
+            )
+            self.assertIn("DSM_UI_THIRD_PARTY_LICENSES.txt", document)
+            self.assertIn("Vue is supplied by DSM and is not bundled", document)
+            self.assertIn(
+                "other pnpm packages whose code is not named in that notice "
+                "are used only during the build",
+                document,
+            )
+        self.assertNotIn(
+            "complete transitive license inventory ships as",
+            about_help,
+        )
+
+        for marker in (
+            "https://github.com/supermarsx/synology-drive-sync/releases",
+            "https://supermarsx.github.io/synology-drive-sync/release-selector.html",
+            "does not fetch or install updates",
+            "does not configure Package Source discovery",
+        ):
+            self.assertIn(marker, app)
+            self.assertIn(marker, about_help)
+        self.assertIn("Package Center <strong>Manual Install</strong>", app)
+        self.assertIn("Package Center &gt; Manual Install", about_help)
+        validate_spk.validate_external_links(app, "App.vue")
+        validate_spk.validate_external_links(about_help, "about.html")
 
     def test_native_appwindow_is_dark_first_accessible_responsive_and_isolated(self) -> None:
         main = (UI_SOURCE / "src/main.js").read_bytes()
@@ -112,11 +279,12 @@ class DsmUiContractTests(unittest.TestCase):
         )
         for route in (
             "Overview", "Profiles", "Routines", "Health / Doctor",
-            "Activity / Logs", "Notifications", "Settings",
+            "Activity / Logs", "Notifications", "Security", "Settings", "About",
         ):
             self.assertIn(f'title: "{route}"', app_text)
         for marker in (
-            'aria-live="polite"', 'aria-labelledby="sdsync-health-title"',
+            'aria-live="polite"', 'id="sdsync-page-title"',
+            'aria-labelledby="sdsync-page-title"',
             "<v-button", "<v-form", "<v-form-item", "<v-single-select",
             "beforeDestroy()", "this.stopTimers();",
             "this.disposed = true;", "this.abortController.abort();",
@@ -132,11 +300,18 @@ class DsmUiContractTests(unittest.TestCase):
             'document.removeEventListener("keydown", this.confirmationKeyHandler, true)',
             'if (this.route === "profiles" && route !== "profiles") this.closeProfile();',
             'const awaitTerminal = kind === "doctor";',
+            'title="Synology Drive Sync"',
+            'this.snapshot && this.snapshot.package && this.snapshot.package.version',
+            'https://github.com/supermarsx/synology-drive-sync/releases',
+            'https://supermarsx.github.io/synology-drive-sync/release-selector.html',
+            'target="_blank" rel="noopener noreferrer"',
         ):
             self.assertIn(marker, app_text)
         for forbidden in (
             "<iframe", "index.html", "document.documentElement",
             "window.location.hash", "hashchange", "v-html", ".innerHTML", "eval(",
+            ':title="windowTitle"', "Your sync estate, at a glance.", "sdsync-hero",
+            "sdsync-check-grid", "sdsync-editor-placeholder", "sdsync-section-heading",
         ):
             self.assertNotIn(forbidden, app_text)
         self.assertTrue(css_text.startswith(".sdsync-app {"))
@@ -170,6 +345,7 @@ class DsmUiContractTests(unittest.TestCase):
         for operation in (
             "configure-profile", "remove-profile", "set-default", "set-secret",
             "schedule", "routine", "remove-routine", "alert-policy", "action",
+            "security-policy", "client-event",
         ):
             self.assertIn(f'"{operation}"', api)
         self.assertNotRegex(app, r"localStorage[^\n]*(?:password|totp|remote_log_token)")
@@ -474,6 +650,12 @@ async function capture(promise) {
             count=1,
             flags=re.DOTALL,
         )
+        executable = re.sub(
+            r'import\s+SecurityPanel\s+from\s+"\./SecurityPanel\.vue";\s*',
+            "",
+            executable,
+            count=1,
+        )
         executable = executable.replace("export default {", "const AppComponent = {", 1)
         executable = executable.replace("apiPost(", "apiPostSpy(")
         harness = "\n".join(
@@ -482,6 +664,8 @@ async function capture(promise) {
                 'const assert = require("node:assert/strict");',
                 r'''
 const ACTIONS = { execute: "action" };
+const SNAPSHOT_SCHEMA = "sdsync.dsm-api.v1";
+const SecurityPanel = {};
 const boundedText = (value, fallback = "") =>
   String(typeof value === "string" && value ? value : fallback).slice(0, 65536);
 const formatBytes = (value) => String(value);
@@ -505,6 +689,10 @@ const methods = AppComponent.methods;
 function operationContext() {
   const context = {
     canMutate: true,
+    canRunOperations: true,
+    canAllowDestructive: true,
+    canRunDoctorWrite: true,
+    capabilities: { write_test: true },
     operationBusy: false,
     disposed: false,
     auth: {},
@@ -517,7 +705,8 @@ function operationContext() {
     refreshSnapshot: async function () {},
     reportMutationError: function (...args) {
       return methods.reportMutationError.apply(this, args);
-    }
+    },
+    hasCapability: function (name) { return this.capabilities[name] === true; }
   };
   return context;
 }
@@ -748,13 +937,13 @@ function bind(context, names) {
 
     def test_icon_family_is_deterministic_snapshotted_and_inside_safe_bounds(self) -> None:
         expected_hashes = {
-            16: "4cb3d5307d64639e723cd59dc0818c6e65a5c748e1355bcc1aed7e5eba4baef1",
-            24: "3c587033dd626d5caceb81606a20c16426e12c259a8afa6aca57c121acc4e493",
-            32: "20cfa35b7f756518707cdd14b0531aa63159d527a7adf6996cdf995fafca33f7",
-            48: "e2d05816e460035d5cfccf76c5c8c685f0d93e570d2e27aaa92e533bee1a0274",
-            64: "d2c7c9310adcd8c9612809ebef9704c38cb2056daf3dff17b682091e4030f3ec",
-            72: "f58f6096d5391b8e2748af9f669cfec48ff13a99a790496300fbfb40ab77b899",
-            256: "687b845fda755e11d55d6f96979c634ad650506d0bb2a905824178acf3f1ebad",
+            16: "23fc20ce25acd0a907508134369affe48babdb8eeeb72b6d4353671937a67128",
+            24: "204efbcf279f78ad6b4af1891f8b3522831cd47d7dfa50bb84d6a0c8729e4027",
+            32: "a4d9ff5108c02e43cd3a086f280f942d0dcdebb645a884a13fef922d6cea0a7f",
+            48: "b3431fe0f4a0c54a126dbf7691b0822f0fdf171bbecc83dbde5373c85ab7d9b4",
+            64: "bf5b241038e696f7f7c56c1eeecb233beb59353c0310f026e6ae79c83e9b180d",
+            72: "6468ba3c0b56d68b577dd9b17a284880ba8110f21b80f19949bae1b1343f0179",
+            256: "6c431626134d444c149d0a83fd5add537693bee81d9f4a3ff2269c8015e111f2",
         }
         self.assertEqual(tuple(expected_hashes), build_spk.UI_ICON_SIZES)
         for size, expected_hash in expected_hashes.items():
@@ -770,23 +959,37 @@ function bind(context, names) {
 
     def test_icon_arrow_apices_stay_ahead_of_bodies_at_every_size(self) -> None:
         arrows = (
-            ("top", build_spk.ICON_TOP_ARC, build_spk.ICON_TOP_TIP_ANGLE),
-            ("bottom", build_spk.ICON_BOTTOM_ARC, build_spk.ICON_BOTTOM_TIP_ANGLE),
+            ("top", build_spk.ICON_TOP_BODY, build_spk.ICON_TOP_TIP),
+            ("bottom", build_spk.ICON_BOTTOM_BODY, build_spk.ICON_BOTTOM_TIP),
         )
-        for name, body_angles, tip_angle in arrows:
-            triangle = build_spk._arrow_triangle(tip_angle)
+        for name, body, tip in arrows:
+            triangle = build_spk._arrow_triangle(body, tip)
             apex = triangle[0]
+            base = body[-1]
+            rear = body[-2]
+            direction = (tip[0] - base[0], tip[1] - base[1])
+            prior = (base[0] - rear[0], base[1] - rear[1])
             with self.subTest(arrow=name, contract="apex"):
-                self.assertGreater(tip_angle, body_angles[1])
-                self.assertAlmostEqual(tip_angle - body_angles[1], 0.32)
+                self.assertGreater(direction[0] * prior[0] + direction[1] * prior[1], 0)
+                self.assertAlmostEqual((triangle[1][0] + triangle[2][0]) / 2, base[0])
+                self.assertAlmostEqual((triangle[1][1] + triangle[2][1]) / 2, base[1])
                 self.assertTrue(build_spk._triangle_contains(*apex, *triangle))
-                self.assertFalse(build_spk._arc_contains(*apex, *body_angles))
+                self.assertFalse(
+                    build_spk._trace_contains(
+                        *apex,
+                        body,
+                        build_spk.ICON_ARROW_HALF_THICKNESS,
+                        stop_at_final_base=True,
+                    )
+                )
 
         supersample = 4
         for size in build_spk.UI_ICON_SIZES:
             resolution = size * supersample
-            for name, body_angles, tip_angle in arrows:
-                triangle = build_spk._arrow_triangle(tip_angle)
+            for name, body, tip in arrows:
+                triangle = build_spk._arrow_triangle(body, tip)
+                base = body[-1]
+                direction = (tip[0] - base[0], tip[1] - base[1])
                 head_samples = 0
                 overlap_samples = 0
                 forward_head_pixels: set[tuple[int, int]] = set()
@@ -800,21 +1003,27 @@ function bind(context, names) {
                         if not on_head:
                             continue
                         head_samples += 1
-                        on_body = build_spk._arc_contains(
-                            normalized_x, normalized_y, *body_angles
+                        on_body = build_spk._trace_contains(
+                            normalized_x,
+                            normalized_y,
+                            body,
+                            build_spk.ICON_ARROW_HALF_THICKNESS,
+                            stop_at_final_base=True,
                         )
                         if on_body:
                             overlap_samples += 1
                             continue
-                        angle = math.atan2(normalized_y - 0.5, normalized_x - 0.5)
-                        if angle > body_angles[1]:
+                        forward = (
+                            (normalized_x - base[0]) * direction[0]
+                            + (normalized_y - base[1]) * direction[1]
+                        )
+                        if forward > 0:
                             forward_head_pixels.add(
                                 (sample_x // supersample, sample_y // supersample)
                             )
                 with self.subTest(size=size, arrow=name, contract="base-overlap"):
                     overlap_ratio = overlap_samples / head_samples
-                    self.assertGreater(overlap_ratio, 0.10)
-                    self.assertLess(overlap_ratio, 0.30)
+                    self.assertLess(overlap_ratio, 0.02)
                     self.assertTrue(forward_head_pixels)
 
     def test_svg_icon_matches_raster_arrow_geometry_and_palette(self) -> None:
@@ -823,38 +1032,29 @@ function bind(context, names) {
         def scalar(value: float) -> str:
             return f"{value:.3f}".rstrip("0").rstrip(".")
 
-        def point(angle: float) -> tuple[float, float]:
-            return (
-                256 * (0.5 + build_spk.ICON_ARROW_RADIUS * math.cos(angle)),
-                256 * (0.5 + build_spk.ICON_ARROW_RADIUS * math.sin(angle)),
-            )
-
-        radius = scalar(256 * build_spk.ICON_ARROW_RADIUS)
         stroke_width = scalar(512 * build_spk.ICON_ARROW_HALF_THICKNESS)
-        for body_angles, color in (
-            (build_spk.ICON_TOP_ARC, build_spk.ICON_TOP),
-            (build_spk.ICON_BOTTOM_ARC, build_spk.ICON_BOTTOM),
+        for body, color in (
+            (build_spk.ICON_TOP_BODY, build_spk.ICON_TOP),
+            (build_spk.ICON_BOTTOM_BODY, build_spk.ICON_BOTTOM),
         ):
-            start = point(body_angles[0])
-            end = point(body_angles[1])
-            path = (
-                f'd="M{start[0]:.3f} {start[1]:.3f} A{radius} {radius} '
-                f'0 0 1 {end[0]:.3f} {end[1]:.3f}"'
+            points = " ".join(
+                f"{x * 256:.3f},{y * 256:.3f}" for x, y in body
             )
             color_hex = "#" + "".join(f"{round(channel):02x}" for channel in color)
-            self.assertIn(path, svg)
+            marker = f'<polyline points="{points}"'
+            self.assertIn(marker, svg)
             self.assertRegex(
                 svg,
-                re.escape(path) + rf'[^>]+stroke="{color_hex}"[^>]+stroke-width="{stroke_width}"',
+                re.escape(marker) + rf'[^>]+stroke="{color_hex}"[^>]+stroke-width="{stroke_width}"',
             )
 
-        for tip_angle, color in (
-            (build_spk.ICON_TOP_TIP_ANGLE, build_spk.ICON_TOP),
-            (build_spk.ICON_BOTTOM_TIP_ANGLE, build_spk.ICON_BOTTOM),
+        for body, tip, color in (
+            (build_spk.ICON_TOP_BODY, build_spk.ICON_TOP_TIP, build_spk.ICON_TOP),
+            (build_spk.ICON_BOTTOM_BODY, build_spk.ICON_BOTTOM_TIP, build_spk.ICON_BOTTOM),
         ):
             points = " ".join(
                 f"{x * 256:.3f},{y * 256:.3f}"
-                for x, y in build_spk._arrow_triangle(tip_angle)
+                for x, y in build_spk._arrow_triangle(body, tip)
             )
             color_hex = "#" + "".join(f"{round(channel):02x}" for channel in color)
             self.assertIn(f'<polygon points="{points}" fill="{color_hex}"/>', svg)
@@ -870,15 +1070,21 @@ function bind(context, names) {
         for color in palette:
             color_hex = "#" + "".join(f"{round(channel):02x}" for channel in color)
             self.assertIn(color_hex, svg)
-        self.assertIn(
-            f'r="{scalar(256 * build_spk.ICON_ORBIT_RADIUS)}"',
-            svg,
+        orbit = " ".join(
+            f"{x * 256:.3f},{y * 256:.3f}" for x, y in build_spk.ICON_ORBIT_POINTS
         )
-        self.assertIn(
-            f'r="{scalar(256 * build_spk.ICON_CENTER_RADIUS)}"',
-            svg,
-        )
-        self.assertLess(svg.rindex("<path"), svg.index("<polygon"))
+        self.assertIn(f'<polyline points="{orbit}"', svg)
+        self.assertNotRegex(svg, r"#(?:65e6c7|2fb69d|d9fff5|08110f)")
+        for body, tip in (
+            (build_spk.ICON_TOP_BODY, build_spk.ICON_TOP_TIP),
+            (build_spk.ICON_BOTTOM_BODY, build_spk.ICON_BOTTOM_TIP),
+        ):
+            body_marker = " ".join(f"{x * 256:.3f},{y * 256:.3f}" for x, y in body)
+            head_marker = " ".join(
+                f"{x * 256:.3f},{y * 256:.3f}"
+                for x, y in build_spk._arrow_triangle(body, tip)
+            )
+            self.assertLess(svg.index(body_marker), svg.index(head_marker))
 
     def test_payload_contains_offline_ui_icons_and_identical_helper_modes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -908,6 +1114,8 @@ function bind(context, names) {
                 "ui/style.css",
                 "ui/images/icon.svg",
                 "ui/texts/enu/strings",
+                "ui/helptoc.conf",
+                *(f"ui/help/enu/{page}.html" for page in build_spk.UI_HELP_PAGES),
             ):
                 self.assertIn(name, members)
             for name in ("ui/index.html", "ui/app.js", "ui/app.css"):
@@ -920,6 +1128,15 @@ function bind(context, names) {
             validate_spk.validate_native_bundle(
                 archive.extractfile(members["ui/SynologyDriveSync.js"]).read(),
                 archive.extractfile(members["ui/style.css"]).read(),
+            )
+            validate_spk.validate_dsm_help(
+                archive.extractfile(members["ui/helptoc.conf"]).read(),
+                {
+                    page: archive.extractfile(
+                        members[f"ui/help/enu/{page}.html"]
+                    ).read()
+                    for page in build_spk.UI_HELP_PAGES
+                },
             )
             self.assertNotIn("ui/texts/enu/mails", members)
             self.assertEqual(installed_size, sum(member.size for member in members.values() if member.isfile()))

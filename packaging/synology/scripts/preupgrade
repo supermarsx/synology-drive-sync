@@ -2,11 +2,73 @@
 set -eu
 . "$(dirname "$0")/common"
 
-refuse_active_run || exit 1
-
-pid=$(script_pid "$controller_pid_file" 2>/dev/null || true)
-if [ -n "$pid" ] && script_pid_live "$pid"; then
-    package_message "controller is still running; DSM must stop it before upgrade"
+# Synology defines preupgrade as a read-only acceptance check and still points
+# SYNOPKG_PKGDEST at the installed target. Do not create locks or markers here.
+expected_uid=$(package_uid 2>/dev/null || true)
+current_uid=$(id -u)
+case $expected_uid:$current_uid in
+    ''|*:*[!0-9]*|*[!0-9]*:*) package_message "cannot validate package identity"; exit 1 ;;
+esac
+[ "$current_uid" != 0 ] && [ "$current_uid" = "$expected_uid" ] || {
+    package_message "preupgrade must run as the installed package identity"
     exit 1
+}
+
+management_lock=$runtime_root/management.lock
+if [ -e "$management_lock" ] || [ -L "$management_lock" ]; then
+    package_message "package-management state is still active or stale"
+    exit 1
+fi
+
+controller_start_file=$runtime_root/controller.starting
+failed_start_api_file=$runtime_root/failed-start.api
+failed_start_controller_file=$runtime_root/failed-start.controller
+for transition_artifact in "$controller_pid_file" "$controller_ready_file" \
+    "$controller_start_file" "$controller_lock" "$api_pid_file" "$api_bound_file" \
+    "$api_ready_file" "$api_socket" "$failed_start_api_file" "$failed_start_controller_file"
+do
+    if [ -e "$transition_artifact" ] || [ -L "$transition_artifact" ]; then
+        package_message "package service topology is not fully stopped: $transition_artifact"
+        exit 1
+    fi
+done
+
+transition_probe=
+service_probe=
+if transition_probe=$("$api_server" --package-transition status 2>/dev/null) \
+    && service_probe=$("$api_server" --service-admission status 2>/dev/null); then
+    case $transition_probe:$service_probe in
+        open:closed|upgrade:closed) ;;
+        *) package_message "upgrade admission is not closed"; exit 1 ;;
+    esac
+    refuse_active_run || exit 1
+    if [ -e "$run_lock" ] || [ -L "$run_lock" ]; then
+        package_message "plan/sync lock is stale or unsafe; run stop before upgrade"
+        exit 1
+    fi
+else
+    # 26.7-26.10 are the reviewed lifecycle-equivalent released schemas predating
+    # the durable admission marker (26.10 changes only the notification application
+    # ID in the relevant runtime helper). Their compatibility path is read-only; DSM/package
+    # transaction serialization and the trusted package UID must exclude
+    # concurrent direct CLI use until the new postinst adopts the marker.
+    legacy_upgrade_source_supported || {
+        package_message "installed package lacks transition support and predates the reviewed 26.7-1 upgrade floor"
+        exit 1
+    }
+    legacy_lock_status=0
+    legacy_stale_run_lock_status || legacy_lock_status=$?
+    case $legacy_lock_status in
+        0) ;;
+        75) package_message "legacy package plan/sync is still active"; exit 1 ;;
+        *) package_message "legacy package run lock is unsafe"; exit 1 ;;
+    esac
+    legacy_core_status=0
+    legacy_package_core_status || legacy_core_status=$?
+    case $legacy_core_status in
+        0) ;;
+        75) package_message "legacy package core must stop before upgrade"; exit 1 ;;
+        *) package_message "legacy package core identity is unsafe"; exit 1 ;;
+    esac
 fi
 exit 0

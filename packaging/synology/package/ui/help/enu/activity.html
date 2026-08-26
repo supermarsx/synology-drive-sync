@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html class="img-no-display">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <link href="../../../../help/help.css" rel="stylesheet" type="text/css">
+  <link href="../../../../help/scrollbar/flexcroll.css" rel="stylesheet" type="text/css">
+  <script type="text/javascript" src="../../../../help/scrollbar/flexcroll.js"></script>
+  <script type="text/javascript" src="../../../../help/scrollbar/initFlexcroll.js"></script>
+  <title>Activity and logs</title>
+</head>
+<body>
+  <h1>Activity and logs</h1>
+  <p>Activity shows bounded structured events and recent package log output. Browser polling runs only while this page and the DSM document are visible.</p>
+
+  <h2>Structured activity</h2>
+  <p>Each event can include time, code, profile, state, category, and level. Events describe package decisions such as queue acceptance, controller execution, routine transitions, notifications, and terminal results. Use the category and exact-level selectors to narrow the rendered event list without deleting or changing durable records. An absent field is displayed as unknown rather than inferred.</p>
+
+  <h2>Log source and line limit</h2>
+  <p>Select all logs or limit the view to audit, controller, scheduler, or sync output. Audit is the administrator-action trail; it is separate from ordinary controller output. The line limit bounds both the request and rendered response. The package also enforces response-size limits before content reaches this AppWindow.</p>
+
+  <h2>Pause and clear</h2>
+  <p><strong>Pause live updates</strong> stops browser refreshes; it does not stop the package service or an active sync. <strong>Clear view</strong> replaces only the current rendered text. It does not delete durable package logs.</p>
+
+  <h2>Troubleshooting an unavailable bridge</h2>
+  <ol>
+    <li>Confirm that the package is running in Package Center.</li>
+    <li>Sign in to DSM again and reopen the AppWindow so the same-origin session can be re-evaluated.</li>
+    <li>Check the package service and controller logs over an administrator-approved DSM support path.</li>
+    <li>Do not expose package-private log or socket paths through a public web alias.</li>
+  </ol>
+
+  <h2>Privacy</h2>
+  <p>Secret values must never appear in status, activity, or log responses. Remote logging is separately configured per profile and accepts only an HTTPS collector URL; its token remains write-only.</p>
+</body>
+</html>

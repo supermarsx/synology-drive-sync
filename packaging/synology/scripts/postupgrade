@@ -4,12 +4,150 @@ set -eu
 
 [ -r "$common_runtime" ] || { package_message "upgraded runtime helper is missing"; exit 1; }
 . "$common_runtime"
+require_package_identity
 ensure_layout
+[ -x "$api_bridge" ] && [ ! -L "$api_bridge" ] || {
+    package_message "upgraded DSM policy migration helper is unavailable"
+    exit 1
+}
+
+upgrade_lifecycle_lock=false
+upgrade_policy_lock=false
+upgrade_management_lock=false
+upgrade_audit_pending=false
+upgrade_commit_started=false
+cleanup_postupgrade() {
+    if [ "$upgrade_audit_pending" = true ]; then
+        upgrade_cleanup_state=failed
+        [ "$upgrade_commit_started" != true ] || upgrade_cleanup_state=outcome_unknown
+        audit_outbox_complete "$SDSYNC_DSM_AUDIT_TRANSACTION" "$upgrade_cleanup_state" \
+            >/dev/null 2>&1 || true
+        upgrade_audit_pending=false
+    fi
+    if [ "$upgrade_management_lock" = true ]; then
+        release_private_process_lock "$management_lock" >/dev/null 2>&1 || true
+        upgrade_management_lock=false
+    fi
+    if [ "$upgrade_policy_lock" = true ]; then
+        release_private_process_lock "$policy_execution_lock" >/dev/null 2>&1 || true
+        upgrade_policy_lock=false
+    fi
+    if [ "$upgrade_lifecycle_lock" = true ]; then
+        release_private_process_lock "$lifecycle_lock" >/dev/null 2>&1 || true
+        upgrade_lifecycle_lock=false
+    fi
+}
+trap cleanup_postupgrade 0
+trap 'exit 1' HUP INT TERM
+
+# Package transitions take lifecycle -> policy -> management. The read-only
+# classification, requested audit, and atomic migration therefore describe
+# one serialized policy document and cannot overwrite a concurrent save.
+acquire_private_process_lock "$lifecycle_lock" || {
+    package_message "package lifecycle is still changing"
+    exit 1
+}
+upgrade_lifecycle_lock=true
+"$api_bridge" --service-admission close || {
+    package_message "could not keep service admission closed during upgrade"
+    exit 1
+}
+acquire_private_process_lock "$policy_execution_lock" || {
+    package_message "another policy-sensitive operation is active"
+    exit 1
+}
+upgrade_policy_lock=true
+acquire_private_process_lock "$management_lock" || {
+    package_message "another package-management operation is active"
+    exit 1
+}
+upgrade_management_lock=true
+upgrade_transition_state=$(package_transition_status) || {
+    package_message "cannot validate the package upgrade marker"
+    exit 1
+}
+case $upgrade_transition_state in
+    open) "$api_bridge" --package-transition prepare upgrade ;;
+    upgrade) ;;
+    *) package_message "cannot complete upgrade during package $upgrade_transition_state"; exit 1 ;;
+esac
+
+migration_status=
+if ! migration_status=$("$api_bridge" --security-policy-migration-status); then
+    package_message "existing DSM security policy is corrupt or uses an unsupported version"
+    exit 1
+fi
+case $migration_status in
+    required|unchanged) ;;
+    *)
+        package_message "DSM security policy migration helper returned an invalid status"
+        exit 1
+        ;;
+esac
+
+if [ "$migration_status" = required ]; then
+    unset SDSYNC_DSM_AUDIT_TRANSACTION SDSYNC_DSM_AUDIT_ACTOR \
+        SDSYNC_DSM_AUDIT_ACTOR_UID SDSYNC_DSM_AUDIT_ORIGIN SDSYNC_DSM_CLIENT_REQUEST_ID
+    SDSYNC_DSM_AUDIT_ACTOR=package-upgrade
+    SDSYNC_DSM_AUDIT_ACTOR_UID=$path_owner
+    SDSYNC_DSM_AUDIT_ORIGIN=controller
+    export SDSYNC_DSM_AUDIT_ACTOR SDSYNC_DSM_AUDIT_ACTOR_UID SDSYNC_DSM_AUDIT_ORIGIN
+    ensure_audit_transaction || {
+        package_message "upgrade security-policy audit transaction could not be created"
+        exit 1
+    }
+    audit_outbox_begin security-policy all "$SDSYNC_DSM_AUDIT_ACTOR" \
+        "$SDSYNC_DSM_AUDIT_ACTOR_UID" "$SDSYNC_DSM_AUDIT_ORIGIN" \
+        "$SDSYNC_DSM_AUDIT_TRANSACTION" || {
+        package_message "upgrade security-policy audit outbox could not be prepared"
+        exit 1
+    }
+    upgrade_audit_pending=true
+    audit_outbox_execute "$SDSYNC_DSM_AUDIT_TRANSACTION" || {
+        package_message "upgrade security-policy execution phase could not be recorded"
+        exit 1
+    }
+    upgrade_commit_started=true
+    migration_result=
+    if ! migration_result=$("$api_bridge" --migrate-security-policy); then
+        audit_outbox_complete "$SDSYNC_DSM_AUDIT_TRANSACTION" outcome_unknown >/dev/null 2>&1 || true
+        upgrade_audit_pending=false
+        package_message "DSM security policy migration outcome is unknown; inspect Activity and audit.log"
+        exit 1
+    fi
+    [ "$migration_result" = migrated ] || {
+        audit_outbox_complete "$SDSYNC_DSM_AUDIT_TRANSACTION" outcome_unknown >/dev/null 2>&1 || true
+        upgrade_audit_pending=false
+        package_message "DSM security policy changed during its serialized migration"
+        exit 1
+    }
+    audit_outbox_complete "$SDSYNC_DSM_AUDIT_TRANSACTION" succeeded >/dev/null 2>&1 || \
+        package_message "warning: upgrade security-policy terminal audit remains pending"
+    upgrade_audit_pending=false
+    append_activity security.policy_changed all changed \
+        "Security policy migrated to schema version 1" security warn false \
+        "$path_owner" package-upgrade >/dev/null 2>&1 || \
+        package_message "warning: security-policy migration detail could not be added to Activity"
+fi
+reconcile_audit_outbox >/dev/null 2>&1 || \
+    package_message "warning: prior mandatory audit records remain pending after policy migration"
+
 if [ -f "$config_file" ]; then
     "$binary" --config "$config_file" --quiet config validate || {
         package_message "existing configuration is incompatible with the upgraded binary"
         exit 1
     }
 fi
+"$api_bridge" --package-transition clear || {
+    package_message "upgrade completed but its transition marker could not be retired"
+    exit 1
+}
+release_private_process_lock "$management_lock"
+upgrade_management_lock=false
+release_private_process_lock "$policy_execution_lock"
+upgrade_policy_lock=false
+release_private_process_lock "$lifecycle_lock"
+upgrade_lifecycle_lock=false
+trap - 0 HUP INT TERM
 package_message "Upgrade completed; private configuration and credentials were retained"
 exit 0

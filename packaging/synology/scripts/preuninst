@@ -2,11 +2,51 @@
 set -eu
 . "$(dirname "$0")/common"
 
+# Synology defines preuninst as a read-only acceptance check.
+expected_uid=$(package_uid 2>/dev/null || true)
+current_uid=$(id -u)
+case $expected_uid:$current_uid in
+    ''|*:*[!0-9]*|*[!0-9]*:*) package_message "cannot validate package identity"; exit 1 ;;
+esac
+[ "$current_uid" != 0 ] && [ "$current_uid" = "$expected_uid" ] || {
+    package_message "preuninst must run as the installed package identity"
+    exit 1
+}
 refuse_active_run || exit 1
-
-pid=$(script_pid "$controller_pid_file" 2>/dev/null || true)
-if [ -n "$pid" ] && script_pid_live "$pid"; then
-    package_message "controller is still running; stop the package before uninstall"
+if [ -e "$run_lock" ] || [ -L "$run_lock" ]; then
+    package_message "plan/sync lock is stale or unsafe; run stop before package removal"
     exit 1
 fi
+management_lock=$runtime_root/management.lock
+if [ -e "$management_lock" ] || [ -L "$management_lock" ]; then
+    package_message "package-management state is still active or stale"
+    exit 1
+fi
+controller_start_file=$runtime_root/controller.starting
+for transition_artifact in "$controller_pid_file" "$controller_ready_file" \
+    "$controller_start_file" "$controller_lock" "$api_pid_file" "$api_bound_file" \
+    "$api_ready_file" "$api_socket" "$runtime_root/failed-start.api" \
+    "$runtime_root/failed-start.controller"
+do
+    if [ -e "$transition_artifact" ] || [ -L "$transition_artifact" ]; then
+        package_message "package service topology is not fully stopped: $transition_artifact"
+        exit 1
+    fi
+done
+transition_state=$("$api_server" --package-transition status 2>/dev/null) || {
+    package_message "installed transition helper is unavailable"
+    exit 1
+}
+service_state=$("$api_server" --service-admission status 2>/dev/null) || {
+    package_message "installed service-admission state is unsafe"
+    exit 1
+}
+[ "$service_state" = closed ] || {
+    package_message "service admission must be closed before package removal"
+    exit 1
+}
+case ${SYNOPKG_PKG_STATUS:-UNINSTALL}:$transition_state in
+    UPGRADE:open|UPGRADE:upgrade|UNINSTALL:open|UNINSTALL:uninstall) ;;
+    *) package_message "package removal phase does not match transition $transition_state"; exit 1 ;;
+esac
 exit 0

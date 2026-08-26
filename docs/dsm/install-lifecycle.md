@@ -25,8 +25,8 @@ not create DSM users, homes, shared folders, Team Folders, or ACLs.
 
 ## Verify and install
 
-The native AppWindow procedure below applies to a verified 26.10-or-later SPK once such a release is
-published. Releases 26.7-26.9 may satisfy the corrected rootless package contract, but they retain
+The native AppWindow procedure below applies to a verified 26.10-or-later SPK. Releases 26.7-26.9
+may satisfy the corrected rootless package contract, but they retain
 their originally published UI and do not gain the native AppWindow retroactively.
 
 1. Verify the asset as described in [Compatibility and release selection](compatibility.md#download-and-verify-one-exact-release).
@@ -156,6 +156,18 @@ Before an upgrade:
 4. install the update through Package Center;
 5. start the package, confirm dashboard/CLI status, run Doctor, and review a fresh additive Plan;
 6. re-enable automation only after those checks pass.
+
+The package declares a direct upgrade floor of `26.7-1`. The markerless 26.7-26.10 lifecycle
+generation is accepted only after a read-only stopped-topology check proves that neither its old
+runner nor an exact package core remains alive; the new post-install hook then adopts any strictly
+validated stale one-line run lock. Releases 26.5 and 26.6 are not eligible for direct upgrade. Move
+such an installation to a verified eligible intermediate SPK through Package Center Manual Install
+before installing the current release.
+
+Because Synology's `preupgrade` hook is read-only, this markerless compatibility path cannot publish
+a new exclusion lock. Do not run `sdsync-dsm` or other package-private commands concurrently with
+the Package Center upgrade; the path assumes DSM serializes the package transaction and that the
+package service UID remains trusted.
 
 DSM stops a running package before upgrade. Lifecycle scripts also refuse upgrade while a verified
 controller or foreground Plan/Run PID remains live. Profiles, credentials, routines, global schedule,

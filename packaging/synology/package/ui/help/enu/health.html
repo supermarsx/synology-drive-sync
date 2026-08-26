@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html class="img-no-display">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <link href="../../../../help/help.css" rel="stylesheet" type="text/css">
+  <link href="../../../../help/scrollbar/flexcroll.css" rel="stylesheet" type="text/css">
+  <script type="text/javascript" src="../../../../help/scrollbar/flexcroll.js"></script>
+  <script type="text/javascript" src="../../../../help/scrollbar/initFlexcroll.js"></script>
+  <title>Health and Target Doctor</title>
+</head>
+<body>
+  <h1>Health and Target Doctor</h1>
+  <p>Target Doctor performs bounded preflight diagnostics for all profiles or one selected profile. The AppWindow waits for terminal Doctor evidence rather than treating queue acceptance as success.</p>
+
+  <h2>Checks</h2>
+  <ol>
+    <li><strong>Source integrity:</strong> walks the complete source and hashes payload files.</li>
+    <li><strong>Reverse-proxy routing:</strong> requires File Station API discovery instead of accepting an HTML login or portal fallback.</li>
+    <li><strong>Authentication:</strong> validates destination credentials without returning secrets to the AppWindow.</li>
+    <li><strong>Destination permission:</strong> checks the configured path or its nearest existing ancestor.</li>
+    <li><strong>Capacity and latency:</strong> reports only evidence actually returned by the target.</li>
+  </ol>
+
+  <h2>Disposable write test</h2>
+  <p>The optional write test creates a unique probe, verifies it, and removes it. It requires package capability, an explicit checkbox, a second cleanup acknowledgement, and a confirmation dialog. Use only a non-critical destination. A cleanup failure is diagnostic failure evidence and must be investigated.</p>
+
+  <h2>Terminal and unknown outcomes</h2>
+  <p><strong>Completed</strong> and <strong>failed</strong> are terminal package results. If a queued job can no longer be observed because status evidence is invalid, expired, or repeatedly unavailable, the UI reports <strong>outcome unknown</strong>. Do not immediately resubmit an unknown operation; inspect Activity and logs to avoid a duplicate.</p>
+
+  <h2>Cached target health</h2>
+  <p>The table displays the newest package-reported evidence for reachability, authentication, writability, latency, Doctor status, last successful sync, and free space. <em>Unavailable</em> means evidence was not supplied; it is not equivalent to success or failure.</p>
+</body>
+</html>

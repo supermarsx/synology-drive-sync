@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html class="img-no-display">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <link href="../../../../help/help.css" rel="stylesheet" type="text/css">
+  <link href="../../../../help/scrollbar/flexcroll.css" rel="stylesheet" type="text/css">
+  <script type="text/javascript" src="../../../../help/scrollbar/flexcroll.js"></script>
+  <script type="text/javascript" src="../../../../help/scrollbar/initFlexcroll.js"></script>
+  <title>Notifications</title>
+</head>
+<body>
+  <h1>Notifications</h1>
+  <p>Package alerts use DSM desktop delivery with fixed localized title and message keys. Dynamic paths, profile names, usernames, URLs, tokens, and error output are deliberately excluded.</p>
+
+  <h2>DSM desktop alert policy</h2>
+  <dl>
+    <dt>Enable alerts</dt><dd>Master switch for package-owned DSM desktop notifications.</dd>
+    <dt>Notify on success</dt><dd>Sends the fixed completion event after a successful sync.</dd>
+    <dt>Notify on failure</dt><dd>Sends the fixed failure event after the failure threshold is met.</dd>
+    <dt>Failures before alert</dt><dd>Consecutive failures required before delivery.</dd>
+    <dt>Cooldown</dt><dd>Minimum seconds between repeated failure alerts.</dd>
+  </dl>
+
+  <h2>Recognized events</h2>
+  <ul>
+    <li><code>sync_succeeded</code> - fixed sync completion title and message.</li>
+    <li><code>sync_failed</code> - fixed sync failure title and message.</li>
+    <li><code>doctor_failed</code> - fixed Target Doctor failure title and message.</li>
+  </ul>
+  <p>Open Activity and package logs for bounded diagnostic detail.</p>
+
+  <h2>Open-session signals</h2>
+  <p>Browser notification and audible-cue settings are optional, non-secret preferences for the current browser. Saving them requires the notification-change policy and records a fixed <code>session-notifications</code> audit event before local persistence. They operate only while the AppWindow session can observe a newly failed result and do not replace DSM package alerts.</p>
+</body>
+</html>

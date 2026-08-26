@@ -3,6 +3,7 @@
     <v-app-window
       ref="appWindow"
       syno-id="SYNO.SDS.App.SynologyDriveSync.Window"
+      title="Synology Drive Sync"
       width="1180"
       height="760"
       :resizable="true"
@@ -11,7 +12,7 @@
         <aside class="sdsync-sidebar" aria-label="Application navigation">
           <div class="sdsync-brand">
             <img src="/webman/3rdparty/synology-drive-sync/images/icon_64.png" width="42" height="42" alt="">
-            <div><strong>Drive Sync</strong><span>File Station control</span></div>
+            <div><strong>Drive Sync</strong><span>File Station sync</span></div>
           </div>
           <nav class="sdsync-nav">
             <button
@@ -36,11 +37,18 @@
 
         <main class="sdsync-workspace">
           <header class="sdsync-topbar">
-            <div><p class="sdsync-eyebrow">DSM package control plane</p><h1>{{ pageTitle }}</h1></div>
+            <div><h1 id="sdsync-page-title">{{ pageTitle }}</h1></div>
             <div class="sdsync-topbar-actions">
               <span class="sdsync-freshness" aria-live="polite">{{ freshness }}</span>
               <v-button
-                type="round-border"
+                type="border"
+                display="text"
+                tooltip="Open this section in DSM Help"
+                aria-label="Open Synology Drive Sync help in DSM Help"
+                @click="openDsmHelp"
+              >Help</v-button>
+              <v-button
+                type="border"
                 display="text"
                 tooltip="Refresh current data"
                 :disabled="snapshotLoading"
@@ -51,22 +59,22 @@
 
           <div v-if="!canMutate" class="sdsync-banner" role="status">
             <div>
-              <strong>Read-only control plane</strong>
-              <span>Live status remains available, but changes stay disabled until the authenticated DSM bridge is ready.</span>
+              <strong>{{ bridgeIssue.title || 'Read-only mode' }}</strong>
+              <span>{{ bridgeIssue.message || 'Live status remains available, but changes stay disabled until the authenticated DSM bridge is ready.' }}</span>
+              <v-button type="border" display="text" tooltip="Retry DSM authentication and reload package status" :disabled="snapshotLoading" @click="refreshSnapshot(true)">Retry</v-button>
             </div>
           </div>
 
-          <section v-if="route === 'overview'" class="sdsync-page" aria-labelledby="sdsync-overview-title">
-            <h2 id="sdsync-overview-title" class="sdsync-sr-only">Overview</h2>
-            <div class="sdsync-hero">
-              <div>
-                <span :class="pillClass(serviceState)">{{ serviceState }}</span>
-                <h2>Your sync estate, at a glance.</h2>
-                <p>{{ overviewSummary }}</p>
+          <section v-if="route === 'overview'" class="sdsync-page" aria-labelledby="sdsync-page-title">
+            <div class="sdsync-overview-status" aria-label="Service status and actions">
+              <div class="sdsync-service-status">
+                <span>Service</span>
+                <strong :class="pillClass(serviceState)">{{ serviceState }}</strong>
+                <small>{{ overviewSummary }}</small>
               </div>
               <div class="sdsync-action-row">
-                <v-button suffix="grey" :disabled="!canMutate || !profiles.length || operationBusy" @click="quickPlan">Plan all profiles</v-button>
-                <v-button suffix="main" :disabled="!canMutate || !profiles.length || operationBusy" @click="quickRun">Run all profiles</v-button>
+                <v-button suffix="grey" tooltip="Preview every configured profile without changing destination files" :disabled="!canRunOperations || !profiles.length || operationBusy" @click="quickPlan">Plan all profiles</v-button>
+                <v-button suffix="main" tooltip="Start a real sync for every configured profile with deletion disabled" :disabled="!canRunOperations || !profiles.length || operationBusy" @click="quickRun">Run all profiles</v-button>
               </div>
             </div>
 
@@ -80,7 +88,7 @@
 
             <div class="sdsync-two-column">
               <article class="sdsync-panel">
-                <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Destinations</p><h3>Profile readiness</h3></div><v-button type="styleless" @click="navigate('profiles')">Manage profiles</v-button></div>
+                <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Destinations</p><h3>Profile readiness</h3></div><v-button type="styleless" tooltip="Open profile configuration and protected credentials" @click="navigate('profiles')">Manage profiles</v-button></div>
                 <p v-if="!profiles.length" class="sdsync-empty">No configured profiles.</p>
                 <div v-for="profile in profiles" :key="profile.name" class="sdsync-compact-profile">
                   <div><strong>{{ profile.name }}</strong><span>{{ profile.remote || profile.remote_path || 'Destination unavailable' }}</span></div>
@@ -88,7 +96,7 @@
                 </div>
               </article>
               <article class="sdsync-panel">
-                <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Recent state</p><h3>Last operation</h3></div><v-button type="styleless" @click="navigate('activity')">Open activity</v-button></div>
+                <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Recent state</p><h3>Last operation</h3></div><v-button type="styleless" tooltip="Inspect structured events and bounded package logs" @click="navigate('activity')">Open activity</v-button></div>
                 <dl class="sdsync-definition-grid">
                   <div><dt>Operation</dt><dd>{{ runOperation }}</dd></div><div><dt>State</dt><dd>{{ runStatus }}</dd></div>
                   <div><dt>Scope</dt><dd>{{ runScope }}</dd></div><div><dt>Started</dt><dd>{{ formatDate(run.started_epoch) }}</dd></div>
@@ -98,19 +106,19 @@
             </div>
           </section>
 
-          <section v-else-if="route === 'profiles'" class="sdsync-page" aria-labelledby="sdsync-profiles-title">
-            <div class="sdsync-section-heading">
-              <div><p class="sdsync-eyebrow">Configuration</p><h2 id="sdsync-profiles-title">Profiles</h2><p>Each profile owns one local source, one File Station destination, and protected credentials.</p></div>
-              <v-button suffix="main" :disabled="!canMutate || operationBusy" @click="openProfile('')">New profile</v-button>
+          <section v-else-if="route === 'profiles'" class="sdsync-page" aria-labelledby="sdsync-page-title">
+            <div class="sdsync-page-actions">
+              <v-button suffix="main" tooltip="Create a validated source-to-File-Station profile" :disabled="!canChangeProfiles || operationBusy" @click="openProfile('')">New profile</v-button>
             </div>
-            <div class="sdsync-profiles-layout">
+            <div :class="['sdsync-profiles-layout', { 'is-catalog-only': !profileEditorOpen }]">
               <div class="sdsync-panel sdsync-profile-catalog">
-                <v-input v-model="profileFilter" clearable placeholder="Filter profiles" aria-label="Filter profiles" />
+                <v-input v-model="profileFilter" clearable placeholder="Filter profiles" aria-label="Filter profiles" aria-describedby="sdsync-help-profile-filter" /><control-help help-key="profile-filter" />
                 <p v-if="!filteredProfiles.length" class="sdsync-empty">No configured profiles.</p>
                 <button
                   v-for="profile in filteredProfiles"
                   :key="profile.name"
                   type="button"
+                  :title="'Edit profile ' + profile.name"
                   :class="['sdsync-profile-row', { 'is-selected': selectedProfile === profile.name }]"
                   :disabled="operationBusy"
                   @click="openProfile(profile.name)"
@@ -120,58 +128,53 @@
                 </button>
               </div>
 
-              <article v-if="!profileEditorOpen" class="sdsync-panel sdsync-editor-placeholder">
-                <p class="sdsync-eyebrow">Profile editor</p><h3>Select a profile or create one</h3>
-                <p>Configuration and secret operations stay separate. Stored credentials are shown only as masked presence flags.</p>
-              </article>
-
-              <v-form v-else v-model="profileForm" class="sdsync-panel sdsync-editor" direction="vertical" @submit="saveProfile">
+              <v-form v-if="profileEditorOpen" v-model="profileForm" class="sdsync-panel sdsync-editor" direction="vertical" @submit="saveProfile">
                 <div class="sdsync-panel-heading">
                   <div><p class="sdsync-eyebrow">Profile editor</p><h3>{{ selectedProfile ? 'Edit ' + selectedProfile : 'New profile' }}</h3></div>
-                  <v-button type="round-border" @click="closeProfile">Close</v-button>
+                  <v-button type="border" tooltip="Close the editor and clear unsubmitted secret fields" @click="closeProfile">Close</v-button>
                 </div>
                 <div class="sdsync-form-grid">
-                  <v-form-item label="Name" prop="name"><v-input v-model.trim="profileForm.name" :readonly="Boolean(selectedProfile)" maxlength="64" placeholder="office_nas" /></v-form-item>
-                  <v-form-item label="Local source" prop="source"><v-input v-model.trim="profileForm.source" placeholder="/volume1/Source" /></v-form-item>
-                  <v-form-item class="span-2" label="File Station URL" prop="url"><v-input v-model.trim="profileForm.url" placeholder="https://files.example.com" /></v-form-item>
-                  <v-form-item label="DSM username" prop="username"><v-input v-model.trim="profileForm.username" autocomplete="username" /></v-form-item>
-                  <v-form-item label="Remote logical path" prop="remote"><v-input v-model.trim="profileForm.remote" placeholder="/home/Drive/NAS Backup" /></v-form-item>
-                  <v-form-item label="Comparison"><v-single-select v-model="profileForm.compare" :options="compareOptions" width="100%" /></v-form-item>
-                  <v-form-item label="Concurrent uploads"><v-input v-model="profileForm.jobs" number-only /></v-form-item>
-                  <v-checkbox v-model="profileForm.allow_http" class="span-2" :disabled="!canMutate">Allow plain HTTP for controlled LAN testing</v-checkbox>
+                  <v-form-item label="Name" prop="name"><v-input v-model.trim="profileForm.name" :readonly="Boolean(selectedProfile)" maxlength="64" placeholder="office_nas" aria-describedby="sdsync-help-profile-name" :disabled="!canChangeProfiles" /><control-help help-key="profile-name" /></v-form-item>
+                  <v-form-item label="Local source" prop="source"><v-input v-model.trim="profileForm.source" placeholder="/volume1/Source" aria-describedby="sdsync-help-profile-source" :disabled="!canChangeProfiles" /><control-help help-key="profile-source" /></v-form-item>
+                  <v-form-item class="span-2" label="File Station URL" prop="url"><v-input v-model.trim="profileForm.url" placeholder="https://files.example.com" aria-describedby="sdsync-help-profile-url" :disabled="!canChangeProfiles" /><control-help help-key="profile-url" /></v-form-item>
+                  <v-form-item label="DSM username" prop="username"><v-input v-model.trim="profileForm.username" autocomplete="username" aria-describedby="sdsync-help-profile-username" :disabled="!canChangeProfiles" /><control-help help-key="profile-username" /></v-form-item>
+                  <v-form-item label="Remote logical path" prop="remote"><v-input v-model.trim="profileForm.remote" placeholder="/home/Drive/NAS Backup" aria-describedby="sdsync-help-profile-remote" :disabled="!canChangeProfiles" /><control-help help-key="profile-remote" /></v-form-item>
+                  <v-form-item label="Comparison"><v-single-select v-model="profileForm.compare" :options="compareOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-compare" :disabled="!canChangeProfiles" /><control-help help-key="profile-compare" /></v-form-item>
+                  <v-form-item label="Concurrent uploads"><v-input v-model="profileForm.jobs" number-only aria-describedby="sdsync-help-profile-jobs" :disabled="!canChangeProfiles" /><control-help help-key="profile-jobs" /></v-form-item>
+                  <v-checkbox v-model="profileForm.allow_http" class="span-2" aria-describedby="sdsync-help-profile-http" :disabled="!canEditHttpException">Allow plain HTTP for controlled LAN testing</v-checkbox><control-help help-key="profile-http" />
                 </div>
 
                 <fieldset class="sdsync-danger-fieldset">
                   <legend>Deletion guard</legend>
-                  <v-checkbox v-model="profileForm.delete" :disabled="!canMutate">Mirror remote deletions after profile and run-level approval</v-checkbox>
-                  <v-form-item label="Maximum deletions per run"><v-input v-model="profileForm.max_delete" number-only /></v-form-item>
+                  <v-checkbox v-model="profileForm.delete" aria-describedby="sdsync-help-profile-delete" :disabled="!canEditProfileDeletion">Mirror remote deletions after profile and run-level approval</v-checkbox><control-help help-key="profile-delete" />
+                  <v-form-item label="Maximum deletions per run"><v-input v-model="profileForm.max_delete" number-only aria-describedby="sdsync-help-profile-max-delete" :disabled="!canChangeProfiles" /><control-help help-key="profile-max-delete" /></v-form-item>
                 </fieldset>
 
                 <details class="sdsync-advanced">
                   <summary><strong>Advanced profile controls</strong><span>Network, retry, output, and remote observability policy</span></summary>
                   <div class="sdsync-form-grid">
-                    <v-form-item class="span-2" label="Excludes"><v-input v-model="profileForm.excludes" type="textarea" :autosize="{ minRows: 3, maxRows: 7 }" placeholder="@eaDir/&#10;**/@eaDir/&#10;#recycle/" /></v-form-item>
-                    <v-checkbox v-model="profileForm.allow_empty_source" class="span-2" :disabled="!canMutate">Allow an empty source (disables the empty-source deletion guard)</v-checkbox>
-                    <v-form-item label="Retries"><v-input v-model="profileForm.retries" number-only /></v-form-item>
-                    <v-form-item label="Upload timeout (seconds)"><v-input v-model="profileForm.timeout" number-only /></v-form-item>
-                    <v-form-item label="Connect timeout (seconds)"><v-input v-model="profileForm.connect_timeout" number-only /></v-form-item>
-                    <v-form-item label="Maximum rate (bytes/s)"><v-input v-model="profileForm.max_rate" number-only /></v-form-item>
-                    <v-form-item class="span-2" label="CA certificate path"><v-input v-model.trim="profileForm.ca_certificate" placeholder="/volume1/certificates/ca.pem" /></v-form-item>
-                    <v-checkbox v-model="profileForm.danger_invalid_certs" class="span-2" :disabled="!canMutate">Accept invalid TLS certificates (unsafe)</v-checkbox>
-                    <v-checkbox v-if="profileForm.danger_invalid_certs" v-model="profileForm.danger_invalid_confirm" class="span-2" label-color="red" :disabled="!canMutate">I accept the interception risk</v-checkbox>
-                    <v-form-item label="Verbosity"><v-single-select v-model="profileForm.verbosity" :options="verbosityOptions" width="100%" /></v-form-item>
-                    <v-checkbox v-model="profileForm.quiet" :disabled="!canMutate">Quiet terminal sink; durable logs remain active</v-checkbox>
-                    <v-form-item label="Log level"><v-single-select v-model="profileForm.log_level" :options="logLevelOptions" width="100%" /></v-form-item>
+                    <v-form-item class="span-2" label="Excludes"><v-input v-model="profileForm.excludes" type="textarea" :autosize="{ minRows: 3, maxRows: 7 }" placeholder="@eaDir/&#10;**/@eaDir/&#10;#recycle/" aria-describedby="sdsync-help-profile-excludes" :disabled="!canChangeProfiles" /><control-help help-key="profile-excludes" /></v-form-item>
+                    <v-checkbox v-model="profileForm.allow_empty_source" class="span-2" aria-describedby="sdsync-help-profile-empty-source" :disabled="!canEditEmptySourceException">Allow an empty source (disables the empty-source deletion guard)</v-checkbox><control-help help-key="profile-empty-source" />
+                    <v-form-item label="Retries"><v-input v-model="profileForm.retries" number-only aria-describedby="sdsync-help-profile-retries" :disabled="!canChangeProfiles" /><control-help help-key="profile-retries" /></v-form-item>
+                    <v-form-item label="Upload timeout (seconds)"><v-input v-model="profileForm.timeout" number-only aria-describedby="sdsync-help-profile-timeout" :disabled="!canChangeProfiles" /><control-help help-key="profile-timeout" /></v-form-item>
+                    <v-form-item label="Connect timeout (seconds)"><v-input v-model="profileForm.connect_timeout" number-only aria-describedby="sdsync-help-profile-connect-timeout" :disabled="!canChangeProfiles" /><control-help help-key="profile-connect-timeout" /></v-form-item>
+                    <v-form-item label="Maximum rate (bytes/s)"><v-input v-model="profileForm.max_rate" number-only aria-describedby="sdsync-help-profile-rate" :disabled="!canChangeProfiles" /><control-help help-key="profile-rate" /></v-form-item>
+                    <v-form-item class="span-2" label="CA certificate path"><v-input v-model.trim="profileForm.ca_certificate" placeholder="/volume1/certificates/ca.pem" aria-describedby="sdsync-help-profile-ca" :disabled="!canChangeProfiles" /><control-help help-key="profile-ca" /></v-form-item>
+                    <v-checkbox v-model="profileForm.danger_invalid_certs" class="span-2" aria-describedby="sdsync-help-profile-invalid-certs" :disabled="!canEditInvalidTlsException">Accept invalid TLS certificates (unsafe)</v-checkbox><control-help help-key="profile-invalid-certs" />
+                    <v-checkbox v-if="profileForm.danger_invalid_certs" v-model="profileForm.danger_invalid_confirm" class="span-2" label-color="red" aria-describedby="sdsync-help-profile-invalid-confirm" :disabled="!canEditInvalidTlsException">I accept the interception risk</v-checkbox><control-help v-if="profileForm.danger_invalid_certs" help-key="profile-invalid-confirm" />
+                    <v-form-item label="Verbosity"><v-single-select v-model="profileForm.verbosity" :options="verbosityOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-verbosity" :disabled="!canChangeProfiles" /><control-help help-key="profile-verbosity" /></v-form-item>
+                    <v-checkbox v-model="profileForm.quiet" aria-describedby="sdsync-help-profile-quiet" :disabled="!canChangeProfiles">Quiet terminal sink; durable logs remain active</v-checkbox><control-help help-key="profile-quiet" />
+                    <v-form-item label="Log level"><v-single-select v-model="profileForm.log_level" :options="logLevelOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-log-level" :disabled="!canChangeProfiles" /><control-help help-key="profile-log-level" /></v-form-item>
                     <v-form-item label="Log format" textonly><span>JSON · package managed</span></v-form-item>
                     <v-form-item label="Progress" textonly><span>Never · package managed</span></v-form-item>
                     <v-form-item label="Output" textonly><span>Human · package managed</span></v-form-item>
-                    <v-form-item class="span-2" label="Remote log URL"><v-input v-model.trim="profileForm.remote_log_url" placeholder="https://collector.example.com/ingest" /></v-form-item>
-                    <v-form-item label="Remote log mode"><v-single-select v-model="profileForm.remote_log_mode" :options="remoteLogModeOptions" width="100%" /></v-form-item>
+                    <v-form-item class="span-2" label="Remote log URL"><v-input v-model.trim="profileForm.remote_log_url" placeholder="https://collector.example.com/ingest" aria-describedby="sdsync-help-profile-log-url" :disabled="!canEditRemoteLogging" /><control-help help-key="profile-log-url" /></v-form-item>
+                    <v-form-item label="Remote log mode"><v-single-select v-model="profileForm.remote_log_mode" :options="remoteLogModeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-log-mode" :disabled="!canEditRemoteLogging" /><control-help help-key="profile-log-mode" /></v-form-item>
                   </div>
                   <div class="sdsync-secret-editor">
                     <div><strong>Remote log token</strong><span>{{ selectedProfileModel && selectedProfileModel.has_remote_log_token ? 'Stored · masked' : 'Not stored' }}</span></div>
-                    <v-single-select v-model="secretModes.remote_log_token" :options="secretModeOptions" width="210" :disabled="!canManageSecrets" />
-                    <v-input v-if="secretModes.remote_log_token === 'replace'" v-model="secretValues.remote_log_token" type="password" maxlength="4096" autocomplete="new-password" placeholder="New token" />
+                    <v-single-select v-model="secretModes.remote_log_token" :options="secretModeOptions" width="210" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-secret-log-mode" :disabled="!canManageSecrets || !canAllowRemoteLogging" /><control-help help-key="secret-log-mode" />
+                    <v-input v-if="secretModes.remote_log_token === 'replace'" v-model="secretValues.remote_log_token" type="password" maxlength="4096" autocomplete="new-password" placeholder="New token" aria-describedby="sdsync-help-secret-log-value" :disabled="!canManageSecrets || !canAllowRemoteLogging" /><control-help v-if="secretModes.remote_log_token === 'replace'" help-key="secret-log-value" />
                   </div>
                 </details>
 
@@ -179,98 +182,142 @@
                   <legend>Protected credentials</legend>
                   <div class="sdsync-secret-editor">
                     <div><strong>Password</strong><span>{{ selectedProfileModel && selectedProfileModel.has_password ? 'Stored · masked' : 'Not stored' }}</span></div>
-                    <v-single-select v-model="secretModes.password" :options="secretModeOptions" width="210" :disabled="!canManageSecrets" />
-                    <v-input v-if="secretModes.password === 'replace'" v-model="secretValues.password" type="password" maxlength="4096" autocomplete="new-password" placeholder="New password" />
+                    <v-single-select v-model="secretModes.password" :options="secretModeOptions" width="210" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-secret-password-mode" :disabled="!canManageSecrets" /><control-help help-key="secret-password-mode" />
+                    <v-input v-if="secretModes.password === 'replace'" v-model="secretValues.password" type="password" maxlength="4096" autocomplete="new-password" placeholder="New password" aria-describedby="sdsync-help-secret-password-value" :disabled="!canManageSecrets" /><control-help v-if="secretModes.password === 'replace'" help-key="secret-password-value" />
                   </div>
                   <div class="sdsync-secret-editor">
                     <div><strong>TOTP seed</strong><span>{{ selectedProfileModel && selectedProfileModel.has_totp ? 'Stored · masked' : 'Not stored' }}</span></div>
-                    <v-single-select v-model="secretModes.totp" :options="secretModeOptions" width="210" :disabled="!canManageSecrets" />
-                    <v-input v-if="secretModes.totp === 'replace'" v-model="secretValues.totp" type="password" maxlength="4096" autocomplete="off" placeholder="Base32 seed or otpauth URI" />
+                    <v-single-select v-model="secretModes.totp" :options="secretModeOptions" width="210" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-secret-totp-mode" :disabled="!canManageSecrets" /><control-help help-key="secret-totp-mode" />
+                    <v-input v-if="secretModes.totp === 'replace'" v-model="secretValues.totp" type="password" maxlength="4096" autocomplete="off" placeholder="Base32 seed or otpauth URI" aria-describedby="sdsync-help-secret-totp-value" :disabled="!canManageSecrets" /><control-help v-if="secretModes.totp === 'replace'" help-key="secret-totp-value" />
                   </div>
                   <p class="sdsync-field-note">Secret values are sent only in the protected request body. They are never returned to this window.</p>
                 </fieldset>
 
-                <v-checkbox v-model="profileForm.make_default" :disabled="!canMutate">Use as default profile</v-checkbox>
+                <v-checkbox v-model="profileForm.make_default" aria-describedby="sdsync-help-profile-default" :disabled="!canChangeProfiles">Use as default profile</v-checkbox><control-help help-key="profile-default" />
                 <div class="sdsync-form-actions">
-                  <v-button v-if="selectedProfile" suffix="red" :disabled="!canMutate || operationBusy" @click="removeProfile">Delete profile</v-button>
+                  <v-button v-if="selectedProfile" suffix="red" tooltip="Remove package configuration and stored credentials, not synchronized files" :disabled="!canChangeProfiles || operationBusy" @click="removeProfile">Delete profile</v-button>
                   <span />
-                  <v-button suffix="cancel" @click="closeProfile">Cancel</v-button>
-                  <v-button suffix="main" html-type="submit" :disabled="!canMutate || operationBusy">Save profile</v-button>
+                  <v-button suffix="cancel" tooltip="Discard unsaved editor values and clear secret fields" @click="closeProfile">Cancel</v-button>
+                  <v-button suffix="main" html-type="submit" tooltip="Validate and apply configuration, then process secret operations" :disabled="!canChangeProfiles || operationBusy">Save profile</v-button>
                 </div>
               </v-form>
             </div>
           </section>
 
-          <section v-else-if="route === 'routines'" class="sdsync-page" aria-labelledby="sdsync-routines-title">
-            <div class="sdsync-section-heading"><div><p class="sdsync-eyebrow">Automation</p><h2 id="sdsync-routines-title">Routines</h2><p>Give each profile an interval, daily-window, or realtime policy with bounded retries, dependencies, and no overlapping syncs.</p></div></div>
+          <section v-else-if="route === 'routines'" class="sdsync-page" aria-labelledby="sdsync-page-title">
             <div class="sdsync-two-column sdsync-routines-grid">
               <v-form v-model="routineForm" class="sdsync-panel" direction="vertical" @submit="saveRoutine">
                 <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Package controller</p><h3>Profile routine</h3></div><span :class="pillClass(selectedRoutine ? selectedRoutine.state : 'unknown')">{{ selectedRoutine ? (selectedRoutine.state || (selectedRoutine.enabled ? 'Enabled' : 'Disabled')) : 'New' }}</span></div>
-                <v-form-item label="Profile"><v-single-select v-model="routineForm.profile" :options="profileOptions" width="100%" :disabled="!canMutate || operationBusy" @input="loadRoutine" /></v-form-item>
-                <v-checkbox v-model="routineForm.enabled" :disabled="!canMutate">Enable routine</v-checkbox>
+                <v-form-item label="Profile"><v-single-select v-model="routineForm.profile" :options="profileOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-routine-profile" :disabled="!canChangeRoutines || operationBusy" @input="loadRoutine" /><control-help help-key="routine-profile" /></v-form-item>
+                <v-checkbox v-model="routineForm.enabled" aria-describedby="sdsync-help-routine-enabled" :disabled="!canChangeRoutines">Enable routine</v-checkbox><control-help help-key="routine-enabled" />
                 <div class="sdsync-form-grid compact">
-                  <v-form-item label="Action"><v-single-select v-model="routineForm.action" :options="routineActionOptions" width="100%" /></v-form-item>
-                  <v-form-item label="Mode"><v-single-select v-model="routineForm.mode" :options="routineModeOptions" width="100%" /></v-form-item>
-                  <v-form-item label="Interval (seconds)"><v-input v-model="routineForm.interval_seconds" number-only /></v-form-item>
-                  <v-form-item label="Window starts"><input v-model="routineForm.time_window_start" class="sdsync-native-input" type="time" aria-label="Window starts"></v-form-item>
-                  <v-form-item label="Window ends"><input v-model="routineForm.time_window_end" class="sdsync-native-input" type="time" aria-label="Window ends"></v-form-item>
-                  <v-form-item label="Realtime debounce (seconds)"><v-input v-model="routineForm.debounce_seconds" number-only /></v-form-item>
-                  <v-form-item label="Fallback poll (seconds)"><v-input v-model="routineForm.poll_seconds" number-only /></v-form-item>
-                  <v-form-item label="Retry attempts"><v-input v-model="routineForm.retry_count" number-only /></v-form-item>
-                  <v-form-item label="Retry backoff (seconds)"><v-input v-model="routineForm.retry_backoff_seconds" number-only /></v-form-item>
+                  <v-form-item label="Action"><v-single-select v-model="routineForm.action" :options="routineActionOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-routine-action" :disabled="!canChangeRoutines" /><control-help help-key="routine-action" /></v-form-item>
+                  <v-form-item label="Mode"><v-single-select v-model="routineForm.mode" :options="routineModeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-routine-mode" :disabled="!canChangeRoutines" /><control-help help-key="routine-mode" /></v-form-item>
+                  <v-form-item label="Interval (seconds)"><v-input v-model="routineForm.interval_seconds" number-only aria-describedby="sdsync-help-routine-interval" :disabled="!canChangeRoutines" /><control-help help-key="routine-interval" /></v-form-item>
+                  <v-form-item label="Window starts"><input v-model="routineForm.time_window_start" class="sdsync-native-input" type="time" aria-label="Window starts" aria-describedby="sdsync-help-routine-window-start" title="Local DSM time at which the daily execution window opens." :disabled="!canChangeRoutines"><control-help help-key="routine-window-start" /></v-form-item>
+                  <v-form-item label="Window ends"><input v-model="routineForm.time_window_end" class="sdsync-native-input" type="time" aria-label="Window ends" aria-describedby="sdsync-help-routine-window-end" title="Local DSM time at which the daily execution window closes." :disabled="!canChangeRoutines"><control-help help-key="routine-window-end" /></v-form-item>
+                  <v-form-item label="Realtime debounce (seconds)"><v-input v-model="routineForm.debounce_seconds" number-only aria-describedby="sdsync-help-routine-debounce" :disabled="!canChangeRoutines" /><control-help help-key="routine-debounce" /></v-form-item>
+                  <v-form-item label="Fallback poll (seconds)"><v-input v-model="routineForm.poll_seconds" number-only aria-describedby="sdsync-help-routine-poll" :disabled="!canChangeRoutines" /><control-help help-key="routine-poll" /></v-form-item>
+                  <v-form-item label="Retry attempts"><v-input v-model="routineForm.retry_count" number-only aria-describedby="sdsync-help-routine-retries" :disabled="!canChangeRoutines" /><control-help help-key="routine-retries" /></v-form-item>
+                  <v-form-item label="Retry backoff (seconds)"><v-input v-model="routineForm.retry_backoff_seconds" number-only aria-describedby="sdsync-help-routine-backoff" :disabled="!canChangeRoutines" /><control-help help-key="routine-backoff" /></v-form-item>
                   <v-form-item class="span-2" label="Wait for routines">
-                    <select v-model="routineForm.depends_on" class="sdsync-native-input" multiple size="4" aria-label="Wait for routines">
+                    <select v-model="routineForm.depends_on" class="sdsync-native-input" multiple size="4" aria-label="Wait for routines" aria-describedby="sdsync-help-routine-dependencies" title="Require selected profile routines to finish before this routine starts." :disabled="!canChangeRoutines">
                       <option v-for="profile in dependencyProfiles" :key="profile.name" :value="profile.name">{{ profile.name }}</option>
-                    </select>
+                    </select><control-help help-key="routine-dependencies" />
                   </v-form-item>
                 </div>
-                <fieldset class="sdsync-weekday-fieldset"><legend>Active weekdays</legend><div class="sdsync-weekdays"><label v-for="day in weekdayOptions" :key="day.value"><input v-model="routineForm.weekdays" type="checkbox" :value="day.value"><span>{{ day.label }}</span></label></div></fieldset>
-                <fieldset class="sdsync-danger-fieldset"><legend>Routine deletion guard</legend><v-checkbox v-model="routineForm.allow_delete" :disabled="!canMutate">Permit profile deletion rules</v-checkbox><v-form-item label="Routine deletion approval ceiling"><v-input v-model="routineForm.max_total_delete" number-only /></v-form-item></fieldset>
-                <div class="sdsync-form-actions"><v-button suffix="red" :disabled="!canMutate || !selectedRoutine || operationBusy" @click="removeRoutine">Remove routine</v-button><span /><v-button suffix="main" html-type="submit" :disabled="!canMutate || !routineForm.profile || operationBusy">Save routine</v-button></div>
+                <fieldset class="sdsync-weekday-fieldset" aria-describedby="sdsync-help-routine-weekdays" :disabled="!canChangeRoutines"><legend>Active weekdays <control-help help-key="routine-weekdays" /></legend><div class="sdsync-weekdays"><label v-for="day in weekdayOptions" :key="day.value" :title="'Allow execution on ' + day.label"><input v-model="routineForm.weekdays" type="checkbox" :value="day.value" :disabled="!canChangeRoutines"><span>{{ day.label }}</span></label></div></fieldset>
+                <fieldset class="sdsync-danger-fieldset"><legend>Routine deletion guard</legend><v-checkbox v-model="routineForm.allow_delete" aria-describedby="sdsync-help-routine-delete" :disabled="!canEditRoutineDeletion">Permit profile deletion rules</v-checkbox><control-help help-key="routine-delete" /><v-form-item label="Routine deletion approval ceiling"><v-input v-model="routineForm.max_total_delete" number-only aria-describedby="sdsync-help-routine-max-delete" :disabled="!canChangeRoutines" /><control-help help-key="routine-max-delete" /></v-form-item></fieldset>
+                <div class="sdsync-form-actions"><v-button suffix="red" tooltip="Remove this automation policy without deleting its profile" :disabled="!canChangeRoutines || !selectedRoutine || operationBusy" @click="removeRoutine">Remove routine</v-button><span /><v-button suffix="main" html-type="submit" tooltip="Validate and apply this per-profile automation policy" :disabled="!canChangeRoutines || !routineForm.profile || operationBusy">Save routine</v-button></div>
               </v-form>
               <div class="sdsync-stack">
-                <article class="sdsync-panel"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Configured routines</p><h3>Per-profile automation</h3></div></div><p v-if="!routines.length" class="sdsync-empty">No configured routines.</p><button v-for="routine in routines" :key="routine.profile" type="button" class="sdsync-routine-row" :disabled="operationBusy" @click="selectRoutine(routine.profile)"><span><strong>{{ routine.profile }}</strong><small>{{ routine.mode || 'interval' }} · {{ routine.backend || 'fallback unreported' }} · {{ routine.state || (routine.enabled ? 'enabled' : 'disabled') }}</small></span><time>{{ routine.enabled ? formatDate(routine.next_run_epoch) : 'Disabled' }}</time></button></article>
-                <article class="sdsync-panel"><p class="sdsync-eyebrow">Timing model</p><h3>Bounded and non-overlapping</h3><div class="sdsync-timeline"><span>Observe</span><i /><span>Debounce</span><i /><span>Preflight</span><i /><span>Run</span></div><p>Realtime uses package polling when native change hooks are unavailable. Long-running syncs cannot pile up.</p></article>
-                <article class="sdsync-panel"><p class="sdsync-eyebrow">Safety invariant</p><h3>One host-local lock</h3><p>Manual plans, manual syncs, and routine runs share one lock.</p></article>
+                <article class="sdsync-panel"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Configured routines</p><h3>Per-profile automation</h3></div></div><p v-if="!routines.length" class="sdsync-empty">No configured routines.</p><button v-for="routine in routines" :key="routine.profile" type="button" class="sdsync-routine-row" :title="'Edit routine for ' + routine.profile" :disabled="operationBusy" @click="selectRoutine(routine.profile)"><span><strong>{{ routine.profile }}</strong><small>{{ routine.mode || 'interval' }} · {{ routine.backend || 'fallback unreported' }} · {{ routine.state || (routine.enabled ? 'enabled' : 'disabled') }}</small></span><time>{{ routine.enabled ? formatDate(routine.next_run_epoch) : 'Disabled' }}</time></button></article>
               </div>
             </div>
           </section>
 
-          <section v-else-if="route === 'health'" class="sdsync-page" aria-labelledby="sdsync-health-title">
-            <div class="sdsync-section-heading"><div><p class="sdsync-eyebrow">Diagnostics</p><h2 id="sdsync-health-title">Health / Doctor</h2><p>Prove source readability, routing, APIs, authentication, and exact destination access before a sync.</p></div></div>
+          <section v-else-if="route === 'health'" class="sdsync-page" aria-labelledby="sdsync-page-title">
             <div class="sdsync-two-column">
               <v-form v-model="doctorForm" class="sdsync-panel" direction="vertical" @submit="runDoctor">
                 <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Target doctor</p><h3>Run a diagnostic</h3></div><span class="sdsync-pill neutral">Manual</span></div>
-                <v-form-item label="Scope"><v-single-select v-model="doctorForm.scope" :options="scopeOptions" width="100%" :disabled="!canMutate" /></v-form-item>
-                <v-checkbox v-model="doctorForm.write_test" :disabled="!canMutate || !hasCapability('write_test')">Disposable write test</v-checkbox>
-                <div v-if="doctorForm.write_test" class="sdsync-warning"><strong>This mutates the selected target briefly.</strong><v-checkbox v-model="doctorForm.write_confirm" :disabled="!canMutate">I prepared a non-critical destination and approve probe cleanup.</v-checkbox></div>
-                <v-button suffix="main" html-type="submit" :disabled="!canMutate || operationBusy">Run doctor</v-button>
+                <v-form-item label="Scope"><v-single-select v-model="doctorForm.scope" :options="scopeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-doctor-scope" :disabled="!canRunOperations" /><control-help help-key="doctor-scope" /></v-form-item>
+                <v-checkbox v-model="doctorForm.write_test" aria-describedby="sdsync-help-doctor-write" :disabled="!canRunOperations || !canRunDoctorWrite || !hasCapability('write_test')">Disposable write test</v-checkbox><control-help help-key="doctor-write" />
+                <div v-if="doctorForm.write_test" class="sdsync-warning"><strong>This mutates the selected target briefly.</strong><v-checkbox v-model="doctorForm.write_confirm" aria-describedby="sdsync-help-doctor-write-confirm" :disabled="!canRunOperations || !canRunDoctorWrite">I prepared a non-critical destination and approve probe cleanup.</v-checkbox><control-help help-key="doctor-write-confirm" /></div>
+                <v-button suffix="main" html-type="submit" tooltip="Run preflight checks and wait for bounded terminal Doctor evidence" :disabled="!canRunOperations || operationBusy">Run doctor</v-button>
               </v-form>
               <article class="sdsync-panel sdsync-diagnostic" aria-live="polite"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Latest diagnostic</p><h3>{{ diagnostic.title }}</h3></div><span class="sdsync-pulse" /></div><pre>{{ diagnostic.output }}</pre></article>
             </div>
-            <div class="sdsync-check-grid"><article><span>01</span><div><strong>Source integrity</strong><p>Walks the complete source and hashes every payload file.</p></div></article><article><span>02</span><div><strong>Reverse-proxy routing</strong><p>Requires File Station API discovery rather than an HTML fallback.</p></div></article><article><span>03</span><div><strong>Destination permission</strong><p>Checks the exact destination or its nearest existing ancestor.</p></div></article><article><span>04</span><div><strong>Disposable write path</strong><p>Explicit opt-in only, with cleanup evidence.</p></div></article></div>
             <article class="sdsync-panel"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Cached per-profile evidence</p><h3>Target health</h3></div><span class="sdsync-freshness">{{ healthFreshness }}</span></div><div class="sdsync-table-wrap"><table><thead><tr><th>Profile</th><th>Last check</th><th>Reachable</th><th>Auth</th><th>Writable</th><th>Latency</th><th>Last success</th><th>Doctor</th><th>Free space</th></tr></thead><tbody><tr v-if="!healthRows.length"><td colspan="9">No cached target-health evidence.</td></tr><tr v-for="health in healthRows" :key="health.profile"><td>{{ health.profile || 'Unknown' }}</td><td>{{ formatDate(health.last_check_epoch || health.checked_at_epoch || health.checked_epoch) }}</td><td :class="healthClass(health.reachable)">{{ booleanEvidence(health.reachable) }}</td><td :class="healthClass(health.authenticated !== undefined ? health.authenticated : health.auth)">{{ booleanEvidence(health.authenticated !== undefined ? health.authenticated : health.auth) }}</td><td :class="healthClass(health.writable)">{{ booleanEvidence(health.writable) }}</td><td>{{ formatDuration(health.latency_ms) }}</td><td>{{ formatDate(health.last_success_epoch || health.last_successful_sync_epoch) }}</td><td>{{ health.doctor_status || health.last_doctor_status || health.state || 'Unavailable' }}</td><td>{{ health.free_space_proven === true ? formatBytes(health.free_space_bytes) : 'Unavailable' }}</td></tr></tbody></table></div></article>
           </section>
 
-          <section v-else-if="route === 'activity'" class="sdsync-page" aria-labelledby="sdsync-activity-title">
-            <div class="sdsync-section-heading"><div><p class="sdsync-eyebrow">Observability</p><h2 id="sdsync-activity-title">Activity / Logs</h2><p>Bounded controller, scheduler, and structured sync output updates while this window is open.</p></div><div class="sdsync-action-row"><v-button suffix="grey" @click="toggleLogs">{{ logsPaused ? 'Resume live updates' : 'Pause live updates' }}</v-button><v-button suffix="grey" @click="clearLogView">Clear view</v-button></div></div>
-            <article class="sdsync-panel"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Structured activity</p><h3>Recent package events</h3></div><span class="sdsync-freshness">{{ activityEvents.length }} event{{ activityEvents.length === 1 ? '' : 's' }}</span></div><ol class="sdsync-activity-feed"><li v-if="!activityEvents.length" class="sdsync-empty">No recorded package events.</li><li v-for="event in reversedActivity" :key="[event.epoch, event.code, event.profile].join(':')"><time>{{ formatDate(event.epoch) }}</time><strong>{{ event.code || 'unknown.event' }}</strong><small>{{ event.profile || 'none' }} · {{ event.state || 'unknown' }}</small></li></ol></article>
-            <article class="sdsync-panel sdsync-log-panel"><div class="sdsync-log-toolbar"><v-single-select v-model="logSource" :options="logSourceOptions" width="180" @input="refreshLogs" /><v-single-select v-model="logLines" :options="logLineOptions" width="150" @input="refreshLogs" /><span>{{ logState }}</span></div><pre tabindex="0">{{ logOutput }}</pre></article>
+          <section v-else-if="route === 'activity'" class="sdsync-page" aria-labelledby="sdsync-page-title">
+            <div class="sdsync-page-actions"><v-button suffix="grey" tooltip="Pause or resume browser-side log refreshes" @click="toggleLogs">{{ logsPaused ? 'Resume live updates' : 'Pause live updates' }}</v-button><v-button suffix="grey" tooltip="Clear only this rendered view; package logs remain intact" @click="clearLogView">Clear view</v-button></div>
+            <article class="sdsync-panel">
+              <div class="sdsync-panel-heading">
+                <div><p class="sdsync-eyebrow">Structured activity</p><h3>Recent package events</h3></div>
+                <span class="sdsync-freshness">{{ reversedActivity.length }} of {{ activityEvents.length }} event{{ activityEvents.length === 1 ? '' : 's' }}</span>
+              </div>
+              <div class="sdsync-log-toolbar" aria-label="Activity filters">
+                <v-input v-model.trim="activitySearch" class="sdsync-activity-search" maxlength="128" placeholder="Search event text or request ID" aria-label="Search activity text or client request ID" aria-describedby="sdsync-help-activity-search" /><control-help help-key="activity-search" />
+                <v-single-select v-model="activityCategory" :options="activityCategoryOptions" width="190" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-activity-category" /><control-help help-key="activity-category" />
+                <v-single-select v-model="activityLevel" :options="activityLevelOptions" width="160" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-activity-level" /><control-help help-key="activity-level" />
+              </div>
+              <ol class="sdsync-activity-feed"><li v-if="!reversedActivity.length" class="sdsync-empty">No package events match these filters.</li><li v-for="event in reversedActivity" :key="[event.epoch, event.code, event.profile, event.category, event.level, event.client_request_id].join(':')"><time>{{ formatDate(event.epoch) }}</time><div class="sdsync-activity-detail"><strong>{{ event.code }}</strong><p v-if="event.message">{{ event.message }}</p><code v-if="event.client_request_id">Client request ID: {{ event.client_request_id }}</code></div><small>{{ event.profile }} · {{ event.state }} · {{ event.category }} / {{ event.level }}</small></li></ol>
+            </article>
+            <article class="sdsync-panel sdsync-log-panel"><div class="sdsync-log-toolbar"><v-single-select v-model="logSource" :options="logSourceOptions" width="180" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-log-source" @input="refreshLogs" /><control-help help-key="log-source" /><v-single-select v-model="logLines" :options="logLineOptions" width="150" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-log-lines" @input="refreshLogs" /><control-help help-key="log-lines" /><span>{{ logState }}</span></div><pre tabindex="0">{{ logOutput }}</pre></article>
           </section>
 
-          <section v-else-if="route === 'notifications'" class="sdsync-page" aria-labelledby="sdsync-notifications-title">
-            <div class="sdsync-section-heading"><div><p class="sdsync-eyebrow">Attention routing</p><h2 id="sdsync-notifications-title">Notifications</h2><p>Choose package-level DSM desktop alerts and optional signals for this open session.</p></div></div>
+          <section v-else-if="route === 'notifications'" class="sdsync-page" aria-labelledby="sdsync-page-title">
             <div class="sdsync-two-column">
-              <v-form v-model="alertForm" class="sdsync-panel" direction="vertical" @submit="saveAlerts"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">DSM desktop alerts</p><h3>Package alert policy</h3></div><span :class="pillClass(alertForm.enabled ? 'running' : 'disabled')">{{ alertForm.enabled ? 'Enabled' : 'Disabled' }}</span></div><v-checkbox v-model="alertForm.enabled" :disabled="!canMutate">Enable DSM desktop alerts</v-checkbox><v-checkbox v-model="alertForm.on_success" :disabled="!canMutate">Notify on success</v-checkbox><v-checkbox v-model="alertForm.on_failure" :disabled="!canMutate">Notify on failure</v-checkbox><v-form-item label="Failures before alert"><v-input v-model="alertForm.failure_threshold" number-only /></v-form-item><v-form-item label="Cooldown (seconds)"><v-input v-model="alertForm.cooldown_seconds" number-only /></v-form-item><v-button suffix="main" html-type="submit" :disabled="!canMutate || operationBusy">Save DSM alert policy</v-button></v-form>
-              <div class="sdsync-stack"><article class="sdsync-panel"><p class="sdsync-eyebrow">Direct desktop delivery</p><h3>Fixed, non-secret messages</h3><ul><li><code>sync_succeeded</code> — fixed completion message</li><li><code>sync_failed</code> — fixed sync failure message</li><li><code>doctor_failed</code> — fixed Doctor failure message</li></ul><p>Details stay in Activity and package logs.</p></article><v-form v-model="notificationForm" class="sdsync-panel" direction="vertical" @submit="saveNotificationPreferences"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Open-session signal</p><h3>Browser fallback</h3></div><span :class="pillClass(notificationPermission)">{{ notificationPermission }}</span></div><v-checkbox v-model="notificationForm.desktop_notifications">Notify while this app is open</v-checkbox><v-checkbox v-model="notificationForm.audible">Audible cue</v-checkbox><v-button suffix="grey" html-type="submit">Save session preferences</v-button></v-form></div>
+              <v-form v-model="alertForm" class="sdsync-panel" direction="vertical" @submit="saveAlerts"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">DSM desktop alerts</p><h3>Package alert policy</h3></div><span :class="pillClass(alertForm.enabled ? 'running' : 'disabled')">{{ alertForm.enabled ? 'Enabled' : 'Disabled' }}</span></div><v-checkbox v-model="alertForm.enabled" aria-describedby="sdsync-help-alerts-enabled" :disabled="!canChangeNotifications">Enable DSM desktop alerts</v-checkbox><control-help help-key="alerts-enabled" /><v-checkbox v-model="alertForm.on_success" aria-describedby="sdsync-help-alerts-success" :disabled="!canChangeNotifications">Notify on success</v-checkbox><control-help help-key="alerts-success" /><v-checkbox v-model="alertForm.on_failure" aria-describedby="sdsync-help-alerts-failure" :disabled="!canChangeNotifications">Notify on failure</v-checkbox><control-help help-key="alerts-failure" /><v-form-item label="Failures before alert"><v-input v-model="alertForm.failure_threshold" number-only :disabled="!canChangeNotifications" aria-describedby="sdsync-help-alerts-threshold" /><control-help help-key="alerts-threshold" /></v-form-item><v-form-item label="Cooldown (seconds)"><v-input v-model="alertForm.cooldown_seconds" number-only :disabled="!canChangeNotifications" aria-describedby="sdsync-help-alerts-cooldown" /><control-help help-key="alerts-cooldown" /></v-form-item><v-button suffix="main" html-type="submit" tooltip="Validate and persist the package-level DSM alert policy" :disabled="!canChangeNotifications || operationBusy">Save DSM alert policy</v-button></v-form>
+              <v-form v-model="notificationForm" class="sdsync-panel" direction="vertical" @submit="saveNotificationPreferences"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Open-session signal</p><h3>Browser fallback</h3></div><span :class="pillClass(notificationPermission)">{{ notificationPermission }}</span></div><v-checkbox v-model="notificationForm.desktop_notifications" aria-describedby="sdsync-help-session-notify" :disabled="!canChangeNotifications">Notify while this app is open</v-checkbox><control-help help-key="session-notify" /><v-checkbox v-model="notificationForm.audible" aria-describedby="sdsync-help-session-audible" :disabled="!canChangeNotifications">Audible cue</v-checkbox><control-help help-key="session-audible" /><v-button suffix="grey" html-type="submit" tooltip="Save and audit non-secret notification preferences in this browser" :disabled="!canChangeNotifications || operationBusy">Save session preferences</v-button></v-form>
             </div>
           </section>
 
-          <section v-else class="sdsync-page" aria-labelledby="sdsync-settings-title">
-            <div class="sdsync-section-heading"><div><p class="sdsync-eyebrow">Application preferences</p><h2 id="sdsync-settings-title">Settings</h2><p>Control this DSM window without changing the sync engine's safety defaults.</p></div></div>
-            <div class="sdsync-two-column">
-              <v-form v-model="settings" class="sdsync-panel" direction="vertical" @submit="saveInterfaceSettings"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Display and refresh</p><h3>Interface</h3></div></div><v-form-item label="Theme"><v-single-select v-model="settings.theme" :options="themeOptions" width="100%" /></v-form-item><v-form-item label="Status refresh"><v-single-select v-model="settings.status_refresh" :options="statusRefreshOptions" width="100%" /></v-form-item><v-form-item label="Log refresh"><v-single-select v-model="settings.log_refresh" :options="logRefreshOptions" width="100%" /></v-form-item><div class="sdsync-form-actions sdsync-settings-actions"><span /><span /><v-button suffix="main" html-type="submit">Save interface settings</v-button></div></v-form>
-              <div class="sdsync-stack"><article class="sdsync-panel"><p class="sdsync-eyebrow">Security posture</p><h3>Fail closed by design</h3><dl class="sdsync-definition-grid"><div><dt>DSM access</dt><dd>Administrators only</dd></div><div><dt>Secrets returned</dt><dd>Never</dd></div><div><dt>Mutation method</dt><dd>Authenticated POST</dd></div><div><dt>Schedule default</dt><dd>Disabled</dd></div></dl></article><article class="sdsync-panel"><p class="sdsync-eyebrow">Package paths</p><h3>Runtime ownership</h3><p>Configuration, credentials, state, and logs remain in package-private DSM FHS directories. This window does not make those paths browser-readable.</p></article></div>
+          <section v-else-if="route === 'security'" class="sdsync-page" aria-labelledby="sdsync-page-title">
+            <security-panel :value="securityForm" :disabled="!canMutate" :busy="operationBusy" :dirty="securityDirty" :theme-class="themeClass" :log-level-options="logLevelOptions" @input="updateSecurityForm" @save="saveSecurityPolicy" />
+          </section>
+
+          <section v-else-if="route === 'settings'" class="sdsync-page" aria-labelledby="sdsync-page-title">
+            <v-form v-model="settings" class="sdsync-panel sdsync-settings-panel" direction="vertical" @submit="saveInterfaceSettings"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Display and refresh</p><h3>Interface</h3></div></div><v-form-item label="Theme"><v-single-select v-model="settings.theme" :options="themeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-theme" :disabled="!canChangeInterface" /><control-help help-key="settings-theme" /></v-form-item><v-form-item label="Status refresh"><v-single-select v-model="settings.status_refresh" :options="statusRefreshOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-status-refresh" :disabled="!canChangeInterface" /><control-help help-key="settings-status-refresh" /></v-form-item><v-form-item label="Log refresh"><v-single-select v-model="settings.log_refresh" :options="logRefreshOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-log-refresh" :disabled="!canChangeInterface" /><control-help help-key="settings-log-refresh" /></v-form-item><div class="sdsync-form-actions sdsync-settings-actions"><span /><span /><v-button suffix="main" html-type="submit" tooltip="Apply, persist, and audit this browser's AppWindow preferences" :disabled="!canChangeInterface || operationBusy">Save interface settings</v-button></div></v-form>
+          </section>
+
+          <section v-else-if="route === 'about'" class="sdsync-page" aria-labelledby="sdsync-page-title">
+            <div class="sdsync-about-grid">
+              <section class="sdsync-panel">
+                <div class="sdsync-panel-heading"><h3>Build identity</h3></div>
+                <dl class="sdsync-about-facts">
+                  <div><dt>Project</dt><dd><code>{{ aboutMetadata.project }}</code></dd></div>
+                  <div><dt>Author</dt><dd><a :href="aboutMetadata.authorUrl" target="_blank" rel="noopener noreferrer">{{ aboutMetadata.author }}</a></dd></div>
+                  <div><dt>Maintainer</dt><dd><a :href="aboutMetadata.maintainerUrl" target="_blank" rel="noopener noreferrer">{{ aboutMetadata.maintainer }}</a></dd></div>
+                  <div><dt>Repository</dt><dd><a :href="aboutMetadata.repository" target="_blank" rel="noopener noreferrer">GitHub</a></dd></div>
+                  <div><dt>License</dt><dd><a :href="aboutMetadata.licenseUrl" target="_blank" rel="noopener noreferrer">{{ aboutMetadata.license }}</a></dd></div>
+                  <div><dt>Installed package version</dt><dd><code>{{ installedPackageVersion }}</code></dd></div>
+                  <div><dt>Core source version</dt><dd><code>{{ aboutMetadata.coreVersion }}</code></dd></div>
+                  <div><dt>DSM UI build version</dt><dd><code>{{ aboutMetadata.uiVersion }}</code></dd></div>
+                  <div><dt>API schema</dt><dd><code>{{ aboutMetadata.apiSchema }}</code></dd></div>
+                </dl>
+              </section>
+              <section class="sdsync-panel">
+                <div class="sdsync-panel-heading"><h3>Updates</h3></div>
+                <div class="sdsync-update-links">
+                  <a :href="aboutMetadata.releasesUrl" target="_blank" rel="noopener noreferrer">GitHub Releases</a>
+                  <a :href="aboutMetadata.releaseSelectorUrl" target="_blank" rel="noopener noreferrer">Compatible release selector</a>
+                </div>
+                <p>Select the exact SPK for the NAS model, DSM version, and CPU architecture, then verify its checksum.</p>
+                <p>Upgrade with Package Center <strong>Manual Install</strong>. Package lifecycle scripts retain configuration and protected secrets during an upgrade.</p>
+                <p class="sdsync-field-note">This AppWindow does not fetch or install updates and does not configure Package Source discovery.</p>
+              </section>
+              <section class="sdsync-panel">
+                <div class="sdsync-panel-heading"><h3>Direct Rust dependencies</h3></div>
+                <p class="sdsync-field-note">Exact direct versions resolved by the frozen <code>Cargo.lock</code> for this build.</p>
+                <ul class="sdsync-dependency-list"><li v-for="dependency in aboutRustDependencies" :key="dependency.name"><span><a :href="dependency.url" target="_blank" rel="noopener noreferrer">{{ dependency.name }}</a><small>{{ dependency.scope }}</small></span><code>{{ dependency.pin }}</code></li></ul>
+              </section>
+              <section class="sdsync-panel">
+                <div class="sdsync-panel-heading"><h3>DSM UI build dependencies</h3></div>
+                <ul class="sdsync-dependency-list"><li v-for="dependency in aboutUiDependencies" :key="dependency.name"><span><a :href="dependency.url" target="_blank" rel="noopener noreferrer">{{ dependency.name }}</a><small>{{ dependency.scope }}</small></span><code>{{ dependency.pin }}</code></li></ul>
+                <p class="sdsync-field-note"><code>THIRD_PARTY_LICENSES.html</code> contains the complete transitive Rust release-dependency license inventory. Notices for runtime code embedded in this AppWindow bundle ship as <code>DSM_UI_THIRD_PARTY_LICENSES.txt</code>. Vue is supplied by DSM and is not bundled; other pnpm packages whose code is not named in that notice are used only during the build.</p>
+              </section>
             </div>
           </section>
 
@@ -308,17 +355,160 @@ import {
   numberOr,
   pick
 } from "./api";
+import SecurityPanel from "./SecurityPanel.vue";
 
 const SETTINGS_KEY = "sdsync.ui.settings.v1";
+const APP_CLASS = "SYNO.SDS.App.SynologyDriveSync.Instance";
+const HELP_APPLICATION = "SYNO.SDS.HelpBrowser.Application";
+const HELP_CONTENT = Object.freeze({
+  overview: "overview.html",
+  profiles: "profiles.html",
+  routines: "routines.html",
+  health: "health.html",
+  activity: "activity.html",
+  notifications: "notifications.html",
+  security: "security.html",
+  settings: "settings.html",
+  about: "about.html"
+});
+const ABOUT_METADATA = Object.freeze({
+  project: "synology-drive-sync",
+  author: "Mariana",
+  authorUrl: "https://github.com/supermarsx",
+  maintainer: "supermarsx",
+  maintainerUrl: "https://github.com/supermarsx/synology-drive-sync",
+  repository: "https://github.com/supermarsx/synology-drive-sync",
+  license: "MIT",
+  licenseUrl: "https://github.com/supermarsx/synology-drive-sync/blob/main/LICENSE",
+  coreVersion: "0.1.0",
+  uiVersion: "1.0.0",
+  apiSchema: SNAPSHOT_SCHEMA,
+  releasesUrl: "https://github.com/supermarsx/synology-drive-sync/releases",
+  releaseSelectorUrl: "https://supermarsx.github.io/synology-drive-sync/release-selector.html"
+});
+const ABOUT_RUST_DEPENDENCIES = Object.freeze([
+  { name: "clap", pin: "4.6.5", scope: "All platforms", url: "https://crates.io/crates/clap" },
+  { name: "clap_complete", pin: "4.6.8", scope: "All platforms", url: "https://crates.io/crates/clap_complete" },
+  { name: "clap_mangen", pin: "0.3.0", scope: "All platforms", url: "https://crates.io/crates/clap_mangen" },
+  { name: "ctrlc", pin: "3.5.2", scope: "All platforms", url: "https://crates.io/crates/ctrlc" },
+  { name: "ignore", pin: "0.4.31", scope: "All platforms", url: "https://crates.io/crates/ignore" },
+  { name: "keyring-core", pin: "1.0.0", scope: "All platforms", url: "https://crates.io/crates/keyring-core" },
+  { name: "md-5", pin: "0.11.0", scope: "All platforms", url: "https://crates.io/crates/md-5" },
+  { name: "hmac", pin: "0.12.1", scope: "All platforms", url: "https://crates.io/crates/hmac" },
+  { name: "reqwest", pin: "0.13.4", scope: "All platforms", url: "https://crates.io/crates/reqwest" },
+  { name: "rpassword", pin: "7.5.4", scope: "All platforms", url: "https://crates.io/crates/rpassword" },
+  { name: "serde", pin: "1.0.229", scope: "All platforms", url: "https://crates.io/crates/serde" },
+  { name: "serde_json", pin: "1.0.151", scope: "All platforms", url: "https://crates.io/crates/serde_json" },
+  { name: "sha2", pin: "0.10.9", scope: "All platforms", url: "https://crates.io/crates/sha2" },
+  { name: "subtle", pin: "2.6.1", scope: "All platforms", url: "https://crates.io/crates/subtle" },
+  { name: "thiserror", pin: "2.0.19", scope: "All platforms", url: "https://crates.io/crates/thiserror" },
+  { name: "toml", pin: "0.9.12+spec-1.1.0", scope: "All platforms", url: "https://crates.io/crates/toml" },
+  { name: "totp-rs", pin: "5.7.2", scope: "All platforms", url: "https://crates.io/crates/totp-rs" },
+  { name: "zeroize", pin: "1.9.0", scope: "All platforms", url: "https://crates.io/crates/zeroize" },
+  { name: "windows-native-keyring-store", pin: "1.1.0", scope: "Windows", url: "https://crates.io/crates/windows-native-keyring-store" },
+  { name: "apple-native-keyring-store", pin: "1.0.1", scope: "macOS", url: "https://crates.io/crates/apple-native-keyring-store" },
+  { name: "libc", pin: "0.2.189", scope: "Linux", url: "https://crates.io/crates/libc" },
+  { name: "zbus-secret-service-keyring-store", pin: "1.0.0", scope: "Linux", url: "https://crates.io/crates/zbus-secret-service-keyring-store" }
+]);
+const ABOUT_UI_DEPENDENCIES = Object.freeze([
+  { name: "@babel/core", pin: "7.18.6", scope: "devDependency", url: "https://www.npmjs.com/package/@babel/core" },
+  { name: "@babel/preset-env", pin: "7.18.6", scope: "devDependency", url: "https://www.npmjs.com/package/@babel/preset-env" },
+  { name: "babel-loader", pin: "8.0.6", scope: "devDependency", url: "https://www.npmjs.com/package/babel-loader" },
+  { name: "css-loader", pin: "3.5.3", scope: "devDependency", url: "https://www.npmjs.com/package/css-loader" },
+  { name: "mini-css-extract-plugin", pin: "0.12.0", scope: "devDependency", url: "https://www.npmjs.com/package/mini-css-extract-plugin" },
+  { name: "vue", pin: "2.7.14", scope: "devDependency", url: "https://www.npmjs.com/package/vue" },
+  { name: "vue-loader", pin: "15.10.1", scope: "devDependency", url: "https://www.npmjs.com/package/vue-loader" },
+  { name: "vue-template-compiler", pin: "2.7.14", scope: "devDependency", url: "https://www.npmjs.com/package/vue-template-compiler" },
+  { name: "webpack", pin: "5.91.0", scope: "devDependency", url: "https://www.npmjs.com/package/webpack" },
+  { name: "webpack-cli", pin: "5.1.4", scope: "devDependency", url: "https://www.npmjs.com/package/webpack-cli" },
+  { name: "pnpm", pin: "pnpm@8.15.9", scope: "packageManager", url: "https://pnpm.io/" }
+]);
+const CONTROL_HELP = Object.freeze({
+  "profile-filter": "Filter the local catalog by profile name.",
+  "profile-name": "Stable profile identifier; existing names cannot be changed.",
+  "profile-source": "Absolute NAS folder that supplies files for this one-way sync.",
+  "profile-url": "HTTPS origin of the destination NAS File Station API.",
+  "profile-username": "Destination DSM account used only by this profile.",
+  "profile-remote": "Logical File Station destination path, not a local mount path.",
+  "profile-compare": "Evidence used to decide whether a destination file needs upload.",
+  "profile-jobs": "Parallel upload workers; accepted range is 1 through 16.",
+  "profile-http": "Permit unencrypted HTTP only for an explicitly controlled LAN.",
+  "profile-delete": "Allow deletion only when both the saved profile and a run approve it.",
+  "profile-max-delete": "Hard per-profile ceiling that stops excessive destination deletion.",
+  "profile-excludes": "Enter one package-relative exclusion pattern per line.",
+  "profile-empty-source": "Disable the empty-source guard only when an empty source is intentional.",
+  "profile-retries": "Retry count for transient upload failures; accepted range is 0 through 5.",
+  "profile-timeout": "Maximum time allowed for one upload request.",
+  "profile-connect-timeout": "Maximum time allowed to establish the destination connection.",
+  "profile-rate": "Upload bandwidth ceiling in bytes per second; zero means unlimited.",
+  "profile-ca": "Absolute NAS path to a trusted PEM certificate bundle.",
+  "profile-invalid-certs": "Bypass TLS certificate validation; this exposes credentials to interception.",
+  "profile-invalid-confirm": "Required acknowledgement before saving the unsafe TLS override.",
+  "profile-verbosity": "Choose the amount of operational detail written to logs.",
+  "profile-quiet": "Suppress the terminal sink while retaining durable package logs.",
+  "profile-log-level": "Minimum severity retained by package logging.",
+  "profile-log-url": "HTTPS endpoint that receives bounded structured log events.",
+  "profile-log-mode": "Choose whether remote-log delivery failure can fail a sync.",
+  "secret-log-mode": "Keep, replace, or clear the package-protected collector token.",
+  "secret-log-value": "Replacement token; it is never returned to this window.",
+  "secret-password-mode": "Keep, replace, or clear the package-protected DSM password.",
+  "secret-password-value": "Replacement DSM password; it is never returned to this window.",
+  "secret-totp-mode": "Keep, replace, or clear the package-protected TOTP seed.",
+  "secret-totp-value": "Replacement TOTP material; it is never returned to this window.",
+  "profile-default": "Select this profile when a command omits an explicit scope.",
+  "routine-profile": "Profile whose automatic policy is being edited.",
+  "routine-enabled": "Allow the package controller to start this routine automatically.",
+  "routine-action": "Choose a real sync or a read-only plan for scheduled execution.",
+  "routine-mode": "Run on an interval, inside a daily window, or after observed changes.",
+  "routine-interval": "Seconds between interval executions; accepted range starts at 60.",
+  "routine-window-start": "Local DSM time at which the daily execution window opens.",
+  "routine-window-end": "Local DSM time at which the daily execution window closes.",
+  "routine-debounce": "Quiet period after an observed change before a realtime run starts.",
+  "routine-poll": "Fallback observation cadence when a native realtime hook is unavailable.",
+  "routine-retries": "Additional routine attempts after a failed execution.",
+  "routine-backoff": "Seconds to wait between routine retry attempts.",
+  "routine-dependencies": "Require selected profile routines to finish before this routine starts.",
+  "routine-weekdays": "Weekdays on which this routine may execute.",
+  "routine-delete": "Permit this routine to use the profile's separately approved deletion policy.",
+  "routine-max-delete": "Additional routine-level ceiling for destination deletions.",
+  "doctor-scope": "Run diagnostics for every profile or one selected profile.",
+  "doctor-write": "Create, verify, and remove one disposable destination probe.",
+  "doctor-write-confirm": "Confirm that the selected destination is non-critical and cleanup is approved.",
+  "activity-search": "Search the rendered event text, metadata, or an exact client request ID.",
+  "activity-category": "Show structured activity from one audited subsystem or from every category.",
+  "activity-level": "Show activity at one exact recorded severity or at every severity.",
+  "log-source": "Limit the live view to controller, scheduler, sync, or all package logs.",
+  "log-lines": "Maximum number of recent bounded log lines to display.",
+  "alerts-enabled": "Allow fixed, non-secret package events to reach the DSM desktop.",
+  "alerts-success": "Send a DSM desktop alert after a successful sync.",
+  "alerts-failure": "Send a DSM desktop alert after the configured failure threshold.",
+  "alerts-threshold": "Consecutive failures required before the package sends an alert.",
+  "alerts-cooldown": "Minimum seconds between repeated failure alerts.",
+  "session-notify": "Use browser notifications only while this AppWindow session is open.",
+  "session-audible": "Play a short local cue for newly observed failures.",
+  "settings-theme": "Use the dark ember theme, follow DSM system preference, or select light mode.",
+  "settings-status-refresh": "Cadence for authenticated package status refreshes while visible.",
+  "settings-log-refresh": "Cadence for live log refreshes while the Activity page is visible."
+});
+
+const ControlHelp = {
+  name: "ControlHelp",
+  props: { helpKey: { type: String, required: true } },
+  computed: {
+    helpId() { return `sdsync-help-${this.helpKey}`; },
+    text() { return CONTROL_HELP[this.helpKey] || "See Synology Drive Sync in DSM Help."; }
+  },
+  template: `<span class="sdsync-field-tip"><button type="button" class="sdsync-field-tip-trigger" :title="text" :aria-label="'Help: ' + text" :aria-describedby="helpId" @keydown.esc="$event.currentTarget.blur()">?</button><span :id="helpId" class="sdsync-field-tip-content" role="tooltip">{{ text }}</span></span>`
+};
 
 function defaults() {
   return { theme: "dark", status_refresh: 5000, log_refresh: 5000, desktop_notifications: false, audible: false };
 }
 
-function loadSettings() {
+function settingsFromStoredValue(storedValue) {
   const fallback = defaults();
   try {
-    const parsed = JSON.parse(window.localStorage.getItem(SETTINGS_KEY) || "null");
+    const parsed = JSON.parse(storedValue || "null");
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return fallback;
     return {
       theme: ["dark", "light", "system"].includes(parsed.theme) ? parsed.theme : fallback.theme,
@@ -329,6 +519,14 @@ function loadSettings() {
     };
   } catch (_error) {
     return fallback;
+  }
+}
+
+function loadSettings() {
+  try {
+    return settingsFromStoredValue(window.localStorage.getItem(SETTINGS_KEY));
+  } catch (_error) {
+    return defaults();
   }
 }
 
@@ -346,12 +544,110 @@ function emptyRoutine(profile = "") {
   return { profile, enabled: false, action: "sync", mode: "interval", interval_seconds: 3600, weekdays: [1, 2, 3, 4, 5, 6, 7], time_window_start: "00:00", time_window_end: "23:59", debounce_seconds: 30, poll_seconds: 30, retry_count: 2, retry_backoff_seconds: 60, allow_delete: false, max_total_delete: 100, depends_on: [] };
 }
 
+const SECURITY_BOOLEAN_FIELDS = Object.freeze([
+  "require_https", "allow_interface_changes", "allow_profile_changes", "allow_secret_changes",
+  "allow_routine_changes", "allow_notification_changes", "allow_operational_actions",
+  "allow_http_targets", "allow_empty_source", "allow_invalid_tls", "allow_destructive_sync",
+  "allow_doctor_write_test", "allow_remote_logging"
+]);
+const SECURITY_LOG_CATEGORIES = Object.freeze([
+  "audit", "bridge", "authentication", "security", "configuration", "secrets",
+  "routines", "operations", "notifications", "sync", "controller", "scheduler"
+]);
+const SECURITY_LOG_LEVELS = Object.freeze(["off", "trace", "debug", "info", "warn", "error"]);
+const CLIENT_REQUEST_ID_PATTERN = /^[0-9a-f]{32}$/;
+const JOB_ID_PATTERN = /^[0-9a-f]{48}$/;
+const ACTIVITY_MESSAGE_LIMIT = 2048;
+const ACTIVITY_FIELD_LIMIT = 128;
+const MUTATION_MESSAGE_LIMIT = 4096;
+
+function defaultSecurityPolicy() {
+  return {
+    policy_version: null,
+    require_https: false,
+    allow_interface_changes: true,
+    allow_profile_changes: true,
+    allow_secret_changes: true,
+    allow_routine_changes: true,
+    allow_notification_changes: true,
+    allow_operational_actions: true,
+    allow_http_targets: true,
+    allow_empty_source: true,
+    allow_invalid_tls: true,
+    allow_destructive_sync: true,
+    allow_doctor_write_test: true,
+    allow_remote_logging: true,
+    csrf_lifetime_seconds: 300,
+    result_retention_seconds: 3600,
+    max_outstanding_jobs: 256,
+    log_levels: {
+      audit: "info", bridge: "info", authentication: "warn", security: "warn",
+      configuration: "info", secrets: "info", routines: "info", operations: "info",
+      notifications: "warn", sync: "info", controller: "info", scheduler: "info"
+    }
+  };
+}
+
+function normalizedSecurityPolicy(source) {
+  const fallback = defaultSecurityPolicy();
+  if (!source || typeof source !== "object" || Array.isArray(source)) return fallback;
+  const normalized = Object.assign({}, fallback);
+  if (Number.isSafeInteger(source.policy_version) && source.policy_version > 0) {
+    normalized.policy_version = source.policy_version;
+  }
+  SECURITY_BOOLEAN_FIELDS.forEach((field) => {
+    if (!Object.prototype.hasOwnProperty.call(source, field)) return;
+    if (typeof source[field] === "boolean") normalized[field] = source[field];
+    else normalized[field] = field === "require_https";
+  });
+  for (const [field, minimum, maximum] of [
+    ["csrf_lifetime_seconds", 60, 900],
+    ["result_retention_seconds", 300, 86400],
+    ["max_outstanding_jobs", 1, 256]
+  ]) {
+    const value = Number(source[field]);
+    if (Number.isInteger(value) && value >= minimum && value <= maximum) normalized[field] = value;
+  }
+  const levels = source.log_levels && typeof source.log_levels === "object" && !Array.isArray(source.log_levels)
+    ? source.log_levels
+    : {};
+  normalized.log_levels = Object.assign({}, fallback.log_levels);
+  SECURITY_LOG_CATEGORIES.forEach((category) => {
+    if (SECURITY_LOG_LEVELS.includes(levels[category])) normalized.log_levels[category] = levels[category];
+  });
+  return normalized;
+}
+
+function validatedClientRequestId(value) {
+  return typeof value === "string" && CLIENT_REQUEST_ID_PATTERN.test(value) ? value : "";
+}
+
+function validatedJobId(value) {
+  return typeof value === "string" && JOB_ID_PATTERN.test(value) ? value : "";
+}
+
+function normalizedActivityEvent(event) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) return null;
+  const field = (value, fallback) => boundedText(value, fallback).slice(0, ACTIVITY_FIELD_LIMIT);
+  return {
+    epoch: numberOr(event.epoch, 0),
+    code: field(event.code, "unknown.event"),
+    profile: field(event.profile, "none"),
+    state: field(event.state, "unknown"),
+    category: field(event.category, "operations"),
+    level: field(event.level, "info"),
+    message: boundedText(event.message, "").slice(0, ACTIVITY_MESSAGE_LIMIT),
+    client_request_id: validatedClientRequestId(event.client_request_id)
+  };
+}
+
 function options(entries) {
   return entries.map(([value, label]) => ({ value, label }));
 }
 
 export default {
   name: "SynologyDriveSyncApp",
+  components: { ControlHelp, SecurityPanel },
   data() {
     const settings = loadSettings();
     return {
@@ -359,19 +655,26 @@ export default {
         { id: "overview", title: "Overview", icon: "⌁" }, { id: "profiles", title: "Profiles", icon: "▤" },
         { id: "routines", title: "Routines", icon: "◷" }, { id: "health", title: "Health / Doctor", icon: "◇" },
         { id: "activity", title: "Activity / Logs", icon: "≋" }, { id: "notifications", title: "Notifications", icon: "◉" },
-        { id: "settings", title: "Settings", icon: "⚙" }
+        { id: "security", title: "Security", icon: "▥" },
+        { id: "settings", title: "Settings", icon: "⚙" },
+        { id: "about", title: "About", icon: "ⓘ" }
       ],
       route: "overview", auth: { signal: undefined }, csrfToken: "", snapshot: null,
       connected: false, connectionLabel: "Connecting to package…", freshness: "Waiting for status",
+      bridgeIssue: { title: "", message: "" },
       snapshotTimer: 0, logTimer: 0, snapshotLoading: false, logsLoading: false, operationBusy: false,
       settings, profileFilter: "", profileEditorOpen: false, selectedProfile: "", profileForm: emptyProfile(),
       secretModes: { password: "keep", totp: "keep", remote_log_token: "keep" },
       secretValues: { password: "", totp: "", remote_log_token: "" },
       routineForm: emptyRoutine(), doctorForm: { scope: "all", write_test: false, write_confirm: false },
       alertForm: { enabled: false, on_success: false, on_failure: true, failure_threshold: 1, cooldown_seconds: 3600 },
+      securityForm: defaultSecurityPolicy(), securityDirty: false,
       notificationForm: { desktop_notifications: settings.desktop_notifications, audible: settings.audible },
+      aboutMetadata: ABOUT_METADATA,
+      aboutRustDependencies: ABOUT_RUST_DEPENDENCIES,
+      aboutUiDependencies: ABOUT_UI_DEPENDENCIES,
       diagnostic: { title: "Not run in this session", output: "No diagnostic output yet." },
-      logsPaused: false, logSource: "all", logLines: 200, logState: "Waiting for logs", logOutput: "No log data yet.", activityEvents: [],
+      logsPaused: false, logSource: "all", logLines: 200, logState: "Waiting for logs", logOutput: "No log data yet.", activityEvents: [], activitySearch: "", activityCategory: "all", activityLevel: "all",
       lastFailureKey: "", toasts: [], toastSequence: 0,
       confirmation: { visible: false, title: "", message: "", button: "Confirm", resolve: null },
       confirmationPriorFocus: null, confirmationKeyHandler: null,
@@ -389,8 +692,27 @@ export default {
     realtimeDetail() { const fallbacks = this.realtimeRoutines.filter((routine) => String(routine.backend || "").includes("poll")).length; return !this.realtimeRoutines.length ? "No enabled realtime routine" : (fallbacks ? `${fallbacks} using polling fallback` : "Native/fallback backend reported healthy"); },
     readyProfileCount() { return this.profiles.filter((profile) => profile.has_password === true).length; },
     capabilities() { return this.snapshot && this.snapshot.capabilities && typeof this.snapshot.capabilities === "object" ? this.snapshot.capabilities : {}; },
+    securityPolicy() { return normalizedSecurityPolicy(this.snapshot && this.snapshot.security_policy); },
+    installedPackageVersion() { return boundedText(this.snapshot && this.snapshot.package && this.snapshot.package.version, "Not reported by package API"); },
     canMutate() { return this.capabilities.mutations === true && Boolean(this.csrfToken); },
-    canManageSecrets() { return this.canMutate && this.capabilities.secrets === true; },
+    canChangeInterface() { return this.canMutate && this.securityPolicy.allow_interface_changes !== false; },
+    canChangeProfiles() { return this.canMutate && this.securityPolicy.allow_profile_changes !== false; },
+    canManageSecrets() { return this.canChangeProfiles && this.capabilities.secrets === true && this.securityPolicy.allow_secret_changes !== false; },
+    canAllowHttp() { return this.canChangeProfiles && this.securityPolicy.allow_http_targets !== false; },
+    canAllowEmptySource() { return this.canChangeProfiles && this.securityPolicy.allow_empty_source !== false; },
+    canAllowInvalidTls() { return this.canChangeProfiles && this.securityPolicy.allow_invalid_tls !== false; },
+    canAllowDestructive() { return this.canMutate && this.securityPolicy.allow_destructive_sync !== false; },
+    canAllowRemoteLogging() { return this.canChangeProfiles && this.securityPolicy.allow_remote_logging !== false; },
+    canEditHttpException() { return this.canChangeProfiles && (this.securityPolicy.allow_http_targets !== false || this.profileForm.allow_http === true); },
+    canEditEmptySourceException() { return this.canChangeProfiles && (this.securityPolicy.allow_empty_source !== false || this.profileForm.allow_empty_source === true); },
+    canEditInvalidTlsException() { return this.canChangeProfiles && (this.securityPolicy.allow_invalid_tls !== false || this.profileForm.danger_invalid_certs === true); },
+    canEditProfileDeletion() { return this.canChangeProfiles && (this.securityPolicy.allow_destructive_sync !== false || this.profileForm.delete === true); },
+    canEditRoutineDeletion() { return this.canChangeRoutines && (this.securityPolicy.allow_destructive_sync !== false || this.routineForm.allow_delete === true); },
+    canEditRemoteLogging() { return this.canChangeProfiles && (this.securityPolicy.allow_remote_logging !== false || Boolean(this.profileForm.remote_log_url)); },
+    canChangeRoutines() { return this.canMutate && this.securityPolicy.allow_routine_changes !== false; },
+    canChangeNotifications() { return this.canMutate && this.securityPolicy.allow_notification_changes !== false; },
+    canRunOperations() { return this.canMutate && this.securityPolicy.allow_operational_actions !== false; },
+    canRunDoctorWrite() { return this.securityPolicy.allow_doctor_write_test !== false; },
     selectedProfileModel() { return this.profiles.find((profile) => String(profile.name) === String(this.selectedProfile)) || null; },
     selectedRoutine() { return this.routines.find((routine) => String(routine.profile) === String(this.routineForm.profile)) || null; },
     dependencyProfiles() { return this.profiles.filter((profile) => String(profile.name) !== String(this.routineForm.profile)); },
@@ -406,7 +728,21 @@ export default {
     nextRun() { const epochs = this.enabledRoutines.map((routine) => Number(routine.next_run_epoch)).filter((value) => Number.isFinite(value) && value > 0); return epochs.length ? formatDate(Math.min(...epochs)) : "None"; },
     healthRows() { const explicit = this.snapshot && this.snapshot.health; if (Array.isArray(explicit)) return explicit; return this.profiles.map((profile) => { const health = profile.health && typeof profile.health === "object" ? profile.health : {}; const routine = this.routines.find((item) => String(item.profile) === String(profile.name)) || {}; return Object.assign({ profile: profile.name, last_success_epoch: routine.last_success_epoch }, health); }); },
     healthFreshness() { const newest = this.healthRows.reduce((value, health) => Math.max(value, numberOr(health.last_check_epoch || health.checked_at_epoch || health.checked_epoch, 0)), 0); return newest ? `Newest check ${formatDate(newest)}` : "Cached time unavailable"; },
-    reversedActivity() { return this.activityEvents.slice().reverse(); },
+    reversedActivity() {
+      const query = boundedText(this.activitySearch, "").trim().toLowerCase().slice(0, ACTIVITY_FIELD_LIMIT);
+      return this.activityEvents.map(normalizedActivityEvent).filter((event) => {
+        if (!event) return false;
+        const category = event.category.toLowerCase();
+        const level = event.level.toLowerCase();
+        const searchable = [
+          event.code, event.profile, event.state, event.category, event.level,
+          event.message, event.client_request_id
+        ].join("\n").toLowerCase();
+        return (this.activityCategory === "all" || category === this.activityCategory)
+          && (this.activityLevel === "all" || level === this.activityLevel)
+          && (!query || searchable.includes(query));
+      }).reverse();
+    },
     notificationPermission() { return window.Notification ? Notification.permission : "unsupported"; },
     themeClass() { const theme = this.settings.theme === "system" ? (this.systemLight ? "is-light" : "is-dark") : `is-${this.settings.theme}`; return theme; },
     compareOptions() { return options([["content", "Content — size, MD5, mtime"], ["metadata", "Metadata — size and mtime"], ["size-only", "Size only"]]); },
@@ -417,9 +753,11 @@ export default {
     routineActionOptions() { return options([["sync", "Sync"], ["plan", "Plan only"]]); },
     routineModeOptions() { return options([["interval", "Interval"], ["daily", "Daily window"], ["realtime", "Realtime watcher"]]); },
     weekdayOptions() { return options([[1, "Mon"], [2, "Tue"], [3, "Wed"], [4, "Thu"], [5, "Fri"], [6, "Sat"], [7, "Sun"]]); },
-    logSourceOptions() { return options([["all", "All logs"], ["controller", "Controller"], ["scheduler", "Scheduler"], ["sync", "Sync"]]); },
+    logSourceOptions() { return options([["all", "All logs"], ["audit", "Audit"], ["controller", "Controller"], ["scheduler", "Scheduler"], ["sync", "Sync"]]); },
+    activityCategoryOptions() { return options([["all", "All categories"], ["audit", "Audit"], ["bridge", "Bridge"], ["authentication", "Authentication"], ["security", "Security"], ["configuration", "Configuration"], ["secrets", "Secrets"], ["routines", "Routines"], ["operations", "Operations"], ["notifications", "Notifications"], ["sync", "Sync"], ["controller", "Controller"], ["scheduler", "Scheduler"]]); },
+    activityLevelOptions() { return options([["all", "All levels"], ...["trace", "debug", "info", "warn", "error"].map((level) => [level, level])]); },
     logLineOptions() { return options([[100, "100 lines"], [200, "200 lines"], [500, "500 lines"], [1000, "1000 lines"]]); },
-    themeOptions() { return options([["dark", "Dark"], ["system", "Follow system"], ["light", "Light"]]); },
+    themeOptions() { return options([["dark", "Hellfire dark"], ["system", "Follow system"], ["light", "Ash light"]]); },
     statusRefreshOptions() { return options([[3000, "Every 3 seconds"], [5000, "Every 5 seconds"], [10000, "Every 10 seconds"], [30000, "Every 30 seconds"]]); },
     logRefreshOptions() { return options([[5000, "Every 5 seconds"], [10000, "Every 10 seconds"], [30000, "Every 30 seconds"]]); }
   },
@@ -445,8 +783,10 @@ export default {
     } catch (error) {
       if (this.disposed) return;
       this.connected = false;
-      this.connectionLabel = "DSM session authentication unavailable";
-      this.toast("Control bridge unavailable", boundedText(error.message, "Sign in to DSM again, then reopen this app."), true);
+      this.csrfToken = "";
+      this.bridgeIssue = this.describeBridgeError(error, "authentication");
+      this.connectionLabel = this.bridgeIssue.title;
+      this.toast(this.bridgeIssue.title, this.bridgeIssue.message, true);
     }
     if (this.disposed) return;
     await this.refreshSnapshot(false);
@@ -468,21 +808,89 @@ export default {
   },
   methods: {
     formatBytes, formatDate, formatDuration,
+    describeBridgeError(error, phase = "status") {
+      const status = Number(error && error.status) || 0;
+      const code = String((error && error.code) || "").toLowerCase();
+      const message = String((error && error.message) || "").toLowerCase();
+      if (status === 401 || code.includes("unauthorized") || code.includes("authentication") || message.includes("redirect")) {
+        return { title: "DSM session expired", message: "Sign in to DSM again, then reopen this app from the DSM desktop." };
+      }
+      if (status === 403 || code.includes("forbidden")) {
+        return { title: "DSM access denied", message: "Use a DSM administrator account and, if HTTPS is required by policy, reopen this app over HTTPS." };
+      }
+      if (status === 404 || code === "non_json_response" || code === "malformed_json") {
+        return { title: "Package UI route unavailable", message: "DSM did not reach this package's native API. Repair or reinstall the same package release, then reopen the app." };
+      }
+      if (status === 503 || code.includes("unavailable")) {
+        return { title: "Package service unavailable", message: "Restart Synology Drive Sync and inspect its API log if the package bridge does not recover." };
+      }
+      if (message.includes("unsupported dsm api schema") || code === "invalid_document") {
+        return { title: "UI and package versions differ", message: "Repair or reinstall one complete release so the AppWindow and package API use the same schema." };
+      }
+      if (message.includes("cancel")) {
+        return { title: "DSM request cancelled", message: "The window stopped the request. Retry while this AppWindow remains open." };
+      }
+      const fallback = phase === "authentication"
+        ? "DSM authentication could not be completed. Reopen this app from the DSM desktop."
+        : "The package endpoint could not be reached. Confirm the package is running, then retry.";
+      return { title: "Package bridge unavailable", message: fallback };
+    },
+    openDsmHelp() {
+      /* global SYNO */
+      const launch = typeof SYNO !== "undefined" && SYNO.SDS && SYNO.SDS.AppLaunch;
+      if (typeof launch !== "function") {
+        this.toast("DSM Help unavailable", "Open DSM Help and select Synology Drive Sync.", true);
+        return;
+      }
+      try {
+        launch(HELP_APPLICATION, { app: APP_CLASS, content: HELP_CONTENT[this.route] || HELP_CONTENT.overview }, false);
+      } catch (_error) {
+        this.toast("DSM Help unavailable", "Open DSM Help and select Synology Drive Sync.", true);
+      }
+    },
     navigate(route) { if (!this.routes.some((item) => item.id === route)) return; if (this.route === "profiles" && route !== "profiles") this.closeProfile(); this.route = route; if (route === "activity") this.refreshLogs(); else window.clearTimeout(this.logTimer); },
     pillClass(state) { const value = String(state || "unknown").toLowerCase(); return ["sdsync-pill", { failed: ["failed", "error", "untrusted", "denied"].includes(value), neutral: ["disabled", "stopped", "unknown", "default", "unsupported", "unavailable"].includes(value) }]; },
     healthClass(value) { return value === true ? "sdsync-health-ok" : (value === false ? "sdsync-health-bad" : "sdsync-health-unknown"); },
     booleanEvidence(value) { return value === true ? "Yes" : (value === false ? "No" : "Unavailable"); },
     reportMutationError(error, failedTitle, unknownTitle, fallback) {
       const unknown = Boolean(error && error.outcomeUnknown === true);
-      const observed = boundedText(error && error.message, fallback);
+      const observed = boundedText(error && error.message, fallback).slice(0, MUTATION_MESSAGE_LIMIT / 2);
+      const requestId = error && error.trustedRequestId === true
+        ? validatedClientRequestId(error.requestId)
+        : "";
+      const jobId = error && error.trustedJobId === true
+        ? validatedJobId(error.jobId)
+        : "";
+      const correlation = [
+        requestId ? `Client request ID: ${requestId}.` : "",
+        jobId ? `Queued job ID: ${jobId}.` : ""
+      ].filter(Boolean).join(" ");
+      const withCorrelation = (detail, defaultMessage) => boundedText(
+        correlation ? `${correlation} ${detail}` : detail,
+        defaultMessage
+      ).slice(0, MUTATION_MESSAGE_LIMIT);
+      const csrfRejected = Boolean(error && error.preAcceptance === true && error.csrfRejected === true);
+      if (csrfRejected) {
+        this.csrfToken = "";
+        this.bridgeIssue = {
+          title: "Mutation token rejected",
+          message: "Select Retry to request a fresh DSM mutation token, review the current state, and then submit again. The rejected POST was not accepted and was not retried."
+        };
+        this.connectionLabel = this.bridgeIssue.title;
+        const message = withCorrelation(`${observed} ${this.bridgeIssue.message}`, this.bridgeIssue.message);
+        this.toast(failedTitle, message, true);
+        return { unknown: false, csrfRejected: true, message, requestId, jobId };
+      }
       const message = unknown
-        ? boundedText(
-          `${observed} The request was already queued; do not retry it or create a duplicate. Inspect Activity and Logs for the eventual outcome.`,
-          "The queued operation outcome is unknown. Do not retry it; inspect Activity and Logs."
+        ? withCorrelation(
+          error && error.acceptanceUnknown === true
+            ? `${observed} Preserve the client request ID and inspect Activity and Logs before taking any further action.`
+            : `${observed} The request was already queued; do not retry it or create a duplicate. Inspect Activity and Logs for the eventual outcome.`,
+          "The operation outcome is unknown. Do not retry it; inspect Activity and Logs."
         )
-        : observed;
+        : withCorrelation(observed, fallback);
       this.toast(unknown ? unknownTitle : failedTitle, message, !unknown);
-      return { unknown, message };
+      return { unknown, message, requestId, jobId };
     },
     hasCapability(name) { return this.capabilities[name] === true; },
     integer(value, fallback) { const parsed = Number(value); return Number.isInteger(parsed) ? parsed : fallback; },
@@ -504,20 +912,115 @@ export default {
         this.snapshot = snapshot;
         if (typeof snapshot.csrf_token === "string" && snapshot.csrf_token) this.csrfToken = snapshot.csrf_token;
         this.connected = true;
-        this.connectionLabel = this.canMutate ? "Authenticated control bridge" : "Package status · read-only";
+        this.bridgeIssue = { title: "", message: "" };
+        this.connectionLabel = this.canMutate ? "Authenticated package bridge" : "Package status · read-only";
         this.freshness = `Updated ${new Intl.DateTimeFormat(undefined, { timeStyle: "medium" }).format(new Date())}`;
         this.hydrateAlerts();
+        this.hydrateSecurityPolicy();
         this.maybeNotifyFailure();
         if (manual) this.toast("Status refreshed", "The latest package snapshot is displayed.");
       } catch (error) {
         if (this.disposed) return;
-        this.snapshot = null; this.csrfToken = ""; this.connected = false; this.connectionLabel = "Control bridge unavailable"; this.freshness = "Status unavailable";
-        if (manual) this.toast("Refresh failed", boundedText(error.message, "Unable to read package status."), true);
+        this.csrfToken = "";
+        this.connected = false;
+        this.bridgeIssue = this.describeBridgeError(error, "status");
+        this.connectionLabel = this.bridgeIssue.title;
+        this.freshness = this.snapshot ? "Stale · last successful snapshot retained" : "Status unavailable";
+        if (manual) this.toast(this.bridgeIssue.title, this.bridgeIssue.message, true);
       } finally { this.snapshotLoading = false; if (!this.disposed) this.scheduleSnapshot(); }
     },
     hydrateAlerts() { const alerts = this.snapshot && this.snapshot.alerts; if (!alerts || typeof alerts !== "object") return; this.alertForm = { enabled: alerts.enabled === true, on_success: alerts.on_success === true, on_failure: alerts.on_failure !== false, failure_threshold: numberOr(alerts.failure_threshold, 1), cooldown_seconds: numberOr(alerts.cooldown_seconds, 3600) }; },
+    hydrateSecurityPolicy(force = false) {
+      if (this.securityDirty && !force) return;
+      const policy = normalizedSecurityPolicy(this.snapshot && this.snapshot.security_policy);
+      this.securityForm = Object.assign({}, policy, { log_levels: Object.assign({}, policy.log_levels) });
+      this.securityDirty = false;
+    },
+    updateSecurityForm(value) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return;
+      this.securityForm = Object.assign({}, value, { log_levels: Object.assign({}, value.log_levels || {}) });
+      this.securityDirty = true;
+    },
+    securityPayload() {
+      const payload = {};
+      SECURITY_BOOLEAN_FIELDS.forEach((field) => { payload[field] = this.securityForm[field]; });
+      payload.csrf_lifetime_seconds = Number(this.securityForm.csrf_lifetime_seconds);
+      payload.result_retention_seconds = Number(this.securityForm.result_retention_seconds);
+      payload.max_outstanding_jobs = Number(this.securityForm.max_outstanding_jobs);
+      const levels = this.securityForm.log_levels && typeof this.securityForm.log_levels === "object"
+        ? this.securityForm.log_levels
+        : {};
+      SECURITY_LOG_CATEGORIES.forEach((category) => { payload[`${category}_log_level`] = levels[category]; });
+      return payload;
+    },
+    validateSecurityPayload(payload) {
+      if (SECURITY_BOOLEAN_FIELDS.some((field) => typeof payload[field] !== "boolean")) {
+        return "Every security permission and risk ceiling must be explicitly enabled or disabled.";
+      }
+      if (!this.between(payload.csrf_lifetime_seconds, 60, 900)) return "CSRF lifetime must be between 60 and 900 seconds.";
+      if (!this.between(payload.result_retention_seconds, 300, 86400)) return "Result retention must be between 300 and 86400 seconds.";
+      if (!this.between(payload.max_outstanding_jobs, 1, 256)) return "Maximum outstanding jobs must be between 1 and 256.";
+      if (SECURITY_LOG_CATEGORIES.some((category) => !SECURITY_LOG_LEVELS.includes(payload[`${category}_log_level`]))) {
+        return "Every log category must use off, trace, debug, info, warn, or error.";
+      }
+      return "";
+    },
+    securityRelaxed(payload) {
+      const current = this.securityPolicy;
+      if (current.require_https === true && payload.require_https === false) return true;
+      return SECURITY_BOOLEAN_FIELDS.some((field) => field !== "require_https" && current[field] === false && payload[field] === true);
+    },
+    async saveSecurityPolicy(event) {
+      if (event && event.preventDefault) event.preventDefault();
+      if (!this.canMutate || !this.securityDirty || this.operationBusy) return;
+      const payload = this.securityPayload();
+      const error = this.validateSecurityPayload(payload);
+      if (error) return this.toast("Security policy not saved", error, true);
+      if (this.securityRelaxed(payload) && !await this.confirmAction(
+        "Relax security restrictions?",
+        "One or more administrator permissions or risk ceilings will become less restrictive. Review the complete policy before continuing.",
+        "Save relaxed policy"
+      )) return;
+      this.operationBusy = true;
+      try {
+        await apiPost(this.auth, this.csrfToken, ACTIONS.securityPolicy, payload);
+        if (this.disposed) return;
+        this.securityDirty = false;
+        this.csrfToken = "";
+        try {
+          await this.refreshCsrf();
+        } catch (_csrfError) {
+          if (this.disposed) return;
+          this.connected = false;
+          this.bridgeIssue = {
+            title: "Mutation token refresh required",
+            message: "The security policy was saved, but DSM did not issue a replacement mutation token. Select Retry to request one; do not repeat the save."
+          };
+          this.connectionLabel = this.bridgeIssue.title;
+          this.freshness = this.snapshot ? "Stale · last successful snapshot retained" : "Status unavailable";
+          this.toast("Security policy saved · refresh required", this.bridgeIssue.message, true);
+          return;
+        }
+        if (this.disposed) return;
+        this.toast("Security policy saved", "The package validated, persisted, enforced, and audited the complete policy.");
+        await this.refreshSnapshot(false);
+        if (!this.disposed) this.hydrateSecurityPolicy(true);
+      } catch (caught) {
+        if (this.disposed) return;
+        const report = this.reportMutationError(caught, "Security policy not saved", "Security policy outcome unknown", "The package rejected the security policy.");
+        if (report.unknown) {
+          this.csrfToken = "";
+          this.securityDirty = false;
+          await this.refreshSnapshot(false);
+          if (!this.disposed && this.connected) this.hydrateSecurityPolicy(true);
+        }
+      } finally {
+        if (!this.disposed) this.operationBusy = false;
+      }
+    },
     openProfile(name) {
       if (this.operationBusy) return;
+      if (!name && !this.canChangeProfiles) return;
       const profile = name ? this.profiles.find((item) => String(item.name) === String(name)) : null;
       this.selectedProfile = profile ? String(profile.name) : "";
       this.profileForm = emptyProfile();
@@ -534,6 +1037,13 @@ export default {
       if (payload.quiet && payload.verbosity !== 0) return "Quiet output cannot be combined with verbose output.";
       if (payload.danger_accept_invalid_certs && !this.profileForm.danger_invalid_confirm) return "Explicitly accept the TLS interception risk.";
       if (payload.remote_log_url && !payload.remote_log_url.startsWith("https://")) return "Remote log delivery requires an HTTPS URL.";
+      if (payload.allow_http && !this.canAllowHttp) return "The security policy does not permit HTTP destinations.";
+      if (payload.allow_empty_source && !this.canAllowEmptySource) return "The security policy does not permit empty-source exceptions.";
+      if (payload.danger_accept_invalid_certs && !this.canAllowInvalidTls) return "The security policy does not permit invalid TLS certificates.";
+      if (payload.delete && !this.canAllowDestructive) return "The security policy does not permit deletion-capable profiles.";
+      if (payload.remote_log_url && !this.canAllowRemoteLogging) return "The security policy does not permit remote logging.";
+      if (secrets.length && !this.canManageSecrets) return "The security policy does not permit protected-secret changes.";
+      if (secrets.some((item) => item.kind === "remote-log-token") && !this.canAllowRemoteLogging) return "The security policy does not permit remote-log token changes.";
       if (secrets.some((item) => item.mode === "replace" && !item.value)) return "Replacement secret values cannot be empty.";
       if (!this.between(payload.jobs, 1, 16)) return "Concurrent uploads must be between 1 and 16.";
       if (!this.between(payload.max_delete, 0, 2147483647)) return "Maximum deletions must be a non-negative integer.";
@@ -546,7 +1056,7 @@ export default {
     },
     async saveProfile(event) {
       if (event && event.preventDefault) event.preventDefault();
-      if (!this.canMutate || this.operationBusy) return;
+      if (!this.canChangeProfiles || this.operationBusy) return;
       const payload = this.profilePayload(); const secrets = this.secretOperations(payload.name); const error = this.validateProfile(payload, secrets);
       if (error) return this.toast("Profile not saved", error, true);
       const risky = payload.allow_empty_source || payload.danger_accept_invalid_certs || payload.delete;
@@ -587,7 +1097,7 @@ export default {
       }
     },
     async removeProfile() {
-      if (!this.canMutate || !this.selectedProfile || this.operationBusy) return;
+      if (!this.canChangeProfiles || !this.selectedProfile || this.operationBusy) return;
       const name = this.selectedProfile;
       if (!await this.confirmAction(`Delete profile ${name}?`, "This removes package-owned configuration and protected credentials. Synced files are not deleted.", "Delete profile")) return;
       this.operationBusy = true;
@@ -609,9 +1119,10 @@ export default {
     routinePayload() { return { profile: this.routineForm.profile, enabled: this.routineForm.enabled === true, action: this.routineForm.action, mode: this.routineForm.mode, interval_seconds: this.integer(this.routineForm.interval_seconds, 3600), weekdays: this.routineForm.weekdays.map(Number), time_window_start: this.routineForm.time_window_start, time_window_end: this.routineForm.time_window_end, debounce_seconds: this.integer(this.routineForm.debounce_seconds, 30), poll_seconds: this.integer(this.routineForm.poll_seconds, 30), retry_count: this.integer(this.routineForm.retry_count, 2), retry_backoff_seconds: this.integer(this.routineForm.retry_backoff_seconds, 60), allow_delete: this.routineForm.allow_delete === true, max_total_delete: this.integer(this.routineForm.max_total_delete, 100), depends_on: this.routineForm.depends_on.map(String) }; },
     async saveRoutine(event) {
       if (event && event.preventDefault) event.preventDefault();
-      if (!this.canMutate || !this.routineForm.profile || this.operationBusy) return;
+      if (!this.canChangeRoutines || !this.routineForm.profile || this.operationBusy) return;
       const payload = this.routinePayload();
       if (!payload.weekdays.length) return this.toast("Routine not saved", "Select at least one active weekday.", true);
+      if (payload.allow_delete && !this.canAllowDestructive) return this.toast("Routine not saved", "The security policy does not permit deletion-capable routines.", true);
       if (!this.between(payload.interval_seconds, 60, 2592000) || !this.between(payload.debounce_seconds, 5, 3600) || !this.between(payload.poll_seconds, 5, 3600) || !this.between(payload.retry_count, 0, 5) || !this.between(payload.retry_backoff_seconds, 10, 86400) || !this.between(payload.max_total_delete, 0, 2147483647)) return this.toast("Routine not saved", "One or more timing, retry, or deletion limits are outside the supported range.", true);
       if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(payload.time_window_start) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(payload.time_window_end)) return this.toast("Routine not saved", "Daily window times must use 24-hour HH:MM format.", true);
       this.operationBusy = true;
@@ -630,7 +1141,7 @@ export default {
     },
     async removeRoutine() {
       const profile = this.routineForm.profile;
-      if (!this.canMutate || !profile || !this.selectedRoutine || this.operationBusy) return;
+      if (!this.canChangeRoutines || !profile || !this.selectedRoutine || this.operationBusy) return;
       if (!await this.confirmAction(`Remove routine for ${profile}?`, "The profile remains configured, but package automation for it will stop.", "Remove routine")) return;
       this.operationBusy = true;
       try {
@@ -648,9 +1159,9 @@ export default {
     },
     async saveAlerts(event) {
       if (event && event.preventDefault) event.preventDefault();
-      if (!this.canMutate || this.operationBusy) return;
+      if (!this.canChangeNotifications || this.operationBusy) return;
       const payload = { enabled: this.alertForm.enabled === true, on_success: this.alertForm.on_success === true, on_failure: this.alertForm.on_failure === true, failure_threshold: this.integer(this.alertForm.failure_threshold, 1), cooldown_seconds: this.integer(this.alertForm.cooldown_seconds, 3600) };
-      if (!this.between(payload.failure_threshold, 1, 100) || !this.between(payload.cooldown_seconds, 60, 604800)) return this.toast("Alert policy not saved", "Failure threshold or cooldown is outside the supported range.", true);
+      if (!this.between(payload.failure_threshold, 1, 100) || !this.between(payload.cooldown_seconds, 60, 2592000)) return this.toast("Alert policy not saved", "Failure threshold or cooldown is outside the supported range.", true);
       this.operationBusy = true;
       try {
         await apiPost(this.auth, this.csrfToken, ACTIONS.alertPolicy, payload);
@@ -665,7 +1176,9 @@ export default {
       }
     },
     async executeOperation(kind, payload) {
-      if (!this.canMutate || this.operationBusy || this.disposed) return;
+      if (!this.canRunOperations || this.operationBusy || this.disposed) return;
+      if (payload && payload.allow_delete === true && !this.canAllowDestructive) return;
+      if (kind === "doctor" && payload && payload.write_test === true && (!this.canRunDoctorWrite || !this.hasCapability("write_test"))) return;
       this.operationBusy = true;
       const awaitTerminal = kind === "doctor";
       try {
@@ -709,15 +1222,146 @@ export default {
       }
     },
     quickPlan() { return this.executeOperation("plan", { scope: "all", write_test: null, allow_delete: false, max_total_delete: 0 }); },
-    async quickRun() { if (!this.canMutate || this.operationBusy) return; if (await this.confirmAction("Run all configured profiles?", "This starts a real one-way sync. Remote deletion stays disabled for this quick action.", "Run all")) return this.executeOperation("run", { scope: "all", write_test: null, allow_delete: false, max_total_delete: 0 }); },
-    async runDoctor(event) { if (event && event.preventDefault) event.preventDefault(); if (!this.canMutate || this.operationBusy) return; if (this.doctorForm.write_test && !this.doctorForm.write_confirm) return this.toast("Write-test confirmation required", "Approve the disposable probe and cleanup before running.", true); if (this.doctorForm.write_test && !await this.confirmAction("Run the disposable target probe?", "The doctor briefly creates, verifies, and removes a unique probe in the selected destination.", "Run write test")) return; this.diagnostic = { title: "Doctor running", output: "Waiting for the package controller…" }; return this.executeOperation("doctor", { scope: this.doctorForm.scope, write_test: this.doctorForm.write_test, allow_delete: null, max_total_delete: null }); },
+    async quickRun() { if (!this.canRunOperations || this.operationBusy) return; if (await this.confirmAction("Run all configured profiles?", "This starts a real one-way sync. Remote deletion stays disabled for this quick action.", "Run all")) return this.executeOperation("run", { scope: "all", write_test: null, allow_delete: false, max_total_delete: 0 }); },
+    async runDoctor(event) { if (event && event.preventDefault) event.preventDefault(); if (!this.canRunOperations || this.operationBusy) return; if (this.doctorForm.write_test && (!this.canRunDoctorWrite || !this.hasCapability("write_test"))) return this.toast("Doctor write test blocked", "The package capability or security policy does not permit disposable destination probes.", true); if (this.doctorForm.write_test && !this.doctorForm.write_confirm) return this.toast("Write-test confirmation required", "Approve the disposable probe and cleanup before running.", true); if (this.doctorForm.write_test && !await this.confirmAction("Run the disposable target probe?", "The doctor briefly creates, verifies, and removes a unique probe in the selected destination.", "Run write test")) return; this.diagnostic = { title: "Doctor running", output: "Waiting for the package controller…" }; return this.executeOperation("doctor", { scope: this.doctorForm.scope, write_test: this.doctorForm.write_test, allow_delete: null, max_total_delete: null }); },
     logsFrom(model) { if (Array.isArray(model.logs)) return model.logs.map((entry) => { if (typeof entry === "string") return entry; if (entry && typeof entry === "object") { if (Array.isArray(entry.lines)) return entry.lines.map((line) => `[${boundedText(entry.source, "log")}] ${boundedText(line, "")}`).join("\n"); return `${entry.timestamp ? `[${entry.timestamp}] ` : ""}${entry.source ? `[${entry.source}] ` : ""}${boundedText(entry.message, "")}`; } return ""; }).join("\n"); return boundedText(model.text || model.output, "No log data yet."); },
     async refreshLogs() { if (this.disposed || this.logsLoading || this.logsPaused || document.hidden || this.route !== "activity") return; this.logsLoading = true; try { const lines = Math.min(1000, Math.max(1, Number(this.logLines) || 200)); const [logs, activity] = await Promise.all([apiGet(this.auth, "logs", { lines, source: this.logSource }), apiGet(this.auth, "activity", { lines })]); if (this.disposed) return; this.logOutput = this.logsFrom(logs).slice(0, MAX_RESPONSE_BYTES); this.activityEvents = arrayOf(activity.events); this.logState = `Live · ${lines} line limit`; } catch (_error) { if (!this.disposed) this.logState = "Logs unavailable"; } finally { this.logsLoading = false; if (!this.disposed) this.scheduleLogs(); } },
     toggleLogs() { this.logsPaused = !this.logsPaused; this.logState = this.logsPaused ? "Paused" : "Resuming"; if (!this.logsPaused) this.refreshLogs(); else window.clearTimeout(this.logTimer); },
     clearLogView() { this.logOutput = "View cleared. The package log was not deleted."; },
-    async saveNotificationPreferences(event) { if (event && event.preventDefault) event.preventDefault(); if (this.notificationForm.desktop_notifications && window.Notification && Notification.permission === "default") { const permission = await Notification.requestPermission(); if (permission !== "granted") this.notificationForm.desktop_notifications = false; } this.settings.desktop_notifications = this.notificationForm.desktop_notifications === true; this.settings.audible = this.notificationForm.audible === true; this.persistSettings(); this.toast("Session preferences saved", "These non-secret browser preferences are stored locally."); },
-    saveInterfaceSettings(event) { if (event && event.preventDefault) event.preventDefault(); this.settings.status_refresh = Number(this.settings.status_refresh); this.settings.log_refresh = Number(this.settings.log_refresh); this.persistSettings(); this.scheduleSnapshot(); this.scheduleLogs(); this.toast("Interface settings saved", "Theme and refresh cadence were updated locally."); },
-    persistSettings() { try { window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(this.settings)); } catch (_error) { this.toast("Preferences not persisted", "Browser storage is unavailable for this DSM session.", true); } },
+    async saveNotificationPreferences(event) {
+      if (event && event.preventDefault) event.preventDefault();
+      if (!this.canChangeNotifications || this.operationBusy) return;
+      this.operationBusy = true;
+      let transaction = null;
+      try {
+        if (this.notificationForm.desktop_notifications && window.Notification && Notification.permission === "default") {
+          const permission = await Notification.requestPermission();
+          if (permission !== "granted") this.notificationForm.desktop_notifications = false;
+        }
+        transaction = this.captureSettingsTransaction();
+        if (!transaction) return;
+        const next = Object.assign({}, transaction.settings, {
+          desktop_notifications: this.notificationForm.desktop_notifications === true,
+          audible: this.notificationForm.audible === true
+        });
+        if (!this.persistSettings(next)) {
+          this.applySettingsState(transaction.settings);
+          return;
+        }
+        this.applySettingsState(next);
+        await apiPost(this.auth, this.csrfToken, ACTIONS.clientEvent, { event: "session-notifications" });
+        if (this.disposed) return;
+        this.toast("Session preferences saved", "These non-secret browser preferences were audited and stored locally.");
+      } catch (error) {
+        if (!this.disposed) {
+          const rejected = this.preferenceAuditWasRejected(error);
+          const restored = rejected && transaction ? this.restoreSettingsTransaction(transaction) : false;
+          this.reportMutationError(
+            error,
+            rejected && restored ? "Session preferences not saved" : (rejected ? "Session preference rollback incomplete" : "Session preferences stored · audit failed"),
+            "Session preferences stored · audit outcome unknown",
+            rejected && restored
+              ? "The package rejected the audit event and the prior browser preferences were restored."
+              : "The browser preferences remain stored locally, but the package audit did not complete."
+          );
+        }
+      } finally {
+        if (!this.disposed) this.operationBusy = false;
+      }
+    },
+    async saveInterfaceSettings(event) {
+      if (event && event.preventDefault) event.preventDefault();
+      if (!this.canChangeInterface || this.operationBusy) return;
+      const candidate = {
+        theme: this.settings.theme,
+        status_refresh: Number(this.settings.status_refresh),
+        log_refresh: Number(this.settings.log_refresh)
+      };
+      if (!["dark", "light", "system"].includes(candidate.theme)
+        || ![3000, 5000, 10000, 30000].includes(candidate.status_refresh)
+        || ![5000, 10000, 30000].includes(candidate.log_refresh)) {
+        this.toast("Interface settings not saved", "Choose a supported theme and refresh cadence.", true);
+        return;
+      }
+      this.operationBusy = true;
+      let transaction = null;
+      try {
+        transaction = this.captureSettingsTransaction();
+        if (!transaction) return;
+        const next = Object.assign({}, transaction.settings, candidate);
+        if (!this.persistSettings(next)) {
+          this.applySettingsState(transaction.settings);
+          this.scheduleSnapshot();
+          this.scheduleLogs();
+          return;
+        }
+        this.applySettingsState(next);
+        this.scheduleSnapshot();
+        this.scheduleLogs();
+        await apiPost(this.auth, this.csrfToken, ACTIONS.clientEvent, { event: "interface-settings" });
+        if (this.disposed) return;
+        this.toast("Interface settings saved", "Theme and refresh cadence were audited and stored locally.");
+      } catch (error) {
+        if (!this.disposed) {
+          const rejected = this.preferenceAuditWasRejected(error);
+          const restored = rejected && transaction ? this.restoreSettingsTransaction(transaction) : false;
+          if (rejected) {
+            this.scheduleSnapshot();
+            this.scheduleLogs();
+          }
+          this.reportMutationError(
+            error,
+            rejected && restored ? "Interface settings not saved" : (rejected ? "Interface setting rollback incomplete" : "Interface settings stored · audit failed"),
+            "Interface settings stored · audit outcome unknown",
+            rejected && restored
+              ? "The package rejected the audit event and the prior interface settings were restored."
+              : "The interface settings remain stored locally, but the package audit did not complete."
+          );
+        }
+      } finally {
+        if (!this.disposed) this.operationBusy = false;
+      }
+    },
+    persistSettings(settings = this.settings) {
+      try {
+        window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+        return true;
+      } catch (_error) {
+        this.toast("Preferences not persisted", "Browser storage is unavailable for this DSM session.", true);
+        return false;
+      }
+    },
+    captureSettingsTransaction() {
+      try {
+        const raw = window.localStorage.getItem(SETTINGS_KEY);
+        return { raw, settings: settingsFromStoredValue(raw) };
+      } catch (_error) {
+        this.toast("Preferences not persisted", "Browser storage is unavailable for this DSM session; no package audit was submitted.", true);
+        return null;
+      }
+    },
+    applySettingsState(settings) {
+      this.settings = Object.assign({}, settings);
+      this.notificationForm = Object.assign({}, this.notificationForm, {
+        desktop_notifications: settings.desktop_notifications === true,
+        audible: settings.audible === true
+      });
+    },
+    restoreSettingsTransaction(transaction) {
+      let restored = true;
+      try {
+        if (transaction.raw === null) window.localStorage.removeItem(SETTINGS_KEY);
+        else window.localStorage.setItem(SETTINGS_KEY, transaction.raw);
+      } catch (_error) {
+        restored = false;
+        this.toast("Preference rollback incomplete", "The prior browser settings could not be restored in local storage. Review this AppWindow before continuing.", true);
+      }
+      this.applySettingsState(transaction.settings);
+      return restored;
+    },
+    preferenceAuditWasRejected(error) {
+      return Boolean(error && error.preAcceptance === true && error.trustedRejection === true);
+    },
     maybeNotifyFailure() { if (this.runStatus !== "failed") return; const key = [this.run.profile || this.run.scope || "unknown", this.run.finished_epoch || this.run.started_epoch || "unknown", this.run.exit_code || "unknown"].join(":"); if (!this.lastFailureKey) { this.lastFailureKey = key; return; } if (key === this.lastFailureKey) return; this.lastFailureKey = key; if (this.settings.desktop_notifications && window.Notification && Notification.permission === "granted") new Notification("Synology Drive Sync failed", { body: "A newly observed package run failed. Open DSM for details.", icon: "/webman/3rdparty/synology-drive-sync/images/icon_64.png", tag: "sdsync-run-failure" }); if (this.settings.audible) this.playCue(); },
     playCue() { try { const AudioContext = window.AudioContext || window.webkitAudioContext; if (!AudioContext) return; const context = new AudioContext(); const oscillator = context.createOscillator(); const gain = context.createGain(); oscillator.frequency.value = 440; gain.gain.setValueAtTime(0.0001, context.currentTime); gain.gain.exponentialRampToValueAtTime(0.08, context.currentTime + 0.02); gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.18); oscillator.connect(gain); gain.connect(context.destination); oscillator.start(); oscillator.stop(context.currentTime + 0.2); oscillator.addEventListener("ended", () => context.close(), { once: true }); } catch (_error) { /* Best-effort local signal only. */ } },
     confirmationElement(reference) {
