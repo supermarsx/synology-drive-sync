@@ -6035,10 +6035,9 @@ mod linux_files {
             (request_id, MAX_JOB_BYTES)
         } else if let Some(request_id) = name.strip_suffix(".secret.tmp") {
             (request_id, MAX_SECRET_BYTES + 1)
-        } else if let Some(request_id) = name.strip_suffix(".response.tmp") {
-            (request_id, MAX_MANAGER_OUTPUT_BYTES)
         } else {
-            return None;
+            let request_id = name.strip_suffix(".response.tmp")?;
+            (request_id, MAX_MANAGER_OUTPUT_BYTES)
         };
         valid_server_job_id(request_id).then_some(maximum)
     }
@@ -10545,7 +10544,7 @@ mod tests {
                 &hostile_staging,
                 package_uid,
                 MAX_JOB_BYTES,
-                &[expected.clone()],
+                std::slice::from_ref(&expected),
             )
             .unwrap_err()
             .kind,
