@@ -39,6 +39,22 @@ ARM_EABI5_HARD_FLOAT = 0x05000400
 PACKAGE_TOOL_TIMEOUT_SECONDS = 120
 
 
+def git_show_repository_file(revision_path: str) -> bytes:
+    """Read a tracked release file while trusting only this exact test checkout."""
+    return subprocess.run(
+        [
+            "git",
+            "-c",
+            f"safe.directory={REPOSITORY}",
+            "show",
+            revision_path,
+        ],
+        cwd=REPOSITORY,
+        check=True,
+        capture_output=True,
+    ).stdout
+
+
 def fake_elf(
     machine: int,
     *,
@@ -7549,18 +7565,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 "packaging/synology/scripts/common",
                 "packaging/synology/scripts/start-stop-status",
             ):
-                earlier = subprocess.run(
-                    ["git", "show", f"{legacy_tag}:{relative}"],
-                    cwd=REPOSITORY,
-                    check=True,
-                    capture_output=True,
-                ).stdout
-                floor = subprocess.run(
-                    ["git", "show", f"26.10:{relative}"],
-                    cwd=REPOSITORY,
-                    check=True,
-                    capture_output=True,
-                ).stdout
+                earlier = git_show_repository_file(f"{legacy_tag}:{relative}")
+                floor = git_show_repository_file(f"26.10:{relative}")
                 if relative.endswith("sdsync-common"):
                     # 26.10 changed only the DSM notification application ID;
                     # lifecycle, run-lock, and core-launch behavior stayed exact.
@@ -7569,13 +7575,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                         b"SYNO.SDS.App.SynologyDriveSync.Instance",
                     )
                 self.assertEqual(earlier, floor, (legacy_tag, relative))
-        old_common = subprocess.run(
-            ["git", "show", "26.10:packaging/synology/package/libexec/sdsync-common"],
-            cwd=REPOSITORY,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
+        old_common = git_show_repository_file(
+            "26.10:packaging/synology/package/libexec/sdsync-common"
+        ).decode("utf-8")
         installed_common = self.real_target / "libexec/sdsync-common"
         installed_common.write_text(old_common, encoding="utf-8")
         installed_common.chmod(0o755)
@@ -7639,13 +7641,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
 
     def test_preupgrade_rejects_exact_legacy_orphan_core_before_adopting_stale_lock(self) -> None:
         installed_common = self.real_target / "libexec/sdsync-common"
-        old_common = subprocess.run(
-            ["git", "show", "26.10:packaging/synology/package/libexec/sdsync-common"],
-            cwd=REPOSITORY,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
+        old_common = git_show_repository_file(
+            "26.10:packaging/synology/package/libexec/sdsync-common"
+        ).decode("utf-8")
         installed_common.write_text(old_common, encoding="utf-8")
         installed_common.chmod(0o755)
         old_api = self.real_target / "bin/sdsync-dsm-api"
@@ -7680,13 +7678,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         old_scripts = self.root / "old-lifecycle"
         old_scripts.mkdir(mode=0o700)
         for name in ("common", "start-stop-status"):
-            source = subprocess.run(
-                ["git", "show", f"26.10:packaging/synology/scripts/{name}"],
-                cwd=REPOSITORY,
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout
+            source = git_show_repository_file(
+                f"26.10:packaging/synology/scripts/{name}"
+            ).decode("utf-8")
             target = old_scripts / name
             target.write_text(source, encoding="utf-8")
             target.chmod(0o755)
