@@ -42,9 +42,9 @@ their originally published UI and do not gain the native AppWindow retroactively
 Installation creates an unprivileged system-internal package identity, private FHS storage, a
 disabled global schedule, the package controller, a package-user API service, the desktop
 application, fixed preloaded desktop-alert I18N text, and deterministic icons. Its privilege manifest
-defaults everything to the package identity and joins that identity to DSM's `http` group; it
-requests no root execution, capability, or identity-changing file mode. It does not grant access to
-a user share, create a profile, store a credential, contact a target, or start a sync.
+contains only `defaults.run-as=package`; it requests no joined web group, root execution, capability,
+or identity-changing file mode. It does not grant access to a user share, create a profile, store a
+credential, contact a target, or start a sync.
 
 DSM may collision-rename the package's NSS username. Use the account shown under **System internal
 user**, or resolve `$PACKAGE_USER` with the canonical
@@ -59,13 +59,15 @@ uninstall permanently purges package-private operational state and requires conf
 
 Use the DSM desktop application menu or Package Center's **Open** action. The application is
 registered for administrators only. A healthy open sequence requires the DSM session cookie,
-administrator membership, and a package CSRF token for mutation. An ordinary `0755` CGI running as
-DSM `http` relays the bounded request through the fixed package:`http` `0660` Unix socket. The
-package-user API service revalidates the request, invokes `authenticate.cgi` against the DSM cookie,
-independently checks administrator membership, and then issues its own short-lived, session-bound
-CSRF token. The native AppWindow does not parse or rewrite the DSM shell location and does not send
-a `SynoToken`; cookie authentication is the active native path. Never copy a DSM cookie or package
-CSRF token into a URL, bookmark, browser storage, or support transcript.
+administrator membership, and a package CSRF token for mutation. Under `defaults.run-as=package`,
+DSM executes the ordinary package-owned `0755` CGI with the exact non-root package UID. It relays the
+bounded request through the fixed package-owned Unix socket, which remains `0000` before startup
+commit and activates on the same inode as `0600`. The package-user API service revalidates the
+request, invokes `authenticate.cgi` against the DSM cookie, independently checks administrator
+membership, and then issues its own short-lived, session-bound CSRF token. The native AppWindow does
+not parse or rewrite the DSM shell location and does not send a `SynoToken`; cookie authentication
+is the active native path. Never copy a DSM cookie or package CSRF token into a URL, bookmark,
+browser storage, or support transcript.
 
 ## Grant read-only access to each local source
 

@@ -19,9 +19,11 @@ same package-owned profiles, credentials, routines, state, and logs. The dashboa
 administrator-only; it never returns a stored password, TOTP seed, or remote logging token to the
 browser. The CLI remains the recovery and automation surface when the dashboard cannot open.
 
-The package requests no root execution, Linux capabilities, set-user-ID bit, or set-group-ID bit.
-Its ordinary `0755` DSM `http` CGI can only relay a bounded request over a fixed package:`http`
-`0660` Unix socket. The package-user API service reauthenticates the DSM session, independently
+The package requests no root execution, Linux capabilities, joined web group, set-user-ID bit, or
+set-group-ID bit. With `defaults.run-as=package`, DSM executes its ordinary package-owned `0755` CGI
+with the same exact non-root package UID as the API service. The CGI can only relay a bounded
+request over a fixed package-owned Unix socket: it is inaccessible at `0000` before startup commit,
+then the same inode activates as `0600`. The service reauthenticates the DSM session, independently
 requires administrator membership and package CSRF, and alone reaches private state or the queue.
 
 The package is not a Synology Drive protocol plug-in. It writes through File Station. Synology Drive
@@ -54,7 +56,7 @@ or an enabled Team Folder.
 | Password, TOTP, and remote-log-token keep/replace/clear behavior | [Secrets and protected values](dsm/secrets.md) |
 | Interval, daily, and realtime routines, dependencies, retries, and deletion approval | [Routines and scheduling](dsm/routines.md) |
 | Doctor, cached health, activity, logs, and DSM desktop alerts | [Health, activity, logs, and notifications](dsm/operations.md) |
-| `authenticate.cgi`, administrator checks, cookie authentication, CSRF, package/`http` socket boundary, and private queue | [Dashboard security model](dsm/security.md) |
+| `authenticate.cgi`, administrator checks, cookie authentication, CSRF, package-UID socket boundary, and private queue | [Dashboard security model](dsm/security.md) |
 | Dashboard-to-`sdsync-dsm` command mapping and private paths | [CLI parity and private paths](dsm/cli-parity.md) |
 | Symptoms, recovery, acceptance evidence, and known unverified behavior | [Troubleshooting and live-NAS acceptance](dsm/troubleshooting.md) |
 | Reproducible package assembly, ELF contracts, icons, and validation | [Build and validate SPKs](dsm/package-development.md) |

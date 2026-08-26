@@ -300,7 +300,7 @@ class BuilderTests(unittest.TestCase):
             "65 through 255 safe ASCII bytes",
             "incomplete active final record is durably truncated",
             "malformed rotated history remain fail closed",
-            "`SO_PEERCRED` identifies the shared DSM web tier",
+            "`SO_PEERCRED` binds both ends to the package's exact non-root UID",
         ):
             self.assertIn(required, normalized)
         selector = (REPOSITORY / "docs/release-selector.md").read_text(encoding="utf-8")
@@ -393,7 +393,7 @@ class BuilderTests(unittest.TestCase):
             self.assertIn(b'auto_upgrade_from="26.7-1"', info)
             self.assertEqual(
                 privilege,
-                {"defaults": {"run-as": "package"}, "join-groupname": "http"},
+                {"defaults": {"run-as": "package"}},
             )
             self.assertNotIn("tool", privilege)
             with tarfile.open(fileobj=io.BytesIO(package_payload), mode="r:gz") as package:
@@ -999,7 +999,7 @@ class BuilderTests(unittest.TestCase):
         privilege = json.loads(privilege_payload)
         self.assertEqual(
             privilege,
-            {"defaults": {"run-as": "package"}, "join-groupname": "http"},
+            {"defaults": {"run-as": "package"}},
         )
         privilege["tool"] = [{
             "relpath": "ui/api.cgi",
@@ -1247,17 +1247,6 @@ class RuntimeTests(unittest.TestCase):
         self.write_api_mock()
         self.fake_system_bin = self.root / "fake-system-bin"
         self.fake_system_bin.mkdir(mode=0o700)
-        fake_getent = self.fake_system_bin / "getent"
-        fake_getent.write_text(
-            "#!/bin/sh\n"
-            'if [ "$#" -eq 2 ] && [ "$1" = group ] && [ "$2" = http ]; then\n'
-            f"  printf 'http:x:{self.drop_gid}:\\n'\n"
-            "  exit 0\n"
-            "fi\n"
-            "exit 2\n",
-            encoding="utf-8",
-        )
-        fake_getent.chmod(0o755)
         self.source_one = self.root / "Source Folder"
         self.source_two = self.root / "Second Source"
         self.source_one.mkdir()
@@ -1498,23 +1487,25 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "        socket_mode = stat.S_IMODE(socket_before.st_mode)\n"
             "        if (not stat.S_ISSOCK(socket_before.st_mode) or socket_path.is_symlink() or\n"
             "                socket_before.st_uid != os.getuid() or socket_before.st_nlink != 1 or\n"
-            "                socket_mode not in (0o600, 0o660) or\n"
-            "                (socket_mode == 0o660 and socket_before.st_gid != os.getgid())):\n"
+            "                socket_mode not in (0o000, 0o600)):\n"
             "            raise SystemExit(73)\n"
-            "        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
-            "        probe.settimeout(0.25)\n"
-            "        try:\n"
-            "            probe.connect(str(socket_path))\n"
-            "        except ConnectionRefusedError:\n"
-            "            pass\n"
-            "        except FileNotFoundError:\n"
-            "            socket_before = None\n"
-            "        except OSError:\n"
+            "        if socket_mode == 0o000 and pid_before is None:\n"
             "            raise SystemExit(73)\n"
-            "        else:\n"
-            "            raise SystemExit(75)\n"
-            "        finally:\n"
-            "            probe.close()\n"
+            "        if socket_mode == 0o600:\n"
+            "            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+            "            probe.settimeout(0.25)\n"
+            "            try:\n"
+            "                probe.connect(str(socket_path))\n"
+            "            except ConnectionRefusedError:\n"
+            "                pass\n"
+            "            except FileNotFoundError:\n"
+            "                socket_before = None\n"
+            "            except OSError:\n"
+            "                raise SystemExit(73)\n"
+            "            else:\n"
+            "                raise SystemExit(75)\n"
+            "            finally:\n"
+            "                probe.close()\n"
             "        if socket_before is not None:\n"
             "            socket_after = os.lstat(socket_path)\n"
             "            if (socket_before.st_dev, socket_before.st_ino) != (socket_after.st_dev, socket_after.st_ino):\n"
@@ -1935,15 +1926,26 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "        mode = stat.S_IMODE(before.st_mode)\n"
             "        safe = (stat.S_ISSOCK(before.st_mode) and "
             "before.st_uid == os.getuid() and before.st_nlink == 1 and "
-            "(mode == 0o600 or (mode == 0o660 and before.st_gid == os.getgid())))\n"
+            "mode in (0o000, 0o600))\n"
             "        if not safe:\n"
             "            raise SystemExit(73)\n"
-            "        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
-            "        probe.settimeout(0.25)\n"
-            "        try:\n"
-            "            probe.connect(socket_path)\n"
-            "        except ConnectionRefusedError:\n"
-            "            probe.close()\n"
+            "        if mode == 0o600:\n"
+            "            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+            "            probe.settimeout(0.25)\n"
+            "            try:\n"
+            "                probe.connect(socket_path)\n"
+            "            except ConnectionRefusedError:\n"
+            "                probe.close()\n"
+            "            except FileNotFoundError:\n"
+            "                probe.close()\n"
+            "                before = None\n"
+            "            except OSError:\n"
+            "                probe.close()\n"
+            "                raise SystemExit(73)\n"
+            "            else:\n"
+            "                probe.close()\n"
+            "                raise SystemExit(75)\n"
+            "        if before is not None:\n"
             "            after = os.lstat(socket_path)\n"
             "            if (before.st_dev, before.st_ino, before.st_uid, before.st_gid, "
             "before.st_mode, before.st_nlink) != "
@@ -1951,17 +1953,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "after.st_mode, after.st_nlink):\n"
             "                raise SystemExit(73)\n"
             "            os.unlink(socket_path)\n"
-            "        except FileNotFoundError:\n"
-            "            probe.close()\n"
-            "        except OSError:\n"
-            "            probe.close()\n"
-            "            raise SystemExit(73)\n"
-            "        else:\n"
-            "            probe.close()\n"
-            "            raise SystemExit(75)\n"
             "    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
             "    server.bind(socket_path)\n"
-            "    os.chmod(socket_path, 0o600 if serve_supervised else 0o660)\n"
+            "    os.chmod(socket_path, 0o000 if serve_supervised else 0o600)\n"
             "    server.listen(4)\n"
             "    server.settimeout(0.1)\n"
             "    if serve_supervised:\n"
@@ -2012,7 +2006,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "        ready_path = Path(os.environ['SYNOPKG_PKGVAR']) / 'run/api.ready'\n"
             "        ready_path.write_text(identity, encoding='ascii')\n"
             "        ready_path.chmod(0o600)\n"
-            "        os.chmod(socket_path, 0o660)\n"
+            "        os.chmod(socket_path, 0o600)\n"
             "    running = True\n"
             "    def stop(_signum, _frame):\n"
             "        global running\n"
@@ -4070,14 +4064,13 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(rejected.returncode, 77)
         self.assertEqual(json.loads(rejected.stdout)["code"], "bridge_required")
 
-    @unittest.skipUnless(os.getuid() == 0, "cross-UID socket proof requires root test setup")
-    def test_rootless_cross_uid_socket_accepts_web_uid_and_rejects_third_uid(self) -> None:
+    @unittest.skipUnless(os.getuid() == 0, "package-UID socket proof requires root test setup")
+    def test_package_owned_socket_accepts_package_uid_and_denies_third_uid(self) -> None:
         package_uid, package_gid = 65530, 65530
-        web_uid, web_gid = 65531, 65531
-        wrong_uid = 65532
+        wrong_uid, wrong_gid = 65531, 65531
         self.root.chmod(0o755)
-        socket_root = self.root / "cross-uid-socket"
-        socket_root.mkdir(mode=0o755)
+        socket_root = self.root / "package-owned-socket"
+        socket_root.mkdir(mode=0o700)
         os.chown(socket_root, package_uid, package_gid)
         socket_path = socket_root / "api.sock"
         ready_path = socket_root / "ready"
@@ -4089,18 +4082,14 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             f"observed={str(observed_path)!r}\n"
             "server=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\n"
             "server.bind(path)\n"
-            f"os.chown(path,-1,{web_gid})\n"
-            "os.chmod(path,0o660)\n"
-            "server.listen(2)\n"
+            "os.chmod(path,0o600)\n"
+            "server.listen(1)\n"
             "open(ready,'w',encoding='utf-8').close()\n"
-            "seen=[]\n"
-            "for _ in range(2):\n"
-            "  connection,_=server.accept()\n"
-            "  _pid,uid,_gid=struct.unpack('3i',connection.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))\n"
-            "  seen.append(uid)\n"
-            f"  connection.sendall(b'1' if uid=={web_uid} else b'0')\n"
-            "  connection.close()\n"
-            "open(observed,'w',encoding='utf-8').write(','.join(map(str,seen)))\n"
+            "connection,_=server.accept()\n"
+            "_pid,uid,_gid=struct.unpack('3i',connection.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))\n"
+            f"connection.sendall(b'1' if uid=={package_uid} else b'0')\n"
+            "connection.close()\n"
+            "open(observed,'w',encoding='utf-8').write(str(uid))\n"
         )
 
         def identity(uid: int, gid: int, groups: list[int]) -> object:
@@ -4116,7 +4105,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            preexec_fn=identity(package_uid, package_gid, [web_gid]),
+            preexec_fn=identity(package_uid, package_gid, []),
         )
         try:
             deadline = time.monotonic() + 5
@@ -4128,34 +4117,39 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 self.fail(server.stderr.read() if server.stderr else "socket server did not start")
             if server.poll() is not None:
                 self.fail(server.stderr.read() if server.stderr else "socket server exited early")
+            socket_metadata = socket_path.stat()
+            self.assertEqual(socket_metadata.st_mode & 0o7777, 0o600)
+            self.assertEqual(socket_metadata.st_uid, package_uid)
+            self.assertEqual(socket_metadata.st_gid, package_gid)
             client_source = (
                 "import socket,sys\n"
-                f"s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect({str(socket_path)!r})\n"
+                "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\n"
+                f"s.connect({str(socket_path)!r})\n"
                 "sys.stdout.buffer.write(s.recv(1))\n"
-            )
-            accepted = subprocess.run(
-                [sys.executable, "-c", client_source],
-                capture_output=True,
-                timeout=5,
-                check=False,
-                preexec_fn=identity(web_uid, web_gid, [web_gid]),
             )
             rejected = subprocess.run(
                 [sys.executable, "-c", client_source],
                 capture_output=True,
                 timeout=5,
                 check=False,
-                preexec_fn=identity(wrong_uid, web_gid, [web_gid]),
+                preexec_fn=identity(wrong_uid, wrong_gid, []),
             )
+            accepted = subprocess.run(
+                [sys.executable, "-c", client_source],
+                capture_output=True,
+                timeout=5,
+                check=False,
+                preexec_fn=identity(package_uid, package_gid, []),
+            )
+            self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+            self.assertIn(b"Permission denied", rejected.stderr)
             self.assertEqual(accepted.returncode, 0, accepted.stderr)
             self.assertEqual(accepted.stdout, b"1")
-            self.assertEqual(rejected.returncode, 0, rejected.stderr)
-            self.assertEqual(rejected.stdout, b"0")
             stdout, stderr = server.communicate(timeout=5)
             self.assertEqual(server.returncode, 0, stdout + stderr)
             self.assertEqual(
                 observed_path.read_text(encoding="utf-8"),
-                f"{web_uid},{wrong_uid}",
+                str(package_uid),
             )
             self.assertNotIn(
                 "/proc/{pid}/exe",
@@ -7345,7 +7339,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         stale.bind(str(api_socket))
         stale.close()
-        api_socket.chmod(0o600)
+        api_socket.chmod(0o000)
         api_pid_file = self.real_var / "run/api.pid"
         api_pid_file.write_text("2147483647\n", encoding="utf-8")
         api_pid_file.chmod(0o600)
@@ -7393,7 +7387,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(api_ready.stat().st_nlink, 1)
         self.assertEqual(api_ready.stat().st_uid, self.drop_uid)
         self.assertTrue(stat.S_ISSOCK(api_socket.stat().st_mode))
-        self.assertEqual(api_socket.stat().st_mode & 0o7777, 0o660)
+        self.assertEqual(api_socket.stat().st_mode & 0o7777, 0o600)
         self.assertEqual(api_socket.stat().st_uid, self.drop_uid)
         self.assertEqual(api_socket.stat().st_gid, self.drop_gid)
         self.assertEqual(api_pid_file.stat().st_mode & 0o7777, 0o600)
@@ -8106,6 +8100,19 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(outside.read_text(encoding="utf-8"), "keep\n")
         api_socket.unlink()
 
+        orphan_prepared = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        orphan_prepared.bind(str(api_socket))
+        orphan_prepared.close()
+        api_socket.chmod(0o000)
+        if os.getuid() == 0:
+            os.chown(api_socket, self.drop_uid, self.drop_gid)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 2)
+        refused_orphan = self.shell(self.lifecycle, "start")
+        self.assertEqual(refused_orphan.returncode, 1, refused_orphan.stderr)
+        self.assertTrue(stat.S_ISSOCK(api_socket.lstat().st_mode))
+        self.assertEqual(api_socket.lstat().st_mode & 0o7777, 0o000)
+        api_socket.unlink()
+
         api_pid_file = self.real_var / "run/api.pid"
         api_pid_file.symlink_to(outside)
         self.assertEqual(self.shell(self.lifecycle, "status").returncode, 2)
@@ -8145,14 +8152,14 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         finally:
             ui_directory.chmod(0o755)
 
-    def test_lifecycle_rejects_wrong_group_stale_socket(self) -> None:
+    def test_lifecycle_ignores_non_authorizing_group_on_mode_0600_socket(self) -> None:
         if os.getuid() != 0:
             self.skipTest("wrong socket group requires a privileged test runner")
         api_socket = self.real_target / "ui/api.sock"
         wrong_group = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         wrong_group.bind(str(api_socket))
         wrong_group.close()
-        api_socket.chmod(0o660)
+        api_socket.chmod(0o600)
         wrong_gid = 0 if self.drop_gid != 0 else 1
         os.chown(api_socket, self.drop_uid, wrong_gid)
         api_pid_file = self.real_var / "run/api.pid"
@@ -8160,12 +8167,14 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         api_pid_file.chmod(0o600)
         os.chown(api_pid_file, self.drop_uid, self.drop_gid)
         try:
-            self.assertEqual(self.shell(self.lifecycle, "status").returncode, 2)
-            refused = self.shell(self.lifecycle, "start")
-            self.assertEqual(refused.returncode, 1, refused.stderr)
-            self.assertTrue(stat.S_ISSOCK(api_socket.lstat().st_mode))
-            self.assertEqual(self.shell(self.lifecycle, "stop").returncode, 1)
-            self.assertTrue(stat.S_ISSOCK(api_socket.lstat().st_mode))
+            self.assertEqual(self.shell(self.lifecycle, "status").returncode, 1)
+            started = self.shell(self.lifecycle, "start", timeout=15)
+            self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+            self.assertEqual(self.shell(self.lifecycle, "status").returncode, 0)
+            self.assertEqual(api_socket.stat().st_mode & 0o7777, 0o600)
+            self.assertEqual(api_socket.stat().st_uid, self.drop_uid)
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
         finally:
             api_socket.unlink(missing_ok=True)
             api_pid_file.unlink(missing_ok=True)
@@ -8176,7 +8185,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(api_socket))
         listener.listen(4)
-        api_socket.chmod(0o660)
+        api_socket.chmod(0o600)
         api_pid_file.write_text("2147483647\n", encoding="utf-8")
         api_pid_file.chmod(0o600)
         if os.getuid() == 0:
@@ -8187,10 +8196,10 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             self.assertEqual(self.shell(self.lifecycle, "status").returncode, 1)
             refused = self.shell(self.lifecycle, "start", timeout=15)
             self.assertEqual(refused.returncode, 1, (refused.stdout, refused.stderr))
-            self.assertIn("API service failed before startup commit", refused.stdout)
+            self.assertIn("refusing unsafe stale API socket or PID state", refused.stdout)
             current = api_socket.lstat()
             self.assertEqual((current.st_dev, current.st_ino), (original.st_dev, original.st_ino))
-            self.assertFalse(api_pid_file.exists())
+            self.assertEqual(api_pid_file.read_text(encoding="ascii"), "2147483647\n")
             refused_stop = self.shell(self.lifecycle, "stop")
             self.assertEqual(refused_stop.returncode, 1, refused_stop.stderr)
             current = api_socket.lstat()

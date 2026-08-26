@@ -85,8 +85,8 @@ deliberately reports:
 }
 ```
 
-Only the package-user API service returns true capabilities and `private_queue=true` after a DSM
-`http` CGI request has crossed the fixed authenticated socket and passed server-side DSM
+Only the package-user API service returns true capabilities and `private_queue=true` after the
+package-owned DSM CGI request has crossed the fixed authenticated socket and passed server-side DSM
 cookie authentication, administrator authorization, optional-token validation when supplied, and
 package CSRF checks. Do not call
 `ui/api.cgi` from SSH, connect to `api.sock`, forge relay data, or write queue files manually. The
@@ -104,8 +104,8 @@ overlap validation.
 | Core binary | `/var/packages/synology-drive-sync/target/bin/synology-drive-sync` |
 | Manager | `/var/packages/synology-drive-sync/target/bin/sdsync-dsm` |
 | API service and private job consumer | `/var/packages/synology-drive-sync/target/bin/sdsync-dsm-api` |
-| Ordinary DSM `http` CGI relay | `/var/packages/synology-drive-sync/target/ui/api.cgi` |
-| Fixed package:`http` `0660` API socket | `/var/packages/synology-drive-sync/target/ui/api.sock` |
+| Package-owned DSM CGI relay (`0755`, exact package UID at runtime) | `/var/packages/synology-drive-sync/target/ui/api.cgi` |
+| Fixed package-owned API socket (`0000` prepared, same inode `0600` active) | `/var/packages/synology-drive-sync/target/ui/api.sock` |
 | Dashboard assets | `/var/packages/synology-drive-sync/target/ui/` |
 | Generated config | `/var/packages/synology-drive-sync/home/config/config.toml` |
 | Profile fragments | `/var/packages/synology-drive-sync/home/config/profiles.d/` |

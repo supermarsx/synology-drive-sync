@@ -40,10 +40,10 @@ instead of hand-creating a link or changing ownership.
 
 The footer distinguishes these states:
 
-- **Authenticated control service** means the ordinary DSM `http` CGI reached the package-user API
-  service over its fixed private socket, the current session passed authentication, administrator
-  membership, optional-token validation when applicable, and CSRF bootstrap checks, and the
-  snapshot explicitly grants mutation capabilities.
+- **Authenticated control service** means the ordinary package-owned CGI, running with the exact
+  non-root package UID, reached the package-user API service over its fixed private socket; the
+  current session passed authentication, administrator membership, optional-token validation when
+  applicable, and CSRF bootstrap checks; and the snapshot explicitly grants mutation capabilities.
 - **Package status · read-only** means a snapshot was available but one or more mutation
   capabilities were not granted. Buttons that could change package state remain disabled.
 - **Status unavailable** means snapshot refresh failed. Existing values may be stale; the interface

@@ -40,10 +40,12 @@ four separate ABI packages: `x86_64`, `armv8`, ARMv7-A hard-float
 (`INFO` arch `armv7 armada370 armada375 armada38x armadaxp comcerto2k monaco`), and `i686` for
 Evansport on the DSM 7.0/7.1 line. Use the
 [release selector](../docs/release-selector.md) instead of guessing from a CPU label; ARMv5, PowerPC,
-unknown, and conflicting inputs fail closed. The SPK runs without root, Linux capabilities, or any
-set-user-ID/set-group-ID file. Its ordinary DSM `http` CGI relays bounded requests over a fixed
-package:`http` `0660` Unix socket to a package-user API service. That service reauthenticates the DSM
-session and enforces administrator membership and package CSRF before reaching private state. The
+unknown, and conflicting inputs fail closed. The SPK runs without root, Linux capabilities, joined
+web groups, or any set-user-ID/set-group-ID file. `defaults.run-as=package` makes DSM execute the
+ordinary package-owned `0755` CGI with the same exact non-root package UID as the API service. The
+CGI relays bounded requests over a fixed package-owned socket that is `0000` before startup commit
+and activates on the same inode as `0600`. The service reauthenticates the DSM session and enforces
+administrator membership and package CSRF before reaching private state. The
 package keeps scheduling disabled after installation, registers the administrator-only native DSM
 AppWindow `SYNO.SDS.App.SynologyDriveSync.Instance`, and supplies the CLI recovery/automation manager at:
 

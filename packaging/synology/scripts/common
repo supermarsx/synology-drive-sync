@@ -270,23 +270,6 @@ package_uid() {
     stat -L -c '%u' "$package_home" 2>/dev/null
 }
 
-http_group_gid() {
-    api_http_gid=
-    if command -v getent >/dev/null 2>&1; then
-        api_http_gid=$(getent group http 2>/dev/null |
-            awk -F: '$1 == "http" && $3 ~ /^[0-9]+$/ { print $3; exit }' || true)
-    fi
-    if [ -z "$api_http_gid" ] && [ -r /etc/group ]; then
-        api_http_gid=$(awk -F: '$1 == "http" && $3 ~ /^[0-9]+$/ { print $3; exit }' /etc/group 2>/dev/null || true)
-    fi
-    case $api_http_gid in ''|*[!0-9]*) return 1 ;; esac
-    case " $(id -G 2>/dev/null || true) " in
-        *" $api_http_gid "*) ;;
-        *) return 1 ;;
-    esac
-    printf '%s\n' "$api_http_gid"
-}
-
 api_socket_parent_safe() {
     [ -d "$api_socket_dir" ] && [ ! -L "$api_socket_dir" ] || {
         package_message "API socket parent is not a real directory: $api_socket_dir"
@@ -322,24 +305,21 @@ api_socket_safe() {
         return 1
     }
     api_expected_uid=$(package_uid 2>/dev/null || true)
-    api_expected_gid=$(http_group_gid 2>/dev/null || true)
     api_socket_uid=$(stat -c '%u' "$api_socket" 2>/dev/null || true)
-    api_socket_gid=$(stat -c '%g' "$api_socket" 2>/dev/null || true)
     api_socket_mode=$(stat -c '%a' "$api_socket" 2>/dev/null || true)
     api_socket_links=$(stat -c '%h' "$api_socket" 2>/dev/null || true)
-    [ -n "$api_expected_uid" ] && [ -n "$api_expected_gid" ] && \
+    [ -n "$api_expected_uid" ] && \
         [ "$api_socket_uid" = "$api_expected_uid" ] && \
-        [ "$api_socket_gid" = "$api_expected_gid" ] && \
-        [ "$api_socket_mode" = 660 ] && [ "$api_socket_links" = 1 ] || {
-        package_message "API socket ownership or mode is outside the package:http 0660 contract"
+        [ "$api_socket_mode" = 600 ] && [ "$api_socket_links" = 1 ] || {
+        package_message "API socket ownership or mode is outside the package-owned 0600 contract"
         return 1
     }
 }
 
 # Before the lifecycle parent commits startup, the API listener must be a real,
-# single-link, package-owned 0600 socket. DSM's http tier cannot connect to this
-# prepared topology. The API changes it to the final package:http 0660 contract
-# only after readiness and worker-pool publication.
+# single-link, package-owned 0000 socket. Nothing can connect to this prepared
+# topology. The API changes it to the final package-owned 0600 contract only
+# after readiness and worker-pool publication.
 api_prepared_socket_safe() {
     api_socket_parent_safe || return 1
     [ -S "$api_socket" ] && [ ! -L "$api_socket" ] || {
@@ -352,9 +332,9 @@ api_prepared_socket_safe() {
     api_socket_links=$(stat -c '%h' "$api_socket" 2>/dev/null || true)
     [ -n "$api_expected_uid" ] \
         && [ "$api_socket_uid" = "$api_expected_uid" ] \
-        && [ "$api_socket_mode" = 600 ] \
+        && [ "$api_socket_mode" = 0 ] \
         && [ "$api_socket_links" = 1 ] || {
-        package_message "prepared API socket is outside the package-owned 0600 contract"
+        package_message "prepared API socket is outside the package-owned 0000 contract"
         return 1
     }
 }
@@ -384,25 +364,18 @@ api_stale_socket_safe() {
     }
     api_expected_uid=$(package_uid 2>/dev/null || true)
     api_socket_uid=$(stat -c '%u' "$api_socket" 2>/dev/null || true)
-    api_socket_gid=$(stat -c '%g' "$api_socket" 2>/dev/null || true)
     api_socket_mode=$(stat -c '%a' "$api_socket" 2>/dev/null || true)
     api_socket_links=$(stat -c '%h' "$api_socket" 2>/dev/null || true)
-    [ -n "$api_expected_uid" ] && [ "$api_socket_uid" = "$api_expected_uid" ] && \
+    [ -n "$api_expected_uid" ] && \
+        [ "$api_socket_uid" = "$api_expected_uid" ] && \
         [ "$api_socket_links" = 1 ] || {
         package_message "API socket is not exclusively owned by the package"
         return 1
     }
     case $api_socket_mode in
-        600) ;;
-        660)
-            api_expected_gid=$(http_group_gid 2>/dev/null || true)
-            [ -n "$api_expected_gid" ] && [ "$api_socket_gid" = "$api_expected_gid" ] || {
-                package_message "API socket is outside the package:http 0660 contract"
-                return 1
-            }
-            ;;
+        0|600) ;;
         *)
-            package_message "API socket is neither a restricted 0600 bind nor package:http 0660"
+            package_message "API socket is neither a package-owned 0000 bind nor activated 0600 socket"
             return 1
             ;;
     esac

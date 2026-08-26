@@ -903,13 +903,10 @@ def validate_privilege(payload: bytes) -> None:
                         "conf/privilege tool permission requests setuid/setgid bits"
                     )
 
-    expected = {
-        "defaults": {"run-as": "package"},
-        "join-groupname": "http",
-    }
+    expected = {"defaults": {"run-as": "package"}}
     if model != expected:
         raise ValidationError(
-            "conf/privilege must use the reviewed rootless package/http contract"
+            "conf/privilege must use the reviewed package-identity contract"
         )
 
 

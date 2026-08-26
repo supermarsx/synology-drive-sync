@@ -569,8 +569,11 @@ status_code() {
     else
         if api_path_exists "$api_socket"; then
             # Metadata alone cannot prove whether an untracked socket is live.
-            # Classify only an exact crash-window/final socket as restartable;
-            # the Rust bind path performs the bounded connect-refused check.
+            # A prepared 0000 listener is recoverable only with its exact dead
+            # package-owned PID record. Without that proof it is inconsistent.
+            api_prepared_socket_safe >/dev/null 2>&1 && return 2
+            # Classify only an exact final socket as restartable; the Rust bind
+            # path performs the bounded connect-refused check.
             api_stale_socket_safe >/dev/null 2>&1 || return 2
             api_stale=true
         fi
@@ -663,17 +666,31 @@ prepare_api_start() {
         fi
         if api_path_exists "$api_socket"; then
             api_stale_socket_safe || return 1
+            "$api_server" --cleanup-stale-api-socket || {
+                package_message "refusing unsafe stale API socket or PID state"
+                return 1
+            }
+            if api_path_exists "$api_socket" || api_path_exists "$api_pid_file"; then
+                package_message "verified stale API cleanup left socket or PID state behind"
+                return 1
+            fi
+        else
+            remove_safe_api_pid_file || return 1
         fi
-        remove_safe_api_pid_file || return 1
     elif api_path_exists "$api_socket"; then
         api_stale_socket_safe || {
             package_message "refusing unsafe untracked API socket: $api_socket"
             return 1
         }
+        api_prepared_socket_safe >/dev/null 2>&1 && {
+            package_message "refusing untracked prepared API socket without an exact dead PID record"
+            return 1
+        }
     fi
-    # Never unlink a socket during start preparation. The Rust bind path alone
-    # validates exact metadata, probes for a live listener with a deadline, and
-    # removes a connection-refused stale socket after a device/inode recheck.
+    # A dead PID plus socket is removed atomically by the Rust verifier above.
+    # For an untracked final socket, the Rust bind path alone validates exact
+    # metadata, probes for a live listener, and removes only connection-refused
+    # state after a device/inode recheck.
 }
 
 cleanup_failed_start() {

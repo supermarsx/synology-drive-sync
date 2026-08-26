@@ -1509,7 +1509,7 @@ function bind(context, names) {
         validate_spk.validate_privilege(json.dumps(privilege).encode())
         duplicate_privilege = (
             b'{"defaults":{"run-as":"root"},'
-            b'"defaults":{"run-as":"package"},"join-groupname":"http"}'
+            b'"defaults":{"run-as":"package"}}'
         )
         with self.assertRaisesRegex(validate_spk.ValidationError, "duplicate JSON key"):
             validate_spk.validate_privilege(duplicate_privilege)
@@ -1527,10 +1527,10 @@ function bind(context, names) {
         with self.assertRaisesRegex(validate_spk.ValidationError, "Linux capabilities"):
             validate_spk.validate_privilege(json.dumps(capabilities).encode())
 
-        wrong_group = privilege_model()
-        wrong_group["join-groupname"] = "package"
-        with self.assertRaisesRegex(validate_spk.ValidationError, "rootless package/http"):
-            validate_spk.validate_privilege(json.dumps(wrong_group).encode())
+        joined_group = privilege_model()
+        joined_group["join-groupname"] = "http"
+        with self.assertRaisesRegex(validate_spk.ValidationError, "package-identity contract"):
+            validate_spk.validate_privilege(json.dumps(joined_group).encode())
 
         setuid_tool = privilege_model()
         setuid_tool["tool"] = [{
@@ -1545,7 +1545,7 @@ function bind(context, names) {
             "relpath": "ui/api.cgi", "user": "package", "group": "package",
             "permission": "0755",
         }]
-        with self.assertRaisesRegex(validate_spk.ValidationError, "rootless package/http"):
+        with self.assertRaisesRegex(validate_spk.ValidationError, "package-identity contract"):
             validate_spk.validate_privilege(json.dumps(ordinary_tool).encode())
 
     @staticmethod

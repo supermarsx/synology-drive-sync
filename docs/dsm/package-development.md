@@ -7,10 +7,12 @@ The SPK assembler accepts two matching Linux executables:
 
 Both must be regular, non-symlink, fully static, little-endian ELF files for the selected DSM
 architecture. The helper is installed byte-for-byte at ordinary `bin/sdsync-dsm-api` mode `0755`
-and at `ui/api.cgi` mode `0755`. The CGI executes as DSM `http` and relays one bounded request to the
-package-user `--serve` process through the fixed `ui/api.sock`, owned by the package user, grouped to
-`http`, and mode `0660`. No outer or inner archive member or installed executable carries a
-set-user-ID/set-group-ID bit. The package requests neither root run-as nor Linux capabilities.
+and at package-owned `ui/api.cgi` mode `0755`. DSM's CGI framework executes that file with its exact
+non-root package-owner UID under `defaults.run-as=package`, matching the package-user `--serve`
+process. The CGI relays one bounded request through fixed `ui/api.sock`; the service binds it as
+package-owned `0000` before startup commit, then activates that same inode as `0600`. No outer or
+inner archive member or installed executable carries a set-user-ID/set-group-ID bit. The package
+requests neither a joined web group, root run-as, nor Linux capabilities.
 
 The complete reviewed `conf/privilege` document is deliberately minimal:
 
@@ -18,8 +20,7 @@ The complete reviewed `conf/privilege` document is deliberately minimal:
 {
   "defaults": {
     "run-as": "package"
-  },
-  "join-groupname": "http"
+  }
 }
 ```
 
@@ -171,14 +172,15 @@ claimed bit-for-bit reproducible across different compiler/linker/runner images.
   `/webman/3rdparty/synology-drive-sync/api.cgi` boundary;
 - static core/helper ELF identity and equality of helper/CGI bytes;
 - no outer or inner archive member has a set-user-ID/set-group-ID bit or is group/world-writable,
-  while `conf/privilege` remains the exact root-free package/`http` contract;
+  while `conf/privilege` remains the exact root-free package-run-as contract with no joined group;
 - authored SVG safe bounds and exact deterministic PNG bytes/dimensions;
 - scoped AppWindow styles, offline assets, no iframe/eval/HTML injection or source maps, exact bridge
   action/schema markers, and no secret local-storage path;
 - the direct `synodsmnotify -c` contract: the exact native application class plus fixed
   administrator/I18N arguments only, no
   legacy `synonotify` event/custom-variable path, and no dynamic profile, exit, log, or secret data;
-- lifecycle scripts, the fixed `package:http` `0660` socket/service contract, private FHS behavior,
+- lifecycle scripts, the fixed package-owned `0000`-prepared/`0600`-active socket/service contract,
+  exact package-UID peer checks, private FHS behavior,
   icons, exact outer/installed license texts, and installed size.
 
 Source-only validation:
@@ -198,18 +200,20 @@ Run the package suite in a Linux/WSL environment that provides its expected shel
 Negative tests deliberately tamper with architecture, helper identity, symlinks, permissions,
 reserved resources, notifier arguments, UI security markers, icons, and archive fields. They
 specifically reject `conf/resource`, legacy sysnotify mail templates, a dynamic notifier operand, an
-archived privilege bit, a non-`0755` CGI, a privilege manifest beyond the exact two-key contract, and
-unsafe socket ownership/mode/peer assumptions. They also reject a wrong native application class,
-missing module wrapper or `depend` field, `type=url`, mismatched `appWindow`, missing bundle/style,
-and traversal in the API path, so the gates do not merely accept the builder's happy path.
+archived privilege bit, a non-`0755` CGI, a privilege manifest beyond the exact package-run-as
+contract, and unsafe socket ownership/mode/peer assumptions. They also reject a wrong native
+application class, missing module wrapper or `depend` field, `type=url`, mismatched `appWindow`,
+missing bundle/style, and traversal in the API path, so the gates do not merely accept the builder's
+happy path.
 
 ## Acceptance boundary
 
-Builder/validator success proves the reviewed archive contract, not DSM installation, AppWindow launch,
-the `http` CGI identity, package-user `authenticate.cgi` execution, socket group behavior,
-administrator groups, direct `synodsmnotify` desktop delivery, source ACLs, reverse proxy, File
-Station, TOTP, Drive indexing, or sync behavior on a physical model. Complete
-[live-NAS acceptance](troubleshooting.md#live-nas-acceptance) before publishing a support claim.
+Builder/validator success proves the reviewed archive contract, not DSM installation, AppWindow
+launch, DSM's executable-owner CGI runtime identity, package-user `authenticate.cgi` execution,
+package-owned socket behavior, administrator groups, direct `synodsmnotify` desktop delivery, source
+ACLs, reverse proxy, File Station, TOTP, Drive indexing, or sync behavior on a physical model.
+Complete [live-NAS acceptance](troubleshooting.md#live-nas-acceptance) before publishing a support
+claim.
 
 Official framework references:
 

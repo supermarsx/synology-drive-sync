@@ -46,16 +46,15 @@ policy.
 > later only when that release is published and its exact SPK/checksum are verified; repository
 > source or a draft artifact is not physical-DSM installation proof.
 
-The corrected 26.7-or-later source contract requests no root run-as, Linux capabilities, set-user-ID
-bit, or set-group-ID bit. Every executable, including `ui/api.cgi`, is ordinary `0755`, and
-`conf/privilege` contains exactly:
+The current corrected source contract requests no root run-as, joined web group, Linux capability,
+set-user-ID bit, or set-group-ID bit. Every executable, including `ui/api.cgi`, is ordinary `0755`,
+and `conf/privilege` contains exactly:
 
 ```json
 {
   "defaults": {
     "run-as": "package"
-  },
-  "join-groupname": "http"
+  }
 }
 ```
 
@@ -382,11 +381,12 @@ accessibility interaction, or browser-header-to-CGI forwarding as already proven
 ### Identity, ACL, and dashboard security
 
 - the actual DSM package identity has read/traverse permission only to intended source shares;
-- `conf/privilege` is the exact package/`http` document above, all installed executables are `0755`,
+- `conf/privilege` is the exact package-run-as document above, all installed executables are `0755`,
   and no package file carries an identity-changing permission bit or Linux capability;
-- `ui/api.cgi` is package-owned `0755` but executes with real/effective DSM `http` UID; the API
-  `--serve` process executes as the package user; and `ui/api.sock` is package:`http` `0660`;
-- the CGI and service reject a substituted socket, wrong owner/group/mode, wrong peer UID, symlink,
+- `ui/api.cgi` is package-owned `0755` and DSM executes it with real/effective UID equal to the
+  exact non-root package UID used by the API `--serve` process; `ui/api.sock` is package-owned
+  `0000` before startup commit and the same inode is `0600` when active;
+- the CGI and service reject a substituted socket, wrong owner/mode, wrong peer UID, symlink,
   extra hard link, unsafe parent, oversized frame, or malformed relay schema;
 - another internal user/root cannot use manager mutations in place of the package identity;
 - non-administrator DSM users cannot launch or call the API;

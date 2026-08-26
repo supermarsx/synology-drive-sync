@@ -80,10 +80,11 @@ link.
 
 Every executable, including `ui/api.cgi`, is ordinary `0755` in both the archive and installed
 package. Nothing carries a set-user-ID/set-group-ID bit. `conf/privilege` contains only
-`defaults.run-as: package` and `join-groupname: http`; it requests no root run-as, tool privilege, or
-Linux capability. The CGI runs unchanged as DSM `http` and relays one bounded request to the
-package-user `sdsync-dsm-api --serve` process through fixed `target/ui/api.sock`, owned by the package
-user, grouped to `http`, and mode `0660`. Both peers verify socket metadata and kernel peer identity.
+`defaults.run-as: package`; it requests no root run-as, joined DSM group, tool privilege, or Linux
+capability. DSM executes the ordinary CGI as its package-file owner, so the CGI and
+`sdsync-dsm-api --serve` daemon share the package identity. They relay one bounded request through
+fixed `target/ui/api.sock`, owned by the package identity and mode `0600`. Both peers verify socket
+metadata and kernel peer identity.
 The validator rejects any privilege-bearing archive member or broader privilege manifest.
 
 The corrected package contains no `conf/resource` acquisition worker or sysnotify mail templates.
@@ -240,8 +241,8 @@ On a real uninstall (`SYNOPKG_PKG_STATUS=UNINSTALL`), the post-uninstall script 
 Static validation proves archive structure, the root-free manifest, ordinary executable modes,
 architecture, static linkage, dashboard/relay contracts, lifecycle behavior, and deterministic
 assembly. Before relying on the package, test its exact NAS model and DSM version with a disposable
-source and target, including Package Center installation and exact warning, CGI `http` identity,
-package-user API service, package:`http` `0660` socket, native AppWindow loading/rendering, browser
+source and target, including Package Center installation and exact warning, CGI package identity,
+package-user API service, package-owned `0600` socket, native AppWindow loading/rendering, browser
 `X-SDSYNC-Request: 1` to CGI `HTTP_X_SDSYNC_REQUEST=1` forwarding, package-user
 `authenticate.cgi`, administrator/CSRF rejection cases,
 reverse-proxy upload limits, TLS trust, TOTP clock synchronization, routines, direct DSM desktop

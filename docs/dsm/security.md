@@ -15,49 +15,49 @@ entire `conf/privilege` contract is:
 {
   "defaults": {
     "run-as": "package"
-  },
-  "join-groupname": "http"
+  }
 }
 ```
 
 The default makes lifecycle scripts and services run as the actual DSM package identity. DSM may
 collision-rename its NSS username, so neither the security boundary nor the documentation assumes a
-literal account name. Joining DSM's `http` group lets that non-root service create the one socket
-shared with DSM's web identity. There is no `tool`, per-action root override, or capability declaration.
+literal account name. The package requests no joined group. There is no `tool`, per-action root
+override, or capability declaration.
 
 | Installed path | Owner | Mode | Runtime identity and purpose |
 | --- | --- | ---: | --- |
 | `bin/synology-drive-sync` | package | `0755` | Package-user sync engine |
 | `bin/sdsync-dsm` | package | `0755` | Package-user shell control-plane manager |
 | `bin/sdsync-dsm-api` | package | `0755` | Package-user API service and private job consumer |
-| `ui/api.cgi` | package | `0755` | DSM `http` CGI process; bounded socket relay only |
-| `ui/api.sock` | package:`http` | `0660` | Fixed API-service Unix socket; never configurable |
+| `ui/api.cgi` | package | `0755` | Package-UID DSM CGI process; bounded socket relay only |
+| `ui/api.sock` | package | `0000` prepared, `0600` active | Fixed API-service Unix socket; never configurable |
 
-The CGI and service are byte-identical copies of the compiled helper, but their arguments and
-runtime identities select different modes. The CGI must have real and effective UID `http`; it does
-not change identity and cannot read package-private state. The long-lived `--serve` process must have
-real and effective UID equal to the package executable's owner. The server creates `ui/api.sock` under a
-package-owned directory that is not group/other-writable, assigns the socket group `http`, and
-requires exact mode `0660` and one link.
+The CGI and service are byte-identical copies of the compiled helper, but their command-line
+arguments select different modes. Under `defaults.run-as=package`, DSM's CGI daemon executes
+the package-owned CGI with real and effective UID equal to the executable's exact non-root owner.
+The long-lived `--serve` process uses that same package UID. The server creates `ui/api.sock` under a
+package-owned directory that is not group/other-writable, binds it with exact mode `0000`, and only
+after its worker pool and exact readiness identity exist activates that same inode with exact mode
+`0600` and one link. Group ownership is not an authorization input because `0600` grants no group
+access.
 
-Both peers authenticate the local transport. The CGI validates the socket owner/group/mode and the
-server's kernel-reported peer UID as the package user. The server accepts only a kernel-reported peer
-UID matching DSM `http`. A symlink, wrong owner/group/mode, additional hard link, wrong peer, unsafe
-parent, or missing socket fails closed.
+Both peers authenticate the local transport. The CGI validates the socket owner, mode, link count,
+and inode stability and requires the server's kernel-reported peer UID to equal the package UID. The
+server accepts only a kernel-reported CGI peer with that same exact non-root package UID. A symlink,
+wrong owner/mode, additional hard link, replaced inode, wrong peer, unsafe parent, or missing socket
+fails closed.
 
-`SO_PEERCRED` identifies the shared DSM web tier, not unique package provenance. A co-resident DSM
-web/CGI package may also execute as the same `http` UID, so DSM's CGI routing/registration and that
-shared web tier are part of the trusted computing and confused-deputy boundary. The package does
-not claim that peer credentials alone isolate a hostile same-UID CGI; cookie authentication,
-administrator authorization, strict relay parsing, and package CSRF remain mandatory above the
-local transport check. Physical-NAS acceptance must exercise this boundary with the installed DSM
-web stack.
+`SO_PEERCRED` binds both ends to the package's exact non-root UID, but peer credentials alone are not
+request authorization: any process already compromised under that UID shares its authority. DSM
+cookie authentication, administrator authorization, strict relay parsing, and package CSRF therefore
+remain mandatory above the local transport check. Physical-NAS acceptance must exercise this
+boundary with the installed DSM web stack.
 
 DSM's official [privilege configuration](https://help.synology.com/developer-guide/privilege/privilege_config.html)
-defines package ownership and joined groups. The builder stores every executable as ordinary `0755`.
-The validator enforces the exact two-key manifest above, rejects any archive set-user-ID/set-group-ID
-member or privilege-bearing tool/capability declaration, and rejects mode, ownership, identity, or
-byte mismatches between the two helper copies.
+defines package run-as behavior. The builder stores every executable as ordinary `0755`. The
+validator enforces the exact package-only manifest above, rejects any archive
+set-user-ID/set-group-ID member or privilege-bearing tool/capability/joined-group declaration, and
+rejects mode, ownership, identity, or byte mismatches between the two helper copies.
 
 ## DSM cookie authentication and the native shell boundary
 
@@ -91,13 +91,14 @@ Every API request goes through these checks:
 1. CGI environment values, query, cookie, content length, content type, method, and headers are
    copied into bounded Rust-owned buffers.
 2. The CGI verifies that it is a regular package-owned file with exact mode `0755`, that both its
-   real and effective UID equal DSM `http`, and that neither web nor package UID is root.
+   real and effective UID equal the executable owner's exact package UID, and that UID is not root.
 3. The CGI invokes DSM's root-owned `authenticate.cgi` with the original bounded native request
    environment, validates one safe returned identity, rejects root, and independently requires DSM
    `administrators` membership.
 4. It clears its environment and sends one length-bounded frame containing that exact authenticated
-   username, numeric UID, and session binding to the fixed `package:http` `0660` socket after
-   validating the socket and server peer identity.
+   username, numeric UID, and session binding to the fixed package-owned `0600` socket after
+   validating the socket, inode, and server peer identity. The pre-commit `0000` state is never
+   connectable.
 5. The package-user server validates the CGI peer UID, decodes one strict relay schema, and repeats
    method, query, header, body, cookie, request marker, and optional compatibility-token validation.
    The native UI leaves that optional field absent.
@@ -289,8 +290,7 @@ responsibility and are sent with same-origin credentials.
 Repository tests cover parsing, CGI/service identity predicates, Unix-socket ownership/mode and peer
 checks, admin membership, CSRF binding, schema rejection, queue paths/modes/order, redaction,
 response bounds, native bundle/style isolation, direct fixed notifier arguments, and SPK privilege/resource layout.
-They do not prove the actual DSM `http` identity/group database, package-identity execution of
-`authenticate.cgi` or `synodsmnotify`, DSM forwarding of `X-SDSYNC-Request: 1` as
-`HTTP_X_SDSYNC_REQUEST=1`, or reverse-proxy/origin
-behavior of a physical DSM release. Validate those on every supported DSM branch before calling the
-dashboard production-ready.
+They do not prove DSM's physical executable-owner CGI runtime behavior, package-identity execution
+of `authenticate.cgi` or `synodsmnotify`, DSM forwarding of `X-SDSYNC-Request: 1` as
+`HTTP_X_SDSYNC_REQUEST=1`, or reverse-proxy/origin behavior of a physical DSM release. Validate
+those on every supported DSM branch before calling the dashboard production-ready.

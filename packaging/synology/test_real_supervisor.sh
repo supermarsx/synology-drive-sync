@@ -6,19 +6,16 @@ package_user=sdsync-package
 package_group=sdsync-package
 package_uid=23101
 package_gid=23101
-http_uid=23102
-http_gid=23102
 administrator_user=sdsync-admin
 administrator_group=administrators
-administrator_uid=23103
-administrator_gid=23103
+administrator_uid=23102
+administrator_gid=23102
 package_base=/var/packages/$package_name
 physical_store=/volume3/@appstore/$package_name
 physical_home=/volume3/@apphome/$package_name
 physical_var=/volume3/@appdata/$package_name
 authenticate_helper=/usr/syno/synoman/webman/modules/authenticate.cgi
 fixture_cookie=id=sdsync-fixture-session
-http_auth_marker=/tmp/sdsync-auth.$http_uid
 package_auth_marker=/tmp/sdsync-auth.$package_uid
 
 usage() {
@@ -42,7 +39,7 @@ spk=$1
     exit 77
 }
 for reserved_path in "$package_base" "$physical_store" "$physical_home" "$physical_var" \
-    "$authenticate_helper" "$http_auth_marker" "$package_auth_marker"
+    "$authenticate_helper" "$package_auth_marker"
 do
     if [ -e "$reserved_path" ] || [ -L "$reserved_path" ]; then
         echo "refusing to replace existing fixture path: $reserved_path" >&2
@@ -97,20 +94,9 @@ tar -xf "$spk" -C "$outer"
 }
 
 addgroup -g "$package_gid" "$package_group" >/dev/null
-addgroup -g "$http_gid" http >/dev/null
 addgroup -g "$administrator_gid" "$administrator_group" >/dev/null
 adduser -D -H -u "$package_uid" -G "$package_group" "$package_user" >/dev/null
-adduser -D -H -u "$http_uid" -G http http >/dev/null
 adduser -D -H -u "$administrator_uid" -G "$administrator_group" "$administrator_user" >/dev/null
-addgroup "$package_user" http >/dev/null
-package_groups=$(su "$package_user" -s /bin/sh -c 'id -G')
-case " $package_groups " in
-    *" $http_gid "*) ;;
-    *)
-        echo "package identity is not a supplementary member of DSM's http group" >&2
-        exit 77
-        ;;
-esac
 administrator_groups=$(su "$administrator_user" -s /bin/sh -c 'id -G')
 case " $administrator_groups " in
     *" $administrator_gid "*) ;;
@@ -129,14 +115,11 @@ set -eu
 [ "${HTTP_COOKIE:-}" = id=sdsync-fixture-session ] || exit 1
 [ "${HTTPS:-}" = on ] || exit 1
 caller_uid=$(id -u)
-case $caller_uid in
-    23101|23102) ;;
-    *) exit 1 ;;
-esac
+[ "$caller_uid" = 23101 ] || exit 1
 umask 077
 auth_marker=/tmp/sdsync-auth.$caller_uid
 [ ! -L "$auth_marker" ] || exit 1
-: > "$auth_marker"
+printf '%s\n' authenticated >> "$auth_marker"
 chmod 0600 "$auth_marker"
 printf '%s\n' sdsync-admin
 EOF
@@ -176,8 +159,8 @@ run_lifecycle() {
         $lifecycle $lifecycle_action"
 }
 
-run_http_cgi() {
-    su http -s /bin/sh -c \
+run_package_cgi() {
+    su "$package_user" -s /bin/sh -c \
         "env -i \
         PATH=/usr/sbin:/usr/bin:/sbin:/bin \
         REQUEST_METHOD=GET \
@@ -201,8 +184,8 @@ if ! { [ -S "$api_socket" ] && [ ! -L "$api_socket" ]; }; then
     echo "started package did not publish a real API socket" >&2
     exit 1
 fi
-[ "$(stat -c '%u:%g:%a:%h' "$api_socket")" = "$package_uid:$http_gid:660:1" ] || {
-    echo "started API socket is outside the package:http 0660 contract" >&2
+[ "$(stat -c '%u:%a:%h' "$api_socket")" = "$package_uid:600:1" ] || {
+    echo "started API socket is outside the package-owned 0600 contract" >&2
     exit 1
 }
 if ! { [ -f "$api_ready" ] && [ ! -L "$api_ready" ]; }; then
@@ -213,13 +196,8 @@ fi
     echo "API readiness is outside the package-owned 0600 contract" >&2
     exit 1
 }
-su http -s /bin/sh -c "test ! -r '$api_ready'" || {
-    echo "DSM http identity can read package-private API readiness" >&2
-    exit 1
-}
-
 set +e
-cgi_response=$(run_http_cgi)
+cgi_response=$(run_package_cgi)
 cgi_status=$?
 set -e
 cgi_response=$(printf '%s' "$cgi_response" | tr -d '\r')
@@ -251,14 +229,12 @@ printf '%s\n' "$csrf_token" | awk -F. '
     echo "installed CGI returned a malformed CSRF token" >&2
     exit 1
 }
-for authenticated_uid in "$http_uid" "$package_uid"; do
-    auth_marker=/tmp/sdsync-auth.$authenticated_uid
-    if ! { [ -f "$auth_marker" ] && [ ! -L "$auth_marker" ] \
-        && [ "$(stat -c '%u:%a:%h' "$auth_marker")" = "$authenticated_uid:600:1" ]; }; then
-        echo "DSM authentication helper was not executed by UID $authenticated_uid" >&2
-        exit 1
-    fi
-done
+if ! { [ -f "$package_auth_marker" ] && [ ! -L "$package_auth_marker" ] \
+    && [ "$(stat -c '%u:%a:%h' "$package_auth_marker")" = "$package_uid:600:1" ] \
+    && [ "$(wc -l < "$package_auth_marker" | tr -d ' ')" = 2 ]; }; then
+    echo "DSM authentication helper was not executed twice by the package CGI/API identity" >&2
+    exit 1
+fi
 csrf_key=$physical_var/control/csrf.key
 if ! { [ -f "$csrf_key" ] && [ ! -L "$csrf_key" ] \
     && [ "$(stat -c '%u:%a:%h' "$csrf_key")" = "$package_uid:600:1" ]; }; then
@@ -278,4 +254,4 @@ set -e
 }
 
 trap - EXIT
-echo "real Rust supervisor, cross-UID CGI, and DSM shell lifecycle passed under BusyBox"
+echo "real Rust supervisor, package-UID CGI, and DSM shell lifecycle passed under BusyBox"

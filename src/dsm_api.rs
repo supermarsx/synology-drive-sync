@@ -71,7 +71,6 @@ const SERVICE_CLOSED_PATH: &str = "/var/packages/synology-drive-sync/var/run/ser
 const FAILED_API_CHILD_PATH: &str = "/var/packages/synology-drive-sync/var/run/failed-start.api";
 const FAILED_CONTROLLER_CHILD_PATH: &str =
     "/var/packages/synology-drive-sync/var/run/failed-start.controller";
-const WEB_IDENTITY: &str = "http";
 const ADMINISTRATORS_GROUP: &str = "administrators";
 const RELAY_SCHEMA: &str = "sdsync.dsm-relay.v1";
 const CGI_ORIGIN_VARIABLES: &[&str] = &[
@@ -2271,14 +2270,12 @@ fn valid_authenticated_username(value: &str) -> bool {
         })
 }
 
-fn validate_cgi_identity(state: &IdentityState, web_uid: u32) -> BridgeResult<u32> {
+fn validate_cgi_identity(state: &IdentityState) -> BridgeResult<u32> {
     let package_uid = state.executable_uid;
     let regular_file = state.executable_mode & 0o170_000 == 0o100_000;
-    if web_uid == 0
-        || package_uid == 0
-        || web_uid == package_uid
-        || state.real_uid != web_uid
-        || state.effective_uid != web_uid
+    if package_uid == 0
+        || state.real_uid != package_uid
+        || state.effective_uid != package_uid
         || !regular_file
         || state.executable_mode & 0o7777 != 0o755
     {
@@ -2600,17 +2597,6 @@ mod linux_runtime {
         })
     }
 
-    pub(super) fn web_identity() -> BridgeResult<(u32, u32)> {
-        let (web_uid, primary_gid) = lookup_user(WEB_IDENTITY)?;
-        let web_gid = lookup_group(WEB_IDENTITY)?;
-        let groups = lookup_groups(WEB_IDENTITY, primary_gid)?;
-        if web_uid == 0 || web_gid == 0 || !identity_belongs_to_group(primary_gid, web_gid, &groups)
-        {
-            return Err(BridgeError::unsafe_runtime());
-        }
-        Ok((web_uid, web_gid))
-    }
-
     pub(super) fn authenticate_and_authorize(
         inputs: &AuthenticationInputs,
         timeout: Duration,
@@ -2842,8 +2828,8 @@ mod linux_socket {
     }
 
     #[cfg(test)]
-    pub(super) fn connect(path: &Path, package_uid: u32, web_gid: u32) -> BridgeResult<UnixStream> {
-        connect_attempt(path, package_uid, web_gid).map_err(|error| match error {
+    pub(super) fn connect(path: &Path, package_uid: u32) -> BridgeResult<UnixStream> {
+        connect_attempt(path, package_uid).map_err(|error| match error {
             ConnectAttemptError::Retryable => BridgeError::new(ErrorKind::Unavailable),
             ConnectAttemptError::Terminal(error) => error,
         })
@@ -2852,14 +2838,13 @@ mod linux_socket {
     pub(super) fn connect_for_cgi(
         path: &Path,
         package_uid: u32,
-        web_gid: u32,
         window: Duration,
     ) -> BridgeResult<UnixStream> {
         let deadline = Instant::now()
             .checked_add(window)
             .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
         loop {
-            match connect_attempt(path, package_uid, web_gid) {
+            match connect_attempt(path, package_uid) {
                 Ok(stream) => return Ok(stream),
                 Err(ConnectAttemptError::Terminal(error)) => return Err(error),
                 Err(ConnectAttemptError::Retryable) => {
@@ -2875,12 +2860,8 @@ mod linux_socket {
         }
     }
 
-    fn connect_attempt(
-        path: &Path,
-        package_uid: u32,
-        web_gid: u32,
-    ) -> Result<UnixStream, ConnectAttemptError> {
-        let before = match connectable_socket_metadata(path, package_uid, web_gid) {
+    fn connect_attempt(path: &Path, package_uid: u32) -> Result<UnixStream, ConnectAttemptError> {
+        let before = match connectable_socket_metadata(path, package_uid) {
             Ok(metadata) => metadata,
             Err(error) if error.kind == ErrorKind::Unavailable => {
                 return Err(ConnectAttemptError::Retryable);
@@ -2909,7 +2890,7 @@ mod linux_socket {
         // Once a verified peer accepted the connection, disappearance or
         // replacement of the filesystem name is a security failure, never a
         // readiness retry. This preserves the before/after inode contract.
-        let after = socket_metadata(path, package_uid, web_gid)
+        let after = socket_metadata(path, package_uid)
             .map_err(|_| ConnectAttemptError::Terminal(BridgeError::unsafe_runtime()))?;
         if !same_object(&before, &after) {
             return Err(ConnectAttemptError::Terminal(BridgeError::unsafe_runtime()));
@@ -2917,9 +2898,10 @@ mod linux_socket {
         Ok(stream)
     }
 
-    pub(super) fn bind(path: &Path, package_uid: u32, web_gid: u32) -> BridgeResult<UnixListener> {
-        let (listener, identity) = bind_prepared(path, package_uid, web_gid)?;
-        if let Err(error) = activate_prepared(path, package_uid, web_gid, &identity) {
+    #[cfg(test)]
+    pub(super) fn bind(path: &Path, package_uid: u32) -> BridgeResult<UnixListener> {
+        let (listener, identity) = bind_prepared(path, package_uid)?;
+        if let Err(error) = activate_prepared(path, package_uid, &identity) {
             drop(listener);
             remove_new_socket(path, package_uid);
             return Err(error);
@@ -2930,15 +2912,19 @@ mod linux_socket {
     pub(super) fn bind_prepared(
         path: &Path,
         package_uid: u32,
-        web_gid: u32,
     ) -> BridgeResult<(UnixListener, fs::Metadata)> {
         validate_socket_parent(path, package_uid)?;
-        remove_stale_socket(path, package_uid, web_gid)?;
+        remove_stale_socket(path, package_uid, false)?;
         let listener = {
             let _lock = UMASK_LOCK
                 .lock()
                 .map_err(|_| BridgeError::unsafe_runtime())?;
-            let _umask = UmaskGuard::replace(0o177);
+            // DSM executes a package CGI as the owner of its executable. The
+            // daemon and CGI therefore share the package UID, so a package-only
+            // 0600 bind would expose the listener before lifecycle commit.
+            // Bind as 0000 and activate the same inode to 0600 only after the
+            // worker pool and exact readiness identity exist.
+            let _umask = UmaskGuard::replace(0o777);
             UnixListener::bind(path).map_err(|_| BridgeError::new(ErrorKind::Unavailable))?
         };
         let identity = match prepared_socket_metadata(path, package_uid) {
@@ -2955,15 +2941,14 @@ mod linux_socket {
     pub(super) fn activate_prepared(
         path: &Path,
         package_uid: u32,
-        web_gid: u32,
         expected: &fs::Metadata,
     ) -> BridgeResult<()> {
         let before = prepared_socket_metadata(path, package_uid)?;
         if !same_inode(expected, &before) {
             return Err(BridgeError::unsafe_runtime());
         }
-        set_socket_contract(path, package_uid, web_gid)?;
-        let after = socket_metadata(path, package_uid, web_gid)?;
+        set_socket_contract(path, package_uid)?;
+        let after = socket_metadata(path, package_uid)?;
         if !same_inode(expected, &after) {
             return Err(BridgeError::unsafe_runtime());
         }
@@ -2974,7 +2959,6 @@ mod linux_socket {
         socket_path: &Path,
         pid_path: &Path,
         package_uid: u32,
-        web_gid: u32,
     ) -> BridgeResult<()> {
         validate_socket_parent(socket_path, package_uid)?;
         let pid_metadata = match fs::symlink_metadata(pid_path) {
@@ -3037,7 +3021,7 @@ mod linux_socket {
             Err(_) => return Err(BridgeError::unsafe_runtime()),
         };
 
-        remove_stale_socket(socket_path, package_uid, web_gid)?;
+        remove_stale_socket(socket_path, package_uid, pid_metadata.is_some())?;
         if let Some(before) = pid_metadata {
             let after =
                 fs::symlink_metadata(pid_path).map_err(|_| BridgeError::unsafe_runtime())?;
@@ -3059,6 +3043,31 @@ mod linux_socket {
             .map_err(|_| BridgeError::new(ErrorKind::Unavailable))
     }
 
+    pub(super) fn remove_own_socket(
+        path: &Path,
+        package_uid: u32,
+        expected: &fs::Metadata,
+    ) -> BridgeResult<()> {
+        validate_socket_parent(path, package_uid)?;
+        let before = match fs::symlink_metadata(path) {
+            Ok(_) => stale_socket_metadata(path, package_uid)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(BridgeError::unsafe_runtime()),
+        };
+        if !same_inode(expected, &before) {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let after = stale_socket_metadata(path, package_uid)?;
+        if !same_object(&before, &after) {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        fs::remove_file(path).map_err(|_| BridgeError::unsafe_runtime())?;
+        let parent = path.parent().ok_or_else(BridgeError::unsafe_runtime)?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| BridgeError::unsafe_runtime())
+    }
+
     fn validate_socket_parent(path: &Path, package_uid: u32) -> BridgeResult<()> {
         let parent = path.parent().ok_or_else(BridgeError::unsafe_runtime)?;
         let metadata = fs::symlink_metadata(parent).map_err(|_| BridgeError::unsafe_runtime())?;
@@ -3072,7 +3081,7 @@ mod linux_socket {
         Ok(())
     }
 
-    fn socket_metadata(path: &Path, package_uid: u32, web_gid: u32) -> BridgeResult<fs::Metadata> {
+    fn socket_metadata(path: &Path, package_uid: u32) -> BridgeResult<fs::Metadata> {
         let metadata = fs::symlink_metadata(path).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
                 BridgeError::new(ErrorKind::Unavailable)
@@ -3080,12 +3089,14 @@ mod linux_socket {
                 BridgeError::unsafe_runtime()
             }
         })?;
+        // Group ownership is deliberately not an authorization input: 0600
+        // grants no group access, while DSM's documented CGI contract binds
+        // execution to the executable owner UID. The inode-stability checks
+        // below still require its observed GID to remain unchanged.
         if package_uid == 0
-            || web_gid == 0
             || !metadata.file_type().is_socket()
             || metadata.st_uid() != package_uid
-            || metadata.st_gid() != web_gid
-            || metadata.st_mode() & 0o7777 != 0o660
+            || metadata.st_mode() & 0o7777 != 0o600
             || metadata.st_nlink() != 1
         {
             return Err(BridgeError::unsafe_runtime());
@@ -3093,12 +3104,8 @@ mod linux_socket {
         Ok(metadata)
     }
 
-    fn connectable_socket_metadata(
-        path: &Path,
-        package_uid: u32,
-        web_gid: u32,
-    ) -> BridgeResult<fs::Metadata> {
-        match socket_metadata(path, package_uid, web_gid) {
+    fn connectable_socket_metadata(path: &Path, package_uid: u32) -> BridgeResult<fs::Metadata> {
+        match socket_metadata(path, package_uid) {
             Ok(metadata) => Ok(metadata),
             Err(error) if error.kind == ErrorKind::Unavailable => Err(error),
             Err(error) => match prepared_socket_metadata(path, package_uid) {
@@ -3119,7 +3126,7 @@ mod linux_socket {
         if package_uid == 0
             || !metadata.file_type().is_socket()
             || metadata.st_uid() != package_uid
-            || metadata.st_mode() & 0o7777 != 0o600
+            || metadata.st_mode() & 0o7777 != 0o000
             || metadata.st_nlink() != 1
         {
             return Err(BridgeError::unsafe_runtime());
@@ -3127,9 +3134,13 @@ mod linux_socket {
         Ok(metadata)
     }
 
-    fn remove_stale_socket(path: &Path, package_uid: u32, web_gid: u32) -> BridgeResult<()> {
+    fn remove_stale_socket(
+        path: &Path,
+        package_uid: u32,
+        dead_pid_verified: bool,
+    ) -> BridgeResult<()> {
         let before = match fs::symlink_metadata(path) {
-            Ok(_) => stale_socket_metadata(path, package_uid, web_gid)?,
+            Ok(_) => stale_socket_metadata(path, package_uid)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(_) => return Err(BridgeError::unsafe_runtime()),
         };
@@ -3137,9 +3148,18 @@ mod linux_socket {
             Ok(_) => return Err(BridgeError::new(ErrorKind::Conflict)),
             Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            // A prepared 0000 socket intentionally denies every rootless
+            // connector, including its package owner. The cleanup CLI may
+            // remove it only after validating the exact package-owned PID file
+            // and proving that PID absent. Ordinary bind recovery never treats
+            // EACCES as evidence that a listener is stale.
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    && dead_pid_verified
+                    && before.st_mode() & 0o7777 == 0o000 => {}
             Err(_) => return Err(BridgeError::unsafe_runtime()),
         }
-        let after = stale_socket_metadata(path, package_uid, web_gid)?;
+        let after = stale_socket_metadata(path, package_uid)?;
         if !same_object(&before, &after) {
             return Err(BridgeError::unsafe_runtime());
         }
@@ -3263,25 +3283,10 @@ mod linux_socket {
         }
     }
 
-    fn set_socket_contract(path: &Path, package_uid: u32, web_gid: u32) -> BridgeResult<()> {
-        let path =
-            CString::new(path.as_os_str().as_bytes()).map_err(|_| BridgeError::unsafe_runtime())?;
-        // SAFETY: path is a live NUL-terminated path; uid_t::MAX means retain
-        // the current owner, while the package user may select its joined http
-        // supplementary group without elevated privilege.
-        if unsafe { libc::chown(path.as_ptr(), libc::uid_t::MAX, web_gid) } != 0 {
-            return Err(BridgeError::unsafe_runtime());
-        }
-        fs::set_permissions(
-            Path::new(std::ffi::OsStr::from_bytes(path.as_bytes())),
-            fs::Permissions::from_mode(0o660),
-        )
-        .map_err(|_| BridgeError::unsafe_runtime())?;
-        socket_metadata(
-            Path::new(std::ffi::OsStr::from_bytes(path.as_bytes())),
-            package_uid,
-            web_gid,
-        )?;
+    fn set_socket_contract(path: &Path, package_uid: u32) -> BridgeResult<()> {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        socket_metadata(path, package_uid)?;
         Ok(())
     }
 
@@ -3294,15 +3299,11 @@ mod linux_socket {
         }
     }
 
-    fn stale_socket_metadata(
-        path: &Path,
-        package_uid: u32,
-        web_gid: u32,
-    ) -> BridgeResult<fs::Metadata> {
+    fn stale_socket_metadata(path: &Path, package_uid: u32) -> BridgeResult<fs::Metadata> {
         let metadata = fs::symlink_metadata(path).map_err(|_| BridgeError::unsafe_runtime())?;
         let permission = metadata.st_mode() & 0o7777;
-        let is_restricted_bind = permission == 0o600;
-        let is_final_socket = permission == 0o660 && metadata.st_gid() == web_gid;
+        let is_restricted_bind = permission == 0o000;
+        let is_final_socket = permission == 0o600;
         if package_uid == 0
             || !metadata.file_type().is_socket()
             || metadata.st_uid() != package_uid
@@ -8193,13 +8194,11 @@ pub(crate) fn main_entry() -> ExitCode {
             let result = (|| {
                 let identity = linux_runtime::identity_state()?;
                 let package_uid = validate_package_identity(&identity)?;
-                let (_, web_gid) = linux_runtime::web_identity()?;
                 linux_runtime::clear_environment()?;
                 linux_socket::cleanup_stale_service_socket(
                     Path::new(API_SOCKET_PATH),
                     Path::new(API_PID_PATH),
                     package_uid,
-                    web_gid,
                 )
             })();
             match result {
@@ -8556,8 +8555,7 @@ fn run_cgi() -> BridgeResult<CgiResponse> {
     {
         let environment = process_environment()?;
         let identity = linux_runtime::identity_state()?;
-        let (web_uid, web_gid) = linux_runtime::web_identity()?;
-        let package_uid = validate_cgi_identity(&identity, web_uid)?;
+        let package_uid = validate_cgi_identity(&identity)?;
         let request = validate_http_request(environment.clone())?;
         let authentication = match &request {
             ValidatedHttpRequest::Get { authentication, .. }
@@ -8582,7 +8580,6 @@ fn run_cgi() -> BridgeResult<CgiResponse> {
         let mut stream = match linux_socket::connect_for_cgi(
             Path::new(API_SOCKET_PATH),
             package_uid,
-            web_gid,
             CGI_SERVICE_CONNECT_WINDOW,
         ) {
             Ok(stream) => stream,
@@ -8705,6 +8702,20 @@ struct SupervisedServerFiles {
 }
 
 #[cfg(target_os = "linux")]
+struct ServerSocketFile {
+    path: &'static Path,
+    package_uid: u32,
+    identity: fs::Metadata,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ServerSocketFile {
+    fn drop(&mut self) {
+        let _ = linux_socket::remove_own_socket(self.path, self.package_uid, &self.identity);
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl Drop for SupervisedServerFiles {
     fn drop(&mut self) {
         let ready = format!("{}\n{}\n{}\n", self.pid, self.start, self.boot);
@@ -8750,7 +8761,7 @@ fn exact_parent_is_live(parent: &SupervisedParent, package_uid: u32) -> BridgeRe
 }
 
 #[cfg(target_os = "linux")]
-fn server_identities() -> BridgeResult<(u32, u32, u32)> {
+fn server_identity() -> BridgeResult<u32> {
     if CGI_ORIGIN_VARIABLES
         .iter()
         .any(|name| std::env::var_os(name).is_some())
@@ -8759,11 +8770,7 @@ fn server_identities() -> BridgeResult<(u32, u32, u32)> {
     }
     let identity = linux_runtime::identity_state()?;
     let package_uid = validate_package_identity(&identity)?;
-    let (web_uid, web_gid) = linux_runtime::web_identity()?;
-    if web_uid == 0 || web_uid == package_uid || web_gid == 0 {
-        return Err(BridgeError::unsafe_runtime());
-    }
-    Ok((package_uid, web_uid, web_gid))
+    Ok(package_uid)
 }
 
 #[cfg(target_os = "linux")]
@@ -8776,7 +8783,7 @@ fn run_supervised_server(parent: SupervisedParent) -> BridgeResult<()> {
     if u32::try_from(unsafe { libc::getppid() }).ok() != Some(parent.pid) {
         return Err(BridgeError::unsafe_runtime());
     }
-    let (package_uid, web_uid, web_gid) = server_identities()?;
+    let package_uid = server_identity()?;
     exact_parent_is_live(&parent, package_uid)?;
     let (pid, start, boot) = linux_files::current_process_identity()?;
     let pid_record = format!("{pid}\n");
@@ -8792,7 +8799,7 @@ fn run_supervised_server(parent: SupervisedParent) -> BridgeResult<()> {
         boot: boot.clone(),
     };
     linux_runtime::clear_environment()?;
-    run_server_loop(package_uid, web_uid, web_gid, Some((&parent, start, &boot)))
+    run_server_loop(package_uid, Some((&parent, start, &boot)))
 }
 
 #[cfg(target_os = "linux")]
@@ -8863,28 +8870,24 @@ fn run_server() -> BridgeResult<()> {
 
     #[cfg(target_os = "linux")]
     {
-        let (package_uid, web_uid, web_gid) = server_identities()?;
+        let package_uid = server_identity()?;
         linux_runtime::clear_environment()?;
-        run_server_loop(package_uid, web_uid, web_gid, None)
+        run_server_loop(package_uid, None)
     }
 }
 
 #[cfg(target_os = "linux")]
 fn run_server_loop(
     package_uid: u32,
-    web_uid: u32,
-    web_gid: u32,
     supervisor: Option<(&SupervisedParent, u64, &str)>,
 ) -> BridgeResult<()> {
-    let (listener, prepared_socket_identity) = if supervisor.is_some() {
-        let (listener, identity) =
-            linux_socket::bind_prepared(Path::new(API_SOCKET_PATH), package_uid, web_gid)?;
-        (listener, Some(identity))
-    } else {
-        (
-            linux_socket::bind(Path::new(API_SOCKET_PATH), package_uid, web_gid)?,
-            None,
-        )
+    let socket_path = Path::new(API_SOCKET_PATH);
+    let (listener, prepared_socket_identity) =
+        linux_socket::bind_prepared(socket_path, package_uid)?;
+    let socket_file = ServerSocketFile {
+        path: Path::new(API_SOCKET_PATH),
+        package_uid,
+        identity: prepared_socket_identity,
     };
     if let Some((parent, start, boot)) = supervisor {
         // PID + socket + this private bound identity form the pre-commit
@@ -8935,20 +8938,14 @@ fn run_server_loop(
     }
     let workers =
         BoundedWorkerPool::start(API_WORKER_COUNT, API_QUEUE_CAPACITY, move |mut stream| {
-            let _ = serve_connection(&mut stream, package_uid, web_uid);
+            let _ = serve_connection(&mut stream, package_uid);
         })?;
-    if let Some(identity) = prepared_socket_identity.as_ref() {
-        // The pre-commit listener is deliberately package-only 0600. Publish
-        // the worker pool and exact readiness identity first, then activate the
-        // socket for DSM's http group. A CGI can therefore never connect to a
-        // listener whose accept loop does not exist yet.
-        linux_socket::activate_prepared(
-            Path::new(API_SOCKET_PATH),
-            package_uid,
-            web_gid,
-            identity,
-        )?;
-    }
+    // The pre-commit listener is deliberately inaccessible at 0000. Publish
+    // the worker pool and, for supervised starts, exact readiness identity
+    // first, then activate the same inode for the package-owned CGI at 0600. A
+    // CGI can therefore never connect to a listener whose accept loop does not
+    // exist yet.
+    linux_socket::activate_prepared(socket_path, package_uid, &socket_file.identity)?;
     loop {
         match listener.accept() {
             Ok((stream, _)) => match workers.try_dispatch(stream) {
@@ -8967,11 +8964,10 @@ fn run_server_loop(
 fn serve_connection(
     stream: &mut std::os::unix::net::UnixStream,
     package_uid: u32,
-    web_uid: u32,
 ) -> BridgeResult<()> {
     linux_socket::configure_stream(stream)?;
     let credentials = linux_socket::peer_credentials(stream)?;
-    linux_socket::validate_peer_uid(credentials.uid, web_uid)?;
+    linux_socket::validate_peer_uid(credentials.uid, package_uid)?;
     let response = match read_single_frame(stream, MAX_RELAY_REQUEST_BYTES, ErrorKind::BadRequest) {
         Ok(request) => {
             handle_relay_request(&request, package_uid).unwrap_or_else(CgiResponse::error)
@@ -8994,10 +8990,11 @@ fn handle_relay_request(encoded: &[u8], package_uid: u32) -> BridgeResult<CgiRes
     // The CGI performs the documented DSM check early, while the native
     // request environment is intact. The package daemon repeats that same
     // root-owned helper check using only the bounded relayed environment and
-    // independently resolves administrator membership. The socket admits only
-    // DSM's exact non-root web UID via SO_PEERCRED; request authority still
+    // independently resolves administrator membership. DSM executes the CGI as
+    // its package-owned executable's exact non-root UID, and the socket admits
+    // only that same package UID via SO_PEERCRED; request authority still
     // comes exclusively from the repeated DSM authentication, never from a
-    // cross-UID /proc lookup that rootless package processes cannot perform.
+    // /proc identity lookup that rootless package processes cannot perform.
     let session = linux_runtime::authenticate_and_authorize(authentication, AUTH_HELPER_TIMEOUT)?;
     validate_relay_authenticated_session(&relay, &session)?;
     let control_paths = ControlPaths::production();
@@ -9858,8 +9855,8 @@ mod tests {
 
         let fixture = TestControlFixture::new("socket-peer");
         let socket = fixture.root.join("api.sock");
-        let listener = linux_socket::bind(&socket, uid, gid).unwrap();
-        let client = linux_socket::connect(&socket, uid, gid).unwrap();
+        let listener = linux_socket::bind(&socket, uid).unwrap();
+        let client = linux_socket::connect(&socket, uid).unwrap();
         let (server, _) = listener.accept().unwrap();
         assert_eq!(linux_socket::peer_credentials(&client).unwrap().uid, uid);
         assert_eq!(linux_socket::peer_credentials(&server).unwrap().uid, uid);
@@ -10149,9 +10146,7 @@ mod tests {
     fn cgi_socket_retry_is_bounded_and_never_retries_unsafe_metadata() {
         // SAFETY: these identity calls have no pointer arguments or preconditions.
         let uid = unsafe { libc::geteuid() };
-        // SAFETY: these identity calls have no pointer arguments or preconditions.
-        let gid = unsafe { libc::getegid() };
-        if uid == 0 || gid == 0 {
+        if uid == 0 {
             return;
         }
         let fixture = TestControlFixture::new("cgi-socket-retry");
@@ -10159,26 +10154,25 @@ mod tests {
         let delayed_socket = socket.clone();
         let server = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
-            let listener = linux_socket::bind(&delayed_socket, uid, gid).unwrap();
+            let listener = linux_socket::bind(&delayed_socket, uid).unwrap();
             let (stream, _) = listener.accept().unwrap();
             assert_eq!(linux_socket::peer_credentials(&stream).unwrap().uid, uid);
         });
         let started = Instant::now();
-        let client =
-            linux_socket::connect_for_cgi(&socket, uid, gid, Duration::from_secs(1)).unwrap();
+        let client = linux_socket::connect_for_cgi(&socket, uid, Duration::from_secs(1)).unwrap();
         assert!(started.elapsed() >= Duration::from_millis(75));
         drop(client);
         server.join().unwrap();
         fs::remove_file(&socket).unwrap();
 
-        let (prepared, prepared_identity) = linux_socket::bind_prepared(&socket, uid, gid).unwrap();
+        let (prepared, prepared_identity) = linux_socket::bind_prepared(&socket, uid).unwrap();
         assert_eq!(
             fs::symlink_metadata(&socket).unwrap().permissions().mode() & 0o7777,
-            0o600
+            0o000
         );
         let prepared_started = Instant::now();
         assert_eq!(
-            linux_socket::connect_for_cgi(&socket, uid, gid, Duration::from_millis(125),)
+            linux_socket::connect_for_cgi(&socket, uid, Duration::from_millis(125),)
                 .unwrap_err()
                 .kind,
             ErrorKind::Unavailable
@@ -10191,21 +10185,27 @@ mod tests {
             "a pre-commit CGI reached the prepared listener"
         );
         prepared.set_nonblocking(false).unwrap();
-        linux_socket::activate_prepared(&socket, uid, gid, &prepared_identity).unwrap();
+        linux_socket::activate_prepared(&socket, uid, &prepared_identity).unwrap();
+        let activated_identity = fs::symlink_metadata(&socket).unwrap();
+        assert_eq!(activated_identity.st_dev(), prepared_identity.st_dev());
+        assert_eq!(activated_identity.st_ino(), prepared_identity.st_ino());
+        assert_eq!(activated_identity.st_uid(), uid);
+        assert_eq!(activated_identity.st_gid(), prepared_identity.st_gid());
+        assert_eq!(activated_identity.permissions().mode() & 0o7777, 0o600);
         let active =
-            linux_socket::connect_for_cgi(&socket, uid, gid, Duration::from_millis(125)).unwrap();
+            linux_socket::connect_for_cgi(&socket, uid, Duration::from_millis(125)).unwrap();
         let (accepted, _) = prepared.accept().unwrap();
         drop(active);
         drop(accepted);
         drop(prepared);
         fs::remove_file(&socket).unwrap();
 
-        let (original, original_identity) = linux_socket::bind_prepared(&socket, uid, gid).unwrap();
+        let (original, original_identity) = linux_socket::bind_prepared(&socket, uid).unwrap();
         fs::remove_file(&socket).unwrap();
         let replacement = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o000)).unwrap();
         assert_eq!(
-            linux_socket::activate_prepared(&socket, uid, gid, &original_identity)
+            linux_socket::activate_prepared(&socket, uid, &original_identity)
                 .unwrap_err()
                 .kind,
             ErrorKind::UnsafeRuntime
@@ -10216,7 +10216,7 @@ mod tests {
 
         let missing_started = Instant::now();
         assert_eq!(
-            linux_socket::connect_for_cgi(&socket, uid, gid, Duration::from_millis(125),)
+            linux_socket::connect_for_cgi(&socket, uid, Duration::from_millis(125),)
                 .unwrap_err()
                 .kind,
             ErrorKind::Unavailable
@@ -10229,7 +10229,7 @@ mod tests {
         symlink(&outside, &socket).unwrap();
         let unsafe_started = Instant::now();
         assert_eq!(
-            linux_socket::connect_for_cgi(&socket, uid, gid, Duration::from_secs(1),)
+            linux_socket::connect_for_cgi(&socket, uid, Duration::from_secs(1),)
                 .unwrap_err()
                 .kind,
             ErrorKind::UnsafeRuntime
@@ -10532,13 +10532,13 @@ mod tests {
         let fixture = TestControlFixture::new("socket-stale");
         let socket = fixture.root.join("api.sock");
         let pid_file = fixture.root.join("api.pid");
-        let listener = linux_socket::bind(&socket, uid, gid).unwrap();
+        let listener = linux_socket::bind(&socket, uid).unwrap();
         let metadata = fs::symlink_metadata(&socket).unwrap();
-        assert_eq!(metadata.permissions().mode() & 0o7777, 0o660);
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
         assert_eq!(metadata.st_uid(), uid);
         assert_eq!(metadata.st_gid(), gid);
         assert_eq!(
-            linux_socket::bind(&socket, uid, gid).unwrap_err().kind,
+            linux_socket::bind(&socket, uid).unwrap_err().kind,
             ErrorKind::Conflict
         );
         let (conflict_probe, _) = listener.accept().unwrap();
@@ -10552,23 +10552,30 @@ mod tests {
         assert_eq!(shutdown_status, 0);
         drop(listener);
 
-        // This is the safe crash window after bind(2) under umask 0177 but
-        // before the final group/mode contract has been applied.
-        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        // This is the safe crash window after bind(2) under umask 0777 but
+        // before the final package-only mode contract has been applied. An
+        // ordinary bind must never interpret EACCES as stale without a
+        // validated dead service PID.
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            linux_socket::bind(&socket, uid).unwrap_err().kind,
+            ErrorKind::UnsafeRuntime
+        );
+        assert!(socket.exists());
         fixture.write_private(&pid_file, b"2147483647\n");
-        linux_socket::cleanup_stale_service_socket(&socket, &pid_file, uid, gid).unwrap();
+        linux_socket::cleanup_stale_service_socket(&socket, &pid_file, uid).unwrap();
         assert!(!socket.exists());
         assert!(!pid_file.exists());
 
-        let recovered = linux_socket::bind(&socket, uid, gid).unwrap();
+        let recovered = linux_socket::bind(&socket, uid).unwrap();
         assert_eq!(
             fs::symlink_metadata(&socket).unwrap().permissions().mode() & 0o7777,
-            0o660
+            0o600
         );
         drop(recovered);
         fixture.write_private(&pid_file, format!("{}\n", std::process::id()).as_bytes());
         assert_eq!(
-            linux_socket::cleanup_stale_service_socket(&socket, &pid_file, uid, gid)
+            linux_socket::cleanup_stale_service_socket(&socket, &pid_file, uid)
                 .unwrap_err()
                 .kind,
             ErrorKind::Conflict
@@ -10582,7 +10589,7 @@ mod tests {
         fs::write(&outside, b"do not remove").unwrap();
         symlink(&outside, &socket).unwrap();
         assert_eq!(
-            linux_socket::bind(&socket, uid, gid).unwrap_err().kind,
+            linux_socket::bind(&socket, uid).unwrap_err().kind,
             ErrorKind::UnsafeRuntime
         );
         assert!(
@@ -12030,14 +12037,14 @@ mod tests {
     }
 
     #[test]
-    fn cgi_identity_derives_package_uid_from_plain_binary_owner() {
+    fn cgi_identity_requires_framework_owned_package_execution() {
         let valid = IdentityState {
-            real_uid: 1023,
-            effective_uid: 1023,
+            real_uid: 1060,
+            effective_uid: 1060,
             executable_uid: 1060,
             executable_mode: 0o100_000 | 0o755,
         };
-        assert_eq!(validate_cgi_identity(&valid, 1023).unwrap(), 1060);
+        assert_eq!(validate_cgi_identity(&valid).unwrap(), 1060);
         for invalid in [
             IdentityState {
                 real_uid: 0,
@@ -12045,11 +12052,16 @@ mod tests {
                 ..valid.clone()
             },
             IdentityState {
-                effective_uid: 1060,
+                real_uid: 1023,
+                effective_uid: 1023,
                 ..valid.clone()
             },
             IdentityState {
-                real_uid: 1060,
+                real_uid: 1023,
+                ..valid.clone()
+            },
+            IdentityState {
+                effective_uid: 1023,
                 ..valid.clone()
             },
             IdentityState {
@@ -12065,20 +12077,19 @@ mod tests {
                 ..valid.clone()
             },
         ] {
-            assert!(validate_cgi_identity(&invalid, 1023).is_err());
+            assert!(validate_cgi_identity(&invalid).is_err());
         }
-        assert!(validate_cgi_identity(&valid, 1060).is_err());
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn rootless_daemon_socket_gate_requires_the_exact_nonroot_web_uid() {
-        let web_uid = 1023;
+    fn rootless_daemon_socket_gate_requires_the_exact_nonroot_package_uid() {
+        let old_web_uid = 1023;
         let package_uid = 1060;
-        assert!(linux_socket::validate_peer_uid(web_uid, web_uid).is_ok());
-        assert!(linux_socket::validate_peer_uid(package_uid, web_uid).is_err());
-        assert!(linux_socket::validate_peer_uid(0, web_uid).is_err());
-        assert!(linux_socket::validate_peer_uid(web_uid, 0).is_err());
+        assert!(linux_socket::validate_peer_uid(package_uid, package_uid).is_ok());
+        assert!(linux_socket::validate_peer_uid(old_web_uid, package_uid).is_err());
+        assert!(linux_socket::validate_peer_uid(0, package_uid).is_err());
+        assert!(linux_socket::validate_peer_uid(package_uid, 0).is_err());
     }
 
     #[test]

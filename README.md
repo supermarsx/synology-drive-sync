@@ -20,9 +20,11 @@ destination is configurable: `/home/Drive/...` targets the remote account's Driv
 writable `/<shared-folder>/...` subdirectory can be selected instead. DSM must provision the remote
 user home or shared-folder root and its permissions first; the sync creates a missing chosen
 subdirectory and all descendants beneath an existing writable parent. The SPK requests no root,
-Linux capability, or identity-changing file mode: an ordinary DSM `http` CGI relays over a fixed
-package:`http` `0660` Unix socket to a package-user API service that reauthenticates the session and
-enforces administrator membership plus package CSRF. See the
+Linux capability, joined web group, or identity-changing file mode. Under `defaults.run-as=package`,
+DSM executes the ordinary package-owned `0755` CGI with the exact non-root package UID. It relays
+over a fixed package-owned Unix socket that remains inaccessible at `0000` until startup commit and
+then activates as `0600`; the package-user API service reauthenticates the session and enforces
+administrator membership plus package CSRF. See the
 [Synology DSM package and dashboard guide](docs/synology-package.md).
 
 > [!WARNING]

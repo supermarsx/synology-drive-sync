@@ -85,9 +85,10 @@ the profile and collector behavior before clearing it.
 
 The page does not place secret values in URLs, local storage, session storage, DOM text, logs, or
 snapshot responses. A replacement travels in one bounded JSON POST over the current same-origin DSM
-session. The ordinary DSM `http` CGI relays it over the fixed private Unix socket. The package-user
-API service reauthenticates the session, validates the exact operation/field schema, publishes the
-job and a separate private secret file atomically, and returns only a queued identifier.
+session. The ordinary package-owned CGI, running with the exact non-root package UID, relays it over
+the fixed private Unix socket. The package-user API service reauthenticates the session, validates
+the exact operation/field schema, publishes the job and a separate private secret file atomically,
+and returns only a queued identifier.
 
 The CGI process does not run the secret-changing manager action. The clean package controller claims
 the private job, reads the protected secret file without following symlinks, feeds it to the manager
