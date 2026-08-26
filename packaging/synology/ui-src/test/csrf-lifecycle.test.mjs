@@ -139,6 +139,70 @@ function securityContext(component, overrides = {}) {
   return context;
 }
 
+test("failed initial CSRF bootstrap is reported once before the scheduled retry", async () => {
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  let csrfReads = 0;
+  let snapshotReads = 0;
+  let scheduledRetries = 0;
+  try {
+    globalThis.window = {
+      AbortController: globalThis.AbortController,
+      matchMedia: () => ({
+        matches: false,
+        addEventListener() {},
+        removeEventListener() {}
+      })
+    };
+    globalThis.document = {
+      hidden: false,
+      addEventListener() {},
+      removeEventListener() {}
+    };
+    const component = await loadAppComponent(
+      async () => ({}),
+      async () => {
+        csrfReads += 1;
+        throw { status: 400, code: "invalid_request", message: "Request could not be completed." };
+      }
+    );
+    const context = {
+      disposed: false,
+      abortController: null,
+      auth: { signal: undefined },
+      csrfToken: "",
+      connected: true,
+      bridgeIssue: { title: "", message: "" },
+      connectionLabel: "Connected",
+      toasts: [],
+      refreshCsrf(...args) { return component.methods.refreshCsrf.apply(this, args); },
+      describeBridgeError(...args) { return component.methods.describeBridgeError.apply(this, args); },
+      toast(title, message, error = false) { this.toasts.push({ title, message, error }); },
+      async refreshSnapshot() { snapshotReads += 1; },
+      scheduleSnapshot() { scheduledRetries += 1; },
+      stopTimers() {}
+    };
+
+    await component.mounted.call(context);
+
+    assert.equal(csrfReads, 1, "mount must not immediately repeat a rejected CSRF request");
+    assert.equal(snapshotReads, 0, "snapshot bootstrap must wait for a valid CSRF token");
+    assert.equal(scheduledRetries, 1, "the normal bounded refresh cadence owns the retry");
+    assert.equal(context.bridgeIssue.title, "DSM request metadata rejected");
+    assert.equal(context.toasts.length, 1);
+    assert.equal(
+      context.describeBridgeError({ status: 400, code: "non_json_response" }).title,
+      "Package UI route unavailable",
+      "an upstream DSM HTML 400 must not be attributed to the package parser"
+    );
+  } finally {
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+});
+
 test("security lifetime change replaces the token before the next serialized mutation", async () => {
   const trace = [];
   const posts = [];

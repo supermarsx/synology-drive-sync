@@ -829,8 +829,10 @@ export default {
       }
     };
     document.addEventListener("visibilitychange", this.visibilityHandler);
+    let csrfReady = false;
     try {
       await this.refreshCsrf();
+      csrfReady = true;
     } catch (error) {
       if (this.disposed) return;
       this.connected = false;
@@ -840,7 +842,8 @@ export default {
       this.toast(this.bridgeIssue.title, this.bridgeIssue.message, true);
     }
     if (this.disposed) return;
-    await this.refreshSnapshot(false);
+    if (csrfReady) await this.refreshSnapshot(false);
+    else this.scheduleSnapshot();
   },
   beforeDestroy() {
     this.disposed = true;
@@ -868,6 +871,9 @@ export default {
       }
       if (status === 403 || code.includes("forbidden")) {
         return { title: "DSM access denied", message: "Use a DSM administrator account and, if HTTPS is required by policy, reopen this app over HTTPS." };
+      }
+      if (status === 400 && code === "invalid_request") {
+        return { title: "DSM request metadata rejected", message: "Install or repair the latest complete package release, then reopen this app from the DSM desktop." };
       }
       if (status === 404 || code === "non_json_response" || code === "malformed_json") {
         return { title: "Package UI route unavailable", message: "DSM did not reach this package's native API. Repair or reinstall the same package release, then reopen the app." };

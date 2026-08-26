@@ -165,6 +165,10 @@ run_package_cgi() {
         PATH=/usr/sbin:/usr/bin:/sbin:/bin \
         REQUEST_METHOD=GET \
         QUERY_STRING=action=csrf \
+        CONTENT_LENGTH= \
+        CONTENT_TYPE= \
+        HTTP_TRANSFER_ENCODING= \
+        HTTP_X_SDSYNC_CSRF= \
         HTTP_COOKIE=$fixture_cookie \
         HTTP_X_SDSYNC_REQUEST=1 \
         HTTPS=on \

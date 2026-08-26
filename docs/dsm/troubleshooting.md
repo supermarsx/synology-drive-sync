@@ -138,6 +138,29 @@ or filesystem path.
 Do not hand-create readiness files, remove locks, broaden socket permissions, or run either service
 as root. Those changes erase the evidence and bypass the package's fail-closed identity checks.
 
+## `api.cgi?action=csrf` returns HTTP 400
+
+First inspect only the response type and bounded error code in the browser Network panel. Do not
+copy cookies, CSRF values, Synology tokens, or the complete request headers.
+
+- Package JSON with schema `sdsync.dsm-error.v1` and code `invalid_request` means Webman reached the
+  package CGI but its request metadata was rejected. Release 26.14 treated DSM/FastCGI variables
+  such as an empty `CONTENT_LENGTH`, `CONTENT_TYPE`, transfer encoding, or mutation-token header as
+  present request data. Install the first release after 26.14; the bridge now treats only exact empty
+  CGI metadata as absent while continuing to reject non-empty GET bodies, content types, transfer
+  encodings, and mutation tokens.
+- Synology HTML rather than the package JSON schema means DSM, its reverse proxy, or QuickConnect
+  rejected the request before the package CGI. Reopen the app from the DSM desktop on the same
+  origin used to sign in. If the response remains HTML, troubleshoot the DSM route rather than the
+  package socket.
+- Package JSON with code `unauthorized` is HTTP 401, not 400. Sign in to DSM again and reopen the
+  AppWindow so the browser can attach the DSM session cookie. A missing cookie is deliberately never
+  converted into package authority.
+
+The compatibility handling does not relax authentication: the browser request marker, DSM cookie,
+administrator membership, repeated `authenticate.cgi` checks, HTTPS policy, session binding, and
+POST CSRF verification remain mandatory.
+
 ## DSM says the page is not found when opening the app
 
 The current source uses the native `type=app` AppWindow introduced in release 26.10. The package's

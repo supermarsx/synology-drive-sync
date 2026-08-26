@@ -1297,7 +1297,11 @@ fn process_environment() -> BridgeResult<CgiEnvironment> {
         content_length: optional("CONTENT_LENGTH", 32)?,
         content_type: optional("CONTENT_TYPE", 128)?,
         query: Zeroizing::new(optional("QUERY_STRING", MAX_QUERY_BYTES)?.unwrap_or_default()),
-        cookie: Zeroizing::new(required("HTTP_COOKIE", MAX_COOKIE_BYTES)?),
+        // Synology's CGI wrapper may omit an unauthenticated Cookie header
+        // entirely. Preserve that as an empty authentication input so the
+        // request is classified as unauthenticated (401), not malformed
+        // transport metadata (400).
+        cookie: Zeroizing::new(optional("HTTP_COOKIE", MAX_COOKIE_BYTES)?.unwrap_or_default()),
         request_marker: optional("HTTP_X_SDSYNC_REQUEST", 8)?,
         synology_token_header: optional("HTTP_X_SYNO_TOKEN", MAX_TOKEN_BYTES)?.map(Zeroizing::new),
         csrf_header: optional("HTTP_X_SDSYNC_CSRF", MAX_CSRF_BYTES)?.map(Zeroizing::new),
@@ -1322,7 +1326,14 @@ fn validate_optional_environment_value(value: Option<&str>, maximum: usize) -> B
 }
 
 fn validate_http_request(mut environment: CgiEnvironment) -> BridgeResult<ValidatedHttpRequest> {
-    if environment.transfer_encoding.is_some() {
+    // DSM's Webman/FastCGI boundary can materialize absent request metadata as
+    // present-but-empty CGI variables. Empty values are semantically absent;
+    // non-empty transfer encodings and GET entity metadata remain rejected.
+    if environment
+        .transfer_encoding
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
         return Err(BridgeError::bad_request());
     }
     if environment.request_marker.as_deref() != Some("1") {
@@ -1352,9 +1363,15 @@ fn validate_http_request(mut environment: CgiEnvironment) -> BridgeResult<Valida
             if environment
                 .content_length
                 .as_deref()
-                .is_some_and(|value| value != "0")
-                || environment.content_type.is_some()
-                || environment.csrf_header.is_some()
+                .is_some_and(|value| !value.is_empty() && value != "0")
+                || environment
+                    .content_type
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                || environment
+                    .csrf_header
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
             {
                 return Err(BridgeError::bad_request());
             }
@@ -11675,12 +11692,91 @@ mod tests {
         get_with_body.content_length = Some("1".to_owned());
         assert!(validate_http_request(get_with_body).is_err());
 
+        let mut dsm_empty_get_metadata = environment("GET", "action=csrf");
+        dsm_empty_get_metadata.content_length = Some(String::new());
+        dsm_empty_get_metadata.content_type = Some(String::new());
+        dsm_empty_get_metadata.csrf_header = Some(Zeroizing::new(String::new()));
+        dsm_empty_get_metadata.transfer_encoding = Some(String::new());
+        assert!(matches!(
+            validate_http_request(dsm_empty_get_metadata),
+            Ok(ValidatedHttpRequest::Get {
+                action: ReadAction::Csrf,
+                ..
+            })
+        ));
+
+        let mut dsm_zero_length_get = environment("GET", "action=csrf");
+        dsm_zero_length_get.content_length = Some("0".to_owned());
+        assert!(matches!(
+            validate_http_request(dsm_zero_length_get),
+            Ok(ValidatedHttpRequest::Get {
+                action: ReadAction::Csrf,
+                ..
+            })
+        ));
+
+        let mut get_with_content_type = environment("GET", "action=csrf");
+        get_with_content_type.content_type = Some("application/json".to_owned());
+        assert_eq!(
+            validate_http_request(get_with_content_type)
+                .unwrap_err()
+                .kind,
+            ErrorKind::BadRequest
+        );
+
+        let mut get_with_transfer_encoding = environment("GET", "action=csrf");
+        get_with_transfer_encoding.transfer_encoding = Some("chunked".to_owned());
+        assert_eq!(
+            validate_http_request(get_with_transfer_encoding)
+                .unwrap_err()
+                .kind,
+            ErrorKind::BadRequest
+        );
+
+        let mut get_with_csrf_header = environment("GET", "action=csrf");
+        get_with_csrf_header.csrf_header = Some(Zeroizing::new("mutation-token".to_owned()));
+        assert_eq!(
+            validate_http_request(get_with_csrf_header)
+                .unwrap_err()
+                .kind,
+            ErrorKind::BadRequest
+        );
+
+        let mut get_without_cookie = environment("GET", "action=csrf");
+        get_without_cookie.cookie = Zeroizing::new(String::new());
+        assert_eq!(
+            validate_http_request(get_without_cookie).unwrap_err().kind,
+            ErrorKind::Unauthorized
+        );
+
         let mut post = post_environment(10);
         post.content_type = Some("text/plain".to_owned());
         assert_eq!(
             validate_http_request(post).unwrap_err().kind,
             ErrorKind::UnsupportedMediaType
         );
+
+        let mut post_without_length = post_environment(10);
+        post_without_length.content_length = Some(String::new());
+        assert_eq!(
+            validate_http_request(post_without_length).unwrap_err().kind,
+            ErrorKind::BadRequest
+        );
+
+        let mut post_without_type = post_environment(10);
+        post_without_type.content_type = Some(String::new());
+        assert_eq!(
+            validate_http_request(post_without_type).unwrap_err().kind,
+            ErrorKind::UnsupportedMediaType
+        );
+
+        let mut post_without_csrf = post_environment(10);
+        post_without_csrf.csrf_header = Some(Zeroizing::new(String::new()));
+        assert_eq!(
+            validate_http_request(post_without_csrf).unwrap_err().kind,
+            ErrorKind::Forbidden
+        );
+
         let mut chunked = post_environment(10);
         chunked.transfer_encoding = Some("chunked".to_owned());
         assert!(validate_http_request(chunked).is_err());
