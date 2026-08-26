@@ -83,7 +83,7 @@ test("every native and DSM Vue control state is explicitly dark themed", () => {
     '.sdsync-app [class*="syno"][class*="input"]',
     '.sdsync-app [class*="syno"][class*="select"]',
     '.sdsync-app [class*="syno"][class*="button"]',
-    '.sdsync-app [class*="checkbox"]',
+    '.sdsync-app .sdsync-check-row > [class*="checkbox"]',
     '.sdsync-app [role="listbox"]',
     '.sdsync-app [role="listbox"] [role="option"][aria-selected="true"]',
     '.sdsync-app [role="tooltip"]'
@@ -176,9 +176,10 @@ test("security controls use compact responsive rows without clipping help", () =
   }
   assert.match(declarations(".sdsync-security-form"), /gap:\s*14px/);
   assert.match(declarations(".sdsync-security-grid"), /grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/);
-  assert.match(declarations(".sdsync-policy-control"), /grid-template-columns:\s*minmax\(0, auto\) 20px/);
-  assert.match(declarations(".sdsync-policy-control"), /justify-content:\s*start/);
-  assert.match(declarations(".sdsync-policy-control"), /overflow:\s*visible/);
+  assert.match(declarations(".sdsync-check-row"), /grid-template-columns:\s*minmax\(0, 1fr\) 20px/);
+  assert.match(declarations(".sdsync-check-row"), /width:\s*100%/);
+  assert.match(declarations(".sdsync-check-row"), /overflow:\s*visible/);
+  assert.match(declarations(".sdsync-policy-control"), /padding-block:\s*3px/);
   assert.match(declarations(".sdsync-log-policy-grid"), /grid-template-columns:\s*repeat\(3, minmax\(0, 1fr\)\)/);
   assert.match(declarations(".sdsync-security-actions"), /justify-content:\s*flex-end/);
   assert.match(css, /\.sdsync-security-grid\s*\{[\s\S]*?grid-template-columns:\s*1fr\s*;/);

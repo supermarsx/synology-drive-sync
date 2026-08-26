@@ -17,7 +17,7 @@
                 <div><p class="sdsync-eyebrow">Change permissions</p><h3>Dashboard operations</h3></div>
               </div>
               <div class="sdsync-policy-list">
-                <div v-for="control in operationControls" :key="control.key" class="sdsync-policy-control">
+                <div v-for="control in operationControls" :key="control.key" class="sdsync-check-row sdsync-policy-control">
                   <v-checkbox
                     :value="value[control.key] === true"
                     :disabled="disabled"
@@ -34,7 +34,7 @@
                 <div><p class="sdsync-eyebrow">Risk ceilings</p><h3>Allowed profile behavior</h3></div>
               </div>
               <div class="sdsync-policy-list">
-                <div v-for="control in riskControls" :key="control.key" class="sdsync-policy-control">
+                <div v-for="control in riskControls" :key="control.key" class="sdsync-check-row sdsync-policy-control">
                   <v-checkbox
                     :value="value[control.key] === true"
                     :disabled="disabled"
