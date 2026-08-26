@@ -101,7 +101,7 @@
             :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass"
             :aria-describedby="helpId('log-' + category.key)"
             @input="updateLogLevel(category.key, $event)"
-          />
+          ><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select>
           <policy-help :help-key="'log-' + category.key" />
         </v-form-item>
       </div>
@@ -112,15 +112,18 @@
       <span v-if="dirty" class="sdsync-field-note" role="status">Unsaved security changes</span>
       <v-button
         suffix="main"
+        display="icon-text"
         html-type="submit"
         tooltip="Validate, persist, enforce, and audit this security and logging policy"
         :disabled="disabled || busy || !dirty"
-      >Save security policy</v-button>
+      ><template #icon><action-icon name="save" /></template>Save security policy</v-button>
     </div>
   </v-form>
 </template>
 
 <script>
+import { ActionIcon } from "./ActionIcon";
+
 const POLICY_HELP = Object.freeze({
   policy_version: "Immutable on-disk security policy schema reported by the package snapshot; updates are managed only by package migrations.",
   require_https: "Reject dashboard requests unless DSM reports an HTTPS connection.",
@@ -155,17 +158,18 @@ const POLICY_HELP = Object.freeze({
 
 const PolicyHelp = {
   name: "PolicyHelp",
+  components: { ActionIcon },
   props: { helpKey: { type: String, required: true } },
   computed: {
     helpId() { return `sdsync-help-security-${this.helpKey}`; },
     text() { return POLICY_HELP[this.helpKey] || "See the Security section in DSM Help."; }
   },
-  template: `<span class="sdsync-field-tip"><button type="button" class="sdsync-field-tip-trigger" :title="text" :aria-label="'Help: ' + text" :aria-describedby="helpId" @keydown.esc="$event.currentTarget.blur()">?</button><span :id="helpId" class="sdsync-field-tip-content" role="tooltip">{{ text }}</span></span>`
+  template: `<span class="sdsync-field-tip"><button type="button" class="sdsync-field-tip-trigger" :title="text" :aria-label="'Help: ' + text" :aria-describedby="helpId" @keydown.esc="$event.currentTarget.blur()"><action-icon name="help" :size="14" /></button><span :id="helpId" class="sdsync-field-tip-content" role="tooltip">{{ text }}</span></span>`
 };
 
 export default {
   name: "SecurityPanel",
-  components: { PolicyHelp },
+  components: { ActionIcon, PolicyHelp },
   props: {
     value: { type: Object, required: true },
     disabled: { type: Boolean, default: false },

@@ -552,6 +552,8 @@ def validate_native_build_contract(
     webpack_payload: bytes,
     config_define_payload: bytes,
     package_payload: bytes,
+    action_icon_payload: bytes | None = None,
+    security_panel_payload: bytes | None = None,
 ) -> None:
     main = main_payload.decode("utf-8")
     app = app_payload.decode("utf-8")
@@ -640,7 +642,10 @@ def validate_native_build_contract(
         "priorFocus && priorFocus.isConnected && priorFocus.focus",
         'if (this.route === "profiles" && route !== "profiles") this.closeProfile();',
         "closeProfile() { this.clearSecrets();",
-        '{ id: "about", title: "About", icon: "ⓘ" }',
+        '{ id: "about", title: "About", icon: "about" }',
+        '<action-icon :name="item.icon" :size="18" />',
+        'import { ActionIcon } from "./ActionIcon";',
+        "components: { ActionIcon, ControlHelp, SecurityPanel }",
         'about: "about.html"',
         'this.snapshot && this.snapshot.package && this.snapshot.package.version',
         'https://github.com/supermarsx/synology-drive-sync/releases',
@@ -651,6 +656,47 @@ def validate_native_build_contract(
             raise ValidationError(
                 f"native DSM component is missing AppWindow interaction contract {marker!r}"
             )
+
+    route_icons = {
+        "overview", "profiles", "routines", "health", "activity",
+        "notifications", "security", "settings", "about",
+    }
+    for icon in route_icons:
+        marker = f'{{ id: "{icon}", title:'
+        route_start = app.find(marker)
+        if route_start < 0 or f'icon: "{icon}"' not in app[route_start:route_start + 120]:
+            raise ValidationError(
+                f"native DSM route {icon!r} must use its canonical shared ActionIcon name"
+            )
+
+    if (action_icon_payload is None) != (security_panel_payload is None):
+        raise ValidationError("shared ActionIcon validation requires both component sources")
+    if action_icon_payload is not None and security_panel_payload is not None:
+        action_icon = action_icon_payload.decode("utf-8")
+        security_panel = security_panel_payload.decode("utf-8")
+        for icon in route_icons | {"help", "save", "chevron-down"}:
+            icon_property = rf'^\s*(?:"{re.escape(icon)}"|{re.escape(icon)}):\s*\['
+            if not re.search(icon_property, action_icon, re.MULTILINE):
+                raise ValidationError(f"shared ActionIcon source is missing canonical icon {icon!r}")
+        for marker in (
+            "export const ActionIcon = {",
+            'name: "ActionIcon"',
+            'class: "sdsync-action-icon"',
+            '"aria-hidden": "true"',
+        ):
+            if marker not in action_icon:
+                raise ValidationError(f"shared ActionIcon source is missing contract {marker!r}")
+        for marker in (
+            'import { ActionIcon } from "./ActionIcon";',
+            "components: { ActionIcon, PolicyHelp }",
+            '<action-icon name="help" :size="14" />',
+            '<action-icon name="save" />',
+            '<action-icon name="chevron-down" />',
+        ):
+            if marker not in security_panel:
+                raise ValidationError(
+                    f"native DSM security panel is missing shared ActionIcon contract {marker!r}"
+                )
 
     operation_guards = (
         r"openProfile\(name\)\s*\{\s*if \(this\.operationBusy\) return;",
@@ -860,6 +906,8 @@ def validate_source() -> None:
         UI_SOURCE / "webpack.config.js",
         UI_SOURCE / "src/main.js",
         UI_SOURCE / "src/App.vue",
+        UI_SOURCE / "src/ActionIcon.js",
+        UI_SOURCE / "src/SecurityPanel.vue",
         UI_SOURCE / "src/api.js",
         UI_SOURCE / "src/styles/native.css",
         UI_SOURCE / "dist/SynologyDriveSync.js",
@@ -909,6 +957,8 @@ def validate_source() -> None:
         (UI_SOURCE / "webpack.config.js").read_bytes(),
         (UI_SOURCE / "config.define").read_bytes(),
         (UI_SOURCE / "package.json").read_bytes(),
+        (UI_SOURCE / "src/ActionIcon.js").read_bytes(),
+        (UI_SOURCE / "src/SecurityPanel.vue").read_bytes(),
     )
     validate_native_bundle(
         (UI_SOURCE / "dist/SynologyDriveSync.js").read_bytes(),

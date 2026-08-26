@@ -116,6 +116,19 @@
   font: inherit;
 }
 
+.sdsync-app button,
+.sdsync-app [role="button"],
+.sdsync-app input:not([type="checkbox"]):not([type="radio"]),
+.sdsync-app textarea,
+.sdsync-app select,
+.sdsync-app [role="combobox"],
+.sdsync-app [aria-haspopup="listbox"] {
+  font-family: "Cascadia Mono", Consolas, monospace !important;
+  font-size: 12px !important;
+  letter-spacing: 0.01em;
+  -webkit-tap-highlight-color: transparent;
+}
+
 .sdsync-app {
   accent-color: var(--sdsync-fire);
   caret-color: var(--sdsync-focus);
@@ -140,7 +153,8 @@
 .sdsync-app [role="combobox"],
 .sdsync-app [aria-haspopup="listbox"] {
   color: var(--sdsync-text) !important;
-  border-color: var(--sdsync-control-border) !important;
+  border: 1px solid var(--sdsync-control-border) !important;
+  border-radius: 1px !important;
   outline: none !important;
   background-color: var(--sdsync-control) !important;
   box-shadow: none !important;
@@ -150,14 +164,97 @@
 .sdsync-app input:not([type="checkbox"]):not([type="radio"]),
 .sdsync-app textarea,
 .sdsync-app select {
-  min-height: 32px;
-  border-width: 1px !important;
-  border-style: solid !important;
-  border-radius: 2px !important;
+  min-height: 34px;
 }
 
 .sdsync-app textarea {
+  min-height: 72px;
+  padding: 7px 9px !important;
   line-height: 1.45;
+  resize: vertical;
+}
+
+.sdsync-app input:not([type="checkbox"]):not([type="radio"]) {
+  min-height: 34px;
+  padding: 6px 9px !important;
+}
+
+.sdsync-app select:not([multiple]) {
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  padding: 6px 32px 6px 9px !important;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%23ffb35c' stroke-width='2' stroke-linecap='square'/%3E%3C/svg%3E") !important;
+  background-repeat: no-repeat !important;
+  background-position: right 10px center !important;
+  background-size: 12px 8px !important;
+}
+
+.sdsync-app.is-light select:not([multiple]) {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%23a93a0d' stroke-width='2' stroke-linecap='square'/%3E%3C/svg%3E") !important;
+}
+
+.sdsync-app select:not([multiple]):disabled {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%23a77d65' stroke-width='2' stroke-linecap='square'/%3E%3C/svg%3E") !important;
+}
+
+.sdsync-app.is-light select:not([multiple]):disabled {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%236f5548' stroke-width='2' stroke-linecap='square'/%3E%3C/svg%3E") !important;
+}
+
+.sdsync-app select[multiple] {
+  padding-inline: 7px !important;
+  background-image: none !important;
+}
+
+.sdsync-app select::-ms-expand {
+  display: none;
+}
+
+.sdsync-app input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.sdsync-app input[type="number"]::-webkit-inner-spin-button,
+.sdsync-app input[type="number"]::-webkit-outer-spin-button {
+  margin: 0;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.sdsync-app input[type="time"] {
+  color-scheme: dark;
+}
+
+.sdsync-app.is-light input[type="time"] {
+  color-scheme: light;
+}
+
+.sdsync-app input[type="time"]::-webkit-calendar-picker-indicator {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  padding: 2px;
+  cursor: pointer;
+  filter: invert(70%) sepia(90%) saturate(1200%) hue-rotate(334deg) brightness(108%);
+  opacity: 0.9;
+}
+
+.sdsync-app.is-light input[type="time"]::-webkit-calendar-picker-indicator {
+  filter: invert(24%) sepia(81%) saturate(2550%) hue-rotate(8deg) brightness(82%);
+}
+
+.sdsync-app input[type="time"]:disabled::-webkit-calendar-picker-indicator {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.sdsync-app input::-ms-clear,
+.sdsync-app input::-ms-reveal,
+.sdsync-app input::-webkit-contacts-auto-fill-button,
+.sdsync-app input::-webkit-credentials-auto-fill-button {
+  display: none !important;
 }
 
 .sdsync-app select option,
@@ -174,17 +271,31 @@
   -webkit-text-fill-color: var(--sdsync-placeholder) !important;
 }
 
-.sdsync-app [class*="syno"][class*="input"],
-.sdsync-app [class*="syno"][class*="select"],
-.sdsync-app [class*="input-container"],
-.sdsync-app [class*="select-container"],
-.sdsync-app [class*="input-wrapper"],
-.sdsync-app [class*="select-wrapper"],
-.sdsync-app [class*="input-wrap"],
-.sdsync-app [class*="select-wrap"] {
+/* DSM components often wrap the real input in one or more visual shells. Keep
+ * those shells transparent so the interactive element owns the only border. */
+.sdsync-app [class*="syno"][class*="input"]:not(input):not(textarea):not(select):not([role="combobox"]),
+.sdsync-app [class*="syno"][class*="select"]:not(input):not(textarea):not(select):not([role="combobox"]),
+.sdsync-app [class*="input-container"]:not(input):not(textarea):not(select):not([role="combobox"]),
+.sdsync-app [class*="select-container"]:not(input):not(textarea):not(select):not([role="combobox"]),
+.sdsync-app [class*="input-wrapper"]:not(input):not(textarea):not(select):not([role="combobox"]),
+.sdsync-app [class*="select-wrapper"]:not(input):not(textarea):not(select):not([role="combobox"]),
+.sdsync-app [class*="input-wrap"]:not(input):not(textarea):not(select):not([role="combobox"]),
+.sdsync-app [class*="select-wrap"]:not(input):not(textarea):not(select):not([role="combobox"]) {
   color: var(--sdsync-text) !important;
-  border-color: var(--sdsync-control-border) !important;
-  background-color: var(--sdsync-control) !important;
+  border-color: transparent !important;
+  outline: 0 !important;
+  background-color: transparent !important;
+  box-shadow: none !important;
+}
+
+.sdsync-app [role="combobox"] input,
+.sdsync-app [aria-haspopup="listbox"] input,
+.sdsync-app [role="combobox"] [class*="input"],
+.sdsync-app [aria-haspopup="listbox"] [class*="input"] {
+  min-height: 30px;
+  border: 0 !important;
+  outline: 0 !important;
+  background: transparent !important;
   box-shadow: none !important;
 }
 
@@ -197,12 +308,64 @@
   caret-color: var(--sdsync-focus) !important;
 }
 
-.sdsync-app [class*="input"] [class*="icon"],
-.sdsync-app [class*="select"] [class*="icon"],
-.sdsync-app [class*="input"] svg,
-.sdsync-app [class*="select"] svg {
+.sdsync-app [class*="input"] [class*="icon"]:not(.sdsync-action-icon) {
+  display: inline-grid !important;
+  width: 22px !important;
+  min-width: 22px !important;
+  height: 30px !important;
+  margin: 0 3px !important;
+  padding: 0 !important;
+  border: 0 !important;
+  place-items: center;
+  color: var(--sdsync-fire) !important;
+  line-height: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.sdsync-app [class*="input"] svg:not(.sdsync-action-icon) {
+  display: block !important;
+  width: 12px !important;
+  height: 12px !important;
+  margin: 0 !important;
   color: var(--sdsync-fire) !important;
   fill: currentColor !important;
+  transform: none !important;
+}
+
+.sdsync-app [class*="select"] [class*="icon"]:not(.sdsync-action-icon),
+.sdsync-app [role="combobox"] [class*="icon"]:not(.sdsync-action-icon),
+.sdsync-app [aria-haspopup="listbox"] [class*="icon"]:not(.sdsync-action-icon) {
+  position: static !important;
+  display: inline-grid !important;
+  width: 22px !important;
+  min-width: 22px !important;
+  height: 30px !important;
+  margin: 0 4px 0 2px !important;
+  padding: 0 !important;
+  border: 0 !important;
+  place-items: center;
+  color: var(--sdsync-fire) !important;
+  line-height: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.sdsync-app [class*="select"] svg,
+.sdsync-app [role="combobox"] svg,
+.sdsync-app [aria-haspopup="listbox"] svg {
+  display: block !important;
+  width: 12px !important;
+  height: 12px !important;
+  overflow: visible !important;
+  margin: 0 !important;
+  color: var(--sdsync-fire) !important;
+  fill: none !important;
+  stroke: currentColor !important;
+  stroke-width: 1.75px !important;
+  stroke-linecap: square !important;
+  stroke-linejoin: miter !important;
+  transform: none !important;
 }
 
 .sdsync-app select option:checked {
@@ -227,20 +390,33 @@
 .sdsync-app select:focus-visible,
 .sdsync-app [role="combobox"]:focus,
 .sdsync-app [role="combobox"]:focus-visible,
-.sdsync-app [class*="input"].focused,
-.sdsync-app [class*="select"].focused {
+.sdsync-app [role="combobox"]:focus-within,
+.sdsync-app [aria-haspopup="listbox"]:focus,
+.sdsync-app [aria-haspopup="listbox"]:focus-visible,
+.sdsync-app [aria-haspopup="listbox"]:focus-within {
   border-color: var(--sdsync-focus) !important;
-  outline: 2px solid var(--sdsync-focus) !important;
-  outline-offset: 1px !important;
+  outline: 0 !important;
   background-color: var(--sdsync-control-hover) !important;
-  box-shadow: 0 0 0 3px rgba(255, 106, 26, 0.2) !important;
+  box-shadow: none !important;
+}
+
+/* The combobox shell owns hover/focus. Its searchable input remains visually
+ * transparent, preventing the DSM component from drawing a second inner box. */
+.sdsync-app [role="combobox"] input:hover,
+.sdsync-app [role="combobox"] input:focus,
+.sdsync-app [role="combobox"] input:focus-visible,
+.sdsync-app [aria-haspopup="listbox"] input:hover,
+.sdsync-app [aria-haspopup="listbox"] input:focus,
+.sdsync-app [aria-haspopup="listbox"] input:focus-visible {
+  border: 0 !important;
+  outline: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
 }
 
 .sdsync-app input:disabled,
 .sdsync-app textarea:disabled,
 .sdsync-app select:disabled,
-.sdsync-app input[readonly],
-.sdsync-app textarea[readonly],
 .sdsync-app [role="combobox"][aria-disabled="true"],
 .sdsync-app [aria-haspopup="listbox"][aria-disabled="true"] {
   color: var(--sdsync-disabled) !important;
@@ -251,7 +427,51 @@
   -webkit-text-fill-color: var(--sdsync-disabled) !important;
 }
 
-.sdsync-app form [aria-invalid="true"],
+.sdsync-app input[readonly],
+.sdsync-app textarea[readonly],
+.sdsync-app [role="combobox"][aria-readonly="true"],
+.sdsync-app [aria-haspopup="listbox"][aria-readonly="true"] {
+  color: var(--sdsync-muted) !important;
+  border-color: var(--sdsync-border) !important;
+  border-style: dashed !important;
+  cursor: default !important;
+  opacity: 1 !important;
+  background-color: var(--sdsync-panel-strong) !important;
+  -webkit-text-fill-color: var(--sdsync-muted) !important;
+}
+
+.sdsync-app input[readonly]:focus,
+.sdsync-app input[readonly]:focus-visible,
+.sdsync-app textarea[readonly]:focus,
+.sdsync-app textarea[readonly]:focus-visible {
+  border-color: var(--sdsync-focus) !important;
+  border-style: solid !important;
+  outline: 0 !important;
+}
+
+.sdsync-app [role="combobox"][aria-readonly="true"]:focus,
+.sdsync-app [role="combobox"][aria-readonly="true"]:focus-visible,
+.sdsync-app [role="combobox"][aria-readonly="true"]:focus-within,
+.sdsync-app [aria-haspopup="listbox"][aria-readonly="true"]:focus,
+.sdsync-app [aria-haspopup="listbox"][aria-readonly="true"]:focus-visible,
+.sdsync-app [aria-haspopup="listbox"][aria-readonly="true"]:focus-within {
+  border-color: var(--sdsync-focus) !important;
+  border-style: solid !important;
+  outline: 0 !important;
+}
+
+.sdsync-app form [aria-invalid="true"]:not(input):not(textarea):not(select):not([role="combobox"]),
+.sdsync-app form [class*="form-item"][aria-invalid="true"] {
+  border-color: transparent !important;
+  outline: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.sdsync-app form input[aria-invalid="true"],
+.sdsync-app form textarea[aria-invalid="true"],
+.sdsync-app form select[aria-invalid="true"],
+.sdsync-app form [role="combobox"][aria-invalid="true"],
 .sdsync-app form [class*="form-item"][class*="error"] input,
 .sdsync-app form [class*="form-item"][class*="error"] textarea,
 .sdsync-app form [class*="form-item"][class*="error"] [role="combobox"],
@@ -260,6 +480,28 @@
   border-color: var(--sdsync-red) !important;
   outline-color: var(--sdsync-red) !important;
   box-shadow: 0 0 0 3px rgba(255, 107, 85, 0.2) !important;
+}
+
+.sdsync-app form input[aria-invalid="true"]:focus,
+.sdsync-app form input[aria-invalid="true"]:focus-visible,
+.sdsync-app form textarea[aria-invalid="true"]:focus,
+.sdsync-app form textarea[aria-invalid="true"]:focus-visible,
+.sdsync-app form select[aria-invalid="true"]:focus,
+.sdsync-app form select[aria-invalid="true"]:focus-visible,
+.sdsync-app form [role="combobox"][aria-invalid="true"]:focus-within {
+  border-color: var(--sdsync-red) !important;
+  outline: 0 !important;
+  box-shadow: none !important;
+}
+
+.sdsync-app form [role="combobox"][aria-invalid="true"] input,
+.sdsync-app form [aria-haspopup="listbox"][aria-invalid="true"] input,
+.sdsync-app form [class*="form-item"][class*="error"] [role="combobox"] input,
+.sdsync-app form [class*="form-item"].invalid [role="combobox"] input {
+  border: 0 !important;
+  outline: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
 }
 
 .sdsync-app form [class*="error"],
@@ -275,29 +517,68 @@
 
 .sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row),
 .sdsync-app [role="button"]:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row),
-.sdsync-app [class*="syno"][class*="button"] {
-  min-height: 32px;
-  padding: 5px 13px !important;
+.sdsync-app [class*="syno"][class*="button"]:is(button, [role="button"]) {
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  gap: 7px !important;
+  min-height: 34px;
+  padding: 6px 13px !important;
   border: 1px solid var(--sdsync-control-border) !important;
-  border-radius: 2px !important;
+  border-radius: 1px !important;
   color: var(--sdsync-text) !important;
   line-height: 20px !important;
+  font-weight: 700 !important;
+  letter-spacing: 0.025em;
+  vertical-align: middle;
+  white-space: nowrap;
   text-shadow: none !important;
   cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
   background: var(--sdsync-panel-strong) !important;
   box-shadow: none !important;
 }
 
 .sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row) *,
 .sdsync-app [role="button"]:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row) *,
-.sdsync-app [class*="syno"][class*="button"] * {
+.sdsync-app [class*="syno"][class*="button"]:is(button, [role="button"]) * {
   color: inherit !important;
   text-shadow: none !important;
 }
 
+.sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row) > .sdsync-action-icon,
+.sdsync-app [role="button"]:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row) > .sdsync-action-icon,
+.sdsync-app [class*="button"] .sdsync-action-icon {
+  display: block !important;
+  width: 15px !important;
+  height: 15px !important;
+  flex: 0 0 15px !important;
+  margin: 0 !important;
+  color: currentColor !important;
+  stroke: currentColor !important;
+  stroke-width: 1.8px !important;
+  stroke-linecap: square !important;
+  stroke-linejoin: miter !important;
+  transform: none !important;
+}
+
+.sdsync-app [class*="button"] [class*="icon"]:not(.sdsync-action-icon) {
+  display: inline-grid !important;
+  width: 16px !important;
+  min-width: 16px !important;
+  height: 16px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  place-items: center;
+  line-height: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
 .sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):hover:not(:disabled),
 .sdsync-app [role="button"]:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):hover:not([aria-disabled="true"]),
-.sdsync-app [class*="syno"][class*="button"]:hover:not(.disabled) {
+.sdsync-app [class*="syno"][class*="button"]:is(button, [role="button"]):hover:not(.disabled) {
   border-color: var(--sdsync-focus) !important;
   color: var(--sdsync-text) !important;
   background: var(--sdsync-control-hover) !important;
@@ -305,11 +586,18 @@
 
 .sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):focus-visible,
 .sdsync-app [role="button"]:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):focus-visible,
-.sdsync-app [class*="syno"][class*="button"].focused {
+.sdsync-app [class*="syno"][class*="button"]:is(button, [role="button"]).focused {
   border-color: var(--sdsync-focus) !important;
   outline: 2px solid var(--sdsync-focus) !important;
   outline-offset: 2px !important;
-  box-shadow: 0 0 0 3px rgba(255, 106, 26, 0.2) !important;
+  box-shadow: none !important;
+}
+
+.sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):active:not(:disabled),
+.sdsync-app [role="button"]:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):active:not([aria-disabled="true"]),
+.sdsync-app [class*="syno"][class*="button"]:is(button, [role="button"]):active:not(.disabled) {
+  transform: translate(1px, 1px);
+  box-shadow: inset 2px 2px 0 rgba(0, 0, 0, 0.32) !important;
 }
 
 .sdsync-app button:disabled,
@@ -323,6 +611,18 @@
   opacity: 1 !important;
   background: var(--sdsync-control-disabled) !important;
   -webkit-text-fill-color: var(--sdsync-disabled) !important;
+  transform: none !important;
+}
+
+/* A Synology button may use a layout wrapper around its actual button. It must
+ * never paint a second border or rounded backing behind that click target. */
+.sdsync-app [class*="syno"][class*="button"]:not(button):not([role="button"]) {
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  outline: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
 }
 
 .sdsync-app button[class*="button"][class*="main"]:not(:disabled):not(.disabled):not([aria-disabled="true"]):not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row),
@@ -383,6 +683,54 @@
   line-height: 20px !important;
 }
 
+.sdsync-app .sdsync-topbar-actions > [class*="button"]:not(button):not([role="button"]) {
+  width: auto !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+/* Clear/reveal/dropdown affordances inside DSM controls are icon targets, not
+ * full action buttons. Keep them aligned without an extra pill or border. */
+.sdsync-app [class*="input"] button:not(.sdsync-field-tip-trigger):not([type="submit"]),
+.sdsync-app [role="combobox"] button:not(.sdsync-field-tip-trigger):not([type="submit"]),
+.sdsync-app [aria-haspopup="listbox"] button:not(.sdsync-field-tip-trigger):not([type="submit"]) {
+  display: inline-grid !important;
+  width: 26px !important;
+  min-width: 26px !important;
+  height: 30px !important;
+  min-height: 30px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  place-items: center;
+  color: var(--sdsync-fire) !important;
+  line-height: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  transform: none !important;
+}
+
+.sdsync-app [class*="input"] button:not(.sdsync-field-tip-trigger):not([type="submit"]):focus-visible,
+.sdsync-app [role="combobox"] button:not(.sdsync-field-tip-trigger):not([type="submit"]):focus-visible,
+.sdsync-app [aria-haspopup="listbox"] button:not(.sdsync-field-tip-trigger):not([type="submit"]):focus-visible {
+  color: var(--sdsync-focus) !important;
+  outline: 2px solid var(--sdsync-focus) !important;
+  outline-offset: -3px !important;
+}
+
+.sdsync-app [class*="input"] button:disabled,
+.sdsync-app [role="combobox"] button:disabled,
+.sdsync-app [aria-haspopup="listbox"] button:disabled {
+  color: var(--sdsync-disabled) !important;
+  cursor: not-allowed !important;
+}
+
 .sdsync-app input[type="checkbox"],
 .sdsync-app input[type="radio"] {
   accent-color: var(--sdsync-fire) !important;
@@ -397,14 +745,27 @@
 
 .sdsync-app [class*="checkbox"] [class*="icon"],
 .sdsync-app [class*="checkbox"] [class*="box"] {
+  display: inline-grid !important;
+  width: 16px !important;
+  min-width: 16px !important;
+  height: 16px !important;
+  padding: 0 !important;
+  border-width: 1px !important;
+  border-style: solid !important;
+  border-radius: 1px !important;
+  place-items: center;
   color: var(--sdsync-text) !important;
   border-color: var(--sdsync-control-border) !important;
   background-color: var(--sdsync-control) !important;
+  box-shadow: none !important;
 }
 
 .sdsync-app [class*="checkbox"].checked [class*="icon"],
 .sdsync-app [class*="checkbox"].checked [class*="box"],
-.sdsync-app [class*="checkbox"] input:checked + * {
+.sdsync-app [class*="checkbox"] input:checked + [class*="icon"],
+.sdsync-app [class*="checkbox"] input:checked + [class*="box"],
+.sdsync-app [class*="checkbox"] input:checked ~ [class*="icon"],
+.sdsync-app [class*="checkbox"] input:checked ~ [class*="box"] {
   color: var(--sdsync-on-accent) !important;
   border-color: var(--sdsync-fire) !important;
   background-color: var(--sdsync-fire) !important;
@@ -418,10 +779,49 @@
   opacity: 1 !important;
 }
 
-.sdsync-app [class*="checkbox"] input:focus-visible + *,
+.sdsync-app [class*="checkbox"].disabled [class*="icon"],
+.sdsync-app [class*="checkbox"].disabled [class*="box"],
+.sdsync-app [class*="checkbox"] input:disabled + * {
+  color: var(--sdsync-disabled) !important;
+  border-color: var(--sdsync-border) !important;
+  background-color: var(--sdsync-control-disabled) !important;
+}
+
+.sdsync-app [class*="checkbox"]:hover:not(.disabled):not([aria-disabled="true"]) [class*="icon"],
+.sdsync-app [class*="checkbox"]:hover:not(.disabled):not([aria-disabled="true"]) [class*="box"] {
+  border-color: var(--sdsync-focus) !important;
+}
+
+.sdsync-app [class*="checkbox"] input:focus-visible + [class*="icon"],
+.sdsync-app [class*="checkbox"] input:focus-visible + [class*="box"],
+.sdsync-app [class*="checkbox"] input:focus-visible ~ [class*="icon"],
+.sdsync-app [class*="checkbox"] input:focus-visible ~ [class*="box"],
 .sdsync-app [class*="checkbox"].focused [class*="icon"] {
   outline: 2px solid var(--sdsync-focus) !important;
   outline-offset: 2px !important;
+}
+
+.sdsync-app label[class*="checkbox"],
+.sdsync-app [class*="checkbox"] > label {
+  display: inline-flex !important;
+  min-height: 20px;
+  align-items: flex-start;
+  gap: 8px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.sdsync-app [class*="checkbox"].disabled > label,
+.sdsync-app [class*="checkbox"][aria-disabled="true"] > label {
+  cursor: not-allowed;
+}
+
+.sdsync-app form [class*="checkbox"][aria-invalid="true"] [class*="icon"],
+.sdsync-app form [class*="checkbox"][aria-invalid="true"] [class*="box"],
+.sdsync-app form [class*="form-item"][class*="error"] [class*="checkbox"] [class*="icon"],
+.sdsync-app form [class*="form-item"][class*="error"] [class*="checkbox"] [class*="box"] {
+  border-color: var(--sdsync-red) !important;
+  box-shadow: 0 0 0 3px rgba(255, 107, 85, 0.2) !important;
 }
 
 .sdsync-app [role="listbox"],
@@ -477,7 +877,7 @@
   --sdsync-shadow: 8px 8px 0 rgba(0, 0, 0, 0.42);
   color: var(--sdsync-text) !important;
   border: 1px solid var(--sdsync-control-border) !important;
-  border-radius: 2px !important;
+  border-radius: 1px !important;
   color-scheme: dark;
   background: var(--sdsync-panel-strong) !important;
   box-shadow: var(--sdsync-shadow) !important;
@@ -505,17 +905,23 @@
 .sdsync-select-dropdown [class*="menu"],
 .sdsync-select-dropdown [class*="scroll"] {
   color: var(--sdsync-text) !important;
-  border-color: var(--sdsync-control-border) !important;
+  border: 0 !important;
+  outline: 0 !important;
   background-color: var(--sdsync-panel-strong) !important;
+  box-shadow: none !important;
   scrollbar-color: var(--sdsync-control-border) var(--sdsync-control);
 }
 
 .sdsync-select-dropdown input,
 .sdsync-select-dropdown [role="combobox"] {
+  min-height: 32px;
+  padding: 6px 8px !important;
   color: var(--sdsync-text) !important;
-  border-color: var(--sdsync-control-border) !important;
+  border: 1px solid var(--sdsync-control-border) !important;
+  border-radius: 1px !important;
   outline: none !important;
   background: var(--sdsync-control) !important;
+  box-shadow: none !important;
   -webkit-text-fill-color: var(--sdsync-text) !important;
 }
 
@@ -529,17 +935,23 @@
 .sdsync-select-dropdown input:focus,
 .sdsync-select-dropdown input:focus-visible,
 .sdsync-select-dropdown [role="combobox"]:focus,
-.sdsync-select-dropdown [role="combobox"]:focus-visible {
+.sdsync-select-dropdown [role="combobox"]:focus-visible,
+.sdsync-select-dropdown [role="combobox"]:focus-within {
   border-color: var(--sdsync-focus) !important;
-  outline: 2px solid var(--sdsync-focus) !important;
-  outline-offset: 1px !important;
+  outline: 0 !important;
+  background: var(--sdsync-control-hover) !important;
+  box-shadow: none !important;
 }
 
 .sdsync-select-dropdown [role="option"],
 .sdsync-select-dropdown [class*="option"],
 .sdsync-select-dropdown [class*="item"],
 .sdsync-select-dropdown li {
+  min-height: 30px;
+  padding: 7px 9px !important;
+  border-left: 2px solid transparent !important;
   color: var(--sdsync-text) !important;
+  line-height: 16px !important;
   text-shadow: none !important;
   background-color: transparent !important;
 }
@@ -563,6 +975,7 @@
 .sdsync-select-dropdown [class*="item"].selected,
 .sdsync-select-dropdown li:hover {
   color: var(--sdsync-text) !important;
+  border-left-color: var(--sdsync-fire) !important;
   outline-color: var(--sdsync-focus) !important;
   background-color: var(--sdsync-control-hover) !important;
 }
@@ -581,10 +994,45 @@
   color: var(--sdsync-fire) !important;
 }
 
-.sdsync-select-dropdown svg,
-.sdsync-select-dropdown [class*="icon"] {
+.sdsync-select-dropdown [class*="icon"]:not(.sdsync-action-icon) {
+  display: inline-grid !important;
+  width: 16px !important;
+  min-width: 16px !important;
+  height: 16px !important;
+  padding: 0 !important;
+  border: 0 !important;
+  place-items: center;
   color: var(--sdsync-fire) !important;
-  fill: currentColor !important;
+  line-height: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.sdsync-select-dropdown svg {
+  display: block !important;
+  width: 12px !important;
+  height: 12px !important;
+  overflow: visible !important;
+  margin: 0 !important;
+  color: var(--sdsync-fire) !important;
+  fill: none !important;
+  stroke: currentColor !important;
+  stroke-width: 1.75px !important;
+  stroke-linecap: square !important;
+  stroke-linejoin: miter !important;
+  transform: none !important;
+}
+
+.sdsync-select-dropdown [role="option"][aria-disabled="true"] svg,
+.sdsync-select-dropdown [class*="option"].disabled svg,
+.sdsync-select-dropdown [class*="item"].disabled svg {
+  color: var(--sdsync-disabled) !important;
+}
+
+.sdsync-app [role="combobox"][aria-disabled="true"] svg,
+.sdsync-app [aria-haspopup="listbox"][aria-disabled="true"] svg,
+.sdsync-app [class*="select"].disabled svg {
+  color: var(--sdsync-disabled) !important;
 }
 
 .sdsync-select-dropdown [role="option"][aria-disabled="true"],
@@ -595,6 +1043,7 @@
   cursor: not-allowed !important;
   opacity: 1 !important;
   background-color: var(--sdsync-control-disabled) !important;
+  border-left-color: transparent !important;
   -webkit-text-fill-color: var(--sdsync-disabled) !important;
 }
 
@@ -654,6 +1103,16 @@
   outline: 2px solid var(--sdsync-focus) !important;
   outline-offset: 2px !important;
   background: var(--sdsync-control-hover) !important;
+}
+
+.sdsync-field-tip-trigger .sdsync-action-icon,
+.sdsync-field-tip-trigger button .sdsync-action-icon {
+  display: block !important;
+  width: 14px !important;
+  height: 14px !important;
+  margin: 0 !important;
+  color: currentColor !important;
+  stroke: currentColor !important;
 }
 
 .sdsync-field-tip-content {
@@ -783,9 +1242,37 @@
   background: rgba(255, 106, 26, 0.12);
 }
 
+.sdsync-action-icon {
+  display: inline-block !important;
+  flex: 0 0 auto;
+  overflow: visible;
+  margin: 0 2px 0 0;
+  color: currentColor;
+  fill: none !important;
+  stroke: currentColor !important;
+  stroke-linecap: square !important;
+  stroke-linejoin: miter !important;
+  vertical-align: -0.15em;
+  vector-effect: non-scaling-stroke;
+}
+
 .sdsync-nav-icon {
-  font-size: 18px;
+  display: inline-grid;
+  width: 24px;
+  min-width: 24px;
+  height: 24px;
+  place-items: center;
+  color: inherit;
+  line-height: 0;
   text-align: center;
+}
+
+.sdsync-nav-icon .sdsync-action-icon {
+  width: 18px !important;
+  height: 18px !important;
+  margin: 0 !important;
+  stroke-width: 1.8px !important;
+  transform: none !important;
 }
 
 .sdsync-sidebar-foot {
@@ -949,30 +1436,37 @@
 .sdsync-pill {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   width: fit-content;
+  min-height: 22px;
   margin-bottom: 11px;
-  padding: 4px 8px;
+  padding: 4px 7px;
   border: 1px solid rgba(255, 106, 26, 0.5);
   border-radius: 1px;
   color: var(--sdsync-fire);
   font-family: "Cascadia Mono", Consolas, monospace;
   font-size: 10px;
   font-weight: 700;
-  line-height: 1;
+  line-height: 12px;
+  letter-spacing: 0.045em;
+  white-space: nowrap;
   text-transform: capitalize;
   background: rgba(255, 106, 26, 0.1);
+  box-shadow: inset 2px 0 0 rgba(255, 106, 26, 0.32);
 }
 
 .sdsync-pill.failed {
   color: var(--sdsync-red);
   border-color: rgba(255, 107, 85, 0.55);
   background: rgba(215, 46, 22, 0.14);
+  box-shadow: inset 2px 0 0 rgba(255, 107, 85, 0.34);
 }
 
 .sdsync-pill.neutral {
   color: var(--sdsync-muted);
   border-color: var(--sdsync-border);
   background: var(--sdsync-panel-strong);
+  box-shadow: inset 2px 0 0 var(--sdsync-border);
 }
 
 .sdsync-metrics {
@@ -1392,18 +1886,22 @@
 
 .sdsync-native-input {
   width: 100%;
-  min-height: 30px;
-  padding: 5px 8px;
-  border: 1px solid var(--sdsync-border);
-  border-radius: 2px;
+  min-height: 34px;
+  padding: 6px 9px;
+  border: 1px solid var(--sdsync-control-border);
+  border-radius: 1px;
   color: var(--sdsync-text);
   outline: none;
-  background: var(--sdsync-bg);
+  background: var(--sdsync-control);
+  box-shadow: none;
 }
 
-.sdsync-native-input:focus {
+.sdsync-native-input:focus,
+.sdsync-native-input:focus-visible {
   border-color: var(--sdsync-focus);
-  box-shadow: 0 0 0 2px rgba(255, 106, 26, 0.18);
+  outline: 0;
+  background: var(--sdsync-control-hover);
+  box-shadow: none;
 }
 
 .sdsync-timeline {

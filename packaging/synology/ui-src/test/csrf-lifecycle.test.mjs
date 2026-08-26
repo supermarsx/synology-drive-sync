@@ -63,6 +63,7 @@ async function loadAppComponent(postSpy, getSpy) {
     formatDuration: String,
     numberOr: (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback,
     pick: (model, ...keys) => keys.map((key) => model && model[key]).find((value) => value !== undefined),
+    ActionIcon: { name: "ActionIcon" },
     SecurityPanel: {}
   };
   return Function(...Object.keys(stubs), executable)(...Object.values(stubs));

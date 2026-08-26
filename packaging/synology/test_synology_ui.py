@@ -257,6 +257,8 @@ class DsmUiContractTests(unittest.TestCase):
             (UI_SOURCE / "webpack.config.js").read_bytes(),
             (UI_SOURCE / "config.define").read_bytes(),
             (UI_SOURCE / "package.json").read_bytes(),
+            (UI_SOURCE / "src/ActionIcon.js").read_bytes(),
+            (UI_SOURCE / "src/SecurityPanel.vue").read_bytes(),
         )
         app_text = app.decode()
         css_text = css.decode()
@@ -665,6 +667,7 @@ async function capture(promise) {
                 r'''
 const ACTIONS = { execute: "action" };
 const SNAPSHOT_SCHEMA = "sdsync.dsm-api.v1";
+const ActionIcon = {};
 const SecurityPanel = {};
 const boundedText = (value, fallback = "") =>
   String(typeof value === "string" && value ? value : fallback).slice(0, 65536);
@@ -925,6 +928,7 @@ function bind(context, names) {
         for source in (
             UI_SOURCE / "src/main.js",
             UI_SOURCE / "src/api.js",
+            UI_SOURCE / "src/ActionIcon.js",
             UI_SOURCE / "dist/SynologyDriveSync.js",
         ):
             result = subprocess.run(
@@ -1154,6 +1158,8 @@ function bind(context, names) {
             "webpack": (UI_SOURCE / "webpack.config.js").read_bytes(),
             "config_define": (UI_SOURCE / "config.define").read_bytes(),
             "package": (UI_SOURCE / "package.json").read_bytes(),
+            "action_icon": (UI_SOURCE / "src/ActionIcon.js").read_bytes(),
+            "security_panel": (UI_SOURCE / "src/SecurityPanel.vue").read_bytes(),
         }
 
         def validate_build(**overrides: bytes) -> None:
@@ -1167,6 +1173,46 @@ function bind(context, names) {
                 payloads["webpack"],
                 payloads["config_define"],
                 payloads["package"],
+                payloads["action_icon"],
+                payloads["security_panel"],
+            )
+
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError,
+            "shared ActionIcon validation requires both component sources",
+        ):
+            validate_spk.validate_native_build_contract(
+                source["main"],
+                source["app"],
+                source["api"],
+                source["css"],
+                source["webpack"],
+                source["config_define"],
+                source["package"],
+                source["action_icon"],
+            )
+        self.assertIn(b"overview: [", source["action_icon"])
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError,
+            "shared ActionIcon source is missing canonical icon 'overview'",
+        ):
+            validate_build(
+                action_icon=source["action_icon"].replace(
+                    b"overview: [", b"overview_removed: [", 1
+                )
+            )
+        security_import = b'import { ActionIcon } from "./ActionIcon";'
+        self.assertIn(security_import, source["security_panel"])
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError,
+            "native DSM security panel is missing shared ActionIcon contract",
+        ):
+            validate_build(
+                security_panel=source["security_panel"].replace(
+                    security_import,
+                    b'import { ActionIcon } from "./MissingActionIcon";',
+                    1,
+                )
             )
 
         with self.assertRaisesRegex(validate_spk.ValidationError, "AppWindow structure"):

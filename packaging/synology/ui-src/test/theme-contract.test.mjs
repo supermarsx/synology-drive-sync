@@ -94,7 +94,16 @@ test("every native and DSM Vue control state is explicitly dark themed", () => {
     assert.match(app, new RegExp(`<${component}\\b`), `AppWindow no longer exercises ${component}`);
   }
   assert.match(css, /-webkit-text-fill-color:\s*var\(--sdsync-disabled\)\s*!important/);
-  assert.match(css, /outline:\s*2px solid var\(--sdsync-focus\)\s*!important/);
+  assert.match(
+    css,
+    /input:not\(\[type="checkbox"\]\):not\(\[type="radio"\]\):focus-visible,[\s\S]*?textarea:focus-visible,[\s\S]*?select:focus-visible,[\s\S]*?\{[\s\S]*?border-color:\s*var\(--sdsync-focus\)\s*!important;[\s\S]*?outline:\s*(?:none|0)\s*!important;[\s\S]*?box-shadow:\s*none\s*!important;/,
+    "form controls must replace the DSM border with one focus border, not stack an outer ring"
+  );
+  assert.match(
+    css,
+    /button:not\([^\n]+\):focus-visible,[\s\S]*?\{[\s\S]*?outline:\s*2px solid var\(--sdsync-focus\)\s*!important;/,
+    "discrete buttons still need an external keyboard focus outline"
+  );
   assert.match(css, /box-shadow:\s*0 0 0 3px rgba\(255, 107, 85, 0\.2\)\s*!important/);
 });
 
@@ -200,7 +209,7 @@ test("hellfire palette and pixel-sharp trace geometry stay coherent", () => {
 test("Refresh uses a compact rectangular border control", () => {
   assert.match(
     app,
-    /<v-button\s+type="border"[\s\S]{0,220}>Refresh<\/v-button>/
+    /<v-button\s+type="border"[\s\S]{0,280}>[\s\S]*?<template #icon><action-icon name="refresh"\s*\/><\/template>Refresh<\/v-button>/
   );
   const topbarTheme = declarations(".sdsync-app .sdsync-topbar-actions > [class*=\"button\"],\n.sdsync-app .sdsync-topbar-actions button,\n.sdsync-app .sdsync-topbar-actions [role=\"button\"]");
   assert.match(topbarTheme, /min-width:\s*76px\s*!important/);

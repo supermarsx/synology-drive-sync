@@ -64,6 +64,7 @@ async function loadAppComponent(postSpy, trace) {
     formatDuration: String,
     numberOr: (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback,
     pick: (model, ...keys) => keys.map((key) => model && model[key]).find((value) => value !== undefined),
+    ActionIcon: { name: "ActionIcon" },
     SecurityPanel: {}
   };
   return Function(...Object.keys(stubs), executable)(...Object.values(stubs));
@@ -284,8 +285,8 @@ test("operational pages contain no marketing hero, placeholder card, or Help-onl
   ]) assert.ok(!app.includes(forbidden), `App.vue retains filler marker ${forbidden}`);
   assert.match(app, /class="sdsync-overview-status" aria-label="Service status and actions"/);
   assert.match(app, /<span>Service<\/span>[\s\S]*?\{\{ serviceState \}\}/);
-  assert.match(app, />Plan all profiles<\/v-button>/);
-  assert.match(app, />Run all profiles<\/v-button>/);
+  assert.match(app, /<v-button\b[^>]*@click="quickPlan"[^>]*>[\s\S]*?<action-icon name="plan"\s*\/>[\s\S]*?Plan all profiles<\/v-button>/);
+  assert.match(app, /<v-button\b[^>]*@click="quickRun"[^>]*>[\s\S]*?<action-icon name="run"\s*\/>[\s\S]*?Run all profiles<\/v-button>/);
 });
 
 test("configurable DSM controls use real accessible help markup and themed portal menus", () => {
@@ -339,7 +340,7 @@ test("complete security policy, client-event auditing, activity filters, and sta
     "Stale · last successful snapshot retained", "this.snapshot ?"
   ]) assert.ok(app.includes(marker), `App.vue lacks ${marker}`);
   assert.doesNotMatch(app, /this\.snapshot\s*=\s*null/);
-  assert.match(app, />Retry<\/v-button>/);
+  assert.match(app, /<v-button\b[^>]*@click="refreshSnapshot\(true\)"[^>]*>[\s\S]*?<action-icon name="refresh"\s*\/>[\s\S]*?Retry<\/v-button>/);
   assert.match(panel, /:disabled="disabled \|\| busy \|\| !dirty"/);
   assert.match(panel, /@input="updateField\(control\.key, \$event === true\)"/);
   assert.match(panel, /<v-form-item label="Policy version">[\s\S]*?:value="policyVersionLabel"[\s\S]*?readonly/);
