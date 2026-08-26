@@ -1367,6 +1367,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         bridge.write_text(
             f"#!{sys.executable}\n"
             "import ctypes\n"
+            "import fcntl\n"
             "import json\n"
             "import os\n"
             "from pathlib import Path\n"
@@ -1716,8 +1717,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "        return True\n"
             "    raise SystemExit(64)\n"
             "\n"
-            "def handle_mock_audit_transaction():\n"
-            "    arguments = sys.argv[1:]\n"
+            "def dispatch_mock_audit_transaction(arguments):\n"
             "    if len(arguments) == 3 and arguments[:2] == ['--audit-transaction', 'repair-log-tail']:\n"
             "        repair_mock_log_tail(arguments[2])\n"
             "        return True\n"
@@ -1766,6 +1766,25 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "        if not target.is_file():\n"
             "            raise SystemExit(73)\n"
             "        record = json.loads(target.read_text(encoding='utf-8'))\n"
+            "        complete_ready = os.environ.get('SDSYNC_TEST_AUDIT_COMPLETE_WRITE_READY')\n"
+            "        complete_release = os.environ.get('SDSYNC_TEST_AUDIT_COMPLETE_WRITE_RELEASE')\n"
+            "        if complete_ready:\n"
+            "            if not complete_release:\n"
+            "                raise SystemExit(64)\n"
+            "            reconcile_arm = os.environ.get('SDSYNC_TEST_AUDIT_RECONCILE_LOCK_ARM')\n"
+            "            if not reconcile_arm:\n"
+            "                raise SystemExit(64)\n"
+            "            Path(reconcile_arm).write_text('reconcile-armed\\n', encoding='ascii')\n"
+            "            target.write_bytes(b'')\n"
+            "            target.chmod(0o600)\n"
+            "            Path(complete_ready).write_text('audit-write-paused\\n', encoding='ascii')\n"
+            "            deadline = time.monotonic() + 10\n"
+            "            while not Path(complete_release).exists() and time.monotonic() < deadline:\n"
+            "                time.sleep(0.01)\n"
+            "            if not Path(complete_release).exists():\n"
+            "                target.write_text(json.dumps(record, separators=(',', ':')), encoding='utf-8')\n"
+            "                target.chmod(0o600)\n"
+            "                raise SystemExit(75)\n"
             "        record['terminal_state'] = state\n"
             "        target.write_text(json.dumps(record, separators=(',', ':')), encoding='utf-8')\n"
             "        target.chmod(0o600)\n"
@@ -1781,6 +1800,25 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "            raise SystemExit(73)\n"
             "        return True\n"
             "    return False\n"
+            "\n"
+            "def handle_mock_audit_transaction():\n"
+            "    arguments = sys.argv[1:]\n"
+            "    if not arguments or arguments[0] != '--audit-transaction':\n"
+            "        return False\n"
+            "    if len(arguments) < 2 or arguments[1] not in ('reconcile', 'begin', 'execute', 'complete'):\n"
+            "        return dispatch_mock_audit_transaction(arguments)\n"
+            "    lock_path = Path(os.environ['SYNOPKG_PKGVAR']) / 'run/audit-outbox.flock'\n"
+            "    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, 'O_CLOEXEC', 0), 0o600)\n"
+            "    try:\n"
+            "        if arguments == ['--audit-transaction', 'reconcile']:\n"
+            "            reconcile_attempt = os.environ.get('SDSYNC_TEST_AUDIT_RECONCILE_LOCK_ATTEMPT')\n"
+            "            reconcile_arm = os.environ.get('SDSYNC_TEST_AUDIT_RECONCILE_LOCK_ARM')\n"
+            "            if reconcile_attempt and reconcile_arm and Path(reconcile_arm).exists():\n"
+            "                Path(reconcile_attempt).write_text('reconcile-lock-attempt\\n', encoding='ascii')\n"
+            "        fcntl.flock(descriptor, fcntl.LOCK_EX)\n"
+            "        return dispatch_mock_audit_transaction(arguments)\n"
+            "    finally:\n"
+            "        os.close(descriptor)\n"
             "\n"
             "if handle_runtime_markers():\n"
             "    raise SystemExit(0)\n"
@@ -5031,6 +5069,88 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             ["requested", "outcome_unknown"],
         )
         install_manager(original_manager)
+
+    def test_controller_reload_serializes_with_terminal_audit_write(self) -> None:
+        self.assertEqual(
+            self.configure("reload-race", self.source_one, "/home/Drive/Reload", True).returncode,
+            0,
+        )
+        password = self.root / "reload-race.password"
+        password.write_text("test-password\n", encoding="utf-8")
+        stored = self.shell(
+            self.manager, "set-password", "reload-race", "--from-file", str(password)
+        )
+        self.assertEqual(stored.returncode, 0, stored.stderr)
+        write_ready = self.root / "audit-complete-write.ready"
+        write_release = self.root / "audit-complete-write.release"
+        reconcile_arm = self.root / "audit-reconcile.arm"
+        reconcile_attempt = self.root / "audit-reconcile-lock.attempt"
+        self.environment.update(
+            {
+                "SDSYNC_TEST_AUDIT_RECONCILE_LOCK_ARM": str(reconcile_arm),
+                "SDSYNC_TEST_AUDIT_RECONCILE_LOCK_ATTEMPT": str(reconcile_attempt),
+            }
+        )
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+
+        controller_pid_path = self.real_var / "run/controller.pid"
+        hidden_controller_pid_path = self.real_var / "run/controller.pid.reload-test"
+        controller_pid = int(controller_pid_path.read_text(encoding="ascii").strip())
+        # Prevent enable's normal reload from coalescing with the exact HUP
+        # injected below. Restore the PID record before readiness validation.
+        controller_pid_path.rename(hidden_controller_pid_path)
+        enabled = self.shell_process(
+            self.manager,
+            "enable",
+            "--interval",
+            "3600",
+            extra_environment={
+                "SDSYNC_TEST_AUDIT_COMPLETE_WRITE_READY": str(write_ready),
+                "SDSYNC_TEST_AUDIT_COMPLETE_WRITE_RELEASE": str(write_release),
+            },
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while not write_ready.is_file() and enabled.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(write_ready.is_file(), "audit completion did not reach its locked write barrier")
+
+            hidden_controller_pid_path.rename(controller_pid_path)
+            os.kill(controller_pid, signal.SIGHUP)
+            deadline = time.monotonic() + 10
+            while (
+                not reconcile_attempt.is_file()
+                and enabled.poll() is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertTrue(
+                reconcile_attempt.is_file(),
+                "controller reconciliation did not reach the held audit lock",
+            )
+            self.assertIsNone(enabled.poll(), "audit completion escaped its injected write barrier")
+            status = self.shell(self.lifecycle, "status")
+            self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+
+            write_release.write_text("release\n", encoding="ascii")
+            stdout, stderr = enabled.communicate(timeout=15)
+            self.assertEqual(enabled.returncode, 0, stdout + stderr)
+            self.capture.write_text("", encoding="utf-8")
+            planned = self.shell(self.manager, "plan", "--all")
+            self.assertEqual(planned.returncode, 0, planned.stderr)
+            self.assertIn("plan --all-profiles", self.capture.read_text(encoding="utf-8"))
+        finally:
+            write_release.touch(exist_ok=True)
+            if hidden_controller_pid_path.exists() and not controller_pid_path.exists():
+                hidden_controller_pid_path.rename(controller_pid_path)
+            if enabled.poll() is None:
+                enabled.terminate()
+                try:
+                    enabled.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    enabled.kill()
+                    enabled.wait(timeout=5)
 
     def test_default_scope_explicit_all_caps_and_command_specific_options(self) -> None:
         self.assertEqual(
