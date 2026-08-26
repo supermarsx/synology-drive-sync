@@ -66,7 +66,25 @@ $architecture = switch ($osArchitecture) {
 
 $headers = @{ 'User-Agent' = 'synology-drive-sync-installer' }
 if ([string]::IsNullOrEmpty($Version)) {
-    $release = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$Repository/releases/latest"
+    $apiHeaders = @{ 'User-Agent' = $headers['User-Agent'] }
+    $githubToken = [Environment]::GetEnvironmentVariable('GH_TOKEN')
+    if ([string]::IsNullOrEmpty($githubToken)) {
+        $githubToken = [Environment]::GetEnvironmentVariable('GITHUB_TOKEN')
+    }
+    try {
+        if (-not [string]::IsNullOrEmpty($githubToken)) {
+            if ($githubToken.Length -gt 4096 -or $githubToken -notmatch '^[!-~]+$') {
+                throw 'GitHub token must be at most 4096 non-whitespace printable ASCII characters.'
+            }
+            $apiHeaders['Authorization'] = "Bearer $githubToken"
+        }
+        $release = Invoke-RestMethod -Headers $apiHeaders -Uri "https://api.github.com/repos/$Repository/releases/latest"
+    }
+    finally {
+        [void] $apiHeaders.Remove('Authorization')
+        $githubToken = $null
+        Remove-Variable -Name githubToken -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
+    }
     $Version = [string] $release.tag_name
     if ($Version -notmatch '^[0-9]{2}\.[1-9][0-9]*$') {
         throw "Latest release tag is not calendar form YY.N: $Version"
@@ -225,8 +243,32 @@ try {
         (($candidateItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
         throw 'Verified archive did not contain the expected executable.'
     }
-    $reportedVersionLines = @(& $candidate --version)
-    $versionExitCode = $LASTEXITCODE
+    $hadGhToken = Test-Path -LiteralPath 'Env:GH_TOKEN'
+    $hadGithubToken = Test-Path -LiteralPath 'Env:GITHUB_TOKEN'
+    $previousGhToken = [Environment]::GetEnvironmentVariable('GH_TOKEN')
+    $previousGithubToken = [Environment]::GetEnvironmentVariable('GITHUB_TOKEN')
+    try {
+        [Environment]::SetEnvironmentVariable('GH_TOKEN', $null, 'Process')
+        [Environment]::SetEnvironmentVariable('GITHUB_TOKEN', $null, 'Process')
+        $reportedVersionLines = @(& $candidate --version)
+        $versionExitCode = $LASTEXITCODE
+    }
+    finally {
+        if ($hadGhToken) {
+            [Environment]::SetEnvironmentVariable('GH_TOKEN', $previousGhToken, 'Process')
+        }
+        else {
+            [Environment]::SetEnvironmentVariable('GH_TOKEN', $null, 'Process')
+        }
+        if ($hadGithubToken) {
+            [Environment]::SetEnvironmentVariable('GITHUB_TOKEN', $previousGithubToken, 'Process')
+        }
+        else {
+            [Environment]::SetEnvironmentVariable('GITHUB_TOKEN', $null, 'Process')
+        }
+        $previousGhToken = $null
+        $previousGithubToken = $null
+    }
     $expectedVersion = "synology-drive-sync $Version"
     if ($versionExitCode -ne 0 -or
         $reportedVersionLines.Count -ne 1 -or

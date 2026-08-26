@@ -85,7 +85,12 @@ jobs:
           cargo build --profile ffi-release --locked
           -p synology-drive-sync-ffi --target "${{ matrix.target }}"
       - name: Exercise non-mutating Windows release installer
-        if: matrix.target == 'x86_64-pc-windows-msvc'
+        if: >-
+          matrix.target == 'x86_64-pc-windows-msvc' &&
+          (github.event_name == 'push' ||
+          github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'

@@ -485,6 +485,63 @@ class AssetContractTests(unittest.TestCase):
 
 
 class WorkflowWiringTests(unittest.TestCase):
+    def test_windows_installer_uses_ci_token_only_for_github_api(self):
+        ci = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+        installer = (REPOSITORY_ROOT / "packaging/install.ps1").read_text(
+            encoding="utf-8"
+        )
+        step_start = ci.index(
+            "      - name: Exercise non-mutating Windows release installer"
+        )
+        step_end = ci.index("\n\n  coverage:", step_start)
+        installer_step = ci[step_start:step_end]
+
+        self.assertIn("github.event_name == 'push'", installer_step)
+        self.assertIn(
+            "github.event.pull_request.head.repo.full_name == github.repository",
+            installer_step,
+        )
+        self.assertIn("GITHUB_TOKEN: ${{ github.token }}", installer_step)
+        self.assertIn(
+            "[Environment]::GetEnvironmentVariable('GH_TOKEN')", installer
+        )
+        self.assertIn(
+            "[Environment]::GetEnvironmentVariable('GITHUB_TOKEN')", installer
+        )
+        self.assertLess(
+            installer.index("[Environment]::GetEnvironmentVariable('GH_TOKEN')"),
+            installer.index("[Environment]::GetEnvironmentVariable('GITHUB_TOKEN')"),
+        )
+        self.assertIn("$githubToken.Length -gt 4096", installer)
+        self.assertIn("$githubToken -notmatch '^[!-~]+$'", installer)
+        self.assertIn(
+            '$apiHeaders[\'Authorization\'] = "Bearer $githubToken"', installer
+        )
+        self.assertIn("$apiHeaders.Remove('Authorization')", installer)
+        self.assertIn("$githubToken = $null", installer)
+        self.assertIn(
+            "Remove-Variable -Name githubToken -ErrorAction SilentlyContinue "
+            "-WhatIf:$false -Confirm:$false",
+            installer,
+        )
+        self.assertEqual(installer.count("Invoke-RestMethod -Headers $apiHeaders"), 1)
+        self.assertEqual(installer.count("Invoke-WebRequest -Headers $headers"), 2)
+        self.assertNotIn("Invoke-WebRequest -Headers $apiHeaders", installer)
+        child_start = installer.index("$reportedVersionLines = @(& $candidate --version)")
+        child_end = installer.index("$expectedVersion =", child_start)
+        for name, previous in (
+            ("GH_TOKEN", "$previousGhToken"),
+            ("GITHUB_TOKEN", "$previousGithubToken"),
+        ):
+            clear = (
+                f"[Environment]::SetEnvironmentVariable('{name}', $null, 'Process')"
+            )
+            restore = f"[Environment]::SetEnvironmentVariable('{name}', {previous}"
+            self.assertLess(installer.index(clear), child_start)
+            self.assertIn(restore, installer[child_start:child_end])
+
     def test_packaging_checkout_fetches_tagged_dsm_upgrade_fixtures(self):
         workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(
             encoding="utf-8"
