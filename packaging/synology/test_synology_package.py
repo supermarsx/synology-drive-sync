@@ -1864,7 +1864,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "    libc = ctypes.CDLL(None, use_errno=True)\n"
             "    if libc.prctl(1, signal.SIGUSR1, 0, 0, 0) != 0 or os.getppid() != expected_parent:\n"
             "        raise SystemExit(73)\n"
-            "    controller = str(Path(os.environ['SYNOPKG_PKGDEST']) / 'libexec/sdsync-controller')\n"
+            "    controller = os.environ.get('SDSYNC_TEST_CONTROLLER_EXEC_PATH') or "
+            "str(Path(os.environ['SYNOPKG_PKGDEST']) / 'libexec/sdsync-controller')\n"
             "    os.execv(controller, [controller])\n"
             "\n"
             f"{consumer_tree}"
@@ -5842,7 +5843,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             'mv -f "$controller_pid_temp" "$controller_pid_file"\n'
             "publish_controller_ready\n"
             "set +e\n"
-            '"$runner" "$@"\n'
+            '"$runner" sync personal false scheduled -\n'
             "runner_status=$?\n"
             "set -e\n"
             'exit "$runner_status"\n',
@@ -5901,7 +5902,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                     os.chown(path, self.drop_uid, self.drop_gid)
             self.assert_injected_launch_is_reaped(
                 controller,
-                ("sync", "personal", "false", "scheduled", "-"),
+                (),
                 environment,
                 pid_file,
                 ready,
@@ -8066,6 +8067,205 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         ):
             self.assertFalse(path.exists(), path)
         self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
+
+    def test_physical_package_destination_accepts_framework_controller_exec_alias(self) -> None:
+        framework_controller = self.fhs / "target/libexec/sdsync-controller"
+        physical_controller = self.real_target / "libexec/sdsync-controller"
+        runtime_identity_result = self.root / "runtime-controller-alias.accepted"
+        identity_probe = self.root / "controller-alias-identity-probe"
+        identity_probe.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "case $1 in\n"
+            "  lifecycle)\n"
+            '    . "${SDSYNC_TEST_LIFECYCLE_COMMON:?}"\n'
+            '    controller_pid_matches "$2"\n'
+            "    ;;\n"
+            "  runtime)\n"
+            '    . "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+            '    pid_matches_command "$2" "$controller"\n'
+            "    ;;\n"
+            "  runtime-ready)\n"
+            '    . "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+            "    controller_ready_status\n"
+            "    ;;\n"
+            "  runtime-parent)\n"
+            '    . "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+            "    require_verified_controller_parent\n"
+            "    controller_ready_status\n"
+            '    printf \'runtime-parent-ok\\n\' > "${SDSYNC_TEST_RUNTIME_CONTROLLER_IDENTITY_RESULT:?}"\n'
+            "    ;;\n"
+            "  lifecycle-file)\n"
+            '    . "${SDSYNC_TEST_LIFECYCLE_COMMON:?}"\n'
+            '    alias_owner=$(stat -L -c \'%u\' "$package_home")\n'
+            '    same_private_executable "$2" "$3" "$alias_owner"\n'
+            "    ;;\n"
+            "  runtime-file)\n"
+            '    . "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+            '    same_private_executable "$2" "$3" "$path_owner"\n'
+            "    ;;\n"
+            "  *) exit 64 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        identity_probe.chmod(0o755)
+
+        controller_source = physical_controller.read_text(encoding="utf-8")
+        ready_call = "publish_controller_ready\n"
+        self.assertEqual(controller_source.count(ready_call), 1)
+        physical_controller.write_text(
+            controller_source.replace(
+                ready_call,
+                ready_call
+                + 'if [ -n "${SDSYNC_TEST_RUNTIME_CONTROLLER_IDENTITY_PROBE:-}" ]; then\n'
+                + '    /bin/sh "$SDSYNC_TEST_RUNTIME_CONTROLLER_IDENTITY_PROBE" runtime-parent "$$"\n'
+                + "fi\n",
+            ),
+            encoding="utf-8",
+        )
+        physical_controller.chmod(0o755)
+        physical_environment = {
+            "SYNOPKG_PKGDEST": str(self.real_target),
+            "SYNOPKG_PKGHOME": str(self.real_home),
+            "SYNOPKG_PKGVAR": str(self.real_var),
+            "SDSYNC_TEST_CONTROLLER_EXEC_PATH": str(framework_controller),
+            "SDSYNC_TEST_RUNTIME_CONTROLLER_IDENTITY_PROBE": str(identity_probe),
+            "SDSYNC_TEST_RUNTIME_CONTROLLER_IDENTITY_RESULT": str(runtime_identity_result),
+        }
+        started = self.shell(
+            self.lifecycle,
+            "start",
+            extra_environment=physical_environment,
+            timeout=15,
+        )
+        self.assertEqual(started.returncode, 0, (started.stdout, started.stderr))
+
+        controller_pid = int(
+            (self.real_var / "run/controller.pid").read_text(encoding="ascii").strip()
+        )
+        probe_environment = {
+            **physical_environment,
+            "SDSYNC_TEST_LIFECYCLE_COMMON": str(self.lifecycle_dir / "common"),
+        }
+        for _ in range(100):
+            if runtime_identity_result.is_file():
+                break
+            time.sleep(0.02)
+        self.assertTrue(runtime_identity_result.is_file(), "runtime controller identity probe did not run")
+        self.assertEqual(runtime_identity_result.read_text(encoding="ascii"), "runtime-parent-ok\n")
+        for identity_layer in ("lifecycle", "runtime", "runtime-ready"):
+            accepted = self.shell(
+                identity_probe,
+                identity_layer,
+                str(controller_pid),
+                extra_environment=probe_environment,
+            )
+            self.assertEqual(
+                accepted.returncode,
+                0,
+                (identity_layer, accepted.stdout, accepted.stderr),
+            )
+
+        unrelated = subprocess.Popen(
+            [
+                "/bin/sh",
+                "-c",
+                "trap 'exit 0' TERM INT HUP; while :; do /bin/sleep 1; done",
+                "sdsync-unrelated",
+                str(framework_controller),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={**self.environment, **physical_environment},
+            preexec_fn=(
+                (lambda: (os.setgroups([]), os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
+                if os.getuid() == 0
+                else None
+            ),
+        )
+        different_controller = self.root / "different-controller"
+        different_controller.write_text(
+            "#!/bin/sh\n"
+            "trap 'exit 0' TERM INT HUP\n"
+            "while :; do /bin/sleep 1; done\n",
+            encoding="utf-8",
+        )
+        different_controller.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(different_controller, self.drop_uid, self.drop_gid)
+        different = subprocess.Popen(
+            [str(different_controller)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={**self.environment, **physical_environment},
+            preexec_fn=(
+                (lambda: (os.setgroups([]), os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
+                if os.getuid() == 0
+                else None
+            ),
+        )
+        try:
+            for rejected_pid in (unrelated.pid, different.pid):
+                for identity_layer in ("lifecycle", "runtime"):
+                    rejected = self.shell(
+                        identity_probe,
+                        identity_layer,
+                        str(rejected_pid),
+                        extra_environment=probe_environment,
+                    )
+                    self.assertNotEqual(
+                        rejected.returncode,
+                        0,
+                        (identity_layer, rejected_pid, rejected.stdout, rejected.stderr),
+                    )
+        finally:
+            for process in (unrelated, different):
+                if process.poll() is None:
+                    process.terminate()
+                process.wait(timeout=5)
+
+        stopped = self.shell(
+            self.lifecycle,
+            "stop",
+            extra_environment=physical_environment,
+            timeout=15,
+        )
+        self.assertEqual(stopped.returncode, 0, (stopped.stdout, stopped.stderr))
+        self.assertTrue(physical_controller.is_file())
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
+
+        def assert_file_alias_rejected(candidate: Path) -> None:
+            for identity_layer in ("lifecycle-file", "runtime-file"):
+                rejected = self.shell(
+                    identity_probe,
+                    identity_layer,
+                    str(physical_controller),
+                    str(candidate),
+                    extra_environment=probe_environment,
+                )
+                self.assertNotEqual(
+                    rejected.returncode,
+                    0,
+                    (identity_layer, candidate, rejected.stdout, rejected.stderr),
+                )
+
+        controller_symlink = self.root / "controller-final-symlink"
+        os.symlink(physical_controller, controller_symlink)
+        assert_file_alias_rejected(controller_symlink)
+        controller_symlink.unlink()
+
+        copied_controller = self.root / "controller-copied-inode"
+        shutil.copy2(physical_controller, copied_controller)
+        if os.getuid() == 0:
+            os.chown(copied_controller, self.drop_uid, self.drop_gid)
+        assert_file_alias_rejected(copied_controller)
+
+        controller_hardlink = self.root / "controller-extra-hardlink"
+        os.link(physical_controller, controller_hardlink)
+        try:
+            assert_file_alias_rejected(framework_controller)
+        finally:
+            controller_hardlink.unlink()
 
     def test_interrupted_start_cannot_leave_a_live_untracked_api(self) -> None:
         environment = self.environment.copy()

@@ -96,6 +96,30 @@ sharing it. Never paste a DSM cookie,
 or token-bearing URL into an issue, chat, screenshot, or support archive. Redact sensitive host,
 account, and path values without removing timestamps, exit codes, DSM build, or package version.
 
+## Release 26.11 controller startup failure on a physical volume
+
+Release 26.11 can fail to start when DSM supplies physical volume paths such as
+`/volume3/@appstore/synology-drive-sync` while the controller supervisor uses the equivalent
+`/var/packages/synology-drive-sync/target` alias. The package then reports `controller failed before
+startup commit`, and `controller.log` contains `controller lifecycle parent did not commit startup`.
+This is an exact-process path-alias mismatch, not a request for root privileges or broader ACLs.
+
+Collect only the fixed symptom and framework-owned link destinations with this read-only command:
+
+```bash
+sudo sh -c '
+  ls -ld /var/packages/synology-drive-sync/target /var/packages/synology-drive-sync/var
+  grep -F "controller lifecycle parent did not commit startup" \
+    /var/packages/synology-drive-sync/var/log/controller.log | tail -n 5
+'
+```
+
+Do not `chmod`, `chown`, remove locks, or run the service as root. Download the first release newer
+than 26.11 whose notes include the DSM controller path-alias fix, verify its SPK and checksum using
+the [release instructions](../releases.md#synology-dsm-packages), then install it through
+**Package Center > Manual Install**. GitHub Releases are the update channel for this package; the
+26.11 asset remains immutable.
+
 ## DSM says the page is not found when opening the app
 
 The current source uses the native `type=app` AppWindow introduced in release 26.10. It does not

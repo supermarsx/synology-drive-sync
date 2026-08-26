@@ -81,10 +81,37 @@ script_pid_matches() {
         grep -F -x "$canonical_command" >/dev/null 2>&1
 }
 
+same_private_executable() {
+    expected_executable=$1
+    candidate_executable=$2
+    executable_owner=$3
+    case $candidate_executable in /*) ;; *) return 1 ;; esac
+    [ -f "$expected_executable" ] && [ ! -L "$expected_executable" ] || return 1
+    [ -f "$candidate_executable" ] && [ ! -L "$candidate_executable" ] || return 1
+
+    expected_executable_identity=$(stat -L -c '%d:%i:%u:%a:%h' "$expected_executable" 2>/dev/null || true)
+    candidate_executable_identity=$(stat -L -c '%d:%i:%u:%a:%h' "$candidate_executable" 2>/dev/null || true)
+    case $expected_executable_identity in
+        *:"$executable_owner":755:1) ;;
+        *) return 1 ;;
+    esac
+    [ "$candidate_executable_identity" = "$expected_executable_identity" ] || return 1
+
+    # DSM may expose the installed target through both SYNOPKG_PKGDEST and
+    # /var/packages/.../target. Recheck both names so a concurrent replacement
+    # cannot turn that legitimate parent-directory alias into a different file.
+    expected_executable_recheck=$(stat -L -c '%d:%i:%u:%a:%h' "$expected_executable" 2>/dev/null || true)
+    candidate_executable_recheck=$(stat -L -c '%d:%i:%u:%a:%h' "$candidate_executable" 2>/dev/null || true)
+    [ "$expected_executable_recheck" = "$expected_executable_identity" ] \
+        && [ "$candidate_executable_recheck" = "$expected_executable_identity" ]
+}
+
 # The controller is a no-argument package script. Lock ownership is not enough
 # to authorize a signal: require the complete argv shape as well as the package
-# UID so another package-owned process cannot become a lifecycle target merely
-# by mentioning the controller path in an unrelated command line.
+# UID and executable inode so another package-owned process cannot become a
+# lifecycle target merely by mentioning the controller path in an unrelated
+# command line. DSM may use its physical SYNOPKG_PKGDEST as the lifecycle path
+# while the Rust supervisor execs the equivalent /var/packages target alias.
 controller_pid_matches() {
     checked_pid=$1
     script_pid_live "$checked_pid" || return 1
@@ -93,18 +120,16 @@ controller_pid_matches() {
     actual_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "/proc/$checked_pid/status" 2>/dev/null | sed -n '1p')
     [ "$actual_uid" = "$expected_uid" ] || return 1
     [ -r "/proc/$checked_pid/cmdline" ] || return 1
-    canonical_controller_dir=$(CDPATH='' cd -- "$(dirname -- "$controller")" 2>/dev/null && pwd -P) || return 1
-    canonical_controller=$canonical_controller_dir/$(basename -- "$controller")
-    tr '\000' '\n' 2>/dev/null < "/proc/$checked_pid/cmdline" |
-        awk -v expected="$controller" -v canonical="$canonical_controller" '
+    controller_argument=$(tr '\000' '\n' 2>/dev/null < "/proc/$checked_pid/cmdline" |
+        awk '
             { argument[NR] = $0 }
             END {
-                if (NR == 1 && (argument[1] == expected || argument[1] == canonical)) exit 0
-                if (NR == 2 && argument[1] ~ /^\// &&
-                    (argument[2] == expected || argument[2] == canonical)) exit 0
+                if (NR == 1) { print argument[1]; exit 0 }
+                if (NR == 2 && argument[1] ~ /^\//) { print argument[2]; exit 0 }
                 exit 1
             }
-        '
+        ') || return 1
+    same_private_executable "$controller" "$controller_argument" "$expected_uid"
 }
 
 api_pid_matches() {
