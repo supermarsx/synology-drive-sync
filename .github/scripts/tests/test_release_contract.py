@@ -591,13 +591,19 @@ class WorkflowWiringTests(unittest.TestCase):
                 '"$emulator" "$binary" synology-drive-sync --version', section
             )
             self.assertIn(
-                'REQUEST_METHOD=GET QEMU_CPU="$QEMU_CPU" "$emulator" '
+                'REQUEST_METHOD=GET QUERY_STRING=action=csrf '
+                'HTTP_X_SDSYNC_REQUEST=1 QEMU_CPU="$QEMU_CPU" "$emulator" '
                 '"$api_binary" sdsync-dsm-api',
                 section,
             )
-            self.assertIn('REQUEST_METHOD=GET "$api_binary"', section)
-            self.assertIn("Status: 400 Bad Request", section)
+            self.assertIn(
+                'REQUEST_METHOD=GET QUERY_STRING=action=csrf '
+                'HTTP_X_SDSYNC_REQUEST=1 "$api_binary"',
+                section,
+            )
+            self.assertIn("Status: 401 Unauthorized", section)
             self.assertIn('"schema":"sdsync.dsm-error.v1"', section)
+            self.assertIn('"code":"unauthorized"', section)
             self.assertIn("Version5 EABI", section)
             self.assertIn("hard-float ABI", section)
             self.assertIn("elf_class: ELF32", section)

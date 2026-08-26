@@ -820,13 +820,13 @@ jobs:
             # guest argument as argv[0], so supply it before the real arguments.
             reported=$(QEMU_CPU="$QEMU_CPU" "$emulator" "$binary" synology-drive-sync --version)
             set +e
-            bridge_output=$(REQUEST_METHOD=GET QEMU_CPU="$QEMU_CPU" "$emulator" "$api_binary" sdsync-dsm-api 2>&1)
+            bridge_output=$(REQUEST_METHOD=GET QUERY_STRING=action=csrf HTTP_X_SDSYNC_REQUEST=1 QEMU_CPU="$QEMU_CPU" "$emulator" "$api_binary" sdsync-dsm-api 2>&1)
             bridge_exit=$?
             set -e
           else
             reported=$("$binary" --version)
             set +e
-            bridge_output=$(REQUEST_METHOD=GET "$api_binary" 2>&1)
+            bridge_output=$(REQUEST_METHOD=GET QUERY_STRING=action=csrf HTTP_X_SDSYNC_REQUEST=1 "$api_binary" 2>&1)
             bridge_exit=$?
             set -e
           fi
@@ -836,9 +836,10 @@ jobs:
             exit 1
           }
           [[ "$bridge_exit" -ne 0 ]]
-          grep -Fq 'Status: 400 Bad Request' <<<"$bridge_output"
+          grep -Fq 'Status: 401 Unauthorized' <<<"$bridge_output"
           grep -Fq 'Content-Type: application/json; charset=utf-8' <<<"$bridge_output"
           grep -Fq '"schema":"sdsync.dsm-error.v1"' <<<"$bridge_output"
+          grep -Fq '"code":"unauthorized"' <<<"$bridge_output"
       - name: Assemble and validate installable SPK
         shell: bash
         env:
