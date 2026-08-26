@@ -6094,7 +6094,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             preexec_fn=(
-                (lambda: (os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
+                (lambda: (os.setgroups([]), os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
                 if os.getuid() == 0
                 else None
             ),
@@ -6102,7 +6102,19 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         try:
             run_lock = self.real_var / "run/run.lock"
             run_lock.mkdir(mode=0o700)
-            (run_lock / "pid").write_text(f"{sleeper.pid}\n", encoding="utf-8")
+            start = (
+                Path(f"/proc/{sleeper.pid}/stat")
+                .read_text(encoding="ascii")
+                .rsplit(") ", 1)[1]
+                .split()[19]
+            )
+            boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+            owner = run_lock / "pid"
+            owner.write_text(f"{sleeper.pid}\n{start}\n{boot}\n", encoding="ascii")
+            owner.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(run_lock, self.drop_uid, self.drop_gid)
+                os.chown(owner, self.drop_uid, self.drop_gid)
             stopped = self.shell(self.lifecycle, "stop")
             self.assertEqual(stopped.returncode, 1, stopped.stderr)
             self.assertIn("unverified plan/sync PID", stopped.stdout)
