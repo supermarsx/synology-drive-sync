@@ -175,7 +175,7 @@ const PolicyHelp = {
     helpId() { return `sdsync-help-security-${this.helpKey}`; },
     text() { return POLICY_HELP[this.helpKey] || "See the Security section in DSM Help."; }
   },
-  template: `<span class="sdsync-field-tip"><button type="button" class="sdsync-field-tip-trigger" :title="text" :aria-label="'Help: ' + text" :aria-describedby="helpId" @keydown.esc="$event.currentTarget.blur()"><action-icon name="help" :size="14" /></button><span :id="helpId" class="sdsync-field-tip-content" role="tooltip">{{ text }}</span></span>`
+  template: `<span class="sdsync-field-tip"><button type="button" class="sdsync-field-tip-trigger" aria-label="Show field help" :aria-describedby="helpId" @keydown.esc="$event.currentTarget.blur()"><action-icon name="help" :size="14" /></button><span :id="helpId" class="sdsync-field-tip-content" role="tooltip">{{ text }}</span></span>`
 };
 
 export default {

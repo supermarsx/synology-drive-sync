@@ -308,8 +308,23 @@ test("configurable DSM controls use real accessible help markup and themed porta
   for (const source of [app, panel]) {
     assert.match(source, /<button type="button" class="sdsync-field-tip-trigger"/);
     assert.match(source, /role="tooltip"/);
-    assert.match(source, /:title="text"/);
+    assert.match(source, /aria-label="Show field help" :aria-describedby="helpId"/);
+    assert.doesNotMatch(source, /class="sdsync-field-tip-trigger"[^>]*\s:?title=/);
     assert.match(source, /@keydown\.esc="\$event\.currentTarget\.blur\(\)"/);
+  }
+  const describedNativeControls = app.match(/<(?:input|select)\b[^>]*aria-describedby="sdsync-help-[^"]+"[^>]*>/g) || [];
+  assert.ok(describedNativeControls.length >= 3, "native described controls are missing");
+  for (const tag of describedNativeControls) {
+    assert.doesNotMatch(tag, /\s:?title=/, `native control has custom help and a browser title: ${tag}`);
+  }
+  const weekdayControls = app.match(/<div class="sdsync-weekdays">([\s\S]*?)<\/div>/);
+  assert.ok(weekdayControls, "weekday controls are missing");
+  assert.doesNotMatch(weekdayControls[1], /<label\b[^>]*\s:?title=/);
+  for (const source of [app, panel]) {
+    const openingTags = source.match(/<[a-z][a-z0-9-]*\b[^>]*>/gi) || [];
+    for (const tag of openingTags) {
+      if (/\btooltip=/.test(tag)) assert.doesNotMatch(tag, /\s:?title=/, `control mixes toolkit and native tooltips: ${tag}`);
+    }
   }
   assert.match(app, /fieldset class="sdsync-weekday-fieldset" aria-describedby="sdsync-help-routine-weekdays"/);
   for (const truthfulProducer of [
