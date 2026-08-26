@@ -485,6 +485,18 @@ class AssetContractTests(unittest.TestCase):
 
 
 class WorkflowWiringTests(unittest.TestCase):
+    def test_packaging_checkout_fetches_tagged_dsm_upgrade_fixtures(self):
+        workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+        packaging = workflow[workflow.index("  packaging:") :]
+        checkout_start = packaging.index("      - uses: actions/checkout@")
+        checkout_end = packaging.index("\n      - ", checkout_start + 1)
+        checkout = packaging[checkout_start:checkout_end]
+
+        self.assertEqual(checkout.count("fetch-depth: 0"), 1)
+        self.assertEqual(checkout.count("persist-credentials: false"), 1)
+
     def test_documentation_selector_is_a_required_rendered_gate(self):
         workflow = (REPOSITORY_ROOT / ".github/workflows/docs.yml").read_text(
             encoding="utf-8"
