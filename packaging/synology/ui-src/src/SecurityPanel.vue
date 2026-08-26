@@ -5,107 +5,118 @@
     direction="vertical"
     @submit="submit"
   >
-    <div class="sdsync-security-grid">
-      <section class="sdsync-panel">
-        <div class="sdsync-panel-heading">
-          <div><p class="sdsync-eyebrow">Change permissions</p><h3>Dashboard operations</h3></div>
-        </div>
-        <div class="sdsync-policy-list">
-          <div v-for="control in operationControls" :key="control.key" class="sdsync-policy-control">
-            <v-checkbox
-              :value="value[control.key] === true"
-              :disabled="disabled"
-              :aria-describedby="helpId(control.key)"
-              @input="updateField(control.key, $event === true)"
-            >{{ control.label }}</v-checkbox>
-            <policy-help :help-key="control.key" />
-          </div>
-        </div>
-      </section>
-
-      <section class="sdsync-panel">
-        <div class="sdsync-panel-heading">
-          <div><p class="sdsync-eyebrow">Risk ceilings</p><h3>Allowed profile behavior</h3></div>
-        </div>
-        <div class="sdsync-policy-list">
-          <div v-for="control in riskControls" :key="control.key" class="sdsync-policy-control">
-            <v-checkbox
-              :value="value[control.key] === true"
-              :disabled="disabled"
-              :aria-describedby="helpId(control.key)"
-              @input="updateField(control.key, $event === true)"
-            >{{ control.label }}</v-checkbox>
-            <policy-help :help-key="control.key" />
-          </div>
-        </div>
-      </section>
+    <div class="sdsync-subtabs" data-subtabs="security" role="tablist" aria-label="Security policy views" @keydown="moveSubtab($event)">
+      <button v-for="tab in securityTabs" :id="'sdsync-security-tab-' + tab.id" :key="tab.id" type="button" :class="['sdsync-subtab', { 'is-active': securityTab === tab.id }]" :data-subtab="tab.id" role="tab" :aria-selected="securityTab === tab.id" :aria-controls="'sdsync-security-panel-' + tab.id" :tabindex="securityTab === tab.id ? 0 : -1" @click="securityTab = tab.id">{{ tab.label }}</button>
     </div>
+    <div class="sdsync-subtab-stage">
+      <transition name="sdsync-subtab-swap" mode="out-in">
+        <div v-if="securityTab === 'policy-controls'" id="sdsync-security-panel-policy-controls" key="policy-controls" class="sdsync-subtab-panel" data-subtab-panel="policy-controls" role="tabpanel" aria-labelledby="sdsync-security-tab-policy-controls" tabindex="0">
+          <div class="sdsync-security-grid">
+            <section class="sdsync-panel">
+              <div class="sdsync-panel-heading">
+                <div><p class="sdsync-eyebrow">Change permissions</p><h3>Dashboard operations</h3></div>
+              </div>
+              <div class="sdsync-policy-list">
+                <div v-for="control in operationControls" :key="control.key" class="sdsync-policy-control">
+                  <v-checkbox
+                    :value="value[control.key] === true"
+                    :disabled="disabled"
+                    :aria-describedby="helpId(control.key)"
+                    @input="updateField(control.key, $event === true)"
+                  >{{ control.label }}</v-checkbox>
+                  <policy-help :help-key="control.key" />
+                </div>
+              </div>
+            </section>
 
-    <section class="sdsync-panel">
-      <div class="sdsync-panel-heading">
-        <div><p class="sdsync-eyebrow">Bounded resources</p><h3>Request and result limits</h3></div>
-      </div>
-      <div class="sdsync-form-grid">
-        <v-form-item label="Policy version">
-          <v-input
-            :value="policyVersionLabel"
-            readonly
-            aria-describedby="sdsync-help-security-policy_version"
-          />
-          <policy-help help-key="policy_version" />
-        </v-form-item>
-        <v-form-item label="CSRF lifetime (seconds)">
-          <v-input
-            :value="value.csrf_lifetime_seconds"
-            number-only
-            :disabled="disabled"
-            :aria-describedby="helpId('csrf_lifetime_seconds')"
-            @input="updateField('csrf_lifetime_seconds', $event)"
-          />
-          <policy-help help-key="csrf_lifetime_seconds" />
-        </v-form-item>
-        <v-form-item label="Result retention (seconds)">
-          <v-input
-            :value="value.result_retention_seconds"
-            number-only
-            :disabled="disabled"
-            :aria-describedby="helpId('result_retention_seconds')"
-            @input="updateField('result_retention_seconds', $event)"
-          />
-          <policy-help help-key="result_retention_seconds" />
-        </v-form-item>
-        <v-form-item label="Maximum outstanding jobs">
-          <v-input
-            :value="value.max_outstanding_jobs"
-            number-only
-            :disabled="disabled"
-            :aria-describedby="helpId('max_outstanding_jobs')"
-            @input="updateField('max_outstanding_jobs', $event)"
-          />
-          <policy-help help-key="max_outstanding_jobs" />
-        </v-form-item>
-      </div>
-    </section>
+            <section class="sdsync-panel">
+              <div class="sdsync-panel-heading">
+                <div><p class="sdsync-eyebrow">Risk ceilings</p><h3>Allowed profile behavior</h3></div>
+              </div>
+              <div class="sdsync-policy-list">
+                <div v-for="control in riskControls" :key="control.key" class="sdsync-policy-control">
+                  <v-checkbox
+                    :value="value[control.key] === true"
+                    :disabled="disabled"
+                    :aria-describedby="helpId(control.key)"
+                    @input="updateField(control.key, $event === true)"
+                  >{{ control.label }}</v-checkbox>
+                  <policy-help :help-key="control.key" />
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
 
-    <section class="sdsync-panel">
-      <div class="sdsync-panel-heading">
-        <div><p class="sdsync-eyebrow">Structured observability</p><h3>Log category levels</h3></div>
-      </div>
-      <div class="sdsync-log-policy-grid">
-        <v-form-item v-for="category in logCategories" :key="category.key" :label="category.label">
-          <v-single-select
-            :value="value.log_levels && value.log_levels[category.key]"
-            :options="logLevelOptions"
-            width="100%"
-            :disabled="disabled"
-            :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass"
-            :aria-describedby="helpId('log-' + category.key)"
-            @input="updateLogLevel(category.key, $event)"
-          ><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select>
-          <policy-help :help-key="'log-' + category.key" />
-        </v-form-item>
-      </div>
-    </section>
+        <div v-else id="sdsync-security-panel-observability-limits" key="observability-limits" class="sdsync-subtab-panel" data-subtab-panel="observability-limits" role="tabpanel" aria-labelledby="sdsync-security-tab-observability-limits" tabindex="0">
+          <section class="sdsync-panel">
+            <div class="sdsync-panel-heading">
+              <div><p class="sdsync-eyebrow">Bounded resources</p><h3>Request and result limits</h3></div>
+            </div>
+            <div class="sdsync-form-grid">
+              <v-form-item label="Policy version">
+                <template #label-after><policy-help class="sdsync-form-label-help" help-key="policy_version" /></template>
+                <v-input
+                  :value="policyVersionLabel"
+                  readonly
+                  aria-describedby="sdsync-help-security-policy_version"
+                />
+              </v-form-item>
+              <v-form-item label="CSRF lifetime (seconds)">
+                <template #label-after><policy-help class="sdsync-form-label-help" help-key="csrf_lifetime_seconds" /></template>
+                <v-input
+                  :value="value.csrf_lifetime_seconds"
+                  number-only
+                  :disabled="disabled"
+                  :aria-describedby="helpId('csrf_lifetime_seconds')"
+                  @input="updateField('csrf_lifetime_seconds', $event)"
+                />
+              </v-form-item>
+              <v-form-item label="Result retention (seconds)">
+                <template #label-after><policy-help class="sdsync-form-label-help" help-key="result_retention_seconds" /></template>
+                <v-input
+                  :value="value.result_retention_seconds"
+                  number-only
+                  :disabled="disabled"
+                  :aria-describedby="helpId('result_retention_seconds')"
+                  @input="updateField('result_retention_seconds', $event)"
+                />
+              </v-form-item>
+              <v-form-item label="Maximum outstanding jobs">
+                <template #label-after><policy-help class="sdsync-form-label-help" help-key="max_outstanding_jobs" /></template>
+                <v-input
+                  :value="value.max_outstanding_jobs"
+                  number-only
+                  :disabled="disabled"
+                  :aria-describedby="helpId('max_outstanding_jobs')"
+                  @input="updateField('max_outstanding_jobs', $event)"
+                />
+              </v-form-item>
+            </div>
+          </section>
+
+          <section class="sdsync-panel">
+            <div class="sdsync-panel-heading">
+              <div><p class="sdsync-eyebrow">Structured observability</p><h3>Log category levels</h3></div>
+            </div>
+            <div class="sdsync-log-policy-grid">
+              <v-form-item v-for="category in logCategories" :key="category.key" :label="category.label">
+                <template #label-after><policy-help class="sdsync-form-label-help" :help-key="'log-' + category.key" /></template>
+                <v-single-select
+                  :value="value.log_levels && value.log_levels[category.key]"
+                  :options="logLevelOptions"
+                  width="100%"
+                  :disabled="disabled"
+                  :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass"
+                  :aria-describedby="helpId('log-' + category.key)"
+                  @input="updateLogLevel(category.key, $event)"
+                ><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select>
+              </v-form-item>
+            </div>
+          </section>
+        </div>
+      </transition>
+    </div>
 
     <div class="sdsync-security-actions">
       <span class="sdsync-field-note">Changes apply to new dashboard requests and package operations.</span>
@@ -180,6 +191,11 @@ export default {
   },
   data() {
     return {
+      securityTabs: [
+        { id: "policy-controls", label: "Permissions & risk" },
+        { id: "observability-limits", label: "Observability & limits" }
+      ],
+      securityTab: "policy-controls",
       operationControls: [
         { key: "require_https", label: "Require HTTPS for this DSM dashboard" },
         { key: "allow_interface_changes", label: "Allow interface preference changes" },
@@ -222,6 +238,23 @@ export default {
   },
   methods: {
     helpId(key) { return `sdsync-help-security-${key}`; },
+    moveSubtab(event) {
+      if (!event || !this.securityTabs.length) return;
+      const current = Math.max(0, this.securityTabs.findIndex((tab) => tab.id === this.securityTab));
+      let next = current;
+      if (event.key === "ArrowRight") next = (current + 1) % this.securityTabs.length;
+      else if (event.key === "ArrowLeft") next = (current - 1 + this.securityTabs.length) % this.securityTabs.length;
+      else if (event.key === "Home") next = 0;
+      else if (event.key === "End") next = this.securityTabs.length - 1;
+      else return;
+      const tablist = event.currentTarget;
+      event.preventDefault();
+      this.securityTab = this.securityTabs[next].id;
+      this.$nextTick(() => {
+        const buttons = tablist && tablist.querySelectorAll ? tablist.querySelectorAll('[role="tab"]') : [];
+        if (buttons[next] && typeof buttons[next].focus === "function") buttons[next].focus();
+      });
+    },
     updateField(key, value) {
       this.$emit("input", Object.assign({}, this.value, { [key]: value }));
     },

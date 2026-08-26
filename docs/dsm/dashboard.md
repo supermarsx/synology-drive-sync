@@ -12,7 +12,12 @@ the bundle loads no CDN scripts, fonts, images, analytics, or hosted search serv
 the matching `appWindow`; it is not a `type=url` pop-up or an iframe around a standalone HTML page.
 The bundle registers the class through `SYNO.namespace` and `Vue.extend`, then renders the dashboard
 inside DSM's `v-app-instance` and `v-app-window` components. DSM loads the packaged
-`SynologyDriveSync.js` and `style.css` assets; there is no packaged `index.html` launch document.
+`SynologyDriveSync.js` and `style.css` assets. The package also ships a byte-pinned, script-free
+`ui/index.html` only so the `/webman/3rdparty/synology-drive-sync/` directory route and explicit
+`index.html` route have a valid Open target. That document contains no dashboard implementation,
+external assets, launch token, or authentication logic; it redirects on the same origin to
+`/webman/index.cgi?launchApp=SYNO.SDS.App.SynologyDriveSync.Instance` and provides the same target as
+an accessible fallback link. The module-keyed native AppWindow remains the only application UI.
 
 The AppWindow calls the canonical same-origin CGI endpoint
 `/webman/3rdparty/synology-drive-sync/api.cgi` directly. `dsmuidir="ui"` lets DSM expose that
@@ -89,7 +94,9 @@ requires credential-presence inspection before any retry.
 
 ## Routines
 
-Routines configures automation independently for each profile. It shows each routine's requested
+Routines uses two keyboard-accessible subtabs. **Configured profiles** is first and shows each
+saved routine; selecting one opens **Package controller**, which edits that profile's automation
+policy. The page shows each routine's requested
 mode, effective backend, state, next run, and last success. The Overview realtime card makes an
 `inotify` backend or `polling` fallback visible rather than implying that a native watcher exists on
 every NAS.
@@ -129,8 +136,9 @@ are in [Health, activity, logs, and notifications](operations.md).
 
 ## Notifications
 
-The package alert policy controls direct DSM desktop alerts. It is separate from the optional
-open-browser fallback:
+Notifications separates **Package alerts** and **Session preferences** into two keyboard-accessible
+subtabs. The package alert policy controls direct DSM desktop alerts. It is separate from the
+optional open-browser fallback:
 
 - DSM desktop alerts can be enabled, triggered on success and/or failure, delayed until a bounded
   consecutive failure threshold, and rate-limited by a cooldown. They are sent directly to logged-in
@@ -143,9 +151,19 @@ TOTP material, bearer token, or arbitrary log text. Inspect Activity and bounded
 specific operation and result. The package does not acquire the `sysnotify` resource or register
 Notification Center rules, email, SMS, mobile, or CMS delivery channels.
 
+## Security
+
+Security uses **Permissions & risk** as its first subtab. It contains dashboard-operation
+permissions and profile risk ceilings. **Observability & limits** is second and keeps bounded CSRF,
+result-retention, and outstanding-job controls together with every structured log-category level.
+Arrow Left/Right, Home, and End move between the tabs. Saving still validates and applies one
+complete security policy, regardless of which subtab is visible. See [DSM security](security.md).
+
 ## Settings
 
-Settings changes only non-secret interface preferences:
+Settings presents compact native horizontal rows: label and field help first, then the input or
+dropdown. On narrow windows the rows stack without changing their label-control order. Settings
+changes only non-secret interface preferences:
 
 | Preference | Values |
 | --- | --- |
@@ -161,10 +179,12 @@ TOTP seeds, and remote-log tokens are memory-only and are never included in that
 ## Accessibility and narrow windows
 
 The application provides labeled controls, keyboard focus indicators, semantic tables and forms,
-polite live regions, and confirmation overlays marked with `role=dialog` and `aria-modal`. A
+polite live regions, accessible internal tablists, and confirmation overlays marked with
+`role=dialog` and `aria-modal`. Primary sections and internal subtabs fade out before the next panel
+fades in; the reduced-motion preference disables those transitions. A
 confirmation moves focus inside the dialog, traps Tab and Shift+Tab, cancels on Escape, and restores
-the prior focus when it closes. Reduced-motion handling is present and navigation collapses for
-narrow AppWindow widths. The application does not currently implement a skip link. Verify keyboard
+the prior focus when it closes. Navigation collapses for narrow AppWindow widths. The application
+does not currently implement a skip link. Verify keyboard
 flow, focus behavior, contrast, zoom, and the exact DSM window sizes during
 [live acceptance](troubleshooting.md#live-nas-acceptance).
 

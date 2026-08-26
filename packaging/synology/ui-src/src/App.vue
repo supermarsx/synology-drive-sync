@@ -29,10 +29,10 @@
               <span>{{ item.title }}</span>
             </button>
           </nav>
-          <div class="sdsync-sidebar-foot">
+          <footer class="sdsync-sidebar-foot" aria-label="Package connection status">
             <span :class="['sdsync-connection-dot', { 'is-online': connected, 'is-error': !connected }]" />
-            <span>{{ connectionLabel }}</span>
-          </div>
+            <span aria-live="polite">{{ connectionLabel }}</span>
+          </footer>
         </aside>
 
         <main class="sdsync-workspace">
@@ -65,6 +65,9 @@
             </div>
           </div>
 
+          <div class="sdsync-page-stage">
+            <transition name="sdsync-page-swap" mode="out-in" appear>
+              <div :key="route" class="sdsync-page-frame">
           <section v-if="route === 'overview'" class="sdsync-page" aria-labelledby="sdsync-page-title">
             <div class="sdsync-overview-status" aria-label="Service status and actions">
               <div class="sdsync-service-status">
@@ -134,42 +137,42 @@
                   <v-button type="border" display="icon-text" tooltip="Close the editor and clear unsubmitted secret fields" @click="closeProfile"><template #icon><action-icon name="close" /></template>Close</v-button>
                 </div>
                 <div class="sdsync-form-grid">
-                  <v-form-item label="Name" prop="name"><v-input v-model.trim="profileForm.name" :readonly="Boolean(selectedProfile)" maxlength="64" placeholder="office_nas" aria-describedby="sdsync-help-profile-name" :disabled="!canChangeProfiles" /><control-help help-key="profile-name" /></v-form-item>
-                  <v-form-item label="Local source" prop="source"><v-input v-model.trim="profileForm.source" placeholder="/volume1/Source" aria-describedby="sdsync-help-profile-source" :disabled="!canChangeProfiles" /><control-help help-key="profile-source" /></v-form-item>
-                  <v-form-item class="span-2" label="File Station URL" prop="url"><v-input v-model.trim="profileForm.url" placeholder="https://files.example.com" aria-describedby="sdsync-help-profile-url" :disabled="!canChangeProfiles" /><control-help help-key="profile-url" /></v-form-item>
-                  <v-form-item label="DSM username" prop="username"><v-input v-model.trim="profileForm.username" autocomplete="username" aria-describedby="sdsync-help-profile-username" :disabled="!canChangeProfiles" /><control-help help-key="profile-username" /></v-form-item>
-                  <v-form-item label="Remote logical path" prop="remote"><v-input v-model.trim="profileForm.remote" placeholder="/home/Drive/NAS Backup" aria-describedby="sdsync-help-profile-remote" :disabled="!canChangeProfiles" /><control-help help-key="profile-remote" /></v-form-item>
-                  <v-form-item label="Comparison"><v-single-select v-model="profileForm.compare" :options="compareOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-compare" :disabled="!canChangeProfiles"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="profile-compare" /></v-form-item>
-                  <v-form-item label="Concurrent uploads"><v-input v-model="profileForm.jobs" number-only aria-describedby="sdsync-help-profile-jobs" :disabled="!canChangeProfiles" /><control-help help-key="profile-jobs" /></v-form-item>
+                  <v-form-item label="Name" prop="name"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-name" /></template><v-input v-model.trim="profileForm.name" :readonly="Boolean(selectedProfile)" maxlength="64" placeholder="office_nas" aria-describedby="sdsync-help-profile-name" :disabled="!canChangeProfiles" /></v-form-item>
+                  <v-form-item label="Local source" prop="source"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-source" /></template><v-input v-model.trim="profileForm.source" placeholder="/volume1/Source" aria-describedby="sdsync-help-profile-source" :disabled="!canChangeProfiles" /></v-form-item>
+                  <v-form-item class="span-2" label="File Station URL" prop="url"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-url" /></template><v-input v-model.trim="profileForm.url" placeholder="https://files.example.com" aria-describedby="sdsync-help-profile-url" :disabled="!canChangeProfiles" /></v-form-item>
+                  <v-form-item label="DSM username" prop="username"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-username" /></template><v-input v-model.trim="profileForm.username" autocomplete="username" aria-describedby="sdsync-help-profile-username" :disabled="!canChangeProfiles" /></v-form-item>
+                  <v-form-item label="Remote logical path" prop="remote"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-remote" /></template><v-input v-model.trim="profileForm.remote" placeholder="/home/Drive/NAS Backup" aria-describedby="sdsync-help-profile-remote" :disabled="!canChangeProfiles" /></v-form-item>
+                  <v-form-item label="Comparison"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-compare" /></template><v-single-select v-model="profileForm.compare" :options="compareOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-compare" :disabled="!canChangeProfiles"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
+                  <v-form-item label="Concurrent uploads"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-jobs" /></template><v-input v-model="profileForm.jobs" number-only aria-describedby="sdsync-help-profile-jobs" :disabled="!canChangeProfiles" /></v-form-item>
                   <v-checkbox v-model="profileForm.allow_http" class="span-2" aria-describedby="sdsync-help-profile-http" :disabled="!canEditHttpException">Allow plain HTTP for controlled LAN testing</v-checkbox><control-help help-key="profile-http" />
                 </div>
 
                 <fieldset class="sdsync-danger-fieldset">
                   <legend>Deletion guard</legend>
                   <v-checkbox v-model="profileForm.delete" aria-describedby="sdsync-help-profile-delete" :disabled="!canEditProfileDeletion">Mirror remote deletions after profile and run-level approval</v-checkbox><control-help help-key="profile-delete" />
-                  <v-form-item label="Maximum deletions per run"><v-input v-model="profileForm.max_delete" number-only aria-describedby="sdsync-help-profile-max-delete" :disabled="!canChangeProfiles" /><control-help help-key="profile-max-delete" /></v-form-item>
+                  <v-form-item label="Maximum deletions per run"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-max-delete" /></template><v-input v-model="profileForm.max_delete" number-only aria-describedby="sdsync-help-profile-max-delete" :disabled="!canChangeProfiles" /></v-form-item>
                 </fieldset>
 
                 <details class="sdsync-advanced">
                   <summary><strong><action-icon name="settings" />&nbsp;Advanced profile controls</strong><span>Network, retry, output, and remote observability policy</span></summary>
                   <div class="sdsync-form-grid">
-                    <v-form-item class="span-2" label="Excludes"><v-input v-model="profileForm.excludes" type="textarea" :autosize="{ minRows: 3, maxRows: 7 }" placeholder="@eaDir/&#10;**/@eaDir/&#10;#recycle/" aria-describedby="sdsync-help-profile-excludes" :disabled="!canChangeProfiles" /><control-help help-key="profile-excludes" /></v-form-item>
+                    <v-form-item class="span-2" label="Excludes"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-excludes" /></template><v-input v-model="profileForm.excludes" type="textarea" :autosize="{ minRows: 3, maxRows: 7 }" placeholder="@eaDir/&#10;**/@eaDir/&#10;#recycle/" aria-describedby="sdsync-help-profile-excludes" :disabled="!canChangeProfiles" /></v-form-item>
                     <v-checkbox v-model="profileForm.allow_empty_source" class="span-2" aria-describedby="sdsync-help-profile-empty-source" :disabled="!canEditEmptySourceException">Allow an empty source (disables the empty-source deletion guard)</v-checkbox><control-help help-key="profile-empty-source" />
-                    <v-form-item label="Retries"><v-input v-model="profileForm.retries" number-only aria-describedby="sdsync-help-profile-retries" :disabled="!canChangeProfiles" /><control-help help-key="profile-retries" /></v-form-item>
-                    <v-form-item label="Upload timeout (seconds)"><v-input v-model="profileForm.timeout" number-only aria-describedby="sdsync-help-profile-timeout" :disabled="!canChangeProfiles" /><control-help help-key="profile-timeout" /></v-form-item>
-                    <v-form-item label="Connect timeout (seconds)"><v-input v-model="profileForm.connect_timeout" number-only aria-describedby="sdsync-help-profile-connect-timeout" :disabled="!canChangeProfiles" /><control-help help-key="profile-connect-timeout" /></v-form-item>
-                    <v-form-item label="Maximum rate (bytes/s)"><v-input v-model="profileForm.max_rate" number-only aria-describedby="sdsync-help-profile-rate" :disabled="!canChangeProfiles" /><control-help help-key="profile-rate" /></v-form-item>
-                    <v-form-item class="span-2" label="CA certificate path"><v-input v-model.trim="profileForm.ca_certificate" placeholder="/volume1/certificates/ca.pem" aria-describedby="sdsync-help-profile-ca" :disabled="!canChangeProfiles" /><control-help help-key="profile-ca" /></v-form-item>
+                    <v-form-item label="Retries"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-retries" /></template><v-input v-model="profileForm.retries" number-only aria-describedby="sdsync-help-profile-retries" :disabled="!canChangeProfiles" /></v-form-item>
+                    <v-form-item label="Upload timeout (seconds)"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-timeout" /></template><v-input v-model="profileForm.timeout" number-only aria-describedby="sdsync-help-profile-timeout" :disabled="!canChangeProfiles" /></v-form-item>
+                    <v-form-item label="Connect timeout (seconds)"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-connect-timeout" /></template><v-input v-model="profileForm.connect_timeout" number-only aria-describedby="sdsync-help-profile-connect-timeout" :disabled="!canChangeProfiles" /></v-form-item>
+                    <v-form-item label="Maximum rate (bytes/s)"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-rate" /></template><v-input v-model="profileForm.max_rate" number-only aria-describedby="sdsync-help-profile-rate" :disabled="!canChangeProfiles" /></v-form-item>
+                    <v-form-item class="span-2" label="CA certificate path"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-ca" /></template><v-input v-model.trim="profileForm.ca_certificate" placeholder="/volume1/certificates/ca.pem" aria-describedby="sdsync-help-profile-ca" :disabled="!canChangeProfiles" /></v-form-item>
                     <v-checkbox v-model="profileForm.danger_invalid_certs" class="span-2" aria-describedby="sdsync-help-profile-invalid-certs" :disabled="!canEditInvalidTlsException">Accept invalid TLS certificates (unsafe)</v-checkbox><control-help help-key="profile-invalid-certs" />
                     <v-checkbox v-if="profileForm.danger_invalid_certs" v-model="profileForm.danger_invalid_confirm" class="span-2" label-color="red" aria-describedby="sdsync-help-profile-invalid-confirm" :disabled="!canEditInvalidTlsException">I accept the interception risk</v-checkbox><control-help v-if="profileForm.danger_invalid_certs" help-key="profile-invalid-confirm" />
-                    <v-form-item label="Verbosity"><v-single-select v-model="profileForm.verbosity" :options="verbosityOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-verbosity" :disabled="!canChangeProfiles"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="profile-verbosity" /></v-form-item>
+                    <v-form-item label="Verbosity"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-verbosity" /></template><v-single-select v-model="profileForm.verbosity" :options="verbosityOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-verbosity" :disabled="!canChangeProfiles"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
                     <v-checkbox v-model="profileForm.quiet" aria-describedby="sdsync-help-profile-quiet" :disabled="!canChangeProfiles">Quiet terminal sink; durable logs remain active</v-checkbox><control-help help-key="profile-quiet" />
-                    <v-form-item label="Log level"><v-single-select v-model="profileForm.log_level" :options="logLevelOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-log-level" :disabled="!canChangeProfiles"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="profile-log-level" /></v-form-item>
+                    <v-form-item label="Log level"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-log-level" /></template><v-single-select v-model="profileForm.log_level" :options="logLevelOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-log-level" :disabled="!canChangeProfiles"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
                     <v-form-item label="Log format" textonly><span>JSON · package managed</span></v-form-item>
                     <v-form-item label="Progress" textonly><span>Never · package managed</span></v-form-item>
                     <v-form-item label="Output" textonly><span>Human · package managed</span></v-form-item>
-                    <v-form-item class="span-2" label="Remote log URL"><v-input v-model.trim="profileForm.remote_log_url" placeholder="https://collector.example.com/ingest" aria-describedby="sdsync-help-profile-log-url" :disabled="!canEditRemoteLogging" /><control-help help-key="profile-log-url" /></v-form-item>
-                    <v-form-item label="Remote log mode"><v-single-select v-model="profileForm.remote_log_mode" :options="remoteLogModeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-log-mode" :disabled="!canEditRemoteLogging"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="profile-log-mode" /></v-form-item>
+                    <v-form-item class="span-2" label="Remote log URL"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-log-url" /></template><v-input v-model.trim="profileForm.remote_log_url" placeholder="https://collector.example.com/ingest" aria-describedby="sdsync-help-profile-log-url" :disabled="!canEditRemoteLogging" /></v-form-item>
+                    <v-form-item label="Remote log mode"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-log-mode" /></template><v-single-select v-model="profileForm.remote_log_mode" :options="remoteLogModeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-log-mode" :disabled="!canEditRemoteLogging"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
                   </div>
                   <div class="sdsync-secret-editor">
                     <div><strong>Remote log token</strong><span>{{ selectedProfileModel && selectedProfileModel.has_remote_log_token ? 'Stored · masked' : 'Not stored' }}</span></div>
@@ -205,34 +208,46 @@
           </section>
 
           <section v-else-if="route === 'routines'" class="sdsync-page" aria-labelledby="sdsync-page-title">
-            <div class="sdsync-two-column sdsync-routines-grid">
-              <v-form v-model="routineForm" class="sdsync-panel" direction="vertical" @submit="saveRoutine">
-                <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Package controller</p><h3>Profile routine</h3></div><span :class="pillClass(selectedRoutine ? selectedRoutine.state : 'unknown')">{{ selectedRoutine ? (selectedRoutine.state || (selectedRoutine.enabled ? 'Enabled' : 'Disabled')) : 'New' }}</span></div>
-                <v-form-item label="Profile"><v-single-select v-model="routineForm.profile" :options="profileOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-routine-profile" :disabled="!canChangeRoutines || operationBusy" @input="loadRoutine"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="routine-profile" /></v-form-item>
-                <v-checkbox v-model="routineForm.enabled" aria-describedby="sdsync-help-routine-enabled" :disabled="!canChangeRoutines">Enable routine</v-checkbox><control-help help-key="routine-enabled" />
-                <div class="sdsync-form-grid compact">
-                  <v-form-item label="Action"><v-single-select v-model="routineForm.action" :options="routineActionOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-routine-action" :disabled="!canChangeRoutines"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="routine-action" /></v-form-item>
-                  <v-form-item label="Mode"><v-single-select v-model="routineForm.mode" :options="routineModeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-routine-mode" :disabled="!canChangeRoutines"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="routine-mode" /></v-form-item>
-                  <v-form-item label="Interval (seconds)"><v-input v-model="routineForm.interval_seconds" number-only aria-describedby="sdsync-help-routine-interval" :disabled="!canChangeRoutines" /><control-help help-key="routine-interval" /></v-form-item>
-                  <v-form-item label="Window starts"><input v-model="routineForm.time_window_start" class="sdsync-native-input" type="time" aria-label="Window starts" aria-describedby="sdsync-help-routine-window-start" title="Local DSM time at which the daily execution window opens." :disabled="!canChangeRoutines"><control-help help-key="routine-window-start" /></v-form-item>
-                  <v-form-item label="Window ends"><input v-model="routineForm.time_window_end" class="sdsync-native-input" type="time" aria-label="Window ends" aria-describedby="sdsync-help-routine-window-end" title="Local DSM time at which the daily execution window closes." :disabled="!canChangeRoutines"><control-help help-key="routine-window-end" /></v-form-item>
-                  <v-form-item label="Realtime debounce (seconds)"><v-input v-model="routineForm.debounce_seconds" number-only aria-describedby="sdsync-help-routine-debounce" :disabled="!canChangeRoutines" /><control-help help-key="routine-debounce" /></v-form-item>
-                  <v-form-item label="Fallback poll (seconds)"><v-input v-model="routineForm.poll_seconds" number-only aria-describedby="sdsync-help-routine-poll" :disabled="!canChangeRoutines" /><control-help help-key="routine-poll" /></v-form-item>
-                  <v-form-item label="Retry attempts"><v-input v-model="routineForm.retry_count" number-only aria-describedby="sdsync-help-routine-retries" :disabled="!canChangeRoutines" /><control-help help-key="routine-retries" /></v-form-item>
-                  <v-form-item label="Retry backoff (seconds)"><v-input v-model="routineForm.retry_backoff_seconds" number-only aria-describedby="sdsync-help-routine-backoff" :disabled="!canChangeRoutines" /><control-help help-key="routine-backoff" /></v-form-item>
-                  <v-form-item class="span-2" label="Wait for routines">
-                    <select v-model="routineForm.depends_on" class="sdsync-native-input" multiple size="4" aria-label="Wait for routines" aria-describedby="sdsync-help-routine-dependencies" title="Require selected profile routines to finish before this routine starts." :disabled="!canChangeRoutines">
-                      <option v-for="profile in dependencyProfiles" :key="profile.name" :value="profile.name">{{ profile.name }}</option>
-                    </select><control-help help-key="routine-dependencies" />
-                  </v-form-item>
+            <div class="sdsync-subtabs" data-subtabs="routines" role="tablist" aria-label="Routine views" @keydown="moveSubtab('routineTab', routineTabs, $event)">
+              <button v-for="tab in routineTabs" :id="'sdsync-routines-tab-' + tab.id" :key="tab.id" type="button" :class="['sdsync-subtab', { 'is-active': routineTab === tab.id }]" :data-subtab="tab.id" role="tab" :aria-selected="routineTab === tab.id" :aria-controls="'sdsync-routines-panel-' + tab.id" :tabindex="routineTab === tab.id ? 0 : -1" @click="routineTab = tab.id">{{ tab.label }}</button>
+            </div>
+            <div class="sdsync-subtab-stage">
+              <transition name="sdsync-subtab-swap" mode="out-in">
+                <div v-if="routineTab === 'configured-profiles'" id="sdsync-routines-panel-configured-profiles" key="configured-profiles" class="sdsync-subtab-panel" data-subtab-panel="configured-profiles" role="tabpanel" aria-labelledby="sdsync-routines-tab-configured-profiles" tabindex="0">
+                  <article class="sdsync-panel">
+                    <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Configured routines</p><h3>Per-profile automation</h3></div></div>
+                    <p v-if="!routines.length" class="sdsync-empty">No configured routines.</p>
+                    <button v-for="routine in routines" :key="routine.profile" type="button" class="sdsync-routine-row" :title="'Edit routine for ' + routine.profile" :disabled="operationBusy" @click="selectRoutine(routine.profile)"><span><strong><action-icon name="edit" />&nbsp;{{ routine.profile }}</strong><small>{{ routine.mode || 'interval' }} · {{ routine.backend || 'fallback unreported' }} · {{ routine.state || (routine.enabled ? 'enabled' : 'disabled') }}</small></span><time>{{ routine.enabled ? formatDate(routine.next_run_epoch) : 'Disabled' }}</time></button>
+                  </article>
                 </div>
-                <fieldset class="sdsync-weekday-fieldset" aria-describedby="sdsync-help-routine-weekdays" :disabled="!canChangeRoutines"><legend>Active weekdays <control-help help-key="routine-weekdays" /></legend><div class="sdsync-weekdays"><label v-for="day in weekdayOptions" :key="day.value" :title="'Allow execution on ' + day.label"><input v-model="routineForm.weekdays" type="checkbox" :value="day.value" :disabled="!canChangeRoutines"><span>{{ day.label }}</span></label></div></fieldset>
-                <fieldset class="sdsync-danger-fieldset"><legend>Routine deletion guard</legend><v-checkbox v-model="routineForm.allow_delete" aria-describedby="sdsync-help-routine-delete" :disabled="!canEditRoutineDeletion">Permit profile deletion rules</v-checkbox><control-help help-key="routine-delete" /><v-form-item label="Routine deletion approval ceiling"><v-input v-model="routineForm.max_total_delete" number-only aria-describedby="sdsync-help-routine-max-delete" :disabled="!canChangeRoutines" /><control-help help-key="routine-max-delete" /></v-form-item></fieldset>
-                <div class="sdsync-form-actions"><v-button suffix="red" display="icon-text" tooltip="Remove this automation policy without deleting its profile" :disabled="!canChangeRoutines || !selectedRoutine || operationBusy" @click="removeRoutine"><template #icon><action-icon name="delete" /></template>Remove routine</v-button><span /><v-button suffix="main" display="icon-text" html-type="submit" tooltip="Validate and apply this per-profile automation policy" :disabled="!canChangeRoutines || !routineForm.profile || operationBusy"><template #icon><action-icon name="save" /></template>Save routine</v-button></div>
-              </v-form>
-              <div class="sdsync-stack">
-                <article class="sdsync-panel"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Configured routines</p><h3>Per-profile automation</h3></div></div><p v-if="!routines.length" class="sdsync-empty">No configured routines.</p><button v-for="routine in routines" :key="routine.profile" type="button" class="sdsync-routine-row" :title="'Edit routine for ' + routine.profile" :disabled="operationBusy" @click="selectRoutine(routine.profile)"><span><strong><action-icon name="edit" />&nbsp;{{ routine.profile }}</strong><small>{{ routine.mode || 'interval' }} · {{ routine.backend || 'fallback unreported' }} · {{ routine.state || (routine.enabled ? 'enabled' : 'disabled') }}</small></span><time>{{ routine.enabled ? formatDate(routine.next_run_epoch) : 'Disabled' }}</time></button></article>
-              </div>
+                <div v-else id="sdsync-routines-panel-package-controller" key="package-controller" class="sdsync-subtab-panel" data-subtab-panel="package-controller" role="tabpanel" aria-labelledby="sdsync-routines-tab-package-controller" tabindex="0">
+                  <v-form v-model="routineForm" class="sdsync-panel" direction="vertical" @submit="saveRoutine">
+                    <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Routine editor</p><h3>Profile automation policy</h3></div><span :class="pillClass(selectedRoutine ? selectedRoutine.state : 'unknown')">{{ selectedRoutine ? (selectedRoutine.state || (selectedRoutine.enabled ? 'Enabled' : 'Disabled')) : 'New' }}</span></div>
+                    <v-form-item label="Profile"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-profile" /></template><v-single-select v-model="routineForm.profile" :options="profileOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-routine-profile" :disabled="!canChangeRoutines || operationBusy" @input="loadRoutine"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
+                    <v-checkbox v-model="routineForm.enabled" aria-describedby="sdsync-help-routine-enabled" :disabled="!canChangeRoutines">Enable routine</v-checkbox><control-help help-key="routine-enabled" />
+                    <div class="sdsync-form-grid compact">
+                      <v-form-item label="Action"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-action" /></template><v-single-select v-model="routineForm.action" :options="routineActionOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-routine-action" :disabled="!canChangeRoutines"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
+                      <v-form-item label="Mode"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-mode" /></template><v-single-select v-model="routineForm.mode" :options="routineModeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-routine-mode" :disabled="!canChangeRoutines"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
+                      <v-form-item label="Interval (seconds)"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-interval" /></template><v-input v-model="routineForm.interval_seconds" number-only aria-describedby="sdsync-help-routine-interval" :disabled="!canChangeRoutines" /></v-form-item>
+                      <v-form-item label="Window starts"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-window-start" /></template><input v-model="routineForm.time_window_start" class="sdsync-native-input" type="time" aria-label="Window starts" aria-describedby="sdsync-help-routine-window-start" title="Local DSM time at which the daily execution window opens." :disabled="!canChangeRoutines"></v-form-item>
+                      <v-form-item label="Window ends"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-window-end" /></template><input v-model="routineForm.time_window_end" class="sdsync-native-input" type="time" aria-label="Window ends" aria-describedby="sdsync-help-routine-window-end" title="Local DSM time at which the daily execution window closes." :disabled="!canChangeRoutines"></v-form-item>
+                      <v-form-item label="Realtime debounce (seconds)"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-debounce" /></template><v-input v-model="routineForm.debounce_seconds" number-only aria-describedby="sdsync-help-routine-debounce" :disabled="!canChangeRoutines" /></v-form-item>
+                      <v-form-item label="Fallback poll (seconds)"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-poll" /></template><v-input v-model="routineForm.poll_seconds" number-only aria-describedby="sdsync-help-routine-poll" :disabled="!canChangeRoutines" /></v-form-item>
+                      <v-form-item label="Retry attempts"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-retries" /></template><v-input v-model="routineForm.retry_count" number-only aria-describedby="sdsync-help-routine-retries" :disabled="!canChangeRoutines" /></v-form-item>
+                      <v-form-item label="Retry backoff (seconds)"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-backoff" /></template><v-input v-model="routineForm.retry_backoff_seconds" number-only aria-describedby="sdsync-help-routine-backoff" :disabled="!canChangeRoutines" /></v-form-item>
+                      <v-form-item class="span-2" label="Wait for routines">
+                        <template #label-after><control-help class="sdsync-form-label-help" help-key="routine-dependencies" /></template>
+                        <select v-model="routineForm.depends_on" class="sdsync-native-input" multiple size="4" aria-label="Wait for routines" aria-describedby="sdsync-help-routine-dependencies" title="Require selected profile routines to finish before this routine starts." :disabled="!canChangeRoutines">
+                          <option v-for="profile in dependencyProfiles" :key="profile.name" :value="profile.name">{{ profile.name }}</option>
+                        </select>
+                      </v-form-item>
+                    </div>
+                    <fieldset class="sdsync-weekday-fieldset" aria-describedby="sdsync-help-routine-weekdays" :disabled="!canChangeRoutines"><legend>Active weekdays <control-help help-key="routine-weekdays" /></legend><div class="sdsync-weekdays"><label v-for="day in weekdayOptions" :key="day.value" :title="'Allow execution on ' + day.label"><input v-model="routineForm.weekdays" type="checkbox" :value="day.value" :disabled="!canChangeRoutines"><span>{{ day.label }}</span></label></div></fieldset>
+                    <fieldset class="sdsync-danger-fieldset"><legend>Routine deletion guard</legend><v-checkbox v-model="routineForm.allow_delete" aria-describedby="sdsync-help-routine-delete" :disabled="!canEditRoutineDeletion">Permit profile deletion rules</v-checkbox><control-help help-key="routine-delete" /><v-form-item label="Routine deletion approval ceiling"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-max-delete" /></template><v-input v-model="routineForm.max_total_delete" number-only aria-describedby="sdsync-help-routine-max-delete" :disabled="!canChangeRoutines" /></v-form-item></fieldset>
+                    <div class="sdsync-form-actions"><v-button suffix="red" display="icon-text" tooltip="Remove this automation policy without deleting its profile" :disabled="!canChangeRoutines || !selectedRoutine || operationBusy" @click="removeRoutine"><template #icon><action-icon name="delete" /></template>Remove routine</v-button><span /><v-button suffix="main" display="icon-text" html-type="submit" tooltip="Validate and apply this per-profile automation policy" :disabled="!canChangeRoutines || !routineForm.profile || operationBusy"><template #icon><action-icon name="save" /></template>Save routine</v-button></div>
+                  </v-form>
+                </div>
+              </transition>
             </div>
           </section>
 
@@ -240,7 +255,7 @@
             <div class="sdsync-two-column">
               <v-form v-model="doctorForm" class="sdsync-panel" direction="vertical" @submit="runDoctor">
                 <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Target doctor</p><h3>Run a diagnostic</h3></div><span class="sdsync-pill neutral">Manual</span></div>
-                <v-form-item label="Scope"><v-single-select v-model="doctorForm.scope" :options="scopeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-doctor-scope" :disabled="!canRunOperations"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="doctor-scope" /></v-form-item>
+                <v-form-item label="Scope"><template #label-after><control-help class="sdsync-form-label-help" help-key="doctor-scope" /></template><v-single-select v-model="doctorForm.scope" :options="scopeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-doctor-scope" :disabled="!canRunOperations"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
                 <v-checkbox v-model="doctorForm.write_test" aria-describedby="sdsync-help-doctor-write" :disabled="!canRunOperations || !canRunDoctorWrite || !hasCapability('write_test')">Disposable write test</v-checkbox><control-help help-key="doctor-write" />
                 <div v-if="doctorForm.write_test" class="sdsync-warning"><strong>This mutates the selected target briefly.</strong><v-checkbox v-model="doctorForm.write_confirm" aria-describedby="sdsync-help-doctor-write-confirm" :disabled="!canRunOperations || !canRunDoctorWrite">I prepared a non-critical destination and approve probe cleanup.</v-checkbox><control-help help-key="doctor-write-confirm" /></div>
                 <v-button suffix="main" display="icon-text" html-type="submit" tooltip="Run preflight checks and wait for bounded terminal Doctor evidence" :disabled="!canRunOperations || operationBusy"><template #icon><action-icon name="doctor" /></template>Run doctor</v-button>
@@ -268,9 +283,31 @@
           </section>
 
           <section v-else-if="route === 'notifications'" class="sdsync-page" aria-labelledby="sdsync-page-title">
-            <div class="sdsync-two-column">
-              <v-form v-model="alertForm" class="sdsync-panel" direction="vertical" @submit="saveAlerts"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">DSM desktop alerts</p><h3>Package alert policy</h3></div><span :class="pillClass(alertForm.enabled ? 'running' : 'disabled')">{{ alertForm.enabled ? 'Enabled' : 'Disabled' }}</span></div><v-checkbox v-model="alertForm.enabled" aria-describedby="sdsync-help-alerts-enabled" :disabled="!canChangeNotifications">Enable DSM desktop alerts</v-checkbox><control-help help-key="alerts-enabled" /><v-checkbox v-model="alertForm.on_success" aria-describedby="sdsync-help-alerts-success" :disabled="!canChangeNotifications">Notify on success</v-checkbox><control-help help-key="alerts-success" /><v-checkbox v-model="alertForm.on_failure" aria-describedby="sdsync-help-alerts-failure" :disabled="!canChangeNotifications">Notify on failure</v-checkbox><control-help help-key="alerts-failure" /><v-form-item label="Failures before alert"><v-input v-model="alertForm.failure_threshold" number-only :disabled="!canChangeNotifications" aria-describedby="sdsync-help-alerts-threshold" /><control-help help-key="alerts-threshold" /></v-form-item><v-form-item label="Cooldown (seconds)"><v-input v-model="alertForm.cooldown_seconds" number-only :disabled="!canChangeNotifications" aria-describedby="sdsync-help-alerts-cooldown" /><control-help help-key="alerts-cooldown" /></v-form-item><v-button suffix="main" display="icon-text" html-type="submit" tooltip="Validate and persist the package-level DSM alert policy" :disabled="!canChangeNotifications || operationBusy"><template #icon><action-icon name="save" /></template>Save DSM alert policy</v-button></v-form>
-              <v-form v-model="notificationForm" class="sdsync-panel" direction="vertical" @submit="saveNotificationPreferences"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Open-session signal</p><h3>Browser fallback</h3></div><span :class="pillClass(notificationPermission)">{{ notificationPermission }}</span></div><v-checkbox v-model="notificationForm.desktop_notifications" aria-describedby="sdsync-help-session-notify" :disabled="!canChangeNotifications">Notify while this app is open</v-checkbox><control-help help-key="session-notify" /><v-checkbox v-model="notificationForm.audible" aria-describedby="sdsync-help-session-audible" :disabled="!canChangeNotifications">Audible cue</v-checkbox><control-help help-key="session-audible" /><v-button suffix="grey" display="icon-text" html-type="submit" tooltip="Save and audit non-secret notification preferences in this browser" :disabled="!canChangeNotifications || operationBusy"><template #icon><action-icon name="save" /></template>Save session preferences</v-button></v-form>
+            <div class="sdsync-subtabs" data-subtabs="notifications" role="tablist" aria-label="Notification settings" @keydown="moveSubtab('notificationTab', notificationTabs, $event)">
+              <button v-for="tab in notificationTabs" :id="'sdsync-notifications-tab-' + tab.id" :key="tab.id" type="button" :class="['sdsync-subtab', { 'is-active': notificationTab === tab.id }]" :data-subtab="tab.id" role="tab" :aria-selected="notificationTab === tab.id" :aria-controls="'sdsync-notifications-panel-' + tab.id" :tabindex="notificationTab === tab.id ? 0 : -1" @click="notificationTab = tab.id">{{ tab.label }}</button>
+            </div>
+            <div class="sdsync-subtab-stage">
+              <transition name="sdsync-subtab-swap" mode="out-in">
+                <div v-if="notificationTab === 'package-alerts'" id="sdsync-notifications-panel-package-alerts" key="package-alerts" class="sdsync-subtab-panel" data-subtab-panel="package-alerts" role="tabpanel" aria-labelledby="sdsync-notifications-tab-package-alerts" tabindex="0">
+                  <v-form v-model="alertForm" class="sdsync-panel" direction="vertical" @submit="saveAlerts">
+                    <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">DSM desktop alerts</p><h3>Package alert policy</h3></div><span :class="pillClass(alertForm.enabled ? 'running' : 'disabled')">{{ alertForm.enabled ? 'Enabled' : 'Disabled' }}</span></div>
+                    <v-checkbox v-model="alertForm.enabled" aria-describedby="sdsync-help-alerts-enabled" :disabled="!canChangeNotifications">Enable DSM desktop alerts</v-checkbox><control-help help-key="alerts-enabled" />
+                    <v-checkbox v-model="alertForm.on_success" aria-describedby="sdsync-help-alerts-success" :disabled="!canChangeNotifications">Notify on success</v-checkbox><control-help help-key="alerts-success" />
+                    <v-checkbox v-model="alertForm.on_failure" aria-describedby="sdsync-help-alerts-failure" :disabled="!canChangeNotifications">Notify on failure</v-checkbox><control-help help-key="alerts-failure" />
+                    <v-form-item label="Failures before alert"><template #label-after><control-help class="sdsync-form-label-help" help-key="alerts-threshold" /></template><v-input v-model="alertForm.failure_threshold" number-only :disabled="!canChangeNotifications" aria-describedby="sdsync-help-alerts-threshold" /></v-form-item>
+                    <v-form-item label="Cooldown (seconds)"><template #label-after><control-help class="sdsync-form-label-help" help-key="alerts-cooldown" /></template><v-input v-model="alertForm.cooldown_seconds" number-only :disabled="!canChangeNotifications" aria-describedby="sdsync-help-alerts-cooldown" /></v-form-item>
+                    <v-button suffix="main" display="icon-text" html-type="submit" tooltip="Validate and persist the package-level DSM alert policy" :disabled="!canChangeNotifications || operationBusy"><template #icon><action-icon name="save" /></template>Save DSM alert policy</v-button>
+                  </v-form>
+                </div>
+                <div v-else id="sdsync-notifications-panel-session-preferences" key="session-preferences" class="sdsync-subtab-panel" data-subtab-panel="session-preferences" role="tabpanel" aria-labelledby="sdsync-notifications-tab-session-preferences" tabindex="0">
+                  <v-form v-model="notificationForm" class="sdsync-panel" direction="vertical" @submit="saveNotificationPreferences">
+                    <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Open-session signal</p><h3>Browser fallback</h3></div><span :class="pillClass(notificationPermission)">{{ notificationPermission }}</span></div>
+                    <v-checkbox v-model="notificationForm.desktop_notifications" aria-describedby="sdsync-help-session-notify" :disabled="!canChangeNotifications">Notify while this app is open</v-checkbox><control-help help-key="session-notify" />
+                    <v-checkbox v-model="notificationForm.audible" aria-describedby="sdsync-help-session-audible" :disabled="!canChangeNotifications">Audible cue</v-checkbox><control-help help-key="session-audible" />
+                    <v-button suffix="grey" display="icon-text" html-type="submit" tooltip="Save and audit non-secret notification preferences in this browser" :disabled="!canChangeNotifications || operationBusy"><template #icon><action-icon name="save" /></template>Save session preferences</v-button>
+                  </v-form>
+                </div>
+              </transition>
             </div>
           </section>
 
@@ -279,7 +316,7 @@
           </section>
 
           <section v-else-if="route === 'settings'" class="sdsync-page" aria-labelledby="sdsync-page-title">
-            <v-form v-model="settings" class="sdsync-panel sdsync-settings-panel" direction="vertical" @submit="saveInterfaceSettings"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Display and refresh</p><h3>Interface</h3></div></div><v-form-item label="Theme"><v-single-select v-model="settings.theme" :options="themeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-theme" :disabled="!canChangeInterface"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="settings-theme" /></v-form-item><v-form-item label="Status refresh"><v-single-select v-model="settings.status_refresh" :options="statusRefreshOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-status-refresh" :disabled="!canChangeInterface"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="settings-status-refresh" /></v-form-item><v-form-item label="Log refresh"><v-single-select v-model="settings.log_refresh" :options="logRefreshOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-log-refresh" :disabled="!canChangeInterface"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="settings-log-refresh" /></v-form-item><div class="sdsync-form-actions sdsync-settings-actions"><span /><span /><v-button suffix="main" display="icon-text" html-type="submit" tooltip="Apply, persist, and audit this browser's AppWindow preferences" :disabled="!canChangeInterface || operationBusy"><template #icon><action-icon name="save" /></template>Save interface settings</v-button></div></v-form>
+            <v-form v-model="settings" class="sdsync-panel sdsync-settings-panel" direction="horizontal" @submit="saveInterfaceSettings"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Display and refresh</p><h3>Interface</h3></div></div><v-form-item label="Theme"><template #label-after><control-help class="sdsync-form-label-help" help-key="settings-theme" /></template><v-single-select v-model="settings.theme" :options="themeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-theme" :disabled="!canChangeInterface"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item><v-form-item label="Status refresh"><template #label-after><control-help class="sdsync-form-label-help" help-key="settings-status-refresh" /></template><v-single-select v-model="settings.status_refresh" :options="statusRefreshOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-status-refresh" :disabled="!canChangeInterface"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item><v-form-item label="Log refresh"><template #label-after><control-help class="sdsync-form-label-help" help-key="settings-log-refresh" /></template><v-single-select v-model="settings.log_refresh" :options="logRefreshOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-log-refresh" :disabled="!canChangeInterface"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item><div class="sdsync-form-actions sdsync-settings-actions"><span /><span /><v-button suffix="main" display="icon-text" html-type="submit" tooltip="Apply, persist, and audit this browser's AppWindow preferences" :disabled="!canChangeInterface || operationBusy"><template #icon><action-icon name="save" /></template>Save interface settings</v-button></div></v-form>
           </section>
 
           <section v-else-if="route === 'about'" class="sdsync-page" aria-labelledby="sdsync-page-title">
@@ -320,7 +357,9 @@
               </section>
             </div>
           </section>
-
+              </div>
+            </transition>
+          </div>
         </main>
 
         <div class="sdsync-toasts" aria-live="polite" aria-relevant="additions"><div v-for="toastItem in toasts" :key="toastItem.id" :class="['sdsync-toast', { 'is-error': toastItem.error }]" :role="toastItem.error ? 'alert' : 'status'"><strong>{{ toastItem.title }}</strong><span>{{ toastItem.message }}</span></div></div>
@@ -668,8 +707,18 @@ export default {
       settings, profileFilter: "", profileEditorOpen: false, selectedProfile: "", profileForm: emptyProfile(),
       secretModes: { password: "keep", totp: "keep", remote_log_token: "keep" },
       secretValues: { password: "", totp: "", remote_log_token: "" },
+      routineTabs: [
+        { id: "configured-profiles", label: "Configured profiles" },
+        { id: "package-controller", label: "Package controller" }
+      ],
+      routineTab: "configured-profiles",
       routineForm: emptyRoutine(), doctorForm: { scope: "all", write_test: false, write_confirm: false },
       alertForm: { enabled: false, on_success: false, on_failure: true, failure_threshold: 1, cooldown_seconds: 3600 },
+      notificationTabs: [
+        { id: "package-alerts", label: "Package alerts" },
+        { id: "session-preferences", label: "Session preferences" }
+      ],
+      notificationTab: "package-alerts",
       securityForm: defaultSecurityPolicy(), securityDirty: false,
       notificationForm: { desktop_notifications: settings.desktop_notifications, audible: settings.audible },
       aboutMetadata: ABOUT_METADATA,
@@ -851,6 +900,23 @@ export default {
       }
     },
     navigate(route) { if (!this.routes.some((item) => item.id === route)) return; if (this.route === "profiles" && route !== "profiles") this.closeProfile(); this.route = route; if (route === "activity") this.refreshLogs(); else window.clearTimeout(this.logTimer); },
+    moveSubtab(stateKey, tabs, event) {
+      if (!event || !Array.isArray(tabs) || !tabs.length) return;
+      const current = Math.max(0, tabs.findIndex((tab) => tab.id === this[stateKey]));
+      let next = current;
+      if (event.key === "ArrowRight") next = (current + 1) % tabs.length;
+      else if (event.key === "ArrowLeft") next = (current - 1 + tabs.length) % tabs.length;
+      else if (event.key === "Home") next = 0;
+      else if (event.key === "End") next = tabs.length - 1;
+      else return;
+      const tablist = event.currentTarget;
+      event.preventDefault();
+      this[stateKey] = tabs[next].id;
+      this.$nextTick(() => {
+        const buttons = tablist && tablist.querySelectorAll ? tablist.querySelectorAll('[role="tab"]') : [];
+        if (buttons[next] && typeof buttons[next].focus === "function") buttons[next].focus();
+      });
+    },
     pillClass(state) { const value = String(state || "unknown").toLowerCase(); return ["sdsync-pill", { failed: ["failed", "error", "untrusted", "denied"].includes(value), neutral: ["disabled", "stopped", "unknown", "default", "unsupported", "unavailable"].includes(value) }]; },
     healthClass(value) { return value === true ? "sdsync-health-ok" : (value === false ? "sdsync-health-bad" : "sdsync-health-unknown"); },
     booleanEvidence(value) { return value === true ? "Yes" : (value === false ? "No" : "Unavailable"); },
@@ -1117,7 +1183,7 @@ export default {
       }
     },
     loadRoutine(profileName) { const profile = typeof profileName === "string" ? profileName : this.routineForm.profile; const routine = this.routines.find((item) => String(item.profile) === String(profile)); this.routineForm = routine ? { profile, enabled: routine.enabled === true, action: routine.action || "sync", mode: routine.mode || "interval", interval_seconds: numberOr(routine.interval_seconds, 3600), weekdays: Array.isArray(routine.weekdays) ? routine.weekdays.map(Number) : String(routine.weekdays || "1,2,3,4,5,6,7").split(",").map(Number), time_window_start: routine.time_window_start || routine.window_start || "00:00", time_window_end: routine.time_window_end || routine.window_end || "23:59", debounce_seconds: numberOr(routine.debounce_seconds, 30), poll_seconds: numberOr(routine.poll_seconds, 30), retry_count: numberOr(routine.retry_count, 2), retry_backoff_seconds: numberOr(routine.retry_backoff_seconds, 60), allow_delete: routine.allow_delete === true, max_total_delete: numberOr(routine.max_total_delete, 100), depends_on: arrayOf(routine.depends_on).map(String) } : emptyRoutine(profile); },
-    selectRoutine(profile) { if (this.operationBusy) return; this.routineForm.profile = profile; this.loadRoutine(profile); },
+    selectRoutine(profile) { if (this.operationBusy) return; this.routineForm.profile = profile; this.loadRoutine(profile); this.routineTab = "package-controller"; },
     routinePayload() { return { profile: this.routineForm.profile, enabled: this.routineForm.enabled === true, action: this.routineForm.action, mode: this.routineForm.mode, interval_seconds: this.integer(this.routineForm.interval_seconds, 3600), weekdays: this.routineForm.weekdays.map(Number), time_window_start: this.routineForm.time_window_start, time_window_end: this.routineForm.time_window_end, debounce_seconds: this.integer(this.routineForm.debounce_seconds, 30), poll_seconds: this.integer(this.routineForm.poll_seconds, 30), retry_count: this.integer(this.routineForm.retry_count, 2), retry_backoff_seconds: this.integer(this.routineForm.retry_backoff_seconds, 60), allow_delete: this.routineForm.allow_delete === true, max_total_delete: this.integer(this.routineForm.max_total_delete, 100), depends_on: this.routineForm.depends_on.map(String) }; },
     async saveRoutine(event) {
       if (event && event.preventDefault) event.preventDefault();

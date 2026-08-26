@@ -71,7 +71,12 @@ Artifacts are named `synology-drive-sync-VERSION-ARCH.spk`, where `ARCH` is `x86
 DSM version `0.1.0-1` in `INFO`. `SOURCE_DATE_EPOCH` controls every tar member and the inner gzip
 header for reproducible output. The builder validates `ui-src/app.config` and `config.define`, then
 deterministically renders the DSM toolkit-equivalent module wrapper under `ui/config` and packages
-`ui/SynologyDriveSync.js` plus `ui/style.css`; the old standalone HTML entry point is not shipped.
+`ui/SynologyDriveSync.js` plus `ui/style.css`. The byte-pinned `ui/index.html` is not a second or
+legacy dashboard: it contains no script, external asset, token handling, or application code. DSM
+serves it for the package directory/index route, and it redirects to the same token-free native
+AppWindow entry at
+`/webman/index.cgi?launchApp=SYNO.SDS.App.SynologyDriveSync.Instance` with an accessible fallback
+link.
 
 Every executable, including `ui/api.cgi`, is ordinary `0755` in both the archive and installed
 package. Nothing carries a set-user-ID/set-group-ID bit. `conf/privilege` contains only

@@ -17,7 +17,9 @@ from pathlib import Path, PurePosixPath
 
 from build_spk import (
     ARCHITECTURES,
+    DIRECT_LAUNCHER_SHA256,
     DSM_APP_CLASS,
+    DSM_LAUNCH_TARGET,
     HERE,
     PackageError,
     UI_SOURCE,
@@ -54,6 +56,7 @@ REQUIRED_PAYLOAD = {
     "share/licenses/DSM_UI_THIRD_PARTY_LICENSES.txt",
     "ui/api.cgi",
     "ui/config",
+    "ui/index.html",
     "ui/SynologyDriveSync.js",
     "ui/style.css",
     "ui/images/icon.svg",
@@ -269,6 +272,33 @@ def validate_ui_config(payload: bytes) -> str:
         raise ValidationError("ui/config module must define exactly the native AppWindow class")
     validate_native_application(applications[APP_ID], "ui/config", generated=True)
     return NATIVE_SCRIPT
+
+
+def validate_direct_launcher(payload: bytes) -> None:
+    if hashlib.sha256(payload).hexdigest() != DIRECT_LAUNCHER_SHA256:
+        raise ValidationError(
+            "ui/index.html does not match the exact reviewed native AppWindow redirect"
+        )
+    try:
+        document = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValidationError("ui/index.html must be UTF-8") from error
+    target = re.escape(DSM_LAUNCH_TARGET)
+    required = (
+        r'^<!doctype html>\n<html lang="en">',
+        r'<meta name="referrer" content="no-referrer">',
+        r'<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; base-uri \'none\'; form-action \'none\'; navigate-to \'self\'">',
+        rf'<meta http-equiv="refresh" content="0;url={target}">',
+        rf'<a href="{target}">Open Synology Drive Sync</a>',
+    )
+    if any(re.search(marker, document) is None for marker in required):
+        raise ValidationError("ui/index.html is missing its safe DSM launch contract")
+    for forbidden in (
+        "<script", "<style", "<img", "<iframe", "<object", "<embed", "<form",
+        "javascript:", "http://", "https://", "//webman", "window.", "document.",
+    ):
+        if forbidden.lower() in document.lower():
+            raise ValidationError(f"ui/index.html contains forbidden launcher content {forbidden}")
 
 
 def validate_ui_texts(strings_payload: bytes) -> None:
@@ -896,6 +926,7 @@ def validate_source() -> None:
         HERE / "package/libexec/sdsync-controller",
         HERE / "package/libexec/sdsync-run",
         HERE / "package/ui/images/icon.svg",
+        HERE / "package/ui/index.html",
         HERE / "package/ui/helptoc.conf",
         HERE / "package/ui/texts/enu/strings",
         UI_SOURCE / "app.config",
@@ -930,7 +961,6 @@ def validate_source() -> None:
             )
     for path in (
         HERE / "package/ui/config",
-        HERE / "package/ui/index.html",
         HERE / "package/ui/app.js",
         HERE / "package/ui/app.css",
     ):
@@ -939,6 +969,7 @@ def validate_source() -> None:
                 "native DSM source must not contain a legacy standalone launcher: "
                 f"{path.relative_to(HERE)}"
             )
+    validate_direct_launcher((HERE / "package/ui/index.html").read_bytes())
     validate_privilege((HERE / "conf/privilege").read_bytes())
     validate_source_app_config((UI_SOURCE / "app.config").read_bytes())
     dist_members = {
@@ -1164,6 +1195,7 @@ def validate_spk(
         for executable in executables:
             require_regular_mode(inner_members, executable, 0o755, "payload executable")
         require_regular_mode(inner_members, "ui/api.cgi", 0o755, "authenticated CGI bridge")
+        require_regular_mode(inner_members, "ui/index.html", 0o644, "DSM direct-route launcher")
         for name, member in inner_members.items():
             mode = member.mode & 0o7777
             if mode & 0o022:
@@ -1191,6 +1223,7 @@ def validate_spk(
         )
         require_regular_mode(inner_members, NATIVE_STYLE, 0o644, "DSM native AppWindow style")
         validate_ui_texts(member_bytes(inner, inner_members["ui/texts/enu/strings"]))
+        validate_direct_launcher(member_bytes(inner, inner_members["ui/index.html"]))
         validate_dsm_help(
             member_bytes(inner, inner_members["ui/helptoc.conf"]),
             {

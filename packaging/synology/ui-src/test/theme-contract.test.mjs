@@ -176,7 +176,8 @@ test("security controls use compact responsive rows without clipping help", () =
   }
   assert.match(declarations(".sdsync-security-form"), /gap:\s*14px/);
   assert.match(declarations(".sdsync-security-grid"), /grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/);
-  assert.match(declarations(".sdsync-policy-control"), /grid-template-columns:\s*minmax\(0, 1fr\) auto/);
+  assert.match(declarations(".sdsync-policy-control"), /grid-template-columns:\s*minmax\(0, auto\) 20px/);
+  assert.match(declarations(".sdsync-policy-control"), /justify-content:\s*start/);
   assert.match(declarations(".sdsync-policy-control"), /overflow:\s*visible/);
   assert.match(declarations(".sdsync-log-policy-grid"), /grid-template-columns:\s*repeat\(3, minmax\(0, 1fr\)\)/);
   assert.match(declarations(".sdsync-security-actions"), /justify-content:\s*flex-end/);

@@ -49,10 +49,18 @@ toolkit-only transformation itself and stages:
 | Source | Installed SPK path |
 | --- | --- |
 | generated wrapper from `app.config` + `config.define` | `ui/config` |
+| `../package/ui/index.html` | `ui/index.html` |
 | `dist/SynologyDriveSync.js` | `ui/SynologyDriveSync.js` |
 | `dist/style.css` | `ui/style.css` |
 | `../package/ui/images` plus deterministic PNG renders | `ui/images` |
 | `../package/ui/texts` | `ui/texts` |
+
+`ui/index.html` is not a second dashboard. It is a script-free, no-external-asset
+same-origin launcher for DSM's directory-index and explicit `index.html` routes.
+It immediately opens
+`/webman/index.cgi?launchApp=SYNO.SDS.App.SynologyDriveSync.Instance` and retains
+an accessible fallback link to that same native AppWindow entry. The installed
+`ui/config` module remains the only application implementation.
 
 This host path does not need a Synology toolkit installation or a DSM host. The
 official Makefile remains available for SDK builds where `/env.mak`, `snpm`, and
