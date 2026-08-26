@@ -84,6 +84,48 @@ jobs:
         run: >-
           cargo build --profile ffi-release --locked
           -p synology-drive-sync-ffi --target "${{ matrix.target }}"
+      - name: Exercise non-mutating Windows release installer
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+          $sandbox = Join-Path $runnerTemp (
+            'sdsync-installer-whatif-' + [Guid]::NewGuid().ToString('N')
+          )
+          [void] [IO.Directory]::CreateDirectory($sandbox)
+          $previousTemp = $env:TEMP
+          $previousTmp = $env:TMP
+          try {
+            $env:TEMP = $sandbox
+            $env:TMP = $sandbox
+            $installDir = Join-Path $sandbox 'persistent-install'
+            & ./packaging/install.ps1 -InstallDir $installDir -WhatIf
+            if (Test-Path -LiteralPath $installDir) {
+              throw "-WhatIf created the persistent install path: $installDir"
+            }
+            $leftovers = @(Get-ChildItem -LiteralPath $sandbox -Force)
+            if ($leftovers.Count -ne 0) {
+              throw "-WhatIf leaked scratch paths: $($leftovers.FullName -join ', ')"
+            }
+          }
+          finally {
+            $env:TEMP = $previousTemp
+            $env:TMP = $previousTmp
+            if ([IO.Directory]::Exists($sandbox)) {
+              $resolvedSandbox = [IO.Path]::GetFullPath($sandbox)
+              $relative = [IO.Path]::GetRelativePath($runnerTemp, $resolvedSandbox)
+              if ([IO.Path]::IsPathRooted($relative) -or
+                  $relative.StartsWith('..', [StringComparison]::Ordinal) -or
+                  -not ([IO.Path]::GetFileName($resolvedSandbox)).StartsWith(
+                    'sdsync-installer-whatif-',
+                    [StringComparison]::Ordinal
+                  )) {
+                throw "Refusing to clean unexpected installer sandbox: $resolvedSandbox"
+              }
+              [IO.Directory]::Delete($resolvedSandbox, $true)
+            }
+          }
 
   coverage:
     name: Coverage (90% line gate)

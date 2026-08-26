@@ -76,7 +76,9 @@ if ([string]::IsNullOrEmpty($Version)) {
 $asset = "synology-drive-sync-$Version-windows-$architecture.zip"
 $releaseUrl = "https://github.com/$Repository/releases/download/$Version"
 $tempDir = Join-Path ([IO.Path]::GetTempPath()) ("sdsync-install-" + [Guid]::NewGuid().ToString('N'))
-[void] (New-Item -ItemType Directory -Path $tempDir)
+# ShouldProcess governs persistent install state. The verified, uniquely named
+# scratch workspace must still exist (and be cleaned) during a -WhatIf probe.
+[void] (New-Item -ItemType Directory -Path $tempDir -WhatIf:$false -Confirm:$false)
 
 try {
     $archivePath = Join-Path $tempDir $asset
@@ -116,6 +118,7 @@ try {
         "$archiveRoot/completions/synology-drive-sync.ps1",
         "$archiveRoot/completions/synology-drive-sync.elv",
         "$archiveRoot/man/synology-drive-sync-completions.1",
+        "$archiveRoot/man/synology-drive-sync-config-init.1",
         "$archiveRoot/man/synology-drive-sync-config-path.1",
         "$archiveRoot/man/synology-drive-sync-config-show.1",
         "$archiveRoot/man/synology-drive-sync-config-validate.1",
@@ -196,7 +199,7 @@ try {
 
         $extractDir = Join-Path $tempDir 'extract'
         $candidateDir = Join-Path $extractDir $archiveRoot
-        [void] (New-Item -ItemType Directory -Path $candidateDir)
+        [void] (New-Item -ItemType Directory -Path $candidateDir -WhatIf:$false -Confirm:$false)
         $candidate = Join-Path $candidateDir 'synology-drive-sync.exe'
         $input = $binaryEntry.Open()
         try {
@@ -292,6 +295,6 @@ finally {
         throw "Refusing to clean unexpected temporary path: $resolvedTemp"
     }
     if (Test-Path -LiteralPath $resolvedTemp -PathType Container) {
-        Remove-Item -LiteralPath $resolvedTemp -Recurse -Force
+        Remove-Item -LiteralPath $resolvedTemp -Recurse -Force -WhatIf:$false -Confirm:$false
     }
 }
