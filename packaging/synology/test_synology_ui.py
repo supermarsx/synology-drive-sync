@@ -37,56 +37,30 @@ class DsmUiContractTests(unittest.TestCase):
         info = (HERE / "INFO.template").read_text(encoding="utf-8")
         self.assertIn('os_min_ver="7.0-40759"', info)
         self.assertIn('os_max_ver="7.4-99999"', info)
-        self.assertIn('dsmuidir="ui"', info)
+        self.assertIn('dsmuidir="synology-drive-sync:ui"', info)
         self.assertIn('dsmappname="SYNO.SDS.App.SynologyDriveSync.Instance"', info)
+        self.assertNotIn("dsmapplaunchname", info)
         self.assertFalse(hasattr(validate_spk, "validate_ui_static"))
         for legacy in ("config", "app.js", "app.css"):
             self.assertFalse(UI.joinpath(legacy).exists())
-        launcher = (UI / "index.html").read_bytes()
-        validate_spk.validate_direct_launcher(launcher)
-        self.assertEqual(
-            hashlib.sha256(launcher).hexdigest(),
-            build_spk.DIRECT_LAUNCHER_SHA256,
-        )
+        self.assertFalse((UI / "index.html").exists())
 
-    def test_direct_package_routes_open_the_native_dsm_appwindow(self) -> None:
-        launcher = (UI / "index.html").read_bytes()
-        document = launcher.decode("utf-8")
-        target = "/webman/index.cgi?launchApp=SYNO.SDS.App.SynologyDriveSync.Instance"
-        self.assertEqual(build_spk.DSM_LAUNCH_TARGET, target)
-        self.assertIn(f'content="0;url={target}"', document)
-        self.assertIn(f'<a href="{target}">Open Synology Drive Sync</a>', document)
-        self.assertIn('name="referrer" content="no-referrer"', document)
-        self.assertIn("default-src 'none'", document)
-        self.assertNotRegex(document, r"<(?:script|style|img|iframe|object|embed|form)\b")
-
-        # DSM's dsmuidir maps this installed index to both the directory-index
-        # route and its explicit filename. The launcher then enters the same
-        # native AppWindow class declared by dsmappname/app.config.
+    def test_dsm_launcher_and_cgi_route_use_documented_independent_contracts(self) -> None:
         info = validate_spk.parse_info((HERE / "INFO.template").read_bytes())
-        self.assertEqual(info["dsmuidir"], "ui")
+        self.assertEqual(info["dsmuidir"], f"{info['package']}:ui")
         self.assertEqual(info["dsmappname"], build_spk.DSM_APP_CLASS)
+        self.assertNotIn("dsmapplaunchname", info)
         self.assertEqual(
-            {
-                "/webman/3rdparty/synology-drive-sync/",
-                "/webman/3rdparty/synology-drive-sync/index.html",
-            },
-            {
-                f"/webman/3rdparty/{info['package']}/",
-                f"/webman/3rdparty/{info['package']}/index.html",
-            },
+            validate_spk.CANONICAL_API,
+            f"/webman/3rdparty/{info['package']}/api.cgi",
         )
-        validate_spk.validate_direct_launcher(launcher)
-        for tampered in (
-            launcher.replace(target.encode(), b"https://evil.invalid/", 1),
-            launcher.replace(b"<main>", b"<script>alert(1)</script><main>", 1),
-            launcher.replace(b"no-referrer", b"unsafe-url", 1),
-        ):
-            with self.assertRaisesRegex(
-                validate_spk.ValidationError,
-                "exact reviewed native AppWindow redirect",
-            ):
-                validate_spk.validate_direct_launcher(tampered)
+        self.assertFalse((UI / "index.html").exists())
+
+    def test_api_listener_is_private_runtime_state_not_webman_payload(self) -> None:
+        lifecycle_common = (HERE / "scripts/common").read_text(encoding="utf-8")
+        self.assertIn("api_socket_dir=$runtime_root", lifecycle_common)
+        self.assertIn("api_socket=$api_socket_dir/api.sock", lifecycle_common)
+        self.assertNotIn("api_socket_dir=$package_root/ui", lifecycle_common)
 
     def test_native_dsm_application_and_direct_notification_contract_match(self) -> None:
         config = json.loads((UI_SOURCE / "app.config").read_text(encoding="utf-8"))
@@ -1159,7 +1133,6 @@ function bind(context, names) {
                 self.assertEqual(validate_spk.png_dimensions(archive.extractfile(members[name]).read()), (size, size))
             for name in (
                 "ui/config",
-                "ui/index.html",
                 "ui/SynologyDriveSync.js",
                 "ui/style.css",
                 "ui/images/icon.svg",
@@ -1168,10 +1141,7 @@ function bind(context, names) {
                 *(f"ui/help/enu/{page}.html" for page in build_spk.UI_HELP_PAGES),
             ):
                 self.assertIn(name, members)
-            self.assertEqual(members["ui/index.html"].mode & 0o7777, 0o644)
-            direct_launcher = archive.extractfile(members["ui/index.html"]).read()
-            self.assertEqual(direct_launcher, (UI / "index.html").read_bytes())
-            validate_spk.validate_direct_launcher(direct_launcher)
+            self.assertNotIn("ui/index.html", members)
             for name in ("ui/app.js", "ui/app.css"):
                 self.assertNotIn(name, members)
             ui_config = archive.extractfile(members["ui/config"]).read()

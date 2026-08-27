@@ -835,7 +835,7 @@ jobs:
             echo "DSM binary version did not exactly match $expected: $reported" >&2
             exit 1
           }
-          [[ "$bridge_exit" -ne 0 ]]
+          [[ "$bridge_exit" -eq 0 ]]
           grep -Fq 'Status: 401 Unauthorized' <<<"$bridge_output"
           grep -Fq 'Content-Type: application/json; charset=utf-8' <<<"$bridge_output"
           grep -Fq '"schema":"sdsync.dsm-error.v1"' <<<"$bridge_output"

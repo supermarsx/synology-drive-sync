@@ -163,20 +163,19 @@ POST CSRF verification remain mandatory.
 
 ## DSM says the page is not found when opening the app
 
-The current source uses the native `type=app` AppWindow introduced in release 26.10. The package's
-directory Open route now resolves through a byte-pinned `index.html` that has no script, external
-asset, token handling, or dashboard implementation. It redirects on the same origin to
-`/webman/index.cgi?launchApp=SYNO.SDS.App.SynologyDriveSync.Instance`, while desktop and Package
-Center launches still instantiate that same native class. DSM's generic “Sorry, the page you are
-looking for is not found” response therefore identifies a missing/stale launcher payload or a
-broken Webman mapping; it is not evidence that a `SynoToken` is required.
+The current source uses a native `type=app` AppWindow. DSM desktop and Package Center instantiate
+the class registered by `dsmappname` and installed `ui/config`; a third-party package directory is
+not a documented AppWindow URL. The package therefore ships no `ui/index.html` or undocumented
+`/webman/index.cgi?launchApp=...` redirect. Opening
+`/webman/3rdparty/synology-drive-sync/` in a separate tab may legitimately show DSM's generic
+“Sorry, the page you are looking for is not found” response and does not by itself prove that the
+native registration or CGI route is broken.
 
 First click **Open** in Package Center or launch **Synology Drive Sync** from the DSM desktop. In the
 browser Network panel, record only each failed request path, status, and response type. Do not copy,
-save, or share arbitrary query strings because they can contain session material. A corrected direct
-launch may request either `/webman/3rdparty/synology-drive-sync/` or its explicit `index.html`, then
-must navigate to the fixed token-free `launchApp` target above. The dashboard's API requests use the
-exact path `/webman/3rdparty/synology-drive-sync/api.cgi`.
+save, or share arbitrary query strings because they can contain session material. A correct native
+launch loads the registered `SynologyDriveSync.js` module. The dashboard's API requests use the exact
+independent path `/webman/3rdparty/synology-drive-sync/api.cgi`.
 
 Then inspect the installed registration and mapping without changing them:
 
@@ -191,24 +190,24 @@ ls -ld "$WEBMAN_LINK" "$UI_ROOT"
 readlink "$WEBMAN_LINK"
 readlink -f "$WEBMAN_LINK"
 stat -Lc '%F %a %U:%G %n' \
-  "$WEBMAN_LINK" "$UI_ROOT" "$UI_ROOT/config" "$UI_ROOT/index.html" \
+  "$WEBMAN_LINK" "$UI_ROOT" "$UI_ROOT/config" \
   "$UI_ROOT/SynologyDriveSync.js" "$UI_ROOT/style.css" "$UI_ROOT/api.cgi"
 grep -F 'SYNO.SDS.App.SynologyDriveSync.Instance' "$UI_ROOT/config"
 grep -F '"type": "app"' "$UI_ROOT/config"
 ```
 
-The installed fields must be `package="synology-drive-sync"`, `dsmuidir="ui"`, and
-`dsmappname="SYNO.SDS.App.SynologyDriveSync.Instance"`. `config`, `index.html`,
-`SynologyDriveSync.js`, and `style.css` must be regular `0644` files; `config` must wrap that class
-beneath the
+The installed fields must be `package="synology-drive-sync"`,
+`dsmuidir="synology-drive-sync:ui"`, and
+`dsmappname="SYNO.SDS.App.SynologyDriveSync.Instance"`. `config`, `SynologyDriveSync.js`, and
+`style.css` must be regular `0644` files; `config` must wrap that class beneath the
 `SynologyDriveSync.js` module and declare `type="app"` with the matching `appWindow`. `api.cgi` must
 be a regular `0755` file. The Webman link must resolve to that installation's `target/ui` for the
 CGI endpoint. Interpret the evidence as follows:
 
-- An Open request for the package root or `index.html` is expected only when it returns the exact
-  same-origin redirect to the native `launchApp` class. A missing/tampered index, an external target,
-  or an installed `.url`/`type=url` config identifies an invalid package or stale DSM registration.
-  Verify and reinstall a corrected published native artifact; do not edit the installed files.
+- A 404 for the package directory or `index.html` in an ordinary browser tab is not an AppWindow
+  failure. Diagnose the DSM desktop/Package Center application-class launch and the exact `api.cgi`
+  route separately. An installed `.url`/`type=url` config still identifies an invalid or stale
+  package.
 - A missing class/module wrapper, bundle, or stylesheet is an invalid/stale SPK payload. Preserve its
   checksum and member listing, then install a verified corrected artifact.
 - A missing or broken Webman link with correct installed metadata is a DSM package-framework
@@ -389,10 +388,10 @@ the exact source NAS and record all of the following:
   lower-privilege/root rejection and retain the bounded log tails above;
 - dashboard icon/Open behavior and actual native DSM AppWindow layout at narrow and wide sizes;
 - the installed module-keyed config registers `SYNO.SDS.App.SynologyDriveSync.Instance` as
-  `type=app`, Package Center and desktop Open instantiate that class, the package root and explicit
-  `index.html` routes redirect only to that same native class, the bundle/style load, DSM's Webman
-  link resolves to `target/ui`, and
-  `/webman/3rdparty/synology-drive-sync/api.cgi` is reached without a routing 404;
+  `type=app`, Package Center and desktop Open instantiate that native AppWindow class, the
+  bundle/style load, and DSM's Webman link resolves to `target/ui`; an ordinary browser request for
+  the package directory or absent `index.html` may return 404 without constituting a native-launch
+  failure, while `/webman/3rdparty/synology-drive-sync/api.cgi` is reached without a routing 404;
 - on every claimed DSM branch—and specifically DSM 7.0/7.1 where supported—the same AppWindow
   launch, rendering, assets, and API path succeed on physical NAS hardware; and
 - a fresh native launch authenticates with the same-origin DSM cookie, does not inspect/rewrite the
@@ -407,7 +406,7 @@ accessibility interaction, or browser-header-to-CGI forwarding as already proven
 - `conf/privilege` is the exact package-run-as document above, all installed executables are `0755`,
   and no package file carries an identity-changing permission bit or Linux capability;
 - `ui/api.cgi` is package-owned `0755` and DSM executes it with real/effective UID equal to the
-  exact non-root package UID used by the API `--serve` process; `ui/api.sock` is package-owned
+  exact non-root package UID used by the API `--serve` process; `var/run/api.sock` is package-owned
   `0000` before startup commit and the same inode is `0600` when active;
 - the CGI and service reject a substituted socket, wrong owner/mode, wrong peer UID, symlink,
   extra hard link, unsafe parent, oversized frame, or malformed relay schema;

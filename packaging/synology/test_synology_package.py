@@ -436,16 +436,7 @@ class BuilderTests(unittest.TestCase):
                 self.assertEqual(package.getmember(ui_entrypoint).mode, 0o644)
                 self.assertIn("ui/style.css", package_members)
                 self.assertEqual(package.getmember("ui/style.css").mode, 0o644)
-                self.assertIn("ui/index.html", package_members)
-                direct_launcher_member = package.getmember("ui/index.html")
-                self.assertTrue(direct_launcher_member.isfile())
-                self.assertEqual(direct_launcher_member.mode, 0o644)
-                direct_launcher = package.extractfile(direct_launcher_member).read()  # type: ignore[union-attr]
-                self.assertEqual(
-                    direct_launcher,
-                    (HERE / "package/ui/index.html").read_bytes(),
-                )
-                validate_spk.validate_direct_launcher(direct_launcher)
+                self.assertNotIn("ui/index.html", package_members)
                 for legacy in ("ui/app.js", "ui/app.css"):
                     self.assertNotIn(legacy, package_members)
                 native_script = package.extractfile(ui_entrypoint).read()  # type: ignore[union-attr]
@@ -1276,7 +1267,7 @@ class RuntimeTests(unittest.TestCase):
                 "SYNOPKG_PKGNAME": "synology-drive-sync",
                 "SYNOPKG_DSM_VERSION_MAJOR": "7",
                 "SDSYNC_TEST_CAPTURE": str(self.capture),
-                "SDSYNC_TEST_API_SOCKET": str(self.real_target / "ui/api.sock"),
+                "SDSYNC_TEST_API_SOCKET": str(self.real_var / "run/api.sock"),
                 "SDSYNC_DSM_STOP_TIMEOUT": "10",
                 "PATH": f"{self.fake_system_bin}:{os.environ['PATH']}",
             }
@@ -5397,7 +5388,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             self.real_var / "run/api.pid",
             self.real_var / "run/api.ready",
             self.real_var / "run/api.bound",
-            self.real_target / "ui/api.sock",
+            self.real_var / "run/api.sock",
         ):
             self.assertFalse(path.exists(), path)
         self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
@@ -6715,7 +6706,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             time.sleep(0.02)
         else:
             self.fail("controller survived a successful concurrent stop")
-        self.assertFalse((self.real_target / "ui/api.sock").exists())
+        self.assertFalse((self.real_var / "run/api.sock").exists())
         self.assertFalse((self.real_var / "run/api.pid").exists())
         self.assertFalse((self.real_var / "run/controller.pid").exists())
         self.assertFalse((self.real_var / "run/controller.lock").exists())
@@ -6774,7 +6765,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 self.real_var / "run/api.pid",
                 self.real_var / "run/api.bound",
                 self.real_var / "run/api.ready",
-                self.real_target / "ui/api.sock",
+                self.real_var / "run/api.sock",
             ):
                 self.assertFalse(path.exists(), path)
             self.assertFalse(release.exists())
@@ -6840,7 +6831,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 self.real_var / "run/api.pid",
                 self.real_var / "run/api.bound",
                 self.real_var / "run/api.ready",
-                self.real_target / "ui/api.sock",
+                self.real_var / "run/api.sock",
                 self.real_var / "run/lifecycle.lock",
             ):
                 self.assertFalse(path.exists(), path)
@@ -6925,7 +6916,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 self.real_var / "run/api.pid",
                 self.real_var / "run/api.bound",
                 self.real_var / "run/api.ready",
-                self.real_target / "ui/api.sock",
+                self.real_var / "run/api.sock",
                 self.real_var / "run/controller.pid",
                 self.real_var / "run/controller.lock",
             ):
@@ -6948,7 +6939,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             for path in (
                 self.real_var / "run/api.pid",
                 self.real_var / "run/api.ready",
-                self.real_target / "ui/api.sock",
+                self.real_var / "run/api.sock",
                 self.real_var / "run/lifecycle.lock",
             ):
                 self.assertFalse(path.exists(), path)
@@ -7021,7 +7012,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 self.real_var / "run/api.pid",
                 self.real_var / "run/api.bound",
                 self.real_var / "run/api.ready",
-                self.real_target / "ui/api.sock",
+                self.real_var / "run/api.sock",
                 self.real_var / "run/lifecycle.lock",
             ):
                 self.assertFalse(path.exists(), path)
@@ -7092,7 +7083,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 self.real_var / "run/api.pid",
                 self.real_var / "run/api.bound",
                 self.real_var / "run/api.ready",
-                self.real_target / "ui/api.sock",
+                self.real_var / "run/api.sock",
                 self.real_var / "run/lifecycle.lock",
             ):
                 self.assertFalse(path.exists(), path)
@@ -7161,7 +7152,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 self.real_var / "run/api.pid",
                 self.real_var / "run/api.bound",
                 self.real_var / "run/api.ready",
-                self.real_target / "ui/api.sock",
+                self.real_var / "run/api.sock",
                 self.real_var / "run/lifecycle.lock",
             ):
                 self.assertFalse(path.exists(), path)
@@ -7358,12 +7349,32 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             self.real_var / "run/controller.lock",
             self.real_var / "run/api.pid",
             self.real_var / "run/api.ready",
-            self.real_target / "ui/api.sock",
+            self.real_var / "run/api.sock",
         ):
             self.assertFalse(path.exists(), path)
 
+    def test_start_uses_private_var_run_when_installed_ui_is_read_only(self) -> None:
+        ui_directory = self.real_target / "ui"
+        api_socket = self.real_var / "run/api.sock"
+        ui_socket = ui_directory / "api.sock"
+        ui_directory.chmod(0o555)
+        try:
+            started = self.shell(self.lifecycle, "start", timeout=15)
+            self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+            self.assertEqual(self.shell(self.lifecycle, "status").returncode, 0)
+            self.assertTrue(stat.S_ISSOCK(api_socket.stat().st_mode))
+            self.assertEqual(api_socket.stat().st_mode & 0o7777, 0o600)
+            self.assertEqual(api_socket.stat().st_uid, self.drop_uid)
+            self.assertFalse(ui_socket.exists())
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+            self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
+        finally:
+            ui_directory.chmod(0o755)
+            self.shell(self.lifecycle, "stop", timeout=15)
+
     def test_start_status_term_stop_and_upgrade_uninstall_run_guard(self) -> None:
-        api_socket = self.real_target / "ui/api.sock"
+        api_socket = self.real_var / "run/api.sock"
         stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         stale.bind(str(api_socket))
         stale.close()
@@ -8094,7 +8105,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(self.shell(self.lifecycle, "stop", timeout=15).returncode, 0)
 
     def test_lifecycle_rejects_untracked_socket_and_unsafe_pid_artifacts(self) -> None:
-        api_socket = self.real_target / "ui/api.sock"
+        api_socket = self.real_var / "run/api.sock"
         outside = self.root / "outside-api-marker"
         outside.write_text("keep\n", encoding="utf-8")
         api_socket.symlink_to(outside)
@@ -8150,18 +8161,17 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertTrue(stat.S_ISSOCK(api_socket.lstat().st_mode))
         api_socket.unlink()
 
-        ui_directory = self.real_target / "ui"
-        ui_directory.chmod(0o2755)
+        runtime_directory = self.real_var / "run"
+        runtime_directory.chmod(0o2700)
         try:
             self.assertEqual(self.shell(self.lifecycle, "prestart").returncode, 150)
-            self.assertEqual(self.shell(self.lifecycle, "start").returncode, 1)
         finally:
-            ui_directory.chmod(0o755)
+            runtime_directory.chmod(0o700)
 
     def test_lifecycle_ignores_non_authorizing_group_on_mode_0600_socket(self) -> None:
         if os.getuid() != 0:
             self.skipTest("wrong socket group requires a privileged test runner")
-        api_socket = self.real_target / "ui/api.sock"
+        api_socket = self.real_var / "run/api.sock"
         wrong_group = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         wrong_group.bind(str(api_socket))
         wrong_group.close()
@@ -8186,7 +8196,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             api_pid_file.unlink(missing_ok=True)
 
     def test_start_never_unlinks_a_live_listener_with_a_stale_pid(self) -> None:
-        api_socket = self.real_target / "ui/api.sock"
+        api_socket = self.real_var / "run/api.sock"
         api_pid_file = self.real_var / "run/api.pid"
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(api_socket))
@@ -8278,7 +8288,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             self.assertNotIn(str(self.root), diagnostics[0])
             self.assertFalse((self.real_var / "run/api.pid").exists())
             self.assertFalse((self.real_var / "run/controller.ready").exists())
-            self.assertFalse((self.real_target / "ui/api.sock").exists())
+            self.assertFalse((self.real_var / "run/api.sock").exists())
             self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
             service_events = [
                 line.split("|", 8)
@@ -8307,7 +8317,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             self.real_var / "run/controller.ready",
             self.real_var / "run/controller.lock",
             self.real_var / "run/api.pid",
-            self.real_target / "ui/api.sock",
+            self.real_var / "run/api.sock",
         ):
             self.assertFalse(path.exists(), path)
         self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
@@ -8623,7 +8633,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             stdout, stderr = process.communicate(timeout=15)
             self.assertNotEqual(process.returncode, 0, (stdout, stderr))
             self.assertFalse(api_pid_file.exists())
-            self.assertFalse((self.real_target / "ui/api.sock").exists())
+            self.assertFalse((self.real_var / "run/api.sock").exists())
             self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
             restarted = self.shell(self.lifecycle, "start", timeout=15)
             self.assertEqual(restarted.returncode, 0, restarted.stderr)

@@ -138,6 +138,9 @@ chmod 0755 "$physical_store"
 chmod 0700 "$physical_home" "$physical_var"
 chown -R "$package_uid:$package_gid" "$physical_store" "$physical_home" "$physical_var" \
     "$package_base/scripts"
+# DSM's installed @appstore payload is not a mutable runtime directory. Model
+# that boundary explicitly so startup cannot regress to binding inside ui/.
+chmod 0555 "$physical_store/ui"
 ln -s "$physical_store" "$package_base/target"
 ln -s "$physical_home" "$package_base/home"
 ln -s "$physical_var" "$package_base/var"
@@ -182,8 +185,12 @@ run_package_cgi() {
 run_lifecycle start
 run_lifecycle status
 
-api_socket=$package_base/target/ui/api.sock
+api_socket=$physical_var/run/api.sock
 api_ready=$physical_var/run/api.ready
+[ ! -e "$physical_store/ui/api.sock" ] && [ ! -L "$physical_store/ui/api.sock" ] || {
+    echo "started package placed mutable API state inside the Webman UI payload" >&2
+    exit 1
+}
 if ! { [ -S "$api_socket" ] && [ ! -L "$api_socket" ]; }; then
     echo "started package did not publish a real API socket" >&2
     exit 1
@@ -254,6 +261,26 @@ stopped_status=$?
 set -e
 [ "$stopped_status" -eq 3 ] || {
     echo "stopped lifecycle returned $stopped_status instead of 3" >&2
+    exit 1
+}
+
+# A resolved, executable CGI with no live backend reports service unavailability.
+# That is intentionally distinct from a missing Webman route (HTTP 404).
+set +e
+stopped_cgi_response=$(run_package_cgi)
+stopped_cgi_status=$?
+set -e
+stopped_cgi_response=$(printf '%s' "$stopped_cgi_response" | tr -d '\r')
+[ "$stopped_cgi_status" -eq 0 ] || {
+    echo "stopped installed CGI did not emit a structured HTTP response" >&2
+    exit 1
+}
+[ "$(printf '%s\n' "$stopped_cgi_response" | sed -n '1p')" = "Status: 503 Service Unavailable" ] || {
+    echo "stopped installed CGI did not distinguish backend unavailability from route absence" >&2
+    exit 1
+}
+printf '%s\n' "$stopped_cgi_response" | grep -Fq '"code":"service_unavailable"' || {
+    echo "stopped installed CGI response is not the service-unavailable schema" >&2
     exit 1
 }
 

@@ -71,20 +71,19 @@ Artifacts are named `synology-drive-sync-VERSION-ARCH.spk`, where `ARCH` is `x86
 DSM version `0.1.0-1` in `INFO`. `SOURCE_DATE_EPOCH` controls every tar member and the inner gzip
 header for reproducible output. The builder validates `ui-src/app.config` and `config.define`, then
 deterministically renders the DSM toolkit-equivalent module wrapper under `ui/config` and packages
-`ui/SynologyDriveSync.js` plus `ui/style.css`. The byte-pinned `ui/index.html` is not a second or
-legacy dashboard: it contains no script, external asset, token handling, or application code. DSM
-serves it for the package directory/index route, and it redirects to the same token-free native
-AppWindow entry at
-`/webman/index.cgi?launchApp=SYNO.SDS.App.SynologyDriveSync.Instance` with an accessible fallback
-link.
+`ui/SynologyDriveSync.js` plus `ui/style.css`. The package deliberately has no standalone
+`ui/index.html` or undocumented `launchApp` redirect. DSM launches the application through the
+registered `dsmappname` and installed `ui/config` AppWindow module; the Webman third-party mapping
+exists for registered assets and `api.cgi`, not as a directory-index application.
 
 Every executable, including `ui/api.cgi`, is ordinary `0755` in both the archive and installed
 package. Nothing carries a set-user-ID/set-group-ID bit. `conf/privilege` contains only
 `defaults.run-as: package`; it requests no root run-as, joined DSM group, tool privilege, or Linux
 capability. DSM executes the ordinary CGI as its package-file owner, so the CGI and
 `sdsync-dsm-api --serve` daemon share the package identity. They relay one bounded request through
-fixed `target/ui/api.sock`, owned by the package identity and mode `0600`. Both peers verify socket
-metadata and kernel peer identity.
+fixed `/var/packages/synology-drive-sync/var/run/api.sock`, owned by the package identity and mode
+`0600`. Mutable socket state never enters the installed/Webman-exposed `target/ui` tree. Both peers
+verify socket metadata and kernel peer identity.
 The validator rejects any privilege-bearing archive member or broader privilege manifest.
 
 The corrected package contains no `conf/resource` acquisition worker or sysnotify mail templates.

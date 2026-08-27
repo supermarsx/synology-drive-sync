@@ -9,7 +9,7 @@ Both must be regular, non-symlink, fully static, little-endian ELF files for the
 architecture. The helper is installed byte-for-byte at ordinary `bin/sdsync-dsm-api` mode `0755`
 and at package-owned `ui/api.cgi` mode `0755`. DSM's CGI framework executes that file with its exact
 non-root package-owner UID under `defaults.run-as=package`, matching the package-user `--serve`
-process. The CGI relays one bounded request through fixed `ui/api.sock`; the service binds it as
+process. The CGI relays one bounded request through fixed `var/run/api.sock`; the service binds it as
 package-owned `0000` before startup commit, then activates that same inode as `0600`. No outer or
 inner archive member or installed executable carries a set-user-ID/set-group-ID bit. The package
 requests neither a joined web group, root run-as, nor Linux capabilities.
@@ -29,7 +29,7 @@ capability declaration.
 
 ## Native DSM AppWindow contract
 
-`INFO` registers `dsmuidir="ui"` and the exact class
+`INFO` registers `dsmuidir="synology-drive-sync:ui"` and the exact class
 `dsmappname="SYNO.SDS.App.SynologyDriveSync.Instance"`. `ui-src/app.config` declares that class as
 `type="app"`, sets `appWindow` to the same value, and keeps `allUsers=false`. `config.define` binds
 the source bundle to `SynologyDriveSync.js`. The assembler deterministically reproduces the normal

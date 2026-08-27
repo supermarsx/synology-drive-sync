@@ -105,7 +105,7 @@ overlap validation.
 | Manager | `/var/packages/synology-drive-sync/target/bin/sdsync-dsm` |
 | API service and private job consumer | `/var/packages/synology-drive-sync/target/bin/sdsync-dsm-api` |
 | Package-owned DSM CGI relay (`0755`, exact package UID at runtime) | `/var/packages/synology-drive-sync/target/ui/api.cgi` |
-| Fixed package-owned API socket (`0000` prepared, same inode `0600` active) | `/var/packages/synology-drive-sync/target/ui/api.sock` |
+| Fixed package-owned API socket (`0000` prepared, same inode `0600` active) | `/var/packages/synology-drive-sync/var/run/api.sock` |
 | Dashboard assets | `/var/packages/synology-drive-sync/target/ui/` |
 | Generated config | `/var/packages/synology-drive-sync/home/config/config.toml` |
 | Profile fragments | `/var/packages/synology-drive-sync/home/config/profiles.d/` |

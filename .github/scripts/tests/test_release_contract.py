@@ -658,6 +658,8 @@ class WorkflowWiringTests(unittest.TestCase):
                 'HTTP_X_SDSYNC_REQUEST=1 "$api_binary"',
                 section,
             )
+            self.assertEqual(section.count('[[ "$bridge_exit" -eq 0 ]]'), 1)
+            self.assertNotIn('[[ "$bridge_exit" -ne 0 ]]', section)
             self.assertIn("Status: 401 Unauthorized", section)
             self.assertIn('"schema":"sdsync.dsm-error.v1"', section)
             self.assertIn('"code":"unauthorized"', section)

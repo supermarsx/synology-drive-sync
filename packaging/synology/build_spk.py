@@ -24,8 +24,6 @@ HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[1]
 PACKAGE = "synology-drive-sync"
 DSM_APP_CLASS = "SYNO.SDS.App.SynologyDriveSync.Instance"
-DSM_LAUNCH_TARGET = f"/webman/index.cgi?launchApp={DSM_APP_CLASS}"
-DIRECT_LAUNCHER_SHA256 = "06f9a9bbe0e0edef75abb88f9fab2ed33ab08fe4ce5cb8407850f1dc2915785d"
 UI_SOURCE = HERE / "ui-src"
 UI_ICON_SIZES = (16, 24, 32, 48, 64, 72, 256)
 UI_HELP_PAGES = (
@@ -493,14 +491,7 @@ def native_ui_payloads() -> tuple[tuple[bytes, str], ...]:
     for page in UI_HELP_PAGES:
         if not re.search(rf'^{re.escape(page)}="[^"\r\n]+"$', strings_text, re.MULTILINE):
             raise PackageError(f"DSM Help text key is missing: help:{page}")
-    direct_launcher_path = HERE / "package/ui/index.html"
-    direct_launcher = _regular_file_bytes(direct_launcher_path)
-    if hashlib.sha256(direct_launcher).hexdigest() != DIRECT_LAUNCHER_SHA256:
-        raise PackageError(
-            "DSM direct-route launcher does not match the exact reviewed native AppWindow redirect"
-        )
     sources = (
-        (direct_launcher_path, "ui/index.html"),
         (UI_SOURCE / "dist/SynologyDriveSync.js", "ui/SynologyDriveSync.js"),
         (UI_SOURCE / "dist/style.css", "ui/style.css"),
         (HERE / "package/ui/images/icon.svg", "ui/images/icon.svg"),

@@ -6,23 +6,22 @@ the bundle loads no CDN scripts, fonts, images, analytics, or hosted search serv
 
 ## Native DSM AppWindow contract
 
-`INFO` binds `dsmuidir="ui"` and
+`INFO` binds `dsmuidir="synology-drive-sync:ui"` and
 `dsmappname="SYNO.SDS.App.SynologyDriveSync.Instance"`. The installed `ui/config` is keyed first by
 `SynologyDriveSync.js`, then by that exact application class. Its entry declares `type="app"` and
 the matching `appWindow`; it is not a `type=url` pop-up or an iframe around a standalone HTML page.
 The bundle registers the class through `SYNO.namespace` and `Vue.extend`, then renders the dashboard
 inside DSM's `v-app-instance` and `v-app-window` components. DSM loads the packaged
-`SynologyDriveSync.js` and `style.css` assets. The package also ships a byte-pinned, script-free
-`ui/index.html` only so the `/webman/3rdparty/synology-drive-sync/` directory route and explicit
-`index.html` route have a valid Open target. That document contains no dashboard implementation,
-external assets, launch token, or authentication logic; it redirects on the same origin to
-`/webman/index.cgi?launchApp=SYNO.SDS.App.SynologyDriveSync.Instance` and provides the same target as
-an accessible fallback link. The module-keyed native AppWindow remains the only application UI.
+`SynologyDriveSync.js` and `style.css` assets. The module-keyed native AppWindow is the only
+application UI: there is no `type=url` entry, standalone `ui/index.html`, or undocumented
+`launchApp` redirect. Opening the third-party directory in a separate browser tab is not the DSM
+AppWindow launch contract and may legitimately return DSM's generic page-not-found response.
 
 The AppWindow calls the canonical same-origin CGI endpoint
-`/webman/3rdparty/synology-drive-sync/api.cgi` directly. `dsmuidir="ui"` lets DSM expose that
-package-owned endpoint through its framework-managed third-party path while the rootless CGI/socket
-authentication boundary remains unchanged.
+`/webman/3rdparty/synology-drive-sync/api.cgi` directly. The explicit
+`dsmuidir="synology-drive-sync:ui"` mapping lets DSM expose that package-owned endpoint through its
+framework-managed third-party path while the rootless CGI/socket authentication boundary remains
+unchanged.
 
 Package lifecycle scripts never create, replace, or repair that `/usr/syno` link. Doing so would
 cross DSM's framework boundary and would require privileges the package deliberately does not have.

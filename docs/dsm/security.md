@@ -30,13 +30,13 @@ override, or capability declaration.
 | `bin/sdsync-dsm` | package | `0755` | Package-user shell control-plane manager |
 | `bin/sdsync-dsm-api` | package | `0755` | Package-user API service and private job consumer |
 | `ui/api.cgi` | package | `0755` | Package-UID DSM CGI process; bounded socket relay only |
-| `ui/api.sock` | package | `0000` prepared, `0600` active | Fixed API-service Unix socket; never configurable |
+| `var/run/api.sock` | package | `0000` prepared, `0600` active | Fixed API-service Unix socket; never configurable |
 
 The CGI and service are byte-identical copies of the compiled helper, but their command-line
 arguments select different modes. Under `defaults.run-as=package`, DSM's CGI daemon executes
 the package-owned CGI with real and effective UID equal to the executable's exact non-root owner.
-The long-lived `--serve` process uses that same package UID. The server creates `ui/api.sock` under a
-package-owned directory that is not group/other-writable, binds it with exact mode `0000`, and only
+The long-lived `--serve` process uses that same package UID. The server creates `var/run/api.sock`
+under DSM's package-owned mutable runtime directory, binds it with exact mode `0000`, and only
 after its worker pool and exact readiness identity exist activates that same inode with exact mode
 `0600` and one link. Group ownership is not an authorization input because `0600` grants no group
 access.

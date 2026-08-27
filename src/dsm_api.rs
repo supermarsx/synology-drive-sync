@@ -60,7 +60,7 @@ const AUDIT_OUTBOX_LOCK_PATH: &str = "/var/packages/synology-drive-sync/var/run/
 const LOG_ROOT: &str = "/var/packages/synology-drive-sync/var/log";
 const AUDIT_LOG_PATH: &str = "/var/packages/synology-drive-sync/var/log/audit.log";
 const ACTIVITY_LOG_PATH: &str = "/var/packages/synology-drive-sync/var/log/activity.log";
-const API_SOCKET_PATH: &str = "/var/packages/synology-drive-sync/target/ui/api.sock";
+const API_SOCKET_PATH: &str = "/var/packages/synology-drive-sync/var/run/api.sock";
 const API_PID_PATH: &str = "/var/packages/synology-drive-sync/var/run/api.pid";
 const API_BOUND_PATH: &str = "/var/packages/synology-drive-sync/var/run/api.bound";
 const API_READY_PATH: &str = "/var/packages/synology-drive-sync/var/run/api.ready";
@@ -394,6 +394,45 @@ impl BridgeError {
 
     const fn internal() -> Self {
         Self::new(ErrorKind::Internal)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CgiFailureStage {
+    Request,
+    Identity,
+    Authentication,
+    Runtime,
+    BridgeConnect,
+    BridgeIo,
+    BridgeProtocol,
+    ServiceRequest,
+}
+
+impl CgiFailureStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Identity => "cgi_identity",
+            Self::Authentication => "dsm_authentication",
+            Self::Runtime => "cgi_runtime",
+            Self::BridgeConnect => "bridge_connect",
+            Self::BridgeIo => "bridge_io",
+            Self::BridgeProtocol => "bridge_protocol",
+            Self::ServiceRequest => "service_request",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CgiFailure {
+    error: BridgeError,
+    stage: CgiFailureStage,
+}
+
+impl CgiFailure {
+    const fn new(stage: CgiFailureStage, error: BridgeError) -> Self {
+        Self { error, stage }
     }
 }
 
@@ -8038,12 +8077,22 @@ impl CgiResponse {
     }
 
     fn service_unavailable() -> Self {
-        let body = br#"{"schema":"sdsync.dsm-error.v1","ok":false,"code":"service_unavailable","message":"The package service is not ready. Retry shortly. If this persists, restart Synology Drive Sync in Package Center and inspect its controller log."}"#.to_vec();
-        Self { status: 503, body }
+        Self::staged_error(
+            CgiFailureStage::BridgeConnect,
+            BridgeError::new(ErrorKind::Unavailable),
+        )
     }
 
     fn error(error: BridgeError) -> Self {
-        let (status, code) = match error.kind {
+        Self::error_payload(error, None)
+    }
+
+    fn staged_error(stage: CgiFailureStage, error: BridgeError) -> Self {
+        Self::error_payload(error, Some(stage))
+    }
+
+    fn error_payload(error: BridgeError, stage: Option<CgiFailureStage>) -> Self {
+        let (status, default_code) = match error.kind {
             ErrorKind::BadRequest => (400, "invalid_request"),
             ErrorKind::Unauthorized => (401, "unauthorized"),
             ErrorKind::Forbidden => (403, "forbidden"),
@@ -8055,11 +8104,47 @@ impl CgiResponse {
             ErrorKind::UnsafeRuntime | ErrorKind::Unavailable => (503, "unavailable"),
             ErrorKind::Internal => (500, "internal_error"),
         };
+        let code = match (error.kind, stage) {
+            (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::Identity)) => "cgi_identity_unsafe",
+            (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::Authentication)) => {
+                "dsm_authentication_unsafe"
+            }
+            (ErrorKind::Unavailable, Some(CgiFailureStage::Authentication)) => {
+                "dsm_authentication_unavailable"
+            }
+            (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::Runtime)) => "cgi_runtime_unsafe",
+            (ErrorKind::Unavailable, Some(CgiFailureStage::Runtime)) => "cgi_runtime_unavailable",
+            (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::BridgeConnect)) => {
+                "bridge_socket_unsafe"
+            }
+            (ErrorKind::Unavailable, Some(CgiFailureStage::BridgeConnect)) => "service_unavailable",
+            (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::BridgeIo)) => "bridge_io_unsafe",
+            (ErrorKind::Unavailable, Some(CgiFailureStage::BridgeIo)) => "bridge_io_unavailable",
+            (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::BridgeProtocol)) => {
+                "bridge_protocol_unsafe"
+            }
+            (ErrorKind::Unavailable, Some(CgiFailureStage::BridgeProtocol)) => {
+                "bridge_protocol_unavailable"
+            }
+            (
+                ErrorKind::UnsafeRuntime | ErrorKind::Unavailable,
+                Some(CgiFailureStage::ServiceRequest),
+            ) => "service_request_unavailable",
+            _ => default_code,
+        };
+        let message = if stage == Some(CgiFailureStage::BridgeConnect)
+            && error.kind == ErrorKind::Unavailable
+        {
+            "The package service is not ready. Retry shortly. If this persists, restart Synology Drive Sync in Package Center and inspect its controller log."
+        } else {
+            "Request could not be completed."
+        };
         let body = serde_json::to_vec(&json!({
             "schema": "sdsync.dsm-error.v1",
             "ok": false,
             "code": code,
-            "message": "Request could not be completed.",
+            "stage": stage.map(CgiFailureStage::as_str),
+            "message": message,
         }))
         .unwrap_or_else(|_| {
             br#"{"schema":"sdsync.dsm-error.v1","ok":false,"code":"internal_error","message":"Request could not be completed."}"#
@@ -8074,14 +8159,9 @@ pub(crate) fn main_entry() -> ExitCode {
     if arguments.is_empty() {
         let response = match run_cgi() {
             Ok(response) => response,
-            Err(error) => CgiResponse::error(error),
+            Err(failure) => CgiResponse::staged_error(failure.stage, failure.error),
         };
-        let success = response.status < 400;
-        if write_cgi_response(&response).is_err() || !success {
-            ExitCode::FAILURE
-        } else {
-            ExitCode::SUCCESS
-        }
+        cgi_exit_code(write_cgi_response(&response).is_ok())
     } else if arguments.len() == 1 && arguments[0] == "--serve" {
         match run_server() {
             Ok(()) => ExitCode::SUCCESS,
@@ -8292,8 +8372,19 @@ pub(crate) fn main_entry() -> ExitCode {
         }
     } else if std::env::var_os("REQUEST_METHOD").is_some() {
         let response = CgiResponse::error(BridgeError::bad_request());
-        let _ = write_cgi_response(&response);
+        cgi_exit_code(write_cgi_response(&response).is_ok())
+    } else {
         ExitCode::FAILURE
+    }
+}
+
+fn cgi_exit_code(response_written: bool) -> ExitCode {
+    // The CGI Status header carries the HTTP outcome. Once a complete response
+    // has been written, the transport itself succeeded; returning a process
+    // failure can make Webman replace an intentional 4xx/5xx response with an
+    // undifferentiated gateway error and discard the safe diagnostic payload.
+    if response_written {
+        ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
@@ -8564,16 +8655,23 @@ fn run_audit_transaction_cli(_arguments: &[OsString]) -> BridgeResult<bool> {
     Err(BridgeError::unsafe_runtime())
 }
 
-fn run_cgi() -> BridgeResult<CgiResponse> {
+fn run_cgi() -> Result<CgiResponse, CgiFailure> {
     #[cfg(not(target_os = "linux"))]
-    return Err(BridgeError::unsafe_runtime());
+    return Err(CgiFailure::new(
+        CgiFailureStage::Identity,
+        BridgeError::unsafe_runtime(),
+    ));
 
     #[cfg(target_os = "linux")]
     {
-        let environment = process_environment()?;
-        let identity = linux_runtime::identity_state()?;
-        let package_uid = validate_cgi_identity(&identity)?;
-        let request = validate_http_request(environment.clone())?;
+        let environment = process_environment()
+            .map_err(|error| CgiFailure::new(CgiFailureStage::Request, error))?;
+        let identity = linux_runtime::identity_state()
+            .map_err(|error| CgiFailure::new(CgiFailureStage::Identity, error))?;
+        let package_uid = validate_cgi_identity(&identity)
+            .map_err(|error| CgiFailure::new(CgiFailureStage::Identity, error))?;
+        let request = validate_http_request(environment.clone())
+            .map_err(|error| CgiFailure::new(CgiFailureStage::Request, error))?;
         let authentication = match &request {
             ValidatedHttpRequest::Get { authentication, .. }
             | ValidatedHttpRequest::Post { authentication, .. } => authentication,
@@ -8581,19 +8679,23 @@ fn run_cgi() -> BridgeResult<CgiResponse> {
         // Synology documents authenticate.cgi being invoked from the custom
         // CGI, where DSM's native request environment is still authoritative.
         let session =
-            linux_runtime::authenticate_and_authorize(authentication, AUTH_HELPER_TIMEOUT)?;
+            linux_runtime::authenticate_and_authorize(authentication, AUTH_HELPER_TIMEOUT)
+                .map_err(|error| CgiFailure::new(CgiFailureStage::Authentication, error))?;
         let body = match request {
             ValidatedHttpRequest::Get { .. } => None,
-            ValidatedHttpRequest::Post { content_length, .. } => {
-                Some(read_exact_body(&mut io::stdin().lock(), content_length)?)
-            }
+            ValidatedHttpRequest::Post { content_length, .. } => Some(
+                read_exact_body(&mut io::stdin().lock(), content_length)
+                    .map_err(|error| CgiFailure::new(CgiFailureStage::Request, error))?,
+            ),
         };
         let encoded = encode_relay_request(
             &environment,
             body.as_ref().map(|value| value.as_slice()),
             &session,
-        )?;
-        linux_runtime::clear_environment()?;
+        )
+        .map_err(|error| CgiFailure::new(CgiFailureStage::Runtime, error))?;
+        linux_runtime::clear_environment()
+            .map_err(|error| CgiFailure::new(CgiFailureStage::Runtime, error))?;
         let mut stream = match linux_socket::connect_for_cgi(
             Path::new(API_SOCKET_PATH),
             package_uid,
@@ -8606,16 +8708,22 @@ fn run_cgi() -> BridgeResult<CgiResponse> {
                 );
                 return Ok(CgiResponse::service_unavailable());
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(CgiFailure::new(CgiFailureStage::BridgeConnect, error));
+            }
         };
-        write_frame(&mut stream, &encoded, MAX_RELAY_REQUEST_BYTES)?;
-        linux_socket::shutdown_write(&stream)?;
+        write_frame(&mut stream, &encoded, MAX_RELAY_REQUEST_BYTES)
+            .map_err(|error| CgiFailure::new(CgiFailureStage::BridgeIo, error))?;
+        linux_socket::shutdown_write(&stream)
+            .map_err(|error| CgiFailure::new(CgiFailureStage::BridgeIo, error))?;
         let response = read_single_frame(
             &mut stream,
             MAX_RELAY_RESPONSE_BYTES,
             ErrorKind::Unavailable,
-        )?;
+        )
+        .map_err(|error| CgiFailure::new(CgiFailureStage::BridgeIo, error))?;
         decode_relay_response(&response)
+            .map_err(|error| CgiFailure::new(CgiFailureStage::BridgeProtocol, error))
     }
 }
 
@@ -8986,10 +9094,9 @@ fn serve_connection(
     let credentials = linux_socket::peer_credentials(stream)?;
     linux_socket::validate_peer_uid(credentials.uid, package_uid)?;
     let response = match read_single_frame(stream, MAX_RELAY_REQUEST_BYTES, ErrorKind::BadRequest) {
-        Ok(request) => {
-            handle_relay_request(&request, package_uid).unwrap_or_else(CgiResponse::error)
-        }
-        Err(error) => CgiResponse::error(error),
+        Ok(request) => handle_relay_request(&request, package_uid)
+            .unwrap_or_else(|failure| CgiResponse::staged_error(failure.stage, failure.error)),
+        Err(error) => CgiResponse::staged_error(CgiFailureStage::BridgeProtocol, error),
     };
     let encoded = encode_relay_response(&response)?;
     write_frame(stream, &encoded, MAX_RELAY_RESPONSE_BYTES)?;
@@ -8997,9 +9104,11 @@ fn serve_connection(
 }
 
 #[cfg(target_os = "linux")]
-fn handle_relay_request(encoded: &[u8], package_uid: u32) -> BridgeResult<CgiResponse> {
-    let relay = decode_relay_request(encoded)?;
-    let (request, body) = validate_relay_http_request(&relay)?;
+fn handle_relay_request(encoded: &[u8], package_uid: u32) -> Result<CgiResponse, CgiFailure> {
+    let relay = decode_relay_request(encoded)
+        .map_err(|error| CgiFailure::new(CgiFailureStage::BridgeProtocol, error))?;
+    let (request, body) = validate_relay_http_request(&relay)
+        .map_err(|error| CgiFailure::new(CgiFailureStage::BridgeProtocol, error))?;
     let authentication = match &request {
         ValidatedHttpRequest::Get { authentication, .. }
         | ValidatedHttpRequest::Post { authentication, .. } => authentication,
@@ -9012,11 +9121,15 @@ fn handle_relay_request(encoded: &[u8], package_uid: u32) -> BridgeResult<CgiRes
     // only that same package UID via SO_PEERCRED; request authority still
     // comes exclusively from the repeated DSM authentication, never from a
     // /proc identity lookup that rootless package processes cannot perform.
-    let session = linux_runtime::authenticate_and_authorize(authentication, AUTH_HELPER_TIMEOUT)?;
-    validate_relay_authenticated_session(&relay, &session)?;
+    let session = linux_runtime::authenticate_and_authorize(authentication, AUTH_HELPER_TIMEOUT)
+        .map_err(|error| CgiFailure::new(CgiFailureStage::Authentication, error))?;
+    validate_relay_authenticated_session(&relay, &session)
+        .map_err(|error| CgiFailure::new(CgiFailureStage::Authentication, error))?;
     let control_paths = ControlPaths::production();
-    linux_files::require_open_runtime_admission(&control_paths, package_uid)?;
-    let policy = linux_files::load_security_policy(package_uid)?;
+    linux_files::require_open_runtime_admission(&control_paths, package_uid)
+        .map_err(|error| CgiFailure::new(CgiFailureStage::ServiceRequest, error))?;
+    let policy = linux_files::load_security_policy(package_uid)
+        .map_err(|error| CgiFailure::new(CgiFailureStage::ServiceRequest, error))?;
     let is_post = matches!(request, ValidatedHttpRequest::Post { .. });
     let result = if policy.require_https && !is_https_request(authentication.https.as_deref()) {
         Err(BridgeError::new(ErrorKind::Forbidden))
@@ -9026,14 +9139,15 @@ fn handle_relay_request(encoded: &[u8], package_uid: u32) -> BridgeResult<CgiRes
             body,
             &session,
             package_uid,
-            current_epoch()?,
+            current_epoch()
+                .map_err(|error| CgiFailure::new(CgiFailureStage::ServiceRequest, error))?,
             &policy,
         )
     };
     if is_post && result.is_err() {
         let _ = record_rejected_post(&session.username, session.uid);
     }
-    result
+    result.map_err(|error| CgiFailure::new(CgiFailureStage::ServiceRequest, error))
 }
 
 fn is_https_request(value: Option<&str>) -> bool {
@@ -9844,7 +9958,7 @@ mod tests {
         assert_eq!(paths.audit_outbox_lock, Path::new(AUDIT_OUTBOX_LOCK_PATH));
         assert_eq!(
             Path::new(API_SOCKET_PATH),
-            Path::new(PACKAGE_ROOT).join("ui/api.sock")
+            Path::new(PACKAGE_VAR).join("run/api.sock")
         );
     }
 
@@ -13722,10 +13836,85 @@ mod tests {
         assert!(!service_text.contains(PACKAGE_HOME));
     }
 
+    #[test]
+    fn cgi_diagnostics_distinguish_authentication_identity_and_bridge_failures() {
+        let cases = [
+            (
+                CgiResponse::staged_error(
+                    CgiFailureStage::Authentication,
+                    BridgeError::new(ErrorKind::Unauthorized),
+                ),
+                401,
+                "unauthorized",
+                "dsm_authentication",
+            ),
+            (
+                CgiResponse::staged_error(CgiFailureStage::Identity, BridgeError::unsafe_runtime()),
+                503,
+                "cgi_identity_unsafe",
+                "cgi_identity",
+            ),
+            (
+                CgiResponse::service_unavailable(),
+                503,
+                "service_unavailable",
+                "bridge_connect",
+            ),
+            (
+                CgiResponse::staged_error(
+                    CgiFailureStage::BridgeIo,
+                    BridgeError::new(ErrorKind::Unavailable),
+                ),
+                503,
+                "bridge_io_unavailable",
+                "bridge_io",
+            ),
+            (
+                CgiResponse::staged_error(
+                    CgiFailureStage::BridgeProtocol,
+                    BridgeError::new(ErrorKind::Unavailable),
+                ),
+                503,
+                "bridge_protocol_unavailable",
+                "bridge_protocol",
+            ),
+        ];
+        for (response, status, code, stage) in cases {
+            assert_eq!(response.status, status);
+            let payload: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(payload["code"], code);
+            assert_eq!(payload["stage"], stage);
+            let text = String::from_utf8(response.body).unwrap();
+            for secret in [
+                "id=session-secret",
+                "SynoToken",
+                API_SOCKET_PATH,
+                PACKAGE_HOME,
+            ] {
+                assert!(!text.contains(secret));
+            }
+        }
+    }
+
+    #[test]
+    fn rendered_cgi_http_errors_are_successful_process_transports() {
+        let unauthorized = CgiResponse::staged_error(
+            CgiFailureStage::Authentication,
+            BridgeError::new(ErrorKind::Unauthorized),
+        );
+        let unavailable = CgiResponse::service_unavailable();
+        assert_eq!(unauthorized.status, 401);
+        assert_eq!(unavailable.status, 503);
+        assert_eq!(cgi_exit_code(true), ExitCode::SUCCESS);
+        assert_eq!(cgi_exit_code(false), ExitCode::FAILURE);
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn non_linux_runtime_compiles_and_fails_closed() {
-        assert_eq!(run_cgi().unwrap_err().kind, ErrorKind::UnsafeRuntime);
+        let failure = run_cgi().unwrap_err();
+        assert_eq!(failure.error.kind, ErrorKind::UnsafeRuntime);
+        assert_eq!(failure.stage, CgiFailureStage::Identity);
         let request = Path::new("request");
         let response = Path::new("response");
         assert_eq!(

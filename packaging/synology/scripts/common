@@ -18,7 +18,7 @@ api_server=$package_root/bin/sdsync-dsm-api
 api_pid_file=$runtime_root/api.pid
 api_bound_file=$runtime_root/api.bound
 api_ready_file=$runtime_root/api.ready
-api_socket_dir=$package_root/ui
+api_socket_dir=$runtime_root
 api_socket=$api_socket_dir/api.sock
 api_log=$log_root/api.log
 
