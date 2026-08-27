@@ -228,6 +228,97 @@ test("HTTP 503 remains a package-service failure when Webman returns non-JSON", 
   );
 });
 
+test("DSM authentication failures provide code-specific recovery guidance", async () => {
+  const component = await loadAppComponent(async () => ({}), async () => ({}));
+
+  const cases = [
+    {
+      status: 503,
+      code: "dsm_authentication_helper_unsafe",
+      title: "DSM authentication helper rejected",
+      guidance: /Repair or reinstall the latest complete package release/,
+      extra: /do not change helper ownership or permissions manually/
+    },
+    {
+      status: 503,
+      code: "dsm_authentication_helper_unavailable",
+      title: "DSM authentication helper unavailable",
+      guidance: /Repair or reinstall the latest complete package release/,
+      extra: /helper still cannot start/
+    },
+    {
+      status: 503,
+      code: "dsm_authentication_webapi_unavailable",
+      title: "DSM session validation unavailable",
+      guidance: /Reopen this app from the DSM desktop/,
+      extra: /confirm DSM web services are available/
+    },
+    {
+      status: 401,
+      code: "dsm_authentication_webapi_rejected",
+      title: "DSM session expired",
+      guidance: /Sign in to DSM again/,
+      extra: /reopen this app from the DSM desktop/
+    },
+    {
+      status: 403,
+      code: "dsm_authentication_webapi_forbidden",
+      title: "DSM access denied",
+      guidance: /DSM administrator account/,
+      extra: /reopen this app over HTTPS/
+    }
+  ];
+
+  for (const expected of cases) {
+    const issue = component.methods.describeBridgeError({
+      status: expected.status,
+      code: expected.code,
+      stage: "dsm_authentication"
+    });
+    assert.equal(issue.title, expected.title);
+    assert.match(issue.message, expected.guidance);
+    assert.match(issue.message, expected.extra);
+    assert.match(issue.message, /Failure stage: dsm_authentication\./);
+    assert.doesNotMatch(issue.message, /Restart Synology Drive Sync/);
+
+    const statuslessIssue = component.methods.describeBridgeError({
+      status: 0,
+      code: expected.code,
+      stage: "dsm_authentication"
+    });
+    assert.equal(
+      statuslessIssue.title,
+      expected.title,
+      `${expected.code} must retain its authentication classification without transport status`
+    );
+  }
+
+  assert.equal(
+    component.methods.describeBridgeError({
+      status: 401,
+      code: "dsm_authentication_webapi_unavailable"
+    }).title,
+    "DSM session expired",
+    "HTTP 401 remains the authoritative expired-session classification"
+  );
+  assert.equal(
+    component.methods.describeBridgeError({
+      status: 403,
+      code: "dsm_authentication_helper_unavailable"
+    }).title,
+    "DSM access denied",
+    "HTTP 403 remains the authoritative access-denied classification"
+  );
+  assert.equal(
+    component.methods.describeBridgeError({
+      status: 503,
+      code: "service_unavailable"
+    }).title,
+    "Package service unavailable",
+    "a non-authentication 503 remains a package-service failure"
+  );
+});
+
 test("GET semantic failures preserve application status and stage over HTTP 200", async () => {
   const restore = installBrowserGlobals();
   try {

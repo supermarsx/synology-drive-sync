@@ -5,10 +5,7 @@ const OWNED_CONTROL_SELECTOR = [
 ].join(", ");
 
 const RESPONSIVE_FORM_SELECTOR = ".sdsync-settings-panel, .sdsync-horizontal-form";
-const RESPONSIVE_ROW_SELECTOR = [
-  ".sdsync-settings-panel > .sdsync-form-item",
-  ".sdsync-horizontal-form > .sdsync-form-item"
-].join(", ");
+const FORM_ROW_SELECTOR = ".sdsync-form-item";
 
 function semanticTargets(owner) {
   if (owner.classList.contains("sdsync-checkbox-control")) {
@@ -41,16 +38,71 @@ function markControlShells(root) {
   }
 }
 
-function markHorizontalFormCells(root) {
-  const rows = root.querySelectorAll(RESPONSIVE_ROW_SELECTOR);
-  for (const row of rows) {
-    const oldCells = row.querySelectorAll(":scope > .sdsync-form-control-cell");
-    for (const oldCell of oldCells) oldCell.classList.remove("sdsync-form-control-cell");
+function markCheckboxParts(root) {
+  const oldParts = root.querySelectorAll(
+    ".sdsync-checkbox-label, .sdsync-checkbox-input, .sdsync-checkbox-glyph"
+  );
+  for (const oldPart of oldParts) {
+    oldPart.classList.remove("sdsync-checkbox-label", "sdsync-checkbox-input", "sdsync-checkbox-glyph");
+  }
 
+  const owners = root.querySelectorAll(".sdsync-checkbox-control");
+  for (const owner of owners) {
+    const label = owner.matches("label") ? owner : owner.querySelector("label");
+    if (label) label.classList.add("sdsync-checkbox-label");
+    const input = owner.querySelector('input[type="checkbox"]');
+    if (!input) continue;
+    input.classList.add("sdsync-checkbox-input");
+    const glyph = input.previousElementSibling;
+    if (glyph && glyph !== label) glyph.classList.add("sdsync-checkbox-glyph");
+  }
+}
+
+function markSelectParts(root) {
+  const oldParts = root.querySelectorAll(
+    ".sdsync-select-row, .sdsync-select-prefix, .sdsync-select-affordance"
+  );
+  for (const oldPart of oldParts) {
+    oldPart.classList.remove("sdsync-select-row", "sdsync-select-prefix", "sdsync-select-affordance");
+  }
+
+  const owners = root.querySelectorAll(".sdsync-select-control");
+  for (const owner of owners) {
+    const targets = semanticTargets(owner);
+    if (!targets.length || targets[0] === owner) continue;
+    const target = targets[0];
+    let row = target.parentElement;
+    while (row && row.parentElement !== owner) row = row.parentElement;
+    if (!row) continue;
+    row.classList.add("sdsync-select-row");
+    let controlChild = target;
+    while (controlChild.parentElement && controlChild.parentElement !== row) {
+      controlChild = controlChild.parentElement;
+    }
+    const prefix = controlChild.previousElementSibling;
+    const affordance = controlChild.nextElementSibling;
+    if (prefix) prefix.classList.add("sdsync-select-prefix");
+    if (affordance) affordance.classList.add("sdsync-select-affordance");
+  }
+}
+
+function markFormControlPaths(root) {
+  const oldShells = root.querySelectorAll(".sdsync-form-control-shell, .sdsync-form-control-cell");
+  for (const oldShell of oldShells) {
+    oldShell.classList.remove("sdsync-form-control-shell", "sdsync-form-control-cell");
+  }
+
+  const rows = root.querySelectorAll(FORM_ROW_SELECTOR);
+  for (const row of rows) {
     const control = row.querySelector(OWNED_CONTROL_SELECTOR + ", .sdsync-native-input");
     if (!control) continue;
     let cell = control;
-    while (cell.parentElement && cell.parentElement !== row) cell = cell.parentElement;
+    let shell = control.parentElement;
+    while (shell && shell !== row) {
+      shell.classList.add("sdsync-form-control-shell");
+      cell = shell;
+      shell = shell.parentElement;
+    }
     if (cell.parentElement === row) cell.classList.add("sdsync-form-control-cell");
   }
 }
@@ -79,7 +131,9 @@ export function installControlLayout(root) {
   const refresh = () => {
     if (!active) return;
     markControlShells(root);
-    markHorizontalFormCells(root);
+    markCheckboxParts(root);
+    markSelectParts(root);
+    markFormControlPaths(root);
     const forms = new Set(root.querySelectorAll(RESPONSIVE_FORM_SELECTOR));
     if (resizeObserver) {
       for (const form of observedForms) {

@@ -280,9 +280,9 @@
 /* Vue merges these package-owned classes onto each DSM component root. The
  * root hooks remain stable even when DSM changes its private class names or
  * inserts an extra shell around the interactive element. */
-.sdsync-app .sdsync-input-control:not(input):not(textarea):not(select):not([role="combobox"]),
-.sdsync-app .sdsync-select-control:not(input):not(textarea):not(select):not([role="combobox"]) {
+.sdsync-app .sdsync-input-control:not(input):not(textarea):not(select):not([role="combobox"]) {
   display: inline-flex !important;
+  width: 100% !important;
   max-width: 100% !important;
   min-width: 0 !important;
   flex-flow: row nowrap !important;
@@ -290,14 +290,30 @@
   margin: 0 !important;
   padding: 0 !important;
   color: var(--sdsync-text) !important;
-  border-color: transparent !important;
+  border: 1px solid var(--sdsync-control-border) !important;
+  border-radius: 1px !important;
   outline: 0 !important;
-  background-color: transparent !important;
+  background-color: var(--sdsync-control) !important;
   box-shadow: none !important;
 }
 
-.sdsync-app .sdsync-input-control:not(input):not(textarea):not(select):not([role="combobox"]) > input,
-.sdsync-app .sdsync-input-control:not(input):not(textarea):not(select):not([role="combobox"]) > textarea,
+.sdsync-app .sdsync-select-control:not(input):not(textarea):not(select):not([role="combobox"]):not([aria-haspopup="listbox"]) {
+  position: relative;
+  display: block !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+  min-height: 30px;
+  margin: 0 !important;
+  padding: 3px 29px 3px 11px !important;
+  color: var(--sdsync-text) !important;
+  border: 1px solid var(--sdsync-control-border) !important;
+  border-radius: 1px !important;
+  outline: 0 !important;
+  background-color: var(--sdsync-control) !important;
+  box-shadow: none !important;
+}
+
 .sdsync-app .sdsync-select-control [role="combobox"],
 .sdsync-app .sdsync-select-control [aria-haspopup="listbox"] {
   width: 100% !important;
@@ -313,6 +329,51 @@
   min-width: 0 !important;
   flex: 1 1 auto !important;
   margin: 0 !important;
+  border: 0 !important;
+  outline: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.sdsync-app .sdsync-select-control input:not([type="checkbox"]):not([type="radio"]) {
+  width: 0 !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+  min-height: 20px !important;
+  flex: 1 1 auto !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  outline: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+/* Current-JS markers outrank the old package selector that made every DSM
+ * select icon a static 22x30 grid item and stacked the dropdown control. */
+.sdsync-app .sdsync-select-control > .sdsync-select-row > .sdsync-select-prefix {
+  position: static !important;
+  display: none !important;
+  width: 0 !important;
+  min-width: 0 !important;
+  height: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+}
+
+.sdsync-app .sdsync-select-control > .sdsync-select-row > .sdsync-select-affordance {
+  position: absolute !important;
+  display: inline-grid !important;
+  top: 2px !important;
+  right: 2px !important;
+  width: 24px !important;
+  min-width: 24px !important;
+  height: 24px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  place-items: center;
+  background: transparent !important;
 }
 
 /* controlLayout.js marks only the wrapper path between an owned component root
@@ -334,7 +395,6 @@
   align-items: center !important;
 }
 
-.sdsync-app .sdsync-select-control,
 .sdsync-app .sdsync-select-control[role="combobox"],
 .sdsync-app .sdsync-select-control[aria-haspopup="listbox"],
 .sdsync-app .sdsync-select-control [role="combobox"],
@@ -763,35 +823,52 @@
 }
 
 .sdsync-app .sdsync-checkbox-control {
-  display: inline-flex !important;
+  position: relative;
+  display: block !important;
   width: 100% !important;
   max-width: 100% !important;
   min-width: 0 !important;
-  min-height: 20px;
-  flex-flow: row nowrap !important;
-  align-items: flex-start !important;
+  min-height: 24px;
   margin: 0 !important;
   padding: 0 !important;
-  line-height: 1.4;
+  line-height: 20px;
   cursor: pointer;
   white-space: normal !important;
   overflow-wrap: anywhere;
 }
 
-.sdsync-app .sdsync-checkbox-control:is(label),
-.sdsync-app .sdsync-checkbox-control label {
-  display: inline-flex !important;
-  width: 100% !important;
+.sdsync-app .sdsync-check-row > .sdsync-checkbox-control > .sdsync-checkbox-label,
+.sdsync-app .sdsync-checkbox-label {
+  display: inline-block !important;
+  width: auto !important;
   max-width: 100% !important;
   min-width: 0 !important;
-  flex-flow: row nowrap !important;
-  align-items: flex-start !important;
-  gap: 8px !important;
   margin: 0 !important;
-  padding: 0 !important;
-  line-height: 1.4;
+  padding: 2px 0 2px 28px !important;
+  line-height: 20px;
   white-space: normal !important;
   overflow-wrap: anywhere;
+}
+
+/* These structural markers deliberately outrank older package CSS that used
+ * high-specificity private-class substring selectors. DSM can keep an old
+ * linked stylesheet alive while current JavaScript is already executing. */
+.sdsync-app .sdsync-check-row > .sdsync-checkbox-control > .sdsync-checkbox-glyph {
+  position: absolute !important;
+  display: block !important;
+  top: 4px !important;
+  left: 0 !important;
+  width: 20px !important;
+  min-width: 20px !important;
+  height: 20px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+}
+
+.sdsync-app .sdsync-check-row > .sdsync-checkbox-control > .sdsync-checkbox-input {
+  position: absolute !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
 }
 
 .sdsync-app .sdsync-checkbox-control.disabled,
@@ -1134,6 +1211,8 @@
   flex-direction: column;
   min-width: 0;
   min-height: 0;
+  height: 100%;
+  max-height: 100%;
   overflow: hidden;
   padding: 22px 14px 16px;
   border-right: 2px solid var(--sdsync-trace);
@@ -1186,8 +1265,8 @@
   flex-direction: column;
   gap: 4px;
   min-height: 0;
-  margin: -5px;
-  padding: 5px;
+  margin: -5px -5px 0;
+  padding: 5px 5px 0;
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -1270,6 +1349,7 @@
   flex: 0 0 auto;
   align-items: center;
   gap: 8px;
+  margin-top: auto;
   padding: 14px 8px 0;
   border-top: 1px solid var(--sdsync-border-soft);
   color: var(--sdsync-muted);
@@ -1305,6 +1385,7 @@
   position: relative;
   min-width: 0;
   min-height: 0;
+  height: 100%;
   padding: 0 26px 36px;
   overflow: auto;
   scrollbar-color: var(--sdsync-control-border) transparent;
@@ -1825,6 +1906,20 @@
   width: 100% !important;
   max-width: 100% !important;
   min-width: 0 !important;
+  height: auto !important;
+  min-height: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  box-sizing: border-box;
+}
+
+.sdsync-app .sdsync-form-control-shell,
+.sdsync-app .sdsync-form-control-cell {
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+  height: auto !important;
+  min-height: 0 !important;
   margin: 0 !important;
   padding: 0 !important;
   box-sizing: border-box;

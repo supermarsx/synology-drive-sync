@@ -53,7 +53,15 @@ module.exports = {
       },
       {
         test: /\.css$/,
-        use: [MiniCssExtractPlugin.loader, "css-loader"]
+        oneOf: [
+          {
+            resourceQuery: /runtime/,
+            type: "asset/source"
+          },
+          {
+            use: [MiniCssExtractPlugin.loader, "css-loader"]
+          }
+        ]
       }
     ]
   },

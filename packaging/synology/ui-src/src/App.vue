@@ -880,6 +880,24 @@ export default {
       if (status === 403) {
         return issue("DSM access denied", "Use a DSM administrator account and, if HTTPS is required by policy, reopen this app over HTTPS.");
       }
+      if ((status === 0 || status === 503) && code === "dsm_authentication_helper_unsafe") {
+        return issue(
+          "DSM authentication helper rejected",
+          "Repair or reinstall the latest complete package release, then reopen this app from the DSM desktop. If the rejection continues, inspect the package API log; do not change helper ownership or permissions manually."
+        );
+      }
+      if ((status === 0 || status === 503) && code === "dsm_authentication_helper_unavailable") {
+        return issue(
+          "DSM authentication helper unavailable",
+          "Repair or reinstall the latest complete package release, then reopen this app from the DSM desktop. If the helper still cannot start, inspect the package API log."
+        );
+      }
+      if ((status === 0 || status === 503) && code === "dsm_authentication_webapi_unavailable") {
+        return issue(
+          "DSM session validation unavailable",
+          "Reopen this app from the DSM desktop. If validation still fails, inspect the package API log and confirm DSM web services are available."
+        );
+      }
       if (status === 400) {
         return issue("DSM request metadata rejected", "Install or repair the latest complete package release, then reopen this app from the DSM desktop.");
       }
@@ -889,11 +907,11 @@ export default {
       if (status === 503) {
         return issue("Package service unavailable", "Restart Synology Drive Sync and inspect its API log if the package bridge does not recover.");
       }
-      if (status === 0 && (code.includes("unauthorized") || code.includes("authentication") || message.includes("redirect"))) {
-        return issue("DSM session expired", "Sign in to DSM again, then reopen this app from the DSM desktop.");
-      }
       if (status === 0 && code.includes("forbidden")) {
         return issue("DSM access denied", "Use a DSM administrator account and, if HTTPS is required by policy, reopen this app over HTTPS.");
+      }
+      if (status === 0 && (code === "dsm_authentication_webapi_rejected" || code.includes("unauthorized") || code.includes("authentication") || message.includes("redirect"))) {
+        return issue("DSM session expired", "Sign in to DSM again, then reopen this app from the DSM desktop.");
       }
       if ((status === 0 || (status >= 200 && status < 300)) && (code === "non_json_response" || code === "malformed_json")) {
         return issue("Package UI route unavailable", "DSM did not reach this package's native API. Repair or reinstall the same package release, then reopen the app.");

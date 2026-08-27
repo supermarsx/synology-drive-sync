@@ -7,6 +7,10 @@ const security = await readFile(new URL("../src/SecurityPanel.vue", import.meta.
 const css = await readFile(new URL("../src/styles/native.css", import.meta.url), "utf8");
 const controlLayout = await readFile(new URL("../src/controlLayout.js", import.meta.url), "utf8");
 const webpack = await readFile(new URL("../webpack.config.js", import.meta.url), "utf8");
+const physicalFixture = await readFile(
+  new URL("./fixtures/dsm-physical-control-dom.html", import.meta.url),
+  "utf8"
+);
 
 function openingTags(source, component) {
   return source.match(new RegExp(`<${component}\\b[^>]*>`, "g")) || [];
@@ -104,6 +108,21 @@ test("every DSM checkbox keeps its label and tooltip in one owned bounded row", 
   );
   assert.doesNotMatch(css, /\.sdsync-checkbox-control[^,{]*\[class\*="(?:icon|box)"\]/,
     "the SDK retains ownership of its private tick glyph");
+
+  const label = declarationsForRuleContaining(
+    ".sdsync-app .sdsync-check-row > .sdsync-checkbox-control > .sdsync-checkbox-label",
+    ".sdsync-app .sdsync-checkbox-label"
+  );
+  assert.match(label, /display:\s*inline-block\s*!important/);
+  assert.match(label, /padding:\s*2px 0 2px 28px\s*!important/);
+});
+
+test("sanitized fixture preserves the captured DSM control hierarchy", () => {
+  assert.match(physicalFixture, /class="dsm-checkbox sdsync-checkbox-control v-checkbox-wrapper disabled"[\s\S]*?<i\b[^>]*v-checkbox-icon[\s\S]*?<input\b[^>]*v-checkbox-input[\s\S]*?<label\b[^>]*v-checkbox-label/);
+  assert.doesNotMatch(physicalFixture, /<label[^>]*>\s*<input\b/, "captured DSM checkbox input is a label sibling");
+  assert.match(physicalFixture, /v-select2-wrapper[\s\S]*?class="input-wrapper[\s\S]*?class="v-select-ul-wrap[\s\S]*?<input[^>]*aria-haspopup="listbox"/);
+  assert.doesNotMatch(physicalFixture, /(?:_SSID|SynoToken|quickconnect|https?:\/\/|Cookie:|session)/i,
+    "fixture must contain structure only, never captured DSM session data");
 });
 
 test("form roots reset only their structural children and exact owned controls", () => {
@@ -121,6 +140,7 @@ test("form roots reset only their structural children and exact owned controls",
   assert.match(structuralChildren, /width:\s*100%\s*!important/);
   assert.match(structuralChildren, /margin:\s*0\s*!important/);
   assert.match(structuralChildren, /padding:\s*0\s*!important/);
+  assert.match(structuralChildren, /height:\s*auto\s*!important/);
   assert.match(structuralChildren, /box-sizing:\s*border-box/);
 
   const controls = declarationsForRuleContaining(
@@ -132,6 +152,14 @@ test("form roots reset only their structural children and exact owned controls",
   assert.match(controls, /min-width:\s*0/);
   assert.match(controls, /box-sizing:\s*border-box/);
 
+  const controlPath = declarationsForRuleContaining(
+    ".sdsync-app .sdsync-form-control-shell",
+    ".sdsync-app .sdsync-form-control-cell"
+  );
+  assert.match(controlPath, /height:\s*auto\s*!important/);
+  assert.match(controlPath, /min-height:\s*0\s*!important/);
+  assert.match(controlPath, /margin:\s*0\s*!important/);
+
   assert.doesNotMatch(css, /\.v-form-item/, "CSS must not rely on unrendered Vue tag names");
   assert.ok(!css.includes('.sdsync-app [class*="input"]'), "input styling leaked back to DSM private classes");
   assert.ok(!css.includes('.sdsync-app [class*="select"]'), "select styling leaked back to DSM private classes");
@@ -142,7 +170,7 @@ test("form roots reset only their structural children and exact owned controls",
 test("input and select internals remain one row through arbitrary private DSM shells", () => {
   const select = declarationsForRuleContainingDeclaration(
     /display:\s*inline-flex\s*!important/,
-    ".sdsync-app .sdsync-select-control",
+    '.sdsync-app .sdsync-select-control[role="combobox"]',
     '.sdsync-app .sdsync-select-control [role="combobox"]',
     '.sdsync-app .sdsync-select-control [aria-haspopup="listbox"]'
   );
@@ -171,6 +199,19 @@ test("input and select internals remain one row through arbitrary private DSM sh
   );
   assert.match(input, /width:\s*0\s*!important/);
   assert.match(input, /flex:\s*1 1 auto\s*!important/);
+
+  const physicalSelect = declarationsForExactSelector(
+    '.sdsync-app .sdsync-select-control:not(input):not(textarea):not(select):not([role="combobox"]):not([aria-haspopup="listbox"])'
+  );
+  assert.match(physicalSelect, /display:\s*block\s*!important/);
+  assert.match(physicalSelect, /padding:\s*3px 29px 3px 11px\s*!important/);
+  assert.match(physicalSelect, /border:\s*1px solid var\(--sdsync-control-border\)\s*!important/);
+
+  const physicalInput = declarationsForExactSelector(
+    '.sdsync-app .sdsync-select-control input:not([type="checkbox"]):not([type="radio"])'
+  );
+  assert.match(physicalInput, /border:\s*0\s*!important/);
+  assert.match(physicalInput, /background:\s*transparent\s*!important/);
 });
 
 test("Settings aligns label and control then stacks at short width", () => {
@@ -220,6 +261,13 @@ test("critical form layout has an explicit Chrome 88 compatibility path", () => 
 
   assert.match(controlLayout, /classList\.add\("sdsync-control-shell", typeClass\)/);
   assert.match(controlLayout, /classList\.add\("sdsync-form-control-cell"\)/);
+  assert.match(controlLayout, /classList\.add\("sdsync-form-control-shell"\)/);
+  assert.match(controlLayout, /classList\.add\("sdsync-checkbox-label"\)/);
+  assert.match(controlLayout, /classList\.add\("sdsync-checkbox-input"\)/);
+  assert.match(controlLayout, /classList\.add\("sdsync-checkbox-glyph"\)/);
+  assert.match(controlLayout, /classList\.add\("sdsync-select-row"\)/);
+  assert.match(controlLayout, /classList\.add\("sdsync-select-prefix"\)/);
+  assert.match(controlLayout, /classList\.add\("sdsync-select-affordance"\)/);
   assert.match(controlLayout, /classList\.toggle\("sdsync-compact-form"/);
   assert.match(controlLayout, /new ResizeObserver\(/);
   assert.match(app, /installControlLayout\(this\.\$el\)/);
