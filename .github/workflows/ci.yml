@@ -237,6 +237,8 @@ jobs:
           package_json_file: packaging/synology/ui-src/package.json
       - name: Build native DSM AppWindow assets
         working-directory: packaging/synology/ui-src
+        env:
+          SDSYNC_UI_BROWSER_GATE: skip-synology-architecture-matrix
         run: |
           pnpm install --frozen-lockfile --ignore-scripts
           pnpm test
@@ -425,6 +427,8 @@ jobs:
       - name: Verify deterministic native DSM AppWindow build
         working-directory: packaging/synology/ui-src
         shell: bash
+        env:
+          SDSYNC_UI_BROWSER_GATE: required
         run: |
           set -euo pipefail
           pnpm install --frozen-lockfile --ignore-scripts

@@ -677,6 +677,32 @@ class WorkflowWiringTests(unittest.TestCase):
             "for synology_arch in armv7 armv8 i686 x86_64; do", release
         )
 
+    def test_ui_computed_browser_gate_is_authoritative_once(self):
+        ci = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+        release = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        ci_synology = ci[
+            ci.index("  synology-package:") : ci.index("\n  packaging:")
+        ]
+        ci_packaging = ci[ci.index("  packaging:") :]
+        release_synology = release[
+            release.index("  build-synology:") : release.index("\n  sbom:")
+        ]
+
+        reviewed_skip = (
+            "SDSYNC_UI_BROWSER_GATE: skip-synology-architecture-matrix"
+        )
+        required = "SDSYNC_UI_BROWSER_GATE: required"
+        self.assertEqual(ci_synology.count(reviewed_skip), 1)
+        self.assertEqual(release_synology.count(reviewed_skip), 1)
+        self.assertNotIn(required, ci_synology)
+        self.assertNotIn(required, release_synology)
+        self.assertEqual(ci_packaging.count(required), 1)
+        self.assertNotIn(reviewed_skip, ci_packaging)
+
     def test_release_precedes_ghcr_and_contract_helper_is_wired(self):
         workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
             encoding="utf-8"

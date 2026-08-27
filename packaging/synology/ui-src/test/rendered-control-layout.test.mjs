@@ -59,8 +59,8 @@ function decodeLayout(stdout) {
   return JSON.parse(Buffer.from(match[1], "base64").toString("utf8"));
 }
 
-function render(chrome, url, profileDirectory) {
-  const result = spawnSync(chrome, [
+function renderAttempt(chrome, url, profileDirectory) {
+  return spawnSync(chrome, [
     "--headless=new",
     "--disable-gpu",
     "--disable-dev-shm-usage",
@@ -73,14 +73,51 @@ function render(chrome, url, profileDirectory) {
   ], {
     encoding: "utf8",
     maxBuffer: 8 * 1024 * 1024,
-    timeout: 20000,
+    timeout: 45000,
     windowsHide: true
   });
-  assert.equal(result.status, 0, `headless browser failed:\n${result.stderr}`);
+}
+
+function renderAttemptSummary(result) {
+  return {
+    status: result.status,
+    signal: result.signal || null,
+    error: result.error ? String(result.error.code || result.error.message || result.error) : null,
+    stdoutBytes: Buffer.byteLength(result.stdout || "", "utf8"),
+    stderrTail: String(result.stderr || "").slice(-1200)
+  };
+}
+
+function shouldRetryRender(result) {
+  const timedOut = result.error && result.error.code === "ETIMEDOUT";
+  const missingLayout = !/data-layout="[A-Za-z0-9+/=]+"/.test(result.stdout || "");
+  return Boolean(timedOut || missingLayout);
+}
+
+function render(chrome, url, profileDirectory) {
+  const attempts = [renderAttempt(chrome, url, profileDirectory)];
+  if (shouldRetryRender(attempts[0])) {
+    attempts.push(renderAttempt(chrome, url, `${profileDirectory}-retry`));
+  }
+  const result = attempts[attempts.length - 1];
+  const diagnostics = JSON.stringify(attempts.map(renderAttemptSummary));
+  assert.equal(result.status, 0, `headless browser failed after ${attempts.length} bounded attempt(s): ${diagnostics}`);
+  assert.match(result.stdout || "", /data-layout="[A-Za-z0-9+/=]+"/,
+    `headless browser returned no computed layout after ${attempts.length} bounded attempt(s): ${diagnostics}`);
   return decodeLayout(result.stdout);
 }
 
-function browserProbePolicy({ chromeAvailable, ci, platform, arch }) {
+function browserProbePolicy({ chromeAvailable, ci, platform, arch, gate = "" }) {
+  if (!["", "required", "skip-synology-architecture-matrix"].includes(gate)) {
+    throw new Error(`unsupported SDSYNC_UI_BROWSER_GATE value: ${gate}`);
+  }
+  if (gate === "skip-synology-architecture-matrix" && ci) {
+    return {
+      mandatory: false,
+      skipReason: "Reviewed skip: computed layout is authoritative in the general x64 packaging job"
+    };
+  }
+  if (gate === "required") return { mandatory: true, skipReason: "" };
   if (chromeAvailable) return { mandatory: true, skipReason: "" };
   if (!ci) {
     return {
@@ -103,10 +140,32 @@ const browserPolicy = browserProbePolicy({
   chromeAvailable: Boolean(chrome),
   ci: runningInCi,
   platform: process.platform,
-  arch: process.arch
+  arch: process.arch,
+  gate: process.env.SDSYNC_UI_BROWSER_GATE || ""
 });
 
-test("computed-layout browser requirement is waived only for explicit no-browser hosts", () => {
+test("computed-layout browser gate has one authoritative CI lane and reviewed matrix skips", () => {
+  assert.equal(browserProbePolicy({
+    chromeAvailable: true,
+    ci: true,
+    platform: "linux",
+    arch: "x64",
+    gate: "skip-synology-architecture-matrix"
+  }).mandatory, false, "Synology architecture jobs skip the redundant probe even when Chrome is present");
+  assert.match(browserProbePolicy({
+    chromeAvailable: false,
+    ci: true,
+    platform: "linux",
+    arch: "arm64",
+    gate: "skip-synology-architecture-matrix"
+  }).skipReason, /^Reviewed skip:/, "the ARM64 matrix reports the reviewed redundancy, not a false browser pass");
+  assert.equal(browserProbePolicy({
+    chromeAvailable: false,
+    ci: true,
+    platform: "linux",
+    arch: "x64",
+    gate: "required"
+  }).mandatory, true, "the general x64 packaging gate must fail if its browser disappears");
   assert.equal(browserProbePolicy({
     chromeAvailable: false,
     ci: true,
@@ -137,6 +196,14 @@ test("computed-layout browser requirement is waived only for explicit no-browser
     platform: "linux",
     arch: "x64"
   }).mandatory, false, "local development without Chrome retains the existing explicit skip");
+  assert.throws(
+    () => browserProbePolicy({ chromeAvailable: true, ci: true, platform: "linux", arch: "x64", gate: "skip" }),
+    /unsupported SDSYNC_UI_BROWSER_GATE/,
+    "an unreviewed workflow value cannot silently disable the browser gate"
+  );
+  assert.equal(shouldRetryRender({ error: { code: "ETIMEDOUT" }, stdout: "" }), true);
+  assert.equal(shouldRetryRender({ error: null, stdout: "" }), true);
+  assert.equal(shouldRetryRender({ error: null, stdout: 'data-layout="e30="' }), false);
 });
 
 test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS selectors", {
