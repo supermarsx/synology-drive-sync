@@ -80,10 +80,10 @@ test("every native and DSM Vue control state is explicitly dark themed", () => {
     '.sdsync-app [role="combobox"][aria-disabled="true"]',
     '.sdsync-app form [aria-invalid="true"]',
     ".sdsync-app input:not([type=\"checkbox\"]):not([type=\"radio\"]):focus-visible",
-    '.sdsync-app [class*="syno"][class*="input"]',
-    '.sdsync-app [class*="syno"][class*="select"]',
+    ".sdsync-app .sdsync-input-control",
+    ".sdsync-app .sdsync-select-control",
     '.sdsync-app [class*="syno"][class*="button"]',
-    ".sdsync-app .sdsync-check-row > .v-checkbox",
+    ".sdsync-app .sdsync-checkbox-control",
     '.sdsync-app [role="listbox"]',
     '.sdsync-app [role="listbox"] [role="option"][aria-selected="true"]',
     '.sdsync-app [role="tooltip"]'

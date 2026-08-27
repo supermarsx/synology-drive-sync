@@ -192,10 +192,7 @@ test("keyboard focus remains visible on every actionable control family", () => 
     ['.sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):focus-visible'],
     [".sdsync-nav-item:focus-visible"],
     [".sdsync-profile-row:focus-visible", ".sdsync-routine-row:focus-visible"],
-    [
-      ".sdsync-app .sdsync-check-row > .v-checkbox:focus-within",
-      ".sdsync-app .sdsync-check-row > label.v-checkbox:focus-within"
-    ],
+    [".sdsync-app .sdsync-checkbox-control:focus-within"],
     [".sdsync-field-tip-trigger:focus-visible"],
     [".sdsync-advanced summary:focus-visible"],
     [".sdsync-weekdays input:focus-visible + span"],

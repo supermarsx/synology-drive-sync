@@ -18,7 +18,7 @@
               </div>
               <div class="sdsync-policy-list">
                 <div v-for="control in operationControls" :key="control.key" class="sdsync-check-row sdsync-policy-control">
-                  <v-checkbox
+                  <v-checkbox class="sdsync-checkbox-control"
                     :value="value[control.key] === true"
                     :disabled="disabled"
                     :aria-describedby="helpId(control.key)"
@@ -35,7 +35,7 @@
               </div>
               <div class="sdsync-policy-list">
                 <div v-for="control in riskControls" :key="control.key" class="sdsync-check-row sdsync-policy-control">
-                  <v-checkbox
+                  <v-checkbox class="sdsync-checkbox-control"
                     :value="value[control.key] === true"
                     :disabled="disabled"
                     :aria-describedby="helpId(control.key)"
@@ -54,17 +54,17 @@
               <div><p class="sdsync-eyebrow">Bounded resources</p><h3>Request and result limits</h3></div>
             </div>
             <div class="sdsync-form-grid">
-              <v-form-item label="Policy version">
+              <v-form-item class="sdsync-form-item" label="Policy version">
                 <template #label-after><policy-help class="sdsync-form-label-help" help-key="policy_version" /></template>
-                <v-input
+                <v-input class="sdsync-input-control"
                   :value="policyVersionLabel"
                   readonly
                   aria-describedby="sdsync-help-security-policy_version"
                 />
               </v-form-item>
-              <v-form-item label="CSRF lifetime (seconds)">
+              <v-form-item class="sdsync-form-item" label="CSRF lifetime (seconds)">
                 <template #label-after><policy-help class="sdsync-form-label-help" help-key="csrf_lifetime_seconds" /></template>
-                <v-input
+                <v-input class="sdsync-input-control"
                   :value="value.csrf_lifetime_seconds"
                   number-only
                   :disabled="disabled"
@@ -72,9 +72,9 @@
                   @input="updateField('csrf_lifetime_seconds', $event)"
                 />
               </v-form-item>
-              <v-form-item label="Result retention (seconds)">
+              <v-form-item class="sdsync-form-item" label="Result retention (seconds)">
                 <template #label-after><policy-help class="sdsync-form-label-help" help-key="result_retention_seconds" /></template>
-                <v-input
+                <v-input class="sdsync-input-control"
                   :value="value.result_retention_seconds"
                   number-only
                   :disabled="disabled"
@@ -82,9 +82,9 @@
                   @input="updateField('result_retention_seconds', $event)"
                 />
               </v-form-item>
-              <v-form-item label="Maximum outstanding jobs">
+              <v-form-item class="sdsync-form-item" label="Maximum outstanding jobs">
                 <template #label-after><policy-help class="sdsync-form-label-help" help-key="max_outstanding_jobs" /></template>
-                <v-input
+                <v-input class="sdsync-input-control"
                   :value="value.max_outstanding_jobs"
                   number-only
                   :disabled="disabled"
@@ -100,9 +100,9 @@
               <div><p class="sdsync-eyebrow">Structured observability</p><h3>Log category levels</h3></div>
             </div>
             <div class="sdsync-log-policy-grid">
-              <v-form-item v-for="category in logCategories" :key="category.key" :label="category.label">
+              <v-form-item class="sdsync-form-item" v-for="category in logCategories" :key="category.key" :label="category.label">
                 <template #label-after><policy-help class="sdsync-form-label-help" :help-key="'log-' + category.key" /></template>
-                <v-single-select
+                <v-single-select class="sdsync-select-control"
                   :value="value.log_levels && value.log_levels[category.key]"
                   :options="logLevelOptions"
                   width="100%"
