@@ -95,26 +95,33 @@ test("primary route content fades out and in with a reduced-motion escape hatch"
   );
   assert.match(app, /:key="route"/, "the transition needs a route-keyed content owner");
 
-  for (const phase of [
-    "enter-active",
-    "leave-active",
-    "enter",
-    "enter-from",
-    "enter-to",
-    "leave-to"
-  ]) {
-    assert.ok(css.includes(`.sdsync-page-swap-${phase}`), `missing primary ${phase} phase`);
+  for (const transition of ["sdsync-page-swap", "sdsync-subtab-swap"]) {
+    for (const vue2Phase of ["enter-active", "leave-active", "enter", "enter-to", "leave", "leave-to"]) {
+      assert.ok(css.includes(`.${transition}-${vue2Phase}`), `missing Vue 2 ${transition}/${vue2Phase} phase`);
+    }
+  }
+
+  for (const variable of ["out", "in"]) {
+    const duration = css.match(new RegExp(`--sdsync-motion-${variable}:\\s*([0-9.]+)ms`));
+    assert.ok(duration, `missing ${variable} transition duration`);
+    assert.ok(Number(duration[1]) >= 120, `${variable} transition is too short to remain perceptible`);
   }
   assert.match(
     css,
-    /\.sdsync-page-swap-enter-active[\s\S]{0,500}transition:[^;]*opacity[^;]*;/,
-    "enter phase must animate opacity"
+    /\.sdsync-page-swap-enter-active[\s\S]{0,650}transition:[\s\S]*?opacity[^;]*,[\s\S]*?transform[^;]*;/,
+    "enter phase must animate a restrained fade and slide"
   );
   assert.match(
     css,
-    /\.sdsync-page-swap-leave-active[\s\S]{0,500}transition:[^;]*opacity[^;]*;/,
-    "leave phase must animate opacity"
+    /\.sdsync-page-swap-leave-active[\s\S]{0,650}transition:[\s\S]*?opacity[^;]*,[\s\S]*?transform[^;]*;/,
+    "leave phase must animate a restrained fade and slide"
   );
+  assert.match(css, /\.sdsync-page-swap-enter,[\s\S]{0,450}opacity:\s*0;[\s\S]{0,120}transform:\s*translateY\(5px\)/);
+  assert.match(css, /\.sdsync-page-swap-leave-to,[\s\S]{0,250}opacity:\s*0;[\s\S]{0,120}transform:\s*translateY\(-3px\)/);
+  assert.match(css, /\.sdsync-page-stage\s*\{[\s\S]{0,120}min-height:/,
+    "out-in route motion needs a stable stage so content does not collapse between phases");
+  assert.match(css, /\.sdsync-subtab-stage\s*\{[\s\S]{0,120}min-height:/,
+    "out-in subtab motion needs a stable stage so content does not collapse between phases");
 
   const reducedStart = css.indexOf("@media (prefers-reduced-motion: reduce)");
   assert.notEqual(reducedStart, -1, "missing reduced-motion media query");
@@ -123,6 +130,7 @@ test("primary route content fades out and in with a reduced-motion escape hatch"
   assert.match(reduced, /\.sdsync-app \*/);
   assert.match(reduced, /transition-duration:\s*0\.01ms\s*!important/);
   assert.match(reduced, /animation-duration:\s*0\.01ms\s*!important/);
+  assert.match(reduced, /transform:\s*none\s*!important/);
 });
 
 test("Settings uses horizontal native form rows with help adjacent to each label", () => {

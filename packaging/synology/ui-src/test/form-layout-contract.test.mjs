@@ -69,8 +69,8 @@ test("every DSM checkbox keeps its label and tooltip in one owned bounded row", 
 
   const checkbox = declarationsForRuleContainingDeclaration(
     /grid-row:\s*1/,
-    '.sdsync-app .sdsync-check-row > [class*="checkbox"]',
-    '.sdsync-app .sdsync-check-row > label[class*="checkbox"]'
+    ".sdsync-app .sdsync-check-row > .v-checkbox",
+    ".sdsync-app .sdsync-check-row > label.v-checkbox"
   );
   assert.match(checkbox, /width:\s*100%\s*!important/);
   assert.match(checkbox, /grid-row:\s*1/);
@@ -82,25 +82,24 @@ test("every DSM checkbox keeps its label and tooltip in one owned bounded row", 
   assert.match(help, /grid-column:\s*2/);
   assert.match(help, /grid-row:\s*1/);
 
-  const tick = declarationsForRuleContaining(
-    '.sdsync-app .sdsync-check-row > [class*="checkbox"] [class*="icon"]',
-    '.sdsync-app .sdsync-check-row > label[class*="checkbox"] > [class*="icon"]'
+  const focus = declarationsForRuleContaining(
+    ".sdsync-app .sdsync-check-row > .v-checkbox:focus-within",
+    ".sdsync-app .sdsync-check-row > label.v-checkbox:focus-within"
   );
-  assert.match(tick, /position:\s*static\s*!important/);
-  assert.match(tick, /flex:\s*0 0 16px\s*!important/);
-  assert.match(tick, /margin:\s*2px 0 0\s*!important/);
-  assert.match(tick, /transform:\s*none\s*!important/);
+  assert.match(focus, /outline:\s*2px solid var\(--sdsync-focus\)\s*!important/);
 
+  assert.doesNotMatch(css, /\.sdsync-check-row[^,{]*\[class\*="(?:icon|box)"\]/,
+    "the SDK must retain ownership of checkbox tick positioning and geometry");
   assert.doesNotMatch(css, /\.sdsync-app\s+\[class\*="checkbox"\]/,
-    "checkbox SDK internals must only be styled below the owned row boundary");
+    "checkbox theming must use the exact rendered v-checkbox root below the owned row");
 });
 
 test("owned form roots remove SDK margins without descendant-wide rewrites", () => {
   const rows = declarationsForRuleContaining(
-    '.sdsync-app .sdsync-form-grid > [class*="form-item"]',
-    '.sdsync-app .sdsync-log-policy-grid > [class*="form-item"]',
-    '.sdsync-app form.sdsync-panel:not(.sdsync-settings-panel) > [class*="form-item"]',
-    '.sdsync-app .sdsync-danger-fieldset > [class*="form-item"]'
+    ".sdsync-app .sdsync-form-grid > .v-form-item",
+    ".sdsync-app .sdsync-log-policy-grid > .v-form-item",
+    ".sdsync-app form.sdsync-panel:not(.sdsync-settings-panel) > .v-form-item",
+    ".sdsync-app .sdsync-danger-fieldset > .v-form-item"
   );
   assert.match(rows, /grid-template-columns:\s*minmax\(0, 1fr\)\s*!important/);
   assert.match(rows, /gap:\s*5px\s*!important/);
@@ -112,6 +111,18 @@ test("owned form roots remove SDK margins without descendant-wide rewrites", () 
   assert.doesNotMatch(css, /\.sdsync-settings-panel \[class\*="form-item"\]/,
     "Settings must not style arbitrary descendant form items");
 
+  const inputs = declarationsForRuleContaining(
+    ".sdsync-app .sdsync-form-grid > .v-form-item > .v-form-item-input",
+    ".sdsync-app .sdsync-log-policy-grid > .v-form-item > .v-form-item-input",
+    ".sdsync-app form.sdsync-panel:not(.sdsync-settings-panel) > .v-form-item > .v-form-item-input",
+    ".sdsync-app .sdsync-danger-fieldset > .v-form-item > .v-form-item-input"
+  );
+  assert.match(inputs, /width:\s*100%\s*!important/);
+  assert.match(inputs, /max-width:\s*100%/);
+  assert.match(inputs, /margin:\s*0\s*!important/);
+  assert.match(inputs, /padding:\s*0\s*!important/);
+  assert.match(inputs, /box-sizing:\s*border-box/);
+
   const nativeInput = declarationsForRuleContaining(".sdsync-native-input");
   assert.match(nativeInput, /width:\s*100%/);
   assert.match(nativeInput, /max-width:\s*100%/);
@@ -121,8 +132,8 @@ test("owned form roots remove SDK margins without descendant-wide rewrites", () 
 
 test("Settings aligns label, adjacent help, and control then stacks at short width", () => {
   const wide = declarationsForRuleContaining(
-    '.sdsync-settings-panel > [class*="form-item"]',
-    '.sdsync-horizontal-form > [class*="form-item"]'
+    ".sdsync-settings-panel > .v-form-item",
+    ".sdsync-horizontal-form > .v-form-item"
   );
   assert.match(wide, /grid-template-columns:\s*minmax\(150px, 220px\) minmax\(0, 1fr\)\s*!important/);
   assert.match(wide, /align-items:\s*center\s*!important/);
@@ -131,10 +142,18 @@ test("Settings aligns label, adjacent help, and control then stacks at short wid
   assert.doesNotMatch(wide, /grid-template-columns:\s*minmax\(0, 1fr\)\s*!important/,
     "the vertical row contract must not override horizontal Settings rows");
 
+  const inputs = declarationsForRuleContaining(
+    ".sdsync-settings-panel > .v-form-item > .v-form-item-input",
+    ".sdsync-horizontal-form > .v-form-item > .v-form-item-input"
+  );
+  assert.match(inputs, /width:\s*100%\s*!important/);
+  assert.match(inputs, /margin:\s*0\s*!important/);
+  assert.match(inputs, /padding:\s*0\s*!important/);
+
   const shortViewport = css.slice(css.indexOf("@media (max-width: 720px)"));
   assert.match(
     shortViewport,
-    /\.sdsync-settings-panel > \[class\*="form-item"\],[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\)\s*!important/
+    /\.sdsync-settings-panel > \.v-form-item,[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\)\s*!important/
   );
   assert.match(shortViewport, /\.sdsync-form-grid[\s\S]*?grid-template-columns:\s*1fr/);
 });

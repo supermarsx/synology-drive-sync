@@ -866,19 +866,31 @@ export default {
       const status = Number(error && error.status) || 0;
       const code = String((error && error.code) || "").toLowerCase();
       const message = String((error && error.message) || "").toLowerCase();
-      if (status === 401 || code.includes("unauthorized") || code.includes("authentication") || message.includes("redirect")) {
+      if (status === 401) {
         return { title: "DSM session expired", message: "Sign in to DSM again, then reopen this app from the DSM desktop." };
       }
-      if (status === 403 || code.includes("forbidden")) {
+      if (status === 403) {
         return { title: "DSM access denied", message: "Use a DSM administrator account and, if HTTPS is required by policy, reopen this app over HTTPS." };
       }
-      if (status === 400 && code === "invalid_request") {
+      if (status === 400) {
         return { title: "DSM request metadata rejected", message: "Install or repair the latest complete package release, then reopen this app from the DSM desktop." };
       }
-      if (status === 404 || code === "non_json_response" || code === "malformed_json") {
+      if (status === 404) {
         return { title: "Package UI route unavailable", message: "DSM did not reach this package's native API. Repair or reinstall the same package release, then reopen the app." };
       }
-      if (status === 503 || code.includes("unavailable")) {
+      if (status === 503) {
+        return { title: "Package service unavailable", message: "Restart Synology Drive Sync and inspect its API log if the package bridge does not recover." };
+      }
+      if (status === 0 && (code.includes("unauthorized") || code.includes("authentication") || message.includes("redirect"))) {
+        return { title: "DSM session expired", message: "Sign in to DSM again, then reopen this app from the DSM desktop." };
+      }
+      if (status === 0 && code.includes("forbidden")) {
+        return { title: "DSM access denied", message: "Use a DSM administrator account and, if HTTPS is required by policy, reopen this app over HTTPS." };
+      }
+      if ((status === 0 || (status >= 200 && status < 300)) && (code === "non_json_response" || code === "malformed_json")) {
+        return { title: "Package UI route unavailable", message: "DSM did not reach this package's native API. Repair or reinstall the same package release, then reopen the app." };
+      }
+      if (status === 0 && code.includes("unavailable")) {
         return { title: "Package service unavailable", message: "Restart Synology Drive Sync and inspect its API log if the package bridge does not recover." };
       }
       if (message.includes("unsupported dsm api schema") || code === "invalid_document") {

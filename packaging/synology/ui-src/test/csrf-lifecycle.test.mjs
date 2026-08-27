@@ -192,8 +192,8 @@ test("failed initial CSRF bootstrap is reported once before the scheduled retry"
     assert.equal(context.toasts.length, 1);
     assert.equal(
       context.describeBridgeError({ status: 400, code: "non_json_response" }).title,
-      "Package UI route unavailable",
-      "an upstream DSM HTML 400 must not be attributed to the package parser"
+      "DSM request metadata rejected",
+      "an upstream DSM HTML 400 must retain its authoritative HTTP classification"
     );
   } finally {
     if (previousWindow === undefined) delete globalThis.window;
@@ -201,6 +201,30 @@ test("failed initial CSRF bootstrap is reported once before the scheduled retry"
     if (previousDocument === undefined) delete globalThis.document;
     else globalThis.document = previousDocument;
   }
+});
+
+test("HTTP 503 remains a package-service failure when Webman returns non-JSON", async () => {
+  const component = await loadAppComponent(async () => ({}), async () => ({}));
+
+  assert.equal(
+    component.methods.describeBridgeError({ status: 503, code: "non_json_response" }).title,
+    "Package service unavailable",
+    "an HTML 503 must not be mislabeled as a missing package UI route"
+  );
+  assert.equal(
+    component.methods.describeBridgeError({ status: 404, code: "non_json_response" }).title,
+    "Package UI route unavailable"
+  );
+  assert.equal(
+    component.methods.describeBridgeError({ status: 200, code: "non_json_response" }).title,
+    "Package UI route unavailable",
+    "a successful-but-malformed response remains a route/bridge document failure"
+  );
+  assert.equal(
+    component.methods.describeBridgeError({ status: 500, code: "non_json_response" }).title,
+    "Package bridge unavailable",
+    "an unclassified server failure must not be rewritten from its parser shape"
+  );
 });
 
 test("security lifetime change replaces the token before the next serialized mutation", async () => {
