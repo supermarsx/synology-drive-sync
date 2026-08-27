@@ -20,11 +20,13 @@ administrator-only; it never returns a stored password, TOTP seed, or remote log
 browser. The CLI remains the recovery and automation surface when the dashboard cannot open.
 
 The package requests no root execution, Linux capabilities, joined web group, set-user-ID bit, or
-set-group-ID bit. With `defaults.run-as=package`, DSM executes its ordinary package-owned `0755` CGI
-with the same exact non-root package UID as the API service. The CGI can only relay a bounded
-request over a fixed package-owned Unix socket: it is inaccessible at `0000` before startup commit,
-then the same inode activates as `0600`. The service reauthenticates the DSM session, independently
-requires administrator membership and package CSRF, and alone reaches private state or the queue.
+set-group-ID bit. `defaults.run-as=package` keeps services on the exact non-root package UID. The
+ordinary package-owned `0755` CGI fails closed unless Webman supplies that same real/effective UID.
+It authenticates the native DSM request exactly once and relays a bounded assertion and request over
+a fixed package-owned Unix socket: it is inaccessible at `0000` before startup commit, then the same
+inode activates as `0600`. The service verifies the exact peer, relay, independently resolved
+account and administrator membership, recomputed session binding, policy, and package CSRF without
+executing DSM's root-owned authenticator again; it alone reaches private state or the queue.
 
 The package is not a Synology Drive protocol plug-in. It writes through File Station. Synology Drive
 can index the result only when the selected destination belongs to the remote account's Drive home
@@ -38,8 +40,9 @@ or an enabled Team Folder.
 
 > [!NOTE]
 > Static packaging, bridge, manager, lifecycle, and mock File Station tests have passed. They do not
-> prove installation on a physical NAS, execution of DSM's cookie authenticator from the
-> package-user service, DSM forwarding of `X-SDSYNC-Request: 1` as `HTTP_X_SDSYNC_REQUEST=1`, or
+> prove installation on a physical NAS, Webman's package-owner CGI identity or access to DSM's
+> protected cookie authenticator, DSM forwarding of `X-SDSYNC-Request: 1` as
+> `HTTP_X_SDSYNC_REQUEST=1`, or
 > synchronization between two live NAS devices. The native AppWindow uses cookie authentication
 > and does not inspect the DSM shell location for a token. Complete the
 > [live-NAS acceptance](dsm/troubleshooting.md#live-nas-acceptance) on disposable folders, and keep
@@ -137,8 +140,8 @@ credentials, state, locks, and logs while leaving both NAS data trees untouched.
 The native AppWindow bundle, fixed desktop-alert I18N text, icons, permission contract, request
 schema, queue, and manager behavior are covered by repository tests. Rendered browser QA could not
 be completed because no browser runtime was available in the test environment. Treat layout in real
-DSM AppWindow sizes and supported DSM versions, package-user `authenticate.cgi` execution,
-`X-SDSYNC-Request: 1` to `HTTP_X_SDSYNC_REQUEST=1` forwarding,
+DSM AppWindow sizes and supported DSM versions, Webman's package-owner CGI identity and protected
+authenticator access, `X-SDSYNC-Request: 1` to `HTTP_X_SDSYNC_REQUEST=1` forwarding,
 Package Center install/start/open behavior, DSM desktop delivery through `synodsmnotify`, and the
 complete two-NAS data path as live acceptance work—not as proven behavior. The SPK does not acquire
 `sysnotify` or register Notification Center email, SMS, mobile, CMS, or rule/channel delivery.

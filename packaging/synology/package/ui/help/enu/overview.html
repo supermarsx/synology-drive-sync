@@ -32,7 +32,7 @@
   </dl>
 
   <h2>Package bridge status</h2>
-  <p><strong>Authenticated package bridge</strong> means the same-origin DSM session passed package authentication and the AppWindow holds a current CSRF token. <strong>Package status - read-only</strong> means status is visible but mutation capabilities are not granted. When a request fails, the banner distinguishes an expired DSM session, denied administrator access, a missing package route, an unavailable package service, and a UI/package schema mismatch. The last successful snapshot remains visible as stale evidence; use <strong>Retry</strong> after completing the banner's recovery instruction.</p>
+  <p><strong>Authenticated package bridge</strong> means the same-origin DSM session passed package authentication and the AppWindow holds a current CSRF token. <strong>Package status - read-only</strong> means status is visible but mutation capabilities are not granted. Package-generated GET failures use HTTP transport 200 so Webman preserves the body; the banner still treats <code>ok=false</code> as failure and reports the original semantic status, code, and stage. A raw empty or HTML 4xx/5xx response instead points to Webman, proxy, route, or CGI-launch handling. The last successful snapshot remains visible as stale evidence; use <strong>Retry</strong> after completing the banner's recovery instruction.</p>
 
   <h2>Safety defaults</h2>
   <ul>

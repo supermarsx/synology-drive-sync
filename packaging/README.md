@@ -41,11 +41,13 @@ four separate ABI packages: `x86_64`, `armv8`, ARMv7-A hard-float
 Evansport on the DSM 7.0/7.1 line. Use the
 [release selector](../docs/release-selector.md) instead of guessing from a CPU label; ARMv5, PowerPC,
 unknown, and conflicting inputs fail closed. The SPK runs without root, Linux capabilities, joined
-web groups, or any set-user-ID/set-group-ID file. `defaults.run-as=package` makes DSM execute the
-ordinary package-owned `0755` CGI with the same exact non-root package UID as the API service. The
-CGI relays bounded requests over a fixed package-owned socket that is `0000` before startup commit
-and activates on the same inode as `0600`. The service reauthenticates the DSM session and enforces
-administrator membership and package CSRF before reaching private state. The
+web groups, or any set-user-ID/set-group-ID file. `defaults.run-as=package` keeps services on the
+exact non-root package UID; the ordinary package-owned `0755` CGI fails closed unless Webman supplies
+that same real/effective UID. The CGI authenticates the native DSM request once and relays it over a
+fixed package-owned socket that is `0000` before startup commit and activates on the same inode as
+`0600`. The service verifies the peer, bounded relay, independently resolved account, administrator
+membership, recomputed session binding, policy, and package CSRF without executing the root-owned
+DSM authenticator again. The
 package keeps scheduling disabled after installation, registers the administrator-only native DSM
 AppWindow `SYNO.SDS.App.SynologyDriveSync.Instance`, and supplies the CLI recovery/automation manager at:
 
@@ -89,8 +91,8 @@ configuration, credentials, state, locks, socket, and logs while leaving both NA
 See the [complete DSM package and dashboard guide](../docs/synology-package.md) for exact install,
 ACL, graphical configuration, secret, diagnostic, routine, security, CLI, upgrade, and acceptance
 behavior. The package has static/mock validation but no recorded physical installation or live
-two-NAS test. Package-user `authenticate.cgi` execution, browser request-marker forwarding to CGI
-`HTTP_X_SDSYNC_REQUEST=1`, and AppWindow loading also remain live
+two-NAS test. Webman's package-owner CGI identity and protected `authenticate.cgi` access, browser
+request-marker forwarding to CGI `HTTP_X_SDSYNC_REQUEST=1`, and AppWindow loading also remain live
 acceptance checks;
 token absence is supported.
 

@@ -54,8 +54,8 @@ Release 26.10 introduced the administrator-only native DSM Vue AppWindow (`type=
 26.7–26.9 assets do not acquire it retroactively. Each 26.10-or-later SPK contains one matching
 static ELF32 or ELF64 sync executable, the AppWindow, the
 `sdsync-dsm` CLI manager, ordinary CGI relay,
-package-user API service, controller/runner helpers, DSM lifecycle scripts, the minimal package/`http`
-`conf/privilege`, preloaded desktop-alert I18N text, icons, generated Rust dependency notices,
+package-user API service, controller/runner helpers, DSM lifecycle scripts, the minimal package-only
+`conf/privilege` with no joined group, preloaded desktop-alert I18N text, icons, generated Rust dependency notices,
 DSM AppWindow bundled-code notices, and musl copyright. It contains no
 `conf/resource` acquisition worker; fixed desktop alerts use direct `synodsmnotify -c` calls and do
 not register Notification Center channels. The package requires DSM `7.0-40759` or newer, while

@@ -15,10 +15,10 @@
 
   <h2>Identity and request protections</h2>
   <ul>
-    <li>The SPK runs as its DSM package identity and joins only the reviewed internal web-service group.</li>
+    <li>The SPK uses only DSM's non-root package identity. It requests no joined web-service group, root run-as, capability, or identity-changing executable mode.</li>
     <li>The AppWindow uses the current same-origin DSM session cookie; it does not accept launch tokens from URLs, fragments, history, or local storage.</li>
     <li>Mutations require authenticated POST, a package CSRF token, a fixed request marker, a strict action schema, and bounded bodies.</li>
-    <li>The control socket remains package-private and requests are handled by the package-owned service.</li>
+    <li>The DSM-launched CGI authenticates once. The package daemon never executes DSM's protected authenticator and accepts only the exact package UID over the package-private socket.</li>
   </ul>
 
   <h2>Configurable policy</h2>

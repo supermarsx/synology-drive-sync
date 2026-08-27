@@ -86,9 +86,10 @@ deliberately reports:
 ```
 
 Only the package-user API service returns true capabilities and `private_queue=true` after the
-package-owned DSM CGI request has crossed the fixed authenticated socket and passed server-side DSM
-cookie authentication, administrator authorization, optional-token validation when supplied, and
-package CSRF checks. Do not call
+DSM-launched package-UID CGI has authenticated the cookie once and crossed the fixed peer-verified
+`0600` socket. The service then validates the strict relay/request, independently resolves the exact
+UID/name and administrator membership, recomputes the cookie/optional-token session binding, and
+checks policy and package CSRF. Do not call
 `ui/api.cgi` from SSH, connect to `api.sock`, forge relay data, or write queue files manually. The
 ordinary `0755` `sdsync-dsm-api --consume-job` form is controller-internal and validates its identity
 and exact private paths.

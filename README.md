@@ -21,10 +21,12 @@ writable `/<shared-folder>/...` subdirectory can be selected instead. DSM must p
 user home or shared-folder root and its permissions first; the sync creates a missing chosen
 subdirectory and all descendants beneath an existing writable parent. The SPK requests no root,
 Linux capability, joined web group, or identity-changing file mode. Under `defaults.run-as=package`,
-DSM executes the ordinary package-owned `0755` CGI with the exact non-root package UID. It relays
-over a fixed package-owned Unix socket that remains inaccessible at `0000` until startup commit and
-then activates as `0600`; the package-user API service reauthenticates the session and enforces
-administrator membership plus package CSRF. See the
+services run as the non-root package UID, and the ordinary package-owned `0755` CGI fails closed
+unless Webman uses that same real/effective UID. The CGI authenticates the DSM session once, then
+relays over a fixed package-owned Unix socket that remains inaccessible at `0000` until startup
+commit and activates as `0600`. The package-user service verifies the exact peer, relay, account,
+administrator membership, session binding, policy, and package CSRF without executing the
+root-owned DSM authenticator again. See the
 [Synology DSM package and dashboard guide](docs/synology-package.md).
 
 > [!WARNING]

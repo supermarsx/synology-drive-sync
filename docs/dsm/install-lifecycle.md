@@ -59,15 +59,16 @@ uninstall permanently purges package-private operational state and requires conf
 
 Use the DSM desktop application menu or Package Center's **Open** action. The application is
 registered for administrators only. A healthy open sequence requires the DSM session cookie,
-administrator membership, and a package CSRF token for mutation. Under `defaults.run-as=package`,
-DSM executes the ordinary package-owned `0755` CGI with the exact non-root package UID. It relays the
-bounded request through the fixed package-owned Unix socket, which remains `0000` before startup
-commit and activates on the same inode as `0600`. The package-user API service revalidates the
-request, invokes `authenticate.cgi` against the DSM cookie, independently checks administrator
-membership, and then issues its own short-lived, session-bound CSRF token. The native AppWindow does
-not parse or rewrite the DSM shell location and does not send a `SynoToken`; cookie authentication
-is the active native path. Never copy a DSM cookie or package CSRF token into a URL, bookmark,
-browser storage, or support transcript.
+administrator membership, and a package CSRF token for mutation. The ordinary package-owned `0755`
+CGI fails closed unless Webman starts it with the exact non-root package UID. It invokes
+`authenticate.cgi` once in that native request context, then relays a bounded assertion and request
+through the fixed package-owned Unix socket, which remains `0000` before startup commit and activates
+on the same inode as `0600`. The package-user service never executes that root-owned helper; it
+verifies the package-UID peer, strict relay/request, independently resolved UID/name/administrator
+membership, recomputed session binding, policy, and package CSRF. The native AppWindow does not
+parse or rewrite the DSM shell location and does not send a `SynoToken`; cookie authentication is
+the active native path. Never copy a DSM cookie or package CSRF token into a URL, bookmark, browser
+storage, or support transcript.
 
 ## Grant read-only access to each local source
 
@@ -197,6 +198,7 @@ Deleted package credentials are not recoverable.
 Record the model, DSM build, `uname -m`, exact SPK filename/version, checksum, optional attestation,
 the exact Package Center warning/result, bounded install/package logs, CGI/API-service/socket
 identities and modes, install/start/open result, package-user ACL test, and first non-writing
-Doctor/Plan. Explicitly test `authenticate.cgi` from the package-user service; repository tests do
-not prove that DSM behavior. Do not describe the installation as production-ready until the complete
+Doctor/Plan. Explicitly prove Webman's package-owner CGI identity and that the native CGI context can
+execute protected `authenticate.cgi`; repository tests do not prove that DSM behavior. Do not
+describe the installation as production-ready until the complete
 [live-NAS acceptance](troubleshooting.md#live-nas-acceptance) passes.

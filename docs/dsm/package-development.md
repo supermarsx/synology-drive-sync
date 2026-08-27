@@ -7,12 +7,13 @@ The SPK assembler accepts two matching Linux executables:
 
 Both must be regular, non-symlink, fully static, little-endian ELF files for the selected DSM
 architecture. The helper is installed byte-for-byte at ordinary `bin/sdsync-dsm-api` mode `0755`
-and at package-owned `ui/api.cgi` mode `0755`. DSM's CGI framework executes that file with its exact
-non-root package-owner UID under `defaults.run-as=package`, matching the package-user `--serve`
-process. The CGI relays one bounded request through fixed `var/run/api.sock`; the service binds it as
-package-owned `0000` before startup commit, then activates that same inode as `0600`. No outer or
-inner archive member or installed executable carries a set-user-ID/set-group-ID bit. The package
-requests neither a joined web group, root run-as, nor Linux capabilities.
+and at package-owned `ui/api.cgi` mode `0755`. The CGI fails closed unless Webman starts it with its
+exact non-root package-owner UID; `defaults.run-as=package` gives the `--serve` process that package
+UID but does not document Webman's launch identity. The CGI authenticates once and relays one bounded
+request through fixed `var/run/api.sock`; the service binds it as package-owned `0000` before startup
+commit, then activates that same inode as `0600`. No outer or inner archive member or installed
+executable carries a set-user-ID/set-group-ID bit. The package requests neither a joined web group,
+root run-as, nor Linux capabilities.
 
 The complete reviewed `conf/privilege` document is deliberately minimal:
 
@@ -209,7 +210,8 @@ happy path.
 ## Acceptance boundary
 
 Builder/validator success proves the reviewed archive contract, not DSM installation, AppWindow
-launch, DSM's executable-owner CGI runtime identity, package-user `authenticate.cgi` execution,
+launch, DSM's executable-owner CGI runtime identity, protected `authenticate.cgi` execution from the
+native Webman CGI context,
 package-owned socket behavior, administrator groups, direct `synodsmnotify` desktop delivery, source
 ACLs, reverse proxy, File Station, TOTP, Drive indexing, or sync behavior on a physical model.
 Complete [live-NAS acceptance](troubleshooting.md#live-nas-acceptance) before publishing a support

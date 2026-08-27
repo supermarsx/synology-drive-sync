@@ -79,11 +79,13 @@ exists for registered assets and `api.cgi`, not as a directory-index application
 Every executable, including `ui/api.cgi`, is ordinary `0755` in both the archive and installed
 package. Nothing carries a set-user-ID/set-group-ID bit. `conf/privilege` contains only
 `defaults.run-as: package`; it requests no root run-as, joined DSM group, tool privilege, or Linux
-capability. DSM executes the ordinary CGI as its package-file owner, so the CGI and
-`sdsync-dsm-api --serve` daemon share the package identity. They relay one bounded request through
-fixed `/var/packages/synology-drive-sync/var/run/api.sock`, owned by the package identity and mode
-`0600`. Mutable socket state never enters the installed/Webman-exposed `target/ui` tree. Both peers
-verify socket metadata and kernel peer identity.
+capability. The ordinary CGI fails closed unless Webman starts it with real/effective UID equal to
+its exact non-root package owner; the `sdsync-dsm-api --serve` daemon uses that package UID through
+the package run-as contract. The CGI authenticates the native DSM request exactly once, then relays
+one bounded assertion and request through fixed
+`/var/packages/synology-drive-sync/var/run/api.sock`, owned by the package identity and mode `0600`.
+Mutable socket state never enters the installed/Webman-exposed `target/ui` tree. Both peers verify
+socket metadata and kernel peer identity; the daemon never executes DSM's root-owned authenticator.
 The validator rejects any privilege-bearing archive member or broader privilege manifest.
 
 The corrected package contains no `conf/resource` acquisition worker or sysnotify mail templates.
@@ -118,8 +120,10 @@ not presented as shipped runtime dependencies.
 2. Start the package. The package-user API service and controller start safely with scheduling
    disabled.
 3. Open the native **Synology Drive Sync** AppWindow from the DSM desktop or Package Center. The
-   server authenticates the current DSM session cookie and independently requires administrator
-   membership. The native UI does not inspect or rewrite the DSM shell location and sends no
+   DSM-launched CGI authenticates the current session cookie exactly once. The package service then
+   independently verifies the package-UID peer, account identity and administrator membership,
+   recomputed session binding, policy, and package CSRF. It never executes DSM's protected
+   authenticator. The native UI does not inspect or rewrite the DSM shell location and sends no
    `SynoToken`. If session authentication or the bridge fails, use the CLI and record the
    physical-NAS evidence.
 4. Enable SSH temporarily for ACL verification and recovery. Resolve the actual package owner as
@@ -242,11 +246,13 @@ architecture, static linkage, dashboard/relay contracts, lifecycle behavior, and
 assembly. Before relying on the package, test its exact NAS model and DSM version with a disposable
 source and target, including Package Center installation and exact warning, CGI package identity,
 package-user API service, package-owned `0600` socket, native AppWindow loading/rendering, browser
-`X-SDSYNC-Request: 1` to CGI `HTTP_X_SDSYNC_REQUEST=1` forwarding, package-user
-`authenticate.cgi`, administrator/CSRF rejection cases,
+`X-SDSYNC-Request: 1` to CGI `HTTP_X_SDSYNC_REQUEST=1` forwarding, protected `authenticate.cgi`
+execution from the native Webman CGI context, nonempty GET error envelopes with HTTP transport 200
+and semantic status/code/stage, administrator/CSRF rejection cases,
 reverse-proxy upload limits, TLS trust, TOTP clock synchronization, routines, direct DSM desktop
 alerts, large files, Drive indexing, restart during a long transfer, upgrade, and uninstall. Rendered browser QA,
-physical installation, and `authenticate.cgi` execution under the package user remain unverified. A
+physical installation, Webman's package-owner CGI identity, and protected authenticator access from
+that CGI context remain unverified. A
 manually built SPK is not automatically a Synology Package Center-approved release.
 
 Official framework references: [package structure](https://help.synology.com/developer-guide/synology_package/introduction.html), [native app launch](https://help.synology.com/developer-guide/synology_package/package_tgz/launch_app.html), [AppWindow framework](https://help.synology.com/developer-guide/appendix/ui_framework/application.html), [architecture mapping](https://help.synology.com/developer-guide/appendix/platarchs.html), [privilege configuration](https://help.synology.com/developer-guide/privilege/privilege_config.html), [FHS paths](https://help.synology.com/developer-guide/integrate_dsm/fhs.html), and [lifecycle status codes](https://help.synology.com/developer-guide/synology_package/scripts.html).

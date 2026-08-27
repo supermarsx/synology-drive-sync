@@ -39,8 +39,8 @@ instead of hand-creating a link or changing ownership.
 
 The footer distinguishes these states:
 
-- **Authenticated control service** means the ordinary package-owned CGI, running with the exact
-  non-root package UID, reached the package-user API service over its fixed private socket; the
+- **Authenticated control service** means the ordinary package-owned CGI passed its fail-closed
+  exact non-root package-UID identity check and reached the package-user API service over its fixed private socket; the
   current session passed authentication, administrator membership, optional-token validation when
   applicable, and CSRF bootstrap checks; and the snapshot explicitly grants mutation capabilities.
 - **Package status · read-only** means a snapshot was available but one or more mutation

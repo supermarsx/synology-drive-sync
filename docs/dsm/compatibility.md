@@ -123,9 +123,9 @@ The validator also binds the filename, `INFO` version/architecture, DSM floor/ce
 dashboard resources, notification texts, deterministic icons, licenses, archive paths, and modes.
 
 For the current source and prospective 26.10-or-later artifacts, these checks do not prove that
-Synology accepts the SPK on a particular physical model, that the
-package-user service can execute DSM's cookie authenticator, that DSM forwards the browser request
-marker as `HTTP_X_SDSYNC_REQUEST=1`, or how the native AppWindow loads and renders on that release. Record those
-separately during
+Synology accepts the SPK on a particular physical model, that Webman starts the CGI with its exact
+package-owner UID and can execute DSM's protected cookie authenticator in that native request
+context, that DSM forwards the browser request marker as `HTTP_X_SDSYNC_REQUEST=1`, or how the native
+AppWindow loads and renders on that release. Record those separately during
 [live-NAS acceptance](troubleshooting.md#live-nas-acceptance). The native dashboard authenticates
 with the DSM session cookie and does not inspect or rewrite the DSM shell location for a token.

@@ -119,15 +119,26 @@ the [release instructions](../releases.md#synology-dsm-packages), then install i
 **Package Center > Manual Install**. GitHub Releases are the update channel for this package; the
 26.11 asset remains immutable.
 
-## `api.cgi?action=csrf` returns HTTP 503
+## `api.cgi?action=csrf` reports semantic status 503
 
-An authenticated 503 response with code `service_unavailable` means the fixed private package API
-socket was not ready for a verified connection. A request that overlaps normal startup retries only
-the missing, connection-refused, or private pre-commit socket state for a short bounded window. Retry
-once after Package Center reports the package running. Repeated 503 responses mean the service did
-not become ready; restart **Synology Drive Sync** in Package Center and inspect the package startup
-result rather than repeatedly refreshing the dashboard. A later Synology `synowebrtc` message such
-as `Peer connection closed` is downstream noise after the HTTP request failed, not the root cause.
+Package-generated GET failures use HTTP transport 200 because Webman can discard or replace non-2xx
+CGI bodies. Failure remains explicit in the nonempty trusted JSON envelope:
+`schema="sdsync.dsm-error.v1"`, `ok=false`, semantic `status`, stable `code`, bounded `stage`, and
+generic `message`. The AppWindow uses those semantic fields, not the transport status, and never
+treats `ok=false` as success. POST failures retain their real HTTP status and mutation-acceptance
+semantics.
+
+Semantic status 503 with code `service_unavailable` and stage `bridge_connect` means the fixed
+package-private API socket was not ready for a verified connection. A request that overlaps normal
+startup retries only the missing, connection-refused, or private pre-commit socket state for a short
+bounded window. Retry once after Package Center reports the package running. Repeated semantic 503
+responses mean the service did not become ready; restart **Synology Drive Sync** in Package Center
+and inspect the package startup result rather than repeatedly refreshing the dashboard.
+
+A raw empty or HTML HTTP 503 is not this package envelope. It indicates Webman, its proxy, the route,
+CGI launch, or another pre-response layer failed or replaced the output. Record its response headers,
+duration, exact package version, and matching bounded Webman/package log lines. A later Synology
+`synowebrtc` message such as `Peer connection closed` is downstream noise, not the root cause.
 
 Failed startup now emits one fixed-value line beginning `startup diagnostic:`. Collect that complete
 line from the Package Center start details or package log, together with the bounded
@@ -138,13 +149,13 @@ or filesystem path.
 Do not hand-create readiness files, remove locks, broaden socket permissions, or run either service
 as root. Those changes erase the evidence and bypass the package's fail-closed identity checks.
 
-## `api.cgi?action=csrf` returns HTTP 400
+## `api.cgi?action=csrf` reports semantic status 400
 
 First inspect only the response type and bounded error code in the browser Network panel. Do not
 copy cookies, CSRF values, Synology tokens, or the complete request headers.
 
-- Package JSON with schema `sdsync.dsm-error.v1` and code `invalid_request` means Webman reached the
-  package CGI but its request metadata was rejected. Release 26.14 treated DSM/FastCGI variables
+- Package JSON with schema `sdsync.dsm-error.v1`, semantic status 400, and code `invalid_request`
+  means Webman reached the package CGI but its request metadata was rejected. Release 26.14 treated DSM/FastCGI variables
   such as an empty `CONTENT_LENGTH`, `CONTENT_TYPE`, transfer encoding, or mutation-token header as
   present request data. Install the first release after 26.14; the bridge now treats only exact empty
   CGI metadata as absent while continuing to reject non-empty GET bodies, content types, transfer
@@ -153,13 +164,13 @@ copy cookies, CSRF values, Synology tokens, or the complete request headers.
   rejected the request before the package CGI. Reopen the app from the DSM desktop on the same
   origin used to sign in. If the response remains HTML, troubleshoot the DSM route rather than the
   package socket.
-- Package JSON with code `unauthorized` is HTTP 401, not 400. Sign in to DSM again and reopen the
-  AppWindow so the browser can attach the DSM session cookie. A missing cookie is deliberately never
-  converted into package authority.
+- Package JSON with code `unauthorized` carries semantic status 401 over GET transport 200. Sign in
+  to DSM again and reopen the AppWindow so the browser can attach the DSM session cookie. A missing
+  cookie is deliberately never converted into package authority.
 
 The compatibility handling does not relax authentication: the browser request marker, DSM cookie,
-administrator membership, repeated `authenticate.cgi` checks, HTTPS policy, session binding, and
-POST CSRF verification remain mandatory.
+one native-CGI `authenticate.cgi` check, independent daemon UID/name/administrator consistency,
+HTTPS policy, recomputed session binding, and POST CSRF verification remain mandatory.
 
 ## DSM says the page is not found when opening the app
 
@@ -461,6 +472,7 @@ TOTP challenge behavior, DSM cookie authentication, direct `synodsmnotify`
 desktop delivery, File Station versions, reverse proxies, and Drive indexing vary across deployed
 systems. In
 particular, Synology documents direct `authenticate.cgi` use by a custom CGI, but this root-free
-design invokes it from the package-user API service after an authenticated local socket relay. That
-execution behavior remains a live-DSM acceptance requirement. A complete record from the exact
-environment is the acceptance evidence.
+design invokes it exactly once from the DSM-launched package-owned CGI while the native request
+environment is authoritative. The daemon never invokes the protected helper. Webman's package-owner
+CGI identity and helper access remain live-DSM acceptance requirements. A complete record from the
+exact environment is the acceptance evidence.
