@@ -1545,7 +1545,8 @@ append_activity() {
         doctor.succeeded|doctor.failed|configuration.changed|notification.unavailable|\
         audit.requested|audit.succeeded|audit.failed|audit.outcome_unknown|\
         module.requested|module.succeeded|module.failed|module.outcome_unknown|\
-        security.policy_changed|security.log_tail_recovered|\
+        security.policy_changed|security.log_tail_recovered|security.failed|\
+        authentication.failed|bridge.failed|\
         service.started|service.stopped|service.restarted|service.start_failed) ;;
         *) return 64 ;;
     esac

@@ -72,6 +72,15 @@ The package daemon never executes the root-owned DSM helper. It independently re
 username, checks exact UID/name and administrator consistency, and recomputes the cookie/token
 session binding before authorizing any action.
 
+The fixed DSM helper entry may be a symlink. Before execution, the CGI resolves it without following
+an unchecked path: every absolute ancestor directory must be root-owned and not group/world
+writable, every lexical symlink boundary must be root-owned and stable across inspection, relative
+targets may not escape the validation root, and loops are rejected. The final canonical target must
+be a root-owned, executable regular file that is not group/world writable. Its device and inode are
+revalidated immediately before the CGI executes that canonical target. Symlink mode `0777` is not
+itself treated as target writability because the validated parent directory is the link-mutation
+boundary. This validation grants no privilege and does not change the package UID.
+
 The native AppWindow has no standalone HTML launch document and receives no package-owned launch
 URL. It does not inspect or rewrite `window.location`, does not try to extract a token from the DSM
 shell location, and sends no `X-SYNO-TOKEN` header. Cookie authentication is therefore the active
@@ -143,7 +152,7 @@ Allowed authenticated GET actions are:
 | --- | --- |
 | `csrf` | none beyond `action` |
 | `snapshot` | none beyond `action` |
-| `logs` | `lines=1..1000`, optional fixed source `all`, `controller`, `scheduler`, or `sync` |
+| `logs` | `lines=1..1000`, optional fixed source `all`, `api`, `controller`, `scheduler`, `sync`, or `audit` |
 | `activity` | `lines=1..1000` |
 | `result` | one 48-character lowercase hexadecimal server job ID |
 
@@ -244,11 +253,15 @@ written. Interior blank or malformed records, malformed newline-terminated activ
 malformed rotated history remain fail closed. Exact record verification and file/directory sync
 complete before the outbox record can be retired.
 
-Category thresholds suppress optional Activity/controller/scheduler records below the configured
-level before persistence. Log reads scan the bounded rotated file and return up to the requested
-number of matching records, so newer trace/debug noise cannot hide an older allowed error. Minimal
-mutation accountability records are mandatory and remain visible even when the optional `audit`
-category level is `off`.
+Category thresholds suppress optional Activity/controller/scheduler and structured pre-relay API
+records below the configured level before persistence. Each pre-relay API record uses the exact
+stage-derived `bridge`, `authentication`, or `security` category; a corrupt or unsafe policy fails
+closed without writing the record or its coalescing state. Log reads scan bounded rotated history and
+return up to the requested number of matching records, so newer trace/debug noise cannot hide an
+older allowed error. A selected log source is emitted alone; `all` divides a fixed encoded-output
+budget across all five sources so the complete JSON remains below the bridge's 1 MiB capture limit.
+Minimal mutation accountability records are mandatory and remain visible even when the optional
+`audit` category level is `off`.
 
 ## Secret and response non-disclosure
 

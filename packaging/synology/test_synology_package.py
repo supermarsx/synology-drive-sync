@@ -2555,10 +2555,127 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             + ("x" * 300_000) + "\n",
             encoding="utf-8",
         )
+        api_log = self.real_var / "log/api.log"
+        api_records = [
+            {
+                "epoch": 10000,
+                "level": "warn",
+                "category": "authentication",
+                "event": "cgi_failure",
+                "service": "synology-drive-sync",
+                "stage": "dsm_authentication",
+                "code": "dsm_authentication_helper_unsafe",
+                "status": 503,
+            },
+            {
+                "epoch": 10001,
+                "level": "info",
+                "category": "bridge",
+                "event": "cgi_failure",
+                "service": "synology-drive-sync",
+                "stage": "bridge_connect",
+                "code": "service_unavailable",
+                "status": 503,
+            },
+            {
+                "epoch": 10002,
+                "level": "warn",
+                "category": "security",
+                "event": "cgi_failure",
+                "service": "synology-drive-sync",
+                "stage": "cgi_identity",
+                "code": "cgi_identity_unsafe",
+                "status": 503,
+            },
+        ]
+        rotated_oldest = self.real_var / "log/api.log.5"
+        rotated_middle = self.real_var / "log/api.log.1"
+        for path, record in [
+            (rotated_oldest, api_records[0]),
+            (rotated_middle, api_records[1]),
+            (api_log, api_records[2]),
+        ]:
+            path.write_text(
+                json.dumps(record, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
         logs, payload = self.api("logs", "--lines", "10")
         self.assertEqual(logs.returncode, 0, logs.stderr)
         self.assertEqual(payload["schema"], "sdsync.dsm-logs.v1")
         self.assertIn("audit", {entry["source"] for entry in payload["logs"]})
+        api_entries = [entry for entry in payload["logs"] if entry["source"] == "api"]
+        self.assertEqual(len(api_entries), 1)
+        self.assertEqual(
+            [json.loads(line)["code"] for line in api_entries[0]["lines"]],
+            [
+                "dsm_authentication_helper_unsafe",
+                "service_unavailable",
+                "cgi_identity_unsafe",
+            ],
+        )
+        unsafe_rotated = self.real_var / "log/api.log.2"
+        unsafe_rotated.symlink_to(controller_log)
+        unsafe_logs, unsafe_logs_payload = self.api("logs", "--lines", "10")
+        self.assertEqual(unsafe_logs.returncode, 73, unsafe_logs.stderr)
+        self.assertEqual(unsafe_logs_payload["code"], "unsafe_state")
+        self.assertTrue(unsafe_rotated.is_symlink())
+        unsafe_rotated.unlink()
+        changed = self.shell(
+            self.manager,
+            "configure-security-policy",
+            *self.security_policy_options(authentication_log_level="off"),
+        )
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        suppressed_diagnostic, suppressed_payload = self.api(
+            "cgi-failure",
+            "--stage", "dsm_authentication",
+            "--code", "dsm_authentication_helper_unsafe",
+            "--status", "503",
+        )
+        self.assertEqual(suppressed_diagnostic.returncode, 0, suppressed_diagnostic.stderr)
+        self.assertTrue(suppressed_payload["ok"])
+        suppressed_activity, suppressed_activity_payload = self.api("activity", "--lines", "100")
+        self.assertEqual(suppressed_activity.returncode, 0, suppressed_activity.stderr)
+        self.assertFalse(
+            any(
+                event["category"] == "authentication"
+                and event["code"] == "authentication.failed"
+                for event in suppressed_activity_payload["events"]
+            )
+        )
+        filtered, filtered_payload = self.api("logs", "--lines", "10")
+        self.assertEqual(filtered.returncode, 0, filtered.stderr)
+        filtered_api = next(entry for entry in filtered_payload["logs"] if entry["source"] == "api")
+        filtered_text = "\n".join(filtered_api["lines"])
+        self.assertNotIn("dsm_authentication_helper_unsafe", filtered_text)
+        self.assertIn("service_unavailable", filtered_text)
+        self.assertIn("cgi_identity_unsafe", filtered_text)
+
+        changed = self.shell(
+            self.manager,
+            "configure-security-policy",
+            *self.security_policy_options(
+                bridge_log_level="off",
+                authentication_log_level="warn",
+                security_log_level="off",
+            ),
+        )
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        filtered, filtered_payload = self.api("logs", "--lines", "10")
+        self.assertEqual(filtered.returncode, 0, filtered.stderr)
+        filtered_api = next(entry for entry in filtered_payload["logs"] if entry["source"] == "api")
+        filtered_text = "\n".join(filtered_api["lines"])
+        self.assertIn("dsm_authentication_helper_unsafe", filtered_text)
+        self.assertNotIn("service_unavailable", filtered_text)
+        self.assertNotIn("cgi_identity_unsafe", filtered_text)
+
+        restored = self.shell(
+            self.manager,
+            "configure-security-policy",
+            *self.security_policy_options(),
+        )
+        self.assertEqual(restored.returncode, 0, restored.stderr)
         rendered = json.dumps(payload)
         self.assertNotIn("\x1b", rendered)
         self.assertNotIn(str(self.real_home), rendered)
@@ -2567,6 +2684,14 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertLess(len(logs.stdout), 300_000)
         correlated_request_id = "d" * 32
         activity_log = self.real_var / "log/activity.log"
+        diagnostic, diagnostic_payload = self.api(
+            "cgi-failure",
+            "--stage", "dsm_authentication",
+            "--code", "dsm_authentication_helper_unsafe",
+            "--status", "503",
+        )
+        self.assertEqual(diagnostic.returncode, 0, diagnostic.stderr)
+        self.assertTrue(diagnostic_payload["ok"])
         with activity_log.open("a", encoding="utf-8") as stream:
             stream.write(
                 "10000|audit.requested|logprofile|requested|audit|info|"
@@ -2580,6 +2705,17 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertTrue(
             any(
                 event["category"] == "audit" and event["code"].startswith("audit.")
+                for event in activity_payload["events"]
+            )
+        )
+        self.assertTrue(
+            any(
+                event["category"] == "authentication"
+                and event["code"] == "authentication.failed"
+                and event["level"] == "warn"
+                and event["message"]
+                == "Package service synology-drive-sync request failed "
+                "stage=dsm_authentication code=dsm_authentication_helper_unsafe status=503"
                 for event in activity_payload["events"]
             )
         )
@@ -2599,6 +2735,71 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         corrupt, corrupt_payload = self.api("snapshot")
         self.assertEqual(corrupt.returncode, 73)
         self.assertIn(corrupt_payload["code"], {"corrupt_state", "unsafe_state"})
+
+    def test_api_logs_selected_source_and_aggregate_output_are_capture_bounded(self) -> None:
+        payload = "x" * 7000
+        records = {
+            "api.log": json.dumps(
+                {"level": "info", "category": "bridge", "message": payload},
+                separators=(",", ":"),
+            ),
+            "controller.log": json.dumps(
+                {"level": "info", "message": payload}, separators=(",", ":")
+            ),
+            "scheduler.log": json.dumps(
+                {"level": "info", "message": payload}, separators=(",", ":")
+            ),
+            "sync.log": json.dumps(
+                {"level": "info", "message": payload}, separators=(",", ":")
+            ),
+            "audit.log": json.dumps(
+                {"level": "info", "category": "audit", "message": payload},
+                separators=(",", ":"),
+            ),
+        }
+        for name, record in records.items():
+            path = self.real_var / "log" / name
+            path.write_text((record + "\n") * 160, encoding="utf-8")
+            path.chmod(0o600)
+
+        all_logs, all_payload = self.api(
+            "logs", "--lines", "1000", "--source", "all"
+        )
+        self.assertEqual(all_logs.returncode, 0, all_logs.stderr)
+        self.assertLess(len(all_logs.stdout.encode("utf-8")), 1024 * 1024)
+        self.assertEqual(
+            [entry["source"] for entry in all_payload["logs"]],
+            ["api", "controller", "scheduler", "sync", "audit"],
+        )
+        self.assertTrue(all(entry["lines"] for entry in all_payload["logs"]))
+        self.assertTrue(all(len(entry["lines"]) <= 1000 for entry in all_payload["logs"]))
+
+        controller_logs, controller_payload = self.api(
+            "logs", "--lines", "1000", "--source", "controller"
+        )
+        self.assertEqual(controller_logs.returncode, 0, controller_logs.stderr)
+        self.assertLess(len(controller_logs.stdout.encode("utf-8")), 1024 * 1024)
+        self.assertEqual(len(controller_payload["logs"]), 1)
+        self.assertEqual(controller_payload["logs"][0]["source"], "controller")
+        all_controller = next(
+            entry for entry in all_payload["logs"] if entry["source"] == "controller"
+        )
+        self.assertGreater(
+            len(controller_payload["logs"][0]["lines"]), len(all_controller["lines"])
+        )
+
+        bounded_logs, bounded_payload = self.api(
+            "logs", "--lines", "7", "--source", "controller"
+        )
+        self.assertEqual(bounded_logs.returncode, 0, bounded_logs.stderr)
+        self.assertEqual(len(bounded_payload["logs"]), 1)
+        self.assertEqual(len(bounded_payload["logs"][0]["lines"]), 7)
+
+        invalid, invalid_payload = self.api(
+            "logs", "--lines", "10", "--source", "unknown"
+        )
+        self.assertEqual(invalid.returncode, 64)
+        self.assertEqual(invalid_payload["code"], "invalid_request")
 
     def test_bridge_audit_correlation_is_exact_durable_and_activity_visible(self) -> None:
         emitter = self.root / "emit-bridge-audit.sh"

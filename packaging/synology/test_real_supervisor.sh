@@ -16,6 +16,7 @@ physical_home=/volume3/@apphome/$package_name
 physical_var=/volume3/@appdata/$package_name
 webman_route=/usr/syno/synoman/webman/3rdparty/$package_name
 authenticate_helper=/usr/syno/synoman/webman/modules/authenticate.cgi
+authenticate_target=/usr/syno/synoman/authenticate.cgi
 fixture_cookie=id=sdsync-fixture-session
 package_auth_marker=/tmp/sdsync-auth.$package_uid
 inaccessible_cgi_summary=/tmp/sdsync-auth-inaccessible.$package_uid
@@ -41,7 +42,7 @@ spk=$1
     exit 77
 }
 for reserved_path in "$package_base" "$physical_store" "$physical_home" "$physical_var" \
-    "$webman_route" "$authenticate_helper" "$package_auth_marker" "$inaccessible_cgi_summary"
+    "$webman_route" "$authenticate_helper" "$authenticate_target" "$package_auth_marker" "$inaccessible_cgi_summary"
 do
     if [ -e "$reserved_path" ] || [ -L "$reserved_path" ]; then
         echo "refusing to replace existing fixture path: $reserved_path" >&2
@@ -113,7 +114,7 @@ case " $administrator_groups " in
 esac
 
 mkdir -p "$(dirname -- "$authenticate_helper")"
-cat > "$authenticate_helper" <<'EOF'
+cat > "$authenticate_target" <<'EOF'
 #!/bin/sh
 set -eu
 [ "${REQUEST_METHOD:-}" = GET ] || exit 1
@@ -129,15 +130,19 @@ printf '%s\n' authenticated >> "$auth_marker"
 chmod 0600 "$auth_marker"
 printf '%s\n' sdsync-admin
 EOF
-chmod 0750 "$authenticate_helper"
-chown 0:system "$authenticate_helper"
+chmod 0750 "$authenticate_target"
+chown 0:system "$authenticate_target"
+ln -s ../../authenticate.cgi "$authenticate_helper"
 system_gid=$(awk -F: '$1 == "system" { print $3; exit }' /etc/group)
 [ -n "$system_gid" ] || {
     echo "fixture system group has no numeric gid" >&2
     exit 73
 }
-[ "$(stat -c '%u:%g:%a:%h' "$authenticate_helper")" = "0:$system_gid:750:1" ] || {
-    echo "mock DSM authentication helper is not root:system 0750" >&2
+[ -L "$authenticate_helper" ] \
+    && [ "$(readlink "$authenticate_helper")" = ../../authenticate.cgi ] \
+    && [ "$(stat -c '%u' "$authenticate_helper")" = 0 ] \
+    && [ "$(stat -c '%u:%g:%a:%h' "$authenticate_target")" = "0:$system_gid:750:1" ] || {
+    echo "mock DSM authentication helper is not a root-owned symlink to root:system 0750" >&2
     exit 73
 }
 if su "$package_user" -s /bin/sh -c "test -x $authenticate_helper"; then
@@ -264,7 +269,7 @@ printf '%s\n' "$inaccessible_cgi_response" | grep -Fq '"schema":"sdsync.dsm-erro
     && printf '%s\n' "$inaccessible_cgi_response" | grep -Fq '"ok":false' \
     && printf '%s\n' "$inaccessible_cgi_response" | grep -Fq '"status":503' \
     && printf '%s\n' "$inaccessible_cgi_response" | grep -Fq '"stage":"dsm_authentication"' \
-    && printf '%s\n' "$inaccessible_cgi_response" | grep -Eq '"code":"dsm_authentication_(unsafe|unavailable)"' || {
+    && printf '%s\n' "$inaccessible_cgi_response" | grep -Fq '"code":"dsm_authentication_helper_unavailable"' || {
     echo "inaccessible DSM authentication helper response lost semantic error evidence" >&2
     exit 1
 }
@@ -272,12 +277,24 @@ printf '%s\n' "$inaccessible_cgi_response" | grep -Fq '"schema":"sdsync.dsm-erro
     echo "non-executable DSM authentication helper was unexpectedly invoked" >&2
     exit 1
 }
+grep -Fq '"service":"synology-drive-sync"' "$physical_var/log/api.log" \
+    && grep -Fq '"stage":"dsm_authentication"' "$physical_var/log/api.log" \
+    && grep -Fq '"code":"dsm_authentication_helper_unavailable"' "$physical_var/log/api.log" || {
+    echo "inaccessible DSM authentication helper did not reach the bounded API diagnostic log" >&2
+    exit 1
+}
+grep -Fq '|authentication.failed|none|failed|authentication|warn|Package service synology-drive-sync request failed stage=dsm_authentication code=dsm_authentication_helper_unavailable status=503' \
+    "$physical_var/log/activity.log" || {
+    echo "inaccessible DSM authentication helper did not reach structured activity" >&2
+    exit 1
+}
 
 # Make only the synthetic helper callable for the successful relay. Requiring
 # exactly one marker proves the CGI authenticates once and the package daemon
 # does not repeat execution of authenticate.cgi after the private relay.
-chmod 0755 "$authenticate_helper"
-[ "$(stat -c '%u:%g:%a:%h' "$authenticate_helper")" = "0:$system_gid:755:1" ] || {
+chmod 0755 "$authenticate_target"
+[ -L "$authenticate_helper" ] \
+    && [ "$(stat -c '%u:%g:%a:%h' "$authenticate_target")" = "0:$system_gid:755:1" ] || {
     echo "mock DSM authentication helper did not enter the explicit callable test phase" >&2
     exit 73
 }

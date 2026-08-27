@@ -95,13 +95,18 @@ only the current view.
 
 The dashboard reads `1..1000` lines and can filter:
 
+- API/CGI diagnostics;
 - controller;
-- scheduler; or
-- sync.
+- scheduler;
+- sync; or
+- mandatory audit history.
 
-Controller and scheduler logs rotate at 10 MiB with five backups. The core sync log uses its own
-10 MiB, three-backup policy. Rotation rejects symlinks. API output replaces private package paths
-with neutral labels and masks secret-file paths; secret values are never an allowed log field.
+API, controller, and scheduler logs rotate at 10 MiB with five backups. The core sync log uses its
+own 10 MiB, three-backup policy. Rotation rejects symlinks, hard links, and unsafe ownership/modes.
+Structured API failure lines obey their exact bridge/authentication/security category threshold.
+API output replaces private package paths with neutral labels and masks secret-file paths; secret
+values are never an allowed log field. Selecting one source reads only that source; `all` remains
+globally bounded below the API bridge's 1 MiB response-capture limit.
 
 The Activity page can pause refresh without changing package logging. Log refresh choices are 5,
 10, or 30 seconds. For SSH recovery:

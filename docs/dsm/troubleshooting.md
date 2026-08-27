@@ -135,6 +135,54 @@ bounded window. Retry once after Package Center reports the package running. Rep
 responses mean the service did not become ready; restart **Synology Drive Sync** in Package Center
 and inspect the package startup result rather than repeatedly refreshing the dashboard.
 
+Semantic stage `dsm_authentication` identifies the native DSM helper boundary. Its fixed codes are:
+
+- `dsm_authentication_helper_unsafe` with status 503: the fixed helper entry, a symlink boundary,
+  resolved ancestor, or final executable failed root-owner/non-writability/type/identity validation;
+- `dsm_authentication_helper_unavailable` with status 503: the validated canonical helper could not
+  be started or did not complete safely within its bound;
+- `dsm_authentication_rejected` with status 401: DSM did not authenticate the native cookie; and
+- `dsm_authentication_forbidden` with status 403: the authenticated account did not satisfy the
+  administrator requirement.
+
+Collect the helper chain and package-UID execute result with read-only checks:
+
+```bash
+AUTH=/usr/syno/synoman/webman/modules/authenticate.cgi
+PACKAGE_USER=synology-drive-sync
+TARGET=$(readlink -f "$AUTH")
+
+stat -c '%F %a %u:%g %h %n' "$AUTH"
+stat -Lc '%F %a %u:%g %h %n' "$AUTH"
+readlink "$AUTH" || true
+printf 'canonical target: %s\n' "$TARGET"
+command -v namei >/dev/null 2>&1 && namei -l "$AUTH"
+sudo -u "$PACKAGE_USER" test -x "$TARGET" \
+  && echo 'package UID can execute canonical helper' \
+  || echo 'package UID cannot execute canonical helper'
+```
+
+These commands expose no DSM cookie or package CSRF token. Preserve the output with the exact
+installed package version and semantic response code.
+
+Do not replace the helper link, broaden directory or target modes, grant set-id/capabilities, run the
+package as root, or call an undocumented DSM login endpoint. The package safely supports DSM's fixed
+helper entry resolving through absolute or relative root-owned symlinks, validates every ancestor and
+link boundary, and rechecks the final device/inode before executing the returned canonical target.
+It does not add a package privilege, change the CGI identity, or alter DSM helper metadata. A
+repository fixture proves that model with a root-owned symlink, but the exact canonical target and
+package-UID executability on each DSM build remain physical-NAS acceptance evidence.
+
+When policy permits the stage-derived warning category, a pre-relay failure is coalesced globally to
+at most one emission per 30 seconds and recorded as fixed, secret-free JSON in
+`/var/packages/synology-drive-sync/var/log/api.log` (10 MiB, five backups). The matching fixed Activity
+event is in `/var/packages/synology-drive-sync/var/log/activity.log` and is visible through the
+dashboard or `sdsync-dsm api activity --lines 100`. Authentication warnings obey
+`authentication_log_level`; `off` suppresses both persistence and Activity before coalescing state is
+touched. Records contain only epoch, level/category, fixed event/service/stage/code, and status—not
+request environment, query, cookie, token, username, or path. An unsafe/corrupt policy or unsafe log
+path fails closed, so preserve the semantic response itself when no diagnostic was persisted.
+
 A raw empty or HTML HTTP 503 is not this package envelope. It indicates Webman, its proxy, the route,
 CGI launch, or another pre-response layer failed or replaced the output. Record its response headers,
 duration, exact package version, and matching bounded Webman/package log lines. A later Synology

@@ -61,14 +61,16 @@ Use the DSM desktop application menu or Package Center's **Open** action. The ap
 registered for administrators only. A healthy open sequence requires the DSM session cookie,
 administrator membership, and a package CSRF token for mutation. The ordinary package-owned `0755`
 CGI fails closed unless Webman starts it with the exact non-root package UID. It invokes
-`authenticate.cgi` once in that native request context, then relays a bounded assertion and request
-through the fixed package-owned Unix socket, which remains `0000` before startup commit and activates
-on the same inode as `0600`. The package-user service never executes that root-owned helper; it
-verifies the package-UID peer, strict relay/request, independently resolved UID/name/administrator
-membership, recomputed session binding, policy, and package CSRF. The native AppWindow does not
-parse or rewrite the DSM shell location and does not send a `SynoToken`; cookie authentication is
-the active native path. Never copy a DSM cookie or package CSRF token into a URL, bookmark, browser
-storage, or support transcript.
+`authenticate.cgi` once in that native request context after resolving its fixed entry through a
+fully root-owned, non-group/world-writable ancestor and symlink chain, revalidating the final
+canonical executable identity without changing the CGI identity or package privileges. It then
+relays a bounded assertion and request through the fixed package-owned Unix socket, which remains
+`0000` before startup commit and activates on the same inode as `0600`. The package-user service
+never executes that root-owned helper; it verifies the package-UID peer, strict relay/request,
+independently resolved UID/name/administrator membership, recomputed session binding, policy, and
+package CSRF. The native AppWindow does not parse or rewrite the DSM shell location and does not
+send a `SynoToken`; cookie authentication is the active native path. Never copy a DSM cookie or
+package CSRF token into a URL, bookmark, browser storage, or support transcript.
 
 ## Grant read-only access to each local source
 

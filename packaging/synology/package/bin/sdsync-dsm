@@ -1562,14 +1562,28 @@ api_json_log_lines() {
     json_log_lines=$2
     json_log_source=$3
     json_log_threshold=$4
-    [ -e "$json_log_path" ] || { printf '[]'; return; }
-    if [ -L "$json_log_path" ] || [ ! -f "$json_log_path" ] || [ ! -r "$json_log_path" ]; then
-        api_error unsafe_state "unsafe package log file" 73
-    fi
+    json_log_byte_limit=$5
+    shift 5
+    json_log_inputs=
+    for json_log_candidate in "$json_log_path" "$@"; do
+        [ -e "$json_log_candidate" ] || [ -L "$json_log_candidate" ] || continue
+        if [ -L "$json_log_candidate" ] || [ ! -f "$json_log_candidate" ] || [ ! -r "$json_log_candidate" ]; then
+            api_error unsafe_state "unsafe package log file" 73
+        fi
+        json_log_inputs="$json_log_inputs $json_log_candidate"
+    done
+    [ -n "$json_log_inputs" ] || { printf '[]'; return; }
+    # All paths are fixed package-owned DSM paths and cannot contain spaces.
+    set -- $json_log_inputs
+    json_log_path_count=$#
     LC_ALL=C awk -v home="$package_home" -v var="$package_var" \
         -v real_home="$package_home_real" -v real_var="$package_var_real" \
-        -v requested="$json_log_lines" -v byte_limit=262144 -v line_limit=8192 \
-        -v source="$json_log_source" -v threshold="$json_log_threshold" '
+        -v requested="$json_log_lines" -v byte_limit="$json_log_byte_limit" -v line_limit=8192 \
+        -v source="$json_log_source" -v threshold="$json_log_threshold" \
+        -v bridge_threshold="$security_runtime_bridge_level" \
+        -v authentication_threshold="$security_runtime_authentication_level" \
+        -v security_threshold="$security_runtime_security_level" \
+        -v log_path_count="$json_log_path_count" '
         function level_rank(level) {
             if (level == "trace") return 0
             if (level == "debug") return 1
@@ -1579,7 +1593,7 @@ api_json_log_lines() {
             return -1
         }
         function structured_level(text, marker, rest, ending, level) {
-            if (source != "controller" && source != "scheduler" && source != "sync") return "info"
+            if (source != "api" && source != "controller" && source != "scheduler" && source != "sync") return "info"
             marker = index(text, "\"level\":\"")
             if (marker == 0) return "info"
             rest = substr(text, marker + 9)
@@ -1587,6 +1601,18 @@ api_json_log_lines() {
             if (ending == 0) return "invalid"
             level = substr(rest, 1, ending - 1)
             return level_rank(level) >= 0 ? level : "invalid"
+        }
+        function api_threshold(text, marker, rest, ending, category) {
+            marker = index(text, "\"category\":\"")
+            if (marker == 0) return bridge_threshold
+            rest = substr(text, marker + 12)
+            ending = index(rest, "\"")
+            if (ending == 0) return "invalid"
+            category = substr(rest, 1, ending - 1)
+            if (category == "bridge") return bridge_threshold
+            if (category == "authentication") return authentication_threshold
+            if (category == "security") return security_threshold
+            return "invalid"
         }
         function replace_literal(text, needle, replacement, at) {
             if (needle == "") return text
@@ -1607,7 +1633,7 @@ api_json_log_lines() {
             return "\"" text "\""
         }
         BEGIN {
-            for (argument = 1; argument < ARGC - 1; argument++) {
+            for (argument = 1; argument < ARGC - log_path_count; argument++) {
                 secret = ""
                 if ((getline secret < ARGV[argument]) > 0 && secret != "") needles[++needle_count] = secret
                 close(ARGV[argument])
@@ -1617,9 +1643,10 @@ api_json_log_lines() {
         {
             line = $0
             if (source != "audit") {
-                if (threshold == "off") next
+                line_threshold = source == "api" ? api_threshold(line) : threshold
+                if (line_threshold == "off" || line_threshold == "invalid") next
                 event_level = structured_level(line)
-                if (event_level == "invalid" || level_rank(event_level) < level_rank(threshold)) next
+                if (event_level == "invalid" || level_rank(event_level) < level_rank(line_threshold)) next
             }
             for (needle_index = 1; needle_index <= needle_count; needle_index++)
                 line = replace_literal(line, needles[needle_index], "[redacted]")
@@ -1651,28 +1678,84 @@ api_json_log_lines() {
             }
             printf "]"
         }
-    ' "$secret_root"/*.password "$secret_root"/*.totp "$secret_root"/*.remote-log-token "$json_log_path"
+    ' "$secret_root"/*.password "$secret_root"/*.totp "$secret_root"/*.remote-log-token \
+        "$@"
 }
 
 api_logs() {
     log_lines=100
+    log_source=all
     while [ "$#" -gt 0 ]; do
-        case $1 in --lines) api_need_value "$@"; log_lines=$2; shift 2 ;; *) api_error invalid_request "unknown logs option" 64 ;; esac
+        case $1 in
+            --lines) api_need_value "$@"; log_lines=$2; shift 2 ;;
+            --source) api_need_value "$@"; log_source=$2; shift 2 ;;
+            *) api_error invalid_request "unknown logs option" 64 ;;
+        esac
     done
     case $log_lines in ''|*[!0-9]*) api_error invalid_request "lines must be an integer" 64 ;; esac
     [ "$log_lines" -ge 1 ] && [ "$log_lines" -le 1000 ] || api_error invalid_request "lines must be 1..1000" 64
+    case $log_source in all|api|controller|scheduler|sync|audit) ;; *) api_error invalid_request "invalid log source" 64 ;; esac
     load_security_policy_runtime || api_error unsafe_state "security policy is unavailable" 73
-    for log_preflight in "$log_root/controller.log" "$log_root/scheduler.log" "$log_root/sync.log" "$audit_log"; do
+    case $log_source in
+        all) set -- "$log_root/api.log" "$log_root/api.log.1" "$log_root/api.log.2" \
+            "$log_root/api.log.3" "$log_root/api.log.4" "$log_root/api.log.5" \
+            "$log_root/controller.log" "$log_root/scheduler.log" "$log_root/sync.log" "$audit_log" ;;
+        api) set -- "$log_root/api.log" "$log_root/api.log.1" "$log_root/api.log.2" \
+            "$log_root/api.log.3" "$log_root/api.log.4" "$log_root/api.log.5" ;;
+        controller) set -- "$log_root/controller.log" ;;
+        scheduler) set -- "$log_root/scheduler.log" ;;
+        sync) set -- "$log_root/sync.log" ;;
+        audit) set -- "$audit_log" ;;
+    esac
+    for log_preflight in "$@"; do
         if [ -e "$log_preflight" ] || [ -L "$log_preflight" ]; then
             [ ! -L "$log_preflight" ] && [ -f "$log_preflight" ] && [ -r "$log_preflight" ] || api_error unsafe_state "unsafe package log file" 73
+            case $log_preflight in
+                "$log_root/api.log"*)
+                    [ "$(stat -c '%u:%a:%h' "$log_preflight" 2>/dev/null || true)" = "$path_owner:600:1" ] \
+                        || api_error unsafe_state "unsafe API log file" 73
+                    ;;
+            esac
         fi
     done
     api_preflight_secret_material
     printf '{"schema":"sdsync.dsm-logs.v1","logs":['
-    printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/controller.log" "$log_lines" controller "$security_runtime_controller_level"; printf '},'
-    printf '{"source":"scheduler","lines":'; api_json_log_lines "$log_root/scheduler.log" "$log_lines" scheduler "$security_runtime_scheduler_level"; printf '},'
-    printf '{"source":"sync","lines":'; api_json_log_lines "$log_root/sync.log" "$log_lines" sync "$security_runtime_sync_level"; printf '},'
-    printf '{"source":"audit","lines":'; api_json_log_lines "$audit_log" "$log_lines" audit trace; printf '}]}\n'
+    if [ "$log_source" = all ]; then
+        # Five encoded arrays plus the fixed envelope stay below the Rust
+        # manager-output capture ceiling of 1 MiB.
+        log_byte_limit=196608
+        printf '{"source":"api","lines":'; api_json_log_lines "$log_root/api.log.5" "$log_lines" api "$security_runtime_bridge_level" "$log_byte_limit" \
+            "$log_root/api.log.4" "$log_root/api.log.3" "$log_root/api.log.2" \
+            "$log_root/api.log.1" "$log_root/api.log"; printf '},'
+        printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/controller.log" "$log_lines" controller "$security_runtime_controller_level" "$log_byte_limit"; printf '},'
+        printf '{"source":"scheduler","lines":'; api_json_log_lines "$log_root/scheduler.log" "$log_lines" scheduler "$security_runtime_scheduler_level" "$log_byte_limit"; printf '},'
+        printf '{"source":"sync","lines":'; api_json_log_lines "$log_root/sync.log" "$log_lines" sync "$security_runtime_sync_level" "$log_byte_limit"; printf '},'
+        printf '{"source":"audit","lines":'; api_json_log_lines "$audit_log" "$log_lines" audit trace "$log_byte_limit"; printf '}'
+    else
+        # A selected source can use most of that ceiling while leaving fixed
+        # headroom for its schema and source envelope.
+        log_byte_limit=786432
+        case $log_source in
+            api)
+                printf '{"source":"api","lines":'; api_json_log_lines "$log_root/api.log.5" "$log_lines" api "$security_runtime_bridge_level" "$log_byte_limit" \
+                    "$log_root/api.log.4" "$log_root/api.log.3" "$log_root/api.log.2" \
+                    "$log_root/api.log.1" "$log_root/api.log"; printf '}'
+                ;;
+            controller)
+                printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/controller.log" "$log_lines" controller "$security_runtime_controller_level" "$log_byte_limit"; printf '}'
+                ;;
+            scheduler)
+                printf '{"source":"scheduler","lines":'; api_json_log_lines "$log_root/scheduler.log" "$log_lines" scheduler "$security_runtime_scheduler_level" "$log_byte_limit"; printf '}'
+                ;;
+            sync)
+                printf '{"source":"sync","lines":'; api_json_log_lines "$log_root/sync.log" "$log_lines" sync "$security_runtime_sync_level" "$log_byte_limit"; printf '}'
+                ;;
+            audit)
+                printf '{"source":"audit","lines":'; api_json_log_lines "$audit_log" "$log_lines" audit trace "$log_byte_limit"; printf '}'
+                ;;
+        esac
+    fi
+    printf ']}\n'
 }
 
 api_activity() {
@@ -2115,6 +2198,39 @@ api_client_event() {
     api_result "Client preference change audited"
 }
 
+api_cgi_failure() {
+    [ "$#" -eq 6 ] || api_error invalid_request "cgi-failure requires stage, code, and status" 64
+    [ "$1" = --stage ] && [ "$3" = --code ] && [ "$5" = --status ] \
+        || api_error invalid_request "cgi-failure arguments are malformed" 64
+    cgi_failure_stage=$2
+    cgi_failure_code=$4
+    cgi_failure_status=$6
+    case "$cgi_failure_stage:$cgi_failure_code:$cgi_failure_status" in
+        request:invalid_request:400|request:method_not_allowed:405|request:payload_too_large:413|request:unsupported_media_type:415)
+            cgi_failure_event=bridge.failed
+            cgi_failure_category=bridge
+            ;;
+        cgi_identity:cgi_identity_unsafe:503|cgi_runtime:cgi_runtime_unsafe:503|cgi_runtime:cgi_runtime_unavailable:503)
+            cgi_failure_event=security.failed
+            cgi_failure_category=security
+            ;;
+        dsm_authentication:dsm_authentication_helper_unsafe:503|dsm_authentication:dsm_authentication_helper_unavailable:503|dsm_authentication:dsm_authentication_rejected:401|dsm_authentication:dsm_authentication_forbidden:403)
+            cgi_failure_event=authentication.failed
+            cgi_failure_category=authentication
+            ;;
+        bridge_connect:service_unavailable:503|bridge_connect:bridge_socket_unsafe:503|bridge_io:bridge_io_unsafe:503|bridge_io:bridge_io_unavailable:503|bridge_protocol:bridge_protocol_unsafe:503|bridge_protocol:bridge_protocol_unavailable:503)
+            cgi_failure_event=bridge.failed
+            cgi_failure_category=bridge
+            ;;
+        *) api_error invalid_request "unsupported cgi-failure diagnostic" 64 ;;
+    esac
+    append_activity "$cgi_failure_event" none failed \
+        "Package service synology-drive-sync request failed stage=$cgi_failure_stage code=$cgi_failure_code status=$cgi_failure_status" \
+        "$cgi_failure_category" warn false \
+        || api_error unavailable "CGI failure activity could not be recorded" 69
+    api_result "CGI failure activity recorded"
+}
+
 api_audit_event() {
     audit_event_operation= audit_event_state= audit_event_profile=
     while [ "$#" -gt 0 ]; do
@@ -2216,6 +2332,7 @@ api_command() {
         snapshot) api_snapshot "$@" ;;
         logs) api_logs "$@" ;;
         activity) api_activity "$@" ;;
+        cgi-failure) api_cgi_failure "$@" ;;
         audit-rejected)
             [ "$#" -eq 0 ] || api_error invalid_request "audit-rejected accepts no arguments" 64
             append_audit_event rejected-post failed all >/dev/null 2>&1 || api_error audit_unavailable "mandatory audit record could not be written" 73

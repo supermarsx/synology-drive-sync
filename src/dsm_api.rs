@@ -60,6 +60,8 @@ const AUDIT_OUTBOX_LOCK_PATH: &str = "/var/packages/synology-drive-sync/var/run/
 const LOG_ROOT: &str = "/var/packages/synology-drive-sync/var/log";
 const AUDIT_LOG_PATH: &str = "/var/packages/synology-drive-sync/var/log/audit.log";
 const ACTIVITY_LOG_PATH: &str = "/var/packages/synology-drive-sync/var/log/activity.log";
+const API_LOG_PATH: &str = "/var/packages/synology-drive-sync/var/log/api.log";
+const CGI_FAILURE_STATE_PATH: &str = "/var/packages/synology-drive-sync/var/run/cgi-failure.state";
 const API_SOCKET_PATH: &str = "/var/packages/synology-drive-sync/var/run/api.sock";
 const API_PID_PATH: &str = "/var/packages/synology-drive-sync/var/run/api.pid";
 const API_BOUND_PATH: &str = "/var/packages/synology-drive-sync/var/run/api.bound";
@@ -428,11 +430,24 @@ impl CgiFailureStage {
 struct CgiFailure {
     error: BridgeError,
     stage: CgiFailureStage,
+    code: Option<&'static str>,
 }
 
 impl CgiFailure {
     const fn new(stage: CgiFailureStage, error: BridgeError) -> Self {
-        Self { error, stage }
+        Self {
+            error,
+            stage,
+            code: None,
+        }
+    }
+
+    const fn coded(stage: CgiFailureStage, error: BridgeError, code: &'static str) -> Self {
+        Self {
+            error,
+            stage,
+            code: Some(code),
+        }
     }
 }
 
@@ -474,6 +489,7 @@ enum ReadAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LogSource {
     All,
+    Api,
     Controller,
     Scheduler,
     Sync,
@@ -484,6 +500,7 @@ impl LogSource {
     fn as_str(self) -> &'static str {
         match self {
             Self::All => "all",
+            Self::Api => "api",
             Self::Controller => "controller",
             Self::Scheduler => "scheduler",
             Self::Sync => "sync",
@@ -1584,6 +1601,7 @@ fn parse_read_action(mut query: BTreeMap<String, String>) -> BridgeResult<ReadAc
             let lines = parse_lines(query.remove("lines"))?;
             let source = match query.remove("source").as_deref().unwrap_or("all") {
                 "all" => LogSource::All,
+                "api" => LogSource::Api,
                 "controller" => LogSource::Controller,
                 "scheduler" => LogSource::Scheduler,
                 "sync" => LogSource::Sync,
@@ -2107,6 +2125,7 @@ fn policy_level_for_log_source(
 ) -> Option<PolicyLogLevel> {
     match source {
         "audit" => Some(policy.audit_log_level),
+        "api" => Some(policy.bridge_log_level),
         "controller" => Some(policy.controller_log_level),
         "scheduler" => Some(policy.scheduler_log_level),
         "sync" => Some(policy.sync_log_level),
@@ -2137,11 +2156,24 @@ fn log_line_visible_at_threshold(policy: &SecurityPolicyArgs, source: &str, line
         // The audit file contains only the non-disableable minimal records.
         return true;
     }
-    let Some(threshold) = policy_level_for_log_source(policy, source) else {
+    let parsed = serde_json::from_str::<Value>(line).ok();
+    let threshold = if source == "api" {
+        match parsed
+            .as_ref()
+            .and_then(|value| value.get("category"))
+            .and_then(Value::as_str)
+        {
+            Some(category) => policy_level_for_category(policy, category),
+            // Opaque legacy API-server output is bridge-owned.
+            None => Some(policy.bridge_log_level),
+        }
+    } else {
+        policy_level_for_log_source(policy, source)
+    };
+    let Some(threshold) = threshold else {
         return false;
     };
-    let event_level = serde_json::from_str::<Value>(line)
-        .ok()
+    let event_level = parsed
         .and_then(|value| {
             value
                 .get("level")
@@ -2154,6 +2186,15 @@ fn log_line_visible_at_threshold(policy: &SecurityPolicyArgs, source: &str, line
         // scheduler lifecycle records are structured at the writer.
         .unwrap_or(PolicyLogLevel::Info);
     threshold.allows(event_level)
+}
+
+fn cgi_failure_category(stage: &str) -> Option<&'static str> {
+    match stage {
+        "request" | "bridge_connect" | "bridge_io" | "bridge_protocol" => Some("bridge"),
+        "cgi_identity" | "cgi_runtime" => Some("security"),
+        "dsm_authentication" => Some("authentication"),
+        _ => None,
+    }
 }
 
 fn parse_security_policy_file(bytes: &[u8]) -> BridgeResult<SecurityPolicyArgs> {
@@ -2399,6 +2440,11 @@ fn trusted_executable_mode(mode: u32) -> bool {
     mode & 0o170_000 == 0o100_000 && mode & 0o022 == 0 && mode & 0o111 != 0
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn trusted_directory_mode(mode: u32) -> bool {
+    mode & 0o170_000 == 0o040_000 && mode & 0o022 == 0
+}
+
 fn parse_authentication_output(output: &[u8]) -> BridgeResult<String> {
     if output.is_empty() || output.len() > MAX_AUTH_OUTPUT_BYTES {
         return Err(BridgeError::new(ErrorKind::Unauthorized));
@@ -2641,6 +2687,33 @@ mod linux_runtime {
     use std::os::linux::fs::MetadataExt;
     use std::ptr;
 
+    const MAX_TRUSTED_SYMLINKS: usize = 16;
+
+    #[derive(Debug)]
+    pub(super) struct TrustedExecutable {
+        pub(super) path: PathBuf,
+        device: u64,
+        inode: u64,
+        owner: u32,
+        mode: u32,
+    }
+
+    impl TrustedExecutable {
+        pub(super) fn revalidate(&self) -> BridgeResult<()> {
+            let metadata =
+                fs::symlink_metadata(&self.path).map_err(|_| BridgeError::unsafe_runtime())?;
+            if metadata.st_dev() != self.device
+                || metadata.st_ino() != self.inode
+                || metadata.st_uid() != self.owner
+                || metadata.st_mode() != self.mode
+                || !trusted_executable_mode(metadata.st_mode())
+            {
+                return Err(BridgeError::unsafe_runtime());
+            }
+            Ok(())
+        }
+    }
+
     pub(super) fn clear_environment() -> BridgeResult<()> {
         // SAFETY: the bridge is deliberately single-threaded and calls clearenv
         // before creating any worker thread.  All required CGI values have
@@ -2670,27 +2743,64 @@ mod linux_runtime {
     pub(super) fn authenticate_and_authorize_cgi(
         inputs: &AuthenticationInputs,
         timeout: Duration,
-    ) -> BridgeResult<AuthenticatedSession> {
-        validate_trusted_executable(Path::new(AUTHENTICATE_PATH), 0)?;
-        let mut command = Command::new(AUTHENTICATE_PATH);
+    ) -> Result<AuthenticatedSession, CgiFailure> {
+        let helper = validate_trusted_executable(Path::new(AUTHENTICATE_PATH), Path::new("/"), 0)
+            .map_err(|error| {
+            CgiFailure::coded(
+                CgiFailureStage::Authentication,
+                error,
+                "dsm_authentication_helper_unsafe",
+            )
+        })?;
+        let mut command = Command::new(&helper.path);
         command
             .env_clear()
             .envs(authentication_command_environment(inputs))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        helper.revalidate().map_err(|error| {
+            CgiFailure::coded(
+                CgiFailureStage::Authentication,
+                error,
+                "dsm_authentication_helper_unsafe",
+            )
+        })?;
         let output = capture_bounded_command(
             &mut command,
             MAX_AUTH_OUTPUT_BYTES,
             MAX_HELPER_STDERR_BYTES,
             timeout,
             None,
-        )?;
+        )
+        .map_err(|error| {
+            CgiFailure::coded(
+                CgiFailureStage::Authentication,
+                error,
+                "dsm_authentication_helper_unavailable",
+            )
+        })?;
         if !output.status_success {
-            return Err(BridgeError::new(ErrorKind::Unauthorized));
+            return Err(CgiFailure::coded(
+                CgiFailureStage::Authentication,
+                BridgeError::new(ErrorKind::Unauthorized),
+                "dsm_authentication_rejected",
+            ));
         }
-        let username = parse_authentication_output(&output.stdout)?;
-        let uid = authorize_relayed_username(&username)?;
+        let username = parse_authentication_output(&output.stdout).map_err(|error| {
+            CgiFailure::coded(
+                CgiFailureStage::Authentication,
+                error,
+                "dsm_authentication_rejected",
+            )
+        })?;
+        let uid = authorize_relayed_username(&username).map_err(|error| {
+            CgiFailure::coded(
+                CgiFailureStage::Authentication,
+                error,
+                "dsm_authentication_forbidden",
+            )
+        })?;
         let binding = session_binding(
             &username,
             uid,
@@ -2825,12 +2935,140 @@ mod linux_runtime {
         }
     }
 
-    fn validate_trusted_executable(path: &Path, expected_uid: u32) -> BridgeResult<()> {
-        let metadata = fs::symlink_metadata(path).map_err(|_| BridgeError::unsafe_runtime())?;
-        if metadata.st_uid() != expected_uid || !trusted_executable_mode(metadata.st_mode()) {
+    fn normalize_within_root(path: &Path, validation_root: &Path) -> BridgeResult<PathBuf> {
+        if !path.is_absolute() || !validation_root.is_absolute() {
             return Err(BridgeError::unsafe_runtime());
         }
-        Ok(())
+        let mut normalized = PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::RootDir => normalized.push(Path::new("/")),
+                std::path::Component::CurDir => {}
+                std::path::Component::Normal(value) => normalized.push(value),
+                std::path::Component::ParentDir => {
+                    if normalized == validation_root || !normalized.pop() {
+                        return Err(BridgeError::unsafe_runtime());
+                    }
+                }
+                std::path::Component::Prefix(_) => {
+                    return Err(BridgeError::unsafe_runtime());
+                }
+            }
+        }
+        if normalized.starts_with(validation_root) {
+            Ok(normalized)
+        } else {
+            Err(BridgeError::unsafe_runtime())
+        }
+    }
+
+    fn same_metadata_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+        left.st_dev() == right.st_dev()
+            && left.st_ino() == right.st_ino()
+            && left.st_uid() == right.st_uid()
+            && left.st_mode() == right.st_mode()
+    }
+
+    pub(super) fn trusted_symlink_boundary(metadata: &fs::Metadata, expected_uid: u32) -> bool {
+        metadata.file_type().is_symlink() && metadata.st_uid() == expected_uid
+    }
+
+    pub(super) fn validate_trusted_executable(
+        path: &Path,
+        validation_root: &Path,
+        expected_uid: u32,
+    ) -> BridgeResult<TrustedExecutable> {
+        let root = normalize_within_root(validation_root, validation_root)?;
+        let root_metadata =
+            fs::symlink_metadata(&root).map_err(|_| BridgeError::unsafe_runtime())?;
+        if root_metadata.st_uid() != expected_uid
+            || !trusted_directory_mode(root_metadata.st_mode())
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+
+        let mut candidate = normalize_within_root(path, &root)?;
+        let mut observed = BTreeSet::new();
+        for _ in 0..=MAX_TRUSTED_SYMLINKS {
+            if !observed.insert(candidate.clone()) {
+                return Err(BridgeError::unsafe_runtime());
+            }
+            let relative = candidate
+                .strip_prefix(&root)
+                .map_err(|_| BridgeError::unsafe_runtime())?;
+            let components = relative
+                .components()
+                .map(|component| match component {
+                    std::path::Component::Normal(value) => Ok(value.to_os_string()),
+                    _ => Err(BridgeError::unsafe_runtime()),
+                })
+                .collect::<BridgeResult<Vec<_>>>()?;
+            if components.is_empty() {
+                return Err(BridgeError::unsafe_runtime());
+            }
+
+            let mut parent = root.clone();
+            let mut redirected = false;
+            for (index, component) in components.iter().enumerate() {
+                let entry = parent.join(component);
+                let before =
+                    fs::symlink_metadata(&entry).map_err(|_| BridgeError::unsafe_runtime())?;
+                if before.file_type().is_symlink() {
+                    if !trusted_symlink_boundary(&before, expected_uid) {
+                        return Err(BridgeError::unsafe_runtime());
+                    }
+                    let target =
+                        fs::read_link(&entry).map_err(|_| BridgeError::unsafe_runtime())?;
+                    if target.as_os_str().is_empty() {
+                        return Err(BridgeError::unsafe_runtime());
+                    }
+                    let after =
+                        fs::symlink_metadata(&entry).map_err(|_| BridgeError::unsafe_runtime())?;
+                    if !same_metadata_identity(&before, &after) {
+                        return Err(BridgeError::unsafe_runtime());
+                    }
+                    let mut rebound = if target.is_absolute() {
+                        target
+                    } else {
+                        parent.join(target)
+                    };
+                    for remainder in &components[index + 1..] {
+                        rebound.push(remainder);
+                    }
+                    candidate = normalize_within_root(&rebound, &root)?;
+                    redirected = true;
+                    break;
+                }
+
+                let final_component = index + 1 == components.len();
+                if final_component {
+                    if before.st_uid() != expected_uid || !trusted_executable_mode(before.st_mode())
+                    {
+                        return Err(BridgeError::unsafe_runtime());
+                    }
+                    let after =
+                        fs::symlink_metadata(&entry).map_err(|_| BridgeError::unsafe_runtime())?;
+                    if !same_metadata_identity(&before, &after) {
+                        return Err(BridgeError::unsafe_runtime());
+                    }
+                    return Ok(TrustedExecutable {
+                        path: entry,
+                        device: after.st_dev(),
+                        inode: after.st_ino(),
+                        owner: after.st_uid(),
+                        mode: after.st_mode(),
+                    });
+                }
+                if before.st_uid() != expected_uid || !trusted_directory_mode(before.st_mode()) {
+                    return Err(BridgeError::unsafe_runtime());
+                }
+                parent = entry;
+            }
+            if !redirected {
+                return Err(BridgeError::unsafe_runtime());
+            }
+        }
+        Err(BridgeError::unsafe_runtime())
     }
 }
 
@@ -4070,7 +4308,7 @@ fn hex_decode_exact<const N: usize>(value: &str) -> Option<[u8; N]> {
 fn read_manager_arguments(action: &ReadAction) -> BridgeResult<Vec<OsString>> {
     let arguments = match action {
         ReadAction::Snapshot => vec!["api".into(), "snapshot".into()],
-        ReadAction::Logs { lines, .. } => {
+        ReadAction::Logs { lines, source } => {
             let scan_lines = lines
                 .saturating_mul(16)
                 .max(lines.saturating_add(128))
@@ -4080,6 +4318,8 @@ fn read_manager_arguments(action: &ReadAction) -> BridgeResult<Vec<OsString>> {
                 "logs".into(),
                 "--lines".into(),
                 scan_lines.to_string().into(),
+                "--source".into(),
+                source.as_str().into(),
             ]
         }
         ReadAction::Activity { lines } => vec![
@@ -5225,6 +5465,11 @@ mod linux_files {
     use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 
     const NOFOLLOW_CLOEXEC: i32 = libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    const CGI_FAILURE_COALESCE_SECONDS: u64 = 30;
+    const MAX_CGI_FAILURE_STATE_BYTES: u64 = 256;
+    pub(super) const MAX_API_LOG_BYTES: u64 = 10 * 1024 * 1024;
+    pub(super) const API_LOG_ROTATIONS: usize = 5;
+    const MAX_CGI_FAILURE_RECORD_BYTES: usize = 512;
     #[cfg(test)]
     thread_local! {
         static FAIL_AUDIT_READY_WRITE_ONCE: std::cell::Cell<bool> = const {
@@ -5235,6 +5480,303 @@ mod linux_files {
     #[cfg(test)]
     pub(super) fn fail_next_audit_ready_write() {
         FAIL_AUDIT_READY_WRITE_ONCE.with(|flag| flag.set(true));
+    }
+
+    pub(super) fn record_pre_relay_cgi_failure(
+        package_uid: u32,
+        now: u64,
+        stage: &str,
+        code: &str,
+        status: u16,
+    ) -> BridgeResult<bool> {
+        let policy = load_security_policy(package_uid)?;
+        record_pre_relay_cgi_failure_under_policy_at(
+            Path::new(LOG_ROOT),
+            Path::new(API_LOG_PATH),
+            Path::new(CGI_FAILURE_STATE_PATH),
+            package_uid,
+            now,
+            stage,
+            code,
+            status,
+            &policy,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_pre_relay_cgi_failure_at(
+        log_root: &Path,
+        api_log: &Path,
+        state_path: &Path,
+        package_uid: u32,
+        now: u64,
+        stage: &str,
+        code: &str,
+        status: u16,
+    ) -> BridgeResult<bool> {
+        record_pre_relay_cgi_failure_under_policy_at(
+            log_root,
+            api_log,
+            state_path,
+            package_uid,
+            now,
+            stage,
+            code,
+            status,
+            &SecurityPolicyArgs::default(),
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_pre_relay_cgi_failure_with_policy_at(
+        log_root: &Path,
+        api_log: &Path,
+        state_path: &Path,
+        policy_path: &Path,
+        package_uid: u32,
+        now: u64,
+        stage: &str,
+        code: &str,
+        status: u16,
+    ) -> BridgeResult<bool> {
+        let policy = load_security_policy_at(policy_path, package_uid)?;
+        record_pre_relay_cgi_failure_under_policy_at(
+            log_root,
+            api_log,
+            state_path,
+            package_uid,
+            now,
+            stage,
+            code,
+            status,
+            &policy,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_pre_relay_cgi_failure_under_policy_at(
+        log_root: &Path,
+        api_log: &Path,
+        state_path: &Path,
+        package_uid: u32,
+        now: u64,
+        stage: &str,
+        code: &str,
+        status: u16,
+        policy: &SecurityPolicyArgs,
+    ) -> BridgeResult<bool> {
+        let category = cgi_failure_category(stage).ok_or_else(BridgeError::bad_request)?;
+        if !event_visible_at_threshold(policy, category, "warn", false) {
+            return Ok(false);
+        }
+        if now == 0
+            || !matches!(status, 400 | 401 | 403 | 405 | 413 | 415 | 500 | 503)
+            || !matches!(
+                stage,
+                "request"
+                    | "cgi_identity"
+                    | "dsm_authentication"
+                    | "cgi_runtime"
+                    | "bridge_connect"
+                    | "bridge_io"
+                    | "bridge_protocol"
+            )
+            || code.is_empty()
+            || code.len() > 64
+            || !code
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err(BridgeError::bad_request());
+        }
+        validate_private_directory(log_root, package_uid)?;
+        let state_root = state_path
+            .parent()
+            .ok_or_else(BridgeError::unsafe_runtime)?;
+        validate_private_directory(state_root, package_uid)?;
+
+        let mut state_options = OpenOptions::new();
+        state_options
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(NOFOLLOW_CLOEXEC);
+        let mut state = state_options
+            .open(state_path)
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        let state_metadata = state
+            .metadata()
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        if !state_metadata.file_type().is_file()
+            || state_metadata.st_uid() != package_uid
+            || state_metadata.st_mode() & 0o7777 != 0o600
+            || state_metadata.st_nlink() != 1
+            || state_metadata.len() > MAX_CGI_FAILURE_STATE_BYTES
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        // A CGI must never wait behind another failing request. The state file
+        // is both the nonblocking coalescing lock and the bounded last-record
+        // cache; the existing activity sink retains its own event-log lock.
+        let lock_status = unsafe { libc::flock(state.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if lock_status != 0 {
+            return match io::Error::last_os_error().raw_os_error() {
+                Some(libc::EAGAIN) => Ok(false),
+                _ => Err(BridgeError::unsafe_runtime()),
+            };
+        }
+
+        let mut previous = String::new();
+        state
+            .read_to_string(&mut previous)
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        if !previous.is_empty() {
+            let previous = previous
+                .strip_suffix('\n')
+                .ok_or_else(BridgeError::unsafe_runtime)?;
+            let fields = previous.split('|').collect::<Vec<_>>();
+            if fields.len() != 4 {
+                return Err(BridgeError::unsafe_runtime());
+            }
+            let previous_epoch = fields[0]
+                .parse::<u64>()
+                .ok()
+                .filter(|epoch| *epoch != 0)
+                .ok_or_else(BridgeError::unsafe_runtime)?;
+            if now.saturating_sub(previous_epoch) < CGI_FAILURE_COALESCE_SECONDS {
+                return Ok(false);
+            }
+        }
+
+        let mut record = serde_json::to_vec(&json!({
+            "epoch": now,
+            "level": "warn",
+            "category": category,
+            "event": "cgi_failure",
+            "service": "synology-drive-sync",
+            "stage": stage,
+            "code": code,
+            "status": status,
+        }))
+        .map_err(|_| BridgeError::internal())?;
+        record.push(b'\n');
+        if record.len() > MAX_CGI_FAILURE_RECORD_BYTES {
+            return Err(BridgeError::internal());
+        }
+
+        rotate_private_api_log(log_root, api_log, package_uid, record.len() as u64)?;
+        let mut log_options = OpenOptions::new();
+        log_options
+            .write(true)
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(NOFOLLOW_CLOEXEC);
+        let log = log_options
+            .open(api_log)
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        let log_metadata = log.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
+        if !log_metadata.file_type().is_file()
+            || log_metadata.st_uid() != package_uid
+            || log_metadata.st_mode() & 0o7777 != 0o600
+            || log_metadata.st_nlink() != 1
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        write_single_record(&log, &record)?;
+
+        let state_record = format!("{now}|{stage}|{code}|{status}\n");
+        if state_record.len() as u64 > MAX_CGI_FAILURE_STATE_BYTES {
+            return Err(BridgeError::internal());
+        }
+        state
+            .set_len(0)
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        state
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        write_single_record(&state, state_record.as_bytes())?;
+        Ok(true)
+    }
+
+    fn rotated_path(base: &Path, index: usize) -> PathBuf {
+        let mut path = base.as_os_str().to_os_string();
+        path.push(format!(".{index}"));
+        PathBuf::from(path)
+    }
+
+    fn private_log_metadata(path: &Path, package_uid: u32) -> BridgeResult<Option<fs::Metadata>> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(BridgeError::unsafe_runtime()),
+        };
+        if !metadata.file_type().is_file()
+            || metadata.st_uid() != package_uid
+            || metadata.st_mode() & 0o7777 != 0o600
+            || metadata.st_nlink() != 1
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(Some(metadata))
+    }
+
+    fn rotate_private_api_log(
+        log_root: &Path,
+        api_log: &Path,
+        package_uid: u32,
+        incoming: u64,
+    ) -> BridgeResult<()> {
+        if api_log.parent() != Some(log_root) || incoming == 0 || incoming > MAX_API_LOG_BYTES {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let active = private_log_metadata(api_log, package_uid)?;
+        for index in 1..=API_LOG_ROTATIONS {
+            private_log_metadata(&rotated_path(api_log, index), package_uid)?;
+        }
+        if active
+            .as_ref()
+            .is_none_or(|metadata| metadata.len().saturating_add(incoming) <= MAX_API_LOG_BYTES)
+        {
+            return Ok(());
+        }
+
+        let oldest = rotated_path(api_log, API_LOG_ROTATIONS);
+        if private_log_metadata(&oldest, package_uid)?.is_some() {
+            fs::remove_file(&oldest).map_err(|_| BridgeError::unsafe_runtime())?;
+        }
+        for index in (2..=API_LOG_ROTATIONS).rev() {
+            let previous = rotated_path(api_log, index - 1);
+            if private_log_metadata(&previous, package_uid)?.is_some() {
+                fs::rename(&previous, rotated_path(api_log, index))
+                    .map_err(|_| BridgeError::unsafe_runtime())?;
+            }
+        }
+        fs::rename(api_log, rotated_path(api_log, 1)).map_err(|_| BridgeError::unsafe_runtime())?;
+        sync_directory(log_root)?;
+        Ok(())
+    }
+
+    fn write_single_record(file: &File, record: &[u8]) -> BridgeResult<()> {
+        // This is deliberately one bounded O_APPEND write so concurrent API
+        // service output cannot be interleaved with a CGI diagnostic. A rare
+        // EINTR/partial write is reported as best-effort failure rather than
+        // retried into a potentially interleaved or duplicated record.
+        let written = unsafe {
+            libc::write(
+                file.as_raw_fd(),
+                record.as_ptr().cast::<libc::c_void>(),
+                record.len(),
+            )
+        };
+        if written == record.len() as isize {
+            Ok(())
+        } else {
+            Err(BridgeError::unsafe_runtime())
+        }
     }
 
     pub(super) fn durably_verify_audit_event(
@@ -8101,6 +8643,7 @@ impl CgiResponse {
         Self { status: 410, body }
     }
 
+    #[cfg(test)]
     fn service_unavailable() -> Self {
         Self::staged_error(
             CgiFailureStage::BridgeConnect,
@@ -8109,14 +8652,22 @@ impl CgiResponse {
     }
 
     fn error(error: BridgeError) -> Self {
-        Self::error_payload(error, None)
+        Self::error_payload(error, None, None)
     }
 
     fn staged_error(stage: CgiFailureStage, error: BridgeError) -> Self {
-        Self::error_payload(error, Some(stage))
+        Self::error_payload(error, Some(stage), None)
     }
 
-    fn error_payload(error: BridgeError, stage: Option<CgiFailureStage>) -> Self {
+    fn failure(failure: CgiFailure) -> Self {
+        Self::error_payload(failure.error, Some(failure.stage), failure.code)
+    }
+
+    fn error_payload(
+        error: BridgeError,
+        stage: Option<CgiFailureStage>,
+        explicit_code: Option<&'static str>,
+    ) -> Self {
         let (status, default_code) = match error.kind {
             ErrorKind::BadRequest => (400, "invalid_request"),
             ErrorKind::Unauthorized => (401, "unauthorized"),
@@ -8129,7 +8680,7 @@ impl CgiResponse {
             ErrorKind::UnsafeRuntime | ErrorKind::Unavailable => (503, "unavailable"),
             ErrorKind::Internal => (500, "internal_error"),
         };
-        let code = match (error.kind, stage) {
+        let code = explicit_code.unwrap_or(match (error.kind, stage) {
             (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::Identity)) => "cgi_identity_unsafe",
             (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::Authentication)) => {
                 "dsm_authentication_unsafe"
@@ -8156,7 +8707,7 @@ impl CgiResponse {
                 Some(CgiFailureStage::ServiceRequest),
             ) => "service_request_unavailable",
             _ => default_code,
-        };
+        });
         let message = if stage == Some(CgiFailureStage::BridgeConnect)
             && error.kind == ErrorKind::Unavailable
         {
@@ -8225,13 +8776,84 @@ impl CgiResponse {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn record_pre_relay_cgi_failure(failure: &CgiFailure) {
+    let diagnostic = CgiResponse::failure(*failure);
+    if !diagnostic.is_trusted_error_envelope() {
+        return;
+    }
+    let Ok(payload) = serde_json::from_slice::<RenderedCgiError<'_>>(&diagnostic.body) else {
+        return;
+    };
+    let Some(stage) = payload.stage else {
+        return;
+    };
+    let package_uid =
+        linux_runtime::identity_state().and_then(|identity| validate_cgi_identity(&identity));
+    let Ok(package_uid) = package_uid else {
+        return;
+    };
+    let Ok(now) = current_epoch() else {
+        return;
+    };
+    let Ok(true) = linux_files::record_pre_relay_cgi_failure(
+        package_uid,
+        now,
+        stage,
+        payload.code,
+        payload.status,
+    ) else {
+        return;
+    };
+    let _ = record_pre_relay_activity(stage, payload.code, payload.status);
+}
+
+#[cfg(target_os = "linux")]
+fn record_pre_relay_activity(stage: &str, code: &str, status: u16) -> BridgeResult<()> {
+    linux_runtime::validate_package_manager()?;
+    let status = status.to_string();
+    let mut command = Command::new(MANAGER_PATH);
+    command
+        .env_clear()
+        .envs(manager_command_environment())
+        .args([
+            "api",
+            "cgi-failure",
+            "--stage",
+            stage,
+            "--code",
+            code,
+            "--status",
+            &status,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let output = capture_bounded_command(
+        &mut command,
+        4 * 1024,
+        MAX_HELPER_STDERR_BYTES,
+        Duration::from_secs(2),
+        None,
+    )?;
+    if output.status_success {
+        Ok(())
+    } else {
+        Err(BridgeError::new(ErrorKind::Unavailable))
+    }
+}
+
 pub(crate) fn main_entry() -> ExitCode {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if arguments.is_empty() {
         let is_get = std::env::var("REQUEST_METHOD").is_ok_and(|method| method == "GET");
         let response = match run_cgi() {
             Ok(response) => response,
-            Err(failure) => CgiResponse::staged_error(failure.stage, failure.error),
+            Err(failure) => {
+                #[cfg(target_os = "linux")]
+                record_pre_relay_cgi_failure(&failure);
+                CgiResponse::failure(failure)
+            }
         }
         .for_cgi_transport(is_get);
         cgi_exit_code(write_cgi_response(&response).is_ok())
@@ -8753,8 +9375,7 @@ fn run_cgi() -> Result<CgiResponse, CgiFailure> {
         // Synology documents authenticate.cgi being invoked from the custom
         // CGI, where DSM's native request environment is still authoritative.
         let session =
-            linux_runtime::authenticate_and_authorize_cgi(authentication, AUTH_HELPER_TIMEOUT)
-                .map_err(|error| CgiFailure::new(CgiFailureStage::Authentication, error))?;
+            linux_runtime::authenticate_and_authorize_cgi(authentication, AUTH_HELPER_TIMEOUT)?;
         let body = match request {
             ValidatedHttpRequest::Get { .. } => None,
             ValidatedHttpRequest::Post { content_length, .. } => Some(
@@ -8777,10 +9398,7 @@ fn run_cgi() -> Result<CgiResponse, CgiFailure> {
         ) {
             Ok(stream) => stream,
             Err(error) if error.kind == ErrorKind::Unavailable => {
-                eprintln!(
-                    "sdsync-dsm-api: authenticated relay could not reach the verified package API service"
-                );
-                return Ok(CgiResponse::service_unavailable());
+                return Err(CgiFailure::new(CgiFailureStage::BridgeConnect, error));
             }
             Err(error) => {
                 return Err(CgiFailure::new(CgiFailureStage::BridgeConnect, error));
@@ -9725,7 +10343,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::{PermissionsExt, symlink};
     #[cfg(target_os = "linux")]
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    };
 
     const REQUEST_ID: &str = "0123456789abcdef0123456789abcdef";
     const JOB_ID: &str = "00060f5e12345678fedcba98765432100123456789abcdef";
@@ -9915,9 +10536,12 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     static NEXT_CONTROL_FIXTURE: AtomicU64 = AtomicU64::new(0);
+    #[cfg(target_os = "linux")]
+    static CONTROL_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
     #[cfg(target_os = "linux")]
     struct TestControlFixture {
+        _process_global_guard: MutexGuard<'static, ()>,
         root: PathBuf,
         requests: PathBuf,
         processing: PathBuf,
@@ -9935,6 +10559,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     impl TestControlFixture {
         fn new(label: &str) -> Self {
+            // bind_prepared deliberately changes the process-global umask while
+            // atomically creating an inaccessible socket. Serialize fixtures
+            // that also create mode-sensitive private files so parallel tests
+            // cannot observe that production startup-only transition.
+            let process_global_guard = CONTROL_FIXTURE_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let sequence = NEXT_CONTROL_FIXTURE.fetch_add(1, Ordering::Relaxed);
             let root = std::env::temp_dir().join(format!(
                 "sdsync-dsm-api-{label}-{}-{sequence}",
@@ -9957,6 +10588,7 @@ mod tests {
                 fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
             }
             Self {
+                _process_global_guard: process_global_guard,
                 csrf_key: root.join("csrf.key"),
                 enqueue_lock: root.join("enqueue.lock"),
                 enqueue_sequence: root.join("enqueue.sequence"),
@@ -10032,6 +10664,516 @@ mod tests {
             Path::new(API_SOCKET_PATH),
             Path::new(PACKAGE_VAR).join("run/api.sock")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trusted_dsm_helper_accepts_rooted_relative_and_absolute_symlinks() {
+        let fixture = TestControlFixture::new("trusted-auth-helper-links");
+        let uid = TestControlFixture::package_uid();
+        let synoman = fixture.root.join("usr/syno/synoman");
+        let modules = synoman.join("webman/modules");
+        for directory in [
+            fixture.root.join("usr"),
+            fixture.root.join("usr/syno"),
+            synoman.clone(),
+            synoman.join("webman"),
+            modules.clone(),
+        ] {
+            fs::create_dir(&directory).unwrap();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let target = synoman.join("authenticate.real");
+        fs::write(&target, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let relative_link = modules.join("authenticate-relative.cgi");
+        symlink("../../authenticate.real", &relative_link).unwrap();
+        let relative =
+            linux_runtime::validate_trusted_executable(&relative_link, &fixture.root, uid).unwrap();
+        assert_eq!(relative.path, target);
+        relative.revalidate().unwrap();
+
+        let absolute_link = modules.join("authenticate-absolute.cgi");
+        symlink(&target, &absolute_link).unwrap();
+        let absolute =
+            linux_runtime::validate_trusted_executable(&absolute_link, &fixture.root, uid).unwrap();
+        assert_eq!(absolute.path, target);
+        absolute.revalidate().unwrap();
+
+        let link_metadata = fs::symlink_metadata(&relative_link).unwrap();
+        assert!(link_metadata.file_type().is_symlink());
+        assert_eq!(link_metadata.st_uid(), uid);
+        assert!(!linux_runtime::trusted_symlink_boundary(
+            &link_metadata,
+            uid.wrapping_add(1)
+        ));
+        // Linux reports symlink permissions as 0777; mutation safety comes
+        // from the trusted link owner and its validated parent directory.
+        assert_eq!(link_metadata.st_mode() & 0o777, 0o777);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trusted_dsm_helper_rejects_loops_escapes_and_writable_ancestors() {
+        let fixture = TestControlFixture::new("unsafe-auth-helper-links");
+        let uid = TestControlFixture::package_uid();
+        let trusted = fixture.root.join("trusted");
+        let modules = trusted.join("modules");
+        fs::create_dir(&trusted).unwrap();
+        fs::create_dir(&modules).unwrap();
+        fs::set_permissions(&trusted, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&modules, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let loop_one = modules.join("loop-one");
+        let loop_two = modules.join("loop-two");
+        symlink("loop-two", &loop_one).unwrap();
+        symlink("loop-one", &loop_two).unwrap();
+        assert!(linux_runtime::validate_trusted_executable(&loop_one, &fixture.root, uid).is_err());
+
+        let escape = modules.join("escape");
+        symlink("../../../outside-validation-root", &escape).unwrap();
+        assert!(linux_runtime::validate_trusted_executable(&escape, &fixture.root, uid).is_err());
+
+        let target = trusted.join("authenticate.real");
+        fs::write(&target, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = modules.join("authenticate.cgi");
+        symlink("../authenticate.real", &link).unwrap();
+        fs::set_permissions(&modules, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(linux_runtime::validate_trusted_executable(&link, &fixture.root, uid).is_err());
+        fs::set_permissions(&modules, fs::Permissions::from_mode(0o700)).unwrap();
+
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(linux_runtime::validate_trusted_executable(&link, &fixture.root, uid).is_err());
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            linux_runtime::validate_trusted_executable(&link, &fixture.root, uid.wrapping_add(1))
+                .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trusted_dsm_helper_revalidation_detects_target_replacement() {
+        let fixture = TestControlFixture::new("auth-helper-revalidation");
+        let uid = TestControlFixture::package_uid();
+        let trusted = fixture.root.join("trusted");
+        fs::create_dir(&trusted).unwrap();
+        fs::set_permissions(&trusted, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = trusted.join("authenticate.real");
+        fs::write(&target, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = trusted.join("authenticate.cgi");
+        symlink("authenticate.real", &link).unwrap();
+        let validated =
+            linux_runtime::validate_trusted_executable(&link, &fixture.root, uid).unwrap();
+
+        fs::rename(&target, trusted.join("authenticate.original")).unwrap();
+        fs::write(&target, b"#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(validated.revalidate().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pre_relay_cgi_diagnostics_are_bounded_secret_free_and_coalesced() {
+        let fixture = TestControlFixture::new("cgi-failure-diagnostics");
+        let uid = TestControlFixture::package_uid();
+        let log_root = fixture.root.join("log");
+        let runtime_root = fixture.root.join("run");
+        for directory in [&log_root, &runtime_root] {
+            fs::create_dir(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let api_log = log_root.join("api.log");
+        let state = runtime_root.join("cgi-failure.state");
+        let arguments = (
+            "dsm_authentication",
+            "dsm_authentication_helper_unsafe",
+            503,
+        );
+        assert!(
+            linux_files::record_pre_relay_cgi_failure_at(
+                &log_root,
+                &api_log,
+                &state,
+                uid,
+                10_000,
+                arguments.0,
+                arguments.1,
+                arguments.2,
+            )
+            .unwrap()
+        );
+        assert!(
+            !linux_files::record_pre_relay_cgi_failure_at(
+                &log_root,
+                &api_log,
+                &state,
+                uid,
+                10_029,
+                arguments.0,
+                arguments.1,
+                arguments.2,
+            )
+            .unwrap()
+        );
+        assert!(
+            !linux_files::record_pre_relay_cgi_failure_at(
+                &log_root,
+                &api_log,
+                &state,
+                uid,
+                10_029,
+                "bridge_connect",
+                "service_unavailable",
+                503,
+            )
+            .unwrap()
+        );
+        assert!(
+            linux_files::record_pre_relay_cgi_failure_at(
+                &log_root,
+                &api_log,
+                &state,
+                uid,
+                10_030,
+                arguments.0,
+                arguments.1,
+                arguments.2,
+            )
+            .unwrap()
+        );
+
+        let records = fs::read_to_string(&api_log).unwrap();
+        let lines = records.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        for line in lines {
+            assert!(line.len() < 512);
+            let record: Value = serde_json::from_str(line).unwrap();
+            let keys = record
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                keys,
+                [
+                    "category", "code", "epoch", "event", "level", "service", "stage", "status",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+            );
+            assert_eq!(record["service"], "synology-drive-sync");
+            assert_eq!(record["stage"], arguments.0);
+            assert_eq!(record["code"], arguments.1);
+            assert_eq!(record["status"], arguments.2);
+            for forbidden in [
+                "id=authenticated-session",
+                "SynoToken",
+                "admin",
+                "QUERY_STRING",
+                "authenticate.cgi",
+                fixture.root.to_str().unwrap(),
+            ] {
+                assert!(!line.contains(forbidden));
+            }
+        }
+        let metadata = fs::symlink_metadata(&api_log).unwrap();
+        assert_eq!(metadata.st_uid(), uid);
+        assert_eq!(metadata.st_mode() & 0o7777, 0o600);
+        assert_eq!(metadata.st_nlink(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pre_relay_persistence_obeys_validated_category_policy_before_writing() {
+        let fixture = TestControlFixture::new("cgi-failure-policy");
+        let uid = TestControlFixture::package_uid();
+        let log_root = fixture.root.join("log");
+        let runtime_root = fixture.root.join("run");
+        let config_root = fixture.root.join("config");
+        for directory in [&log_root, &runtime_root, &config_root] {
+            fs::create_dir(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let api_log = log_root.join("api.log");
+        let state = runtime_root.join("cgi-failure.state");
+        let policy_path = config_root.join("security.conf");
+
+        let authentication_off = security_policy_document().replace(
+            "authentication_log_level=warn",
+            "authentication_log_level=off",
+        );
+        fixture.write_private(&policy_path, authentication_off.as_bytes());
+        assert!(
+            !linux_files::record_pre_relay_cgi_failure_with_policy_at(
+                &log_root,
+                &api_log,
+                &state,
+                &policy_path,
+                uid,
+                40_000,
+                "dsm_authentication",
+                "dsm_authentication_helper_unsafe",
+                503,
+            )
+            .unwrap()
+        );
+        assert!(!api_log.exists());
+        assert!(!state.exists());
+
+        assert!(
+            linux_files::record_pre_relay_cgi_failure_with_policy_at(
+                &log_root,
+                &api_log,
+                &state,
+                &policy_path,
+                uid,
+                40_000,
+                "bridge_connect",
+                "service_unavailable",
+                503,
+            )
+            .unwrap()
+        );
+        let first = fs::read_to_string(&api_log).unwrap();
+        assert!(first.contains(r#""category":"bridge""#));
+
+        let separated = security_policy_document()
+            .replace("bridge_log_level=info", "bridge_log_level=off")
+            .replace("security_log_level=warn", "security_log_level=off");
+        fixture.write_private(&policy_path, separated.as_bytes());
+        assert!(
+            linux_files::record_pre_relay_cgi_failure_with_policy_at(
+                &log_root,
+                &api_log,
+                &state,
+                &policy_path,
+                uid,
+                40_030,
+                "dsm_authentication",
+                "dsm_authentication_helper_unsafe",
+                503,
+            )
+            .unwrap()
+        );
+        assert!(
+            !linux_files::record_pre_relay_cgi_failure_with_policy_at(
+                &log_root,
+                &api_log,
+                &state,
+                &policy_path,
+                uid,
+                40_060,
+                "cgi_identity",
+                "cgi_identity_unsafe",
+                503,
+            )
+            .unwrap()
+        );
+        let records = fs::read_to_string(&api_log).unwrap();
+        assert_eq!(records.lines().count(), 2);
+        assert!(records.contains(r#""category":"authentication""#));
+        assert!(!records.contains(r#""category":"security""#));
+
+        fixture.write_private(&policy_path, b"corrupt\n");
+        assert!(
+            linux_files::record_pre_relay_cgi_failure_with_policy_at(
+                &log_root,
+                &api_log,
+                &state,
+                &policy_path,
+                uid,
+                40_060,
+                "dsm_authentication",
+                "dsm_authentication_helper_unsafe",
+                503,
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(&api_log).unwrap(), records);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pre_relay_api_log_rotation_is_bounded_and_rejects_unsafe_entries() {
+        let fixture = TestControlFixture::new("cgi-failure-rotation");
+        let uid = TestControlFixture::package_uid();
+        let log_root = fixture.root.join("log");
+        let runtime_root = fixture.root.join("run");
+        for directory in [&log_root, &runtime_root] {
+            fs::create_dir(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let api_log = log_root.join("api.log");
+        let state = runtime_root.join("cgi-failure.state");
+        let create_private = |path: &Path, size: u64| {
+            let file = File::create(path).unwrap();
+            file.set_len(size).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        create_private(&api_log, linux_files::MAX_API_LOG_BYTES);
+
+        let rotated_one = log_root.join("api.log.1");
+        symlink("attacker", &rotated_one).unwrap();
+        assert!(
+            linux_files::record_pre_relay_cgi_failure_at(
+                &log_root,
+                &api_log,
+                &state,
+                uid,
+                20_000,
+                "bridge_connect",
+                "service_unavailable",
+                503,
+            )
+            .is_err()
+        );
+        assert!(rotated_one.is_symlink());
+        assert_eq!(
+            fs::metadata(&api_log).unwrap().len(),
+            linux_files::MAX_API_LOG_BYTES
+        );
+        fs::remove_file(&rotated_one).unwrap();
+
+        let hardlink_source = fixture.root.join("hardlink-source");
+        create_private(&hardlink_source, 1);
+        fs::hard_link(&hardlink_source, &rotated_one).unwrap();
+        assert!(
+            linux_files::record_pre_relay_cgi_failure_at(
+                &log_root,
+                &api_log,
+                &state,
+                uid,
+                20_000,
+                "bridge_connect",
+                "service_unavailable",
+                503,
+            )
+            .is_err()
+        );
+        assert_eq!(fs::symlink_metadata(&rotated_one).unwrap().st_nlink(), 2);
+        fs::remove_file(&rotated_one).unwrap();
+        fs::remove_file(&hardlink_source).unwrap();
+
+        create_private(&rotated_one, 1);
+        fs::set_permissions(&rotated_one, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(
+            linux_files::record_pre_relay_cgi_failure_at(
+                &log_root,
+                &api_log,
+                &state,
+                uid,
+                20_000,
+                "bridge_connect",
+                "service_unavailable",
+                503,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::symlink_metadata(&rotated_one).unwrap().st_mode() & 0o7777,
+            0o640
+        );
+        fs::remove_file(&rotated_one).unwrap();
+
+        for index in 1..=linux_files::API_LOG_ROTATIONS {
+            create_private(&log_root.join(format!("api.log.{index}")), index as u64);
+        }
+        assert!(
+            linux_files::record_pre_relay_cgi_failure_at(
+                &log_root,
+                &api_log,
+                &state,
+                uid,
+                20_000,
+                "bridge_connect",
+                "service_unavailable",
+                503,
+            )
+            .unwrap()
+        );
+        let active = fs::symlink_metadata(&api_log).unwrap();
+        assert_eq!(active.st_uid(), uid);
+        assert_eq!(active.st_mode() & 0o7777, 0o600);
+        assert_eq!(active.st_nlink(), 1);
+        assert!(active.len() < 512);
+        assert_eq!(
+            fs::metadata(&rotated_one).unwrap().len(),
+            linux_files::MAX_API_LOG_BYTES
+        );
+        assert_eq!(fs::metadata(log_root.join("api.log.5")).unwrap().len(), 4);
+        assert!(!log_root.join("api.log.6").exists());
+
+        let unsafe_active = log_root.join("unsafe-active");
+        let unsafe_active_state = runtime_root.join("unsafe-active.state");
+        fixture.write_private(&unsafe_active_state, b"");
+        symlink("api.log", &unsafe_active).unwrap();
+        assert!(
+            linux_files::record_pre_relay_cgi_failure_at(
+                &log_root,
+                &unsafe_active,
+                &unsafe_active_state,
+                uid,
+                20_030,
+                "bridge_connect",
+                "service_unavailable",
+                503,
+            )
+            .is_err()
+        );
+        assert!(unsafe_active.is_symlink());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pre_relay_cgi_coalescing_has_one_global_concurrent_emission_window() {
+        use std::sync::{Arc, Barrier};
+
+        let fixture = TestControlFixture::new("cgi-failure-concurrency");
+        let uid = TestControlFixture::package_uid();
+        let log_root = fixture.root.join("log");
+        let runtime_root = fixture.root.join("run");
+        for directory in [&log_root, &runtime_root] {
+            fs::create_dir(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let api_log = log_root.join("api.log");
+        let state = runtime_root.join("cgi-failure.state");
+        let barrier = Arc::new(Barrier::new(8));
+        let mut workers = Vec::new();
+        for index in 0..8 {
+            let barrier = Arc::clone(&barrier);
+            let log_root = log_root.clone();
+            let api_log = api_log.clone();
+            let state = state.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                let (stage, code) = if index % 2 == 0 {
+                    ("dsm_authentication", "dsm_authentication_helper_unsafe")
+                } else {
+                    ("bridge_connect", "service_unavailable")
+                };
+                linux_files::record_pre_relay_cgi_failure_at(
+                    &log_root, &api_log, &state, uid, 30_000, stage, code, 503,
+                )
+            }));
+        }
+        let mut emitted = 0;
+        for worker in workers {
+            if worker.join().unwrap().unwrap() {
+                emitted += 1;
+            }
+        }
+        assert_eq!(emitted, 1);
+        let records = fs::read_to_string(&api_log).unwrap();
+        assert_eq!(records.lines().count(), 1);
+        serde_json::from_str::<Value>(records.trim_end()).unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -11763,6 +12905,22 @@ mod tests {
             }
         ));
 
+        let api_logs = validate_http_request(environment(
+            "GET",
+            "action=logs&lines=10&source=api&SynoToken=abc123",
+        ))
+        .unwrap();
+        assert!(matches!(
+            api_logs,
+            ValidatedHttpRequest::Get {
+                action: ReadAction::Logs {
+                    lines: 10,
+                    source: LogSource::Api
+                },
+                ..
+            }
+        ));
+
         let result = validate_http_request(environment(
             "GET",
             &format!("action=result&job_id={JOB_ID}&SynoToken=abc123"),
@@ -11801,6 +12959,32 @@ mod tests {
                 )
             ))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn read_manager_log_arguments_forward_the_fixed_source_and_bound_scan_lines() {
+        assert_eq!(
+            read_manager_arguments(&ReadAction::Logs {
+                lines: 10,
+                source: LogSource::Api,
+            })
+            .unwrap(),
+            ["api", "logs", "--lines", "160", "--source", "api"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            read_manager_arguments(&ReadAction::Logs {
+                lines: 1000,
+                source: LogSource::All,
+            })
+            .unwrap(),
+            ["api", "logs", "--lines", "1000", "--source", "all"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -13724,7 +14908,7 @@ mod tests {
 
     #[test]
     fn log_source_filter_and_snapshot_capabilities_are_bridge_owned() {
-        let logs = br#"{"schema":"sdsync.dsm-logs.v1","logs":[{"source":"controller","lines":[]},{"source":"sync","lines":[]}]}"#;
+        let logs = br#"{"schema":"sdsync.dsm-logs.v1","logs":[{"source":"api","lines":["{\"level\":\"warn\"}"]},{"source":"controller","lines":[]},{"source":"sync","lines":[]}]}"#;
         let filtered = parse_and_sanitize_manager_json(
             logs,
             &ReadAction::Logs {
@@ -13738,6 +14922,44 @@ mod tests {
         let value: Value = serde_json::from_slice(&filtered).unwrap();
         assert_eq!(value["logs"].as_array().unwrap().len(), 1);
         assert_eq!(value["logs"][0]["source"], "sync");
+
+        let api_filtered = parse_and_sanitize_manager_json(
+            logs,
+            &ReadAction::Logs {
+                lines: 10,
+                source: LogSource::Api,
+            },
+            None,
+            Some(&SecurityPolicyArgs::default()),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&api_filtered).unwrap();
+        assert_eq!(value["logs"].as_array().unwrap().len(), 1);
+        assert_eq!(value["logs"][0]["source"], "api");
+        assert_eq!(value["logs"][0]["lines"].as_array().unwrap().len(), 1);
+
+        let authentication_off = SecurityPolicyArgs {
+            authentication_log_level: PolicyLogLevel::Off,
+            ..SecurityPolicyArgs::default()
+        };
+        let hidden = parse_and_sanitize_manager_json(
+            br#"{"schema":"sdsync.dsm-logs.v1","logs":[{"source":"api","lines":["{\"level\":\"warn\",\"category\":\"authentication\"}","{\"level\":\"warn\",\"category\":\"security\"}","{\"level\":\"info\",\"category\":\"bridge\"}"]}]}"#,
+            &ReadAction::Logs {
+                lines: 10,
+                source: LogSource::Api,
+            },
+            None,
+            Some(&authentication_off),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&hidden).unwrap();
+        let lines = value["logs"][0]["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.as_str().unwrap().contains("authentication"))
+        );
 
         let snapshot = parse_and_sanitize_manager_json(
             br#"{"schema":"sdsync.dsm-api.v1","capabilities":{"mutations":false}}"#,
@@ -13966,6 +15188,40 @@ mod tests {
             ] {
                 assert!(!text.contains(secret));
             }
+        }
+
+        for (error, status, code) in [
+            (
+                BridgeError::unsafe_runtime(),
+                503,
+                "dsm_authentication_helper_unsafe",
+            ),
+            (
+                BridgeError::new(ErrorKind::Unavailable),
+                503,
+                "dsm_authentication_helper_unavailable",
+            ),
+            (
+                BridgeError::new(ErrorKind::Unauthorized),
+                401,
+                "dsm_authentication_rejected",
+            ),
+            (
+                BridgeError::new(ErrorKind::Forbidden),
+                403,
+                "dsm_authentication_forbidden",
+            ),
+        ] {
+            let response = CgiResponse::failure(CgiFailure::coded(
+                CgiFailureStage::Authentication,
+                error,
+                code,
+            ));
+            let payload: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(response.status, status);
+            assert_eq!(payload["status"], status);
+            assert_eq!(payload["code"], code);
+            assert_eq!(payload["stage"], "dsm_authentication");
         }
     }
 
