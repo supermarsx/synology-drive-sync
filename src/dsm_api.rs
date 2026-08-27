@@ -20,6 +20,8 @@ use std::ffi::{CString, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(target_os = "linux")]
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 #[cfg(target_os = "linux")]
@@ -45,6 +47,8 @@ const MANAGER_PATH: &str = "/var/packages/synology-drive-sync/target/bin/sdsync-
 const BINARY_PATH: &str = "/var/packages/synology-drive-sync/target/bin/synology-drive-sync";
 const CONTROLLER_PATH: &str = "/var/packages/synology-drive-sync/target/libexec/sdsync-controller";
 const AUTHENTICATE_PATH: &str = "/usr/syno/synoman/webman/modules/authenticate.cgi";
+const DSM_USER_SERVICE_PATH: &str = "/webapi/entry.cgi";
+const DSM_USER_SERVICE_API: &str = "SYNO.Core.Desktop.Initdata";
 const CONTROL_ROOT: &str = "/var/packages/synology-drive-sync/var/control";
 const REQUESTS_DIR: &str = "/var/packages/synology-drive-sync/var/control/requests";
 const PROCESSING_DIR: &str = "/var/packages/synology-drive-sync/var/control/processing";
@@ -143,6 +147,7 @@ const MAX_AUDIT_OUTBOX_BYTES: usize = 4 * 1024;
 const MAX_MANAGER_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_AUTHENTICATED_USERNAME_BYTES: usize = 256;
 const MAX_AUTH_OUTPUT_BYTES: usize = MAX_AUTHENTICATED_USERNAME_BYTES + 2;
+const MAX_DSM_USER_SERVICE_OUTPUT_BYTES: usize = MAX_MANAGER_OUTPUT_BYTES;
 const MAX_SECRET_BYTES: usize = 4096;
 const MAX_JOB_AGE_SECONDS: u64 = 24 * 60 * 60;
 const RESULT_RETENTION_SECONDS: u64 = 60 * 60;
@@ -2684,6 +2689,10 @@ fn decode_relay_response(payload: &[u8]) -> BridgeResult<CgiResponse> {
 #[cfg(target_os = "linux")]
 mod linux_runtime {
     use super::*;
+    use reqwest::StatusCode;
+    use reqwest::blocking::Client;
+    use reqwest::header::{ACCEPT, CONTENT_LENGTH, COOKIE, HeaderValue};
+    use reqwest::redirect::Policy;
     use std::os::linux::fs::MetadataExt;
     use std::ptr;
 
@@ -2752,6 +2761,29 @@ mod linux_runtime {
                 "dsm_authentication_helper_unsafe",
             )
         })?;
+        if !caller_can_execute(&helper.path).map_err(|error| {
+            CgiFailure::coded(
+                CgiFailureStage::Authentication,
+                error,
+                "dsm_authentication_helper_unavailable",
+            )
+        })? {
+            let username = query_dsm_user_service(inputs, timeout).map_err(|error| {
+                let code = match error.kind {
+                    ErrorKind::Unauthorized => "dsm_authentication_webapi_rejected",
+                    ErrorKind::Forbidden => "dsm_authentication_webapi_forbidden",
+                    _ => "dsm_authentication_webapi_unavailable",
+                };
+                CgiFailure::coded(CgiFailureStage::Authentication, error, code)
+            })?;
+            return authorize_authenticated_username(username, inputs).map_err(|error| {
+                CgiFailure::coded(
+                    CgiFailureStage::Authentication,
+                    error,
+                    "dsm_authentication_webapi_forbidden",
+                )
+            });
+        }
         let mut command = Command::new(&helper.path);
         command
             .env_clear()
@@ -2794,13 +2826,20 @@ mod linux_runtime {
                 "dsm_authentication_rejected",
             )
         })?;
-        let uid = authorize_relayed_username(&username).map_err(|error| {
+        authorize_authenticated_username(username, inputs).map_err(|error| {
             CgiFailure::coded(
                 CgiFailureStage::Authentication,
                 error,
                 "dsm_authentication_forbidden",
             )
-        })?;
+        })
+    }
+
+    fn authorize_authenticated_username(
+        username: String,
+        inputs: &AuthenticationInputs,
+    ) -> BridgeResult<AuthenticatedSession> {
+        let uid = authorize_relayed_username(&username)?;
         let binding = session_binding(
             &username,
             uid,
@@ -2812,6 +2851,145 @@ mod linux_runtime {
             uid,
             binding,
         })
+    }
+
+    fn caller_can_execute(path: &Path) -> BridgeResult<bool> {
+        let path = CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        // SAFETY: path is a live NUL-terminated string and X_OK only asks the
+        // kernel to evaluate this process's real UID and group permissions.
+        if unsafe { libc::access(path.as_ptr(), libc::X_OK) } == 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        if is_execute_permission_denied(&error) {
+            Ok(false)
+        } else {
+            Err(BridgeError::new(ErrorKind::Unavailable))
+        }
+    }
+
+    pub(super) fn is_execute_permission_denied(error: &io::Error) -> bool {
+        error.raw_os_error() == Some(libc::EACCES)
+    }
+
+    #[derive(Deserialize)]
+    struct DsmUserServiceEnvelope {
+        success: bool,
+        data: Option<DsmUserServiceData>,
+    }
+
+    #[derive(Deserialize)]
+    struct DsmUserServiceData {
+        #[serde(rename = "Session")]
+        session: DsmUserServiceSession,
+    }
+
+    #[derive(Deserialize)]
+    struct DsmUserServiceSession {
+        user: String,
+        is_admin: bool,
+    }
+
+    pub(super) fn query_dsm_user_service(
+        inputs: &AuthenticationInputs,
+        timeout: Duration,
+    ) -> BridgeResult<String> {
+        let port = inputs
+            .server_port
+            .as_deref()
+            .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+        if port.is_empty()
+            || (port.len() > 1 && port.starts_with('0'))
+            || !port.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(BridgeError::new(ErrorKind::Unavailable));
+        }
+        let port = port
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+        let https = is_https_request(inputs.https.as_deref());
+        let scheme = if https { "https" } else { "http" };
+        let url = format!(
+            "{scheme}://127.0.0.1:{port}{DSM_USER_SERVICE_PATH}?api={DSM_USER_SERVICE_API}&version=1&method=get_user_service"
+        );
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(Policy::none())
+            .http1_only()
+            .connect_timeout(timeout)
+            .timeout(timeout)
+            // DSM commonly uses a user-selected or self-signed certificate.
+            // The peer is still pinned to the IPv4 loopback literal above;
+            // no hostname, proxy, redirect, or remote address is accepted.
+            .danger_accept_invalid_certs(https)
+            .build()
+            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+        let mut cookie = HeaderValue::from_str(inputs.cookie.as_str())
+            .map_err(|_| BridgeError::new(ErrorKind::Unauthorized))?;
+        cookie.set_sensitive(true);
+        let mut request = client
+            .get(&url)
+            .header(ACCEPT, "application/json")
+            .header(COOKIE, cookie);
+        if let Some(token) = &inputs.synology_token {
+            let mut token = HeaderValue::from_str(token.as_str())
+                .map_err(|_| BridgeError::new(ErrorKind::Unauthorized))?;
+            token.set_sensitive(true);
+            request = request.header("X-SYNO-TOKEN", token);
+        }
+        let response = request
+            .send()
+            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+        if response.status() != StatusCode::OK
+            || response
+                .remote_addr()
+                .is_some_and(|peer| peer.ip() != IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        {
+            return Err(BridgeError::new(ErrorKind::Unavailable));
+        }
+        let declared_length = response.headers().get(CONTENT_LENGTH).map(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|length| *length > 0 && *length <= MAX_DSM_USER_SERVICE_OUTPUT_BYTES)
+                .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))
+        });
+        let declared_length = declared_length.transpose()?;
+        let mut body = Vec::with_capacity(declared_length.unwrap_or(4096));
+        response
+            .take((MAX_DSM_USER_SERVICE_OUTPUT_BYTES + 1) as u64)
+            .read_to_end(&mut body)
+            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+        if body.is_empty()
+            || body.len() > MAX_DSM_USER_SERVICE_OUTPUT_BYTES
+            || declared_length.is_some_and(|length| body.len() != length)
+        {
+            return Err(BridgeError::new(ErrorKind::Unavailable));
+        }
+        parse_dsm_user_service_output(&body)
+    }
+
+    pub(super) fn parse_dsm_user_service_output(body: &[u8]) -> BridgeResult<String> {
+        let envelope = serde_json::from_slice::<DsmUserServiceEnvelope>(body)
+            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+        if !envelope.success {
+            return Err(BridgeError::new(ErrorKind::Unauthorized));
+        }
+        let session = envelope
+            .data
+            .ok_or_else(|| BridgeError::new(ErrorKind::Unauthorized))?
+            .session;
+        if !valid_authenticated_username(&session.user) {
+            return Err(BridgeError::new(ErrorKind::Unauthorized));
+        }
+        if !session.is_admin {
+            return Err(BridgeError::new(ErrorKind::Forbidden));
+        }
+        Ok(session.user)
     }
 
     pub(super) fn authorize_relayed_username(username: &str) -> BridgeResult<u32> {
@@ -10540,6 +10718,51 @@ mod tests {
     static CONTROL_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
     #[cfg(target_os = "linux")]
+    fn user_service_inputs(port: u16, token: Option<&str>) -> AuthenticationInputs {
+        AuthenticationInputs {
+            cookie: Zeroizing::new("id=loopback-session-secret".to_owned()),
+            synology_token: token.map(|value| Zeroizing::new(value.to_owned())),
+            remote_address: Some("192.0.2.8".to_owned()),
+            server_address: Some("192.0.2.2".to_owned()),
+            server_name: Some("attacker-controlled.invalid".to_owned()),
+            server_port: Some(port.to_string()),
+            https: Some("off".to_owned()),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_user_service_response(
+        response: Vec<u8>,
+        delay: Duration,
+    ) -> (u16, std::thread::JoinHandle<String>) {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, peer) = listener.accept().unwrap();
+            assert!(peer.ip().is_loopback());
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buffer[..read]);
+                assert!(request.len() <= 16 * 1024);
+            }
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+            let _ = stream.write_all(&response);
+            String::from_utf8(request).unwrap()
+        });
+        (port, worker)
+    }
+
+    #[cfg(target_os = "linux")]
     struct TestControlFixture {
         _process_global_guard: MutexGuard<'static, ()>,
         root: PathBuf,
@@ -10774,6 +10997,172 @@ mod tests {
         fs::write(&target, b"#!/bin/sh\nexit 1\n").unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(validated.revalidate().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dsm_user_service_fallback_is_loopback_only_and_keeps_secrets_in_headers() {
+        let body = br#"{"success":true,"data":{"Session":{"user":"fixture-admin","is_admin":true},"UserSettings":{},"AppPrivilege":[],"ServiceStatus":{}}}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        )
+        .into_bytes();
+        let (port, worker) = spawn_user_service_response(response, Duration::ZERO);
+        let inputs = user_service_inputs(port, Some("header-token-secret"));
+        let username =
+            linux_runtime::query_dsm_user_service(&inputs, Duration::from_secs(2)).unwrap();
+        assert_eq!(username, "fixture-admin");
+
+        let request = worker.join().unwrap();
+        assert!(request.starts_with(
+            "GET /webapi/entry.cgi?api=SYNO.Core.Desktop.Initdata&version=1&method=get_user_service HTTP/1.1\r\n"
+        ));
+        assert!(!request.contains("attacker-controlled.invalid"));
+        assert!(!request.contains("SynoToken="));
+        assert!(request.to_ascii_lowercase().contains("host: 127.0.0.1:"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("cookie: id=loopback-session-secret")
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-syno-token: header-token-secret")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dsm_user_service_accepts_bounded_chunked_json_without_content_length() {
+        let body =
+            br#"{"success":true,"data":{"Session":{"user":"chunked-admin","is_admin":true}}}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        )
+        .into_bytes();
+        let (port, worker) = spawn_user_service_response(response, Duration::ZERO);
+        let inputs = user_service_inputs(port, None);
+        assert_eq!(
+            linux_runtime::query_dsm_user_service(&inputs, Duration::from_secs(2)).unwrap(),
+            "chunked-admin"
+        );
+        worker.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dsm_user_service_rejects_status_length_redirect_timeout_and_malformed_identity() {
+        fn unavailable(error: BridgeError) {
+            assert_eq!(error.kind, ErrorKind::Unavailable);
+            let rendered = format!("{error:?}");
+            assert!(!rendered.contains("loopback-session-secret"));
+            assert!(!rendered.contains("header-token-secret"));
+        }
+
+        let cases = [
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                .to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: invalid\r\nConnection: close\r\n\r\n{}"
+                .to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\n{}"
+                .to_vec(),
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_DSM_USER_SERVICE_OUTPUT_BYTES + 1
+            )
+            .into_bytes(),
+            b"HTTP/1.1 302 Found\r\nLocation: http://192.0.2.99/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        ];
+        for response in cases {
+            let (port, worker) = spawn_user_service_response(response, Duration::ZERO);
+            let inputs = user_service_inputs(port, Some("header-token-secret"));
+            unavailable(
+                linux_runtime::query_dsm_user_service(&inputs, Duration::from_secs(2)).unwrap_err(),
+            );
+            let request = worker.join().unwrap();
+            assert!(!request.contains("SynoToken="));
+        }
+
+        let (port, worker) = spawn_user_service_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_vec(),
+            Duration::from_millis(250),
+        );
+        let inputs = user_service_inputs(port, None);
+        unavailable(
+            linux_runtime::query_dsm_user_service(&inputs, Duration::from_millis(75)).unwrap_err(),
+        );
+        worker.join().unwrap();
+
+        for body in [
+            br#"not-json"#.as_slice(),
+            br#"{"success":true,"data":{"Session":{"is_admin":true}}}"#.as_slice(),
+            br#"{"success":true,"data":{"Session":{"user":null,"is_admin":true}}}"#.as_slice(),
+            br#"{"success":true,"data":{"Session":{"user":"admin","is_admin":"yes"}}}"#.as_slice(),
+            br#"{"success":true,"data":{"Session":{"user":"admin"}}}"#.as_slice(),
+        ] {
+            unavailable(linux_runtime::parse_dsm_user_service_output(body).unwrap_err());
+        }
+        assert_eq!(
+            linux_runtime::parse_dsm_user_service_output(br#"{"success":true}"#)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Unauthorized
+        );
+
+        for user in ["", "line\nbreak", "bidi\u{202e}name"] {
+            let body = serde_json::to_vec(&json!({
+                "success": true,
+                "data": {"Session": {"user": user, "is_admin": true}}
+            }))
+            .unwrap();
+            assert_eq!(
+                linux_runtime::parse_dsm_user_service_output(&body)
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::Unauthorized
+            );
+        }
+        let non_admin =
+            br#"{"success":true,"data":{"Session":{"user":"ordinary","is_admin":false}}}"#;
+        assert_eq!(
+            linux_runtime::parse_dsm_user_service_output(non_admin)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Forbidden
+        );
+        let rejected = br#"{"success":false,"error":{"code":119}}"#;
+        assert_eq!(
+            linux_runtime::parse_dsm_user_service_output(rejected)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Unauthorized
+        );
+        assert_eq!(
+            linux_runtime::authorize_relayed_username("root")
+                .unwrap_err()
+                .kind,
+            ErrorKind::Forbidden
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_kernel_execute_permission_denial_selects_the_rootless_fallback() {
+        assert!(linux_runtime::is_execute_permission_denied(
+            &io::Error::from_raw_os_error(libc::EACCES)
+        ));
+        for error in [libc::ENOENT, libc::ELOOP, libc::ENOTDIR, libc::EIO] {
+            assert!(!linux_runtime::is_execute_permission_denied(
+                &io::Error::from_raw_os_error(error)
+            ));
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -15202,14 +15591,29 @@ mod tests {
                 "dsm_authentication_helper_unavailable",
             ),
             (
+                BridgeError::new(ErrorKind::Unavailable),
+                503,
+                "dsm_authentication_webapi_unavailable",
+            ),
+            (
                 BridgeError::new(ErrorKind::Unauthorized),
                 401,
                 "dsm_authentication_rejected",
             ),
             (
+                BridgeError::new(ErrorKind::Unauthorized),
+                401,
+                "dsm_authentication_webapi_rejected",
+            ),
+            (
                 BridgeError::new(ErrorKind::Forbidden),
                 403,
                 "dsm_authentication_forbidden",
+            ),
+            (
+                BridgeError::new(ErrorKind::Forbidden),
+                403,
+                "dsm_authentication_webapi_forbidden",
             ),
         ] {
             let response = CgiResponse::failure(CgiFailure::coded(

@@ -43,11 +43,15 @@ Evansport on the DSM 7.0/7.1 line. Use the
 unknown, and conflicting inputs fail closed. The SPK runs without root, Linux capabilities, joined
 web groups, or any set-user-ID/set-group-ID file. `defaults.run-as=package` keeps services on the
 exact non-root package UID; the ordinary package-owned `0755` CGI fails closed unless Webman supplies
-that same real/effective UID. The CGI authenticates the native DSM request once and relays it over a
-fixed package-owned socket that is `0000` before startup commit and activates on the same inode as
-`0600`. The service verifies the peer, bounded relay, independently resolved account, administrator
-membership, recomputed session binding, policy, and package CSRF without executing the root-owned
-DSM authenticator again. The
+that same real/effective UID. The CGI validates DSM's fixed root-owned `authenticate.cgi` and uses it
+as the primary authenticator when the package UID can execute it. A kernel permission denial on an
+otherwise trusted helper, including DSM's observed `root:system 0750` layout, selects a bounded
+loopback-only DSM user-service request carrying the current cookie. That response must contain a
+valid `Session.user` and exact `is_admin=true`, after which the CGI independently resolves the NSS
+identity and administrator membership. It then relays over a fixed package-owned socket that is
+`0000` before startup commit and activates on the same inode as `0600`; the service repeats the peer,
+relay, identity, session-binding, policy, and package-CSRF checks. Neither path requests root, a
+joined DSM group, or a `conf/resource` acquisition. The
 package keeps scheduling disabled after installation, registers the administrator-only native DSM
 AppWindow `SYNO.SDS.App.SynologyDriveSync.Instance`, and supplies the CLI recovery/automation manager at:
 
@@ -91,10 +95,11 @@ configuration, credentials, state, locks, socket, and logs while leaving both NA
 See the [complete DSM package and dashboard guide](../docs/synology-package.md) for exact install,
 ACL, graphical configuration, secret, diagnostic, routine, security, CLI, upgrade, and acceptance
 behavior. The package has static/mock validation but no recorded physical installation or live
-two-NAS test. Webman's package-owner CGI identity and protected `authenticate.cgi` access, browser
-request-marker forwarding to CGI `HTTP_X_SDSYNC_REQUEST=1`, and AppWindow loading also remain live
-acceptance checks;
-token absence is supported.
+two-NAS test. Webman's package-owner CGI identity, the direct-helper or loopback user-service branch
+selected by the installed helper permissions, browser request-marker forwarding to CGI
+`HTTP_X_SDSYNC_REQUEST=1`, and AppWindow loading remain live acceptance checks; token absence is
+supported. The fallback user-service shape was observed in the supplied DSM runtime capture and is
+not a public Synology API promise, so it must be re-proven on each supported DSM branch.
 
 ## Verified binary installer lifecycle
 

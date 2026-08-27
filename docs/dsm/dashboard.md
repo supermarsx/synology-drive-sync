@@ -31,9 +31,11 @@ instead of hand-creating a link or changing ownership.
 
 > [!NOTE]
 > The native AppWindow authenticates through the current DSM session cookie, which the browser sends
-> only to the same-origin packaged CGI. It does not inspect or rewrite the DSM shell location and
-> does not derive or forward a `SynoToken`. Package mutation still requires the independently issued
-> package CSRF token.
+> only to the same-origin packaged CGI. Server-side authentication uses the validated direct DSM
+> helper when executable or the bounded loopback user-service path when that trusted helper is
+> kernel-inaccessible. The UI does not inspect or rewrite the DSM shell location and does not derive
+> or forward a `SynoToken`. Package mutation still requires the independently issued package CSRF
+> token.
 
 ## Connection and read-only states
 

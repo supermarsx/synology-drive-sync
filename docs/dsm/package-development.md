@@ -210,8 +210,9 @@ happy path.
 ## Acceptance boundary
 
 Builder/validator success proves the reviewed archive contract, not DSM installation, AppWindow
-launch, DSM's executable-owner CGI runtime identity, protected `authenticate.cgi` execution from the
-native Webman CGI context,
+launch, DSM's executable-owner CGI runtime identity, protected `authenticate.cgi` execution when
+kernel-accessible, bounded loopback user-service authentication when the validated helper is
+kernel-inaccessible,
 package-owned socket behavior, administrator groups, direct `synodsmnotify` desktop delivery, source
 ACLs, reverse proxy, File Station, TOTP, Drive indexing, or sync behavior on a physical model.
 Complete [live-NAS acceptance](troubleshooting.md#live-nas-acceptance) before publishing a support

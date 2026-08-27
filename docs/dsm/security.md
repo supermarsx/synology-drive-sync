@@ -66,11 +66,10 @@ rejects mode, ownership, identity, or byte mismatches between the two helper cop
 
 The DSM session cookie is the authoritative browser authentication input. JavaScript never reads
 that cookie; `credentials: "same-origin"` lets the browser attach it to the packaged `api.cgi`
-request. The DSM-launched CGI invokes `authenticate.cgi` exactly once in that native Webman request
-context, resolves the returned non-root account, and requires administrator membership before relay.
-The package daemon never executes the root-owned DSM helper. It independently resolves the relayed
-username, checks exact UID/name and administrator consistency, and recomputes the cookie/token
-session binding before authorizing any action.
+request. The DSM-launched CGI validates the fixed `authenticate.cgi` path first. If the kernel says
+that the package UID can execute the validated root-owned helper, direct `authenticate.cgi`
+execution is the primary path. The CGI accepts one bounded safe non-root identity and independently
+requires administrator membership before relay.
 
 The fixed DSM helper entry may be a symlink. Before execution, the CGI resolves it without following
 an unchecked path: every absolute ancestor directory must be root-owned and not group/world
@@ -79,7 +78,30 @@ targets may not escape the validation root, and loops are rejected. The final ca
 be a root-owned, executable regular file that is not group/world writable. Its device and inode are
 revalidated immediately before the CGI executes that canonical target. Symlink mode `0777` is not
 itself treated as target writability because the validated parent directory is the link-mutation
-boundary. This validation grants no privilege and does not change the package UID.
+boundary. This validation grants no privilege and does not change the package UID. An unsafe helper,
+symlink, ancestor, or revalidation failure always fails closed.
+
+If and only if that full path validation succeeds but the kernel returns `EACCES` for an execute
+probe—as occurs with the supplied DSM capture's root-owned `root:system 0750` canonical helper—the
+CGI does not attempt execution. It issues one bounded HTTP/1 request to literal
+`127.0.0.1:$SERVER_PORT/webapi/entry.cgi` using the current request's `HTTPS` state. The only query
+fields are `api=SYNO.Core.Desktop.Initdata`, `version=1`, and `method=get_user_service`. Proxy use and
+redirects are disabled, `SERVER_NAME` and remote addresses are not destination inputs, connect and
+request time are bounded, and at most 1 MiB of response is accepted. The DSM cookie is a sensitive
+header; an optional compatibility token, when already present, is a sensitive `X-SYNO-TOKEN`
+header. There is no cookie or token URL.
+
+The loopback response must be HTTP 200 and valid JSON with `success=true`, a valid string
+`data.Session.user`, and Boolean `data.Session.is_admin=true`. Missing, malformed, oversized,
+redirected, timed-out, non-administrator, and failed responses fail closed. The CGI then resolves the
+reported username through NSS, rejects root, and independently requires membership in DSM's
+`administrators` group. A validated helper that is executable but fails to start, times out, changes,
+or rejects the cookie does not fall back to the user service; nor does any kernel probe failure other
+than permission denial.
+
+The package daemon never executes the root-owned DSM helper or calls the loopback user service. It
+independently resolves the relayed username, checks exact UID/name and administrator consistency, and
+recomputes the cookie/token session binding before authorizing any action.
 
 The native AppWindow has no standalone HTML launch document and receives no package-owned launch
 URL. It does not inspect or rewrite `window.location`, does not try to extract a token from the DSM
@@ -87,11 +109,13 @@ shell location, and sends no `X-SYNO-TOKEN` header. Cookie authentication is the
 native browser path. DSM owns the containing shell document and its document-level policies.
 
 Synology's DSM 7 [application authentication guide](https://help.synology.com/developer-guide/integrate_dsm/web_authentication.html)
-documents cookie validation through `authenticate.cgi`; it does not document a DSM 7 JavaScript API
-for retrieving a launch token. This application therefore does not call an undocumented login
-endpoint or depend on DSM browser globals for authentication. Physical-NAS acceptance must still
-prove that Webman starts `ui/api.cgi` with the required package-owner identity and that this native
-CGI context can execute DSM's protected `authenticate.cgi`. The authenticated identity transport
+documents cookie validation through `authenticate.cgi`; it does not publicly promise the
+`SYNO.Core.Desktop.Initdata` user-service response as a package API or document a DSM 7 JavaScript API
+for retrieving a launch token. The fallback contract is therefore DSM runtime behavior observed in
+the supplied physical capture, not a public compatibility promise. It remains server-side,
+loopback-pinned, and fail-closed; the UI does not call a login endpoint or depend on DSM browser
+globals. Physical-NAS acceptance must prove Webman's package-owner CGI identity and whichever branch
+the installed helper permissions select. The authenticated identity transport
 accepts exact valid UTF-8 names from 1 through
 256 bytes, including spaces, `DOMAIN\\Username`, and `Username@LDAP_FQDN`; control, bidi-format, and
 activity-delimiter characters are rejected. The static package binary cannot directly load
@@ -107,22 +131,29 @@ Every API request goes through these checks:
    copied into bounded Rust-owned buffers.
 2. The CGI verifies that it is a regular package-owned file with exact mode `0755`, that both its
    real and effective UID equal the executable owner's exact package UID, and that UID is not root.
-3. The CGI invokes DSM's root-owned `authenticate.cgi` with a bounded allowlisted authentication
-   environment derived from the native request, validates one safe returned identity, rejects root,
-   and independently requires DSM `administrators` membership.
-4. It clears its environment and sends one length-bounded frame containing that exact authenticated
+3. The CGI validates DSM's fixed root-owned `authenticate.cgi` path, canonical target, ancestors,
+   ownership, writability, type, and stable identity.
+4. When the kernel permits execution, the CGI invokes that helper with a bounded allowlisted
+   environment derived from the native request. Only when the trusted-helper execute probe receives
+   kernel `EACCES` does it instead call the fixed bounded loopback user service with the request
+   cookie. That fallback requires `Session.user` and `is_admin=true`; it uses no proxy, redirect,
+   remote host, or token URL.
+5. The CGI validates one safe returned identity, rejects root, independently resolves its numeric NSS
+   UID, and requires DSM `administrators` membership regardless of the selected branch.
+6. It clears its environment and sends one length-bounded frame containing that exact authenticated
    username, numeric UID, and session binding to the fixed package-owned `0600` socket after
    validating the socket, inode, and server peer identity. The pre-commit `0000` state is never
    connectable.
-5. The package-user server validates the CGI peer UID, decodes one strict relay schema, and repeats
+7. The package-user server validates the CGI peer UID, decodes one strict relay schema, and repeats
    method, query, header, body, cookie, request marker, and optional compatibility-token validation.
    The native UI leaves that optional field absent.
-6. Without executing `authenticate.cgi` again, the server independently resolves the asserted
-   username through DSM's account database. Its numeric UID must exactly match the CGI assertion,
-   and the server recomputes the cookie/token session binding from the strict relay fields.
-7. Root is rejected, and independent membership in the DSM `administrators` group is required even
+8. Without executing `authenticate.cgi` or calling the user service again, the server independently
+   resolves the asserted username through DSM's account database. Its numeric UID must exactly match
+   the CGI assertion, and the server recomputes the cookie/token session binding from the strict
+   relay fields.
+9. Root is rejected, and independent membership in the DSM `administrators` group is required even
    though the desktop app is also registered with `allUsers: false`.
-8. The server reads package-private state or queues a mutation only after authentication,
+10. The server reads package-private state or queues a mutation only after authentication,
    authorization, and—on POST—independent package CSRF verification succeed.
 
 UI registration and socket access are not authorization. The server repeats the HTTP validation and
@@ -314,11 +345,14 @@ responsibility and are sent with same-origin credentials.
 ## Security acceptance limits
 
 Repository tests cover parsing, CGI/service identity predicates, Unix-socket ownership/mode and peer
-checks, one-time CGI authentication under synthetic helper permissions, daemon non-execution of the
-helper, GET semantic error transport, admin membership, CSRF binding, schema rejection, queue
+checks, direct CGI authentication under synthetic executable-helper permissions, the
+kernel-inaccessible `root:system 0750` loopback fallback, response bounds and malformed identities,
+daemon non-execution of the helper/user service, GET semantic error transport, admin membership,
+CSRF binding, schema rejection, queue
 paths/modes/order, redaction, response bounds, native bundle/style isolation, direct fixed notifier
 arguments, and SPK privilege/resource layout. They do not prove DSM's physical executable-owner CGI
-runtime behavior, Webman's ability to execute a protected `root:system` `authenticate.cgi`,
+runtime behavior, direct protected-helper execution on a DSM where it is permitted, the captured
+loopback user-service behavior on every DSM branch,
 package-identity execution of `synodsmnotify`, DSM forwarding of `X-SDSYNC-Request: 1` as
 `HTTP_X_SDSYNC_REQUEST=1`, or reverse-proxy/origin behavior of a physical DSM release. Validate those
 on every supported DSM branch before calling the dashboard production-ready.

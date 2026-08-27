@@ -302,8 +302,16 @@ class BuilderTests(unittest.TestCase):
         text = (REPOSITORY / "docs/dsm/security.md").read_text(encoding="utf-8")
         normalized = " ".join(text.split())
         for required in (
-            "The CGI invokes DSM's root-owned `authenticate.cgi`",
-            "Without executing `authenticate.cgi` again, the server independently resolves",
+            "direct `authenticate.cgi` execution is the primary path",
+            "If and only if that full path validation succeeds but the kernel returns `EACCES`",
+            "literal `127.0.0.1:$SERVER_PORT/webapi/entry.cgi`",
+            "Proxy use and redirects are disabled",
+            "There is no cookie or token URL",
+            "valid string `data.Session.user`",
+            "Boolean `data.Session.is_admin=true`",
+            "not a public compatibility promise",
+            "Without executing `authenticate.cgi` or calling the user service "
+            "again, the server independently resolves",
             "read-only GET failures use `Status: 200 OK`",
             "stable pre-acceptance code `csrf_rejected`",
             "`security-policy`, `client-event`, and `action`",
@@ -320,6 +328,20 @@ class BuilderTests(unittest.TestCase):
             "`SO_PEERCRED` binds both ends to the package's exact non-root UID",
         ):
             self.assertIn(required, normalized)
+        troubleshooting = (
+            REPOSITORY / "docs/dsm/troubleshooting.md"
+        ).read_text(encoding="utf-8")
+        troubleshooting = " ".join(troubleshooting.split())
+        for required in (
+            "`dsm_authentication_webapi_unavailable` with status 503",
+            "`dsm_authentication_webapi_rejected` with status 401",
+            "`dsm_authentication_webapi_forbidden` with status 403",
+            "expected trigger for the bounded loopback user-service path",
+            "not a public API promise",
+            "without any chmod, group, root, privilege, or resource change",
+            "no proxy, redirect, remote host, cookie URL, or token URL",
+        ):
+            self.assertIn(required, troubleshooting)
         selector = (REPOSITORY / "docs/release-selector.md").read_text(encoding="utf-8")
         self.assertIn("lifecycle-equivalent 26.7-26.10", selector)
         self.assertNotIn("byte-equivalent 26.7-26.10", selector)
@@ -2538,6 +2560,21 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             )[0].returncode,
             64,
         )
+
+    def test_api_accepts_rootless_webapi_authentication_diagnostics(self) -> None:
+        for code, status in [
+            ("dsm_authentication_webapi_unavailable", "503"),
+            ("dsm_authentication_webapi_rejected", "401"),
+            ("dsm_authentication_webapi_forbidden", "403"),
+        ]:
+            result, payload = self.api(
+                "cgi-failure",
+                "--stage", "dsm_authentication",
+                "--code", code,
+                "--status", status,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(payload["ok"])
 
     def test_api_logs_activity_and_corrupt_state_fail_closed(self) -> None:
         self.assertEqual(

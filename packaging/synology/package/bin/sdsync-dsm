@@ -2214,7 +2214,7 @@ api_cgi_failure() {
             cgi_failure_event=security.failed
             cgi_failure_category=security
             ;;
-        dsm_authentication:dsm_authentication_helper_unsafe:503|dsm_authentication:dsm_authentication_helper_unavailable:503|dsm_authentication:dsm_authentication_rejected:401|dsm_authentication:dsm_authentication_forbidden:403)
+        dsm_authentication:dsm_authentication_helper_unsafe:503|dsm_authentication:dsm_authentication_helper_unavailable:503|dsm_authentication:dsm_authentication_webapi_unavailable:503|dsm_authentication:dsm_authentication_rejected:401|dsm_authentication:dsm_authentication_webapi_rejected:401|dsm_authentication:dsm_authentication_forbidden:403|dsm_authentication:dsm_authentication_webapi_forbidden:403)
             cgi_failure_event=authentication.failed
             cgi_failure_category=authentication
             ;;

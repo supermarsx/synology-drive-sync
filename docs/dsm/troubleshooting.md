@@ -135,15 +135,25 @@ bounded window. Retry once after Package Center reports the package running. Rep
 responses mean the service did not become ready; restart **Synology Drive Sync** in Package Center
 and inspect the package startup result rather than repeatedly refreshing the dashboard.
 
-Semantic stage `dsm_authentication` identifies the native DSM helper boundary. Its fixed codes are:
+Semantic stage `dsm_authentication` identifies the server-side DSM identity boundary. Its fixed
+codes are:
 
 - `dsm_authentication_helper_unsafe` with status 503: the fixed helper entry, a symlink boundary,
   resolved ancestor, or final executable failed root-owner/non-writability/type/identity validation;
-- `dsm_authentication_helper_unavailable` with status 503: the validated canonical helper could not
-  be started or did not complete safely within its bound;
-- `dsm_authentication_rejected` with status 401: DSM did not authenticate the native cookie; and
-- `dsm_authentication_forbidden` with status 403: the authenticated account did not satisfy the
-  administrator requirement.
+- `dsm_authentication_helper_unavailable` with status 503: the validated helper's execute permission
+  could not be probed safely, or an executable direct helper could not start or complete within its
+  bound;
+- `dsm_authentication_rejected` with status 401: the executable direct helper did not authenticate
+  the native cookie;
+- `dsm_authentication_forbidden` with status 403: the direct-helper identity did not satisfy the
+  independent account/administrator requirement;
+- `dsm_authentication_webapi_unavailable` with status 503: the kernel-inaccessible-helper fallback
+  could not obtain one bounded HTTP 200 response from the loopback-pinned DSM user service, or the
+  body was malformed/oversized or did not match the required typed session schema;
+- `dsm_authentication_webapi_rejected` with status 401: that user service returned `success=false`,
+  omitted session data, or returned a semantically invalid username; and
+- `dsm_authentication_webapi_forbidden` with status 403: the typed response contained
+  `is_admin=false`, or the returned account failed the independent NSS/administrator check.
 
 Collect the helper chain and package-UID execute result with read-only checks:
 
@@ -165,13 +175,22 @@ sudo -u "$PACKAGE_USER" test -x "$TARGET" \
 These commands expose no DSM cookie or package CSRF token. Preserve the output with the exact
 installed package version and semantic response code.
 
-Do not replace the helper link, broaden directory or target modes, grant set-id/capabilities, run the
-package as root, or call an undocumented DSM login endpoint. The package safely supports DSM's fixed
-helper entry resolving through absolute or relative root-owned symlinks, validates every ancestor and
-link boundary, and rechecks the final device/inode before executing the returned canonical target.
-It does not add a package privilege, change the CGI identity, or alter DSM helper metadata. A
-repository fixture proves that model with a root-owned symlink, but the exact canonical target and
-package-UID executability on each DSM build remain physical-NAS acceptance evidence.
+Do not replace the helper link, broaden directory or target modes, grant set-id/capabilities, join the
+package to DSM's `system` group, add a `conf/resource` acquisition, run the package as root, or call a
+DSM endpoint manually with the cookie. The package safely supports DSM's fixed helper entry resolving
+through absolute or relative root-owned symlinks, validates every ancestor and link boundary, and
+rechecks the final device/inode. If `test -x` succeeds, direct helper execution remains primary. If
+the safe canonical helper is `root:system 0750` and `test -x` fails for the package UID, that is the
+expected trigger for the bounded loopback user-service path—not a request to change permissions.
+
+The fallback connects only to literal `127.0.0.1` on the current CGI server port, derives HTTP versus
+HTTPS from the current request, disables proxying and redirects, bounds time and response bytes, and
+uses the cookie only as a sensitive header. It never trusts `SERVER_NAME`, a remote address, or a
+token-bearing URL. It requires valid `Session.user` and exact `is_admin=true`, then repeats NSS and
+administrator membership checks before relay. Synology publicly documents direct `authenticate.cgi`
+use by custom CGI; the fallback user-service response is DSM runtime behavior observed in the
+supplied capture, not a public API promise. Preserve the actual branch and result as physical-NAS
+acceptance evidence.
 
 When policy permits the stage-derived warning category, a pre-relay failure is coalesced globally to
 at most one emission per 30 seconds and recorded as fixed, secret-free JSON in
@@ -217,8 +236,9 @@ copy cookies, CSRF values, Synology tokens, or the complete request headers.
   cookie is deliberately never converted into package authority.
 
 The compatibility handling does not relax authentication: the browser request marker, DSM cookie,
-one native-CGI `authenticate.cgi` check, independent daemon UID/name/administrator consistency,
-HTTPS policy, recomputed session binding, and POST CSRF verification remain mandatory.
+one validated native-CGI identity path, independent CGI and daemon UID/name/administrator checks,
+HTTPS policy, recomputed session binding, and POST CSRF verification remain mandatory. A trusted
+kernel-executable helper cannot silently fall back after a direct-path failure.
 
 ## DSM says the page is not found when opening the app
 
@@ -291,11 +311,13 @@ or rewrite the DSM shell location and sends no `SynoToken`. If the exact message
 token is required, the installed UI predates the 26.10 native contract. Do not paste anything into
 the URL; install a verified 26.10-or-later artifact once published, or use the CLI meanwhile.
 
-The application intentionally has no undocumented DSM-global or login-API fallback. If a fresh
-launch cannot authenticate, record the model, DSM build, package version, launch path, `api.cgi`
-status, and bounded package logs, then use [CLI parity](cli-parity.md) while diagnosing the service.
-Never paste a cookie or package CSRF token into an issue, screenshot, terminal, browser storage, or
-bookmark.
+The application has no DSM-browser-global or client-side login fallback. Server-side, it executes a
+validated `authenticate.cgi` when kernel-accessible or uses the bounded loopback user-service path
+when that same trusted helper receives `EACCES`. If a fresh launch cannot authenticate, record the
+model, DSM build, package version, launch path, helper owner/mode and package-UID `test -x` result,
+`api.cgi` semantic status/code/stage, and bounded package logs, then use
+[CLI parity](cli-parity.md) while diagnosing the service. Never paste a cookie or package CSRF token
+into an issue, screenshot, terminal, browser storage, or bookmark.
 
 ## Dashboard is read-only
 
@@ -454,10 +476,12 @@ the exact source NAS and record all of the following:
 - on every claimed DSM branch—and specifically DSM 7.0/7.1 where supported—the same AppWindow
   launch, rendering, assets, and API path succeed on physical NAS hardware; and
 - a fresh native launch authenticates with the same-origin DSM cookie, does not inspect/rewrite the
-  DSM shell location, and sends no `X-SYNO-TOKEN` header.
+  DSM shell location, sends no `X-SYNO-TOKEN` header, and records whether the installed helper used
+  the direct or kernel-inaccessible loopback branch.
 
-Rendered browser QA was unavailable in the development environment. Do not mark layout,
-accessibility interaction, or browser-header-to-CGI forwarding as already proven.
+Automated Chrome fixture QA passed against the captured DSM control structure. It does not prove
+native physical-DSM rendering, accessibility interaction, or browser-header-to-CGI forwarding;
+record those results from the installed AppWindow.
 
 ### Identity, ACL, and dashboard security
 
@@ -474,6 +498,13 @@ accessibility interaction, or browser-header-to-CGI forwarding as already proven
 - DSM maps a browser request containing exactly `X-SDSYNC-Request: 1` into the CGI environment as
   `HTTP_X_SDSYNC_REQUEST=1`, the bounded relay preserves that marker to the package-user service,
   and an omitted or wrong-value marker is rejected;
+- the complete `authenticate.cgi` chain remains root-owned and non-group/world-writable; an
+  executable helper uses the direct path, while an observed `root:system 0750` helper that the
+  package UID cannot execute succeeds through the loopback user service without any chmod, group,
+  root, privilege, or resource change;
+- the loopback branch reaches only literal `127.0.0.1` on the current CGI port with no proxy,
+  redirect, remote host, cookie URL, or token URL; malformed/oversized responses, missing
+  `Session.user`, non-Boolean/false `is_admin`, and independent NSS/group mismatches fail closed;
 - a stale cookie, any malformed/mismatched optional compatibility token supplied directly to the
   API parser, missing/expired CSRF, wrong methods/fields, and direct CGI calls fail closed, while the
   token-free native UI succeeds through cookie authentication; and
@@ -519,8 +550,10 @@ accessibility interaction, or browser-header-to-CGI forwarding as already proven
 TOTP challenge behavior, DSM cookie authentication, direct `synodsmnotify`
 desktop delivery, File Station versions, reverse proxies, and Drive indexing vary across deployed
 systems. In
-particular, Synology documents direct `authenticate.cgi` use by a custom CGI, but this root-free
-design invokes it exactly once from the DSM-launched package-owned CGI while the native request
-environment is authoritative. The daemon never invokes the protected helper. Webman's package-owner
-CGI identity and helper access remain live-DSM acceptance requirements. A complete record from the
-exact environment is the acceptance evidence.
+particular, Synology documents direct `authenticate.cgi` use by a custom CGI. This root-free design
+uses that validated helper as the primary path when kernel-executable. On the supplied DSM runtime,
+the same trusted canonical helper is `root:system 0750`; the CGI instead uses the bounded loopback
+`SYNO.Core.Desktop.Initdata` user-service behavior observed in that capture. Synology does not
+publicly promise that fallback response as a package API. The daemon invokes neither path. Webman's
+package-owner CGI identity and the selected direct/fallback behavior remain live-DSM acceptance
+requirements. A complete record from the exact environment is the acceptance evidence.

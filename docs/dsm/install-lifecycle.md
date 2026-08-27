@@ -60,10 +60,14 @@ uninstall permanently purges package-private operational state and requires conf
 Use the DSM desktop application menu or Package Center's **Open** action. The application is
 registered for administrators only. A healthy open sequence requires the DSM session cookie,
 administrator membership, and a package CSRF token for mutation. The ordinary package-owned `0755`
-CGI fails closed unless Webman starts it with the exact non-root package UID. It invokes
-`authenticate.cgi` once in that native request context after resolving its fixed entry through a
-fully root-owned, non-group/world-writable ancestor and symlink chain, revalidating the final
-canonical executable identity without changing the CGI identity or package privileges. It then
+CGI fails closed unless Webman starts it with the exact non-root package UID. It resolves DSM's fixed
+`authenticate.cgi` through a fully root-owned, non-group/world-writable ancestor and symlink chain
+and revalidates the final canonical executable identity. When the kernel permits execution, that
+direct helper is the primary path. When the trusted helper is kernel-inaccessible—as with the
+observed `root:system 0750` layout—the CGI uses a bounded loopback-only DSM user-service request with
+the current cookie and requires valid `Session.user` plus exact `is_admin=true`. It independently
+resolves the resulting NSS identity and administrator membership without changing the CGI identity,
+package privileges, or DSM helper metadata. It then
 relays a bounded assertion and request through the fixed package-owned Unix socket, which remains
 `0000` before startup commit and activates on the same inode as `0600`. The package-user service
 never executes that root-owned helper; it verifies the package-UID peer, strict relay/request,
@@ -200,7 +204,9 @@ Deleted package credentials are not recoverable.
 Record the model, DSM build, `uname -m`, exact SPK filename/version, checksum, optional attestation,
 the exact Package Center warning/result, bounded install/package logs, CGI/API-service/socket
 identities and modes, install/start/open result, package-user ACL test, and first non-writing
-Doctor/Plan. Explicitly prove Webman's package-owner CGI identity and that the native CGI context can
-execute protected `authenticate.cgi`; repository tests do not prove that DSM behavior. Do not
+Doctor/Plan. Explicitly prove Webman's package-owner CGI identity and record which DSM authentication
+branch is selected: direct protected-helper execution when executable, or successful bounded
+loopback user-service authentication when the validated `root:system 0750` helper is denied by the
+kernel. Repository tests do not prove either physical DSM behavior. Do not
 describe the installation as production-ready until the complete
 [live-NAS acceptance](troubleshooting.md#live-nas-acceptance) passes.

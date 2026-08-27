@@ -19,7 +19,8 @@ authenticate_helper=/usr/syno/synoman/webman/modules/authenticate.cgi
 authenticate_target=/usr/syno/synoman/authenticate.cgi
 fixture_cookie=id=sdsync-fixture-session
 package_auth_marker=/tmp/sdsync-auth.$package_uid
-inaccessible_cgi_summary=/tmp/sdsync-auth-inaccessible.$package_uid
+user_service_marker=/tmp/sdsync-user-service.$package_uid
+user_service_port=18080
 
 usage() {
     echo "usage: $0 /absolute/path/to/synology-drive-sync-<version>-x86_64.spk" >&2
@@ -42,7 +43,7 @@ spk=$1
     exit 77
 }
 for reserved_path in "$package_base" "$physical_store" "$physical_home" "$physical_var" \
-    "$webman_route" "$authenticate_helper" "$authenticate_target" "$package_auth_marker" "$inaccessible_cgi_summary"
+    "$webman_route" "$authenticate_helper" "$authenticate_target" "$package_auth_marker" "$user_service_marker"
 do
     if [ -e "$reserved_path" ] || [ -L "$reserved_path" ]; then
         echo "refusing to replace existing fixture path: $reserved_path" >&2
@@ -53,6 +54,9 @@ done
 fixture_root=$(mktemp -d /tmp/sdsync-real-supervisor.XXXXXX)
 outer=$fixture_root/outer
 cgi_summary=$fixture_root/cgi-summary
+fallback_cgi_summary=$fixture_root/fallback-cgi-summary
+user_service_root=$fixture_root/user-service
+user_service_pid=
 lifecycle_log=$physical_var/log/lifecycle.log
 lifecycle=$package_base/scripts/start-stop-status
 mkdir -p "$outer"
@@ -60,6 +64,10 @@ mkdir -p "$outer"
 dump_diagnostics() {
     result=$?
     trap - EXIT
+    if [ -n "$user_service_pid" ]; then
+        kill "$user_service_pid" >/dev/null 2>&1 || true
+        wait "$user_service_pid" >/dev/null 2>&1 || true
+    fi
     if [ "$result" -ne 0 ]; then
         echo "real DSM supervisor lifecycle failed with status $result" >&2
         for diagnostic in \
@@ -72,7 +80,7 @@ dump_diagnostics() {
             "$physical_var/run/controller.pid" \
             "$physical_var/run/controller.starting" \
             "$physical_var/run/controller.ready" \
-            "$inaccessible_cgi_summary" \
+            "$fallback_cgi_summary" \
             "$cgi_summary"
         do
             if [ -f "$diagnostic" ] && [ ! -L "$diagnostic" ]; then
@@ -150,6 +158,40 @@ if su "$package_user" -s /bin/sh -c "test -x $authenticate_helper"; then
     exit 73
 fi
 
+mkdir -p "$user_service_root"
+cat > "$user_service_root/respond" <<'EOF'
+#!/bin/sh
+set -eu
+IFS= read -r request_line || exit 1
+request_line=$(printf '%s' "$request_line" | tr -d '\r')
+[ "$request_line" = "GET /webapi/entry.cgi?api=SYNO.Core.Desktop.Initdata&version=1&method=get_user_service HTTP/1.1" ] || exit 1
+cookie_seen=false
+while IFS= read -r header
+do
+    header=$(printf '%s' "$header" | tr -d '\r')
+    [ -n "$header" ] || break
+    case $(printf '%s' "$header" | tr '[:upper:]' '[:lower:]') in
+        'cookie: id=sdsync-fixture-session') cookie_seen=true ;;
+    esac
+done
+[ "$cookie_seen" = true ] || exit 1
+umask 077
+marker=/tmp/sdsync-user-service.23101
+[ ! -L "$marker" ] || exit 1
+printf '%s\n' authenticated >> "$marker"
+chmod 0600 "$marker"
+body='{"success":true,"data":{"Session":{"user":"sdsync-admin","is_admin":true},"UserSettings":{},"AppPrivilege":[],"ServiceStatus":{}}}'
+printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' "${#body}" "$body"
+EOF
+chmod 0755 "$user_service_root/respond"
+nc -lk -s 127.0.0.1 -p "$user_service_port" -e "$user_service_root/respond" &
+user_service_pid=$!
+sleep 0.1
+kill -0 "$user_service_pid" >/dev/null 2>&1 || {
+    echo "mock DSM loopback user-service did not start" >&2
+    exit 73
+}
+
 mkdir -p "$physical_store" "$physical_home" "$physical_var" "$package_base"
 tar -xzf "$outer/package.tgz" -C "$physical_store"
 cp -R "$outer/scripts" "$package_base/scripts"
@@ -189,6 +231,8 @@ run_lifecycle() {
 }
 
 run_package_cgi() {
+    request_https=${cgi_https-on}
+    request_port=${cgi_port-5001}
     su "$package_user" -s /bin/sh -c \
         "env -i \
         PATH=/usr/sbin:/usr/bin:/sbin:/bin \
@@ -200,11 +244,11 @@ run_package_cgi() {
         HTTP_X_SDSYNC_CSRF= \
         HTTP_COOKIE=$fixture_cookie \
         HTTP_X_SDSYNC_REQUEST=1 \
-        HTTPS=on \
+        HTTPS=$request_https \
         REMOTE_ADDR=127.0.0.1 \
         SERVER_ADDR=127.0.0.1 \
         SERVER_NAME=localhost \
-        SERVER_PORT=5001 \
+        SERVER_PORT=$request_port \
         $webman_route/api.cgi"
 }
 
@@ -235,63 +279,59 @@ fi
 }
 
 # A physical DSM can expose authenticate.cgi as root:system 0750. The package
-# identity must not be able to execute that helper, and a handled authentication
-# failure must still survive Webman's tendency to discard non-2xx CGI bodies.
-# GET therefore uses HTTP 200 transport with the original 503 and failure stage
-# inside the bounded package error envelope.
+# identity cannot execute that helper, so the CGI must authenticate through the
+# fixed rootless DSM user-service on loopback and still reach the private relay.
 set +e
-inaccessible_cgi_response=$(run_package_cgi)
-inaccessible_cgi_status=$?
+fallback_cgi_response=$(cgi_https=off cgi_port=$user_service_port run_package_cgi)
+fallback_cgi_status=$?
 set -e
-inaccessible_cgi_response=$(printf '%s' "$inaccessible_cgi_response" | tr -d '\r')
-inaccessible_cgi_status_line=$(printf '%s\n' "$inaccessible_cgi_response" | sed -n '1p')
-inaccessible_cgi_content_length=$(printf '%s\n' "$inaccessible_cgi_response" |
+fallback_cgi_response=$(printf '%s' "$fallback_cgi_response" | tr -d '\r')
+fallback_cgi_status_line=$(printf '%s\n' "$fallback_cgi_response" | sed -n '1p')
+fallback_cgi_content_length=$(printf '%s\n' "$fallback_cgi_response" |
     sed -n 's/^Content-Length: \([0-9][0-9]*\)$/\1/p' | sed -n '1p')
-inaccessible_cgi_body=$(printf '%s\n' "$inaccessible_cgi_response" | sed '1,/^$/d')
+fallback_cgi_body=$(printf '%s\n' "$fallback_cgi_response" | sed '1,/^$/d')
 {
-    printf 'exit=%s\n' "$inaccessible_cgi_status"
-    printf 'status=%s\n' "$inaccessible_cgi_status_line"
-    printf '%s\n' "$inaccessible_cgi_response"
-} > "$inaccessible_cgi_summary"
-chmod 0600 "$inaccessible_cgi_summary"
-[ "$inaccessible_cgi_status" -eq 0 ] \
-    && [ "$inaccessible_cgi_status_line" = "Status: 200 OK" ] || {
-    echo "inaccessible DSM authentication helper did not produce a handled GET envelope" >&2
+    printf 'exit=%s\n' "$fallback_cgi_status"
+    printf 'status=%s\n' "$fallback_cgi_status_line"
+    printf '%s\n' "$fallback_cgi_response"
+} > "$fallback_cgi_summary"
+chmod 0600 "$fallback_cgi_summary"
+[ "$fallback_cgi_status" -eq 0 ] \
+    && [ "$fallback_cgi_status_line" = "Status: 200 OK" ] || {
+    echo "rootless DSM authentication fallback did not produce a successful GET envelope" >&2
     exit 1
 }
-[ -n "$inaccessible_cgi_body" ] \
-    && printf '%s\n' "$inaccessible_cgi_content_length" | grep -Eq '^[1-9][0-9]*$' \
-    && [ "$(printf '%s' "$inaccessible_cgi_body" | wc -c | tr -d ' ')" = "$inaccessible_cgi_content_length" ] || {
-    echo "inaccessible DSM authentication helper response body or Content-Length is empty or inconsistent" >&2
+[ -n "$fallback_cgi_body" ] \
+    && printf '%s\n' "$fallback_cgi_content_length" | grep -Eq '^[1-9][0-9]*$' \
+    && [ "$(printf '%s' "$fallback_cgi_body" | wc -c | tr -d ' ')" = "$fallback_cgi_content_length" ] || {
+    echo "rootless DSM authentication fallback body or Content-Length is empty or inconsistent" >&2
     exit 1
 }
-printf '%s\n' "$inaccessible_cgi_response" | grep -Fq '"schema":"sdsync.dsm-error.v1"' \
-    && printf '%s\n' "$inaccessible_cgi_response" | grep -Fq '"ok":false' \
-    && printf '%s\n' "$inaccessible_cgi_response" | grep -Fq '"status":503' \
-    && printf '%s\n' "$inaccessible_cgi_response" | grep -Fq '"stage":"dsm_authentication"' \
-    && printf '%s\n' "$inaccessible_cgi_response" | grep -Fq '"code":"dsm_authentication_helper_unavailable"' || {
-    echo "inaccessible DSM authentication helper response lost semantic error evidence" >&2
+printf '%s\n' "$fallback_cgi_response" | grep -Fq '"schema":"sdsync.dsm-csrf.v1"' || {
+    echo "rootless DSM authentication fallback did not reach the CSRF API" >&2
     exit 1
 }
 [ ! -e "$package_auth_marker" ] && [ ! -L "$package_auth_marker" ] || {
     echo "non-executable DSM authentication helper was unexpectedly invoked" >&2
     exit 1
 }
-grep -Fq '"service":"synology-drive-sync"' "$physical_var/log/api.log" \
-    && grep -Fq '"stage":"dsm_authentication"' "$physical_var/log/api.log" \
-    && grep -Fq '"code":"dsm_authentication_helper_unavailable"' "$physical_var/log/api.log" || {
-    echo "inaccessible DSM authentication helper did not reach the bounded API diagnostic log" >&2
+if ! { [ -f "$user_service_marker" ] && [ ! -L "$user_service_marker" ] \
+    && [ "$(stat -c '%u:%a:%h' "$user_service_marker")" = "0:600:1" ] \
+    && [ "$(wc -l < "$user_service_marker" | tr -d ' ')" = 1 ]; }; then
+    echo "fixed loopback DSM user-service was not invoked exactly once" >&2
     exit 1
-}
-grep -Fq '|authentication.failed|none|failed|authentication|warn|Package service synology-drive-sync request failed stage=dsm_authentication code=dsm_authentication_helper_unavailable status=503' \
-    "$physical_var/log/activity.log" || {
-    echo "inaccessible DSM authentication helper did not reach structured activity" >&2
+fi
+if grep -Fq '"stage":"dsm_authentication"' "$physical_var/log/api.log"; then
+    echo "successful rootless authentication fallback emitted a failure diagnostic" >&2
     exit 1
-}
+fi
 
 # Make only the synthetic helper callable for the successful relay. Requiring
-# exactly one marker proves the CGI authenticates once and the package daemon
-# does not repeat execution of authenticate.cgi after the private relay.
+# one helper marker and one unchanged user-service marker proves the executable
+# DSM helper remains primary and the daemon repeats neither authentication path.
+kill "$user_service_pid"
+wait "$user_service_pid" >/dev/null 2>&1 || true
+user_service_pid=
 chmod 0755 "$authenticate_target"
 [ -L "$authenticate_helper" ] \
     && [ "$(stat -c '%u:%g:%a:%h' "$authenticate_target")" = "0:$system_gid:755:1" ] || {
@@ -335,6 +375,10 @@ if ! { [ -f "$package_auth_marker" ] && [ ! -L "$package_auth_marker" ] \
     && [ "$(stat -c '%u:%a:%h' "$package_auth_marker")" = "$package_uid:600:1" ] \
     && [ "$(wc -l < "$package_auth_marker" | tr -d ' ')" = 1 ]; }; then
     echo "DSM authentication helper was not executed exactly once by the package CGI" >&2
+    exit 1
+fi
+if [ "$(wc -l < "$user_service_marker" | tr -d ' ')" != 1 ]; then
+    echo "executable DSM helper unexpectedly retried the loopback user-service" >&2
     exit 1
 fi
 csrf_key=$physical_var/control/csrf.key
