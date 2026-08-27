@@ -303,7 +303,8 @@ class BuilderTests(unittest.TestCase):
         normalized = " ".join(text.split())
         for required in (
             "The CGI invokes DSM's root-owned `authenticate.cgi`",
-            "The server independently executes DSM's root-owned",
+            "Without executing `authenticate.cgi` again, the server independently resolves",
+            "read-only GET failures use `Status: 200 OK`",
             "stable pre-acceptance code `csrf_rejected`",
             "`security-policy`, `client-event`, and `action`",
             "`policy_version=1`",

@@ -660,9 +660,13 @@ class WorkflowWiringTests(unittest.TestCase):
             )
             self.assertEqual(section.count('[[ "$bridge_exit" -eq 0 ]]'), 1)
             self.assertNotIn('[[ "$bridge_exit" -ne 0 ]]', section)
-            self.assertIn("Status: 401 Unauthorized", section)
+            self.assertIn(
+                "grep -Fq 'Status: 200 OK' <<<\"$bridge_output\"", section
+            )
             self.assertIn('"schema":"sdsync.dsm-error.v1"', section)
+            self.assertIn('"status":401', section)
             self.assertIn('"code":"unauthorized"', section)
+            self.assertNotIn("Status: 401 Unauthorized", section)
             self.assertIn("Version5 EABI", section)
             self.assertIn("hard-float ABI", section)
             self.assertIn("elf_class: ELF32", section)

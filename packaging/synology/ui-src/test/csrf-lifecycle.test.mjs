@@ -227,6 +227,145 @@ test("HTTP 503 remains a package-service failure when Webman returns non-JSON", 
   );
 });
 
+test("GET semantic failures preserve application status and stage over HTTP 200", async () => {
+  const restore = installBrowserGlobals();
+  try {
+    globalThis.fetch = async () => jsonResponse({
+      schema: "sdsync.dsm-error.v1",
+      ok: false,
+      status: 503,
+      code: "service_unavailable",
+      stage: "bridge_connect",
+      message: "The package service is unavailable."
+    });
+    const api = await loadApi();
+
+    await assert.rejects(
+      api.apiGet({}, "csrf"),
+      (error) => {
+        assert.equal(error instanceof api.DsmApiError, true);
+        assert.equal(error.status, 503);
+        assert.equal(error.transportStatus, 200);
+        assert.equal(error.stage, "bridge_connect");
+        assert.equal(error.code, "service_unavailable");
+        assert.equal(error.trustedRejection, true);
+        return true;
+      }
+    );
+
+    const component = await loadAppComponent(async () => ({}), async () => ({}));
+    const issue = component.methods.describeBridgeError({
+      status: 503,
+      code: "service_unavailable",
+      stage: "bridge_connect"
+    });
+    assert.equal(issue.title, "Package service unavailable");
+    assert.match(issue.message, /Failure stage: bridge_connect\./);
+  } finally {
+    restore();
+  }
+});
+
+test("HTTP 200 semantic error envelopes are never returned as successful GET models", async () => {
+  const restore = installBrowserGlobals();
+  try {
+    globalThis.fetch = async () => jsonResponse({
+      schema: "sdsync.dsm-error.v1",
+      ok: false,
+      status: 400,
+      code: "invalid_request",
+      stage: "request",
+      message: "Request metadata was rejected."
+    });
+    const api = await loadApi();
+    await assert.rejects(
+      api.apiGet({}, "snapshot"),
+      (error) => error instanceof api.DsmApiError
+        && error.status === 400
+        && error.stage === "request"
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("GET semantic status must be numeric before it becomes a trusted rejection", async () => {
+  const restore = installBrowserGlobals();
+  try {
+    globalThis.fetch = async () => jsonResponse({
+      schema: "sdsync.dsm-error.v1",
+      ok: false,
+      status: "503",
+      code: "service_unavailable",
+      stage: "bridge_connect",
+      message: "The package service is unavailable."
+    });
+    const api = await loadApi();
+    await assert.rejects(
+      api.apiGet({}, "csrf"),
+      (error) => {
+        assert.equal(error instanceof api.DsmApiError, true);
+        assert.equal(error.status, 200);
+        assert.equal(error.transportStatus, 200);
+        assert.equal(error.trustedRejection, false);
+        return true;
+      }
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("GET result never accepts an ok-false semantic 410 as an expired result model", async () => {
+  const restore = installBrowserGlobals();
+  try {
+    globalThis.fetch = async () => jsonResponse({
+      schema: "sdsync.dsm-error.v1",
+      ok: false,
+      status: 410,
+      code: "result_expired",
+      stage: "service_request",
+      message: "The result is no longer available."
+    });
+    const api = await loadApi();
+    await assert.rejects(
+      api.apiGet({}, "result", { job_id: "a".repeat(48) }),
+      (error) => error instanceof api.DsmApiError
+        && error.status === 410
+        && error.transportStatus === 200
+        && error.trustedRejection === true
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("POST keeps transport-status semantics for an untrusted HTTP 200 error document", async () => {
+  const restore = installBrowserGlobals();
+  try {
+    globalThis.fetch = async () => jsonResponse({
+      schema: "sdsync.dsm-error.v1",
+      ok: false,
+      status: 403,
+      code: "csrf_rejected",
+      stage: "mutation-authentication",
+      message: "Mutation token rejected."
+    });
+    const api = await loadApi();
+    await assert.rejects(
+      api.apiPost({}, "csrf-token", api.ACTIONS.clientEvent, { event: "interface-settings" }, false),
+      (error) => {
+        assert.equal(error instanceof api.MutationOutcomeUnknownError, true);
+        assert.equal(error.outcomeUnknown, true);
+        assert.equal(error.acceptanceUnknown, true);
+        return true;
+      }
+    );
+  } finally {
+    restore();
+  }
+});
+
 test("security lifetime change replaces the token before the next serialized mutation", async () => {
   const trace = [];
   const posts = [];

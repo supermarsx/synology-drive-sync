@@ -44,11 +44,12 @@ export class MutationOutcomeUnknownError extends Error {
 }
 
 export class DsmApiError extends Error {
-  constructor(message, status = 0, code = "api_error") {
+  constructor(message, status = 0, code = "api_error", stage = "") {
     super(message);
     this.name = "DsmApiError";
     this.status = Number.isInteger(Number(status)) ? Number(status) : 0;
     this.code = boundedText(code, "api_error").slice(0, 128);
+    this.stage = boundedText(stage, "").slice(0, 128);
   }
 }
 
@@ -188,7 +189,7 @@ function assertNoReturnedSecrets(model) {
   }
 }
 
-async function responseJson(response, allowGoneResult = false) {
+async function responseJson(response, allowGoneResult = false, preserveSemanticStatus = false) {
   if (response.redirected) {
     throw new DsmApiError("DSM authentication redirected the API request", response.status, "authentication_redirect");
   }
@@ -213,19 +214,37 @@ async function responseJson(response, allowGoneResult = false) {
     throw new DsmApiError("API returned an invalid document", response.status, "invalid_document");
   }
   assertNoReturnedSecrets(model);
-  const allowedGone = allowGoneResult && response.status === 410;
+  const semanticStatus = model.status;
+  const validSemanticStatus = typeof semanticStatus === "number"
+    && Number.isInteger(semanticStatus)
+    && semanticStatus >= 400
+    && semanticStatus < 600;
+  const trustedErrorDocument = model.schema === "sdsync.dsm-error.v1"
+    && model.ok === false
+    && typeof model.code === "string"
+    && typeof model.message === "string";
+  const trustedSemanticError = preserveSemanticStatus && trustedErrorDocument;
+  const effectiveStatus = preserveSemanticStatus
+    && trustedSemanticError
+    && validSemanticStatus
+    ? semanticStatus
+    : response.status;
+  const allowedGone = allowGoneResult
+    && response.status === 410
+    && model.schema === RESULT_STATUS_SCHEMA
+    && model.state === "expired_or_missing"
+    && model.ok !== false;
   if ((!response.ok && !allowedGone) || (model.ok === false && !allowedGone)) {
     const error = new DsmApiError(
       boundedText(model.message, "API request failed"),
-      response.status,
-      boundedText(model.code, `http_${response.status || 0}`)
+      effectiveStatus,
+      boundedText(model.code, `http_${effectiveStatus || 0}`),
+      boundedText(model.stage, "")
     );
-    error.trustedRejection = response.status >= 400
-      && response.status < 600
-      && model.schema === "sdsync.dsm-error.v1"
-      && model.ok === false
-      && typeof model.code === "string"
-      && typeof model.message === "string";
+    error.transportStatus = response.status;
+    error.trustedRejection = effectiveStatus >= 400
+      && effectiveStatus < 600
+      && trustedErrorDocument;
     throw error;
   }
   return model;
@@ -260,7 +279,7 @@ export async function apiGet(auth, action, parameters = {}) {
     signal: auth && auth.signal ? auth.signal : undefined,
     headers: authenticatedHeaders({ Accept: "application/json" })
   });
-  return responseJson(response, action === "result");
+  return responseJson(response, action === "result", true);
 }
 
 function delay(milliseconds, signal) {

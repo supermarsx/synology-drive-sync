@@ -836,9 +836,10 @@ jobs:
             exit 1
           }
           [[ "$bridge_exit" -eq 0 ]]
-          grep -Fq 'Status: 401 Unauthorized' <<<"$bridge_output"
+          grep -Fq 'Status: 200 OK' <<<"$bridge_output"
           grep -Fq 'Content-Type: application/json; charset=utf-8' <<<"$bridge_output"
           grep -Fq '"schema":"sdsync.dsm-error.v1"' <<<"$bridge_output"
+          grep -Fq '"status":401' <<<"$bridge_output"
           grep -Fq '"code":"unauthorized"' <<<"$bridge_output"
       - name: Assemble and validate installable SPK
         shell: bash

@@ -732,17 +732,31 @@ fn validate_relay_http_request(
 
 fn validate_relay_authenticated_session(
     relay: &RelayRequest,
-    independently_authenticated: &AuthenticatedSession,
-) -> BridgeResult<()> {
+    authentication: &AuthenticationInputs,
+    independently_resolved_uid: u32,
+) -> BridgeResult<AuthenticatedSession> {
     let binding = hex_decode_exact::<32>(&relay.session_binding)
         .ok_or_else(|| BridgeError::new(ErrorKind::Unauthorized))?;
-    if relay.authenticated_username != independently_authenticated.username
-        || relay.authenticated_uid != independently_authenticated.uid
-        || !session_binding_matches(&binding, &independently_authenticated.binding)
-    {
+    if independently_resolved_uid == 0 || relay.authenticated_uid != independently_resolved_uid {
         return Err(BridgeError::new(ErrorKind::Unauthorized));
     }
-    Ok(())
+    let expected_binding = session_binding(
+        &relay.authenticated_username,
+        independently_resolved_uid,
+        &authentication.cookie,
+        authentication
+            .synology_token
+            .as_ref()
+            .map(|value| value.as_str()),
+    );
+    if !session_binding_matches(&binding, &expected_binding) {
+        return Err(BridgeError::new(ErrorKind::Unauthorized));
+    }
+    Ok(AuthenticatedSession {
+        username: relay.authenticated_username.clone(),
+        uid: independently_resolved_uid,
+        binding: expected_binding,
+    })
 }
 
 struct AuthenticatedSession {
@@ -2653,7 +2667,7 @@ mod linux_runtime {
         })
     }
 
-    pub(super) fn authenticate_and_authorize(
+    pub(super) fn authenticate_and_authorize_cgi(
         inputs: &AuthenticationInputs,
         timeout: Duration,
     ) -> BridgeResult<AuthenticatedSession> {
@@ -8063,6 +8077,17 @@ struct CgiResponse {
     body: Vec<u8>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenderedCgiError<'a> {
+    schema: &'a str,
+    ok: bool,
+    status: u16,
+    code: &'a str,
+    stage: Option<&'a str>,
+    message: &'a str,
+}
+
 impl CgiResponse {
     fn success(body: Vec<u8>) -> Self {
         Self { status: 200, body }
@@ -8142,25 +8167,73 @@ impl CgiResponse {
         let body = serde_json::to_vec(&json!({
             "schema": "sdsync.dsm-error.v1",
             "ok": false,
+            "status": status,
             "code": code,
             "stage": stage.map(CgiFailureStage::as_str),
             "message": message,
         }))
         .unwrap_or_else(|_| {
-            br#"{"schema":"sdsync.dsm-error.v1","ok":false,"code":"internal_error","message":"Request could not be completed."}"#
-                .to_vec()
+            format!(
+                r#"{{"schema":"sdsync.dsm-error.v1","ok":false,"status":{status},"code":"internal_error","stage":null,"message":"Request could not be completed."}}"#
+            )
+            .into_bytes()
         });
         Self { status, body }
+    }
+
+    fn for_cgi_transport(mut self, is_get: bool) -> Self {
+        if is_get && self.is_trusted_error_envelope() {
+            // Webman can replace CGI 4xx/5xx bodies with an empty gateway
+            // response. GET is read-only, so carry the original application
+            // status in the authenticated JSON envelope while keeping the CGI
+            // transport successful. Mutation failures retain their real HTTP
+            // status and are never normalized here.
+            self.status = 200;
+        }
+        self
+    }
+
+    fn is_trusted_error_envelope(&self) -> bool {
+        let Ok(payload) = serde_json::from_slice::<RenderedCgiError<'_>>(&self.body) else {
+            return false;
+        };
+        payload.schema == "sdsync.dsm-error.v1"
+            && !payload.ok
+            && payload.status == self.status
+            && !payload.code.is_empty()
+            && payload.code.len() <= 64
+            && payload
+                .code
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            && payload.stage.is_none_or(|stage| {
+                matches!(
+                    stage,
+                    "request"
+                        | "cgi_identity"
+                        | "dsm_authentication"
+                        | "cgi_runtime"
+                        | "bridge_connect"
+                        | "bridge_io"
+                        | "bridge_protocol"
+                        | "service_request"
+                )
+            })
+            && !payload.message.is_empty()
+            && payload.message.len() <= 512
+            && !payload.message.bytes().any(|byte| byte.is_ascii_control())
     }
 }
 
 pub(crate) fn main_entry() -> ExitCode {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if arguments.is_empty() {
+        let is_get = std::env::var("REQUEST_METHOD").is_ok_and(|method| method == "GET");
         let response = match run_cgi() {
             Ok(response) => response,
             Err(failure) => CgiResponse::staged_error(failure.stage, failure.error),
-        };
+        }
+        .for_cgi_transport(is_get);
         cgi_exit_code(write_cgi_response(&response).is_ok())
     } else if arguments.len() == 1 && arguments[0] == "--serve" {
         match run_server() {
@@ -8371,7 +8444,8 @@ pub(crate) fn main_entry() -> ExitCode {
             Err(_) => ExitCode::from(73),
         }
     } else if std::env::var_os("REQUEST_METHOD").is_some() {
-        let response = CgiResponse::error(BridgeError::bad_request());
+        let is_get = std::env::var("REQUEST_METHOD").is_ok_and(|method| method == "GET");
+        let response = CgiResponse::error(BridgeError::bad_request()).for_cgi_transport(is_get);
         cgi_exit_code(write_cgi_response(&response).is_ok())
     } else {
         ExitCode::FAILURE
@@ -8679,7 +8753,7 @@ fn run_cgi() -> Result<CgiResponse, CgiFailure> {
         // Synology documents authenticate.cgi being invoked from the custom
         // CGI, where DSM's native request environment is still authoritative.
         let session =
-            linux_runtime::authenticate_and_authorize(authentication, AUTH_HELPER_TIMEOUT)
+            linux_runtime::authenticate_and_authorize_cgi(authentication, AUTH_HELPER_TIMEOUT)
                 .map_err(|error| CgiFailure::new(CgiFailureStage::Authentication, error))?;
         let body = match request {
             ValidatedHttpRequest::Get { .. } => None,
@@ -9113,17 +9187,15 @@ fn handle_relay_request(encoded: &[u8], package_uid: u32) -> Result<CgiResponse,
         ValidatedHttpRequest::Get { authentication, .. }
         | ValidatedHttpRequest::Post { authentication, .. } => authentication,
     };
-    // The CGI performs the documented DSM check early, while the native
-    // request environment is intact. The package daemon repeats that same
-    // root-owned helper check using only the bounded relayed environment and
-    // independently resolves administrator membership. DSM executes the CGI as
-    // its package-owned executable's exact non-root UID, and the socket admits
-    // only that same package UID via SO_PEERCRED; request authority still
-    // comes exclusively from the repeated DSM authentication, never from a
-    // /proc identity lookup that rootless package processes cannot perform.
-    let session = linux_runtime::authenticate_and_authorize(authentication, AUTH_HELPER_TIMEOUT)
+    // The DSM-launched CGI performs the documented authenticate.cgi check
+    // exactly once while DSM's native request environment is authoritative.
+    // The package daemon never re-executes that protected system helper. It
+    // independently resolves the relayed username through NSS, rechecks
+    // administrator membership, requires the exact package UID at SO_PEERCRED
+    // in serve_connection, and recomputes the cookie/token session binding.
+    let resolved_uid = linux_runtime::authorize_relayed_username(&relay.authenticated_username)
         .map_err(|error| CgiFailure::new(CgiFailureStage::Authentication, error))?;
-    validate_relay_authenticated_session(&relay, &session)
+    let session = validate_relay_authenticated_session(&relay, authentication, resolved_uid)
         .map_err(|error| CgiFailure::new(CgiFailureStage::Authentication, error))?;
     let control_paths = ControlPaths::production();
     linux_files::require_open_runtime_admission(&control_paths, package_uid)
@@ -12068,43 +12140,51 @@ mod tests {
     }
 
     #[test]
-    fn relayed_assertion_must_match_an_independently_authenticated_dsm_session() {
+    fn relayed_assertion_must_match_independent_uid_and_recomputed_binding() {
         const AUTHENTICATED_UID: u32 = 2000;
-        let environment = environment("GET", "action=snapshot&SynoToken=dsm-token");
-        let session = bound_authenticated_session(&environment, AUTHENTICATED_UID);
-        let encoded = encode_relay_request(&environment, None, &session).unwrap();
+        let query_environment = environment("GET", "action=snapshot&SynoToken=dsm-token");
+        let session = bound_authenticated_session(&query_environment, AUTHENTICATED_UID);
+        let encoded = encode_relay_request(&query_environment, None, &session).unwrap();
         let relay = decode_relay_request(&encoded).unwrap();
-        validate_relay_authenticated_session(&relay, &session).unwrap();
+        let validate = |relay: &RelayRequest| {
+            let (request, _) = validate_relay_http_request(relay)?;
+            let authentication = match &request {
+                ValidatedHttpRequest::Get { authentication, .. }
+                | ValidatedHttpRequest::Post { authentication, .. } => authentication,
+            };
+            validate_relay_authenticated_session(relay, authentication, AUTHENTICATED_UID)
+        };
+        let validated = validate(&relay).unwrap();
+        assert_eq!(validated.username, "admin");
+        assert_eq!(validated.uid, AUTHENTICATED_UID);
+
+        let mut header_environment = environment("GET", "action=snapshot");
+        header_environment.synology_token_header = Some(Zeroizing::new("header-token".to_owned()));
+        let header_session = bound_authenticated_session(&header_environment, AUTHENTICATED_UID);
+        let header_encoded =
+            encode_relay_request(&header_environment, None, &header_session).unwrap();
+        let header_relay = decode_relay_request(&header_encoded).unwrap();
+        let validated_header = validate(&header_relay).unwrap();
+        assert_eq!(validated_header.username, "admin");
+        assert_eq!(validated_header.uid, AUTHENTICATED_UID);
 
         let mut swapped_username = decode_relay_request(&encoded).unwrap();
         swapped_username.authenticated_username = "other-admin".to_owned();
         assert_eq!(
-            validate_relay_authenticated_session(&swapped_username, &session)
-                .err()
-                .unwrap()
-                .kind,
+            validate(&swapped_username).err().unwrap().kind,
             ErrorKind::Unauthorized
         );
 
-        // A same-UID process can calculate the public digest used as a relay
-        // consistency binding. It still cannot substitute that for the
-        // daemon's independent authenticate.cgi result.
-        let mut forged = decode_relay_request(&encoded).unwrap();
-        forged.authenticated_username = "other-admin".to_owned();
-        forged.session_binding = hex_encode(&session_binding(
-            "other-admin",
+        let mut forged_uid = decode_relay_request(&encoded).unwrap();
+        forged_uid.authenticated_uid = AUTHENTICATED_UID + 1;
+        forged_uid.session_binding = hex_encode(&session_binding(
+            &forged_uid.authenticated_username,
             AUTHENTICATED_UID + 1,
-            &environment.cookie,
-            environment
-                .synology_token_header
-                .as_ref()
-                .map(|value| value.as_str()),
+            &query_environment.cookie,
+            Some("dsm-token"),
         ));
         assert_eq!(
-            validate_relay_authenticated_session(&forged, &session)
-                .err()
-                .unwrap()
-                .kind,
+            validate(&forged_uid).err().unwrap().kind,
             ErrorKind::Unauthorized
         );
 
@@ -12114,22 +12194,14 @@ mod tests {
             changed_binding.session_binding.replace_range(..1, "1");
         }
         assert_eq!(
-            validate_relay_authenticated_session(&changed_binding, &session)
-                .err()
-                .unwrap()
-                .kind,
+            validate(&changed_binding).err().unwrap().kind,
             ErrorKind::Unauthorized
         );
 
         let mut changed_cookie = decode_relay_request(&encoded).unwrap();
         changed_cookie.cookie = "id=different-session".to_owned();
-        let changed_environment = changed_cookie.environment();
-        let changed_session = bound_authenticated_session(&changed_environment, AUTHENTICATED_UID);
         assert_eq!(
-            validate_relay_authenticated_session(&changed_cookie, &changed_session)
-                .err()
-                .unwrap()
-                .kind,
+            validate(&changed_cookie).err().unwrap().kind,
             ErrorKind::Unauthorized
         );
     }
@@ -13882,6 +13954,7 @@ mod tests {
         for (response, status, code, stage) in cases {
             assert_eq!(response.status, status);
             let payload: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(payload["status"], status);
             assert_eq!(payload["code"], code);
             assert_eq!(payload["stage"], stage);
             let text = String::from_utf8(response.body).unwrap();
@@ -13897,7 +13970,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_cgi_http_errors_are_successful_process_transports() {
+    fn get_error_envelopes_survive_webman_as_successful_process_transports() {
         let unauthorized = CgiResponse::staged_error(
             CgiFailureStage::Authentication,
             BridgeError::new(ErrorKind::Unauthorized),
@@ -13905,6 +13978,39 @@ mod tests {
         let unavailable = CgiResponse::service_unavailable();
         assert_eq!(unauthorized.status, 401);
         assert_eq!(unavailable.status, 503);
+
+        let get_unauthorized = unauthorized.for_cgi_transport(true);
+        let get_unavailable = unavailable.for_cgi_transport(true);
+        for (response, application_status, stage) in [
+            (get_unauthorized, 401, "dsm_authentication"),
+            (get_unavailable, 503, "bridge_connect"),
+        ] {
+            assert_eq!(response.status, 200);
+            let payload: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(payload["schema"], "sdsync.dsm-error.v1");
+            assert_eq!(payload["ok"], false);
+            assert_eq!(payload["status"], application_status);
+            assert_eq!(payload["stage"], stage);
+        }
+
+        let post_unavailable = CgiResponse::service_unavailable().for_cgi_transport(false);
+        assert_eq!(post_unavailable.status, 503);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&post_unavailable.body).unwrap()["status"],
+            503
+        );
+        let expired_read = queued_expired_response("aabbcc").unwrap();
+        assert_eq!(expired_read.status, 410);
+        assert_eq!(expired_read.for_cgi_transport(true).status, 410);
+
+        for body in [
+            br#"not-json"#.to_vec(),
+            br#"{"schema":"foreign.error.v1","ok":false,"status":503,"code":"unavailable","stage":"bridge_connect","message":"No."}"#.to_vec(),
+            br#"{"schema":"sdsync.dsm-error.v1","ok":false,"status":503,"code":"unavailable","stage":"bridge_connect","message":"No.","foreign":true}"#.to_vec(),
+        ] {
+            let untrusted = CgiResponse { status: 503, body }.for_cgi_transport(true);
+            assert_eq!(untrusted.status, 503);
+        }
         assert_eq!(cgi_exit_code(true), ExitCode::SUCCESS);
         assert_eq!(cgi_exit_code(false), ExitCode::FAILURE);
     }
