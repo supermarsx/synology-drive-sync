@@ -3701,13 +3701,28 @@ mod linux_socket {
     }
 
     fn connectable_socket_metadata(path: &Path, package_uid: u32) -> BridgeResult<fs::Metadata> {
-        match socket_metadata(path, package_uid) {
-            Ok(metadata) => Ok(metadata),
-            Err(error) if error.kind == ErrorKind::Unavailable => Err(error),
-            Err(error) => match prepared_socket_metadata(path, package_uid) {
-                Ok(_) => Err(BridgeError::new(ErrorKind::Unavailable)),
-                Err(_) => Err(error),
-            },
+        let metadata = fs::symlink_metadata(path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                BridgeError::new(ErrorKind::Unavailable)
+            } else {
+                BridgeError::unsafe_runtime()
+            }
+        })?;
+        if package_uid == 0
+            || !metadata.file_type().is_socket()
+            || metadata.st_uid() != package_uid
+            || metadata.st_nlink() != 1
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        // Classify the lifecycle state from one metadata snapshot. Reading the
+        // active and prepared contracts separately lets a legitimate 0000 ->
+        // 0600 activation occur between the reads, falsely turning readiness
+        // into a terminal unsafe-runtime failure.
+        match metadata.st_mode() & 0o7777 {
+            0o600 => Ok(metadata),
+            0o000 => Err(BridgeError::new(ErrorKind::Unavailable)),
+            _ => Err(BridgeError::unsafe_runtime()),
         }
     }
 
