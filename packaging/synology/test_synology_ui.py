@@ -381,17 +381,48 @@ class DsmUiContractTests(unittest.TestCase):
             re.findall(r'["\']([^"\']*api\.cgi)["\']', api),
             ["/webman/3rdparty/synology-drive-sync/api.cgi"],
         )
-        self.assertEqual(api.count('credentials: "same-origin"'), 2)
+        self.assertEqual(api.count('credentials: "same-origin"'), 3)
         self.assertEqual(api.count('"X-SDSYNC-Request"'), 1)
-        self.assertIn("function authenticatedHeaders(headers)", api)
+        self.assertEqual(api.count('"X-SYNO-TOKEN"'), 1)
+        self.assertIn("function authenticatedHeaders(headers, dsmAuth)", api)
+        self.assertIn(
+            "const effectiveCsrfToken = await csrfForCurrentAuthGeneration("
+            "auth, csrfToken, requestDsmAuth);",
+            api,
+        )
+        post_source = api[api.index("export async function apiPost(") :]
+        self.assertEqual(post_source.count("fetch(API_URL, {"), 1)
+        self.assertEqual(post_source.count("apiPost("), 1)
+        self.assertLess(
+            post_source.index("const requestDsmAuth = dsmAuthSnapshot();"),
+            post_source.index("const effectiveCsrfToken = await csrfForCurrentAuthGeneration"),
+        )
+        self.assertLess(
+            post_source.index("const effectiveCsrfToken = await csrfForCurrentAuthGeneration"),
+            post_source.index("response = await fetch(API_URL, {"),
+        )
+        self.assertIn(
+            'apiGetWithDsmAuth(auth, "result", { job_id: jobId }, dsmAuth)',
+            api,
+        )
+        self.assertIn(
+            'export const DSM_TOKEN_URL = '
+            '"/webapi/entry.cgi?api=SYNO.API.Auth&version=6&method=token";',
+            api,
+        )
         self.assertIn('auth: { signal: undefined }', app)
-        for source in (api, app):
-            for forbidden in (
-                "login.cgi", "consumeLaunchToken", "window.location", "window.history",
-                "history.replaceState", "X-SYNO-TOKEN", "SynoToken", "synotoken",
-                "launch token", "hashchange",
-            ):
-                self.assertNotIn(forbidden, source)
+        for forbidden in (
+            "login.cgi", "consumeLaunchToken", "window.location", "window.history",
+            "history.replaceState", "launch token", "hashchange", "localStorage",
+            "sessionStorage", "indexedDB", "document.cookie", "console.",
+        ):
+            self.assertNotIn(forbidden, api)
+        for forbidden in (
+            "login.cgi", "consumeLaunchToken", "window.location", "window.history",
+            "history.replaceState", "X-SYNO-TOKEN", "SynoToken", "synotoken",
+            "launch token", "hashchange",
+        ):
+            self.assertNotIn(forbidden, app)
 
     def test_native_api_authentication_and_headers_behave_in_appwindow_context(self) -> None:
         node = shutil.which("node")
@@ -406,10 +437,32 @@ class DsmUiContractTests(unittest.TestCase):
                 'const assert = require("node:assert/strict");',
                 executable_source,
                 r'''
+const tokenRequests = [];
 const requests = [];
+const dsmTokenRaw = "native-token+/= current?";
+const dsmToken = encodeURIComponent(dsmTokenRaw);
 global.window = {
+  AbortController: AbortController,
+  TextEncoder: TextEncoder,
   crypto: {
     getRandomValues: function (values) { values.fill(1); return values; }
+  },
+  fetch: async function (url, options) {
+    tokenRequests.push({ url: url, options: options });
+    const body = JSON.stringify({ success: true, data: { synotoken: dsmTokenRaw } });
+    return {
+      redirected: false,
+      ok: true,
+      status: 200,
+      headers: {
+        get: function (name) {
+          if (name.toLowerCase() === "content-type") return "application/json; charset=utf-8";
+          if (name.toLowerCase() === "content-length") return String(new TextEncoder().encode(body).byteLength);
+          return null;
+        }
+      },
+      text: async function () { return body; }
+    };
   },
   setTimeout: setTimeout,
   clearTimeout: clearTimeout
@@ -449,6 +502,13 @@ global.fetch = async function (url, options) {
   await apiPost(adversarialFields, "csrf-token", "set-default", { name: "profile" }, false);
   const postAdversarial = requests[requests.length - 1];
 
+  assert.equal(tokenRequests.length, 1);
+  assert.equal(tokenRequests[0].url, DSM_TOKEN_URL);
+  assert.equal(tokenRequests[0].options.method, "GET");
+  assert.equal(tokenRequests[0].options.credentials, "same-origin");
+  assert.equal(tokenRequests[0].options.cache, "no-store");
+  assert.equal(tokenRequests[0].options.redirect, "error");
+  assert.equal("body" in tokenRequests[0].options, false);
   assert.equal(
     getCookieOnly.url,
     "/webman/3rdparty/synology-drive-sync/api.cgi?action=snapshot"
@@ -459,7 +519,8 @@ global.fetch = async function (url, options) {
     assert.equal(request.options.credentials, "same-origin");
     assert.deepEqual(request.options.headers, {
       Accept: "application/json",
-      "X-SDSYNC-Request": "1"
+      "X-SDSYNC-Request": "1",
+      "X-SYNO-TOKEN": dsmToken
     });
   }
   assert.equal(getAdversarial.options.signal, signalMarker);
@@ -471,10 +532,17 @@ global.fetch = async function (url, options) {
       "Content-Type": "application/json",
       Accept: "application/json",
       "X-SDSYNC-CSRF": "csrf-token",
-      "X-SDSYNC-Request": "1"
+      "X-SDSYNC-Request": "1",
+      "X-SYNO-TOKEN": dsmToken
     });
   }
   assert.equal(postAdversarial.options.signal, signalMarker);
+  for (const request of requests) {
+    assert.equal(request.url.includes(dsmTokenRaw), false);
+    assert.equal(request.url.includes(dsmToken), false);
+    assert.equal(String(request.options.body || "").includes(dsmTokenRaw), false);
+    assert.equal(String(request.options.body || "").includes(dsmToken), false);
+  }
 
   const cancellation = new AbortController();
   const pendingDelay = delay(60000, cancellation.signal);
@@ -1288,11 +1356,26 @@ function bind(context, names) {
                     b"headers: authenticatedHeaders(", b"headers: (", 1
                 )
             )
-        with self.assertRaisesRegex(validate_spk.ValidationError, "launch-token authentication"):
+        with self.assertRaisesRegex(validate_spk.ValidationError, "effectiveCsrfToken"):
             validate_build(
                 api=source["api"].replace(
-                    b"function authenticatedHeaders(headers)",
-                    b"function authenticatedHeaders(auth, headers)",
+                    b'"X-SDSYNC-CSRF": effectiveCsrfToken',
+                    b'"X-SDSYNC-CSRF": csrfToken',
+                    1,
+                )
+            )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "exactly one package dispatch"):
+            validate_build(
+                api=source["api"] + b"\nfetch(API_URL, {});\n"
+            )
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError,
+            "pinned module-owned authentication snapshot",
+        ):
+            validate_build(
+                api=source["api"].replace(
+                    b"function authenticatedHeaders(headers, dsmAuth)",
+                    b"function authenticatedHeaders(auth, headers, dsmAuth)",
                     1,
                 )
             )
@@ -1300,13 +1383,26 @@ function bind(context, names) {
             ("token parser", b"\nfunction consumeLaunchToken() {}\n"),
             ("shell location", b"\nwindow.location.href;\n"),
             ("shell history", b"\nwindow.history.replaceState(null, '', '/');\n"),
-            ("Synology token header", b'\nheaders["X-SYNO-TOKEN"] = "value";\n'),
-            ("Synology token parameter", b'\nconst tokenName = "SynoToken";\n'),
+            ("persistent token storage", b'\nlocalStorage.setItem("dsm-auth", "value");\n'),
         ):
             with self.subTest(name=name), self.assertRaisesRegex(
-                validate_spk.ValidationError, "cookie-only AppWindow authentication"
+                validate_spk.ValidationError, "launch state or persistent storage"
             ):
                 validate_build(api=source["api"] + marker)
+        with self.assertRaisesRegex(validate_spk.ValidationError, "bounded in-memory DSM token"):
+            validate_build(
+                api=source["api"] + b'\nheaders["X-SYNO-TOKEN"] = "value";\n'
+            )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "must not log or place the token"):
+            validate_build(api=source["api"] + b'\nconst unsafe = "?SynoToken=value";\n')
+        with self.assertRaisesRegex(validate_spk.ValidationError, "reviewed DSM token bootstrap path"):
+            validate_build(
+                api=source["api"].replace(
+                    b"method=token",
+                    b"method=login",
+                    1,
+                )
+            )
         with self.assertRaisesRegex(validate_spk.ValidationError, "external network endpoint"):
             validate_build(api=source["api"] + b'\nfetch("https://evil.invalid/");\n')
         with self.assertRaisesRegex(validate_spk.ValidationError, "AppWindow cancellation"):

@@ -22,12 +22,16 @@ user home or shared-folder root and its permissions first; the sync creates a mi
 subdirectory and all descendants beneath an existing writable parent. The SPK requests no root,
 Linux capability, joined web group, or identity-changing file mode. Under `defaults.run-as=package`,
 services run as the non-root package UID, and the ordinary package-owned `0755` CGI fails closed
-unless Webman uses that same real/effective UID. The CGI first validates DSM's fixed root-owned
-`authenticate.cgi`; it executes that helper when the kernel permits the package UID to do so. When
-the validated helper is instead kernel-inaccessible, as with DSM's observed `root:system 0750`
-layout, the CGI uses a bounded loopback-only DSM user-service request carrying the current cookie and
-requires both a valid session user and DSM's administrator flag. It then independently resolves the
-account and administrator membership before relaying over a fixed package-owned Unix socket that is
+unless Webman uses that same real/effective UID. The AppWindow obtains Synology's official
+`SYNO.API.Auth` version 6 `method=token` value by same-origin request, encodes it exactly once into
+module memory, and sends it only as `X-SYNO-TOKEN` to the package CGI; it never transports the token
+through a launch URL, history, request body, persistent storage, or logs. The CGI probes `X_OK` on
+DSM's exact fixed `authenticate.cgi` before inspecting helper metadata. A successful probe undergoes
+full trusted-path validation and pre-execution revalidation. `EACCES` skips that validator and selects
+the bounded loopback-only DSM user-service request carrying the current cookie and token as headers;
+all other probe errors fail closed. The loopback response requires both a valid session user and
+DSM's administrator flag. It then independently resolves the account and administrator membership
+before relaying over a fixed package-owned Unix socket that is
 `0000` until startup commit and `0600` afterward. The package requests no root or DSM group/resource
 privilege for either path. See the
 [Synology DSM package and dashboard guide](docs/synology-package.md).

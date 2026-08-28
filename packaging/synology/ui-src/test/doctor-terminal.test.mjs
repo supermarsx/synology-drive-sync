@@ -241,7 +241,13 @@ test("AppWindow overlays, focus behavior, labels, secrets, and mutation guards r
 });
 
 test("polling has no client deadline and toolkit make always rebuilds source", () => {
-  assert.doesNotMatch(apiSource, /consumeLaunchToken|X-SYNO-TOKEN|SynoToken|launch token|window\.location|window\.history/i);
+  assert.match(apiSource, /\/webapi\/entry\.cgi\?api=SYNO\.API\.Auth&version=6&method=token/);
+  assert.match(apiSource, /authenticated\["X-SYNO-TOKEN"\] = dsmAuth\.token/);
+  assert.match(apiSource, /apiGetWithDsmAuth\(auth, "result", \{ job_id: jobId \}, dsmAuth\)/);
+  assert.doesNotMatch(
+    apiSource,
+    /consumeLaunchToken|launch token|window\.location|window\.history|history\.replaceState|localStorage|sessionStorage|document\.cookie/i
+  );
   assert.match(apiSource, /credentials: "same-origin"/);
   assert.match(apiSource, /"X-SDSYNC-Request": "1"/);
   assert.doesNotMatch(apiSource, /RESULT_POLL_ATTEMPTS|within two minutes/);

@@ -30,12 +30,15 @@ If Package Center's **Open** action shows DSM's “page not found” response, u
 instead of hand-creating a link or changing ownership.
 
 > [!NOTE]
-> The native AppWindow authenticates through the current DSM session cookie, which the browser sends
-> only to the same-origin packaged CGI. Server-side authentication uses the validated direct DSM
-> helper when executable or the bounded loopback user-service path when that trusted helper is
-> kernel-inaccessible. The UI does not inspect or rewrite the DSM shell location and does not derive
-> or forward a `SynoToken`. Package mutation still requires the independently issued package CSRF
-> token.
+> The native AppWindow first uses the official same-origin
+> `GET /webapi/entry.cgi?api=SYNO.API.Auth&version=6&method=token` bootstrap. It encodes a valid
+> returned token exactly once, keeps it only in module memory, and sends it only as `X-SYNO-TOKEN`
+> to the packaged CGI; the browser separately sends the DSM cookie through same-origin credentials.
+> It never reads a token from or writes one to the launch URL, history, request body, persistent
+> storage, or logs. Server-side authentication probes `X_OK` on the fixed DSM helper before metadata
+> validation: an executable entry is fully validated/revalidated before direct execution, while
+> `EACCES` skips the validator and selects the bounded loopback user-service path. Package mutation
+> still requires the independently issued package CSRF token.
 
 ## Connection and read-only states
 
@@ -43,8 +46,9 @@ The footer distinguishes these states:
 
 - **Authenticated control service** means the ordinary package-owned CGI passed its fail-closed
   exact non-root package-UID identity check and reached the package-user API service over its fixed private socket; the
-  current session passed authentication, administrator membership, optional-token validation when
-  applicable, and CSRF bootstrap checks; and the snapshot explicitly grants mutation capabilities.
+  current session passed authentication, administrator membership, SynoToken validation when the
+  bootstrap supplied one, and CSRF bootstrap checks; and the snapshot explicitly grants mutation
+  capabilities.
 - **Package status · read-only** means a snapshot was available but one or more mutation
   capabilities were not granted. Buttons that could change package state remain disabled.
 - **Status unavailable** means snapshot refresh failed. Existing values may be stale; the interface

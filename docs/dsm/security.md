@@ -62,34 +62,65 @@ validator enforces the exact package-only manifest above, rejects any archive
 set-user-ID/set-group-ID member or privilege-bearing tool/capability/joined-group declaration, and
 rejects mode, ownership, identity, or byte mismatches between the two helper copies.
 
-## DSM cookie authentication and the native shell boundary
+## DSM cookie and SynoToken authentication at the native shell boundary
 
-The DSM session cookie is the authoritative browser authentication input. JavaScript never reads
-that cookie; `credentials: "same-origin"` lets the browser attach it to the packaged `api.cgi`
-request. The DSM-launched CGI validates the fixed `authenticate.cgi` path first. If the kernel says
-that the package UID can execute the validated root-owned helper, direct `authenticate.cgi`
-execution is the primary path. The CGI accepts one bounded safe non-root identity and independently
-requires administrator membership before relay.
+The DSM session cookie remains the authoritative browser session credential. JavaScript never reads
+that cookie. Before its first package API request, the AppWindow makes the official same-origin
+`GET /webapi/entry.cgi?api=SYNO.API.Auth&version=6&method=token` request with
+`credentials: "same-origin"`, `cache: "no-store"`, redirect rejection, JSON-only bounded response
+handling, and no request body. It accepts only `success=true` with a bounded nonempty
+`data.synotoken`, URL-component-encodes that raw value exactly once, shares one in-flight bootstrap,
+and caches only the normalized value in JavaScript module memory for the current AppWindow. A reload
+creates a new module and reacquires the token. Package requests carry it only as the
+`X-SYNO-TOKEN` header alongside `X-SDSYNC-Request: 1`; the browser independently attaches the DSM
+cookie through same-origin credentials.
 
-The fixed DSM helper entry may be a symlink. Before execution, the CGI resolves it without following
-an unchecked path: every absolute ancestor directory must be root-owned and not group/world
-writable, every lexical symlink boundary must be root-owned and stable across inspection, relative
-targets may not escape the validation root, and loops are rejected. The final canonical target must
-be a root-owned, executable regular file that is not group/world writable. Its device and inode are
-revalidated immediately before the CGI executes that canonical target. Symlink mode `0777` is not
-itself treated as target writability because the validated parent directory is the link-mutation
-boundary. This validation grants no privilege and does not change the package UID. An unsafe helper,
-symlink, ancestor, or revalidation failure always fails closed.
+The native AppWindow never reads SynoToken from or writes it to a browser-visible launch URL,
+`window.location`, history, Referer, bookmark, package action URL/query string, package request body,
+`localStorage`, `sessionStorage`, IndexedDB, Activity, logs, notifications, queue results, or support
+diagnostics.
+Direct `authenticate.cgi` execution is the sole query-string transport: its child process receives a
+process-local, token-only `QUERY_STRING` containing `SynoToken=<exactly-once-encoded-value>` and no
+package action. The fixed token-bootstrap URL contains no token, and the package action URL and body
+contain no token. A failed or invalid bounded bootstrap leaves the package header absent for the
+retry cooldown; it never activates launch-URL, browser-global, storage, or client-side login fallback
+behavior.
 
-If and only if that full path validation succeeds but the kernel returns `EACCES` for an execute
-probe—as occurs with the supplied DSM capture's root-owned `root:system 0750` canonical helper—the
-CGI does not attempt execution. It issues one bounded HTTP/1 request to literal
-`127.0.0.1:$SERVER_PORT/webapi/entry.cgi` using the current request's `HTTPS` state. The only query
-fields are `api=SYNO.Core.Desktop.Initdata`, `version=1`, and `method=get_user_service`. Proxy use and
-redirects are disabled, `SERVER_NAME` and remote addresses are not destination inputs, connect and
-request time are bounded, and at most 1 MiB of response is accepted. The DSM cookie is a sensitive
-header; an optional compatibility token, when already present, is a sensitive `X-SYNO-TOKEN`
-header. There is no cookie or token URL.
+The DSM-launched CGI first asks the kernel whether its exact fixed
+`/usr/syno/synoman/webman/modules/authenticate.cgi` entry is executable by the package UID. This
+`X_OK` probe occurs before helper metadata, ancestor, or symlink validation. If the probe succeeds,
+and only then, the CGI performs the full trusted-path validation described below. If the probe
+returns `EACCES`, it skips that validator and selects the bounded loopback user-service branch. Every
+other probe error fails closed as `dsm_authentication_helper_unavailable`; it does not select
+loopback.
+
+For an executable helper entry, the CGI resolves it without following an unchecked path: every
+absolute ancestor directory must be root-owned and not group/world writable, every lexical symlink
+boundary must be root-owned and stable across inspection, relative targets may not escape the
+validation root, and loops are rejected. The final canonical target must be a root-owned, executable
+regular file that is not group/world writable. Its device and inode are revalidated immediately
+before direct execution. Symlink mode `0777` is not itself treated as target writability because the
+validated parent directory is the link-mutation boundary. This validation grants no privilege and
+does not change the package UID. An unsafe helper, symlink, ancestor, or revalidation failure always
+fails closed.
+
+Direct execution clears the inherited environment, forces `REQUEST_METHOD=GET`, and replaces the
+package action query with either an empty query or the percent-encoded `SynoToken` field only. The
+bounded allowlist retains the cookie, optional `X-SYNO-TOKEN`, address/server fields, and native DSM
+CGI context including `GATEWAY_INTERFACE`, `HTTP_HOST`, `REMOTE_PORT`, `REQUEST_SCHEME`,
+`SERVER_PROTOCOL`, `SCRIPT_NAME`, `SCRIPT_FILENAME`, `DOCUMENT_ROOT`, `SCGI`, and `SOCKET` when
+present. Loader variables, package request/CSRF headers, transfer/content metadata, and the original
+package action query are never inherited. The CGI accepts one bounded safe non-root identity and
+independently requires administrator membership before relay.
+
+When the initial fixed-path `X_OK` probe returns `EACCES`—as on a protected `root:system 0750`
+layout—the CGI does not validate or attempt to execute the inaccessible helper. It issues one bounded
+HTTP/1 request to literal `127.0.0.1:$SERVER_PORT/webapi/entry.cgi` using the current request's
+`HTTPS` state. The only query fields are `api=SYNO.Core.Desktop.Initdata`, `version=1`, and
+`method=get_user_service`. Proxy use and redirects are disabled, `SERVER_NAME` and remote addresses
+are not destination inputs, connect and request time are bounded, and at most 1 MiB of response is
+accepted. The DSM cookie and optional normalized token are sensitive headers; the token is sent as
+`X-SYNO-TOKEN`. There is no cookie or token URL.
 
 The loopback response must be HTTP 200 and valid JSON with `success=true`, a valid string
 `data.Session.user`, and Boolean `data.Session.is_admin=true`. Missing, malformed, oversized,
@@ -104,18 +135,20 @@ independently resolves the relayed username, checks exact UID/name and administr
 recomputes the cookie/token session binding before authorizing any action.
 
 The native AppWindow has no standalone HTML launch document and receives no package-owned launch
-URL. It does not inspect or rewrite `window.location`, does not try to extract a token from the DSM
-shell location, and sends no `X-SYNO-TOKEN` header. Cookie authentication is therefore the active
-native browser path. DSM owns the containing shell document and its document-level policies.
+URL. It does not inspect or rewrite `window.location` and does not depend on DSM browser globals. DSM
+owns the containing shell document and its document-level policies.
 
-Synology's DSM 7 [application authentication guide](https://help.synology.com/developer-guide/integrate_dsm/web_authentication.html)
-documents cookie validation through `authenticate.cgi`; it does not publicly promise the
-`SYNO.Core.Desktop.Initdata` user-service response as a package API or document a DSM 7 JavaScript API
-for retrieving a launch token. The fallback contract is therefore DSM runtime behavior observed in
-the supplied physical capture, not a public compatibility promise. It remains server-side,
-loopback-pinned, and fail-closed; the UI does not call a login endpoint or depend on DSM browser
-globals. Physical-NAS acceptance must prove Webman's package-owner CGI identity and whichever branch
-the installed helper permissions select. The authenticated identity transport
+Synology's official DSM 7 [application authentication guide](https://help.synology.com/developer-guide/integrate_dsm/web_authentication.html)
+documents direct `authenticate.cgi` use by a custom CGI and the native request environment it needs.
+The official [DSM Login Web API Guide](https://global.download.synology.com/download/Document/Software/DeveloperGuide/Os/DSM/All/enu/DSM_Login_Web_API_Guide_enu.pdf)
+documents `SYNO.API.Auth` version 6 `method=token`, keeping the returned SynoToken in a JavaScript
+variable, and querying it again after a reload. Neither guide publishes
+`SYNO.Core.Desktop.Initdata/get_user_service` as a package API. Its typed response shape is
+corroborated by saved first-party DSM runtime sources, not by the supplied HTTP capture, and remains
+private/unpublished behavior. The fallback is therefore still a physical-NAS acceptance requirement
+on every supported DSM branch. It remains server-side, loopback-pinned, header-only for credentials,
+and fail-closed. Physical-NAS acceptance must also prove Webman's package-owner CGI identity and the
+official token bootstrap/direct-helper behavior. The authenticated identity transport
 accepts exact valid UTF-8 names from 1 through
 256 bytes, including spaces, `DOMAIN\\Username`, and `Username@LDAP_FQDN`; control, bidi-format, and
 activity-delimiter characters are rejected. The static package binary cannot directly load
@@ -125,35 +158,39 @@ name-collision cases—remain a required physical-DSM acceptance matrix.
 
 ## Authentication and authorization sequence
 
-Every API request goes through these checks:
+Every native AppWindow API request goes through these checks:
 
-1. CGI environment values, query, cookie, content length, content type, method, and headers are
+1. The AppWindow performs or joins the bounded official same-origin `SYNO.API.Auth` version 6
+   `method=token` bootstrap, retains an exactly-once-encoded valid token only in module memory, and
+   puts it only in the package request's `X-SYNO-TOKEN` header when available.
+2. CGI environment values, query, cookie, content length, content type, method, and headers are
    copied into bounded Rust-owned buffers.
-2. The CGI verifies that it is a regular package-owned file with exact mode `0755`, that both its
+3. The CGI verifies that it is a regular package-owned file with exact mode `0755`, that both its
    real and effective UID equal the executable owner's exact package UID, and that UID is not root.
-3. The CGI validates DSM's fixed root-owned `authenticate.cgi` path, canonical target, ancestors,
-   ownership, writability, type, and stable identity.
-4. When the kernel permits execution, the CGI invokes that helper with a bounded allowlisted
-   environment derived from the native request. Only when the trusted-helper execute probe receives
-   kernel `EACCES` does it instead call the fixed bounded loopback user service with the request
-   cookie. That fallback requires `Session.user` and `is_admin=true`; it uses no proxy, redirect,
-   remote host, or token URL.
-5. The CGI validates one safe returned identity, rejects root, independently resolves its numeric NSS
+4. The CGI probes `X_OK` on DSM's exact fixed `authenticate.cgi` entry before inspecting helper
+   metadata. `EACCES` selects loopback without calling the validator; any other probe error fails
+   closed.
+5. Only after `X_OK` succeeds does the CGI validate the canonical target, ancestors, ownership,
+   writability, type, and stable identity, then revalidate immediately before direct execution.
+6. The direct helper receives the bounded native CGI allowlist, forced GET, token-only query, cookie,
+   and optional `X-SYNO-TOKEN`. The `EACCES` branch instead calls the fixed bounded loopback user
+   service with credentials in headers only. That fallback requires `Session.user` and
+   `is_admin=true`; it uses no proxy, redirect, remote host, or token URL.
+7. The CGI validates one safe returned identity, rejects root, independently resolves its numeric NSS
    UID, and requires DSM `administrators` membership regardless of the selected branch.
-6. It clears its environment and sends one length-bounded frame containing that exact authenticated
+8. It clears its environment and sends one length-bounded frame containing that exact authenticated
    username, numeric UID, and session binding to the fixed package-owned `0600` socket after
    validating the socket, inode, and server peer identity. The pre-commit `0000` state is never
    connectable.
-7. The package-user server validates the CGI peer UID, decodes one strict relay schema, and repeats
-   method, query, header, body, cookie, request marker, and optional compatibility-token validation.
-   The native UI leaves that optional field absent.
-8. Without executing `authenticate.cgi` or calling the user service again, the server independently
+9. The package-user server validates the CGI peer UID, decodes one strict relay schema, and repeats
+   method, query, header, body, cookie, request marker, and optional SynoToken validation.
+10. Without executing `authenticate.cgi` or calling the user service again, the server independently
    resolves the asserted username through DSM's account database. Its numeric UID must exactly match
    the CGI assertion, and the server recomputes the cookie/token session binding from the strict
    relay fields.
-9. Root is rejected, and independent membership in the DSM `administrators` group is required even
+11. Root is rejected, and independent membership in the DSM `administrators` group is required even
    though the desktop app is also registered with `allUsers: false`.
-10. The server reads package-private state or queues a mutation only after authentication,
+12. The server reads package-private state or queues a mutation only after authentication,
    authorization, and—on POST—independent package CSRF verification succeed.
 
 UI registration and socket access are not authorization. The server repeats the HTTP validation and
@@ -166,14 +203,16 @@ DSM cookie authentication is necessary but not sufficient for POST. An authentic
 
 - authenticated username and UID;
 - current DSM cookie;
-- any optional compatibility token supplied directly to the API parser (absent for the native UI);
+- the normalized SynoToken supplied in `X-SYNO-TOKEN` when the official bootstrap succeeded;
 - issue and expiry times; and
 - a random nonce.
 
 The signing key is a package-owned private file. Mutation POSTs require the token in
 `X-SDSYNC-CSRF`; expired, malformed, replayed in another session, or incorrectly signed values are
 rejected with the stable pre-acceptance code `csrf_rejected`. The UI holds it only in memory and
-never automatically retries an outcome-uncertain POST.
+never automatically retries an outcome-uncertain POST. If a bounded token-bootstrap retry changes
+the AppWindow's DSM authentication generation, the client first reissues CSRF under that exact
+generation, replaces its module-memory token, and only then dispatches the first POST once.
 
 ## Exact HTTP surface
 
@@ -187,9 +226,9 @@ Allowed authenticated GET actions are:
 | `activity` | `lines=1..1000` |
 | `result` | one 48-character lowercase hexadecimal server job ID |
 
-The server parser retains a bounded optional token field for compatibility and rejects a malformed or
-mismatched supplied value rather than silently downgrading it. The native AppWindow never populates
-that field. GET rejects a request body, content type, CSRF header,
+The API parser accepts a bounded token from `X-SYNO-TOKEN` or the legacy `SynoToken` query field and
+requires exact agreement if both are present. The native AppWindow uses only the header and never puts
+the token in its package URL/query. GET rejects a request body, content type, CSRF header,
 duplicate/unknown query key, invalid transfer encoding, or unsupported action. Every browser API
 request also requires the fixed custom marker `X-SDSYNC-Request: 1`; the package emits no CORS
 permission that would let a foreign origin manufacture that header.
@@ -336,23 +375,27 @@ those keys on a particular DSM build; that remains live-NAS acceptance.
 
 The page uses a restrictive self-only Content Security Policy, no inline event handlers, no `eval`,
 no dynamic HTML injection, and no external fetch/WebSocket/EventSource URL. DOM output is assigned as
-text. Only the local CGI endpoint is reachable under `connect-src 'self'`; the Unix socket is never a
-browser endpoint.
+text. `connect-src 'self'` permits only same-origin DSM endpoints: the fixed official token-bootstrap
+endpoint and the local package CGI are the authentication/control destinations. The Unix socket is
+never a browser endpoint.
 
-Local storage contains only theme/refresh/open-session-notification preferences. Cookies remain DSM's
-responsibility and are sent with same-origin credentials.
+Local storage contains only theme/refresh/open-session-notification preferences. It never contains a
+DSM cookie, SynoToken, or package CSRF token. Cookies remain DSM's responsibility and are sent with
+same-origin credentials; SynoToken remains module-memory-only.
 
 ## Security acceptance limits
 
 Repository tests cover parsing, CGI/service identity predicates, Unix-socket ownership/mode and peer
-checks, direct CGI authentication under synthetic executable-helper permissions, the
-kernel-inaccessible `root:system 0750` loopback fallback, response bounds and malformed identities,
-daemon non-execution of the helper/user service, GET semantic error transport, admin membership,
-CSRF binding, schema rejection, queue
+checks, the official token bootstrap's bounded same-origin/memory-only/header-only contract, direct
+CGI authentication under synthetic executable-helper permissions, `X_OK`-before-validation ordering,
+the kernel-inaccessible `root:system 0750` loopback fallback, response bounds and malformed
+identities, daemon non-execution of the helper/user service, GET semantic error transport, admin
+membership, CSRF binding, schema rejection, queue
 paths/modes/order, redaction, response bounds, native bundle/style isolation, direct fixed notifier
 arguments, and SPK privilege/resource layout. They do not prove DSM's physical executable-owner CGI
-runtime behavior, direct protected-helper execution on a DSM where it is permitted, the captured
-loopback user-service behavior on every DSM branch,
+runtime behavior, the official token response and header forwarding in a native physical AppWindow,
+direct protected-helper execution on a DSM where it is permitted, the private loopback user-service
+behavior on every DSM branch,
 package-identity execution of `synodsmnotify`, DSM forwarding of `X-SDSYNC-Request: 1` as
 `HTTP_X_SDSYNC_REQUEST=1`, or reverse-proxy/origin behavior of a physical DSM release. Validate those
 on every supported DSM branch before calling the dashboard production-ready.

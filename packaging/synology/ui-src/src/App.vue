@@ -816,7 +816,12 @@ export default {
   async mounted() {
     this.controlLayoutCleanup = installControlLayout(this.$el);
     this.abortController = typeof window.AbortController === "function" ? new window.AbortController() : null;
-    this.auth = { signal: this.abortController ? this.abortController.signal : undefined };
+    this.auth = {
+      signal: this.abortController ? this.abortController.signal : undefined,
+      onCsrfReissued: (previousToken, replacementToken) => {
+        if (!this.disposed && this.csrfToken === previousToken) this.csrfToken = replacementToken;
+      }
+    };
     this.mediaQuery = window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
     this.systemLight = Boolean(this.mediaQuery && this.mediaQuery.matches);
     this.mediaHandler = (event) => { this.systemLight = event.matches; };

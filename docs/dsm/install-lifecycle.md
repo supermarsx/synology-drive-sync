@@ -59,22 +59,26 @@ uninstall permanently purges package-private operational state and requires conf
 
 Use the DSM desktop application menu or Package Center's **Open** action. The application is
 registered for administrators only. A healthy open sequence requires the DSM session cookie,
-administrator membership, and a package CSRF token for mutation. The ordinary package-owned `0755`
-CGI fails closed unless Webman starts it with the exact non-root package UID. It resolves DSM's fixed
-`authenticate.cgi` through a fully root-owned, non-group/world-writable ancestor and symlink chain
-and revalidates the final canonical executable identity. When the kernel permits execution, that
-direct helper is the primary path. When the trusted helper is kernel-inaccessible—as with the
-observed `root:system 0750` layout—the CGI uses a bounded loopback-only DSM user-service request with
-the current cookie and requires valid `Session.user` plus exact `is_admin=true`. It independently
+the official same-origin `SYNO.API.Auth` version 6 `method=token` bootstrap, administrator
+membership, and a package CSRF token for mutation. The AppWindow exactly-once-encodes a valid token,
+keeps it only in module memory, and sends it only as the package `X-SYNO-TOKEN` header. The ordinary
+package-owned `0755` CGI fails closed unless Webman starts it with the exact non-root package UID. It
+first probes `X_OK` on DSM's fixed `authenticate.cgi`, before path or metadata validation. When that
+probe succeeds, it resolves the helper through a fully root-owned, non-group/world-writable ancestor
+and symlink chain, validates the canonical executable, and revalidates its identity immediately
+before direct execution. When the probe returns `EACCES`—as with a protected `root:system 0750`
+layout—the CGI skips the validator and uses a bounded loopback-only DSM user-service request with the
+current cookie and optional token as headers. Every other probe error fails closed. The fallback
+requires valid `Session.user` plus exact `is_admin=true`. It independently
 resolves the resulting NSS identity and administrator membership without changing the CGI identity,
 package privileges, or DSM helper metadata. It then
 relays a bounded assertion and request through the fixed package-owned Unix socket, which remains
 `0000` before startup commit and activates on the same inode as `0600`. The package-user service
 never executes that root-owned helper; it verifies the package-UID peer, strict relay/request,
 independently resolved UID/name/administrator membership, recomputed session binding, policy, and
-package CSRF. The native AppWindow does not parse or rewrite the DSM shell location and does not
-send a `SynoToken`; cookie authentication is the active native path. Never copy a DSM cookie or
-package CSRF token into a URL, bookmark, browser storage, or support transcript.
+package CSRF. The native AppWindow does not parse or rewrite the DSM shell location and never places
+SynoToken in a launch URL, history, request body, persistent storage, or logs. Never copy a DSM
+cookie, SynoToken, or package CSRF token into a URL, bookmark, browser storage, or support transcript.
 
 ## Grant read-only access to each local source
 
@@ -205,8 +209,10 @@ Record the model, DSM build, `uname -m`, exact SPK filename/version, checksum, o
 the exact Package Center warning/result, bounded install/package logs, CGI/API-service/socket
 identities and modes, install/start/open result, package-user ACL test, and first non-writing
 Doctor/Plan. Explicitly prove Webman's package-owner CGI identity and record which DSM authentication
-branch is selected: direct protected-helper execution when executable, or successful bounded
-loopback user-service authentication when the validated `root:system 0750` helper is denied by the
-kernel. Repository tests do not prove either physical DSM behavior. Do not
+branch is selected: full validation/revalidation and direct protected-helper execution after a
+successful `X_OK` probe, or successful bounded loopback user-service authentication when that probe
+returns `EACCES` without invoking the path validator. Also record the official token bootstrap and
+`X-SYNO-TOKEN` header forwarding without recording the token itself. Repository tests do not prove
+those physical DSM behaviors. Do not
 describe the installation as production-ready until the complete
 [live-NAS acceptance](troubleshooting.md#live-nas-acceptance) passes.

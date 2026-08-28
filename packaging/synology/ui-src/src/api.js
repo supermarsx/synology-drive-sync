@@ -1,4 +1,5 @@
 export const API_URL = "/webman/3rdparty/synology-drive-sync/api.cgi";
+export const DSM_TOKEN_URL = "/webapi/entry.cgi?api=SYNO.API.Auth&version=6&method=token";
 export const SNAPSHOT_SCHEMA = "sdsync.dsm-api.v1";
 export const REQUEST_SCHEMA = "sdsync.dsm-request.v1";
 export const QUEUED_SCHEMA = "sdsync.dsm-queued.v1";
@@ -6,10 +7,22 @@ export const RESULT_STATUS_SCHEMA = "sdsync.dsm-result-status.v1";
 export const RESULT_SCHEMA = "sdsync.dsm-result.v1";
 export const MAX_RESPONSE_BYTES = 1024 * 1024;
 
+const CSRF_SCHEMA = "sdsync.dsm-csrf.v1";
 const RESULT_POLL_INTERVAL_MS = 2000;
 const RESULT_POLL_OBSERVATION_FAILURES = 5;
+const MAX_DSM_TOKEN_RESPONSE_BYTES = 16 * 1024;
+const MAX_DSM_TOKEN_BYTES = 1024;
+const MAX_CSRF_TOKEN_BYTES = 4096;
+const DSM_TOKEN_BOOTSTRAP_TIMEOUT_MS = 5000;
+const DSM_TOKEN_RETRY_DELAY_MS = 30000;
 const CLIENT_REQUEST_ID_PATTERN = /^[0-9a-f]{32}$/;
 const JOB_ID_PATTERN = /^[0-9a-f]{48}$/;
+
+let cachedDsmToken = "";
+let dsmTokenBootstrapPromise = null;
+let dsmTokenRetryAfter = 0;
+let dsmAuthGeneration = 0;
+const csrfGenerationByAuth = new WeakMap();
 
 function validClientRequestId(value) {
   return typeof value === "string" && CLIENT_REQUEST_ID_PATTERN.test(value) ? value : "";
@@ -250,8 +263,124 @@ async function responseJson(response, allowGoneResult = false, preserveSemanticS
   return model;
 }
 
-function authenticatedHeaders(headers) {
-  return Object.assign({}, headers, { "X-SDSYNC-Request": "1" });
+function boundedUtf8Length(value) {
+  if (window.TextEncoder && typeof window.TextEncoder === "function") {
+    return new window.TextEncoder().encode(value).byteLength;
+  }
+  // A JavaScript UTF-16 code unit occupies at most three UTF-8 bytes for the
+  // JSON syntax and token alphabet accepted below. This conservative fallback
+  // can reject an unusual response early but can never relax the byte bound.
+  return value.length * 3;
+}
+
+function normalizeDsmToken(value) {
+  if (typeof value !== "string" || !value || boundedUtf8Length(value) > MAX_DSM_TOKEN_BYTES) {
+    return "";
+  }
+  try {
+    const encoded = encodeURIComponent(value);
+    return encoded.length <= MAX_DSM_TOKEN_BYTES && /^[\x21-\x7e]+$/.test(encoded)
+      ? encoded
+      : "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+async function bootstrapDsmToken() {
+  if (typeof window !== "object" || typeof window.fetch !== "function") return "";
+
+  const controller = typeof window.AbortController === "function"
+    ? new window.AbortController()
+    : null;
+  const timeout = controller && typeof window.setTimeout === "function"
+    ? window.setTimeout(() => controller.abort(), DSM_TOKEN_BOOTSTRAP_TIMEOUT_MS)
+    : null;
+  try {
+    const response = await window.fetch(DSM_TOKEN_URL, {
+      method: "GET",
+      credentials: "same-origin",
+      cache: "no-store",
+      redirect: "error",
+      signal: controller ? controller.signal : undefined,
+      headers: { Accept: "application/json" }
+    });
+    if (response.redirected || response.status !== 200 || !response.ok) return "";
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.toLowerCase().includes("application/json")) return "";
+    const declaredLength = response.headers.get("content-length");
+    if (declaredLength !== null) {
+      if (!/^[1-9][0-9]*$/.test(declaredLength)) return "";
+      const length = Number(declaredLength);
+      if (!Number.isSafeInteger(length) || length > MAX_DSM_TOKEN_RESPONSE_BYTES) return "";
+    }
+    const body = await response.text();
+    if (!body || boundedUtf8Length(body) > MAX_DSM_TOKEN_RESPONSE_BYTES) return "";
+    let model;
+    try {
+      model = JSON.parse(body);
+    } catch (_error) {
+      return "";
+    }
+    if (!model || typeof model !== "object" || Array.isArray(model) || model.success !== true) {
+      return "";
+    }
+    const data = model.data;
+    if (!data || typeof data !== "object" || Array.isArray(data)) return "";
+    return normalizeDsmToken(data.synotoken);
+  } catch (_error) {
+    return "";
+  } finally {
+    if (timeout !== null && typeof window.clearTimeout === "function") {
+      window.clearTimeout(timeout);
+    }
+  }
+}
+
+async function ensureDsmToken() {
+  if (cachedDsmToken) return cachedDsmToken;
+  if (dsmTokenBootstrapPromise) return dsmTokenBootstrapPromise;
+  if (Date.now() < dsmTokenRetryAfter) return "";
+
+  dsmTokenBootstrapPromise = bootstrapDsmToken()
+    .then((token) => {
+      if (token) {
+        if (token !== cachedDsmToken) {
+          cachedDsmToken = token;
+          dsmAuthGeneration += 1;
+        }
+      } else dsmTokenRetryAfter = Date.now() + DSM_TOKEN_RETRY_DELAY_MS;
+      return token;
+    })
+    .finally(() => { dsmTokenBootstrapPromise = null; });
+  return dsmTokenBootstrapPromise;
+}
+
+function dsmAuthSnapshot() {
+  return {
+    token: cachedDsmToken,
+    generation: dsmAuthGeneration
+  };
+}
+
+function authenticatedHeaders(headers, dsmAuth) {
+  const authenticated = Object.assign({}, headers, { "X-SDSYNC-Request": "1" });
+  if (dsmAuth.token) authenticated["X-SYNO-TOKEN"] = dsmAuth.token;
+  return authenticated;
+}
+
+function validCsrfModel(model) {
+  return model
+    && model.schema === CSRF_SCHEMA
+    && typeof model.csrf_token === "string"
+    && model.csrf_token.length > 0
+    && model.csrf_token.length <= MAX_CSRF_TOKEN_BYTES;
+}
+
+function rememberCsrfGeneration(auth, model, generation) {
+  if (auth && typeof auth === "object" && validCsrfModel(model)) {
+    csrfGenerationByAuth.set(auth, generation);
+  }
 }
 
 function exactKeys(actual, expected, label) {
@@ -268,18 +397,25 @@ function endpoint(action, parameters) {
   return `${API_URL}?${query.toString()}`;
 }
 
-export async function apiGet(auth, action, parameters = {}) {
-  if (!GET_ACTIONS.includes(action)) throw new Error("Unsupported API read action");
-  exactKeys(parameters, GET_ARGUMENT_KEYS[action], "Read");
+async function apiGetWithDsmAuth(auth, action, parameters, dsmAuth) {
   const response = await fetch(endpoint(action, parameters), {
     method: "GET",
     credentials: "same-origin",
     cache: "no-store",
     redirect: "error",
     signal: auth && auth.signal ? auth.signal : undefined,
-    headers: authenticatedHeaders({ Accept: "application/json" })
+    headers: authenticatedHeaders({ Accept: "application/json" }, dsmAuth)
   });
-  return responseJson(response, action === "result", true);
+  const model = await responseJson(response, action === "result", true);
+  if (action === "csrf") rememberCsrfGeneration(auth, model, dsmAuth.generation);
+  return model;
+}
+
+export async function apiGet(auth, action, parameters = {}) {
+  if (!GET_ACTIONS.includes(action)) throw new Error("Unsupported API read action");
+  exactKeys(parameters, GET_ARGUMENT_KEYS[action], "Read");
+  await ensureDsmToken();
+  return apiGetWithDsmAuth(auth, action, parameters, dsmAuthSnapshot());
 }
 
 function delay(milliseconds, signal) {
@@ -300,7 +436,13 @@ function delay(milliseconds, signal) {
   });
 }
 
-async function pollJobResult(auth, jobId, pollIntervalMs = RESULT_POLL_INTERVAL_MS, requestId = "") {
+async function pollJobResult(
+  auth,
+  jobId,
+  dsmAuth,
+  pollIntervalMs = RESULT_POLL_INTERVAL_MS,
+  requestId = ""
+) {
   if (!/^[0-9a-f]{48}$/.test(jobId)) {
     throw new Error("API returned an invalid queued job identifier");
   }
@@ -311,7 +453,7 @@ async function pollJobResult(auth, jobId, pollIntervalMs = RESULT_POLL_INTERVAL_
   for (;;) {
     let status;
     try {
-      status = await apiGet(auth, "result", { job_id: jobId });
+      status = await apiGetWithDsmAuth(auth, "result", { job_id: jobId }, dsmAuth);
     } catch (error) {
       if (auth && auth.signal && auth.signal.aborted) throw error;
       consecutiveObservationFailures += 1;
@@ -411,6 +553,23 @@ function dispatchedOutcomeUnknown(id) {
   );
 }
 
+async function csrfForCurrentAuthGeneration(auth, csrfToken, dsmAuth) {
+  if (!auth || typeof auth !== "object") return csrfToken;
+  const issuedGeneration = csrfGenerationByAuth.get(auth);
+  if (issuedGeneration === undefined || issuedGeneration === dsmAuth.generation) return csrfToken;
+
+  const previousToken = csrfToken;
+  const model = await apiGetWithDsmAuth(auth, "csrf", {}, dsmAuth);
+  if (!validCsrfModel(model)) {
+    throw new Error("Authenticated bridge did not reissue a valid CSRF token");
+  }
+  const replacementToken = model.csrf_token;
+  if (typeof auth.onCsrfReissued === "function") {
+    auth.onCsrfReissued(previousToken, replacementToken);
+  }
+  return replacementToken;
+}
+
 export async function apiPost(
   auth,
   csrfToken,
@@ -424,6 +583,9 @@ export async function apiPost(
   if (!expectedKeys) throw new Error("Unsupported API mutation action");
   exactKeys(payload, expectedKeys, "Mutation");
 
+  await ensureDsmToken();
+  const requestDsmAuth = dsmAuthSnapshot();
+  const effectiveCsrfToken = await csrfForCurrentAuthGeneration(auth, csrfToken, requestDsmAuth);
   const id = requestId();
   const request = JSON.stringify({
     schema: REQUEST_SCHEMA,
@@ -442,8 +604,8 @@ export async function apiPost(
       headers: authenticatedHeaders({
         Accept: "application/json",
         "Content-Type": "application/json",
-        "X-SDSYNC-CSRF": csrfToken
-      }),
+        "X-SDSYNC-CSRF": effectiveCsrfToken
+      }, requestDsmAuth),
       body: request
     });
   } catch (_error) {
@@ -469,5 +631,7 @@ export async function apiPost(
     || !/^[0-9a-f]{48}$/.test(String(queued.job_id || ""))) {
     throw dispatchedOutcomeUnknown(id);
   }
-  return awaitTerminal ? pollJobResult(auth, queued.job_id, pollIntervalMs, id) : queued;
+  return awaitTerminal
+    ? pollJobResult(auth, queued.job_id, requestDsmAuth, pollIntervalMs, id)
+    : queued;
 }

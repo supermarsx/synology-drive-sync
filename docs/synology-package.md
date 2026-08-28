@@ -22,9 +22,14 @@ browser. The CLI remains the recovery and automation surface when the dashboard 
 The package requests no root execution, Linux capabilities, joined web group, set-user-ID bit, or
 set-group-ID bit. `defaults.run-as=package` keeps services on the exact non-root package UID. The
 ordinary package-owned `0755` CGI fails closed unless Webman supplies that same real/effective UID.
-It validates DSM's fixed root-owned `authenticate.cgi` and executes it when the kernel permits. If a
-trusted helper is kernel-inaccessible—as in the supplied DSM capture's `root:system 0750` layout—the
-CGI instead makes one bounded request to a loopback-pinned DSM user service with the current cookie,
+The AppWindow uses Synology's official same-origin `SYNO.API.Auth` version 6 `method=token` bootstrap,
+keeps the exactly-once-encoded value in module memory, and sends it only in the package
+`X-SYNO-TOKEN` header. It never uses a launch URL, history, body, persistent storage, or logs for
+token transport. The CGI probes `X_OK` on DSM's fixed root-owned `authenticate.cgi` before helper
+metadata validation. An executable entry undergoes full trusted-path validation and immediate
+pre-execution revalidation. `EACCES` skips the validator and instead makes one bounded request to a
+loopback-pinned DSM user service with the current cookie and optional token as sensitive headers;
+every other probe error fails closed. The fallback
 requires `Session.user` plus exact `is_admin=true`, and independently resolves NSS identity and
 administrator membership. It then relays a bounded assertion and request over a fixed package-owned
 Unix socket: it is inaccessible at `0000` before startup commit, then the same inode activates as
@@ -45,10 +50,10 @@ or an enabled Team Folder.
 > Static packaging, bridge, manager, lifecycle, and mock File Station tests have passed. They do not
 > prove installation on a physical NAS, Webman's package-owner CGI identity, the direct-helper or
 > loopback user-service authentication branch selected by the installed DSM permissions, DSM
-> forwarding of `X-SDSYNC-Request: 1` as
+> official token response or forwarding of `X-SYNO-TOKEN` and `X-SDSYNC-Request: 1` as
 > `HTTP_X_SDSYNC_REQUEST=1`, or
-> synchronization between two live NAS devices. The native AppWindow uses cookie authentication
-> and does not inspect the DSM shell location for a token. Complete the
+> synchronization between two live NAS devices. The native AppWindow obtains SynoToken only from the
+> official same-origin API and never inspects the DSM shell location for it. Complete the
 > [live-NAS acceptance](dsm/troubleshooting.md#live-nas-acceptance) on disposable folders, and keep
 > deletion disabled until its separate destructive test passes.
 
@@ -63,7 +68,7 @@ or an enabled Team Folder.
 | Password, TOTP, and remote-log-token keep/replace/clear behavior | [Secrets and protected values](dsm/secrets.md) |
 | Interval, daily, and realtime routines, dependencies, retries, and deletion approval | [Routines and scheduling](dsm/routines.md) |
 | Doctor, cached health, activity, logs, and DSM desktop alerts | [Health, activity, logs, and notifications](dsm/operations.md) |
-| `authenticate.cgi`, administrator checks, cookie authentication, CSRF, package-UID socket boundary, and private queue | [Dashboard security model](dsm/security.md) |
+| Official SynoToken bootstrap, `authenticate.cgi`, administrator checks, cookie authentication, CSRF, package-UID socket boundary, and private queue | [Dashboard security model](dsm/security.md) |
 | Dashboard-to-`sdsync-dsm` command mapping and private paths | [CLI parity and private paths](dsm/cli-parity.md) |
 | Symptoms, recovery, acceptance evidence, and known unverified behavior | [Troubleshooting and live-NAS acceptance](dsm/troubleshooting.md) |
 | Reproducible package assembly, ELF contracts, icons, and validation | [Build and validate SPKs](dsm/package-development.md) |
@@ -81,10 +86,12 @@ status such as `77`, or a protocol term such as `X-SDSYNC-CSRF`.
 3. Grant the package's actual **System internal user** read-only access to the intended local source
    share. The package grants itself no share access.
 4. Start the package and open **Synology Drive Sync** from the DSM desktop or Package Center. The
-   current DSM session cookie is authenticated server-side. The native UI does not inspect or
-   rewrite the DSM shell location and sends no `SynoToken`. If session authentication or the control
-   bridge fails, use the troubleshooting checks and CLI; do not copy cookies or CSRF material into
-   a bookmark, local storage, log, or support transcript.
+   current DSM session cookie remains browser-managed while the native UI requests
+   `SYNO.API.Auth` version 6 `method=token`, retains the exactly-once-encoded result only in module
+   memory, and sends it only as `X-SYNO-TOKEN` to the package CGI. It does not inspect or rewrite the
+   DSM shell location. If session authentication or the control bridge fails, use the troubleshooting
+   checks and CLI; never copy cookies, SynoToken, or CSRF material into a URL, request body, bookmark,
+   browser storage, log, or support transcript.
 5. Create one profile, store its password, run non-writing Doctor, and review Plan. Profile/secret
    saves and Doctor wait for a sanitized terminal controller result; Plan and Run remain
    asynchronous. Run remains additive/update-only unless deletion is independently approved at every

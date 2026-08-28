@@ -241,6 +241,30 @@ pid_matches_command() {
     return 0
 }
 
+internal_api_bridge_parent_argv_authorized() {
+    internal_cmdline=$1
+    [ -r "$internal_cmdline" ] || return 77
+    # The bridge is a native executable, so its mode must be argv[1]. Match the
+    # complete public CLI shape for every mode that can legitimately spawn the
+    # manager's private audit endpoint; finding a trusted word anywhere later
+    # in argv is never authorization.
+    tr '\000' '\n' 2>/dev/null < "$internal_cmdline" |
+        awk '
+            NR == 2 { mode = $0 }
+            NR == 3 { subcommand = $0 }
+            END {
+                allowed = \
+                    (NR == 2 && mode == "--serve") || \
+                    (NR == 5 && mode == "--serve-supervised") || \
+                    (NR == 4 && mode == "--consume-job") || \
+                    (NR == 3 && mode == "--audit-transaction" && subcommand == "reconcile") || \
+                    (NR == 9 && mode == "--audit-transaction" && subcommand == "begin") || \
+                    (NR == 5 && mode == "--audit-transaction" && subcommand == "complete")
+                exit allowed ? 0 : 1
+            }
+        '
+}
+
 require_internal_api_bridge_parent() {
     internal_parent=${PPID:-0}
     pid_matches_command "$internal_parent" "$api_bridge" || return 77
@@ -253,15 +277,7 @@ require_internal_api_bridge_parent() {
         *) return 73 ;;
     esac
     [ "$parent_bridge_identity" = "$expected_bridge_identity" ] || return 77
-    parent_bridge_mode=false
-    while IFS= read -r internal_parent_argument; do
-        case $internal_parent_argument in
-            --serve|--consume-job|--audit-transaction) parent_bridge_mode=true ;;
-        esac
-    done <<EOF
-$(tr '\000' '\n' 2>/dev/null < "/proc/$internal_parent/cmdline" || true)
-EOF
-    [ "$parent_bridge_mode" = true ] || return 77
+    internal_api_bridge_parent_argv_authorized "/proc/$internal_parent/cmdline" || return 77
 }
 
 require_verified_controller_parent() {

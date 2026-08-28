@@ -90,14 +90,20 @@ const CGI_ORIGIN_VARIABLES: &[&str] = &[
     "HTTP_X_SYNO_TOKEN",
     "HTTP_X_SDSYNC_CSRF",
     "HTTP_TRANSFER_ENCODING",
+    "HTTP_HOST",
     "REMOTE_ADDR",
+    "REMOTE_PORT",
+    "REQUEST_SCHEME",
     "SERVER_ADDR",
     "SERVER_NAME",
     "SERVER_PORT",
+    "SERVER_PROTOCOL",
     "HTTPS",
     "SCRIPT_NAME",
     "SCRIPT_FILENAME",
     "DOCUMENT_ROOT",
+    "SCGI",
+    "SOCKET",
 ];
 const CORE_CLI_ENVIRONMENT_VARIABLES: &[&str] = &[
     "SDSYNC_CONFIG",
@@ -480,6 +486,21 @@ struct CgiEnvironment {
     server_port: Option<String>,
     https: Option<String>,
     transfer_encoding: Option<String>,
+    native_authentication_context: NativeAuthenticationContext,
+}
+
+#[derive(Clone, Default)]
+struct NativeAuthenticationContext {
+    gateway_interface: Option<String>,
+    http_host: Option<String>,
+    remote_port: Option<String>,
+    request_scheme: Option<String>,
+    server_protocol: Option<String>,
+    script_name: Option<String>,
+    script_filename: Option<String>,
+    document_root: Option<String>,
+    scgi: Option<String>,
+    socket: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -534,6 +555,7 @@ struct AuthenticationInputs {
     server_name: Option<String>,
     server_port: Option<String>,
     https: Option<String>,
+    native_context: NativeAuthenticationContext,
 }
 
 #[derive(Serialize)]
@@ -606,6 +628,10 @@ impl RelayRequest {
             server_port: self.server_port.clone(),
             https: self.https.clone(),
             transfer_encoding: self.transfer_encoding.clone(),
+            // DSM-native authentication context is needed only by the
+            // pre-relay authenticate.cgi invocation. It is deliberately not
+            // serialized across the package-private relay after authentication.
+            native_authentication_context: NativeAuthenticationContext::default(),
         }
     }
 
@@ -1386,6 +1412,18 @@ fn process_environment() -> BridgeResult<CgiEnvironment> {
         server_port: optional("SERVER_PORT", 8)?,
         https: optional("HTTPS", 16)?,
         transfer_encoding: optional("HTTP_TRANSFER_ENCODING", 64)?,
+        native_authentication_context: NativeAuthenticationContext {
+            gateway_interface: optional("GATEWAY_INTERFACE", 64)?,
+            http_host: optional("HTTP_HOST", 512)?,
+            remote_port: optional("REMOTE_PORT", 8)?,
+            request_scheme: optional("REQUEST_SCHEME", 16)?,
+            server_protocol: optional("SERVER_PROTOCOL", 32)?,
+            script_name: optional("SCRIPT_NAME", MAX_QUERY_BYTES)?,
+            script_filename: optional("SCRIPT_FILENAME", MAX_QUERY_BYTES)?,
+            document_root: optional("DOCUMENT_ROOT", MAX_QUERY_BYTES)?,
+            scgi: optional("SCGI", 64)?,
+            socket: optional("SOCKET", MAX_QUERY_BYTES)?,
+        },
     })
 }
 
@@ -1431,6 +1469,7 @@ fn validate_http_request(mut environment: CgiEnvironment) -> BridgeResult<Valida
         server_name: environment.server_name,
         server_port: environment.server_port,
         https: environment.https,
+        native_context: environment.native_authentication_context,
     };
 
     match environment.method.as_str() {
@@ -2472,7 +2511,10 @@ fn authentication_command_environment(inputs: &AuthenticationInputs) -> Vec<(OsS
         .synology_token
         .as_ref()
         .map_or_else(String::new, |token| {
-            format!("SynoToken={}", percent_encode_query_value(token.as_bytes()))
+            format!(
+                "SynoToken={}",
+                normalize_synology_token_query_value(token.as_bytes())
+            )
         });
     let mut variables = vec![
         (
@@ -2509,12 +2551,62 @@ fn authentication_command_environment(inputs: &AuthenticationInputs) -> Vec<(OsS
         ("SERVER_NAME", inputs.server_name.as_ref()),
         ("SERVER_PORT", inputs.server_port.as_ref()),
         ("HTTPS", inputs.https.as_ref()),
+        (
+            "GATEWAY_INTERFACE",
+            inputs.native_context.gateway_interface.as_ref(),
+        ),
+        ("HTTP_HOST", inputs.native_context.http_host.as_ref()),
+        ("REMOTE_PORT", inputs.native_context.remote_port.as_ref()),
+        (
+            "REQUEST_SCHEME",
+            inputs.native_context.request_scheme.as_ref(),
+        ),
+        (
+            "SERVER_PROTOCOL",
+            inputs.native_context.server_protocol.as_ref(),
+        ),
+        ("SCRIPT_NAME", inputs.native_context.script_name.as_ref()),
+        (
+            "SCRIPT_FILENAME",
+            inputs.native_context.script_filename.as_ref(),
+        ),
+        (
+            "DOCUMENT_ROOT",
+            inputs.native_context.document_root.as_ref(),
+        ),
+        ("SCGI", inputs.native_context.scgi.as_ref()),
+        ("SOCKET", inputs.native_context.socket.as_ref()),
     ] {
         if let Some(value) = value {
             variables.push((OsString::from(name), OsString::from(value)));
         }
     }
     variables
+}
+
+fn normalize_synology_token_query_value(value: &[u8]) -> String {
+    // DSM's first-party JavaScript contract sends encodeURIComponent(raw) in
+    // X-SYNO-TOKEN, while direct callers may still supply the raw token. Decode
+    // only complete %HH triplets, preserve every malformed/literal percent,
+    // and deliberately keep '+' literal rather than applying form semantics.
+    // Encoding the resulting bytes once makes both supported representations
+    // converge on one canonical helper query without changing the header.
+    let mut decoded = Zeroizing::new(Vec::with_capacity(value.len()));
+    let mut index = 0;
+    while index < value.len() {
+        if value[index] == b'%'
+            && index + 2 < value.len()
+            && let (Some(high), Some(low)) =
+                (hex_nibble(value[index + 1]), hex_nibble(value[index + 2]))
+        {
+            decoded.push((high << 4) | low);
+            index += 3;
+            continue;
+        }
+        decoded.push(value[index]);
+        index += 1;
+    }
+    percent_encode_query_value(&decoded)
 }
 
 fn percent_encode_query_value(value: &[u8]) -> String {
@@ -2749,41 +2841,64 @@ mod linux_runtime {
         })
     }
 
+    #[derive(Debug)]
+    pub(super) enum AuthenticationHelperSelection<T> {
+        Direct(T),
+        Loopback,
+    }
+
+    pub(super) fn select_authentication_helper<T>(
+        probe_execute: impl FnOnce(&Path) -> io::Result<()>,
+        validate: impl FnOnce(&Path) -> BridgeResult<T>,
+    ) -> Result<AuthenticationHelperSelection<T>, CgiFailure> {
+        let path = Path::new(AUTHENTICATE_PATH);
+        match probe_execute(path) {
+            Ok(()) => validate(path)
+                .map(AuthenticationHelperSelection::Direct)
+                .map_err(|error| {
+                    CgiFailure::coded(
+                        CgiFailureStage::Authentication,
+                        error,
+                        "dsm_authentication_helper_unsafe",
+                    )
+                }),
+            Err(error) if is_execute_permission_denied(&error) => {
+                Ok(AuthenticationHelperSelection::Loopback)
+            }
+            Err(_) => Err(CgiFailure::coded(
+                CgiFailureStage::Authentication,
+                BridgeError::new(ErrorKind::Unavailable),
+                "dsm_authentication_helper_unavailable",
+            )),
+        }
+    }
+
     pub(super) fn authenticate_and_authorize_cgi(
         inputs: &AuthenticationInputs,
         timeout: Duration,
     ) -> Result<AuthenticatedSession, CgiFailure> {
-        let helper = validate_trusted_executable(Path::new(AUTHENTICATE_PATH), Path::new("/"), 0)
-            .map_err(|error| {
-            CgiFailure::coded(
-                CgiFailureStage::Authentication,
-                error,
-                "dsm_authentication_helper_unsafe",
-            )
-        })?;
-        if !caller_can_execute(&helper.path).map_err(|error| {
-            CgiFailure::coded(
-                CgiFailureStage::Authentication,
-                error,
-                "dsm_authentication_helper_unavailable",
-            )
+        let helper = match select_authentication_helper(probe_caller_execute, |path| {
+            validate_trusted_executable(path, Path::new("/"), 0)
         })? {
-            let username = query_dsm_user_service(inputs, timeout).map_err(|error| {
-                let code = match error.kind {
-                    ErrorKind::Unauthorized => "dsm_authentication_webapi_rejected",
-                    ErrorKind::Forbidden => "dsm_authentication_webapi_forbidden",
-                    _ => "dsm_authentication_webapi_unavailable",
-                };
-                CgiFailure::coded(CgiFailureStage::Authentication, error, code)
-            })?;
-            return authorize_authenticated_username(username, inputs).map_err(|error| {
-                CgiFailure::coded(
-                    CgiFailureStage::Authentication,
-                    error,
-                    "dsm_authentication_webapi_forbidden",
-                )
-            });
-        }
+            AuthenticationHelperSelection::Loopback => {
+                let username = query_dsm_user_service(inputs, timeout).map_err(|error| {
+                    let code = match error.kind {
+                        ErrorKind::Unauthorized => "dsm_authentication_webapi_rejected",
+                        ErrorKind::Forbidden => "dsm_authentication_webapi_forbidden",
+                        _ => "dsm_authentication_webapi_unavailable",
+                    };
+                    CgiFailure::coded(CgiFailureStage::Authentication, error, code)
+                })?;
+                return authorize_authenticated_username(username, inputs).map_err(|error| {
+                    CgiFailure::coded(
+                        CgiFailureStage::Authentication,
+                        error,
+                        "dsm_authentication_webapi_forbidden",
+                    )
+                });
+            }
+            AuthenticationHelperSelection::Direct(helper) => helper,
+        };
         let mut command = Command::new(&helper.path);
         command
             .env_clear()
@@ -2853,20 +2968,15 @@ mod linux_runtime {
         })
     }
 
-    fn caller_can_execute(path: &Path) -> BridgeResult<bool> {
+    fn probe_caller_execute(path: &Path) -> io::Result<()> {
         let path = CString::new(path.as_os_str().as_encoded_bytes())
-            .map_err(|_| BridgeError::unsafe_runtime())?;
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
         // SAFETY: path is a live NUL-terminated string and X_OK only asks the
         // kernel to evaluate this process's real UID and group permissions.
         if unsafe { libc::access(path.as_ptr(), libc::X_OK) } == 0 {
-            return Ok(true);
+            return Ok(());
         }
-        let error = io::Error::last_os_error();
-        if is_execute_permission_denied(&error) {
-            Ok(false)
-        } else {
-            Err(BridgeError::new(ErrorKind::Unavailable))
-        }
+        Err(io::Error::last_os_error())
     }
 
     pub(super) fn is_execute_permission_denied(error: &io::Error) -> bool {
@@ -10545,6 +10655,20 @@ mod tests {
             server_port: Some("5001".to_owned()),
             https: Some("on".to_owned()),
             transfer_encoding: None,
+            native_authentication_context: NativeAuthenticationContext {
+                gateway_interface: Some("CGI/1.1".to_owned()),
+                http_host: Some("nas.example.invalid:5001".to_owned()),
+                remote_port: Some("54321".to_owned()),
+                request_scheme: Some("https".to_owned()),
+                server_protocol: Some("HTTP/2.0".to_owned()),
+                script_name: Some("/webman/3rdparty/synology-drive-sync/api.cgi".to_owned()),
+                script_filename: Some(
+                    "/var/packages/synology-drive-sync/target/ui/api.cgi".to_owned(),
+                ),
+                document_root: Some("/usr/syno/synoman".to_owned()),
+                scgi: Some("1".to_owned()),
+                socket: Some("/run/synoscgi.sock".to_owned()),
+            },
         }
     }
 
@@ -10727,6 +10851,7 @@ mod tests {
             server_name: Some("attacker-controlled.invalid".to_owned()),
             server_port: Some(port.to_string()),
             https: Some("off".to_owned()),
+            native_context: NativeAuthenticationContext::default(),
         }
     }
 
@@ -11010,7 +11135,7 @@ mod tests {
         )
         .into_bytes();
         let (port, worker) = spawn_user_service_response(response, Duration::ZERO);
-        let inputs = user_service_inputs(port, Some("header-token-secret"));
+        let inputs = user_service_inputs(port, Some("native-token%2B%2F%3D"));
         let username =
             linux_runtime::query_dsm_user_service(&inputs, Duration::from_secs(2)).unwrap();
         assert_eq!(username, "fixture-admin");
@@ -11027,11 +11152,15 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("cookie: id=loopback-session-secret")
         );
-        assert!(
-            request
-                .to_ascii_lowercase()
-                .contains("x-syno-token: header-token-secret")
-        );
+        let forwarded_token = request
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("x-syno-token")
+                    .then_some(value.trim())
+            })
+            .unwrap();
+        assert_eq!(forwarded_token, "native-token%2B%2F%3D");
     }
 
     #[cfg(target_os = "linux")]
@@ -11154,14 +11283,88 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn only_kernel_execute_permission_denial_selects_the_rootless_fallback() {
-        assert!(linux_runtime::is_execute_permission_denied(
-            &io::Error::from_raw_os_error(libc::EACCES)
+    fn authentication_helper_execute_probe_precedes_metadata_validation() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let selection = linux_runtime::select_authentication_helper(
+            |path| {
+                assert_eq!(path, Path::new(AUTHENTICATE_PATH));
+                calls.borrow_mut().push("probe");
+                Ok(())
+            },
+            |path| {
+                assert_eq!(path, Path::new(AUTHENTICATE_PATH));
+                calls.borrow_mut().push("validate");
+                Ok(7_u8)
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            selection,
+            linux_runtime::AuthenticationHelperSelection::Direct(7)
         ));
-        for error in [libc::ENOENT, libc::ELOOP, libc::ENOTDIR, libc::EIO] {
-            assert!(!linux_runtime::is_execute_permission_denied(
-                &io::Error::from_raw_os_error(error)
-            ));
+        assert_eq!(*calls.borrow(), ["probe", "validate"]);
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        let failure = linux_runtime::select_authentication_helper(
+            |_| {
+                calls.borrow_mut().push("probe");
+                Ok(())
+            },
+            |_| {
+                calls.borrow_mut().push("validate");
+                Err::<u8, _>(BridgeError::unsafe_runtime())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(failure.stage, CgiFailureStage::Authentication);
+        assert_eq!(failure.code, Some("dsm_authentication_helper_unsafe"));
+        assert_eq!(*calls.borrow(), ["probe", "validate"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_eacces_selects_loopback_without_metadata_validation() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let selection = linux_runtime::select_authentication_helper(
+            |_| {
+                calls.borrow_mut().push("probe");
+                Err(io::Error::from_raw_os_error(libc::EACCES))
+            },
+            |_| {
+                calls.borrow_mut().push("validate");
+                Ok(7_u8)
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            selection,
+            linux_runtime::AuthenticationHelperSelection::Loopback
+        ));
+        assert_eq!(*calls.borrow(), ["probe"]);
+
+        for errno in [
+            libc::EPERM,
+            libc::ENOENT,
+            libc::ELOOP,
+            libc::ENOTDIR,
+            libc::EIO,
+        ] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let failure = linux_runtime::select_authentication_helper(
+                |_| {
+                    calls.borrow_mut().push("probe");
+                    Err(io::Error::from_raw_os_error(errno))
+                },
+                |_| {
+                    calls.borrow_mut().push("validate");
+                    Ok(7_u8)
+                },
+            )
+            .unwrap_err();
+            assert_eq!(failure.stage, CgiFailureStage::Authentication);
+            assert_eq!(failure.error.kind, ErrorKind::Unavailable);
+            assert_eq!(failure.code, Some("dsm_authentication_helper_unavailable"));
+            assert_eq!(*calls.borrow(), ["probe"], "errno {errno}");
         }
     }
 
@@ -13989,21 +14192,119 @@ mod tests {
     }
 
     #[test]
+    fn synology_token_query_normalization_is_exactly_once_and_header_preserving() {
+        let command_environment = |token: &str| -> BTreeMap<String, String> {
+            let mut request = environment("GET", "action=snapshot");
+            request.synology_token_header = Some(Zeroizing::new(token.to_owned()));
+            let authentication = match validate_http_request(request).unwrap() {
+                ValidatedHttpRequest::Get { authentication, .. } => authentication,
+                _ => unreachable!(),
+            };
+            authentication_command_environment(&authentication)
+                .into_iter()
+                .map(|(name, value)| (name.into_string().unwrap(), value.into_string().unwrap()))
+                .collect()
+        };
+
+        for (header, expected_query) in [
+            ("native-token%2B%2F%3D", "SynoToken=native-token%2B%2F%3D"),
+            ("native-token+/=", "SynoToken=native-token%2B%2F%3D"),
+            ("literal+plus", "SynoToken=literal%2Bplus"),
+            ("literal%25percent", "SynoToken=literal%25percent"),
+            ("literal%percent", "SynoToken=literal%25percent"),
+            ("trailing%", "SynoToken=trailing%25"),
+            ("short%2", "SynoToken=short%252"),
+            ("bad%GG", "SynoToken=bad%25GG"),
+            ("lower%2b", "SynoToken=lower%2B"),
+            ("%252B", "SynoToken=%252B"),
+        ] {
+            let environment = command_environment(header);
+            assert_eq!(environment["HTTP_X_SYNO_TOKEN"], header);
+            assert_eq!(environment["QUERY_STRING"], expected_query);
+        }
+
+        let cookie = "id=authenticated-session";
+        let encoded = "native-token%2B%2F%3D";
+        let raw = "native-token+/=";
+        assert_eq!(
+            command_environment(encoded)["QUERY_STRING"],
+            command_environment(raw)["QUERY_STRING"]
+        );
+        assert_ne!(
+            session_binding("admin", 1000, cookie, Some(encoded)),
+            session_binding("admin", 1000, cookie, Some(raw)),
+            "session binding must retain the exact package header representation"
+        );
+    }
+
+    #[test]
     fn child_environments_are_allowlists_without_request_secrets_for_manager() {
         let cookie_request = validate_http_request(environment("GET", "action=snapshot")).unwrap();
         let cookie_authentication = match cookie_request {
             ValidatedHttpRequest::Get { authentication, .. } => authentication,
             _ => unreachable!(),
         };
-        let cookie_auth_names = authentication_command_environment(&cookie_authentication)
+        let cookie_auth_environment = authentication_command_environment(&cookie_authentication)
             .into_iter()
-            .map(|(name, _)| name.into_string().unwrap())
-            .collect::<BTreeSet<_>>();
-        assert!(cookie_auth_names.contains("HTTP_COOKIE"));
-        assert!(!cookie_auth_names.contains("HTTP_X_SYNO_TOKEN"));
-        assert!(!cookie_auth_names.contains("HTTP_X_SDSYNC_REQUEST"));
-        assert!(!cookie_auth_names.contains("LD_PRELOAD"));
-        assert!(!cookie_auth_names.contains("HTTP_X_SDSYNC_CSRF"));
+            .map(|(name, value)| (name.into_string().unwrap(), value.into_string().unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        let expected_cookie_authentication_names = [
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "REQUEST_METHOD",
+            "QUERY_STRING",
+            "HTTP_COOKIE",
+            "REMOTE_ADDR",
+            "SERVER_ADDR",
+            "SERVER_NAME",
+            "SERVER_PORT",
+            "HTTPS",
+            "GATEWAY_INTERFACE",
+            "HTTP_HOST",
+            "REMOTE_PORT",
+            "REQUEST_SCHEME",
+            "SERVER_PROTOCOL",
+            "SCRIPT_NAME",
+            "SCRIPT_FILENAME",
+            "DOCUMENT_ROOT",
+            "SCGI",
+            "SOCKET",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+        assert_eq!(
+            cookie_auth_environment
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            expected_cookie_authentication_names
+        );
+        assert_eq!(cookie_auth_environment["REQUEST_METHOD"], "GET");
+        assert_eq!(cookie_auth_environment["QUERY_STRING"], "");
+        assert_eq!(cookie_auth_environment["GATEWAY_INTERFACE"], "CGI/1.1");
+        assert_eq!(
+            cookie_auth_environment["HTTP_HOST"],
+            "nas.example.invalid:5001"
+        );
+        assert_eq!(cookie_auth_environment["REMOTE_PORT"], "54321");
+        assert_eq!(cookie_auth_environment["REQUEST_SCHEME"], "https");
+        assert_eq!(cookie_auth_environment["SERVER_PROTOCOL"], "HTTP/2.0");
+        assert_eq!(
+            cookie_auth_environment["SCRIPT_NAME"],
+            "/webman/3rdparty/synology-drive-sync/api.cgi"
+        );
+        assert_eq!(
+            cookie_auth_environment["SCRIPT_FILENAME"],
+            "/var/packages/synology-drive-sync/target/ui/api.cgi"
+        );
+        assert_eq!(
+            cookie_auth_environment["DOCUMENT_ROOT"],
+            "/usr/syno/synoman"
+        );
+        assert_eq!(cookie_auth_environment["SCGI"], "1");
+        assert_eq!(cookie_auth_environment["SOCKET"], "/run/synoscgi.sock");
 
         let token_request =
             validate_http_request(environment("GET", "action=snapshot&SynoToken=dsm-token"))
@@ -14012,15 +14313,51 @@ mod tests {
             ValidatedHttpRequest::Get { authentication, .. } => authentication,
             _ => unreachable!(),
         };
-        let token_auth_names = authentication_command_environment(&token_authentication)
+        let token_auth_environment = authentication_command_environment(&token_authentication)
             .into_iter()
-            .map(|(name, _)| name.into_string().unwrap())
-            .collect::<BTreeSet<_>>();
-        assert!(token_auth_names.contains("HTTP_COOKIE"));
-        assert!(token_auth_names.contains("HTTP_X_SYNO_TOKEN"));
-        assert!(!token_auth_names.contains("HTTP_X_SDSYNC_REQUEST"));
-        assert!(!token_auth_names.contains("LD_PRELOAD"));
-        assert!(!token_auth_names.contains("HTTP_X_SDSYNC_CSRF"));
+            .map(|(name, value)| (name.into_string().unwrap(), value.into_string().unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        let mut expected_token_authentication_names = expected_cookie_authentication_names;
+        expected_token_authentication_names.insert("HTTP_X_SYNO_TOKEN".to_owned());
+        assert_eq!(
+            token_auth_environment
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            expected_token_authentication_names
+        );
+        assert_eq!(
+            token_auth_environment["QUERY_STRING"],
+            "SynoToken=dsm-token"
+        );
+        assert_eq!(token_auth_environment["HTTP_X_SYNO_TOKEN"], "dsm-token");
+        assert!(!token_auth_environment["QUERY_STRING"].contains("action="));
+
+        for excluded in [
+            "CONTENT_LENGTH",
+            "CONTENT_TYPE",
+            "HTTP_TRANSFER_ENCODING",
+            "HTTP_X_SDSYNC_REQUEST",
+            "HTTP_X_SDSYNC_CSRF",
+            "LD_LIBRARY_PATH",
+            "LD_PRELOAD",
+        ] {
+            assert!(!token_auth_environment.contains_key(excluded));
+        }
+        for detected in [
+            "GATEWAY_INTERFACE",
+            "HTTP_HOST",
+            "REMOTE_PORT",
+            "REQUEST_SCHEME",
+            "SERVER_PROTOCOL",
+            "SCRIPT_NAME",
+            "SCRIPT_FILENAME",
+            "DOCUMENT_ROOT",
+            "SCGI",
+            "SOCKET",
+        ] {
+            assert!(CGI_ORIGIN_VARIABLES.contains(&detected));
+        }
 
         let manager_names = manager_command_environment()
             .into_iter()

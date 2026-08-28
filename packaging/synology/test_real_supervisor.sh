@@ -17,7 +17,9 @@ physical_var=/volume3/@appdata/$package_name
 webman_route=/usr/syno/synoman/webman/3rdparty/$package_name
 authenticate_helper=/usr/syno/synoman/webman/modules/authenticate.cgi
 authenticate_target=/usr/syno/synoman/authenticate.cgi
+authenticate_helper_parent=$(dirname -- "$authenticate_helper")
 fixture_cookie=id=sdsync-fixture-session
+fixture_synology_token=sdsync-fixture%2B%2F%3D
 package_auth_marker=/tmp/sdsync-auth.$package_uid
 user_service_marker=/tmp/sdsync-user-service.$package_uid
 user_service_port=18080
@@ -73,6 +75,8 @@ dump_diagnostics() {
         for diagnostic in \
             "$lifecycle_log" \
             "$physical_var/log/api.log" \
+            "$physical_var/log/audit.log" \
+            "$physical_var/log/activity.log" \
             "$physical_var/log/controller.log" \
             "$physical_var/run/api.pid" \
             "$physical_var/run/api.bound" \
@@ -86,6 +90,31 @@ dump_diagnostics() {
             if [ -f "$diagnostic" ] && [ ! -L "$diagnostic" ]; then
                 echo "--- $diagnostic" >&2
                 sed -n '1,240p' "$diagnostic" >&2 || true
+            fi
+        done
+        echo "--- private runtime metadata" >&2
+        for diagnostic_path in \
+            "$physical_var/log" \
+            "$physical_var/state/audit-outbox" \
+            "$physical_var/control/requests" \
+            "$physical_var/control/processing" \
+            "$physical_var/control/responses" \
+            "$physical_var/control/staging"
+        do
+            if [ -e "$diagnostic_path" ] && [ ! -L "$diagnostic_path" ]; then
+                stat -c '%n %u:%g %a %h' "$diagnostic_path" >&2 || true
+            fi
+        done
+        for diagnostic_record in \
+            "$physical_var/state/audit-outbox"/*.event \
+            "$physical_var/control/requests"/*.json \
+            "$physical_var/control/processing"/*.json \
+            "$physical_var/control/responses"/*.json
+        do
+            if [ -f "$diagnostic_record" ] && [ ! -L "$diagnostic_record" ]; then
+                echo "--- $diagnostic_record" >&2
+                stat -c '%n %u:%g %a %h' "$diagnostic_record" >&2 || true
+                sed -n '1,40p' "$diagnostic_record" >&2 || true
             fi
         done
         echo "--- processes" >&2
@@ -126,8 +155,9 @@ cat > "$authenticate_target" <<'EOF'
 #!/bin/sh
 set -eu
 [ "${REQUEST_METHOD:-}" = GET ] || exit 1
-[ "${QUERY_STRING:-}" = "" ] || exit 1
+[ "${QUERY_STRING:-}" = "SynoToken=sdsync-fixture%2B%2F%3D" ] || exit 1
 [ "${HTTP_COOKIE:-}" = id=sdsync-fixture-session ] || exit 1
+[ "${HTTP_X_SYNO_TOKEN:-}" = sdsync-fixture%2B%2F%3D ] || exit 1
 [ "${HTTPS:-}" = on ] || exit 1
 caller_uid=$(id -u)
 [ "$caller_uid" = 23101 ] || exit 1
@@ -141,6 +171,11 @@ EOF
 chmod 0750 "$authenticate_target"
 chown 0:system "$authenticate_target"
 ln -s ../../authenticate.cgi "$authenticate_helper"
+# The fallback decision must be based on the package identity's execute probe,
+# not on userspace trust assumptions about a helper it cannot execute. Make the
+# helper parent deliberately incompatible with the direct-helper metadata rules
+# while preserving the real DSM root:system 0750 EACCES condition at the target.
+chmod 0775 "$authenticate_helper_parent"
 system_gid=$(awk -F: '$1 == "system" { print $3; exit }' /etc/group)
 [ -n "$system_gid" ] || {
     echo "fixture system group has no numeric gid" >&2
@@ -149,8 +184,9 @@ system_gid=$(awk -F: '$1 == "system" { print $3; exit }' /etc/group)
 [ -L "$authenticate_helper" ] \
     && [ "$(readlink "$authenticate_helper")" = ../../authenticate.cgi ] \
     && [ "$(stat -c '%u' "$authenticate_helper")" = 0 ] \
+    && [ "$(stat -c '%u:%a' "$authenticate_helper_parent")" = "0:775" ] \
     && [ "$(stat -c '%u:%g:%a:%h' "$authenticate_target")" = "0:$system_gid:750:1" ] || {
-    echo "mock DSM authentication helper is not a root-owned symlink to root:system 0750" >&2
+    echo "mock DSM authentication helper did not enter the metadata-unsafe EACCES phase" >&2
     exit 73
 }
 if su "$package_user" -s /bin/sh -c "test -x $authenticate_helper"; then
@@ -165,16 +201,20 @@ set -eu
 IFS= read -r request_line || exit 1
 request_line=$(printf '%s' "$request_line" | tr -d '\r')
 [ "$request_line" = "GET /webapi/entry.cgi?api=SYNO.Core.Desktop.Initdata&version=1&method=get_user_service HTTP/1.1" ] || exit 1
+case $request_line in *SynoToken*|*sdsync-fixture%2B%2F%3D*) exit 1 ;; esac
 cookie_seen=false
+token_seen=false
 while IFS= read -r header
 do
     header=$(printf '%s' "$header" | tr -d '\r')
     [ -n "$header" ] || break
     case $(printf '%s' "$header" | tr '[:upper:]' '[:lower:]') in
         'cookie: id=sdsync-fixture-session') cookie_seen=true ;;
+        'x-syno-token: sdsync-fixture%2b%2f%3d') token_seen=true ;;
     esac
 done
 [ "$cookie_seen" = true ] || exit 1
+[ "$token_seen" = true ] || exit 1
 umask 077
 marker=/tmp/sdsync-user-service.23101
 [ ! -L "$marker" ] || exit 1
@@ -230,19 +270,27 @@ run_lifecycle() {
         $lifecycle $lifecycle_action"
 }
 
-run_package_cgi() {
+run_package_cgi_get() {
+    request_query=$1
+    case $request_query in
+        ''|*[!A-Za-z0-9_.=\&-]*)
+            echo "unsafe fixture CGI query" >&2
+            return 64
+            ;;
+    esac
     request_https=${cgi_https-on}
     request_port=${cgi_port-5001}
     su "$package_user" -s /bin/sh -c \
         "env -i \
         PATH=/usr/sbin:/usr/bin:/sbin:/bin \
         REQUEST_METHOD=GET \
-        QUERY_STRING=action=csrf \
+        QUERY_STRING='$request_query' \
         CONTENT_LENGTH= \
         CONTENT_TYPE= \
         HTTP_TRANSFER_ENCODING= \
         HTTP_X_SDSYNC_CSRF= \
         HTTP_COOKIE=$fixture_cookie \
+        HTTP_X_SYNO_TOKEN=$fixture_synology_token \
         HTTP_X_SDSYNC_REQUEST=1 \
         HTTPS=$request_https \
         REMOTE_ADDR=127.0.0.1 \
@@ -250,6 +298,70 @@ run_package_cgi() {
         SERVER_NAME=localhost \
         SERVER_PORT=$request_port \
         $webman_route/api.cgi"
+}
+
+run_package_cgi() {
+    run_package_cgi_get action=csrf
+}
+
+run_package_cgi_post() {
+    request_body=$1
+    request_csrf=$2
+    case $request_csrf in
+        ''|*[!A-Za-z0-9._-]*)
+            echo "unsafe fixture CSRF token" >&2
+            return 64
+            ;;
+    esac
+    request_length=$(printf '%s' "$request_body" | wc -c | tr -d ' ')
+    case $request_length in ''|*[!0-9]*) return 73 ;; esac
+    request_https=${cgi_https-on}
+    request_port=${cgi_port-5001}
+    printf '%s' "$request_body" | su "$package_user" -s /bin/sh -c \
+        "env -i \
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        REQUEST_METHOD=POST \
+        QUERY_STRING= \
+        CONTENT_LENGTH=$request_length \
+        CONTENT_TYPE=application/json \
+        HTTP_TRANSFER_ENCODING= \
+        HTTP_X_SDSYNC_CSRF='$request_csrf' \
+        HTTP_COOKIE=$fixture_cookie \
+        HTTP_X_SYNO_TOKEN=$fixture_synology_token \
+        HTTP_X_SDSYNC_REQUEST=1 \
+        HTTPS=$request_https \
+        REMOTE_ADDR=127.0.0.1 \
+        SERVER_ADDR=127.0.0.1 \
+        SERVER_NAME=localhost \
+        SERVER_PORT=$request_port \
+        $webman_route/api.cgi"
+}
+
+require_cgi_json_response() {
+    response_label=$1
+    response_exit=$2
+    response_expected_status=$3
+    response_expected_schema=$4
+    response_payload=$5
+    response_status_line=$(printf '%s\n' "$response_payload" | sed -n '1p')
+    response_content_length=$(printf '%s\n' "$response_payload" |
+        sed -n 's/^Content-Length: \([0-9][0-9]*\)$/\1/p' | sed -n '1p')
+    response_body=$(printf '%s\n' "$response_payload" | sed '1,/^$/d')
+    [ "$response_exit" -eq 0 ] \
+        && [ "$response_status_line" = "Status: $response_expected_status" ] || {
+        echo "$response_label did not return Status: $response_expected_status" >&2
+        return 1
+    }
+    [ -n "$response_body" ] \
+        && printf '%s\n' "$response_content_length" | grep -Eq '^[1-9][0-9]*$' \
+        && [ "$(printf '%s' "$response_body" | wc -c | tr -d ' ')" = "$response_content_length" ] || {
+        echo "$response_label body or Content-Length is empty or inconsistent" >&2
+        return 1
+    }
+    printf '%s\n' "$response_body" | grep -Fq "\"schema\":\"$response_expected_schema\"" || {
+        echo "$response_label returned an unexpected schema" >&2
+        return 1
+    }
 }
 
 run_lifecycle start
@@ -326,14 +438,188 @@ if grep -Fq '"stage":"dsm_authentication"' "$physical_var/log/api.log"; then
     exit 1
 fi
 
+fallback_csrf_token=$(printf '%s\n' "$fallback_cgi_body" |
+    sed -n 's/.*"csrf_token":"\([^"]*\)".*/\1/p' | sed -n '1p')
+printf '%s\n' "$fallback_csrf_token" | awk -F. '
+    NF == 5 && $1 == "v1" && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ &&
+    length($4) == 32 && $4 ~ /^[0-9a-f]+$/ &&
+    length($5) == 64 && $5 ~ /^[0-9a-f]+$/ { accepted = 1 }
+    END { exit accepted ? 0 : 1 }
+' || {
+    echo "rootless DSM authentication fallback returned a malformed CSRF token" >&2
+    exit 1
+}
+fallback_auth_requests=1
+
+# Prove the fallback identity is accepted by the package-owned relay for a real
+# manager-backed read, rather than only by the synthetic CSRF endpoint.
+set +e
+fallback_snapshot_response=$(cgi_https=off cgi_port=$user_service_port \
+    run_package_cgi_get action=snapshot)
+fallback_snapshot_status=$?
+set -e
+fallback_auth_requests=$((fallback_auth_requests + 1))
+fallback_snapshot_response=$(printf '%s' "$fallback_snapshot_response" | tr -d '\r')
+require_cgi_json_response "fallback-authenticated snapshot" "$fallback_snapshot_status" \
+    "200 OK" sdsync.dsm-api.v1 "$fallback_snapshot_response"
+printf '%s\n' "$fallback_snapshot_response" | grep -Fq '"private_queue":true' \
+    && printf '%s\n' "$fallback_snapshot_response" | grep -Fq '"mutations":true' || {
+    echo "fallback-authenticated snapshot did not expose the live private relay capabilities" >&2
+    exit 1
+}
+
+# client-event records a preference notification only; it changes no package
+# configuration or secret. Its asynchronous result proves the authenticated
+# CGI, CSRF verifier, durable queue, controller consumer, and manager all agree.
+mutation_request_id=0123456789abcdef0123456789abcdef
+mutation_body="{\"schema\":\"sdsync.dsm-request.v1\",\"request_id\":\"$mutation_request_id\",\"operation\":\"client-event\",\"arguments\":{\"event\":\"interface-settings\"}}"
+set +e
+fallback_queued_response=$(cgi_https=off cgi_port=$user_service_port \
+    run_package_cgi_post "$mutation_body" "$fallback_csrf_token")
+fallback_queued_status=$?
+set -e
+fallback_auth_requests=$((fallback_auth_requests + 1))
+fallback_queued_response=$(printf '%s' "$fallback_queued_response" | tr -d '\r')
+{
+    printf '%s\n' '--- fallback-authenticated client event'
+    printf 'exit=%s\n' "$fallback_queued_status"
+    printf '%s\n' "$fallback_queued_response"
+} >> "$fallback_cgi_summary"
+require_cgi_json_response "fallback-authenticated client event" "$fallback_queued_status" \
+    "202 Accepted" sdsync.dsm-queued.v1 "$fallback_queued_response"
+printf '%s\n' "$fallback_queued_response" | grep -Fq "\"request_id\":\"$mutation_request_id\"" \
+    && printf '%s\n' "$fallback_queued_response" | grep -Fq '"state":"queued"' \
+    && printf '%s\n' "$fallback_queued_response" | grep -Fq '"replayed":false' || {
+    echo "fallback-authenticated client event was not durably queued as a new request" >&2
+    exit 1
+}
+queued_job_id=$(printf '%s\n' "$fallback_queued_response" |
+    sed -n 's/.*"job_id":"\([0-9a-f][0-9a-f]*\)".*/\1/p' | sed -n '1p')
+printf '%s\n' "$queued_job_id" | awk '
+    length($0) == 48 && $0 ~ /^[0-9a-f]+$/ { accepted = 1 }
+    END { exit accepted ? 0 : 1 }
+' || {
+    echo "fallback-authenticated client event returned a malformed server job ID" >&2
+    exit 1
+}
+
+fallback_result_complete=false
+fallback_result_attempt=0
+while [ "$fallback_result_attempt" -lt 45 ]; do
+    fallback_result_attempt=$((fallback_result_attempt + 1))
+    set +e
+    fallback_result_response=$(cgi_https=off cgi_port=$user_service_port \
+        run_package_cgi_get "action=result&job_id=$queued_job_id")
+    fallback_result_status=$?
+    set -e
+    fallback_auth_requests=$((fallback_auth_requests + 1))
+    fallback_result_response=$(printf '%s' "$fallback_result_response" | tr -d '\r')
+    fallback_result_status_line=$(printf '%s\n' "$fallback_result_response" | sed -n '1p')
+    case $fallback_result_status_line in
+        "Status: 202 Accepted")
+            require_cgi_json_response "pending fallback-authenticated result" \
+                "$fallback_result_status" "202 Accepted" sdsync.dsm-result-status.v1 \
+                "$fallback_result_response"
+            printf '%s\n' "$fallback_result_response" | grep -Fq '"state":"pending"' \
+                && printf '%s\n' "$fallback_result_response" | grep -Fq "\"job_id\":\"$queued_job_id\"" || {
+                echo "fallback-authenticated result lost its pending job identity" >&2
+                exit 1
+            }
+            sleep 1
+            ;;
+        "Status: 200 OK")
+            require_cgi_json_response "completed fallback-authenticated result" \
+                "$fallback_result_status" "200 OK" sdsync.dsm-result-status.v1 \
+                "$fallback_result_response"
+            printf '%s\n' "$fallback_result_response" | grep -Fq '"state":"complete"' \
+                && printf '%s\n' "$fallback_result_response" | grep -Fq "\"job_id\":\"$queued_job_id\"" \
+                && printf '%s\n' "$fallback_result_response" | grep -Fq "\"client_request_id\":\"$mutation_request_id\"" \
+                && printf '%s\n' "$fallback_result_response" | grep -Fq "\"actor_uid\":$administrator_uid" \
+                && printf '%s\n' "$fallback_result_response" | grep -Fq '"audit_pending":false' \
+                && printf '%s\n' "$fallback_result_response" | grep -Fq '"schema":"sdsync.dsm-result.v1"' \
+                && printf '%s\n' "$fallback_result_response" | grep -Fq '"ok":true' \
+                && printf '%s\n' "$fallback_result_response" | grep -Fq 'Client preference change audited' || {
+                echo "fallback-authenticated controller result lost terminal identity or success evidence" >&2
+                exit 1
+            }
+            fallback_result_complete=true
+            break
+            ;;
+        *)
+            {
+                printf '%s\n' "--- unexpected fallback result attempt $fallback_result_attempt"
+                printf 'exit=%s\n' "$fallback_result_status"
+                printf '%s\n' "$fallback_result_response"
+            } >> "$fallback_cgi_summary"
+            echo "fallback-authenticated result polling returned an unexpected CGI envelope" >&2
+            exit 1
+            ;;
+    esac
+done
+[ "$fallback_result_complete" = true ] || {
+    echo "fallback-authenticated client event did not complete within 45 seconds" >&2
+    exit 1
+}
+
+set +e
+fallback_activity_response=$(cgi_https=off cgi_port=$user_service_port \
+    run_package_cgi_get 'action=activity&lines=200')
+fallback_activity_status=$?
+set -e
+fallback_auth_requests=$((fallback_auth_requests + 1))
+fallback_activity_response=$(printf '%s' "$fallback_activity_response" | tr -d '\r')
+require_cgi_json_response "fallback-authenticated activity" "$fallback_activity_status" \
+    "200 OK" sdsync.dsm-activity.v1 "$fallback_activity_response"
+printf '%s\n' "$fallback_activity_response" | grep -Fq '"code":"audit.succeeded"' \
+    && printf '%s\n' "$fallback_activity_response" | grep -Fq '"state":"succeeded"' \
+    && printf '%s\n' "$fallback_activity_response" | grep -Fq "\"client_request_id\":\"$mutation_request_id\"" \
+    && printf '%s\n' "$fallback_activity_response" | grep -Fq 'Module interface-settings succeeded' || {
+    echo "fallback-authenticated Activity feed did not expose the terminal client event" >&2
+    exit 1
+}
+
+set +e
+fallback_logs_response=$(cgi_https=off cgi_port=$user_service_port \
+    run_package_cgi_get 'action=logs&lines=200&source=audit')
+fallback_logs_status=$?
+set -e
+fallback_auth_requests=$((fallback_auth_requests + 1))
+fallback_logs_response=$(printf '%s' "$fallback_logs_response" | tr -d '\r')
+require_cgi_json_response "fallback-authenticated audit logs" "$fallback_logs_status" \
+    "200 OK" sdsync.dsm-logs.v1 "$fallback_logs_response"
+printf '%s\n' "$fallback_logs_response" | grep -Fq '"source":"audit"' \
+    && printf '%s\n' "$fallback_logs_response" | grep -Fq 'interface-settings' \
+    && printf '%s\n' "$fallback_logs_response" | grep -Fq 'succeeded' \
+    && printf '%s\n' "$fallback_logs_response" | grep -Fq "$mutation_request_id" || {
+    echo "fallback-authenticated audit log feed did not expose the terminal client event" >&2
+    exit 1
+}
+
+[ ! -e "$package_auth_marker" ] && [ ! -L "$package_auth_marker" ] || {
+    echo "metadata-unsafe non-executable DSM authentication helper was unexpectedly invoked" >&2
+    exit 1
+}
+if ! { [ -f "$user_service_marker" ] && [ ! -L "$user_service_marker" ] \
+    && [ "$(stat -c '%u:%a:%h' "$user_service_marker")" = "0:600:1" ] \
+    && [ "$(wc -l < "$user_service_marker" | tr -d ' ')" = "$fallback_auth_requests" ]; }; then
+    echo "fixed loopback DSM user-service did not authenticate every fallback CGI request exactly once" >&2
+    exit 1
+fi
+if grep -Fq '"stage":"dsm_authentication"' "$physical_var/log/api.log"; then
+    echo "successful fallback-authenticated end-to-end flow emitted an authentication failure" >&2
+    exit 1
+fi
+
 # Make only the synthetic helper callable for the successful relay. Requiring
-# one helper marker and one unchanged user-service marker proves the executable
+# one helper marker and an unchanged fallback request count proves the executable
 # DSM helper remains primary and the daemon repeats neither authentication path.
 kill "$user_service_pid"
 wait "$user_service_pid" >/dev/null 2>&1 || true
 user_service_pid=
+chmod 0755 "$authenticate_helper_parent"
 chmod 0755 "$authenticate_target"
 [ -L "$authenticate_helper" ] \
+    && [ "$(stat -c '%u:%a' "$authenticate_helper_parent")" = "0:755" ] \
     && [ "$(stat -c '%u:%g:%a:%h' "$authenticate_target")" = "0:$system_gid:755:1" ] || {
     echo "mock DSM authentication helper did not enter the explicit callable test phase" >&2
     exit 73
@@ -377,7 +663,7 @@ if ! { [ -f "$package_auth_marker" ] && [ ! -L "$package_auth_marker" ] \
     echo "DSM authentication helper was not executed exactly once by the package CGI" >&2
     exit 1
 fi
-if [ "$(wc -l < "$user_service_marker" | tr -d ' ')" != 1 ]; then
+if [ "$(wc -l < "$user_service_marker" | tr -d ' ')" != "$fallback_auth_requests" ]; then
     echo "executable DSM helper unexpectedly retried the loopback user-service" >&2
     exit 1
 fi

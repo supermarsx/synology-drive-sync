@@ -210,9 +210,10 @@ happy path.
 ## Acceptance boundary
 
 Builder/validator success proves the reviewed archive contract, not DSM installation, AppWindow
-launch, DSM's executable-owner CGI runtime identity, protected `authenticate.cgi` execution when
-kernel-accessible, bounded loopback user-service authentication when the validated helper is
-kernel-inaccessible,
+launch, the official same-origin `SYNO.API.Auth` version 6 token response and package
+`X-SYNO-TOKEN` forwarding, DSM's executable-owner CGI runtime identity, fixed-helper `X_OK` probing,
+protected `authenticate.cgi` validation/revalidation and execution after a successful probe, bounded
+loopback user-service authentication when that probe returns `EACCES` without invoking the validator,
 package-owned socket behavior, administrator groups, direct `synodsmnotify` desktop delivery, source
 ACLs, reverse proxy, File Station, TOTP, Drive indexing, or sync behavior on a physical model.
 Complete [live-NAS acceptance](troubleshooting.md#live-nas-acceptance) before publishing a support
@@ -223,6 +224,8 @@ Official framework references:
 - [Package structure](https://help.synology.com/developer-guide/synology_package/introduction.html)
 - [Native package app launch](https://help.synology.com/developer-guide/synology_package/package_tgz/launch_app.html)
 - [AppWindow UI framework](https://help.synology.com/developer-guide/appendix/ui_framework/application.html)
+- [Application authentication](https://help.synology.com/developer-guide/integrate_dsm/web_authentication.html)
+- [DSM Login Web API Guide](https://global.download.synology.com/download/Document/Software/DeveloperGuide/Os/DSM/All/enu/DSM_Login_Web_API_Guide_enu.pdf)
 - [Privilege configuration](https://help.synology.com/developer-guide/privilege/privilege_config.html)
 - [FHS paths](https://help.synology.com/developer-guide/integrate_dsm/fhs.html)
 - [Platform and `arch` values](https://help.synology.com/developer-guide/appendix/platarchs.html)

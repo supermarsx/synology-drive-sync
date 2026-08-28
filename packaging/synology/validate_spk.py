@@ -68,6 +68,7 @@ NATIVE_MODULE = "SynologyDriveSync.js"
 NATIVE_SCRIPT = "ui/SynologyDriveSync.js"
 NATIVE_STYLE = "ui/style.css"
 CANONICAL_API = "/webman/3rdparty/synology-drive-sync/api.cgi"
+DSM_TOKEN_API = "/webapi/entry.cgi?api=SYNO.API.Auth&version=6&method=token"
 DSM_MINIMUM = "7.0-40759"
 DSM_MAXIMUM = "7.4-99999"
 FIXED_INFO = {
@@ -409,9 +410,32 @@ def validate_native_api_source(payload: bytes) -> None:
     endpoints = re.findall(r'["\']([^"\']*api\.cgi)["\']', source)
     if endpoints != [CANONICAL_API]:
         raise ValidationError("native DSM UI must use only the canonical absolute package CGI path")
+    token_endpoints = re.findall(r'["\'](/webapi/[^"\']+)["\']', source)
+    if token_endpoints != [DSM_TOKEN_API]:
+        raise ValidationError("native DSM UI must use exactly the reviewed DSM token bootstrap path")
     for marker in (
+        f'export const DSM_TOKEN_URL = "{DSM_TOKEN_API}";',
         'credentials: "same-origin"',
-        '"X-SDSYNC-CSRF": csrfToken',
+        'cache: "no-store"',
+        'redirect: "error"',
+        '"X-SDSYNC-CSRF": effectiveCsrfToken',
+        'const MAX_DSM_TOKEN_RESPONSE_BYTES = 16 * 1024;',
+        'const MAX_DSM_TOKEN_BYTES = 1024;',
+        'const DSM_TOKEN_BOOTSTRAP_TIMEOUT_MS = 5000;',
+        'const DSM_TOKEN_RETRY_DELAY_MS = 30000;',
+        'let cachedDsmToken = "";',
+        "encodeURIComponent(value)",
+        "encoded.length <= MAX_DSM_TOKEN_BYTES",
+        "async function bootstrapDsmToken()",
+        "async function ensureDsmToken()",
+        "let dsmAuthGeneration = 0;",
+        "const csrfGenerationByAuth = new WeakMap();",
+        "dsmAuthGeneration += 1;",
+        "function dsmAuthSnapshot()",
+        "async function apiGetWithDsmAuth(auth, action, parameters, dsmAuth)",
+        "async function csrfForCurrentAuthGeneration(auth, csrfToken, dsmAuth)",
+        "const requestDsmAuth = dsmAuthSnapshot();",
+        "const effectiveCsrfToken = await csrfForCurrentAuthGeneration(auth, csrfToken, requestDsmAuth);",
         "crypto.getRandomValues",
         "request_id: id",
         "operation: action",
@@ -427,8 +451,10 @@ def validate_native_api_source(payload: bytes) -> None:
     ):
         if marker not in source:
             raise ValidationError(f"native DSM API source is missing security contract {marker!r}")
-    if source.count('credentials: "same-origin"') != 2:
-        raise ValidationError("native DSM GET and POST must both use same-origin credentials")
+    if source.count('credentials: "same-origin"') != 3:
+        raise ValidationError(
+            "native DSM token bootstrap, GET, and POST must all use same-origin credentials"
+        )
     if source.count("signal: auth && auth.signal ? auth.signal : undefined") != 2:
         raise ValidationError("native DSM GET and POST must both support AppWindow cancellation")
     for forbidden in (
@@ -436,34 +462,69 @@ def validate_native_api_source(payload: bytes) -> None:
         r"\bwindow\.location\b",
         r"\bwindow\.history\b",
         r"\bhistory\.replaceState\b",
-        r"X-SYNO-TOKEN",
-        r"SynoToken",
         r"launch[- ]token",
+        r"\blocalStorage\b",
+        r"\bsessionStorage\b",
+        r"\bindexedDB\b",
+        r"\bdocument\.cookie\b",
     ):
         if re.search(forbidden, source, re.IGNORECASE):
             raise ValidationError(
-                "native DSM API must use cookie-only AppWindow authentication without launch-token parsing"
+                "native DSM API must not derive authentication from launch state or persistent storage"
             )
+
+    bootstrap_start = source.find("async function bootstrapDsmToken()")
+    bootstrap_end = source.find("\nfunction authenticatedHeaders(", bootstrap_start)
+    if bootstrap_start < 0 or bootstrap_end < 0:
+        raise ValidationError("native DSM API source is missing the bounded DSM token bootstrap")
+    bootstrap_source = source[bootstrap_start:bootstrap_end]
+    for marker in (
+        "window.fetch(DSM_TOKEN_URL",
+        'method: "GET"',
+        'credentials: "same-origin"',
+        'cache: "no-store"',
+        'redirect: "error"',
+        'headers: { Accept: "application/json" }',
+        "response.redirected",
+        "response.status !== 200",
+        'response.headers.get("content-type")',
+        'response.headers.get("content-length")',
+        "MAX_DSM_TOKEN_RESPONSE_BYTES",
+        "boundedUtf8Length(body)",
+        "JSON.parse(body)",
+        "model.success !== true",
+        "normalizeDsmToken(data.synotoken)",
+    ):
+        if marker not in bootstrap_source:
+            raise ValidationError(
+                f"native DSM token bootstrap is missing bounded contract {marker!r}"
+            )
+    if "console." in bootstrap_source or re.search(
+        r"[?&](?:SynoToken|synotoken)=", source, re.IGNORECASE
+    ):
+        raise ValidationError("native DSM token bootstrap must not log or place the token in a URL")
 
     headers_start = source.find("function authenticatedHeaders(")
     headers_end = source.find("\nfunction exactKeys(", headers_start)
     if headers_start < 0 or headers_end < 0:
         raise ValidationError("native DSM API source is missing the authenticated-header bridge")
     authenticated_headers = source[headers_start:headers_end]
-    if "function authenticatedHeaders(headers)" not in authenticated_headers:
-        raise ValidationError("native DSM headers must not accept browser launch-token authentication")
+    if "function authenticatedHeaders(headers, dsmAuth)" not in authenticated_headers:
+        raise ValidationError(
+            "native DSM headers must use only the pinned module-owned authentication snapshot"
+        )
     marker_names = re.findall(r'["\']X-SDSYNC-Request["\']', source)
-    marker_values = re.findall(
-        r'return\s+Object\.assign\(\s*\{\s*\}\s*,\s*headers\s*,\s*\{\s*'
-        r'["\']X-SDSYNC-Request["\']\s*:\s*["\']([^"\']*)["\']\s*\}\s*\)\s*;',
-        authenticated_headers,
-    )
     if (
         len(marker_names) != 1
-        or marker_values != ["1"]
-        or authenticated_headers.count("return Object.assign(") != 1
+        or 'Object.assign({}, headers, { "X-SDSYNC-Request": "1" })' not in authenticated_headers
     ):
         raise ValidationError("native DSM UI must emit exactly one X-SDSYNC-Request header with value 1")
+    if source.count('"X-SYNO-TOKEN"') != 1 or (
+        'authenticated["X-SYNO-TOKEN"] = dsmAuth.token' not in authenticated_headers
+    ):
+        raise ValidationError(
+            "native DSM UI must emit the bounded in-memory DSM token only through X-SYNO-TOKEN"
+        )
     for method, start_marker, end_marker in (
         ("GET", "export async function apiGet(", "\nfunction delay("),
         ("POST", "export async function apiPost(", None),
@@ -473,10 +534,38 @@ def validate_native_api_source(payload: bytes) -> None:
         if request_start < 0 or request_end < 0:
             raise ValidationError(f"native DSM API source is missing the {method} request bridge")
         request_source = source[request_start:request_end]
-        if len(re.findall(r"\bheaders\s*:\s*authenticatedHeaders\s*\(", request_source)) != 1:
+        if request_source.count("await ensureDsmToken();") != 1:
             raise ValidationError(
-                f"native DSM {method} requests must emit X-SDSYNC-Request through authenticatedHeaders"
+                f"native DSM {method} requests must await the shared DSM token bootstrap"
             )
+        if method == "GET":
+            if (
+                "return apiGetWithDsmAuth(auth, action, parameters, dsmAuthSnapshot());"
+                not in request_source
+            ):
+                raise ValidationError(
+                    "native DSM GET requests must dispatch with one immutable authentication snapshot"
+                )
+        elif len(re.findall(r"\bheaders\s*:\s*authenticatedHeaders\s*\(", request_source)) != 1:
+            raise ValidationError(
+                "native DSM POST requests must emit X-SDSYNC-Request through authenticatedHeaders"
+            )
+
+    get_dispatch_start = source.find("async function apiGetWithDsmAuth(")
+    get_dispatch_end = source.find("\nexport async function apiGet(", get_dispatch_start)
+    if get_dispatch_start < 0 or get_dispatch_end < 0:
+        raise ValidationError("native DSM API source is missing exact-snapshot GET dispatch")
+    get_dispatch_source = source[get_dispatch_start:get_dispatch_end]
+    if (
+        get_dispatch_source.count("fetch(endpoint(action, parameters), {") != 1
+        or get_dispatch_source.count("headers: authenticatedHeaders(") != 1
+        or "{ Accept: \"application/json\" }, dsmAuth" not in get_dispatch_source
+        or "rememberCsrfGeneration(auth, model, dsmAuth.generation)" not in get_dispatch_source
+        or "ensureDsmToken" in get_dispatch_source
+    ):
+        raise ValidationError(
+            "native DSM GET requests must use one pinned authentication snapshot without re-bootstrap"
+        )
 
     poll_start = source.find("async function pollJobResult(")
     poll_end = source.find("\nfunction requestId(", poll_start)
@@ -485,6 +574,7 @@ def validate_native_api_source(payload: bytes) -> None:
     poll_source = source[poll_start:poll_end]
     for marker in (
         "pollIntervalMs = RESULT_POLL_INTERVAL_MS",
+        'apiGetWithDsmAuth(auth, "result", { job_id: jobId }, dsmAuth)',
         "let consecutiveObservationFailures = 0;",
         "for (;;)",
         "if (auth && auth.signal && auth.signal.aborted) throw error;",
@@ -523,12 +613,27 @@ def validate_native_api_source(payload: bytes) -> None:
             )
 
     post_start = source.find("export async function apiPost(")
+    post_source = source[post_start:] if post_start >= 0 else ""
     if post_start < 0 or (
-        "return awaitTerminal ? pollJobResult(auth, queued.job_id, pollIntervalMs, id) : queued;"
-        not in source[post_start:]
+        "? pollJobResult(auth, queued.job_id, requestDsmAuth, pollIntervalMs, id)"
+        not in post_source
     ):
         raise ValidationError(
             "native DSM POST must explicitly choose terminal observation or queued return"
+        )
+    auth_snapshot = post_source.find("const requestDsmAuth = dsmAuthSnapshot();")
+    csrf_refresh = post_source.find(
+        "const effectiveCsrfToken = await csrfForCurrentAuthGeneration(auth, csrfToken, requestDsmAuth);"
+    )
+    request_identity = post_source.find("const id = requestId();")
+    post_dispatch = post_source.find("response = await fetch(API_URL, {")
+    if not (0 <= auth_snapshot < csrf_refresh < request_identity < post_dispatch):
+        raise ValidationError(
+            "native DSM POST must pin authentication before refreshing CSRF and dispatching"
+        )
+    if post_source.count("fetch(API_URL, {") != 1 or post_source.count("apiPost(") != 1:
+        raise ValidationError(
+            "native DSM POST must have exactly one package dispatch and must never retry itself"
         )
     if re.search(
         r"(?:fetch\s*\(|new\s+(?:WebSocket|EventSource)\s*\()\s*['\"](?:https?:)?//",
@@ -799,7 +904,8 @@ def validate_native_bundle(script_payload: bytes, style_payload: bytes) -> None:
     style = style_payload.decode("utf-8")
     for marker in (
         APP_ID, "v-app-instance", "v-app-window", CANONICAL_API,
-        "X-SDSYNC-Request", "X-SDSYNC-CSRF", "same-origin", "beforeDestroy",
+        DSM_TOKEN_API, "X-SDSYNC-Request", "X-SDSYNC-CSRF", "X-SYNO-TOKEN",
+        "same-origin", "beforeDestroy",
         "https://github.com/supermarsx/synology-drive-sync/releases",
         "https://supermarsx.github.io/synology-drive-sync/release-selector.html",
         "noopener noreferrer",
@@ -814,7 +920,7 @@ def validate_native_bundle(script_payload: bytes, style_payload: bytes) -> None:
         "location.hash", "hashchange",
         "sourceMappingURL", "eval(", "new Function(", "__VUE_DEVTOOLS_GLOBAL_HOOK__",
         "You are running Vue in development mode", 'version:"2.7.14"',
-        "consumeLaunchToken", "X-SYNO-TOKEN", "SynoToken", "launch token",
+        "consumeLaunchToken", "launch token",
     ):
         if forbidden.lower() in script.lower():
             raise ValidationError(f"native DSM bundle contains forbidden runtime {forbidden}")

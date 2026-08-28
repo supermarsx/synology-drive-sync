@@ -81,10 +81,15 @@ package. Nothing carries a set-user-ID/set-group-ID bit. `conf/privilege` contai
 `defaults.run-as: package`; it requests no root run-as, joined DSM group, tool privilege, or Linux
 capability. The ordinary CGI fails closed unless Webman starts it with real/effective UID equal to
 its exact non-root package owner; the `sdsync-dsm-api --serve` daemon uses that package UID through
-the package run-as contract. The CGI first validates the fixed root-owned `authenticate.cgi`. It
-executes the helper when the kernel permits that package UID to do so; if the trusted helper is
-kernel-inaccessible, including the observed DSM `root:system 0750` mode, it performs one bounded
-loopback-only `SYNO.Core.Desktop.Initdata` `get_user_service` request using the current DSM cookie.
+the package run-as contract. The AppWindow first obtains the official `SYNO.API.Auth` version 6
+`method=token` response by a bounded same-origin GET, exactly-once-encodes the returned value into
+module memory, and adds it only as `X-SYNO-TOKEN` on package requests. It never uses a launch URL,
+history, request body, persistent storage, or logs to transport the token. The CGI probes `X_OK` on
+the exact fixed root-owned `authenticate.cgi` before any helper path or metadata validation. `X_OK`
+success selects full trusted-path validation, immediate pre-execution revalidation, and direct
+execution. `EACCES` skips the validator and selects one bounded loopback-only
+`SYNO.Core.Desktop.Initdata` `get_user_service` request using the current DSM cookie and optional
+token as sensitive headers. Every other probe error fails closed.
 The response must contain a valid `Session.user` and exact `is_admin=true`, and the CGI then
 independently resolves NSS identity and `administrators` membership. It relays one bounded assertion
 and request through fixed
@@ -96,10 +101,11 @@ fallback pins the destination to literal IPv4 loopback and the current CGI serve
 proxying and redirects, bounds time and response bytes, and never puts a cookie or token in the URL.
 It does not trust `SERVER_NAME`, another host, or a redirected peer.
 
-Synology publicly documents the direct `authenticate.cgi` custom-CGI path. The user-service response
-shape above is DSM runtime behavior observed in the supplied physical capture, not a public API
-compatibility promise. Physical-NAS acceptance must therefore re-prove it on each supported DSM
-branch rather than treating repository fixtures as platform proof.
+Synology publicly documents the direct `authenticate.cgi` custom-CGI path and the official
+`SYNO.API.Auth` version 6 `method=token` JavaScript bootstrap. The private user-service response shape
+above is corroborated by saved first-party DSM runtime sources, not by the supplied HTTP capture, and
+is not a public API compatibility promise. Physical-NAS acceptance must therefore re-prove it on each
+supported DSM branch rather than treating repository fixtures as platform proof.
 
 The corrected package contains no `conf/resource` acquisition worker or sysnotify mail templates.
 Optional alerts invoke `/usr/syno/bin/synodsmnotify -c` with only the fixed application ID
@@ -133,14 +139,16 @@ not presented as shipped runtime dependencies.
 2. Start the package. The package-user API service and controller start safely with scheduling
    disabled.
 3. Open the native **Synology Drive Sync** AppWindow from the DSM desktop or Package Center. The
-   DSM-launched CGI authenticates the current session cookie through the validated direct helper or,
-   only when kernel permissions deny execution of that otherwise trusted helper, through the bounded
-   loopback user-service path. The package service then
+   UI performs the official same-origin `SYNO.API.Auth` version 6 `method=token` bootstrap, retains the
+   exactly-once-encoded result only in module memory, and sends it only as the package
+   `X-SYNO-TOKEN` header. The DSM-launched CGI probes the fixed helper first: an executable entry is
+   fully validated/revalidated before direct execution, while `EACCES` skips validation and selects
+   the bounded loopback user-service path. The package service then
    independently verifies the package-UID peer, account identity and administrator membership,
    recomputed session binding, policy, and package CSRF. It never executes DSM's protected
-   authenticator. The native UI does not inspect or rewrite the DSM shell location and sends no
-   `SynoToken`. If session authentication or the bridge fails, use the CLI and record the
-   physical-NAS evidence.
+   authenticator. The native UI does not inspect or rewrite the DSM shell location and never places
+   the token in a launch URL, history, body, persistent storage, or logs. If session authentication or
+   the bridge fails, use the CLI and record the physical-NAS evidence.
 4. Enable SSH temporarily for ACL verification and recovery. Resolve the actual package owner as
    shown in [CLI parity](../../docs/dsm/cli-parity.md#discover-the-actual-package-identity); the
    management entry point is:
@@ -261,10 +269,11 @@ architecture, static linkage, dashboard/relay contracts, lifecycle behavior, and
 assembly. Before relying on the package, test its exact NAS model and DSM version with a disposable
 source and target, including Package Center installation and exact warning, CGI package identity,
 package-user API service, package-owned `0600` socket, native AppWindow loading/rendering, browser
-`X-SDSYNC-Request: 1` to CGI `HTTP_X_SDSYNC_REQUEST=1` forwarding, the primary protected
-`authenticate.cgi` path when executable or the loopback user-service path when a validated
-`root:system 0750` helper is kernel-inaccessible, nonempty GET error envelopes with HTTP transport 200
-and semantic status/code/stage, administrator/CSRF rejection cases,
+same-origin `SYNO.API.Auth` token bootstrap and `X-SYNO-TOKEN` forwarding,
+`X-SDSYNC-Request: 1` to CGI `HTTP_X_SDSYNC_REQUEST=1` forwarding, the fixed-helper `X_OK` probe,
+full validation/revalidation/direct execution when executable, or validator-skipping loopback when
+the probe returns `EACCES`, nonempty GET error envelopes with HTTP transport 200 and semantic
+status/code/stage, administrator/CSRF rejection cases,
 reverse-proxy upload limits, TLS trust, TOTP clock synchronization, routines, direct DSM desktop
 alerts, large files, Drive indexing, restart during a long transfer, upgrade, and uninstall.
 Automated Chrome fixture QA passes against the captured DSM control structure; physical native DSM
@@ -272,4 +281,4 @@ rendering and accessibility interaction, browser-header forwarding, package inst
 package-owner CGI identity, and both DSM authentication branch contracts remain unverified. A
 manually built SPK is not automatically a Synology Package Center-approved release.
 
-Official framework references: [package structure](https://help.synology.com/developer-guide/synology_package/introduction.html), [native app launch](https://help.synology.com/developer-guide/synology_package/package_tgz/launch_app.html), [AppWindow framework](https://help.synology.com/developer-guide/appendix/ui_framework/application.html), [architecture mapping](https://help.synology.com/developer-guide/appendix/platarchs.html), [privilege configuration](https://help.synology.com/developer-guide/privilege/privilege_config.html), [FHS paths](https://help.synology.com/developer-guide/integrate_dsm/fhs.html), and [lifecycle status codes](https://help.synology.com/developer-guide/synology_package/scripts.html).
+Official framework references: [package structure](https://help.synology.com/developer-guide/synology_package/introduction.html), [native app launch](https://help.synology.com/developer-guide/synology_package/package_tgz/launch_app.html), [AppWindow framework](https://help.synology.com/developer-guide/appendix/ui_framework/application.html), [application authentication](https://help.synology.com/developer-guide/integrate_dsm/web_authentication.html), [DSM Login Web API](https://global.download.synology.com/download/Document/Software/DeveloperGuide/Os/DSM/All/enu/DSM_Login_Web_API_Guide_enu.pdf), [architecture mapping](https://help.synology.com/developer-guide/appendix/platarchs.html), [privilege configuration](https://help.synology.com/developer-guide/privilege/privilege_config.html), [FHS paths](https://help.synology.com/developer-guide/integrate_dsm/fhs.html), and [lifecycle status codes](https://help.synology.com/developer-guide/synology_package/scripts.html).

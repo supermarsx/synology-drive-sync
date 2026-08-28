@@ -191,6 +191,11 @@ test("failed initial CSRF bootstrap is reported once before the scheduled retry"
     assert.equal(scheduledRetries, 1, "the normal bounded refresh cadence owns the retry");
     assert.equal(context.bridgeIssue.title, "DSM request metadata rejected");
     assert.equal(context.toasts.length, 1);
+    context.csrfToken = "csrf-cookie-only";
+    context.auth.onCsrfReissued("different-token", "csrf-token-bound");
+    assert.equal(context.csrfToken, "csrf-cookie-only", "a stale callback must not replace newer CSRF state");
+    context.auth.onCsrfReissued("csrf-cookie-only", "csrf-token-bound");
+    assert.equal(context.csrfToken, "csrf-token-bound", "the exact reissued CSRF must replace AppWindow state");
     assert.equal(
       context.describeBridgeError({ status: 400, code: "non_json_response" }).title,
       "DSM request metadata rejected",

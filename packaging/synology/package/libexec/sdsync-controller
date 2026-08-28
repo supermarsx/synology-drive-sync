@@ -117,8 +117,15 @@ process_control_queue() {
             [ ! -L "$processing_secret" ] && rm -f "$processing_secret" 2>/dev/null || true
             continue
         }
+        # The package framework exposes @appdata through this stable alias even
+        # when SYNOPKG_PKGVAR names its physical /volume*/@appdata location.
+        # The native consumer deliberately accepts only these lexical parents;
+        # keep the controller's own file operations on the physical paths but
+        # cross the executable trust boundary through the framework aliases.
+        consumer_processing_request=$package_base/var/control/processing/$queued_name
+        consumer_response_final=$package_base/var/control/responses/$queued_id.json
         controller_log_event trace control_request_dispatched "id=$queued_id"
-        "$api_bridge" --consume-job "$processing_request" "$response_final" &
+        "$api_bridge" --consume-job "$consumer_processing_request" "$consumer_response_final" &
         active_pid=$!
         # TERM can be delivered after the asynchronous launch but before the
         # assignment above. Recheck the latched shutdown state so that window

@@ -302,14 +302,31 @@ class BuilderTests(unittest.TestCase):
         text = (REPOSITORY / "docs/dsm/security.md").read_text(encoding="utf-8")
         normalized = " ".join(text.split())
         for required in (
-            "direct `authenticate.cgi` execution is the primary path",
-            "If and only if that full path validation succeeds but the kernel returns `EACCES`",
+            "`X_OK` probe occurs before helper metadata",
+            "If the probe returns `EACCES`, it skips that validator",
+            "Only after `X_OK` succeeds does the CGI validate",
+            "api=SYNO.API.Auth&version=6&method=token",
+            "URL-component-encodes that raw value exactly once",
+            "module memory for the current AppWindow",
+            "only as the `X-SYNO-TOKEN` header",
+            "browser-visible launch URL, `window.location`, history, Referer, bookmark, "
+            "package action URL/query string, package request body, `localStorage`, "
+            "`sessionStorage`, IndexedDB",
+            "process-local, token-only `QUERY_STRING` containing "
+            "`SynoToken=<exactly-once-encoded-value>`",
             "literal `127.0.0.1:$SERVER_PORT/webapi/entry.cgi`",
             "Proxy use and redirects are disabled",
             "There is no cookie or token URL",
             "valid string `data.Session.user`",
             "Boolean `data.Session.is_admin=true`",
-            "not a public compatibility promise",
+            "corroborated by saved first-party DSM runtime sources, not by the supplied "
+            "HTTP capture",
+            "private/unpublished behavior",
+            "application authentication guide",
+            "DSM Login Web API Guide",
+            "https://help.synology.com/developer-guide/integrate_dsm/web_authentication.html",
+            "https://global.download.synology.com/download/Document/Software/DeveloperGuide/"
+            "Os/DSM/All/enu/DSM_Login_Web_API_Guide_enu.pdf",
             "Without executing `authenticate.cgi` or calling the user service "
             "again, the server independently resolves",
             "read-only GET failures use `Status: 200 OK`",
@@ -336,10 +353,12 @@ class BuilderTests(unittest.TestCase):
             "`dsm_authentication_webapi_unavailable` with status 503",
             "`dsm_authentication_webapi_rejected` with status 401",
             "`dsm_authentication_webapi_forbidden` with status 403",
-            "expected trigger for the bounded loopback user-service path",
+            "If that probe fails with `EACCES`, it deliberately skips path validation",
             "not a public API promise",
             "without any chmod, group, root, privilege, or resource change",
             "no proxy, redirect, remote host, cookie URL, or token URL",
+            "official same-origin `SYNO.API.Auth` version 6 `method=token`",
+            "sends it as `X-SYNO-TOKEN` on package requests",
         ):
             self.assertIn(required, troubleshooting)
         selector = (REPOSITORY / "docs/release-selector.md").read_text(encoding="utf-8")
@@ -1248,6 +1267,21 @@ class RuntimeTests(unittest.TestCase):
         for path in (self.real_home, self.real_var, self.fhs):
             path.mkdir(parents=True, mode=0o700, exist_ok=True)
         shutil.copytree(HERE / "package", self.real_target)
+        # Relocate DSM's fixed /var/packages/<name> framework alias into the
+        # isolated fixture. Physical SYNOPKG_* paths remain distinct targets,
+        # exactly as they are under /volume*/@app{store,home,data} on DSM.
+        runtime_common = self.real_target / "libexec/sdsync-common"
+        runtime_common_source = runtime_common.read_text(encoding="utf-8")
+        production_base = "package_base=/var/packages/$package_name\n"
+        self.assertEqual(runtime_common_source.count(production_base), 1)
+        runtime_common.write_text(
+            runtime_common_source.replace(
+                production_base,
+                f"package_base={shlex.quote(str(self.fhs))}\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
         self.lifecycle_dir = self.root / "lifecycle"
         shutil.copytree(HERE / "scripts", self.lifecycle_dir)
         for path in self.real_target.rglob("*"):
@@ -1319,6 +1353,7 @@ class RuntimeTests(unittest.TestCase):
         *,
         queue_capture: Path | None = None,
         queue_lock: Path | None = None,
+        queue_argv_capture: Path | None = None,
         consumer_tree_pid_file: Path | None = None,
         consumer_tree_ready_file: Path | None = None,
         consumer_tree_done_file: Path | None = None,
@@ -1326,9 +1361,16 @@ class RuntimeTests(unittest.TestCase):
         bridge = self.real_target / "bin/sdsync-dsm-api"
         consume = ""
         if queue_capture is not None and queue_lock is not None:
+            argv_capture = ""
+            if queue_argv_capture is not None:
+                argv_capture = f'''
+    with Path({str(queue_argv_capture)!r}).open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(sys.argv[2:], separators=(",", ":")) + "\\n")
+'''
             consume = f'''\nif len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
     request = Path(sys.argv[2])
     response = Path(sys.argv[3])
+{argv_capture}
     job_id = request.stem
     capture = Path({str(queue_capture)!r})
     lock = Path({str(queue_lock)!r})
@@ -4960,6 +5002,59 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertLessEqual(len(safe_responses), 256)
         self.assertIn("kind=processing_indeterminate", controller_log_path.read_text(encoding="utf-8"))
 
+    def test_controller_dispatches_physical_pkgvar_jobs_through_framework_aliases(self) -> None:
+        runtime_common = self.real_target / "libexec/sdsync-common"
+        common_source = runtime_common.read_text(encoding="utf-8")
+        self.assertIn(f"package_base={shlex.quote(str(self.fhs))}\n", common_source)
+
+        bridge_capture = self.root / "physical-pkgvar-bridge-capture"
+        bridge_lock = self.root / "physical-pkgvar-bridge-lock"
+        bridge_argv_capture = self.root / "physical-pkgvar-bridge-argv"
+        self.write_api_mock(
+            queue_capture=bridge_capture,
+            queue_lock=bridge_lock,
+            queue_argv_capture=bridge_argv_capture,
+        )
+        job_id = "c" * 48
+        physical_request = self.real_var / f"control/requests/{job_id}.json"
+        physical_response = self.real_var / f"control/responses/{job_id}.json"
+        physical_request.write_text("{}\n", encoding="utf-8")
+        physical_request.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(physical_request, self.drop_uid, self.drop_gid)
+
+        physical_environment = {
+            "SYNOPKG_PKGDEST": str(self.real_target),
+            "SYNOPKG_PKGHOME": str(self.real_home),
+            "SYNOPKG_PKGVAR": str(self.real_var),
+        }
+        started = self.shell(
+            self.lifecycle,
+            "start",
+            extra_environment=physical_environment,
+            timeout=15,
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        for _ in range(300):
+            if physical_response.is_file() and bridge_argv_capture.is_file():
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("controller did not consume the physical SYNOPKG_PKGVAR request")
+
+        captured = [
+            json.loads(line)
+            for line in bridge_argv_capture.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(len(captured), 1)
+        expected_request = self.fhs / f"var/control/processing/{job_id}.json"
+        expected_response = self.fhs / f"var/control/responses/{job_id}.json"
+        self.assertEqual(captured[0], [str(expected_request), str(expected_response)])
+        self.assertNotEqual(captured[0], [str(physical_request), str(physical_response)])
+        self.assertEqual(expected_request.resolve(), self.real_var / f"control/processing/{job_id}.json")
+        self.assertEqual(expected_response.resolve(), physical_response)
+        self.assertTrue(physical_response.is_file())
+
     def test_controller_reconciles_terminal_audit_before_pruning_without_new_work(self) -> None:
         transaction = "controller-reconcile-" + ("a" * 48)
         job_id = "d" * 48
@@ -8560,6 +8655,84 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         ):
             self.assertFalse(path.exists(), path)
         self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
+
+    def test_private_audit_parent_modes_require_exact_bridge_argv_shape(self) -> None:
+        probe = self.root / "private-audit-parent-argv-probe"
+        probe.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            '. "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+            'internal_api_bridge_parent_argv_authorized "$1"\n',
+            encoding="utf-8",
+        )
+        probe.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(probe, self.drop_uid, self.drop_gid)
+
+        bridge = str(self.fhs / "target/bin/sdsync-dsm-api")
+        accepted = {
+            "serve": [bridge, "--serve"],
+            "supervised-serve": [bridge, "--serve-supervised", "123", "456", "boot-id"],
+            "consumer": [bridge, "--consume-job", "/private/request", "/private/response"],
+            "audit-reconcile": [bridge, "--audit-transaction", "reconcile"],
+            "audit-begin": [
+                bridge,
+                "--audit-transaction",
+                "begin",
+                "interface-settings",
+                "all",
+                "administrator",
+                "1000",
+                "bridge",
+                "transaction",
+            ],
+            "audit-complete": [
+                bridge,
+                "--audit-transaction",
+                "complete",
+                "transaction",
+                "succeeded",
+            ],
+        }
+        rejected = {
+            "mode-later-with-accepted-count": [
+                bridge,
+                "ignored",
+                "--serve-supervised",
+                "123",
+                "456",
+            ],
+            "supervised-missing-parent-identity": [
+                bridge,
+                "--serve-supervised",
+                "123",
+                "456",
+            ],
+            "serve-with-extra-argument": [bridge, "--serve", "ignored"],
+            "non-manager-audit-subcommand": [
+                bridge,
+                "--audit-transaction",
+                "execute",
+                "transaction",
+            ],
+        }
+
+        def cmdline(name: str, arguments: list[str]) -> Path:
+            path = self.root / f"private-audit-parent-{name}.cmdline"
+            path.write_bytes(b"\0".join(argument.encode("utf-8") for argument in arguments) + b"\0")
+            path.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(path, self.drop_uid, self.drop_gid)
+            return path
+
+        for name, arguments in accepted.items():
+            with self.subTest(name=name):
+                result = self.shell(probe, str(cmdline(name, arguments)))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for name, arguments in rejected.items():
+            with self.subTest(name=name):
+                result = self.shell(probe, str(cmdline(name, arguments)))
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_physical_package_destination_accepts_framework_controller_exec_alias(self) -> None:
         framework_controller = self.fhs / "target/libexec/sdsync-controller"

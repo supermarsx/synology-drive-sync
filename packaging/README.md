@@ -43,10 +43,13 @@ Evansport on the DSM 7.0/7.1 line. Use the
 unknown, and conflicting inputs fail closed. The SPK runs without root, Linux capabilities, joined
 web groups, or any set-user-ID/set-group-ID file. `defaults.run-as=package` keeps services on the
 exact non-root package UID; the ordinary package-owned `0755` CGI fails closed unless Webman supplies
-that same real/effective UID. The CGI validates DSM's fixed root-owned `authenticate.cgi` and uses it
-as the primary authenticator when the package UID can execute it. A kernel permission denial on an
-otherwise trusted helper, including DSM's observed `root:system 0750` layout, selects a bounded
-loopback-only DSM user-service request carrying the current cookie. That response must contain a
+that same real/effective UID. The AppWindow obtains the official same-origin `SYNO.API.Auth` version 6
+`method=token` response, exactly-once-encodes it into module memory, and sends it only as the package
+`X-SYNO-TOKEN` header. The CGI probes `X_OK` on DSM's fixed root-owned `authenticate.cgi` before
+inspecting helper metadata. A successful probe triggers full trusted-path validation, immediate
+pre-execution revalidation, and direct execution. `EACCES` skips the validator and selects a bounded
+loopback-only DSM user-service request carrying the current cookie and optional token as sensitive
+headers; every other probe error fails closed. That response must contain a
 valid `Session.user` and exact `is_admin=true`, after which the CGI independently resolves the NSS
 identity and administrator membership. It then relays over a fixed package-owned socket that is
 `0000` before startup commit and activates on the same inode as `0600`; the service repeats the peer,
@@ -85,10 +88,13 @@ arguments or generated TOML.
 The package controller provides per-profile interval/daily/realtime routines, native-watcher polling
 fallback, dependencies, bounded retry/backoff, a legacy global interval schedule, cooperative
 start/stop, one run lock, state, bounded logs, and fixed DSM notifications. Package Center lifecycle
-also controls the package-user API service. The dashboard uses DSM cookie authentication, an
-independent administrator check, mandatory package CSRF, and a private controller queue; the native
-UI does not inspect the DSM shell location or send a `SynoToken`, and stored secrets are never returned. Deletion requires profile and
-action-level approval. Upgrade retains
+also controls the package-user API service. The dashboard uses the browser-managed DSM cookie,
+official same-origin `SYNO.API.Auth` version 6 `method=token` bootstrap, an independent administrator
+check, mandatory package CSRF, and a private controller queue. The native UI retains the
+exactly-once-encoded SynoToken only in module memory and sends it only as `X-SYNO-TOKEN`; it never
+uses the DSM shell location, launch URL, history, request body, persistent storage, or logs for token
+transport, and stored secrets are never returned. Deletion requires profile and action-level
+approval. Upgrade retains
 private configuration and credentials and validates them; uninstall removes package-owned
 configuration, credentials, state, locks, socket, and logs while leaving both NAS data trees untouched.
 
@@ -96,10 +102,13 @@ See the [complete DSM package and dashboard guide](../docs/synology-package.md) 
 ACL, graphical configuration, secret, diagnostic, routine, security, CLI, upgrade, and acceptance
 behavior. The package has static/mock validation but no recorded physical installation or live
 two-NAS test. Webman's package-owner CGI identity, the direct-helper or loopback user-service branch
-selected by the installed helper permissions, browser request-marker forwarding to CGI
-`HTTP_X_SDSYNC_REQUEST=1`, and AppWindow loading remain live acceptance checks; token absence is
-supported. The fallback user-service shape was observed in the supplied DSM runtime capture and is
-not a public Synology API promise, so it must be re-proven on each supported DSM branch.
+selected by fixed-path `X_OK`, official token bootstrap/header forwarding, browser request-marker
+forwarding to CGI `HTTP_X_SDSYNC_REQUEST=1`, and AppWindow loading remain live acceptance checks. An
+unavailable or invalid token bootstrap leaves `X-SYNO-TOKEN` absent only for the bounded retry
+cooldown; absence is not the normal documented path and never activates launch-URL or storage
+fallback. The private fallback user-service shape is corroborated by saved first-party DSM runtime
+sources, was not present in the supplied HTTP capture, and is not a public Synology API promise, so
+it must be re-proven on each supported DSM branch.
 
 ## Verified binary installer lifecycle
 
