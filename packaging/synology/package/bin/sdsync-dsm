@@ -34,15 +34,16 @@ Usage:
 configure-profile options:
   --compare content|metadata|size-only   (default: content)
   --jobs 1..16                          (default: 2)
-  --delete --max-delete N               (explicit exact-mirror mode)
+  --delete --max-delete 0..2147483647   (explicit exact-mirror mode)
   --allow-http                          (HTTPS is otherwise required)
   --allow-empty-source true|false       (default: false)
   --exclude PATTERN                     (repeatable; defaults include DSM metadata)
   --clear-excludes                      (start with an empty exclude list)
-  --retries 0..5 --timeout SECONDS --connect-timeout SECONDS
-  --max-rate BYTES_PER_SECOND|none --ca-certificate FILE
+  --retries 0..5 --timeout 1..86400 --connect-timeout 1..600
+  --max-rate 1..9007199254740991|none --ca-certificate FILE
   --danger-accept-invalid-certs true|false
   --log-level trace|debug|info|warn|error|off
+  --log-format human|json --progress auto|always|never --output human|json|ndjson
   --remote-log-url URL --remote-log-mode best-effort|required
   --default                             (make this the default profile)
 
@@ -250,7 +251,7 @@ configure_routine_audit_target() {
             --retry-attempts|--retry-count) audit_canonical=retry-count ;;
             --retry-backoff|--retry-backoff-seconds) audit_canonical=retry-backoff ;;
             --profile|--enabled|--action|--mode|--interval|--weekdays|--debounce-seconds|\
-            --poll-seconds|--allow-delete|--max-total-delete)
+            --retry-exponential|--poll-seconds|--allow-delete|--max-total-delete)
                 audit_canonical=$audit_option
                 ;;
             *) return 64 ;;
@@ -496,11 +497,17 @@ reload_controller_if_running() {
 }
 
 write_disabled_schedule() {
+    disabled_schedule_interval=$(setting "$schedule_file" interval_seconds 3600)
+    disabled_schedule_max=$(setting "$schedule_file" max_total_delete 100)
+    case $disabled_schedule_interval in ''|*[!0-9]*) die "stored schedule interval is invalid" ;; esac
+    [ "$disabled_schedule_interval" -ge 60 ] && [ "$disabled_schedule_interval" -le 2592000 ] || \
+        die "stored schedule interval is invalid"
+    decimal_at_most "$disabled_schedule_max" "$dsm_delete_limit" || \
+        die "stored schedule deletion bound is invalid"
     schedule_temp=$schedule_file.tmp.$$
     {
         printf 'enabled=false\ninterval_seconds=%s\nallow_delete=false\nmax_total_delete=%s\n' \
-            "$(setting "$schedule_file" interval_seconds 3600)" \
-            "$(setting "$schedule_file" max_total_delete 100)"
+            "$disabled_schedule_interval" "$disabled_schedule_max"
     } > "$schedule_temp"
     finish_private_file "$schedule_temp"
     mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
@@ -772,6 +779,8 @@ configure_profile() {
     case $jobs in ''|*[!0-9]*) die "jobs must be an integer from 1 through 16" ;; esac
     if [ "$jobs" -lt 1 ] || [ "$jobs" -gt 16 ]; then die "jobs must be from 1 through 16"; fi
     case $max_delete in ''|*[!0-9]*) die "max-delete must be a non-negative integer" ;; esac
+    decimal_at_most "$max_delete" "$dsm_delete_limit" || \
+        die "max-delete must be from 0 through 2147483647"
     if [ "$delete" = true ] && [ "$max_delete_set" != true ]; then
         die "--delete requires an explicit --max-delete bound"
     fi
@@ -780,18 +789,26 @@ configure_profile() {
     done
     case $retries in ''|*[!0-9]*) die "retries must be an integer from 0 through 5" ;; esac
     [ "$retries" -le 5 ] || die "retries must be from 0 through 5"
-    for timeout_value in "$timeout" "$connect_timeout"; do
-        case $timeout_value in ''|*[!0-9]*) die "timeouts must be positive integers" ;; esac
-        [ "$timeout_value" -gt 0 ] || die "timeouts must be positive integers"
-    done
-    case $max_rate in none) ;; ''|*[!0-9]*) die "max-rate must be a positive integer or none" ;; *) [ "$max_rate" -gt 0 ] || die "max-rate must be positive" ;; esac
+    [ "$allow_empty_source" != true ] || [ "$delete" = true ] || \
+        die "--allow-empty-source requires --delete"
+    case $timeout in ''|*[!0-9]*) die "timeout must be an integer from 1 through 86400" ;; esac
+    decimal_at_most "$timeout" 86400 && [ "$timeout" -ge 1 ] || \
+        die "timeout must be from 1 through 86400 seconds"
+    case $connect_timeout in ''|*[!0-9]*) die "connect-timeout must be an integer from 1 through 600" ;; esac
+    decimal_at_most "$connect_timeout" 600 && [ "$connect_timeout" -ge 1 ] || \
+        die "connect-timeout must be from 1 through 600 seconds"
+    case $max_rate in
+        none) ;;
+        ''|*[!0-9]*) die "max-rate must be a positive integer or none" ;;
+        *) decimal_at_most "$max_rate" 9007199254740991 && [ "$max_rate" -gt 0 ] || \
+            die "max-rate must be from 1 through 9007199254740991, or none" ;;
+    esac
     case $log_level in trace|debug|info|warn|error|off) ;; *) die "invalid log-level" ;; esac
     case $log_format in human|json) ;; *) die "log-format must be human or json" ;; esac
     case $progress in auto|always|never) ;; *) die "progress must be auto, always, or never" ;; esac
-    case $output in human|json) ;; *) die "output must be human or json" ;; esac
+    case $output in human|json|ndjson) ;; *) die "output must be human, json, or ndjson" ;; esac
     case $verbosity in ''|*[!0-9]*) die "verbose must be 0, 1, or 2" ;; esac
     [ "$verbosity" -le 2 ] || die "verbose must be 0, 1, or 2"
-    [ "$quiet" != true ] || [ "$verbosity" = 0 ] || die "quiet and verbose cannot both be enabled"
     validate_toml_text log-file "$log_file"
     [ "$log_file" = "$log_root/sync.log" ] || \
         die "DSM log-file must be the package-managed sync.log path"
@@ -828,7 +845,8 @@ configure_profile() {
         printf 'username = "%s"\n' "$dsm_username"
         printf 'password-file = "%s/%s.password"\n' "$secret_root" "$profile_name"
         printf 'totp-secret-file = "%s/%s.totp"\n' "$secret_root" "$profile_name"
-        printf 'remote-log-token-file = "%s/%s.remote-log-token"\n' "$secret_root" "$profile_name"
+        [ -z "$remote_log_url" ] || \
+            printf 'remote-log-token-file = "%s/%s.remote-log-token"\n' "$secret_root" "$profile_name"
         printf 'no-vault = true\ncompare = "%s"\njobs = %s\n' "$compare" "$jobs"
         printf 'excludes = [%s]\n' "$excludes_toml"
         printf 'delete = %s\nallow-empty-source = %s\nmax-delete = %s\n' "$delete" "$allow_empty_source" "$max_delete"
@@ -936,7 +954,7 @@ configure_routine() {
     routine_profile= routine_enabled=true routine_action=sync routine_mode=interval
     routine_interval=3600 routine_weekdays=1,2,3,4,5,6,7
     routine_window_start=00:00 routine_window_end=23:59
-    routine_debounce=5 routine_retries=2 routine_backoff=60 routine_poll=30
+    routine_debounce=45 routine_retries=5 routine_backoff=60 routine_retry_exponential=true routine_poll=30
     routine_allow_delete=false routine_max_total=100 routine_dependencies=
     while [ "$#" -gt 0 ]; do
         case $1 in
@@ -951,6 +969,7 @@ configure_routine() {
             --debounce-seconds) need_value "$@"; routine_debounce=$2; shift 2 ;;
             --retry-attempts|--retry-count) need_value "$@"; routine_retries=$2; shift 2 ;;
             --retry-backoff|--retry-backoff-seconds) need_value "$@"; routine_backoff=$2; shift 2 ;;
+            --retry-exponential) need_value "$@"; routine_retry_exponential=$2; shift 2 ;;
             --poll-seconds) need_value "$@"; routine_poll=$2; shift 2 ;;
             --allow-delete) need_value "$@"; routine_allow_delete=$2; shift 2 ;;
             --max-total-delete) need_value "$@"; routine_max_total=$2; shift 2 ;;
@@ -963,26 +982,50 @@ configure_routine() {
         esac
     done
     valid_name "$routine_profile" && profile_exists "$routine_profile" || die "configure-routine requires an existing profile"
-    case $routine_enabled:$routine_allow_delete in true:true|true:false|false:true|false:false) ;; *) die "routine booleans must be true or false" ;; esac
+    case $routine_enabled:$routine_allow_delete:$routine_retry_exponential in
+        true:true:true|true:true:false|true:false:true|true:false:false|\
+        false:true:true|false:true:false|false:false:true|false:false:false) ;;
+        *) die "routine booleans must be true or false" ;;
+    esac
     case $routine_action in plan|sync) ;; *) die "routine action must be plan or sync" ;; esac
     case $routine_mode in interval|daily|realtime) ;; *) die "routine mode must be interval, daily, or realtime" ;; esac
-    case $routine_interval in ''|*[!0-9]*) die "routine interval must be an integer" ;; esac
-    [ "$routine_interval" -ge 60 ] && [ "$routine_interval" -le 2592000 ] || die "routine interval must be 60..2592000 seconds"
-    validate_weekdays "$routine_weekdays"
-    validate_clock_time "$routine_window_start"
-    validate_clock_time "$routine_window_end"
-    case $routine_debounce in ''|*[!0-9]*) die "debounce-seconds must be an integer" ;; esac
-    [ "$routine_debounce" -ge 1 ] && [ "$routine_debounce" -le 3600 ] || die "debounce-seconds must be 1..3600"
+    case $routine_mode in
+        interval)
+            case $routine_interval in ''|*[!0-9]*) die "routine interval must be an integer" ;; esac
+            [ "$routine_interval" -ge 60 ] && [ "$routine_interval" -le 2592000 ] || die "routine interval must be 60..2592000 seconds"
+            routine_weekdays=1,2,3,4,5,6,7
+            routine_window_start=00:00 routine_window_end=23:59
+            routine_debounce=45 routine_poll=30
+            ;;
+        daily)
+            validate_weekdays "$routine_weekdays"
+            validate_clock_time "$routine_window_start"
+            validate_clock_time "$routine_window_end"
+            routine_interval=3600
+            routine_debounce=45 routine_poll=30
+            ;;
+        realtime)
+            case $routine_debounce in ''|*[!0-9]*) die "debounce-seconds must be an integer" ;; esac
+            [ "$routine_debounce" -ge 1 ] && [ "$routine_debounce" -le 3600 ] || die "debounce-seconds must be 1..3600"
+            case $routine_poll in ''|*[!0-9]*) die "poll-seconds must be an integer" ;; esac
+            [ "$routine_poll" -ge 5 ] && [ "$routine_poll" -le 3600 ] || die "poll-seconds must be 5..3600"
+            routine_interval=3600
+            routine_weekdays=1,2,3,4,5,6,7
+            routine_window_start=00:00 routine_window_end=23:59
+            ;;
+    esac
     case $routine_retries in ''|*[!0-9]*) die "retry-attempts must be 0..5" ;; esac
     [ "$routine_retries" -le 5 ] || die "retry-attempts must be 0..5"
     case $routine_backoff in ''|*[!0-9]*) die "retry-backoff must be an integer" ;; esac
-    [ "$routine_backoff" -ge 10 ] && [ "$routine_backoff" -le 86400 ] || die "retry-backoff must be 10..86400 seconds"
-    case $routine_poll in ''|*[!0-9]*) die "poll-seconds must be an integer" ;; esac
-    [ "$routine_poll" -ge 5 ] && [ "$routine_poll" -le 3600 ] || die "poll-seconds must be 5..3600"
+    [ "$routine_backoff" -ge 10 ] && [ "$routine_backoff" -le 300 ] || die "retry-backoff must be 10..300 seconds"
     case $routine_max_total in ''|*[!0-9]*) die "max-total-delete must be a non-negative integer" ;; esac
+    decimal_at_most "$routine_max_total" "$dsm_delete_limit" || \
+        die "max-total-delete must be from 0 through 2147483647"
     if [ "$routine_allow_delete" = true ]; then
         profile_delete_bound=$(sed -n 's/^max-delete = //p' "$profiles_dir/$routine_profile.toml" | sed -n '1p')
         case $profile_delete_bound in ''|*[!0-9]*) die "profile has an invalid deletion bound" ;; esac
+        decimal_at_most "$profile_delete_bound" "$dsm_delete_limit" || \
+            die "profile has an invalid deletion bound"
         [ "$routine_max_total" -ge "$profile_delete_bound" ] || die "routine max-total-delete cannot be lower than the profile max-delete bound"
     fi
     [ "$security_runtime_allow_destructive_sync" = true ] || [ "$routine_allow_delete" != true ] || \
@@ -1005,7 +1048,8 @@ configure_routine() {
         printf 'enabled=%s\naction=%s\nmode=%s\ninterval_seconds=%s\n' "$routine_enabled" "$routine_action" "$routine_mode" "$routine_interval"
         printf 'weekdays=%s\ntime_window_start=%s\ntime_window_end=%s\ndebounce_seconds=%s\n' \
             "$routine_weekdays" "$routine_window_start" "$routine_window_end" "$routine_debounce"
-        printf 'retry_count=%s\nretry_backoff_seconds=%s\npoll_seconds=%s\n' "$routine_retries" "$routine_backoff" "$routine_poll"
+        printf 'retry_count=%s\nretry_backoff_seconds=%s\nretry_exponential=%s\npoll_seconds=%s\n' \
+            "$routine_retries" "$routine_backoff" "$routine_retry_exponential" "$routine_poll"
         printf 'allow_delete=%s\nmax_total_delete=%s\ndepends_on=%s\n' \
             "$routine_allow_delete" "$routine_max_total" "$routine_dependencies"
     } > "$routine_temp"
@@ -1227,6 +1271,8 @@ configure_schedule() {
     case $schedule_interval in ''|*[!0-9]*) die "interval must be an integer" ;; esac
     [ "$schedule_interval" -ge 60 ] && [ "$schedule_interval" -le 2592000 ] || die "interval must be 60..2592000 seconds"
     case $schedule_max_total in ''|*[!0-9]*) die "max-total-delete must be non-negative" ;; esac
+    decimal_at_most "$schedule_max_total" "$dsm_delete_limit" || \
+        die "max-total-delete must be from 0 through 2147483647"
     if [ "$schedule_enabled" = true ]; then
         found=false
         for fragment in "$profiles_dir"/*.toml; do
@@ -1343,6 +1389,8 @@ selection() {
         selected_scope=$(current_default 2>/dev/null) || die "no configured default profile"
     fi
     case $selected_max_total in ''|*[!0-9]*) die "max-total-delete must be non-negative" ;; esac
+    decimal_at_most "$selected_max_total" "$dsm_delete_limit" || \
+        die "max-total-delete must be from 0 through 2147483647"
     if [ "$max_total_seen" = true ] && [ "$selected_scope" != all ]; then
         die "--max-total-delete is only valid with explicit --all"
     fi
@@ -1831,10 +1879,13 @@ api_profile_json() {
     api_toml_string "$profile_fragment" remote '' true; profile_remote=$toml_value
     api_toml_string "$profile_fragment" password-file '' true; profile_password_locator=$toml_value
     api_toml_string "$profile_fragment" totp-secret-file '' true; profile_totp_locator=$toml_value
-    api_toml_string "$profile_fragment" remote-log-token-file '' true; profile_remote_token_locator=$toml_value
+    api_toml_string "$profile_fragment" remote-log-token-file '' false; profile_remote_token_locator=$toml_value
     [ "$profile_password_locator" = "$secret_root/$profile_name.password" ] || api_error corrupt_config "profile password locator escaped package storage" 73
     [ "$profile_totp_locator" = "$secret_root/$profile_name.totp" ] || api_error corrupt_config "profile TOTP locator escaped package storage" 73
-    [ "$profile_remote_token_locator" = "$secret_root/$profile_name.remote-log-token" ] || api_error corrupt_config "profile remote log token locator escaped package storage" 73
+    if [ -n "$profile_remote_token_locator" ]; then
+        [ "$profile_remote_token_locator" = "$secret_root/$profile_name.remote-log-token" ] || \
+            api_error corrupt_config "profile remote log token locator escaped package storage" 73
+    fi
     api_toml_scalar "$profile_fragment" no-vault true bool
     [ "$toml_value" = true ] || api_error corrupt_config "DSM profiles must keep the OS vault disabled" 73
     api_toml_string "$profile_fragment" compare content false; profile_compare=$toml_value
@@ -1843,13 +1894,18 @@ api_profile_json() {
     [ "$profile_jobs" -ge 1 ] && [ "$profile_jobs" -le 16 ] || api_error corrupt_config "invalid profile jobs" 73
     api_toml_scalar "$profile_fragment" delete false bool; profile_delete=$toml_value
     api_toml_scalar "$profile_fragment" max-delete 100 number; profile_max_delete=$toml_value
+    decimal_at_most "$profile_max_delete" "$dsm_delete_limit" || api_error corrupt_config "invalid profile max-delete" 73
     api_toml_scalar "$profile_fragment" allow-http false bool; profile_allow_http=$toml_value
     api_toml_scalar "$profile_fragment" allow-empty-source false bool; profile_allow_empty=$toml_value
+    [ "$profile_allow_empty" != true ] || [ "$profile_delete" = true ] || \
+        api_error corrupt_config "profile allow-empty-source requires delete" 73
     api_toml_scalar "$profile_fragment" retries 2 number; profile_retries=$toml_value
     [ "$profile_retries" -le 5 ] || api_error corrupt_config "invalid profile retries" 73
     api_toml_scalar "$profile_fragment" timeout 7200 number; profile_timeout=$toml_value
     api_toml_scalar "$profile_fragment" connect-timeout 15 number; profile_connect_timeout=$toml_value
-    [ "$profile_timeout" -gt 0 ] && [ "$profile_connect_timeout" -gt 0 ] || api_error corrupt_config "invalid profile timeout" 73
+    decimal_at_most "$profile_timeout" 86400 && [ "$profile_timeout" -gt 0 ] && \
+        decimal_at_most "$profile_connect_timeout" 600 && [ "$profile_connect_timeout" -gt 0 ] || \
+        api_error corrupt_config "invalid profile timeout" 73
     api_toml_scalar "$profile_fragment" danger-accept-invalid-certs false bool; profile_invalid_certs=$toml_value
     api_toml_scalar "$profile_fragment" verbose 0 number; profile_verbose=$toml_value
     api_toml_scalar "$profile_fragment" quiet false bool; profile_quiet=$toml_value
@@ -1863,13 +1919,18 @@ api_profile_json() {
     case $profile_log_level in trace|debug|info|warn|error|off) ;; *) api_error corrupt_config "invalid profile log level" 73 ;; esac
     case $profile_log_format in human|json) ;; *) api_error corrupt_config "invalid profile log format" 73 ;; esac
     case $profile_progress in auto|always|never) ;; *) api_error corrupt_config "invalid profile progress mode" 73 ;; esac
-    case $profile_output in human|json) ;; *) api_error corrupt_config "invalid profile output mode" 73 ;; esac
+    case $profile_output in human|json|ndjson) ;; *) api_error corrupt_config "invalid profile output mode" 73 ;; esac
     case $profile_remote_log_mode in best-effort|required) ;; *) api_error corrupt_config "invalid remote log mode" 73 ;; esac
     [ "$profile_log_file" = "$log_root/sync.log" ] || \
         api_error corrupt_config "profile log file is outside the fixed package-managed path" 73
-    if [ -n "$profile_remote_log_url" ]; then case $profile_remote_log_url in https://*) ;; *) api_error corrupt_config "remote log URL is not HTTPS" 73 ;; esac; fi
+    if [ -n "$profile_remote_log_url" ]; then
+        case $profile_remote_log_url in https://*) ;; *) api_error corrupt_config "remote log URL is not HTTPS" 73 ;; esac
+        [ "$profile_remote_token_locator" = "$secret_root/$profile_name.remote-log-token" ] || \
+            api_error corrupt_config "remote logging profile is missing its package token locator" 73
+    fi
     api_toml_string "$profile_fragment" ca-certificate '' false; profile_ca_certificate=$toml_value
     api_toml_scalar "$profile_fragment" max-rate 0 number; profile_max_rate=$toml_value
+    decimal_at_most "$profile_max_rate" 9007199254740991 || api_error corrupt_config "invalid profile max-rate" 73
     excludes_count=$(grep -c '^excludes = ' "$profile_fragment" 2>/dev/null || true)
     [ "$excludes_count" = 1 ] || api_error corrupt_config "profile has invalid excludes" 73
     profile_excludes=$(sed -n 's/^excludes = //p' "$profile_fragment")
@@ -1937,20 +1998,42 @@ api_routine_json() {
     api_load_kv "$routine_path" weekdays 1,2,3,4,5,6,7; routine_weekdays=$kv_value
     api_load_kv "$routine_path" time_window_start 00:00; routine_start=$kv_value
     api_load_kv "$routine_path" time_window_end 23:59; routine_end=$kv_value
-    api_load_kv "$routine_path" debounce_seconds 5; routine_debounce=$kv_value
-    api_load_kv "$routine_path" retry_count 2; routine_retries=$kv_value
+    api_load_kv "$routine_path" debounce_seconds 45; routine_debounce=$kv_value
+    api_load_kv "$routine_path" retry_count 5; routine_retries=$kv_value
     api_load_kv "$routine_path" retry_backoff_seconds 60; routine_backoff=$kv_value
+    api_load_kv_optional "$routine_path" retry_exponential true; routine_retry_exponential=$kv_value
     api_load_kv "$routine_path" poll_seconds 30; routine_poll=$kv_value
     api_load_kv "$routine_path" allow_delete false; routine_delete=$kv_value
     api_load_kv "$routine_path" max_total_delete 100; routine_max_total=$kv_value
     api_load_kv "$routine_path" depends_on ''; routine_dependencies=$kv_value
-    case $routine_enabled:$routine_delete in true:true|true:false|false:true|false:false) ;; *) api_error corrupt_config "invalid routine booleans" 73 ;; esac
+    case $routine_enabled:$routine_delete:$routine_retry_exponential in
+        true:true:true|true:true:false|true:false:true|true:false:false|\
+        false:true:true|false:true:false|false:false:true|false:false:false) ;;
+        *) api_error corrupt_config "invalid routine booleans" 73 ;;
+    esac
     case $routine_action in plan|sync) ;; *) api_error corrupt_config "invalid routine action" 73 ;; esac
     case $routine_mode in interval|daily|realtime) ;; *) api_error corrupt_config "invalid routine mode" 73 ;; esac
-    case $routine_interval:$routine_debounce:$routine_retries:$routine_backoff:$routine_poll:$routine_max_total in *[!0-9:]*) api_error corrupt_config "invalid routine numeric value" 73 ;; esac
-    printf '%s\n' "$routine_weekdays" | grep -Eq '^[1-7](,[1-7])*$' || api_error corrupt_config "invalid routine weekdays" 73
-    case $routine_start in [0-1][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;; *) api_error corrupt_config "invalid routine start time" 73 ;; esac
-    case $routine_end in [0-1][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;; *) api_error corrupt_config "invalid routine end time" 73 ;; esac
+    case $routine_retries:$routine_backoff:$routine_max_total in *[!0-9:]*) api_error corrupt_config "invalid routine numeric value" 73 ;; esac
+    [ "$routine_retries" -le 5 ] || api_error corrupt_config "invalid routine retry count" 73
+    [ "$routine_backoff" -ge 10 ] || api_error corrupt_config "invalid routine retry backoff" 73
+    decimal_at_most "$routine_max_total" "$dsm_delete_limit" || api_error corrupt_config "invalid routine deletion bound" 73
+    [ "$routine_backoff" -le 300 ] || routine_backoff=300
+    case $routine_mode in
+        interval)
+            case $routine_interval in ''|*[!0-9]*) api_error corrupt_config "invalid routine interval" 73 ;; esac
+            [ "$routine_interval" -ge 60 ] && [ "$routine_interval" -le 2592000 ] || api_error corrupt_config "invalid routine interval" 73
+            ;;
+        daily)
+            printf '%s\n' "$routine_weekdays" | grep -Eq '^[1-7](,[1-7])*$' || api_error corrupt_config "invalid routine weekdays" 73
+            case $routine_start in [0-1][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;; *) api_error corrupt_config "invalid routine start time" 73 ;; esac
+            case $routine_end in [0-1][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;; *) api_error corrupt_config "invalid routine end time" 73 ;; esac
+            ;;
+        realtime)
+            case $routine_debounce:$routine_poll in *[!0-9:]*) api_error corrupt_config "invalid realtime routine timing" 73 ;; esac
+            [ "$routine_debounce" -ge 1 ] && [ "$routine_debounce" -le 3600 ] || api_error corrupt_config "invalid realtime debounce" 73
+            [ "$routine_poll" -ge 5 ] && [ "$routine_poll" -le 3600 ] || api_error corrupt_config "invalid realtime poll interval" 73
+            ;;
+    esac
     routine_state_file=$routine_state_dir/$routine_name.state
     api_load_kv "$routine_state_file" state never; routine_state=$kv_value
     api_load_kv "$routine_state_file" next_run_epoch 0; routine_next=$kv_value
@@ -1959,12 +2042,18 @@ api_routine_json() {
     case $routine_state in never|scheduled|running|succeeded|failed|deferred) ;; *) api_error corrupt_state "invalid routine state" 73 ;; esac
     case $routine_backend in none|interval|daily|inotify|polling) ;; *) api_error corrupt_state "invalid routine backend" 73 ;; esac
     case $routine_next:$routine_last_success in *[!0-9:]*) api_error corrupt_state "invalid routine epoch" 73 ;; esac
-    printf '{"profile":%s,"enabled":%s,"action":%s,"mode":%s,"interval_seconds":%s,' \
-        "$(json_quote "$routine_name")" "$routine_enabled" "$(json_quote "$routine_action")" "$(json_quote "$routine_mode")" "$routine_interval"
-    printf '"weekdays":[%s],"time_window_start":%s,"time_window_end":%s,"debounce_seconds":%s,' \
-        "$routine_weekdays" "$(json_quote "$routine_start")" "$(json_quote "$routine_end")" "$routine_debounce"
-    printf '"retry_count":%s,"retry_backoff_seconds":%s,"poll_seconds":%s,"allow_delete":%s,"max_total_delete":%s,"depends_on":' \
-        "$routine_retries" "$routine_backoff" "$routine_poll" "$routine_delete" "$routine_max_total"
+    printf '{"profile":%s,"enabled":%s,"action":%s,"mode":%s,' \
+        "$(json_quote "$routine_name")" "$routine_enabled" "$(json_quote "$routine_action")" "$(json_quote "$routine_mode")"
+    case $routine_mode in
+        interval) printf '"interval_seconds":%s,' "$routine_interval" ;;
+        daily)
+            printf '"weekdays":[%s],"time_window_start":%s,"time_window_end":%s,' \
+                "$routine_weekdays" "$(json_quote "$routine_start")" "$(json_quote "$routine_end")"
+            ;;
+        realtime) printf '"debounce_seconds":%s,"poll_seconds":%s,' "$routine_debounce" "$routine_poll" ;;
+    esac
+    printf '"retry_count":%s,"retry_backoff_seconds":%s,"retry_exponential":%s,"allow_delete":%s,"max_total_delete":%s,"depends_on":' \
+        "$routine_retries" "$routine_backoff" "$routine_retry_exponential" "$routine_delete" "$routine_max_total"
     api_dependencies_json "$routine_dependencies"
     printf ',"backend":%s,"state":%s,"next_run_epoch":%s,"last_success_epoch":%s}' \
         "$(json_quote "$routine_backend")" "$(json_quote "$routine_state")" "$routine_next" "$routine_last_success"
@@ -1992,6 +2081,7 @@ api_snapshot() {
     case $schedule_enabled:$schedule_delete in true:true|true:false|false:true|false:false) ;; *) api_error corrupt_state "schedule has invalid booleans" 73 ;; esac
     case $schedule_interval:$schedule_max in *[!0-9:]*) api_error corrupt_state "schedule has invalid numbers" 73 ;; esac
     [ "$schedule_interval" -ge 60 ] && [ "$schedule_interval" -le 2592000 ] || api_error corrupt_state "schedule interval is out of range" 73
+    decimal_at_most "$schedule_max" "$dsm_delete_limit" || api_error corrupt_state "schedule deletion bound is out of range" 73
     api_load_kv "$controller_state" state stopped; controller_status=$kv_value
     api_load_kv "$controller_state" pid 0; controller_pid=$kv_value
     api_load_kv "$controller_state" next_run_epoch 0; controller_next=$kv_value
@@ -2214,7 +2304,7 @@ api_cgi_failure() {
             cgi_failure_event=security.failed
             cgi_failure_category=security
             ;;
-        dsm_authentication:dsm_authentication_helper_unsafe:503|dsm_authentication:dsm_authentication_helper_unavailable:503|dsm_authentication:dsm_authentication_webapi_unavailable:503|dsm_authentication:dsm_authentication_rejected:401|dsm_authentication:dsm_authentication_webapi_rejected:401|dsm_authentication:dsm_authentication_forbidden:403|dsm_authentication:dsm_authentication_webapi_forbidden:403)
+        dsm_authentication:dsm_authentication_helper_unsafe:503|dsm_authentication:dsm_authentication_helper_unavailable:503|dsm_authentication:dsm_authentication_webapi_unavailable:503|dsm_authentication:dsm_authentication_rejected:401|dsm_authentication:dsm_authentication_quickconnect_unsupported:401|dsm_authentication:dsm_authentication_webapi_rejected:401|dsm_authentication:dsm_authentication_forbidden:403|dsm_authentication:dsm_authentication_webapi_forbidden:403)
             cgi_failure_event=authentication.failed
             cgi_failure_category=authentication
             ;;
@@ -2533,6 +2623,8 @@ case $command_name in
         case $interval in ''|*[!0-9]*) die "interval must be an integer" ;; esac
         if [ "$interval" -lt 60 ] || [ "$interval" -gt 2592000 ]; then die "interval must be 60..2592000 seconds"; fi
         case $maximum_total in ''|*[!0-9]*) die "max-total-delete must be non-negative" ;; esac
+        decimal_at_most "$maximum_total" "$dsm_delete_limit" || \
+            die "max-total-delete must be from 0 through 2147483647"
         [ "$security_runtime_allow_destructive_sync" = true ] || [ "$allow_schedule_delete" != true ] || \
             policy_denied "security policy blocks destructive schedules"
         found=false; for fragment in "$profiles_dir"/*.toml; do [ -f "$fragment" ] || continue; found=true; name=${fragment##*/}; name=${name%.toml}; profile_secret_exists "$name" || die "profile '$name' has no password"; done

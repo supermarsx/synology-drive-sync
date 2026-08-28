@@ -30,7 +30,7 @@
   <p>Retries cover transient failures. Upload and connection timeouts are bounded. Maximum rate uses bytes per second; zero means unlimited. A CA certificate path should reference a package-readable PEM bundle. Accepting invalid certificates disables identity verification and requires a separate interception-risk acknowledgement.</p>
 
   <h2>Exclusions and logging</h2>
-  <p>Enter one exclusion pattern per line. Package output remains structured JSON with progress disabled. Verbosity and quiet mode cannot be enabled together. Remote logging requires HTTPS; <em>required</em> mode can fail the operation when delivery fails, while <em>best effort</em> records the delivery problem without failing the sync.</p>
+  <p>Enter one exclusion pattern per line. Log format can be <code>human</code> or <code>json</code>; progress can be <code>auto</code>, <code>always</code>, or <code>never</code>; and command output can be <code>human</code>, <code>json</code>, or <code>ndjson</code>. Quiet suppresses terminal-style output independently, so nonzero verbosity can still raise durable log detail. Remote logging requires HTTPS; <em>required</em> mode can fail the operation when delivery fails, while <em>best effort</em> records the delivery problem without failing the sync.</p>
 
   <h2>Protected credentials</h2>
   <p>Password, TOTP seed, and remote-log token have three independent operations: keep, replace, or clear. Replacement fields are write-only. Saving first applies profile configuration and then applies requested secret operations; if a later stage fails, inspect the refreshed credential-presence flags before retrying.</p>

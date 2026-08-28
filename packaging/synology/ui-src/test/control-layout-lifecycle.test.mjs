@@ -83,7 +83,8 @@ test("responsive form observers release removed routes and cannot restart after 
   const resize = resizeInstances[0];
   const mutation = mutationInstances[0];
   assert.equal(resize.observed.has(first), true);
-  assert.equal(first.classList.contains("sdsync-compact-form"), true);
+  assert.equal(first.classList.contains("sdsync-compact-form"), false,
+    "a usable 640px form must retain label/control rows");
 
   const second = form(900);
   renderedForms = [second];
@@ -100,7 +101,7 @@ test("responsive form observers release removed routes and cannot restart after 
   assert.equal(resize.observed.has(second), false);
   assert.equal(resize.observed.has(first), true, "a reinserted route receives a fresh observation");
 
-  const queuedAfterRemoval = form(500);
+  const queuedAfterRemoval = form(380);
   renderedForms = [queuedAfterRemoval];
   mutation.callback();
   cleanup();

@@ -60,10 +60,13 @@ or an enabled Team Folder.
 > Static packaging, bridge, manager, lifecycle, and mock File Station tests have passed. They do not
 > prove installation on a physical NAS, Webman's package-owner CGI identity, the direct-helper or
 > loopback user-service authentication branch selected by the installed DSM permissions, DSM
-> official token response or forwarding of `X-SYNO-TOKEN` and `X-SDSYNC-Request: 1` as
+> official `method=token` response, this package's private forwarding of `X-SYNO-TOKEN`, or DSM
+> forwarding of `X-SDSYNC-Request: 1` as
 > `HTTP_X_SDSYNC_REQUEST=1`, or
 > synchronization between two live NAS devices. The native AppWindow obtains SynoToken only from the
-> official same-origin API and never inspects the DSM shell location for it. Complete the
+> official same-origin API and never inspects the DSM shell location for it. Synology explicitly
+> excludes third-party applications from QuickConnect support, so use LAN, DDNS, VPN, or a tested DSM
+> custom reverse proxy for acceptance. Complete the
 > [live-NAS acceptance](dsm/troubleshooting.md#live-nas-acceptance) on disposable folders, and keep
 > deletion disabled until its separate destructive test passes.
 

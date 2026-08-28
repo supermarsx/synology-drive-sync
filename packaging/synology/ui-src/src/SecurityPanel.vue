@@ -1,8 +1,8 @@
 <template>
   <v-form
     :value="value"
-    class="sdsync-security-form"
-    direction="vertical"
+    class="sdsync-security-form sdsync-horizontal-form"
+    direction="horizontal"
     @submit="submit"
   >
     <div class="sdsync-subtabs" data-subtabs="security" role="tablist" aria-label="Security policy views" @keydown="moveSubtab($event)">
@@ -53,8 +53,8 @@
             <div class="sdsync-panel-heading">
               <div><p class="sdsync-eyebrow">Bounded resources</p><h3>Request and result limits</h3></div>
             </div>
-            <div class="sdsync-form-grid">
-              <v-form-item class="sdsync-form-item" label="Policy version">
+            <div class="sdsync-form-grid sdsync-inline-field-list">
+              <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Policy version" label-flex="0 0 150px" control-flex="1 1 auto">
                 <template #label-after><policy-help class="sdsync-form-label-help" help-key="policy_version" /></template>
                 <v-input class="sdsync-input-control"
                   :value="policyVersionLabel"
@@ -62,7 +62,7 @@
                   aria-describedby="sdsync-help-security-policy_version"
                 />
               </v-form-item>
-              <v-form-item class="sdsync-form-item" label="CSRF lifetime (seconds)">
+              <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="CSRF lifetime (seconds)" label-flex="0 0 150px" control-flex="1 1 auto">
                 <template #label-after><policy-help class="sdsync-form-label-help" help-key="csrf_lifetime_seconds" /></template>
                 <v-input class="sdsync-input-control"
                   :value="value.csrf_lifetime_seconds"
@@ -72,7 +72,7 @@
                   @input="updateField('csrf_lifetime_seconds', $event)"
                 />
               </v-form-item>
-              <v-form-item class="sdsync-form-item" label="Result retention (seconds)">
+              <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Result retention (seconds)" label-flex="0 0 150px" control-flex="1 1 auto">
                 <template #label-after><policy-help class="sdsync-form-label-help" help-key="result_retention_seconds" /></template>
                 <v-input class="sdsync-input-control"
                   :value="value.result_retention_seconds"
@@ -82,7 +82,7 @@
                   @input="updateField('result_retention_seconds', $event)"
                 />
               </v-form-item>
-              <v-form-item class="sdsync-form-item" label="Maximum outstanding jobs">
+              <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Maximum outstanding jobs" label-flex="0 0 150px" control-flex="1 1 auto">
                 <template #label-after><policy-help class="sdsync-form-label-help" help-key="max_outstanding_jobs" /></template>
                 <v-input class="sdsync-input-control"
                   :value="value.max_outstanding_jobs"

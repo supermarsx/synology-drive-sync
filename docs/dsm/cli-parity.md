@@ -29,7 +29,7 @@ administrator's ACL instead of the package user's real source access.
 
 | Dashboard action | CLI parity |
 | --- | --- |
-| New/save profile | `configure-profile --name NAME --source ... --url ... --username ... --remote ...` |
+| New/save profile | `configure-profile --name NAME --source ... --url ... --username ... --remote ... [profile options]` |
 | Remove profile | `remove-profile NAME` |
 | Use as default | `set-default NAME` |
 | Profile list/default badges | `list-profiles` |
@@ -54,6 +54,17 @@ With no profile name, Doctor/Plan/Run uses the selected default. Only explicit `
 profile. `--write-test` applies only to Doctor. `--allow-delete` applies only to Plan/Run, and
 `--max-total-delete` applies to an all-profile deletion action. Inapplicable or trailing options are
 rejected rather than ignored.
+
+`configure-profile` is a complete replacement of the named profile's non-secret settings. It covers
+the dashboard's target, sync, safety, network, TLS, local-output, and remote-observability fields,
+including `--log-format`, `--progress`, and `--output`. DSM keeps the local log path, OS-vault policy,
+and credential-file locators fixed. Password, TOTP, and remote-log-token values use the separate
+write-only commands above and survive an ordinary profile reconfiguration unless explicitly cleared.
+The DSM profile contract accepts `--output human|json|ndjson`, caps `--max-delete` at `2147483647`
+for armv7 portability, and caps `--max-rate` at JavaScript's exact-integer maximum
+`9007199254740991`.
+Routine, legacy-schedule, and all-profile foreground `--max-total-delete` ceilings use the same
+`0..2147483647` portable bound.
 
 ## Common recovery sequence
 

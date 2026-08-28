@@ -26,6 +26,7 @@ if [ "$run_scope" != all ]; then
     [ "$maximum_total" = - ] || usage
 else
     case $maximum_total in ''|*[!0-9]*) usage ;; esac
+    decimal_at_most "$maximum_total" "$dsm_delete_limit" || usage
 fi
 
 ensure_layout

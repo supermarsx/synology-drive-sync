@@ -76,7 +76,9 @@ Artifacts are named `synology-drive-sync-VERSION-ARCH.spk`, where `ARCH` is `x86
 DSM version `0.1.0-1` in `INFO`. `SOURCE_DATE_EPOCH` controls every tar member and the inner gzip
 header for reproducible output. The builder validates `ui-src/app.config` and `config.define`, then
 deterministically renders the DSM toolkit-equivalent module wrapper under `ui/config` and packages
-`ui/SynologyDriveSync.js` plus `ui/style.css`. The package deliberately has no standalone
+the exact bundle as `ui/SynologyDriveSync.<bundle-sha256-prefix>.js` plus `ui/style.css`. The
+installed config uses that same content-addressed key, so an upgraded bundle cannot reuse a stale
+DSM or reverse-proxy JavaScript URL. The package deliberately has no standalone
 `ui/index.html` or undocumented `launchApp` redirect. DSM launches the application through the
 registered `dsmappname` and installed `ui/config` AppWindow module; the Webman third-party mapping
 exists for registered assets and `api.cgi`, not as a directory-index application.
@@ -191,7 +193,7 @@ not presented as shipped runtime dependencies.
      --remote '/ArchiveTeam/Documents'
    ```
 
-`configure-profile` atomically regenerates a strict non-secret TOML file. Quotes, backslashes, control lines, relative sources, remote `/`, and `.`/`..` remote segments are rejected. Sources are canonicalized and cannot be the filesystem root, overlap package storage, or sit inside DSM-managed trees. DSM-managed components (`@eaDir`, `#recycle`, `#snapshot`, `@tmp`, `@sharebin`, `@apphome`, `@appdata`, `@appstore`, `@apptemp`, `@appconf`, and `.SynologyWorkingDirectory`) are rejected as source/remote roots and excluded while scanning. Remote components also enforce Synology Drive/Windows portability limits: no leading `~`, control or reserved characters, reserved device names, trailing dot/space, or paths longer than 247 characters. Updating a profile retains its protected credentials.
+`configure-profile` atomically regenerates a strict non-secret TOML file. Quotes, backslashes, control lines, relative sources, remote `/`, and `.`/`..` remote segments are rejected. Sources are canonicalized and cannot be the filesystem root, overlap package storage, or sit inside DSM-managed trees. DSM-managed components (`@eaDir`, `#recycle`, `#snapshot`, `@tmp`, `@sharebin`, `@apphome`, `@appdata`, `@appstore`, `@apptemp`, `@appconf`, and `.SynologyWorkingDirectory`) are rejected as source/remote roots and excluded while scanning. Remote components also enforce Synology Drive/Windows portability limits: no leading `~`, control or reserved characters, reserved device names, trailing dot/space, or paths longer than 247 characters. `max-delete` is capped at `2147483647` for armv7 portability, and `max-rate` at `9007199254740991` for exact dashboard round-tripping. Updating a profile retains its protected credentials. The remote-log token locator is emitted only while a collector URL is configured; disabling the URL retains the write-only token file and its presence flag without leaving a core-invalid token source in TOML.
 
 `silent_install=yes` and `silent_upgrade=yes` are intentional: there is no install wizard carrying credentials or paths. This supports Package Center/CMS installation without placing secrets in wizard environment variables. Configuration remains an explicit, auditable post-install dashboard or package-identity CLI operation. Uninstallation is not silent because it permanently purges package-owned profiles, credentials, state, queue, and logs.
 
@@ -231,8 +233,12 @@ All profile, secret, and scheduler mutations use a package-manager lock and refu
 
 ## Routines, scheduler, and service management
 
-The dashboard configures independent interval, daily-window, or realtime routines for each profile,
-including debounce, polling fallback, retries/backoff, dependencies, and layered deletion approval.
+The dashboard configures independent routines per profile: interval cadence, daily weekdays/window,
+or realtime debounce and polling fallback. Retries/backoff, dependencies, and layered deletion
+approval are common controls.
+Routine and legacy-schedule aggregate deletion ceilings use the same portable
+`0..2147483647` bound as profile deletion limits. A pending whole-action retry owns admission until
+its deadline; daily cadence and realtime change detection cannot consume another attempt early.
 The CLI retains this legacy all-profile interval schedule. DSM Package Center start/stop controls
 the long-lived, unprivileged package-user API service and controller, and all automation remains
 disabled until explicitly enabled:

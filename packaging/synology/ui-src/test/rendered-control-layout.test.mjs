@@ -13,7 +13,7 @@ const physicalControlFixture = await readFile(
   new URL("./fixtures/dsm-physical-control-dom.html", import.meta.url),
   "utf8"
 );
-const baselineCss = css.slice(0, css.indexOf("@container (max-width: 720px)"));
+const baselineCss = css.slice(0, css.indexOf("@container (max-width: 420px)"));
 const inlineControlLayout = controlLayout.replace(/^export\s+/gm, "");
 
 function chromeCandidates() {
@@ -63,11 +63,38 @@ function decodeLayout(stdout) {
   return JSON.parse(Buffer.from(match[1], "base64").toString("utf8"));
 }
 
-function renderAttempt(chrome, url, profileDirectory) {
-  return spawnSync(chrome, [
+function terminateOwnedBrowserProcesses(profileDirectory) {
+  if (!profileDirectory) return;
+  if (process.platform === "win32") {
+    spawnSync("powershell.exe", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "$needle = $env:SDSYNC_TEST_BROWSER_PROFILE; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($needle) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+    ], {
+      env: { ...process.env, SDSYNC_TEST_BROWSER_PROFILE: profileDirectory },
+      encoding: "utf8",
+      timeout: 5000,
+      windowsHide: true
+    });
+    return;
+  }
+  spawnSync("pkill", ["-TERM", "-f", profileDirectory], {
+    encoding: "utf8",
+    timeout: 5000,
+    windowsHide: true
+  });
+}
+
+function renderAttempt(chrome, url, profileDirectory, timeoutMs = 45000) {
+  const result = spawnSync(chrome, [
     "--headless=new",
     "--disable-gpu",
     "--disable-dev-shm-usage",
+    "--disable-background-networking",
+    "--disable-breakpad",
+    "--disable-component-update",
+    "--disable-crash-reporter",
     "--no-sandbox",
     `--user-data-dir=${profileDirectory}`,
     "--window-size=1100,1000",
@@ -77,9 +104,11 @@ function renderAttempt(chrome, url, profileDirectory) {
   ], {
     encoding: "utf8",
     maxBuffer: 8 * 1024 * 1024,
-    timeout: 45000,
+    timeout: timeoutMs,
     windowsHide: true
   });
+  terminateOwnedBrowserProcesses(profileDirectory);
+  return result;
 }
 
 function renderAttemptSummary(result) {
@@ -98,10 +127,10 @@ function shouldRetryRender(result) {
   return Boolean(timedOut || missingLayout);
 }
 
-function render(chrome, url, profileDirectory) {
-  const attempts = [renderAttempt(chrome, url, profileDirectory)];
-  if (shouldRetryRender(attempts[0])) {
-    attempts.push(renderAttempt(chrome, url, `${profileDirectory}-retry`));
+function render(chrome, url, profileDirectory, { retry = true, timeoutMs = 45000 } = {}) {
+  const attempts = [renderAttempt(chrome, url, profileDirectory, timeoutMs)];
+  if (retry && shouldRetryRender(attempts[0])) {
+    attempts.push(renderAttempt(chrome, url, `${profileDirectory}-retry`, timeoutMs));
   }
   const result = attempts[attempts.length - 1];
   const diagnostics = JSON.stringify(attempts.map(renderAttemptSummary));
@@ -249,6 +278,10 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
         min-width: 440px !important;
         margin: 24px !important;
         padding: 18px !important;
+        color: #111 !important;
+        border: 3px solid #ddd !important;
+        background: #fff !important;
+        box-shadow: 0 2px 4px #aaa !important;
       }
       .dsm-host .dsm-select,
       .dsm-host [role="combobox"] {
@@ -270,6 +303,8 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
         max-width: none !important;
         min-width: 520px !important;
         margin: 18px !important;
+        color: #111 !important;
+        background: #fff !important;
       }
       .dsm-host .v-checkbox-wrapper {
         position: relative;
@@ -391,6 +426,20 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
                 </div>
               </div>
             </form>
+            <form id="routine-panel" class="sdsync-panel sdsync-horizontal-form sdsync-routine-editor">
+              <div class="sdsync-form-grid compact sdsync-routine-fields">
+                <div id="routine-row" class="dsm-form-item sdsync-form-item sdsync-inline-form-item">
+                  <div id="routine-label-shell" class="v-form-item-label"><label>Mode</label></div>
+                  <div id="routine-control-shell" class="v-form-item-input">
+                    <div class="v-form-item-control">
+                      <div id="routine-input-root" class="sdsync-input-control">
+                        <input id="routine-input" class="dsm-text-input" value="realtime">
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </form>
           </div>
           <div id="variant-rack">
             <div class="variant">
@@ -497,13 +546,17 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
             container: rect("settings-panel"),
             selectForm: formRow("select-row", "select-label-shell", "select-control-shell"),
             inputForm: formRow("input-row", "input-label-shell", "input-control-shell"),
+            routineForm: formRow("routine-row", "routine-label-shell", "routine-control-shell"),
             formSelect: selectVariant("form-select-root", "form-select-shell-one", "form-select-input", "form-select-trigger", ["form-select-shell-one", "form-select-shell-two"]),
             formSelectPrefixStyle: style("form-select-prefix"),
             formSelectTriggerStyle: style("form-select-trigger"),
             formSelectInputStyle: style("form-select-input"),
+            formSelectShellStyles: ["form-select-shell-one", "form-select-shell-two"].map(style),
             selectControlPath: ["select-control-shell", "select-control-inner", "select-control-anonymous"].map((id) => ({ rect: rect(id), style: style(id) })),
             inputRoot: { rect: rect("input-root"), style: style("input-root") },
             inputShells: [rect("input-shell-one"), rect("input-shell-two")],
+            inputShellStyles: [style("input-shell-one"), style("input-shell-two")],
+            textInputStyle: style("text-input"),
             textInput: rect("text-input"),
             checkRow: rect("check-row"),
             checkboxRoot: { rect: rect("checkbox-root"), style: style("checkbox-root") },
@@ -535,9 +588,10 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
     await writeFile(htmlPath, html, "utf8");
     const url = pathToFileURL(htmlPath).href;
     const wide = render(chrome, `${url}?container=900`, join(temporaryDirectory, "profile-wide"));
-    const narrow = render(chrome, `${url}?container=640`, join(temporaryDirectory, "profile-narrow"));
+    const medium = render(chrome, `${url}?container=640`, join(temporaryDirectory, "profile-medium"));
+    const narrow = render(chrome, `${url}?container=380`, join(temporaryDirectory, "profile-narrow"));
 
-    for (const form of [wide.selectForm, wide.inputForm]) {
+    for (const form of [wide.selectForm, wide.inputForm, wide.routineForm]) {
       assert.equal(form.row.style.display, "grid");
       assert.match(form.row.style.gridTemplateColumns, /\S+\s+\S+/);
       assert.equal(form.row.style.marginTop, "0px");
@@ -556,6 +610,11 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
     assert.ok(parseFloat(wide.formSelect.root.style.paddingLeft) >= 11, "select root lost its SDK-aligned inset");
     assert.equal(wide.formSelectInputStyle.borderTopWidth, "0px", "inner DSM select input drew a second outline");
     assert.equal(wide.formSelectInputStyle.backgroundColor, "rgba(0, 0, 0, 0)", "inner DSM select input drew a second surface");
+    assert.equal(wide.formSelect.root.style.backgroundColor, "rgb(16, 7, 6)", "DSM select root kept a white host surface");
+    for (const shell of wide.formSelectShellStyles) {
+      assert.equal(shell.backgroundColor, "rgba(0, 0, 0, 0)", "DSM select shell kept a white host surface");
+      assert.equal(shell.borderTopWidth, "0px", "DSM select shell kept a duplicate host border");
+    }
     assert.equal(wide.formSelectPrefixStyle.display, "none", "empty DSM select prefix icon consumed a column");
     assert.equal(wide.formSelectTriggerStyle.position, "absolute", "dropdown affordance stacked into the select row");
     assert.equal(wide.formSelect.trigger.width, 24);
@@ -579,14 +638,22 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
       assert.equal(shell.style.marginTop, "0px", "DSM form-item input wrapper retained outer margin");
       assert.equal(shell.style.marginLeft, "0px", "DSM form-item input wrapper retained horizontal margin");
       assert.equal(shell.style.paddingTop, "0px", "DSM form-item input wrapper retained outer padding");
+      assert.equal(shell.style.backgroundColor, "rgba(0, 0, 0, 0)", "DSM form-item wrapper kept a white host surface");
+      assert.equal(shell.style.borderTopWidth, "0px", "DSM form-item wrapper kept a duplicate host border");
     }
 
     assert.equal(wide.inputRoot.style.display, "inline-flex");
+    assert.equal(wide.inputRoot.style.backgroundColor, "rgb(16, 7, 6)", "DSM input root kept a white host surface");
     assert.ok(wide.textInput.width > 200, "nested text input collapsed");
     assert.ok(wide.textInput.right <= wide.inputRoot.rect.right + 0.1, "nested text input overflowed its owned root");
     for (const shell of wide.inputShells) {
       assert.ok(shell.right <= wide.inputRoot.rect.right + 0.1, "nested private input shell overflowed its root");
     }
+    for (const shell of wide.inputShellStyles) {
+      assert.equal(shell.backgroundColor, "rgba(0, 0, 0, 0)", "nested input shell kept a white host surface");
+      assert.equal(shell.borderTopWidth, "0px", "nested input shell kept a duplicate host border");
+    }
+    assert.equal(wide.textInputStyle.backgroundColor, "rgba(0, 0, 0, 0)", "semantic input obscured its dark owned root");
 
     assert.equal(wide.checkboxRoot.style.display, "block");
     assert.equal(wide.checkboxLabel.style.display, "inline-block");
@@ -627,10 +694,18 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
       assert.ok(parseFloat(wide.shell.leave.transitionDuration) >= 0.16, "page leave transition is not smooth");
     }
 
-    assert.ok(wide.viewport > 720 && narrow.viewport > 720, "fixture must keep the DSM browser viewport wide");
-    assert.ok(wide.container.width > 720, `wide AppWindow unexpectedly narrow: ${wide.container.width}`);
-    assert.ok(narrow.container.width <= 720, `narrow AppWindow missed its container query: ${narrow.container.width}`);
-    for (const form of [narrow.selectForm, narrow.inputForm]) {
+    assert.ok(wide.viewport > 720 && medium.viewport > 720 && narrow.viewport > 720, "fixture must keep the DSM browser viewport wide");
+    assert.ok(wide.container.width > 420, `wide AppWindow unexpectedly narrow: ${wide.container.width}`);
+    assert.ok(medium.container.width > 420, `medium AppWindow unexpectedly compact: ${medium.container.width}`);
+    for (const form of [medium.selectForm, medium.inputForm, medium.routineForm]) {
+      assert.match(form.row.style.gridTemplateColumns, /\S+\s+\S+/,
+        "usable medium AppWindow stacked a label and control");
+      assert.equal(form.control.style.gridColumnStart, "2");
+      assert.equal(form.control.style.gridRowStart, "1");
+      assert.ok(overlapsVertically(form.label, form.control.rect), "medium label and control stacked vertically");
+    }
+    assert.ok(narrow.container.width <= 420, `narrow AppWindow missed its compact threshold: ${narrow.container.width}`);
+    for (const form of [narrow.selectForm, narrow.inputForm, narrow.routineForm]) {
       assert.equal(form.row.style.display, "grid");
       assert.doesNotMatch(form.row.style.gridTemplateColumns, /\S+\s+\S+/);
       assert.equal(form.control.style.gridColumnStart, "1");
@@ -638,6 +713,190 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
       assert.ok(form.control.rect.top >= form.label.bottom - 1, "narrow AppWindow control did not stack below its label");
     }
     assert.equal(narrow.formSelect.combo.style.flexDirection, "row", "narrow form stacked the select internals");
+  } finally {
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("resizable AppWindow bounds its shell, owned overlays, tooltips, and secret replacement grid", {
+  skip: browserPolicy.skipReason || false
+}, async () => {
+  assert.ok(chrome, `Chrome/Chromium is required on ${process.platform}/${process.arch} CI`);
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "sdsync-shell-boundary-"));
+  try {
+    const html = `<!doctype html>
+      <meta charset="utf-8">
+      <style>
+        html, body { margin: 0; width: 1100px; height: 1000px; overflow: hidden; }
+        ${baselineCss}
+        #app-shell { position: relative; height: 700px; margin: 20px 0 0 80px; }
+        #secret-panel { position: relative; width: 100%; min-width: 0; }
+        #tip-owner { position: absolute; right: 8px; bottom: 8px; }
+        #unrelated-overlay { position: fixed; left: 1030px; top: 860px; width: 420px; height: 120px; }
+        .fixture-secret-control { min-height: 34px; padding: 7px; border: 1px solid currentColor; }
+      </style>
+      <body>
+        <div id="app-shell" class="sdsync-app is-dark">
+          <aside id="responsive-sidebar" class="sdsync-sidebar">
+            <div class="sdsync-brand"><span aria-hidden="true">DS</span><div><strong>Drive Sync</strong><span>File Station sync</span></div></div>
+            <nav class="sdsync-nav"><button class="sdsync-nav-item"><span class="sdsync-nav-icon">A</span><span>Activity</span></button></nav>
+            <footer class="sdsync-sidebar-foot"><span class="sdsync-connection-dot"></span><span>Package connected</span></footer>
+          </aside>
+          <main id="responsive-workspace" class="sdsync-workspace">
+            <section id="secret-panel" class="sdsync-panel">
+              <div id="secret-editor" class="sdsync-secret-editor">
+                <div id="secret-summary" class="sdsync-secret-summary"><strong>Password</strong><span>Stored · masked</span></div>
+                <div id="secret-mode" class="sdsync-secret-mode fixture-secret-control">Replace</div>
+                <span id="secret-mode-help" class="sdsync-secret-mode-help">?</span>
+                <div id="secret-value" class="sdsync-secret-value fixture-secret-control">replacement</div>
+                <span id="secret-value-help" class="sdsync-secret-value-help">?</span>
+              </div>
+            </section>
+            <span id="tip-owner" class="sdsync-field-tip">
+              <button class="sdsync-field-tip-trigger" type="button">?</button>
+              <span id="field-tip" class="sdsync-field-tip-content" role="tooltip">A bounded field explanation that remains readable beside the right and bottom AppWindow edges.</span>
+            </span>
+          </main>
+        </div>
+        <div id="unrelated-overlay">DSM-owned overlay</div>
+        <script>
+          ${inlineControlLayout}
+          const requestedWidth = Number(new URLSearchParams(location.search).get("shell")) || 900;
+          const app = document.getElementById("app-shell");
+          app.style.width = requestedWidth + "px";
+          const cleanup = installControlLayout(app);
+          const packageOverlay = document.createElement("div");
+          packageOverlay.id = "package-overlay";
+          packageOverlay.className = "sdsync-select-dropdown is-dark";
+          packageOverlay.textContent = "Package select menu";
+          packageOverlay.style.cssText = "position:fixed;left:1040px;top:890px;width:500px;height:240px";
+          document.body.appendChild(packageOverlay);
+          const rect = (id) => {
+            const value = document.getElementById(id).getBoundingClientRect();
+            return { left: value.left, right: value.right, top: value.top, bottom: value.bottom, width: value.width, height: value.height };
+          };
+          const grid = (id) => {
+            const value = getComputedStyle(document.getElementById(id));
+            return { columnStart: value.gridColumnStart, columnEnd: value.gridColumnEnd, rowStart: value.gridRowStart, rowEnd: value.gridRowEnd };
+          };
+          setTimeout(() => {
+            const workspace = document.getElementById("responsive-workspace");
+            const before = {
+              shell: rect("app-shell"),
+              shellClasses: app.className,
+              shellClientWidth: app.clientWidth,
+              shellScrollWidth: app.scrollWidth,
+              sidebar: rect("responsive-sidebar"),
+              workspace: rect("responsive-workspace"),
+              workspaceClientWidth: workspace.clientWidth,
+              workspaceScrollWidth: workspace.scrollWidth,
+              overlay: rect("package-overlay"),
+              overlayClasses: packageOverlay.className,
+              overlayPosition: packageOverlay.style.position,
+              overlayLeft: packageOverlay.style.left,
+              overlayTop: packageOverlay.style.top,
+              overlayStyleAttribute: packageOverlay.getAttribute("style"),
+              overlayComputedPosition: getComputedStyle(packageOverlay).position,
+              overlayComputedLeft: getComputedStyle(packageOverlay).left,
+              overlayComputedTop: getComputedStyle(packageOverlay).top,
+              overlayTransform: getComputedStyle(packageOverlay).transform,
+              overlayMaxWidth: packageOverlay.style.getPropertyValue("max-width"),
+              tooltip: rect("field-tip"),
+              tooltipOwner: rect("tip-owner"),
+              tooltipClasses: document.getElementById("field-tip").className,
+              secret: {
+                summary: { rect: rect("secret-summary"), grid: grid("secret-summary") },
+                mode: { rect: rect("secret-mode"), grid: grid("secret-mode") },
+                modeHelp: { rect: rect("secret-mode-help"), grid: grid("secret-mode-help") },
+                value: { rect: rect("secret-value"), grid: grid("secret-value") },
+                valueHelp: { rect: rect("secret-value-help"), grid: grid("secret-value-help") }
+              },
+              unrelatedStyle: document.getElementById("unrelated-overlay").getAttribute("style") || ""
+            };
+            cleanup();
+            const after = {
+              shellClasses: app.className,
+              overlayClasses: packageOverlay.className,
+              overlayPosition: packageOverlay.style.position,
+              overlayLeft: packageOverlay.style.left,
+              overlayTop: packageOverlay.style.top,
+              overlayMaxWidth: packageOverlay.style.maxWidth,
+              tooltipClasses: document.getElementById("field-tip").className,
+              tooltipLeft: document.getElementById("field-tip").style.getPropertyValue("--sdsync-tip-left"),
+              unrelatedStyle: document.getElementById("unrelated-overlay").getAttribute("style") || ""
+            };
+            document.body.setAttribute("data-layout", btoa(JSON.stringify({ before, after })));
+          }, 80);
+        </script>
+      </body>`;
+    const htmlPath = join(temporaryDirectory, "shell-boundary.html");
+    await writeFile(htmlPath, html, "utf8");
+    const url = pathToFileURL(htmlPath).href;
+    const boundaryRender = { retry: false, timeoutMs: 15000 };
+    const wide = render(chrome, `${url}?shell=900`, join(temporaryDirectory, "profile-shell-wide"), boundaryRender);
+    const medium = render(chrome, `${url}?shell=640`, join(temporaryDirectory, "profile-shell-medium"), boundaryRender);
+    const narrow = render(chrome, `${url}?shell=380`, join(temporaryDirectory, "profile-shell-narrow"), boundaryRender);
+
+    for (const result of [wide, medium, narrow]) {
+      const { before, after } = result;
+      assert.ok(before.shellScrollWidth <= before.shellClientWidth,
+        `AppWindow gained horizontal overflow: ${JSON.stringify(before)}`);
+      assert.ok(before.workspaceScrollWidth <= before.workspaceClientWidth,
+        `workspace gained horizontal overflow: ${JSON.stringify(before)}`);
+      assert.ok(before.sidebar.right <= before.workspace.left + 0.1, "sidebar overlaid the workspace");
+      assert.ok(before.workspace.right <= before.shell.right + 0.1, "workspace escaped the AppWindow");
+      assert.match(before.overlayClasses, /\bsdsync-overlay-bounded\b/);
+      assert.ok(before.overlay.left >= before.shell.left + 7.9, "package dropdown escaped the left edge");
+      assert.ok(before.overlay.right <= before.shell.right - 7.9,
+        `package dropdown escaped the right edge: ${JSON.stringify({ shell: before.shell, overlay: before.overlay, position: before.overlayPosition, left: before.overlayLeft, style: before.overlayStyleAttribute, computedPosition: before.overlayComputedPosition, computedLeft: before.overlayComputedLeft, transform: before.overlayTransform })}`);
+      assert.ok(before.overlay.top >= before.shell.top + 7.9,
+        `package dropdown escaped the top edge: ${JSON.stringify({ shell: before.shell, overlay: before.overlay, top: before.overlayTop })}`);
+      assert.ok(before.overlay.bottom <= before.shell.bottom - 7.9,
+        `package dropdown escaped the bottom edge: ${JSON.stringify({ shell: before.shell, overlay: before.overlay, top: before.overlayTop })}`);
+      assert.match(before.tooltipClasses, /\bsdsync-tip-bounded\b/);
+      assert.ok(before.tooltip.left >= before.shell.left + 7.9, "field tooltip escaped the left edge");
+      assert.ok(before.tooltip.right <= before.shell.right - 7.9, "field tooltip escaped the right edge");
+      assert.ok(before.tooltip.top >= before.shell.top + 7.9, "field tooltip escaped the top edge");
+      assert.ok(before.tooltip.bottom <= before.shell.bottom - 7.9, "field tooltip escaped the bottom edge");
+      assert.ok(before.tooltip.bottom <= before.tooltipOwner.top,
+        "bottom-edge tooltip was not placed above its trigger");
+      assert.doesNotMatch(after.shellClasses, /sdsync-(?:medium|compact)-shell/);
+      assert.doesNotMatch(after.overlayClasses, /sdsync-overlay-bounded/);
+      assert.equal(after.overlayPosition, "fixed");
+      assert.equal(after.overlayLeft, "1040px");
+      assert.equal(after.overlayTop, "890px");
+      assert.equal(after.overlayMaxWidth, "");
+      assert.doesNotMatch(after.tooltipClasses, /sdsync-tip-bounded/);
+      assert.equal(after.tooltipLeft, "");
+      assert.equal(before.unrelatedStyle, after.unrelatedStyle, "unrelated DSM overlay was mutated");
+    }
+
+    assert.match(wide.before.shellClasses, /\bsdsync-medium-shell\b/);
+    assert.doesNotMatch(wide.before.shellClasses, /\bsdsync-compact-shell\b/);
+    for (const result of [medium, narrow]) {
+      assert.match(result.before.shellClasses, /\bsdsync-medium-shell\b/);
+      assert.match(result.before.shellClasses, /\bsdsync-compact-shell\b/);
+    }
+    assert.equal(wide.before.secret.summary.grid.columnStart, "1");
+    assert.equal(wide.before.secret.summary.grid.rowStart, "1");
+    assert.equal(wide.before.secret.mode.grid.columnStart, "2");
+    assert.equal(wide.before.secret.mode.grid.rowStart, "1");
+    assert.equal(wide.before.secret.modeHelp.grid.columnStart, "3");
+    assert.equal(wide.before.secret.value.grid.columnStart, "2");
+    assert.equal(wide.before.secret.value.grid.rowStart, "2");
+    assert.equal(wide.before.secret.valueHelp.grid.columnStart, "3");
+    for (const result of [medium, narrow]) {
+      assert.equal(result.before.secret.summary.grid.columnStart, "1");
+      assert.equal(result.before.secret.summary.grid.rowStart, "1");
+      assert.equal(result.before.secret.mode.grid.columnStart, "1");
+      assert.equal(result.before.secret.mode.grid.rowStart, "2");
+      assert.equal(result.before.secret.modeHelp.grid.columnStart, "2");
+      assert.equal(result.before.secret.value.grid.columnStart, "1");
+      assert.equal(result.before.secret.value.grid.rowStart, "3");
+      assert.equal(result.before.secret.valueHelp.grid.columnStart, "2");
+      assert.ok(overlapsVertically(result.before.secret.mode.rect, result.before.secret.modeHelp.rect));
+      assert.ok(overlapsVertically(result.before.secret.value.rect, result.before.secret.valueHelp.rect));
+    }
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true });
   }

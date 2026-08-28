@@ -386,6 +386,12 @@
   flex: 1 1 auto !important;
   margin: 0 !important;
   padding: 0 !important;
+  color: var(--sdsync-text) !important;
+  border: 0 !important;
+  outline: 0 !important;
+  background-color: transparent !important;
+  background-image: none !important;
+  box-shadow: none !important;
 }
 
 .sdsync-app .sdsync-input-shell,
@@ -929,12 +935,22 @@
   --sdsync-fire: #ff6a1a;
   --sdsync-on-accent: #0b0706;
   --sdsync-shadow: 8px 8px 0 rgba(0, 0, 0, 0.42);
+  width: auto !important;
+  max-width: min(360px, calc(100vw - 24px)) !important;
+  max-height: min(420px, calc(100vh - 24px)) !important;
+  overflow-x: hidden !important;
+  overflow-y: auto !important;
+  overscroll-behavior: contain;
   color: var(--sdsync-text) !important;
   border: 1px solid var(--sdsync-control-border) !important;
   border-radius: 1px !important;
   color-scheme: dark;
   background: var(--sdsync-panel-strong) !important;
   box-shadow: var(--sdsync-shadow) !important;
+}
+
+.sdsync-select-dropdown.sdsync-overlay-bounded {
+  transition: none !important;
 }
 
 .sdsync-select-dropdown.is-light {
@@ -958,6 +974,9 @@
 .sdsync-select-dropdown [class*="dropdown"],
 .sdsync-select-dropdown [class*="menu"],
 .sdsync-select-dropdown [class*="scroll"] {
+  width: 100% !important;
+  max-width: 100% !important;
+  overflow-x: hidden !important;
   color: var(--sdsync-text) !important;
   border: 0 !important;
   outline: 0 !important;
@@ -1175,7 +1194,7 @@
   inset-block-start: calc(100% + 5px);
   inset-inline-start: 0;
   width: max-content;
-  max-width: min(300px, calc(100vw - 96px));
+  max-width: min(240px, calc(100vw - 96px));
   max-height: 180px;
   overflow: auto;
   padding: 8px 10px;
@@ -1201,6 +1220,21 @@
   visibility: visible;
   opacity: 1;
   transform: translateY(0);
+}
+
+.sdsync-check-row > .sdsync-field-tip .sdsync-field-tip-content,
+.sdsync-filter-control > .sdsync-field-tip .sdsync-field-tip-content {
+  inset-inline-start: auto;
+  inset-inline-end: 0;
+}
+
+.sdsync-field-tip-content.sdsync-tip-bounded {
+  inset-block-start: var(--sdsync-tip-top, calc(100% + 5px)) !important;
+  inset-block-end: auto !important;
+  inset-inline-start: var(--sdsync-tip-left, 0) !important;
+  inset-inline-end: auto !important;
+  max-width: var(--sdsync-tip-max-width, 240px) !important;
+  max-height: var(--sdsync-tip-max-height, 180px) !important;
 }
 
 .sdsync-sidebar {
@@ -1387,7 +1421,8 @@
   min-height: 0;
   height: 100%;
   padding: 0 26px 36px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   scrollbar-color: var(--sdsync-control-border) transparent;
   background-image: repeating-linear-gradient(
     to bottom,
@@ -1887,10 +1922,10 @@
   gap: 12px 15px;
 }
 
-.sdsync-app .sdsync-form-grid > .sdsync-form-item,
-.sdsync-app .sdsync-log-policy-grid > .sdsync-form-item,
-.sdsync-app form.sdsync-panel:not(.sdsync-settings-panel) > .sdsync-form-item,
-.sdsync-app .sdsync-danger-fieldset > .sdsync-form-item {
+.sdsync-app .sdsync-form-grid > .sdsync-form-item:not(.sdsync-inline-form-item),
+.sdsync-app .sdsync-log-policy-grid > .sdsync-form-item:not(.sdsync-inline-form-item),
+.sdsync-app form.sdsync-panel:not(.sdsync-settings-panel) > .sdsync-form-item:not(.sdsync-inline-form-item),
+.sdsync-app .sdsync-danger-fieldset > .sdsync-form-item:not(.sdsync-inline-form-item) {
   display: grid !important;
   grid-template-columns: minmax(0, 1fr) !important;
   align-content: start;
@@ -1922,6 +1957,12 @@
   min-height: 0 !important;
   margin: 0 !important;
   padding: 0 !important;
+  color: var(--sdsync-text) !important;
+  border: 0 !important;
+  outline: 0 !important;
+  background-color: transparent !important;
+  background-image: none !important;
+  box-shadow: none !important;
   box-sizing: border-box;
 }
 
@@ -1941,11 +1982,12 @@
 }
 
 .sdsync-settings-panel > .sdsync-form-item,
-.sdsync-horizontal-form > .sdsync-form-item {
+.sdsync-horizontal-form > .sdsync-form-item,
+.sdsync-app .sdsync-inline-form-item {
   display: grid !important;
-  grid-template-columns: minmax(150px, 220px) minmax(0, 1fr) !important;
+  grid-template-columns: minmax(130px, 200px) minmax(0, 1fr) !important;
   align-items: center !important;
-  gap: 16px !important;
+  gap: 14px !important;
   max-width: 100% !important;
   min-width: 0 !important;
   margin: 0 !important;
@@ -1958,7 +2000,8 @@
 }
 
 .sdsync-settings-panel > .sdsync-form-item > .sdsync-form-control-cell,
-.sdsync-horizontal-form > .sdsync-form-item > .sdsync-form-control-cell {
+.sdsync-horizontal-form > .sdsync-form-item > .sdsync-form-control-cell,
+.sdsync-app .sdsync-inline-form-item > .sdsync-form-control-cell {
   grid-column: 2 !important;
   grid-row: 1 !important;
   align-self: stretch;
@@ -1966,6 +2009,89 @@
   width: 100% !important;
   max-width: 100% !important;
   min-width: 0 !important;
+  margin: 0 !important;
+}
+
+.sdsync-routine-fields,
+.sdsync-inline-field-list {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+}
+
+.sdsync-routine-fields > .span-2 {
+  grid-column: 1;
+}
+
+.sdsync-filter-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+  width: 100%;
+  margin: 0 0 14px;
+  padding: 0;
+  border-top: 1px solid var(--sdsync-border-soft);
+}
+
+.sdsync-filter-row {
+  display: grid;
+  grid-template-columns: minmax(88px, 130px) minmax(0, 1fr);
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--sdsync-border-soft);
+}
+
+.sdsync-filter-label {
+  min-width: 0;
+  color: var(--sdsync-text);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.sdsync-filter-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 20px;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.sdsync-filter-control > .sdsync-input-control,
+.sdsync-filter-control > .sdsync-select-control {
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+  margin: 0 !important;
+}
+
+.sdsync-filter-control > .sdsync-field-tip {
+  margin: 0 !important;
+}
+
+.sdsync-log-filters {
+  margin-bottom: 12px;
+}
+
+.sdsync-log-state {
+  justify-self: end;
+  padding-top: 7px;
+  color: var(--sdsync-muted);
+  font-size: 10px;
+}
+
+.sdsync-submit-row {
+  display: flex;
+  width: 100%;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  margin: 16px 0 2px;
+  padding-top: 12px;
+  border-top: 1px solid var(--sdsync-border-soft);
+}
+
+.sdsync-submit-row > * {
   margin: 0 !important;
 }
 
@@ -2077,7 +2203,8 @@
 
 .sdsync-secret-editor {
   display: grid;
-  grid-template-columns: minmax(120px, 1fr) 210px minmax(180px, 1fr);
+  grid-template-columns: minmax(120px, 1fr) minmax(180px, 210px) 20px;
+  grid-template-rows: auto auto;
   align-items: center;
   gap: 10px;
   min-width: 0;
@@ -2086,8 +2213,53 @@
   border-radius: 2px;
 }
 
+.sdsync-secret-summary {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  align-self: center;
+}
+
+.sdsync-secret-mode {
+  grid-column: 2;
+  grid-row: 1;
+  width: 100% !important;
+  min-width: 0;
+}
+
+.sdsync-secret-mode-help {
+  grid-column: 3;
+  grid-row: 1;
+}
+
+.sdsync-secret-value {
+  grid-column: 2;
+  grid-row: 2;
+  width: 100% !important;
+  min-width: 0;
+}
+
+.sdsync-secret-value-help {
+  grid-column: 3;
+  grid-row: 2;
+}
+
 .sdsync-field-note {
   margin: 0;
+}
+
+.sdsync-readonly-value {
+  min-width: 0;
+  color: var(--sdsync-muted);
+  overflow-wrap: anywhere;
+}
+
+.sdsync-secret-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 2px;
+  padding-top: 12px;
+  border-top: 1px solid var(--sdsync-border-soft);
 }
 
 .sdsync-form-actions {
@@ -2634,6 +2806,146 @@
   }
 }
 
+/* DSM resizes an AppWindow independently from the browser viewport. These
+ * package-owned classes are maintained from the rendered shell width so the
+ * same layout applies inside a narrow floating window and a narrow browser. */
+.sdsync-app.sdsync-medium-shell {
+  grid-template-columns: 196px minmax(0, 1fr);
+}
+
+.sdsync-app.sdsync-medium-shell .sdsync-metrics {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.sdsync-app.sdsync-medium-shell .sdsync-profiles-layout,
+.sdsync-app.sdsync-medium-shell .sdsync-two-column,
+.sdsync-app.sdsync-medium-shell .sdsync-about-grid,
+.sdsync-app.sdsync-medium-shell .sdsync-security-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.sdsync-app.sdsync-medium-shell .sdsync-profile-catalog {
+  position: static;
+  max-height: 280px;
+}
+
+.sdsync-app.sdsync-compact-shell {
+  grid-template-columns: 64px minmax(0, 1fr);
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-sidebar {
+  padding-inline: 8px;
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-brand {
+  justify-content: center;
+  padding-inline: 0;
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-brand div,
+.sdsync-app.sdsync-compact-shell .sdsync-nav-item > span:last-child,
+.sdsync-app.sdsync-compact-shell .sdsync-sidebar-foot > span:last-child {
+  display: none;
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-nav-item {
+  display: flex;
+  justify-content: center;
+  padding-inline: 5px;
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-workspace {
+  min-width: 0;
+  padding-inline: 16px;
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-page-stage {
+  min-height: clamp(300px, calc(100vh - 150px), 620px);
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-subtab-stage {
+  min-height: 280px;
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-subtabs {
+  width: 100%;
+  padding: 2px;
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-subtab {
+  flex: 1 0 max-content;
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-overview-status,
+.sdsync-app.sdsync-compact-shell .sdsync-topbar {
+  align-items: flex-start;
+  flex-direction: column;
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-topbar-actions,
+.sdsync-app.sdsync-compact-shell .sdsync-action-row,
+.sdsync-app.sdsync-compact-shell .sdsync-form-actions,
+.sdsync-app.sdsync-compact-shell .sdsync-page-actions {
+  max-width: 100%;
+  flex-wrap: wrap;
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-metrics,
+.sdsync-app.sdsync-compact-shell .sdsync-form-grid,
+.sdsync-app.sdsync-compact-shell .sdsync-log-policy-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-service-status,
+.sdsync-app.sdsync-compact-shell .sdsync-about-facts > div {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-form-grid .span-2,
+.sdsync-app.sdsync-compact-shell .sdsync-form-grid > .span-2 {
+  grid-column: auto;
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-secret-editor {
+  grid-template-columns: minmax(0, 1fr) 20px;
+  grid-template-rows: auto auto auto;
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-secret-summary {
+  grid-column: 1 / span 2;
+  grid-row: 1;
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-secret-mode {
+  grid-column: 1;
+  grid-row: 2;
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-secret-mode-help {
+  grid-column: 2;
+  grid-row: 2;
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-secret-value {
+  grid-column: 1;
+  grid-row: 3;
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-secret-value-help {
+  grid-column: 2;
+  grid-row: 3;
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-activity-feed li {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 3px;
+}
+
+.sdsync-app.sdsync-compact-shell :where(.sdsync-workspace, .sdsync-page-stage, .sdsync-page-frame, .sdsync-page, .sdsync-panel, .sdsync-subtab-stage, .sdsync-subtab-panel, .sdsync-form-grid, .sdsync-secret-editor) {
+  max-width: 100%;
+  min-width: 0;
+}
+
 @media (max-width: 980px) {
   .sdsync-app {
     grid-template-columns: 196px minmax(0, 1fr);
@@ -2725,20 +3037,6 @@
     grid-column: auto;
   }
 
-  .sdsync-settings-panel > .sdsync-form-item,
-  .sdsync-horizontal-form > .sdsync-form-item {
-    display: grid !important;
-    grid-template-columns: minmax(0, 1fr) !important;
-    align-items: stretch !important;
-    gap: 6px !important;
-  }
-
-  .sdsync-settings-panel > .sdsync-form-item > .sdsync-form-control-cell,
-  .sdsync-horizontal-form > .sdsync-form-item > .sdsync-form-control-cell {
-    grid-column: 1 !important;
-    grid-row: 2 !important;
-  }
-
   .sdsync-secret-editor {
     grid-template-columns: 1fr;
   }
@@ -2753,7 +3051,8 @@
  * narrow while the browser viewport remains wide. The container query is a
  * progressive enhancement, not the compatibility path. */
 .sdsync-settings-panel.sdsync-compact-form > .sdsync-form-item,
-.sdsync-horizontal-form.sdsync-compact-form > .sdsync-form-item {
+.sdsync-horizontal-form.sdsync-compact-form > .sdsync-form-item,
+.sdsync-horizontal-form.sdsync-compact-form .sdsync-inline-form-item {
   display: grid !important;
   grid-template-columns: minmax(0, 1fr) !important;
   align-items: stretch !important;
@@ -2761,7 +3060,8 @@
 }
 
 .sdsync-settings-panel.sdsync-compact-form > .sdsync-form-item > .sdsync-form-control-cell,
-.sdsync-horizontal-form.sdsync-compact-form > .sdsync-form-item > .sdsync-form-control-cell {
+.sdsync-horizontal-form.sdsync-compact-form > .sdsync-form-item > .sdsync-form-control-cell,
+.sdsync-horizontal-form.sdsync-compact-form .sdsync-inline-form-item > .sdsync-form-control-cell {
   grid-column: 1 !important;
   grid-row: 2 !important;
 }
@@ -2773,9 +3073,10 @@
   }
 }
 
-@container (max-width: 720px) {
+@container (max-width: 420px) {
   .sdsync-settings-panel > .sdsync-form-item,
-  .sdsync-horizontal-form > .sdsync-form-item {
+  .sdsync-horizontal-form > .sdsync-form-item,
+  .sdsync-horizontal-form .sdsync-inline-form-item {
     display: grid !important;
     grid-template-columns: minmax(0, 1fr) !important;
     align-items: stretch !important;
@@ -2783,8 +3084,32 @@
   }
 
   .sdsync-settings-panel > .sdsync-form-item > .sdsync-form-control-cell,
-  .sdsync-horizontal-form > .sdsync-form-item > .sdsync-form-control-cell {
+  .sdsync-horizontal-form > .sdsync-form-item > .sdsync-form-control-cell,
+  .sdsync-horizontal-form .sdsync-inline-form-item > .sdsync-form-control-cell {
     grid-column: 1 !important;
     grid-row: 2 !important;
+  }
+}
+
+@media (max-width: 420px) {
+  .sdsync-settings-panel > .sdsync-form-item,
+  .sdsync-horizontal-form > .sdsync-form-item,
+  .sdsync-horizontal-form .sdsync-inline-form-item {
+    display: grid !important;
+    grid-template-columns: minmax(0, 1fr) !important;
+    align-items: stretch !important;
+    gap: 6px !important;
+  }
+
+  .sdsync-settings-panel > .sdsync-form-item > .sdsync-form-control-cell,
+  .sdsync-horizontal-form > .sdsync-form-item > .sdsync-form-control-cell,
+  .sdsync-horizontal-form .sdsync-inline-form-item > .sdsync-form-control-cell {
+    grid-column: 1 !important;
+    grid-row: 2 !important;
+  }
+
+  .sdsync-filter-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 5px;
   }
 }

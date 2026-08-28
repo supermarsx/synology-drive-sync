@@ -2,6 +2,7 @@
 # Shared DSM package paths and narrowly scoped filesystem helpers.
 
 package_name=synology-drive-sync
+dsm_delete_limit=2147483647
 package_base=/var/packages/$package_name
 package_root=${SYNOPKG_PKGDEST:-$package_base/target}
 package_home=${SYNOPKG_PKGHOME:-$package_base/home}
@@ -71,6 +72,37 @@ if command -v stat >/dev/null 2>&1 && [ -d "$package_home" ]; then
     path_owner=$(stat -L -c '%u' "$package_home" 2>/dev/null || true)
     path_group=$(stat -L -c '%g' "$package_home" 2>/dev/null || true)
 fi
+
+# Compare a non-negative decimal string without first feeding an out-of-range
+# value to the shell's numeric operators. Callers may safely use ordinary
+# integer comparisons after this succeeds with the DSM deletion ceiling.
+decimal_at_most() {
+    decimal_candidate=${1:-}
+    decimal_limit=${2:-}
+    case $decimal_candidate in ''|*[!0-9]*) return 1 ;; esac
+    case $decimal_limit in ''|*[!0-9]*) return 1 ;; esac
+    while [ "${decimal_candidate#0}" != "$decimal_candidate" ]; do
+        decimal_candidate=${decimal_candidate#0}
+    done
+    while [ "${decimal_limit#0}" != "$decimal_limit" ]; do
+        decimal_limit=${decimal_limit#0}
+    done
+    [ -n "$decimal_candidate" ] || decimal_candidate=0
+    [ -n "$decimal_limit" ] || decimal_limit=0
+    [ "${#decimal_candidate}" -lt "${#decimal_limit}" ] && return 0
+    [ "${#decimal_candidate}" -gt "${#decimal_limit}" ] && return 1
+    # Equal-width input may still exceed the host shell's integer range (for
+    # example 9999999999 on a 32-bit NAS). Compare one safe digit at a time.
+    while [ -n "$decimal_candidate" ]; do
+        decimal_candidate_digit=${decimal_candidate%"${decimal_candidate#?}"}
+        decimal_limit_digit=${decimal_limit%"${decimal_limit#?}"}
+        [ "$decimal_candidate_digit" -lt "$decimal_limit_digit" ] && return 0
+        [ "$decimal_candidate_digit" -gt "$decimal_limit_digit" ] && return 1
+        decimal_candidate=${decimal_candidate#?}
+        decimal_limit=${decimal_limit#?}
+    done
+    return 0
+}
 
 set_private_owner() {
     private_path=$1
@@ -1444,6 +1476,95 @@ load_security_policy_runtime() {
 
 epoch_now() {
     date +%s
+}
+
+# Interval and realtime routines are deliberately independent of the NAS
+# calendar. Only daily routines are admitted through the configured weekday
+# and local-clock window.
+routine_clock_allows() {
+    routine_clock_mode=$1
+    routine_clock_weekdays=$2
+    routine_clock_start=$3
+    routine_clock_end=$4
+    case $routine_clock_mode in
+        interval|realtime) return 0 ;;
+        daily) ;;
+        *) return 1 ;;
+    esac
+    routine_clock_weekday=$(date +%u)
+    case ,$routine_clock_weekdays, in *,$routine_clock_weekday,*) ;; *) return 1 ;; esac
+    routine_clock_now=$(date +%H%M)
+    routine_clock_start_number=$(printf '%s' "$routine_clock_start" | tr -d ':')
+    routine_clock_end_number=$(printf '%s' "$routine_clock_end" | tr -d ':')
+    routine_clock_now=${routine_clock_now#0}; [ -n "$routine_clock_now" ] || routine_clock_now=0
+    routine_clock_start_number=${routine_clock_start_number#0}; [ -n "$routine_clock_start_number" ] || routine_clock_start_number=0
+    routine_clock_end_number=${routine_clock_end_number#0}; [ -n "$routine_clock_end_number" ] || routine_clock_end_number=0
+    if [ "$routine_clock_start_number" -le "$routine_clock_end_number" ]; then
+        [ "$routine_clock_now" -ge "$routine_clock_start_number" ] && [ "$routine_clock_now" -le "$routine_clock_end_number" ]
+    else
+        [ "$routine_clock_now" -ge "$routine_clock_start_number" ] || [ "$routine_clock_now" -le "$routine_clock_end_number" ]
+    fi
+}
+
+# Return the whole-action retry delay. Missing retry_exponential fields from
+# pre-toggle routine files preserve the former exponential behavior at their
+# call sites; every fixed or exponential delay is bounded to five minutes.
+routine_retry_delay() {
+    routine_retry_base=$1
+    routine_retry_attempt=$2
+    routine_retry_exponential=$3
+    case $routine_retry_base in ''|*[!0-9]*) return 64 ;; esac
+    case $routine_retry_attempt in ''|*[!0-9]*) return 64 ;; esac
+    case $routine_retry_exponential in true|false) ;; *) return 64 ;; esac
+    [ "$routine_retry_base" -ge 10 ] || return 64
+    [ "$routine_retry_attempt" -ge 1 ] && [ "$routine_retry_attempt" -le 5 ] || return 64
+    routine_retry_result=$routine_retry_base
+    [ "$routine_retry_result" -le 300 ] || routine_retry_result=300
+    if [ "$routine_retry_exponential" = true ]; then
+        routine_retry_index=1
+        while [ "$routine_retry_index" -lt "$routine_retry_attempt" ]; do
+            if [ "$routine_retry_result" -ge 150 ]; then
+                routine_retry_result=300
+                break
+            fi
+            routine_retry_result=$((routine_retry_result * 2))
+            routine_retry_index=$((routine_retry_index + 1))
+        done
+    fi
+    printf '%s\n' "$routine_retry_result"
+}
+
+# A native watcher event becomes runnable only after the event file has been
+# quiet for the complete debounce period. Return 1 while a valid event remains
+# pending and 73 for unsafe or malformed state so callers can fail closed.
+realtime_event_due() {
+    realtime_event_path=$1
+    realtime_event_now=$2
+    realtime_event_debounce=$3
+    realtime_event_identity=
+    case $realtime_event_now in ''|*[!0-9]*) return 73 ;; esac
+    case $realtime_event_debounce in ''|*[!0-9]*) return 73 ;; esac
+    [ "$realtime_event_debounce" -ge 1 ] && [ "$realtime_event_debounce" -le 3600 ] || return 73
+    [ ! -L "$realtime_event_path" ] && [ -f "$realtime_event_path" ] && [ -r "$realtime_event_path" ] || return 73
+    [ -s "$realtime_event_path" ] || return 1
+    realtime_event_stat=$(stat -c '%i:%s:%Y' "$realtime_event_path" 2>/dev/null) || return 73
+    case $realtime_event_stat in ''|*[!0-9:]*) return 73 ;; esac
+    realtime_event_old_ifs=$IFS
+    IFS=:
+    set -- $realtime_event_stat
+    IFS=$realtime_event_old_ifs
+    [ "$#" -eq 3 ] || return 73
+    case $1:$2:$3 in *[!0-9:]*) return 73 ;; esac
+    [ "$2" -gt 0 ] || return 73
+    realtime_event_mtime=$3
+    [ "$realtime_event_mtime" -le "$realtime_event_now" ] || return 73
+    if [ $((realtime_event_now - realtime_event_mtime)) -ge "$realtime_event_debounce" ]; then
+        # The controller revalidates this inode/size/mtime generation while the
+        # native writer is stopped before consuming the marker.
+        realtime_event_identity=$realtime_event_stat
+        return 0
+    fi
+    return 1
 }
 
 write_controller_state() {

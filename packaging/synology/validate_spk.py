@@ -23,8 +23,11 @@ from build_spk import (
     UI_SOURCE,
     UI_HELP_PAGES,
     UI_ICON_SIZES,
+    UI_MODULE_DIGEST_HEX_LENGTH,
+    UI_SOURCE_MODULE,
     elf_contract,
     elf_data_contract,
+    native_ui_module_name,
     normalized_versions,
     png_icon,
 )
@@ -54,7 +57,6 @@ REQUIRED_PAYLOAD = {
     "share/licenses/DSM_UI_THIRD_PARTY_LICENSES.txt",
     "ui/api.cgi",
     "ui/config",
-    "ui/SynologyDriveSync.js",
     "ui/style.css",
     "ui/images/icon.svg",
     "ui/helptoc.conf",
@@ -64,8 +66,9 @@ REQUIRED_PAYLOAD = {
 }
 APP_ID = DSM_APP_CLASS
 APP_NAMESPACE = "SYNO.SDS.App.SynologyDriveSync"
-NATIVE_MODULE = "SynologyDriveSync.js"
-NATIVE_SCRIPT = "ui/SynologyDriveSync.js"
+NATIVE_MODULE_PATTERN = re.compile(
+    rf"SynologyDriveSync\.[0-9a-f]{{{UI_MODULE_DIGEST_HEX_LENGTH}}}\.js"
+)
 NATIVE_STYLE = "ui/style.css"
 CANONICAL_API = "/webman/3rdparty/synology-drive-sync/api.cgi"
 DSM_TOKEN_API = "/webapi/entry.cgi?api=SYNO.API.Auth&version=6&method=token"
@@ -261,15 +264,20 @@ def validate_source_app_config(payload: bytes) -> None:
 
 def validate_ui_config(payload: bytes) -> str:
     model = load_unique_json(payload, "ui/config")
-    if not isinstance(model, dict) or set(model) != {NATIVE_MODULE}:
+    if not isinstance(model, dict) or len(model) != 1:
         raise ValidationError(
             "ui/config must register exactly one reviewed native JavaScript module"
         )
-    applications = model[NATIVE_MODULE]
+    module = next(iter(model))
+    if not isinstance(module, str) or NATIVE_MODULE_PATTERN.fullmatch(module) is None:
+        raise ValidationError(
+            "ui/config native module must use the exact content-addressed filename contract"
+        )
+    applications = model[module]
     if not isinstance(applications, dict) or set(applications) != {APP_ID}:
         raise ValidationError("ui/config module must define exactly the native AppWindow class")
     validate_native_application(applications[APP_ID], "ui/config", generated=True)
-    return NATIVE_SCRIPT
+    return f"ui/{module}"
 
 
 def validate_ui_texts(strings_payload: bytes) -> None:
@@ -657,6 +665,8 @@ def validate_native_build_contract(
     webpack_payload: bytes,
     config_define_payload: bytes,
     package_payload: bytes,
+    runtime_styles_payload: bytes,
+    control_layout_payload: bytes,
     action_icon_payload: bytes | None = None,
     security_panel_payload: bytes | None = None,
 ) -> None:
@@ -664,9 +674,15 @@ def validate_native_build_contract(
     app = app_payload.decode("utf-8")
     css = css_payload.decode("utf-8")
     webpack = webpack_payload.decode("utf-8")
+    runtime_styles = runtime_styles_payload.decode("utf-8")
+    control_layout = control_layout_payload.decode("utf-8")
 
     for marker in (
         'import Vue from "vue";',
+        'import "./styles/native.css";',
+        'import runtimeCss from "./styles/native.css?runtime";',
+        'import { installRuntimeStyles } from "./runtimeStyles";',
+        "installRuntimeStyles(runtimeCss);",
         f'SYNO.namespace("{APP_NAMESPACE}");',
         f"{APP_ID} = Vue.extend({{",
         "components: { App }",
@@ -676,6 +692,45 @@ def validate_native_build_contract(
             raise ValidationError(f"native DSM entry module is missing {marker!r}")
     if main.count("Vue.extend(") != 1 or main.count(f"{APP_ID} =") != 1:
         raise ValidationError("native DSM entry module must define exactly one reviewed Vue class")
+
+    for marker in (
+        'const RUNTIME_STYLE_ID = "sdsync-current-runtime-style";',
+        "export function installRuntimeStyles(cssText, targetDocument = document)",
+        "targetDocument.getElementById(RUNTIME_STYLE_ID)",
+        'targetDocument.createElement("style")',
+        'style.setAttribute("data-sdsync-runtime-style", "current")',
+        "style.textContent !== cssText",
+        "style.textContent = cssText",
+    ):
+        if marker not in runtime_styles:
+            raise ValidationError(
+                f"native DSM runtime stylesheet source is missing {marker!r}"
+            )
+    if runtime_styles.count("export function installRuntimeStyles(") != 1:
+        raise ValidationError(
+            "native DSM runtime stylesheet source must expose exactly one installer"
+        )
+
+    for marker in (
+        "export function installControlLayout(root)",
+        "new ResizeObserver(",
+        "new MutationObserver(",
+        'root.querySelectorAll(RESPONSIVE_FORM_SELECTOR)',
+        "return () => {",
+    ):
+        if marker not in control_layout:
+            raise ValidationError(
+                f"native DSM control-layout source is missing {marker!r}"
+            )
+    for marker in (
+        'import { installControlLayout } from "./controlLayout";',
+        "this.controlLayoutCleanup = installControlLayout(this.$el);",
+        "if (this.controlLayoutCleanup) this.controlLayoutCleanup();",
+    ):
+        if marker not in app:
+            raise ValidationError(
+                f"native DSM component is missing control-layout contract {marker!r}"
+            )
 
     structural_markers = (
         f'<v-app-instance class-name="{APP_ID}">',
@@ -877,8 +932,8 @@ def validate_native_build_contract(
 
     config_define = load_unique_json(config_define_payload, "ui-src/config.define")
     if config_define != {
-        NATIVE_MODULE: {
-            "JSfiles": [f"dist/{NATIVE_MODULE}"],
+        UI_SOURCE_MODULE: {
+            "JSfiles": [f"dist/{UI_SOURCE_MODULE}"],
             "params": "-s -c skip",
         }
     }:
@@ -897,6 +952,132 @@ def validate_native_build_contract(
         raise ValidationError("native DSM UI build dependencies must be exact and use DSM Vue 2.7.14")
 
     validate_native_api_source(api_payload)
+
+
+def _javascript_string_literals(source: str):
+    """Yield decoded ordinary JavaScript string literals outside comments/templates."""
+    simple_escapes = {
+        "b": "\b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "v": "\v",
+        "0": "\0",
+    }
+    index = 0
+    length = len(source)
+    while index < length:
+        current = source[index]
+        following = source[index + 1] if index + 1 < length else ""
+        if current == "/" and following == "/":
+            newline = source.find("\n", index + 2)
+            index = length if newline < 0 else newline + 1
+            continue
+        if current == "/" and following == "*":
+            end = source.find("*/", index + 2)
+            index = length if end < 0 else end + 2
+            continue
+        if current == "`":
+            index += 1
+            while index < length:
+                if source[index] == "\\":
+                    index += 2
+                elif source[index] == "`":
+                    index += 1
+                    break
+                else:
+                    index += 1
+            continue
+        if current not in ("'", '"'):
+            index += 1
+            continue
+
+        quote = current
+        index += 1
+        decoded: list[str] = []
+        valid = True
+        while index < length:
+            current = source[index]
+            if current == quote:
+                index += 1
+                if valid:
+                    yield "".join(decoded)
+                break
+            if current in "\r\n":
+                valid = False
+                index += 1
+                break
+            if current != "\\":
+                decoded.append(current)
+                index += 1
+                continue
+
+            index += 1
+            if index >= length:
+                valid = False
+                break
+            escaped = source[index]
+            index += 1
+            if escaped in simple_escapes:
+                decoded.append(simple_escapes[escaped])
+            elif escaped == "x":
+                digits = source[index:index + 2]
+                if len(digits) != 2 or re.fullmatch(r"[0-9a-fA-F]{2}", digits) is None:
+                    valid = False
+                    break
+                decoded.append(chr(int(digits, 16)))
+                index += 2
+            elif escaped == "u":
+                if index < length and source[index] == "{":
+                    end = source.find("}", index + 1)
+                    digits = source[index + 1:end] if end >= 0 else ""
+                    if (
+                        not digits
+                        or len(digits) > 6
+                        or re.fullmatch(r"[0-9a-fA-F]+", digits) is None
+                        or int(digits, 16) > 0x10FFFF
+                    ):
+                        valid = False
+                        break
+                    decoded.append(chr(int(digits, 16)))
+                    index = end + 1
+                else:
+                    digits = source[index:index + 4]
+                    if len(digits) != 4 or re.fullmatch(r"[0-9a-fA-F]{4}", digits) is None:
+                        valid = False
+                        break
+                    decoded.append(chr(int(digits, 16)))
+                    index += 4
+            elif escaped == "\r":
+                if index < length and source[index] == "\n":
+                    index += 1
+            elif escaped == "\n":
+                pass
+            else:
+                decoded.append(escaped)
+        else:
+            break
+
+
+def _validate_runtime_style_bundle(script: str, style: str) -> None:
+    for marker in (
+        "sdsync-current-runtime-style",
+        "data-sdsync-runtime-style",
+        "text/css",
+        "getElementById",
+        "createElement",
+        "appendChild",
+        "textContent",
+    ):
+        if marker not in script:
+            raise ValidationError(
+                f"native DSM bundle is missing runtime stylesheet injection marker {marker!r}"
+            )
+    if not any(literal == style for literal in _javascript_string_literals(script)):
+        raise ValidationError(
+            "native DSM bundle does not embed the exact packaged stylesheet bytes"
+        )
 
 
 def validate_native_bundle(script_payload: bytes, style_payload: bytes) -> None:
@@ -943,6 +1124,7 @@ def validate_native_bundle(script_payload: bytes, style_payload: bytes) -> None:
         )
     ):
         raise ValidationError("native DSM style bundle is not isolated to the AppWindow")
+    _validate_runtime_style_bundle(script, style)
 
 
 def validate_privilege(payload: bytes) -> None:
@@ -1012,6 +1194,8 @@ def validate_source() -> None:
         UI_SOURCE / "src/ActionIcon.js",
         UI_SOURCE / "src/SecurityPanel.vue",
         UI_SOURCE / "src/api.js",
+        UI_SOURCE / "src/runtimeStyles.js",
+        UI_SOURCE / "src/controlLayout.js",
         UI_SOURCE / "src/styles/native.css",
         UI_SOURCE / "dist/SynologyDriveSync.js",
         UI_SOURCE / "dist/style.css",
@@ -1047,7 +1231,7 @@ def validate_source() -> None:
         path.name
         for path in (UI_SOURCE / "dist").iterdir()
     }
-    if dist_members != {NATIVE_MODULE, "style.css"}:
+    if dist_members != {UI_SOURCE_MODULE, "style.css"}:
         raise ValidationError(
             "native DSM dist must contain only SynologyDriveSync.js and style.css"
         )
@@ -1059,6 +1243,8 @@ def validate_source() -> None:
         (UI_SOURCE / "webpack.config.js").read_bytes(),
         (UI_SOURCE / "config.define").read_bytes(),
         (UI_SOURCE / "package.json").read_bytes(),
+        (UI_SOURCE / "src/runtimeStyles.js").read_bytes(),
+        (UI_SOURCE / "src/controlLayout.js").read_bytes(),
         (UI_SOURCE / "src/ActionIcon.js").read_bytes(),
         (UI_SOURCE / "src/SecurityPanel.vue").read_bytes(),
     )
@@ -1226,6 +1412,16 @@ def validate_spk(
         missing = REQUIRED_PAYLOAD - inner_members.keys()
         if missing:
             raise ValidationError(f"package.tgz is missing members: {sorted(missing)}")
+        native_modules = {
+            name
+            for name in inner_members
+            if PurePosixPath(name).parent == PurePosixPath("ui")
+            and NATIVE_MODULE_PATTERN.fullmatch(PurePosixPath(name).name) is not None
+        }
+        if len(native_modules) != 1:
+            raise ValidationError(
+                "package.tgz must contain exactly one content-addressed DSM AppWindow module"
+            )
         allowed_inner = REQUIRED_PAYLOAD | {
             "bin",
             "libexec",
@@ -1237,7 +1433,7 @@ def validate_spk(
             "ui/images",
             "ui/texts",
             "ui/texts/enu",
-        }
+        } | native_modules
         unexpected = inner_members.keys() - allowed_inner
         if unexpected:
             raise ValidationError(
@@ -1291,6 +1487,12 @@ def validate_spk(
         require_regular_mode(
             inner_members, ui_module, 0o644, "DSM native AppWindow module"
         )
+        ui_bundle = member_bytes(inner, inner_members[ui_module])
+        expected_ui_module = f"ui/{native_ui_module_name(ui_bundle)}"
+        if ui_module != expected_ui_module:
+            raise ValidationError(
+                "ui/config native module digest does not match the exact packaged bundle bytes"
+            )
         require_regular_mode(inner_members, NATIVE_STYLE, 0o644, "DSM native AppWindow style")
         validate_ui_texts(member_bytes(inner, inner_members["ui/texts/enu/strings"]))
         validate_dsm_help(
@@ -1305,7 +1507,7 @@ def validate_spk(
         validate_notifier(member_bytes(inner, inner_members["libexec/sdsync-common"]))
         validate_svg_icon(member_bytes(inner, inner_members["ui/images/icon.svg"]))
         validate_native_bundle(
-            member_bytes(inner, inner_members[NATIVE_SCRIPT]),
+            ui_bundle,
             member_bytes(inner, inner_members[NATIVE_STYLE]),
         )
         for size in UI_ICON_SIZES:

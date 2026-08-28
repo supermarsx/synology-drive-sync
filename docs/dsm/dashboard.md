@@ -8,11 +8,13 @@ the bundle loads no CDN scripts, fonts, images, analytics, or hosted search serv
 
 `INFO` binds `dsmuidir="synology-drive-sync:ui"` and
 `dsmappname="SYNO.SDS.App.SynologyDriveSync.Instance"`. The installed `ui/config` is keyed first by
-`SynologyDriveSync.js`, then by that exact application class. Its entry declares `type="app"` and
+the exact content-addressed `SynologyDriveSync.<bundle-sha256-prefix>.js` filename, then by that
+application class. Its entry declares `type="app"` and
 the matching `appWindow`; it is not a `type=url` pop-up or an iframe around a standalone HTML page.
 The bundle registers the class through `SYNO.namespace` and `Vue.extend`, then renders the dashboard
-inside DSM's `v-app-instance` and `v-app-window` components. DSM loads the packaged
-`SynologyDriveSync.js` and `style.css` assets. The module-keyed native AppWindow is the only
+inside DSM's `v-app-instance` and `v-app-window` components. DSM loads that packaged module and
+`style.css`; a changed bundle receives a changed URL so DSM or a reverse proxy cannot reuse the
+previous JavaScript across an upgrade. The module-keyed native AppWindow is the only
 application UI: there is no `type=url` entry, standalone `ui/index.html`, or undocumented
 `launchApp` redirect. Opening the third-party directory in a separate browser tab is not the DSM
 AppWindow launch contract and may legitimately return DSM's generic page-not-found response.
@@ -100,15 +102,16 @@ requires credential-presence inspection before any retry.
 ## Routines
 
 Routines uses two keyboard-accessible subtabs. **Configured profiles** is first and shows each
-saved routine; selecting one opens **Package controller**, which edits that profile's automation
-policy. The page shows each routine's requested
+saved routine; selecting one opens the **New routine** subtab's routine editor with that profile's
+automation policy loaded. The page shows each routine's requested
 mode, effective backend, state, next run, and last success. The Overview realtime card makes an
 `inotify` backend or `polling` fallback visible rather than implying that a native watcher exists on
 every NAS.
 
-The timing panel describes the execution sequence: observe, debounce, preflight, run. Manual Plan,
-manual Run, the legacy global interval schedule, and per-profile routines share one host-local run
-lock. See [Routines and scheduling](routines.md).
+The editor shows only timing controls that affect the selected mode: interval cadence, daily
+weekdays/window, or realtime debounce/polling. Manual Plan, manual Run, the legacy global interval
+schedule, and per-profile routines share one host-local run lock. See
+[Routines and scheduling](routines.md).
 
 ## Health / Doctor
 
@@ -137,8 +140,9 @@ alone; the `all` response is globally bounded below the bridge capture limit. **
 only the browser presentation; it does not delete package logs.
 
 Snapshot polling pauses while the document is hidden. Log polling occurs only while Activity is
-open and not paused. Refresh intervals are controlled in Settings. Full event and retention details
-are in [Health, activity, logs, and notifications](operations.md).
+open and not paused. Refresh intervals are controlled in Settings. **Manual only** cancels the
+corresponding background timer while retaining the explicit Refresh or Activity-page reload action.
+Full event and retention details are in [Health, activity, logs, and notifications](operations.md).
 
 ## Notifications
 
@@ -174,8 +178,8 @@ changes only non-secret interface preferences:
 | Preference | Values |
 | --- | --- |
 | Theme | Dark, follow system, or light; dark is the default |
-| Status refresh | 3, 5, 10, or 30 seconds |
-| Log refresh | 5, 10, or 30 seconds |
+| Status refresh | Manual only, or every 3, 5, 10, or 30 seconds |
+| Log refresh | Manual only, or every 5, 10, or 30 seconds |
 | Open-session notification | Off/on, subject to browser permission |
 | Audible cue | Off/on, best effort |
 

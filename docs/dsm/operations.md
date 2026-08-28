@@ -108,8 +108,10 @@ API output replaces private package paths with neutral labels and masks secret-f
 values are never an allowed log field. Selecting one source reads only that source; `all` remains
 globally bounded below the API bridge's 1 MiB response-capture limit.
 
-The Activity page can pause refresh without changing package logging. Log refresh choices are 5,
-10, or 30 seconds. For SSH recovery:
+The Activity page can pause refresh without changing package logging. Log refresh choices are
+**Manual only**, 5, 10, or 30 seconds. Manual-only mode clears the background log timer; selecting
+Activity or changing its source/line filters still performs an explicit bounded refresh. For SSH
+recovery:
 
 ```bash
 sudo -u "$PACKAGE_USER" -- "$MANAGER" logs 200

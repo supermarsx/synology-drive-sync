@@ -197,6 +197,7 @@ ensure_realtime_watcher() {
     watcher_profile=$1
     watcher_source=$2
     realtime_backend=polling
+    realtime_watcher_pid=
     [ -n "${inotify_command:-}" ] || return 0
     watcher_pid_path=$runtime_root/watch-$watcher_profile.pid
     watcher_event_path=$runtime_root/watch-$watcher_profile.events
@@ -205,6 +206,7 @@ ensure_realtime_watcher() {
     watcher_existing=$(read_pid "$watcher_pid_path" 2>/dev/null || true)
     if [ -n "$watcher_existing" ] && pid_matches_command "$watcher_existing" "$inotify_command"; then
         realtime_backend=inotify
+        realtime_watcher_pid=$watcher_existing
         return 0
     fi
     if [ -f "$watcher_pid_path" ]; then
@@ -228,6 +230,52 @@ ensure_realtime_watcher() {
     printf '%s\n' "$watcher_pid" > "$watcher_pid_path"
     finish_private_file "$watcher_pid_path"
     realtime_backend=inotify
+    realtime_watcher_pid=$watcher_pid
+}
+
+# Stop the native marker writer while comparing and consuming one exact event
+# generation. Events raised while the writer is stopped remain queued by
+# inotify and are appended after CONT, so a concurrent event cannot be erased
+# by the truncate or bypass its own full debounce period.
+consume_realtime_event() {
+    consume_event_path=$1
+    consume_watcher_pid=$2
+    consume_expected_identity=$3
+    realtime_event_watcher_resumed=true
+    case $consume_watcher_pid in ''|*[!0-9]*) return 73 ;; esac
+    case $consume_expected_identity in ''|*[!0-9:]*) return 73 ;; esac
+    kill -STOP "$consume_watcher_pid" 2>/dev/null || return 73
+    consume_event_status=0
+    if ! pid_matches_command "$consume_watcher_pid" "$inotify_command"; then
+        consume_event_status=73
+    elif ! sed -n 's/^State:[[:space:]]*\([Tt]\).*/\1/p' \
+        "/proc/$consume_watcher_pid/status" 2>/dev/null | grep -Eq '^[Tt]$'; then
+        # STOP delivery is asynchronous. Do not inspect or truncate the marker
+        # until procfs confirms that the writer can no longer append to it.
+        consume_event_status=1
+    elif [ -L "$consume_event_path" ] || [ ! -f "$consume_event_path" ] || [ ! -r "$consume_event_path" ]; then
+        consume_event_status=73
+    elif ! consume_actual_identity=$(stat -c '%i:%s:%Y' "$consume_event_path" 2>/dev/null); then
+        consume_event_status=73
+    else
+        case $consume_actual_identity in
+            ''|*[!0-9:]*) consume_event_status=73 ;;
+            *)
+                if [ "$consume_actual_identity" != "$consume_expected_identity" ]; then
+                    consume_event_status=1
+                elif ! : > "$consume_event_path"; then
+                    consume_event_status=73
+                elif ! finish_private_file "$consume_event_path"; then
+                    consume_event_status=73
+                fi
+                ;;
+        esac
+    fi
+    if ! kill -CONT "$consume_watcher_pid" 2>/dev/null; then
+        realtime_event_watcher_resumed=false
+        [ "$consume_event_status" -eq 0 ] || consume_event_status=73
+    fi
+    return "$consume_event_status"
 }
 
 source_fingerprint() (
@@ -297,25 +345,6 @@ source_fingerprint() (
     ' "$fingerprint_checksum"
 )
 
-time_window_allows() {
-    allowed_weekdays=$1
-    allowed_start=$2
-    allowed_end=$3
-    current_weekday=$(date +%u)
-    case ,$allowed_weekdays, in *,$current_weekday,*) ;; *) return 1 ;; esac
-    current_clock=$(date +%H%M)
-    window_start=$(printf '%s' "$allowed_start" | tr -d ':')
-    window_end=$(printf '%s' "$allowed_end" | tr -d ':')
-    current_clock=${current_clock#0}; [ -n "$current_clock" ] || current_clock=0
-    window_start=${window_start#0}; [ -n "$window_start" ] || window_start=0
-    window_end=${window_end#0}; [ -n "$window_end" ] || window_end=0
-    if [ "$window_start" -le "$window_end" ]; then
-        [ "$current_clock" -ge "$window_start" ] && [ "$current_clock" -le "$window_end" ]
-    else
-        [ "$current_clock" -ge "$window_start" ] || [ "$current_clock" -le "$window_end" ]
-    fi
-}
-
 dependencies_allow() {
     dependency_list=$1
     [ -n "$dependency_list" ] || return 0
@@ -377,28 +406,51 @@ process_routines() {
         routine_weekdays=$(setting "$routine_config" weekdays 1,2,3,4,5,6,7)
         routine_start=$(setting "$routine_config" time_window_start 00:00)
         routine_end=$(setting "$routine_config" time_window_end 23:59)
-        routine_debounce=$(setting "$routine_config" debounce_seconds 5)
-        routine_retries=$(setting "$routine_config" retry_count 2)
+        routine_debounce=$(setting "$routine_config" debounce_seconds 45)
+        routine_retries=$(setting "$routine_config" retry_count 5)
         routine_backoff=$(setting "$routine_config" retry_backoff_seconds 60)
+        routine_retry_exponential=$(setting "$routine_config" retry_exponential true)
         routine_poll=$(setting "$routine_config" poll_seconds 30)
         routine_delete=$(setting "$routine_config" allow_delete false)
         routine_max_total=$(setting "$routine_config" max_total_delete 100)
         routine_dependencies=$(setting "$routine_config" depends_on '')
-        case $routine_enabled:$routine_delete in true:true|true:false|false:true|false:false) ;; *) controller_log_event warn routine_invalid "profile=$routine_profile field=boolean"; continue ;; esac
+        case $routine_enabled:$routine_delete:$routine_retry_exponential in
+            true:true:true|true:true:false|true:false:true|true:false:false|\
+            false:true:true|false:true:false|false:false:true|false:false:false) ;;
+            *) controller_log_event warn routine_invalid "profile=$routine_profile field=boolean"; continue ;;
+        esac
         [ "$routine_enabled" = true ] || continue
         case $routine_action in plan|sync) ;; *) controller_log_event warn routine_invalid "profile=$routine_profile field=action"; continue ;; esac
         case $routine_mode in interval|daily|realtime) ;; *) controller_log_event warn routine_invalid "profile=$routine_profile field=mode"; continue ;; esac
-        case $routine_interval:$routine_debounce:$routine_retries:$routine_backoff:$routine_poll:$routine_max_total in *[!0-9:]*) controller_log_event warn routine_invalid "profile=$routine_profile field=number"; continue ;; esac
-        [ "$routine_interval" -ge 60 ] && [ "$routine_interval" -le 2592000 ] || continue
-        [ "$routine_debounce" -ge 1 ] && [ "$routine_debounce" -le 3600 ] || continue
+        case $routine_retries:$routine_backoff:$routine_max_total in *[!0-9:]*) controller_log_event warn routine_invalid "profile=$routine_profile field=number"; continue ;; esac
         [ "$routine_retries" -le 5 ] || continue
-        [ "$routine_backoff" -ge 10 ] && [ "$routine_backoff" -le 86400 ] || continue
-        [ "$routine_poll" -ge 5 ] && [ "$routine_poll" -le 3600 ] || continue
-        printf '%s\n' "$routine_weekdays" | grep -Eq '^[1-7](,[1-7])*$' || continue
-        printf '%s\n' "$routine_start" | grep -Eq '^([0-1][0-9]|2[0-3]):[0-5][0-9]$' || continue
-        printf '%s\n' "$routine_end" | grep -Eq '^([0-1][0-9]|2[0-3]):[0-5][0-9]$' || continue
+        [ "$routine_backoff" -ge 10 ] || continue
+        decimal_at_most "$routine_max_total" "$dsm_delete_limit" || {
+            controller_log_event warn routine_invalid "profile=$routine_profile field=max_total_delete"
+            continue
+        }
+        # Older releases accepted a larger base. Preserve those configs while
+        # applying the new five-minute runtime ceiling.
+        [ "$routine_backoff" -le 300 ] || routine_backoff=300
+        case $routine_mode in
+            interval)
+                case $routine_interval in ''|*[!0-9]*) continue ;; esac
+                [ "$routine_interval" -ge 60 ] && [ "$routine_interval" -le 2592000 ] || continue
+                ;;
+            daily)
+                printf '%s\n' "$routine_weekdays" | grep -Eq '^[1-7](,[1-7])*$' || continue
+                printf '%s\n' "$routine_start" | grep -Eq '^([0-1][0-9]|2[0-3]):[0-5][0-9]$' || continue
+                printf '%s\n' "$routine_end" | grep -Eq '^([0-1][0-9]|2[0-3]):[0-5][0-9]$' || continue
+                ;;
+            realtime)
+                case $routine_debounce:$routine_poll in *[!0-9:]*) continue ;; esac
+                [ "$routine_debounce" -ge 1 ] && [ "$routine_debounce" -le 3600 ] || continue
+                [ "$routine_poll" -ge 5 ] && [ "$routine_poll" -le 3600 ] || continue
+                ;;
+        esac
         routine_profile_max=$(sed -n 's/^max-delete = //p' "$profiles_dir/$routine_profile.toml" | sed -n '1p')
         case $routine_profile_max in ''|*[!0-9]*) continue ;; esac
+        decimal_at_most "$routine_profile_max" "$dsm_delete_limit" || continue
         if [ "$routine_delete" = true ] && [ "$routine_max_total" -lt "$routine_profile_max" ]; then
             controller_log_event warn routine_deferred "profile=$routine_profile reason=delete_bound" scheduler
             continue
@@ -414,17 +466,30 @@ process_routines() {
         routine_last_poll_value=$(setting "$routine_state_path" last_poll_epoch 0)
         routine_fingerprint_value=$(setting "$routine_state_path" fingerprint none)
         routine_backend_value=$(setting "$routine_state_path" backend none)
+        routine_native_event_due=false
+        routine_native_event_identity=
+        routine_native_watcher_pid=
         case $routine_state_value in never|scheduled|running|succeeded|failed|deferred) ;; *) controller_log_event warn routine_state_invalid "profile=$routine_profile"; continue ;; esac
         case $routine_next_value:$routine_last_success_value:$routine_last_attempt_value:$routine_retry_value:$routine_last_poll_value in *[!0-9:]*) controller_log_event warn routine_state_invalid "profile=$routine_profile"; continue ;; esac
         due=false
-        if [ "$routine_retry_value" -gt 0 ] && [ "$routine_next_value" -gt 0 ] && [ "$routine_now" -ge "$routine_next_value" ]; then
-            due=true
-        elif ! time_window_allows "$routine_weekdays" "$routine_start" "$routine_end"; then
+        if ! routine_clock_allows "$routine_mode" "$routine_weekdays" "$routine_start" "$routine_end"; then
             routine_state_value=deferred
             routine_backend_value=$routine_mode
             write_routine_state "$routine_profile"
             append_activity routine.deferred "$routine_profile" deferred "Routine outside configured window" routines warn 2>/dev/null || true
             continue
+        elif [ "$routine_retry_value" -gt 0 ]; then
+            # A pending whole-action retry owns admission until its deadline.
+            # Daily cadence and realtime events must not bypass the selected
+            # fixed/exponential delay and accidentally consume another attempt.
+            if [ "$routine_next_value" -eq 0 ]; then
+                controller_log_event warn routine_state_invalid "profile=$routine_profile field=retry_deadline"
+                continue
+            elif [ "$routine_now" -ge "$routine_next_value" ]; then
+                due=true
+            else
+                continue
+            fi
         else
             case $routine_mode in
                 interval)
@@ -445,9 +510,32 @@ process_routines() {
                     [ -d "$profile_source" ] && [ ! -L "$profile_source" ] || continue
                     if ensure_realtime_watcher "$routine_profile" "$profile_source"; then routine_backend_value=$realtime_backend; else routine_backend_value=polling; fi
                     watcher_event_path=$runtime_root/watch-$routine_profile.events
-                    if [ "$routine_backend_value" = inotify ] && [ -s "$watcher_event_path" ] && [ $((routine_now - routine_last_attempt_value)) -ge "$routine_debounce" ]; then
-                        : > "$watcher_event_path"; finish_private_file "$watcher_event_path"; due=true
-                    elif [ $((routine_now - routine_last_poll_value)) -ge "$routine_poll" ]; then
+                    watcher_event_pending=false
+                    if [ "$routine_backend_value" = inotify ]; then
+                        if [ -L "$watcher_event_path" ] || [ ! -f "$watcher_event_path" ] || [ ! -r "$watcher_event_path" ]; then
+                            controller_log_event warn routine_event_invalid "profile=$routine_profile"
+                            continue
+                        fi
+                        if [ -s "$watcher_event_path" ]; then
+                            watcher_event_pending=true
+                            watcher_event_status=0
+                            realtime_event_due "$watcher_event_path" "$routine_now" "$routine_debounce" || watcher_event_status=$?
+                            case $watcher_event_status in
+                                0)
+                                    routine_native_event_due=true
+                                    routine_native_event_identity=$realtime_event_identity
+                                    routine_native_watcher_pid=$realtime_watcher_pid
+                                    due=true
+                                    ;;
+                                1) ;;
+                                *)
+                                    controller_log_event warn routine_event_invalid "profile=$routine_profile phase=debounce"
+                                    continue
+                                    ;;
+                            esac
+                        fi
+                    fi
+                    if [ "$due" != true ] && [ "$watcher_event_pending" != true ] && [ $((routine_now - routine_last_poll_value)) -ge "$routine_poll" ]; then
                         if ! current_fingerprint=$(source_fingerprint "$profile_source" 2>/dev/null); then
                             controller_log_event warn routine_poll_unavailable "profile=$routine_profile reason=fingerprint"
                             continue
@@ -479,6 +567,33 @@ process_routines() {
         # was being evaluated. A signal after this check is covered again once
         # the direct child PID has been assigned below.
         [ "$shutdown" = false ] || break
+        if [ "$routine_native_event_due" = true ]; then
+            native_consume_status=0
+            consume_realtime_event "$watcher_event_path" "$routine_native_watcher_pid" \
+                "$routine_native_event_identity" || native_consume_status=$?
+            case $native_consume_status in
+                0)
+                    if [ "$realtime_event_watcher_resumed" != true ]; then
+                        controller_log_event warn routine_event_invalid "profile=$routine_profile phase=resume"
+                    fi
+                    routine_last_poll_value=$routine_now
+                    if refreshed_fingerprint=$(source_fingerprint "$profile_source" 2>/dev/null) && [ -n "$refreshed_fingerprint" ]; then
+                        routine_fingerprint_value=$refreshed_fingerprint
+                    else
+                        controller_log_event warn routine_poll_unavailable "profile=$routine_profile reason=post_event_fingerprint"
+                    fi
+                    ;;
+                1)
+                    # A newer native event arrived after the due check. Keep
+                    # the marker intact so its write time starts a new debounce.
+                    continue
+                    ;;
+                *)
+                    controller_log_event warn routine_event_invalid "profile=$routine_profile phase=consume"
+                    continue
+                    ;;
+            esac
+        fi
         routine_state_value=running
         routine_last_attempt_value=$routine_now
         write_routine_state "$routine_profile"
@@ -499,11 +614,12 @@ process_routines() {
             routine_state_value=failed
             if [ "$routine_retry_value" -lt "$routine_retries" ]; then
                 routine_retry_value=$((routine_retry_value + 1))
-                retry_delay=$routine_backoff
-                retry_index=1
-                while [ "$retry_index" -lt "$routine_retry_value" ]; do retry_delay=$((retry_delay * 2)); [ "$retry_delay" -le 2592000 ] || { retry_delay=2592000; break; }; retry_index=$((retry_index + 1)); done
+                retry_delay=$(routine_retry_delay "$routine_backoff" "$routine_retry_value" "$routine_retry_exponential") || {
+                    controller_log_event warn routine_invalid "profile=$routine_profile field=retry_delay"
+                    continue
+                }
                 routine_next_value=$((routine_finished + retry_delay))
-                append_activity routine.retry_scheduled "$routine_profile" scheduled "Routine retry scheduled" routines info 2>/dev/null || true
+                append_activity routine.retry_scheduled "$routine_profile" scheduled "Routine retry scheduled in ${retry_delay}s" routines info 2>/dev/null || true
             else
                 routine_retry_value=0
                 case $routine_mode in interval) routine_next_value=$((routine_finished + routine_interval)) ;; daily) routine_last_day_value=$(date +%Y-%m-%d); routine_next_value=0 ;; realtime) routine_next_value=0 ;; esac
@@ -613,7 +729,20 @@ while [ "$shutdown" = false ]; do
     case $enabled in true|false) ;; *) enabled=false ;; esac
     case $allow_delete in true|false) ;; *) allow_delete=false ;; esac
     case $interval in ''|*[!0-9]*) interval=3600 ;; esac
-    case $maximum_total in ''|*[!0-9]*) maximum_total=100 ;; esac
+    case $maximum_total in
+        ''|*[!0-9]*)
+            enabled=false
+            maximum_total=100
+            controller_log_event warn schedule_invalid "field=max_total_delete"
+            ;;
+        *)
+            if ! decimal_at_most "$maximum_total" "$dsm_delete_limit"; then
+                enabled=false
+                maximum_total=100
+                controller_log_event warn schedule_invalid "field=max_total_delete"
+            fi
+            ;;
+    esac
     if [ "$interval" -lt 60 ] || [ "$interval" -gt 2592000 ]; then
         interval=3600
     fi

@@ -152,6 +152,10 @@ codes are:
   its bound;
 - `dsm_authentication_rejected` with status 401: the executable direct helper did not authenticate
   the native cookie;
+- `dsm_authentication_quickconnect_unsupported` with status 401: the same direct-helper rejection
+  arrived with a strictly parsed `*.quickconnect.to` authority. Synology excludes third-party
+  applications from QuickConnect support, so retry through LAN, DDNS, VPN, or a separately tested
+  DSM custom reverse proxy. This code is diagnostic only and never changes authentication;
 - `dsm_authentication_forbidden` with status 403: the direct-helper identity did not satisfy the
   independent account/administrator requirement;
 - `dsm_authentication_webapi_unavailable` with status 503: the kernel-inaccessible-helper fallback
@@ -217,6 +221,16 @@ touched. Records contain only epoch, level/category, fixed event/service/stage/c
 request environment, query, cookie, token, username, or path. An unsafe/corrupt policy or unsafe log
 path fails closed, so preserve the semantic response itself when no diagnostic was persisted.
 
+Synology's
+[QuickConnect support list](https://kb.synology.com/en-eu/DSM/tutorial/Which_services_support_QuickConnect)
+marks every third-party service and application unsupported. Its
+[QuickConnect white paper](https://global.download.synology.com/download/Document/Software/WhitePaper/Os/DSM/All/enu/Synology_QuickConnect_White_Paper_enu.pdf)
+also distinguishes direct, relay, and WebRTC paths. Do not copy proxy-origin headers into the helper
+or replace `REMOTE_ADDR` to work around a rejection: DSM's native source/session validation remains
+authoritative. The package recognizes a valid QuickConnect hostname only after rejection to improve
+the error code; it neither authorizes the request nor invokes the private loopback user service on
+that basis.
+
 A raw empty or HTML HTTP 503 is not this package envelope. It indicates Webman, its proxy, the route,
 CGI launch, or another pre-response layer failed or replaced the output. Record its response headers,
 duration, exact package version, and matching bounded Webman/package log lines. A later Synology
@@ -268,7 +282,8 @@ native registration or CGI route is broken.
 First click **Open** in Package Center or launch **Synology Drive Sync** from the DSM desktop. In the
 browser Network panel, record only each failed request path, status, and response type. Do not copy,
 save, or share arbitrary query strings because they can contain session material. A correct native
-launch loads the registered `SynologyDriveSync.js` module. The dashboard's API requests use the exact
+launch loads the registered content-addressed `SynologyDriveSync.<bundle-sha256-prefix>.js` module.
+The dashboard's API requests use the exact
 independent path `/webman/3rdparty/synology-drive-sync/api.cgi`.
 
 Then inspect the installed registration and mapping without changing them:
@@ -284,17 +299,19 @@ ls -ld "$WEBMAN_LINK" "$UI_ROOT"
 readlink "$WEBMAN_LINK"
 readlink -f "$WEBMAN_LINK"
 stat -Lc '%F %a %U:%G %n' \
-  "$WEBMAN_LINK" "$UI_ROOT" "$UI_ROOT/config" \
-  "$UI_ROOT/SynologyDriveSync.js" "$UI_ROOT/style.css" "$UI_ROOT/api.cgi"
+  "$WEBMAN_LINK" "$UI_ROOT" "$UI_ROOT/config" "$UI_ROOT/style.css" "$UI_ROOT/api.cgi"
+find "$UI_ROOT" -maxdepth 1 -type f -name 'SynologyDriveSync.*.js' -exec \
+  stat -Lc '%F %a %U:%G %n' {} \;
 grep -F 'SYNO.SDS.App.SynologyDriveSync.Instance' "$UI_ROOT/config"
 grep -F '"type": "app"' "$UI_ROOT/config"
 ```
 
 The installed fields must be `package="synology-drive-sync"`,
 `dsmuidir="synology-drive-sync:ui"`, and
-`dsmappname="SYNO.SDS.App.SynologyDriveSync.Instance"`. `config`, `SynologyDriveSync.js`, and
-`style.css` must be regular `0644` files; `config` must wrap that class beneath the
-`SynologyDriveSync.js` module and declare `type="app"` with the matching `appWindow`. `api.cgi` must
+`dsmappname="SYNO.SDS.App.SynologyDriveSync.Instance"`. `config`, `style.css`, and exactly one
+content-addressed `SynologyDriveSync.<bundle-sha256-prefix>.js` must be regular `0644` files;
+`config` must wrap that class beneath the same module filename and declare `type="app"` with the
+matching `appWindow`. `api.cgi` must
 be a regular `0755` file. The Webman link must resolve to that installation's `target/ui` for the
 CGI endpoint. Interpret the evidence as follows:
 
@@ -388,7 +405,7 @@ Check the package identity can read and traverse the local source. Then review:
 - remote `/`, repeated separators, trailing slash, dot segments, managed/reserved components, and
   portability length;
 - `jobs`, retry, timeout, connect-timeout, rate, and exclude bounds;
-- quiet combined with nonzero verbosity;
+- verbosity, quiet terminal suppression, log/progress formats, and result-output mode;
 - remote-log required mode without an HTTPS collector URL; and
 - invalid-certificate selection without the explicit interception-risk confirmation.
 
@@ -497,9 +514,11 @@ the exact source NAS and record all of the following:
   launch, rendering, assets, and API path succeed on physical NAS hardware; and
 - a fresh native launch performs or joins one in-flight official same-origin `SYNO.API.Auth` version
   6 `method=token` request, retries a failed bootstrap only after the bounded cooldown, retains the
-  exactly-once-encoded value only in module memory, sends it as `X-SYNO-TOKEN` on package requests,
-  never inspects/rewrites the DSM shell location, and records whether the installed helper used the
-  direct or `EACCES` loopback branch without recording the token itself.
+  exactly-once-encoded value only in module memory, sends it through this package's private
+  `X-SYNO-TOKEN` browser-to-CGI bridge, never inspects/rewrites the DSM shell location, and records
+  whether the installed helper used the direct or `EACCES` loopback branch without recording the
+  token itself. The official contract is `method=token`, `data.synotoken`, and the `SynoToken`
+  parameter—not our private header name.
 
 Automated Chrome fixture QA passed against the captured DSM control structure. It does not prove
 native physical-DSM rendering, accessibility interaction, or browser-header-to-CGI forwarding;
@@ -528,7 +547,8 @@ record those results from the installed AppWindow.
   redirect, remote host, cookie URL, or token URL; malformed/oversized responses, missing
   `Session.user`, non-Boolean/false `is_admin`, and independent NSS/group mismatches fail closed;
 - a stale cookie, malformed/mismatched SynoToken, missing/expired CSRF, wrong methods/fields, and
-  direct CGI calls fail closed, while official token bootstrap and header forwarding succeed; and
+  direct CGI calls fail closed, while the official token bootstrap and package-private header bridge
+  succeed; and
 - no secret appears in a launch/package URL, URL history, Referer, package request body, browser
   storage, Activity, logs, DSM desktop alerts, queue result, or support evidence.
 
@@ -577,5 +597,7 @@ helper first, validates/revalidates it only after `X_OK` succeeds, and selects b
 validation only on `EACCES`. The private `SYNO.Core.Desktop.Initdata` response shape is corroborated
 by saved first-party DSM runtime sources, not by the supplied HTTP capture; Synology does not publicly
 promise it as a package API. The daemon invokes neither authentication path. Webman's package-owner
-CGI identity, official token/header behavior, and selected direct/fallback branch remain live-DSM
-acceptance requirements. A complete record from the exact environment is the acceptance evidence.
+CGI identity, official token response, package-private header bridge, and selected direct/fallback
+branch remain live-DSM acceptance requirements. QuickConnect relay access is outside Synology's
+third-party application support; use a supported route for that acceptance record. A complete record
+from the exact environment is the acceptance evidence.

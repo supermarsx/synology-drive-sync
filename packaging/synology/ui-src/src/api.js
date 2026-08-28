@@ -93,8 +93,8 @@ export const ARGUMENT_KEYS = Object.freeze({
   "configure-profile": Object.freeze([
     "allow_empty_source", "allow_http", "ca_certificate", "compare",
     "connect_timeout_seconds", "danger_accept_invalid_certs", "delete",
-    "excludes", "jobs", "log_level", "make_default", "max_delete",
-    "max_rate_bytes_per_second", "name", "quiet", "remote",
+    "excludes", "jobs", "log_format", "log_level", "make_default", "max_delete",
+    "max_rate_bytes_per_second", "name", "output", "progress", "quiet", "remote",
     "remote_log_mode", "remote_log_url", "retries", "source",
     "timeout_seconds", "url", "username", "verbosity"
   ]),
@@ -105,7 +105,7 @@ export const ARGUMENT_KEYS = Object.freeze({
   routine: Object.freeze([
     "action", "allow_delete", "debounce_seconds", "depends_on", "enabled",
     "interval_seconds", "max_total_delete", "mode", "poll_seconds", "profile",
-    "retry_backoff_seconds", "retry_count", "time_window_end",
+    "retry_backoff_seconds", "retry_count", "retry_exponential", "time_window_end",
     "time_window_start", "weekdays"
   ]),
   "remove-routine": Object.freeze(["name"]),
@@ -125,6 +125,16 @@ export const ARGUMENT_KEYS = Object.freeze({
   ]),
   "client-event": Object.freeze(["event"]),
   action: Object.freeze(["allow_delete", "kind", "max_total_delete", "scope", "write_test"])
+});
+
+const ROUTINE_COMMON_ARGUMENT_KEYS = Object.freeze([
+  "action", "allow_delete", "depends_on", "enabled", "max_total_delete", "mode", "profile",
+  "retry_backoff_seconds", "retry_count", "retry_exponential"
+]);
+const ROUTINE_MODE_ARGUMENT_KEYS = Object.freeze({
+  interval: Object.freeze(["interval_seconds"]),
+  daily: Object.freeze(["time_window_end", "time_window_start", "weekdays"]),
+  realtime: Object.freeze(["debounce_seconds", "poll_seconds"])
 });
 
 export function boundedText(value, fallback = "") {
@@ -390,6 +400,22 @@ function exactKeys(actual, expected, label) {
   }
 }
 
+function exactMutationKeys(action, payload) {
+  if (action !== ACTIONS.routine) {
+    exactKeys(payload, ARGUMENT_KEYS[action], "Mutation");
+    return;
+  }
+  const modeKeys = payload && ROUTINE_MODE_ARGUMENT_KEYS[payload.mode];
+  if (!modeKeys) {
+    throw new Error("Mutation arguments do not match the reviewed bridge contract");
+  }
+  exactKeys(
+    payload,
+    [...ROUTINE_COMMON_ARGUMENT_KEYS, ...modeKeys].sort(),
+    "Mutation"
+  );
+}
+
 function endpoint(action, parameters) {
   const query = new URLSearchParams();
   query.set("action", action);
@@ -581,7 +607,7 @@ export async function apiPost(
   if (!csrfToken) throw new Error("Authenticated DSM mutation bridge is unavailable");
   const expectedKeys = ARGUMENT_KEYS[action];
   if (!expectedKeys) throw new Error("Unsupported API mutation action");
-  exactKeys(payload, expectedKeys, "Mutation");
+  exactMutationKeys(action, payload);
 
   await ensureDsmToken();
   const requestDsmAuth = dsmAuthSnapshot();

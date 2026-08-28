@@ -2,10 +2,10 @@ Synology Drive Sync DSM AppWindow bundled-code notices
 =====================================================
 
 This file covers third-party runtime code incorporated into the generated
-ui/SynologyDriveSync.js AppWindow bundle. Packages used only to build the UI are
-not represented as shipped runtime code. The Vue npm package is externalized;
-DSM supplies the global Vue runtime and the Vue npm runtime is not copied into
-the AppWindow bundle.
+ui/SynologyDriveSync.<32-hex-sha256-prefix>.js AppWindow bundle. Packages used
+only to build the UI are not represented as shipped runtime code. The Vue npm
+package is externalized; DSM supplies the global Vue runtime. The Vue npm
+runtime is not copied into the AppWindow bundle.
 
 vue-loader 15.10.1
 ------------------

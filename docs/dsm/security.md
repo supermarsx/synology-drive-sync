@@ -69,11 +69,14 @@ that cookie. Before its first package API request, the AppWindow makes the offic
 `GET /webapi/entry.cgi?api=SYNO.API.Auth&version=6&method=token` request with
 `credentials: "same-origin"`, `cache: "no-store"`, redirect rejection, JSON-only bounded response
 handling, and no request body. It accepts only `success=true` with a bounded nonempty
-`data.synotoken`, URL-component-encodes that raw value exactly once, shares one in-flight bootstrap,
-and caches only the normalized value in JavaScript module memory for the current AppWindow. A reload
-creates a new module and reacquires the token. Package requests carry it only as the
-`X-SYNO-TOKEN` header alongside `X-SDSYNC-Request: 1`; the browser independently attaches the DSM
-cookie through same-origin credentials.
+`data.synotoken`, as documented for `method=token`, URL-component-encodes that raw value exactly
+once, shares one in-flight bootstrap, and caches only the normalized value in JavaScript module
+memory for the current AppWindow. A reload creates a new module and reacquires the token. Our
+package-specific browser bridge then carries that value only in `X-SYNO-TOKEN` alongside
+`X-SDSYNC-Request: 1`; `X-SYNO-TOKEN` is not presented as a Synology-documented browser header. The
+browser independently attaches the DSM cookie through same-origin credentials. The package CGI
+canonicalizes the private header into its `SynoToken` helper query; Synology documents `SynoToken`
+as a Web API parameter, while this helper transport remains package-observed/private behavior.
 
 The native AppWindow never reads SynoToken from or writes it to a browser-visible launch URL,
 `window.location`, history, Referer, bookmark, package action URL/query string, package request body,
@@ -145,7 +148,9 @@ Synology's official DSM 7 [application authentication guide](https://help.synolo
 documents direct `authenticate.cgi` use by a custom CGI and the native request environment it needs.
 The official [DSM Login Web API Guide](https://global.download.synology.com/download/Document/Software/DeveloperGuide/Os/DSM/All/enu/DSM_Login_Web_API_Guide_enu.pdf)
 documents `SYNO.API.Auth` version 6 `method=token`, keeping the returned SynoToken in a JavaScript
-variable, and querying it again after a reload. Neither guide publishes
+variable, querying it again after a reload, and using `SynoToken` as an API parameter. The
+AppWindow-to-package `X-SYNO-TOKEN` header and its exactly-once canonicalization are this package's
+private transport, not an official Synology header contract. Neither guide publishes
 `SYNO.Core.Desktop.Initdata/get_user_service` as a package API. Its typed response shape is
 corroborated by saved first-party DSM runtime sources, not by the supplied HTTP capture, and remains
 private/unpublished behavior. The fallback is therefore still a physical-NAS acceptance requirement
@@ -158,6 +163,18 @@ activity-delimiter characters are rejected. The static package binary cannot dir
 DSM/glibc NSS modules (though an available NSCD path may serve lookups), so local, LDAP, and AD
 administrator/non-administrator accounts—including qualified, Unicode, nested-group, and
 name-collision cases—remain a required physical-DSM acceptance matrix.
+
+QuickConnect is not an authentication compatibility target for this third-party package. Synology's
+[supported-services list](https://kb.synology.com/en-eu/DSM/tutorial/Which_services_support_QuickConnect)
+explicitly excludes all third-party services and applications, while its
+[QuickConnect white paper](https://global.download.synology.com/download/Document/Software/WhitePaper/Os/DSM/All/enu/Synology_QuickConnect_White_Paper_enu.pdf)
+documents direct, relay, and WebRTC connection modes. A relay can therefore present a different
+native request/source context to `authenticate.cgi`; DSM authentication remains authoritative. The
+package does not trust or replay `X-Forwarded-*`/`X-Real-IP`, and an executable-helper rejection
+never falls back to the private user service. After such a rejection, only a strictly parsed
+`*.quickconnect.to` `HTTP_HOST` changes the fixed diagnostic code to
+`dsm_authentication_quickconnect_unsupported`; it cannot change acceptance. Use LAN, DDNS, VPN, or a
+separately tested DSM reverse-proxy/custom-domain route for physical acceptance.
 
 ## Authentication and authorization sequence
 
@@ -389,16 +406,20 @@ same-origin credentials; SynoToken remains module-memory-only.
 ## Security acceptance limits
 
 Repository tests cover parsing, CGI/service identity predicates, Unix-socket ownership/mode and peer
-checks, the official token bootstrap's bounded same-origin/memory-only/header-only contract, direct
+checks, the official same-origin `method=token` bootstrap plus the package-private
+memory-only/header-only bridge contract, direct
 CGI authentication under synthetic executable-helper permissions, `X_OK`-before-validation ordering,
 the kernel-inaccessible `root:system 0750` loopback fallback, response bounds and malformed
 identities, daemon non-execution of the helper/user service, GET semantic error transport, admin
 membership, CSRF binding, schema rejection, queue
 paths/modes/order, redaction, response bounds, native bundle/style isolation, direct fixed notifier
 arguments, and SPK privilege/resource layout. They do not prove DSM's physical executable-owner CGI
-runtime behavior, the official token response and header forwarding in a native physical AppWindow,
+runtime behavior, the official token response and package-private `X-SYNO-TOKEN` forwarding in a
+native physical AppWindow,
 direct protected-helper execution on a DSM where it is permitted, the private loopback user-service
 behavior on every DSM branch,
 package-identity execution of `synodsmnotify`, DSM forwarding of `X-SDSYNC-Request: 1` as
-`HTTP_X_SDSYNC_REQUEST=1`, or reverse-proxy/origin behavior of a physical DSM release. Validate those
-on every supported DSM branch before calling the dashboard production-ready.
+`HTTP_X_SDSYNC_REQUEST=1`, or reverse-proxy/origin behavior of a physical DSM release. QuickConnect
+relay access is explicitly outside third-party package support; validate supported LAN, DDNS, VPN,
+or custom reverse-proxy routes on every supported DSM branch before calling the dashboard
+production-ready.

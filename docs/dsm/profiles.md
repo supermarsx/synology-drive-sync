@@ -1,8 +1,9 @@
 # Profiles and destinations
 
-A DSM profile binds one physical local source to one File Station logical destination, target
-account, protected credential set, safety policy, and observability policy. Profiles are independent:
-they may use different sources, NAS URLs, accounts, credentials, and target paths.
+A DSM profile is the complete unit for one sync target. It binds one physical local source to the
+target NAS URL, DSM account, File Station logical destination, protected credential set, safety
+policy, network behavior, and observability/output policy. Profiles are independent: they may use
+different sources, NAS URLs, accounts, credentials, target paths, and runtime settings.
 
 Selecting an existing profile in the dashboard makes **Name** read-only. There is no silent rename.
 Create a distinct profile, validate it, and remove the old one when a name must change.
@@ -60,8 +61,8 @@ required, and all-profile actions can require an aggregate bound. See
 | Excludes | One non-empty glob per line; at most 64 entries, each at most 512 bytes |
 | Allow an empty source | Dangerous opt-out from the empty-source deletion guard; off by default |
 | Retries | `0..5`; default `2` |
-| Upload timeout | `1..86400` seconds; default `7200` |
-| Connect timeout | Effective dashboard bridge range `1..600` seconds; default `15` |
+| Upload timeout | DSM manager and dashboard range `1..86400` seconds; default `7200` |
+| Connect timeout | DSM manager and dashboard range `1..600` seconds; default `15` |
 | Maximum rate | Positive bytes per second, or `0` in the form for unlimited |
 
 Default excludes include DSM metadata such as `@eaDir/`, nested `**/@eaDir/`, `#recycle/`, and
@@ -89,19 +90,22 @@ Neither bypass should be a normal production setting.
 | Dashboard field | DSM package behavior |
 | --- | --- |
 | Verbosity | `0` normal, `1` verbose, `2` very verbose |
-| Quiet terminal sink | Suppresses terminal-style output while durable logs remain active; cannot be combined with nonzero verbosity |
+| Quiet terminal sink | Suppresses terminal-style output while durable logs remain active; nonzero verbosity may still raise durable log detail |
 | Log level | `trace`, `debug`, `info`, `warn`, `error`, or `off` |
-| Log format | Displayed as package-managed `json` |
+| Log format | `human` or `json`; default `json` |
 | Log file | Displayed read-only as the private package sync log |
-| Progress | Displayed as package-managed `never` |
-| Output | Displayed as package-managed `human` action output |
+| Progress | `auto`, `always`, or `never`; default `never` |
+| Output | `human`, `json`, or newline-delimited `ndjson`; default `human` |
 
-The four package-managed values are deliberate DSM invariants. They keep unattended logs
-deterministic, bounded, and private and prevent the browser from selecting arbitrary filesystem
-paths. Workstation TOML/CLI deployments can choose other supported log format, log path, progress,
-and output values; the DSM dashboard intentionally cannot. The SSH manager can render a profile with
-different valid values only inside the same private log boundary, but normal dashboard saves retain
-the package-managed contract.
+The log file path remains a DSM invariant: the dashboard cannot redirect output to an arbitrary
+filesystem path. Log format, progress rendering, and command-result output are safe enumerations and
+are configurable per profile. `json` logs preserve structured severity/category data; human logs are
+shown as opaque informational lines by threshold filtering. Scheduled runs suppress terminal output,
+so changing progress/output mainly affects foreground Doctor, Plan, and Run actions.
+
+DSM constrains `max-delete` to `0..2147483647` so the same saved profile is representable on armv7
+and 64-bit NAS builds. `max-rate` is either unlimited or `1..9007199254740991` bytes per second so
+its exact integer value round-trips through the JavaScript dashboard without precision loss.
 
 ## Remote logging fields
 
@@ -114,6 +118,31 @@ the package-managed contract.
 **Best effort** records local logging even when remote delivery fails. **Required** makes remote
 logging failure affect operation success; use it only when the collector is itself reliable and the
 failure semantics are desired. The token is never returned with the URL or profile snapshot.
+
+The token can be staged while remote logging is disabled. In that state its protected file and
+`has_remote_log_token` presence flag are retained, but the generated core profile omits the token
+locator. Enabling a remote-log URL restores the fixed package-owned locator; disabling the URL omits
+it again. This keeps the core configuration valid without disclosing or deleting a credential that
+the administrator intentionally retained.
+
+## Complete DSM profile contract
+
+The dashboard and manager expose every safe, profile-scoped core setting. A few core TOML fields are
+represented by safer DSM-specific controls instead of raw paths:
+
+| Core profile concern | DSM representation |
+| --- | --- |
+| Source and target | `source`, `url`, `username`, and `remote` editable fields |
+| Password and TOTP locators | Fixed package-owned files; values are write-only keep/replace/clear operations |
+| Remote-log token locator | Fixed package-owned file, referenced only while a remote-log URL is configured |
+| OS credential vault | Always disabled because the DSM service has package-private credential files |
+| Sync/safety/network | Comparison, jobs, excludes, deletion bounds, empty-source guard, retries, timeouts, rate, CA, and TLS exceptions |
+| Local output | Verbosity, quiet, log level, log format, progress, and result output |
+| Local log path | Fixed private `sync.log`; visible read-only in the snapshot |
+| Remote observability | HTTPS collector URL, delivery mode, and write-only token |
+
+Snapshots return all non-secret values plus only `has_password`, `has_totp`, and
+`has_remote_log_token`. They never return a credential value or a credential-file locator.
 
 ## Saving, defaults, and removal
 

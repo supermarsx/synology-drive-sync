@@ -163,12 +163,15 @@ test("Settings uses horizontal native form rows with help adjacent to each label
   }
 });
 
-test("Routines prioritizes Configured profiles before Package controller", () => {
+test("Routines prioritizes Configured profiles before the routine editor", () => {
   const routines = routeSection("routines");
   const definitions = tabDefinitions(app, "routineTabs", "Routines");
   const labels = tabContract(routines, "Routines", definitions, "routineTabs");
-  assert.deepEqual(labels, ["Configured profiles", "Package controller"]);
+  assert.deepEqual(labels, ["Configured profiles", "New routine"]);
   assert.match(app, /routineTab:\s*"configured-profiles"/, "Configured profiles must be the initial routine view");
+  assert.match(routines, /data-subtab-panel="routine-editor"/);
+  assert.match(app, /this\.routineTab = "routine-editor"/);
+  assert.doesNotMatch(routines, /package-controller|Package controller/);
   assertTabLabelsAreNotRepeatedAsHeadings(routines, labels, "Routines");
 });
 

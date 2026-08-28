@@ -34,9 +34,11 @@ capability declaration.
 `dsmappname="SYNO.SDS.App.SynologyDriveSync.Instance"`. `ui-src/app.config` declares that class as
 `type="app"`, sets `appWindow` to the same value, and keeps `allUsers=false`. `config.define` binds
 the source bundle to `SynologyDriveSync.js`. The assembler deterministically reproduces the normal
-DSM toolkit merge: installed `ui/config` is keyed by `SynologyDriveSync.js`, contains the class
-entry plus `depend: []`, and is packaged with regular `ui/SynologyDriveSync.js` and `ui/style.css`
-files at mode `0644`.
+DSM toolkit merge while deriving the installed module filename from the exact bundle SHA-256:
+`ui/config` and `ui/SynologyDriveSync.<bundle-sha256-prefix>.js` use the same content-addressed key,
+contain the class entry plus `depend: []`, and are packaged with `ui/style.css` at mode `0644`.
+Changing the bundle changes its installed URL, preventing stale JavaScript reuse through DSM or a
+reverse proxy; the validator rejects a filename whose digest does not match its bytes.
 
 The bundle uses `SYNO.namespace` and `Vue.extend`; its root is `v-app-instance` containing
 `v-app-window`. It renders the dashboard directly rather than embedding a `type=url` page or iframe.

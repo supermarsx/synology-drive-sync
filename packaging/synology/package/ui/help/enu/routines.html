@@ -11,23 +11,23 @@
 </head>
 <body>
   <h1>Routines and realtime hooks</h1>
-  <p>The page opens on <strong>Configured profiles</strong>, where each saved routine can be inspected and selected. Selecting one switches to <strong>Package controller</strong>, the editor for that profile's automation policy. Each profile can have one package-controller routine. A routine remains inert until it is saved and enabled. Choose <strong>Sync</strong> for a real transfer or <strong>Plan only</strong> for read-only comparison.</p>
+  <p>The page opens on <strong>Configured profiles</strong>, where each saved routine can be inspected and selected. Selecting one switches to <strong>New routine</strong> and loads that profile in the routine editor. Each profile can have one saved routine. A routine remains inert until it is saved and enabled. Choose <strong>Sync</strong> for a real transfer or <strong>Plan only</strong> for read-only comparison.</p>
 
   <h2>Execution modes</h2>
   <dl>
-    <dt>Interval</dt><dd>Runs after the configured number of seconds, subject to enabled weekdays and the operation lock.</dd>
-    <dt>Daily window</dt><dd>Runs only between the start and end times in DSM local time.</dd>
-    <dt>Realtime</dt><dd>Observes source changes, waits for the debounce period, performs preflight, and starts a run. When a native change hook is unavailable, the package reports and uses the configured polling fallback.</dd>
+    <dt>Interval</dt><dd>Runs after the configured number of seconds. It has no weekday or time-window restriction.</dd>
+    <dt>Daily window</dt><dd>Runs on the selected weekdays and only between the start and end times in DSM local time.</dd>
+    <dt>Realtime</dt><dd>Observes source changes, waits for a full quiet debounce period after the latest event, performs preflight, and starts a run. It has no interval or calendar window. The debounce defaults to 45 seconds. Dependency deferral preserves the pending event; a newer event restarts the quiet period. A consumed native event also refreshes the fallback fingerprint, so polling cannot dispatch it early or a second time. When a native change hook is unavailable, the package reports and uses the configured polling fallback.</dd>
   </dl>
 
-  <h2>Timing model</h2>
-  <p>Realtime work follows four stages: observe, debounce, preflight, run. Debounce coalesces bursts of changes. Fallback poll controls how often the source is checked without native hooks. Retry attempts and backoff apply after an execution fails; they do not permit overlapping operations.</p>
+  <h2>Retries</h2>
+  <p>Whole-action retries default to five. The base delay is 10 to 300 seconds. Exponential backoff can be enabled to double later delays or disabled to keep the base delay fixed; every delay is capped at five minutes. A pending retry owns admission until its deadline, so daily cadence and realtime events cannot bypass the delay. Retries do not permit overlapping operations.</p>
 
   <h2>Dependencies and weekdays</h2>
-  <p>Wait-for dependencies require selected profile routines to finish first. Avoid dependency cycles. At least one active weekday is required. The controller evaluates daily-window times and weekdays using the NAS clock, so keep DSM time synchronization healthy.</p>
+  <p>Wait-for dependencies require selected profile routines to finish first. Avoid dependency cycles. Daily mode requires at least one active weekday and evaluates its window using the NAS clock, so keep DSM time synchronization healthy. Interval and realtime modes ignore calendar controls.</p>
 
   <h2>Deletion policy</h2>
-  <p>A routine cannot independently enable deletion. It can only permit deletion already allowed by the profile, and its deletion approval ceiling adds another limit. Use a plan to review proposed removals before enabling either layer.</p>
+  <p>A routine cannot independently enable deletion. It can only permit deletion already allowed by the profile, and its deletion approval ceiling adds another limit. The ceiling is a non-negative integer no greater than 2147483647 on every supported NAS architecture. Use a plan to review proposed removals before enabling either layer.</p>
 
   <h2>One host-local lock</h2>
   <p>Manual plans, manual syncs, Doctor operations, and scheduled routines coordinate through package state. A long-running sync cannot pile up concurrent sync processes; subsequent routine work waits or records the controller decision.</p>

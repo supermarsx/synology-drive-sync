@@ -113,7 +113,9 @@ test("tooltips, overlays, tables, and log surfaces stay readable inside the AppW
     ".sdsync-field-tip-trigger:focus-visible",
     ".sdsync-field-tip:hover .sdsync-field-tip-content",
     ".sdsync-field-tip:focus-within .sdsync-field-tip-content",
-    "max-width: min(300px, calc(100vw - 96px))",
+    "max-width: min(240px, calc(100vw - 96px))",
+    "max-width: min(360px, calc(100vw - 24px))",
+    "max-height: min(420px, calc(100vh - 24px))",
     "max-width: 320px",
     ".sdsync-toast.is-error",
     ".sdsync-modal:focus-visible",
@@ -161,6 +163,15 @@ test("PortalTarget select menus use a package-owned dark-theme boundary", () => 
   ]) {
     assert.ok(css.includes(marker), `missing portal select contract ${marker}`);
   }
+  const portal = declarations(".sdsync-select-dropdown");
+  assert.match(portal, /max-width:\s*min\(360px, calc\(100vw - 24px\)\)\s*!important/);
+  assert.match(portal, /max-height:\s*min\(420px, calc\(100vh - 24px\)\)\s*!important/);
+  assert.match(portal, /overflow-x:\s*hidden\s*!important/);
+  assert.match(declarations(".sdsync-workspace"), /overflow-x:\s*hidden/);
+  assert.match(
+    css,
+    /\.sdsync-check-row > \.sdsync-field-tip \.sdsync-field-tip-content,[\s\S]*?inset-inline-start:\s*auto;[\s\S]*?inset-inline-end:\s*0;/
+  );
 });
 
 test("security controls use compact responsive rows without clipping help", () => {

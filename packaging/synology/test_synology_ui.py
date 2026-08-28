@@ -77,15 +77,18 @@ class DsmUiContractTests(unittest.TestCase):
         self.assertIs(application["allowMultiInstance"], False)
         self.assertIs(application["hidden"], False)
         installed_config = json.loads(build_spk.native_ui_payloads()[0][0])
+        bundle = (UI_SOURCE / "dist/SynologyDriveSync.js").read_bytes()
+        module = build_spk.native_ui_module_name(bundle)
+        module_path = f"ui/{module}"
         expected_installed_application = dict(application)
         expected_installed_application["depend"] = []
         self.assertEqual(
             installed_config,
-            {"SynologyDriveSync.js": {app_id: expected_installed_application}},
+            {module: {app_id: expected_installed_application}},
         )
         self.assertEqual(
             validate_spk.validate_ui_config(json.dumps(installed_config).encode()),
-            "ui/SynologyDriveSync.js",
+            module_path,
         )
         self.assertFalse((HERE / "conf/resource").exists())
         self.assertFalse((UI / "texts/enu/mails").exists())
@@ -276,6 +279,8 @@ class DsmUiContractTests(unittest.TestCase):
             (UI_SOURCE / "webpack.config.js").read_bytes(),
             (UI_SOURCE / "config.define").read_bytes(),
             (UI_SOURCE / "package.json").read_bytes(),
+            (UI_SOURCE / "src/runtimeStyles.js").read_bytes(),
+            (UI_SOURCE / "src/controlLayout.js").read_bytes(),
             (UI_SOURCE / "src/ActionIcon.js").read_bytes(),
             (UI_SOURCE / "src/SecurityPanel.vue").read_bytes(),
         )
@@ -352,7 +357,7 @@ class DsmUiContractTests(unittest.TestCase):
         for field in (
             "allow_empty_source", "ca_certificate", "connect_timeout",
             "danger_invalid_certs", "excludes", "max_rate", "remote_log_mode",
-            "remote_log_token", "retry_backoff_seconds", "retry_count",
+            "remote_log_token", "retry_backoff_seconds", "retry_count", "retry_exponential",
             "time_window_end", "time_window_start", "weekdays",
         ):
             self.assertIn(field, app)
@@ -1002,7 +1007,7 @@ function bind(context, names) {
         for marker in (
             "runOperation() { return boundedText(this.run.operation, \"Unavailable\"); }",
             "runScope() { return boundedText(this.run.scope, \"Unavailable\"); }",
-            "numberOr(routine.retry_count, 2)",
+            "numberOr(routine.retry_count, 5)",
             "numberOr(routine.max_total_delete, 100)",
         ):
             self.assertIn(marker, app)
@@ -1187,6 +1192,8 @@ function bind(context, names) {
             payload, installed_size = build_spk.payload_archive(core, helper)
         with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
             members = {member.name: member for member in archive.getmembers()}
+            bundle = (UI_SOURCE / "dist/SynologyDriveSync.js").read_bytes()
+            module_path = f"ui/{build_spk.native_ui_module_name(bundle)}"
             self.assertEqual(members["bin/sdsync-dsm-api"].mode & 0o7777, 0o755)
             self.assertEqual(members["ui/api.cgi"].mode & 0o7777, 0o755)
             self.assertEqual(archive.extractfile(members["bin/sdsync-dsm-api"]).read(), b"api-fixture")
@@ -1201,7 +1208,7 @@ function bind(context, names) {
                 self.assertEqual(validate_spk.png_dimensions(archive.extractfile(members[name]).read()), (size, size))
             for name in (
                 "ui/config",
-                "ui/SynologyDriveSync.js",
+                module_path,
                 "ui/style.css",
                 "ui/images/icon.svg",
                 "ui/texts/enu/strings",
@@ -1215,10 +1222,10 @@ function bind(context, names) {
             ui_config = archive.extractfile(members["ui/config"]).read()
             self.assertEqual(
                 validate_spk.validate_ui_config(ui_config),
-                "ui/SynologyDriveSync.js",
+                module_path,
             )
             validate_spk.validate_native_bundle(
-                archive.extractfile(members["ui/SynologyDriveSync.js"]).read(),
+                archive.extractfile(members[module_path]).read(),
                 archive.extractfile(members["ui/style.css"]).read(),
             )
             validate_spk.validate_dsm_help(
@@ -1246,6 +1253,8 @@ function bind(context, names) {
             "webpack": (UI_SOURCE / "webpack.config.js").read_bytes(),
             "config_define": (UI_SOURCE / "config.define").read_bytes(),
             "package": (UI_SOURCE / "package.json").read_bytes(),
+            "runtime_styles": (UI_SOURCE / "src/runtimeStyles.js").read_bytes(),
+            "control_layout": (UI_SOURCE / "src/controlLayout.js").read_bytes(),
             "action_icon": (UI_SOURCE / "src/ActionIcon.js").read_bytes(),
             "security_panel": (UI_SOURCE / "src/SecurityPanel.vue").read_bytes(),
         }
@@ -1261,6 +1270,8 @@ function bind(context, names) {
                 payloads["webpack"],
                 payloads["config_define"],
                 payloads["package"],
+                payloads["runtime_styles"],
+                payloads["control_layout"],
                 payloads["action_icon"],
                 payloads["security_panel"],
             )
@@ -1277,6 +1288,8 @@ function bind(context, names) {
                 source["webpack"],
                 source["config_define"],
                 source["package"],
+                source["runtime_styles"],
+                source["control_layout"],
                 source["action_icon"],
             )
         self.assertIn(b"overview: [", source["action_icon"])
@@ -1494,9 +1507,38 @@ function bind(context, names) {
             validate_build(
                 webpack=source["webpack"].replace(b'vue: "Vue"', b'vue: "BundledVue"', 1)
             )
+        for name, key, original, replacement, pattern in (
+            (
+                "runtime style entry invocation",
+                "main",
+                b"installRuntimeStyles(runtimeCss);",
+                b"void runtimeCss;",
+                "entry module is missing",
+            ),
+            (
+                "runtime style text assignment",
+                "runtime_styles",
+                b"style.textContent = cssText",
+                b'style.textContent = ""',
+                "runtime stylesheet source",
+            ),
+            (
+                "control layout export",
+                "control_layout",
+                b"export function installControlLayout(root)",
+                b"function removedControlLayout(root)",
+                "control-layout source",
+            ),
+        ):
+            self.assertIn(original, source[key], name)
+            with self.subTest(name=name), self.assertRaisesRegex(
+                validate_spk.ValidationError, pattern
+            ):
+                validate_build(**{key: source[key].replace(original, replacement, 1)})
 
         script = (UI_SOURCE / "dist/SynologyDriveSync.js").read_bytes()
         style = (UI_SOURCE / "dist/style.css").read_bytes()
+        validate_spk.validate_native_bundle(script, style)
         for name, suffix, pattern in (
             ("eval", b"\neval('bad')", "forbidden runtime"),
             ("source map", b"\n//# sourceMappingURL=bad.map", "forbidden runtime"),
@@ -1513,9 +1555,28 @@ function bind(context, names) {
             validate_spk.validate_native_bundle(
                 script, style + b'\n.sdsync-app { background: url("https://evil.invalid/x"); }'
             )
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError, "runtime stylesheet injection marker"
+        ):
+            validate_spk.validate_native_bundle(
+                script.replace(
+                    b"sdsync-current-runtime-style",
+                    b"sdsync-removed-runtime-style",
+                    1,
+                ),
+                style,
+            )
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError, "exact packaged stylesheet bytes"
+        ):
+            validate_spk.validate_native_bundle(
+                script,
+                style + b"\n.sdsync-app { --validator-mismatch: 1; }\n",
+            )
 
         installed_payload = build_spk.native_ui_payloads()[0][0]
         config = json.loads(installed_payload)
+        module = next(iter(config))
         duplicate_all_users = installed_payload.replace(
             b'"allUsers": false',
             b'"allUsers": true, "allUsers": false',
@@ -1523,14 +1584,14 @@ function bind(context, names) {
         )
         with self.assertRaisesRegex(validate_spk.ValidationError, "duplicate JSON key"):
             validate_spk.validate_ui_config(duplicate_all_users)
-        config["SynologyDriveSync.js"][validate_spk.APP_ID]["allUsers"] = True
+        config[module][validate_spk.APP_ID]["allUsers"] = True
         with self.assertRaisesRegex(validate_spk.ValidationError, "allUsers"):
             validate_spk.validate_ui_config(json.dumps(config).encode())
         config = json.loads(installed_payload)
-        del config["SynologyDriveSync.js"][validate_spk.APP_ID]["depend"]
+        del config[module][validate_spk.APP_ID]["depend"]
         with self.assertRaisesRegex(validate_spk.ValidationError, "dependency list"):
             validate_spk.validate_ui_config(json.dumps(config).encode())
-        with self.assertRaisesRegex(validate_spk.ValidationError, "one reviewed native"):
+        with self.assertRaisesRegex(validate_spk.ValidationError, "content-addressed filename"):
             validate_spk.validate_ui_config(
                 json.dumps({".url": {validate_spk.APP_ID: {"type": "url"}}}).encode()
             )

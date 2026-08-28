@@ -34,7 +34,7 @@ shape is:
 
 ```json
 {
-  "SynologyDriveSync.js": {
+  "SynologyDriveSync.<32-hex-sha256-prefix>.js": {
     "SYNO.SDS.App.SynologyDriveSync.Instance": {
       "type": "app",
       "appWindow": "SYNO.SDS.App.SynologyDriveSync.Instance"
@@ -49,10 +49,16 @@ toolkit-only transformation itself and stages:
 | Source | Installed SPK path |
 | --- | --- |
 | generated wrapper from `app.config` + `config.define` | `ui/config` |
-| `dist/SynologyDriveSync.js` | `ui/SynologyDriveSync.js` |
+| `dist/SynologyDriveSync.js` | `ui/SynologyDriveSync.<32-hex-sha256-prefix>.js` |
 | `dist/style.css` | `ui/style.css` |
 | `../package/ui/images` plus deterministic PNG renders | `ui/images` |
 | `../package/ui/texts` | `ui/texts` |
+
+The installed module key and filename use the first 32 hexadecimal characters
+of the exact bundle's SHA-256 digest. The stable `dist/SynologyDriveSync.js`
+source name remains the SDK/webpack build target, while each changed bundle is
+delivered under a new AppWindow URL so DSM and reverse proxies cannot reuse an
+older script with the new package metadata.
 
 There is intentionally no `ui/index.html`, `type=url` application, or undocumented
 `/webman/index.cgi?launchApp=...` redirect. DSM desktop and Package Center launch the registered

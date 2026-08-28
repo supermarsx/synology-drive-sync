@@ -92,7 +92,8 @@ start/stop, one run lock, state, bounded logs, and fixed DSM notifications. Pack
 also controls the package-user API service. The dashboard uses the browser-managed DSM cookie,
 official same-origin `SYNO.API.Auth` version 6 `method=token` bootstrap, an independent administrator
 check, mandatory package CSRF, and a private controller queue. The native UI retains the
-exactly-once-encoded SynoToken only in module memory and sends it only as `X-SYNO-TOKEN`; it never
+exactly-once-encoded SynoToken only in module memory and sends it only through this package's private
+`X-SYNO-TOKEN` browser-to-CGI bridge; that header is not a Synology-documented transport. The UI never
 uses the DSM shell location, launch URL, history, request body, persistent storage, or logs for token
 transport, and stored secrets are never returned. Deletion requires profile and action-level
 approval. Upgrade retains
@@ -103,7 +104,7 @@ See the [complete DSM package and dashboard guide](../docs/synology-package.md) 
 ACL, graphical configuration, secret, diagnostic, routine, security, CLI, upgrade, and acceptance
 behavior. The package has static/mock validation but no recorded physical installation or live
 two-NAS test. Webman's package-owner CGI identity, the direct-helper or loopback user-service branch
-selected by fixed-path `X_OK`, official token bootstrap/header forwarding, browser request-marker
+selected by fixed-path `X_OK`, official token bootstrap and package-private header forwarding, browser request-marker
 forwarding to CGI `HTTP_X_SDSYNC_REQUEST=1`, and AppWindow loading remain live acceptance checks. An
 unavailable or invalid token bootstrap leaves `X-SYNO-TOKEN` absent only for the bounded retry
 cooldown; absence is not the normal documented path and never activates launch-URL or storage

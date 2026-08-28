@@ -138,10 +138,10 @@
                 </div>
                 <div class="sdsync-form-grid">
                   <v-form-item class="sdsync-form-item" label="Name" prop="name"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-name" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.name" :readonly="Boolean(selectedProfile)" maxlength="64" placeholder="office_nas" aria-describedby="sdsync-help-profile-name" :disabled="!canChangeProfiles" /></v-form-item>
-                  <v-form-item class="sdsync-form-item" label="Local source" prop="source"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-source" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.source" placeholder="/volume1/Source" aria-describedby="sdsync-help-profile-source" :disabled="!canChangeProfiles" /></v-form-item>
-                  <v-form-item class="sdsync-form-item span-2" label="File Station URL" prop="url"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-url" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.url" placeholder="https://files.example.com" aria-describedby="sdsync-help-profile-url" :disabled="!canChangeProfiles" /></v-form-item>
-                  <v-form-item class="sdsync-form-item" label="DSM username" prop="username"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-username" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.username" autocomplete="username" aria-describedby="sdsync-help-profile-username" :disabled="!canChangeProfiles" /></v-form-item>
-                  <v-form-item class="sdsync-form-item" label="Remote logical path" prop="remote"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-remote" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.remote" placeholder="/home/Drive/NAS Backup" aria-describedby="sdsync-help-profile-remote" :disabled="!canChangeProfiles" /></v-form-item>
+                  <v-form-item class="sdsync-form-item" label="Local source" prop="source"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-source" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.source" maxlength="4096" placeholder="/volume1/Source" aria-describedby="sdsync-help-profile-source" :disabled="!canChangeProfiles" /></v-form-item>
+                  <v-form-item class="sdsync-form-item span-2" label="File Station URL" prop="url"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-url" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.url" maxlength="2048" placeholder="https://files.example.com" aria-describedby="sdsync-help-profile-url" :disabled="!canChangeProfiles" /></v-form-item>
+                  <v-form-item class="sdsync-form-item" label="DSM username" prop="username"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-username" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.username" maxlength="256" autocomplete="username" aria-describedby="sdsync-help-profile-username" :disabled="!canChangeProfiles" /></v-form-item>
+                  <v-form-item class="sdsync-form-item" label="Remote logical path" prop="remote"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-remote" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.remote" maxlength="247" placeholder="/home/Drive/NAS Backup" aria-describedby="sdsync-help-profile-remote" :disabled="!canChangeProfiles" /></v-form-item>
                   <v-form-item class="sdsync-form-item" label="Comparison"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-compare" /></template><v-single-select class="sdsync-select-control" v-model="profileForm.compare" :options="compareOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-compare" :disabled="!canChangeProfiles"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
                   <v-form-item class="sdsync-form-item" label="Concurrent uploads"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-jobs" /></template><v-input class="sdsync-input-control" v-model="profileForm.jobs" number-only aria-describedby="sdsync-help-profile-jobs" :disabled="!canChangeProfiles" /></v-form-item>
                   <div class="sdsync-check-row span-2"><v-checkbox class="sdsync-checkbox-control" v-model="profileForm.allow_http" aria-describedby="sdsync-help-profile-http" :disabled="!canEditHttpException">Allow plain HTTP for controlled LAN testing</v-checkbox><control-help help-key="profile-http" /></div>
@@ -162,38 +162,42 @@
                     <v-form-item class="sdsync-form-item" label="Upload timeout (seconds)"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-timeout" /></template><v-input class="sdsync-input-control" v-model="profileForm.timeout" number-only aria-describedby="sdsync-help-profile-timeout" :disabled="!canChangeProfiles" /></v-form-item>
                     <v-form-item class="sdsync-form-item" label="Connect timeout (seconds)"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-connect-timeout" /></template><v-input class="sdsync-input-control" v-model="profileForm.connect_timeout" number-only aria-describedby="sdsync-help-profile-connect-timeout" :disabled="!canChangeProfiles" /></v-form-item>
                     <v-form-item class="sdsync-form-item" label="Maximum rate (bytes/s)"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-rate" /></template><v-input class="sdsync-input-control" v-model="profileForm.max_rate" number-only aria-describedby="sdsync-help-profile-rate" :disabled="!canChangeProfiles" /></v-form-item>
-                    <v-form-item class="sdsync-form-item span-2" label="CA certificate path"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-ca" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.ca_certificate" placeholder="/volume1/certificates/ca.pem" aria-describedby="sdsync-help-profile-ca" :disabled="!canChangeProfiles" /></v-form-item>
+                    <v-form-item class="sdsync-form-item span-2" label="CA certificate path"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-ca" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.ca_certificate" maxlength="4096" placeholder="/volume1/certificates/ca.pem" aria-describedby="sdsync-help-profile-ca" :disabled="!canChangeProfiles" /></v-form-item>
                     <div class="sdsync-check-row span-2"><v-checkbox class="sdsync-checkbox-control" v-model="profileForm.danger_invalid_certs" aria-describedby="sdsync-help-profile-invalid-certs" :disabled="!canEditInvalidTlsException">Accept invalid TLS certificates (unsafe)</v-checkbox><control-help help-key="profile-invalid-certs" /></div>
                     <div v-if="profileForm.danger_invalid_certs" class="sdsync-check-row span-2"><v-checkbox class="sdsync-checkbox-control" v-model="profileForm.danger_invalid_confirm" label-color="red" aria-describedby="sdsync-help-profile-invalid-confirm" :disabled="!canEditInvalidTlsException">I accept the interception risk</v-checkbox><control-help help-key="profile-invalid-confirm" /></div>
                     <v-form-item class="sdsync-form-item" label="Verbosity"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-verbosity" /></template><v-single-select class="sdsync-select-control" v-model="profileForm.verbosity" :options="verbosityOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-verbosity" :disabled="!canChangeProfiles"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
                     <div class="sdsync-check-row"><v-checkbox class="sdsync-checkbox-control" v-model="profileForm.quiet" aria-describedby="sdsync-help-profile-quiet" :disabled="!canChangeProfiles">Quiet terminal sink; durable logs remain active</v-checkbox><control-help help-key="profile-quiet" /></div>
                     <v-form-item class="sdsync-form-item" label="Log level"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-log-level" /></template><v-single-select class="sdsync-select-control" v-model="profileForm.log_level" :options="logLevelOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-log-level" :disabled="!canChangeProfiles"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
-                    <v-form-item class="sdsync-form-item" label="Log format" textonly><span>JSON · package managed</span></v-form-item>
-                    <v-form-item class="sdsync-form-item" label="Progress" textonly><span>Never · package managed</span></v-form-item>
-                    <v-form-item class="sdsync-form-item" label="Output" textonly><span>Human · package managed</span></v-form-item>
-                    <v-form-item class="sdsync-form-item span-2" label="Remote log URL"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-log-url" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.remote_log_url" placeholder="https://collector.example.com/ingest" aria-describedby="sdsync-help-profile-log-url" :disabled="!canEditRemoteLogging" /></v-form-item>
+                    <v-form-item class="sdsync-form-item" label="Log format"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-log-format" /></template><v-single-select class="sdsync-select-control" v-model="profileForm.log_format" :options="logFormatOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-log-format" :disabled="!canChangeProfiles"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
+                    <v-form-item class="sdsync-form-item" label="Progress"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-progress" /></template><v-single-select class="sdsync-select-control" v-model="profileForm.progress" :options="progressOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-progress" :disabled="!canChangeProfiles"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
+                    <v-form-item class="sdsync-form-item" label="Output"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-output" /></template><v-single-select class="sdsync-select-control" v-model="profileForm.output" :options="outputOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-output" :disabled="!canChangeProfiles"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
+                    <v-form-item class="sdsync-form-item span-2" label="Log file" textonly><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-log-file" /></template><span class="sdsync-readonly-value">{{ profileLogFile }}</span></v-form-item>
+                    <v-form-item class="sdsync-form-item span-2" label="Remote log URL"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-log-url" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.remote_log_url" maxlength="2048" placeholder="https://collector.example.com/ingest" aria-describedby="sdsync-help-profile-log-url" :disabled="!canEditRemoteLogging" /></v-form-item>
                     <v-form-item class="sdsync-form-item" label="Remote log mode"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-log-mode" /></template><v-single-select class="sdsync-select-control" v-model="profileForm.remote_log_mode" :options="remoteLogModeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-log-mode" :disabled="!canEditRemoteLogging"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
                   </div>
                   <div class="sdsync-secret-editor">
-                    <div><strong>Remote log token</strong><span>{{ selectedProfileModel && selectedProfileModel.has_remote_log_token ? 'Stored · masked' : 'Not stored' }}</span></div>
-                    <v-single-select class="sdsync-select-control" v-model="secretModes.remote_log_token" :options="secretModeOptions" width="210" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-secret-log-mode" :disabled="!canManageSecrets || !canAllowRemoteLogging"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="secret-log-mode" />
-                    <v-input class="sdsync-input-control" v-if="secretModes.remote_log_token === 'replace'" v-model="secretValues.remote_log_token" type="password" maxlength="4096" autocomplete="new-password" placeholder="New token" aria-describedby="sdsync-help-secret-log-value" :disabled="!canManageSecrets || !canAllowRemoteLogging" /><control-help v-if="secretModes.remote_log_token === 'replace'" help-key="secret-log-value" />
+                    <div class="sdsync-secret-summary"><strong>Remote log token</strong><span>{{ selectedProfileModel && selectedProfileModel.has_remote_log_token ? 'Stored · masked' : 'Not stored' }}</span></div>
+                    <v-single-select class="sdsync-select-control sdsync-secret-mode" v-model="secretModes.remote_log_token" :options="secretModeOptions" width="210" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-secret-log-mode" :disabled="!canManageSecrets"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help class="sdsync-secret-mode-help" help-key="secret-log-mode" />
+                    <v-input class="sdsync-input-control sdsync-secret-value" v-if="secretModes.remote_log_token === 'replace'" v-model="secretValues.remote_log_token" type="password" maxlength="4096" autocomplete="new-password" placeholder="New token" aria-describedby="sdsync-help-secret-log-value" :disabled="!canReplaceRemoteLogToken" /><control-help class="sdsync-secret-value-help" v-if="secretModes.remote_log_token === 'replace'" help-key="secret-log-value" />
                   </div>
                 </details>
 
                 <fieldset class="sdsync-secret-fieldset">
                   <legend>Protected credentials</legend>
                   <div class="sdsync-secret-editor">
-                    <div><strong>Password</strong><span>{{ selectedProfileModel && selectedProfileModel.has_password ? 'Stored · masked' : 'Not stored' }}</span></div>
-                    <v-single-select class="sdsync-select-control" v-model="secretModes.password" :options="secretModeOptions" width="210" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-secret-password-mode" :disabled="!canManageSecrets"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="secret-password-mode" />
-                    <v-input class="sdsync-input-control" v-if="secretModes.password === 'replace'" v-model="secretValues.password" type="password" maxlength="4096" autocomplete="new-password" placeholder="New password" aria-describedby="sdsync-help-secret-password-value" :disabled="!canManageSecrets" /><control-help v-if="secretModes.password === 'replace'" help-key="secret-password-value" />
+                    <div class="sdsync-secret-summary"><strong>Password</strong><span>{{ selectedProfileModel && selectedProfileModel.has_password ? 'Stored · masked' : 'Not stored' }}</span></div>
+                    <v-single-select class="sdsync-select-control sdsync-secret-mode" v-model="secretModes.password" :options="secretModeOptions" width="210" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-secret-password-mode" :disabled="!canManageSecrets"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help class="sdsync-secret-mode-help" help-key="secret-password-mode" />
+                    <v-input class="sdsync-input-control sdsync-secret-value" v-if="secretModes.password === 'replace'" v-model="secretValues.password" type="password" maxlength="4096" autocomplete="new-password" placeholder="New password" aria-describedby="sdsync-help-secret-password-value" :disabled="!canManageSecrets" /><control-help class="sdsync-secret-value-help" v-if="secretModes.password === 'replace'" help-key="secret-password-value" />
                   </div>
                   <div class="sdsync-secret-editor">
-                    <div><strong>TOTP seed</strong><span>{{ selectedProfileModel && selectedProfileModel.has_totp ? 'Stored · masked' : 'Not stored' }}</span></div>
-                    <v-single-select class="sdsync-select-control" v-model="secretModes.totp" :options="secretModeOptions" width="210" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-secret-totp-mode" :disabled="!canManageSecrets"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="secret-totp-mode" />
-                    <v-input class="sdsync-input-control" v-if="secretModes.totp === 'replace'" v-model="secretValues.totp" type="password" maxlength="4096" autocomplete="off" placeholder="Base32 seed or otpauth URI" aria-describedby="sdsync-help-secret-totp-value" :disabled="!canManageSecrets" /><control-help v-if="secretModes.totp === 'replace'" help-key="secret-totp-value" />
+                    <div class="sdsync-secret-summary"><strong>TOTP seed</strong><span>{{ selectedProfileModel && selectedProfileModel.has_totp ? 'Stored · masked' : 'Not stored' }}</span></div>
+                    <v-single-select class="sdsync-select-control sdsync-secret-mode" v-model="secretModes.totp" :options="secretModeOptions" width="210" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-secret-totp-mode" :disabled="!canManageSecrets"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help class="sdsync-secret-mode-help" help-key="secret-totp-mode" />
+                    <v-input class="sdsync-input-control sdsync-secret-value" v-if="secretModes.totp === 'replace'" v-model="secretValues.totp" type="password" maxlength="4096" autocomplete="off" placeholder="Base32 seed or otpauth URI" aria-describedby="sdsync-help-secret-totp-value" :disabled="!canManageSecrets" /><control-help class="sdsync-secret-value-help" v-if="secretModes.totp === 'replace'" help-key="secret-totp-value" />
                   </div>
                   <p class="sdsync-field-note">Secret values are sent only in the protected request body. They are never returned to this window.</p>
+                  <div v-if="selectedProfile" class="sdsync-secret-actions">
+                    <v-button suffix="main" display="icon-text" html-type="button" tooltip="Apply only changed password, TOTP, and remote-log token operations without rewriting profile configuration" :disabled="!canManageSecrets || !hasPendingSecretOperations || operationBusy" @click="saveProfileSecrets"><template #icon><action-icon name="save" /></template>Save changed secrets</v-button>
+                  </div>
                 </fieldset>
 
                 <div class="sdsync-check-row"><v-checkbox class="sdsync-checkbox-control" v-model="profileForm.make_default" aria-describedby="sdsync-help-profile-default" :disabled="!canChangeProfiles">Use as default profile</v-checkbox><control-help help-key="profile-default" /></div>
@@ -220,21 +224,22 @@
                     <button v-for="routine in routines" :key="routine.profile" type="button" class="sdsync-routine-row" :title="'Edit routine for ' + routine.profile" :disabled="operationBusy" @click="selectRoutine(routine.profile)"><span><strong><action-icon name="edit" />&nbsp;{{ routine.profile }}</strong><small>{{ routine.mode || 'interval' }} · {{ routine.backend || 'fallback unreported' }} · {{ routine.state || (routine.enabled ? 'enabled' : 'disabled') }}</small></span><time>{{ routine.enabled ? formatDate(routine.next_run_epoch) : 'Disabled' }}</time></button>
                   </article>
                 </div>
-                <div v-else id="sdsync-routines-panel-package-controller" key="package-controller" class="sdsync-subtab-panel" data-subtab-panel="package-controller" role="tabpanel" aria-labelledby="sdsync-routines-tab-package-controller" tabindex="0">
-                  <v-form v-model="routineForm" class="sdsync-panel" direction="vertical" @submit="saveRoutine">
+                <div v-else id="sdsync-routines-panel-routine-editor" key="routine-editor" class="sdsync-subtab-panel" data-subtab-panel="routine-editor" role="tabpanel" aria-labelledby="sdsync-routines-tab-routine-editor" tabindex="0">
+                  <v-form v-model="routineForm" class="sdsync-panel sdsync-horizontal-form sdsync-routine-editor" direction="horizontal" @submit="saveRoutine">
                     <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Routine editor</p><h3>Profile automation policy</h3></div><span :class="pillClass(selectedRoutine ? selectedRoutine.state : 'unknown')">{{ selectedRoutine ? (selectedRoutine.state || (selectedRoutine.enabled ? 'Enabled' : 'Disabled')) : 'New' }}</span></div>
-                    <v-form-item class="sdsync-form-item" label="Profile"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-profile" /></template><v-single-select class="sdsync-select-control" v-model="routineForm.profile" :options="profileOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-routine-profile" :disabled="!canChangeRoutines || operationBusy" @input="loadRoutine"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
+                    <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Profile" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-profile" /></template><v-single-select class="sdsync-select-control" v-model="routineForm.profile" :options="profileOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-routine-profile" :disabled="!canChangeRoutines || operationBusy" @input="loadRoutine"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
                     <div class="sdsync-check-row"><v-checkbox class="sdsync-checkbox-control" v-model="routineForm.enabled" aria-describedby="sdsync-help-routine-enabled" :disabled="!canChangeRoutines">Enable routine</v-checkbox><control-help help-key="routine-enabled" /></div>
-                    <div class="sdsync-form-grid compact">
-                      <v-form-item class="sdsync-form-item" label="Action"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-action" /></template><v-single-select class="sdsync-select-control" v-model="routineForm.action" :options="routineActionOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-routine-action" :disabled="!canChangeRoutines"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
-                      <v-form-item class="sdsync-form-item" label="Mode"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-mode" /></template><v-single-select class="sdsync-select-control" v-model="routineForm.mode" :options="routineModeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-routine-mode" :disabled="!canChangeRoutines"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
-                      <v-form-item class="sdsync-form-item" label="Interval (seconds)"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-interval" /></template><v-input class="sdsync-input-control" v-model="routineForm.interval_seconds" number-only aria-describedby="sdsync-help-routine-interval" :disabled="!canChangeRoutines" /></v-form-item>
-                      <v-form-item class="sdsync-form-item" label="Window starts"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-window-start" /></template><input v-model="routineForm.time_window_start" class="sdsync-native-input" type="time" aria-label="Window starts" aria-describedby="sdsync-help-routine-window-start" :disabled="!canChangeRoutines"></v-form-item>
-                      <v-form-item class="sdsync-form-item" label="Window ends"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-window-end" /></template><input v-model="routineForm.time_window_end" class="sdsync-native-input" type="time" aria-label="Window ends" aria-describedby="sdsync-help-routine-window-end" :disabled="!canChangeRoutines"></v-form-item>
-                      <v-form-item class="sdsync-form-item" label="Realtime debounce (seconds)"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-debounce" /></template><v-input class="sdsync-input-control" v-model="routineForm.debounce_seconds" number-only aria-describedby="sdsync-help-routine-debounce" :disabled="!canChangeRoutines" /></v-form-item>
-                      <v-form-item class="sdsync-form-item" label="Fallback poll (seconds)"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-poll" /></template><v-input class="sdsync-input-control" v-model="routineForm.poll_seconds" number-only aria-describedby="sdsync-help-routine-poll" :disabled="!canChangeRoutines" /></v-form-item>
-                      <v-form-item class="sdsync-form-item" label="Retry attempts"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-retries" /></template><v-input class="sdsync-input-control" v-model="routineForm.retry_count" number-only aria-describedby="sdsync-help-routine-retries" :disabled="!canChangeRoutines" /></v-form-item>
-                      <v-form-item class="sdsync-form-item" label="Retry backoff (seconds)"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-backoff" /></template><v-input class="sdsync-input-control" v-model="routineForm.retry_backoff_seconds" number-only aria-describedby="sdsync-help-routine-backoff" :disabled="!canChangeRoutines" /></v-form-item>
+                    <div class="sdsync-form-grid compact sdsync-routine-fields">
+                      <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Action" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-action" /></template><v-single-select class="sdsync-select-control" v-model="routineForm.action" :options="routineActionOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-routine-action" :disabled="!canChangeRoutines"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
+                      <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Mode" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-mode" /></template><v-single-select class="sdsync-select-control" v-model="routineForm.mode" :options="routineModeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-routine-mode" :disabled="!canChangeRoutines"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
+                      <v-form-item v-if="routineForm.mode === 'interval'" class="sdsync-form-item sdsync-inline-form-item" label="Interval (seconds)" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-interval" /></template><v-input class="sdsync-input-control" v-model="routineForm.interval_seconds" number-only aria-describedby="sdsync-help-routine-interval" :disabled="!canChangeRoutines" /></v-form-item>
+                      <v-form-item v-if="routineForm.mode === 'daily'" class="sdsync-form-item sdsync-inline-form-item" label="Window starts" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-window-start" /></template><input v-model="routineForm.time_window_start" class="sdsync-native-input" type="time" aria-label="Window starts" aria-describedby="sdsync-help-routine-window-start" :disabled="!canChangeRoutines"></v-form-item>
+                      <v-form-item v-if="routineForm.mode === 'daily'" class="sdsync-form-item sdsync-inline-form-item" label="Window ends" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-window-end" /></template><input v-model="routineForm.time_window_end" class="sdsync-native-input" type="time" aria-label="Window ends" aria-describedby="sdsync-help-routine-window-end" :disabled="!canChangeRoutines"></v-form-item>
+                      <v-form-item v-if="routineForm.mode === 'realtime'" class="sdsync-form-item sdsync-inline-form-item" label="Realtime debounce (seconds)" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-debounce" /></template><v-input class="sdsync-input-control" v-model="routineForm.debounce_seconds" number-only aria-describedby="sdsync-help-routine-debounce" :disabled="!canChangeRoutines" /></v-form-item>
+                      <v-form-item v-if="routineForm.mode === 'realtime'" class="sdsync-form-item sdsync-inline-form-item" label="Fallback poll (seconds)" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-poll" /></template><v-input class="sdsync-input-control" v-model="routineForm.poll_seconds" number-only aria-describedby="sdsync-help-routine-poll" :disabled="!canChangeRoutines" /></v-form-item>
+                      <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Retry attempts" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-retries" /></template><v-input class="sdsync-input-control" v-model="routineForm.retry_count" number-only aria-describedby="sdsync-help-routine-retries" :disabled="!canChangeRoutines" /></v-form-item>
+                      <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Retry backoff (seconds)" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-backoff" /></template><v-input class="sdsync-input-control" v-model="routineForm.retry_backoff_seconds" number-only min="10" max="300" aria-describedby="sdsync-help-routine-backoff" :disabled="!canChangeRoutines" /></v-form-item>
+                      <div class="sdsync-check-row"><v-checkbox class="sdsync-checkbox-control" v-model="routineForm.retry_exponential" aria-describedby="sdsync-help-routine-exponential" :disabled="!canChangeRoutines">Use exponential retry backoff (maximum 300 seconds)</v-checkbox><control-help help-key="routine-exponential" /></div>
                       <v-form-item class="sdsync-form-item span-2" label="Wait for routines">
                         <template #label-after><control-help class="sdsync-form-label-help" help-key="routine-dependencies" /></template>
                         <select v-model="routineForm.depends_on" class="sdsync-native-input" multiple size="4" aria-label="Wait for routines" aria-describedby="sdsync-help-routine-dependencies" :disabled="!canChangeRoutines">
@@ -242,7 +247,7 @@
                         </select>
                       </v-form-item>
                     </div>
-                    <fieldset class="sdsync-weekday-fieldset" aria-describedby="sdsync-help-routine-weekdays" :disabled="!canChangeRoutines"><legend>Active weekdays <control-help help-key="routine-weekdays" /></legend><div class="sdsync-weekdays"><label v-for="day in weekdayOptions" :key="day.value"><input v-model="routineForm.weekdays" type="checkbox" :value="day.value" :disabled="!canChangeRoutines"><span>{{ day.label }}</span></label></div></fieldset>
+                    <fieldset v-if="routineForm.mode === 'daily'" class="sdsync-weekday-fieldset" aria-describedby="sdsync-help-routine-weekdays" :disabled="!canChangeRoutines"><legend>Active weekdays <control-help help-key="routine-weekdays" /></legend><div class="sdsync-weekdays"><label v-for="day in weekdayOptions" :key="day.value"><input v-model="routineForm.weekdays" type="checkbox" :value="day.value" :disabled="!canChangeRoutines"><span>{{ day.label }}</span></label></div></fieldset>
                     <fieldset class="sdsync-danger-fieldset"><legend>Routine deletion guard</legend><div class="sdsync-check-row"><v-checkbox class="sdsync-checkbox-control" v-model="routineForm.allow_delete" aria-describedby="sdsync-help-routine-delete" :disabled="!canEditRoutineDeletion">Permit profile deletion rules</v-checkbox><control-help help-key="routine-delete" /></div><v-form-item class="sdsync-form-item" label="Routine deletion approval ceiling"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-max-delete" /></template><v-input class="sdsync-input-control" v-model="routineForm.max_total_delete" number-only aria-describedby="sdsync-help-routine-max-delete" :disabled="!canChangeRoutines" /></v-form-item></fieldset>
                     <div class="sdsync-form-actions"><v-button suffix="red" display="icon-text" tooltip="Remove this automation policy without deleting its profile" :disabled="!canChangeRoutines || !selectedRoutine || operationBusy" @click="removeRoutine"><template #icon><action-icon name="delete" /></template>Remove routine</v-button><span /><v-button suffix="main" display="icon-text" html-type="submit" tooltip="Validate and apply this per-profile automation policy" :disabled="!canChangeRoutines || !routineForm.profile || operationBusy"><template #icon><action-icon name="save" /></template>Save routine</v-button></div>
                   </v-form>
@@ -253,12 +258,12 @@
 
           <section v-else-if="route === 'health'" class="sdsync-page" aria-labelledby="sdsync-page-title">
             <div class="sdsync-two-column">
-              <v-form v-model="doctorForm" class="sdsync-panel" direction="vertical" @submit="runDoctor">
+              <v-form v-model="doctorForm" class="sdsync-panel sdsync-horizontal-form sdsync-doctor-form" direction="horizontal" @submit="runDoctor">
                 <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Target doctor</p><h3>Run a diagnostic</h3></div><span class="sdsync-pill neutral">Manual</span></div>
-                <v-form-item class="sdsync-form-item" label="Scope"><template #label-after><control-help class="sdsync-form-label-help" help-key="doctor-scope" /></template><v-single-select class="sdsync-select-control" v-model="doctorForm.scope" :options="scopeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-doctor-scope" :disabled="!canRunOperations"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
+                <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Scope" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="doctor-scope" /></template><v-single-select class="sdsync-select-control" v-model="doctorForm.scope" :options="scopeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-doctor-scope" :disabled="!canRunOperations"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
                 <div class="sdsync-check-row"><v-checkbox class="sdsync-checkbox-control" v-model="doctorForm.write_test" aria-describedby="sdsync-help-doctor-write" :disabled="!canRunOperations || !canRunDoctorWrite || !hasCapability('write_test')">Disposable write test</v-checkbox><control-help help-key="doctor-write" /></div>
                 <div v-if="doctorForm.write_test" class="sdsync-warning"><strong>This mutates the selected target briefly.</strong><div class="sdsync-check-row"><v-checkbox class="sdsync-checkbox-control" v-model="doctorForm.write_confirm" aria-describedby="sdsync-help-doctor-write-confirm" :disabled="!canRunOperations || !canRunDoctorWrite">I prepared a non-critical destination and approve probe cleanup.</v-checkbox><control-help help-key="doctor-write-confirm" /></div></div>
-                <v-button suffix="main" display="icon-text" html-type="submit" tooltip="Run preflight checks and wait for bounded terminal Doctor evidence" :disabled="!canRunOperations || operationBusy"><template #icon><action-icon name="doctor" /></template>Run doctor</v-button>
+                <div class="sdsync-submit-row"><v-button suffix="main" display="icon-text" html-type="submit" tooltip="Run preflight checks and wait for bounded terminal Doctor evidence" :disabled="!canRunOperations || operationBusy"><template #icon><action-icon name="doctor" /></template>Run doctor</v-button></div>
               </v-form>
               <article class="sdsync-panel sdsync-diagnostic" aria-live="polite"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Latest diagnostic</p><h3>{{ diagnostic.title }}</h3></div><span class="sdsync-pulse" /></div><pre>{{ diagnostic.output }}</pre></article>
             </div>
@@ -272,14 +277,14 @@
                 <div><p class="sdsync-eyebrow">Structured activity</p><h3>Recent package events</h3></div>
                 <span class="sdsync-freshness">{{ reversedActivity.length }} of {{ activityEvents.length }} event{{ activityEvents.length === 1 ? '' : 's' }}</span>
               </div>
-              <div class="sdsync-log-toolbar" aria-label="Activity filters">
-                <v-input v-model.trim="activitySearch" class="sdsync-input-control sdsync-activity-search" maxlength="128" placeholder="Search event text or request ID" aria-label="Search activity text or client request ID" aria-describedby="sdsync-help-activity-search" /><control-help help-key="activity-search" />
-                <v-single-select class="sdsync-select-control" v-model="activityCategory" :options="activityCategoryOptions" width="190" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-activity-category"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-category" />
-                <v-single-select class="sdsync-select-control" v-model="activityLevel" :options="activityLevelOptions" width="160" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-activity-level"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-level" />
+              <div class="sdsync-filter-list" aria-label="Activity filters">
+                <div class="sdsync-filter-row"><span class="sdsync-filter-label">Search</span><div class="sdsync-filter-control"><v-input v-model.trim="activitySearch" class="sdsync-input-control sdsync-activity-search" maxlength="128" placeholder="Search event text or request ID" aria-label="Search activity text or client request ID" aria-describedby="sdsync-help-activity-search" /><control-help help-key="activity-search" /></div></div>
+                <div class="sdsync-filter-row"><span class="sdsync-filter-label">Category</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityCategory" :options="activityCategoryOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity category" aria-describedby="sdsync-help-activity-category"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-category" /></div></div>
+                <div class="sdsync-filter-row"><span class="sdsync-filter-label">Level</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityLevel" :options="activityLevelOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity level" aria-describedby="sdsync-help-activity-level"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-level" /></div></div>
               </div>
               <ol class="sdsync-activity-feed"><li v-if="!reversedActivity.length" class="sdsync-empty">No package events match these filters.</li><li v-for="event in reversedActivity" :key="[event.epoch, event.code, event.profile, event.category, event.level, event.client_request_id].join(':')"><time>{{ formatDate(event.epoch) }}</time><div class="sdsync-activity-detail"><strong>{{ event.code }}</strong><p v-if="event.message">{{ event.message }}</p><code v-if="event.client_request_id">Client request ID: {{ event.client_request_id }}</code></div><small>{{ event.profile }} · {{ event.state }} · {{ event.category }} / {{ event.level }}</small></li></ol>
             </article>
-            <article class="sdsync-panel sdsync-log-panel"><div class="sdsync-log-toolbar"><v-single-select class="sdsync-select-control" v-model="logSource" :options="logSourceOptions" width="180" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-log-source" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-source" /><v-single-select class="sdsync-select-control" v-model="logLines" :options="logLineOptions" width="150" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-log-lines" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-lines" /><span>{{ logState }}</span></div><pre tabindex="0">{{ logOutput }}</pre></article>
+            <article class="sdsync-panel sdsync-log-panel"><div class="sdsync-filter-list sdsync-log-filters" aria-label="Log filters"><div class="sdsync-filter-row"><span class="sdsync-filter-label">Source</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="logSource" :options="logSourceOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Log source" aria-describedby="sdsync-help-log-source" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-source" /></div></div><div class="sdsync-filter-row"><span class="sdsync-filter-label">Lines</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="logLines" :options="logLineOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Log line count" aria-describedby="sdsync-help-log-lines" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-lines" /></div></div><span class="sdsync-log-state">{{ logState }}</span></div><pre tabindex="0">{{ logOutput }}</pre></article>
           </section>
 
           <section v-else-if="route === 'notifications'" class="sdsync-page" aria-labelledby="sdsync-page-title">
@@ -289,14 +294,14 @@
             <div class="sdsync-subtab-stage">
               <transition name="sdsync-subtab-swap" mode="out-in">
                 <div v-if="notificationTab === 'package-alerts'" id="sdsync-notifications-panel-package-alerts" key="package-alerts" class="sdsync-subtab-panel" data-subtab-panel="package-alerts" role="tabpanel" aria-labelledby="sdsync-notifications-tab-package-alerts" tabindex="0">
-                  <v-form v-model="alertForm" class="sdsync-panel" direction="vertical" @submit="saveAlerts">
+                  <v-form v-model="alertForm" class="sdsync-panel sdsync-horizontal-form sdsync-alert-form" direction="horizontal" @submit="saveAlerts">
                     <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">DSM desktop alerts</p><h3>Package alert policy</h3></div><span :class="pillClass(alertForm.enabled ? 'running' : 'disabled')">{{ alertForm.enabled ? 'Enabled' : 'Disabled' }}</span></div>
                     <div class="sdsync-check-row"><v-checkbox class="sdsync-checkbox-control" v-model="alertForm.enabled" aria-describedby="sdsync-help-alerts-enabled" :disabled="!canChangeNotifications">Enable DSM desktop alerts</v-checkbox><control-help help-key="alerts-enabled" /></div>
                     <div class="sdsync-check-row"><v-checkbox class="sdsync-checkbox-control" v-model="alertForm.on_success" aria-describedby="sdsync-help-alerts-success" :disabled="!canChangeNotifications">Notify on success</v-checkbox><control-help help-key="alerts-success" /></div>
                     <div class="sdsync-check-row"><v-checkbox class="sdsync-checkbox-control" v-model="alertForm.on_failure" aria-describedby="sdsync-help-alerts-failure" :disabled="!canChangeNotifications">Notify on failure</v-checkbox><control-help help-key="alerts-failure" /></div>
-                    <v-form-item class="sdsync-form-item" label="Failures before alert"><template #label-after><control-help class="sdsync-form-label-help" help-key="alerts-threshold" /></template><v-input class="sdsync-input-control" v-model="alertForm.failure_threshold" number-only :disabled="!canChangeNotifications" aria-describedby="sdsync-help-alerts-threshold" /></v-form-item>
-                    <v-form-item class="sdsync-form-item" label="Cooldown (seconds)"><template #label-after><control-help class="sdsync-form-label-help" help-key="alerts-cooldown" /></template><v-input class="sdsync-input-control" v-model="alertForm.cooldown_seconds" number-only :disabled="!canChangeNotifications" aria-describedby="sdsync-help-alerts-cooldown" /></v-form-item>
-                    <v-button suffix="main" display="icon-text" html-type="submit" tooltip="Validate and persist the package-level DSM alert policy" :disabled="!canChangeNotifications || operationBusy"><template #icon><action-icon name="save" /></template>Save DSM alert policy</v-button>
+                    <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Failures before alert" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="alerts-threshold" /></template><v-input class="sdsync-input-control" v-model="alertForm.failure_threshold" number-only :disabled="!canChangeNotifications" aria-describedby="sdsync-help-alerts-threshold" /></v-form-item>
+                    <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Cooldown (seconds)" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="alerts-cooldown" /></template><v-input class="sdsync-input-control" v-model="alertForm.cooldown_seconds" number-only :disabled="!canChangeNotifications" aria-describedby="sdsync-help-alerts-cooldown" /></v-form-item>
+                    <div class="sdsync-submit-row"><v-button suffix="main" display="icon-text" html-type="submit" tooltip="Validate and persist the package-level DSM alert policy" :disabled="!canChangeNotifications || operationBusy"><template #icon><action-icon name="save" /></template>Save DSM alert policy</v-button></div>
                   </v-form>
                 </div>
                 <div v-else id="sdsync-notifications-panel-session-preferences" key="session-preferences" class="sdsync-subtab-panel" data-subtab-panel="session-preferences" role="tabpanel" aria-labelledby="sdsync-notifications-tab-session-preferences" tabindex="0">
@@ -304,7 +309,7 @@
                     <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Open-session signal</p><h3>Browser fallback</h3></div><span :class="pillClass(notificationPermission)">{{ notificationPermission }}</span></div>
                     <div class="sdsync-check-row"><v-checkbox class="sdsync-checkbox-control" v-model="notificationForm.desktop_notifications" aria-describedby="sdsync-help-session-notify" :disabled="!canChangeNotifications">Notify while this app is open</v-checkbox><control-help help-key="session-notify" /></div>
                     <div class="sdsync-check-row"><v-checkbox class="sdsync-checkbox-control" v-model="notificationForm.audible" aria-describedby="sdsync-help-session-audible" :disabled="!canChangeNotifications">Audible cue</v-checkbox><control-help help-key="session-audible" /></div>
-                    <v-button suffix="grey" display="icon-text" html-type="submit" tooltip="Save and audit non-secret notification preferences in this browser" :disabled="!canChangeNotifications || operationBusy"><template #icon><action-icon name="save" /></template>Save session preferences</v-button>
+                    <div class="sdsync-submit-row"><v-button suffix="grey" display="icon-text" html-type="submit" tooltip="Save and audit non-secret notification preferences in this browser" :disabled="!canChangeNotifications || operationBusy"><template #icon><action-icon name="save" /></template>Save session preferences</v-button></div>
                   </v-form>
                 </div>
               </transition>
@@ -475,9 +480,9 @@ const CONTROL_HELP = Object.freeze({
   "profile-jobs": "Parallel upload workers; accepted range is 1 through 16.",
   "profile-http": "Permit unencrypted HTTP only for an explicitly controlled LAN.",
   "profile-delete": "Allow deletion only when both the saved profile and a run approve it.",
-  "profile-max-delete": "Hard per-profile ceiling that stops excessive destination deletion.",
-  "profile-excludes": "Enter one package-relative exclusion pattern per line.",
-  "profile-empty-source": "Disable the empty-source guard only when an empty source is intentional.",
+  "profile-max-delete": "Hard per-profile ceiling that stops excessive destination deletion. New profiles default to 100.",
+  "profile-excludes": "Enter one package-relative exclusion pattern per line. New profiles start with the four DSM-safe defaults; remove every line only to clear them explicitly.",
+  "profile-empty-source": "Disable the empty-source guard only when an empty source is intentional. This exception requires bounded destination deletion to be enabled.",
   "profile-retries": "Retry count for transient upload failures; accepted range is 0 through 5.",
   "profile-timeout": "Maximum time allowed for one upload request.",
   "profile-connect-timeout": "Maximum time allowed to establish the destination connection.",
@@ -486,11 +491,15 @@ const CONTROL_HELP = Object.freeze({
   "profile-invalid-certs": "Bypass TLS certificate validation; this exposes credentials to interception.",
   "profile-invalid-confirm": "Required acknowledgement before saving the unsafe TLS override.",
   "profile-verbosity": "Choose the amount of operational detail written to logs.",
-  "profile-quiet": "Suppress the terminal sink while retaining durable package logs.",
+  "profile-quiet": "Suppress the interactive terminal sink while retaining durable package logs. It may be combined with higher verbosity for richer durable records.",
   "profile-log-level": "Minimum severity retained by package logging.",
-  "profile-log-url": "HTTPS endpoint that receives bounded structured log events.",
+  "profile-log-format": "Choose human-readable or structured JSON records for this profile.",
+  "profile-progress": "Choose automatic, always-on, or disabled progress rendering for this profile.",
+  "profile-output": "Choose human-readable, JSON, or newline-delimited JSON command output for this profile.",
+  "profile-log-file": "Fixed package-owned sync log path. Profiles cannot redirect it outside protected package storage.",
+  "profile-log-url": "Optional HTTPS endpoint for bounded structured events. Removing it disables delivery without clearing the stored token.",
   "profile-log-mode": "Choose whether remote-log delivery failure can fail a sync.",
-  "secret-log-mode": "Keep, replace, or clear the package-protected collector token.",
+  "secret-log-mode": "Keep, replace, or clear the package-protected collector token independently. Delivery uses it only while an HTTPS remote-log URL is configured.",
   "secret-log-value": "Replacement token; it is never returned to this window.",
   "secret-password-mode": "Keep, replace, or clear the package-protected DSM password.",
   "secret-password-value": "Replacement DSM password; it is never returned to this window.",
@@ -507,7 +516,8 @@ const CONTROL_HELP = Object.freeze({
   "routine-debounce": "Quiet period after an observed change before a realtime run starts.",
   "routine-poll": "Fallback observation cadence when a native realtime hook is unavailable.",
   "routine-retries": "Additional routine attempts after a failed execution.",
-  "routine-backoff": "Seconds to wait between routine retry attempts.",
+  "routine-backoff": "Base retry delay from 10 through 300 seconds; every computed delay is capped at 300 seconds.",
+  "routine-exponential": "Increase the retry delay after each failure; fixed and exponential delays never exceed 300 seconds.",
   "routine-dependencies": "Require selected profile routines to finish before this routine starts.",
   "routine-weekdays": "Weekdays on which this routine may execute.",
   "routine-delete": "Permit this routine to use the profile's separately approved deletion policy.",
@@ -528,8 +538,8 @@ const CONTROL_HELP = Object.freeze({
   "session-notify": "Use browser notifications only while this AppWindow session is open.",
   "session-audible": "Play a short local cue for newly observed failures.",
   "settings-theme": "Use the dark ember theme, follow DSM system preference, or select light mode.",
-  "settings-status-refresh": "Cadence for authenticated package status refreshes while visible.",
-  "settings-log-refresh": "Cadence for live log refreshes while the Activity page is visible."
+  "settings-status-refresh": "Cadence for authenticated package status refreshes while visible; Manual disables its timer.",
+  "settings-log-refresh": "Cadence for live log refreshes while the Activity page is visible; Manual disables its timer."
 });
 
 const ControlHelp = {
@@ -554,8 +564,8 @@ function settingsFromStoredValue(storedValue) {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return fallback;
     return {
       theme: ["dark", "light", "system"].includes(parsed.theme) ? parsed.theme : fallback.theme,
-      status_refresh: [3000, 5000, 10000, 30000].includes(Number(parsed.status_refresh)) ? Number(parsed.status_refresh) : fallback.status_refresh,
-      log_refresh: [5000, 10000, 30000].includes(Number(parsed.log_refresh)) ? Number(parsed.log_refresh) : fallback.log_refresh,
+      status_refresh: [0, 3000, 5000, 10000, 30000].includes(Number(parsed.status_refresh)) ? Number(parsed.status_refresh) : fallback.status_refresh,
+      log_refresh: [0, 5000, 10000, 30000].includes(Number(parsed.log_refresh)) ? Number(parsed.log_refresh) : fallback.log_refresh,
       desktop_notifications: parsed.desktop_notifications === true,
       audible: parsed.audible === true
     };
@@ -572,18 +582,47 @@ function loadSettings() {
   }
 }
 
+function utf8ByteLength(value) {
+  let bytes = 0;
+  for (const character of String(value || "")) {
+    const point = character.codePointAt(0);
+    bytes += point <= 0x7f ? 1 : (point <= 0x7ff ? 2 : (point <= 0xffff ? 3 : 4));
+  }
+  return bytes;
+}
+
+function hasControlCharacter(value) {
+  return Array.from(String(value || "")).some((character) => {
+    const point = character.codePointAt(0);
+    return point <= 0x1f || (point >= 0x7f && point <= 0x9f);
+  });
+}
+
+function validBoundedText(value, maximumBytes) {
+  return typeof value === "string"
+    && value.length > 0
+    && utf8ByteLength(value) <= maximumBytes
+    && !hasControlCharacter(value);
+}
+
+function hasDotPathSegment(value) {
+  return String(value || "").split("/").some((segment) => segment === "." || segment === "..");
+}
+
 function emptyProfile() {
   return {
     name: "", source: "", url: "", username: "", remote: "", compare: "content", jobs: 2,
-    allow_http: false, delete: false, max_delete: 5, make_default: false, excludes: "",
+    allow_http: false, delete: false, max_delete: 100, make_default: false,
+    excludes: "@eaDir/\n**/@eaDir/\n#recycle/\n#snapshot/",
     allow_empty_source: false, retries: 2, timeout: 7200, connect_timeout: 15, max_rate: 0,
     ca_certificate: "", danger_invalid_certs: false, danger_invalid_confirm: false,
-    verbosity: 0, quiet: false, log_level: "info", remote_log_url: "", remote_log_mode: "best-effort"
+    verbosity: 0, quiet: false, log_level: "info", log_format: "json", progress: "never",
+    output: "human", remote_log_url: "", remote_log_mode: "best-effort"
   };
 }
 
 function emptyRoutine(profile = "") {
-  return { profile, enabled: false, action: "sync", mode: "interval", interval_seconds: 3600, weekdays: [1, 2, 3, 4, 5, 6, 7], time_window_start: "00:00", time_window_end: "23:59", debounce_seconds: 30, poll_seconds: 30, retry_count: 2, retry_backoff_seconds: 60, allow_delete: false, max_total_delete: 100, depends_on: [] };
+  return { profile, enabled: false, action: "sync", mode: "interval", interval_seconds: 3600, weekdays: [1, 2, 3, 4, 5, 6, 7], time_window_start: "00:00", time_window_end: "23:59", debounce_seconds: 45, poll_seconds: 30, retry_count: 5, retry_backoff_seconds: 60, retry_exponential: true, allow_delete: false, max_total_delete: 100, depends_on: [] };
 }
 
 const SECURITY_BOOLEAN_FIELDS = Object.freeze([
@@ -710,7 +749,7 @@ export default {
       secretValues: { password: "", totp: "", remote_log_token: "" },
       routineTabs: [
         { id: "configured-profiles", label: "Configured profiles" },
-        { id: "package-controller", label: "Package controller" }
+        { id: "routine-editor", label: "New routine" }
       ],
       routineTab: "configured-profiles",
       routineForm: emptyRoutine(), doctorForm: { scope: "all", write_test: false, write_confirm: false },
@@ -749,12 +788,13 @@ export default {
     canMutate() { return this.capabilities.mutations === true && Boolean(this.csrfToken); },
     canChangeInterface() { return this.canMutate && this.securityPolicy.allow_interface_changes !== false; },
     canChangeProfiles() { return this.canMutate && this.securityPolicy.allow_profile_changes !== false; },
-    canManageSecrets() { return this.canChangeProfiles && this.capabilities.secrets === true && this.securityPolicy.allow_secret_changes !== false; },
+    canManageSecrets() { return this.canMutate && this.capabilities.secrets === true && this.securityPolicy.allow_secret_changes !== false; },
     canAllowHttp() { return this.canChangeProfiles && this.securityPolicy.allow_http_targets !== false; },
     canAllowEmptySource() { return this.canChangeProfiles && this.securityPolicy.allow_empty_source !== false; },
     canAllowInvalidTls() { return this.canChangeProfiles && this.securityPolicy.allow_invalid_tls !== false; },
     canAllowDestructive() { return this.canMutate && this.securityPolicy.allow_destructive_sync !== false; },
     canAllowRemoteLogging() { return this.canChangeProfiles && this.securityPolicy.allow_remote_logging !== false; },
+    canReplaceRemoteLogToken() { return this.canManageSecrets && this.securityPolicy.allow_remote_logging !== false; },
     canEditHttpException() { return this.canChangeProfiles && (this.securityPolicy.allow_http_targets !== false || this.profileForm.allow_http === true); },
     canEditEmptySourceException() { return this.canChangeProfiles && (this.securityPolicy.allow_empty_source !== false || this.profileForm.allow_empty_source === true); },
     canEditInvalidTlsException() { return this.canChangeProfiles && (this.securityPolicy.allow_invalid_tls !== false || this.profileForm.danger_invalid_certs === true); },
@@ -766,6 +806,8 @@ export default {
     canRunOperations() { return this.canMutate && this.securityPolicy.allow_operational_actions !== false; },
     canRunDoctorWrite() { return this.securityPolicy.allow_doctor_write_test !== false; },
     selectedProfileModel() { return this.profiles.find((profile) => String(profile.name) === String(this.selectedProfile)) || null; },
+    profileLogFile() { return boundedText(this.selectedProfileModel && this.selectedProfileModel.log_file, "Package-managed sync.log"); },
+    hasPendingSecretOperations() { return Object.keys(this.secretModes).some((field) => this.secretModes[field] !== "keep"); },
     selectedRoutine() { return this.routines.find((routine) => String(routine.profile) === String(this.routineForm.profile)) || null; },
     dependencyProfiles() { return this.profiles.filter((profile) => String(profile.name) !== String(this.routineForm.profile)); },
     profileOptions() { return options([["", "Choose a profile"], ...this.profiles.map((profile) => [String(profile.name), String(profile.name)])]); },
@@ -800,6 +842,9 @@ export default {
     compareOptions() { return options([["content", "Content — size, MD5, mtime"], ["metadata", "Metadata — size and mtime"], ["size-only", "Size only"]]); },
     verbosityOptions() { return options([[0, "Normal"], [1, "Verbose"], [2, "Very verbose"]]); },
     logLevelOptions() { return options(["trace", "debug", "info", "warn", "error", "off"].map((value) => [value, value])); },
+    logFormatOptions() { return options([["human", "Human readable"], ["json", "Structured JSON"]]); },
+    progressOptions() { return options([["auto", "Automatic"], ["always", "Always"], ["never", "Never"]]); },
+    outputOptions() { return options([["human", "Human readable"], ["json", "JSON"], ["ndjson", "Newline-delimited JSON"]]); },
     remoteLogModeOptions() { return options([["best-effort", "Best effort"], ["required", "Required"]]); },
     secretModeOptions() { return options([["keep", "Keep existing"], ["replace", "Replace securely"], ["clear", "Clear stored value"]]); },
     routineActionOptions() { return options([["sync", "Sync"], ["plan", "Plan only"]]); },
@@ -810,8 +855,8 @@ export default {
     activityLevelOptions() { return options([["all", "All levels"], ...["trace", "debug", "info", "warn", "error"].map((level) => [level, level])]); },
     logLineOptions() { return options([[100, "100 lines"], [200, "200 lines"], [500, "500 lines"], [1000, "1000 lines"]]); },
     themeOptions() { return options([["dark", "Hellfire dark"], ["system", "Follow system"], ["light", "Ash light"]]); },
-    statusRefreshOptions() { return options([[3000, "Every 3 seconds"], [5000, "Every 5 seconds"], [10000, "Every 10 seconds"], [30000, "Every 30 seconds"]]); },
-    logRefreshOptions() { return options([[5000, "Every 5 seconds"], [10000, "Every 10 seconds"], [30000, "Every 30 seconds"]]); }
+    statusRefreshOptions() { return options([[0, "Manual only"], [3000, "Every 3 seconds"], [5000, "Every 5 seconds"], [10000, "Every 10 seconds"], [30000, "Every 30 seconds"]]); },
+    logRefreshOptions() { return options([[0, "Manual only"], [5000, "Every 5 seconds"], [10000, "Every 10 seconds"], [30000, "Every 30 seconds"]]); }
   },
   async mounted() {
     this.controlLayoutCleanup = installControlLayout(this.$el);
@@ -879,6 +924,12 @@ export default {
         title,
         message: stage ? `${detail} Failure stage: ${stage}.` : detail
       });
+      if ((status === 0 || status === 401) && code === "dsm_authentication_quickconnect_unsupported") {
+        return issue(
+          "QuickConnect relay unsupported",
+          "QuickConnect relay cannot authenticate this third-party package AppWindow. Connect through the NAS LAN address, DDNS, a VPN, or a separately tested DSM custom reverse proxy, then reopen the app from the DSM desktop."
+        );
+      }
       if (status === 401) {
         return issue("DSM session expired", "Sign in to DSM again, then reopen this app from the DSM desktop.");
       }
@@ -1014,8 +1065,8 @@ export default {
     between(value, minimum, maximum) { const parsed = Number(value); return Number.isInteger(parsed) && parsed >= minimum && parsed <= maximum; },
     toast(title, message, error = false) { if (this.disposed) return; const item = { id: ++this.toastSequence, title, message, error }; this.toasts.push(item); const timer = window.setTimeout(() => { if (this.disposed) return; const index = this.toasts.findIndex((candidate) => candidate.id === item.id); if (index >= 0) this.toasts.splice(index, 1); this.toastTimers = this.toastTimers.filter((candidate) => candidate !== timer); }, 6000); this.toastTimers.push(timer); },
     stopTimers() { window.clearTimeout(this.snapshotTimer); window.clearTimeout(this.logTimer); this.snapshotTimer = 0; this.logTimer = 0; },
-    scheduleSnapshot() { window.clearTimeout(this.snapshotTimer); if (!this.disposed && !document.hidden) this.snapshotTimer = window.setTimeout(() => this.refreshSnapshot(false), Number(this.settings.status_refresh)); },
-    scheduleLogs() { window.clearTimeout(this.logTimer); if (!this.disposed && !document.hidden && this.route === "activity" && !this.logsPaused) this.logTimer = window.setTimeout(() => this.refreshLogs(), Number(this.settings.log_refresh)); },
+    scheduleSnapshot() { window.clearTimeout(this.snapshotTimer); this.snapshotTimer = 0; const interval = Number(this.settings.status_refresh); if (interval > 0 && !this.disposed && !document.hidden) this.snapshotTimer = window.setTimeout(() => this.refreshSnapshot(false), interval); },
+    scheduleLogs() { window.clearTimeout(this.logTimer); this.logTimer = 0; const interval = Number(this.settings.log_refresh); if (interval > 0 && !this.disposed && !document.hidden && this.route === "activity" && !this.logsPaused) this.logTimer = window.setTimeout(() => this.refreshLogs(), interval); },
     async refreshCsrf() { if (this.disposed) return; this.csrfToken = ""; const model = await apiGet(this.auth, "csrf"); if (this.disposed) return; if (typeof model.csrf_token !== "string" || !model.csrf_token || model.csrf_token.length > 4096) throw new Error("Authenticated bridge did not issue a valid CSRF token"); this.csrfToken = model.csrf_token; },
     async refreshSnapshot(manual) {
       if (this.disposed || this.snapshotLoading || document.hidden) return;
@@ -1141,27 +1192,94 @@ export default {
       const profile = name ? this.profiles.find((item) => String(item.name) === String(name)) : null;
       this.selectedProfile = profile ? String(profile.name) : "";
       this.profileForm = emptyProfile();
-      if (profile) this.profileForm = Object.assign(this.profileForm, { name: pick(profile, "name") || "", source: pick(profile, "source") || "", url: pick(profile, "url") || "", username: pick(profile, "username") || "", remote: pick(profile, "remote", "remote_path") || "", compare: pick(profile, "compare") || "content", jobs: numberOr(pick(profile, "jobs"), 2), allow_http: pick(profile, "allow_http") === true, delete: pick(profile, "delete") === true, max_delete: numberOr(pick(profile, "max_delete"), 5), make_default: pick(profile, "is_default", "default") === true, excludes: arrayOf(profile.excludes).join("\n"), allow_empty_source: pick(profile, "allow_empty_source") === true, retries: numberOr(pick(profile, "retries"), 2), timeout: numberOr(pick(profile, "timeout", "upload_timeout_seconds"), 7200), connect_timeout: numberOr(pick(profile, "connect_timeout", "connect_timeout_seconds"), 15), max_rate: numberOr(pick(profile, "max_rate", "max_rate_bytes_per_second"), 0), ca_certificate: pick(profile, "ca_certificate") || "", danger_invalid_certs: pick(profile, "danger_invalid_certs", "danger_accept_invalid_certs") === true, verbosity: numberOr(pick(profile, "verbosity"), 0), quiet: pick(profile, "quiet") === true, log_level: pick(profile, "log_level") || "info", remote_log_url: pick(profile, "remote_log_url") || "", remote_log_mode: pick(profile, "remote_log_mode") || "best-effort" });
+      if (profile) this.profileForm = Object.assign(this.profileForm, {
+        name: pick(profile, "name") || "", source: pick(profile, "source") || "",
+        url: pick(profile, "url") || "", username: pick(profile, "username") || "",
+        remote: pick(profile, "remote", "remote_path") || "",
+        compare: pick(profile, "compare") || "content", jobs: numberOr(pick(profile, "jobs"), 2),
+        allow_http: pick(profile, "allow_http") === true, delete: pick(profile, "delete") === true,
+        max_delete: numberOr(pick(profile, "max_delete"), 100),
+        make_default: pick(profile, "is_default", "default") === true,
+        excludes: arrayOf(profile.excludes).join("\n"),
+        allow_empty_source: pick(profile, "allow_empty_source") === true,
+        retries: numberOr(pick(profile, "retries"), 2),
+        timeout: numberOr(pick(profile, "timeout", "upload_timeout_seconds"), 7200),
+        connect_timeout: numberOr(pick(profile, "connect_timeout", "connect_timeout_seconds"), 15),
+        max_rate: numberOr(pick(profile, "max_rate", "max_rate_bytes_per_second"), 0),
+        ca_certificate: pick(profile, "ca_certificate") || "",
+        danger_invalid_certs: pick(profile, "danger_invalid_certs", "danger_accept_invalid_certs") === true,
+        verbosity: numberOr(pick(profile, "verbosity"), 0), quiet: pick(profile, "quiet") === true,
+        log_level: pick(profile, "log_level") || "info",
+        log_format: pick(profile, "log_format") || "json",
+        progress: pick(profile, "progress") || "never",
+        output: pick(profile, "output") || "human",
+        remote_log_url: pick(profile, "remote_log_url") || "",
+        remote_log_mode: pick(profile, "remote_log_mode") || "best-effort"
+      });
       this.secretModes = { password: "keep", totp: "keep", remote_log_token: "keep" }; this.clearSecrets(); this.profileEditorOpen = true;
     },
     closeProfile() { this.clearSecrets(); this.secretModes = { password: "keep", totp: "keep", remote_log_token: "keep" }; this.profileEditorOpen = false; this.selectedProfile = ""; },
     clearSecrets() { this.secretValues = { password: "", totp: "", remote_log_token: "" }; },
-    profilePayload() { const maxRate = this.integer(this.profileForm.max_rate, 0); return { name: this.profileForm.name, source: this.profileForm.source, url: this.profileForm.url, username: this.profileForm.username, remote: this.profileForm.remote, compare: this.profileForm.compare, jobs: this.integer(this.profileForm.jobs, 2), allow_http: this.profileForm.allow_http === true, delete: this.profileForm.delete === true, max_delete: this.integer(this.profileForm.max_delete, 5), make_default: this.profileForm.make_default === true, excludes: String(this.profileForm.excludes || "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean), allow_empty_source: this.profileForm.allow_empty_source === true, retries: this.integer(this.profileForm.retries, 2), timeout_seconds: this.integer(this.profileForm.timeout, 7200), connect_timeout_seconds: this.integer(this.profileForm.connect_timeout, 15), max_rate_bytes_per_second: maxRate === 0 ? null : maxRate, ca_certificate: this.profileForm.ca_certificate || null, danger_accept_invalid_certs: this.profileForm.danger_invalid_certs === true, verbosity: this.integer(this.profileForm.verbosity, 0), quiet: this.profileForm.quiet === true, log_level: this.profileForm.log_level, remote_log_url: this.profileForm.remote_log_url || null, remote_log_mode: this.profileForm.remote_log_mode }; },
+    profilePayload() {
+      const maxRate = this.integer(this.profileForm.max_rate, 0);
+      return {
+        name: this.profileForm.name, source: this.profileForm.source, url: this.profileForm.url,
+        username: this.profileForm.username, remote: this.profileForm.remote,
+        compare: this.profileForm.compare, jobs: this.integer(this.profileForm.jobs, 2),
+        allow_http: this.profileForm.allow_http === true, delete: this.profileForm.delete === true,
+        max_delete: this.integer(this.profileForm.max_delete, 100),
+        make_default: this.profileForm.make_default === true,
+        excludes: String(this.profileForm.excludes || "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean),
+        allow_empty_source: this.profileForm.allow_empty_source === true,
+        retries: this.integer(this.profileForm.retries, 2),
+        timeout_seconds: this.integer(this.profileForm.timeout, 7200),
+        connect_timeout_seconds: this.integer(this.profileForm.connect_timeout, 15),
+        max_rate_bytes_per_second: maxRate === 0 ? null : maxRate,
+        ca_certificate: this.profileForm.ca_certificate || null,
+        danger_accept_invalid_certs: this.profileForm.danger_invalid_certs === true,
+        verbosity: this.integer(this.profileForm.verbosity, 0), quiet: this.profileForm.quiet === true,
+        log_level: this.profileForm.log_level, log_format: this.profileForm.log_format,
+        progress: this.profileForm.progress, output: this.profileForm.output,
+        remote_log_url: this.profileForm.remote_log_url || null,
+        remote_log_mode: this.profileForm.remote_log_mode
+      };
+    },
     secretOperations(profile) { return [["password", "password"], ["totp", "totp"], ["remote_log_token", "remote-log-token"]].filter(([field]) => this.secretModes[field] !== "keep").map(([field, kind]) => ({ profile, kind, mode: this.secretModes[field], value: this.secretModes[field] === "replace" ? this.secretValues[field] : null })); },
+    validateSecretOperations(secrets) {
+      if (!secrets.length) return "";
+      if (!this.canManageSecrets) return "The security policy does not permit protected-secret changes.";
+      if (secrets.some((item) => !["replace", "clear"].includes(item.mode))) return "Choose keep, replace, or clear for each protected secret.";
+      if (secrets.some((item) => item.kind === "remote-log-token" && item.mode === "replace") && !this.canReplaceRemoteLogToken) return "The security policy does not permit replacing a remote-log token. You may still clear its stored value.";
+      if (secrets.some((item) => item.mode === "replace" && !item.value)) return "Replacement secret values cannot be empty.";
+      if (secrets.some((item) => item.mode === "replace" && (utf8ByteLength(item.value) > 4096 || /[\0\r\n]/.test(item.value)))) return "Replacement secrets must be one line and no more than 4096 bytes.";
+      return "";
+    },
     validateProfile(payload, secrets) {
       if (!/^[A-Za-z0-9_-]{1,64}$/.test(payload.name)) return "Name must use letters, digits, underscore, or hyphen.";
       if (!payload.source || !payload.url || !payload.username || !payload.remote) return "Name, source, URL, username, and remote path are required.";
-      if (payload.quiet && payload.verbosity !== 0) return "Quiet output cannot be combined with verbose output.";
+      if (!validBoundedText(payload.source, 4096) || !payload.source.startsWith("/") || hasDotPathSegment(payload.source)) return "Local source must be an absolute NAS path without dot segments.";
+      if (!validBoundedText(payload.url, 2048) || !(payload.url.startsWith("https://") || (payload.allow_http && payload.url.startsWith("http://")))) return "File Station URL must use HTTPS, or HTTP only with the controlled-LAN exception enabled.";
+      if (!validBoundedText(payload.username, 256)) return "DSM username must be 1 through 256 bytes without control characters.";
+      if (!validBoundedText(payload.remote, 247) || !payload.remote.startsWith("/") || payload.remote === "/" || payload.remote.endsWith("/") || payload.remote.includes("//") || hasDotPathSegment(payload.remote)) return "Remote path must be an absolute non-root File Station path without trailing, empty, or dot segments.";
+      if (payload.excludes.length > 64 || payload.excludes.some((item) => !validBoundedText(item, 512))) return "Use at most 64 non-empty exclusion patterns of 512 bytes each.";
+      if (payload.ca_certificate !== null && (!validBoundedText(payload.ca_certificate, 4096) || !payload.ca_certificate.startsWith("/") || hasDotPathSegment(payload.ca_certificate))) return "CA certificate must be an absolute NAS path without dot segments.";
       if (payload.danger_accept_invalid_certs && !this.profileForm.danger_invalid_confirm) return "Explicitly accept the TLS interception risk.";
-      if (payload.remote_log_url && !payload.remote_log_url.startsWith("https://")) return "Remote log delivery requires an HTTPS URL.";
+      if (payload.remote_log_url && (!validBoundedText(payload.remote_log_url, 2048) || !payload.remote_log_url.startsWith("https://"))) return "Remote log delivery requires an HTTPS URL of at most 2048 bytes.";
+      if (payload.remote_log_mode === "required" && !payload.remote_log_url) return "Required remote logging needs an HTTPS remote log URL.";
+      if (payload.allow_empty_source && !payload.delete) return "Allowing an empty source requires deletion to be enabled and bounded for this profile.";
+      if (!["content", "metadata", "size-only"].includes(payload.compare)) return "Choose a supported comparison mode.";
+      if (!["trace", "debug", "info", "warn", "error", "off"].includes(payload.log_level)) return "Choose a supported log level.";
+      if (!["human", "json"].includes(payload.log_format)) return "Choose human-readable or JSON log format.";
+      if (!["auto", "always", "never"].includes(payload.progress)) return "Choose a supported progress mode.";
+      if (!["human", "json", "ndjson"].includes(payload.output)) return "Choose human-readable, JSON, or newline-delimited JSON output.";
+      if (!["best-effort", "required"].includes(payload.remote_log_mode)) return "Choose a supported remote log mode.";
       if (payload.allow_http && !this.canAllowHttp) return "The security policy does not permit HTTP destinations.";
       if (payload.allow_empty_source && !this.canAllowEmptySource) return "The security policy does not permit empty-source exceptions.";
       if (payload.danger_accept_invalid_certs && !this.canAllowInvalidTls) return "The security policy does not permit invalid TLS certificates.";
       if (payload.delete && !this.canAllowDestructive) return "The security policy does not permit deletion-capable profiles.";
       if (payload.remote_log_url && !this.canAllowRemoteLogging) return "The security policy does not permit remote logging.";
-      if (secrets.length && !this.canManageSecrets) return "The security policy does not permit protected-secret changes.";
-      if (secrets.some((item) => item.kind === "remote-log-token") && !this.canAllowRemoteLogging) return "The security policy does not permit remote-log token changes.";
-      if (secrets.some((item) => item.mode === "replace" && !item.value)) return "Replacement secret values cannot be empty.";
+      const secretError = this.validateSecretOperations(secrets);
+      if (secretError) return secretError;
       if (!this.between(payload.jobs, 1, 16)) return "Concurrent uploads must be between 1 and 16.";
       if (!this.between(payload.max_delete, 0, 2147483647)) return "Maximum deletions must be a non-negative integer.";
       if (!this.between(payload.retries, 0, 5)) return "Retries must be between 0 and 5.";
@@ -1213,6 +1331,46 @@ export default {
         if (!this.disposed) this.operationBusy = false;
       }
     },
+    async saveProfileSecrets(event) {
+      if (event && event.preventDefault) event.preventDefault();
+      const profile = this.selectedProfile;
+      if (!profile || !this.canManageSecrets || this.operationBusy) return;
+      const secrets = this.secretOperations(profile);
+      if (!secrets.length) return this.toast("No secret changes", "Choose Replace securely or Clear stored value for at least one protected secret.");
+      const error = this.validateSecretOperations(secrets);
+      if (error) return this.toast("Secrets not saved", error, true);
+      if (secrets.some((item) => item.mode === "clear")
+        && !await this.confirmAction("Clear stored profile secrets?", "Only the selected password, TOTP, or remote-log token values will be removed. Profile configuration remains unchanged.", "Clear selected secrets")) return;
+      this.operationBusy = true;
+      this.clearSecrets();
+      let applied = 0;
+      try {
+        for (const secret of secrets) {
+          await apiPost(this.auth, this.csrfToken, ACTIONS.setSecret, secret);
+          applied += 1;
+          if (this.disposed) return;
+        }
+        this.secretModes = { password: "keep", totp: "keep", remote_log_token: "keep" };
+        this.toast("Secrets saved", "The package applied and audited only the selected protected-secret operations.");
+        await this.refreshSnapshot(false);
+      } catch (caught) {
+        if (this.disposed) return;
+        this.secretModes = { password: "keep", totp: "keep", remote_log_token: "keep" };
+        const partiallyApplied = applied > 0;
+        const reportedError = partiallyApplied && caught.outcomeUnknown !== true
+          ? new Error(`${boundedText(caught.message, "A later secret stage failed.")} Earlier secret stages were applied; inspect credential presence before retrying.`)
+          : caught;
+        this.reportMutationError(
+          reportedError,
+          partiallyApplied ? "Secrets partially applied" : "Secrets not saved",
+          partiallyApplied ? "Secrets partially applied · outcome unknown" : "Secret outcome unknown",
+          "The package rejected the protected-secret operation."
+        );
+        await this.refreshSnapshot(false);
+      } finally {
+        if (!this.disposed) this.operationBusy = false;
+      }
+    },
     async removeProfile() {
       if (!this.canChangeProfiles || !this.selectedProfile || this.operationBusy) return;
       const name = this.selectedProfile;
@@ -1231,17 +1389,25 @@ export default {
         if (!this.disposed) this.operationBusy = false;
       }
     },
-    loadRoutine(profileName) { const profile = typeof profileName === "string" ? profileName : this.routineForm.profile; const routine = this.routines.find((item) => String(item.profile) === String(profile)); this.routineForm = routine ? { profile, enabled: routine.enabled === true, action: routine.action || "sync", mode: routine.mode || "interval", interval_seconds: numberOr(routine.interval_seconds, 3600), weekdays: Array.isArray(routine.weekdays) ? routine.weekdays.map(Number) : String(routine.weekdays || "1,2,3,4,5,6,7").split(",").map(Number), time_window_start: routine.time_window_start || routine.window_start || "00:00", time_window_end: routine.time_window_end || routine.window_end || "23:59", debounce_seconds: numberOr(routine.debounce_seconds, 30), poll_seconds: numberOr(routine.poll_seconds, 30), retry_count: numberOr(routine.retry_count, 2), retry_backoff_seconds: numberOr(routine.retry_backoff_seconds, 60), allow_delete: routine.allow_delete === true, max_total_delete: numberOr(routine.max_total_delete, 100), depends_on: arrayOf(routine.depends_on).map(String) } : emptyRoutine(profile); },
-    selectRoutine(profile) { if (this.operationBusy) return; this.routineForm.profile = profile; this.loadRoutine(profile); this.routineTab = "package-controller"; },
-    routinePayload() { return { profile: this.routineForm.profile, enabled: this.routineForm.enabled === true, action: this.routineForm.action, mode: this.routineForm.mode, interval_seconds: this.integer(this.routineForm.interval_seconds, 3600), weekdays: this.routineForm.weekdays.map(Number), time_window_start: this.routineForm.time_window_start, time_window_end: this.routineForm.time_window_end, debounce_seconds: this.integer(this.routineForm.debounce_seconds, 30), poll_seconds: this.integer(this.routineForm.poll_seconds, 30), retry_count: this.integer(this.routineForm.retry_count, 2), retry_backoff_seconds: this.integer(this.routineForm.retry_backoff_seconds, 60), allow_delete: this.routineForm.allow_delete === true, max_total_delete: this.integer(this.routineForm.max_total_delete, 100), depends_on: this.routineForm.depends_on.map(String) }; },
+    loadRoutine(profileName) { const profile = typeof profileName === "string" ? profileName : this.routineForm.profile; const routine = this.routines.find((item) => String(item.profile) === String(profile)); this.routineForm = routine ? { profile, enabled: routine.enabled === true, action: routine.action || "sync", mode: routine.mode || "interval", interval_seconds: numberOr(routine.interval_seconds, 3600), weekdays: Array.isArray(routine.weekdays) ? routine.weekdays.map(Number) : String(routine.weekdays || "1,2,3,4,5,6,7").split(",").map(Number), time_window_start: routine.time_window_start || routine.window_start || "00:00", time_window_end: routine.time_window_end || routine.window_end || "23:59", debounce_seconds: numberOr(routine.debounce_seconds, 45), poll_seconds: numberOr(routine.poll_seconds, 30), retry_count: numberOr(routine.retry_count, 5), retry_backoff_seconds: numberOr(routine.retry_backoff_seconds, 60), retry_exponential: routine.retry_exponential !== false, allow_delete: routine.allow_delete === true, max_total_delete: numberOr(routine.max_total_delete, 100), depends_on: arrayOf(routine.depends_on).map(String) } : emptyRoutine(profile); },
+    selectRoutine(profile) { if (this.operationBusy) return; this.routineForm.profile = profile; this.loadRoutine(profile); this.routineTab = "routine-editor"; },
+    routinePayload() {
+      const payload = { profile: this.routineForm.profile, enabled: this.routineForm.enabled === true, action: this.routineForm.action, mode: this.routineForm.mode, retry_count: this.integer(this.routineForm.retry_count, 5), retry_backoff_seconds: this.integer(this.routineForm.retry_backoff_seconds, 60), retry_exponential: this.routineForm.retry_exponential !== false, allow_delete: this.routineForm.allow_delete === true, max_total_delete: this.integer(this.routineForm.max_total_delete, 100), depends_on: this.routineForm.depends_on.map(String) };
+      if (payload.mode === "interval") payload.interval_seconds = this.integer(this.routineForm.interval_seconds, 3600);
+      else if (payload.mode === "daily") Object.assign(payload, { weekdays: this.routineForm.weekdays.map(Number), time_window_start: this.routineForm.time_window_start, time_window_end: this.routineForm.time_window_end });
+      else if (payload.mode === "realtime") Object.assign(payload, { debounce_seconds: this.integer(this.routineForm.debounce_seconds, 45), poll_seconds: this.integer(this.routineForm.poll_seconds, 30) });
+      return payload;
+    },
     async saveRoutine(event) {
       if (event && event.preventDefault) event.preventDefault();
       if (!this.canChangeRoutines || !this.routineForm.profile || this.operationBusy) return;
       const payload = this.routinePayload();
-      if (!payload.weekdays.length) return this.toast("Routine not saved", "Select at least one active weekday.", true);
+      if (payload.mode === "daily" && !payload.weekdays.length) return this.toast("Routine not saved", "Select at least one active weekday.", true);
       if (payload.allow_delete && !this.canAllowDestructive) return this.toast("Routine not saved", "The security policy does not permit deletion-capable routines.", true);
-      if (!this.between(payload.interval_seconds, 60, 2592000) || !this.between(payload.debounce_seconds, 5, 3600) || !this.between(payload.poll_seconds, 5, 3600) || !this.between(payload.retry_count, 0, 5) || !this.between(payload.retry_backoff_seconds, 10, 86400) || !this.between(payload.max_total_delete, 0, 2147483647)) return this.toast("Routine not saved", "One or more timing, retry, or deletion limits are outside the supported range.", true);
-      if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(payload.time_window_start) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(payload.time_window_end)) return this.toast("Routine not saved", "Daily window times must use 24-hour HH:MM format.", true);
+      if (!this.between(payload.retry_count, 0, 5) || !this.between(payload.retry_backoff_seconds, 10, 300) || !this.between(payload.max_total_delete, 0, 2147483647)) return this.toast("Routine not saved", "One or more retry or deletion limits are outside the supported range.", true);
+      if (payload.mode === "interval" && !this.between(payload.interval_seconds, 60, 2592000)) return this.toast("Routine not saved", "Interval must be between 60 and 2592000 seconds.", true);
+      if (payload.mode === "realtime" && (!this.between(payload.debounce_seconds, 1, 3600) || !this.between(payload.poll_seconds, 5, 3600))) return this.toast("Routine not saved", "Realtime debounce or fallback poll is outside the supported range.", true);
+      if (payload.mode === "daily" && (!/^([01]\d|2[0-3]):[0-5]\d$/.test(payload.time_window_start) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(payload.time_window_end))) return this.toast("Routine not saved", "Daily window times must use 24-hour HH:MM format.", true);
       this.operationBusy = true;
       try {
         await apiPost(this.auth, this.csrfToken, ACTIONS.routine, payload);
@@ -1395,8 +1561,8 @@ export default {
         log_refresh: Number(this.settings.log_refresh)
       };
       if (!["dark", "light", "system"].includes(candidate.theme)
-        || ![3000, 5000, 10000, 30000].includes(candidate.status_refresh)
-        || ![5000, 10000, 30000].includes(candidate.log_refresh)) {
+        || ![0, 3000, 5000, 10000, 30000].includes(candidate.status_refresh)
+        || ![0, 5000, 10000, 30000].includes(candidate.log_refresh)) {
         this.toast("Interface settings not saved", "Choose a supported theme and refresh cadence.", true);
         return;
       }

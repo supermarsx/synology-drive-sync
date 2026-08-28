@@ -308,7 +308,7 @@ class BuilderTests(unittest.TestCase):
             "api=SYNO.API.Auth&version=6&method=token",
             "URL-component-encodes that raw value exactly once",
             "module memory for the current AppWindow",
-            "only as the `X-SYNO-TOKEN` header",
+            "carries that value only in `X-SYNO-TOKEN`",
             "browser-visible launch URL, `window.location`, history, Referer, bookmark, "
             "package action URL/query string, package request body, `localStorage`, "
             "`sessionStorage`, IndexedDB",
@@ -358,12 +358,28 @@ class BuilderTests(unittest.TestCase):
             "without any chmod, group, root, privilege, or resource change",
             "no proxy, redirect, remote host, cookie URL, or token URL",
             "official same-origin `SYNO.API.Auth` version 6 `method=token`",
-            "sends it as `X-SYNO-TOKEN` on package requests",
+            "sent only as the package `X-SYNO-TOKEN` header",
         ):
             self.assertIn(required, troubleshooting)
         selector = (REPOSITORY / "docs/release-selector.md").read_text(encoding="utf-8")
         self.assertIn("lifecycle-equivalent 26.7-26.10", selector)
         self.assertNotIn("byte-equivalent 26.7-26.10", selector)
+
+    def test_integrated_profile_help_tracks_mutable_output_contract(self) -> None:
+        profile_help = (
+            REPOSITORY / "packaging/synology/package/ui/help/enu/profiles.html"
+        ).read_text(encoding="utf-8")
+        normalized = " ".join(profile_help.split())
+        for required in (
+            "Log format can be <code>human</code> or <code>json</code>",
+            "progress can be <code>auto</code>, <code>always</code>, or <code>never</code>",
+            "command output can be <code>human</code>, <code>json</code>, or <code>ndjson</code>",
+            "Quiet suppresses terminal-style output independently",
+            "nonzero verbosity can still raise durable log detail",
+        ):
+            self.assertIn(required, normalized)
+        self.assertNotIn("progress disabled", normalized)
+        self.assertNotIn("cannot be enabled together", normalized)
 
     def build(
         self,
@@ -464,15 +480,18 @@ class BuilderTests(unittest.TestCase):
                 ui_entrypoint = validate_spk.validate_ui_config(ui_config_payload)
                 self.assertEqual(installed_api, self.last_api_binary.read_bytes())
                 self.assertEqual(cgi_api, installed_api)
-                self.assertEqual(set(ui_config), {"SynologyDriveSync.js"})
-                native_applications = ui_config["SynologyDriveSync.js"]
+                self.assertEqual(len(ui_config), 1)
+                module = next(iter(ui_config))
+                self.assertRegex(module, validate_spk.NATIVE_MODULE_PATTERN)
+                self.assertNotEqual(module, "SynologyDriveSync.js")
+                native_applications = ui_config[module]
                 self.assertEqual(set(native_applications), {validate_spk.APP_ID})
                 native_application = native_applications[validate_spk.APP_ID]
                 self.assertEqual(native_application["type"], "app")
                 self.assertEqual(native_application["appWindow"], validate_spk.APP_ID)
                 self.assertEqual(native_application["depend"], [])
                 self.assertNotIn("url", native_application)
-                self.assertEqual(ui_entrypoint, "ui/SynologyDriveSync.js")
+                self.assertEqual(ui_entrypoint, f"ui/{module}")
                 self.assertIn(ui_entrypoint, package_members)
                 self.assertTrue(package.getmember(ui_entrypoint).isfile())
                 self.assertEqual(package.getmember(ui_entrypoint).mode, 0o644)
@@ -497,22 +516,24 @@ class BuilderTests(unittest.TestCase):
         source = json.loads((HERE / "ui-src/app.config").read_text(encoding="utf-8"))
         application = copy.deepcopy(source[validate_spk.APP_ID])
         application["depend"] = []
+        bundle = (HERE / "ui-src/dist/SynologyDriveSync.js").read_bytes()
+        module = validate_spk.native_ui_module_name(bundle)
         installed = {
-            "SynologyDriveSync.js": {validate_spk.APP_ID: application}
+            module: {validate_spk.APP_ID: application}
         }
         validate_spk.validate_ui_config(json.dumps(installed).encode("utf-8"))
 
         cases: list[tuple[str, dict[str, object], str]] = []
         legacy = {".url": {"com.supermarsx.SynologyDriveSync": {"type": "url"}}}
-        cases.append(("legacy-url-wrapper", legacy, "one reviewed native"))
+        cases.append(("legacy-url-wrapper", legacy, "content-addressed filename contract"))
 
         wrong_module = copy.deepcopy(installed)
-        wrong_module["app.js"] = wrong_module.pop("SynologyDriveSync.js")
-        cases.append(("legacy-module-name", wrong_module, "one reviewed native"))
+        wrong_module["SynologyDriveSync.js"] = wrong_module.pop(module)
+        cases.append(("legacy-module-name", wrong_module, "content-addressed filename"))
 
         wrong_class = copy.deepcopy(installed)
-        wrong_class["SynologyDriveSync.js"]["com.supermarsx.SynologyDriveSync"] = (
-            wrong_class["SynologyDriveSync.js"].pop(validate_spk.APP_ID)
+        wrong_class[module]["com.supermarsx.SynologyDriveSync"] = (
+            wrong_class[module].pop(validate_spk.APP_ID)
         )
         cases.append(("legacy-class", wrong_class, "native AppWindow class"))
 
@@ -523,11 +544,11 @@ class BuilderTests(unittest.TestCase):
             ("nonempty-depend", "depend", ["unreviewed.js"], "dependency list"),
         ):
             config = copy.deepcopy(installed)
-            config["SynologyDriveSync.js"][validate_spk.APP_ID][key] = value
+            config[module][validate_spk.APP_ID][key] = value
             cases.append((name, config, pattern))
 
         missing_depend = copy.deepcopy(installed)
-        del missing_depend["SynologyDriveSync.js"][validate_spk.APP_ID]["depend"]
+        del missing_depend[module][validate_spk.APP_ID]["depend"]
         cases.append(("missing-depend", missing_depend, "dependency list"))
 
         for name, config, pattern in cases:
@@ -535,6 +556,45 @@ class BuilderTests(unittest.TestCase):
                 validate_spk.ValidationError, pattern
             ):
                 validate_spk.validate_ui_config(json.dumps(config).encode("utf-8"))
+
+    def test_native_appwindow_module_is_content_addressed_across_upgrades(self) -> None:
+        artifact = self.build("x86_64", 62)
+        with tarfile.open(artifact, "r:") as outer:
+            package_payload = outer.extractfile("package.tgz").read()  # type: ignore[union-attr]
+        with tarfile.open(fileobj=io.BytesIO(package_payload), mode="r:gz") as package:
+            config_payload = package.extractfile("ui/config").read()  # type: ignore[union-attr]
+            entrypoint = validate_spk.validate_ui_config(config_payload)
+            bundle = package.extractfile(entrypoint).read()  # type: ignore[union-attr]
+            self.assertEqual(entrypoint, f"ui/{validate_spk.native_ui_module_name(bundle)}")
+            self.assertNotIn("ui/SynologyDriveSync.js", {member.name for member in package.getmembers()})
+            self.assertNotEqual(
+                validate_spk.native_ui_module_name(bundle),
+                validate_spk.native_ui_module_name(bundle + b"upgrade"),
+                "a changed upgrade bundle must receive a different proxy/cache URL",
+            )
+
+        changed_bundle = bytearray(bundle)
+        changed_bundle[-1] ^= 1
+        tampered = self.root / "ui-module-digest-mismatch" / artifact.name
+        tampered.parent.mkdir()
+        repack_outer(
+            artifact,
+            tampered,
+            payload_overrides={
+                "package.tgz": repack_payload_member(
+                    package_payload, entrypoint, bytes(changed_bundle)
+                )
+            },
+        )
+        result = subprocess.run(
+            [sys.executable, str(HERE / "validate_spk.py"), str(tampered)],
+            capture_output=True,
+            text=True,
+            timeout=PACKAGE_TOOL_TIMEOUT_SECONDS,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("module digest does not match", result.stderr)
 
     def test_builder_omits_and_validator_rejects_reserved_resource_manifest(self) -> None:
         artifact = self.build("x86_64", 62)
@@ -2497,11 +2557,12 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "configure-profile", "--name", "zeta", "--source", str(self.source_one),
             "--url", "https://files.example.test/", "--username", "zeta-bot",
             "--remote", "/home/Drive/Zeta", "--compare", "metadata", "--jobs", "4",
-            "--allow-empty-source", "true", "--clear-excludes", "--exclude", "*.tmp",
+            "--delete", "true", "--max-delete", "12", "--allow-empty-source", "true",
+            "--clear-excludes", "--exclude", "*.tmp",
             "--retries", "5", "--timeout", "123", "--connect-timeout", "9",
             "--max-rate", "4096", "--ca-certificate", str(ca_file),
             "--verbose", "2", "--quiet", "false", "--log-level", "debug",
-            "--log-format", "json", "--progress", "never", "--output", "json",
+            "--log-format", "human", "--progress", "always", "--output", "json",
             "--remote-log-url", "https://logs.example.test/ingest", "--remote-log-mode", "required",
             "--default",
         )
@@ -2533,6 +2594,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(zeta["excludes"], ["*.tmp"])
         self.assertEqual(zeta["upload_timeout_seconds"], 123)
         self.assertEqual(zeta["max_rate_bytes_per_second"], 4096)
+        self.assertEqual(zeta["log_format"], "human")
+        self.assertEqual(zeta["progress"], "always")
+        self.assertEqual(zeta["output"], "json")
         self.assertEqual(zeta["remote_log_mode"], "required")
         self.assertTrue(zeta["has_password"])
         self.assertNotIn(secret, snapshot.stdout + snapshot.stderr)
@@ -2545,6 +2609,141 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(cleared.returncode, 0, cleared.stderr)
         self.assertFalse(clear_payload["has_password"])
 
+    def test_real_core_profile_contract_and_remote_log_token_toggle(self) -> None:
+        override = os.environ.get("SDSYNC_VALIDATOR_BINARY")
+        candidates = ([Path(override)] if override else []) + [
+            REPOSITORY / "target/debug/synology-drive-sync",
+            REPOSITORY / "target/release/synology-drive-sync",
+        ]
+        built = [
+            candidate
+            for candidate in candidates
+            if candidate.is_file() and os.access(candidate, os.X_OK)
+        ]
+        self.assertTrue(
+            built,
+            "real-core DSM profile regression requires `cargo build --locked` or "
+            "SDSYNC_VALIDATOR_BINARY",
+        )
+        real_core = max(built, key=lambda candidate: candidate.stat().st_mtime_ns)
+        installed_core = self.real_target / "bin/synology-drive-sync"
+        shutil.copy2(real_core, installed_core)
+        installed_core.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(installed_core, self.drop_uid, self.drop_gid)
+
+        base = [
+            "configure-profile", "--name", "core-profile", "--source", str(self.source_one),
+            "--url", "https://files.example.test/", "--username", "core-bot",
+            "--remote", "/home/Drive/Core",
+        ]
+        for invalid_options, expected_text in [
+            (("--allow-empty-source", "true"), "requires --delete"),
+            (("--timeout", "86401"), "1 through 86400"),
+            (("--connect-timeout", "601"), "1 through 600"),
+            (("--max-delete", "2147483648"), "0 through 2147483647"),
+            (("--max-rate", "9007199254740992"), "1 through 9007199254740991"),
+        ]:
+            rejected = self.shell(self.manager, *base, *invalid_options)
+            self.assertEqual(rejected.returncode, 64, rejected.stdout + rejected.stderr)
+            self.assertIn(expected_text, rejected.stderr)
+        fragment = self.real_home / "config/profiles.d/core-profile.toml"
+        self.assertFalse(fragment.exists())
+
+        configured = self.shell(
+            self.manager,
+            *base,
+            "--max-delete", "2147483647",
+            "--max-rate", "9007199254740991",
+            "--quiet", "true",
+            "--verbose", "2",
+            "--output", "ndjson",
+            "--default",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+        fragment_text = fragment.read_text(encoding="utf-8")
+        self.assertNotIn("remote-log-token-file", fragment_text)
+        bounded_snapshot, bounded_payload = self.api("snapshot")
+        self.assertEqual(bounded_snapshot.returncode, 0, bounded_snapshot.stderr)
+        bounded_profile = bounded_payload["profiles"][0]
+        self.assertEqual(bounded_profile["max_delete"], 2147483647)
+        self.assertEqual(
+            bounded_profile["max_rate_bytes_per_second"], 9007199254740991
+        )
+        self.assertTrue(bounded_profile["quiet"])
+        self.assertEqual(bounded_profile["verbosity"], 2)
+        self.assertEqual(bounded_profile["output"], "ndjson")
+
+        for current, corrupt in [
+            ("max-delete = 2147483647", "max-delete = 2147483648"),
+            ("max-rate = 9007199254740991", "max-rate = 9007199254740992"),
+            ("timeout = 7200", "timeout = 86401"),
+            ("connect-timeout = 15", "connect-timeout = 601"),
+        ]:
+            valid_fragment = fragment.read_text(encoding="utf-8")
+            self.assertIn(current, valid_fragment)
+            fragment.write_text(valid_fragment.replace(current, corrupt), encoding="utf-8")
+            rejected_snapshot, rejected_payload = self.api("snapshot")
+            self.assertEqual(
+                rejected_snapshot.returncode,
+                73,
+                rejected_snapshot.stdout + rejected_snapshot.stderr,
+            )
+            self.assertEqual(rejected_payload["code"], "corrupt_config")
+            fragment.write_text(valid_fragment, encoding="utf-8")
+
+        token_value = "remote-token-that-must-remain-write-only"
+        stored, stored_payload = self.api(
+            "set-secret", "--profile", "core-profile", "--kind", "remote-log-token",
+            "--mode", "replace", input_text=token_value + "\n",
+        )
+        self.assertEqual(stored.returncode, 0, stored.stdout + stored.stderr)
+        self.assertTrue(stored_payload["has_remote_log_token"])
+        token_file = self.real_home / "secrets/core-profile.remote-log-token"
+        token_bytes = token_file.read_bytes()
+
+        enabled = self.shell(
+            self.manager, *base,
+            "--remote-log-url", "https://logs.example.test/ingest",
+            "--remote-log-mode", "required",
+            "--log-format", "human", "--progress", "auto", "--output", "json",
+        )
+        self.assertEqual(enabled.returncode, 0, enabled.stdout + enabled.stderr)
+        fragment_text = fragment.read_text(encoding="utf-8")
+        self.assertIn(
+            f'remote-log-token-file = "{self.fhs / "home/secrets/core-profile.remote-log-token"}"',
+            fragment_text,
+        )
+        self.assertEqual(token_file.read_bytes(), token_bytes)
+        enabled_snapshot, enabled_payload = self.api("snapshot")
+        self.assertEqual(enabled_snapshot.returncode, 0, enabled_snapshot.stderr)
+        profile = enabled_payload["profiles"][0]
+        self.assertTrue(profile["has_remote_log_token"])
+        self.assertEqual(profile["log_format"], "human")
+        self.assertEqual(profile["progress"], "auto")
+        self.assertEqual(profile["output"], "json")
+
+        disabled = self.shell(self.manager, *base)
+        self.assertEqual(disabled.returncode, 0, disabled.stdout + disabled.stderr)
+        self.assertNotIn("remote-log-token-file", fragment.read_text(encoding="utf-8"))
+        self.assertEqual(token_file.read_bytes(), token_bytes)
+        final_validation = self.executable(
+            installed_core,
+            "--config", str(self.real_home / "config/config.toml"),
+            "--quiet", "config", "validate",
+        )
+        self.assertEqual(
+            final_validation.returncode,
+            0,
+            final_validation.stdout + final_validation.stderr,
+        )
+        final_snapshot, final_payload = self.api("snapshot")
+        self.assertEqual(final_snapshot.returncode, 0, final_snapshot.stderr)
+        self.assertTrue(final_payload["profiles"][0]["has_remote_log_token"])
+        serialized = final_snapshot.stdout + final_snapshot.stderr
+        self.assertNotIn(token_value, serialized)
+        self.assertNotIn(".remote-log-token", serialized)
+
     def test_api_routine_alert_schedule_and_invalid_action_contracts(self) -> None:
         self.assertEqual(self.configure("alpha", self.source_one, "/home/Drive/Alpha", True).returncode, 0)
         self.assertEqual(self.configure("beta", self.source_two, "/home/Drive/Beta").returncode, 0)
@@ -2556,9 +2755,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             self.assertEqual(result.returncode, 0, result.stderr)
         routine, _ = self.api(
             "routine", "--profile", "beta", "--enabled", "true", "--action", "sync",
-            "--mode", "realtime", "--interval", "300", "--weekdays", "1,2,3,4,5,6,7",
-            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--mode", "realtime",
             "--debounce-seconds", "3", "--retry-count", "4", "--retry-backoff-seconds", "30",
+            "--retry-exponential", "false",
             "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
             "--depends-on", "alpha",
         )
@@ -2579,6 +2778,11 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(payload["alerts"]["failure_threshold"], 2)
         self.assertEqual(payload["routines"][0]["depends_on"], ["alpha"])
         self.assertEqual(payload["routines"][0]["mode"], "realtime")
+        self.assertFalse(payload["routines"][0]["retry_exponential"])
+        self.assertEqual(payload["routines"][0]["debounce_seconds"], 3)
+        self.assertEqual(payload["routines"][0]["poll_seconds"], 5)
+        for irrelevant in ("interval_seconds", "weekdays", "time_window_start", "time_window_end"):
+            self.assertNotIn(irrelevant, payload["routines"][0])
 
         invalid, invalid_payload = self.api(
             "action", "--kind", "doctor", "--scope", "alpha", "--allow-delete", "true"
@@ -2594,20 +2798,96 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(
             self.api(
                 "routine", "--profile", "alpha", "--enabled", "true", "--action", "sync",
-                "--mode", "interval", "--interval", "300", "--weekdays", "1,2,3,4,5,6,7",
-                "--time-window-start", "00:00", "--time-window-end", "23:59",
-                "--debounce-seconds", "5", "--retry-count", "1", "--retry-backoff-seconds", "30",
-                "--poll-seconds", "30", "--allow-delete", "false", "--max-total-delete", "100",
+                "--mode", "interval", "--interval", "300",
+                "--retry-count", "1", "--retry-backoff-seconds", "30",
+                "--retry-exponential", "true", "--allow-delete", "false", "--max-total-delete", "100",
                 "--depends-on", "beta",
             )[0].returncode,
             64,
         )
 
-    def test_api_accepts_rootless_webapi_authentication_diagnostics(self) -> None:
+    def test_routine_and_schedule_deletion_bounds_are_portable_and_snapshot_safe(self) -> None:
+        self.assertEqual(
+            self.configure("bounded", self.source_one, "/home/Drive/Bounded", True).returncode,
+            0,
+        )
+        boundary = "2147483647"
+        outside = "2147483648"
+        same_width_huge = "9999999999"
+
+        routine, _ = self.api(
+            "routine", "--profile", "bounded", "--enabled", "true", "--action", "sync",
+            "--mode", "interval", "--interval", "3600", "--retry-count", "5",
+            "--retry-backoff-seconds", "60", "--retry-exponential", "true",
+            "--allow-delete", "false", "--max-total-delete", boundary,
+        )
+        self.assertEqual(routine.returncode, 0, routine.stdout + routine.stderr)
+        schedule, _ = self.api(
+            "schedule", "--enabled", "false", "--interval", "3600",
+            "--allow-delete", "false", "--max-total-delete", boundary,
+        )
+        self.assertEqual(schedule.returncode, 0, schedule.stdout + schedule.stderr)
+
+        snapshot, payload = self.api("snapshot")
+        self.assertEqual(snapshot.returncode, 0, snapshot.stdout + snapshot.stderr)
+        self.assertEqual(payload["schedule"]["max_total_delete"], int(boundary))
+        self.assertEqual(payload["routines"][0]["max_total_delete"], int(boundary))
+
+        for invalid_bound in (outside, same_width_huge):
+            for action in (
+                (
+                    "routine", "--profile", "bounded", "--enabled", "true", "--action", "sync",
+                    "--mode", "interval", "--interval", "3600", "--retry-count", "5",
+                    "--retry-backoff-seconds", "60", "--retry-exponential", "true",
+                    "--allow-delete", "false", "--max-total-delete", invalid_bound,
+                ),
+                (
+                    "schedule", "--enabled", "false", "--interval", "3600",
+                    "--allow-delete", "false", "--max-total-delete", invalid_bound,
+                ),
+            ):
+                rejected, rejected_payload = self.api(*action)
+                self.assertEqual(rejected.returncode, 64, rejected.stdout + rejected.stderr)
+                self.assertEqual(rejected_payload["code"], "invalid_request")
+
+        routine_path = self.real_home / "config/routines.d/bounded.conf"
+        schedule_path = self.real_home / "config/schedule.conf"
+        for invalid_bound in (outside, same_width_huge):
+            for path, expected_code in (
+                (routine_path, "corrupt_config"),
+                (schedule_path, "corrupt_state"),
+            ):
+                valid = path.read_text(encoding="utf-8")
+                self.assertIn(f"max_total_delete={boundary}", valid)
+                path.write_text(
+                    valid.replace(
+                        f"max_total_delete={boundary}",
+                        f"max_total_delete={invalid_bound}",
+                    ),
+                    encoding="utf-8",
+                )
+                rejected, rejected_payload = self.api("snapshot")
+                self.assertEqual(rejected.returncode, 73, rejected.stdout + rejected.stderr)
+                self.assertEqual(rejected_payload["code"], expected_code)
+                self.assertNotIn("Illegal number", rejected.stderr)
+                path.write_text(valid, encoding="utf-8")
+
+    def test_routine_documentation_uses_the_current_editor_name(self) -> None:
+        dashboard = (REPOSITORY / "docs/dsm/dashboard.md").read_text(encoding="utf-8")
+        integrated_help = (
+            HERE / "package/ui/help/enu/routines.html"
+        ).read_text(encoding="utf-8")
+        for document in (dashboard, integrated_help):
+            self.assertIn("Configured profiles", document)
+            self.assertIn("New routine", document)
+            self.assertNotIn("Package controller", document)
+
+    def test_api_accepts_dsm_authentication_diagnostics(self) -> None:
         for code, status in [
             ("dsm_authentication_webapi_unavailable", "503"),
             ("dsm_authentication_webapi_rejected", "401"),
             ("dsm_authentication_webapi_forbidden", "403"),
+            ("dsm_authentication_quickconnect_unsupported", "401"),
         ]:
             result, payload = self.api(
                 "cgi-failure",
@@ -3475,7 +3755,10 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             ("allow_invalid_tls", ("--danger-accept-invalid-certs", "true")),
             ("allow_destructive_sync", ("--delete", "--max-delete", "5")),
             ("allow_remote_logging", ("--remote-log-url", "https://logs.example.test/ingest")),
-            ("allow_empty_source", ("--allow-empty-source", "true")),
+            (
+                "allow_empty_source",
+                ("--delete", "--max-delete", "5", "--allow-empty-source", "true"),
+            ),
         )
         for index, (key, extra) in enumerate(risk_cases):
             save_policy(**{key: False})
@@ -4352,7 +4635,10 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(rejected.returncode, 77)
         self.assertEqual(json.loads(rejected.stdout)["code"], "bridge_required")
 
-    @unittest.skipUnless(os.getuid() == 0, "package-UID socket proof requires root test setup")
+    @unittest.skipUnless(
+        os.name == "posix" and os.getuid() == 0,
+        "package-UID socket proof requires a POSIX root test setup",
+    )
     def test_package_owned_socket_accepts_package_uid_and_denies_third_uid(self) -> None:
         package_uid, package_gid = 65530, 65530
         wrong_uid, wrong_gid = 65531, 65531
@@ -4485,6 +4771,275 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             1,
         )
 
+    def test_routine_mode_clock_and_retry_delay_helpers_are_deterministic(self) -> None:
+        helper = self.root / "routine-policy-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            'case "$1" in\n'
+            '  clock) shift; if routine_clock_allows "$@"; then echo allowed; else echo denied; fi ;;\n'
+            '  retry) shift; routine_retry_delay "$@" ;;\n'
+            '  event) shift; event_status=0; realtime_event_due "$@" || event_status=$?; '
+            'case $event_status in 0) echo due ;; 1) echo pending ;; *) echo invalid ;; esac ;;\n'
+            '  *) exit 64 ;;\n'
+            'esac\n',
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(helper, self.drop_uid, self.drop_gid)
+
+        fake_bin = self.root / "routine-policy-bin"
+        fake_bin.mkdir(mode=0o700)
+        fake_date = fake_bin / "date"
+        fake_date.write_text(
+            "#!/bin/sh\n"
+            'case "${1:-}" in +%u) echo 1 ;; +%H%M) echo 1200 ;; *) exec /bin/date "$@" ;; esac\n',
+            encoding="utf-8",
+        )
+        fake_date.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(fake_bin, self.drop_uid, self.drop_gid)
+            os.chown(fake_date, self.drop_uid, self.drop_gid)
+        clock_environment = {"PATH": f"{fake_bin}:{self.environment['PATH']}"}
+
+        for mode in ("interval", "realtime"):
+            result = self.shell(
+                helper, "clock", mode, "7", "23:00", "23:01",
+                extra_environment=clock_environment,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "allowed")
+        outside_weekday = self.shell(
+            helper, "clock", "daily", "7", "00:00", "23:59",
+            extra_environment=clock_environment,
+        )
+        outside_window = self.shell(
+            helper, "clock", "daily", "1", "13:00", "14:00",
+            extra_environment=clock_environment,
+        )
+        inside_daily = self.shell(
+            helper, "clock", "daily", "1", "11:00", "13:00",
+            extra_environment=clock_environment,
+        )
+        self.assertEqual(outside_weekday.stdout.strip(), "denied")
+        self.assertEqual(outside_window.stdout.strip(), "denied")
+        self.assertEqual(inside_daily.stdout.strip(), "allowed")
+
+        cases = [
+            (("60", "1", "false"), "60"),
+            (("60", "5", "false"), "60"),
+            (("60", "2", "true"), "120"),
+            (("200", "2", "true"), "300"),
+            (("300", "5", "true"), "300"),
+        ]
+        for arguments, expected in cases:
+            result = self.shell(helper, "retry", *arguments)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), expected)
+
+        event_path = self.real_var / "run/watch-debounce.events"
+        event_path.write_text("event at 100\n", encoding="utf-8")
+        os.utime(event_path, (100, 100))
+        before_due = self.shell(helper, "event", str(event_path), "144", "45")
+        at_due = self.shell(helper, "event", str(event_path), "145", "45")
+        self.assertEqual(before_due.stdout.strip(), "pending")
+        self.assertEqual(at_due.stdout.strip(), "due")
+
+        event_path.write_text("new event at 130\n", encoding="utf-8")
+        os.utime(event_path, (130, 130))
+        reset_before_due = self.shell(helper, "event", str(event_path), "174", "45")
+        reset_at_due = self.shell(helper, "event", str(event_path), "175", "45")
+        self.assertEqual(reset_before_due.stdout.strip(), "pending")
+        self.assertEqual(reset_at_due.stdout.strip(), "due")
+        linked_event = self.real_var / "run/watch-debounce-linked.events"
+        os.symlink(event_path, linked_event)
+        linked_status = self.shell(helper, "event", str(linked_event), "175", "45")
+        self.assertEqual(linked_status.stdout.strip(), "invalid")
+
+        controller_source = (self.real_target / "libexec/sdsync-controller").read_text(encoding="utf-8")
+        self.assertIn(
+            'realtime_event_due "$watcher_event_path" "$routine_now" "$routine_debounce"',
+            controller_source,
+        )
+        self.assertIn(
+            '[ "$due" != true ] && [ "$watcher_event_pending" != true ]',
+            controller_source,
+            "fingerprint fallback must not bypass a pending native-event debounce",
+        )
+
+    def test_pending_daily_and_realtime_retries_own_admission_until_deadline(self) -> None:
+        profiles = (
+            ("daily-retry", self.source_one, "/home/Drive/Daily", "daily"),
+            ("realtime-retry", self.source_two, "/home/Drive/Realtime", "realtime"),
+        )
+        for profile, source, remote, mode in profiles:
+            self.assertEqual(self.configure(profile, source, remote).returncode, 0)
+            secret, _ = self.api(
+                "set-secret", "--profile", profile, "--kind", "password", "--mode", "replace",
+                input_text="test-password\n",
+            )
+            self.assertEqual(secret.returncode, 0, secret.stderr)
+            arguments = [
+                "routine", "--profile", profile, "--enabled", "true", "--action", "sync",
+                "--mode", mode, "--retry-count", "5", "--retry-backoff-seconds", "60",
+                "--retry-exponential", "true", "--allow-delete", "false",
+                "--max-total-delete", "100",
+            ]
+            if mode == "daily":
+                arguments.extend(
+                    [
+                        "--weekdays", "1,2,3,4,5,6,7", "--time-window-start", "00:00",
+                        "--time-window-end", "23:59",
+                    ]
+                )
+            else:
+                arguments.extend(["--debounce-seconds", "45", "--poll-seconds", "5"])
+            routine, _ = self.api(*arguments)
+            self.assertEqual(routine.returncode, 0, routine.stdout + routine.stderr)
+
+            state_path = self.real_var / f"state/routines/{profile}.state"
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(
+                "state=failed\n"
+                "next_run_epoch=200\n"
+                "last_success_epoch=0\n"
+                "last_attempt_epoch=100\n"
+                "retry_attempt=1\n"
+                "last_day=none\n"
+                "last_poll_epoch=0\n"
+                "fingerprint=none\n"
+                f"backend={'polling' if mode == 'realtime' else mode}\n",
+                encoding="utf-8",
+            )
+            state_path.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(state_path, self.drop_uid, self.drop_gid)
+
+        fake_bin = self.root / "retry-deadline-bin"
+        fake_bin.mkdir(mode=0o700)
+        clock = self.root / "retry-deadline-clock"
+        clock.write_text("100\n", encoding="utf-8")
+        fake_date = fake_bin / "date"
+        fake_date.write_text(
+            "#!/bin/sh\n"
+            ': "${SDSYNC_TEST_CLOCK:?}"\n'
+            'case "${1:-}" in\n'
+            '  +%s) exec /bin/cat "$SDSYNC_TEST_CLOCK" ;;\n'
+            '  +%u) echo 1 ;;\n'
+            '  +%H%M) echo 1200 ;;\n'
+            '  +%Y-%m-%d) echo 2026-08-24 ;;\n'
+            '  *) exec /bin/date "$@" ;;\n'
+            "esac\n",
+            encoding="utf-8",
+        )
+        fake_sleep = fake_bin / "sleep"
+        fake_sleep.write_text(
+            "#!/bin/sh\ncase ${1:-} in 1) exec /bin/sleep 1 ;; *) exec /bin/sleep 0.03 ;; esac\n",
+            encoding="utf-8",
+        )
+        fake_inotify = fake_bin / "inotifywait"
+        fake_inotify.write_text("#!/bin/sh\nexit 69\n", encoding="utf-8")
+        for path in (fake_date, fake_sleep, fake_inotify):
+            path.chmod(0o755)
+        if os.getuid() == 0:
+            for path in (fake_bin, clock, fake_date, fake_sleep, fake_inotify):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        environment = {
+            "PATH": f"{fake_bin}:{self.environment['PATH']}",
+            "SDSYNC_TEST_CLOCK": str(clock),
+        }
+
+        invocations = {
+            profile: f"sync --profile {profile} --no-delete" for profile, _, _, _ in profiles
+        }
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            time.sleep(0.3)
+            before_deadline = self.capture.read_text(encoding="utf-8")
+            for invocation in invocations.values():
+                self.assertNotIn(invocation, before_deadline)
+
+            clock.write_text("200\n", encoding="utf-8")
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                captured = self.capture.read_text(encoding="utf-8")
+                if all(captured.count(invocation) == 1 for invocation in invocations.values()):
+                    break
+                time.sleep(0.03)
+            else:
+                self.fail(
+                    "daily and realtime retries did not dispatch once at their deadline: "
+                    + self.capture.read_text(encoding="utf-8")
+                )
+            time.sleep(0.3)
+            captured = self.capture.read_text(encoding="utf-8")
+            for invocation in invocations.values():
+                self.assertEqual(captured.count(invocation), 1, captured)
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", extra_environment=environment, timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_routine_missing_config_fields_use_new_defaults(self) -> None:
+        self.assertEqual(
+            self.configure("defaults", self.source_one, "/home/Drive/Defaults", True).returncode,
+            0,
+        )
+        routine, _ = self.api(
+            "routine", "--profile", "defaults", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--poll-seconds", "30",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        snapshot, payload = self.api("snapshot")
+        self.assertEqual(snapshot.returncode, 0, snapshot.stderr)
+        model = next(item for item in payload["routines"] if item["profile"] == "defaults")
+        self.assertEqual(model["debounce_seconds"], 45)
+        self.assertEqual(model["retry_count"], 5)
+        self.assertTrue(model["retry_exponential"])
+        for irrelevant in ("interval_seconds", "weekdays", "time_window_start", "time_window_end"):
+            self.assertNotIn(irrelevant, model)
+
+        routine_path = self.real_home / "config/routines.d/defaults.conf"
+        legacy_text = routine_path.read_text(encoding="utf-8")
+        legacy_text = legacy_text.replace("retry_backoff_seconds=60\n", "retry_backoff_seconds=900\n")
+        legacy_text = legacy_text.replace("retry_exponential=true\n", "")
+        routine_path.write_text(legacy_text, encoding="utf-8")
+        legacy_snapshot, legacy_payload = self.api("snapshot")
+        self.assertEqual(legacy_snapshot.returncode, 0, legacy_snapshot.stderr)
+        legacy_model = next(item for item in legacy_payload["routines"] if item["profile"] == "defaults")
+        self.assertEqual(legacy_model["retry_backoff_seconds"], 300)
+        self.assertTrue(legacy_model["retry_exponential"])
+
+        interval, _ = self.api(
+            "routine", "--profile", "defaults", "--enabled", "true", "--action", "sync",
+            "--mode", "interval", "--interval", "600",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(interval.returncode, 0, interval.stderr)
+        _, interval_payload = self.api("snapshot")
+        interval_model = next(item for item in interval_payload["routines"] if item["profile"] == "defaults")
+        self.assertEqual(interval_model["interval_seconds"], 600)
+        for irrelevant in ("weekdays", "time_window_start", "time_window_end", "debounce_seconds", "poll_seconds"):
+            self.assertNotIn(irrelevant, interval_model)
+
+        daily, _ = self.api(
+            "routine", "--profile", "defaults", "--enabled", "true", "--action", "sync",
+            "--mode", "daily", "--weekdays", "1,3,5",
+            "--time-window-start", "01:30", "--time-window-end", "04:00",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(daily.returncode, 0, daily.stderr)
+        _, daily_payload = self.api("snapshot")
+        daily_model = next(item for item in daily_payload["routines"] if item["profile"] == "defaults")
+        self.assertEqual(daily_model["weekdays"], [1, 3, 5])
+        self.assertEqual(daily_model["time_window_start"], "01:30")
+        self.assertEqual(daily_model["time_window_end"], "04:00")
+        for irrelevant in ("interval_seconds", "debounce_seconds", "poll_seconds"):
+            self.assertNotIn(irrelevant, daily_model)
+
     def test_routine_runner_launch_signal_is_forwarded_after_pid_assignment(self) -> None:
         self.assertEqual(
             self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode,
@@ -4592,6 +5147,169 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         captured = self.capture.read_text(encoding="utf-8")
         self.assertIn("sync --profile interval --no-delete", captured)
         self.assertIn("sync --profile watch --no-delete", captured)
+
+    def test_controller_native_realtime_waits_for_a_full_quiet_period(self) -> None:
+        self.assertEqual(
+            self.configure("base", self.source_one, "/home/Drive/Base", True).returncode,
+            0,
+        )
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode,
+            0,
+        )
+        (self.source_two / "watched.txt").write_text("initial\n", encoding="utf-8")
+        for profile in ("base", "watch"):
+            secret, _ = self.api(
+                "set-secret", "--profile", profile, "--kind", "password", "--mode", "replace",
+                input_text="test-password\n",
+            )
+            self.assertEqual(secret.returncode, 0, secret.stderr)
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--debounce-seconds", "45", "--poll-seconds", "5",
+            "--retry-count", "0", "--retry-backoff-seconds", "10",
+            "--retry-exponential", "true", "--allow-delete", "false", "--max-total-delete", "100",
+            "--depends-on", "base",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+
+        fake_bin = self.root / "native-debounce-bin"
+        fake_bin.mkdir(mode=0o700)
+        clock = self.root / "native-debounce-clock"
+        clock.write_text("100\n", encoding="utf-8")
+        fake_date = fake_bin / "date"
+        fake_date.write_text(
+            "#!/bin/sh\n"
+            ': "${SDSYNC_TEST_CLOCK:?}"\n'
+            'case "${1:-}" in\n'
+            '  +%s) exec /bin/cat "$SDSYNC_TEST_CLOCK" ;;\n'
+            '  +%u) echo 1 ;;\n'
+            '  +%H%M) echo 1200 ;;\n'
+            '  +%Y-%m-%d) echo 2026-08-24 ;;\n'
+            '  *) exec /bin/date "$@" ;;\n'
+            'esac\n',
+            encoding="utf-8",
+        )
+        fake_sleep = fake_bin / "sleep"
+        fake_sleep.write_text(
+            "#!/bin/sh\ncase ${1:-} in 1) exec /bin/sleep 1 ;; *) exec /bin/sleep 0.03 ;; esac\n",
+            encoding="utf-8",
+        )
+        fake_inotify = fake_bin / "inotifywait"
+        fake_inotify.write_text(
+            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do /bin/sleep 1; done\n",
+            encoding="utf-8",
+        )
+        for path in (fake_date, fake_sleep, fake_inotify):
+            path.chmod(0o755)
+        if os.getuid() == 0:
+            for path in (fake_bin, clock, fake_date, fake_sleep, fake_inotify):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        environment = {
+            "PATH": f"{fake_bin}:{self.environment['PATH']}",
+            "SDSYNC_TEST_CLOCK": str(clock),
+        }
+
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        state_path = self.real_var / "state/routines/watch.state"
+        event_path = self.real_var / "run/watch-watch.events"
+        initialization_deadline = time.monotonic() + 15
+        while time.monotonic() < initialization_deadline:
+            if (
+                state_path.is_file()
+                and "fingerprint=none" not in state_path.read_text(encoding="utf-8")
+                and event_path.is_file()
+            ):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("native watcher did not establish its initial fingerprint and event file")
+
+        self.capture.write_text("", encoding="utf-8")
+        (self.source_two / "watched.txt").write_text(
+            "changed with a different size\n", encoding="utf-8"
+        )
+        event_path.write_text("change\n", encoding="utf-8")
+        os.utime(event_path, (100, 100))
+        clock.write_text("144\n", encoding="utf-8")
+        time.sleep(0.3)
+        invocation = "sync --profile watch --no-delete"
+        self.assertNotIn(
+            invocation,
+            self.capture.read_text(encoding="utf-8"),
+            "fingerprint fallback bypassed the pending native debounce",
+        )
+
+        clock.write_text("145\n", encoding="utf-8")
+        time.sleep(0.3)
+        self.assertNotIn(invocation, self.capture.read_text(encoding="utf-8"))
+        self.assertTrue(
+            event_path.read_text(encoding="utf-8"),
+            "a due native event must remain pending while its dependency is deferred",
+        )
+        base_plan = self.shell(self.manager, "plan", "base")
+        self.assertEqual(base_plan.returncode, 0, base_plan.stderr)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if invocation in self.capture.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("native realtime event did not run after 45 quiet seconds")
+
+        stable_deadline = time.monotonic() + 15
+        while time.monotonic() < stable_deadline:
+            state_text = state_path.read_text(encoding="utf-8")
+            if "state=succeeded" in state_text and "last_poll_epoch=145" in state_text:
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("native realtime event did not finish with a refreshed fingerprint")
+        time.sleep(0.3)
+        self.assertIn("state=succeeded", state_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            self.capture.read_text(encoding="utf-8").count(invocation),
+            1,
+            "one native event must not be redispatched by the fingerprint fallback",
+        )
+
+        (self.source_two / "watched.txt").write_text("second change\n", encoding="utf-8")
+        event_path.write_text("event at 200\n", encoding="utf-8")
+        os.utime(event_path, (200, 200))
+        clock.write_text("244\n", encoding="utf-8")
+        time.sleep(0.3)
+        self.assertEqual(self.capture.read_text(encoding="utf-8").count(invocation), 1)
+
+        (self.source_two / "watched.txt").write_text(
+            "third change resets debounce\n", encoding="utf-8"
+        )
+        event_path.write_text("new event at 230\n", encoding="utf-8")
+        os.utime(event_path, (230, 230))
+        clock.write_text("274\n", encoding="utf-8")
+        time.sleep(0.3)
+        self.assertEqual(self.capture.read_text(encoding="utf-8").count(invocation), 1)
+
+        clock.write_text("275\n", encoding="utf-8")
+        reset_deadline = time.monotonic() + 15
+        while time.monotonic() < reset_deadline:
+            if self.capture.read_text(encoding="utf-8").count(invocation) == 2:
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("a rewritten native marker did not restart and complete its debounce")
+        reset_stable_deadline = time.monotonic() + 15
+        while time.monotonic() < reset_stable_deadline:
+            state_text = state_path.read_text(encoding="utf-8")
+            if "state=succeeded" in state_text and "last_poll_epoch=275" in state_text:
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("the reset native event did not finish")
+        time.sleep(0.3)
+        self.assertIn("state=succeeded", state_path.read_text(encoding="utf-8"))
+        self.assertEqual(self.capture.read_text(encoding="utf-8").count(invocation), 2)
 
     def test_realtime_fingerprint_stage_failure_never_dispatches_partial_state(self) -> None:
         self.assertEqual(

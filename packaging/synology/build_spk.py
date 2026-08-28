@@ -25,6 +25,8 @@ REPOSITORY = HERE.parents[1]
 PACKAGE = "synology-drive-sync"
 DSM_APP_CLASS = "SYNO.SDS.App.SynologyDriveSync.Instance"
 UI_SOURCE = HERE / "ui-src"
+UI_SOURCE_MODULE = "SynologyDriveSync.js"
+UI_MODULE_DIGEST_HEX_LENGTH = 32
 UI_ICON_SIZES = (16, 24, 32, 48, 64, 72, 256)
 UI_HELP_PAGES = (
     "overview",
@@ -357,6 +359,12 @@ def _regular_file_bytes(path: Path) -> bytes:
     return payload
 
 
+def native_ui_module_name(bundle: bytes) -> str:
+    """Return the cache-isolated installed module name for exact bundle bytes."""
+    digest = hashlib.sha256(bundle).hexdigest()[:UI_MODULE_DIGEST_HEX_LENGTH]
+    return f"SynologyDriveSync.{digest}.js"
+
+
 def _validate_external_links(document: str, label: str) -> None:
     """Allow inert HTTPS anchors while rejecting remote assets and opener access."""
     for tag in re.findall(r"<[^>]+>", document):
@@ -419,16 +427,19 @@ def native_ui_payloads() -> tuple[tuple[bytes, str], ...]:
     config_define_path = UI_SOURCE / "config.define"
     config_define = _json_object(config_define_path)
     expected_define = {
-        "SynologyDriveSync.js": {
-            "JSfiles": ["dist/SynologyDriveSync.js"],
+        UI_SOURCE_MODULE: {
+            "JSfiles": [f"dist/{UI_SOURCE_MODULE}"],
             "params": "-s -c skip",
         }
     }
     if config_define != expected_define:
         raise PackageError(
-            "config.define must map SynologyDriveSync.js to the deterministic "
-            "dist/SynologyDriveSync.js bundle"
+            f"config.define must map {UI_SOURCE_MODULE} to the deterministic "
+            f"dist/{UI_SOURCE_MODULE} bundle"
         )
+
+    bundle = _regular_file_bytes(UI_SOURCE / f"dist/{UI_SOURCE_MODULE}")
+    installed_module = native_ui_module_name(bundle)
 
     # parse_requires.py adds the dependency list and GenerateJSDepend.php
     # combines app.config with config.define into this module-keyed installed
@@ -438,7 +449,7 @@ def native_ui_payloads() -> tuple[tuple[bytes, str], ...]:
     installed_application["depend"] = []
     installed_config = (
         json.dumps(
-            {"SynologyDriveSync.js": {DSM_APP_CLASS: installed_application}},
+            {installed_module: {DSM_APP_CLASS: installed_application}},
             ensure_ascii=False,
             indent=2,
             separators=(",", ": "),
@@ -492,14 +503,13 @@ def native_ui_payloads() -> tuple[tuple[bytes, str], ...]:
         if not re.search(rf'^{re.escape(page)}="[^"\r\n]+"$', strings_text, re.MULTILINE):
             raise PackageError(f"DSM Help text key is missing: help:{page}")
     sources = (
-        (UI_SOURCE / "dist/SynologyDriveSync.js", "ui/SynologyDriveSync.js"),
         (UI_SOURCE / "dist/style.css", "ui/style.css"),
         (HERE / "package/ui/images/icon.svg", "ui/images/icon.svg"),
         (strings_path, "ui/texts/enu/strings"),
         (help_toc_path, "ui/helptoc.conf"),
         *help_sources,
     )
-    return ((installed_config, "ui/config"),) + tuple(
+    return ((installed_config, "ui/config"), (bundle, f"ui/{installed_module}")) + tuple(
         (_regular_file_bytes(source), destination) for source, destination in sources
     )
 

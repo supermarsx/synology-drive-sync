@@ -238,6 +238,13 @@ test("DSM authentication failures provide code-specific recovery guidance", asyn
 
   const cases = [
     {
+      status: 401,
+      code: "dsm_authentication_quickconnect_unsupported",
+      title: "QuickConnect relay unsupported",
+      guidance: /QuickConnect relay cannot authenticate this third-party package AppWindow/,
+      extra: /LAN address, DDNS, a VPN, or a separately tested DSM custom reverse proxy/
+    },
+    {
       status: 503,
       code: "dsm_authentication_helper_unsafe",
       title: "DSM authentication helper rejected",
@@ -285,6 +292,9 @@ test("DSM authentication failures provide code-specific recovery guidance", asyn
     assert.match(issue.message, expected.extra);
     assert.match(issue.message, /Failure stage: dsm_authentication\./);
     assert.doesNotMatch(issue.message, /Restart Synology Drive Sync/);
+    if (expected.code === "dsm_authentication_quickconnect_unsupported") {
+      assert.doesNotMatch(issue.message, /chmod|reinstall|permissions/i);
+    }
 
     const statuslessIssue = component.methods.describeBridgeError({
       status: 0,

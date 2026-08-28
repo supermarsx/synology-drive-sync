@@ -326,7 +326,7 @@ test("configurable DSM controls use real accessible help markup and themed porta
       if (/\btooltip=/.test(tag)) assert.doesNotMatch(tag, /\s:?title=/, `control mixes toolkit and native tooltips: ${tag}`);
     }
   }
-  assert.match(app, /fieldset class="sdsync-weekday-fieldset" aria-describedby="sdsync-help-routine-weekdays"/);
+  assert.match(app, /<fieldset\b[^>]*class="sdsync-weekday-fieldset"[^>]*aria-describedby="sdsync-help-routine-weekdays"/);
   for (const truthfulProducer of [
     "accepted and rejected dashboard mutation bridge events",
     "authenticated identity events emitted for accepted dashboard mutations",
@@ -358,7 +358,7 @@ test("complete security policy, client-event auditing, activity filters, and sta
   assert.match(app, /<v-button\b[^>]*@click="refreshSnapshot\(true\)"[^>]*>[\s\S]*?<action-icon name="refresh"\s*\/>[\s\S]*?Retry<\/v-button>/);
   assert.match(panel, /:disabled="disabled \|\| busy \|\| !dirty"/);
   assert.match(panel, /@input="updateField\(control\.key, \$event === true\)"/);
-  assert.match(panel, /<v-form-item\b[^>]*label="Policy version">[\s\S]*?:value="policyVersionLabel"[\s\S]*?readonly/);
+  assert.match(panel, /<v-form-item\b[^>]*label="Policy version"[^>]*>[\s\S]*?:value="policyVersionLabel"[\s\S]*?readonly/);
   assert.match(panel, /updates are managed only by package migrations/);
   assert.match(app, /policy_version: null/);
 
@@ -366,6 +366,114 @@ test("complete security policy, client-event auditing, activity filters, and sta
   assert.ok(settingsSection);
   assert.match(settingsSection[0], /<v-form/);
   assert.doesNotMatch(settingsSection[0], /<article\b/);
+});
+
+test("routine editor emits only mode-relevant timing fields with bounded retry policy", async () => {
+  const component = await loadAppComponent(async () => ({ ok: true }), []);
+  const methods = component.methods;
+  const base = {
+    profile: "office", enabled: true, action: "sync", mode: "interval",
+    interval_seconds: 3600, weekdays: [1, 2, 3, 4, 5],
+    time_window_start: "08:00", time_window_end: "20:00",
+    debounce_seconds: 45, poll_seconds: 30, retry_count: 5,
+    retry_backoff_seconds: 60, retry_exponential: true,
+    allow_delete: false, max_total_delete: 100, depends_on: []
+  };
+  const context = {
+    routineForm: { ...base },
+    integer(value, fallback) {
+      const parsed = Number(value);
+      return Number.isInteger(parsed) ? parsed : fallback;
+    }
+  };
+
+  const payloadFor = (mode) => {
+    context.routineForm = { ...base, mode };
+    return methods.routinePayload.call(context);
+  };
+  const interval = payloadFor("interval");
+  assert.equal(interval.interval_seconds, 3600);
+  for (const key of ["weekdays", "time_window_start", "time_window_end", "debounce_seconds", "poll_seconds"]) {
+    assert.equal(Object.hasOwn(interval, key), false, `interval leaked ${key}`);
+  }
+  const daily = payloadFor("daily");
+  assert.deepEqual(daily.weekdays, [1, 2, 3, 4, 5]);
+  assert.equal(daily.time_window_start, "08:00");
+  assert.equal(daily.time_window_end, "20:00");
+  for (const key of ["interval_seconds", "debounce_seconds", "poll_seconds"]) {
+    assert.equal(Object.hasOwn(daily, key), false, `daily leaked ${key}`);
+  }
+  const realtime = payloadFor("realtime");
+  assert.equal(realtime.debounce_seconds, 45);
+  assert.equal(realtime.poll_seconds, 30);
+  for (const key of ["interval_seconds", "weekdays", "time_window_start", "time_window_end"]) {
+    assert.equal(Object.hasOwn(realtime, key), false, `realtime leaked ${key}`);
+  }
+  assert.equal(realtime.retry_count, 5);
+  assert.equal(realtime.retry_backoff_seconds, 60);
+  assert.equal(realtime.retry_exponential, true);
+
+  assert.match(app, /v-if="routineForm\.mode === 'interval'"[^>]*label="Interval \(seconds\)"/);
+  assert.equal((app.match(/v-if="routineForm\.mode === 'daily'"[^>]*label="Window (?:starts|ends)"/g) || []).length, 2);
+  assert.equal((app.match(/v-if="routineForm\.mode === 'realtime'"[^>]*label="(?:Realtime debounce|Fallback poll) \(seconds\)"/g) || []).length, 2);
+  assert.match(app, /<fieldset v-if="routineForm\.mode === 'daily'" class="sdsync-weekday-fieldset"/);
+  assert.match(app, /debounce_seconds: 45/);
+  assert.match(app, /between\(payload\.debounce_seconds, 1, 3600\)/);
+  assert.match(app, /retry_count: 5/);
+  assert.match(app, /retry_exponential: true/);
+  assert.match(app, /retry_backoff_seconds, 10, 300/);
+});
+
+test("Manual refresh options clear timers without creating replacements", async () => {
+  const component = await loadAppComponent(async () => ({ ok: true }), []);
+  const methods = component.methods;
+  assert.deepEqual(component.computed.statusRefreshOptions(), [
+    { value: 0, label: "Manual only" },
+    { value: 3000, label: "Every 3 seconds" },
+    { value: 5000, label: "Every 5 seconds" },
+    { value: 10000, label: "Every 10 seconds" },
+    { value: 30000, label: "Every 30 seconds" }
+  ]);
+  assert.equal(component.computed.logRefreshOptions()[0].value, 0);
+
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const cleared = [];
+  const scheduled = [];
+  globalThis.window = {
+    clearTimeout(timer) { cleared.push(timer); },
+    setTimeout(callback, delay) { scheduled.push({ callback, delay }); return scheduled.length + 100; }
+  };
+  globalThis.document = { hidden: false };
+  try {
+    const context = {
+      snapshotTimer: 41,
+      logTimer: 42,
+      settings: { status_refresh: 0, log_refresh: 0 },
+      disposed: false,
+      route: "activity",
+      logsPaused: false,
+      refreshSnapshot() {},
+      refreshLogs() {}
+    };
+    methods.scheduleSnapshot.call(context);
+    methods.scheduleLogs.call(context);
+    assert.deepEqual(cleared, [41, 42]);
+    assert.equal(context.snapshotTimer, 0);
+    assert.equal(context.logTimer, 0);
+    assert.equal(scheduled.length, 0, "Manual mode created a background timer");
+
+    context.settings.status_refresh = 3000;
+    context.settings.log_refresh = 5000;
+    methods.scheduleSnapshot.call(context);
+    methods.scheduleLogs.call(context);
+    assert.deepEqual(scheduled.map((entry) => entry.delay), [3000, 5000]);
+  } finally {
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
 });
 
 test("security save and browser preference saves are behaviorally audited", async () => {

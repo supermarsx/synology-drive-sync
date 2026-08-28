@@ -81,6 +81,11 @@ sudo -u "$PACKAGE_USER" -- "$MANAGER" remove-remote-log-token personal
 Clearing the token while remote-log mode is `required` can make subsequent operations fail. Review
 the profile and collector behavior before clearing it.
 
+A token may be replaced or retained before a collector URL is enabled. The protected file remains in
+package storage and the snapshot reports only its presence, but the generated core TOML references
+that file only while `remote-log-url` is configured. Removing the URL therefore disables use of the
+token without deleting it; restoring the URL reconnects the same fixed locator.
+
 ## Browser and service handling
 
 The page does not place secret values in URLs, local storage, session storage, DOM text, logs, or

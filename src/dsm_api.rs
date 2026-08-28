@@ -155,6 +155,7 @@ const MAX_AUTHENTICATED_USERNAME_BYTES: usize = 256;
 const MAX_AUTH_OUTPUT_BYTES: usize = MAX_AUTHENTICATED_USERNAME_BYTES + 2;
 const MAX_DSM_USER_SERVICE_OUTPUT_BYTES: usize = MAX_MANAGER_OUTPUT_BYTES;
 const MAX_SECRET_BYTES: usize = 4096;
+const MAX_DSM_DELETE_BOUND: u64 = 2_147_483_647;
 const MAX_JOB_AGE_SECONDS: u64 = 24 * 60 * 60;
 const RESULT_RETENTION_SECONDS: u64 = 60 * 60;
 const MAX_OUTSTANDING_JOBS: usize = 256;
@@ -926,6 +927,9 @@ struct ConfigureProfileArgs {
     verbosity: u8,
     quiet: bool,
     log_level: LogLevel,
+    log_format: LogFormat,
+    progress: ProgressMode,
+    output: OutputFormat,
     remote_log_url: Option<String>,
     remote_log_mode: RemoteLogMode,
     make_default: bool,
@@ -969,6 +973,58 @@ impl LogLevel {
             Self::Warn => "warn",
             Self::Error => "error",
             Self::Off => "off",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum LogFormat {
+    Human,
+    Json,
+}
+
+impl LogFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Json => "json",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ProgressMode {
+    Auto,
+    Always,
+    Never,
+}
+
+impl ProgressMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum OutputFormat {
+    Human,
+    Json,
+    Ndjson,
+}
+
+impl OutputFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Json => "json",
+            Self::Ndjson => "ndjson",
         }
     }
 }
@@ -1073,14 +1129,21 @@ struct RoutineArgs {
     enabled: bool,
     action: RoutineAction,
     mode: RoutineMode,
-    interval_seconds: u32,
-    weekdays: Vec<u8>,
-    time_window_start: String,
-    time_window_end: String,
-    debounce_seconds: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interval_seconds: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weekdays: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    time_window_start: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    time_window_end: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    debounce_seconds: Option<u32>,
     retry_count: u8,
     retry_backoff_seconds: u32,
-    poll_seconds: u32,
+    retry_exponential: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    poll_seconds: Option<u32>,
     allow_delete: bool,
     max_total_delete: u64,
     depends_on: Vec<String>,
@@ -2006,6 +2069,8 @@ fn validate_secret(value: &str) -> BridgeResult<()> {
 }
 
 fn validate_configure_profile(value: &ConfigureProfileArgs) -> BridgeResult<()> {
+    const MAX_DSM_RATE_BYTES_PER_SECOND: u64 = 9_007_199_254_740_991;
+
     validate_name(&value.name)?;
     validate_bounded_text(&value.source, 4096, false)?;
     if !value.source.starts_with('/') || contains_dot_segment(&value.source) {
@@ -2028,14 +2093,17 @@ fn validate_configure_profile(value: &ConfigureProfileArgs) -> BridgeResult<()> 
         return Err(BridgeError::bad_request());
     }
     if !(1..=16).contains(&value.jobs)
+        || value.max_delete > MAX_DSM_DELETE_BOUND
         || value.retries > 5
         || value.timeout_seconds == 0
         || value.timeout_seconds > 86_400
         || value.connect_timeout_seconds == 0
         || value.connect_timeout_seconds > 600
-        || value.max_rate_bytes_per_second == Some(0)
+        || value
+            .max_rate_bytes_per_second
+            .is_some_and(|rate| rate == 0 || rate > MAX_DSM_RATE_BYTES_PER_SECOND)
         || value.verbosity > 2
-        || (value.quiet && value.verbosity != 0)
+        || (value.allow_empty_source && !value.delete)
         || value.excludes.len() > 64
     {
         return Err(BridgeError::bad_request());
@@ -2068,7 +2136,9 @@ fn contains_dot_segment(value: &str) -> bool {
 }
 
 fn validate_schedule(value: &ScheduleArgs) -> BridgeResult<()> {
-    if !(60..=2_592_000).contains(&value.interval_seconds) {
+    if !(60..=2_592_000).contains(&value.interval_seconds)
+        || value.max_total_delete > MAX_DSM_DELETE_BOUND
+    {
         return Err(BridgeError::bad_request());
     }
     Ok(())
@@ -2076,26 +2146,68 @@ fn validate_schedule(value: &ScheduleArgs) -> BridgeResult<()> {
 
 fn validate_routine(value: &RoutineArgs) -> BridgeResult<()> {
     validate_existing_name(&value.profile)?;
-    if !(60..=2_592_000).contains(&value.interval_seconds)
-        || !(1..=3600).contains(&value.debounce_seconds)
-        || value.retry_count > 5
-        || !(10..=86_400).contains(&value.retry_backoff_seconds)
-        || !(5..=3600).contains(&value.poll_seconds)
-        || value.weekdays.is_empty()
-        || value.weekdays.len() > 7
+    if value.retry_count > 5
+        || !(10..=300).contains(&value.retry_backoff_seconds)
+        || value.max_total_delete > MAX_DSM_DELETE_BOUND
         || value.depends_on.len() > 64
-        || !valid_clock_time(&value.time_window_start)
-        || !valid_clock_time(&value.time_window_end)
     {
         return Err(BridgeError::bad_request());
     }
-    let mut weekdays = BTreeSet::new();
-    if value
-        .weekdays
-        .iter()
-        .any(|weekday| !(1..=7).contains(weekday) || !weekdays.insert(*weekday))
-    {
-        return Err(BridgeError::bad_request());
+    match value.mode {
+        RoutineMode::Interval => {
+            if !value
+                .interval_seconds
+                .is_some_and(|seconds| (60..=2_592_000).contains(&seconds))
+                || value.weekdays.is_some()
+                || value.time_window_start.is_some()
+                || value.time_window_end.is_some()
+                || value.debounce_seconds.is_some()
+                || value.poll_seconds.is_some()
+            {
+                return Err(BridgeError::bad_request());
+            }
+        }
+        RoutineMode::Daily => {
+            let (Some(weekdays), Some(window_start), Some(window_end)) = (
+                value.weekdays.as_ref(),
+                value.time_window_start.as_deref(),
+                value.time_window_end.as_deref(),
+            ) else {
+                return Err(BridgeError::bad_request());
+            };
+            if value.interval_seconds.is_some()
+                || value.debounce_seconds.is_some()
+                || value.poll_seconds.is_some()
+                || weekdays.is_empty()
+                || weekdays.len() > 7
+                || !valid_clock_time(window_start)
+                || !valid_clock_time(window_end)
+            {
+                return Err(BridgeError::bad_request());
+            }
+            let mut unique_weekdays = BTreeSet::new();
+            if weekdays
+                .iter()
+                .any(|weekday| !(1..=7).contains(weekday) || !unique_weekdays.insert(*weekday))
+            {
+                return Err(BridgeError::bad_request());
+            }
+        }
+        RoutineMode::Realtime => {
+            if !value
+                .debounce_seconds
+                .is_some_and(|seconds| (1..=3600).contains(&seconds))
+                || !value
+                    .poll_seconds
+                    .is_some_and(|seconds| (5..=3600).contains(&seconds))
+                || value.interval_seconds.is_some()
+                || value.weekdays.is_some()
+                || value.time_window_start.is_some()
+                || value.time_window_end.is_some()
+            {
+                return Err(BridgeError::bad_request());
+            }
+        }
     }
     let mut dependencies = BTreeSet::new();
     for dependency in &value.depends_on {
@@ -2396,7 +2508,10 @@ fn validate_operational_action(value: &OperationalActionArgs) -> BridgeResult<()
             }
             let _allow_delete = value.allow_delete.ok_or_else(BridgeError::bad_request)?;
             if value.scope == "all" {
-                if value.max_total_delete.is_none() {
+                if value
+                    .max_total_delete
+                    .is_none_or(|maximum| maximum > MAX_DSM_DELETE_BOUND)
+                {
                     return Err(BridgeError::bad_request());
                 }
             } else if value.max_total_delete.is_some() {
@@ -2896,21 +3011,7 @@ mod linux_runtime {
             validate_dsm_authentication_helper(path)
         })? {
             AuthenticationHelperSelection::Loopback => {
-                let username = query_dsm_user_service(inputs, timeout).map_err(|error| {
-                    let code = match error.kind {
-                        ErrorKind::Unauthorized => "dsm_authentication_webapi_rejected",
-                        ErrorKind::Forbidden => "dsm_authentication_webapi_forbidden",
-                        _ => "dsm_authentication_webapi_unavailable",
-                    };
-                    CgiFailure::coded(CgiFailureStage::Authentication, error, code)
-                })?;
-                return authorize_authenticated_username(username, inputs).map_err(|error| {
-                    CgiFailure::coded(
-                        CgiFailureStage::Authentication,
-                        error,
-                        "dsm_authentication_webapi_forbidden",
-                    )
-                });
+                return authenticate_via_dsm_user_service(inputs, timeout);
             }
             AuthenticationHelperSelection::Direct(helper) => helper,
         };
@@ -2942,20 +3043,11 @@ mod linux_runtime {
                 "dsm_authentication_helper_unavailable",
             )
         })?;
-        if !output.status_success {
-            return Err(CgiFailure::coded(
-                CgiFailureStage::Authentication,
-                BridgeError::new(ErrorKind::Unauthorized),
-                "dsm_authentication_rejected",
-            ));
-        }
-        let username = parse_authentication_output(&output.stdout).map_err(|error| {
-            CgiFailure::coded(
-                CgiFailureStage::Authentication,
-                error,
-                "dsm_authentication_rejected",
-            )
-        })?;
+        let username = authenticated_helper_username(
+            output.status_success,
+            &output.stdout,
+            inputs.native_context.http_host.as_deref(),
+        )?;
         authorize_authenticated_username(username, inputs).map_err(|error| {
             CgiFailure::coded(
                 CgiFailureStage::Authentication,
@@ -2963,6 +3055,106 @@ mod linux_runtime {
                 "dsm_authentication_forbidden",
             )
         })
+    }
+
+    pub(super) fn authenticated_helper_username(
+        status_success: bool,
+        stdout: &[u8],
+        http_host: Option<&str>,
+    ) -> Result<String, CgiFailure> {
+        if !status_success {
+            return Err(CgiFailure::coded(
+                CgiFailureStage::Authentication,
+                BridgeError::new(ErrorKind::Unauthorized),
+                authentication_rejection_code(http_host),
+            ));
+        }
+        parse_authentication_output(stdout).map_err(|error| {
+            CgiFailure::coded(
+                CgiFailureStage::Authentication,
+                error,
+                authentication_rejection_code(http_host),
+            )
+        })
+    }
+
+    fn authenticate_via_dsm_user_service(
+        inputs: &AuthenticationInputs,
+        timeout: Duration,
+    ) -> Result<AuthenticatedSession, CgiFailure> {
+        let username = query_dsm_user_service(inputs, timeout).map_err(|error| {
+            let code = match error.kind {
+                ErrorKind::Unauthorized => "dsm_authentication_webapi_rejected",
+                ErrorKind::Forbidden => "dsm_authentication_webapi_forbidden",
+                _ => "dsm_authentication_webapi_unavailable",
+            };
+            CgiFailure::coded(CgiFailureStage::Authentication, error, code)
+        })?;
+        authorize_authenticated_username(username, inputs).map_err(|error| {
+            CgiFailure::coded(
+                CgiFailureStage::Authentication,
+                error,
+                "dsm_authentication_webapi_forbidden",
+            )
+        })
+    }
+
+    pub(super) fn authentication_rejection_code(http_host: Option<&str>) -> &'static str {
+        if is_quickconnect_authority(http_host) {
+            "dsm_authentication_quickconnect_unsupported"
+        } else {
+            "dsm_authentication_rejected"
+        }
+    }
+
+    fn is_quickconnect_authority(value: Option<&str>) -> bool {
+        let Some(authority) = value else {
+            return false;
+        };
+        if authority.is_empty()
+            || !authority.is_ascii()
+            || authority.bytes().any(|byte| byte.is_ascii_whitespace())
+        {
+            return false;
+        }
+        let host = match authority.rsplit_once(':') {
+            Some((host, port))
+                if !host.contains(':')
+                    && !host.is_empty()
+                    && !port.is_empty()
+                    && port.bytes().all(|byte| byte.is_ascii_digit())
+                    && (port.len() == 1 || !port.starts_with('0'))
+                    && port.parse::<u16>().is_ok_and(|port| port != 0) =>
+            {
+                host
+            }
+            Some(_) => return false,
+            None => authority,
+        };
+        let host = host.strip_suffix('.').unwrap_or(host);
+        if host.len() > 253 {
+            return false;
+        }
+        let normalized = host.to_ascii_lowercase();
+        let Some(prefix) = normalized.strip_suffix(".quickconnect.to") else {
+            return false;
+        };
+        !prefix.is_empty()
+            && prefix.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                    && label
+                        .as_bytes()
+                        .first()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    && label
+                        .as_bytes()
+                        .last()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+            })
     }
 
     fn authorize_authenticated_username(
@@ -4748,11 +4940,9 @@ fn mutation_manager_arguments(mutation: &Mutation) -> Vec<OsString> {
             push_pair(&mut arguments, "--verbose", &value.verbosity.to_string());
             push_pair(&mut arguments, "--quiet", bool_text(value.quiet));
             push_pair(&mut arguments, "--log-level", value.log_level.as_str());
-            // These values are deliberately fixed by the bridge: callers may
-            // not redirect logs or select a format/path interpreted by a shell.
-            push_pair(&mut arguments, "--log-format", "json");
-            push_pair(&mut arguments, "--progress", "never");
-            push_pair(&mut arguments, "--output", "human");
+            push_pair(&mut arguments, "--log-format", value.log_format.as_str());
+            push_pair(&mut arguments, "--progress", value.progress.as_str());
+            push_pair(&mut arguments, "--output", value.output.as_str());
             if let Some(remote_log_url) = &value.remote_log_url {
                 push_pair(&mut arguments, "--remote-log-url", remote_log_url);
             }
@@ -4800,29 +4990,41 @@ fn mutation_manager_arguments(mutation: &Mutation) -> Vec<OsString> {
             push_pair(&mut arguments, "--enabled", bool_text(value.enabled));
             push_pair(&mut arguments, "--action", value.action.as_str());
             push_pair(&mut arguments, "--mode", value.mode.as_str());
-            push_pair(
-                &mut arguments,
-                "--interval",
-                &value.interval_seconds.to_string(),
-            );
-            let weekdays = value
-                .weekdays
-                .iter()
-                .map(u8::to_string)
-                .collect::<Vec<_>>()
-                .join(",");
-            push_pair(&mut arguments, "--weekdays", &weekdays);
-            push_pair(
-                &mut arguments,
-                "--time-window-start",
-                &value.time_window_start,
-            );
-            push_pair(&mut arguments, "--time-window-end", &value.time_window_end);
-            push_pair(
-                &mut arguments,
-                "--debounce-seconds",
-                &value.debounce_seconds.to_string(),
-            );
+            match value.mode {
+                RoutineMode::Interval => {
+                    if let Some(interval_seconds) = value.interval_seconds {
+                        push_pair(&mut arguments, "--interval", &interval_seconds.to_string());
+                    }
+                }
+                RoutineMode::Daily => {
+                    if let Some(weekdays) = &value.weekdays {
+                        let weekdays = weekdays
+                            .iter()
+                            .map(u8::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        push_pair(&mut arguments, "--weekdays", &weekdays);
+                    }
+                    if let Some(window_start) = &value.time_window_start {
+                        push_pair(&mut arguments, "--time-window-start", window_start);
+                    }
+                    if let Some(window_end) = &value.time_window_end {
+                        push_pair(&mut arguments, "--time-window-end", window_end);
+                    }
+                }
+                RoutineMode::Realtime => {
+                    if let Some(debounce_seconds) = value.debounce_seconds {
+                        push_pair(
+                            &mut arguments,
+                            "--debounce-seconds",
+                            &debounce_seconds.to_string(),
+                        );
+                    }
+                    if let Some(poll_seconds) = value.poll_seconds {
+                        push_pair(&mut arguments, "--poll-seconds", &poll_seconds.to_string());
+                    }
+                }
+            }
             push_pair(
                 &mut arguments,
                 "--retry-count",
@@ -4835,8 +5037,8 @@ fn mutation_manager_arguments(mutation: &Mutation) -> Vec<OsString> {
             );
             push_pair(
                 &mut arguments,
-                "--poll-seconds",
-                &value.poll_seconds.to_string(),
+                "--retry-exponential",
+                bool_text(value.retry_exponential),
             );
             push_pair(
                 &mut arguments,
@@ -10819,6 +11021,9 @@ mod tests {
             "verbosity": 0,
             "quiet": false,
             "log_level": "info",
+            "log_format": "human",
+            "progress": "auto",
+            "output": "json",
             "remote_log_url": null,
             "remote_log_mode": "best-effort",
             "make_default": true
@@ -10831,14 +11036,12 @@ mod tests {
             "enabled": true,
             "action": "sync",
             "mode": "daily",
-            "interval_seconds": 3600,
             "weekdays": [1, 2, 3, 4, 5],
             "time_window_start": "01:30",
             "time_window_end": "04:00",
-            "debounce_seconds": 5,
-            "retry_count": 2,
+            "retry_count": 5,
             "retry_backoff_seconds": 60,
-            "poll_seconds": 30,
+            "retry_exponential": true,
             "allow_delete": false,
             "max_total_delete": 100,
             "depends_on": ["upstream"]
@@ -11389,6 +11592,91 @@ mod tests {
                 .unwrap_err()
                 .kind,
             ErrorKind::Forbidden
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn quickconnect_authentication_diagnostic_uses_a_strict_host_suffix_only() {
+        for authority in [
+            Some("example-nas.eu.quickconnect.to"),
+            Some("192.0.2.10:5001"),
+            Some("nas.example.invalid"),
+            None,
+        ] {
+            assert_eq!(
+                linux_runtime::authenticated_helper_username(
+                    true,
+                    b"authenticated-admin\n",
+                    authority,
+                )
+                .unwrap(),
+                "authenticated-admin",
+                "a host diagnostic must never alter helper acceptance"
+            );
+        }
+
+        for authority in [
+            "example-nas.eu.quickconnect.to",
+            "EXAMPLE-NAS.EU.QUICKCONNECT.TO",
+            "device.direct.quickconnect.to:443",
+            "device.quickconnect.to.",
+        ] {
+            assert_eq!(
+                linux_runtime::authentication_rejection_code(Some(authority)),
+                "dsm_authentication_quickconnect_unsupported",
+                "authority {authority}"
+            );
+            assert_eq!(
+                linux_runtime::authenticated_helper_username(false, b"", Some(authority))
+                    .unwrap_err()
+                    .code,
+                Some("dsm_authentication_quickconnect_unsupported")
+            );
+        }
+
+        for authority in [
+            "192.0.2.10:5001",
+            "nas.example.invalid",
+            "quickconnect.to",
+            "quickconnect.to.evil.invalid",
+            "device.quickconnect.to.evil.invalid",
+            "device.quickconnect.to:invalid",
+            "device.quickconnect.to:0",
+            "device.quickconnect.to:0443",
+            "device.quickconnect.to:65536",
+            "device.quickconnect.to:443:extra",
+            "-device.quickconnect.to",
+            "device-.quickconnect.to",
+            "device..quickconnect.to",
+            "device quickconnect.to",
+            "[::1]:5001",
+        ] {
+            assert_eq!(
+                linux_runtime::authentication_rejection_code(Some(authority)),
+                "dsm_authentication_rejected",
+                "authority {authority}"
+            );
+            assert_eq!(
+                linux_runtime::authenticated_helper_username(false, b"", Some(authority))
+                    .unwrap_err()
+                    .code,
+                Some("dsm_authentication_rejected")
+            );
+        }
+        assert_eq!(
+            linux_runtime::authentication_rejection_code(None),
+            "dsm_authentication_rejected"
+        );
+        assert_eq!(
+            linux_runtime::authenticated_helper_username(
+                true,
+                b"\n",
+                Some("device.quickconnect.to"),
+            )
+            .unwrap_err()
+            .code,
+            Some("dsm_authentication_quickconnect_unsupported")
         );
     }
 
@@ -15069,6 +15357,7 @@ mod tests {
 
         let mut empty_source_arguments = configure_arguments();
         empty_source_arguments["allow_empty_source"] = json!(true);
+        empty_source_arguments["delete"] = json!(true);
         policy = SecurityPolicyArgs {
             allow_empty_source: false,
             ..SecurityPolicyArgs::default()
@@ -15354,18 +15643,83 @@ mod tests {
         assert!(
             arguments
                 .windows(2)
-                .any(|pair| pair == ["--log-format", "json"])
+                .any(|pair| pair == ["--log-format", "human"])
         );
         assert!(
             arguments
                 .windows(2)
-                .any(|pair| pair == ["--progress", "never"])
+                .any(|pair| pair == ["--progress", "auto"])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--output", "json"])
         );
         assert!(!arguments.iter().any(|argument| argument == MANAGER_PATH));
 
         let mut unknown = configure_arguments();
         unknown["executable"] = json!("/tmp/evil");
         assert!(parse_mutation_request(&request("configure-profile", unknown)).is_err());
+
+        for (field, value) in [
+            ("log_format", "yaml"),
+            ("progress", "sometimes"),
+            ("output", "xml"),
+        ] {
+            let mut invalid = configure_arguments();
+            invalid[field] = json!(value);
+            assert!(parse_mutation_request(&request("configure-profile", invalid)).is_err());
+        }
+
+        let mut unsafe_empty_source = configure_arguments();
+        unsafe_empty_source["allow_empty_source"] = json!(true);
+        assert!(
+            parse_mutation_request(&request("configure-profile", unsafe_empty_source)).is_err()
+        );
+        let mut bounded_empty_source = configure_arguments();
+        bounded_empty_source["allow_empty_source"] = json!(true);
+        bounded_empty_source["delete"] = json!(true);
+        assert!(
+            parse_mutation_request(&request("configure-profile", bounded_empty_source)).is_ok()
+        );
+
+        let mut portable_boundaries = configure_arguments();
+        portable_boundaries["max_delete"] = json!(2_147_483_647_u64);
+        portable_boundaries["max_rate_bytes_per_second"] = json!(9_007_199_254_740_991_u64);
+        portable_boundaries["quiet"] = json!(true);
+        portable_boundaries["verbosity"] = json!(2);
+        portable_boundaries["output"] = json!("ndjson");
+        let parsed =
+            parse_mutation_request(&request("configure-profile", portable_boundaries)).unwrap();
+        let arguments = argument_strings(&parsed.mutation);
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--max-delete", "2147483647"])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--max-rate", "9007199254740991"])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--output", "ndjson"])
+        );
+
+        for (field, value) in [
+            ("max_delete", 2_147_483_648_u64),
+            ("max_rate_bytes_per_second", 9_007_199_254_740_992_u64),
+        ] {
+            let mut outside_portable_bound = configure_arguments();
+            outside_portable_bound[field] = json!(value);
+            assert!(
+                parse_mutation_request(&request("configure-profile", outside_portable_bound))
+                    .is_err(),
+                "{field} must remain exactly representable on every DSM target"
+            );
+        }
     }
 
     #[test]
@@ -15517,6 +15871,38 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_delete_bounds_are_portable_and_dispatch_exactly() {
+        let boundary = MAX_DSM_DELETE_BOUND;
+        for (operation, mut arguments) in [
+            (
+                "schedule",
+                json!({"enabled":true,"interval_seconds":3600,"allow_delete":true,"max_total_delete":boundary}),
+            ),
+            ("routine", routine_arguments()),
+            (
+                "action",
+                json!({"kind":"run","scope":"all","write_test":null,"allow_delete":true,"max_total_delete":boundary}),
+            ),
+        ] {
+            arguments["max_total_delete"] = json!(boundary);
+            let parsed = parse_mutation_request(&request(operation, arguments.clone())).unwrap();
+            let manager_arguments = argument_strings(&parsed.mutation);
+            assert!(
+                manager_arguments
+                    .windows(2)
+                    .any(|pair| pair == ["--max-total-delete", "2147483647"]),
+                "{operation} must dispatch the exact portable boundary"
+            );
+
+            arguments["max_total_delete"] = json!(boundary + 1);
+            assert!(
+                parse_mutation_request(&request(operation, arguments)).is_err(),
+                "{operation} must reject the first value outside the portable boundary"
+            );
+        }
+    }
+
+    #[test]
     fn routine_ranges_dependencies_and_unknown_fields_fail_closed() {
         let mut duplicate = routine_arguments();
         duplicate["weekdays"] = json!([1, 1]);
@@ -15527,6 +15913,58 @@ mod tests {
         let mut unknown = routine_arguments();
         unknown["command"] = json!("sync --evil");
         assert!(parse_mutation_request(&request("routine", unknown)).is_err());
+    }
+
+    #[test]
+    fn routine_mode_contract_rejects_irrelevant_timing_fields() {
+        let common = json!({
+            "profile": "nightly",
+            "enabled": true,
+            "action": "sync",
+            "retry_count": 5,
+            "retry_backoff_seconds": 60,
+            "retry_exponential": true,
+            "allow_delete": false,
+            "max_total_delete": 100,
+            "depends_on": []
+        });
+        let mut interval = common.clone();
+        interval["mode"] = json!("interval");
+        interval["interval_seconds"] = json!(3600);
+        assert!(parse_mutation_request(&request("routine", interval.clone())).is_ok());
+        interval["weekdays"] = json!([1]);
+        assert!(parse_mutation_request(&request("routine", interval)).is_err());
+
+        let mut daily = common.clone();
+        daily["mode"] = json!("daily");
+        daily["weekdays"] = json!([1, 3, 5]);
+        daily["time_window_start"] = json!("01:30");
+        daily["time_window_end"] = json!("04:00");
+        assert!(parse_mutation_request(&request("routine", daily.clone())).is_ok());
+        daily["interval_seconds"] = json!(3600);
+        assert!(parse_mutation_request(&request("routine", daily)).is_err());
+
+        let mut realtime = common;
+        realtime["mode"] = json!("realtime");
+        realtime["debounce_seconds"] = json!(45);
+        realtime["poll_seconds"] = json!(30);
+        assert!(parse_mutation_request(&request("routine", realtime.clone())).is_ok());
+        realtime["time_window_start"] = json!("00:00");
+        assert!(parse_mutation_request(&request("routine", realtime)).is_err());
+    }
+
+    #[test]
+    fn routine_retry_contract_requires_toggle_and_caps_new_base() {
+        let mut missing_toggle = routine_arguments();
+        missing_toggle
+            .as_object_mut()
+            .unwrap()
+            .remove("retry_exponential");
+        assert!(parse_mutation_request(&request("routine", missing_toggle)).is_err());
+
+        let mut too_large = routine_arguments();
+        too_large["retry_backoff_seconds"] = json!(301);
+        assert!(parse_mutation_request(&request("routine", too_large)).is_err());
     }
 
     #[test]
@@ -16061,6 +16499,11 @@ mod tests {
                 BridgeError::new(ErrorKind::Unauthorized),
                 401,
                 "dsm_authentication_rejected",
+            ),
+            (
+                BridgeError::new(ErrorKind::Unauthorized),
+                401,
+                "dsm_authentication_quickconnect_unsupported",
             ),
             (
                 BridgeError::new(ErrorKind::Unauthorized),
