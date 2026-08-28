@@ -16,7 +16,7 @@ physical_home=/volume3/@apphome/$package_name
 physical_var=/volume3/@appdata/$package_name
 webman_route=/usr/syno/synoman/webman/3rdparty/$package_name
 authenticate_helper=/usr/syno/synoman/webman/modules/authenticate.cgi
-authenticate_target=/usr/syno/synoman/authenticate.cgi
+authenticate_target=/usr/syno/synoman/webman/authenticate.cgi
 authenticate_helper_parent=$(dirname -- "$authenticate_helper")
 fixture_cookie=id=sdsync-fixture-session
 fixture_synology_token=sdsync-fixture%2B%2F%3D
@@ -170,11 +170,11 @@ printf '%s\n' sdsync-admin
 EOF
 chmod 0750 "$authenticate_target"
 chown 0:system "$authenticate_target"
-ln -s ../../authenticate.cgi "$authenticate_helper"
+ln -s ../authenticate.cgi "$authenticate_helper"
 # The fallback decision must be based on the package identity's execute probe,
 # not on userspace trust assumptions about a helper it cannot execute. Make the
 # helper parent deliberately incompatible with the direct-helper metadata rules
-# while preserving the real DSM root:system 0750 EACCES condition at the target.
+# while preserving the documented DSM root:system 0750 EACCES condition.
 chmod 0775 "$authenticate_helper_parent"
 system_gid=$(awk -F: '$1 == "system" { print $3; exit }' /etc/group)
 [ -n "$system_gid" ] || {
@@ -182,7 +182,7 @@ system_gid=$(awk -F: '$1 == "system" { print $3; exit }' /etc/group)
     exit 73
 }
 [ -L "$authenticate_helper" ] \
-    && [ "$(readlink "$authenticate_helper")" = ../../authenticate.cgi ] \
+    && [ "$(readlink "$authenticate_helper")" = ../authenticate.cgi ] \
     && [ "$(stat -c '%u' "$authenticate_helper")" = 0 ] \
     && [ "$(stat -c '%u:%a' "$authenticate_helper_parent")" = "0:775" ] \
     && [ "$(stat -c '%u:%g:%a:%h' "$authenticate_target")" = "0:$system_gid:750:1" ] || {
@@ -610,17 +610,39 @@ if grep -Fq '"stage":"dsm_authentication"' "$physical_var/log/api.log"; then
     exit 1
 fi
 
-# Make only the synthetic helper callable for the successful relay. Requiring
-# one helper marker and an unchanged fallback request count proves the executable
-# DSM helper remains primary and the daemon repeats neither authentication path.
+# Make only the synthetic helper callable. A near-miss system UID with the wrong
+# GID must fail closed before the exact DSM 1:1 target is accepted. Requiring one
+# helper marker and an unchanged fallback request count then proves the trusted
+# executable helper remains primary and neither authentication path is repeated.
 kill "$user_service_pid"
 wait "$user_service_pid" >/dev/null 2>&1 || true
 user_service_pid=
 chmod 0755 "$authenticate_helper_parent"
 chmod 0755 "$authenticate_target"
+chown 1:0 "$authenticate_target"
+set +e
+wrong_owner_response=$(run_package_cgi)
+wrong_owner_status=$?
+set -e
+wrong_owner_response=$(printf '%s' "$wrong_owner_response" | tr -d '\r')
+require_cgi_json_response "wrong-owner DSM authentication helper" \
+    "$wrong_owner_status" "200 OK" "sdsync.dsm-error.v1" \
+    "$wrong_owner_response"
+if ! { printf '%s\n' "$wrong_owner_response" \
+        | grep -Fq '"code":"dsm_authentication_helper_unsafe"' \
+        && printf '%s\n' "$wrong_owner_response" | grep -Fq '"status":503'; }; then
+    echo "wrong-owner DSM authentication helper did not fail closed" >&2
+    exit 1
+fi
+if [ -e "$package_auth_marker" ] || [ -L "$package_auth_marker" ]; then
+    echo "wrong-owner DSM authentication helper was unexpectedly invoked" >&2
+    exit 1
+fi
+
+chown 1:1 "$authenticate_target"
 [ -L "$authenticate_helper" ] \
     && [ "$(stat -c '%u:%a' "$authenticate_helper_parent")" = "0:755" ] \
-    && [ "$(stat -c '%u:%g:%a:%h' "$authenticate_target")" = "0:$system_gid:755:1" ] || {
+    && [ "$(stat -c '%u:%g:%a:%h' "$authenticate_target")" = "1:1:755:1" ] || {
     echo "mock DSM authentication helper did not enter the explicit callable test phase" >&2
     exit 73
 }

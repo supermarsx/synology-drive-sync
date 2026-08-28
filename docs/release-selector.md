@@ -30,24 +30,27 @@ lifecycle has no published DSM 7 package say **manual review / no SPK**. A separ
 option preserves that same fail-closed path for a model added after the snapshot; the selector never
 chooses a nearest-looking model.
 
-> **DSM package safety hold:** do not install `.spk` assets from releases `26.5` or `26.6`.
+> **DSM package safety hold:** do not install `.spk` assets from releases `26.5`, `26.6`, or
+> `26.20`. Release `26.20` rejects DSM's standard `system:system` authentication helper. The selector
+> refuses these SPKs even when model, DSM, and architecture otherwise match.
 > Release `26.5` contains identity-changing/set-ID privilege metadata that DSM rejects for a
 > third-party package; release `26.6` instead requests the Synology-only `sysnotify` resource worker.
 > The selector blocks those DSM assets even when GitHub reports one as the latest uploaded file and
 > links to [GitHub Releases](https://github.com/supermarsx/synology-drive-sync/releases) instead of
-> exposing a download. Release `26.7` or newer is eligible only when its exact canonical asset is
-> present. This hold does not block desktop, Rust SDK, C SDK, or container artifacts from the same
-> tags because those artifacts are not DSM packages.
+> exposing a download. A non-blocked `26.7`-or-newer release is eligible only when its exact
+> canonical asset is present. This hold does not block desktop, Rust SDK, C SDK, or container
+> artifacts from the same tags because those artifacts are not DSM packages.
 
 Release `26.10` introduced the native DSM AppWindow. Published `26.7`-`26.9` SPKs keep
-the UI they were released with; select `26.10` or later when the native AppWindow is required.
+the UI they were released with; select a non-blocked `26.10`-or-later release when the native
+AppWindow is required, never `26.20`.
 New SPKs declare `auto_upgrade_from="26.7-1"`: Package Center may offer a direct upgrade only from
 the reviewed lifecycle-equivalent 26.7-26.10 generation or newer. Its only relevant source drift is
 the fixed DSM notification application ID in 26.10; runner, lock, and lifecycle behavior is unchanged.
 Installations on 26.5 or
 26.6 must not be upgraded in place; use **Package Center > Manual Install** to move first to a
-verified 26.7-or-later intermediate SPK, then install the current release. This repository does not
-provide a private update feed or self-updater.
+verified, non-blocked 26.7-or-later intermediate SPK, then install the current release. This
+repository does not provide a private update feed or self-updater.
 
 DSM compatibility follows SynologyOpenSource's
 [`pkgscripts-ng` platform mapping through DSM 7.4](https://github.com/SynologyOpenSource/pkgscripts-ng/blob/DSM7.4/include/pkg_util.sh).

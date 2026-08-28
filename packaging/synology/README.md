@@ -20,6 +20,11 @@ The source is independently selectable for every profile and is a physical local
 > worker with `pkgmgr_worker_violation`. Use 26.7 or later only when that release is published and
 > its exact SPK/checksum are verified; a local build is not physical-DSM installation proof.
 
+> [!WARNING]
+> Release 26.20 has a DSM authentication bug: it rejects DSM's standard `system:system` (`1:1`)
+> `authenticate.cgi`. Use 26.21 or later after verifying its exact SPK and checksum. Never change
+> DSM-owned helper files to work around an incompatible package.
+
 ## Build and validate
 
 Build the pinned native DSM UI first, then supply two fully static, little-endian Linux ELFs matching
@@ -85,7 +90,7 @@ the package run-as contract. The AppWindow first obtains the official `SYNO.API.
 `method=token` response by a bounded same-origin GET, exactly-once-encodes the returned value into
 module memory, and adds it only as `X-SYNO-TOKEN` on package requests. It never uses a launch URL,
 history, request body, persistent storage, or logs to transport the token. The CGI probes `X_OK` on
-the exact fixed root-owned `authenticate.cgi` before any helper path or metadata validation. `X_OK`
+the exact fixed `authenticate.cgi` entry before any helper path or metadata validation. `X_OK`
 success selects full trusted-path validation, immediate pre-execution revalidation, and direct
 execution. `EACCES` skips the validator and selects one bounded loopback-only
 `SYNO.Core.Desktop.Initdata` `get_user_service` request using the current DSM cookie and optional
@@ -95,11 +100,17 @@ independently resolves NSS identity and `administrators` membership. It relays o
 and request through fixed
 `/var/packages/synology-drive-sync/var/run/api.sock`, owned by the package identity and mode `0600`.
 Mutable socket state never enters the installed/Webman-exposed `target/ui` tree. Both peers verify
-socket metadata and kernel peer identity; the daemon never executes DSM's root-owned authenticator.
+socket metadata and kernel peer identity; the daemon never executes DSM's authenticator.
 The validator rejects any privilege-bearing archive member or broader privilege manifest. The
 fallback pins the destination to literal IPv4 loopback and the current CGI server port, disables
 proxying and redirects, bounds time and response bytes, and never puts a cookie or token in the URL.
 It does not trust `SERVER_NAME`, another host, or a redirected peer.
+
+Direct-helper path validation keeps every ancestor directory and symlink root-owned and
+non-group/world-writable. The final canonical executable accepts DSM's standard exact built-in
+`system:system` identity (`UID:GID 1:1`) or the legacy root-owned form, with its device, inode, UID,
+GID, and mode revalidated immediately before execution. This requires no extra package group,
+capability, set-id bit, or root execution.
 
 Synology publicly documents the direct `authenticate.cgi` custom-CGI path and the official
 `SYNO.API.Auth` version 6 `method=token` JavaScript bootstrap. The private user-service response shape
@@ -128,8 +139,8 @@ not presented as shipped runtime dependencies.
 
 ## Install and initial configuration
 
-1. For the native AppWindow flow below, use a verified 26.10-or-later SPK. Releases 26.7-26.9 retain
-   their originally published UI. In DSM Package Center, choose
+1. For the native AppWindow flow below, use a verified, non-blocked 26.10-or-later SPK; never use
+   26.20. Releases 26.7-26.9 retain their originally published UI. In DSM Package Center, choose
    **Manual Install** and select the SPK for the NAS architecture. DSM
    normally warns that this is a third-party package; that publisher-trust warning is expected for a
    package not distributed by Synology. A refusal saying root or lower privileges are required is a

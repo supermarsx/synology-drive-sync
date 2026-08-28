@@ -25,8 +25,8 @@ ordinary package-owned `0755` CGI fails closed unless Webman supplies that same 
 The AppWindow uses Synology's official same-origin `SYNO.API.Auth` version 6 `method=token` bootstrap,
 keeps the exactly-once-encoded value in module memory, and sends it only in the package
 `X-SYNO-TOKEN` header. It never uses a launch URL, history, body, persistent storage, or logs for
-token transport. The CGI probes `X_OK` on DSM's fixed root-owned `authenticate.cgi` before helper
-metadata validation. An executable entry undergoes full trusted-path validation and immediate
+token transport. The CGI probes `X_OK` on DSM's fixed `authenticate.cgi` entry before helper metadata
+validation. An executable entry undergoes full trusted-path validation and immediate
 pre-execution revalidation. `EACCES` skips the validator and instead makes one bounded request to a
 loopback-pinned DSM user service with the current cookie and optional token as sensitive headers;
 every other probe error fails closed. The fallback
@@ -35,6 +35,11 @@ administrator membership. It then relays a bounded assertion and request over a 
 Unix socket: it is inaccessible at `0000` before startup commit, then the same inode activates as
 `0600`. The service repeats the peer, relay, account, membership, session-binding, policy, and package
 CSRF checks; it alone reaches private state or the queue. No root/group resource is requested.
+
+The direct-helper validator requires root-owned, non-writable ancestor directories and symlinks. Its
+final canonical executable accepts DSM's standard exact built-in `system:system` identity
+(`UID:GID 1:1`) or the legacy root-owned form. Any other owner, writable boundary, replacement, or
+identity change fails closed.
 
 The package is not a Synology Drive protocol plug-in. It writes through File Station. Synology Drive
 can index the result only when the selected destination belongs to the remote account's Drive home
@@ -45,6 +50,11 @@ or an enabled Team Folder.
 > 26.6 is rejected on affected DSM by its `conf/resource` `sysnotify` acquisition worker with
 > `pkgmgr_worker_violation`. Use 26.7 or later only when that release is published and its exact
 > SPK/checksum are verified. Published assets are not repaired in place.
+
+> [!WARNING]
+> Release 26.20 has a DSM authentication bug: it rejects DSM's standard `system:system` (`1:1`)
+> `authenticate.cgi`. Use 26.21 or later after verifying its exact SPK and checksum. Never change
+> DSM-owned helper files to work around an incompatible package.
 
 > [!NOTE]
 > Static packaging, bridge, manager, lifecycle, and mock File Station tests have passed. They do not
@@ -81,8 +91,9 @@ status such as `77`, or a protocol term such as `X-SDSYNC-CSRF`.
 
 1. Use the [release selector](release-selector.md) with the exact NAS model, DSM branch/build, and
    `uname -m` value. Do not choose an SPK from a marketing CPU label alone.
-2. For this native AppWindow flow, select a published 26.10-or-later SPK. Verify it against the same
-   release's `SHA256SUMS`, then install it through **Package Center > Manual Install**.
+2. For this native AppWindow flow, select a published, non-blocked 26.10-or-later SPK; never select
+   26.20. Verify it against the same release's `SHA256SUMS`, then install it through
+   **Package Center > Manual Install**.
 3. Grant the package's actual **System internal user** read-only access to the intended local source
    share. The package grants itself no share access.
 4. Start the package and open **Synology Drive Sync** from the DSM desktop or Package Center. The

@@ -46,6 +46,11 @@ policy.
 > later only when that release is published and its exact SPK/checksum are verified; repository
 > source or a draft artifact is not physical-DSM installation proof.
 
+> [!WARNING]
+> Release 26.20 has a DSM authentication bug: it rejects DSM's standard `system:system` (`1:1`)
+> `authenticate.cgi`. Use 26.21 or later after verifying its exact SPK and checksum. Do not change
+> the helper link, ownership, mode, package groups, or package privilege policy.
+
 The current corrected source contract requests no root run-as, joined web group, Linux capability,
 set-user-ID bit, or set-group-ID bit. Every executable, including `ui/api.cgi`, is ordinary `0755`,
 and `conf/privilege` contains exactly:
@@ -139,8 +144,9 @@ Semantic stage `dsm_authentication` identifies the server-side DSM identity boun
 codes are:
 
 - `dsm_authentication_helper_unsafe` with status 503: `X_OK` succeeded, but the fixed helper entry, a
-  symlink boundary, resolved ancestor, final executable, or immediate pre-execution identity failed
-  root-owner/non-writability/type/stability validation;
+  root-owned symlink boundary/ancestor, the final DSM `system:system` (`1:1`) or legacy root-owned
+  executable, or immediate pre-execution identity failed owner/non-writability/type/stability
+  validation;
 - `dsm_authentication_helper_unavailable` with status 503: the fixed-path `X_OK` probe failed with
   anything other than `EACCES`, or a validated executable helper could not start or complete within
   its bound;
@@ -160,8 +166,12 @@ Collect the helper chain and package-UID execute result with read-only checks:
 
 ```bash
 AUTH=/usr/syno/synoman/webman/modules/authenticate.cgi
-PACKAGE_USER=synology-drive-sync
+PACKAGE_USER=$(stat -L -c '%U' /var/packages/synology-drive-sync/home)
 TARGET=$(readlink -f "$AUTH")
+
+case $PACKAGE_USER in
+  ''|root|UNKNOWN) echo 'unsafe or unresolved package identity' >&2; exit 1 ;;
+esac
 
 stat -c '%F %a %u:%g %h %n' "$AUTH"
 stat -Lc '%F %a %u:%g %h %n' "$AUTH"
@@ -180,7 +190,10 @@ Do not replace the helper link, broaden directory or target modes, grant set-id/
 package to DSM's `system` group, add a `conf/resource` acquisition, run the package as root, or call a
 DSM endpoint manually with the cookie. The package probes the exact fixed helper entry before
 inspecting its metadata. If fixed-entry `test -x` succeeds, it validates every ancestor/link boundary
-and the canonical target, then rechecks the final device/inode immediately before direct execution.
+and the canonical target, then rechecks the final device/inode/UID/GID/mode immediately before direct
+execution. Root-owned ancestors and links remain mandatory. The final canonical executable accepts
+DSM's exact built-in `system:system` identity (`1:1`) or the legacy root-owned form; no package group
+membership or permission change is required.
 If that probe fails with `EACCES`, it deliberately skips path validation and selects the bounded
 loopback user-service path—not a request to change permissions. Any other probe error fails closed.
 

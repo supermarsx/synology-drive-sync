@@ -25,9 +25,10 @@ not create DSM users, homes, shared folders, Team Folders, or ACLs.
 
 ## Verify and install
 
-The native AppWindow procedure below applies to a verified 26.10-or-later SPK. Releases 26.7-26.9
-may satisfy the corrected rootless package contract, but they retain
-their originally published UI and do not gain the native AppWindow retroactively.
+The native AppWindow procedure below applies to a verified, non-blocked 26.10-or-later SPK. Never
+install the blocked 26.20 DSM package. Releases 26.7-26.9 may satisfy the corrected rootless package
+contract, but they retain their originally published UI and do not gain the native AppWindow
+retroactively.
 
 1. Verify the asset as described in [Compatibility and release selection](compatibility.md#download-and-verify-one-exact-release).
 2. In DSM, open **Package Center > Manual Install**.
@@ -64,9 +65,10 @@ membership, and a package CSRF token for mutation. The AppWindow exactly-once-en
 keeps it only in module memory, and sends it only as the package `X-SYNO-TOKEN` header. The ordinary
 package-owned `0755` CGI fails closed unless Webman starts it with the exact non-root package UID. It
 first probes `X_OK` on DSM's fixed `authenticate.cgi`, before path or metadata validation. When that
-probe succeeds, it resolves the helper through a fully root-owned, non-group/world-writable ancestor
-and symlink chain, validates the canonical executable, and revalidates its identity immediately
-before direct execution. When the probe returns `EACCES`—as with a protected `root:system 0750`
+probe succeeds, it resolves the helper through a root-owned, non-group/world-writable ancestor and
+symlink chain, accepts DSM's standard exact `system:system` (`1:1`) canonical executable or the
+legacy root-owned form, and revalidates its identity immediately before direct execution. When the
+probe returns `EACCES`—as with a protected `root:system 0750`
 layout—the CGI skips the validator and uses a bounded loopback-only DSM user-service request with the
 current cookie and optional token as headers. Every other probe error fails closed. The fallback
 requires valid `Session.user` plus exact `is_admin=true`. It independently
@@ -74,7 +76,7 @@ resolves the resulting NSS identity and administrator membership without changin
 package privileges, or DSM helper metadata. It then
 relays a bounded assertion and request through the fixed package-owned Unix socket, which remains
 `0000` before startup commit and activates on the same inode as `0600`. The package-user service
-never executes that root-owned helper; it verifies the package-UID peer, strict relay/request,
+never executes that DSM authentication helper; it verifies the package-UID peer, strict relay/request,
 independently resolved UID/name/administrator membership, recomputed session binding, policy, and
 package CSRF. The native AppWindow does not parse or rewrite the DSM shell location and never places
 SynoToken in a launch URL, history, request body, persistent storage, or logs. Never copy a DSM

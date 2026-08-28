@@ -209,7 +209,10 @@ test("selector form remains one raw HTML block for mdBook", () => {
     assert.match(submitButton[1], /\baria-hidden="true"/);
     assert.match(submitButton[1], /\bfocusable="false"/);
     assert.match(submitButton[1], /Find my release/);
-    assert.match(source, /DSM package safety hold:[\s\S]*releases `26\.5` or `26\.6`/);
+    assert.match(
+        source,
+        /DSM package safety hold:[\s\S]*releases `26\.5`, `26\.6`, or[\s\S]*`26\.20`/,
+    );
     assert.match(
         source,
         /\[GitHub Releases\]\(https:\/\/github\.com\/supermarsx\/synology-drive-sync\/releases\)/,
@@ -1065,11 +1068,12 @@ test("live GitHub asset must exist and be uploaded before an exact link is emitt
     assert.equal(redirected.exact, false);
 });
 
-test("known-invalid 26.5 and 26.6 DSM SPKs are never recommended", () => {
+test("known-invalid DSM SPK releases are never recommended", () => {
     const base = resolve({});
     const expectedReasons = new Map([
         ["26.5", /identity-changing\/set-ID privilege metadata/],
         ["26.6", /Synology-only sysnotify resource worker/],
+        ["26.20", /system:system \(UID:GID 1:1\) canonical authentication helper/],
     ]);
 
     for (const [tag, expectedReason] of expectedReasons) {
@@ -1094,7 +1098,7 @@ test("known-invalid 26.5 and 26.6 DSM SPKs are never recommended", () => {
         assert.equal(result.downloadUrl, "https://github.com/supermarsx/synology-drive-sync/releases", tag);
         assert.match(result.message, new RegExp(`release ${tag.replace(".", "\\.")}`), tag);
         assert.match(result.details, expectedReason, tag);
-        assert.match(result.details, /26\.7 or newer/, tag);
+        assert.match(result.details, /later fixed release/, tag);
     }
 });
 
@@ -1124,7 +1128,7 @@ test("26.7 DSM SPK is accepted only through its exact canonical asset URL", () =
     );
 });
 
-test("26.5 and 26.6 safety hold is scoped to DSM SPKs", () => {
+test("known-invalid DSM safety holds are scoped to SPKs", () => {
     const selections = [
         selector.resolveSelection({
             purpose: "desktop-cli",
@@ -1139,7 +1143,7 @@ test("26.5 and 26.6 safety hold is scoped to DSM SPKs", () => {
         }),
     ];
 
-    for (const tag of ["26.5", "26.6"]) {
+    for (const tag of ["26.5", "26.6", "26.20"]) {
         const releaseAssets = [
             `synology-drive-sync-${tag}-linux-x86_64.tar.gz`,
             `synology-drive-sync-${tag}-rust-sdk.tar.gz`,

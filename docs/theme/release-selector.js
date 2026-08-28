@@ -47,6 +47,8 @@
             "Release 26.5 SPKs contain identity-changing/set-ID privilege metadata that DSM rejects for a third-party package.",
         "26.6":
             "Release 26.6 SPKs request the Synology-only sysnotify resource worker, which DSM rejects for a third-party package.",
+        "26.20":
+            "Release 26.20 SPKs reject DSM's standard system:system (UID:GID 1:1) canonical authentication helper as unsafe.",
     });
     const DSM_PACKAGE_MAXIMUM = Object.freeze({
         major: 7,
@@ -846,7 +848,7 @@
                 ok: false,
                 code: "known_invalid_dsm_spk_release",
                 message: `Do not download or install DSM SPKs from release ${tag}.`,
-                details: `${invalidDsmSpkReason} Review GitHub Releases for a fixed release (26.7 or newer); the selector will verify its exact asset before offering a download.`,
+                details: `${invalidDsmSpkReason} Review GitHub Releases for a later fixed release; the selector will verify its exact asset before offering a download.`,
                 tag,
                 exact: false,
                 releaseCorrelated: true,

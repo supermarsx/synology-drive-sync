@@ -87,7 +87,7 @@ The page does not place secret values in URLs, local storage, session storage, D
 snapshot responses. A replacement travels in one bounded JSON POST over the current same-origin DSM
 session. The ordinary package-owned CGI authenticates that DSM request once, then relays it over the
 fixed package-private `0600` Unix socket. The package-user API service does not execute DSM's
-root-owned authenticator; it verifies the exact package-UID peer, relayed account/session binding,
+authenticator; it verifies the exact package-UID peer, relayed account/session binding,
 administrator membership, policy, package CSRF, and operation/field schema, then publishes the job
 and a separate private secret file atomically and returns only a queued identifier.
 

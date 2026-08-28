@@ -2477,11 +2477,16 @@ fn identity_belongs_to_group(
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn trusted_executable_mode(mode: u32) -> bool {
-    // This predicate is used only for Synology's fixed, root-owned system
-    // authenticate.cgi. DSM may ship that system helper with set-id bits;
-    // package files remain independently required to be ordinary 0755 files.
-    mode & 0o170_000 == 0o100_000 && mode & 0o022 == 0 && mode & 0o111 != 0
+fn trusted_executable_mode(mode: u32, owner: (u32, u32)) -> bool {
+    // Preserve the legacy root-owned helper contract, which may carry set-id
+    // bits. Every non-root owner pair--including DSM's standard system:system
+    // 1:1 target--must remain an ordinary non-set-id executable. Package files
+    // are independently required to be exactly 0755.
+    let root_owned = owner.0 == 0;
+    mode & 0o170_000 == 0o100_000
+        && mode & 0o022 == 0
+        && mode & 0o111 != 0
+        && (root_owned || mode & 0o6000 == 0)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -2789,6 +2794,11 @@ mod linux_runtime {
     use std::ptr;
 
     const MAX_TRUSTED_SYMLINKS: usize = 16;
+    // DSM exposes this built-in account as system:system, but executable trust
+    // is enforced against the exact numeric identities reported by the
+    // kernel rather than adding an NSS dependency to the CGI preflight.
+    const DSM_AUTHENTICATION_HELPER_UID: u32 = 1;
+    const DSM_AUTHENTICATION_HELPER_GID: u32 = 1;
 
     #[derive(Debug)]
     pub(super) struct TrustedExecutable {
@@ -2796,6 +2806,7 @@ mod linux_runtime {
         device: u64,
         inode: u64,
         owner: u32,
+        group: u32,
         mode: u32,
     }
 
@@ -2806,8 +2817,12 @@ mod linux_runtime {
             if metadata.st_dev() != self.device
                 || metadata.st_ino() != self.inode
                 || metadata.st_uid() != self.owner
+                || metadata.st_gid() != self.group
                 || metadata.st_mode() != self.mode
-                || !trusted_executable_mode(metadata.st_mode())
+                || !trusted_executable_mode(
+                    metadata.st_mode(),
+                    (metadata.st_uid(), metadata.st_gid()),
+                )
             {
                 return Err(BridgeError::unsafe_runtime());
             }
@@ -2878,7 +2893,7 @@ mod linux_runtime {
         timeout: Duration,
     ) -> Result<AuthenticatedSession, CgiFailure> {
         let helper = match select_authentication_helper(probe_caller_execute, |path| {
-            validate_trusted_executable(path, Path::new("/"), 0)
+            validate_dsm_authentication_helper(path)
         })? {
             AuthenticationHelperSelection::Loopback => {
                 let username = query_dsm_user_service(inputs, timeout).map_err(|error| {
@@ -3254,17 +3269,52 @@ mod linux_runtime {
         left.st_dev() == right.st_dev()
             && left.st_ino() == right.st_ino()
             && left.st_uid() == right.st_uid()
+            && left.st_gid() == right.st_gid()
             && left.st_mode() == right.st_mode()
+    }
+
+    pub(super) fn trusted_executable_target_owner(
+        owner_uid: u32,
+        owner_gid: u32,
+        boundary_uid: u32,
+        alternate_owner: Option<(u32, u32)>,
+    ) -> bool {
+        owner_uid == boundary_uid
+            || alternate_owner.is_some_and(|(uid, gid)| owner_uid == uid && owner_gid == gid)
     }
 
     pub(super) fn trusted_symlink_boundary(metadata: &fs::Metadata, expected_uid: u32) -> bool {
         metadata.file_type().is_symlink() && metadata.st_uid() == expected_uid
     }
 
+    #[cfg(test)]
     pub(super) fn validate_trusted_executable(
         path: &Path,
         validation_root: &Path,
         expected_uid: u32,
+    ) -> BridgeResult<TrustedExecutable> {
+        validate_trusted_executable_with_target_owner(path, validation_root, expected_uid, None)
+    }
+
+    fn validate_dsm_authentication_helper(path: &Path) -> BridgeResult<TrustedExecutable> {
+        // DSM's fixed path and symlink chain are root-owned while its standard
+        // resolved vendor helper uses the built-in system:system identity
+        // (numeric 1:1). Permit that identity only for the final executable;
+        // every ancestor and symlink remains subject to the root-owned boundary
+        // contract below.
+        validate_trusted_executable_with_target_owner(
+            path,
+            Path::new("/"),
+            0,
+            Some((DSM_AUTHENTICATION_HELPER_UID, DSM_AUTHENTICATION_HELPER_GID)),
+        )
+    }
+
+    fn validate_trusted_executable_with_target_owner(
+        path: &Path,
+        validation_root: &Path,
+        expected_uid: u32,
+        alternate_target_owner: Option<(u32, u32)>,
     ) -> BridgeResult<TrustedExecutable> {
         let root = normalize_within_root(validation_root, validation_root)?;
         let root_metadata =
@@ -3330,8 +3380,15 @@ mod linux_runtime {
 
                 let final_component = index + 1 == components.len();
                 if final_component {
-                    if before.st_uid() != expected_uid || !trusted_executable_mode(before.st_mode())
-                    {
+                    if !trusted_executable_target_owner(
+                        before.st_uid(),
+                        before.st_gid(),
+                        expected_uid,
+                        alternate_target_owner,
+                    ) || !trusted_executable_mode(
+                        before.st_mode(),
+                        (before.st_uid(), before.st_gid()),
+                    ) {
                         return Err(BridgeError::unsafe_runtime());
                     }
                     let after =
@@ -3344,6 +3401,7 @@ mod linux_runtime {
                         device: after.st_dev(),
                         inode: after.st_ino(),
                         owner: after.st_uid(),
+                        group: after.st_gid(),
                         mode: after.st_mode(),
                     });
                 }
@@ -11078,6 +11136,44 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn trusted_dsm_helper_target_owner_policy_is_exact() {
+        assert!(linux_runtime::trusted_executable_target_owner(
+            0,
+            0,
+            0,
+            Some((1, 1))
+        ));
+        assert!(linux_runtime::trusted_executable_target_owner(
+            0,
+            99,
+            0,
+            Some((1, 1))
+        ));
+        assert!(linux_runtime::trusted_executable_target_owner(
+            1,
+            1,
+            0,
+            Some((1, 1))
+        ));
+        assert!(!linux_runtime::trusted_executable_target_owner(
+            1,
+            0,
+            0,
+            Some((1, 1))
+        ));
+        assert!(!linux_runtime::trusted_executable_target_owner(
+            2,
+            1,
+            0,
+            Some((1, 1))
+        ));
+        assert!(!linux_runtime::trusted_executable_target_owner(
+            1, 1, 0, None
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn trusted_dsm_helper_rejects_loops_escapes_and_writable_ancestors() {
         let fixture = TestControlFixture::new("unsafe-auth-helper-links");
         let uid = TestControlFixture::package_uid();
@@ -14100,12 +14196,26 @@ mod tests {
     }
 
     #[test]
-    fn trusted_system_helper_mode_allows_root_set_id_but_rejects_mutable_files() {
-        assert!(trusted_executable_mode(0o100_755));
-        assert!(trusted_executable_mode(0o104_755));
-        assert!(trusted_executable_mode(0o102_755));
+    fn trusted_legacy_root_helper_mode_allows_set_id_but_rejects_mutable_files() {
+        assert!(trusted_executable_mode(0o100_755, (0, 0)));
+        assert!(trusted_executable_mode(0o104_755, (0, 0)));
+        assert!(trusted_executable_mode(0o102_755, (0, 0)));
         for mode in [0o100_775, 0o100_757, 0o040_755, 0o100_644] {
-            assert!(!trusted_executable_mode(mode), "accepted mode {mode:o}");
+            assert!(
+                !trusted_executable_mode(mode, (0, 0)),
+                "accepted root-owned mode {mode:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_standard_dsm_helper_mode_rejects_set_id_bits() {
+        assert!(trusted_executable_mode(0o100_755, (1, 1)));
+        for mode in [0o104_755, 0o102_755] {
+            assert!(
+                !trusted_executable_mode(mode, (1, 1)),
+                "accepted system:system mode {mode:o}"
+            );
         }
     }
 

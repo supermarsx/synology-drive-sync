@@ -45,8 +45,9 @@ web groups, or any set-user-ID/set-group-ID file. `defaults.run-as=package` keep
 exact non-root package UID; the ordinary package-owned `0755` CGI fails closed unless Webman supplies
 that same real/effective UID. The AppWindow obtains the official same-origin `SYNO.API.Auth` version 6
 `method=token` response, exactly-once-encodes it into module memory, and sends it only as the package
-`X-SYNO-TOKEN` header. The CGI probes `X_OK` on DSM's fixed root-owned `authenticate.cgi` before
-inspecting helper metadata. A successful probe triggers full trusted-path validation, immediate
+`X-SYNO-TOKEN` header. The CGI probes `X_OK` on DSM's fixed `authenticate.cgi` entry before
+inspecting helper metadata. A successful probe triggers root-only ancestor/symlink validation, an
+exact root- or DSM `system:system` (`1:1`)-owned canonical executable check, immediate
 pre-execution revalidation, and direct execution. `EACCES` skips the validator and selects a bounded
 loopback-only DSM user-service request carrying the current cookie and optional token as sensitive
 headers; every other probe error fails closed. That response must contain a

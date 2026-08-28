@@ -97,12 +97,15 @@ loopback.
 For an executable helper entry, the CGI resolves it without following an unchecked path: every
 absolute ancestor directory must be root-owned and not group/world writable, every lexical symlink
 boundary must be root-owned and stable across inspection, relative targets may not escape the
-validation root, and loops are rejected. The final canonical target must be a root-owned, executable
-regular file that is not group/world writable. Its device and inode are revalidated immediately
-before direct execution. Symlink mode `0777` is not itself treated as target writability because the
-validated parent directory is the link-mutation boundary. This validation grants no privilege and
-does not change the package UID. An unsafe helper, symlink, ancestor, or revalidation failure always
-fails closed.
+validation root, and loops are rejected. The final canonical target must be an executable regular
+file that is not group/world writable and is owned by DSM's standard exact built-in `system:system`
+identity (`UID:GID 1:1`) or by root for compatibility with legacy layouts. A `system:system` target
+must not carry setuid or setgid bits. Only the final executable may use the `system` identity; every
+ancestor and symlink boundary remains root-owned. The final device, inode, UID, GID, and mode are
+revalidated immediately before direct execution. Symlink mode `0777` is not itself treated as target
+writability because the validated parent directory is the link-mutation boundary. This validation
+grants no privilege and does not change the package UID. Any other owner, unsafe helper mode,
+symlink, ancestor, or revalidation failure always fails closed.
 
 Direct execution clears the inherited environment, forces `REQUEST_METHOD=GET`, and replaces the
 package action query with either an empty query or the percent-encoded `SynoToken` field only. The
@@ -130,7 +133,7 @@ reported username through NSS, rejects root, and independently requires membersh
 or rejects the cookie does not fall back to the user service; nor does any kernel probe failure other
 than permission denial.
 
-The package daemon never executes the root-owned DSM helper or calls the loopback user service. It
+The package daemon never executes the DSM authentication helper or calls the loopback user service. It
 independently resolves the relayed username, checks exact UID/name and administrator consistency, and
 recomputes the cookie/token session binding before authorizing any action.
 
