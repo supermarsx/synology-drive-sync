@@ -719,8 +719,8 @@ def payload_archive(binary: Path, api_binary: Path) -> tuple[bytes, int]:
         HERE / "package/libexec/sdsync-run",
     )
     notice_sources = (
-        REPOSITORY / "LICENSE",
-        REPOSITORY / "THIRD_PARTY_LICENSES.html",
+        REPOSITORY / "license.md",
+        REPOSITORY / "third_party_licenses.html",
         HERE / "licenses/musl-COPYRIGHT",
         HERE / "licenses/DSM_UI_THIRD_PARTY_LICENSES.txt",
     )
@@ -766,7 +766,7 @@ def payload_archive(binary: Path, api_binary: Path) -> tuple[bytes, int]:
         add_bytes(
             archive,
             "share/licenses/synology-drive-sync-LICENSE",
-            (REPOSITORY / "LICENSE").read_bytes(),
+            (REPOSITORY / "license.md").read_bytes(),
             0o644,
         )
         add_bytes(
@@ -778,7 +778,7 @@ def payload_archive(binary: Path, api_binary: Path) -> tuple[bytes, int]:
         add_bytes(
             archive,
             "share/licenses/THIRD_PARTY_LICENSES.html",
-            (REPOSITORY / "THIRD_PARTY_LICENSES.html").read_bytes(),
+            (REPOSITORY / "third_party_licenses.html").read_bytes(),
             0o644,
         )
         add_bytes(
@@ -835,7 +835,7 @@ def create_spk(
         add_bytes(archive, "INFO", info, 0o644)
         add_bytes(archive, "PACKAGE_ICON.PNG", png_icon(64), 0o644)
         add_bytes(archive, "PACKAGE_ICON_256.PNG", png_icon(256), 0o644)
-        license_path = REPOSITORY / "LICENSE"
+        license_path = REPOSITORY / "license.md"
         add_bytes(archive, "LICENSE", license_path.read_bytes(), 0o644)
         archive.addfile(tar_info("LICENSES", 0o755, directory=True))
         add_bytes(
@@ -847,7 +847,7 @@ def create_spk(
         add_bytes(
             archive,
             "LICENSES/THIRD_PARTY_LICENSES.html",
-            (REPOSITORY / "THIRD_PARTY_LICENSES.html").read_bytes(),
+            (REPOSITORY / "third_party_licenses.html").read_bytes(),
             0o644,
         )
         add_bytes(

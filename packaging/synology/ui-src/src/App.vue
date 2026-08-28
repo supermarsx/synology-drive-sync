@@ -420,7 +420,7 @@ const ABOUT_METADATA = Object.freeze({
   maintainerUrl: "https://github.com/supermarsx/synology-drive-sync",
   repository: "https://github.com/supermarsx/synology-drive-sync",
   license: "MIT",
-  licenseUrl: "https://github.com/supermarsx/synology-drive-sync/blob/main/LICENSE",
+  licenseUrl: "https://github.com/supermarsx/synology-drive-sync/blob/main/license.md",
   coreVersion: "0.1.0",
   uiVersion: "1.0.0",
   apiSchema: SNAPSHOT_SCHEMA,

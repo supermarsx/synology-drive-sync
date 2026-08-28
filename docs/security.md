@@ -1,7 +1,7 @@
 # Security
 
 The authoritative disclosure policy and supported-version statement live in the repository's
-[SECURITY.md](https://github.com/supermarsx/synology-drive-sync/blob/main/SECURITY.md). Report suspected
+[security.md](https://github.com/supermarsx/synology-drive-sync/blob/main/security.md). Report suspected
 vulnerabilities through the private channel named there rather than a public issue.
 
 ## Operational security baseline

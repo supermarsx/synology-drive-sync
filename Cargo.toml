@@ -5,20 +5,21 @@ edition = "2024"
 rust-version = "1.88"
 description = "Lean one-way folder sync to Synology Drive-backed folders through File Station WebAPI"
 license = "MIT"
+readme = "readme.md"
 repository = "https://github.com/supermarsx/synology-drive-sync"
 keywords = ["synology", "file-station", "sync", "backup", "cli"]
 categories = ["command-line-utilities", "filesystem"]
 include = [
-    "Cargo.lock",
-    "LICENSE",
-    "README.md",
-    "THIRD_PARTY_LICENSES.html",
-    "build.rs",
-    "config.example.toml",
-    "docs/observability.schema.json",
-    "examples/sdk/**",
-    "src/**",
-    "tests/**",
+    "/Cargo.lock",
+    "/license.md",
+    "/readme.md",
+    "/third_party_licenses.html",
+    "/build.rs",
+    "/config.example.toml",
+    "/docs/observability.schema.json",
+    "/examples/sdk/**",
+    "/src/**",
+    "/tests/**",
 ]
 
 [[example]]

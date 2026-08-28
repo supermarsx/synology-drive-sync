@@ -91,7 +91,7 @@ def cargo_tree_packages(target: str) -> set[str]:
 
 def main() -> None:
     if len(sys.argv) != 3:
-        fail("usage: verify-third-party-notices.py LICENSES.json THIRD_PARTY_LICENSES.html")
+        fail("usage: verify-third-party-notices.py LICENSES.json third_party_licenses.html")
 
     with Path("about.toml").open("rb") as config_file:
         config = tomllib.load(config_file)

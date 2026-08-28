@@ -10,5 +10,5 @@ packaging/systemd
 packaging/windows
 *.log
 *.md
-!README.md
-!LICENSE
+!readme.md
+!license.md

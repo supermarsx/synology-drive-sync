@@ -24,9 +24,33 @@ jobs:
       - name: Audit locked dependencies against fresh RustSec data
         run: bash .github/scripts/run-cargo-audit.sh
       - name: Reproduce third-party notices from Cargo.lock
-        run: bash .github/scripts/generate-third-party-notices.sh "$RUNNER_TEMP/THIRD_PARTY_LICENSES.html"
+        run: bash .github/scripts/generate-third-party-notices.sh "$RUNNER_TEMP/third_party_licenses.html"
       - name: Refuse stale third-party notices
-        run: cmp --silent THIRD_PARTY_LICENSES.html "$RUNNER_TEMP/THIRD_PARTY_LICENSES.html"
+        run: cmp --silent third_party_licenses.html "$RUNNER_TEMP/third_party_licenses.html"
+      - name: Verify Rust crate membership
+        shell: bash
+        run: |
+          set -euo pipefail
+          members="$RUNNER_TEMP/sdsync-cargo-package-members.txt"
+          cargo package -p synology-drive-sync --locked --allow-dirty --list > "$members"
+          for expected in license.md readme.md third_party_licenses.html; do
+            count=$(grep -Fxc "$expected" "$members" || true)
+            [[ "$count" == 1 ]] || {
+              echo "Cargo package must contain root $expected exactly once" >&2
+              exit 1
+            }
+          done
+          if grep -Eq '(^|/)node_modules/|^packaging/' "$members"; then
+            echo 'Cargo package leaked UI/build-only files:' >&2
+            grep -E '(^|/)node_modules/|^packaging/' "$members" >&2
+            exit 1
+          fi
+          for forbidden in LICENSE README.md SECURITY.md CONTRIBUTING.md THIRD_PARTY_LICENSES.html; do
+            if grep -Fxq "$forbidden" "$members"; then
+              echo "Cargo package contains legacy root filename $forbidden" >&2
+              exit 1
+            fi
+          done
 
   test:
     name: Test ${{ matrix.platform }} ${{ matrix.architecture }}
@@ -473,8 +497,8 @@ jobs:
           SDSYNC_USERNAME: ci-audit
           SDSYNC_SOURCE: ${{ github.workspace }}
           SDSYNC_REMOTE: /ci-audit
-          SDSYNC_PASSWORD_FILE: ${{ github.workspace }}/LICENSE
-          SDSYNC_TOTP_SECRET_FILE: ${{ github.workspace }}/LICENSE
+          SDSYNC_PASSWORD_FILE: ${{ github.workspace }}/license.md
+          SDSYNC_TOTP_SECRET_FILE: ${{ github.workspace }}/license.md
           SDSYNC_JOBS: "2"
         run: |
           docker compose -f compose.yaml config --quiet
@@ -485,7 +509,7 @@ jobs:
           SDSYNC_USERNAME: ci-audit
           SDSYNC_SOURCE: ${{ github.workspace }}
           SDSYNC_REMOTE: /ci-audit
-          SDSYNC_PASSWORD_FILE: ${{ github.workspace }}/LICENSE
+          SDSYNC_PASSWORD_FILE: ${{ github.workspace }}/license.md
           SDSYNC_JOBS: "2"
           DOCKER_BUILDKIT: "1"
         run: docker compose -f compose.yaml build sync
@@ -495,8 +519,8 @@ jobs:
           SDSYNC_USERNAME: ci-audit
           SDSYNC_SOURCE: ${{ github.workspace }}
           SDSYNC_REMOTE: /ci-audit
-          SDSYNC_PASSWORD_FILE: ${{ github.workspace }}/LICENSE
-          SDSYNC_TOTP_SECRET_FILE: ${{ github.workspace }}/LICENSE
+          SDSYNC_PASSWORD_FILE: ${{ github.workspace }}/license.md
+          SDSYNC_TOTP_SECRET_FILE: ${{ github.workspace }}/license.md
           SDSYNC_JOBS: "2"
         run: |
           set -euo pipefail
@@ -510,7 +534,7 @@ jobs:
           docker compose -f compose.yaml run --rm --no-deps -T \
             --entrypoint /bin/sh sync -eu -c '
               [ "$(id -u):$(id -g)" = "10001:10001" ]
-              [ -r /source/LICENSE ]
+              [ -r /source/license.md ]
               [ -s /run/secrets/sdsync_password ]
               [ -r /run/secrets/sdsync_password ]
             '
@@ -518,7 +542,7 @@ jobs:
           docker compose -f compose.yaml -f compose.totp.yaml run \
             --rm --no-deps -T --entrypoint /bin/sh sync -eu -c '
               [ "$(id -u):$(id -g)" = "10001:10001" ]
-              [ -r /source/LICENSE ]
+              [ -r /source/license.md ]
               [ -s /run/secrets/sdsync_password ]
               [ -r /run/secrets/sdsync_password ]
               [ -s /run/secrets/sdsync_totp ]

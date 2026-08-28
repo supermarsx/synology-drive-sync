@@ -10,7 +10,7 @@ download_url="https://github.com/EmbarkStudios/cargo-about/releases/download/$ve
 
 repository_root=$(git rev-parse --show-toplevel)
 cd "$repository_root"
-output=${1:-THIRD_PARTY_LICENSES.html}
+output=${1:-third_party_licenses.html}
 
 temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/sdsync-cargo-about.XXXXXXXX")
 cleanup() {

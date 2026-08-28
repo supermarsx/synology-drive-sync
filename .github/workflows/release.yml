@@ -365,7 +365,10 @@ jobs:
           binary="target/$TARGET/release/synology-drive-sync"
           mkdir -p "$package_root/completions" "$package_root/man"
           install -m 0755 "$binary" "$package_root/synology-drive-sync"
-          install -m 0644 LICENSE README.md SECURITY.md THIRD_PARTY_LICENSES.html "$package_root/"
+          install -m 0644 license.md "$package_root/LICENSE"
+          install -m 0644 readme.md "$package_root/README.md"
+          install -m 0644 security.md "$package_root/SECURITY.md"
+          install -m 0644 third_party_licenses.html "$package_root/THIRD_PARTY_LICENSES.html"
           "$binary" completions bash > "$package_root/completions/synology-drive-sync.bash"
           "$binary" completions zsh > "$package_root/completions/_synology-drive-sync"
           "$binary" completions fish > "$package_root/completions/synology-drive-sync.fish"
@@ -396,7 +399,8 @@ jobs:
           mkdir -p "$sdk_package/include" "$sdk_package/lib" "$sdk_package/examples/ffi"
           install -m 0644 include/sdsync.h "$sdk_package/include/sdsync.h"
           install -m 0644 examples/ffi/basic.c "$sdk_package/examples/ffi/basic.c"
-          install -m 0644 LICENSE THIRD_PARTY_LICENSES.html "$sdk_package/"
+          install -m 0644 license.md "$sdk_package/LICENSE"
+          install -m 0644 third_party_licenses.html "$sdk_package/THIRD_PARTY_LICENSES.html"
           case "$PLATFORM" in
             linux) library="target/$TARGET/ffi-release/libsdsync.so" ;;
             macos) library="target/$TARGET/ffi-release/libsdsync.dylib" ;;
@@ -563,7 +567,10 @@ jobs:
           New-Item -ItemType Directory -Path $completionRoot, $manRoot | Out-Null
           $binary = Join-Path "target/$env:TARGET/release" 'synology-drive-sync.exe'
           Copy-Item -LiteralPath $binary -Destination $packageRoot
-          Copy-Item -LiteralPath LICENSE, README.md, SECURITY.md, THIRD_PARTY_LICENSES.html -Destination $packageRoot
+          Copy-Item -LiteralPath license.md -Destination (Join-Path $packageRoot 'LICENSE')
+          Copy-Item -LiteralPath readme.md -Destination (Join-Path $packageRoot 'README.md')
+          Copy-Item -LiteralPath security.md -Destination (Join-Path $packageRoot 'SECURITY.md')
+          Copy-Item -LiteralPath third_party_licenses.html -Destination (Join-Path $packageRoot 'THIRD_PARTY_LICENSES.html')
           & $binary completions bash | Out-File (Join-Path $completionRoot 'synology-drive-sync.bash') -Encoding utf8
           if ($LASTEXITCODE -ne 0) { throw 'bash completion generation failed' }
           & $binary completions zsh | Out-File (Join-Path $completionRoot '_synology-drive-sync') -Encoding utf8
@@ -602,7 +609,8 @@ jobs:
           New-Item -ItemType Directory -Path $includeRoot, $libraryRoot, $exampleRoot | Out-Null
           Copy-Item -LiteralPath include/sdsync.h -Destination (Join-Path $includeRoot 'sdsync.h')
           Copy-Item -LiteralPath examples/ffi/basic.c -Destination (Join-Path $exampleRoot 'basic.c')
-          Copy-Item -LiteralPath LICENSE, THIRD_PARTY_LICENSES.html -Destination $sdkPackage
+          Copy-Item -LiteralPath license.md -Destination (Join-Path $sdkPackage 'LICENSE')
+          Copy-Item -LiteralPath third_party_licenses.html -Destination (Join-Path $sdkPackage 'THIRD_PARTY_LICENSES.html')
           $targetRoot = "target/$env:TARGET/ffi-release"
           $dll = Join-Path $targetRoot 'sdsync.dll'
           $dllBytes = [IO.File]::ReadAllBytes($dll)
@@ -1262,7 +1270,7 @@ jobs:
             "$SHA"
           install -m 0755 packaging/install.sh dist/install.sh
           install -m 0644 packaging/install.ps1 dist/install.ps1
-          install -m 0644 THIRD_PARTY_LICENSES.html dist/THIRD_PARTY_LICENSES.html
+          install -m 0644 third_party_licenses.html dist/THIRD_PARTY_LICENSES.html
           for synology_arch in armv7 armv8 i686 x86_64; do
             python3 packaging/synology/validate_spk.py \
               --arch "$synology_arch" \

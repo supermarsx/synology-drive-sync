@@ -417,7 +417,7 @@ def validate_rendered_compose_identity() -> None:
             "SDSYNC_USERNAME": "service-validator",
             "SDSYNC_SOURCE": str(ROOT),
             "SDSYNC_REMOTE": "/service-validator",
-            "SDSYNC_PASSWORD_FILE": str(ROOT / "LICENSE"),
+            "SDSYNC_PASSWORD_FILE": str(ROOT / "license.md"),
             "SDSYNC_RUNTIME_UID": "12345",
             "SDSYNC_RUNTIME_GID": "23456",
         }

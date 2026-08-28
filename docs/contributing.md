@@ -1,7 +1,7 @@
 # Contributing
 
 The authoritative contributor workflow lives in
-[CONTRIBUTING.md](https://github.com/supermarsx/synology-drive-sync/blob/main/CONTRIBUTING.md).
+[contributing.md](https://github.com/supermarsx/synology-drive-sync/blob/main/contributing.md).
 
 Before proposing a change:
 

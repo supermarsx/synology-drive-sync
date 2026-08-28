@@ -1,10 +1,10 @@
 # License and third-party notices
 
 `synology-drive-sync` is distributed under the
-[MIT License](https://github.com/supermarsx/synology-drive-sync/blob/main/LICENSE).
+[MIT License](https://github.com/supermarsx/synology-drive-sync/blob/main/license.md).
 
 The generated
-[third-party notices](https://github.com/supermarsx/synology-drive-sync/blob/main/THIRD_PARTY_LICENSES.html)
+[third-party notices](https://github.com/supermarsx/synology-drive-sync/blob/main/third_party_licenses.html)
 record the locked Rust release-dependency graph and are shipped with release artifacts. CI regenerates
 the notice document from Cargo metadata and refuses a stale tracked copy. DSM SPKs also contain
 [AppWindow bundled-code notices](https://github.com/supermarsx/synology-drive-sync/blob/main/packaging/synology/licenses/DSM_UI_THIRD_PARTY_LICENSES.txt)

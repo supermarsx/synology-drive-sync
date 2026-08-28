@@ -46,7 +46,8 @@ RUN apt-get update && \
 
 COPY --from=builder --chown=root:root /tmp/synology-drive-sync /usr/local/bin/synology-drive-sync
 COPY --chown=root:root packaging/docker/entrypoint.sh /usr/local/bin/container-entrypoint
-COPY --chown=root:root LICENSE THIRD_PARTY_LICENSES.html /usr/share/licenses/synology-drive-sync/
+COPY --chown=root:root license.md /usr/share/licenses/synology-drive-sync/LICENSE
+COPY --chown=root:root third_party_licenses.html /usr/share/licenses/synology-drive-sync/THIRD_PARTY_LICENSES.html
 
 RUN chmod 0755 /usr/local/bin/synology-drive-sync /usr/local/bin/container-entrypoint
 

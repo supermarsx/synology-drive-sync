@@ -27,8 +27,10 @@ unless Webman uses that same real/effective UID. The AppWindow obtains Synology'
 module memory, and sends it only as `X-SYNO-TOKEN` to the package CGI; it never transports the token
 through a launch URL, history, request body, persistent storage, or logs. The CGI probes `X_OK` on
 DSM's exact fixed `authenticate.cgi` before inspecting helper metadata. A successful probe undergoes
-full trusted-path validation and pre-execution revalidation. `EACCES` skips that validator and selects
-the bounded loopback-only DSM user-service request carrying the current cookie and token as headers;
+full trusted-path validation and pre-execution revalidation: ancestors and symlinks remain root-owned,
+while the canonical executable accepts DSM's standard exact `system:system` (`1:1`) ownership and the
+legacy root-owned form. `EACCES` skips that validator and selects the bounded loopback-only DSM
+user-service request carrying the current cookie and token as headers;
 all other probe errors fail closed. The loopback response requires both a valid session user and
 DSM's administrator flag. It then independently resolves the account and administrator membership
 before relaying over a fixed package-owned Unix socket that is
@@ -42,6 +44,11 @@ privilege for either path. See the
 > `pkgmgr_worker_violation`. Use 26.7 or later only when that release is published and its exact
 > SPK/checksum are verified. Published assets are not repaired in place, and repository validation
 > is not physical-DSM installation proof.
+
+> [!WARNING]
+> Release 26.20 has a DSM authentication bug: it rejects DSM's standard `system:system` (`1:1`)
+> `authenticate.cgi`. Use 26.21 or later after verifying its exact SPK and checksum. Never change
+> DSM-owned helper files to work around an incompatible package.
 
 > [!IMPORTANT]
 > The automated suite uses deterministic local and mock-HTTP tests; it does not log in to a live NAS. Before trusting a deployment, run the [source and target diagnostics](docs/diagnostics-and-batch.md), review `plan`, complete the [disposable live-NAS acceptance](docs/production-acceptance.md), and keep `--delete` disabled.
@@ -368,7 +375,7 @@ Excluded paths are outside the sync scope, not considered absent. Matching remot
 
 Hidden regular files are included. Symlinks, junctions/reparse points, special or unreadable entries, non-UTF-8 names, unsafe Drive names, case collisions, and obvious platform path overflows fail preflight before remote mutation. The selected remote prefix is included in Drive portability and path-length checks, and case variants across the local and remote hierarchies fail before File Station can create both spellings. File Station CIFS/NFS/ISO/remote mounts are never traversed or deleted.
 
-Path checks and later file opens are not a transactional filesystem snapshot. Run under an unprivileged account that exclusively owns the source, keep the tree quiescent during synchronization, and never run elevated over a source that another user or less-trusted process can rename or replace. A concurrent path-component swap can otherwise race portable link/reparse checks and redirect a later traversal or upload outside the tree that was originally inspected. See [Security policy](SECURITY.md).
+Path checks and later file opens are not a transactional filesystem snapshot. Run under an unprivileged account that exclusively owns the source, keep the tree quiescent during synchronization, and never run elevated over a source that another user or less-trusted process can rename or replace. A concurrent path-component swap can otherwise race portable link/reparse checks and redirect a later traversal or upload outside the tree that was originally inspected. See [Security policy](security.md).
 
 The default `--compare content` requires matching byte length, MD5, and file mtime at File Station's one-second resolution. An upload is successful only after the local file is rehashed and the exact remote destination reports the expected bytes; a final rescan and replan also enforce the expected mtime before success. The correspondence is rebuilt from current local and NAS state on every run; there is no persistent path/hash database that can become stale.
 
@@ -464,8 +471,8 @@ published separately for `linux/amd64` and `linux/arm64` as both `YY.N` and `lat
 Use the [release selector](docs/release-selector.md) to resolve an exact Synology model/DSM/runtime
 combination or desktop OS/CPU, then see [Release artifacts and verification](docs/releases.md) before
 deploying in a sensitive environment. Pin a calendar version or container digest rather than relying
-on mutable `latest`. For DSM, reject 26.5 and 26.6 even if the selector matches their architecture;
-use a 26.7-or-later SPK only when that release is published.
+on mutable `latest`. For DSM, reject 26.5, 26.6, and 26.20 even if the selector matches their
+architecture; use a non-blocked 26.7-or-later SPK only when that release is published.
 
 ## Failure clues
 
@@ -510,8 +517,8 @@ cargo build --profile ffi-release --locked -p synology-drive-sync-ffi
 The CLI intentionally uses the ordinary release profile. Build the C ABI with `ffi-release` so
 Rust panics unwind into its containment boundary instead of aborting the embedding process.
 
-See [Testing and coverage](docs/testing.md), [CONTRIBUTING.md](CONTRIBUTING.md), and
-[SECURITY.md](SECURITY.md). Tests do not read or write the host OS credential vault.
+See [Testing and coverage](docs/testing.md), [contributing.md](contributing.md), and
+[security.md](security.md). Tests do not read or write the host OS credential vault.
 
 ## Official references
 
@@ -526,5 +533,5 @@ See [Testing and coverage](docs/testing.md), [CONTRIBUTING.md](CONTRIBUTING.md),
 
 ## License
 
-[MIT](LICENSE). Dependency license texts and attributions are in
-[THIRD_PARTY_LICENSES.html](THIRD_PARTY_LICENSES.html).
+[MIT](license.md). Dependency license texts and attributions are in
+[third_party_licenses.html](third_party_licenses.html).
