@@ -57,6 +57,24 @@ function overlapsVertically(a, b) {
   return Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 4;
 }
 
+function cssGridTrackCount(value) {
+  const source = String(value || "").trim();
+  if (!source || source === "none") return 0;
+  let depth = 0;
+  let tracks = 1;
+  let betweenTracks = false;
+  for (const character of source) {
+    if (character === "(") depth += 1;
+    else if (character === ")") depth = Math.max(0, depth - 1);
+    else if (/\s/.test(character) && depth === 0) betweenTracks = true;
+    else if (betweenTracks && depth === 0) {
+      tracks += 1;
+      betweenTracks = false;
+    }
+  }
+  return tracks;
+}
+
 function decodeLayout(stdout) {
   const match = stdout.match(/data-layout="([A-Za-z0-9+/=]+)"/);
   assert.ok(match, `headless browser did not expose computed layout:\n${stdout.slice(-2000)}`);
@@ -237,6 +255,8 @@ test("computed-layout browser gate has one authoritative CI lane and reviewed ma
   assert.equal(shouldRetryRender({ error: { code: "ETIMEDOUT" }, stdout: "" }), true);
   assert.equal(shouldRetryRender({ error: null, stdout: "" }), true);
   assert.equal(shouldRetryRender({ error: null, stdout: 'data-layout="e30="' }), false);
+  assert.equal(cssGridTrackCount("minmax(0px, 1fr)"), 1);
+  assert.equal(cssGridTrackCount("190px minmax(0px, 1fr)"), 2);
 });
 
 test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS selectors", {
@@ -282,6 +302,33 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
         border: 3px solid #ddd !important;
         background: #fff !important;
         box-shadow: 0 2px 4px #aaa !important;
+      }
+      .dsm-host .v-form-item-input.fit-container,
+      .dsm-host .v-form-item-control.fit-container,
+      .dsm-host .v-textfield.fit-container,
+      .dsm-host .v-textfield-input.fit-container,
+      .dsm-host .v-textfield-input-inner.fit-container {
+        display: inline-block !important;
+        inline-size: 84px !important;
+        width: 84px !important;
+        max-inline-size: 84px !important;
+        max-width: 84px !important;
+        min-inline-size: 84px !important;
+        min-width: 84px !important;
+        flex: 0 0 84px !important;
+        margin: 19px !important;
+        padding: 13px !important;
+        background: #fff !important;
+      }
+      .dsm-host input.v-textfield-input-element.fit-container,
+      .dsm-host textarea.v-textfield-input-element.fit-container {
+        inline-size: 64px !important;
+        width: 64px !important;
+        max-inline-size: 64px !important;
+        max-width: 64px !important;
+        min-inline-size: 64px !important;
+        min-width: 64px !important;
+        flex: 0 0 64px !important;
       }
       .dsm-host .dsm-select,
       .dsm-host [role="combobox"] {
@@ -412,19 +459,6 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
           <div id="window-shell">
             <form id="settings-panel" class="sdsync-settings-panel">
               ${physicalControlFixture}
-              <div id="input-row" class="dsm-form-item sdsync-form-item">
-                <div id="input-label-shell" class="dsm-private-label"><label>Search</label></div>
-                <div id="input-control-shell" class="dsm-private-control-shell">
-                  <div id="input-root" class="sdsync-input-control">
-                    <span class="dsm-owned-decoration" aria-hidden="true"></span>
-                    <div id="input-shell-one" class="dsm-private-input-shell">
-                      <div id="input-shell-two" class="dsm-private-input-shell">
-                        <input id="text-input" class="dsm-text-input" value="request identifier">
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
             </form>
             <form id="routine-panel" class="sdsync-panel sdsync-horizontal-form sdsync-routine-editor">
               <div class="sdsync-form-grid compact sdsync-routine-fields">
@@ -440,20 +474,56 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
                 </div>
               </div>
             </form>
-            <form id="profile-editor" class="sdsync-panel sdsync-editor">
-              <div class="sdsync-form-grid">
-                <div id="editor-row" class="dsm-form-item sdsync-form-item">
-                  <div id="editor-label-shell" class="v-form-item-label"><label>Target</label></div>
-                  <div id="editor-control-shell" class="v-form-item-input">
-                    <div class="v-form-item-control">
-                      <div id="editor-input-root" class="sdsync-input-control">
-                        <input id="editor-input" class="dsm-text-input" value="https://nas.example.test">
+            <div id="profile-layout" class="sdsync-profiles-layout is-editor-only">
+              <form id="profile-editor" class="sdsync-panel sdsync-editor sdsync-profile-editor">
+                <div id="profile-main-grid" class="sdsync-form-grid">
+                  <div id="editor-row" class="dsm-form-item sdsync-form-item">
+                    <div id="editor-label-shell" class="v-form-item-label"><label>Target</label></div>
+                    <div id="editor-control-shell" class="v-form-item-input">
+                      <div class="v-form-item-control">
+                        <div id="editor-input-root" class="sdsync-input-control">
+                          <input id="editor-input" class="dsm-text-input" value="https://nas.example.test">
+                        </div>
                       </div>
                     </div>
                   </div>
+                  <div id="editor-source-row" class="dsm-form-item sdsync-form-item">
+                    <div id="editor-source-label" class="v-form-item-label"><label>Local source</label></div>
+                    <div id="editor-source-control" class="v-form-item-input">
+                      <div class="v-form-item-control"><div class="sdsync-input-control"><input class="dsm-text-input" value="/volume1/source"></div></div>
+                    </div>
+                  </div>
                 </div>
-              </div>
-            </form>
+                <details id="profile-advanced" class="sdsync-advanced" open>
+                  <summary><strong>Advanced profile controls</strong><span>Network and retry policy</span></summary>
+                  <div id="profile-advanced-grid" class="sdsync-form-grid">
+                    <div id="advanced-row" class="dsm-form-item sdsync-form-item">
+                      <div id="advanced-label" class="v-form-item-label"><label>Retries</label></div>
+                      <div id="advanced-control" class="v-form-item-input">
+                        <div class="v-form-item-control"><div class="sdsync-input-control"><input class="dsm-text-input" value="3"></div></div>
+                      </div>
+                    </div>
+                    <div id="advanced-toggle-row" class="sdsync-toggle-row">
+                      <span id="advanced-toggle-label" class="sdsync-toggle-label">Quiet terminal sink</span>
+                      <div id="advanced-checkbox-root" class="sdsync-checkbox-control"><input type="checkbox" checked aria-label="Quiet terminal sink"></div>
+                    </div>
+                  </div>
+                </details>
+                <fieldset id="profile-danger" class="sdsync-danger-fieldset">
+                  <legend>Deletion guard</legend>
+                  <div id="danger-toggle-row" class="sdsync-toggle-row is-danger">
+                    <span id="danger-toggle-label" class="sdsync-toggle-label">Mirror remote deletions</span>
+                    <div id="danger-checkbox-root" class="sdsync-checkbox-control"><input type="checkbox" aria-label="Mirror remote deletions"></div>
+                  </div>
+                  <div id="danger-row" class="dsm-form-item sdsync-form-item">
+                    <div id="danger-label" class="v-form-item-label"><label>Maximum deletions per run</label></div>
+                    <div id="danger-control" class="v-form-item-input">
+                      <div class="v-form-item-control"><div class="sdsync-input-control"><input class="dsm-text-input" value="100"></div></div>
+                    </div>
+                  </div>
+                </fieldset>
+              </form>
+            </div>
           </div>
           <div id="variant-rack">
             <div class="variant">
@@ -506,10 +576,14 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
           const requestedWidth = Number(new URLSearchParams(location.search).get("container")) || 900;
           document.getElementById("window-shell").style.width = requestedWidth + "px";
           installControlLayout(document.querySelector(".sdsync-app"));
-          const rect = (id) => {
-            const value = document.getElementById(id).getBoundingClientRect();
-            return { left: value.left, right: value.right, top: value.top, bottom: value.bottom, width: value.width, height: value.height };
-          };
+           const rect = (id) => {
+             const value = document.getElementById(id).getBoundingClientRect();
+             return { left: value.left, right: value.right, top: value.top, bottom: value.bottom, width: value.width, height: value.height };
+           };
+           const overflow = (id) => {
+             const value = document.getElementById(id);
+             return { clientWidth: value.clientWidth, scrollWidth: value.scrollWidth };
+           };
           const style = (id) => {
             const value = getComputedStyle(document.getElementById(id));
             return {
@@ -559,15 +633,34 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
             control: { rect: rect(control), style: style(control) }
           });
           const result = {
-            viewport: innerWidth,
-            container: rect("settings-panel"),
+             viewport: innerWidth,
+             container: rect("settings-panel"),
+             windowShellOverflow: overflow("window-shell"),
              selectForm: formRow("select-row", "select-label-shell", "select-control-shell"),
              inputForm: formRow("input-row", "input-label-shell", "input-control-shell"),
+             textareaForm: formRow("textarea-row", "textarea-label-shell", "textarea-control-shell"),
              routineForm: formRow("routine-row", "routine-label-shell", "routine-control-shell"),
              editorForm: formRow("editor-row", "editor-label-shell", "editor-control-shell"),
              editor: {
                rect: rect("profile-editor"),
                compact: document.getElementById("profile-editor").classList.contains("sdsync-compact-form")
+             },
+             profile: {
+               layout: { rect: rect("profile-layout"), style: style("profile-layout"), overflow: overflow("profile-layout") },
+               editor: { rect: rect("profile-editor"), style: style("profile-editor") },
+               mainGrid: { rect: rect("profile-main-grid"), style: style("profile-main-grid") },
+               advancedGrid: { rect: rect("profile-advanced-grid"), style: style("profile-advanced-grid") },
+               danger: { rect: rect("profile-danger"), style: style("profile-danger") },
+               rows: {
+                 target: formRow("editor-row", "editor-label-shell", "editor-control-shell"),
+                 source: formRow("editor-source-row", "editor-source-label", "editor-source-control"),
+                 advanced: formRow("advanced-row", "advanced-label", "advanced-control"),
+                 danger: formRow("danger-row", "danger-label", "danger-control")
+               },
+               toggles: {
+                 advanced: { row: rect("advanced-toggle-row"), label: rect("advanced-toggle-label"), control: rect("advanced-checkbox-root") },
+                 danger: { row: rect("danger-toggle-row"), label: rect("danger-toggle-label"), control: rect("danger-checkbox-root") }
+               }
              },
             formSelect: selectVariant("form-select-root", "form-select-shell-one", "form-select-input", "form-select-trigger", ["form-select-shell-one", "form-select-shell-two"]),
             formSelectPrefixStyle: style("form-select-prefix"),
@@ -575,11 +668,16 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
             formSelectInputStyle: style("form-select-input"),
             formSelectShellStyles: ["form-select-shell-one", "form-select-shell-two"].map(style),
             selectControlPath: ["select-control-shell", "select-control-inner", "select-control-anonymous"].map((id) => ({ rect: rect(id), style: style(id) })),
-            inputRoot: { rect: rect("input-root"), style: style("input-root") },
-            inputShells: [rect("input-shell-one"), rect("input-shell-two")],
-            inputShellStyles: [style("input-shell-one"), style("input-shell-two")],
-            textInputStyle: style("text-input"),
-            textInput: rect("text-input"),
+             inputRoot: { rect: rect("input-root"), style: style("input-root") },
+             inputControlPath: ["input-control-shell", "input-control-inner", "input-control-anonymous"].map((id) => ({ rect: rect(id), style: style(id) })),
+             inputShells: [rect("input-shell-one"), rect("input-shell-two")],
+             inputShellStyles: [style("input-shell-one"), style("input-shell-two")],
+             textInputStyle: style("text-input"),
+             textInput: rect("text-input"),
+             textareaRoot: { rect: rect("textarea-root"), style: style("textarea-root") },
+             textareaControlPath: ["textarea-control-shell", "textarea-control-inner", "textarea-control-anonymous"].map((id) => ({ rect: rect(id), style: style(id) })),
+             textareaShell: { rect: rect("textarea-shell-one"), style: style("textarea-shell-one") },
+             textareaInput: { rect: rect("textarea-input"), style: style("textarea-input") },
              checkRow: rect("check-row"),
              toggleLabel: { rect: rect("toggle-label"), style: style("toggle-label") },
              checkboxRoot: { rect: rect("checkbox-root"), style: style("checkbox-root") },
@@ -613,8 +711,9 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
     const wide = render(chrome, `${url}?container=900`, join(temporaryDirectory, "profile-wide"));
     const medium = render(chrome, `${url}?container=640`, join(temporaryDirectory, "profile-medium"));
     const narrow = render(chrome, `${url}?container=380`, join(temporaryDirectory, "profile-narrow"));
+    const profileRows = (layout) => Object.values(layout.profile.rows);
 
-    for (const form of [wide.selectForm, wide.inputForm, wide.routineForm, wide.editorForm]) {
+    for (const form of [wide.selectForm, wide.inputForm, wide.textareaForm, wide.routineForm, ...profileRows(wide)]) {
       assert.equal(form.row.style.display, "grid");
       assert.match(form.row.style.gridTemplateColumns, /\S+\s+\S+/);
       assert.equal(form.row.style.marginTop, "0px");
@@ -682,6 +781,83 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
     }
     assert.equal(wide.textInputStyle.backgroundColor, "rgba(0, 0, 0, 0)", "semantic input obscured its dark owned root");
 
+    for (const [layoutName, layout] of [["wide", wide], ["medium", medium], ["narrow", narrow]]) {
+      for (const control of [
+        {
+          name: "input",
+          form: layout.inputForm,
+          root: layout.inputRoot,
+          semantic: { rect: layout.textInput, style: layout.textInputStyle },
+          shells: layout.inputShells.map((rect, index) => ({ rect, style: layout.inputShellStyles[index] })),
+          path: layout.inputControlPath
+        },
+        {
+          name: "textarea",
+          form: layout.textareaForm,
+          root: layout.textareaRoot,
+          semantic: layout.textareaInput,
+          shells: [layout.textareaShell],
+          path: layout.textareaControlPath
+        }
+      ]) {
+        const context = `${layoutName} ${control.name}`;
+        assert.equal(control.root.style.backgroundColor, "rgb(16, 7, 6)", `${context} root kept a white DSM surface`);
+        assert.ok(control.root.rect.width >= control.form.control.rect.width - 1,
+          `${context} root did not fill its form control track`);
+        assert.ok(control.semantic.rect.width >= control.root.rect.width * 0.75,
+          `${context} semantic control remained crunched by fit-container`);
+        assert.ok(control.semantic.rect.right <= control.root.rect.right + 0.1,
+          `${context} semantic control overflowed its owned root`);
+        assert.equal(control.semantic.style.minWidth, "0px",
+          `${context} semantic control retained the fit-container minimum width`);
+        assert.notEqual(control.semantic.style.maxWidth, "64px",
+          `${context} semantic control retained the fit-container maximum width`);
+        assert.equal(control.semantic.style.marginLeft, "0px",
+          `${context} semantic control retained a hostile outer margin`);
+        assert.equal(control.semantic.style.backgroundColor, "rgba(0, 0, 0, 0)",
+          `${context} semantic control obscured its dark owned root`);
+        for (const shell of control.shells) {
+          assert.ok(shell.rect.width >= control.root.rect.width * 0.75,
+            `${context} nested textfield shell remained fit-content instead of using the owned root`);
+          assert.ok(shell.rect.right <= control.root.rect.right + 0.1,
+            `${context} nested textfield shell overflowed its owned root`);
+          assert.equal(shell.style.marginLeft, "0px", `${context} DSM shell retained a hostile outer margin`);
+          assert.equal(shell.style.backgroundColor, "rgba(0, 0, 0, 0)", `${context} DSM shell kept a white host surface`);
+        }
+        for (const shell of control.path) {
+          assert.ok(shell.rect.width >= control.form.control.rect.width - 1,
+            `${context} form-item shell remained fit-content instead of filling the control track`);
+          assert.ok(shell.rect.right <= control.form.control.rect.right + 0.1,
+            `${context} form-item shell overflowed its control track`);
+          assert.equal(shell.style.marginLeft, "0px", `${context} form-item shell retained a hostile outer margin`);
+          assert.equal(shell.style.backgroundColor, "rgba(0, 0, 0, 0)", `${context} form-item shell kept a white host surface`);
+        }
+      }
+      assert.ok(layout.windowShellOverflow.scrollWidth <= layout.windowShellOverflow.clientWidth + 1,
+        `${layoutName} AppWindow acquired horizontal overflow from a form control`);
+
+      for (const grid of [layout.profile.layout, layout.profile.mainGrid, layout.profile.advancedGrid, layout.profile.danger]) {
+        assert.equal(cssGridTrackCount(grid.style.gridTemplateColumns), 1,
+          `${layoutName} profile editor did not keep exactly one configuration track: ${grid.style.gridTemplateColumns}`);
+      }
+      assert.ok(layout.profile.editor.rect.width >= layout.profile.layout.rect.width - 1,
+        `${layoutName} dedicated profile editor did not fill its catalog-replacement track`);
+      assert.ok(layout.profile.layout.overflow.scrollWidth <= layout.profile.layout.overflow.clientWidth + 1,
+        `${layoutName} dedicated profile editor introduced horizontal overflow`);
+      assert.ok(layout.profile.rows.source.row.rect.top >= layout.profile.rows.target.row.rect.bottom - 1,
+        `${layoutName} main profile fields shared a visual line`);
+      assert.ok(layout.profile.toggles.advanced.row.top >= layout.profile.rows.advanced.row.rect.bottom - 1,
+        `${layoutName} advanced field and toggle shared a visual line`);
+      assert.ok(layout.profile.rows.danger.row.rect.top >= layout.profile.toggles.danger.row.bottom - 1,
+        `${layoutName} danger toggle and field shared a visual line`);
+      for (const toggle of Object.values(layout.profile.toggles)) {
+        assert.ok(toggle.label.right <= toggle.control.left + 1,
+          `${layoutName} profile toggle overlapped its label`);
+        assert.ok(toggle.control.right >= toggle.row.right - 1,
+          `${layoutName} profile toggle did not remain at the right edge of its own row`);
+      }
+    }
+
     for (const layout of [wide, medium, narrow]) {
       assert.match(layout.checkboxRoot.style.display, /^(?:inline-)?grid$/);
       assert.equal(layout.checkboxRoot.rect.width, 22);
@@ -733,7 +909,7 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
     assert.ok(wide.container.width > 520, `wide AppWindow unexpectedly narrow: ${wide.container.width}`);
     assert.ok(medium.container.width > 520, `medium AppWindow unexpectedly compact: ${medium.container.width}`);
     assert.equal(medium.editor.compact, false, "editor observer marked a 640px editor compact");
-    for (const form of [medium.selectForm, medium.inputForm, medium.routineForm, medium.editorForm]) {
+    for (const form of [medium.selectForm, medium.inputForm, medium.textareaForm, medium.routineForm, ...profileRows(medium)]) {
       assert.match(form.row.style.gridTemplateColumns, /\S+\s+\S+/,
         "usable medium AppWindow stacked a label and control");
       assert.equal(form.control.style.gridColumnStart, "2");
@@ -749,8 +925,12 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
     for (const [name, form] of Object.entries({
       select: narrow.selectForm,
       input: narrow.inputForm,
+      textarea: narrow.textareaForm,
       routine: narrow.routineForm,
-      editor: narrow.editorForm
+      profileTarget: narrow.profile.rows.target,
+      profileSource: narrow.profile.rows.source,
+      profileAdvanced: narrow.profile.rows.advanced,
+      profileDanger: narrow.profile.rows.danger
     })) {
       assert.equal(form.row.style.display, "grid");
       assert.doesNotMatch(form.row.style.gridTemplateColumns, /\S+\s+\S+/,

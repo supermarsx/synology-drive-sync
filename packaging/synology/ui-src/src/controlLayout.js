@@ -36,9 +36,11 @@ function shellClass(owner) {
 function markControlShells(root) {
   const owners = root.querySelectorAll(OWNED_CONTROL_SELECTOR);
   for (const owner of owners) {
+    owner.classList.add("sdsync-control-owner");
     const typeClass = shellClass(owner);
     const targets = semanticTargets(owner);
     for (const target of targets) {
+      target.classList.add("sdsync-semantic-control");
       let shell = target.parentElement;
       while (shell && shell !== owner) {
         shell.classList.add("sdsync-control-shell", typeClass);

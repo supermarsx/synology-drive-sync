@@ -111,11 +111,12 @@
           </section>
 
           <section v-else-if="route === 'profiles'" class="sdsync-page" aria-labelledby="sdsync-page-title">
-            <div class="sdsync-page-actions">
+            <div v-if="!profileEditorOpen" class="sdsync-page-actions">
               <v-button suffix="main" display="icon-text" tooltip="Create a validated source-to-File-Station profile" :disabled="!canChangeProfiles || operationBusy" @click="openProfile('')"><template #icon><action-icon name="add" /></template>New profile</v-button>
             </div>
-            <div :class="['sdsync-profiles-layout', { 'is-catalog-only': !profileEditorOpen }]">
-              <div class="sdsync-panel sdsync-profile-catalog">
+            <div :class="['sdsync-profiles-layout', profileEditorOpen ? 'is-editor-only' : 'is-catalog-only']">
+              <transition name="sdsync-page-swap" mode="out-in">
+              <div v-if="!profileEditorOpen" key="profile-catalog" class="sdsync-panel sdsync-profile-catalog">
                 <div class="sdsync-profile-filters" role="search" aria-label="Profile catalog filters">
                   <div class="sdsync-profile-filter-field"><span class="sdsync-profile-filter-label">Search <control-help help-key="profile-filter" /></span><v-input class="sdsync-input-control" v-model="profileFilter" clearable maxlength="128" placeholder="Name, target, account, or path" aria-label="Search profiles" aria-describedby="sdsync-help-profile-filter" /></div>
                   <div class="sdsync-profile-filter-field"><span class="sdsync-profile-filter-label">Show <control-help help-key="profile-filter-status" /></span><v-single-select class="sdsync-select-control" v-model="profileFilterStatus" :options="profileFilterStatusOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Filter profiles by readiness" aria-describedby="sdsync-help-profile-filter-status"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></div>
@@ -136,7 +137,7 @@
                 </button>
               </div>
 
-              <v-form v-if="profileEditorOpen" v-model="profileForm" class="sdsync-panel sdsync-editor" direction="vertical" @submit="saveProfile">
+              <v-form v-else key="profile-editor" v-model="profileForm" class="sdsync-panel sdsync-editor sdsync-profile-editor" direction="vertical" @submit="saveProfile">
                 <div class="sdsync-panel-heading">
                   <div><p class="sdsync-eyebrow">Profile editor</p><h3>{{ selectedProfile ? 'Edit ' + selectedProfile : 'New profile' }}</h3></div>
                   <v-button type="border" display="icon-text" tooltip="Close the editor and clear unsubmitted secret fields" @click="closeProfile"><template #icon><action-icon name="close" /></template>Close</v-button>
@@ -213,6 +214,7 @@
                   <v-button suffix="main" display="icon-text" html-type="submit" tooltip="Validate and apply configuration immediately, then process explicit secret operations" :disabled="!canChangeProfiles || operationBusy"><template #icon><action-icon name="save" /></template>{{ selectedProfile ? 'Save now' : 'Create profile' }}</v-button>
                 </div>
               </v-form>
+              </transition>
             </div>
           </section>
 
@@ -389,7 +391,9 @@ import { createAutosaveCoordinator } from "./autosave";
 import { installControlLayout } from "./controlLayout";
 import {
   ACTIONS,
+  AUTOSAVE_API_LIMITS,
   MAX_RESPONSE_BYTES,
+  QueuedOutcomeUnknownError,
   SNAPSHOT_SCHEMA,
   apiGet,
   apiPost,
@@ -405,8 +409,53 @@ import SecurityPanel from "./SecurityPanel.vue";
 
 const SETTINGS_KEY = "sdsync.ui.settings.v1";
 const AUTOSAVE_SCOPES = Object.freeze(["profile", "routine", "alerts", "security", "interface"]);
+const PROFILE_SECRET_KINDS = Object.freeze(["password", "totp", "remote-log-token"]);
 
-function currentAutosaveStatus(coordinator, failures, savedMessage = "All changes saved") {
+function emptyProfileFailureRecords() {
+  return {
+    configuration: { active: false, outcomeUnknown: false, requiresInspection: false },
+    secrets: {
+      password: { active: false, outcomeUnknown: false, requiresInspection: false },
+      totp: { active: false, outcomeUnknown: false, requiresInspection: false },
+      "remote-log-token": { active: false, outcomeUnknown: false, requiresInspection: false }
+    }
+  };
+}
+
+function profileFailureSummary(records) {
+  const safe = records && typeof records === "object" ? records : emptyProfileFailureRecords();
+  const candidates = [safe.configuration].concat(PROFILE_SECRET_KINDS.map((kind) => safe.secrets && safe.secrets[kind]));
+  const active = candidates.filter((record) => record && record.active === true);
+  return {
+    active: active.length > 0,
+    outcomeUnknown: active.some((record) => record.outcomeUnknown === true),
+    requiresInspection: active.some((record) => record.requiresInspection === true)
+  };
+}
+
+function currentAutosaveStatus(
+  coordinator,
+  failures,
+  savedMessage = "All changes saved",
+  outcomeUnknownScopes = null,
+  inspectionScopes = null
+) {
+  for (const scope of AUTOSAVE_SCOPES) {
+    if (failures && failures[scope] === true && outcomeUnknownScopes && outcomeUnknownScopes[scope] === true) {
+      return {
+        phase: "blocked",
+        message: `${scope.charAt(0).toUpperCase()}${scope.slice(1)} autosave outcome unknown · inspect Activity / Logs before any retry`
+      };
+    }
+  }
+  for (const scope of AUTOSAVE_SCOPES) {
+    if (failures && failures[scope] === true && inspectionScopes && inspectionScopes[scope] === true) {
+      return {
+        phase: "blocked",
+        message: `${scope.charAt(0).toUpperCase()}${scope.slice(1)} changes need inspection · inspect Activity / Logs before another mutation`
+      };
+    }
+  }
   for (const scope of AUTOSAVE_SCOPES) {
     if (failures && failures[scope] === true) {
       return { phase: "blocked", message: `${scope.charAt(0).toUpperCase()}${scope.slice(1)} autosave paused · use Save now` };
@@ -724,6 +773,45 @@ function validatedJobId(value) {
   return typeof value === "string" && JOB_ID_PATTERN.test(value) ? value : "";
 }
 
+function partialMutationInspectionRequired(caught, fallback, appliedDetail) {
+  const observed = boundedText(caught && caught.message, fallback).slice(0, MUTATION_MESSAGE_LIMIT / 2);
+  const failure = new Error(
+    `${observed} ${appliedDetail} Do not retry this multi-stage operation; inspect Activity and Logs before taking any further action.`
+  );
+  failure.name = "PartialMutationInspectionRequiredError";
+  failure.outcomeUnknown = Boolean(caught && caught.outcomeUnknown === true);
+  failure.requiresInspection = true;
+  failure.partialApplication = true;
+
+  const requestId = caught && caught.trustedRequestId === true
+    ? validatedClientRequestId(caught.requestId)
+    : "";
+  const jobId = caught && caught.trustedJobId === true
+    ? validatedJobId(caught.jobId)
+    : "";
+  if (requestId) {
+    failure.requestId = requestId;
+    failure.trustedRequestId = true;
+  }
+  if (jobId) {
+    failure.jobId = jobId;
+    failure.trustedJobId = true;
+  }
+
+  for (const field of ["accepted", "acceptanceUnknown", "preAcceptance", "trustedRejection", "csrfRejected", "clientTimeout"]) {
+    if (caught && caught[field] === true) failure[field] = true;
+  }
+  for (const field of ["status", "transportStatus"]) {
+    const value = Number(caught && caught[field]);
+    if (Number.isInteger(value)) failure[field] = value;
+  }
+  for (const field of ["code", "stage"]) {
+    const value = boundedText(caught && caught[field], "").slice(0, 128);
+    if (value) failure[field] = value;
+  }
+  return failure;
+}
+
 function normalizedActivityEvent(event) {
   if (!event || typeof event !== "object" || Array.isArray(event)) return null;
   const field = (value, fallback) => boundedText(value, fallback).slice(0, ACTIVITY_FIELD_LIMIT);
@@ -763,6 +851,9 @@ export default {
       snapshotTimer: 0, logTimer: 0, snapshotLoading: false, snapshotPromise: null, snapshotRefreshQueued: false, logsLoading: false, operationBusy: false,
       autosaveCoordinator: null, autosavePhase: "saved", autosaveMessage: "Autosave ready", alertDirty: false,
       autosaveFailureScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
+      autosaveOutcomeUnknownScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
+      autosaveInspectionScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
+      profileFailureRecords: emptyProfileFailureRecords(),
       settings, profileFilter: "", profileFilterStatus: "all", profileEditorOpen: false, selectedProfile: "", profileForm: emptyProfile(),
       secretModes: { password: "keep", totp: "keep", remote_log_token: "keep" },
       secretValues: { password: "", totp: "", remote_log_token: "" },
@@ -902,7 +993,8 @@ export default {
       delayMs: 1300,
       dispatch: (task) => this.dispatchAutosave(task),
       onSuccess: (task) => this.autosaveSucceeded(task),
-      onError: (error, task) => this.autosaveFailed(error, task)
+      onError: (error, task) => this.autosaveFailed(error, task),
+      onSuperseded: () => this.refreshAutosaveStatus()
     });
     this.autosaveCoordinator.hydrate("interface", this.interfaceSettingsPayload());
     this.controlLayoutCleanup = installControlLayout(this.$el);
@@ -1086,7 +1178,13 @@ export default {
       ));
       this.autosaveCoordinator.setScopeBlocked(scope, failurePaused || Boolean(candidate.manual));
       if (scope === "alerts") this.alertDirty = next.dirty;
-      const status = currentAutosaveStatus(this.autosaveCoordinator, this.autosaveFailureScopes);
+      const status = currentAutosaveStatus(
+        this.autosaveCoordinator,
+        this.autosaveFailureScopes,
+        "All changes saved",
+        this.autosaveOutcomeUnknownScopes,
+        this.autosaveInspectionScopes
+      );
       this.autosavePhase = status.phase;
       this.autosaveMessage = status.phase === "blocked" && candidate.manual && !anyFailurePaused ? candidate.manual : status.message;
     },
@@ -1096,13 +1194,29 @@ export default {
       this.autosaveMessage = "Saving changes…";
       this.operationBusy = true;
       try {
-        if (task.scope === "profile") await apiPost(this.auth, this.csrfToken, ACTIONS.configureProfile, task.value);
-        else if (task.scope === "routine") await apiPost(this.auth, this.csrfToken, ACTIONS.routine, task.value);
-        else if (task.scope === "alerts") await apiPost(this.auth, this.csrfToken, ACTIONS.alertPolicy, task.value);
+        const post = (action, payload) => apiPost(
+          this.auth,
+          this.csrfToken,
+          action,
+          payload,
+          true,
+          undefined,
+          AUTOSAVE_API_LIMITS
+        );
+        if (task.scope === "profile") await post(ACTIONS.configureProfile, task.value);
+        else if (task.scope === "routine") await post(ACTIONS.routine, task.value);
+        else if (task.scope === "alerts") await post(ACTIONS.alertPolicy, task.value);
         else if (task.scope === "security") {
-          await apiPost(this.auth, this.csrfToken, ACTIONS.securityPolicy, task.value);
+          await post(ACTIONS.securityPolicy, task.value);
           this.csrfToken = "";
-          await this.refreshCsrf();
+          try {
+            await this.refreshCsrf(AUTOSAVE_API_LIMITS);
+          } catch (_error) {
+            throw new QueuedOutcomeUnknownError(
+              "",
+              "DSM applied the security autosave, but refreshed request authentication is unavailable. Do not save the policy again; inspect Activity and Logs."
+            );
+          }
         } else if (task.scope === "interface") {
           const transaction = this.captureSettingsTransaction();
           if (!transaction) throw new Error("Browser preference storage is unavailable.");
@@ -1110,15 +1224,21 @@ export default {
           if (!this.persistSettings(next)) throw new Error("Browser preference storage rejected the update.");
           this.applySettingsState(next);
           try {
-            await apiPost(this.auth, this.csrfToken, ACTIONS.clientEvent, { event: "interface-settings" });
+            await post(ACTIONS.clientEvent, { event: "interface-settings" });
           } catch (error) {
-            if (this.preferenceAuditWasRejected(error)) this.restoreSettingsTransaction(transaction);
+            if (this.preferenceAuditWasRejected(error)
+              || (error && error.preAcceptance === true && error.clientTimeout === true)) {
+              this.restoreSettingsTransaction(transaction);
+            }
             throw error;
           }
           this.scheduleSnapshot();
           this.scheduleLogs();
         } else throw new Error("Unsupported autosave scope.");
-        if (task.scope !== "interface") await this.refreshSnapshot(false, true);
+        // A trusted POST acknowledgement completes autosave. Snapshot refresh
+        // is follow-up observation and must not hold the mutation queue or its
+        // status in "Saving" when DSM/QuickConnect reads are slow.
+        if (task.scope !== "interface") void this.refreshSnapshot(false, true);
       } catch (error) {
         if (!this.disposed) this.reportMutationError(error, "Autosave failed", "Autosave outcome unknown", "The package rejected the autosave mutation.");
         throw error;
@@ -1127,16 +1247,28 @@ export default {
       }
     },
     autosaveSucceeded(task) {
-      if (this.autosaveFailureScopes) this.autosaveFailureScopes[task.scope] = false;
+      if (task.scope === "profile") {
+        this.clearProfileConfigurationFailure(false);
+      } else {
+        if (this.autosaveFailureScopes) this.autosaveFailureScopes[task.scope] = false;
+        if (this.autosaveOutcomeUnknownScopes) this.autosaveOutcomeUnknownScopes[task.scope] = false;
+        if (this.autosaveInspectionScopes) this.autosaveInspectionScopes[task.scope] = false;
+      }
       const state = this.autosaveCoordinator ? this.autosaveCoordinator.getState(task.scope) : null;
       if (task.scope === "alerts" && state && !state.dirty) this.alertDirty = false;
       if (task.scope === "security" && state && !state.dirty) this.securityDirty = false;
-      const status = currentAutosaveStatus(this.autosaveCoordinator, this.autosaveFailureScopes, "Changes autosaved");
+      const status = currentAutosaveStatus(
+        this.autosaveCoordinator,
+        this.autosaveFailureScopes,
+        "Changes autosaved",
+        this.autosaveOutcomeUnknownScopes,
+        this.autosaveInspectionScopes
+      );
       this.autosavePhase = status.phase;
       this.autosaveMessage = status.message;
     },
-    autosaveFailed(_error, task) {
-      this.pauseAutosave(task.scope);
+    autosaveFailed(error, task) {
+      this.pauseAutosave(task.scope, error);
     },
     hydrateAutosave(scope, payload, authoritative = true) {
       if (!this.autosaveCoordinator || !payload) return;
@@ -1145,16 +1277,41 @@ export default {
       if (!this.autosaveFailureScopes || typeof this.autosaveFailureScopes !== "object") {
         this.autosaveFailureScopes = { profile: false, routine: false, alerts: false, security: false, interface: false };
       }
-      this.autosaveFailureScopes[scope] = preserveFailure;
-      if (preserveFailure) this.autosaveCoordinator.setScopeBlocked(scope, true);
+      if (!this.autosaveOutcomeUnknownScopes || typeof this.autosaveOutcomeUnknownScopes !== "object") {
+        this.autosaveOutcomeUnknownScopes = { profile: false, routine: false, alerts: false, security: false, interface: false };
+      }
+      if (!this.autosaveInspectionScopes || typeof this.autosaveInspectionScopes !== "object") {
+        this.autosaveInspectionScopes = { profile: false, routine: false, alerts: false, security: false, interface: false };
+      }
+      if (scope === "profile") {
+        if (authoritative === true) this.clearProfileConfigurationFailure(false);
+        else this.syncProfileFailureState(false);
+      } else {
+        this.autosaveFailureScopes[scope] = preserveFailure;
+        if (!preserveFailure) this.autosaveOutcomeUnknownScopes[scope] = false;
+        if (!preserveFailure) this.autosaveInspectionScopes[scope] = false;
+        if (preserveFailure) this.autosaveCoordinator.setScopeBlocked(scope, true);
+      }
       if (scope === "alerts") this.alertDirty = false;
       if (scope === "security") this.securityDirty = false;
-      const status = currentAutosaveStatus(this.autosaveCoordinator, this.autosaveFailureScopes);
+      const status = currentAutosaveStatus(
+        this.autosaveCoordinator,
+        this.autosaveFailureScopes,
+        "All changes saved",
+        this.autosaveOutcomeUnknownScopes,
+        this.autosaveInspectionScopes
+      );
       this.autosavePhase = status.phase;
       this.autosaveMessage = status.message;
     },
     refreshAutosaveStatus(savedMessage = "All changes saved") {
-      const status = currentAutosaveStatus(this.autosaveCoordinator, this.autosaveFailureScopes, savedMessage);
+      const status = currentAutosaveStatus(
+        this.autosaveCoordinator,
+        this.autosaveFailureScopes,
+        savedMessage,
+        this.autosaveOutcomeUnknownScopes,
+        this.autosaveInspectionScopes
+      );
       this.autosavePhase = status.phase;
       this.autosaveMessage = status.message;
       return status;
@@ -1163,21 +1320,100 @@ export default {
       if (this.autosaveCoordinator) this.autosaveCoordinator.cancel(scope);
       if (refreshStatus) this.refreshAutosaveStatus();
     },
-    pauseAutosave(scope) {
-      this.cancelAutosave(scope, false);
+    ensureProfileFailureRecords() {
+      const records = this.profileFailureRecords;
+      const valid = records && typeof records === "object"
+        && records.configuration && typeof records.configuration === "object"
+        && records.secrets && typeof records.secrets === "object"
+        && PROFILE_SECRET_KINDS.every((kind) => records.secrets[kind] && typeof records.secrets[kind] === "object");
+      if (!valid) this.profileFailureRecords = emptyProfileFailureRecords();
+      return this.profileFailureRecords;
+    },
+    syncProfileFailureState(refreshStatus = true) {
       if (!this.autosaveFailureScopes || typeof this.autosaveFailureScopes !== "object") {
         this.autosaveFailureScopes = { profile: false, routine: false, alerts: false, security: false, interface: false };
       }
+      if (!this.autosaveOutcomeUnknownScopes || typeof this.autosaveOutcomeUnknownScopes !== "object") {
+        this.autosaveOutcomeUnknownScopes = { profile: false, routine: false, alerts: false, security: false, interface: false };
+      }
+      if (!this.autosaveInspectionScopes || typeof this.autosaveInspectionScopes !== "object") {
+        this.autosaveInspectionScopes = { profile: false, routine: false, alerts: false, security: false, interface: false };
+      }
+      const summary = profileFailureSummary(this.ensureProfileFailureRecords());
+      this.autosaveFailureScopes.profile = summary.active;
+      this.autosaveOutcomeUnknownScopes.profile = summary.outcomeUnknown;
+      this.autosaveInspectionScopes.profile = summary.requiresInspection;
+      if (this.autosaveCoordinator) {
+        const state = this.autosaveCoordinator.getState("profile");
+        if (state.registered) this.autosaveCoordinator.setScopeBlocked("profile", summary.active);
+      }
+      if (refreshStatus) this.refreshAutosaveStatus();
+      return summary;
+    },
+    recordProfileFailure(secretKind, error) {
+      const records = this.ensureProfileFailureRecords();
+      const record = PROFILE_SECRET_KINDS.includes(secretKind)
+        ? records.secrets[secretKind]
+        : records.configuration;
+      record.active = true;
+      record.outcomeUnknown = record.outcomeUnknown === true || Boolean(error && error.outcomeUnknown === true);
+      record.requiresInspection = record.requiresInspection === true
+        || Boolean(error && (error.requiresInspection === true || error.outcomeUnknown === true));
+      return this.syncProfileFailureState();
+    },
+    clearProfileConfigurationFailure(refreshStatus = true) {
+      const record = this.ensureProfileFailureRecords().configuration;
+      record.active = false;
+      record.outcomeUnknown = false;
+      record.requiresInspection = false;
+      return this.syncProfileFailureState(refreshStatus);
+    },
+    clearProfileSecretFailures(secretKinds, refreshStatus = true) {
+      const records = this.ensureProfileFailureRecords();
+      const kinds = Array.isArray(secretKinds) ? secretKinds : [];
+      for (const kind of PROFILE_SECRET_KINDS) {
+        if (!kinds.includes(kind)) continue;
+        records.secrets[kind].active = false;
+        records.secrets[kind].outcomeUnknown = false;
+        records.secrets[kind].requiresInspection = false;
+      }
+      return this.syncProfileFailureState(refreshStatus);
+    },
+    pauseAutosave(scope, error = null, profileSecretKind = "") {
+      this.cancelAutosave(scope, false);
+      if (scope === "profile") {
+        this.recordProfileFailure(profileSecretKind, error);
+        return;
+      }
+      if (!this.autosaveFailureScopes || typeof this.autosaveFailureScopes !== "object") {
+        this.autosaveFailureScopes = { profile: false, routine: false, alerts: false, security: false, interface: false };
+      }
+      if (!this.autosaveOutcomeUnknownScopes || typeof this.autosaveOutcomeUnknownScopes !== "object") {
+        this.autosaveOutcomeUnknownScopes = { profile: false, routine: false, alerts: false, security: false, interface: false };
+      }
+      if (!this.autosaveInspectionScopes || typeof this.autosaveInspectionScopes !== "object") {
+        this.autosaveInspectionScopes = { profile: false, routine: false, alerts: false, security: false, interface: false };
+      }
       this.autosaveFailureScopes[scope] = true;
+      this.autosaveOutcomeUnknownScopes[scope] = this.autosaveOutcomeUnknownScopes[scope] === true
+        || Boolean(error && error.outcomeUnknown === true);
+      this.autosaveInspectionScopes[scope] = this.autosaveInspectionScopes[scope] === true
+        || Boolean(error && (error.requiresInspection === true || error.outcomeUnknown === true));
       if (this.autosaveCoordinator) {
         const state = this.autosaveCoordinator.getState(scope);
         if (state.registered) this.autosaveCoordinator.setScopeBlocked(scope, true);
       }
-      this.autosavePhase = "blocked";
-      this.autosaveMessage = `${scope.charAt(0).toUpperCase()}${scope.slice(1)} autosave paused · use Save now`;
+      this.refreshAutosaveStatus();
     },
     clearAutosaveFailure(scope) {
+      if (scope === "profile") {
+        this.profileFailureRecords = emptyProfileFailureRecords();
+        this.syncProfileFailureState();
+        return;
+      }
       if (this.autosaveFailureScopes) this.autosaveFailureScopes[scope] = false;
+      if (this.autosaveOutcomeUnknownScopes) this.autosaveOutcomeUnknownScopes[scope] = false;
+      if (this.autosaveInspectionScopes) this.autosaveInspectionScopes[scope] = false;
       this.refreshAutosaveStatus();
     },
     describeBridgeError(error, phase = "status") {
@@ -1287,6 +1523,7 @@ export default {
     booleanEvidence(value) { return value === true ? "Yes" : (value === false ? "No" : "Unavailable"); },
     reportMutationError(error, failedTitle, unknownTitle, fallback) {
       const unknown = Boolean(error && error.outcomeUnknown === true);
+      const inspection = Boolean(error && error.requiresInspection === true);
       const observed = boundedText(error && error.message, fallback).slice(0, MUTATION_MESSAGE_LIMIT / 2);
       const requestId = error && error.trustedRequestId === true
         ? validatedClientRequestId(error.requestId)
@@ -1302,7 +1539,7 @@ export default {
         correlation ? `${correlation} ${detail}` : detail,
         defaultMessage
       ).slice(0, MUTATION_MESSAGE_LIMIT);
-      const csrfRejected = Boolean(error && error.preAcceptance === true && error.csrfRejected === true);
+      const csrfRejected = Boolean(!unknown && !inspection && error && error.preAcceptance === true && error.csrfRejected === true);
       if (csrfRejected) {
         this.csrfToken = "";
         this.bridgeIssue = {
@@ -1314,16 +1551,21 @@ export default {
         this.toast(failedTitle, message, true);
         return { unknown: false, csrfRejected: true, message, requestId, jobId };
       }
-      const message = unknown
+      const message = inspection
         ? withCorrelation(
-          error && error.acceptanceUnknown === true
+          `${observed} This multi-stage save is only partially applied. Do not submit it again; inspect Activity and Logs before reconciling the current profile and credential state.`,
+          "The operation was only partially applied. Do not retry it; inspect Activity and Logs."
+        )
+        : unknown
+          ? withCorrelation(
+            error && error.acceptanceUnknown === true
             ? `${observed} Preserve the client request ID and inspect Activity and Logs before taking any further action.`
             : `${observed} The request was already queued; do not retry it or create a duplicate. Inspect Activity and Logs for the eventual outcome.`,
-          "The operation outcome is unknown. Do not retry it; inspect Activity and Logs."
-        )
-        : withCorrelation(observed, fallback);
-      this.toast(unknown ? unknownTitle : failedTitle, message, !unknown);
-      return { unknown, message, requestId, jobId };
+            "The operation outcome is unknown. Do not retry it; inspect Activity and Logs."
+          )
+          : withCorrelation(observed, fallback);
+      this.toast(unknown || inspection ? unknownTitle : failedTitle, message, !unknown && !inspection);
+      return { unknown, inspection, message, requestId, jobId };
     },
     hasCapability(name) { return this.capabilities[name] === true; },
     integer(value, fallback) { const parsed = Number(value); return Number.isInteger(parsed) ? parsed : fallback; },
@@ -1332,9 +1574,9 @@ export default {
     stopTimers() { window.clearTimeout(this.snapshotTimer); window.clearTimeout(this.logTimer); this.snapshotTimer = 0; this.logTimer = 0; },
     scheduleSnapshot() { window.clearTimeout(this.snapshotTimer); this.snapshotTimer = 0; const interval = Number(this.settings.status_refresh); if (interval > 0 && !this.disposed && !document.hidden) this.snapshotTimer = window.setTimeout(() => this.refreshSnapshot(false), interval); },
     scheduleLogs() { window.clearTimeout(this.logTimer); this.logTimer = 0; const interval = Number(this.settings.log_refresh); if (interval > 0 && !this.disposed && !document.hidden && this.route === "activity" && !this.logsPaused) this.logTimer = window.setTimeout(() => this.refreshLogs(), interval); },
-    async refreshCsrf() { if (this.disposed) return; this.csrfToken = ""; const model = await apiGet(this.auth, "csrf"); if (this.disposed) return; if (typeof model.csrf_token !== "string" || !model.csrf_token || model.csrf_token.length > 4096) throw new Error("Authenticated bridge did not issue a valid CSRF token"); this.csrfToken = model.csrf_token; },
+    async refreshCsrf(options = undefined) { if (this.disposed) return; this.csrfToken = ""; const model = await apiGet(this.auth, "csrf", {}, options); if (this.disposed) return; if (typeof model.csrf_token !== "string" || !model.csrf_token || model.csrf_token.length > 4096) throw new Error("Authenticated bridge did not issue a valid CSRF token"); this.csrfToken = model.csrf_token; },
     async refreshSnapshot(manual, requirePostMutationRead = false) {
-      if (this.disposed || document.hidden) return;
+      if (this.disposed || document.hidden) return false;
       if (this.snapshotPromise) {
         if (requirePostMutationRead) this.snapshotRefreshQueued = true;
         return this.snapshotPromise;
@@ -1342,11 +1584,12 @@ export default {
       this.snapshotLoading = true;
       let cycle;
       cycle = (async () => {
+        let succeeded = false;
         try {
           if (!this.csrfToken) await this.refreshCsrf();
-          if (this.disposed) return;
+          if (this.disposed) return false;
           const snapshot = await apiGet(this.auth, "snapshot");
-          if (this.disposed) return;
+          if (this.disposed) return false;
           if (snapshot.schema !== SNAPSHOT_SCHEMA) throw new Error("Unsupported DSM API schema");
           this.snapshot = snapshot;
           if (typeof snapshot.csrf_token === "string" && snapshot.csrf_token) this.csrfToken = snapshot.csrf_token;
@@ -1357,6 +1600,7 @@ export default {
           this.hydrateAlerts();
           this.hydrateSecurityPolicy();
           this.maybeNotifyFailure();
+          succeeded = true;
           if (manual) this.toast("Status refreshed", "The latest package snapshot is displayed.");
         } catch (error) {
           if (this.disposed) return;
@@ -1371,9 +1615,13 @@ export default {
           this.snapshotLoading = false;
           const followUp = this.snapshotRefreshQueued;
           this.snapshotRefreshQueued = false;
-          if (followUp && !this.disposed && !document.hidden) return this.refreshSnapshot(false, false);
+          if (followUp) {
+            if (!this.disposed && !document.hidden) return this.refreshSnapshot(false, false);
+            return false;
+          }
           if (!this.disposed) this.scheduleSnapshot();
         }
+        return succeeded;
       })();
       this.snapshotPromise = cycle;
       return cycle;
@@ -1455,7 +1703,11 @@ export default {
         } catch (_csrfError) {
           if (this.disposed) return;
           this.hydrateAutosave("security", payload);
-          this.pauseAutosave("security");
+          const appliedPolicy = new QueuedOutcomeUnknownError(
+            "",
+            "DSM applied the security policy, but refreshed request authentication is unavailable. Do not save the policy again; inspect Activity and Logs."
+          );
+          this.pauseAutosave("security", appliedPolicy);
           this.connected = false;
           this.bridgeIssue = {
             title: "Mutation token refresh required",
@@ -1472,7 +1724,7 @@ export default {
         if (!this.disposed) this.hydrateSecurityPolicy(true);
       } catch (caught) {
         if (this.disposed) return;
-        this.pauseAutosave("security");
+        this.pauseAutosave("security", caught);
         const report = this.reportMutationError(caught, "Security policy not saved", "Security policy outcome unknown", "The package rejected the security policy.");
         if (report.unknown) {
           this.csrfToken = "";
@@ -1602,36 +1854,50 @@ export default {
       if (risky && !await this.confirmAction("Save dangerous profile settings?", "Review plain-HTTP, deletion, empty-source, and TLS settings before continuing.", "Save profile")) return;
       this.operationBusy = true; this.clearSecrets();
       let configurationApplied = false;
-      let secretsApplied = 0;
+      let activeSecretKind = "";
+      const appliedSecretKinds = [];
       try {
         await apiPost(this.auth, this.csrfToken, ACTIONS.configureProfile, payload);
         configurationApplied = true;
+        this.clearProfileConfigurationFailure(false);
         if (this.disposed) return;
         for (const secret of secrets) {
+          activeSecretKind = secret.kind;
           await apiPost(this.auth, this.csrfToken, ACTIONS.setSecret, secret);
-          secretsApplied += 1;
+          appliedSecretKinds.push(secret.kind);
+          activeSecretKind = "";
           if (this.disposed) return;
         }
         this.hydrateAutosave("profile", payload);
         this.toast("Profile saved", "The controller applied the validated configuration and protected credential operations.");
         this.closeProfile();
-        await this.refreshSnapshot(false, true);
+        const observed = await this.refreshSnapshot(false, true);
+        if (!this.disposed && observed === true) {
+          this.clearProfileSecretFailures(appliedSecretKinds);
+        } else if (!this.disposed) {
+          this.refreshAutosaveStatus();
+        }
       } catch (caught) {
         if (this.disposed) return;
-        this.pauseAutosave("profile");
-        const partiallyApplied = configurationApplied || secretsApplied > 0;
-        const reportedError = partiallyApplied && caught.outcomeUnknown !== true
-          ? new Error(`${boundedText(caught.message, "A later profile stage failed.")} Earlier profile stages were applied; inspect credential presence before retrying.`)
+        const partiallyApplied = configurationApplied || appliedSecretKinds.length > 0;
+        const reportedError = partiallyApplied
+          ? partialMutationInspectionRequired(caught, "A later profile stage failed.", "Earlier profile stages were applied.")
           : caught;
+        this.pauseAutosave("profile", reportedError, activeSecretKind);
         this.reportMutationError(
           reportedError,
           partiallyApplied ? "Profile partially applied" : "Profile not saved",
-          partiallyApplied ? "Profile partially applied · outcome unknown" : "Profile outcome unknown",
+          partiallyApplied ? "Profile partially applied · inspect state" : "Profile outcome unknown",
           "The package rejected the change."
         );
         if (partiallyApplied || caught.outcomeUnknown === true) {
           this.closeProfile();
-          await this.refreshSnapshot(false, true);
+          const observed = await this.refreshSnapshot(false, true);
+          if (!this.disposed && observed === true) {
+            this.clearProfileSecretFailures(appliedSecretKinds);
+          } else if (!this.disposed) {
+            this.refreshAutosaveStatus();
+          }
         }
       } finally {
         if (!this.disposed) this.operationBusy = false;
@@ -1649,30 +1915,46 @@ export default {
         && !await this.confirmAction("Clear stored profile secrets?", "Only the selected password, TOTP, or remote-log token values will be removed. Profile configuration remains unchanged.", "Clear selected secrets")) return;
       this.operationBusy = true;
       this.clearSecrets();
-      let applied = 0;
+      let activeSecretKind = "";
+      const appliedSecretKinds = [];
       try {
         for (const secret of secrets) {
+          activeSecretKind = secret.kind;
           await apiPost(this.auth, this.csrfToken, ACTIONS.setSecret, secret);
-          applied += 1;
+          appliedSecretKinds.push(secret.kind);
+          activeSecretKind = "";
           if (this.disposed) return;
         }
         this.secretModes = { password: "keep", totp: "keep", remote_log_token: "keep" };
         this.toast("Secrets saved", "The package applied and audited only the selected protected-secret operations.");
-        await this.refreshSnapshot(false, true);
+        const observed = await this.refreshSnapshot(false, true);
+        if (!this.disposed && observed === true) {
+          this.clearProfileSecretFailures(appliedSecretKinds);
+        } else if (!this.disposed) {
+          this.refreshAutosaveStatus();
+        }
       } catch (caught) {
         if (this.disposed) return;
         this.secretModes = { password: "keep", totp: "keep", remote_log_token: "keep" };
-        const partiallyApplied = applied > 0;
-        const reportedError = partiallyApplied && caught.outcomeUnknown !== true
-          ? new Error(`${boundedText(caught.message, "A later secret stage failed.")} Earlier secret stages were applied; inspect credential presence before retrying.`)
+        const partiallyApplied = appliedSecretKinds.length > 0;
+        const reportedError = partiallyApplied
+          ? partialMutationInspectionRequired(caught, "A later secret stage failed.", "Earlier secret stages were applied.")
           : caught;
+        if (partiallyApplied || caught.outcomeUnknown === true) {
+          this.pauseAutosave("profile", reportedError, activeSecretKind);
+        }
         this.reportMutationError(
           reportedError,
           partiallyApplied ? "Secrets partially applied" : "Secrets not saved",
-          partiallyApplied ? "Secrets partially applied · outcome unknown" : "Secret outcome unknown",
+          partiallyApplied ? "Secrets partially applied · inspect state" : "Secret outcome unknown",
           "The package rejected the protected-secret operation."
         );
-        await this.refreshSnapshot(false, true);
+        const observed = await this.refreshSnapshot(false, true);
+        if (!this.disposed && observed === true) {
+          this.clearProfileSecretFailures(appliedSecretKinds);
+        } else if (!this.disposed) {
+          this.refreshAutosaveStatus();
+        }
       } finally {
         if (!this.disposed) this.operationBusy = false;
       }
@@ -1725,7 +2007,7 @@ export default {
         if (!this.disposed) this.loadRoutine(payload.profile);
       } catch (error) {
         if (this.disposed) return;
-        this.pauseAutosave("routine");
+        this.pauseAutosave("routine", error);
         this.reportMutationError(error, "Routine not saved", "Routine outcome unknown", "The package rejected the routine.");
       } finally {
         if (!this.disposed) this.operationBusy = false;
@@ -1767,7 +2049,7 @@ export default {
         await this.refreshSnapshot(false, true);
       } catch (error) {
         if (this.disposed) return;
-        this.pauseAutosave("alerts");
+        this.pauseAutosave("alerts", error);
         this.reportMutationError(error, "Alert policy not saved", "Alert policy outcome unknown", "The package rejected the policy.");
       } finally {
         if (!this.disposed) this.operationBusy = false;
@@ -1907,7 +2189,7 @@ export default {
             this.scheduleLogs();
           }
           this.hydrateAutosave("interface", this.interfaceSettingsPayload());
-          this.pauseAutosave("interface");
+          this.pauseAutosave("interface", error);
           this.reportMutationError(
             error,
             rejected && restored ? "Interface settings not saved" : (rejected ? "Interface setting rollback incomplete" : "Interface settings stored · audit failed"),

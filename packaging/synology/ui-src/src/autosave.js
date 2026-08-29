@@ -80,6 +80,7 @@ export class AutosaveCoordinator {
     this.dispatch = configuration.dispatch;
     this.onError = typeof configuration.onError === "function" ? configuration.onError : null;
     this.onSuccess = typeof configuration.onSuccess === "function" ? configuration.onSuccess : null;
+    this.onSuperseded = typeof configuration.onSuperseded === "function" ? configuration.onSuperseded : null;
     this.now = typeof configuration.now === "function" ? configuration.now : () => Date.now();
     this.setTimer = typeof configuration.setTimeout === "function"
       ? configuration.setTimeout
@@ -240,7 +241,7 @@ export class AutosaveCoordinator {
     if (currentEpoch) {
       if (succeeded) this._notify(this.onSuccess, task);
       else this._notify(this.onError, error, task);
-    }
+    } else this._notify(this.onSuperseded, task, succeeded ? null : error);
     if (!this.disposed) this._drain();
   }
 

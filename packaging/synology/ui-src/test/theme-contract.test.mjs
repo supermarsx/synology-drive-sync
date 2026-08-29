@@ -82,6 +82,10 @@ test("every native and DSM Vue control state is explicitly dark themed", () => {
     ".sdsync-app input:not([type=\"checkbox\"]):not([type=\"radio\"]):focus-visible",
     ".sdsync-app .sdsync-input-control",
     ".sdsync-app .sdsync-select-control",
+    ".sdsync-app .sdsync-control-owner.sdsync-input-control",
+    ".sdsync-app .sdsync-control-owner.sdsync-select-control",
+    ".sdsync-app .sdsync-control-owner.sdsync-input-control input.sdsync-semantic-control",
+    ".sdsync-app .sdsync-control-owner.sdsync-input-control textarea.sdsync-semantic-control",
     '.sdsync-app [class*="syno"][class*="button"]',
     ".sdsync-app .sdsync-checkbox-control",
     ".sdsync-app .sdsync-toggle-row .sdsync-checkbox-input",
@@ -194,6 +198,10 @@ test("security controls use compact responsive rows without clipping help", () =
   assert.match(declarations(".sdsync-toggle-row"), /overflow:\s*visible/);
   assert.match(declarations(".sdsync-policy-control"), /padding-block:\s*3px/);
   assert.match(declarations(".sdsync-log-policy-grid"), /grid-template-columns:\s*minmax\(0, 1fr\)/);
+  assert.doesNotMatch(declarations(".sdsync-log-policy-grid"), /border-top:/,
+    "the first security row owns the separator; its grid must not double it");
+  assert.doesNotMatch(declarations(".sdsync-form-grid"), /border-top:/,
+    "the first form row owns the separator; its grid must not double it");
   assert.match(declarations(".sdsync-security-actions"), /justify-content:\s*flex-end/);
   assert.match(css, /\.sdsync-security-grid\s*\{[\s\S]*?grid-template-columns:\s*1fr\s*;/);
   assert.match(css, /\.sdsync-log-policy-grid\s*\{[\s\S]*?grid-template-columns:\s*1fr\s*;/);

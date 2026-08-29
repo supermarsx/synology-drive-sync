@@ -440,10 +440,10 @@ def validate_native_api_source(payload: bytes) -> None:
         "const csrfGenerationByAuth = new WeakMap();",
         "dsmAuthGeneration += 1;",
         "function dsmAuthSnapshot()",
-        "async function apiGetWithDsmAuth(auth, action, parameters, dsmAuth)",
-        "async function csrfForCurrentAuthGeneration(auth, csrfToken, dsmAuth)",
+        "async function apiGetWithDsmAuth(auth, action, parameters, dsmAuth, rememberGeneration = true)",
+        "async function csrfForCurrentAuthGeneration(auth, csrfToken, dsmAuth, limits = null)",
         "const requestDsmAuth = dsmAuthSnapshot();",
-        "const effectiveCsrfToken = await csrfForCurrentAuthGeneration(auth, csrfToken, requestDsmAuth);",
+        "const effectiveCsrfToken = await csrfForCurrentAuthGeneration(auth, csrfToken, requestDsmAuth, limits);",
         "crypto.getRandomValues",
         "request_id: id",
         "operation: action",
@@ -547,12 +547,57 @@ def validate_native_api_source(payload: bytes) -> None:
                 f"native DSM {method} requests must await the shared DSM token bootstrap"
             )
         if method == "GET":
+            auth_snapshot = request_source.find(
+                "const requestDsmAuth = dsmAuthSnapshot();"
+            )
+            deferred_generation = request_source.find(
+                'const deferredCsrfGeneration = Boolean(limits && action === "csrf");'
+            )
+            get_request = request_source.find(
+                "const request = apiGetWithDsmAuth("
+            )
+            suppressed_generation = request_source.find(
+                "!deferredCsrfGeneration", get_request
+            )
+            unbounded_return = request_source.find(
+                "if (!limits) return request;", suppressed_generation
+            )
+            bounded_acceptance = request_source.find(
+                "const model = await withinLimit(", unbounded_return
+            )
+            deferred_commit_guard = request_source.find(
+                "if (deferredCsrfGeneration) {", bounded_acceptance
+            )
+            deferred_commit = request_source.find(
+                "rememberCsrfGeneration(auth, model, requestDsmAuth.generation)",
+                deferred_commit_guard,
+            )
+            model_return = request_source.find("return model;", deferred_commit)
             if (
-                "return apiGetWithDsmAuth(auth, action, parameters, dsmAuthSnapshot());"
+                "export async function apiGet(auth, action, parameters = {}, options = undefined)"
                 not in request_source
+                or "const limits = normalizedRequestLimits(options);" not in request_source
+                or request_source.count("apiGetWithDsmAuth(") != 1
+                or request_source.count(
+                    "rememberCsrfGeneration(auth, model, requestDsmAuth.generation)"
+                )
+                != 1
+                or "limits.readTimeoutMs" not in request_source
+                or not (
+                    0
+                    <= auth_snapshot
+                    < deferred_generation
+                    < get_request
+                    < suppressed_generation
+                    < unbounded_return
+                    < bounded_acceptance
+                    < deferred_commit_guard
+                    < deferred_commit
+                    < model_return
+                )
             ):
                 raise ValidationError(
-                    "native DSM GET requests must dispatch with one immutable authentication snapshot"
+                    "native DSM bounded CSRF reads must suppress detached generation writes and commit only after accepted observation"
                 )
         elif len(re.findall(r"\bheaders\s*:\s*authenticatedHeaders\s*\(", request_source)) != 1:
             raise ValidationError(
@@ -565,14 +610,63 @@ def validate_native_api_source(payload: bytes) -> None:
         raise ValidationError("native DSM API source is missing exact-snapshot GET dispatch")
     get_dispatch_source = source[get_dispatch_start:get_dispatch_end]
     if (
-        get_dispatch_source.count("fetch(endpoint(action, parameters), {") != 1
+        "async function apiGetWithDsmAuth(auth, action, parameters, dsmAuth, rememberGeneration = true)"
+        not in get_dispatch_source
+        or get_dispatch_source.count("fetch(endpoint(action, parameters), {") != 1
         or get_dispatch_source.count("headers: authenticatedHeaders(") != 1
         or "{ Accept: \"application/json\" }, dsmAuth" not in get_dispatch_source
-        or "rememberCsrfGeneration(auth, model, dsmAuth.generation)" not in get_dispatch_source
+        or 'if (rememberGeneration && action === "csrf") {' not in get_dispatch_source
+        or get_dispatch_source.count(
+            "rememberCsrfGeneration(auth, model, dsmAuth.generation)"
+        )
+        != 1
         or "ensureDsmToken" in get_dispatch_source
     ):
         raise ValidationError(
             "native DSM GET requests must use one pinned authentication snapshot without re-bootstrap"
+        )
+
+    csrf_reissue_start = source.find("async function csrfForCurrentAuthGeneration(")
+    csrf_reissue_end = source.find("\nexport async function apiPost(", csrf_reissue_start)
+    if csrf_reissue_start < 0 or csrf_reissue_end < 0:
+        raise ValidationError("native DSM API source is missing bounded CSRF generation reissue")
+    csrf_reissue_source = source[csrf_reissue_start:csrf_reissue_end]
+    csrf_request = csrf_reissue_source.find(
+        'const request = apiGetWithDsmAuth(auth, "csrf", {}, dsmAuth, false);'
+    )
+    bounded_acceptance = csrf_reissue_source.find("const model = limits")
+    bounded_wait = csrf_reissue_source.find("? await withinLimit(", bounded_acceptance)
+    unbounded_wait = csrf_reissue_source.find(": await request;", bounded_wait)
+    model_validation = csrf_reissue_source.find("if (!validCsrfModel(model))", unbounded_wait)
+    generation_commit = csrf_reissue_source.find(
+        "rememberCsrfGeneration(auth, model, dsmAuth.generation)", model_validation
+    )
+    replacement_publish = csrf_reissue_source.find(
+        'if (typeof auth.onCsrfReissued === "function")', generation_commit
+    )
+    if (
+        "async function csrfForCurrentAuthGeneration(auth, csrfToken, dsmAuth, limits = null)"
+        not in csrf_reissue_source
+        or csrf_reissue_source.count("apiGetWithDsmAuth(") != 1
+        or csrf_reissue_source.count(
+            "rememberCsrfGeneration(auth, model, dsmAuth.generation)"
+        )
+        != 1
+        or "limits.csrfReissueTimeoutMs" not in csrf_reissue_source
+        or 'safeReadTimeout(\n        "csrf_reissue",' not in csrf_reissue_source
+        or not (
+            0
+            <= csrf_request
+            < bounded_acceptance
+            < bounded_wait
+            < unbounded_wait
+            < model_validation
+            < generation_commit
+            < replacement_publish
+        )
+    ):
+        raise ValidationError(
+            "native DSM bounded CSRF reissue must suppress detached generation writes and commit only after an accepted valid response"
         )
 
     poll_start = source.find("async function pollJobResult(")
@@ -583,6 +677,10 @@ def validate_native_api_source(payload: bytes) -> None:
     for marker in (
         "pollIntervalMs = RESULT_POLL_INTERVAL_MS",
         'apiGetWithDsmAuth(auth, "result", { job_id: jobId }, dsmAuth)',
+        "limits = null",
+        "observation = null",
+        "limits.resultRequestTimeoutMs",
+        "queuedObservationTimeout(",
         "let consecutiveObservationFailures = 0;",
         "for (;;)",
         "if (auth && auth.signal && auth.signal.aborted) throw error;",
@@ -600,7 +698,9 @@ def validate_native_api_source(payload: bytes) -> None:
             raise ValidationError(
                 f"native DSM queued-result observer is missing {marker!r}"
             )
-    if poll_source.count("await delay(interval, auth && auth.signal);") != 2:
+    if poll_source.count(
+        "await delay(interval, auth && auth.signal, limits, observation);"
+    ) != 2:
         raise ValidationError(
             "native DSM queued-result observer must retry pending and transport observations"
         )
@@ -623,7 +723,10 @@ def validate_native_api_source(payload: bytes) -> None:
     post_start = source.find("export async function apiPost(")
     post_source = source[post_start:] if post_start >= 0 else ""
     if post_start < 0 or (
-        "? pollJobResult(auth, queued.job_id, requestDsmAuth, pollIntervalMs, id)"
+        "if (!awaitTerminal) return queued;" not in post_source
+        or "if (!limits) return pollJobResult(auth, queued.job_id, requestDsmAuth, pollIntervalMs, id);"
+        not in post_source
+        or "pollJobResult(auth, queued.job_id, requestDsmAuth, pollIntervalMs, id, limits, observation)"
         not in post_source
     ):
         raise ValidationError(
@@ -631,10 +734,10 @@ def validate_native_api_source(payload: bytes) -> None:
         )
     auth_snapshot = post_source.find("const requestDsmAuth = dsmAuthSnapshot();")
     csrf_refresh = post_source.find(
-        "const effectiveCsrfToken = await csrfForCurrentAuthGeneration(auth, csrfToken, requestDsmAuth);"
+        "const effectiveCsrfToken = await csrfForCurrentAuthGeneration(auth, csrfToken, requestDsmAuth, limits);"
     )
     request_identity = post_source.find("const id = requestId();")
-    post_dispatch = post_source.find("response = await fetch(API_URL, {")
+    post_dispatch = post_source.find("const dispatched = fetch(API_URL, {")
     if not (0 <= auth_snapshot < csrf_refresh < request_identity < post_dispatch):
         raise ValidationError(
             "native DSM POST must pin authentication before refreshing CSRF and dispatching"

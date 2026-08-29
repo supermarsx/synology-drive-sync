@@ -163,10 +163,54 @@ test("Settings uses horizontal native form rows with help adjacent to each label
   }
 });
 
+test("Profiles swaps a full-width catalog and editor as mutually exclusive keyed views", () => {
+  const profiles = routeSection("profiles");
+
+  assert.match(
+    profiles,
+    /<div\b(?=[^>]*\bv-if="!profileEditorOpen")(?=[^>]*\bclass="[^"]*sdsync-page-actions[^"]*")[^>]*>\s*<v-button\b(?=[^>]*@click="openProfile\(''\)")[^>]*>[\s\S]*?New profile<\/v-button>\s*<\/div>/,
+    "the New profile action must belong to the catalog view"
+  );
+  assert.match(
+    profiles,
+    /:class="\['sdsync-profiles-layout', profileEditorOpen \? 'is-editor-only' : 'is-catalog-only'\]"/,
+    "the profile view must expose explicit one-track catalog/editor layout modes"
+  );
+
+  const exclusiveViews = profiles.match(
+    /<transition\b(?=[^>]*\bname="sdsync-page-swap")(?=[^>]*\bmode="out-in")[^>]*>\s*(<div\b(?=[^>]*\bv-if="!profileEditorOpen")(?=[^>]*\bkey="profile-catalog")(?=[^>]*\bclass="[^"]*sdsync-profile-catalog[^"]*")[^>]*>[\s\S]*?<\/div>)\s*(<v-form\b(?=[^>]*\bv-else\b)(?=[^>]*\bkey="profile-editor")(?=[^>]*\bclass="[^"]*sdsync-editor[^"]*")[^>]*>[\s\S]*?<\/v-form>)\s*<\/transition>/
+  );
+  assert.ok(exclusiveViews, "catalog v-if and editor v-else must be immediate keyed siblings in one out-in transition");
+
+  const catalog = exclusiveViews[1];
+  const editor = exclusiveViews[2];
+  assert.match(catalog, /@click="openProfile\(profile\.name\)"/,
+    "an existing profile must enter the same dedicated editor view");
+  assert.match(editor, /<div class="sdsync-form-grid">/,
+    "the dedicated editor must retain the one-field-per-line form grid");
+  assert.match(editor, /<v-button\b(?=[^>]*@click="closeProfile")[^>]*>[\s\S]*?Close<\/v-button>/);
+  assert.match(editor, /<v-button\b(?=[^>]*@click="closeProfile")[^>]*>[\s\S]*?Cancel<\/v-button>/);
+  assert.equal((editor.match(/@click="closeProfile"/g) || []).length, 2,
+    "Close and Cancel must share the same catalog-return behavior");
+  assert.doesNotMatch(profiles, /sdsync-profile-catalog[\s\S]*?<v-form\b[^>]*\bv-if="profileEditorOpen"/,
+    "catalog and editor must never return to the former simultaneous two-column contract");
+
+  const viewModes = css.match(
+    /\.sdsync-profiles-layout\.is-catalog-only,[\s\S]*?\.sdsync-profiles-layout\.is-editor-only,[\s\S]*?\{([\s\S]*?)\}/
+  );
+  assert.ok(viewModes, "profile catalog/editor layout modes need an explicit shared CSS rule");
+  assert.match(viewModes[1], /grid-template-columns:\s*minmax\(0, 1fr\)/,
+    "both profile views must occupy one full-width grid track");
+  const formGrid = css.match(/\.sdsync-form-grid\s*\{([\s\S]*?)\}/);
+  assert.ok(formGrid, "profile editor form grid styling is missing");
+  assert.match(formGrid[1], /grid-template-columns:\s*minmax\(0, 1fr\)/,
+    "profile fields must remain one per line instead of becoming a second editor column");
+});
+
 test("Routines uses a profile-style New routine action and a catalog-first editor without redundant subtabs", () => {
   const routines = routeSection("routines");
   const profileAction = routeSection("profiles").match(
-    /<div class="sdsync-page-actions">\s*(<v-button\b[^>]*>[\s\S]*?New profile<\/v-button>)\s*<\/div>/
+    /<div\b(?=[^>]*\bv-if="!profileEditorOpen")(?=[^>]*\bclass="sdsync-page-actions")[^>]*>\s*(<v-button\b[^>]*>[\s\S]*?New profile<\/v-button>)\s*<\/div>/
   );
   const routineAction = routines.match(
     /<div class="sdsync-page-actions">\s*(<v-button\b[^>]*>[\s\S]*?New routine<\/v-button>)\s*<\/div>/

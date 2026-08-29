@@ -127,6 +127,16 @@ test("every DSM checkbox uses one right-hand package-owned semantic toggle row",
 });
 
 test("sanitized fixture preserves the captured DSM control hierarchy", () => {
+  assert.match(
+    physicalFixture,
+    /class="v-form-item-input fit-container"[\s\S]*?class="v-form-item-control fit-container"[\s\S]*?class="v-textfield sdsync-input-control fit-container"[\s\S]*?class="v-textfield-input fit-container"[\s\S]*?<input[^>]*class="v-textfield-input-element fit-container"/,
+    "fixture must preserve the fit-container textfield and nested form-item shells"
+  );
+  assert.match(
+    physicalFixture,
+    /class="v-textfield sdsync-input-control fit-container"[\s\S]*?class="v-textfield-input fit-container"[\s\S]*?<textarea[^>]*class="v-textfield-input-element fit-container"/,
+    "fixture must preserve the textarea variant of the same SDK wrapper"
+  );
   assert.match(physicalFixture, /class="sdsync-toggle-row"[\s\S]*?class="sdsync-toggle-label"[\s\S]*?class="dsm-checkbox sdsync-checkbox-control v-checkbox-wrapper"[\s\S]*?<i\b[^>]*v-checkbox-icon[\s\S]*?<input\b[^>]*v-checkbox-input[\s\S]*?<label\b[^>]*v-checkbox-label/);
   assert.match(physicalFixture, /id="checkbox"[^>]*\bchecked\b/, "fixture must exercise the visible checked state");
   assert.doesNotMatch(physicalFixture, /<label[^>]*>\s*<input\b/, "captured DSM checkbox input is a label sibling");
@@ -173,6 +183,18 @@ test("form roots make exact owned controls full-width without private DSM leakag
   assert.match(controlPath, /background-color:\s*transparent\s*!important/);
   assert.match(controlPath, /box-shadow:\s*none\s*!important/);
 
+  const fillPath = declarationsForRuleContaining(
+    ".sdsync-app .sdsync-form-item[class] .sdsync-form-control-shell",
+    ".sdsync-app .sdsync-form-item[class] > .sdsync-form-control-cell"
+  );
+  assert.match(fillPath, /inline-size:\s*100%\s*!important/);
+  assert.match(fillPath, /width:\s*100%\s*!important/);
+  assert.match(fillPath, /max-inline-size:\s*100%\s*!important/);
+  assert.match(fillPath, /min-inline-size:\s*0\s*!important/);
+  assert.match(fillPath, /flex:\s*1 1 0%\s*!important/);
+  assert.match(fillPath, /margin:\s*0\s*!important/);
+  assert.match(fillPath, /background-color:\s*transparent\s*!important/);
+
   assert.doesNotMatch(css, /\.v-form-item/, "CSS must not rely on unrendered Vue tag names");
   assert.ok(!css.includes('.sdsync-app [class*="input"]'), "input styling leaked back to DSM private classes");
   assert.ok(!css.includes('.sdsync-app [class*="select"]'), "select styling leaked back to DSM private classes");
@@ -198,6 +220,41 @@ test("input and select internals remain one row through arbitrary private DSM sh
   assert.match(shells, /max-width:\s*100%\s*!important/);
   assert.match(shells, /min-width:\s*0\s*!important/);
   assert.match(shells, /margin:\s*0\s*!important/);
+
+  const markedOwner = declarationsForRuleContaining(
+    ".sdsync-app .sdsync-control-owner.sdsync-input-control",
+    ".sdsync-app .sdsync-control-owner.sdsync-select-control"
+  );
+  assert.match(markedOwner, /inline-size:\s*100%\s*!important/);
+  assert.match(markedOwner, /width:\s*100%\s*!important/);
+  assert.match(markedOwner, /max-inline-size:\s*100%\s*!important/);
+  assert.match(markedOwner, /min-inline-size:\s*0\s*!important/);
+  assert.match(markedOwner, /flex:\s*1 1 0%\s*!important/);
+
+  const markedShell = declarationsForRuleContaining(
+    ".sdsync-app .sdsync-control-owner.sdsync-input-control .sdsync-control-shell.sdsync-input-shell",
+    ".sdsync-app .sdsync-control-owner.sdsync-select-control .sdsync-control-shell.sdsync-select-shell"
+  );
+  assert.match(markedShell, /inline-size:\s*100%\s*!important/);
+  assert.match(markedShell, /width:\s*100%\s*!important/);
+  assert.match(markedShell, /flex:\s*1 1 0%\s*!important/);
+  assert.match(markedShell, /margin:\s*0\s*!important/);
+  assert.match(markedShell, /padding:\s*0\s*!important/);
+  assert.match(markedShell, /background-color:\s*transparent\s*!important/);
+
+  const semanticFill = declarationsForRuleContaining(
+    '.sdsync-app .sdsync-control-owner.sdsync-input-control input.sdsync-semantic-control:not([type="checkbox"]):not([type="radio"])',
+    ".sdsync-app .sdsync-control-owner.sdsync-input-control textarea.sdsync-semantic-control"
+  );
+  assert.match(semanticFill, /inline-size:\s*100%\s*!important/);
+  assert.match(semanticFill, /width:\s*100%\s*!important/);
+  assert.match(semanticFill, /max-inline-size:\s*100%\s*!important/);
+  assert.match(semanticFill, /max-width:\s*100%\s*!important/);
+  assert.match(semanticFill, /min-inline-size:\s*0\s*!important/);
+  assert.match(semanticFill, /min-width:\s*0\s*!important/);
+  assert.match(semanticFill, /flex:\s*1 1 0%\s*!important/);
+  assert.match(semanticFill, /margin:\s*0\s*!important/);
+  assert.match(semanticFill, /background:\s*transparent\s*!important/);
 
   const inputControl = declarationsForRuleContaining(
     '.sdsync-app .sdsync-input-control input:not([type="checkbox"]):not([type="radio"])',
@@ -275,6 +332,60 @@ test("owned horizontal forms align labels and controls until genuinely narrow wi
     "profile editors must stack by their own AppWindow track width");
 });
 
+test("profile catalog and editor are exclusive full-width views with one configuration field per line", () => {
+  assert.match(
+    app,
+    /:class="\['sdsync-profiles-layout', profileEditorOpen \? 'is-editor-only' : 'is-catalog-only'\]"/
+  );
+  assert.match(
+    app,
+    /<transition name="sdsync-page-swap" mode="out-in">\s*<div v-if="!profileEditorOpen" key="profile-catalog"[^>]*\bsdsync-profile-catalog\b/
+  );
+  assert.match(
+    app,
+    /<v-form v-else key="profile-editor"[^>]*\bsdsync-profile-editor\b/,
+    "the editor must replace the catalog instead of opening as its second column"
+  );
+  assert.doesNotMatch(app, /<v-form v-if="profileEditorOpen"[^>]*\bsdsync-profile-editor\b/,
+    "the profile catalog and editor must not render simultaneously");
+
+  const editorTrack = declarationsForRuleContaining(
+    ".sdsync-app .sdsync-profiles-layout.is-editor-only",
+    ".sdsync-app .sdsync-profiles-layout.is-editor-only > .sdsync-profile-editor"
+  );
+  assert.match(editorTrack, /width:\s*100%/);
+  assert.match(editorTrack, /max-width:\s*100%/);
+  assert.match(editorTrack, /min-width:\s*0/);
+
+  const profileSections = declarationsForRuleContaining(
+    ".sdsync-app .sdsync-profile-editor > .sdsync-form-grid",
+    ".sdsync-app .sdsync-profile-editor .sdsync-advanced > .sdsync-form-grid",
+    ".sdsync-app .sdsync-profile-editor > .sdsync-danger-fieldset",
+    ".sdsync-app .sdsync-profile-editor > .sdsync-secret-fieldset"
+  );
+  assert.match(profileSections, /grid-template-columns:\s*minmax\(0, 1fr\)/);
+  assert.match(profileSections, /width:\s*100%/);
+  assert.match(profileSections, /min-width:\s*0/);
+
+  const profileRows = declarationsForRuleContaining(
+    ".sdsync-app .sdsync-profile-editor > .sdsync-form-grid > *",
+    ".sdsync-app .sdsync-profile-editor .sdsync-advanced > .sdsync-form-grid > *",
+    ".sdsync-app .sdsync-profile-editor > .sdsync-danger-fieldset > *",
+    ".sdsync-app .sdsync-profile-editor > .sdsync-secret-fieldset > *"
+  );
+  assert.match(profileRows, /grid-column:\s*1 \/ -1/);
+  assert.match(profileRows, /max-width:\s*100%/);
+  assert.match(profileRows, /min-width:\s*0/);
+
+  const editorStart = app.indexOf('<v-form v-else key="profile-editor"');
+  const editorEnd = app.indexOf("</v-form>", editorStart);
+  const profileEditor = app.slice(editorStart, editorEnd);
+  assert.ok(editorStart >= 0 && editorEnd > editorStart, "profile editor template is missing");
+  assert.match(profileEditor, /class="sdsync-danger-fieldset"/);
+  assert.match(profileEditor, /class="sdsync-advanced"/);
+  assert.match(profileEditor, /class="sdsync-toggle-row(?: [^"]*)?"/);
+});
+
 test("critical form layout has an explicit Chrome 88 compatibility path", () => {
   assert.match(webpack, /targets:\s*\{\s*chrome:\s*["']88["']\s*\}/);
   assert.doesNotMatch(css, /:has\(/, "critical layout must not require relational selectors unavailable in Chrome 88");
@@ -287,6 +398,8 @@ test("critical form layout has an explicit Chrome 88 compatibility path", () => 
   assert.match(baselineCss, /> \.sdsync-form-control-cell/);
 
   assert.match(controlLayout, /classList\.add\("sdsync-control-shell", typeClass\)/);
+  assert.match(controlLayout, /classList\.add\("sdsync-control-owner"\)/);
+  assert.match(controlLayout, /classList\.add\("sdsync-semantic-control"\)/);
   assert.match(controlLayout, /classList\.add\("sdsync-form-control-cell"\)/);
   assert.match(controlLayout, /classList\.add\("sdsync-form-control-shell"\)/);
   assert.match(controlLayout, /classList\.add\("sdsync-checkbox-label"\)/);

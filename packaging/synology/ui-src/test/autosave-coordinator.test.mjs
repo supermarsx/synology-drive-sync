@@ -202,10 +202,11 @@ test("authoritative hydration during an in-flight save supersedes its stale comp
   const clock = new FakeClock();
   const first = deferred();
   const values = [];
+  const superseded = [];
   const coordinator = autosave.createAutosaveCoordinator(coordinatorOptions(clock, (task) => {
     values.push(task.value.value);
     return first.promise;
-  }));
+  }, { onSuperseded: (task, error) => superseded.push({ task, error }) }));
 
   coordinator.hydrate("alerts", { value: "snapshot-1" });
   coordinator.update("alerts", { value: "submitted" });
@@ -216,6 +217,9 @@ test("authoritative hydration during an in-flight save supersedes its stale comp
   first.resolve();
   await clock.settle();
   assert.deepEqual(values, ["submitted"]);
+  assert.equal(superseded.length, 1);
+  assert.equal(superseded[0].task.scope, "alerts");
+  assert.equal(superseded[0].error, null);
   assert.deepEqual(coordinator.getState("alerts"), {
     scope: "alerts", registered: true, dirty: false, scheduled: false, queued: false,
     busy: false, blocked: false, cancelled: false, inFlight: false, revision: 3, dueAt: 0
@@ -230,10 +234,14 @@ test("authoritative hydration also supersedes a stale rejection without pausing 
   const first = deferred();
   const values = [];
   const failures = [];
+  const superseded = [];
   const coordinator = autosave.createAutosaveCoordinator(coordinatorOptions(clock, (task) => {
     values.push(task.value.value);
     return values.length === 1 ? first.promise : Promise.resolve();
-  }, { onError: (error, task) => failures.push({ error, task }) }));
+  }, {
+    onError: (error, task) => failures.push({ error, task }),
+    onSuperseded: (task, error) => superseded.push({ task, error })
+  }));
 
   coordinator.hydrate("security", { value: "snapshot-1" });
   coordinator.update("security", { value: "submitted" });
@@ -245,6 +253,9 @@ test("authoritative hydration also supersedes a stale rejection without pausing 
   assert.equal(coordinator.getState("security").blocked, false);
   assert.equal(coordinator.getState("security").dirty, false);
   assert.deepEqual(failures, [], "a superseded failure must not replace reconciled UI status");
+  assert.equal(superseded.length, 1, "superseded settlement must still release a Saving status");
+  assert.equal(superseded[0].task.scope, "security");
+  assert.match(superseded[0].error.message, /stale transport rejection/);
 
   coordinator.update("security", { value: "later edit" });
   await clock.advance(1300);

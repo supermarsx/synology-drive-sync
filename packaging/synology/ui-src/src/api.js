@@ -6,6 +6,14 @@ export const QUEUED_SCHEMA = "sdsync.dsm-queued.v1";
 export const RESULT_STATUS_SCHEMA = "sdsync.dsm-result-status.v1";
 export const RESULT_SCHEMA = "sdsync.dsm-result.v1";
 export const MAX_RESPONSE_BYTES = 1024 * 1024;
+export const AUTOSAVE_API_LIMITS = Object.freeze({
+  csrfReissueTimeoutMs: 10000,
+  postRequestTimeoutMs: 15000,
+  postResponseTimeoutMs: 10000,
+  readTimeoutMs: 10000,
+  resultRequestTimeoutMs: 10000,
+  resultObservationTimeoutMs: 30000
+});
 
 const CSRF_SCHEMA = "sdsync.dsm-csrf.v1";
 const RESULT_POLL_INTERVAL_MS = 2000;
@@ -63,6 +71,15 @@ export class DsmApiError extends Error {
     this.status = Number.isInteger(Number(status)) ? Number(status) : 0;
     this.code = boundedText(code, "api_error").slice(0, 128);
     this.stage = boundedText(stage, "").slice(0, 128);
+  }
+}
+
+export class ClientRequestTimeoutError extends DsmApiError {
+  constructor(message, stage) {
+    super(message, 0, "client_timeout", stage);
+    this.name = "ClientRequestTimeoutError";
+    this.clientTimeout = true;
+    this.preAcceptance = true;
   }
 }
 
@@ -400,6 +417,108 @@ function exactKeys(actual, expected, label) {
   }
 }
 
+function normalizedRequestLimits(options) {
+  if (options === undefined || options === null) return null;
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("API request limits must be an object");
+  }
+  const timeoutKeys = [
+    "csrfReissueTimeoutMs", "postRequestTimeoutMs", "postResponseTimeoutMs",
+    "readTimeoutMs", "resultRequestTimeoutMs", "resultObservationTimeoutMs"
+  ];
+  const supportedKeys = new Set([...timeoutKeys, "setTimeout", "clearTimeout"]);
+  if (Object.keys(options).some((key) => !supportedKeys.has(key))) {
+    throw new TypeError("API request limits contain an unsupported option");
+  }
+  const normalized = {};
+  timeoutKeys.forEach((key) => {
+    const value = Number(options[key]);
+    if (!Number.isInteger(value) || value < 1 || value > 600000) {
+      throw new TypeError(`${key} must be an integer from 1 through 600000 milliseconds`);
+    }
+    normalized[key] = value;
+  });
+  if (options.setTimeout !== undefined && typeof options.setTimeout !== "function") {
+    throw new TypeError("API request setTimeout option must be a function");
+  }
+  if (options.clearTimeout !== undefined && typeof options.clearTimeout !== "function") {
+    throw new TypeError("API request clearTimeout option must be a function");
+  }
+  normalized.setTimer = typeof options.setTimeout === "function"
+    ? options.setTimeout
+    : (callback, milliseconds) => window.setTimeout(callback, milliseconds);
+  normalized.clearTimer = typeof options.clearTimeout === "function"
+    ? options.clearTimeout
+    : (timer) => window.clearTimeout(timer);
+  if ((options.setTimeout === undefined) !== (options.clearTimeout === undefined)) {
+    throw new TypeError("API request limits must provide both timer functions or neither");
+  }
+  return normalized;
+}
+
+function withinLimit(
+  promise,
+  milliseconds,
+  limits,
+  errorFactory,
+  onTimeout = null,
+  cancellation = null
+) {
+  return new Promise((resolve, reject) => {
+    if (cancellation && cancellation.expired) {
+      reject(errorFactory());
+      return;
+    }
+    let settled = false;
+    const clearCancellation = () => {
+      if (cancellation && cancellation.cancelCurrent === cancel) cancellation.cancelCurrent = null;
+    };
+    const cancel = () => {
+      if (settled) return;
+      settled = true;
+      limits.clearTimer(timer);
+      clearCancellation();
+      reject(errorFactory());
+    };
+    const timer = limits.setTimer(() => {
+      if (settled) return;
+      settled = true;
+      clearCancellation();
+      if (onTimeout) onTimeout();
+      reject(errorFactory());
+    }, milliseconds);
+    if (cancellation) cancellation.cancelCurrent = cancel;
+    Promise.resolve(promise).then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        limits.clearTimer(timer);
+        clearCancellation();
+        resolve(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        limits.clearTimer(timer);
+        clearCancellation();
+        reject(error);
+      }
+    );
+  });
+}
+
+function safeReadTimeout(stage, detail) {
+  return new ClientRequestTimeoutError(detail, stage);
+}
+
+function queuedObservationTimeout(jobId, requestId, detail) {
+  return new QueuedOutcomeUnknownError(
+    jobId,
+    `${detail} Do not retry it; inspect Activity and Logs.`,
+    requestId
+  );
+}
+
 function exactMutationKeys(action, payload) {
   if (action !== ACTIONS.routine) {
     exactKeys(payload, ARGUMENT_KEYS[action], "Mutation");
@@ -423,7 +542,7 @@ function endpoint(action, parameters) {
   return `${API_URL}?${query.toString()}`;
 }
 
-async function apiGetWithDsmAuth(auth, action, parameters, dsmAuth) {
+async function apiGetWithDsmAuth(auth, action, parameters, dsmAuth, rememberGeneration = true) {
   const response = await fetch(endpoint(action, parameters), {
     method: "GET",
     credentials: "same-origin",
@@ -433,32 +552,78 @@ async function apiGetWithDsmAuth(auth, action, parameters, dsmAuth) {
     headers: authenticatedHeaders({ Accept: "application/json" }, dsmAuth)
   });
   const model = await responseJson(response, action === "result", true);
-  if (action === "csrf") rememberCsrfGeneration(auth, model, dsmAuth.generation);
+  if (rememberGeneration && action === "csrf") {
+    rememberCsrfGeneration(auth, model, dsmAuth.generation);
+  }
   return model;
 }
 
-export async function apiGet(auth, action, parameters = {}) {
+export async function apiGet(auth, action, parameters = {}, options = undefined) {
   if (!GET_ACTIONS.includes(action)) throw new Error("Unsupported API read action");
   exactKeys(parameters, GET_ARGUMENT_KEYS[action], "Read");
+  const limits = normalizedRequestLimits(options);
   await ensureDsmToken();
-  return apiGetWithDsmAuth(auth, action, parameters, dsmAuthSnapshot());
+  const requestDsmAuth = dsmAuthSnapshot();
+  const deferredCsrfGeneration = Boolean(limits && action === "csrf");
+  const request = apiGetWithDsmAuth(
+    auth,
+    action,
+    parameters,
+    requestDsmAuth,
+    !deferredCsrfGeneration
+  );
+  if (!limits) return request;
+  const model = await withinLimit(
+      request,
+      limits.readTimeoutMs,
+      limits,
+      () => safeReadTimeout("read_observation", "DSM did not return a complete read response within the autosave limit.")
+  );
+  if (deferredCsrfGeneration) {
+    rememberCsrfGeneration(auth, model, requestDsmAuth.generation);
+  }
+  return model;
 }
 
-function delay(milliseconds, signal) {
+function delay(milliseconds, signal, limits = null, cancellation = null) {
   return new Promise((resolve, reject) => {
     if (signal && signal.aborted) {
       reject(new Error("DSM UI request was cancelled"));
       return;
     }
-    const timer = window.setTimeout(() => {
+    if (cancellation && cancellation.expired) {
+      reject(new Error("DSM result observation was cancelled after its autosave limit elapsed"));
+      return;
+    }
+    const setTimer = limits ? limits.setTimer : (callback, delayMs) => window.setTimeout(callback, delayMs);
+    const clearTimer = limits ? limits.clearTimer : (value) => window.clearTimeout(value);
+    let settled = false;
+    const cleanup = () => {
       if (signal) signal.removeEventListener("abort", cancel);
+      if (cancellation && cancellation.cancelCurrent === cancelObservation) cancellation.cancelCurrent = null;
+    };
+    const timer = setTimer(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
       resolve();
     }, milliseconds);
     function cancel() {
-      window.clearTimeout(timer);
+      if (settled) return;
+      settled = true;
+      clearTimer(timer);
+      cleanup();
       reject(new Error("DSM UI request was cancelled"));
     }
+    function cancelObservation() {
+      if (settled) return;
+      settled = true;
+      clearTimer(timer);
+      cleanup();
+      reject(new Error("DSM result observation was cancelled after its autosave limit elapsed"));
+    }
     if (signal) signal.addEventListener("abort", cancel, { once: true });
+    if (cancellation) cancellation.cancelCurrent = cancelObservation;
   });
 }
 
@@ -467,7 +632,9 @@ async function pollJobResult(
   jobId,
   dsmAuth,
   pollIntervalMs = RESULT_POLL_INTERVAL_MS,
-  requestId = ""
+  requestId = "",
+  limits = null,
+  observation = null
 ) {
   if (!/^[0-9a-f]{48}$/.test(jobId)) {
     throw new Error("API returned an invalid queued job identifier");
@@ -477,11 +644,33 @@ async function pollJobResult(
     : RESULT_POLL_INTERVAL_MS;
   let consecutiveObservationFailures = 0;
   for (;;) {
+    if (observation && observation.expired) {
+      throw queuedObservationTimeout(
+        jobId,
+        requestId,
+        "DSM accepted the operation, but terminal result observation exceeded the autosave limit."
+      );
+    }
     let status;
     try {
-      status = await apiGetWithDsmAuth(auth, "result", { job_id: jobId }, dsmAuth);
+      const request = apiGetWithDsmAuth(auth, "result", { job_id: jobId }, dsmAuth);
+      status = limits
+        ? await withinLimit(
+          request,
+          limits.resultRequestTimeoutMs,
+          limits,
+          () => queuedObservationTimeout(
+            jobId,
+            requestId,
+            "DSM accepted the operation, but a terminal result request exceeded the autosave limit."
+          ),
+          null,
+          observation
+        )
+        : await request;
     } catch (error) {
       if (auth && auth.signal && auth.signal.aborted) throw error;
+      if (error instanceof QueuedOutcomeUnknownError) throw error;
       consecutiveObservationFailures += 1;
       // The POST was already accepted. Repeated transport/auth observation
       // failures are not evidence that the queued mutation failed, so surface
@@ -493,8 +682,15 @@ async function pollJobResult(
           requestId
         );
       }
-      await delay(interval, auth && auth.signal);
+      await delay(interval, auth && auth.signal, limits, observation);
       continue;
+    }
+    if (observation && observation.expired) {
+      throw queuedObservationTimeout(
+        jobId,
+        requestId,
+        "DSM accepted the operation, but terminal result observation exceeded the autosave limit."
+      );
     }
     consecutiveObservationFailures = 0;
     if (status.schema !== RESULT_STATUS_SCHEMA || status.job_id !== jobId) {
@@ -505,7 +701,7 @@ async function pollJobResult(
       );
     }
     if (status.state === "pending") {
-      await delay(interval, auth && auth.signal);
+      await delay(interval, auth && auth.signal, limits, observation);
       continue;
     }
     if (status.state === "expired_or_missing") {
@@ -579,16 +775,31 @@ function dispatchedOutcomeUnknown(id) {
   );
 }
 
-async function csrfForCurrentAuthGeneration(auth, csrfToken, dsmAuth) {
+async function csrfForCurrentAuthGeneration(auth, csrfToken, dsmAuth, limits = null) {
   if (!auth || typeof auth !== "object") return csrfToken;
   const issuedGeneration = csrfGenerationByAuth.get(auth);
   if (issuedGeneration === undefined || issuedGeneration === dsmAuth.generation) return csrfToken;
 
   const previousToken = csrfToken;
-  const model = await apiGetWithDsmAuth(auth, "csrf", {}, dsmAuth);
+  // A timed-out reissue may still settle later at the fetch layer. Do not let
+  // that detached response advance the accepted generation without also
+  // delivering its replacement token to the AppWindow.
+  const request = apiGetWithDsmAuth(auth, "csrf", {}, dsmAuth, false);
+  const model = limits
+    ? await withinLimit(
+      request,
+      limits.csrfReissueTimeoutMs,
+      limits,
+      () => safeReadTimeout(
+        "csrf_reissue",
+        "DSM request authentication could not be refreshed within the autosave limit; no mutation request was sent."
+      )
+    )
+    : await request;
   if (!validCsrfModel(model)) {
     throw new Error("Authenticated bridge did not reissue a valid CSRF token");
   }
+  rememberCsrfGeneration(auth, model, dsmAuth.generation);
   const replacementToken = model.csrf_token;
   if (typeof auth.onCsrfReissued === "function") {
     auth.onCsrfReissued(previousToken, replacementToken);
@@ -602,16 +813,18 @@ export async function apiPost(
   action,
   payload,
   awaitTerminal = true,
-  pollIntervalMs = RESULT_POLL_INTERVAL_MS
+  pollIntervalMs = RESULT_POLL_INTERVAL_MS,
+  options = undefined
 ) {
   if (!csrfToken) throw new Error("Authenticated DSM mutation bridge is unavailable");
   const expectedKeys = ARGUMENT_KEYS[action];
   if (!expectedKeys) throw new Error("Unsupported API mutation action");
   exactMutationKeys(action, payload);
+  const limits = normalizedRequestLimits(options);
 
   await ensureDsmToken();
   const requestDsmAuth = dsmAuthSnapshot();
-  const effectiveCsrfToken = await csrfForCurrentAuthGeneration(auth, csrfToken, requestDsmAuth);
+  const effectiveCsrfToken = await csrfForCurrentAuthGeneration(auth, csrfToken, requestDsmAuth, limits);
   const id = requestId();
   const request = JSON.stringify({
     schema: REQUEST_SCHEMA,
@@ -621,7 +834,7 @@ export async function apiPost(
   });
   let response;
   try {
-    response = await fetch(API_URL, {
+    const dispatched = fetch(API_URL, {
       method: "POST",
       credentials: "same-origin",
       cache: "no-store",
@@ -634,14 +847,31 @@ export async function apiPost(
       }, requestDsmAuth),
       body: request
     });
+    response = limits
+      ? await withinLimit(
+        dispatched,
+        limits.postRequestTimeoutMs,
+        limits,
+        () => dispatchedOutcomeUnknown(id)
+      )
+      : await dispatched;
   } catch (_error) {
     throw dispatchedOutcomeUnknown(id);
   }
 
   let queued;
   try {
-    queued = await responseJson(response);
+    const body = responseJson(response);
+    queued = limits
+      ? await withinLimit(
+        body,
+        limits.postResponseTimeoutMs,
+        limits,
+        () => dispatchedOutcomeUnknown(id)
+      )
+      : await body;
   } catch (error) {
+    if (error instanceof MutationOutcomeUnknownError) throw error;
     if (error instanceof DsmApiError && error.trustedRejection === true) {
       error.preAcceptance = true;
       error.requestId = id;
@@ -657,7 +887,21 @@ export async function apiPost(
     || !/^[0-9a-f]{48}$/.test(String(queued.job_id || ""))) {
     throw dispatchedOutcomeUnknown(id);
   }
-  return awaitTerminal
-    ? pollJobResult(auth, queued.job_id, requestDsmAuth, pollIntervalMs, id)
-    : queued;
+  if (!awaitTerminal) return queued;
+  if (!limits) return pollJobResult(auth, queued.job_id, requestDsmAuth, pollIntervalMs, id);
+  const observation = { expired: false, cancelCurrent: null };
+  return withinLimit(
+    pollJobResult(auth, queued.job_id, requestDsmAuth, pollIntervalMs, id, limits, observation),
+    limits.resultObservationTimeoutMs,
+    limits,
+    () => queuedObservationTimeout(
+      queued.job_id,
+      id,
+      "DSM accepted the operation, but terminal result observation exceeded the autosave limit."
+    ),
+    () => {
+      observation.expired = true;
+      if (observation.cancelCurrent) observation.cancelCurrent();
+    }
+  );
 }

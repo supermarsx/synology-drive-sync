@@ -232,12 +232,12 @@ test("AppWindow overlays, focus behavior, labels, secrets, and mutation guards r
   assert.match(source, /removeProfile\(\)[\s\S]*?this\.operationBusy\) return/);
   assert.match(source, /removeRoutine\(\)[\s\S]*?this\.operationBusy\) return/);
   assert.match(source, /:disabled="!canRunOperations \|\| !profiles\.length \|\| operationBusy"/);
-  assert.match(source, /let configurationApplied = false;\s*let secretsApplied = 0;/);
+  assert.match(source, /let configurationApplied = false;\s*let activeSecretKind = "";\s*const appliedSecretKinds = \[\];/);
   assert.match(source, /ACTIONS\.configureProfile, payload\);\s*configurationApplied = true;/);
-  assert.match(source, /ACTIONS\.setSecret, secret\);\s*secretsApplied \+= 1;/);
+  assert.match(source, /activeSecretKind = secret\.kind;\s*await apiPost[\s\S]*?ACTIONS\.setSecret, secret\);\s*appliedSecretKinds\.push\(secret\.kind\)/);
   assert.match(source, /partiallyApplied \? "Profile partially applied" : "Profile not saved"/);
-  assert.match(source, /inspect credential presence before retrying/);
-  assert.match(source, /if \(partiallyApplied \|\| caught\.outcomeUnknown === true\)[\s\S]*?this\.closeProfile\(\);[\s\S]*?await this\.refreshSnapshot\(false, true\)/);
+  assert.match(source, /Do not retry this multi-stage operation; inspect Activity and Logs/);
+  assert.match(source, /if \(partiallyApplied \|\| caught\.outcomeUnknown === true\)[\s\S]*?this\.closeProfile\(\);[\s\S]*?const observed = await this\.refreshSnapshot\(false, true\)/);
 });
 
 test("polling has no client deadline and toolkit make always rebuilds source", () => {

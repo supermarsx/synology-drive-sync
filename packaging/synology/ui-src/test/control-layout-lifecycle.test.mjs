@@ -27,6 +27,37 @@ function form(width) {
   };
 }
 
+test("nested fit-container textfield shells receive stable package-owned fill markers", () => {
+  const target = { classList: classList("v-textfield-input-element", "fit-container"), parentElement: null };
+  const inner = { classList: classList("v-textfield-input-inner", "fit-container"), parentElement: null };
+  const outer = { classList: classList("v-textfield-input", "fit-container"), parentElement: null };
+  const owner = {
+    classList: classList("sdsync-input-control", "v-textfield", "fit-container"),
+    querySelectorAll(selector) {
+      return selector.includes("input:not") ? [target] : [];
+    }
+  };
+  target.parentElement = inner;
+  inner.parentElement = outer;
+  outer.parentElement = owner;
+  const root = {
+    querySelectorAll(selector) {
+      return selector.includes(".sdsync-input-control") ? [owner] : [];
+    }
+  };
+  const context = vm.createContext({ Set });
+  vm.runInContext(`${source.replace(/^export\s+/gm, "")}\nthis.markControlShells = markControlShells;`, context);
+
+  context.markControlShells(root);
+
+  assert.equal(owner.classList.contains("sdsync-control-owner"), true);
+  assert.equal(target.classList.contains("sdsync-semantic-control"), true);
+  for (const shell of [inner, outer]) {
+    assert.equal(shell.classList.contains("sdsync-control-shell"), true);
+    assert.equal(shell.classList.contains("sdsync-input-shell"), true);
+  }
+});
+
 test("responsive form observers release removed routes and cannot restart after cleanup", async () => {
   const resizeInstances = [];
   const mutationInstances = [];

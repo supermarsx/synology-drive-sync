@@ -174,6 +174,44 @@ test("new profile defaults, explicit exclude clearing, snapshot hydration, and p
   assert.deepEqual(context.secretModes, { password: "keep", totp: "keep", remote_log_token: "keep" });
 });
 
+test("profile catalog-to-editor state transitions preserve filters and close safely", () => {
+  const component = loadAppComponent();
+  const methods = component.methods;
+  const cancelled = [];
+  const profile = completeProfile();
+  const context = bind({
+    operationBusy: false,
+    canChangeProfiles: true,
+    profiles: [profile],
+    selectedProfile: "",
+    profileForm: {},
+    profileEditorOpen: false,
+    profileFilter: "volume1",
+    profileFilterStatus: "ready",
+    secretModes: {},
+    secretValues: {},
+    autosaveCoordinator: null,
+    cancelAutosave(scope) { cancelled.push(scope); }
+  }, methods, ["clearSecrets", "integer", "profilePayload", "hydrateAutosave"]);
+
+  methods.openProfile.call(context, "");
+  assert.equal(context.profileEditorOpen, true, "New profile must leave the catalog for the editor view");
+  assert.equal(context.selectedProfile, "");
+  assert.deepEqual([context.profileFilter, context.profileFilterStatus], ["volume1", "ready"]);
+
+  methods.closeProfile.call(context);
+  assert.equal(context.profileEditorOpen, false, "Close must return to the catalog view");
+  assert.equal(context.selectedProfile, "");
+  assert.deepEqual(cancelled, ["profile"]);
+  assert.deepEqual(context.secretValues, { password: "", totp: "", remote_log_token: "" });
+  assert.deepEqual([context.profileFilter, context.profileFilterStatus], ["volume1", "ready"],
+    "returning to the catalog must preserve the user's filters");
+
+  methods.openProfile.call(context, profile.name);
+  assert.equal(context.profileEditorOpen, true, "an existing profile must use the same dedicated editor view");
+  assert.equal(context.selectedProfile, profile.name);
+});
+
 test("structured profile filters search useful fields and distinguish no matches from an empty catalog", () => {
   const component = loadAppComponent();
   const profiles = [
@@ -234,11 +272,26 @@ test("secret-only save is independent of profile edits and remote-token clear re
       selectedProfile: "nightly", canManageSecrets: true, canChangeProfiles: false,
       canReplaceRemoteLogToken, operationBusy: false, disposed: false,
       auth: {}, csrfToken: "csrf", secretModes, secretValues, toasts: [], refreshes: 0,
+      autosaveCoordinator: null, autosavePhase: "saved", autosaveMessage: "All changes saved",
+      autosaveFailureScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
+      autosaveOutcomeUnknownScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
+      autosaveInspectionScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
+      profileFailureRecords: {
+        configuration: { active: false, outcomeUnknown: false, requiresInspection: false },
+        secrets: {
+          password: { active: false, outcomeUnknown: false, requiresInspection: false },
+          totp: { active: false, outcomeUnknown: false, requiresInspection: false },
+          "remote-log-token": { active: false, outcomeUnknown: false, requiresInspection: false }
+        }
+      },
       toast(title, message, error = false) { this.toasts.push({ title, message, error }); },
       confirmAction: async () => true,
-      refreshSnapshot: async function () { this.refreshes += 1; },
+      refreshSnapshot: async function () { this.refreshes += 1; return true; },
       reportMutationError() { throw new Error("unexpected mutation failure"); }
-    }, methods, ["secretOperations", "validateSecretOperations", "clearSecrets"]);
+    }, methods, [
+      "secretOperations", "validateSecretOperations", "clearSecrets", "refreshAutosaveStatus",
+      "ensureProfileFailureRecords", "syncProfileFailureState", "clearProfileSecretFailures"
+    ]);
   }
 
   const password = secretContext(

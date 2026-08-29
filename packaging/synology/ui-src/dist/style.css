@@ -348,6 +348,42 @@
   box-shadow: none !important;
 }
 
+/* controlLayout.js adds sdsync-control-owner after DSM has rendered the
+ * component root. The extra package-owned specificity defeats fit-content
+ * SDK classes without naming or depending on DSM's private class names. */
+.sdsync-app .sdsync-control-owner.sdsync-input-control:not(input):not(textarea):not(select):not([role="combobox"]),
+.sdsync-app .sdsync-control-owner.sdsync-select-control:not(input):not(textarea):not(select):not([role="combobox"]):not([aria-haspopup="listbox"]) {
+  inline-size: 100% !important;
+  width: 100% !important;
+  max-inline-size: 100% !important;
+  max-width: 100% !important;
+  min-inline-size: 0 !important;
+  min-width: 0 !important;
+  flex: 1 1 0% !important;
+}
+
+.sdsync-app .sdsync-control-owner.sdsync-input-control:not(input):not(textarea):not(select):not([role="combobox"]) {
+  display: inline-flex !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  color: var(--sdsync-text) !important;
+  border: 1px solid var(--sdsync-control-border) !important;
+  background-color: var(--sdsync-control) !important;
+  background-image: none !important;
+  box-shadow: none !important;
+}
+
+.sdsync-app .sdsync-control-owner.sdsync-select-control:not(input):not(textarea):not(select):not([role="combobox"]):not([aria-haspopup="listbox"]) {
+  display: block !important;
+  margin: 0 !important;
+  padding: 3px 29px 3px 11px !important;
+  color: var(--sdsync-text) !important;
+  border: 1px solid var(--sdsync-control-border) !important;
+  background-color: var(--sdsync-control) !important;
+  background-image: none !important;
+  box-shadow: none !important;
+}
+
 .sdsync-app .sdsync-select-control [role="combobox"],
 .sdsync-app .sdsync-select-control [aria-haspopup="listbox"] {
   width: 100% !important;
@@ -360,6 +396,22 @@
 .sdsync-app .sdsync-input-control textarea {
   width: 100% !important;
   max-width: 100% !important;
+  min-width: 0 !important;
+  flex: 1 1 0% !important;
+  margin: 0 !important;
+  border: 0 !important;
+  outline: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.sdsync-app .sdsync-control-owner.sdsync-input-control input.sdsync-semantic-control:not([type="checkbox"]):not([type="radio"]),
+.sdsync-app .sdsync-control-owner.sdsync-input-control textarea.sdsync-semantic-control {
+  inline-size: 100% !important;
+  width: 100% !important;
+  max-inline-size: 100% !important;
+  max-width: 100% !important;
+  min-inline-size: 0 !important;
   min-width: 0 !important;
   flex: 1 1 0% !important;
   margin: 0 !important;
@@ -433,6 +485,29 @@
   display: inline-flex !important;
   flex-flow: row nowrap !important;
   align-items: center !important;
+}
+
+.sdsync-app .sdsync-control-owner.sdsync-input-control .sdsync-control-shell.sdsync-input-shell,
+.sdsync-app .sdsync-control-owner.sdsync-select-control .sdsync-control-shell.sdsync-select-shell {
+  display: inline-flex !important;
+  inline-size: 100% !important;
+  width: 100% !important;
+  max-inline-size: 100% !important;
+  max-width: 100% !important;
+  min-inline-size: 0 !important;
+  min-width: 0 !important;
+  flex: 1 1 0% !important;
+  flex-flow: row nowrap !important;
+  align-items: center !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  color: var(--sdsync-text) !important;
+  border: 0 !important;
+  outline: 0 !important;
+  background-color: transparent !important;
+  background-image: none !important;
+  box-shadow: none !important;
+  box-sizing: border-box;
 }
 
 .sdsync-app .sdsync-select-control[role="combobox"],
@@ -1914,8 +1989,44 @@
 }
 
 .sdsync-profiles-layout.is-catalog-only,
+.sdsync-profiles-layout.is-editor-only,
 .sdsync-routines-layout.is-catalog-only {
   grid-template-columns: minmax(0, 1fr);
+}
+
+.sdsync-profiles-layout.is-editor-only > .sdsync-editor {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+
+/* The profile catalog and editor are alternate views. When the editor is
+ * active it owns the full AppWindow track, and each configuration control
+ * owns a separate row even inside advanced and danger sections. */
+.sdsync-app .sdsync-profiles-layout.is-editor-only,
+.sdsync-app .sdsync-profiles-layout.is-editor-only > .sdsync-profile-editor {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.sdsync-app .sdsync-profile-editor > .sdsync-form-grid,
+.sdsync-app .sdsync-profile-editor .sdsync-advanced > .sdsync-form-grid,
+.sdsync-app .sdsync-profile-editor > .sdsync-danger-fieldset,
+.sdsync-app .sdsync-profile-editor > .sdsync-secret-fieldset {
+  grid-template-columns: minmax(0, 1fr);
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.sdsync-app .sdsync-profile-editor > .sdsync-form-grid > *,
+.sdsync-app .sdsync-profile-editor .sdsync-advanced > .sdsync-form-grid > *,
+.sdsync-app .sdsync-profile-editor > .sdsync-danger-fieldset > *,
+.sdsync-app .sdsync-profile-editor > .sdsync-secret-fieldset > * {
+  grid-column: 1 / -1;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .sdsync-profile-catalog,
@@ -2081,6 +2192,28 @@
   width: 100% !important;
   max-width: 100% !important;
   min-width: 0 !important;
+  height: auto !important;
+  min-height: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  color: var(--sdsync-text) !important;
+  border: 0 !important;
+  outline: 0 !important;
+  background-color: transparent !important;
+  background-image: none !important;
+  box-shadow: none !important;
+  box-sizing: border-box;
+}
+
+.sdsync-app .sdsync-form-item[class] .sdsync-form-control-shell,
+.sdsync-app .sdsync-form-item[class] > .sdsync-form-control-cell {
+  inline-size: 100% !important;
+  width: 100% !important;
+  max-inline-size: 100% !important;
+  max-width: 100% !important;
+  min-inline-size: 0 !important;
+  min-width: 0 !important;
+  flex: 1 1 0% !important;
   height: auto !important;
   min-height: 0 !important;
   margin: 0 !important;

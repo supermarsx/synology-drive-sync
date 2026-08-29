@@ -393,8 +393,31 @@ class DsmUiContractTests(unittest.TestCase):
         self.assertIn("function authenticatedHeaders(headers, dsmAuth)", api)
         self.assertIn(
             "const effectiveCsrfToken = await csrfForCurrentAuthGeneration("
-            "auth, csrfToken, requestDsmAuth);",
+            "auth, csrfToken, requestDsmAuth, limits);",
             api,
+        )
+        self.assertIn(
+            "async function apiGetWithDsmAuth(auth, action, parameters, dsmAuth, "
+            "rememberGeneration = true)",
+            api,
+        )
+        self.assertIn(
+            'const request = apiGetWithDsmAuth(auth, "csrf", {}, dsmAuth, false);',
+            api,
+        )
+        get_source = api[
+            api.index("export async function apiGet(") : api.index("\nfunction delay(")
+        ]
+        self.assertIn(
+            'const deferredCsrfGeneration = Boolean(limits && action === "csrf");',
+            get_source,
+        )
+        self.assertIn("!deferredCsrfGeneration", get_source)
+        self.assertLess(
+            get_source.index("const model = await withinLimit("),
+            get_source.index(
+                "rememberCsrfGeneration(auth, model, requestDsmAuth.generation)"
+            ),
         )
         post_source = api[api.index("export async function apiPost(") :]
         self.assertEqual(post_source.count("fetch(API_URL, {"), 1)
@@ -405,7 +428,7 @@ class DsmUiContractTests(unittest.TestCase):
         )
         self.assertLess(
             post_source.index("const effectiveCsrfToken = await csrfForCurrentAuthGeneration"),
-            post_source.index("response = await fetch(API_URL, {"),
+            post_source.index("const dispatched = fetch(API_URL, {"),
         )
         self.assertIn(
             'apiGetWithDsmAuth(auth, "result", { job_id: jobId }, dsmAuth)',
@@ -1379,6 +1402,48 @@ function bind(context, names) {
                     1,
                 )
             )
+        late_csrf_request = (
+            b'const request = apiGetWithDsmAuth(auth, "csrf", {}, dsmAuth, false);'
+        )
+        self.assertIn(late_csrf_request, source["api"])
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError, "bounded CSRF reissue"
+        ):
+            validate_build(
+                api=source["api"].replace(
+                    late_csrf_request,
+                    late_csrf_request.replace(b"false", b"true"),
+                    1,
+                )
+            )
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError, "bounded CSRF reads"
+        ):
+            validate_build(
+                api=source["api"].replace(
+                    b"!deferredCsrfGeneration",
+                    b"true",
+                    1,
+                )
+            )
+        csrf_helper = source["api"].index(
+            b"async function csrfForCurrentAuthGeneration("
+        )
+        bounded_acceptance = source["api"].index(b"  const model = limits", csrf_helper)
+        generation_commit = (
+            b"  rememberCsrfGeneration(auth, model, dsmAuth.generation);\n"
+        )
+        generation_commit_at = source["api"].index(generation_commit, bounded_acceptance)
+        commit_before_acceptance = (
+            source["api"][:bounded_acceptance]
+            + generation_commit
+            + source["api"][bounded_acceptance:generation_commit_at]
+            + source["api"][generation_commit_at + len(generation_commit) :]
+        )
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError, "commit only after an accepted valid response"
+        ):
+            validate_build(api=commit_before_acceptance)
         with self.assertRaisesRegex(validate_spk.ValidationError, "exactly one package dispatch"):
             validate_build(
                 api=source["api"] + b"\nfetch(API_URL, {});\n"
@@ -1441,7 +1506,7 @@ function bind(context, names) {
         with self.assertRaisesRegex(validate_spk.ValidationError, "retry pending and transport"):
             validate_build(
                 api=source["api"].replace(
-                    b"await delay(interval, auth && auth.signal);",
+                    b"await delay(interval, auth && auth.signal, limits, observation);",
                     b"await Promise.resolve();",
                     1,
                 )
