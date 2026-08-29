@@ -13,7 +13,7 @@ const physicalControlFixture = await readFile(
   new URL("./fixtures/dsm-physical-control-dom.html", import.meta.url),
   "utf8"
 );
-const baselineCss = css.slice(0, css.indexOf("@container (max-width: 420px)"));
+const baselineCss = css.slice(0, css.indexOf("@container (max-width: 520px)"));
 const inlineControlLayout = controlLayout.replace(/^export\s+/gm, "");
 
 function chromeCandidates() {
@@ -440,6 +440,20 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
                 </div>
               </div>
             </form>
+            <form id="profile-editor" class="sdsync-panel sdsync-editor">
+              <div class="sdsync-form-grid">
+                <div id="editor-row" class="dsm-form-item sdsync-form-item">
+                  <div id="editor-label-shell" class="v-form-item-label"><label>Target</label></div>
+                  <div id="editor-control-shell" class="v-form-item-input">
+                    <div class="v-form-item-control">
+                      <div id="editor-input-root" class="sdsync-input-control">
+                        <input id="editor-input" class="dsm-text-input" value="https://nas.example.test">
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </form>
           </div>
           <div id="variant-rack">
             <div class="variant">
@@ -512,11 +526,14 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
               paddingTop: value.paddingTop,
               paddingLeft: value.paddingLeft,
               minWidth: value.minWidth,
-              maxWidth: value.maxWidth,
-              borderTopWidth: value.borderTopWidth,
-              backgroundColor: value.backgroundColor,
-              opacity: value.opacity,
-              overflowY: value.overflowY,
+               maxWidth: value.maxWidth,
+               borderTopWidth: value.borderTopWidth,
+               borderTopColor: value.borderTopColor,
+               backgroundColor: value.backgroundColor,
+               backgroundImage: value.backgroundImage,
+               opacity: value.opacity,
+               pointerEvents: value.pointerEvents,
+               overflowY: value.overflowY,
               position: value.position,
               transitionDuration: value.transitionDuration,
               transitionProperty: value.transitionProperty,
@@ -544,9 +561,14 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
           const result = {
             viewport: innerWidth,
             container: rect("settings-panel"),
-            selectForm: formRow("select-row", "select-label-shell", "select-control-shell"),
-            inputForm: formRow("input-row", "input-label-shell", "input-control-shell"),
-            routineForm: formRow("routine-row", "routine-label-shell", "routine-control-shell"),
+             selectForm: formRow("select-row", "select-label-shell", "select-control-shell"),
+             inputForm: formRow("input-row", "input-label-shell", "input-control-shell"),
+             routineForm: formRow("routine-row", "routine-label-shell", "routine-control-shell"),
+             editorForm: formRow("editor-row", "editor-label-shell", "editor-control-shell"),
+             editor: {
+               rect: rect("profile-editor"),
+               compact: document.getElementById("profile-editor").classList.contains("sdsync-compact-form")
+             },
             formSelect: selectVariant("form-select-root", "form-select-shell-one", "form-select-input", "form-select-trigger", ["form-select-shell-one", "form-select-shell-two"]),
             formSelectPrefixStyle: style("form-select-prefix"),
             formSelectTriggerStyle: style("form-select-trigger"),
@@ -558,8 +580,9 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
             inputShellStyles: [style("input-shell-one"), style("input-shell-two")],
             textInputStyle: style("text-input"),
             textInput: rect("text-input"),
-            checkRow: rect("check-row"),
-            checkboxRoot: { rect: rect("checkbox-root"), style: style("checkbox-root") },
+             checkRow: rect("check-row"),
+             toggleLabel: { rect: rect("toggle-label"), style: style("toggle-label") },
+             checkboxRoot: { rect: rect("checkbox-root"), style: style("checkbox-root") },
             checkboxLabel: { rect: rect("checkbox-label"), style: style("checkbox-label") },
             checkbox: { rect: rect("checkbox"), style: style("checkbox") },
             checkboxGlyph: { rect: rect("checkbox-decoration"), style: style("checkbox-decoration") },
@@ -591,7 +614,7 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
     const medium = render(chrome, `${url}?container=640`, join(temporaryDirectory, "profile-medium"));
     const narrow = render(chrome, `${url}?container=380`, join(temporaryDirectory, "profile-narrow"));
 
-    for (const form of [wide.selectForm, wide.inputForm, wide.routineForm]) {
+    for (const form of [wide.selectForm, wide.inputForm, wide.routineForm, wide.editorForm]) {
       assert.equal(form.row.style.display, "grid");
       assert.match(form.row.style.gridTemplateColumns, /\S+\s+\S+/);
       assert.equal(form.row.style.marginTop, "0px");
@@ -603,6 +626,10 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
         `wide label shell leaked into its control column: ${JSON.stringify(form)}`
       );
       assert.ok(overlapsVertically(form.label, form.control.rect), "wide label and control stacked vertically");
+      assert.ok(form.control.rect.right >= form.row.rect.right - 1,
+        `wide control did not fill its horizontal form track: ${JSON.stringify(form)}`);
+      assert.ok(form.control.rect.width >= form.row.rect.width * 0.5,
+        `wide control was crunched by its label track: ${JSON.stringify(form)}`);
     }
 
     assert.equal(wide.formSelect.root.style.display, "block", "physical DSM select root owns the surface");
@@ -655,22 +682,30 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
     }
     assert.equal(wide.textInputStyle.backgroundColor, "rgba(0, 0, 0, 0)", "semantic input obscured its dark owned root");
 
-    assert.equal(wide.checkboxRoot.style.display, "block");
-    assert.equal(wide.checkboxLabel.style.display, "inline-block");
-    assert.ok(parseFloat(wide.checkboxLabel.style.paddingLeft) >= 28, "checkbox label lost the SDK glyph reservation");
-    assert.equal(wide.checkbox.style.position, "absolute");
-    assert.equal(wide.checkbox.style.opacity, "0");
-    assert.equal(wide.checkboxGlyph.style.position, "absolute");
-    assert.equal(wide.checkboxGlyph.rect.width, 20);
-    assert.equal(wide.checkboxGlyph.rect.height, 20);
-    assert.ok(overlapsVertically(wide.checkboxGlyph.rect, wide.checkboxText), "checkbox glyph and label text stacked vertically");
-    assert.ok(wide.checkboxGlyph.rect.right <= wide.checkboxText.left + 1, "checkbox glyph overlapped the label text");
-    assert.ok(wide.checkboxRoot.rect.width <= wide.checkRow.width + 0.1, "checkbox root overflowed its owned grid track");
-    assert.ok(wide.checkboxRoot.rect.right <= wide.checkboxHelp.left + 0.1, "checkbox label overlapped its help control");
-    assert.ok(
-      wide.checkboxHelp.right <= wide.checkRow.right + 0.1,
-      `checkbox help escaped its owned row: ${JSON.stringify({ row: wide.checkRow, root: wide.checkboxRoot, help: wide.checkboxHelp })}`
-    );
+    for (const layout of [wide, medium, narrow]) {
+      assert.match(layout.checkboxRoot.style.display, /^(?:inline-)?grid$/);
+      assert.equal(layout.checkboxRoot.rect.width, 22);
+      assert.equal(layout.checkboxRoot.rect.height, 22);
+      assert.equal(layout.checkboxLabel.style.display, "none", "DSM checkbox label remained visibly duplicated");
+      assert.equal(layout.checkboxGlyph.style.display, "none", "DSM checkbox glyph remained visibly vendor-themed");
+      assert.equal(layout.checkbox.style.position, "relative");
+      assert.equal(layout.checkbox.style.opacity, "1");
+      assert.equal(layout.checkbox.style.pointerEvents, "auto");
+      assert.equal(layout.checkbox.rect.width, 22);
+      assert.equal(layout.checkbox.rect.height, 22);
+      assert.equal(layout.checkbox.style.backgroundColor, "rgb(255, 106, 26)",
+        "checked semantic toggle lost the hellfire surface");
+      assert.notEqual(layout.checkbox.style.backgroundImage, "none",
+        "checked semantic toggle lost its package-owned mark");
+      assert.ok(layout.toggleLabel.rect.right <= layout.checkboxRoot.rect.left + 1,
+        "right-hand toggle overlapped its visible label");
+      assert.ok(layout.checkboxRoot.rect.right >= layout.checkRow.right - 1,
+        "semantic toggle did not stay at the row's right edge");
+      assert.ok(layout.checkboxHelp.right <= layout.toggleLabel.rect.right + 0.1,
+        "toggle help escaped its visible label boundary");
+      assert.ok(layout.checkboxRoot.rect.right <= layout.checkRow.right + 0.1,
+        "semantic toggle escaped its owned row");
+    }
 
     assert.ok(wide.shell.sidebar.bottom <= wide.shell.app.bottom + 0.1, "sidebar escaped the short AppWindow");
     assert.ok(wide.shell.footer.rect.bottom <= wide.shell.app.bottom + 0.1, "status footer escaped the short AppWindow");
@@ -695,22 +730,36 @@ test("Chrome 88 fallback contains hostile DSM wrappers without modern CSS select
     }
 
     assert.ok(wide.viewport > 720 && medium.viewport > 720 && narrow.viewport > 720, "fixture must keep the DSM browser viewport wide");
-    assert.ok(wide.container.width > 420, `wide AppWindow unexpectedly narrow: ${wide.container.width}`);
-    assert.ok(medium.container.width > 420, `medium AppWindow unexpectedly compact: ${medium.container.width}`);
-    for (const form of [medium.selectForm, medium.inputForm, medium.routineForm]) {
+    assert.ok(wide.container.width > 520, `wide AppWindow unexpectedly narrow: ${wide.container.width}`);
+    assert.ok(medium.container.width > 520, `medium AppWindow unexpectedly compact: ${medium.container.width}`);
+    assert.equal(medium.editor.compact, false, "editor observer marked a 640px editor compact");
+    for (const form of [medium.selectForm, medium.inputForm, medium.routineForm, medium.editorForm]) {
       assert.match(form.row.style.gridTemplateColumns, /\S+\s+\S+/,
         "usable medium AppWindow stacked a label and control");
       assert.equal(form.control.style.gridColumnStart, "2");
       assert.equal(form.control.style.gridRowStart, "1");
       assert.ok(overlapsVertically(form.label, form.control.rect), "medium label and control stacked vertically");
+      assert.ok(form.control.rect.right >= form.row.rect.right - 1,
+        "medium control did not fill its horizontal form track");
+      assert.ok(form.control.rect.width >= form.row.rect.width * 0.55,
+        "medium control was crunched by its label track");
     }
-    assert.ok(narrow.container.width <= 420, `narrow AppWindow missed its compact threshold: ${narrow.container.width}`);
-    for (const form of [narrow.selectForm, narrow.inputForm, narrow.routineForm]) {
+    assert.ok(narrow.container.width <= 520, `narrow AppWindow missed its compact threshold: ${narrow.container.width}`);
+    assert.equal(narrow.editor.compact, true, "editor observer missed a sub-520px editor");
+    for (const [name, form] of Object.entries({
+      select: narrow.selectForm,
+      input: narrow.inputForm,
+      routine: narrow.routineForm,
+      editor: narrow.editorForm
+    })) {
       assert.equal(form.row.style.display, "grid");
-      assert.doesNotMatch(form.row.style.gridTemplateColumns, /\S+\s+\S+/);
+      assert.doesNotMatch(form.row.style.gridTemplateColumns, /\S+\s+\S+/,
+        `${name} row did not stack at the 520px compact threshold`);
       assert.equal(form.control.style.gridColumnStart, "1");
       assert.equal(form.control.style.gridRowStart, "2");
       assert.ok(form.control.rect.top >= form.label.bottom - 1, "narrow AppWindow control did not stack below its label");
+      assert.ok(form.control.rect.width >= form.row.rect.width - 1,
+        "compact form control did not expand to the full row width");
     }
     assert.equal(narrow.formSelect.combo.style.flexDirection, "row", "narrow form stacked the select internals");
   } finally {

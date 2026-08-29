@@ -35,6 +35,11 @@ function loadAppComponent(postSpy = async () => ({ ok: true })) {
     formatBytes: String, formatDate: String, formatDuration: String,
     numberOr: (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback,
     pick: (model, ...keys) => keys.map((key) => model && model[key]).find((value) => value !== undefined),
+    createAutosaveCoordinator: () => ({
+      cancel() {}, dispose() {}, getState: () => ({ registered: false, dirty: false }),
+      hydrate() {}, setGlobalBusy() {}, setScopeBlocked() {}, update: () => ({ dirty: false })
+    }),
+    installControlLayout: () => () => {},
     ActionIcon: { name: "ActionIcon" }, SecurityPanel: {}
   };
   return Function(...Object.keys(stubs), executable)(...Object.values(stubs));
@@ -119,8 +124,9 @@ test("new profile defaults, explicit exclude clearing, snapshot hydration, and p
   const methods = component.methods;
   const context = bind({
     operationBusy: false, canChangeProfiles: true, profiles: [], selectedProfile: "",
-    profileForm: {}, profileEditorOpen: false, secretModes: {}, secretValues: {}
-  }, methods, ["clearSecrets"]);
+    profileForm: {}, profileEditorOpen: false, secretModes: {}, secretValues: {},
+    autosaveCoordinator: null
+  }, methods, ["clearSecrets", "integer", "profilePayload", "hydrateAutosave"]);
 
   methods.openProfile.call(context, "");
   assert.equal(context.profileForm.excludes, "@eaDir/\n**/@eaDir/\n#recycle/\n#snapshot/");
@@ -166,6 +172,29 @@ test("new profile defaults, explicit exclude clearing, snapshot hydration, and p
   assert.equal(component.computed.profileLogFile.call({ selectedProfileModel: profile }), profile.log_file);
   assert.deepEqual(context.secretValues, { password: "", totp: "", remote_log_token: "" });
   assert.deepEqual(context.secretModes, { password: "keep", totp: "keep", remote_log_token: "keep" });
+});
+
+test("structured profile filters search useful fields and distinguish no matches from an empty catalog", () => {
+  const component = loadAppComponent();
+  const profiles = [
+    completeProfile({ name: "alpha", source: "/volume1/source", has_password: true, default: true }),
+    completeProfile({ name: "beta", source: "/volume2/media", has_password: false, default: false })
+  ];
+  const routines = [{ profile: "beta", enabled: true }];
+  const filtered = (profileFilter, profileFilterStatus) => component.computed.filteredProfiles.call({
+    profiles, routines, profileFilter, profileFilterStatus
+  }).map((profile) => profile.name);
+
+  assert.deepEqual(filtered("volume2", "all"), ["beta"]);
+  assert.deepEqual(filtered("", "ready"), ["alpha"]);
+  assert.deepEqual(filtered("", "needs-password"), ["beta"]);
+  assert.deepEqual(filtered("", "default"), ["alpha"]);
+  assert.deepEqual(filtered("", "automated"), ["beta"]);
+  assert.deepEqual(filtered("does-not-exist", "all"), []);
+  assert.match(
+    appSource,
+    /v-if="!filteredProfiles\.length"[^>]*>\{\{ profiles\.length \? 'No matching profiles\.' : 'No configured profiles\.' \}\}/
+  );
 });
 
 test("profile validation mirrors target, path, safety, output, and remote logging bounds", () => {

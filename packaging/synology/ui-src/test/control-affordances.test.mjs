@@ -187,12 +187,36 @@ test("input, select, and textarea states remain explicitly theme-owned", () => {
   requireDeclaration(autofill, /-webkit-box-shadow:\s*0 0 0 1000px var\(--sdsync-control\) inset\s*!important/);
 });
 
+test("right-hand semantic toggles own every visible hellfire state", () => {
+  const base = ruleContaining(".sdsync-app .sdsync-toggle-row .sdsync-checkbox-input");
+  for (const declaration of [
+    /width:\s*22px\s*!important/,
+    /height:\s*22px\s*!important/,
+    /border:\s*1px solid var\(--sdsync-control-border\)\s*!important/,
+    /appearance:\s*none\s*!important/,
+    /background-color:\s*var\(--sdsync-control\)\s*!important/,
+    /pointer-events:\s*auto\s*!important/
+  ]) requireDeclaration(base, declaration, `semantic toggle base lacks ${declaration}`);
+
+  const checked = ruleContaining(".sdsync-app .sdsync-toggle-row .sdsync-checkbox-input:checked");
+  requireDeclaration(checked, /border-color:\s*var\(--sdsync-primary\)\s*!important/);
+  requireDeclaration(checked, /background-color:\s*var\(--sdsync-primary\)\s*!important/);
+  requireDeclaration(checked, /background-image:\s*var\(--sdsync-check-mark\)\s*!important/);
+
+  const danger = ruleContaining(".sdsync-app .sdsync-toggle-row.is-danger .sdsync-checkbox-input:checked");
+  requireDeclaration(danger, /background-color:\s*var\(--sdsync-danger\)\s*!important/);
+
+  const disabled = ruleContaining(".sdsync-app .sdsync-toggle-row .sdsync-checkbox-input:disabled");
+  requireDeclaration(disabled, /background-color:\s*var\(--sdsync-control-disabled\)\s*!important/);
+  requireDeclaration(disabled, /cursor:\s*not-allowed\s*!important/);
+});
+
 test("keyboard focus remains visible on every actionable control family", () => {
   const focusContracts = [
     ['.sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):focus-visible'],
     [".sdsync-nav-item:focus-visible"],
     [".sdsync-profile-row:focus-visible", ".sdsync-routine-row:focus-visible"],
-    [".sdsync-app .sdsync-checkbox-control:focus-within"],
+    [".sdsync-app .sdsync-toggle-row .sdsync-checkbox-input:focus-visible"],
     [".sdsync-field-tip-trigger:focus-visible"],
     [".sdsync-advanced summary:focus-visible"],
     [".sdsync-weekdays input:focus-visible + span"],
@@ -258,12 +282,9 @@ test("action buttons retain visible labels and meaningful icon coverage", () => 
     "Plan all profiles",
     "Run all profiles",
     "New profile",
-    "Save profile",
-    "Save routine",
+    "Save now",
     "Run doctor",
-    "Clear view",
-    "Save interface settings",
-    "Save security policy"
+    "Clear view"
   ]) {
     const button = buttons.find((candidate) => buttonLabel(candidate).includes(label));
     assert.ok(button, `missing critical action ${label}`);

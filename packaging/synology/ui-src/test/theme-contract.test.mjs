@@ -84,6 +84,8 @@ test("every native and DSM Vue control state is explicitly dark themed", () => {
     ".sdsync-app .sdsync-select-control",
     '.sdsync-app [class*="syno"][class*="button"]',
     ".sdsync-app .sdsync-checkbox-control",
+    ".sdsync-app .sdsync-toggle-row .sdsync-checkbox-input",
+    ".sdsync-app .sdsync-toggle-row .sdsync-checkbox-input:checked",
     '.sdsync-app [role="listbox"]',
     '.sdsync-app [role="listbox"] [role="option"][aria-selected="true"]',
     '.sdsync-app [role="tooltip"]'
@@ -170,7 +172,7 @@ test("PortalTarget select menus use a package-owned dark-theme boundary", () => 
   assert.match(declarations(".sdsync-workspace"), /overflow-x:\s*hidden/);
   assert.match(
     css,
-    /\.sdsync-check-row > \.sdsync-field-tip \.sdsync-field-tip-content,[\s\S]*?inset-inline-start:\s*auto;[\s\S]*?inset-inline-end:\s*0;/
+    /\.sdsync-toggle-label > \.sdsync-field-tip \.sdsync-field-tip-content,[\s\S]*?inset-inline-start:\s*auto;[\s\S]*?inset-inline-end:\s*0;/
   );
 });
 
@@ -187,11 +189,11 @@ test("security controls use compact responsive rows without clipping help", () =
   }
   assert.match(declarations(".sdsync-security-form"), /gap:\s*14px/);
   assert.match(declarations(".sdsync-security-grid"), /grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/);
-  assert.match(declarations(".sdsync-check-row"), /grid-template-columns:\s*minmax\(0, 1fr\) 20px/);
-  assert.match(declarations(".sdsync-check-row"), /width:\s*100%/);
-  assert.match(declarations(".sdsync-check-row"), /overflow:\s*visible/);
+  assert.match(declarations(".sdsync-toggle-row"), /grid-template-columns:\s*minmax\(145px, 190px\) minmax\(44px, 1fr\)/);
+  assert.match(declarations(".sdsync-toggle-row"), /width:\s*100%/);
+  assert.match(declarations(".sdsync-toggle-row"), /overflow:\s*visible/);
   assert.match(declarations(".sdsync-policy-control"), /padding-block:\s*3px/);
-  assert.match(declarations(".sdsync-log-policy-grid"), /grid-template-columns:\s*repeat\(3, minmax\(0, 1fr\)\)/);
+  assert.match(declarations(".sdsync-log-policy-grid"), /grid-template-columns:\s*minmax\(0, 1fr\)/);
   assert.match(declarations(".sdsync-security-actions"), /justify-content:\s*flex-end/);
   assert.match(css, /\.sdsync-security-grid\s*\{[\s\S]*?grid-template-columns:\s*1fr\s*;/);
   assert.match(css, /\.sdsync-log-policy-grid\s*\{[\s\S]*?grid-template-columns:\s*1fr\s*;/);
@@ -211,6 +213,8 @@ test("hellfire palette and pixel-sharp trace geometry stay coherent", () => {
   for (const [name, expected] of exactPalette) {
     assert.equal(dark.get(name), expected, `hellfire token --${name} drifted`);
   }
+  assert.match(declarations(".sdsync-app"), /--sdsync-check-mark:\s*url\("data:image\/svg\+xml/,
+    "checked semantic toggles need a package-owned local mark");
   assert.match(css, /background-image:\s*repeating-linear-gradient\(/);
   assert.equal((css.match(/(?:repeating-)?linear-gradient\(/g) || []).length, 1);
   assert.match(css, /border-left:\s*2px solid var\(--sdsync-trace\)/);

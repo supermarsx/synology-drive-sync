@@ -28,6 +28,7 @@
   --sdsync-toast-error-surface: #35100b;
   --sdsync-on-accent: #0b0706;
   --sdsync-on-danger: #fff4e8;
+  --sdsync-check-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3 8.5 6.5 12 13 4' fill='none' stroke='%230b0706' stroke-width='2.4' stroke-linecap='square' stroke-linejoin='miter'/%3E%3C/svg%3E");
   --sdsync-shadow: 8px 8px 0 rgba(0, 0, 0, 0.42);
   --sdsync-motion-out: 160ms;
   --sdsync-motion-in: 220ms;
@@ -74,8 +75,41 @@
   --sdsync-toast-error-surface: #f4d5ca;
   --sdsync-on-accent: #fff8f2;
   --sdsync-on-danger: #fff8f2;
+  --sdsync-check-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3 8.5 6.5 12 13 4' fill='none' stroke='%23fff8f2' stroke-width='2.4' stroke-linecap='square' stroke-linejoin='miter'/%3E%3C/svg%3E");
   --sdsync-shadow: 6px 6px 0 rgba(74, 27, 16, 0.16);
   color-scheme: light;
+}
+
+.sdsync-autosave-state {
+  display: inline-flex;
+  max-width: 260px;
+  min-height: 28px;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 7px;
+  border: 1px solid var(--sdsync-border);
+  border-radius: 1px;
+  color: var(--sdsync-muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10px;
+  line-height: 1.25;
+  background: var(--sdsync-panel-strong);
+}
+
+.sdsync-autosave-state > .sdsync-action-icon {
+  flex: 0 0 13px;
+}
+
+.sdsync-autosave-state.is-saving,
+.sdsync-autosave-state.is-pending {
+  color: var(--sdsync-amber);
+  border-color: var(--sdsync-fire);
+}
+
+.sdsync-autosave-state.is-blocked {
+  color: var(--sdsync-red);
+  border-color: var(--sdsync-danger);
+  background: var(--sdsync-danger-surface);
 }
 
 .sdsync-app *,
@@ -324,10 +358,10 @@
 
 .sdsync-app .sdsync-input-control input:not([type="checkbox"]):not([type="radio"]),
 .sdsync-app .sdsync-input-control textarea {
-  width: 0 !important;
+  width: 100% !important;
   max-width: 100% !important;
   min-width: 0 !important;
-  flex: 1 1 auto !important;
+  flex: 1 1 0% !important;
   margin: 0 !important;
   border: 0 !important;
   outline: 0 !important;
@@ -336,11 +370,11 @@
 }
 
 .sdsync-app .sdsync-select-control input:not([type="checkbox"]):not([type="radio"]) {
-  width: 0 !important;
+  width: 100% !important;
   max-width: 100% !important;
   min-width: 0 !important;
   min-height: 20px !important;
-  flex: 1 1 auto !important;
+  flex: 1 1 0% !important;
   margin: 0 !important;
   padding: 0 !important;
   border: 0 !important;
@@ -378,7 +412,7 @@
 
 /* controlLayout.js marks only the wrapper path between an owned component root
  * and its semantic control. These stable runtime hooks work on DSM's Chrome 88
- * baseline without guessing private SDK classes or styling checkbox inputs. */
+ * baseline without guessing private SDK wrapper classes. */
 .sdsync-app .sdsync-control-shell {
   width: 100% !important;
   max-width: 100% !important;
@@ -414,11 +448,11 @@
 
 .sdsync-app [role="combobox"] input,
 .sdsync-app [aria-haspopup="listbox"] input {
-  width: 0 !important;
+  width: 100% !important;
   min-height: 30px;
   max-width: 100% !important;
   min-width: 0 !important;
-  flex: 1 1 auto !important;
+  flex: 1 1 0% !important;
   margin: 0 !important;
   border: 0 !important;
   outline: 0 !important;
@@ -824,57 +858,80 @@
 }
 
 .sdsync-app .sdsync-checkbox-control:focus-within {
-  outline: 2px solid var(--sdsync-focus) !important;
-  outline-offset: 2px !important;
+  outline: 0 !important;
 }
 
 .sdsync-app .sdsync-checkbox-control {
   position: relative;
-  display: block !important;
-  width: 100% !important;
-  max-width: 100% !important;
-  min-width: 0 !important;
-  min-height: 24px;
+  display: inline-grid !important;
+  width: 22px !important;
+  max-width: 22px !important;
+  min-width: 22px !important;
+  height: 22px !important;
+  min-height: 22px;
   margin: 0 !important;
   padding: 0 !important;
-  line-height: 20px;
+  place-items: center;
+  line-height: 0;
   cursor: pointer;
-  white-space: normal !important;
-  overflow-wrap: anywhere;
 }
 
-.sdsync-app .sdsync-check-row > .sdsync-checkbox-control > .sdsync-checkbox-label,
-.sdsync-app .sdsync-checkbox-label {
-  display: inline-block !important;
-  width: auto !important;
-  max-width: 100% !important;
+.sdsync-app .sdsync-toggle-row .sdsync-checkbox-label,
+.sdsync-app .sdsync-toggle-row .sdsync-checkbox-glyph {
+  display: none !important;
+  width: 0 !important;
   min-width: 0 !important;
-  margin: 0 !important;
-  padding: 2px 0 2px 28px !important;
-  line-height: 20px;
-  white-space: normal !important;
-  overflow-wrap: anywhere;
-}
-
-/* These structural markers deliberately outrank older package CSS that used
- * high-specificity private-class substring selectors. DSM can keep an old
- * linked stylesheet alive while current JavaScript is already executing. */
-.sdsync-app .sdsync-check-row > .sdsync-checkbox-control > .sdsync-checkbox-glyph {
-  position: absolute !important;
-  display: block !important;
-  top: 4px !important;
-  left: 0 !important;
-  width: 20px !important;
-  min-width: 20px !important;
-  height: 20px !important;
+  height: 0 !important;
   margin: 0 !important;
   padding: 0 !important;
 }
 
-.sdsync-app .sdsync-check-row > .sdsync-checkbox-control > .sdsync-checkbox-input {
-  position: absolute !important;
-  opacity: 0 !important;
-  pointer-events: none !important;
+.sdsync-app .sdsync-toggle-row .sdsync-checkbox-input {
+  position: relative !important;
+  display: block !important;
+  inset: auto !important;
+  width: 22px !important;
+  min-width: 22px !important;
+  height: 22px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 1px solid var(--sdsync-control-border) !important;
+  border-radius: 1px !important;
+  outline: 0 !important;
+  opacity: 1 !important;
+  cursor: pointer !important;
+  pointer-events: auto !important;
+  appearance: none !important;
+  -webkit-appearance: none !important;
+  background-color: var(--sdsync-control) !important;
+  background-image: none !important;
+  background-position: center !important;
+  background-repeat: no-repeat !important;
+  background-size: 16px 16px !important;
+  box-shadow: inset 0 0 0 1px rgba(255, 106, 26, 0.08) !important;
+}
+
+.sdsync-app .sdsync-toggle-row .sdsync-checkbox-input:hover:not(:disabled) {
+  border-color: var(--sdsync-focus) !important;
+  background-color: var(--sdsync-control-hover) !important;
+}
+
+.sdsync-app .sdsync-toggle-row .sdsync-checkbox-input:focus-visible {
+  border-color: var(--sdsync-focus) !important;
+  outline: 2px solid var(--sdsync-focus) !important;
+  outline-offset: 2px !important;
+  box-shadow: none !important;
+}
+
+.sdsync-app .sdsync-toggle-row .sdsync-checkbox-input:checked {
+  border-color: var(--sdsync-primary) !important;
+  background-color: var(--sdsync-primary) !important;
+  background-image: var(--sdsync-check-mark) !important;
+}
+
+.sdsync-app .sdsync-toggle-row.is-danger .sdsync-checkbox-input:checked {
+  border-color: var(--sdsync-danger) !important;
+  background-color: var(--sdsync-danger) !important;
 }
 
 .sdsync-app .sdsync-checkbox-control.disabled,
@@ -882,6 +939,18 @@
   color: var(--sdsync-disabled) !important;
   cursor: not-allowed;
   opacity: 1 !important;
+}
+
+.sdsync-app .sdsync-toggle-row .sdsync-checkbox-input:disabled {
+  border-color: var(--sdsync-border) !important;
+  cursor: not-allowed !important;
+  background-color: var(--sdsync-control-disabled) !important;
+  box-shadow: none !important;
+}
+
+.sdsync-app .sdsync-toggle-row .sdsync-checkbox-input:checked:disabled {
+  background-color: var(--sdsync-border) !important;
+  background-image: var(--sdsync-check-mark) !important;
 }
 
 .sdsync-app [role="listbox"],
@@ -1222,7 +1291,7 @@
   transform: translateY(0);
 }
 
-.sdsync-check-row > .sdsync-field-tip .sdsync-field-tip-content,
+.sdsync-toggle-label > .sdsync-field-tip .sdsync-field-tip-content,
 .sdsync-filter-control > .sdsync-field-tip .sdsync-field-tip-content {
   inset-inline-start: auto;
   inset-inline-end: 0;
@@ -1836,22 +1905,73 @@
   text-overflow: ellipsis;
 }
 
-.sdsync-profiles-layout {
+.sdsync-profiles-layout,
+.sdsync-routines-layout {
   display: grid;
-  grid-template-columns: 285px minmax(0, 1fr);
+  grid-template-columns: 255px minmax(0, 1fr);
   gap: 16px;
   align-items: start;
 }
 
-.sdsync-profiles-layout.is-catalog-only {
+.sdsync-profiles-layout.is-catalog-only,
+.sdsync-routines-layout.is-catalog-only {
   grid-template-columns: minmax(0, 1fr);
 }
 
-.sdsync-profile-catalog {
+.sdsync-profile-catalog,
+.sdsync-routine-catalog {
   position: sticky;
   top: 98px;
   max-height: calc(100vh - 150px);
   overflow: auto;
+}
+
+.sdsync-profile-filters {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--sdsync-border-soft);
+}
+
+.sdsync-profile-filter-field {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.sdsync-profile-filter-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--sdsync-text);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.sdsync-profile-filter-summary {
+  display: flex;
+  min-width: 0;
+  min-height: 28px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--sdsync-muted);
+  font-size: 10px;
+}
+
+.sdsync-profile-filter-summary > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.sdsync-app .sdsync-profile-filter-summary button,
+.sdsync-app .sdsync-profile-filter-summary [role="button"] {
+  min-height: 26px !important;
+  padding: 2px 5px !important;
 }
 
 .sdsync-profile-row,
@@ -1878,6 +1998,11 @@
   border-color: var(--sdsync-border);
   outline: none;
   background: var(--sdsync-panel-strong);
+}
+
+.sdsync-routine-row.is-selected {
+  border-color: var(--sdsync-fire);
+  box-shadow: inset 2px 0 0 var(--sdsync-fire);
 }
 
 .sdsync-profile-row:focus-visible,
@@ -1918,8 +2043,10 @@
 
 .sdsync-form-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px 15px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+  width: 100%;
+  min-width: 0;
 }
 
 .sdsync-app .sdsync-form-grid > .sdsync-form-item:not(.sdsync-inline-form-item),
@@ -1927,14 +2054,15 @@
 .sdsync-app form.sdsync-panel:not(.sdsync-settings-panel) > .sdsync-form-item:not(.sdsync-inline-form-item),
 .sdsync-app .sdsync-danger-fieldset > .sdsync-form-item:not(.sdsync-inline-form-item) {
   display: grid !important;
-  grid-template-columns: minmax(0, 1fr) !important;
-  align-content: start;
-  align-items: stretch !important;
-  gap: 5px !important;
+  grid-template-columns: minmax(145px, 190px) minmax(260px, 1fr) !important;
+  align-content: center;
+  align-items: center !important;
+  gap: 14px !important;
   max-width: 100% !important;
   min-width: 0 !important;
   margin: 0 !important;
-  padding: 0 !important;
+  padding: 8px 0 !important;
+  border-top: 1px solid var(--sdsync-border-soft);
 }
 
 .sdsync-app .sdsync-form-item > * {
@@ -1985,7 +2113,7 @@
 .sdsync-horizontal-form > .sdsync-form-item,
 .sdsync-app .sdsync-inline-form-item {
   display: grid !important;
-  grid-template-columns: minmax(130px, 200px) minmax(0, 1fr) !important;
+  grid-template-columns: minmax(145px, 190px) minmax(260px, 1fr) !important;
   align-items: center !important;
   gap: 14px !important;
   max-width: 100% !important;
@@ -2001,7 +2129,10 @@
 
 .sdsync-settings-panel > .sdsync-form-item > .sdsync-form-control-cell,
 .sdsync-horizontal-form > .sdsync-form-item > .sdsync-form-control-cell,
-.sdsync-app .sdsync-inline-form-item > .sdsync-form-control-cell {
+.sdsync-app .sdsync-inline-form-item > .sdsync-form-control-cell,
+.sdsync-app .sdsync-form-grid > .sdsync-form-item > .sdsync-form-control-cell,
+.sdsync-app .sdsync-log-policy-grid > .sdsync-form-item > .sdsync-form-control-cell,
+.sdsync-app .sdsync-danger-fieldset > .sdsync-form-item > .sdsync-form-control-cell {
   grid-column: 2 !important;
   grid-row: 1 !important;
   align-self: stretch;
@@ -2110,35 +2241,47 @@
   vertical-align: middle;
 }
 
-.sdsync-check-row {
+.sdsync-toggle-row {
   position: relative;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 20px;
-  align-items: start;
-  gap: 6px;
+  grid-template-columns: minmax(145px, 190px) minmax(44px, 1fr);
+  align-items: center;
+  gap: 14px;
   min-width: 0;
   width: 100%;
   margin: 0;
-  padding: 2px 0;
+  padding: 8px 0;
+  border-top: 1px solid var(--sdsync-border-soft);
   overflow: visible;
 }
 
-.sdsync-app .sdsync-check-row > .sdsync-checkbox-control {
+.sdsync-toggle-label {
+  display: inline-flex;
   grid-column: 1;
   grid-row: 1;
-  width: 100% !important;
-  max-width: 100%;
   min-width: 0;
-  margin: 0 !important;
-  padding: 0 !important;
+  align-items: center;
+  gap: 5px;
+  color: var(--sdsync-text);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
-.sdsync-check-row > .sdsync-field-tip {
-  z-index: 2;
+.sdsync-toggle-row.is-danger .sdsync-toggle-label {
+  color: var(--sdsync-red);
+}
+
+.sdsync-app .sdsync-toggle-row > .sdsync-checkbox-control {
   grid-column: 2;
   grid-row: 1;
-  justify-self: start;
+  justify-self: end;
+  width: 100% !important;
+  max-width: 22px !important;
+  min-width: 22px !important;
   margin: 0 !important;
+  padding: 0 !important;
 }
 
 .sdsync-form-grid .span-2,
@@ -2203,7 +2346,7 @@
 
 .sdsync-secret-editor {
   display: grid;
-  grid-template-columns: minmax(120px, 1fr) minmax(180px, 210px) 20px;
+  grid-template-columns: minmax(150px, 0.65fr) minmax(240px, 1fr) 20px;
   grid-template-rows: auto auto;
   align-items: center;
   gap: 10px;
@@ -2737,8 +2880,8 @@
 
 .sdsync-log-policy-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
   overflow: visible;
 }
 
@@ -2818,13 +2961,15 @@
 }
 
 .sdsync-app.sdsync-medium-shell .sdsync-profiles-layout,
+.sdsync-app.sdsync-medium-shell .sdsync-routines-layout,
 .sdsync-app.sdsync-medium-shell .sdsync-two-column,
 .sdsync-app.sdsync-medium-shell .sdsync-about-grid,
 .sdsync-app.sdsync-medium-shell .sdsync-security-grid {
   grid-template-columns: minmax(0, 1fr);
 }
 
-.sdsync-app.sdsync-medium-shell .sdsync-profile-catalog {
+.sdsync-app.sdsync-medium-shell .sdsync-profile-catalog,
+.sdsync-app.sdsync-medium-shell .sdsync-routine-catalog {
   position: static;
   max-height: 280px;
 }
@@ -2956,13 +3101,15 @@
   }
 
   .sdsync-profiles-layout,
+  .sdsync-routines-layout,
   .sdsync-two-column,
   .sdsync-about-grid,
   .sdsync-security-grid {
     grid-template-columns: 1fr;
   }
 
-  .sdsync-profile-catalog {
+  .sdsync-profile-catalog,
+  .sdsync-routine-catalog {
     position: static;
     max-height: 280px;
   }
@@ -3052,7 +3199,8 @@
  * progressive enhancement, not the compatibility path. */
 .sdsync-settings-panel.sdsync-compact-form > .sdsync-form-item,
 .sdsync-horizontal-form.sdsync-compact-form > .sdsync-form-item,
-.sdsync-horizontal-form.sdsync-compact-form .sdsync-inline-form-item {
+.sdsync-horizontal-form.sdsync-compact-form .sdsync-inline-form-item,
+.sdsync-app .sdsync-editor.sdsync-compact-form .sdsync-form-item[class] {
   display: grid !important;
   grid-template-columns: minmax(0, 1fr) !important;
   align-items: stretch !important;
@@ -3061,22 +3209,25 @@
 
 .sdsync-settings-panel.sdsync-compact-form > .sdsync-form-item > .sdsync-form-control-cell,
 .sdsync-horizontal-form.sdsync-compact-form > .sdsync-form-item > .sdsync-form-control-cell,
-.sdsync-horizontal-form.sdsync-compact-form .sdsync-inline-form-item > .sdsync-form-control-cell {
+.sdsync-horizontal-form.sdsync-compact-form .sdsync-inline-form-item > .sdsync-form-control-cell,
+.sdsync-app .sdsync-editor.sdsync-compact-form .sdsync-form-item > .sdsync-form-control-cell {
   grid-column: 1 !important;
   grid-row: 2 !important;
 }
 
 @supports (container-type: inline-size) {
   .sdsync-settings-panel,
-  .sdsync-horizontal-form {
+  .sdsync-horizontal-form,
+  .sdsync-editor {
     container-type: inline-size;
   }
 }
 
-@container (max-width: 420px) {
+@container (max-width: 520px) {
   .sdsync-settings-panel > .sdsync-form-item,
   .sdsync-horizontal-form > .sdsync-form-item,
-  .sdsync-horizontal-form .sdsync-inline-form-item {
+  .sdsync-horizontal-form .sdsync-inline-form-item,
+  .sdsync-app .sdsync-editor .sdsync-form-item[class] {
     display: grid !important;
     grid-template-columns: minmax(0, 1fr) !important;
     align-items: stretch !important;
@@ -3085,16 +3236,18 @@
 
   .sdsync-settings-panel > .sdsync-form-item > .sdsync-form-control-cell,
   .sdsync-horizontal-form > .sdsync-form-item > .sdsync-form-control-cell,
-  .sdsync-horizontal-form .sdsync-inline-form-item > .sdsync-form-control-cell {
+  .sdsync-horizontal-form .sdsync-inline-form-item > .sdsync-form-control-cell,
+  .sdsync-app .sdsync-editor .sdsync-form-item > .sdsync-form-control-cell {
     grid-column: 1 !important;
     grid-row: 2 !important;
   }
 }
 
-@media (max-width: 420px) {
+@media (max-width: 520px) {
   .sdsync-settings-panel > .sdsync-form-item,
   .sdsync-horizontal-form > .sdsync-form-item,
-  .sdsync-horizontal-form .sdsync-inline-form-item {
+  .sdsync-horizontal-form .sdsync-inline-form-item,
+  .sdsync-app .sdsync-editor .sdsync-form-item[class] {
     display: grid !important;
     grid-template-columns: minmax(0, 1fr) !important;
     align-items: stretch !important;
@@ -3103,7 +3256,8 @@
 
   .sdsync-settings-panel > .sdsync-form-item > .sdsync-form-control-cell,
   .sdsync-horizontal-form > .sdsync-form-item > .sdsync-form-control-cell,
-  .sdsync-horizontal-form .sdsync-inline-form-item > .sdsync-form-control-cell {
+  .sdsync-horizontal-form .sdsync-inline-form-item > .sdsync-form-control-cell,
+  .sdsync-app .sdsync-editor .sdsync-form-item > .sdsync-form-control-cell {
     grid-column: 1 !important;
     grid-row: 2 !important;
   }

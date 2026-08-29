@@ -163,16 +163,33 @@ test("Settings uses horizontal native form rows with help adjacent to each label
   }
 });
 
-test("Routines prioritizes Configured profiles before the routine editor", () => {
+test("Routines uses a profile-style New routine action and a catalog-first editor without redundant subtabs", () => {
   const routines = routeSection("routines");
-  const definitions = tabDefinitions(app, "routineTabs", "Routines");
-  const labels = tabContract(routines, "Routines", definitions, "routineTabs");
-  assert.deepEqual(labels, ["Configured profiles", "New routine"]);
-  assert.match(app, /routineTab:\s*"configured-profiles"/, "Configured profiles must be the initial routine view");
-  assert.match(routines, /data-subtab-panel="routine-editor"/);
-  assert.match(app, /this\.routineTab = "routine-editor"/);
+  const profileAction = routeSection("profiles").match(
+    /<div class="sdsync-page-actions">\s*(<v-button\b[^>]*>[\s\S]*?New profile<\/v-button>)\s*<\/div>/
+  );
+  const routineAction = routines.match(
+    /<div class="sdsync-page-actions">\s*(<v-button\b[^>]*>[\s\S]*?New routine<\/v-button>)\s*<\/div>/
+  );
+  assert.ok(profileAction, "Profiles needs its primary New profile action");
+  assert.ok(routineAction, "Routines needs its primary New routine action");
+  for (const action of [profileAction[1], routineAction[1]]) {
+    assert.match(action, /suffix="main"/);
+    assert.match(action, /display="icon-text"/);
+    assert.match(action, /<action-icon name="add"\s*\/>/);
+  }
+  assert.match(routineAction[1], /@click="openRoutine\(''\)"/);
+  assert.match(routines, /:class="\['sdsync-routines-layout', \{ 'is-catalog-only': !routineEditorOpen \}\]"/);
+  assert.ok(
+    routines.indexOf('class="sdsync-panel sdsync-routine-catalog"')
+      < routines.indexOf('v-if="routineEditorOpen"'),
+    "the configured routine catalog must precede the conditional editor"
+  );
+  assert.match(app, /routineEditorOpen:\s*false/);
+  assert.match(app, /openRoutine\(profile = ""\) \{[^}]*this\.routineEditorOpen = true; this\.loadRoutine\(profile\); \}/);
+  assert.doesNotMatch(routines, /sdsync-subtabs|role="tablist"|role="tabpanel"|data-subtab-panel/);
+  assert.doesNotMatch(app, /routineTabs|routineTab:/);
   assert.doesNotMatch(routines, /package-controller|Package controller/);
-  assertTabLabelsAreNotRepeatedAsHeadings(routines, labels, "Routines");
 });
 
 test("Notifications separates DSM policy from open-session behavior into two tabs", () => {

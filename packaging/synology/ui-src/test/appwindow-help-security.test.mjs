@@ -64,6 +64,11 @@ async function loadAppComponent(postSpy, trace) {
     formatDuration: String,
     numberOr: (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback,
     pick: (model, ...keys) => keys.map((key) => model && model[key]).find((value) => value !== undefined),
+    createAutosaveCoordinator: () => ({
+      cancel() {}, dispose() {}, getState: () => ({ registered: false, dirty: false }),
+      hydrate() {}, setGlobalBusy() {}, setScopeBlocked() {}, update: () => ({ dirty: false })
+    }),
+    installControlLayout: () => () => {},
     ActionIcon: { name: "ActionIcon" },
     SecurityPanel: {}
   };
@@ -517,15 +522,17 @@ test("security save and browser preference saves are behaviorally audited", asyn
     securityForm: structuredClone(basePolicy),
     securityPolicy: structuredClone(basePolicy),
     connected: true,
+    autosaveCoordinator: null,
     toasts: [],
     toast(title, message, error) { this.toasts.push({ title, message, error }); },
     confirmAction: async () => true,
+    async refreshCsrf() { this.csrfToken = "csrf-refreshed"; },
     refreshSnapshot: async () => {},
     hydrateSecurityPolicy: () => {}
   };
   for (const method of [
     "between", "securityPayload", "validateSecurityPayload", "securityRelaxed",
-    "saveSecurityPolicy", "reportMutationError"
+    "refreshAutosaveStatus", "cancelAutosave", "pauseAutosave", "saveSecurityPolicy", "reportMutationError"
   ]) context[method] = (...args) => methods[method].apply(context, args);
   await context.saveSecurityPolicy({ preventDefault() {} });
   assert.equal(calls[0].action, "security-policy");
@@ -554,6 +561,7 @@ test("security save and browser preference saves are behaviorally audited", asyn
       canChangeNotifications: true,
       operationBusy: false,
       disposed: false,
+      autosaveCoordinator: null,
       auth: {},
       csrfToken: "csrf",
       settings: { theme: "dark", status_refresh: 5000, log_refresh: 5000, desktop_notifications: false, audible: false },
@@ -566,6 +574,8 @@ test("security save and browser preference saves are behaviorally audited", asyn
     for (const method of [
       "persistSettings", "captureSettingsTransaction", "applySettingsState",
       "restoreSettingsTransaction", "preferenceAuditWasRejected",
+      "interfaceSettingsPayload", "validateInterfacePayload", "hydrateAutosave", "refreshAutosaveStatus",
+      "cancelAutosave", "pauseAutosave",
       "saveInterfaceSettings", "saveNotificationPreferences"
     ]) {
       preference[method] = (...args) => methods[method].apply(preference, args);
@@ -599,6 +609,7 @@ test("browser preference persistence and audit ordering preserve truthful outcom
       canChangeNotifications: true,
       operationBusy: false,
       disposed: false,
+      autosaveCoordinator: null,
       auth: {},
       csrfToken: "csrf",
       settings: Object.assign({}, prior),
@@ -611,6 +622,8 @@ test("browser preference persistence and audit ordering preserve truthful outcom
     for (const method of [
       "persistSettings", "captureSettingsTransaction", "applySettingsState",
       "restoreSettingsTransaction", "preferenceAuditWasRejected",
+      "interfaceSettingsPayload", "validateInterfacePayload", "hydrateAutosave", "refreshAutosaveStatus",
+      "cancelAutosave", "pauseAutosave",
       "saveInterfaceSettings", "saveNotificationPreferences", "reportMutationError"
     ]) context[method] = (...args) => methods[method].apply(context, args);
     return context;

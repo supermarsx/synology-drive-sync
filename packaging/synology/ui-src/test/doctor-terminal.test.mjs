@@ -237,7 +237,7 @@ test("AppWindow overlays, focus behavior, labels, secrets, and mutation guards r
   assert.match(source, /ACTIONS\.setSecret, secret\);\s*secretsApplied \+= 1;/);
   assert.match(source, /partiallyApplied \? "Profile partially applied" : "Profile not saved"/);
   assert.match(source, /inspect credential presence before retrying/);
-  assert.match(source, /if \(partiallyApplied \|\| caught\.outcomeUnknown === true\)[\s\S]*?this\.closeProfile\(\);[\s\S]*?await this\.refreshSnapshot\(false\)/);
+  assert.match(source, /if \(partiallyApplied \|\| caught\.outcomeUnknown === true\)[\s\S]*?this\.closeProfile\(\);[\s\S]*?await this\.refreshSnapshot\(false, true\)/);
 });
 
 test("polling has no client deadline and toolkit make always rebuilds source", () => {

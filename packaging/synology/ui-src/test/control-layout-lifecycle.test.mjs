@@ -65,7 +65,7 @@ test("responsive form observers release removed routes and cannot restart after 
   let renderedForms = [];
   const root = {
     querySelectorAll(selector) {
-      if (selector === ".sdsync-settings-panel, .sdsync-horizontal-form") return renderedForms;
+      if (selector === ".sdsync-settings-panel, .sdsync-horizontal-form, .sdsync-editor") return renderedForms;
       return [];
     }
   };
@@ -78,21 +78,31 @@ test("responsive form observers release removed routes and cannot restart after 
   vm.runInContext(`${source.replace(/^export\s+/gm, "")}\nthis.installControlLayout = installControlLayout;`, context);
 
   const first = form(640);
-  renderedForms = [first];
+  const editorAtThreshold = form(520);
+  const editorAboveThreshold = form(521);
+  renderedForms = [first, editorAtThreshold, editorAboveThreshold];
   const cleanup = context.installControlLayout(root);
   const resize = resizeInstances[0];
   const mutation = mutationInstances[0];
   assert.equal(resize.observed.has(first), true);
+  assert.equal(resize.observed.has(editorAtThreshold), true, "profile editors receive their own width observer");
+  assert.equal(resize.observed.has(editorAboveThreshold), true, "wide profile editors stay observed while resizing");
   assert.equal(first.classList.contains("sdsync-compact-form"), false,
     "a usable 640px form must retain label/control rows");
+  assert.equal(editorAtThreshold.classList.contains("sdsync-compact-form"), true,
+    "the inclusive 520px boundary must stack editor fields");
+  assert.equal(editorAboveThreshold.classList.contains("sdsync-compact-form"), false,
+    "an editor one pixel above the compact boundary must retain horizontal rows");
 
   const second = form(900);
   renderedForms = [second];
   mutation.callback();
   await Promise.resolve();
-  assert.deepEqual(resize.unobserved, [first]);
+  assert.deepEqual(resize.unobserved, [first, editorAtThreshold, editorAboveThreshold]);
   assert.equal(resize.observed.has(first), false);
   assert.equal(first.classList.contains("sdsync-compact-form"), false);
+  assert.equal(editorAtThreshold.classList.contains("sdsync-compact-form"), false,
+    "removed editors release their scoped compact class");
   assert.equal(resize.observed.has(second), true);
 
   renderedForms = [first];

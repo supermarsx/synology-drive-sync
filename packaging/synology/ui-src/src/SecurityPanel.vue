@@ -17,14 +17,15 @@
                 <div><p class="sdsync-eyebrow">Change permissions</p><h3>Dashboard operations</h3></div>
               </div>
               <div class="sdsync-policy-list">
-                <div v-for="control in operationControls" :key="control.key" class="sdsync-check-row sdsync-policy-control">
+                <div v-for="control in operationControls" :key="control.key" class="sdsync-toggle-row sdsync-policy-control">
+                  <span class="sdsync-toggle-label">{{ control.label }} <policy-help :help-key="control.key" /></span>
                   <v-checkbox class="sdsync-checkbox-control"
                     :value="value[control.key] === true"
                     :disabled="disabled"
+                    :aria-label="control.label"
                     :aria-describedby="helpId(control.key)"
                     @input="updateField(control.key, $event === true)"
-                  >{{ control.label }}</v-checkbox>
-                  <policy-help :help-key="control.key" />
+                  />
                 </div>
               </div>
             </section>
@@ -34,14 +35,15 @@
                 <div><p class="sdsync-eyebrow">Risk ceilings</p><h3>Allowed profile behavior</h3></div>
               </div>
               <div class="sdsync-policy-list">
-                <div v-for="control in riskControls" :key="control.key" class="sdsync-check-row sdsync-policy-control">
+                <div v-for="control in riskControls" :key="control.key" class="sdsync-toggle-row sdsync-policy-control">
+                  <span class="sdsync-toggle-label">{{ control.label }} <policy-help :help-key="control.key" /></span>
                   <v-checkbox class="sdsync-checkbox-control"
                     :value="value[control.key] === true"
                     :disabled="disabled"
+                    :aria-label="control.label"
                     :aria-describedby="helpId(control.key)"
                     @input="updateField(control.key, $event === true)"
-                  >{{ control.label }}</v-checkbox>
-                  <policy-help :help-key="control.key" />
+                  />
                 </div>
               </div>
             </section>
@@ -127,7 +129,7 @@
         html-type="submit"
         tooltip="Validate, persist, enforce, and audit this security and logging policy"
         :disabled="disabled || busy || !dirty"
-      ><template #icon><action-icon name="save" /></template>Save security policy</v-button>
+      ><template #icon><action-icon name="save" /></template>Save now</v-button>
     </div>
   </v-form>
 </template>

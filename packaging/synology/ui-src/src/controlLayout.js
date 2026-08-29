@@ -4,14 +4,14 @@ const OWNED_CONTROL_SELECTOR = [
   ".sdsync-checkbox-control"
 ].join(", ");
 
-const RESPONSIVE_FORM_SELECTOR = ".sdsync-settings-panel, .sdsync-horizontal-form";
+const RESPONSIVE_FORM_SELECTOR = ".sdsync-settings-panel, .sdsync-horizontal-form, .sdsync-editor";
 const FORM_ROW_SELECTOR = ".sdsync-form-item";
 const APP_SHELL_SELECTOR = ".sdsync-app";
 const OWNED_OVERLAY_SELECTOR = ".sdsync-select-dropdown";
 const FIELD_TIP_SELECTOR = ".sdsync-field-tip";
-const SHELL_MEDIUM_WIDTH = 980;
+const SHELL_MEDIUM_WIDTH = 1100;
 const SHELL_COMPACT_WIDTH = 720;
-const FORM_COMPACT_WIDTH = 420;
+const FORM_COMPACT_WIDTH = 520;
 const BOUNDARY_INSET = 8;
 const OVERLAY_STYLE_PROPERTIES = [
   "position", "left", "right", "top", "bottom", "width", "max-width", "max-height"

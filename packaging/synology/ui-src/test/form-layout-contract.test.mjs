@@ -16,11 +16,12 @@ function openingTags(source, component) {
   return source.match(new RegExp(`<${component}\\b[^>]*>`, "g")) || [];
 }
 
-function ownedCheckboxRows(source, helpComponent) {
+function ownedToggleRows(source, helpComponent) {
   const expression = new RegExp(
-    `<div\\b(?=[^>]*\\bclass="[^"]*\\bsdsync-check-row\\b[^"]*")[^>]*>`
-      + `\\s*<v-checkbox\\b[\\s\\S]*?<\\/v-checkbox>\\s*`
-      + `<${helpComponent}\\b[^>]*\\/>\\s*<\\/div>`,
+    `<div\\b(?=[^>]*\\bclass="[^"]*\\bsdsync-toggle-row\\b[^"]*")[^>]*>`
+      + `[\\s\\S]*?<span\\b(?=[^>]*\\bclass="[^"]*\\bsdsync-toggle-label\\b[^"]*")[^>]*>`
+      + `[\\s\\S]*?<${helpComponent}\\b[^>]*\\/>[\\s\\S]*?<\\/span>\\s*`
+      + `<v-checkbox\\b[\\s\\S]*?(?:\\/>|<\\/v-checkbox>)\\s*<\\/div>`,
     "g"
   );
   return source.match(expression) || [];
@@ -74,23 +75,24 @@ test("every DSM field component exposes a package-owned rendered-root hook", () 
   }
 });
 
-test("every DSM checkbox keeps its label and tooltip in one owned bounded row", () => {
-  const appRows = ownedCheckboxRows(app, "control-help");
-  const securityRows = ownedCheckboxRows(security, "policy-help");
-  assert.equal(appRows.length, openingTags(app, "v-checkbox").length, "App checkbox/help siblings escaped their row");
-  assert.equal(securityRows.length, openingTags(security, "v-checkbox").length, "Security checkbox/help siblings escaped their row");
+test("every DSM checkbox uses one right-hand package-owned semantic toggle row", () => {
+  const appRows = ownedToggleRows(app, "control-help");
+  const securityRows = ownedToggleRows(security, "policy-help");
+  assert.equal(appRows.length, openingTags(app, "v-checkbox").length, "App checkbox escaped its labelled toggle row");
+  assert.equal(securityRows.length, openingTags(security, "v-checkbox").length, "Security checkbox escaped its labelled toggle row");
 
-  const row = declarationsForExactSelector(".sdsync-check-row");
-  assert.match(row, /grid-template-columns:\s*minmax\(0, 1fr\) 20px/);
+  const row = declarationsForExactSelector(".sdsync-toggle-row");
+  assert.match(row, /grid-template-columns:\s*minmax\(145px, 190px\) minmax\(44px, 1fr\)/);
   assert.match(row, /width:\s*100%/);
   assert.match(row, /overflow:\s*visible/);
 
   const checkbox = declarationsForRuleContainingDeclaration(
     /grid-row:\s*1/,
-    ".sdsync-app .sdsync-check-row > .sdsync-checkbox-control"
+    ".sdsync-app .sdsync-toggle-row > .sdsync-checkbox-control"
   );
-  assert.match(checkbox, /width:\s*100%\s*!important/);
-  assert.match(checkbox, /grid-column:\s*1/);
+  assert.match(checkbox, /grid-column:\s*2/);
+  assert.match(checkbox, /justify-self:\s*end/);
+  assert.match(checkbox, /max-width:\s*22px\s*!important/);
   assert.match(checkbox, /margin:\s*0\s*!important/);
 
   const privateShells = declarationsForExactSelector(".sdsync-app .sdsync-control-shell");
@@ -102,42 +104,48 @@ test("every DSM checkbox keeps its label and tooltip in one owned bounded row", 
   assert.match(privateShells, /background-image:\s*none\s*!important/);
 
   const focus = declarationsForExactSelector(".sdsync-app .sdsync-checkbox-control:focus-within");
-  assert.match(focus, /outline:\s*2px solid var\(--sdsync-focus\)\s*!important/);
+  assert.match(focus, /outline:\s*0\s*!important/);
   assert.doesNotMatch(css, /\.v-checkbox/, "CSS must not guess that a Vue registration name survives rendering");
-  assert.doesNotMatch(
-    css,
-    /\.sdsync-app \.sdsync-checkbox-control input\[type="checkbox"\]\s*\{/,
-    "DSM retains ownership of its checkbox input geometry and position"
-  );
   assert.doesNotMatch(css, /\.sdsync-checkbox-control[^,{]*\[class\*="(?:icon|box)"\]/,
     "the SDK retains ownership of its private tick glyph");
 
-  const label = declarationsForRuleContaining(
-    ".sdsync-app .sdsync-check-row > .sdsync-checkbox-control > .sdsync-checkbox-label",
-    ".sdsync-app .sdsync-checkbox-label"
+  const hiddenSdkParts = declarationsForRuleContaining(
+    ".sdsync-app .sdsync-toggle-row .sdsync-checkbox-label",
+    ".sdsync-app .sdsync-toggle-row .sdsync-checkbox-glyph"
   );
-  assert.match(label, /display:\s*inline-block\s*!important/);
-  assert.match(label, /padding:\s*2px 0 2px 28px\s*!important/);
+  assert.match(hiddenSdkParts, /display:\s*none\s*!important/);
+
+  const semanticToggle = declarationsForExactSelector(
+    ".sdsync-app .sdsync-toggle-row .sdsync-checkbox-input"
+  );
+  assert.match(semanticToggle, /position:\s*relative\s*!important/);
+  assert.match(semanticToggle, /width:\s*22px\s*!important/);
+  assert.match(semanticToggle, /opacity:\s*1\s*!important/);
+  assert.match(semanticToggle, /pointer-events:\s*auto\s*!important/);
+  assert.match(semanticToggle, /appearance:\s*none\s*!important/);
+  assert.match(semanticToggle, /background-color:\s*var\(--sdsync-control\)\s*!important/);
 });
 
 test("sanitized fixture preserves the captured DSM control hierarchy", () => {
-  assert.match(physicalFixture, /class="dsm-checkbox sdsync-checkbox-control v-checkbox-wrapper disabled"[\s\S]*?<i\b[^>]*v-checkbox-icon[\s\S]*?<input\b[^>]*v-checkbox-input[\s\S]*?<label\b[^>]*v-checkbox-label/);
+  assert.match(physicalFixture, /class="sdsync-toggle-row"[\s\S]*?class="sdsync-toggle-label"[\s\S]*?class="dsm-checkbox sdsync-checkbox-control v-checkbox-wrapper"[\s\S]*?<i\b[^>]*v-checkbox-icon[\s\S]*?<input\b[^>]*v-checkbox-input[\s\S]*?<label\b[^>]*v-checkbox-label/);
+  assert.match(physicalFixture, /id="checkbox"[^>]*\bchecked\b/, "fixture must exercise the visible checked state");
   assert.doesNotMatch(physicalFixture, /<label[^>]*>\s*<input\b/, "captured DSM checkbox input is a label sibling");
   assert.match(physicalFixture, /v-select2-wrapper[\s\S]*?class="input-wrapper[\s\S]*?class="v-select-ul-wrap[\s\S]*?<input[^>]*aria-haspopup="listbox"/);
   assert.doesNotMatch(physicalFixture, /(?:_SSID|SynoToken|quickconnect|https?:\/\/|Cookie:|session)/i,
     "fixture must contain structure only, never captured DSM session data");
 });
 
-test("form roots reset only their structural children and exact owned controls", () => {
+test("form roots make exact owned controls full-width without private DSM leakage", () => {
   const rows = declarationsForRuleContaining(
     ".sdsync-app .sdsync-form-grid > .sdsync-form-item",
     ".sdsync-app .sdsync-log-policy-grid > .sdsync-form-item",
     ".sdsync-app form.sdsync-panel:not(.sdsync-settings-panel) > .sdsync-form-item",
     ".sdsync-app .sdsync-danger-fieldset > .sdsync-form-item"
   );
-  assert.match(rows, /grid-template-columns:\s*minmax\(0, 1fr\)\s*!important/);
-  assert.match(rows, /gap:\s*5px\s*!important/);
+  assert.match(rows, /grid-template-columns:\s*minmax\(145px, 190px\) minmax\(260px, 1fr\)\s*!important/);
+  assert.match(rows, /gap:\s*14px\s*!important/);
   assert.match(rows, /margin:\s*0\s*!important/);
+  assert.match(rows, /padding:\s*8px 0\s*!important/);
 
   const structuralChildren = declarationsForExactSelector(".sdsync-app .sdsync-form-item > *");
   assert.match(structuralChildren, /width:\s*100%\s*!important/);
@@ -195,15 +203,19 @@ test("input and select internals remain one row through arbitrary private DSM sh
     '.sdsync-app .sdsync-input-control input:not([type="checkbox"]):not([type="radio"])',
     ".sdsync-app .sdsync-input-control textarea"
   );
-  assert.match(inputControl, /width:\s*0\s*!important/);
-  assert.match(inputControl, /flex:\s*1 1 auto\s*!important/);
+  assert.match(inputControl, /width:\s*100%\s*!important/);
+  assert.match(inputControl, /max-width:\s*100%\s*!important/);
+  assert.match(inputControl, /min-width:\s*0\s*!important/);
+  assert.match(inputControl, /flex:\s*1 1 0%\s*!important/);
 
   const input = declarationsForRuleContaining(
     '.sdsync-app [role="combobox"] input',
     '.sdsync-app [aria-haspopup="listbox"] input'
   );
-  assert.match(input, /width:\s*0\s*!important/);
-  assert.match(input, /flex:\s*1 1 auto\s*!important/);
+  assert.match(input, /width:\s*100%\s*!important/);
+  assert.match(input, /max-width:\s*100%\s*!important/);
+  assert.match(input, /min-width:\s*0\s*!important/);
+  assert.match(input, /flex:\s*1 1 0%\s*!important/);
 
   const physicalSelect = declarationsForExactSelector(
     '.sdsync-app .sdsync-select-control:not(input):not(textarea):not(select):not([role="combobox"]):not([aria-haspopup="listbox"])'
@@ -225,7 +237,7 @@ test("owned horizontal forms align labels and controls until genuinely narrow wi
     ".sdsync-horizontal-form > .sdsync-form-item",
     ".sdsync-app .sdsync-inline-form-item"
   );
-  assert.match(wide, /grid-template-columns:\s*minmax\(130px, 200px\) minmax\(0, 1fr\)\s*!important/);
+  assert.match(wide, /grid-template-columns:\s*minmax\(145px, 190px\) minmax\(260px, 1fr\)\s*!important/);
   assert.match(wide, /align-items:\s*center\s*!important/);
   assert.match(wide, /gap:\s*14px\s*!important/);
   assert.match(css, /\.sdsync-app \.sdsync-form-grid > \.sdsync-form-item:not\(\.sdsync-inline-form-item\)/,
@@ -244,7 +256,7 @@ test("owned horizontal forms align labels and controls until genuinely narrow wi
   assert.doesNotMatch(css, /\.sdsync-form-item\s*>\s*:first-child/,
     "control placement must not depend on undocumented DSM child order");
 
-  const shortViewport = css.slice(css.indexOf("@media (max-width: 420px)"));
+  const shortViewport = css.slice(css.indexOf("@media (max-width: 520px)"));
   assert.match(
     shortViewport,
     /\.sdsync-settings-panel > \.sdsync-form-item,[\s\S]*?\.sdsync-horizontal-form \.sdsync-inline-form-item[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\)\s*!important/
@@ -256,15 +268,18 @@ test("owned horizontal forms align labels and controls until genuinely narrow wi
     /\.sdsync-settings-panel\.sdsync-compact-form > \.sdsync-form-item,[\s\S]*?\.sdsync-horizontal-form\.sdsync-compact-form \.sdsync-inline-form-item[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\)\s*!important/
   );
   assert.match(shortOwnedForm, /grid-column:\s*1\s*!important[\s\S]*?grid-row:\s*2\s*!important/);
-  assert.match(controlLayout, /FORM_COMPACT_WIDTH = 420/);
+  assert.match(controlLayout, /FORM_COMPACT_WIDTH = 520/);
   assert.match(controlLayout, /width <= FORM_COMPACT_WIDTH/);
+  assert.match(controlLayout, /RESPONSIVE_FORM_SELECTOR = "\.sdsync-settings-panel, \.sdsync-horizontal-form, \.sdsync-editor"/);
+  assert.match(shortOwnedForm, /\.sdsync-editor\.sdsync-compact-form \.sdsync-form-item/,
+    "profile editors must stack by their own AppWindow track width");
 });
 
 test("critical form layout has an explicit Chrome 88 compatibility path", () => {
   assert.match(webpack, /targets:\s*\{\s*chrome:\s*["']88["']\s*\}/);
   assert.doesNotMatch(css, /:has\(/, "critical layout must not require relational selectors unavailable in Chrome 88");
 
-  const progressiveStart = css.indexOf("@container (max-width: 420px)");
+  const progressiveStart = css.indexOf("@container (max-width: 520px)");
   assert.ok(progressiveStart > 0, "container-query enhancement is missing");
   const baselineCss = css.slice(0, progressiveStart);
   assert.match(baselineCss, /\.sdsync-app \.sdsync-control-shell\s*\{/);
@@ -346,9 +361,14 @@ test("requested DSM policy, routine, Doctor, and alert fields use SDK horizontal
     assert.match(app, new RegExp(`<span class="sdsync-filter-label">${label}<\\/span>`));
   }
   assert.equal((app.match(/class="sdsync-submit-row"/g) || []).length, 3);
-  for (const action of ["Run doctor", "Save DSM alert policy", "Save session preferences"]) {
+  for (const action of ["Run doctor", "Save session preferences"]) {
     assert.match(app, new RegExp(`class="sdsync-submit-row"[\\s\\S]{0,500}>${action}<\\/v-button>`));
   }
+  assert.match(
+    app,
+    /class="sdsync-submit-row"[\s\S]{0,500}tooltip="Validate and persist the package-level DSM alert policy immediately"[\s\S]{0,350}>Save now<\/v-button>/,
+    "the DSM alert policy keeps its bounded action row after adopting autosave copy"
+  );
 
   assert.match(declarationsForExactSelector(".sdsync-routine-fields,\n.sdsync-inline-field-list"), /grid-template-columns:\s*minmax\(0, 1fr\)/);
   assert.match(declarationsForExactSelector(".sdsync-filter-row"), /grid-template-columns:\s*minmax\(88px, 130px\) minmax\(0, 1fr\)/);

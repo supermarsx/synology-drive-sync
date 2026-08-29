@@ -364,7 +364,8 @@ class DsmUiContractTests(unittest.TestCase):
         for marker in (
             "keep", "replace", "clear", "interval", "daily", "realtime",
             "Reachable", "Writable", "Latency", "Last success", "Free space",
-            "failure_threshold", "cooldown_seconds", "Save interface settings",
+            "failure_threshold", "cooldown_seconds",
+            "Apply, persist, and audit this browser's AppWindow preferences immediately",
             "sdsync-settings-actions",
         ):
             self.assertIn(marker, app)
@@ -857,6 +858,7 @@ function bind(context, names) {
     logTimer: 0,
     profileEditorOpen: true,
     selectedProfile: "private",
+    autosaveCoordinator: null,
     secretModes: {
       password: "replace", totp: "replace", remote_log_token: "replace"
     },
@@ -865,7 +867,7 @@ function bind(context, names) {
     },
     refreshLogs: function () {}
   };
-  bind(routeContext, ["clearSecrets", "closeProfile"]);
+  bind(routeContext, ["refreshAutosaveStatus", "cancelAutosave", "clearSecrets", "closeProfile"]);
   methods.navigate.call(routeContext, "overview");
   assert.deepEqual(routeContext.secretValues, {
     password: "", totp: "", remote_log_token: ""

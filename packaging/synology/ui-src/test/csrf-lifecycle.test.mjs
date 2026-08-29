@@ -63,6 +63,10 @@ async function loadAppComponent(postSpy, getSpy) {
     formatDuration: String,
     numberOr: (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback,
     pick: (model, ...keys) => keys.map((key) => model && model[key]).find((value) => value !== undefined),
+    createAutosaveCoordinator: () => ({
+      cancel() {}, dispose() {}, getState: () => ({ registered: false, dirty: false }),
+      hydrate() {}, setGlobalBusy() {}, setScopeBlocked() {}, update: () => ({ dirty: false })
+    }),
     installControlLayout: () => () => {},
     ActionIcon: { name: "ActionIcon" },
     SecurityPanel: {}
@@ -104,6 +108,7 @@ function securityContext(component, overrides = {}) {
     securityDirty: true,
     operationBusy: false,
     disposed: false,
+    autosaveCoordinator: null,
     auth: {},
     csrfToken: "csrf-before-policy-save",
     securityForm: securityPolicy(420),
@@ -135,6 +140,8 @@ function securityContext(component, overrides = {}) {
   }, overrides);
   for (const name of [
     "between", "securityPayload", "validateSecurityPayload", "securityRelaxed",
+    "interfaceSettingsPayload", "validateInterfacePayload", "hydrateAutosave", "refreshAutosaveStatus",
+    "cancelAutosave", "pauseAutosave",
     "saveSecurityPolicy", "saveInterfaceSettings", "reportMutationError", "refreshCsrf"
   ]) context[name] = (...args) => methods[name].apply(context, args);
   return context;
@@ -175,7 +182,9 @@ test("failed initial CSRF bootstrap is reported once before the scheduled retry"
       connected: true,
       bridgeIssue: { title: "", message: "" },
       connectionLabel: "Connected",
+      settings: { theme: "dark", status_refresh: 5000, log_refresh: 5000 },
       toasts: [],
+      interfaceSettingsPayload(...args) { return component.methods.interfaceSettingsPayload.apply(this, args); },
       refreshCsrf(...args) { return component.methods.refreshCsrf.apply(this, args); },
       describeBridgeError(...args) { return component.methods.describeBridgeError.apply(this, args); },
       toast(title, message, error = false) { this.toasts.push({ title, message, error }); },
