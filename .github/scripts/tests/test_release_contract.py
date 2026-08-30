@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import io
 import json
+import re
 import subprocess
 import sys
 import tarfile
@@ -485,6 +486,94 @@ class AssetContractTests(unittest.TestCase):
 
 
 class WorkflowWiringTests(unittest.TestCase):
+    def test_release_container_bases_are_current_and_immutable(self):
+        dockerfile = (REPOSITORY_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn(
+            "FROM rust:1.88-bookworm@sha256:"
+            "af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS builder",
+            dockerfile,
+        )
+        self.assertIn(
+            "FROM debian:bookworm-slim@sha256:"
+            "88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime",
+            dockerfile,
+        )
+        for instruction in re.findall(r"^FROM\s+([^\s]+)", dockerfile, re.MULTILINE):
+            self.assertRegex(instruction, r"@sha256:[0-9a-f]{64}$")
+
+        notice_generator = (
+            REPOSITORY_ROOT / ".github/scripts/generate-third-party-notices.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("version=0.9.2", notice_generator)
+        self.assertIn(
+            "archive_sha256="
+            "9099a59e820c38a68b9d65f300662a567d56562f9a10f6aa4c7e86c17c2566af",
+            notice_generator,
+        )
+
+    def test_actions_node_and_hosted_runners_are_current_and_immutable(self):
+        workflow_directory = REPOSITORY_ROOT / ".github/workflows"
+        workflow_paths = sorted(
+            [*workflow_directory.glob("*.yml"), *workflow_directory.glob("*.yaml")]
+        )
+        workflows = "\n".join(
+            path.read_text(encoding="utf-8") for path in workflow_paths
+        )
+        expected_actions = {
+            "Swatinem/rust-cache": "6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+            "actions/attest": "1e69f48acb82d1966a394da916b4c1698aa569d6",
+            "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+            "actions/configure-pages": "45bfe0192ca1faeb007ade9deae92b16b8254a0d",
+            "actions/deploy-pages": "cd2ce8fcbc39b97be8ca5fce6e763baed58fa128",
+            "actions/download-artifact": "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+            "actions/setup-node": "820762786026740c76f36085b0efc47a31fe5020",
+            "actions/upload-artifact": "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+            "actions/upload-pages-artifact": "fc324d3547104276b827a68afc52ff2a11cc49c9",
+            "dtolnay/rust-toolchain": "4360b52568e2003a75bf9bc1d59f33a8e3fc893c",
+            "lycheeverse/lychee-action": "e7477775783ea5526144ba13e8db5eec57747ce8",
+            "pnpm/action-setup": "0977fd99725f1db4007ccb2928dbb4e90d06cc86",
+            "taiki-e/install-action": "742a3317eac7bd62f91cd888b4eead5e784ba833",
+        }
+        uses_values = re.findall(
+            r"^\s*(?:-\s+)?uses:\s+([^#\s]+)(?:\s+#.*)?$",
+            workflows,
+            re.MULTILINE,
+        )
+        parsed_actions: list[tuple[str, str]] = []
+        for value in uses_values:
+            match = re.fullmatch(r"([^@\s]+)@([0-9a-f]{40})", value)
+            self.assertIsNotNone(match, f"action is not pinned to an immutable SHA: {value}")
+            assert match is not None
+            parsed_actions.append((match.group(1), match.group(2)))
+
+        self.assertEqual({name for name, _ in parsed_actions}, set(expected_actions))
+        for name, sha in parsed_actions:
+            self.assertEqual(sha, expected_actions[name], name)
+
+        self.assertEqual(
+            re.findall(r"^\s*node-version:\s*([^#\s]+)", workflows, re.MULTILINE),
+            ["24.20.0"] * 4,
+        )
+        self.assertNotIn("mlugg/setup-zig", workflows)
+        self.assertNotIn("ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION", workflows)
+        self.assertEqual(workflows.count("tool: cargo-zigbuild@0.23.3"), 3)
+
+        runner_labels = set(
+            re.findall(r"^\s*(?:runs-on:|- runner:)\s+([^$\s][^\s]*)\s*$", workflows, re.MULTILINE)
+        )
+        self.assertEqual(
+            runner_labels,
+            {
+                "macos-26",
+                "macos-26-intel",
+                "ubuntu-24.04",
+                "ubuntu-24.04-arm",
+                "windows-11-vs2026-arm",
+                "windows-2025-vs2026",
+            },
+        )
+        self.assertNotIn("ubuntu-26.04", workflows)
+
     def test_windows_installer_uses_ci_token_only_for_github_api(self):
         ci = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(
             encoding="utf-8"
@@ -609,15 +698,17 @@ class WorkflowWiringTests(unittest.TestCase):
             "i686": "i686-unknown-linux-musl",
             "armv7": "armv7-unknown-linux-musleabihf",
         }
-        zig_action = (
-            "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29"
-        )
+        zig_installer = "run: bash .github/scripts/install-zig.sh"
         installer_action = (
-            "taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc"
+            "taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833"
         )
         qemu_image = (
             "docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:"
             "400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0"
+        )
+        alpine_image = (
+            "docker.io/library/alpine:3.24.1@sha256:"
+            "28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b"
         )
 
         for section in sections:
@@ -626,11 +717,12 @@ class WorkflowWiringTests(unittest.TestCase):
                 self.assertEqual(section.count(f"rust_target: {target}"), 1)
             self.assertEqual(section.count("cross_compile: true"), 2)
             self.assertEqual(section.count("cross_compile: false"), 2)
-            self.assertIn(zig_action, section)
-            self.assertIn("version: 0.16.0", section)
+            self.assertIn(zig_installer, section)
+            self.assertNotIn("setup-zig", section)
             self.assertIn(installer_action, section)
-            self.assertIn("tool: cargo-zigbuild@0.23.2", section)
+            self.assertIn("tool: cargo-zigbuild@0.23.3", section)
             self.assertIn(qemu_image, section)
+            self.assertIn(alpine_image, section)
             self.assertIn("qemu_binary: qemu-i386", section)
             self.assertIn("qemu_binary: qemu-arm", section)
             self.assertIn("qemu_cpu: qemu32", section)
@@ -675,6 +767,19 @@ class WorkflowWiringTests(unittest.TestCase):
 
         self.assertIn(
             "for synology_arch in armv7 armv8 i686 x86_64; do", release
+        )
+
+        zig_script = (REPOSITORY_ROOT / ".github/scripts/install-zig.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('readonly zig_version="0.16.0"', zig_script)
+        self.assertIn(
+            "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00",
+            zig_script,
+        )
+        self.assertIn(
+            "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17",
+            zig_script,
         )
 
     def test_ui_computed_browser_gate_is_authoritative_once(self):
@@ -859,6 +964,22 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("& cl.exe @compileArgs", workflow)
         self.assertIn('target/$TARGET/ffi-release/libsdsync.so', workflow)
         self.assertIn("release ceiling is GLIBC_2.35", workflow)
+        self.assertEqual(workflow.count('"$TARGET.2.35"'), 2)
+        self.assertIn("cargo zigbuild --release --locked", workflow)
+        self.assertIn(
+            "cargo zigbuild -p synology-drive-sync-ffi --profile ffi-release --locked",
+            workflow,
+        )
+        self.assertEqual(
+            workflow.count('export MACOSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET"'),
+            2,
+        )
+        self.assertIn('macos_deployment_target: "10.12"', workflow)
+        self.assertIn('macos_deployment_target: "11.0"', workflow)
+        self.assertEqual(workflow.count("tool: cargo-zigbuild@0.23.3"), 2)
+        self.assertIn("name: Verify emitted macOS deployment floors", workflow)
+        self.assertIn('build_metadata=$(xcrun vtool -show-build "$artifact")', workflow)
+        self.assertIn('[[ "$minos" == "$MACOS_DEPLOYMENT_TARGET" ]]', workflow)
         self.assertIn("--prefix=\"synology-drive-sync-$TAG-rust-sdk/\"", workflow)
         self.assertIn("jq -e --rawfile notes \"$notes\" '.body == $notes'", workflow)
         self.assertNotIn("jq -r '.body'", workflow)
@@ -924,7 +1045,7 @@ class WorkflowWiringTests(unittest.TestCase):
             coverage_env.splitlines(),
             [
                 "RUST_TOOLCHAIN=1.88.0",
-                "CARGO_LLVM_COV_VERSION=0.8.7",
+                "CARGO_LLVM_COV_VERSION=0.9.0",
                 "COVERAGE_MIN_LINES=90",
                 "COVERAGE_DSM_MIN_LINES=74",
             ],

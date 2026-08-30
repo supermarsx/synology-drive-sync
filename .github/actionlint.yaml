@@ -1,0 +1,5 @@
+# actionlint v1.7.12 predates GitHub's GA Windows 11 ARM64 + VS 2026 label.
+# Keep this allow-list exact until actionlint's built-in hosted-runner table catches up.
+self-hosted-runner:
+  labels:
+    - windows-11-vs2026-arm

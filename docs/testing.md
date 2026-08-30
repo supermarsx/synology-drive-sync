@@ -41,7 +41,7 @@ Install those prerequisites before running a report:
 
 ```bash
 rustup toolchain install 1.88.0 --component llvm-tools-preview
-cargo +1.88.0 install cargo-llvm-cov --version 0.8.7 --locked
+cargo +1.88.0 install cargo-llvm-cov --version 0.9.0 --locked
 ```
 
 Run the full report or the same hard check used by CI:
@@ -79,17 +79,17 @@ treats doctest coverage as experimental.
 
 ## Verified pinned result
 
-On 2026-08-26, the Bash `check` path passed with the pinned Rust 1.88.0 toolchain and
-`cargo-llvm-cov 0.8.7`:
+On 2026-08-30, the PowerShell `Check` path passed with the pinned Rust 1.88.0 toolchain and
+`cargo-llvm-cov 0.9.0`:
 
-```bash
-bash scripts/coverage.sh check
+```powershell
+pwsh -File scripts/coverage.ps1 -Mode Check
 ```
 
-- Non-DSM lines: **18,972 / 20,299 = 93.4627%**
-- DSM boundary lines: **7,396 / 9,978 = 74.1231%**
-- Unfiltered total lines: **26,368 / 30,277 = 87.0892%**
-- Tests: **489 passed** across all targets
+- Non-DSM lines: **20,167 / 21,576 = 93.4696%**
+- DSM boundary lines: **5,086 / 5,775 = 88.0693%**
+- Unfiltered total lines: **25,253 / 27,351 = 92.3293%**
+- Tests: **500 passed** across all targets
 
 This is the verified repository gate result; CI regenerates `coverage-summary.json` rather than
 trusting a committed report.

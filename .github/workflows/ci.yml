@@ -17,10 +17,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable (2026-08-05)
         with:
           toolchain: 1.88.0
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Audit locked dependencies against fresh RustSec data
         run: bash .github/scripts/run-cargo-audit.sh
       - name: Reproduce third-party notices from Cargo.lock
@@ -58,27 +58,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-22.04
+          - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             platform: linux
             architecture: x86_64
-          - runner: ubuntu-22.04-arm
+          - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             platform: linux
             architecture: aarch64
-          - runner: macos-15-intel
+          - runner: macos-26-intel
             target: x86_64-apple-darwin
             platform: macos
             architecture: x86_64
-          - runner: macos-15
+          - runner: macos-26
             target: aarch64-apple-darwin
             platform: macos
             architecture: aarch64
-          - runner: windows-2025
+          - runner: windows-2025-vs2026
             target: x86_64-pc-windows-msvc
             platform: windows
             architecture: x86_64
-          - runner: windows-11-arm
+          - runner: windows-11-vs2026-arm
             target: aarch64-pc-windows-msvc
             platform: windows
             architecture: aarch64
@@ -88,11 +88,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable (2026-08-05)
         with:
           targets: ${{ matrix.target }}
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: test-${{ matrix.target }}
       - name: Formatting
@@ -164,11 +164,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable (2026-08-05)
         with:
           toolchain: 1.88.0
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install pinned cargo-llvm-cov
         shell: bash
         run: |
@@ -181,7 +181,7 @@ jobs:
         run: bash scripts/coverage.sh check
       - name: Preserve coverage summary
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-summary
           path: target/llvm-cov/coverage-summary.json
@@ -189,16 +189,16 @@ jobs:
           retention-days: 14
 
   msrv:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable (2026-08-05)
         with:
           toolchain: 1.88.0
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Rust 1.88 compatibility
         run: cargo test --locked --workspace --all-targets
 
@@ -254,9 +254,9 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.15.0
+          node-version: 24.20.0
           package-manager-cache: false
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           package_json_file: packaging/synology/ui-src/package.json
       - name: Build native DSM AppWindow assets
@@ -268,23 +268,22 @@ jobs:
           pnpm test
           pnpm run build
           git diff --exit-code -- dist
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable (2026-08-05)
         with:
           toolchain: 1.88.0
           targets: ${{ matrix.rust_target }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: synology-${{ matrix.synology_arch }}
       - name: Install pinned Zig cross-linker
         if: matrix.cross_compile == true
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.16.0
+        shell: bash
+        run: bash .github/scripts/install-zig.sh
       - name: Install pinned cargo-zigbuild
         if: matrix.cross_compile == true
-        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
         with:
-          tool: cargo-zigbuild@0.23.2
+          tool: cargo-zigbuild@0.23.3
       - name: Extract pinned QEMU user emulator
         if: matrix.cross_compile == true
         env:
@@ -422,7 +421,7 @@ jobs:
         if: matrix.synology_arch == 'x86_64'
         shell: bash
         env:
-          ALPINE_IMAGE: docker.io/library/alpine:3.22.1@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1
+          ALPINE_IMAGE: docker.io/library/alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
         run: >-
           docker run --rm --network none --platform linux/amd64
           --volume "$PWD:/workspace:ro"
@@ -443,9 +442,9 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.15.0
+          node-version: 24.20.0
           package-manager-cache: false
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           package_json_file: packaging/synology/ui-src/package.json
       - name: Verify deterministic native DSM AppWindow build
@@ -464,10 +463,10 @@ jobs:
           [[ "$(sha256sum dist/SynologyDriveSync.js | awk '{print $1}')" == "$first_js" ]]
           [[ "$(sha256sum dist/style.css | awk '{print $1}')" == "$first_css" ]]
           git diff --exit-code -- dist
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable (2026-07-16)
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable (2026-08-05)
         with:
           toolchain: 1.88.0
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: packaging
       - name: Build the binary the packaging validators execute
