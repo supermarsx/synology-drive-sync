@@ -587,15 +587,15 @@ test("an explicit pre-acceptance CSRF 403 clears the token and never retries POS
   }
 });
 
-test("a lost 202 acknowledgement is outcome-unknown with the original client request ID", async () => {
+test("repeatedly lost 202 acknowledgements remain outcome-unknown with one client request ID", async () => {
   const restore = installBrowserGlobals();
   try {
     const api = await loadApi();
-    let dispatchedRequestId = "";
+    const dispatchedBodies = [];
     let fetchCount = 0;
     globalThis.fetch = async (_url, options) => {
       fetchCount += 1;
-      dispatchedRequestId = JSON.parse(options.body).request_id;
+      dispatchedBodies.push(options.body);
       return {
         redirected: false,
         status: 202,
@@ -613,6 +613,7 @@ test("a lost 202 acknowledgement is outcome-unknown with the original client req
         { event: "interface-settings" }
       ),
       (error) => {
+        const dispatchedRequestId = JSON.parse(dispatchedBodies[0]).request_id;
         assert.equal(error instanceof api.MutationOutcomeUnknownError, true);
         assert.equal(error.outcomeUnknown, true);
         assert.equal(error.acceptanceUnknown, true);
@@ -620,11 +621,17 @@ test("a lost 202 acknowledgement is outcome-unknown with the original client req
         assert.equal(error.trustedRequestId, true);
         assert.match(error.requestId, /^[0-9a-f]{32}$/);
         assert.match(error.message, new RegExp(dispatchedRequestId));
-        assert.match(error.message, /Do not retry it automatically/);
+        assert.match(error.message, /Automatic exact-request recovery/);
+        assert.match(error.message, /do not start a new request/i);
         return true;
       }
     );
-    assert.equal(fetchCount, 1, "a lost acknowledgement must never trigger an automatic POST retry");
+    assert.equal(fetchCount, 3, "ambiguous dispatch recovery must remain strictly bounded");
+    assert.deepEqual(
+      dispatchedBodies,
+      [dispatchedBodies[0], dispatchedBodies[0], dispatchedBodies[0]],
+      "every recovery attempt must reuse the exact serialized request"
+    );
   } finally {
     restore();
   }

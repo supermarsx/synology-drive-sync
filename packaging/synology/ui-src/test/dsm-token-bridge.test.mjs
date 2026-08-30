@@ -399,11 +399,15 @@ test("accepted cookie-only mutations pin authentication through terminal result 
   }
 });
 
-test("token bridge has no launch-location or persistent-storage dependency", () => {
+test("token bridge has no persistent dependency and bounded attempts link and release abort signals", () => {
   assert.match(apiSource, /\/webapi\/entry\.cgi\?api=SYNO\.API\.Auth&version=6&method=token/);
   assert.match(apiSource, /authenticated\["X-SYNO-TOKEN"\] = dsmAuth\.token/);
   assert.match(apiSource, /function dsmAuthSnapshot\(\)/);
-  assert.match(apiSource, /apiGetWithDsmAuth\(auth, "result", \{ job_id: jobId \}, dsmAuth\)/);
+  assert.match(apiSource, /function linkedAbortAttempt\(parentSignal\)/);
+  assert.match(apiSource, /const attempt = linkedAbortAttempt\(auth && auth\.signal\);[\s\S]*?apiGetWithDsmAuth\([\s\S]*?attempt\.signal[\s\S]*?\)[\s\S]*?finally \{[\s\S]*?attempt\.release\(\)/);
+  assert.match(apiSource, /withinLimit\([\s\S]*?limits\.resultRequestTimeoutMs,[\s\S]*?attempt\.abort,[\s\S]*?observation/);
+  assert.match(apiSource, /parentSignal\.addEventListener\("abort", abort, \{ once: true \}\)/);
+  assert.match(apiSource, /parentSignal\.removeEventListener\("abort", abort\)/);
   assert.doesNotMatch(
     apiSource,
     /consumeLaunchToken|launch token|window\.location|window\.history|history\.replaceState|localStorage|sessionStorage|indexedDB|document\.cookie|console\./i

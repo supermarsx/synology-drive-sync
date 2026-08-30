@@ -15,9 +15,19 @@ export const AUTOSAVE_API_LIMITS = Object.freeze({
   resultObservationTimeoutMs: 30000
 });
 
+const TERMINAL_API_ATTEMPT_TIMEOUTS = Object.freeze({
+  csrfReissueTimeoutMs: 10000,
+  postRequestTimeoutMs: 15000,
+  postResponseTimeoutMs: 10000,
+  readTimeoutMs: 10000,
+  resultRequestTimeoutMs: 10000
+});
+
 const CSRF_SCHEMA = "sdsync.dsm-csrf.v1";
 const RESULT_POLL_INTERVAL_MS = 2000;
 const RESULT_POLL_OBSERVATION_FAILURES = 5;
+const POST_DISPATCH_REPLAY_DELAYS_MS = Object.freeze([250, 1000]);
+const POST_DISPATCH_MAX_ATTEMPTS = POST_DISPATCH_REPLAY_DELAYS_MS.length + 1;
 const MAX_DSM_TOKEN_RESPONSE_BYTES = 16 * 1024;
 const MAX_DSM_TOKEN_BYTES = 1024;
 const MAX_CSRF_TOKEN_BYTES = 4096;
@@ -417,6 +427,37 @@ function authenticatedHeaders(headers, dsmAuth) {
   return authenticated;
 }
 
+function linkedAbortAttempt(parentSignal) {
+  const AbortControllerClass = typeof window === "object"
+    && typeof window.AbortController === "function"
+    ? window.AbortController
+    : null;
+  if (!AbortControllerClass) {
+    return { signal: parentSignal, abort() {}, release() {} };
+  }
+  const controller = new AbortControllerClass();
+  let listening = false;
+  const abort = () => {
+    if (!controller.signal.aborted) controller.abort();
+  };
+  if (parentSignal) {
+    if (parentSignal.aborted) abort();
+    else if (typeof parentSignal.addEventListener === "function") {
+      parentSignal.addEventListener("abort", abort, { once: true });
+      listening = true;
+    }
+  }
+  return {
+    signal: controller.signal,
+    abort,
+    release() {
+      if (!listening || !parentSignal || typeof parentSignal.removeEventListener !== "function") return;
+      parentSignal.removeEventListener("abort", abort);
+      listening = false;
+    }
+  };
+}
+
 function validCsrfModel(model) {
   return model
     && model.schema === CSRF_SCHEMA
@@ -477,6 +518,15 @@ function normalizedRequestLimits(options) {
   return normalized;
 }
 
+function terminalAttemptLimits() {
+  return {
+    ...TERMINAL_API_ATTEMPT_TIMEOUTS,
+    resultObservationTimeoutMs: null,
+    setTimer: (callback, milliseconds) => window.setTimeout(callback, milliseconds),
+    clearTimer: (timer) => window.clearTimeout(timer)
+  };
+}
+
 function withinLimit(
   promise,
   milliseconds,
@@ -487,6 +537,7 @@ function withinLimit(
 ) {
   return new Promise((resolve, reject) => {
     if (cancellation && cancellation.expired) {
+      if (onTimeout) onTimeout();
       reject(errorFactory());
       return;
     }
@@ -499,6 +550,7 @@ function withinLimit(
       settled = true;
       limits.clearTimer(timer);
       clearCancellation();
+      if (onTimeout) onTimeout();
       reject(errorFactory());
     };
     const timer = limits.setTimer(() => {
@@ -563,13 +615,20 @@ function endpoint(action, parameters) {
   return `${API_URL}?${query.toString()}`;
 }
 
-async function apiGetWithDsmAuth(auth, action, parameters, dsmAuth, rememberGeneration = true) {
+async function apiGetWithDsmAuth(
+  auth,
+  action,
+  parameters,
+  dsmAuth,
+  rememberGeneration = true,
+  requestSignal = auth && auth.signal ? auth.signal : undefined
+) {
   const response = await fetch(endpoint(action, parameters), {
     method: "GET",
     credentials: "same-origin",
     cache: "no-store",
     redirect: "error",
-    signal: auth && auth.signal ? auth.signal : undefined,
+    signal: requestSignal,
     headers: authenticatedHeaders({ Accept: "application/json" }, dsmAuth)
   });
   const model = await responseJson(response, action === "result", true);
@@ -582,24 +641,31 @@ async function apiGetWithDsmAuth(auth, action, parameters, dsmAuth, rememberGene
 export async function apiGet(auth, action, parameters = {}, options = undefined) {
   if (!GET_ACTIONS.includes(action)) throw new Error("Unsupported API read action");
   exactKeys(parameters, GET_ARGUMENT_KEYS[action], "Read");
-  const limits = normalizedRequestLimits(options);
+  const configuredLimits = normalizedRequestLimits(options);
+  const limits = configuredLimits || terminalAttemptLimits();
   await ensureDsmToken();
   const requestDsmAuth = dsmAuthSnapshot();
-  const deferredCsrfGeneration = Boolean(limits && action === "csrf");
-  const request = apiGetWithDsmAuth(
-    auth,
-    action,
-    parameters,
-    requestDsmAuth,
-    !deferredCsrfGeneration
-  );
-  if (!limits) return request;
-  const model = await withinLimit(
-      request,
+  const deferredCsrfGeneration = action === "csrf";
+  const attempt = linkedAbortAttempt(auth && auth.signal);
+  let model;
+  try {
+    model = await withinLimit(
+      apiGetWithDsmAuth(
+        auth,
+        action,
+        parameters,
+        requestDsmAuth,
+        !deferredCsrfGeneration,
+        attempt.signal
+      ),
       limits.readTimeoutMs,
       limits,
-      () => safeReadTimeout("read_observation", "DSM did not return a complete read response within the autosave limit.")
-  );
+      () => safeReadTimeout("read_observation", "DSM did not return a complete read response within the client read limit."),
+      attempt.abort
+    );
+  } finally {
+    attempt.release();
+  }
   if (deferredCsrfGeneration) {
     rememberCsrfGeneration(auth, model, requestDsmAuth.generation);
   }
@@ -674,29 +740,50 @@ async function pollJobResult(
     }
     let status;
     try {
-      const request = apiGetWithDsmAuth(auth, "result", { job_id: jobId }, dsmAuth);
-      status = limits
-        ? await withinLimit(
-          request,
-          limits.resultRequestTimeoutMs,
-          limits,
-          () => queuedObservationTimeout(
-            jobId,
-            requestId,
-            "DSM accepted the operation, but a terminal result request exceeded the autosave limit."
-          ),
-          null,
-          observation
-        )
-        : await request;
+      const attempt = linkedAbortAttempt(auth && auth.signal);
+      try {
+        const request = apiGetWithDsmAuth(
+          auth,
+          "result",
+          { job_id: jobId },
+          dsmAuth,
+          true,
+          attempt.signal
+        );
+        status = limits
+          ? await withinLimit(
+            request,
+            limits.resultRequestTimeoutMs,
+            limits,
+            () => queuedObservationTimeout(
+              jobId,
+              requestId,
+              "DSM accepted the operation, but a terminal result request exceeded the autosave limit."
+            ),
+            attempt.abort,
+            observation
+          )
+          : await request;
+      } finally {
+        attempt.release();
+      }
     } catch (error) {
       if (auth && auth.signal && auth.signal.aborted) throw error;
-      if (error instanceof QueuedOutcomeUnknownError) throw error;
+      if (observation && observation.expired) {
+        throw queuedObservationTimeout(
+          jobId,
+          requestId,
+          "DSM accepted the operation, but terminal result observation exceeded the autosave limit."
+        );
+      }
       consecutiveObservationFailures += 1;
       // The POST was already accepted. Repeated transport/auth observation
       // failures are not evidence that the queued mutation failed, so surface
       // an explicit outcome-unknown state rather than inviting a duplicate.
-      if (consecutiveObservationFailures >= RESULT_POLL_OBSERVATION_FAILURES) {
+      // Bounded callers own an overall observation deadline, so transient
+      // request failures remain retryable until that deadline. Unbounded
+      // callers retain a finite failure ceiling rather than polling forever.
+      if (!observation && consecutiveObservationFailures >= RESULT_POLL_OBSERVATION_FAILURES) {
         throw new QueuedOutcomeUnknownError(
           jobId,
           "DSM accepted the operation, but its result cannot currently be observed. Do not retry it; inspect Activity and Logs.",
@@ -792,7 +879,7 @@ function isExplicitCsrfRejection(error) {
 function dispatchedOutcomeUnknown(id) {
   return new MutationOutcomeUnknownError(
     id,
-    `DSM may have accepted client request ${id}, but no trustworthy rejection or queue acknowledgement was received. Do not retry it automatically; inspect Activity and Logs using this request ID.`
+    `Automatic exact-request recovery for client request ${id} could not obtain a trustworthy rejection or queue acknowledgement. DSM may already have accepted it; do not start a new request, and inspect Activity and Logs using this request ID.`
   );
 }
 
@@ -805,18 +892,26 @@ async function csrfForCurrentAuthGeneration(auth, csrfToken, dsmAuth, limits = n
   // A timed-out reissue may still settle later at the fetch layer. Do not let
   // that detached response advance the accepted generation without also
   // delivering its replacement token to the AppWindow.
-  const request = apiGetWithDsmAuth(auth, "csrf", {}, dsmAuth, false);
-  const model = limits
-    ? await withinLimit(
-      request,
-      limits.csrfReissueTimeoutMs,
-      limits,
-      () => safeReadTimeout(
-        "csrf_reissue",
-        "DSM request authentication could not be refreshed within the autosave limit; no mutation request was sent."
-      )
-    )
-    : await request;
+  let model;
+  if (limits) {
+    const attempt = linkedAbortAttempt(auth.signal);
+    try {
+      model = await withinLimit(
+        apiGetWithDsmAuth(auth, "csrf", {}, dsmAuth, false, attempt.signal),
+        limits.csrfReissueTimeoutMs,
+        limits,
+        () => safeReadTimeout(
+          "csrf_reissue",
+          "DSM request authentication could not be refreshed within the autosave limit; no mutation request was sent."
+        ),
+        attempt.abort
+      );
+    } finally {
+      attempt.release();
+    }
+  } else {
+    model = await apiGetWithDsmAuth(auth, "csrf", {}, dsmAuth, false);
+  }
   if (!validCsrfModel(model)) {
     throw new Error("Authenticated bridge did not reissue a valid CSRF token");
   }
@@ -841,7 +936,8 @@ export async function apiPost(
   const expectedKeys = ARGUMENT_KEYS[action];
   if (!expectedKeys) throw new Error("Unsupported API mutation action");
   exactMutationKeys(action, payload);
-  const limits = normalizedRequestLimits(options);
+  const boundedObservationLimits = normalizedRequestLimits(options);
+  const limits = boundedObservationLimits || terminalAttemptLimits();
 
   await ensureDsmToken();
   const requestDsmAuth = dsmAuthSnapshot();
@@ -853,63 +949,100 @@ export async function apiPost(
     operation: action,
     arguments: payload
   });
-  let response;
-  try {
-    const dispatched = fetch(API_URL, {
-      method: "POST",
-      credentials: "same-origin",
-      cache: "no-store",
-      redirect: "error",
-      signal: auth && auth.signal ? auth.signal : undefined,
-      headers: authenticatedHeaders({
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        "X-SDSYNC-CSRF": effectiveCsrfToken
-      }, requestDsmAuth),
-      body: request
-    });
-    response = limits
-      ? await withinLimit(
-        dispatched,
-        limits.postRequestTimeoutMs,
-        limits,
-        () => dispatchedOutcomeUnknown(id)
-      )
-      : await dispatched;
-  } catch (_error) {
-    throw dispatchedOutcomeUnknown(id);
-  }
-
   let queued;
-  try {
-    const body = responseJson(response);
-    queued = limits
-      ? await withinLimit(
-        body,
-        limits.postResponseTimeoutMs,
-        limits,
-        () => dispatchedOutcomeUnknown(id)
-      )
-      : await body;
-  } catch (error) {
-    if (error instanceof MutationOutcomeUnknownError) throw error;
-    if (error instanceof DsmApiError && error.trustedRejection === true) {
-      error.preAcceptance = true;
-      error.requestId = id;
-      error.trustedRequestId = true;
-      if (isExplicitCsrfRejection(error)) error.csrfRejected = true;
-      throw error;
+  let dispatchAmbiguous = false;
+  for (let attempt = 0; attempt < POST_DISPATCH_MAX_ATTEMPTS; attempt += 1) {
+    const requestAttempt = linkedAbortAttempt(auth && auth.signal);
+    let response;
+    try {
+      try {
+        const dispatched = fetch(API_URL, {
+          method: "POST",
+          credentials: "same-origin",
+          cache: "no-store",
+          redirect: "error",
+          signal: requestAttempt.signal,
+          headers: authenticatedHeaders({
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "X-SDSYNC-CSRF": effectiveCsrfToken
+          }, requestDsmAuth),
+          body: request
+        });
+        response = limits
+          ? await withinLimit(
+            dispatched,
+            limits.postRequestTimeoutMs,
+            limits,
+            () => dispatchedOutcomeUnknown(id),
+            requestAttempt.abort
+          )
+          : await dispatched;
+      } catch (_error) {
+        dispatchAmbiguous = true;
+      }
+
+      if (response) {
+        try {
+          const body = responseJson(response);
+          queued = limits
+            ? await withinLimit(
+              body,
+              limits.postResponseTimeoutMs,
+              limits,
+              () => dispatchedOutcomeUnknown(id),
+              requestAttempt.abort
+            )
+            : await body;
+        } catch (error) {
+          if (!dispatchAmbiguous
+            && error instanceof DsmApiError
+            && error.trustedRejection === true) {
+            error.preAcceptance = true;
+            error.requestId = id;
+            error.trustedRequestId = true;
+            if (isExplicitCsrfRejection(error)) error.csrfRejected = true;
+            throw error;
+          }
+          if (dispatchAmbiguous
+            && error instanceof DsmApiError
+            && error.trustedRejection === true) {
+            throw dispatchedOutcomeUnknown(id);
+          }
+          dispatchAmbiguous = true;
+        }
+      }
+    } finally {
+      requestAttempt.release();
     }
-    throw dispatchedOutcomeUnknown(id);
-  }
-  if (queued.schema !== QUEUED_SCHEMA
-    || queued.state !== "queued"
-    || queued.request_id !== id
-    || !/^[0-9a-f]{48}$/.test(String(queued.job_id || ""))) {
-    throw dispatchedOutcomeUnknown(id);
+
+    if (queued
+      && queued.schema === QUEUED_SCHEMA
+      && queued.state === "queued"
+      && queued.request_id === id
+      && validJobId(queued.job_id)) {
+      break;
+    }
+    queued = null;
+    dispatchAmbiguous = true;
+    if (attempt + 1 >= POST_DISPATCH_MAX_ATTEMPTS
+      || (auth && auth.signal && auth.signal.aborted)) {
+      throw dispatchedOutcomeUnknown(id);
+    }
+    try {
+      await delay(
+        POST_DISPATCH_REPLAY_DELAYS_MS[attempt],
+        auth && auth.signal,
+        limits
+      );
+    } catch (_error) {
+      throw dispatchedOutcomeUnknown(id);
+    }
   }
   if (!awaitTerminal) return queued;
-  if (!limits) return pollJobResult(auth, queued.job_id, requestDsmAuth, pollIntervalMs, id);
+  if (!boundedObservationLimits) {
+    return pollJobResult(auth, queued.job_id, requestDsmAuth, pollIntervalMs, id, limits, null);
+  }
   const observation = { expired: false, cancelCurrent: null };
   return withinLimit(
     pollJobResult(auth, queued.job_id, requestDsmAuth, pollIntervalMs, id, limits, observation),
