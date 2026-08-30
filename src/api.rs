@@ -3262,7 +3262,7 @@ mod tests {
     fn write_scripted_response(stream: &mut TcpStream, status: StatusCode, response_body: &str) {
         if let Some(encoded) = response_body.strip_prefix("sdsync-test-binary:") {
             let mut body = Vec::with_capacity(encoded.len() / 2);
-            for pair in encoded.as_bytes().chunks_exact(2) {
+            for pair in encoded.as_bytes().as_chunks::<2>().0 {
                 let high = char::from(pair[0])
                     .to_digit(16)
                     .expect("scripted binary high nibble") as u8;
