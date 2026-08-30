@@ -1312,6 +1312,20 @@ class BuilderTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, name)
             self.assertIn(marker, result.stderr, name)
 
+    def test_routine_documentation_tracks_current_catalog_and_editor_names(self) -> None:
+        dashboard = (REPOSITORY / "docs/dsm/dashboard.md").read_text(encoding="utf-8")
+        integrated_help = (
+            HERE / "package/ui/help/enu/routines.html"
+        ).read_text(encoding="utf-8")
+        for document in (dashboard, integrated_help):
+            self.assertIn("Configured routines", document)
+            self.assertIn("New routine", document)
+            self.assertIn("Routine editor", document)
+            self.assertNotIn("Configured profiles", document)
+            self.assertNotIn("Selecting one switches", document)
+        self.assertNotIn("**Package controller**", dashboard)
+        self.assertNotIn("<strong>Package controller</strong>", integrated_help)
+
 
 @unittest.skipUnless(os.name == "posix", "DSM shell lifecycle mocks require a POSIX host")
 class RuntimeTests(unittest.TestCase):
@@ -2948,16 +2962,6 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 self.assertEqual(rejected_payload["code"], expected_code)
                 self.assertNotIn("Illegal number", rejected.stderr)
                 path.write_text(valid, encoding="utf-8")
-
-    def test_routine_documentation_uses_the_current_editor_name(self) -> None:
-        dashboard = (REPOSITORY / "docs/dsm/dashboard.md").read_text(encoding="utf-8")
-        integrated_help = (
-            HERE / "package/ui/help/enu/routines.html"
-        ).read_text(encoding="utf-8")
-        for document in (dashboard, integrated_help):
-            self.assertIn("Configured profiles", document)
-            self.assertIn("New routine", document)
-            self.assertNotIn("Package controller", document)
 
     def test_api_accepts_dsm_authentication_diagnostics(self) -> None:
         for code, status in [

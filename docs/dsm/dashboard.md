@@ -114,9 +114,9 @@ reconciliation or a fresh AppWindow session.
 
 ## Routines
 
-Routines opens on a catalog of configured per-profile automation. **New routine** opens a dedicated
-editor beside the catalog; selecting a saved routine opens that same editor with the profile's
-automation policy loaded. The page shows each routine's requested
+Routines opens on **Configured routines**, a catalog of per-profile automation. **New routine** opens
+the **Routine editor** beside the catalog; selecting a saved routine opens that same editor with the
+profile's automation policy loaded. The page shows each routine's requested
 mode, effective backend, state, next run, and last success. The Overview realtime card makes an
 `inotify` backend or `polling` fallback visible rather than implying that a native watcher exists on
 every NAS.
