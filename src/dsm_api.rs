@@ -186,6 +186,8 @@ const AUTH_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
 const READ_MANAGER_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(target_os = "linux")]
+const CONTROLLER_WAKE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
 const MAX_HELPER_STDERR_BYTES: usize = 64 * 1024;
 #[cfg(target_os = "linux")]
 const API_WORKER_COUNT: usize = 4;
@@ -355,6 +357,14 @@ impl EnqueueOutcome {
                 ..
             }
         )
+    }
+
+    fn should_wake_controller(&self) -> bool {
+        // An Existing result can be an exact replay after the original 202
+        // acknowledgement or advisory wake was lost. USR2 is idempotent and
+        // does not alter queue state, so replay assists pending work too; an
+        // already-complete job only causes a harmless extra controller turn.
+        matches!(self, Self::Existing(_) | Self::Published { .. })
     }
 }
 
@@ -6619,6 +6629,18 @@ fn run_read_manager(arguments: &[OsString]) -> BridgeResult<CapturedOutput> {
 }
 
 #[cfg(target_os = "linux")]
+fn wake_controller_after_enqueue() {
+    // The canonical request is externally visible after its durability attempt
+    // at this point. A wake failure must never turn accepted work (including a
+    // durability-uncertain publication) into an ordinary error or invite a
+    // duplicate dispatch. The controller's bounded polling fallback remains.
+    let Ok(mut command) = manager_command(&["api".into(), "controller-wake".into()], false) else {
+        return;
+    };
+    let _ = capture_bounded_command(&mut command, 1024, 1024, CONTROLLER_WAKE_TIMEOUT, None);
+}
+
+#[cfg(target_os = "linux")]
 fn record_rejected_post(audit_actor: &str, audit_actor_uid: u32) -> BridgeResult<()> {
     record_rejected_operation(audit_actor, audit_actor_uid, "bridge")
 }
@@ -11531,6 +11553,9 @@ fn execute_authenticated_request(
             let state = enqueue_outcome.response_state();
             let replayed = enqueue_outcome.replayed();
             let durability_warning = enqueue_outcome.durability_warning();
+            if enqueue_outcome.should_wake_controller() {
+                wake_controller_after_enqueue();
+            }
             let response = serde_json::to_vec(&json!({
                 "schema": "sdsync.dsm-queued.v1",
                 "ok": true,
@@ -18747,6 +18772,23 @@ mod tests {
         assert!(valid_server_job_id(&first_id));
         assert!(first_id < second_id);
         assert!(next_enqueue_sequence(u64::MAX, 1).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fresh_publications_and_exact_replays_request_an_idempotent_controller_wake() {
+        let existing = EnqueueOutcome::Existing(JOB_ID.to_owned());
+        let published = EnqueueOutcome::Published {
+            job_id: JOB_ID.to_owned(),
+            durability_uncertain: false,
+        };
+        let uncertain = EnqueueOutcome::Published {
+            job_id: JOB_ID.to_owned(),
+            durability_uncertain: true,
+        };
+        assert!(existing.should_wake_controller());
+        assert!(published.should_wake_controller());
+        assert!(uncertain.should_wake_controller());
     }
 
     #[test]

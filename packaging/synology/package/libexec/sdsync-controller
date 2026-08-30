@@ -656,6 +656,7 @@ sleep_pid=
 next_run=0
 wait_interrupted=false
 reload_requested=false
+queue_wake_requested=false
 
 cleanup_controller() {
     stop_realtime_watchers 2>/dev/null || true
@@ -684,8 +685,16 @@ request_reload() {
         kill -TERM "$sleep_pid" 2>/dev/null || true
     fi
 }
+request_queue_wake() {
+    queue_wake_requested=true
+    wait_interrupted=true
+    if [ -n "$sleep_pid" ] && pid_is_live "$sleep_pid"; then
+        kill -TERM "$sleep_pid" 2>/dev/null || true
+    fi
+}
 trap request_shutdown TERM INT
 trap request_reload HUP
+trap request_queue_wake USR2
 trap cleanup_controller 0
 
 controller_start_lease_matches_parent || {
@@ -730,6 +739,10 @@ publish_controller_ready
 unset SDSYNC_DSM_CONTROLLER_START_PARENT_PID SDSYNC_DSM_CONTROLLER_START_PARENT_TICKS \
     SDSYNC_DSM_CONTROLLER_START_PARENT_BOOT
 while [ "$shutdown" = false ]; do
+    # A signal received just before this reset is already followed by an
+    # immediate queue turn. Signals received during the turn remain latched so
+    # the sleep handoff below cannot lose them.
+    queue_wake_requested=false
     if [ "$reload_requested" = true ]; then
         # Rebase the next deadline on the newly persisted cadence. This is what makes
         # a 1-hour -> 60-second reconfiguration take effect promptly after HUP.
@@ -832,6 +845,12 @@ while [ "$shutdown" = false ]; do
     [ "$sleep_for" -gt 0 ] || sleep_for=1
     sleep "$sleep_for" &
     sleep_pid=$!
+    # Close the signal-before-sleep race: USR2 either kills an already-published
+    # sleep PID in its handler or leaves this latch set so the new sleep is
+    # terminated here. FIFO ordering and one-request-per-turn remain unchanged.
+    if [ "$queue_wake_requested" = true ] && pid_is_live "$sleep_pid"; then
+        kill -TERM "$sleep_pid" 2>/dev/null || true
+    fi
     set +e
     wait "$sleep_pid"
     set -e

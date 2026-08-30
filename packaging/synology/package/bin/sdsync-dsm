@@ -497,6 +497,28 @@ reload_controller_if_running() {
     kill -HUP "$running_pid"
 }
 
+# Queue publication must not inherit the controller's idle polling interval.
+# This wake-only signal is deliberately separate from HUP: it interrupts an
+# idle sleep without rebasing schedules or restarting realtime watchers.
+wake_controller_for_queue() {
+    running_pid=$(read_pid "$controller_pid_file" 2>/dev/null || true)
+    [ -n "$running_pid" ] || return 0
+    pid_is_live "$running_pid" || return 0
+    if ! controller_persisted_identity_status "$running_pid"; then
+        echo "refusing to wake unverified controller PID $running_pid" >&2
+        return 73
+    fi
+    wake_controller_start=$persisted_controller_start
+    wake_controller_boot=$persisted_controller_boot
+    controller_persisted_identity_status "$running_pid" \
+        && [ "$persisted_controller_start" = "$wake_controller_start" ] \
+        && [ "$persisted_controller_boot" = "$wake_controller_boot" ] || {
+        echo "controller identity changed immediately before queue wake" >&2
+        return 73
+    }
+    kill -USR2 "$running_pid"
+}
+
 write_disabled_schedule() {
     disabled_schedule_interval=$(setting "$schedule_file" interval_seconds 3600)
     disabled_schedule_max=$(setting "$schedule_file" max_total_delete 100)
@@ -2426,11 +2448,11 @@ api_command() {
     api_operation=${1:-}
     [ "$#" -eq 0 ] || shift
     case $api_operation in
-        audit-event|audit-rejected)
-            # These bounded sinks are internal package interfaces. The package
-            # UID owns the audit state and is therefore the integrity boundary;
-            # normal public CLI entrypoints still discard caller attribution.
-            require_internal_api_bridge_parent || api_error forbidden "private bridge audit endpoint" 77
+        audit-event|audit-rejected|controller-wake)
+            # These bounded operations are internal package interfaces. The
+            # package UID owns their private state and is therefore the integrity
+            # boundary; normal public CLI entrypoints still discard attribution.
+            require_internal_api_bridge_parent || api_error forbidden "private bridge endpoint" 77
             ;;
         *)
             # Public/API mutation entry never trusts caller-reserved context.
@@ -2458,6 +2480,11 @@ api_command() {
             api_result "Rejected dashboard mutation audited"
             ;;
         audit-event) api_audit_event "$@" ;;
+        controller-wake)
+            [ "$#" -eq 0 ] || api_error invalid_request "controller-wake accepts no arguments" 64
+            wake_controller_for_queue || api_error unsafe_state "queued work was accepted, but the controller could not be woken safely" 73
+            api_result "Controller queue wake requested"
+            ;;
         configure-profile)
             [ "$#" -gt 0 ] || api_error invalid_request "configure-profile needs options" 64
             api_capture_or_error false "$manager" configure-profile "$@"

@@ -7646,6 +7646,321 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             time.sleep(0.05)
         self.assertLessEqual(rebased, int(time.time()) + 65)
 
+    def test_queue_wake_closes_sleep_handoff_preserves_active_work_and_rejects_forged_pid(self) -> None:
+        controller = self.real_target / "libexec/sdsync-controller"
+        controller_source = controller.read_text(encoding="utf-8")
+        self.assertIn("trap request_queue_wake USR2", controller_source)
+        self.assertIn(
+            'if [ "$queue_wake_requested" = true ] && pid_is_live "$sleep_pid"; then',
+            controller_source,
+        )
+        queue_function = controller_source[
+            controller_source.index("process_control_queue() {") :
+            controller_source.index("\n}\n\nstop_realtime_watchers()") + 2
+        ]
+        self.assertIn(
+            "Consume one bounded request per controller turn", queue_function
+        )
+        self.assertIn("        break\n", queue_function)
+
+        rust_source = (REPOSITORY / "src/dsm_api.rs").read_text(encoding="utf-8")
+        wake_function_start = rust_source.index("fn wake_controller_after_enqueue() {")
+        wake_function_end = rust_source.index("\n}\n", wake_function_start) + 2
+        rust_wake_function = rust_source[wake_function_start:wake_function_end]
+        self.assertIn(
+            'let Ok(mut command) = manager_command(&["api".into(), "controller-wake".into()], false) else {\n'
+            "        return;\n"
+            "    };",
+            rust_wake_function,
+        )
+        self.assertIn("let _ = capture_bounded_command", rust_wake_function)
+        enqueue_start = rust_source.index(
+            "            let enqueue_outcome = linux_files::enqueue("
+        )
+        accepted_end = rust_source.index(
+            "            Ok(CgiResponse::accepted(response))", enqueue_start
+        )
+        accepted_path = rust_source[enqueue_start:accepted_end]
+        wake_call = (
+            "            if enqueue_outcome.should_wake_controller() {\n"
+            "                wake_controller_after_enqueue();\n"
+            "            }\n"
+        )
+        self.assertIn(wake_call, accepted_path)
+        self.assertLess(
+            accepted_path.index("            )?;\n            let job_id"),
+            accepted_path.index(wake_call),
+            "controller wake must remain after successful canonical enqueue",
+        )
+
+        turn_log = self.root / "controller-wake.turns"
+        idle_ready = self.root / "controller-wake.idle"
+        handoff_ready = self.root / "controller-wake.handoff-ready"
+        handoff_release = self.root / "controller-wake.handoff-release"
+        wake_observed = self.root / "controller-wake.observed"
+        reload_observed = self.root / "controller-wake.reload"
+        loop_needle = 'while [ "$shutdown" = false ]; do\n'
+        sleep_handoff_needle = '    sleep "$sleep_for" &\n    sleep_pid=$!\n'
+        wake_needle = "request_queue_wake() {\n    queue_wake_requested=true\n"
+        reload_needle = "request_reload() {\n    reload_requested=true\n"
+        for needle in (loop_needle, sleep_handoff_needle, wake_needle, reload_needle):
+            self.assertEqual(controller_source.count(needle), 1, needle)
+        controller.write_text(
+            controller_source.replace(
+                loop_needle,
+                loop_needle
+                + '    [ -z "${SDSYNC_TEST_QUEUE_WAKE_TURNS:-}" ] || '
+                + 'printf \'turn\\n\' >> "$SDSYNC_TEST_QUEUE_WAKE_TURNS"\n',
+                1,
+            )
+            .replace(
+                sleep_handoff_needle,
+                '    sleep "$sleep_for" &\n'
+                + '    if [ -n "${SDSYNC_TEST_QUEUE_WAKE_HANDOFF_READY:-}" ] '
+                + '&& [ ! -e "$SDSYNC_TEST_QUEUE_WAKE_HANDOFF_READY" ]; then\n'
+                + '        : > "$SDSYNC_TEST_QUEUE_WAKE_HANDOFF_READY"\n'
+                + '        while [ ! -e "$SDSYNC_TEST_QUEUE_WAKE_HANDOFF_RELEASE" ]; do '
+                + '/bin/sleep 0.01; done\n'
+                + '    fi\n'
+                + '    sleep_pid=$!\n'
+                + '    [ -z "${SDSYNC_TEST_QUEUE_WAKE_IDLE:-}" ] || '
+                + ': > "$SDSYNC_TEST_QUEUE_WAKE_IDLE"\n',
+                1,
+            )
+            .replace(
+                wake_needle,
+                wake_needle
+                + '    [ -z "${SDSYNC_TEST_QUEUE_WAKE_OBSERVED:-}" ] || '
+                + ': > "$SDSYNC_TEST_QUEUE_WAKE_OBSERVED"\n',
+                1,
+            )
+            .replace(
+                reload_needle,
+                reload_needle
+                + '    [ -z "${SDSYNC_TEST_QUEUE_RELOAD_OBSERVED:-}" ] || '
+                + ': > "$SDSYNC_TEST_QUEUE_RELOAD_OBSERVED"\n',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        controller.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(controller, self.drop_uid, self.drop_gid)
+
+        manager_source = self.manager.read_text(encoding="utf-8")
+        wake_start = manager_source.index("wake_controller_for_queue() {")
+        wake_end = manager_source.index("\n}\n", wake_start) + 3
+        wake_function = manager_source[wake_start:wake_end]
+        self.assertIn('kill -USR2 "$running_pid"', wake_function)
+        self.assertIn(
+            'controller_persisted_identity_status "$running_pid"', wake_function
+        )
+        self.assertIn("audit-event|audit-rejected|controller-wake)", manager_source)
+
+        wake_harness = self.root / "controller-wake-harness"
+        wake_harness.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            '. "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+            + wake_function
+            + "wake_controller_for_queue\n",
+            encoding="utf-8",
+        )
+        wake_harness.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(wake_harness, self.drop_uid, self.drop_gid)
+
+        wake_environment = {
+            "SDSYNC_TEST_QUEUE_WAKE_TURNS": str(turn_log),
+            "SDSYNC_TEST_QUEUE_WAKE_IDLE": str(idle_ready),
+            "SDSYNC_TEST_QUEUE_WAKE_HANDOFF_READY": str(handoff_ready),
+            "SDSYNC_TEST_QUEUE_WAKE_HANDOFF_RELEASE": str(handoff_release),
+            "SDSYNC_TEST_QUEUE_WAKE_OBSERVED": str(wake_observed),
+            "SDSYNC_TEST_QUEUE_RELOAD_OBSERVED": str(reload_observed),
+            "SDSYNC_TEST_HOLD_CONSUMER": "true",
+        }
+        started = self.shell(
+            self.lifecycle,
+            "start",
+            extra_environment=wake_environment,
+            timeout=15,
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+
+        controller_pid_file = self.real_var / "run/controller.pid"
+        unrelated: subprocess.Popen[str] | None = None
+        active_pid: int | None = None
+        original_pid_record = controller_pid_file.read_bytes()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if handoff_ready.is_file() and turn_log.is_file():
+                    if len(turn_log.read_text(encoding="ascii").splitlines()) >= 1:
+                        break
+                time.sleep(0.01)
+            else:
+                self.fail("controller never reached the pre-sleep-PID handoff")
+
+            baseline_turns = len(turn_log.read_text(encoding="ascii").splitlines())
+            wake_started = time.monotonic()
+            woke = self.shell(wake_harness, timeout=5)
+            wake_elapsed = time.monotonic() - wake_started
+            self.assertEqual(woke.returncode, 0, woke.stdout + woke.stderr)
+            self.assertLess(wake_elapsed, 2.0)
+            deadline = time.monotonic() + 2
+            while not wake_observed.is_file() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(
+                wake_observed.is_file(),
+                "USR2 was not handled while sleep_pid was still unpublished",
+            )
+            self.assertFalse(idle_ready.exists(), "controller crossed the handoff too early")
+            handoff_release.touch()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                current_turns = len(
+                    turn_log.read_text(encoding="ascii").splitlines()
+                )
+                if idle_ready.is_file() and current_turns > baseline_turns:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("latched USR2 did not terminate the newly published sleep PID")
+            self.assertFalse(
+                reload_observed.exists(), "queue wake incorrectly entered HUP reload"
+            )
+
+            # Dispatch a synthetic queued job whose consumer remains active. A
+            # second USR2 must interrupt only the controller's wait, never the
+            # active child or the HUP/reload path.
+            active_request = self.real_var / "control/requests" / ("1" * 48 + ".json")
+            active_request.write_text("{}\n", encoding="utf-8")
+            active_request.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(active_request, self.drop_uid, self.drop_gid)
+            wake_observed.unlink(missing_ok=True)
+            dispatched = self.shell(wake_harness, timeout=5)
+            self.assertEqual(
+                dispatched.returncode, 0, dispatched.stdout + dispatched.stderr
+            )
+            state_path = self.real_var / "state/controller.state"
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if state_path.is_file():
+                    state = dict(
+                        line.split("=", 1)
+                        for line in state_path.read_text(encoding="utf-8").splitlines()
+                    )
+                    candidate = int(state.get("active_pid", "0"))
+                    if candidate > 1:
+                        try:
+                            os.kill(candidate, 0)
+                        except ProcessLookupError:
+                            pass
+                        else:
+                            active_pid = candidate
+                            break
+                time.sleep(0.01)
+            else:
+                self.fail("controller never published the held queue consumer PID")
+
+            wake_observed.unlink(missing_ok=True)
+            active_wake = self.shell(wake_harness, timeout=5)
+            self.assertEqual(
+                active_wake.returncode, 0, active_wake.stdout + active_wake.stderr
+            )
+            deadline = time.monotonic() + 2
+            while not wake_observed.is_file() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(wake_observed.is_file(), "active-wait USR2 was not observed")
+            time.sleep(0.25)
+            assert active_pid is not None
+            os.kill(active_pid, 0)
+            self.assertFalse(
+                reload_observed.exists(), "active-wait USR2 incorrectly entered HUP reload"
+            )
+
+            denied = self.shell(self.manager, "api", "controller-wake", timeout=5)
+            self.assertEqual(denied.returncode, 77, denied.stdout + denied.stderr)
+            self.assertIn("private bridge endpoint", denied.stdout + denied.stderr)
+            os.kill(active_pid, 0)
+
+            forged_observed = self.root / "controller-wake.forged-signal"
+            forged_ready = self.root / "controller-wake.forged-ready"
+            forged_script = self.root / "controller-wake-forged-target"
+            forged_script.write_text(
+                "#!/bin/sh\n"
+                "set -eu\n"
+                'trap \': > "$SDSYNC_TEST_FORGED_SIGNAL"\' USR2\n'
+                ': > "$SDSYNC_TEST_FORGED_READY"\n'
+                "while :; do /bin/sleep 0.1; done\n",
+                encoding="utf-8",
+            )
+            forged_script.chmod(0o755)
+            if os.getuid() == 0:
+                os.chown(forged_script, self.drop_uid, self.drop_gid)
+            unrelated = self.shell_process(
+                forged_script,
+                extra_environment={
+                    "SDSYNC_TEST_FORGED_SIGNAL": str(forged_observed),
+                    "SDSYNC_TEST_FORGED_READY": str(forged_ready),
+                },
+            )
+            deadline = time.monotonic() + 5
+            while not forged_ready.is_file() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(forged_ready.is_file(), "forged target did not start")
+
+            controller_pid_file.write_text(f"{unrelated.pid}\n", encoding="ascii")
+            controller_pid_file.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(controller_pid_file, self.drop_uid, self.drop_gid)
+            accepted_request = (
+                self.real_var / "control/requests" / ("2" * 48 + ".json")
+            )
+            accepted_bytes = b'{"accepted":true}\n'
+            accepted_request.write_bytes(accepted_bytes)
+            accepted_request.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(accepted_request, self.drop_uid, self.drop_gid)
+            refused = self.shell(wake_harness, timeout=5)
+            self.assertEqual(refused.returncode, 73, refused.stdout + refused.stderr)
+            self.assertIn("refusing to wake unverified controller PID", refused.stderr)
+            time.sleep(0.25)
+            self.assertIsNone(unrelated.poll(), "forged same-UID target was signaled")
+            self.assertFalse(forged_observed.exists())
+            self.assertEqual(accepted_request.read_bytes(), accepted_bytes)
+            accepted_request.unlink()
+
+            controller_pid_file.write_bytes(original_pid_record)
+            controller_pid_file.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(controller_pid_file, self.drop_uid, self.drop_gid)
+            os.kill(active_pid, signal.SIGTERM)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(active_pid, 0)
+                except ProcessLookupError:
+                    active_pid = None
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("held queue consumer did not terminate cleanly")
+        finally:
+            controller_pid_file.write_bytes(original_pid_record)
+            controller_pid_file.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(controller_pid_file, self.drop_uid, self.drop_gid)
+            if active_pid is not None:
+                try:
+                    os.kill(active_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            if unrelated is not None and unrelated.poll() is None:
+                unrelated.terminate()
+                unrelated.communicate(timeout=5)
+
     def test_package_stop_waits_for_an_active_scheduled_run(self) -> None:
         self.assertEqual(
             self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode,
