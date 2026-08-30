@@ -370,12 +370,20 @@ the CSRF key.
 ## A queued action remains pending or becomes outcome-unknown
 
 Each mutation uses one serialized body and client request ID. When POST delivery or acknowledgement
-is ambiguous, the AppWindow automatically replays that exact request at most twice; an already
-accepted replay resolves to the same job. Profile saves, authentication/remote-browser probes, and
-autosave mutations then retry transient result reads within explicit overall limits. Other terminal
-observers continue while pending but produce a typed outcome-unknown result after five consecutive
-result-observation failures, invalid or `expired_or_missing` evidence, or AppWindow shutdown. Closing
-the AppWindow aborts browser observation but does not cancel a job already accepted by the server.
+is ambiguous, the AppWindow first performs an authenticated `request-status` lookup for that client
+request ID. The ownership binding uses the unique DSM `id` cookie, authenticated username/UID, and the
+exact optional launch token; mutable ancillary QuickConnect cookies are ignored. An owned positive
+mapping supplies the original server job ID, so the browser resumes its normal result poll without
+submitting a duplicate. Missing and foreign-session mappings are deliberately indistinguishable. Only
+an exact schema-validated `unresolved` response authorizes a bounded replay of the byte-identical
+serialized request; a malformed, unavailable, or operation-mismatched response never authorizes one.
+Private-queue idempotency resolves an already accepted replay to the same job.
+
+Profile saves, authentication/remote-browser probes, and autosave mutations retry transient result
+reads within explicit overall limits. Other terminal observers continue while pending but produce a
+typed outcome-unknown result after five consecutive result-observation failures, invalid or
+`expired_or_missing` evidence, or AppWindow shutdown. Closing the AppWindow aborts browser observation
+but does not cancel a job already accepted by the server.
 
 1. Refresh the dashboard snapshot.
 2. Inspect structured Activity and bounded logs.
@@ -385,11 +393,18 @@ the AppWindow aborts browser observation but does not cancel a job already accep
    earlier secret stages may have applied before a later stage failed or became outcome-unknown.
 6. Note the request and job correlation shown by the UI, when available.
 7. Only the affected UI scope and dependent operations are paused; use independent controls normally.
-   Authentication testing and remote browsing permit a deliberate new request for the current
-   profile draft. A new trusted success supplies fresh evidence but does not erase the earlier
-   request/job correlation; retain it until explicit reconciliation or a fresh AppWindow.
-8. Reopen the AppWindow to clear a persistent mutation scope only after deciding the first job did
-   not apply or after reconciling the resulting state. Do not blindly create a new request.
+   A connection-request incident freezes the affected profile and credential fields and blocks profile
+   submission, authentication, and File Station requests so the submitted draft cannot drift and two
+   temporary sessions cannot overlap. Use **Reconcile connection request** to resume the exact queued
+   result.
+8. When the banner offers **Reconcile profile request**, use it before another save. It performs no
+   mutation. A success requires exact request/job/operation ownership; configuration success also
+   requires an exact fresh non-secret snapshot, while secret success requires trustworthy presence
+   state for the named profile. An exactly correlated terminal failure unlocks only the failed stage
+   for correction. Any mismatch leaves the draft locked.
+9. Keep the AppWindow open while evidence is unresolved. Close and Cancel are intentionally disabled
+   so the profile and credential draft cannot be discarded accidentally. Do not blindly create a new
+   request.
 
 The bridge caps the queue at 256 outstanding safe entries. Request/secret artifacts retain for up to
 24 hours; completed responses and unrecoverable processing-orphan artifacts retain for one hour,

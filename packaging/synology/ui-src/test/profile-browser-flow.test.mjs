@@ -19,7 +19,11 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function loadAppComponent({ post = async () => ({ ok: true }), get = async () => ({}) } = {}) {
+function loadAppComponent({
+  post = async () => ({ ok: true }),
+  get = async () => ({}),
+  reconcile = async () => ({})
+} = {}) {
   const script = appSource.match(/<script>\s*([\s\S]*?)\s*<\/script>/);
   assert.ok(script, "App.vue script block is missing");
   let executable = script[1]
@@ -39,10 +43,25 @@ function loadAppComponent({ post = async () => ({ ok: true }), get = async () =>
     },
     AUTOSAVE_API_LIMITS: Object.freeze({}),
     MAX_RESPONSE_BYTES: 1024 * 1024,
-    QueuedOutcomeUnknownError: class QueuedOutcomeUnknownError extends Error {},
+    QueuedOutcomeUnknownError: class QueuedOutcomeUnknownError extends Error {
+      constructor(jobId, message, requestId = "", operation = "", stage = "result_observation") {
+        super(message);
+        this.name = "QueuedOutcomeUnknownError";
+        this.jobId = jobId;
+        this.requestId = requestId;
+        this.trustedJobId = typeof jobId === "string" && /^[a-f0-9]{48}$/.test(jobId);
+        this.trustedRequestId = typeof requestId === "string" && /^[a-f0-9]{32}$/.test(requestId);
+        this.operation = operation;
+        this.stage = stage;
+        this.outcomeUnknown = true;
+        this.accepted = true;
+      }
+    },
     SNAPSHOT_SCHEMA: "sdsync.dsm-api.v1",
     apiGet: get,
     apiPost: post,
+    purgeReconciliationAuth: () => undefined,
+    reconcileMutationRequest: reconcile,
     arrayOf: (value) => Array.isArray(value) ? value : [],
     boundedText: (value, fallback = "") => String(typeof value === "string" && value ? value : fallback).slice(0, 65536),
     formatBytes: String,
@@ -50,7 +69,10 @@ function loadAppComponent({ post = async () => ({ ok: true }), get = async () =>
     formatDuration: String,
     numberOr: (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback,
     pick: (model, ...keys) => keys.map((key) => model && model[key]).find((value) => value !== undefined),
-    createAutosaveCoordinator: () => ({}),
+    createAutosaveCoordinator: () => ({
+      cancel() {}, dispose() {}, getState: () => ({ registered: false, dirty: false }),
+      hydrate() {}, setGlobalBusy() {}, setScopeBlocked() {}, update: () => ({ dirty: false })
+    }),
     installControlLayout: () => () => {},
     ActionIcon: { name: "ActionIcon" },
     SecurityPanel: {}
@@ -70,6 +92,127 @@ function connectionForm() {
     connect_timeout: 15, timeout: 120, retries: 2,
     source: "/volume1/source", remote: "/home/Drive/Backup"
   };
+}
+
+function reconciliationPayload(overrides = {}) {
+  return {
+    name: "new-profile",
+    source: "/volume1/source",
+    url: "https://nas.example.invalid",
+    username: "backup-user",
+    remote: "/home/Drive/Backup",
+    compare: "content",
+    jobs: 2,
+    allow_http: false,
+    delete: false,
+    max_delete: 100,
+    make_default: false,
+    excludes: ["@eaDir/", "#recycle/"],
+    allow_empty_source: false,
+    retries: 2,
+    timeout_seconds: 7200,
+    connect_timeout_seconds: 15,
+    max_rate_bytes_per_second: null,
+    ca_certificate: null,
+    danger_accept_invalid_certs: false,
+    verbosity: 0,
+    quiet: false,
+    log_level: "info",
+    log_format: "json",
+    progress: "never",
+    output: "human",
+    remote_log_url: null,
+    remote_log_mode: "best-effort",
+    ...overrides
+  };
+}
+
+function reconciliationSnapshot(payload, overrides = {}) {
+  return {
+    ...payload,
+    default: payload.make_default,
+    upload_timeout_seconds: payload.timeout_seconds,
+    danger_invalid_certs: payload.danger_accept_invalid_certs,
+    ...overrides
+  };
+}
+
+function profileFailureRecords(activeStage) {
+  return {
+    configuration: {
+      active: activeStage === "configuration",
+      outcomeUnknown: activeStage === "configuration",
+      requiresInspection: activeStage === "configuration"
+    },
+    secrets: Object.fromEntries(["password", "totp", "remote-log-token"].map((kind) => [
+      kind,
+      {
+        active: activeStage === kind,
+        outcomeUnknown: activeStage === kind,
+        requiresInspection: activeStage === kind
+      }
+    ]))
+  };
+}
+
+function reconciliationContext(component, incident, overrides = {}) {
+  const toasts = [];
+  const hydrations = [];
+  const activeStage = incident.operation === "configure-profile" ? "configuration" : incident.secretKind;
+  const context = {
+    disposed: false,
+    auth: { account: "fixture" },
+    operationBusy: false,
+    profileReconciliationState: "idle",
+    profileReconciliationIncident: incident,
+    canReconcileProfileIncident: true,
+    profileSaveState: "error",
+    profileSaveMessage: "The earlier outcome is unresolved.",
+    selectedProfile: "",
+    selectedProfileModel: null,
+    profiles: [],
+    profileForm: { name: incident.subject },
+    secretModes: { password: "replace", totp: "replace", remote_log_token: "replace" },
+    secretValues: {
+      password: "draft-password",
+      totp: "JBSWY3DPEHPK3PXP",
+      remote_log_token: "draft-token"
+    },
+    autosaveCoordinator: null,
+    profileConnectionAutosaveHeld: false,
+    autosaveFailureScopes: { profile: true, routine: false, alerts: false, security: false, interface: false },
+    autosaveOutcomeUnknownScopes: { profile: true, routine: false, alerts: false, security: false, interface: false },
+    autosaveInspectionScopes: { profile: true, routine: false, alerts: false, security: false, interface: false },
+    autosaveIncidents: {
+      profile: incident,
+      routine: { active: false },
+      alerts: { active: false },
+      security: { active: false },
+      interface: { active: false }
+    },
+    profileFailureRecords: profileFailureRecords(activeStage),
+    toasts,
+    hydrations,
+    toast(title, message, error = false) { toasts.push({ title, message, error }); },
+    hydrateAutosave(...args) { hydrations.push(args); },
+    refreshAutosaveStatus() {},
+    reportMutationError(error) {
+      return {
+        unknown: error && error.outcomeUnknown === true,
+        inspection: error && error.requiresInspection === true,
+        message: error && error.message ? error.message : "Reconciliation remains unresolved."
+      };
+    },
+    refreshSnapshot: async () => false,
+    ...overrides
+  };
+  return bind(context, component.methods, [
+    "ensureProfileFailureRecords",
+    "syncProfileFailureState",
+    "clearProfileConfigurationFailure",
+    "clearProfileSecretFailures",
+    "applyTrustedSecretPresence"
+  ]);
 }
 
 function connectionContext(methods, overrides = {}) {
@@ -160,6 +303,378 @@ test("profile live operation is limited to authentication and genuine creation s
   context.disposed = false;
   context.profileSaveState = "success";
   assert.equal(component.computed.profileLiveOperation.call(context), null);
+});
+
+test("manual profile reconciliation is exposed only for a supported capability and trusted incident", () => {
+  assert.match(
+    appSource,
+    /v-if="profileReconciliationIncident && hasCapability\('request_reconciliation'\)"[\s\S]*?:disabled="!canReconcileProfileIncident"[\s\S]*?@click="reconcileProfileIncident"/
+  );
+
+  const component = loadAppComponent();
+  const incident = {
+    active: true,
+    requestId: "a".repeat(32),
+    operation: "configure-profile",
+    expectedConfiguration: reconciliationPayload(),
+    secretKind: ""
+  };
+  const accepted = component.computed.profileReconciliationIncident.call({
+    autosaveIncidents: { profile: incident }
+  });
+  assert.strictEqual(accepted, incident);
+
+  const capabilityChecks = [];
+  const availability = (enabled) => component.computed.canReconcileProfileIncident.call({
+    profileReconciliationIncident: accepted,
+    operationBusy: false,
+    profileReconciliationState: "idle",
+    hasCapability(name) { capabilityChecks.push(name); return enabled; }
+  });
+  assert.equal(availability(false), false);
+  assert.equal(availability(true), true);
+  assert.deepEqual(capabilityChecks, ["request_reconciliation", "request_reconciliation"]);
+  assert.equal(component.computed.profileReconciliationIncident.call({
+    autosaveIncidents: { profile: { ...incident, requestId: "untrusted" } }
+  }), null);
+  assert.equal(component.computed.profileReconciliationIncident.call({
+    autosaveIncidents: { profile: { ...incident, operation: "remove-profile" } }
+  }), null);
+
+  assert.match(appSource, /v-else-if="connectionReconciliationIncident && hasCapability\('request_reconciliation'\)"[\s\S]*?@click="reconcileConnectionIncident"/);
+  const connectionIncident = {
+    active: true,
+    requestId: "f".repeat(32),
+    operation: "test-profile-auth"
+  };
+  assert.strictEqual(component.computed.connectionReconciliationIncident.call({
+    isolatedIncidents: { connection: connectionIncident }
+  }), connectionIncident);
+  assert.equal(component.computed.connectionReconciliationIncident.call({
+    isolatedIncidents: { connection: { ...connectionIncident, operation: "configure-profile" } }
+  }), null);
+});
+
+test("confirmed configure reconciliation verifies an exact fresh snapshot without replaying drafts", async () => {
+  const requestId = "b".repeat(32);
+  const jobId = "c".repeat(48);
+  const expectedConfiguration = reconciliationPayload();
+  const incident = {
+    active: true,
+    outcomeUnknown: true,
+    requiresInspection: true,
+    message: "The configure result could not be observed.",
+    requestId,
+    jobId,
+    subject: expectedConfiguration.name,
+    operation: "configure-profile",
+    stage: "configuration",
+    transportStage: "result_observation",
+    secretKind: "",
+    expectedConfiguration,
+    creatingProfile: true
+  };
+  const posts = [];
+  const reconciliationCalls = [];
+  const component = loadAppComponent({
+    post: async (...args) => { posts.push(args); return { ok: true }; },
+    reconcile: async (...args) => {
+      reconciliationCalls.push(args);
+      return {
+        schema: "sdsync.dsm-reconciled-result.v1",
+        request_id: requestId,
+        job_id: jobId,
+        operation: "configure-profile",
+        result: { ok: true }
+      };
+    }
+  });
+  const refreshes = [];
+  const context = reconciliationContext(component, incident, {
+    refreshSnapshot: async function (...args) {
+      refreshes.push(args);
+      this.profiles = [reconciliationSnapshot(expectedConfiguration)];
+      return true;
+    }
+  });
+  const modesBefore = structuredClone(context.secretModes);
+  const valuesBefore = structuredClone(context.secretValues);
+
+  await component.methods.reconcileProfileIncident.call(context, { preventDefault() {} });
+
+  assert.equal(posts.length, 0, "reconciliation must not submit configuration or credential mutations");
+  assert.equal(reconciliationCalls.length, 1);
+  assert.strictEqual(reconciliationCalls[0][0], context.auth);
+  assert.deepEqual(reconciliationCalls[0].slice(1, 4), [requestId, "configure-profile", undefined]);
+  assert.deepEqual(refreshes, [[false, true]], "success must be checked against a post-result snapshot read");
+  assert.equal(context.selectedProfile, expectedConfiguration.name, "confirmed creation selects the new profile");
+  assert.deepEqual(context.hydrations, [["profile", expectedConfiguration, false]]);
+  assert.deepEqual(context.secretModes, modesBefore);
+  assert.deepEqual(context.secretValues, valuesBefore);
+  assert.equal(context.autosaveIncidents.profile.active, false);
+  assert.equal(context.autosaveOutcomeUnknownScopes.profile, false);
+  assert.equal(context.autosaveInspectionScopes.profile, false);
+  assert.equal(context.profileSaveState, "success");
+  assert.match(context.profileSaveMessage, /credential drafts were not submitted/i);
+  assert.equal(context.operationBusy, false);
+  assert.equal(context.profileReconciliationState, "idle");
+});
+
+test("snapshot mismatch or unavailable fresh evidence leaves configure reconciliation locked", async () => {
+  for (const scenario of [
+    {
+      name: "mismatch",
+      refresh(context, expected) {
+        context.profiles = [reconciliationSnapshot(expected, { source: "/volume1/different" })];
+        return true;
+      },
+      message: /does not exactly match/i
+    },
+    {
+      name: "unavailable",
+      refresh(context) {
+        context.profiles = [];
+        return false;
+      },
+      message: /cannot yet be verified/i
+    }
+  ]) {
+    const requestId = scenario.name === "mismatch" ? "d".repeat(32) : "e".repeat(32);
+    const jobId = scenario.name === "mismatch" ? "f".repeat(48) : "1".repeat(48);
+    const expectedConfiguration = reconciliationPayload();
+    const incident = {
+      active: true,
+      outcomeUnknown: true,
+      requiresInspection: true,
+      message: "The configure result could not be observed.",
+      requestId,
+      jobId,
+      subject: expectedConfiguration.name,
+      operation: "configure-profile",
+      stage: "configuration",
+      transportStage: "result_observation",
+      secretKind: "",
+      expectedConfiguration,
+      creatingProfile: true
+    };
+    let posts = 0;
+    const component = loadAppComponent({
+      post: async () => { posts += 1; return { ok: true }; },
+      reconcile: async () => ({
+        schema: "sdsync.dsm-reconciled-result.v1",
+        request_id: requestId,
+        job_id: jobId,
+        operation: "configure-profile",
+        result: { ok: true }
+      })
+    });
+    const context = reconciliationContext(component, incident, {
+      refreshSnapshot: async function () { return scenario.refresh(this, expectedConfiguration); }
+    });
+    const valuesBefore = structuredClone(context.secretValues);
+
+    await component.methods.reconcileProfileIncident.call(context, { preventDefault() {} });
+
+    assert.equal(posts, 0, `${scenario.name} reconciliation replayed a mutation`);
+    assert.strictEqual(context.autosaveIncidents.profile, incident, `${scenario.name} evidence cleared the incident`);
+    assert.equal(context.autosaveOutcomeUnknownScopes.profile, true);
+    assert.equal(context.autosaveInspectionScopes.profile, true);
+    assert.equal(context.selectedProfile, "");
+    assert.deepEqual(context.hydrations, []);
+    assert.deepEqual(context.secretValues, valuesBefore);
+    assert.equal(context.profileSaveState, "error");
+    assert.match(context.profileSaveMessage, scenario.message);
+    assert.equal(context.operationBusy, false);
+  }
+});
+
+test("terminal configure failure unlocks the preserved draft for correction without redispatch", async () => {
+  const requestId = "2".repeat(32);
+  const jobId = "3".repeat(48);
+  const expectedConfiguration = reconciliationPayload();
+  const incident = {
+    active: true,
+    outcomeUnknown: true,
+    requiresInspection: true,
+    message: "The configure result could not be observed.",
+    requestId,
+    jobId,
+    subject: expectedConfiguration.name,
+    operation: "configure-profile",
+    stage: "configuration",
+    transportStage: "result_observation",
+    secretKind: "",
+    expectedConfiguration,
+    creatingProfile: true
+  };
+  const terminalFailure = Object.assign(new Error("DSM rejected the queued profile configuration."), {
+    accepted: true,
+    outcomeUnknown: false,
+    trustedJobId: true,
+    jobId,
+    trustedRequestId: true,
+    requestId,
+    operation: "configure-profile"
+  });
+  let posts = 0;
+  let refreshes = 0;
+  const component = loadAppComponent({
+    post: async () => { posts += 1; return { ok: true }; },
+    reconcile: async () => { throw terminalFailure; }
+  });
+  const context = reconciliationContext(component, incident, {
+    profileEditorOpen: true,
+    canChangeProfiles: true,
+    profileConnectionState: "idle",
+    pathBrowser: { visible: false, kind: "", loading: false },
+    refreshSnapshot: async function () { refreshes += 1; this.profiles = []; return true; }
+  });
+  const valuesBefore = structuredClone(context.secretValues);
+
+  await component.methods.reconcileProfileIncident.call(context, { preventDefault() {} });
+
+  assert.equal(posts, 0);
+  assert.equal(refreshes, 1);
+  assert.equal(context.autosaveIncidents.profile.active, false);
+  assert.equal(context.autosaveFailureScopes.profile, false);
+  assert.equal(context.autosaveOutcomeUnknownScopes.profile, false);
+  assert.equal(context.autosaveInspectionScopes.profile, false);
+  assert.deepEqual(context.secretValues, valuesBefore);
+  assert.equal(context.profileSaveState, "error");
+  assert.match(context.profileSaveMessage, /rejected the queued profile configuration/i);
+  assert.equal(component.computed.profileReconciliationIncident.call({
+    autosaveIncidents: context.autosaveIncidents
+  }), null);
+  assert.equal(component.computed.canSubmitProfile.call({
+    profileEditorOpen: context.profileEditorOpen,
+    canChangeProfiles: context.canChangeProfiles,
+    profileOutcomeUnresolved: false,
+    profileSaveState: context.profileSaveState,
+    profileConnectionState: context.profileConnectionState,
+    pathBrowser: context.pathBrowser
+  }), true, "a settled terminal failure must permit a corrected manual save");
+});
+
+test("profile reconciliation keeps the draft locked on job or terminal correlation mismatch", async () => {
+  const requestId = "a".repeat(32);
+  const jobId = "b".repeat(48);
+  const expectedConfiguration = reconciliationPayload();
+  const baseIncident = {
+    active: true,
+    outcomeUnknown: true,
+    requiresInspection: true,
+    message: "The configure result could not be observed.",
+    requestId,
+    jobId,
+    subject: expectedConfiguration.name,
+    operation: "configure-profile",
+    stage: "configuration",
+    transportStage: "result_observation",
+    secretKind: "",
+    expectedConfiguration,
+    creatingProfile: true
+  };
+  const cases = [
+    {
+      name: "recovered job mismatch",
+      reconcile: async () => ({
+        schema: "sdsync.dsm-reconciled-result.v1",
+        request_id: requestId,
+        job_id: "c".repeat(48),
+        operation: "configure-profile",
+        result: { ok: true }
+      })
+    },
+    {
+      name: "terminal operation mismatch",
+      reconcile: async () => { throw Object.assign(new Error("Rejected"), {
+        accepted: true,
+        outcomeUnknown: false,
+        trustedJobId: true,
+        jobId,
+        trustedRequestId: true,
+        requestId,
+        operation: "set-secret"
+      }); }
+    }
+  ];
+
+  for (const scenario of cases) {
+    const incident = structuredClone(baseIncident);
+    const component = loadAppComponent({ reconcile: scenario.reconcile });
+    let refreshes = 0;
+    const context = reconciliationContext(component, incident, {
+      refreshSnapshot: async () => { refreshes += 1; return true; }
+    });
+
+    await component.methods.reconcileProfileIncident.call(context, { preventDefault() {} });
+
+    assert.strictEqual(context.autosaveIncidents.profile, incident, `${scenario.name} cleared the incident`);
+    assert.equal(context.autosaveOutcomeUnknownScopes.profile, true);
+    assert.equal(context.autosaveInspectionScopes.profile, true);
+    assert.equal(refreshes, 0, `${scenario.name} trusted package state before correlation`);
+  }
+});
+
+test("confirmed secret reconciliation clears only the exact credential draft", async () => {
+  const requestId = "4".repeat(32);
+  const jobId = "5".repeat(48);
+  const incident = {
+    active: true,
+    outcomeUnknown: true,
+    requiresInspection: true,
+    message: "The TOTP result could not be observed.",
+    requestId,
+    jobId,
+    subject: "nightly",
+    operation: "set-secret",
+    stage: "secret:totp",
+    transportStage: "result_observation",
+    secretKind: "totp",
+    expectedConfiguration: null,
+    creatingProfile: false
+  };
+  const model = { name: "nightly", has_password: false, has_totp: false, has_remote_log_token: false };
+  let posts = 0;
+  const component = loadAppComponent({
+    post: async () => { posts += 1; return { ok: true }; },
+    reconcile: async () => ({
+      schema: "sdsync.dsm-reconciled-result.v1",
+      request_id: requestId,
+      job_id: jobId,
+      operation: "set-secret",
+      result: { ok: true, has_password: true, has_totp: true, has_remote_log_token: true }
+    })
+  });
+  const context = reconciliationContext(component, incident, {
+    selectedProfile: "nightly",
+    selectedProfileModel: model,
+    refreshSnapshot: async function () { this.profiles = [model]; return true; }
+  });
+
+  await component.methods.reconcileProfileIncident.call(context, { preventDefault() {} });
+
+  assert.equal(posts, 0);
+  assert.deepEqual(context.secretModes, {
+    password: "replace",
+    totp: "keep",
+    remote_log_token: "replace"
+  });
+  assert.deepEqual(context.secretValues, {
+    password: "draft-password",
+    totp: "",
+    remote_log_token: "draft-token"
+  });
+  assert.deepEqual(model, {
+    name: "nightly",
+    has_password: true,
+    has_totp: true,
+    has_remote_log_token: true
+  });
+  assert.deepEqual(context.hydrations, []);
+  assert.equal(context.autosaveIncidents.profile.active, false);
+  assert.equal(context.profileSaveState, "success");
+  assert.match(context.profileSaveMessage, /Other credential drafts remain untouched/i);
 });
 
 test("new-profile authentication uses transient credentials and unlocks only the unchanged draft", async () => {
@@ -298,21 +813,29 @@ test("pending authentication progress is hidden when its editor closes or AppWin
   }
 });
 
-test("unknown authentication evidence stays connection-scoped and correlated after deliberate retry", async () => {
+test("unknown authentication evidence blocks retries and resumes only the exact queued request", async () => {
   let posts = 0;
   const expires = Math.floor(Date.now() / 1000) + 300;
   const proof = `v1.${expires}.${"a".repeat(64)}.${"b".repeat(64)}`;
   const requestId = "1".repeat(32);
   const jobId = "2".repeat(48);
   const unknown = Object.assign(new Error("Authentication outcome is unknown"), {
-    outcomeUnknown: true, trustedRequestId: true, requestId, trustedJobId: true, jobId
+    outcomeUnknown: true, trustedRequestId: true, requestId, trustedJobId: true, jobId,
+    operation: "test-profile-auth"
   });
   const component = loadAppComponent({
     post: async () => {
       posts += 1;
       if (posts === 1) throw unknown;
       return { connection_proof: proof, connection_proof_expires_at_epoch: expires };
-    }
+    },
+    reconcile: async () => ({
+      schema: "sdsync.dsm-reconciled-result.v1",
+      request_id: requestId,
+      job_id: jobId,
+      operation: "test-profile-auth",
+      result: { ok: true, connection_proof: proof, connection_proof_expires_at_epoch: expires }
+    })
   });
   const context = connectionContext(component.methods);
 
@@ -323,17 +846,27 @@ test("unknown authentication evidence stays connection-scoped and correlated aft
   assert.equal(context.autosaveFailureScopes.profile, false, "a connection incident must not poison profile autosave");
   context.connectionIncidentEvidence = component.computed.connectionIncidentEvidence.call(context);
   await component.methods.testProfileAuthentication.call(context, { preventDefault() {} });
-
-  assert.equal(posts, 2);
+  assert.equal(posts, 1, "an unresolved accepted request must never be retried");
   assert.equal(context.isolatedIncidents.connection.active, true);
   assert.equal(context.isolatedIncidents.connection.requestId, requestId);
   assert.equal(context.isolatedIncidents.connection.jobId, jobId);
-  assert.match(context.profileConnectionMessage, /prior unresolved connection evidence remains/i);
+  context.connectionReconciliationIncident = component.computed.connectionReconciliationIncident.call(context);
+  context.canReconcileConnectionIncident = true;
+  context.profileReconciliationState = "idle";
+  await component.methods.reconcileConnectionIncident.call(context, { preventDefault() {} });
+
+  assert.equal(posts, 1, "reconciliation must remain read-only");
+  assert.equal(context.isolatedIncidents.connection.active, false);
   assert.equal(context.operationBusy, false);
+  assert.equal(context.profileConnectionState, "idle");
+  assert.equal(context.connectionProof, "", "an old proof must not be applied to a potentially edited draft");
+  await component.methods.testProfileAuthentication.call(context, { preventDefault() {} });
+  assert.equal(posts, 2, "a fresh test is allowed only after the prior request settles");
   assert.equal(context.profileConnectionState, "success");
+  assert.equal(context.connectionProof, proof);
 });
 
-test("cleanup-required File Station evidence survives later success until explicit reconciliation", async () => {
+test("cleanup-required File Station evidence blocks later requests until explicit reconciliation", async () => {
   const api = await loadApi();
   const codes = [
     "file_station_logout_failed",
@@ -356,7 +889,7 @@ test("cleanup-required File Station evidence survives later success until explic
       authenticationPosts += 1;
       if (authenticationPosts === 1) {
         throw Object.assign(new api.DsmApiError("Temporary session logout failed", 502, codes[0]), {
-          trustedRequestId: true, requestId: cleanupRequestId
+          trustedRequestId: true, requestId: cleanupRequestId, operation: "test-profile-auth"
         });
       }
       return { connection_proof: proof, connection_proof_expires_at_epoch: expires };
@@ -368,11 +901,11 @@ test("cleanup-required File Station evidence survives later success until explic
   assert.equal(authenticationContext.toasts.at(-1).title, "Authentication cleanup needs inspection");
   authenticationContext.connectionIncidentEvidence = authentication.computed.connectionIncidentEvidence.call(authenticationContext);
   await authentication.methods.testProfileAuthentication.call(authenticationContext, { preventDefault() {} });
-  assert.equal(authenticationPosts, 2);
+  assert.equal(authenticationPosts, 1);
   assert.equal(authenticationContext.isolatedIncidents.connection.active, true);
   assert.equal(authenticationContext.isolatedIncidents.connection.requestId, cleanupRequestId);
   assert.match(authentication.computed.incidentGuidance.call(authenticationContext), new RegExp(cleanupRequestId));
-  assert.match(authenticationContext.profileConnectionMessage, /prior unresolved connection evidence remains/i);
+  assert.match(authenticationContext.toasts.at(-1).title, /locked/i);
 
   for (const code of codes.slice(1)) {
     let browsePosts = 0;
@@ -395,9 +928,9 @@ test("cleanup-required File Station evidence survives later success until explic
     assert.match(context.pathBrowser.error, /logout failed|cleanup/i);
     context.connectionIncidentEvidence = component.computed.connectionIncidentEvidence.call(context);
     await component.methods.browsePath.call(context, "/home/Drive");
-    assert.equal(browsePosts, 2, `${code} must permit a deliberate connection-only retry`);
-    assert.equal(context.isolatedIncidents.connection.active, true, `${code} cleanup evidence must outlive an unrelated later success`);
-    assert.match(context.pathBrowser.error, /prior unresolved connection evidence remains/i);
+    assert.equal(browsePosts, 1, `${code} must block an overlapping connection request`);
+    assert.equal(context.isolatedIncidents.connection.active, true, `${code} cleanup evidence must remain until reconciliation`);
+    assert.match(context.pathBrowser.error, /locked|resolve the exact request/i);
   }
 });
 
@@ -435,15 +968,31 @@ test("remote browsing is auth-gated and sends the proof with the exact transient
   assert.deepEqual(context.pathBrowser.directories, [{ name: "Child", path: "/home/Drive/Child" }]);
 });
 
-test("unknown File Station browse evidence remains isolated after a trusted new retry", async () => {
+test("unknown File Station browse evidence blocks overlap and exact reconciliation unlocks browsing", async () => {
   let posts = 0;
-  const unknown = Object.assign(new Error("Browse outcome is unknown"), { outcomeUnknown: true });
+  const requestId = "8".repeat(32);
+  const jobId = "9".repeat(48);
+  const unknown = Object.assign(new Error("Browse outcome is unknown"), {
+    outcomeUnknown: true,
+    trustedRequestId: true,
+    requestId,
+    trustedJobId: true,
+    jobId,
+    operation: "browse-remote"
+  });
   const component = loadAppComponent({
     post: async (_auth, _csrf, _action, payload) => {
       posts += 1;
       if (posts === 1) throw unknown;
       return { directory_schema: "sdsync.dsm-remote-directories.v1", current: payload.parent, directories: [], truncated: false };
-    }
+    },
+    reconcile: async () => ({
+      schema: "sdsync.dsm-reconciled-result.v1",
+      request_id: requestId,
+      job_id: jobId,
+      operation: "browse-remote",
+      result: { ok: true, directory_schema: "sdsync.dsm-remote-directories.v1", current: "/home/Drive", directories: [], truncated: false }
+    })
   });
   const context = connectionContext(component.methods, {
     connectionTestReady: true,
@@ -458,10 +1007,17 @@ test("unknown File Station browse evidence remains isolated after a trusted new 
   assert.equal(context.autosaveFailureScopes.profile, false);
   context.connectionIncidentEvidence = component.computed.connectionIncidentEvidence.call(context);
   await component.methods.browsePath.call(context, "/home/Drive");
-
-  assert.equal(posts, 2);
+  assert.equal(posts, 1);
   assert.equal(context.isolatedIncidents.connection.active, true);
-  assert.match(context.pathBrowser.error, /prior unresolved connection evidence remains/i);
+  assert.match(context.pathBrowser.error, /locked|resolve the exact request/i);
+
+  context.connectionReconciliationIncident = component.computed.connectionReconciliationIncident.call(context);
+  context.canReconcileConnectionIncident = true;
+  context.profileReconciliationState = "idle";
+  await component.methods.reconcileConnectionIncident.call(context, { preventDefault() {} });
+  assert.equal(context.isolatedIncidents.connection.active, false);
+  await component.methods.browsePath.call(context, "/home/Drive");
+  assert.equal(posts, 2);
 });
 
 test("authentication proof expiry closes remote browsing and prevents another browse dispatch", async () => {
@@ -1018,6 +1574,169 @@ test("closing an editor always requests one fresh snapshot and active operations
   component.methods.navigate.call(navigating, "activity");
   assert.equal(navigating.route, "profiles");
   assert.equal(toasts[0].error, true);
+});
+
+test("unresolved profile or connection outcomes preserve the complete editor draft", () => {
+  assert.match(appSource, /:disabled="[^"]*profileOutcomeUnresolved \|\| connectionOutcomeUnresolved" @click="closeProfile"/);
+  const component = loadAppComponent();
+  for (const unresolved of ["profile", "connection"]) {
+    let destructiveCalls = 0;
+    const profileForm = reconciliationPayload();
+    const secretValues = { password: "draft-password", totp: "draft-totp", remote_log_token: "draft-token" };
+    const context = {
+      profileSaveState: "error",
+      profileConnectionState: "error",
+      profileReconciliationState: "idle",
+      profileOutcomeUnresolved: unresolved === "profile",
+      connectionOutcomeUnresolved: unresolved === "connection",
+      profileEditorOpen: true,
+      selectedProfile: "new-profile",
+      profileForm,
+      secretValues,
+      cancelAutosave() { destructiveCalls += 1; },
+      closePathBrowser() { destructiveCalls += 1; },
+      clearSecrets() { destructiveCalls += 1; },
+      clearConnectionProofTimer() { destructiveCalls += 1; },
+      refreshSnapshot() { destructiveCalls += 1; }
+    };
+
+    component.methods.closeProfile.call(context);
+
+    assert.equal(destructiveCalls, 0, `${unresolved} recovery must not clear or refresh the draft`);
+    assert.equal(context.profileEditorOpen, true);
+    assert.strictEqual(context.profileForm, profileForm);
+    assert.strictEqual(context.secretValues, secretValues);
+    assert.equal(context.selectedProfile, "new-profile");
+  }
+});
+
+test("unresolved recovery freezes profile and secret inputs without changing their draft", () => {
+  const component = loadAppComponent();
+  assert.match(
+    appSource,
+    /canChangeProfiles\(\) \{ return this\.canMutate && !this\.operationBusy && !this\.profileOutcomeUnresolved && !this\.connectionOutcomeUnresolved && this\.securityPolicy\.allow_profile_changes !== false; \}/
+  );
+  assert.match(
+    appSource,
+    /canManageSecrets\(\) \{ return this\.canMutate && !this\.operationBusy && !this\.profileOutcomeUnresolved && !this\.connectionOutcomeUnresolved && this\.capabilities\.secrets === true && this\.securityPolicy\.allow_secret_changes !== false; \}/
+  );
+
+  for (const unresolved of ["profile", "connection"]) {
+    const profileForm = reconciliationPayload({ source: `/volume1/${unresolved}-draft` });
+    const secretValues = {
+      password: `${unresolved}-password`,
+      totp: `${unresolved}-totp`,
+      remote_log_token: `${unresolved}-token`
+    };
+    const context = {
+      canMutate: true,
+      operationBusy: false,
+      profileOutcomeUnresolved: unresolved === "profile",
+      connectionOutcomeUnresolved: unresolved === "connection",
+      capabilities: { secrets: true },
+      securityPolicy: { allow_profile_changes: true, allow_secret_changes: true },
+      profileForm,
+      secretValues
+    };
+
+    assert.equal(component.computed.canChangeProfiles.call(context), false);
+    assert.equal(component.computed.canManageSecrets.call(context), false);
+    assert.strictEqual(context.profileForm, profileForm);
+    assert.strictEqual(context.secretValues, secretValues);
+    assert.equal(context.profileForm.source, `/volume1/${unresolved}-draft`);
+    assert.equal(context.secretValues.password, `${unresolved}-password`);
+  }
+});
+
+test("visibility loss retains recovery secrets and clears ordinary transient secrets", async () => {
+  assert.match(
+    appSource,
+    /const protectedProfileDraft = this\.profileEditorOpen === true[\s\S]*?\|\| this\.profileOutcomeUnresolved[\s\S]*?\|\| this\.connectionOutcomeUnresolved\);\s*if \(!protectedProfileDraft\) this\.clearSecrets\(\);/
+  );
+  const component = loadAppComponent();
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
+  let visibilityHandler = null;
+  let cleared = 0;
+  globalThis.document = {
+    hidden: false,
+    addEventListener(name, handler) {
+      if (name === "visibilitychange") visibilityHandler = handler;
+    },
+    removeEventListener() {}
+  };
+  globalThis.window = {
+    AbortController: globalThis.AbortController,
+    matchMedia: () => ({
+      matches: false,
+      addEventListener() {},
+      removeEventListener() {}
+    })
+  };
+  try {
+    const secretValues = {
+      password: "draft-password",
+      totp: "draft-totp",
+      remote_log_token: "draft-token"
+    };
+    const context = {
+      disposed: false,
+      abortController: null,
+      auth: { signal: undefined },
+      csrfToken: "csrf",
+      settings: { theme: "dark", status_refresh: 0, log_refresh: 0 },
+      route: "profiles",
+      operationBusy: false,
+      profileEditorOpen: true,
+      profileSaveState: "error",
+      profileConnectionState: "error",
+      profileReconciliationState: "idle",
+      profileOutcomeUnresolved: true,
+      connectionOutcomeUnresolved: false,
+      secretModes: { password: "replace", totp: "replace", remote_log_token: "replace" },
+      secretValues,
+      $el: {},
+      $watch() { return () => {}; },
+      connectionWatchCleanups: [],
+      interfaceSettingsPayload() { return {}; },
+      async refreshCsrf() {},
+      async refreshSnapshot() {},
+      refreshLogs() {},
+      stopTimers() {},
+      clearSecrets() {
+        cleared += 1;
+        component.methods.clearSecrets.call(this);
+      }
+    };
+
+    await component.mounted.call(context);
+    assert.equal(typeof visibilityHandler, "function");
+    globalThis.document.hidden = true;
+    visibilityHandler();
+    assert.equal(cleared, 0, "recovery visibility loss must not erase transient credentials");
+    assert.strictEqual(context.secretValues, secretValues);
+    assert.deepEqual(context.secretValues, {
+      password: "draft-password", totp: "draft-totp", remote_log_token: "draft-token"
+    });
+
+    context.profileOutcomeUnresolved = false;
+    visibilityHandler();
+    assert.equal(cleared, 1, "ordinary visibility loss must still clear transient credentials");
+    assert.deepEqual(context.secretValues, { password: "", totp: "", remote_log_token: "" });
+    if (context.abortController) context.abortController.abort();
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  }
+});
+
+test("AppWindow teardown purges only its retained reconciliation authentication", () => {
+  assert.match(
+    appSource,
+    /beforeDestroy\(\) \{[\s\S]*?purgeReconciliationAuth\(this\.auth\)[\s\S]*?this\.auth = \{ signal: undefined \}/
+  );
 });
 
 test("path chooser is a contained keyboard dialog with focus restoration", () => {

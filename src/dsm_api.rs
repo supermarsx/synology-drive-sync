@@ -325,6 +325,13 @@ enum EnqueueOutcome {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug, Eq, PartialEq)]
+enum SessionRequestStatus {
+    Pending { job_id: String, operation: String },
+    Complete { job_id: String, operation: String },
+}
+
+#[cfg(target_os = "linux")]
 impl EnqueueOutcome {
     fn job_id(&self) -> &str {
         match self {
@@ -524,6 +531,7 @@ enum ReadAction {
     Logs { lines: u16, source: LogSource },
     Activity { lines: u16 },
     Result { job_id: String },
+    RequestStatus { request_id: String },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -810,7 +818,7 @@ fn validate_relay_authenticated_session(
             .synology_token
             .as_ref()
             .map(|value| value.as_str()),
-    );
+    )?;
     if !session_binding_matches(&binding, &expected_binding) {
         return Err(BridgeError::new(ErrorKind::Unauthorized));
     }
@@ -899,6 +907,7 @@ struct RawQueuedResponse<'a> {
 }
 
 struct ParsedQueuedResponse {
+    operation: Option<String>,
     client_request_id: String,
     requested_by: String,
     requested_uid: u32,
@@ -1601,9 +1610,10 @@ fn validate_http_request(mut environment: CgiEnvironment) -> BridgeResult<Valida
     if environment.request_marker.as_deref() != Some("1") {
         return Err(BridgeError::new(ErrorKind::Forbidden));
     }
-    if environment.cookie.is_empty() {
-        return Err(BridgeError::new(ErrorKind::Unauthorized));
-    }
+    // Synology's authenticated DSM session is the unique `id` cookie. Reject
+    // absent or ambiguous identities before invoking either authentication
+    // path; ancillary browser/proxy cookies are not session credentials.
+    dsm_session_cookie_id(&environment.cookie)?;
 
     let mut query = parse_urlencoded(&environment.query)?;
     let query_token = query.remove("SynoToken").map(Zeroizing::new);
@@ -1830,6 +1840,14 @@ fn parse_read_action(mut query: BTreeMap<String, String>) -> BridgeResult<ReadAc
                 .ok_or_else(BridgeError::bad_request)?;
             require_empty_query(&query)?;
             ReadAction::Result { job_id }
+        }
+        "request-status" => {
+            let request_id = query
+                .remove("request_id")
+                .filter(|value| valid_client_request_id(value))
+                .ok_or_else(BridgeError::bad_request)?;
+            require_empty_query(&query)?;
+            ReadAction::RequestStatus { request_id }
         }
         _ => return Err(BridgeError::bad_request()),
     };
@@ -3310,22 +3328,62 @@ fn manager_command_environment() -> Vec<(OsString, OsString)> {
     ]
 }
 
+fn valid_cookie_octets(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            matches!(
+                byte,
+                0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e
+            )
+        })
+}
+
+fn dsm_session_cookie_id(cookie: &str) -> BridgeResult<&str> {
+    let mut session_id = None;
+    for raw_pair in cookie.split(';') {
+        // RFC 6265 emits a single SP after `;`. Leading OWS is harmless, but
+        // whitespace within a cookie-pair is not normalized because doing so
+        // could disagree with DSM's authentication parser.
+        let pair = raw_pair.trim_start_matches(' ');
+        if pair.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = pair.split_once('=') else {
+            if pair.trim_matches(' ').eq_ignore_ascii_case("id") {
+                return Err(BridgeError::new(ErrorKind::Unauthorized));
+            }
+            continue;
+        };
+        let normalized_name = name.trim_matches(' ');
+        if !normalized_name.eq_ignore_ascii_case("id") {
+            continue;
+        }
+        if name != "id" || session_id.is_some() || !valid_cookie_octets(value) {
+            return Err(BridgeError::new(ErrorKind::Unauthorized));
+        }
+        session_id = Some(value);
+    }
+    session_id.ok_or_else(|| BridgeError::new(ErrorKind::Unauthorized))
+}
+
 fn session_binding(
     username: &str,
     uid: u32,
     cookie: &str,
     synology_token: Option<&str>,
-) -> [u8; 32] {
+) -> BridgeResult<[u8; 32]> {
+    let session_id = dsm_session_cookie_id(cookie)?;
     let mut digest = Sha256::new();
-    digest.update(b"sdsync-dsm-session-v1\0");
+    digest.update(b"sdsync-dsm-session-v2\0");
     update_length_prefixed(&mut digest, username.as_bytes());
     digest.update(uid.to_be_bytes());
-    update_length_prefixed(&mut digest, cookie.as_bytes());
-    // An absent launch token occupies the otherwise-invalid empty-token slot.
-    // This preserves the v1 binding for every previously valid non-empty token
-    // while keeping cookie-only and token-authenticated sessions distinct.
+    update_length_prefixed(&mut digest, session_id.as_bytes());
+    // An absent launch token occupies the otherwise-invalid empty-token slot,
+    // keeping cookie-only and token-authenticated sessions distinct. There is
+    // deliberately no raw-cookie v1 fallback: old bindings fail closed rather
+    // than restoring dependence on mutable ancillary cookies.
     update_length_prefixed(&mut digest, synology_token.unwrap_or_default().as_bytes());
-    digest.finalize().into()
+    Ok(digest.finalize().into())
 }
 
 fn audit_transaction_id(
@@ -3709,7 +3767,7 @@ mod linux_runtime {
             uid,
             &inputs.cookie,
             inputs.synology_token.as_ref().map(|value| value.as_str()),
-        );
+        )?;
         Ok(AuthenticatedSession {
             username,
             uid,
@@ -5426,7 +5484,8 @@ fn read_manager_arguments(action: &ReadAction) -> BridgeResult<Vec<OsString>> {
         ReadAction::Csrf
         | ReadAction::SourceDirectories { .. }
         | ReadAction::SourcePath { .. }
-        | ReadAction::Result { .. } => {
+        | ReadAction::Result { .. }
+        | ReadAction::RequestStatus { .. } => {
             return Err(BridgeError::internal());
         }
     };
@@ -5736,7 +5795,8 @@ fn parse_and_sanitize_manager_json(
         ReadAction::Csrf
         | ReadAction::SourceDirectories { .. }
         | ReadAction::SourcePath { .. }
-        | ReadAction::Result { .. } => {
+        | ReadAction::Result { .. }
+        | ReadAction::RequestStatus { .. } => {
             return Err(BridgeError::internal());
         }
     };
@@ -5768,6 +5828,7 @@ fn parse_and_sanitize_manager_json(
                     "source_browser": true,
                     "profile_connection_test": true,
                     "remote_browser": true,
+                    "request_reconciliation": true,
                 }),
             );
             if let Some(policy) = runtime_policy {
@@ -5837,7 +5898,8 @@ fn parse_and_sanitize_manager_json(
         ReadAction::Csrf
         | ReadAction::SourceDirectories { .. }
         | ReadAction::SourcePath { .. }
-        | ReadAction::Result { .. } => {}
+        | ReadAction::Result { .. }
+        | ReadAction::RequestStatus { .. } => {}
     }
     serde_json::to_vec(&value).map_err(|_| BridgeError::internal())
 }
@@ -6398,24 +6460,7 @@ fn parse_queued_response(
     };
     if response.job_id != expected_job_id
         || !valid_server_job_id(response.job_id)
-        || operation.is_some_and(|operation| {
-            !matches!(
-                operation,
-                "configure-profile"
-                    | "remove-profile"
-                    | "set-default"
-                    | "set-secret"
-                    | "test-profile-auth"
-                    | "browse-remote"
-                    | "schedule"
-                    | "routine"
-                    | "remove-routine"
-                    | "alert-policy"
-                    | "security-policy"
-                    | "client-event"
-                    | "action"
-            )
-        })
+        || operation.is_some_and(|operation| !valid_mutation_operation(operation))
         || !valid_client_request_id(response.client_request_id)
         || !valid_authenticated_username(response.requested_by)
         || response.requested_uid == 0
@@ -6439,6 +6484,7 @@ fn parse_queued_response(
         return Err(BridgeError::new(ErrorKind::Unavailable));
     }
     Ok(ParsedQueuedResponse {
+        operation: operation.map(str::to_owned),
         client_request_id: response.client_request_id.to_owned(),
         requested_by: response.requested_by.to_owned(),
         requested_uid: response.requested_uid,
@@ -6648,6 +6694,25 @@ fn valid_audit_transaction(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn valid_mutation_operation(value: &str) -> bool {
+    matches!(
+        value,
+        "configure-profile"
+            | "remove-profile"
+            | "set-default"
+            | "set-secret"
+            | "test-profile-auth"
+            | "browse-remote"
+            | "schedule"
+            | "routine"
+            | "remove-routine"
+            | "alert-policy"
+            | "security-policy"
+            | "client-event"
+            | "action"
+    )
 }
 
 fn valid_audit_operation(value: &str) -> bool {
@@ -8522,6 +8587,21 @@ mod linux_files {
 
     type IdempotencyRecord = (String, String, u32, [u8; 32], String);
 
+    struct SessionRequestRecord {
+        client_request_id: String,
+        requested_by: String,
+        requested_uid: u32,
+        session_binding: [u8; 32],
+        operation: Option<String>,
+        complete: bool,
+    }
+
+    impl Drop for SessionRequestRecord {
+        fn drop(&mut self) {
+            self.session_binding.zeroize();
+        }
+    }
+
     fn read_any_idempotency_record(
         paths: &ControlPaths<'_>,
         package_uid: u32,
@@ -8562,6 +8642,115 @@ mod linux_files {
             )));
         }
         Ok(None)
+    }
+
+    fn read_any_session_request_record(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+        job_id: &str,
+    ) -> BridgeResult<Option<SessionRequestRecord>> {
+        let response_path = paths.responses.join(format!("{job_id}.json"));
+        if let Some(bytes) = read_transient_optional_private_file(
+            &response_path,
+            package_uid,
+            MAX_MANAGER_OUTPUT_BYTES,
+        )? {
+            let parsed = parse_queued_response(&bytes, job_id)?;
+            return Ok(Some(SessionRequestRecord {
+                client_request_id: parsed.client_request_id.clone(),
+                requested_by: parsed.requested_by.clone(),
+                requested_uid: parsed.requested_uid,
+                session_binding: parsed.session_binding,
+                operation: parsed.operation.clone(),
+                complete: true,
+            }));
+        }
+
+        for directory in [paths.requests, paths.processing] {
+            let path = directory.join(format!("{job_id}.json"));
+            let Some(bytes) =
+                read_transient_optional_private_file(&path, package_uid, MAX_JOB_BYTES)?
+            else {
+                continue;
+            };
+            let parsed = parse_job(&bytes)?;
+            return Ok(Some(SessionRequestRecord {
+                client_request_id: parsed.client_request_id.clone(),
+                requested_by: parsed.requested_by.clone(),
+                requested_uid: parsed.requested_uid,
+                session_binding: parsed.session_binding,
+                operation: Some(parsed.mutation.operation_id().to_owned()),
+                complete: false,
+            }));
+        }
+        Ok(None)
+    }
+
+    pub(super) fn find_session_request(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+        client_request_id: &str,
+        requested_by: &str,
+        requested_uid: u32,
+        session_binding: &[u8; 32],
+    ) -> BridgeResult<Option<SessionRequestStatus>> {
+        if !valid_client_request_id(client_request_id)
+            || !valid_authenticated_username(requested_by)
+            || requested_uid == 0
+        {
+            return Err(BridgeError::bad_request());
+        }
+        validate_private_directory(paths.requests, package_uid)?;
+        validate_private_directory(paths.processing, package_uid)?;
+        validate_private_directory(paths.responses, package_uid)?;
+
+        for _ in 0..4 {
+            let before = collect_json_job_ids(paths, package_uid)?;
+            let mut owned_job_id: Option<String> = None;
+            let mut found: Option<SessionRequestStatus> = None;
+            let mut vanished = false;
+            for job_id in &before {
+                let Some(record) = read_any_session_request_record(paths, package_uid, job_id)?
+                else {
+                    vanished = true;
+                    continue;
+                };
+                if record.client_request_id != client_request_id
+                    || !session_binding_matches(&record.session_binding, session_binding)
+                {
+                    continue;
+                }
+                if record.requested_by != requested_by || record.requested_uid != requested_uid {
+                    return Err(BridgeError::unsafe_runtime());
+                }
+                if owned_job_id
+                    .as_deref()
+                    .is_some_and(|existing| existing != job_id)
+                {
+                    return Err(BridgeError::unsafe_runtime());
+                }
+                owned_job_id = Some(job_id.to_owned());
+                found = record.operation.as_ref().map(|operation| {
+                    if record.complete {
+                        SessionRequestStatus::Complete {
+                            job_id: job_id.to_owned(),
+                            operation: operation.clone(),
+                        }
+                    } else {
+                        SessionRequestStatus::Pending {
+                            job_id: job_id.to_owned(),
+                            operation: operation.clone(),
+                        }
+                    }
+                });
+            }
+            let after = collect_json_job_ids(paths, package_uid)?;
+            if !vanished && before == after {
+                return Ok(found);
+            }
+            std::thread::yield_now();
+        }
+        Err(BridgeError::new(ErrorKind::Unavailable))
     }
 
     fn find_idempotent_job(
@@ -11291,6 +11480,14 @@ fn execute_authenticated_request(
                 now,
                 policy.result_retention_seconds,
             ),
+            ReadAction::RequestStatus { request_id } => execute_request_status_action(
+                &control_paths,
+                &request_id,
+                &session.username,
+                &session.binding,
+                session.uid,
+                package_uid,
+            ),
             action => execute_read_action(&action, policy),
         },
         ValidatedHttpRequest::Post { csrf_token, .. } => {
@@ -11347,6 +11544,82 @@ fn execute_authenticated_request(
             Ok(CgiResponse::accepted(response))
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn execute_request_status_action(
+    paths: &ControlPaths<'_>,
+    request_id: &str,
+    authenticated_username: &str,
+    session_binding: &[u8; 32],
+    authenticated_uid: u32,
+    package_uid: u32,
+) -> BridgeResult<CgiResponse> {
+    if !valid_client_request_id(request_id) {
+        return Err(BridgeError::bad_request());
+    }
+    let status = linux_files::find_session_request(
+        paths,
+        package_uid,
+        request_id,
+        authenticated_username,
+        authenticated_uid,
+        session_binding,
+    )?;
+    match status {
+        Some(SessionRequestStatus::Pending { job_id, operation }) => {
+            request_status_found_response(request_id, &job_id, &operation, "pending", false)
+        }
+        Some(SessionRequestStatus::Complete { job_id, operation }) => {
+            request_status_found_response(request_id, &job_id, &operation, "complete", true)
+        }
+        None => request_status_unresolved_response(request_id),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn request_status_found_response(
+    request_id: &str,
+    job_id: &str,
+    operation: &str,
+    state: &str,
+    complete: bool,
+) -> BridgeResult<CgiResponse> {
+    if !valid_client_request_id(request_id)
+        || !valid_server_job_id(job_id)
+        || !valid_mutation_operation(operation)
+        || !matches!(state, "pending" | "complete")
+        || (state == "complete") != complete
+    {
+        return Err(BridgeError::new(ErrorKind::Unavailable));
+    }
+    let body = serde_json::to_vec(&json!({
+        "schema": "sdsync.dsm-request-status.v1",
+        "request_id": request_id,
+        "job_id": job_id,
+        "operation": operation,
+        "state": state,
+    }))
+    .map_err(|_| BridgeError::internal())?;
+    if complete {
+        Ok(CgiResponse::success(body))
+    } else {
+        Ok(CgiResponse::accepted(body))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn request_status_unresolved_response(request_id: &str) -> BridgeResult<CgiResponse> {
+    if !valid_client_request_id(request_id) {
+        return Err(BridgeError::bad_request());
+    }
+    let body = serde_json::to_vec(&json!({
+        "schema": "sdsync.dsm-request-status.v1",
+        "request_id": request_id,
+        "state": "unresolved",
+    }))
+    .map_err(|_| BridgeError::internal())?;
+    Ok(CgiResponse::accepted(body))
 }
 
 #[cfg(target_os = "linux")]
@@ -12282,7 +12555,8 @@ mod tests {
                     .synology_token
                     .as_ref()
                     .map(|value| value.as_str()),
-            ),
+            )
+            .unwrap(),
         }
     }
 
@@ -15148,6 +15422,31 @@ mod tests {
             audit_events.borrow()[0].1.client_request_id.as_deref(),
             Some(REQUEST_ID)
         );
+        assert_eq!(
+            linux_files::find_session_request(
+                &paths,
+                package_uid,
+                REQUEST_ID,
+                "admin",
+                1000,
+                &session,
+            )
+            .unwrap(),
+            Some(SessionRequestStatus::Pending {
+                job_id: first_id.clone(),
+                operation: "remove-profile".to_owned(),
+            })
+        );
+        let pending_status =
+            execute_request_status_action(&paths, REQUEST_ID, "admin", &session, 1000, package_uid)
+                .unwrap();
+        assert_eq!(pending_status.status, 202);
+        let pending_status: Value = serde_json::from_slice(&pending_status.body).unwrap();
+        assert_eq!(pending_status["schema"], "sdsync.dsm-request-status.v1");
+        assert_eq!(pending_status["request_id"], REQUEST_ID);
+        assert_eq!(pending_status["job_id"], first_id);
+        assert_eq!(pending_status["operation"], "remove-profile");
+        assert_eq!(pending_status["state"], "pending");
 
         let replay = linux_files::enqueue(&paths, enqueue_request(), 1, |record, state| {
             audit_calls.set(audit_calls.get() + 1);
@@ -15181,6 +15480,21 @@ mod tests {
         let queued_path = fixture.requests.join(format!("{first_id}.json"));
         let processing_path = fixture.processing.join(format!("{first_id}.json"));
         fs::rename(&queued_path, &processing_path).unwrap();
+        assert_eq!(
+            linux_files::find_session_request(
+                &paths,
+                package_uid,
+                REQUEST_ID,
+                "admin",
+                1000,
+                &session,
+            )
+            .unwrap(),
+            Some(SessionRequestStatus::Pending {
+                job_id: first_id.clone(),
+                operation: "remove-profile".to_owned(),
+            })
+        );
         let job = parse_job(&fs::read(&processing_path).unwrap()).unwrap();
         let result = json!({
             "schema": "sdsync.dsm-result.v1",
@@ -15205,6 +15519,31 @@ mod tests {
         .unwrap();
         fs::remove_file(&processing_path).unwrap();
 
+        assert_eq!(
+            linux_files::find_session_request(
+                &paths,
+                package_uid,
+                REQUEST_ID,
+                "admin",
+                1000,
+                &session,
+            )
+            .unwrap(),
+            Some(SessionRequestStatus::Complete {
+                job_id: first_id.clone(),
+                operation: "remove-profile".to_owned(),
+            })
+        );
+        let complete_status =
+            execute_request_status_action(&paths, REQUEST_ID, "admin", &session, 1000, package_uid)
+                .unwrap();
+        assert_eq!(complete_status.status, 200);
+        let complete_status: Value = serde_json::from_slice(&complete_status.body).unwrap();
+        assert_eq!(complete_status["request_id"], REQUEST_ID);
+        assert_eq!(complete_status["job_id"], first_id);
+        assert_eq!(complete_status["operation"], "remove-profile");
+        assert_eq!(complete_status["state"], "complete");
+
         let completed_replay =
             linux_files::enqueue(&paths, enqueue_request(), 1, |record, state| {
                 audit_calls.set(audit_calls.get() + 1);
@@ -15223,6 +15562,164 @@ mod tests {
             record.client_request_id.as_deref() == Some(REQUEST_ID)
                 && record.job_id.as_deref() == Some(first_id.as_str())
         }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn request_status_conceals_missing_and_foreign_session_records_identically() {
+        assert_eq!(
+            request_status_found_response(
+                REQUEST_ID,
+                JOB_ID,
+                "untrusted-operation",
+                "pending",
+                false,
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::Unavailable,
+            "request-status must not echo an unvalidated operation"
+        );
+
+        let fixture = TestControlFixture::new("request-status-concealment");
+        let paths = fixture.paths();
+        let package_uid = TestControlFixture::package_uid();
+        let current_session = [7_u8; 32];
+        let foreign_session = [8_u8; 32];
+
+        let missing = execute_request_status_action(
+            &paths,
+            REQUEST_ID,
+            "admin",
+            &current_session,
+            1000,
+            package_uid,
+        )
+        .unwrap();
+        assert_eq!(missing.status, 202);
+
+        let mutation = Mutation::RemoveProfile(NameArgs {
+            name: "archive".to_owned(),
+        });
+        let fingerprint = mutation_request_fingerprint(&[9_u8; 32], &mutation, None).unwrap();
+        let foreign = linux_files::enqueue(
+            &paths,
+            EnqueueRequest {
+                package_uid,
+                client_request_id: REQUEST_ID,
+                requested_by: "other-admin",
+                requested_uid: 2000,
+                session_binding: &foreign_session,
+                audit_transaction: JOB_ID,
+                request_fingerprint: &fingerprint,
+                issued_at_epoch: current_epoch().unwrap(),
+                mutation: &mutation,
+                secret: None,
+            },
+            1,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+
+        let concealed = execute_request_status_action(
+            &paths,
+            REQUEST_ID,
+            "admin",
+            &current_session,
+            1000,
+            package_uid,
+        )
+        .unwrap();
+        assert_eq!(concealed.status, missing.status);
+        assert_eq!(concealed.body, missing.body);
+        let unresolved: Value = serde_json::from_slice(&concealed.body).unwrap();
+        assert_eq!(unresolved["schema"], "sdsync.dsm-request-status.v1");
+        assert_eq!(unresolved["request_id"], REQUEST_ID);
+        assert_eq!(unresolved["state"], "unresolved");
+        assert!(unresolved.get("job_id").is_none());
+        assert!(unresolved.get("operation").is_none());
+
+        let owned = execute_request_status_action(
+            &paths,
+            REQUEST_ID,
+            "other-admin",
+            &foreign_session,
+            2000,
+            package_uid,
+        )
+        .unwrap();
+        let owned: Value = serde_json::from_slice(&owned.body).unwrap();
+        assert_eq!(owned["job_id"], foreign.job_id());
+        assert_eq!(owned["operation"], "remove-profile");
+        assert_eq!(owned["state"], "pending");
+
+        let current_job_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let current_audit_transaction = "cccccccccccccccccccccccccccccccccccccccccccccccc";
+        let current_job = canonical_job_bytes(
+            current_job_id,
+            REQUEST_ID,
+            "admin",
+            1000,
+            &current_session,
+            current_audit_transaction,
+            &fingerprint,
+            current_epoch().unwrap(),
+            &mutation,
+        )
+        .unwrap();
+        fixture.write_private(
+            &fixture.requests.join(format!("{current_job_id}.json")),
+            &current_job,
+        );
+        assert_eq!(
+            linux_files::find_session_request(
+                &paths,
+                package_uid,
+                REQUEST_ID,
+                "admin",
+                1000,
+                &current_session,
+            )
+            .unwrap(),
+            Some(SessionRequestStatus::Pending {
+                job_id: current_job_id.to_owned(),
+                operation: "remove-profile".to_owned(),
+            }),
+            "a foreign-session collision must not hide the current session's mapping"
+        );
+
+        let duplicate_job_id = "dddddddddddddddddddddddddddddddddddddddddddddddd";
+        let duplicate_audit_transaction = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let duplicate_job = canonical_job_bytes(
+            duplicate_job_id,
+            REQUEST_ID,
+            "admin",
+            1000,
+            &current_session,
+            duplicate_audit_transaction,
+            &fingerprint,
+            current_epoch().unwrap(),
+            &mutation,
+        )
+        .unwrap();
+        fixture.write_private(
+            &fixture.requests.join(format!("{duplicate_job_id}.json")),
+            &duplicate_job,
+        );
+        assert_eq!(
+            linux_files::find_session_request(
+                &paths,
+                package_uid,
+                REQUEST_ID,
+                "admin",
+                1000,
+                &current_session,
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::UnsafeRuntime,
+            "two owned mappings for one client request ID must fail closed"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -15313,6 +15810,19 @@ mod tests {
             } if job_id == JOB_ID
         ));
 
+        let request_status = validate_http_request(environment(
+            "GET",
+            &format!("action=request-status&request_id={REQUEST_ID}&SynoToken=abc123"),
+        ))
+        .unwrap();
+        assert!(matches!(
+            request_status,
+            ValidatedHttpRequest::Get {
+                action: ReadAction::RequestStatus { request_id },
+                ..
+            } if request_id == REQUEST_ID
+        ));
+
         assert!(validate_http_request(environment("GET", "action=unknown&SynoToken=x")).is_err());
         assert!(
             validate_http_request(environment("GET", "action=snapshot&extra=x&SynoToken=x"))
@@ -15339,6 +15849,19 @@ mod tests {
             ))
             .is_err()
         );
+        for query in [
+            "action=request-status",
+            &format!("action=request-status&request_id={JOB_ID}"),
+            &format!(
+                "action=request-status&request_id={}",
+                REQUEST_ID.to_ascii_uppercase()
+            ),
+            &format!("action=request-status&request_id={REQUEST_ID}&extra=x"),
+        ] {
+            assert!(
+                validate_http_request(environment("GET", &format!("{query}&SynoToken=x"))).is_err()
+            );
+        }
     }
 
     #[test]
@@ -15740,12 +16263,15 @@ mod tests {
 
         let mut forged_uid = decode_relay_request(&encoded).unwrap();
         forged_uid.authenticated_uid = AUTHENTICATED_UID + 1;
-        forged_uid.session_binding = hex_encode(&session_binding(
-            &forged_uid.authenticated_username,
-            AUTHENTICATED_UID + 1,
-            &query_environment.cookie,
-            Some("dsm-token"),
-        ));
+        forged_uid.session_binding = hex_encode(
+            &session_binding(
+                &forged_uid.authenticated_username,
+                AUTHENTICATED_UID + 1,
+                &query_environment.cookie,
+                Some("dsm-token"),
+            )
+            .unwrap(),
+        );
         assert_eq!(
             validate(&forged_uid).err().unwrap().kind,
             ErrorKind::Unauthorized
@@ -15760,6 +16286,13 @@ mod tests {
             validate(&changed_binding).err().unwrap().kind,
             ErrorKind::Unauthorized
         );
+
+        let mut changed_ancillary_cookies = decode_relay_request(&encoded).unwrap();
+        changed_ancillary_cookies.cookie =
+            "did=rotated-device; io=rotated-socket; id=authenticated-session; stay_login=0"
+                .to_owned();
+        let validated_ancillary = validate(&changed_ancillary_cookies).unwrap();
+        assert_eq!(validated_ancillary.binding, session.binding);
 
         let mut changed_cookie = decode_relay_request(&encoded).unwrap();
         changed_cookie.cookie = "id=different-session".to_owned();
@@ -16032,8 +16565,8 @@ mod tests {
             command_environment(raw)["QUERY_STRING"]
         );
         assert_ne!(
-            session_binding("admin", 1000, cookie, Some(encoded)),
-            session_binding("admin", 1000, cookie, Some(raw)),
+            session_binding("admin", 1000, cookie, Some(encoded)).unwrap(),
+            session_binding("admin", 1000, cookie, Some(raw)).unwrap(),
             "session binding must retain the exact package header representation"
         );
     }
@@ -16171,15 +16704,65 @@ mod tests {
     }
 
     #[test]
+    fn session_binding_uses_only_one_exact_dsm_id_cookie() {
+        let expected = session_binding("admin", 1000, "id=session-a", Some("token-a")).unwrap();
+        for cookie in [
+            "id=session-a",
+            "_SSID=transport-a; id=session-a; did=device-a; stay_login=1; io=socket-a",
+            "io=socket-b; stay_login=0; did=device-b; id=session-a; _CrPoSt=proxy-b",
+            " did=device-c;  id=session-a; io=socket-c",
+        ] {
+            assert_eq!(
+                session_binding("admin", 1000, cookie, Some("token-a")).unwrap(),
+                expected,
+                "ancillary cookie order and churn must not change DSM session identity"
+            );
+        }
+        assert_ne!(
+            session_binding("admin", 1000, "did=device-a; id=session-b", Some("token-a")).unwrap(),
+            expected,
+            "changing DSM's id cookie must change the session binding"
+        );
+
+        for cookie in [
+            "",
+            "did=device-a; stay_login=1",
+            "id=",
+            "id=session-a; id=session-a",
+            "id=session-a; id=session-b",
+            "id=session-a; ID=session-a",
+            "ID=session-a",
+            "id =session-a",
+            "id=\"session-a\"",
+            "id=session a",
+        ] {
+            assert_eq!(
+                session_binding("admin", 1000, cookie, Some("token-a"))
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::Unauthorized,
+                "missing, duplicate, ambiguous, or invalid DSM id cookies must fail closed"
+            );
+            let mut request = environment("GET", "action=snapshot&SynoToken=token-a");
+            request.cookie = Zeroizing::new(cookie.to_owned());
+            assert_eq!(
+                validate_http_request(request).unwrap_err().kind,
+                ErrorKind::Unauthorized,
+                "invalid DSM session identity must be rejected before authentication"
+            );
+        }
+    }
+
+    #[test]
     fn csrf_is_session_bound_short_lived_and_tamper_evident() {
         let key = [7_u8; 32];
-        let first = session_binding("admin", 1000, "id=session-a", Some("token-a"));
-        let second = session_binding("admin", 1000, "id=session-b", Some("token-a"));
-        let cookie_only = session_binding("admin", 1000, "id=session-a", None);
+        let first = session_binding("admin", 1000, "id=session-a", Some("token-a")).unwrap();
+        let second = session_binding("admin", 1000, "id=session-b", Some("token-a")).unwrap();
+        let cookie_only = session_binding("admin", 1000, "id=session-a", None).unwrap();
         assert_ne!(first, cookie_only);
         assert_eq!(
             hex_encode(&first),
-            "3f4ccb5350a9e97bcd1cf2decc083b780c7518f1b1fa8e2426b859bc2233937b"
+            "766459af09183f12f60c47bcd079757cec914923c2c960ffdd3552e32924692c"
         );
         let cookie_token = issue_csrf_token(
             &key,
@@ -17838,6 +18421,7 @@ mod tests {
         .unwrap();
         let response = canonical_queued_response_bytes(&job, 10_005, &result, false).unwrap();
         let parsed = parse_queued_response(&response, JOB_ID).unwrap();
+        assert_eq!(parsed.operation.as_deref(), Some("remove-profile"));
         assert_eq!(parsed.session_binding, [9_u8; 32]);
         assert!(session_binding_matches(
             &parsed.session_binding,
@@ -17852,7 +18436,9 @@ mod tests {
         let mut retained_v1: Value = serde_json::from_slice(&response).unwrap();
         retained_v1["schema"] = json!("sdsync.dsm-queued-response.v1");
         retained_v1.as_object_mut().unwrap().remove("operation");
-        assert!(parse_queued_response(&serde_json::to_vec(&retained_v1).unwrap(), JOB_ID).is_ok());
+        let parsed_v1 =
+            parse_queued_response(&serde_json::to_vec(&retained_v1).unwrap(), JOB_ID).unwrap();
+        assert_eq!(parsed_v1.operation.as_deref(), None);
         retained_v1["operation"] = json!("remove-profile");
         assert!(parse_queued_response(&serde_json::to_vec(&retained_v1).unwrap(), JOB_ID).is_err());
         assert!(
@@ -18105,6 +18691,7 @@ mod tests {
         assert_eq!(value["package"]["version"], env!("SDSYNC_VERSION"));
         assert_eq!(value["capabilities"]["mutations"], true);
         assert_eq!(value["capabilities"]["private_queue"], true);
+        assert_eq!(value["capabilities"]["request_reconciliation"], true);
         assert_eq!(
             value["security_policy"]["queue_limits"],
             json!({

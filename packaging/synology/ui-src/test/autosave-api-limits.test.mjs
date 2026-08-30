@@ -78,6 +78,26 @@ class FakeClock {
   }
 }
 
+function trackedAbortSource() {
+  const controller = new AbortController();
+  const listeners = new Set();
+  return {
+    signal: {
+      get aborted() { return controller.signal.aborted; },
+      addEventListener(type, listener, options) {
+        if (type === "abort") listeners.add(listener);
+        controller.signal.addEventListener(type, listener, options);
+      },
+      removeEventListener(type, listener) {
+        if (type === "abort") listeners.delete(listener);
+        controller.signal.removeEventListener(type, listener);
+      }
+    },
+    abort() { controller.abort(); },
+    get listenerCount() { return listeners.size; }
+  };
+}
+
 function installBrowser(packageFetch, tokenFetch = undefined, timers = undefined) {
   const previous = { window: globalThis.window, fetch: globalThis.fetch };
   globalThis.window = {
@@ -158,16 +178,30 @@ test("default GET aborts a hung response body with an ordinary typed read timeou
 test("unbounded-terminal POST dispatch still times out, aborts, and exact-replays", async () => {
   const clock = new FakeClock();
   const bodies = [];
-  const signals = [];
-  const restore = installBrowser((_url, options) => {
-    bodies.push(options.body);
-    signals.push(options.signal);
-    return new Promise(() => {});
+  const postSignals = [];
+  const requestStatusSignals = [];
+  let requestStatusReads = 0;
+  const restore = installBrowser((url, options) => {
+    if (options.method === "POST") {
+      bodies.push(options.body);
+      postSignals.push(options.signal);
+      return new Promise(() => {});
+    }
+    const requestId = new URL(url, "https://nas.example.invalid").searchParams.get("request_id");
+    requestStatusReads += 1;
+    requestStatusSignals.push(options.signal);
+    return Promise.resolve(jsonResponse({
+      schema: "sdsync.dsm-request-status.v1",
+      request_id: requestId,
+      state: "unresolved"
+    }));
   }, undefined, clock);
   try {
     const api = await loadApi();
+    const parent = trackedAbortSource();
+    assert.equal(api.AUTOSAVE_API_LIMITS.postRequestTimeoutMs, 45000);
     const pending = api.apiPost(
-      {},
+      { signal: parent.signal },
       "csrf-token",
       api.ACTIONS.clientEvent,
       { event: "interface-settings" },
@@ -178,10 +212,12 @@ test("unbounded-terminal POST dispatch still times out, aborts, and exact-replay
       assert.equal(error instanceof api.MutationOutcomeUnknownError, true);
       assert.equal(error.outcomeUnknown, true);
       assert.match(error.requestId, /^[0-9a-f]{32}$/);
+      assert.equal(error.operation, api.ACTIONS.clientEvent);
+      assert.equal(error.stage, "request_reconciliation");
       return true;
     });
 
-    for (const [timeout, backoff] of [[15000, 250], [15000, 1000], [15000, null]]) {
+    for (const [timeout, backoff] of [[45000, 250], [45000, 1000], [45000, null]]) {
       await clock.settleUntil(() => clock.hasTimerIn(timeout), "default POST attempt timeout");
       await clock.advance(timeout);
       if (backoff !== null) {
@@ -190,10 +226,19 @@ test("unbounded-terminal POST dispatch still times out, aborts, and exact-replay
       }
     }
 
+    await clock.settleUntil(
+      () => clock.hasTimerIn(30000),
+      "default exact-request reconciliation deadline"
+    );
+    await clock.advance(30000);
+
     await rejected;
     assert.equal(bodies.length, 3);
     assert.deepEqual(bodies, [bodies[0], bodies[0], bodies[0]]);
-    assert.equal(signals.every((signal) => signal instanceof AbortSignal && signal.aborted), true);
+    assert.ok(requestStatusReads >= 4, "every replay and final recovery must consult request-status");
+    assert.equal(postSignals.every((signal) => signal instanceof AbortSignal && signal.aborted), true);
+    assert.equal(requestStatusSignals.every((signal) => signal instanceof AbortSignal && !signal.aborted), true);
+    assert.equal(parent.listenerCount, 0, "settled and cancelled attempts must release parent abort listeners");
     assert.equal(clock.timers.size, 0);
   } finally {
     restore();
@@ -265,29 +310,46 @@ function limits(api, clock, overrides = {}) {
 
 test("autosave bounds exact replay of a hung dispatched POST as acceptance-unknown", async () => {
   const bodies = [];
-  const signals = [];
-  const restore = installBrowser((_url, options) => {
-    bodies.push(options.body);
-    signals.push(options.signal);
-    return new Promise(() => {});
+  const postSignals = [];
+  const requestStatusSignals = [];
+  const restore = installBrowser((url, options) => {
+    if (options.method === "POST") {
+      bodies.push(options.body);
+      postSignals.push(options.signal);
+      return new Promise(() => {});
+    }
+    const requestId = new URL(url, "https://nas.example.invalid").searchParams.get("request_id");
+    requestStatusSignals.push(options.signal);
+    return Promise.resolve(jsonResponse({
+      schema: "sdsync.dsm-request-status.v1",
+      request_id: requestId,
+      state: "unresolved"
+    }));
   });
   try {
     const api = await loadApi();
     const clock = new FakeClock();
+    const parent = trackedAbortSource();
     const pending = api.apiPost(
-      {},
+      { signal: parent.signal },
       "csrf-token",
       api.ACTIONS.clientEvent,
       { event: "interface-settings" },
       false,
       0,
-      limits(api, clock, { postRequestTimeoutMs: 5 })
+      limits(api, clock, {
+        postRequestTimeoutMs: 5,
+        requestReconciliationTimeoutMs: 6,
+        requestReconciliationPollIntervalMs: 2
+      })
     );
     const rejected = assert.rejects(pending, (error) => {
       assert.equal(error instanceof api.MutationOutcomeUnknownError, true);
       assert.equal(error.outcomeUnknown, true);
       assert.equal(error.acceptanceUnknown, true);
       assert.match(error.requestId, /^[0-9a-f]{32}$/);
+      assert.equal(error.operation, api.ACTIONS.clientEvent);
+      assert.equal(error.stage, "request_reconciliation");
       return true;
     });
     await clock.settleUntil(() => clock.hasTimerIn(5), "POST request timeout");
@@ -300,12 +362,16 @@ test("autosave bounds exact replay of a hung dispatched POST as acceptance-unkno
     await clock.advance(1000);
     await clock.settleUntil(() => clock.hasTimerIn(5), "final replayed POST request timeout");
     await clock.advance(5);
+    await clock.settleUntil(() => clock.hasTimerIn(6), "final request reconciliation deadline");
+    await clock.advance(6);
     await rejected;
     assert.equal(bodies.length, 3);
     assert.deepEqual(bodies, [bodies[0], bodies[0], bodies[0]], "every ambiguous dispatch replay must use the exact serialized body");
     assert.match(JSON.parse(bodies[0]).request_id, /^[0-9a-f]{32}$/);
-    assert.equal(signals.every((signal) => signal instanceof AbortSignal && signal.aborted), true,
+    assert.equal(postSignals.every((signal) => signal instanceof AbortSignal && signal.aborted), true,
       "every timed-out dispatch must abort its own fetch before replay");
+    assert.equal(requestStatusSignals.every((signal) => signal instanceof AbortSignal && !signal.aborted), true);
+    assert.equal(parent.listenerCount, 0);
     assert.equal(clock.timers.size, 0);
   } finally {
     restore();
@@ -314,28 +380,45 @@ test("autosave bounds exact replay of a hung dispatched POST as acceptance-unkno
 
 test("autosave bounds exact replay of a hung POST response body as acceptance-unknown", async () => {
   const bodies = [];
-  const signals = [];
-  const restore = installBrowser((_url, options) => {
-    bodies.push(options.body);
-    signals.push(options.signal);
-    return Promise.resolve(jsonResponse({}, 202, new Promise(() => {})));
+  const postSignals = [];
+  const requestStatusSignals = [];
+  const restore = installBrowser((url, options) => {
+    if (options.method === "POST") {
+      bodies.push(options.body);
+      postSignals.push(options.signal);
+      return Promise.resolve(jsonResponse({}, 202, new Promise(() => {})));
+    }
+    const requestId = new URL(url, "https://nas.example.invalid").searchParams.get("request_id");
+    requestStatusSignals.push(options.signal);
+    return Promise.resolve(jsonResponse({
+      schema: "sdsync.dsm-request-status.v1",
+      request_id: requestId,
+      state: "unresolved"
+    }));
   });
   try {
     const api = await loadApi();
     const clock = new FakeClock();
+    const parent = trackedAbortSource();
     const pending = api.apiPost(
-      {},
+      { signal: parent.signal },
       "csrf-token",
       api.ACTIONS.clientEvent,
       { event: "interface-settings" },
       false,
       0,
-      limits(api, clock, { postResponseTimeoutMs: 5 })
+      limits(api, clock, {
+        postResponseTimeoutMs: 5,
+        requestReconciliationTimeoutMs: 6,
+        requestReconciliationPollIntervalMs: 2
+      })
     );
     const rejected = assert.rejects(pending, (error) => {
       assert.equal(error instanceof api.MutationOutcomeUnknownError, true);
       assert.equal(error.outcomeUnknown, true);
       assert.equal(error.acceptanceUnknown, true);
+      assert.equal(error.operation, api.ACTIONS.clientEvent);
+      assert.equal(error.stage, "request_reconciliation");
       return true;
     });
     await clock.settleUntil(() => clock.hasTimerIn(5), "POST response timeout");
@@ -348,98 +431,361 @@ test("autosave bounds exact replay of a hung POST response body as acceptance-un
     await clock.advance(1000);
     await clock.settleUntil(() => clock.hasTimerIn(5), "final replayed POST response timeout");
     await clock.advance(5);
+    await clock.settleUntil(() => clock.hasTimerIn(6), "final response reconciliation deadline");
+    await clock.advance(6);
     await rejected;
     assert.equal(bodies.length, 3);
     assert.deepEqual(bodies, [bodies[0], bodies[0], bodies[0]], "every response-observation replay must use the exact serialized body");
-    assert.equal(signals.every((signal) => signal instanceof AbortSignal && signal.aborted), true,
+    assert.equal(postSignals.every((signal) => signal instanceof AbortSignal && signal.aborted), true,
       "every timed-out response body must abort its fetch before replay");
+    assert.equal(requestStatusSignals.every((signal) => signal instanceof AbortSignal && !signal.aborted), true);
+    assert.equal(parent.listenerCount, 0);
     assert.equal(clock.timers.size, 0);
   } finally {
     restore();
   }
 });
 
-test("lost 202 acknowledgement replays the exact request and observes the original job", async () => {
-  const jobId = "9".repeat(48);
-  const posts = [];
-  const attemptSignals = [];
-  let resultReads = 0;
-  const restore = installBrowser(
-    (_url, options) => {
-      attemptSignals.push(options.signal);
-      if (options.method === "POST") {
-        posts.push({ body: options.body, headers: { ...options.headers } });
-        const request = JSON.parse(options.body);
-        if (posts.length === 1) {
-          return Promise.resolve({
-            redirected: false,
-            status: 202,
+test("lost 202 acknowledgement resolves authenticated pending and complete request mappings without replay", async (t) => {
+  for (const requestState of ["pending", "complete"]) {
+    await t.test(requestState, async () => {
+      const jobId = requestState === "pending" ? "9".repeat(48) : "7".repeat(48);
+      const packageRequests = [];
+      const attemptSignals = [];
+      let requestId = "";
+      const restore = installBrowser(
+        (url, options) => {
+          const action = options.method === "POST"
+            ? "post"
+            : new URL(url, "https://nas.example.invalid").searchParams.get("action");
+          packageRequests.push({ action, url, options });
+          attemptSignals.push(options.signal);
+          if (action === "post") {
+            requestId = JSON.parse(options.body).request_id;
+            return Promise.resolve({
+              redirected: false,
+              status: 202,
+              ok: true,
+              headers: { get: () => "application/json" },
+              async text() { throw new TypeError("socket closed after queue admission"); }
+            });
+          }
+          if (action === "request-status") {
+            const requestedId = new URL(url, "https://nas.example.invalid").searchParams.get("request_id");
+            return Promise.resolve(jsonResponse({
+              schema: "sdsync.dsm-request-status.v1",
+              request_id: requestedId,
+              state: requestState,
+              job_id: jobId,
+              operation: "client-event"
+            }));
+          }
+          assert.equal(action, "result");
+          return Promise.resolve(jsonResponse({
+            schema: "sdsync.dsm-result-status.v1",
             ok: true,
-            headers: { get: () => "application/json" },
-            async text() { throw new TypeError("socket closed after queue admission"); }
-          });
-        }
-        return Promise.resolve(jsonResponse({
-          schema: "sdsync.dsm-queued.v1",
-          ok: true,
-          state: "queued",
-          replayed: true,
-          request_id: request.request_id,
-          job_id: jobId
-        }, 202));
+            state: "complete",
+            job_id: jobId,
+            client_request_id: requestId,
+            result: {
+              schema: "sdsync.dsm-result.v1",
+              ok: true,
+              existing: true,
+              event: "interface-settings"
+            }
+          }));
+        },
+        () => Promise.resolve(jsonResponse({ success: true, data: { synotoken: "pinned token" } }))
+      );
+      try {
+        const api = await loadApi();
+        const clock = new FakeClock();
+        const parent = trackedAbortSource();
+        const result = await api.apiPost(
+          { signal: parent.signal },
+          "csrf-token",
+          api.ACTIONS.clientEvent,
+          { event: "interface-settings" },
+          true,
+          0,
+          limits(api, clock)
+        );
+
+        assert.equal(result.ok, true);
+        assert.equal(result.existing, true);
+        assert.match(requestId, /^[0-9a-f]{32}$/);
+        assert.deepEqual(packageRequests.map((request) => request.action), ["post", "request-status", "result"]);
+        assert.equal(
+          packageRequests.filter((request) => request.action === "post").length,
+          1,
+          "an authenticated request-status match must suppress exact POST replay"
+        );
+        const statusRead = packageRequests.find((request) => request.action === "request-status");
+        const resultRead = packageRequests.find((request) => request.action === "result");
+        assert.equal(
+          new URL(statusRead.url, "https://nas.example.invalid").searchParams.get("request_id"),
+          requestId
+        );
+        assert.equal(statusRead.options.headers["X-SDSYNC-Request"], "1");
+        assert.equal(statusRead.options.headers["X-SYNO-TOKEN"], "pinned%20token");
+        assert.equal(
+          new URL(resultRead.url, "https://nas.example.invalid").searchParams.get("job_id"),
+          jobId
+        );
+        assert.equal(resultRead.options.headers["X-SYNO-TOKEN"], "pinned%20token");
+        assert.equal(attemptSignals.every((signal) => signal instanceof AbortSignal && !signal.aborted), true);
+        assert.equal(parent.listenerCount, 0, "all successful request attempts must release parent abort listeners");
+        assert.equal(clock.timers.size, 0, "successful reconciliation must clear every deadline timer");
+        parent.abort();
+        await clock.settle();
+        assert.equal(attemptSignals.every((signal) => !signal.aborted), true,
+          "settled attempts must remain detached from later AppWindow cancellation");
+      } finally {
+        restore();
       }
-      resultReads += 1;
-      return Promise.resolve(jsonResponse({
-        schema: "sdsync.dsm-result-status.v1",
+    });
+  }
+});
+
+test("ambiguous POST does not replay after an invalid request-status document", async () => {
+  const clock = new FakeClock();
+  const parent = trackedAbortSource();
+  let posts = 0;
+  let statusReads = 0;
+  let requestId = "";
+  const restore = installBrowser((url, options) => {
+    if (options.method === "POST") {
+      posts += 1;
+      requestId = JSON.parse(options.body).request_id;
+      return Promise.resolve({
+        redirected: false,
+        status: 202,
         ok: true,
-        state: "complete",
-        job_id: jobId,
-        result: { schema: "sdsync.dsm-result.v1", ok: true, event: "interface-settings" }
-      }));
-    },
-    () => Promise.resolve(jsonResponse({ success: true, data: { synotoken: "pinned token" } }))
-  );
+        headers: { get: () => "application/json" },
+        async text() { throw new TypeError("queue acknowledgement was lost"); }
+      });
+    }
+    const parsed = new URL(url, "https://nas.example.invalid");
+    assert.equal(parsed.searchParams.get("action"), "request-status");
+    assert.equal(parsed.searchParams.get("request_id"), requestId);
+    statusReads += 1;
+    return Promise.resolve(jsonResponse({
+      schema: "sdsync.dsm-request-status.v1",
+      request_id: requestId,
+      state: "pending",
+      job_id: "8".repeat(48),
+      operation: "client-event",
+      unexpected: true
+    }));
+  });
   try {
     const api = await loadApi();
-    const clock = new FakeClock();
-    const controller = new AbortController();
-    const pending = api.apiPost(
-      { signal: controller.signal },
-      "csrf-token",
-      api.ACTIONS.clientEvent,
-      { event: "interface-settings" },
-      true,
-      5,
-      limits(api, clock)
+    await assert.rejects(
+      api.apiPost(
+        { signal: parent.signal },
+        "csrf-token",
+        api.ACTIONS.clientEvent,
+        { event: "interface-settings" },
+        false,
+        0,
+        limits(api, clock)
+      ),
+      (error) => {
+        assert.equal(error instanceof api.MutationOutcomeUnknownError, true);
+        assert.equal(error.requestId, requestId);
+        assert.equal(error.operation, api.ACTIONS.clientEvent);
+        assert.equal(error.stage, "request_reconciliation");
+        return true;
+      }
     );
-    await clock.settleUntil(() => clock.hasTimerIn(250), "lost-ack replay backoff");
-    await clock.advance(250);
-    const result = await pending;
-    assert.equal(result.ok, true);
-    assert.equal(posts.length, 2);
-    assert.equal(posts[1].body, posts[0].body);
-    assert.deepEqual(posts[1].headers, posts[0].headers);
-    assert.equal(posts[0].headers["X-SDSYNC-CSRF"], "csrf-token");
-    assert.equal(posts[0].headers["X-SYNO-TOKEN"], "pinned%20token");
-    assert.match(JSON.parse(posts[0].body).request_id, /^[0-9a-f]{32}$/);
-    assert.equal(resultReads, 1);
-    assert.equal(attemptSignals.length, 3);
-    assert.equal(attemptSignals.every((signal) => !signal.aborted), true);
-    controller.abort();
-    await clock.settle();
-    assert.equal(attemptSignals.every((signal) => !signal.aborted), true,
-      "settled attempts must release their parent abort listeners");
+    assert.equal(posts, 1, "invalid reconciliation evidence must never authorize exact POST replay");
+    assert.equal(statusReads, 2, "final read-only reconciliation may recheck but must not mutate");
+    assert.equal(parent.listenerCount, 0);
     assert.equal(clock.timers.size, 0);
   } finally {
     restore();
+  }
+});
+
+test("unresolved, malformed, and wrong-operation request mappings remain mutation-outcome-unknown", async (t) => {
+  const requestId = "4".repeat(32);
+  const jobId = "6".repeat(48);
+  const cases = [
+    ["unresolved", (api) => ({
+      schema: api.REQUEST_STATUS_SCHEMA,
+      request_id: requestId,
+      state: "unresolved"
+    })],
+    ["malformed", (api) => ({
+      schema: api.REQUEST_STATUS_SCHEMA,
+      request_id: requestId,
+      state: "pending",
+      job_id: jobId,
+      operation: api.ACTIONS.clientEvent,
+      unexpected: true
+    })],
+    ["wrong operation", (api) => ({
+      schema: api.REQUEST_STATUS_SCHEMA,
+      request_id: requestId,
+      state: "complete",
+      job_id: jobId,
+      operation: api.ACTIONS.setDefault
+    })]
+  ];
+
+  for (const [name, statusModel] of cases) {
+    await t.test(name, async () => {
+      const clock = new FakeClock();
+      const requestSignals = [];
+      let statusReads = 0;
+      let api;
+      const restore = installBrowser((url, options) => {
+        const parsed = new URL(url, "https://nas.example.invalid");
+        assert.equal(parsed.searchParams.get("action"), "request-status");
+        assert.equal(parsed.searchParams.get("request_id"), requestId);
+        statusReads += 1;
+        requestSignals.push(options.signal);
+        return Promise.resolve(jsonResponse(statusModel(api)));
+      });
+      try {
+        api = await loadApi();
+        const parent = trackedAbortSource();
+        const pending = api.reconcileMutationRequest(
+          { signal: parent.signal },
+          requestId,
+          api.ACTIONS.clientEvent,
+          0,
+          limits(api, clock, {
+            readTimeoutMs: 3,
+            requestReconciliationTimeoutMs: 5,
+            requestReconciliationPollIntervalMs: 1
+          })
+        );
+        const rejected = assert.rejects(pending, (error) => {
+          assert.equal(error instanceof api.MutationOutcomeUnknownError, true);
+          assert.equal(error.outcomeUnknown, true);
+          assert.equal(error.acceptanceUnknown, true);
+          assert.equal(error.requestId, requestId);
+          assert.equal(error.trustedRequestId, true);
+          assert.equal(error.operation, api.ACTIONS.clientEvent);
+          assert.equal(error.stage, "request_reconciliation");
+          return true;
+        });
+
+        if (name === "unresolved") {
+          await clock.settleUntil(() => clock.hasTimerIn(5), "request reconciliation deadline");
+          await clock.advance(5);
+        }
+        await rejected;
+        if (name === "unresolved") {
+          assert.ok(statusReads >= 2, "unresolved mappings must be polled until the reconciliation deadline");
+        } else {
+          assert.equal(statusReads, 1);
+        }
+        assert.equal(requestSignals.every((signal) => signal instanceof AbortSignal), true);
+        const settledSignalStates = requestSignals.map((signal) => signal.aborted);
+        assert.equal(parent.listenerCount, 0, "failed reconciliation must release parent abort listeners");
+        assert.equal(clock.timers.size, 0, "failed reconciliation must clear deadlines and polling delays");
+        parent.abort();
+        await clock.settle();
+        assert.deepEqual(
+          requestSignals.map((signal) => signal.aborted),
+          settledSignalStates,
+          "later AppWindow cancellation must not reach settled reconciliation attempts"
+        );
+      } finally {
+        restore();
+      }
+    });
+  }
+});
+
+test("terminal results require the original client request ID", async (t) => {
+  for (const terminalId of ["missing", "mismatched"]) {
+    await t.test(terminalId, async () => {
+      const clock = new FakeClock();
+      const jobId = terminalId === "missing" ? "3".repeat(48) : "5".repeat(48);
+      const attemptSignals = [];
+      let requestId = "";
+      let resultReads = 0;
+      const restore = installBrowser((url, options) => {
+        attemptSignals.push(options.signal);
+        if (options.method === "POST") {
+          const request = JSON.parse(options.body);
+          requestId = request.request_id;
+          return Promise.resolve(jsonResponse({
+            schema: "sdsync.dsm-queued.v1",
+            ok: true,
+            state: "queued",
+            request_id: requestId,
+            job_id: jobId
+          }, 202));
+        }
+        const parsed = new URL(url, "https://nas.example.invalid");
+        assert.equal(parsed.searchParams.get("action"), "result");
+        assert.equal(parsed.searchParams.get("job_id"), jobId);
+        resultReads += 1;
+        const status = {
+          schema: "sdsync.dsm-result-status.v1",
+          ok: true,
+          state: "complete",
+          job_id: jobId,
+          result: { schema: "sdsync.dsm-result.v1", ok: true, should_not_escape: true }
+        };
+        if (terminalId === "mismatched") {
+          status.client_request_id = `${requestId[0] === "0" ? "1" : "0"}${requestId.slice(1)}`;
+        }
+        return Promise.resolve(jsonResponse(status));
+      });
+      try {
+        const api = await loadApi();
+        const parent = trackedAbortSource();
+        await assert.rejects(
+          api.apiPost(
+            { signal: parent.signal },
+            "csrf-token",
+            api.ACTIONS.clientEvent,
+            { event: "interface-settings" },
+            true,
+            0,
+            limits(api, clock)
+          ),
+          (error) => {
+            assert.equal(error instanceof api.QueuedOutcomeUnknownError, true);
+            assert.equal(error.outcomeUnknown, true);
+            assert.equal(error.accepted, true);
+            assert.equal(error.requestId, requestId);
+            assert.equal(error.jobId, jobId);
+            assert.equal(error.operation, api.ACTIONS.clientEvent);
+            assert.equal(error.stage, "result_observation");
+            assert.match(error.message, /invalid terminal result/i);
+            return true;
+          }
+        );
+        assert.equal(resultReads, 1);
+        assert.equal(attemptSignals.every((signal) => signal instanceof AbortSignal && !signal.aborted), true);
+        assert.equal(parent.listenerCount, 0);
+        assert.equal(clock.timers.size, 0);
+      } finally {
+        restore();
+      }
+    });
   }
 });
 
 test("cancellation during ambiguous dispatch backoff prevents replay and clears its timer", async () => {
   let posts = 0;
-  const restore = installBrowser(() => {
-    posts += 1;
-    return Promise.reject(new TypeError("temporary dispatch failure"));
+  const restore = installBrowser((url, options) => {
+    if (options.method === "POST") {
+      posts += 1;
+      return Promise.reject(new TypeError("temporary dispatch failure"));
+    }
+    const requestId = new URL(url, "https://nas.example.invalid").searchParams.get("request_id");
+    return Promise.resolve(jsonResponse({
+      schema: "sdsync.dsm-request-status.v1",
+      request_id: requestId,
+      state: "unresolved"
+    }));
   });
   try {
     const api = await loadApi();
@@ -519,7 +865,15 @@ test("AppWindow cancellation aborts the active dispatch attempt and prevents rep
 
 test("trusted rejection after an ambiguous dispatch remains acceptance-unknown", async () => {
   const bodies = [];
-  const restore = installBrowser((_url, options) => {
+  const restore = installBrowser((url, options) => {
+    if (options.method !== "POST") {
+      const requestId = new URL(url, "https://nas.example.invalid").searchParams.get("request_id");
+      return Promise.resolve(jsonResponse({
+        schema: "sdsync.dsm-request-status.v1",
+        request_id: requestId,
+        state: "unresolved"
+      }));
+    }
     bodies.push(options.body);
     if (bodies.length === 1) {
       return Promise.resolve({
@@ -555,6 +909,8 @@ test("trusted rejection after an ambiguous dispatch remains acceptance-unknown",
       assert.equal(error.preAcceptance, undefined);
       assert.equal(error.csrfRejected, undefined);
       assert.equal(error.requestId, JSON.parse(bodies[0]).request_id);
+      assert.equal(error.operation, api.ACTIONS.clientEvent);
+      assert.equal(error.stage, "post_ack_body_observation");
       return true;
     });
     await clock.settleUntil(() => clock.hasTimerIn(250), "rejection replay backoff");
@@ -768,9 +1124,11 @@ test("late default direct-CSRF settlement cannot suppress the next required reis
 test("bounded result polling survives more than five transient observation failures", async () => {
   const jobId = "8".repeat(48);
   let resultReads = 0;
+  let requestId = "";
   const restore = installBrowser((_url, options) => {
     if (options.method === "POST") {
       const request = JSON.parse(options.body);
+      requestId = request.request_id;
       return Promise.resolve(jsonResponse({
         schema: "sdsync.dsm-queued.v1",
         ok: true,
@@ -786,6 +1144,7 @@ test("bounded result polling survives more than five transient observation failu
       ok: true,
       state: "complete",
       job_id: jobId,
+      client_request_id: requestId,
       result: { schema: "sdsync.dsm-result.v1", ok: true, recovered: true }
     }));
   });

@@ -76,6 +76,24 @@
             <div>
               <strong>Scoped outcome needs reconciliation</strong>
               <span>{{ incidentGuidance }}</span>
+              <v-button
+                v-if="profileReconciliationIncident && hasCapability('request_reconciliation')"
+                type="border"
+                display="icon-text"
+                tooltip="Resolve this exact client request ID through the authenticated private queue; no new mutation is submitted"
+                :disabled="!canReconcileProfileIncident"
+                :aria-busy="profileReconciliationState === 'checking' ? 'true' : 'false'"
+                @click="reconcileProfileIncident"
+              ><template #icon><action-icon :class="{ 'sdsync-is-spinning': profileReconciliationState === 'checking' }" name="refresh" /></template>{{ profileReconciliationState === 'checking' ? 'Reconciling…' : 'Reconcile profile request' }}</v-button>
+              <v-button
+                v-else-if="connectionReconciliationIncident && hasCapability('request_reconciliation')"
+                type="border"
+                display="icon-text"
+                tooltip="Resolve this exact authentication or File Station request through the authenticated private queue; no new request is submitted"
+                :disabled="!canReconcileConnectionIncident"
+                :aria-busy="profileReconciliationState === 'checking' ? 'true' : 'false'"
+                @click="reconcileConnectionIncident"
+              ><template #icon><action-icon :class="{ 'sdsync-is-spinning': profileReconciliationState === 'checking' }" name="refresh" /></template>{{ profileReconciliationState === 'checking' ? 'Reconciling…' : 'Reconcile connection request' }}</v-button>
             </div>
           </div>
 
@@ -153,7 +171,7 @@
               <v-form v-else key="profile-editor" v-model="profileForm" class="sdsync-panel sdsync-editor sdsync-profile-editor" direction="vertical" @submit="saveProfile">
                 <div class="sdsync-panel-heading">
                   <div><p class="sdsync-eyebrow">Profile editor</p><h3>{{ selectedProfile ? 'Edit ' + selectedProfile : 'New profile' }}</h3></div>
-                  <v-button type="border" display="icon-text" tooltip="Close the editor and clear unsubmitted secret fields" :disabled="profileSaveState === 'saving' || profileConnectionState === 'testing'" @click="closeProfile"><template #icon><action-icon name="close" /></template>Close</v-button>
+                  <v-button type="border" display="icon-text" :tooltip="profileOutcomeUnresolved || connectionOutcomeUnresolved ? profileDraftRecoveryGuidance : 'Close the editor and clear unsubmitted secret fields'" :disabled="profileSaveState === 'saving' || profileConnectionState === 'testing' || profileReconciliationState === 'checking' || profileOutcomeUnresolved || connectionOutcomeUnresolved" @click="closeProfile"><template #icon><action-icon name="close" /></template>Close</v-button>
                 </div>
                 <div class="sdsync-form-grid">
                   <v-form-item class="sdsync-form-item" label="Name" prop="name"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-name" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.name" :readonly="Boolean(selectedProfile)" maxlength="64" placeholder="office_nas" aria-describedby="sdsync-help-profile-name" :disabled="!canChangeProfiles" /></v-form-item>
@@ -218,7 +236,7 @@
                     <v-input class="sdsync-input-control sdsync-secret-value" v-if="secretModes.totp === 'replace'" v-model="secretValues.totp" type="password" maxlength="4096" autocomplete="off" placeholder="Base32 seed or otpauth URI" aria-describedby="sdsync-help-secret-totp-value" :disabled="!canManageSecrets" /><control-help class="sdsync-secret-value-help" v-if="secretModes.totp === 'replace'" help-key="secret-totp-value" />
                   </div>
                   <div class="sdsync-connection-test span-2">
-                    <v-button type="border" display="icon-text" html-type="button" :tooltip="profileConnectionActionGuidance || 'Authenticate with this draft without storing it, then close the temporary File Station session'" :disabled="!canTestProfileAuthentication" :aria-busy="profileConnectionState === 'testing' ? 'true' : 'false'" @click="testProfileAuthentication"><template #icon><action-icon :class="{ 'sdsync-is-spinning': profileConnectionState === 'testing' }" :name="profileConnectionState === 'testing' ? 'refresh' : 'doctor'" /></template>{{ profileConnectionState === 'testing' ? 'Testing authentication…' : (profileConnectionBlocked ? 'Authentication locked' : (connectionOutcomeUnresolved ? 'Retry authentication' : 'Test authentication')) }}</v-button>
+                    <v-button type="border" display="icon-text" html-type="button" :tooltip="profileConnectionActionGuidance || 'Authenticate with this draft without storing it, then close the temporary File Station session'" :disabled="!canTestProfileAuthentication" :aria-busy="profileConnectionState === 'testing' ? 'true' : 'false'" @click="testProfileAuthentication"><template #icon><action-icon :class="{ 'sdsync-is-spinning': profileConnectionState === 'testing' }" :name="profileConnectionState === 'testing' ? 'refresh' : 'doctor'" /></template>{{ profileConnectionState === 'testing' ? 'Testing authentication…' : (profileConnectionBlocked ? 'Authentication locked' : (connectionOutcomeUnresolved ? 'Reconciliation required' : 'Test authentication')) }}</v-button>
                     <span :class="['sdsync-connection-state', 'is-' + profileConnectionState]" role="status" aria-live="polite">{{ profileConnectionMessage }}</span>
                   </div>
                   <p class="sdsync-field-note">Secret values are sent only in the protected request body. They are never returned to this window.</p>
@@ -231,7 +249,7 @@
                 <div class="sdsync-form-actions">
                   <v-button v-if="selectedProfile" suffix="red" display="icon-text" :tooltip="profileOutcomeUnresolved ? profileOutcomeGuidance : 'Remove package configuration and stored credentials, not synchronized files'" :disabled="!canRemoveProfile" @click="removeProfile"><template #icon><action-icon name="delete" /></template>Delete profile</v-button>
                   <span class="sdsync-field-note">Existing safe profile changes autosave after 1.3 seconds. Creation, secrets, and new risk approvals stay explicit.</span>
-                  <v-button suffix="cancel" display="icon-text" tooltip="Discard unsaved editor values and clear secret fields" :disabled="profileSaveState === 'saving' || profileConnectionState === 'testing'" @click="closeProfile"><template #icon><action-icon name="close" /></template>Cancel</v-button>
+                  <v-button suffix="cancel" display="icon-text" :tooltip="profileOutcomeUnresolved || connectionOutcomeUnresolved ? profileDraftRecoveryGuidance : 'Discard unsaved editor values and clear secret fields'" :disabled="profileSaveState === 'saving' || profileConnectionState === 'testing' || profileReconciliationState === 'checking' || profileOutcomeUnresolved || connectionOutcomeUnresolved" @click="closeProfile"><template #icon><action-icon name="close" /></template>Cancel</v-button>
                   <v-button suffix="main" display="icon-text" html-type="submit" :tooltip="profileOutcomeUnresolved ? profileOutcomeGuidance : 'Validate and apply configuration immediately, then process explicit secret operations'" :disabled="!canSubmitProfile" :aria-busy="profileSaveState === 'saving' ? 'true' : 'false'"><template #icon><action-icon :class="{ 'sdsync-is-spinning': profileSaveState === 'saving' }" :name="profileSaveState === 'saving' ? 'refresh' : 'save'" /></template>{{ profileSaveButtonText }}</v-button>
                 </div>
                 <p v-if="profileSaveMessage" :class="['sdsync-save-state', 'is-' + profileSaveState]" role="status" aria-live="polite">{{ profileSaveMessage }}</p>
@@ -452,6 +470,8 @@ import {
   SNAPSHOT_SCHEMA,
   apiGet,
   apiPost,
+  purgeReconciliationAuth,
+  reconcileMutationRequest,
   arrayOf,
   boundedText,
   formatBytes,
@@ -476,11 +496,13 @@ const INCIDENT_SCOPE_LABELS = Object.freeze({
 const PROFILE_SECRET_KINDS = Object.freeze(["password", "totp", "remote-log-token"]);
 const PROFILE_CONNECTION_API_LIMITS = Object.freeze({
   csrfReissueTimeoutMs: 10000,
-  postRequestTimeoutMs: 30000,
+  postRequestTimeoutMs: 45000,
   postResponseTimeoutMs: 10000,
   readTimeoutMs: 30000,
   resultRequestTimeoutMs: 15000,
-  resultObservationTimeoutMs: 120000
+  resultObservationTimeoutMs: 120000,
+  requestReconciliationTimeoutMs: 45000,
+  requestReconciliationPollIntervalMs: 1000
 });
 
 function emptyProfileFailureRecords() {
@@ -516,11 +538,25 @@ function scopeMutationOutcomeUnresolved(component, scope) {
 }
 
 function emptyIsolatedIncident() {
-  return { active: false, kind: "", outcomeUnknown: false, requiresInspection: false, message: "", requestId: "", jobId: "", subject: "", retryable: false };
+  return { active: false, kind: "", operation: "", outcomeUnknown: false, requiresInspection: false, message: "", requestId: "", jobId: "", subject: "", retryable: false };
 }
 
 function emptyScopeIncident() {
-  return { active: false, outcomeUnknown: false, requiresInspection: false, message: "", requestId: "", jobId: "", subject: "" };
+  return {
+    active: false,
+    outcomeUnknown: false,
+    requiresInspection: false,
+    message: "",
+    requestId: "",
+    jobId: "",
+    subject: "",
+    operation: "",
+    stage: "",
+    transportStage: "",
+    secretKind: "",
+    expectedConfiguration: null,
+    creatingProfile: false
+  };
 }
 
 function isolatedIncidentUnresolved(component, scope) {
@@ -570,10 +606,7 @@ function isolatedIncidentGuidance(component, scope) {
     ? [incident.subject ? `Subject: ${incident.subject}.` : "", incident.requestId ? `Client request ID: ${incident.requestId}.` : "", incident.jobId ? `Queued job ID: ${incident.jobId}.` : ""].filter(Boolean).join(" ")
     : "";
   if (scope === "connection") {
-    const retry = incident && incident.retryable === true
-      ? "A deliberate new request for the current connection draft remains available and produces fresh evidence; it does not erase this earlier correlation."
-      : "This cleanup-required evidence remains until explicit reconciliation or a fresh AppWindow session.";
-    return `${label} has unresolved evidence. ${reason} ${correlation} ${retry} Profile saves and unrelated controls and autosave remain available.`.replace(/\s+/g, " ").trim();
+    return `${label} is locked in this AppWindow. ${reason} ${correlation} Resolve the exact request before changing the preserved profile and credential draft or starting another authentication or File Station request. Unrelated controls and autosave remain available.`.replace(/\s+/g, " ").trim();
   }
   return `${label} is locked in this AppWindow. ${reason} ${correlation} Inspect Activity / Logs and current package state before another request in this scope. Profile saves and unrelated controls and autosave remain available.`.replace(/\s+/g, " ").trim();
 }
@@ -620,19 +653,27 @@ function recordIsolatedIncident(component, scope, kind, error, report = null, me
   incidents[scope] = {
     active: true,
     kind: preserve ? previous.kind : kind,
+    operation: preserve
+      ? previous.operation
+      : boundedText((error && error.operation) || details.operation, "").slice(0, 64),
     outcomeUnknown: previous.outcomeUnknown === true || outcomeUnknown,
     requiresInspection: previous.requiresInspection === true || requiresInspection,
     message: preserve ? previous.message : boundedText((report && report.message) || (error && error.message), "Operation evidence needs inspection.").slice(0, MUTATION_MESSAGE_LIMIT),
     requestId: preserve ? previous.requestId : ((report && report.requestId) || ""),
     jobId: preserve ? previous.jobId : ((report && report.jobId) || ""),
     subject: preserve ? previous.subject : boundedText(details.subject, "").slice(0, 256),
-    retryable: preserve ? previous.retryable === true : details.retryable === true
+    retryable: false
   };
   component.isolatedIncidents = incidents;
   return true;
 }
 
-function recordScopeIncident(component, scope, error, subject = "") {
+function clearIsolatedIncident(component, scope) {
+  if (!component.isolatedIncidents || typeof component.isolatedIncidents !== "object") return;
+  component.isolatedIncidents[scope] = emptyIsolatedIncident();
+}
+
+function recordScopeIncident(component, scope, error, subject = "", metadata = undefined) {
   const outcomeUnknown = Boolean(error && error.outcomeUnknown === true);
   const requiresInspection = Boolean(error && (error.requiresInspection === true || outcomeUnknown));
   if (!outcomeUnknown && !requiresInspection) return false;
@@ -641,6 +682,11 @@ function recordScopeIncident(component, scope, error, subject = "") {
   }
   const previous = component.autosaveIncidents[scope] || emptyScopeIncident();
   if (previous.active === true) return true;
+  const details = metadata && typeof metadata === "object" ? metadata : {};
+  const operation = boundedText(error && error.operation, "").slice(0, 64);
+  const transportStage = boundedText(error && error.stage, "").slice(0, 128);
+  const secretKind = PROFILE_SECRET_KINDS.includes(details.secretKind) ? details.secretKind : "";
+  const stage = secretKind ? `secret:${secretKind}` : (operation === ACTIONS.configureProfile ? "configuration" : transportStage);
   component.autosaveIncidents[scope] = {
     active: true,
     outcomeUnknown,
@@ -648,7 +694,15 @@ function recordScopeIncident(component, scope, error, subject = "") {
     message: boundedText(error && error.message, "Mutation evidence needs inspection.").slice(0, MUTATION_MESSAGE_LIMIT),
     requestId: error && error.trustedRequestId === true ? validatedClientRequestId(error.requestId) : "",
     jobId: error && error.trustedJobId === true ? validatedJobId(error.jobId) : "",
-    subject: boundedText(subject, "").slice(0, 256)
+    subject: boundedText(subject, "").slice(0, 256),
+    operation,
+    stage,
+    transportStage,
+    secretKind,
+    expectedConfiguration: details.expectedConfiguration && typeof details.expectedConfiguration === "object"
+      ? JSON.parse(JSON.stringify(details.expectedConfiguration))
+      : null,
+    creatingProfile: details.creatingProfile === true
   };
   return true;
 }
@@ -1045,7 +1099,7 @@ function partialMutationInspectionRequired(caught, fallback, appliedDetail) {
     const value = Number(caught && caught[field]);
     if (Number.isInteger(value)) failure[field] = value;
   }
-  for (const field of ["code", "stage"]) {
+  for (const field of ["code", "stage", "operation"]) {
     const value = boundedText(caught && caught[field], "").slice(0, 128);
     if (value) failure[field] = value;
   }
@@ -1065,6 +1119,52 @@ function normalizedActivityEvent(event) {
     message: boundedText(event.message, "").slice(0, ACTIVITY_MESSAGE_LIMIT),
     client_request_id: validatedClientRequestId(event.client_request_id)
   };
+}
+
+function canonicalProfileConfiguration(value, snapshot = false) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const field = (direct, ...aliases) => snapshot ? pick(value, direct, ...aliases) : value[direct];
+  const nullableText = (candidate) => {
+    const text = typeof candidate === "string" ? candidate : "";
+    return text || null;
+  };
+  return {
+    name: field("name"),
+    source: field("source"),
+    url: field("url"),
+    username: field("username"),
+    remote: field("remote", "remote_path"),
+    compare: field("compare"),
+    jobs: Number(field("jobs")),
+    allow_http: field("allow_http") === true,
+    delete: field("delete") === true,
+    max_delete: Number(field("max_delete")),
+    make_default: snapshot ? field("default", "is_default") === true : field("make_default") === true,
+    excludes: arrayOf(field("excludes")).map(String),
+    allow_empty_source: field("allow_empty_source") === true,
+    retries: Number(field("retries")),
+    timeout_seconds: Number(field("timeout_seconds", "upload_timeout_seconds", "timeout")),
+    connect_timeout_seconds: Number(field("connect_timeout_seconds", "connect_timeout")),
+    max_rate_bytes_per_second: Number(field("max_rate_bytes_per_second", "max_rate")) > 0
+      ? Number(field("max_rate_bytes_per_second", "max_rate"))
+      : null,
+    ca_certificate: nullableText(field("ca_certificate")),
+    danger_accept_invalid_certs: field("danger_accept_invalid_certs", "danger_invalid_certs") === true,
+    verbosity: Number(field("verbosity")),
+    quiet: field("quiet") === true,
+    log_level: field("log_level"),
+    log_format: field("log_format"),
+    progress: field("progress"),
+    output: field("output"),
+    remote_log_url: nullableText(field("remote_log_url")),
+    remote_log_mode: field("remote_log_mode")
+  };
+}
+
+function profileSnapshotMatchesExpected(profile, expected) {
+  const observed = canonicalProfileConfiguration(profile, true);
+  const submitted = canonicalProfileConfiguration(expected, false);
+  return Boolean(observed && submitted && JSON.stringify(observed) === JSON.stringify(submitted));
 }
 
 function options(entries) {
@@ -1100,7 +1200,7 @@ export default {
       secretModes: { password: "keep", totp: "keep", remote_log_token: "keep" },
       secretValues: { password: "", totp: "", remote_log_token: "" },
       profileConnectionState: "idle", profileConnectionMessage: "Test authentication to unlock the File Station browser.", connectionProof: "", connectionProofExpires: 0, connectionProofTimer: 0, profileConnectionRequest: 0, profileConnectionAutosaveHeld: false,
-      profileSaveState: "idle", profileSaveMessage: "", pathBrowser: emptyPathBrowser(),
+      profileSaveState: "idle", profileSaveMessage: "", profileReconciliationState: "idle", pathBrowser: emptyPathBrowser(),
       routineEditorOpen: false, routineForm: emptyRoutine(), doctorForm: { scope: "all", write_test: false, write_confirm: false },
       alertForm: { enabled: false, on_success: false, on_failure: true, failure_threshold: 1, cooldown_seconds: 3600 },
       notificationTabs: [
@@ -1167,6 +1267,7 @@ export default {
     securityOutcomeGuidance() { return scopeMutationGuidance(this, "security"); },
     interfaceOutcomeGuidance() { return scopeMutationGuidance(this, "interface"); },
     connectionOutcomeGuidance() { return isolatedIncidentGuidance(this, "connection"); },
+    profileDraftRecoveryGuidance() { return this.profileOutcomeUnresolved ? this.profileOutcomeGuidance : this.connectionOutcomeGuidance; },
     operationOutcomeGuidance() { return isolatedIncidentGuidance(this, "operations"); },
     profileConnectionBlocked() { return this.profileOutcomeUnresolved; },
     profileConnectionBlockedGuidance() { return this.profileOutcomeGuidance; },
@@ -1175,13 +1276,44 @@ export default {
     routineMutationGuidance() { return this.profileOutcomeUnresolved ? this.profileOutcomeGuidance : this.routineOutcomeGuidance; },
     operationMutationGuidance() { return this.profileOutcomeUnresolved ? this.profileOutcomeGuidance : (this.operationOutcomeUnresolved ? this.operationOutcomeGuidance : ""); },
     connectionIncidentEvidence() { const incident = this.isolatedIncidents && this.isolatedIncidents.connection; return boundedText(incident && incident.message, ""); },
-    profileRecoveryActive() { return this.profileEditorOpen === true && this.profileOutcomeUnresolved && this.profileSaveState !== "saving" && this.profileConnectionState !== "testing"; },
+    profileRecoveryActive() { return this.profileEditorOpen === true && (this.profileOutcomeUnresolved || this.connectionOutcomeUnresolved) && this.profileSaveState !== "saving" && this.profileConnectionState !== "testing"; },
+    profileReconciliationIncident() {
+      const incident = this.autosaveIncidents && this.autosaveIncidents.profile;
+      if (!incident || incident.active !== true || !validatedClientRequestId(incident.requestId)) return null;
+      if (![ACTIONS.configureProfile, ACTIONS.setSecret].includes(incident.operation)) return null;
+      if (incident.operation === ACTIONS.configureProfile
+        && (!incident.expectedConfiguration || typeof incident.expectedConfiguration !== "object")) return null;
+      if (incident.operation === ACTIONS.setSecret && !PROFILE_SECRET_KINDS.includes(incident.secretKind)) return null;
+      return incident;
+    },
+    connectionReconciliationIncident() {
+      const incident = this.isolatedIncidents && this.isolatedIncidents.connection;
+      if (!incident || incident.active !== true || !validatedClientRequestId(incident.requestId)) return null;
+      if (![ACTIONS.testProfileAuth, ACTIONS.browseRemote].includes(incident.operation)) return null;
+      return incident;
+    },
+    canReconcileProfileIncident() {
+      return Boolean(
+        this.profileReconciliationIncident
+        && this.hasCapability("request_reconciliation")
+        && !this.operationBusy
+        && this.profileReconciliationState !== "checking"
+      );
+    },
+    canReconcileConnectionIncident() {
+      return Boolean(
+        this.connectionReconciliationIncident
+        && this.hasCapability("request_reconciliation")
+        && !this.operationBusy
+        && this.profileReconciliationState !== "checking"
+      );
+    },
     snapshotRefreshBlocked() { return this.profileSaveState === "saving" || this.profileConnectionState === "testing" || (this.profileEditorOpen === true && !this.profileRecoveryActive); },
     snapshotRefreshTooltip() { return this.snapshotRefreshBlocked ? "Close the profile editor before refreshing package status" : (this.profileRecoveryActive ? "Read fresh package evidence without overwriting the preserved profile or secret draft" : "Refresh current data"); },
     canChangeInterface() { return this.canMutate && !this.operationBusy && this.securityPolicy.allow_interface_changes !== false; },
-    canChangeProfiles() { return this.canMutate && !this.operationBusy && this.securityPolicy.allow_profile_changes !== false; },
-    canManageSecrets() { return this.canMutate && !this.operationBusy && this.capabilities.secrets === true && this.securityPolicy.allow_secret_changes !== false; },
-    canTestProfileAuthentication() { return this.profileEditorOpen && this.canMutate && !this.operationBusy && !this.profileOutcomeUnresolved && this.capabilities.profile_connection_test === true && this.securityPolicy.allow_operational_actions !== false && this.profileConnectionState !== "testing" && this.profileSaveState !== "saving"; },
+    canChangeProfiles() { return this.canMutate && !this.operationBusy && !this.profileOutcomeUnresolved && !this.connectionOutcomeUnresolved && this.securityPolicy.allow_profile_changes !== false; },
+    canManageSecrets() { return this.canMutate && !this.operationBusy && !this.profileOutcomeUnresolved && !this.connectionOutcomeUnresolved && this.capabilities.secrets === true && this.securityPolicy.allow_secret_changes !== false; },
+    canTestProfileAuthentication() { return this.profileEditorOpen && this.canMutate && !this.operationBusy && !this.profileOutcomeUnresolved && !this.connectionOutcomeUnresolved && this.capabilities.profile_connection_test === true && this.securityPolicy.allow_operational_actions !== false && this.profileConnectionState !== "testing" && this.profileSaveState !== "saving"; },
     connectionTestReady() { return this.profileConnectionState === "success" && Boolean(this.connectionProof) && this.connectionProofExpires > 0; },
     canSubmitProfile() { return this.profileEditorOpen && this.canChangeProfiles && !this.profileOutcomeUnresolved && this.profileSaveState !== "saving" && this.profileConnectionState !== "testing" && !(this.pathBrowser.visible && this.pathBrowser.kind === "remote" && this.pathBrowser.loading); },
     canSubmitProfileSecrets() { return Boolean(this.selectedProfile) && this.canManageSecrets && this.hasPendingSecretOperations && !this.profileOutcomeUnresolved && this.profileSaveState !== "saving" && this.profileConnectionState !== "testing" && !(this.pathBrowser.visible && this.pathBrowser.kind === "remote" && this.pathBrowser.loading); },
@@ -1199,6 +1331,12 @@ export default {
         return {
           title: "Testing profile authentication",
           message: boundedText(this.profileConnectionMessage, "Discovering File Station and testing this connection draft…")
+        };
+      }
+      if (this.profileReconciliationState === "checking") {
+        return {
+          title: "Reconciling profile request",
+          message: boundedText(this.profileSaveMessage, "Resolving the preserved request against the authenticated package queue…")
         };
       }
       if (this.profileSaveState === "saving" && !this.selectedProfile) {
@@ -1324,7 +1462,13 @@ export default {
     this.visibilityHandler = () => {
       if (document.hidden) {
         this.stopTimers();
-        this.clearSecrets();
+        const protectedProfileDraft = this.profileEditorOpen === true
+          && (this.profileSaveState === "saving"
+            || this.profileConnectionState === "testing"
+            || this.profileReconciliationState === "checking"
+            || this.profileOutcomeUnresolved
+            || this.connectionOutcomeUnresolved);
+        if (!protectedProfileDraft) this.clearSecrets();
         if (this.autosaveCoordinator) this.autosaveCoordinator.setGlobalBusy(true);
       } else {
         if (this.autosaveCoordinator) this.autosaveCoordinator.setGlobalBusy(this.operationBusy);
@@ -1351,6 +1495,7 @@ export default {
   },
   beforeDestroy() {
     this.disposed = true;
+    purgeReconciliationAuth(this.auth);
     if (this.autosaveCoordinator) this.autosaveCoordinator.dispose();
     if (this.abortController) this.abortController.abort();
     this.stopTimers();
@@ -1605,7 +1750,12 @@ export default {
         this.refreshAutosaveStatus("Profile autosave held for the active connection request");
         return;
       }
-      this.pauseAutosave(task.scope, error);
+      this.pauseAutosave(
+        task.scope,
+        error,
+        "",
+        task.scope === "profile" ? { expectedConfiguration: task.value, creatingProfile: false } : undefined
+      );
     },
     hydrateAutosave(scope, payload, authoritative = true) {
       if (!this.autosaveCoordinator || !payload) return;
@@ -1738,12 +1888,15 @@ export default {
       }
       return this.syncProfileFailureState(refreshStatus);
     },
-    pauseAutosave(scope, error = null, profileSecretKind = "") {
+    pauseAutosave(scope, error = null, profileSecretKind = "", metadata = undefined) {
       this.cancelAutosave(scope, false);
       const subject = scope === "profile"
         ? boundedText(this.selectedProfile || (this.profileForm && this.profileForm.name), "")
         : (scope === "routine" ? boundedText(this.routineForm && this.routineForm.profile, "") : INCIDENT_SCOPE_LABELS[scope]);
-      recordScopeIncident(this, scope, error, subject);
+      const incidentMetadata = Object.assign({}, metadata && typeof metadata === "object" ? metadata : {}, {
+        secretKind: profileSecretKind
+      });
+      recordScopeIncident(this, scope, error, subject, incidentMetadata);
       if (scope === "profile") {
         this.recordProfileFailure(profileSecretKind, error);
         return;
@@ -1949,6 +2102,271 @@ export default {
           : withCorrelation(observed, fallback);
       this.toast(unknown || inspection ? unknownTitle : failedTitle, message, !unknown && !inspection);
       return { unknown, inspection, message, requestId, jobId };
+    },
+    async reconcileProfileIncident(event) {
+      if (event && event.preventDefault) event.preventDefault();
+      const incident = this.profileReconciliationIncident;
+      if (!incident || !this.canReconcileProfileIncident) return;
+      const requestId = incident.requestId;
+      const operation = incident.operation;
+      this.operationBusy = true;
+      this.profileReconciliationState = "checking";
+      this.profileSaveMessage = `Resolving client request ${requestId} against the authenticated private queue…`;
+      this.toast(
+        "Profile reconciliation started",
+        "Looking up the exact preserved request ID. This read-only recovery does not submit or replay profile configuration or credentials."
+      );
+      try {
+        const recovered = await reconcileMutationRequest(
+          this.auth,
+          requestId,
+          operation,
+          undefined,
+          AUTOSAVE_API_LIMITS
+        );
+        if (this.disposed || this.profileReconciliationIncident !== incident) return;
+        if (!recovered
+          || recovered.schema !== "sdsync.dsm-reconciled-result.v1"
+          || recovered.request_id !== requestId
+          || recovered.operation !== operation
+          || !validatedJobId(recovered.job_id)
+          || (validatedJobId(incident.jobId) && recovered.job_id !== incident.jobId)
+          || !recovered.result
+          || recovered.result.ok !== true) {
+          throw new QueuedOutcomeUnknownError(
+            recovered && recovered.job_id,
+            "DSM returned an invalid reconciled profile result. The preserved request remains locked.",
+            requestId,
+            operation,
+            "request_reconciliation"
+          );
+        }
+
+        this.profileSaveMessage = "The request completed. Verifying current package state without replacing the open draft…";
+        const refreshed = await this.refreshSnapshot(false, true);
+        if (this.disposed || this.profileReconciliationIncident !== incident) return;
+        const observedProfile = this.profiles.find((profile) => String(profile.name) === String(incident.subject));
+        if (refreshed !== true || !observedProfile) {
+          throw new QueuedOutcomeUnknownError(
+            recovered.job_id,
+            "The request completed, but its profile cannot yet be verified in a fresh package snapshot. The draft remains locked.",
+            requestId,
+            operation,
+            "snapshot_reconciliation"
+          );
+        }
+        if (incident.expectedConfiguration
+          && !profileSnapshotMatchesExpected(observedProfile, incident.expectedConfiguration)) {
+          throw new QueuedOutcomeUnknownError(
+            recovered.job_id,
+            "The request completed, but the current package profile does not exactly match the submitted non-secret configuration. The draft remains locked.",
+            requestId,
+            operation,
+            "snapshot_reconciliation"
+          );
+        }
+
+        if (!this.selectedProfile) this.selectedProfile = String(incident.subject);
+        if (incident.expectedConfiguration) {
+          this.hydrateAutosave("profile", incident.expectedConfiguration, false);
+        }
+        if (operation === ACTIONS.configureProfile) {
+          this.clearProfileConfigurationFailure(false);
+          this.profileSaveState = "success";
+          this.profileSaveMessage = "Profile configuration reconciled. Protected credential drafts were not submitted; review and save them explicitly.";
+          this.toast(
+            "Profile configuration reconciled",
+            "DSM confirmed the exact queued request and the fresh snapshot matches. Protected credential drafts remain untouched."
+          );
+        } else {
+          if (!this.applyTrustedSecretPresence(recovered.result)) {
+            throw new QueuedOutcomeUnknownError(
+              recovered.job_id,
+              "DSM completed the secret request, but returned no trustworthy secret-presence result. The draft remains locked.",
+              requestId,
+              operation,
+              "request_reconciliation"
+            );
+          }
+          const field = incident.secretKind === "remote-log-token" ? "remote_log_token" : incident.secretKind;
+          if (this.secretModes && Object.prototype.hasOwnProperty.call(this.secretModes, field)) this.secretModes[field] = "keep";
+          if (this.secretValues && Object.prototype.hasOwnProperty.call(this.secretValues, field)) this.secretValues[field] = "";
+          this.clearProfileSecretFailures([incident.secretKind], false);
+          this.profileSaveState = "success";
+          this.profileSaveMessage = `Protected ${incident.secretKind} operation reconciled. Other credential drafts remain untouched.`;
+          this.toast(
+            "Protected credential reconciled",
+            `DSM confirmed only the ${incident.secretKind} operation. Other credential drafts were not submitted or cleared.`
+          );
+        }
+        this.syncProfileFailureState();
+      } catch (caught) {
+        if (this.disposed || this.profileReconciliationIncident !== incident) return;
+        const knownTerminalFailure = Boolean(
+          caught
+          && caught.accepted === true
+          && caught.outcomeUnknown !== true
+          && caught.trustedJobId === true
+          && validatedJobId(caught.jobId)
+          && (!validatedJobId(incident.jobId) || caught.jobId === incident.jobId)
+          && caught.trustedRequestId === true
+          && caught.requestId === requestId
+          && caught.operation === operation
+        );
+        if (knownTerminalFailure) {
+          const refreshed = await this.refreshSnapshot(false, true);
+          if (this.disposed || this.profileReconciliationIncident !== incident) return;
+          const observedProfile = this.profiles.find((profile) => String(profile.name) === String(incident.subject));
+          if (incident.expectedConfiguration
+            && refreshed === true
+            && observedProfile
+            && profileSnapshotMatchesExpected(observedProfile, incident.expectedConfiguration)) {
+            this.hydrateAutosave("profile", incident.expectedConfiguration, false);
+          }
+          if (operation === ACTIONS.configureProfile) this.clearProfileConfigurationFailure(false);
+          else this.clearProfileSecretFailures([incident.secretKind], false);
+          this.profileSaveState = "error";
+          this.profileSaveMessage = boundedText(caught.message, "DSM rejected the preserved request. Correct the draft and try again.");
+          this.toast(
+            "Profile request reconciled as failed",
+            `${this.profileSaveMessage} No new mutation was submitted; the settled stage is unlocked for correction.`,
+            true
+          );
+          this.syncProfileFailureState();
+          return;
+        }
+        this.profileSaveState = "error";
+        const report = this.reportMutationError(
+          caught,
+          "Profile reconciliation failed",
+          "Profile reconciliation still unresolved",
+          "The exact request could not be reconciled.",
+          {
+            unknownGuidance: "No new mutation was submitted. Keep the draft open and try reconciliation again after checking Activity / Logs.",
+            inspectionGuidance: "No new mutation was submitted. Keep the draft open and verify current profile state before another save."
+          }
+        );
+        this.profileSaveMessage = report.message;
+      } finally {
+        if (!this.disposed) {
+          this.profileReconciliationState = "idle";
+          this.operationBusy = false;
+        }
+      }
+    },
+    async reconcileConnectionIncident(event) {
+      if (event && event.preventDefault) event.preventDefault();
+      const incident = this.connectionReconciliationIncident;
+      if (!incident || !this.canReconcileConnectionIncident) return;
+      const requestId = incident.requestId;
+      const operation = incident.operation;
+      this.operationBusy = true;
+      this.profileReconciliationState = "checking";
+      this.profileConnectionMessage = `Resolving client request ${requestId} against the authenticated private queue…`;
+      this.toast(
+        "Connection reconciliation started",
+        "Looking up the exact preserved request ID. This read-only recovery does not start another File Station session."
+      );
+      try {
+        const recovered = await reconcileMutationRequest(
+          this.auth,
+          requestId,
+          operation,
+          undefined,
+          PROFILE_CONNECTION_API_LIMITS
+        );
+        if (this.disposed || this.connectionReconciliationIncident !== incident) return;
+        if (!recovered
+          || recovered.schema !== "sdsync.dsm-reconciled-result.v1"
+          || recovered.request_id !== requestId
+          || recovered.operation !== operation
+          || !validatedJobId(recovered.job_id)
+          || (validatedJobId(incident.jobId) && recovered.job_id !== incident.jobId)
+          || !recovered.result
+          || recovered.result.ok !== true) {
+          throw new QueuedOutcomeUnknownError(
+            recovered && recovered.job_id,
+            "DSM returned an invalid reconciled connection result. The preserved request remains locked.",
+            requestId,
+            operation,
+            "request_reconciliation"
+          );
+        }
+        if (operation === ACTIONS.testProfileAuth) {
+          const proof = boundedText(recovered.result.connection_proof, "");
+          const expires = Number(recovered.result.connection_proof_expires_at_epoch);
+          const proofExpires = Number(proof.split(".")[1]);
+          if (!/^v1\.[0-9]+\.[0-9a-f]{64}\.[0-9a-f]{64}$/.test(proof)
+            || !Number.isSafeInteger(expires)
+            || !Number.isSafeInteger(proofExpires)
+            || proofExpires !== expires) {
+            throw new QueuedOutcomeUnknownError(
+              recovered.job_id,
+              "The reconciled authentication result is invalid. The preserved request remains locked.",
+              requestId,
+              operation,
+              "request_reconciliation"
+            );
+          }
+          this.connectionProof = "";
+          this.connectionProofExpires = 0;
+          this.clearConnectionProofTimer();
+          this.profileConnectionState = "idle";
+          this.profileConnectionMessage = "The previous authentication request succeeded and settled safely. Test the current draft once more to unlock File Station browsing.";
+        } else {
+          this.profileConnectionState = "idle";
+          this.profileConnectionMessage = "The previous File Station browse request settled. You may browse again.";
+          if (this.pathBrowser && this.pathBrowser.visible && this.pathBrowser.kind === "remote") this.pathBrowser.error = "";
+        }
+        clearIsolatedIncident(this, "connection");
+        this.toast(
+          operation === ACTIONS.testProfileAuth ? "Authentication reconciled" : "File Station request reconciled",
+          operation === ACTIONS.testProfileAuth
+            ? "DSM confirmed the exact queued authentication request and its temporary session cleanup. Test the current draft again before browsing."
+            : "DSM confirmed the exact queued browse request. No new File Station request was submitted."
+        );
+      } catch (caught) {
+        if (this.disposed || this.connectionReconciliationIncident !== incident) return;
+        const knownTerminalFailure = Boolean(
+          caught
+          && caught.accepted === true
+          && caught.outcomeUnknown !== true
+          && caught.trustedJobId === true
+          && validatedJobId(caught.jobId)
+          && (!validatedJobId(incident.jobId) || caught.jobId === incident.jobId)
+          && caught.trustedRequestId === true
+          && caught.requestId === requestId
+          && caught.operation === operation
+        );
+        if (knownTerminalFailure) {
+          clearIsolatedIncident(this, "connection");
+          this.profileConnectionState = "error";
+          this.profileConnectionMessage = boundedText(caught.message, "DSM rejected the preserved connection request. Correct the draft and try again.");
+          this.toast(
+            "Connection request reconciled as failed",
+            `${this.profileConnectionMessage} No new request was submitted; another authentication or File Station request is now permitted.`,
+            true
+          );
+          return;
+        }
+        this.profileConnectionState = "error";
+        const report = this.reportMutationError(
+          caught,
+          "Connection reconciliation failed",
+          "Connection reconciliation still unresolved",
+          "The exact request could not be reconciled.",
+          {
+            unknownGuidance: "No new request was submitted. Keep the draft open and try reconciliation again after checking Activity / Logs.",
+            inspectionGuidance: "No new request was submitted. Keep the draft open until the exact request can be reconciled."
+          }
+        );
+        this.profileConnectionMessage = report.message;
+      } finally {
+        if (!this.disposed) {
+          this.profileReconciliationState = "idle";
+          this.operationBusy = false;
+        }
+      }
     },
     hasCapability(name) { return this.capabilities[name] === true; },
     integer(value, fallback) { const parsed = Number(value); return Number.isInteger(parsed) ? parsed : fallback; },
@@ -2210,6 +2628,7 @@ export default {
     async testProfileAuthentication(event) {
       if (event && event.preventDefault) event.preventDefault();
       if (scopeMutationOutcomeUnresolved(this, "profile")) return this.toast("Authentication test locked", scopeMutationGuidance(this, "profile"), true);
+      if (isolatedIncidentUnresolved(this, "connection")) return this.toast("Authentication test locked", isolatedIncidentGuidance(this, "connection"), true);
       if (!this.canTestProfileAuthentication) return this.toast("Authentication test unavailable", "Wait for the current profile operation to finish and confirm that operational actions are permitted.", true);
       const payload = this.connectionRequestPayload();
       if (payload.error) return this.toast("Authentication not tested", payload.error, true);
@@ -2252,10 +2671,7 @@ export default {
         if (this.disposed || request !== this.profileConnectionRequest || !this.profileEditorOpen) return;
         this.profileConnectionState = "error";
         const uncertain = Boolean(error && (error.outcomeUnknown === true || error.requiresInspection === true));
-        const retryable = Boolean(error && error.outcomeUnknown === true && error.requiresInspection !== true);
-        const retryGuidance = retryable
-          ? "Keep this evidence while inspecting Activity / Logs. A deliberate new authentication test for the current draft remains available and produces fresh evidence without erasing this correlation; profile saves and unrelated autosave remain available."
-          : "Keep this cleanup evidence while inspecting Activity / Logs. It remains until explicit reconciliation or a fresh AppWindow session; profile saves and unrelated autosave remain available.";
+        const retryGuidance = "Keep this evidence while inspecting Activity / Logs. Resolve the exact client request before changing this preserved draft or starting another authentication or File Station request; unrelated autosave remains available.";
         const report = this.reportMutationError(
           error,
           "Authentication failed",
@@ -2265,7 +2681,7 @@ export default {
         );
         recordIsolatedIncident(this, "connection", "Authentication test", error, report, {
           subject: `${this.selectedProfile || "New profile"} · ${this.profileForm.url}`,
-          retryable
+          operation: ACTIONS.testProfileAuth
         });
         this.profileConnectionMessage = report.message;
       } finally {
@@ -2284,6 +2700,7 @@ export default {
     openRemotePathBrowser(event) {
       if (event && event.preventDefault) event.preventDefault();
       if (scopeMutationOutcomeUnresolved(this, "profile")) return this.toast("File Station browse locked", scopeMutationGuidance(this, "profile"), true);
+      if (isolatedIncidentUnresolved(this, "connection")) return this.toast("File Station browse locked", isolatedIncidentGuidance(this, "connection"), true);
       if (this.connectionProofExpires <= Math.floor(Date.now() / 1000)) this.invalidateConnectionTest();
       if (!this.connectionTestReady) return this.toast("Test authentication first", "The File Station browser unlocks only after this exact connection and credential draft authenticates successfully.", true);
       const initial = this.profileForm.remote && this.profileForm.remote.startsWith("/") ? this.profileForm.remote : "/";
@@ -2336,6 +2753,10 @@ export default {
       if (kind === "remote" && this.connectionProofExpires <= Math.floor(Date.now() / 1000)) {
         this.invalidateConnectionTest();
         return this.toast("Authentication expired", "Test authentication again before browsing File Station.", true);
+      }
+      if (kind === "remote" && isolatedIncidentUnresolved(this, "connection")) {
+        this.pathBrowser.error = isolatedIncidentGuidance(this, "connection");
+        return;
       }
       if (kind === "remote" && !this.connectionTestReady) {
         this.closePathBrowser();
@@ -2397,10 +2818,7 @@ export default {
         if (kind === "remote") {
           const uncertain = Boolean(error && (error.outcomeUnknown === true || error.requiresInspection === true));
           if (!presentationCurrent && !uncertain) return;
-          const retryable = Boolean(error && error.outcomeUnknown === true && error.requiresInspection !== true);
-          const retryGuidance = retryable
-            ? "Keep this evidence while inspecting Activity / Logs. A deliberate new browse request remains available and produces fresh evidence without erasing this correlation; profile saves and unrelated autosave remain available."
-            : "Keep this cleanup evidence while inspecting Activity / Logs. It remains until explicit reconciliation or a fresh AppWindow session; profile saves and unrelated autosave remain available.";
+          const retryGuidance = "Keep this evidence while inspecting Activity / Logs. Resolve the exact client request before changing this preserved draft or starting another authentication or File Station request; unrelated autosave remains available.";
           const report = this.reportMutationError(
             error,
             "File Station browse failed",
@@ -2410,7 +2828,7 @@ export default {
           );
           recordIsolatedIncident(this, "connection", "File Station browse", error, report, {
             subject: remoteIncidentSubject,
-            retryable
+            operation: ACTIONS.browseRemote
           });
           if (presentationCurrent) this.pathBrowser.error = report.message;
         } else {
@@ -2490,6 +2908,7 @@ export default {
       this.clearConnectionProofTimer();
       this.profileSaveState = "idle";
       this.profileSaveMessage = "";
+      this.profileReconciliationState = "idle";
       this.closePathBrowser();
       this.profileEditorOpen = true;
       this.freshness = "Profile draft active · status refresh paused";
@@ -2497,7 +2916,11 @@ export default {
       if (this.autosaveCoordinator) this.autosaveCoordinator.setScopeBlocked("profile", !profile);
     },
     closeProfile(options = undefined) {
-      if (this.profileSaveState === "saving" || this.profileConnectionState === "testing") return;
+      if (this.profileSaveState === "saving"
+        || this.profileConnectionState === "testing"
+        || this.profileReconciliationState === "checking"
+        || this.profileOutcomeUnresolved
+        || this.connectionOutcomeUnresolved) return;
       this.cancelAutosave("profile");
       this.snapshotGeneration += 1;
       this.profileConnectionRequest += 1;
@@ -2511,6 +2934,7 @@ export default {
       this.clearConnectionProofTimer();
       this.profileSaveState = "idle";
       this.profileSaveMessage = "";
+      this.profileReconciliationState = "idle";
       this.profileEditorOpen = false;
       this.selectedProfile = "";
       if (options && options.refresh === false) return;
@@ -2667,7 +3091,10 @@ export default {
         const reportedError = partiallyApplied
           ? partialMutationInspectionRequired(caught, "A later profile stage failed.", "Earlier profile stages were applied.")
           : caught;
-        this.pauseAutosave("profile", reportedError, activeSecretKind);
+        this.pauseAutosave("profile", reportedError, activeSecretKind, {
+          expectedConfiguration: payload,
+          creatingProfile
+        });
         this.reportMutationError(
           reportedError,
           partiallyApplied ? "Profile partially applied" : "Profile not saved",

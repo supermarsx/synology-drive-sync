@@ -45,6 +45,56 @@ class DsmUiContractTests(unittest.TestCase):
             self.assertFalse(UI.joinpath(legacy).exists())
         self.assertFalse((UI / "index.html").exists())
 
+    def test_reconciliation_identity_capability_docs_and_bundle_contract(self) -> None:
+        repository = HERE.parents[1]
+        backend = (repository / "src/dsm_api.rs").read_text(encoding="utf-8")
+        app = (UI_SOURCE / "src/App.vue").read_text(encoding="utf-8")
+        bundle = (UI_SOURCE / "dist/SynologyDriveSync.js").read_text(encoding="utf-8")
+        profiles = " ".join(
+            (repository / "docs/dsm/profiles.md").read_text(encoding="utf-8").split()
+        )
+        troubleshooting = " ".join(
+            (repository / "docs/dsm/troubleshooting.md").read_text(encoding="utf-8").split()
+        )
+
+        binding_start = backend.index("fn dsm_session_cookie_id(cookie: &str)")
+        binding_end = backend.index("\nfn audit_transaction_id(", binding_start)
+        binding = backend[binding_start:binding_end]
+        for marker in (
+            'if name != "id" || session_id.is_some() || !valid_cookie_octets(value)',
+            "let session_id = dsm_session_cookie_id(cookie)?;",
+            'digest.update(b"sdsync-dsm-session-v2\\0");',
+            "update_length_prefixed(&mut digest, session_id.as_bytes());",
+        ):
+            self.assertIn(marker, binding)
+        self.assertNotIn("cookie.as_bytes()", binding)
+        self.assertIn("fn session_binding_uses_only_one_exact_dsm_id_cookie()", backend)
+        self.assertIn('"request_reconciliation": true,', backend)
+        self.assertIn('this.hasCapability("request_reconciliation")', app)
+
+        for marker in (
+            "same authenticated DSM `id` session",
+            "Close and Cancel are disabled",
+            "Reconcile connection request",
+            "exactly correlated terminal failure",
+        ):
+            self.assertIn(marker, profiles)
+        for marker in (
+            "unique DSM `id` cookie",
+            "mutable ancillary QuickConnect cookies are ignored",
+            "exact request/job/operation ownership",
+            "Close and Cancel are intentionally disabled",
+        ):
+            self.assertIn(marker, troubleshooting)
+        for marker in (
+            "sdsync.dsm-request-status.v1",
+            "request_reconciliation",
+            "Reconcile profile request",
+            "Reconcile connection request",
+            "The preserved request remains locked.",
+        ):
+            self.assertIn(marker, bundle)
+
     def test_dsm_launcher_and_cgi_route_use_documented_independent_contracts(self) -> None:
         info = validate_spk.parse_info((HERE / "INFO.template").read_bytes())
         self.assertEqual(info["dsmuidir"], f"{info['package']}:ui")
@@ -617,6 +667,26 @@ global.fetch = async function (url, options) {
   const pendingDelay = delay(60000, cancellation.signal);
   cancellation.abort();
   await assert.rejects(pendingDelay, /DSM UI request was cancelled/);
+
+  const retainedAuth = {};
+  const otherAuth = {};
+  const retainedRequestId = "c".repeat(32);
+  rememberReconciliationAuth(retainedAuth, retainedRequestId, {
+    token: "ephemeral-reconciliation-token",
+    generation: 7
+  });
+  const retainedEntries = reconciliationAuthByOwner.get(retainedAuth);
+  const retainedRecord = retainedEntries.get(retainedRequestId);
+  assert.deepEqual(rememberedReconciliationAuth(retainedAuth, retainedRequestId), {
+    token: "ephemeral-reconciliation-token",
+    generation: 7
+  });
+  assert.equal(rememberedReconciliationAuth(otherAuth, retainedRequestId), null);
+  purgeReconciliationAuth(retainedAuth);
+  assert.equal(retainedRecord.token, "");
+  assert.equal(reconciliationAuthByOwner.has(retainedAuth), false);
+  assert.equal(rememberedReconciliationAuth(retainedAuth, retainedRequestId), null);
+  purgeReconciliationAuth(retainedAuth);
 })().catch(function (error) {
   process.stderr.write(String(error && error.stack ? error.stack : error));
   process.exitCode = 1;
@@ -648,6 +718,7 @@ global.fetch = async function (url, options) {
                 executable_source,
                 r'''
 const jobId = "a".repeat(48);
+const clientRequestId = "02".repeat(16);
 const pending = () => ({
   schema: RESULT_STATUS_SCHEMA,
   job_id: jobId,
@@ -656,6 +727,7 @@ const pending = () => ({
 const complete = (result) => ({
   schema: RESULT_STATUS_SCHEMA,
   job_id: jobId,
+  client_request_id: clientRequestId,
   state: "complete",
   result: result
 });
@@ -948,6 +1020,102 @@ function bind(context, names) {
   assert.equal(routeContext.profileEditorOpen, false);
   assert.equal(routeContext.selectedProfile, "");
   assert.equal(routeContext.closePathBrowserCalls, 1);
+
+  function unresolvedDraftContext(profileOutcome, connectionOutcome) {
+    const context = {
+      routes: [{ id: "profiles" }, { id: "activity" }],
+      route: "profiles",
+      logTimer: 0,
+      snapshotGeneration: 4,
+      profileConnectionRequest: 9,
+      profileSaveState: "error",
+      profileConnectionState: "error",
+      profileReconciliationState: "idle",
+      profileOutcomeUnresolved: profileOutcome,
+      connectionOutcomeUnresolved: connectionOutcome,
+      profileRecoveryActive: true,
+      profileEditorOpen: true,
+      selectedProfile: "preserved",
+      profileForm: { name: "preserved", source: "/volume1/preserved" },
+      autosaveCoordinator: null,
+      secretModes: {
+        password: "replace", totp: "replace", remote_log_token: "replace"
+      },
+      secretValues: {
+        password: "draft-password", totp: "draft-totp", remote_log_token: "draft-token"
+      },
+      closePathBrowserCalls: 0,
+      cancelAutosaveCalls: 0,
+      refreshLogsCalls: 0,
+      refreshSnapshotCalls: 0,
+      closePathBrowser: function () { this.closePathBrowserCalls += 1; },
+      clearConnectionProofTimer: function () {},
+      cancelAutosave: function () { this.cancelAutosaveCalls += 1; },
+      refreshLogs: function () { this.refreshLogsCalls += 1; },
+      refreshSnapshot: async function () { this.refreshSnapshotCalls += 1; return true; },
+      toast: function () {}
+    };
+    bind(context, ["clearSecrets", "closeProfile"]);
+    return context;
+  }
+
+  for (const preserved of [
+    unresolvedDraftContext(true, false),
+    unresolvedDraftContext(false, true)
+  ]) {
+    methods.closeProfile.call(preserved);
+    assert.equal(preserved.profileEditorOpen, true);
+    assert.equal(preserved.selectedProfile, "preserved");
+    assert.deepEqual(preserved.profileForm, {
+      name: "preserved", source: "/volume1/preserved"
+    });
+    assert.deepEqual(preserved.secretValues, {
+      password: "draft-password", totp: "draft-totp", remote_log_token: "draft-token"
+    });
+    assert.equal(preserved.cancelAutosaveCalls, 0);
+    assert.equal(preserved.closePathBrowserCalls, 0);
+
+    methods.navigate.call(preserved, "activity");
+    assert.equal(preserved.route, "activity");
+    assert.equal(preserved.profileEditorOpen, true);
+    assert.equal(preserved.refreshLogsCalls, 1);
+    assert.equal(preserved.refreshSnapshotCalls, 1);
+    assert.equal(preserved.cancelAutosaveCalls, 0);
+  }
+
+  const blockedConnection = {
+    autosaveOutcomeUnknownScopes: { profile: false },
+    autosaveInspectionScopes: { profile: false },
+    isolatedIncidents: {
+      connection: {
+        active: true,
+        kind: "Authentication test",
+        operation: "test-profile-auth",
+        outcomeUnknown: true,
+        requiresInspection: false,
+        message: "preserved uncertain connection request",
+        requestId: "d".repeat(32),
+        jobId: "e".repeat(48),
+        subject: "preserved",
+        retryable: false
+      }
+    },
+    toasts: [],
+    toast: function (title, message, error) {
+      this.toasts.push({ title, message, error });
+    },
+    showPathBrowserCalls: 0,
+    showPathBrowser: function () { this.showPathBrowserCalls += 1; }
+  };
+  const beforeBlockedConnection = postCalls.length;
+  await methods.testProfileAuthentication.call(blockedConnection);
+  methods.openRemotePathBrowser.call(blockedConnection);
+  assert.equal(postCalls.length, beforeBlockedConnection);
+  assert.equal(blockedConnection.showPathBrowserCalls, 0);
+  assert.deepEqual(
+    blockedConnection.toasts.map((toast) => toast.title),
+    ["Authentication test locked", "File Station browse locked"]
+  );
 
   const focusLog = [];
   const listeners = [];
@@ -1426,6 +1594,40 @@ function bind(context, names) {
             validate_build(
                 app=source["app"].replace(b"this.abortController.abort();", b"", 1)
             )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "destruction cleanup"):
+            validate_build(
+                app=source["app"].replace(
+                    b"purgeReconciliationAuth(this.auth);", b"", 1
+                )
+            )
+        protected_close_binding = (
+            b':disabled="profileSaveState === \'saving\' || profileConnectionState === \'testing\' '
+            b'|| profileReconciliationState === \'checking\' || profileOutcomeUnresolved '
+            b'|| connectionOutcomeUnresolved"'
+        )
+        self.assertEqual(source["app"].count(protected_close_binding), 2)
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError, "Close and Cancel must both preserve"
+        ):
+            validate_build(
+                app=source["app"].replace(
+                    protected_close_binding,
+                    protected_close_binding.replace(
+                        b"|| connectionOutcomeUnresolved", b"|| false"
+                    ),
+                    1,
+                )
+            )
+        close_connection_guard = b"        || this.connectionOutcomeUnresolved) return;"
+        self.assertIn(close_connection_guard, source["app"])
+        with self.assertRaisesRegex(validate_spk.ValidationError, "fail closed"):
+            validate_build(
+                app=source["app"].replace(
+                    close_connection_guard,
+                    b"        || false) return;",
+                    1,
+                )
+            )
         with self.assertRaisesRegex(validate_spk.ValidationError, "canonical absolute"):
             validate_build(
                 api=source["api"].replace(
@@ -1538,6 +1740,23 @@ function bind(context, names) {
             validate_build(
                 api=source["api"] + b'\nheaders["X-SYNO-TOKEN"] = "value";\n'
             )
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError,
+            "security contract|scoped reconciliation authentication",
+        ):
+            validate_build(
+                api=source["api"].replace(
+                    b"const reconciliationAuthByOwner = new WeakMap();",
+                    b"const reconciliationAuthByOwner = new Map();",
+                    1,
+                )
+            )
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError, "reconciliation authentication cache"
+        ):
+            validate_build(
+                api=source["api"].replace(b'remembered.token = "";', b"", 1)
+            )
         with self.assertRaisesRegex(validate_spk.ValidationError, "must not log or place the token"):
             validate_build(api=source["api"] + b'\nconst unsafe = "?SynoToken=value";\n')
         with self.assertRaisesRegex(validate_spk.ValidationError, "reviewed DSM token bootstrap path"):
@@ -1615,6 +1834,44 @@ function bind(context, names) {
                     1,
                 )
             )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "queued-result observer"):
+            validate_build(
+                api=source["api"].replace(
+                    b"status.client_request_id !== requestId",
+                    b"false",
+                    1,
+                )
+            )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "request reconciliation"):
+            validate_build(
+                api=source["api"].replace(
+                    b"model.operation !== expectedOperation",
+                    b"false",
+                    1,
+                )
+            )
+        connection_guard = (
+            b'if (isolatedIncidentUnresolved(this, "connection")) return this.toast('
+            b'"Authentication test locked"'
+        )
+        self.assertIn(connection_guard, source["app"])
+        with self.assertRaisesRegex(validate_spk.ValidationError, "block overlapping"):
+            validate_build(
+                app=source["app"].replace(
+                    connection_guard,
+                    b'if (false) return this.toast("Authentication test locked"',
+                    1,
+                )
+            )
+        for marker in (
+            b"recovered.request_id !== requestId",
+            b"recovered.operation !== operation",
+            b"recovered.job_id !== incident.jobId",
+        ):
+            with self.subTest(reconciliation_correlation=marker.decode()), self.assertRaisesRegex(
+                validate_spk.ValidationError, "correlate the exact request, job, and operation"
+            ):
+                validate_build(app=source["app"].replace(marker, b"false", 1))
         for name, original, replacement, pattern in (
             (
                 "toast root",

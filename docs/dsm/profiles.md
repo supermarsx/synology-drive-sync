@@ -188,12 +188,34 @@ retained unless their separate secret selector says replace or clear.
 
 Dashboard profile and credential saves are published through the private queue and poll a sanitized
 terminal result before reporting success. Their request and result-observation phases are bounded so
-the editor cannot remain stuck on **Saving** indefinitely. If a bound is reached after acceptance,
-the result is outcome-unknown and the editor preserves unapplied credential drafts for Activity and
-Logs inspection; it never silently retries. Each protected value is cleared only after its own
-terminal success. Status polling, including manual refresh, is suspended while the editor owns a
-draft or save, and late status responses are generation-fenced so they cannot overwrite it. Closing
-the editor performs one fresh status read even when periodic refresh is set to **Manual only**.
+the editor cannot remain stuck on **Saving** indefinitely. The browser timeout is longer than the
+package relay ceiling. If DSM loses the POST acknowledgement, the AppWindow uses the same authenticated
+DSM `id` session, launch-token generation, and client request ID to discover the already queued job.
+Ancillary QuickConnect/browser cookies may change order or value without changing that identity. Only
+an exact, well-formed `unresolved` lookup can authorize the bounded replay of the byte-identical body;
+a positive mapping resumes the existing job, and malformed or unavailable evidence never replays it.
+
+If automatic observation still ends without trustworthy evidence, Close and Cancel are disabled and
+the editor remains open with every unapplied credential draft. **Reconcile profile request** performs
+only authenticated reads: it never submits configuration or a credential. A recovered configuration
+success is unlocked only after a fresh snapshot exactly matches the submitted non-secret profile. A
+recovered secret success clears only that one confirmed secret field. An exactly correlated terminal
+failure unlocks that failed stage for correction. Pending, expired, foreign-session, malformed,
+job-mismatched, or unresolved evidence stays locked because absence is not proof that DSM rejected the
+original POST.
+
+Authentication tests and remote browsing use the same recovery rule. While either exact request is
+unresolved, the UI freezes the affected profile and credential fields, blocks profile submission and
+a second connection request, and offers **Reconcile connection request** when the package advertises
+support. A reconciled authentication success settles the old request but does not reuse its proof;
+one fresh test then unlocks browsing. A settled failure likewise unlocks the preserved draft for
+correction. No credential is stored by the test or included in the incident record.
+
+Each protected value is cleared only after its own terminal success. Status polling, including manual
+refresh, is suspended while the editor owns an ordinary draft or save, and late status responses are
+generation-fenced so they cannot overwrite it. Recovery reads are allowed without hydrating over the
+open draft. An ordinary Close performs one fresh status read even when periodic refresh is set to
+**Manual only**; unresolved recovery deliberately prevents Close from destroying its draft.
 Removing a profile also removes its package-owned password, TOTP,
 remote-log-token, routine, and cached state, then rebuilds the generated configuration. It does not
 touch local or remote data. Removing the final profile disables the legacy global schedule.

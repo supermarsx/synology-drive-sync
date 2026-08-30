@@ -330,9 +330,11 @@ outcome-unknown after `expired_or_missing` evidence, five consecutive result-obs
 invalid evidence, or AppWindow shutdown. The typed error carries the client request ID and, after an
 accepted acknowledgement, the job ID because the server job may still have applied. Only the
 affected UI scope and operations that depend on it are paused: profile, routine, alerts, security,
-interface, or Run/Doctor. Connection probes use a separate deliberately retryable incident. Plan and
-Run remain asynchronous: the UI retains their job IDs only in memory and follows normal run,
-Activity, and log evidence.
+interface, or Run/Doctor. Connection probes use a separate incident scope, but an unresolved probe
+freezes the affected profile and credential fields and blocks profile submission, authentication,
+and File Station requests until an exact read-only reconciliation settles it. Plan and Run remain
+asynchronous: the UI retains their job IDs only in memory and follows normal run, Activity, and log
+evidence.
 
 ## Mandatory audit and log policy
 

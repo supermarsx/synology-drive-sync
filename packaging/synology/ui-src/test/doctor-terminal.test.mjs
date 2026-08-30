@@ -58,9 +58,11 @@ test("queued terminal polling outlives the former two-minute attempt horizon", a
     const api = await loadApi();
     const jobId = "a".repeat(48);
     let resultReads = 0;
+    let requestId = "";
     globalThis.fetch = async (url, options) => {
       if (options.method === "POST") {
         const request = JSON.parse(options.body);
+        requestId = request.request_id;
         assert.equal(url, api.API_URL);
         assert.equal(options.credentials, "same-origin");
         assert.equal(options.headers["X-SDSYNC-Request"], "1");
@@ -88,6 +90,7 @@ test("queued terminal polling outlives the former two-minute attempt horizon", a
         ok: true,
         state: "complete",
         job_id: jobId,
+        client_request_id: requestId,
         result: {
           schema: api.RESULT_SCHEMA,
           ok: true,
@@ -120,9 +123,11 @@ test("only an actual terminal failure is reported as failed and its output is pr
   try {
     const api = await loadApi();
     const jobId = "b".repeat(48);
+    let requestId = "";
     globalThis.fetch = async (_url, options) => {
       if (options.method === "POST") {
         const request = JSON.parse(options.body);
+        requestId = request.request_id;
         return jsonResponse({
           schema: api.QUEUED_SCHEMA,
           ok: true,
@@ -136,6 +141,7 @@ test("only an actual terminal failure is reported as failed and its output is pr
         ok: true,
         state: "complete",
         job_id: jobId,
+        client_request_id: requestId,
         result: {
           schema: api.RESULT_SCHEMA,
           ok: false,
@@ -160,6 +166,7 @@ test("only an actual terminal failure is reported as failed and its output is pr
         assert.equal(error.outcomeUnknown, undefined);
         assert.equal(error.message, "Doctor rejected the target");
         assert.equal(error.resultOutput, "exact bounded terminal failure evidence");
+        assert.equal(error.operation, api.ACTIONS.execute);
         return true;
       }
     );
@@ -255,8 +262,8 @@ test("unbounded polling bounds each attempt and has a five-failure ceiling while
   assert.match(apiSource, /const limits = boundedObservationLimits \|\| terminalAttemptLimits\(\)/);
   assert.match(apiSource, /if \(!observation && consecutiveObservationFailures >= RESULT_POLL_OBSERVATION_FAILURES\)/);
   assert.match(apiSource, /const RESULT_POLL_OBSERVATION_FAILURES = 5/);
-  assert.match(apiSource, /return pollJobResult\(auth, queued\.job_id, requestDsmAuth, pollIntervalMs, id, limits, null\)/);
-  assert.match(apiSource, /withinLimit\([\s\S]*?pollJobResult\([\s\S]*?limits,[\s\S]*?observation\)[\s\S]*?limits\.resultObservationTimeoutMs/);
+  assert.match(apiSource, /const result = await awaitQueuedResult\([\s\S]*?id,[\s\S]*?action,[\s\S]*?limits,[\s\S]*?boundedObservationLimits[\s\S]*?\)/);
+  assert.match(apiSource, /pollJobResult\([\s\S]*?requestId,[\s\S]*?limits,[\s\S]*?observation,[\s\S]*?operation[\s\S]*?\)[\s\S]*?limits\.resultObservationTimeoutMs/);
   assert.match(apiSource, /observation\.expired = true;[\s\S]*?observation\.cancelCurrent\(\)/);
   assert.match(apiSource, /if \(auth && auth\.signal && auth\.signal\.aborted\) throw error/);
   assert.doesNotMatch(source, /waitForNewProfile|secret handoff deadline/);

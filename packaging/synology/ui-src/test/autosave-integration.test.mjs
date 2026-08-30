@@ -115,6 +115,8 @@ function loadAppComponent(
     SNAPSHOT_SCHEMA: "sdsync.dsm-api.v1",
     apiGet: getSpy,
     apiPost: postSpy,
+    purgeReconciliationAuth: () => undefined,
+    reconcileMutationRequest: async () => ({}),
     arrayOf: (value) => Array.isArray(value) ? value : [],
     boundedText: (value, fallback = "") => String(typeof value === "string" && value ? value : fallback),
     formatBytes: String,
@@ -460,7 +462,10 @@ test("failure pause state blocks later edits and retained manual forms never res
   assert.equal(context.autosavePhase, "blocked");
   assert.match(context.autosaveMessage, /use Save now/);
 
-  assert.match(methodSource("autosaveFailed", "hydrateAutosave"), /pauseAutosave\(task\.scope, error\)/);
+  assert.match(
+    methodSource("autosaveFailed", "hydrateAutosave"),
+    /pauseAutosave\(\s*task\.scope,\s*error,\s*"",\s*task\.scope === "profile" \? \{ expectedConfiguration: task\.value, creatingProfile: false \} : undefined\s*\)/
+  );
   const pause = methodSource("pauseAutosave", "clearAutosaveFailure");
   assert.match(pause, /autosaveFailureScopes\[scope\] = true/);
   assert.match(pause, /setScopeBlocked\(scope, true\)/);
@@ -475,7 +480,7 @@ test("failure pause state blocks later edits and retained manual forms never res
   }
   assert.match(
     methodSource("async saveProfile", "async saveProfileSecrets"),
-    /pauseAutosave\("profile", reportedError, activeSecretKind\)/
+    /pauseAutosave\(\s*"profile",\s*reportedError,\s*activeSecretKind,\s*\{\s*expectedConfiguration: payload,\s*creatingProfile\s*\}\s*\)/
   );
   assert.match(
     methodSource("async saveProfileSecrets", "async removeProfile"),
@@ -925,6 +930,94 @@ test("scope incidents preserve the first trusted correlation and profile subject
   assert.match(guidance, new RegExp(first.requestId));
   assert.match(guidance, new RegExp(first.jobId));
   assert.doesNotMatch(guidance, new RegExp(later.requestId));
+});
+
+test("manual profile incidents retain reconciliation metadata without retaining credential values", async () => {
+  const configuration = {
+    name: "new-profile",
+    source: "/volume1/source",
+    url: "https://nas.example.invalid",
+    username: "backup-user",
+    remote: "/home/Drive/Backup",
+    allow_http: false,
+    allow_empty_source: false,
+    danger_accept_invalid_certs: false,
+    delete: false
+  };
+  const passwordDraft = "fixture-password-must-not-enter-incident";
+  const configureUnknown = Object.assign(new Error("The queued configuration result was not observable."), {
+    outcomeUnknown: true,
+    trustedRequestId: true,
+    requestId: "4".repeat(32),
+    trustedJobId: true,
+    jobId: "5".repeat(48),
+    operation: "configure-profile",
+    stage: "result_observation"
+  });
+  const configureMethods = loadAppComponent(async () => { throw configureUnknown; }).methods;
+  const configure = manualFailureContext(configureMethods, "profile", {
+    selectedProfile: "",
+    profileForm: { name: configuration.name },
+    canChangeProfiles: true,
+    profileAutosavePayload: () => configuration,
+    secretOperations: () => [{
+      profile: configuration.name,
+      kind: "password",
+      mode: "replace",
+      value: passwordDraft
+    }],
+    validateProfile: () => "",
+    clearSecrets() {},
+    closeProfile() {}
+  }).context;
+
+  await configureMethods.saveProfile.call(configure, { preventDefault() {} });
+
+  const configureIncident = configure.autosaveIncidents.profile;
+  assert.equal(configureIncident.operation, "configure-profile");
+  assert.equal(configureIncident.stage, "configuration");
+  assert.equal(configureIncident.transportStage, "result_observation");
+  assert.equal(configureIncident.secretKind, "");
+  assert.equal(configureIncident.creatingProfile, true);
+  assert.deepEqual(configureIncident.expectedConfiguration, configuration);
+  assert.notStrictEqual(configureIncident.expectedConfiguration, configuration, "incident configuration must be a detached snapshot");
+  assert.equal(
+    Object.keys(configureIncident.expectedConfiguration).some((key) => /password|totp|token|secret/i.test(key)),
+    false
+  );
+  assert.equal(JSON.stringify(configureIncident).includes(passwordDraft), false);
+
+  const totpDraft = "JBSWY3DPEHPK3PXP-MUST-NOT-ENTER-INCIDENT";
+  const secretUnknown = Object.assign(new Error("The queued protected credential result was not observable."), {
+    outcomeUnknown: true,
+    trustedRequestId: true,
+    requestId: "6".repeat(32),
+    trustedJobId: true,
+    jobId: "7".repeat(48),
+    operation: "set-secret",
+    stage: "result_observation"
+  });
+  const secretMethods = loadAppComponent(async () => { throw secretUnknown; }).methods;
+  const secret = manualFailureContext(secretMethods, "profile", {
+    selectedProfile: "nightly",
+    profileForm: { name: "nightly" },
+    canManageSecrets: true,
+    secretOperations: () => [{ profile: "nightly", kind: "totp", mode: "replace", value: totpDraft }],
+    validateSecretOperations: () => "",
+    secretModes: { password: "keep", totp: "replace", remote_log_token: "keep" },
+    secretValues: { password: "", totp: totpDraft, remote_log_token: "" }
+  }).context;
+
+  await secretMethods.saveProfileSecrets.call(secret, { preventDefault() {} });
+
+  const secretIncident = secret.autosaveIncidents.profile;
+  assert.equal(secretIncident.operation, "set-secret");
+  assert.equal(secretIncident.stage, "secret:totp");
+  assert.equal(secretIncident.transportStage, "result_observation");
+  assert.equal(secretIncident.secretKind, "totp");
+  assert.equal(secretIncident.expectedConfiguration, null);
+  assert.equal(Object.prototype.hasOwnProperty.call(secretIncident, "value"), false);
+  assert.equal(JSON.stringify(secretIncident).includes(totpDraft), false);
 });
 
 test("an unresolved profile blocks dependent routines and operations but not unrelated alerts", async () => {

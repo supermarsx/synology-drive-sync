@@ -5,22 +5,29 @@ export const REQUEST_SCHEMA = "sdsync.dsm-request.v1";
 export const QUEUED_SCHEMA = "sdsync.dsm-queued.v1";
 export const RESULT_STATUS_SCHEMA = "sdsync.dsm-result-status.v1";
 export const RESULT_SCHEMA = "sdsync.dsm-result.v1";
+export const REQUEST_STATUS_SCHEMA = "sdsync.dsm-request-status.v1";
 export const MAX_RESPONSE_BYTES = 1024 * 1024;
 export const AUTOSAVE_API_LIMITS = Object.freeze({
   csrfReissueTimeoutMs: 10000,
-  postRequestTimeoutMs: 15000,
+  // The CGI relay has a 30-second I/O ceiling. The browser must not cancel a
+  // request while that bounded backend hand-off can still complete.
+  postRequestTimeoutMs: 45000,
   postResponseTimeoutMs: 10000,
   readTimeoutMs: 10000,
   resultRequestTimeoutMs: 10000,
-  resultObservationTimeoutMs: 30000
+  resultObservationTimeoutMs: 30000,
+  requestReconciliationTimeoutMs: 30000,
+  requestReconciliationPollIntervalMs: 1000
 });
 
 const TERMINAL_API_ATTEMPT_TIMEOUTS = Object.freeze({
   csrfReissueTimeoutMs: 10000,
-  postRequestTimeoutMs: 15000,
+  postRequestTimeoutMs: 45000,
   postResponseTimeoutMs: 10000,
   readTimeoutMs: 10000,
-  resultRequestTimeoutMs: 10000
+  resultRequestTimeoutMs: 10000,
+  requestReconciliationTimeoutMs: 30000,
+  requestReconciliationPollIntervalMs: 1000
 });
 
 const CSRF_SCHEMA = "sdsync.dsm-csrf.v1";
@@ -33,6 +40,10 @@ const MAX_DSM_TOKEN_BYTES = 1024;
 const MAX_CSRF_TOKEN_BYTES = 4096;
 const DSM_TOKEN_BOOTSTRAP_TIMEOUT_MS = 5000;
 const DSM_TOKEN_RETRY_DELAY_MS = 30000;
+const MAX_RECONCILIATION_AUTH_ENTRIES = 64;
+// The backend permits result retention as low as 300 seconds. A request's DSM
+// token snapshot must never remain eligible beyond that observable lifetime.
+const RECONCILIATION_AUTH_TTL_MS = 5 * 60 * 1000;
 const CLIENT_REQUEST_ID_PATTERN = /^[0-9a-f]{32}$/;
 const JOB_ID_PATTERN = /^[0-9a-f]{48}$/;
 const FILE_STATION_CLEANUP_INSPECTION_CODES = new Set([
@@ -47,6 +58,7 @@ let dsmTokenBootstrapPromise = null;
 let dsmTokenRetryAfter = 0;
 let dsmAuthGeneration = 0;
 const csrfGenerationByAuth = new WeakMap();
+const reconciliationAuthByOwner = new WeakMap();
 
 function validClientRequestId(value) {
   return typeof value === "string" && CLIENT_REQUEST_ID_PATTERN.test(value) ? value : "";
@@ -56,25 +68,114 @@ function validJobId(value) {
   return typeof value === "string" && JOB_ID_PATTERN.test(value) ? value : "";
 }
 
+function reconciliationAuthOwner(auth) {
+  return auth && (typeof auth === "object" || typeof auth === "function") ? auth : null;
+}
+
+function reconciliationAuthNow() {
+  const monotonic = typeof window === "object"
+    && window.performance
+    && typeof window.performance.now === "function"
+    ? Number(window.performance.now())
+    : NaN;
+  return Number.isFinite(monotonic) && monotonic >= 0 ? monotonic : Date.now();
+}
+
+function reconciliationAuthExpired(remembered, now) {
+  return !remembered
+    || !Number.isFinite(remembered.createdAt)
+    || !Number.isFinite(remembered.expiresAt)
+    || now < remembered.createdAt
+    || now >= remembered.expiresAt;
+}
+
+function clearReconciliationAuthEntry(entries, requestId) {
+  const remembered = entries.get(requestId);
+  if (!remembered) return;
+  remembered.token = "";
+  entries.delete(requestId);
+}
+
+function rememberReconciliationAuth(auth, requestId, dsmAuth) {
+  const owner = reconciliationAuthOwner(auth);
+  if (!owner || !validClientRequestId(requestId) || !dsmAuth || typeof dsmAuth !== "object") return;
+  let entries = reconciliationAuthByOwner.get(owner);
+  if (!entries) {
+    entries = new Map();
+    reconciliationAuthByOwner.set(owner, entries);
+  }
+  const now = reconciliationAuthNow();
+  for (const [retainedRequestId, remembered] of entries) {
+    if (reconciliationAuthExpired(remembered, now)) {
+      clearReconciliationAuthEntry(entries, retainedRequestId);
+    }
+  }
+  clearReconciliationAuthEntry(entries, requestId);
+  entries.set(requestId, {
+    token: typeof dsmAuth.token === "string" ? dsmAuth.token : "",
+    generation: Number.isSafeInteger(dsmAuth.generation) ? dsmAuth.generation : 0,
+    createdAt: now,
+    expiresAt: now + RECONCILIATION_AUTH_TTL_MS
+  });
+  while (entries.size > MAX_RECONCILIATION_AUTH_ENTRIES) {
+    const oldest = entries.keys().next().value;
+    clearReconciliationAuthEntry(entries, oldest);
+  }
+}
+
+function rememberedReconciliationAuth(auth, requestId) {
+  const owner = reconciliationAuthOwner(auth);
+  const entries = owner ? reconciliationAuthByOwner.get(owner) : null;
+  const remembered = entries ? entries.get(requestId) : null;
+  if (remembered && reconciliationAuthExpired(remembered, reconciliationAuthNow())) {
+    clearReconciliationAuthEntry(entries, requestId);
+    if (entries.size === 0) reconciliationAuthByOwner.delete(owner);
+    return null;
+  }
+  return remembered ? { token: remembered.token, generation: remembered.generation } : null;
+}
+
+function forgetReconciliationAuth(auth, requestId) {
+  const owner = reconciliationAuthOwner(auth);
+  const entries = owner ? reconciliationAuthByOwner.get(owner) : null;
+  if (!entries) return;
+  clearReconciliationAuthEntry(entries, requestId);
+  if (entries.size === 0) reconciliationAuthByOwner.delete(owner);
+}
+
+export function purgeReconciliationAuth(auth) {
+  const owner = reconciliationAuthOwner(auth);
+  const entries = owner ? reconciliationAuthByOwner.get(owner) : null;
+  if (!entries) return;
+  for (const requestId of [...entries.keys()]) {
+    clearReconciliationAuthEntry(entries, requestId);
+  }
+  reconciliationAuthByOwner.delete(owner);
+}
+
 export class QueuedOutcomeUnknownError extends Error {
-  constructor(jobId, message, requestId = "") {
+  constructor(jobId, message, requestId = "", operation = "", stage = "result_observation") {
     super(message);
     this.name = "QueuedOutcomeUnknownError";
     this.jobId = validJobId(jobId);
     this.requestId = validClientRequestId(requestId);
     this.trustedJobId = Boolean(this.jobId);
     this.trustedRequestId = Boolean(this.requestId);
+    this.operation = typeof operation === "string" && ARGUMENT_KEYS[operation] ? operation : "";
+    this.stage = boundedText(stage, "result_observation").slice(0, 128);
     this.outcomeUnknown = true;
     this.accepted = true;
   }
 }
 
 export class MutationOutcomeUnknownError extends Error {
-  constructor(requestId, message) {
+  constructor(requestId, message, operation = "", stage = "post_dispatch_observation") {
     super(message);
     this.name = "MutationOutcomeUnknownError";
     this.requestId = validClientRequestId(requestId);
     this.trustedRequestId = Boolean(this.requestId);
+    this.operation = typeof operation === "string" && ARGUMENT_KEYS[operation] ? operation : "";
+    this.stage = boundedText(stage, "post_dispatch_observation").slice(0, 128);
     this.outcomeUnknown = true;
     this.acceptanceUnknown = true;
   }
@@ -116,7 +217,7 @@ export const ACTIONS = Object.freeze({
   execute: "action"
 });
 
-const GET_ACTIONS = Object.freeze(["csrf", "snapshot", "source-directories", "source-path", "logs", "activity", "result"]);
+const GET_ACTIONS = Object.freeze(["csrf", "snapshot", "source-directories", "source-path", "logs", "activity", "result", "request-status"]);
 const GET_ARGUMENT_KEYS = Object.freeze({
   csrf: Object.freeze([]),
   snapshot: Object.freeze([]),
@@ -124,7 +225,8 @@ const GET_ARGUMENT_KEYS = Object.freeze({
   "source-path": Object.freeze(["path"]),
   logs: Object.freeze(["lines", "source"]),
   activity: Object.freeze(["lines"]),
-  result: Object.freeze(["job_id"])
+  result: Object.freeze(["job_id"]),
+  "request-status": Object.freeze(["request_id"])
 });
 
 export const ARGUMENT_KEYS = Object.freeze({
@@ -486,7 +588,8 @@ function normalizedRequestLimits(options) {
   }
   const timeoutKeys = [
     "csrfReissueTimeoutMs", "postRequestTimeoutMs", "postResponseTimeoutMs",
-    "readTimeoutMs", "resultRequestTimeoutMs", "resultObservationTimeoutMs"
+    "readTimeoutMs", "resultRequestTimeoutMs", "resultObservationTimeoutMs",
+    "requestReconciliationTimeoutMs", "requestReconciliationPollIntervalMs"
   ];
   const supportedKeys = new Set([...timeoutKeys, "setTimeout", "clearTimeout"]);
   if (Object.keys(options).some((key) => !supportedKeys.has(key))) {
@@ -584,11 +687,12 @@ function safeReadTimeout(stage, detail) {
   return new ClientRequestTimeoutError(detail, stage);
 }
 
-function queuedObservationTimeout(jobId, requestId, detail) {
+function queuedObservationTimeout(jobId, requestId, detail, operation = "") {
   return new QueuedOutcomeUnknownError(
     jobId,
     `${detail} Do not retry it; inspect Activity and Logs.`,
-    requestId
+    requestId,
+    operation
   );
 }
 
@@ -721,7 +825,8 @@ async function pollJobResult(
   pollIntervalMs = RESULT_POLL_INTERVAL_MS,
   requestId = "",
   limits = null,
-  observation = null
+  observation = null,
+  expectedOperation = ""
 ) {
   if (!/^[0-9a-f]{48}$/.test(jobId)) {
     throw new Error("API returned an invalid queued job identifier");
@@ -735,7 +840,8 @@ async function pollJobResult(
       throw queuedObservationTimeout(
         jobId,
         requestId,
-        "DSM accepted the operation, but terminal result observation exceeded the autosave limit."
+        "DSM accepted the operation, but terminal result observation exceeded the autosave limit.",
+        expectedOperation
       );
     }
     let status;
@@ -758,7 +864,8 @@ async function pollJobResult(
             () => queuedObservationTimeout(
               jobId,
               requestId,
-              "DSM accepted the operation, but a terminal result request exceeded the autosave limit."
+              "DSM accepted the operation, but a terminal result request exceeded the autosave limit.",
+              expectedOperation
             ),
             attempt.abort,
             observation
@@ -773,7 +880,8 @@ async function pollJobResult(
         throw queuedObservationTimeout(
           jobId,
           requestId,
-          "DSM accepted the operation, but terminal result observation exceeded the autosave limit."
+          "DSM accepted the operation, but terminal result observation exceeded the autosave limit.",
+          expectedOperation
         );
       }
       consecutiveObservationFailures += 1;
@@ -787,7 +895,8 @@ async function pollJobResult(
         throw new QueuedOutcomeUnknownError(
           jobId,
           "DSM accepted the operation, but its result cannot currently be observed. Do not retry it; inspect Activity and Logs.",
-          requestId
+          requestId,
+          expectedOperation
         );
       }
       await delay(interval, auth && auth.signal, limits, observation);
@@ -797,7 +906,8 @@ async function pollJobResult(
       throw queuedObservationTimeout(
         jobId,
         requestId,
-        "DSM accepted the operation, but terminal result observation exceeded the autosave limit."
+        "DSM accepted the operation, but terminal result observation exceeded the autosave limit.",
+        expectedOperation
       );
     }
     consecutiveObservationFailures = 0;
@@ -805,7 +915,8 @@ async function pollJobResult(
       throw new QueuedOutcomeUnknownError(
         jobId,
         "The queued operation is still outcome-unknown because DSM returned an invalid result document. Do not retry it; inspect Activity and Logs.",
-        requestId
+        requestId,
+        expectedOperation
       );
     }
     if (status.state === "pending") {
@@ -819,7 +930,8 @@ async function pollJobResult(
           status.result && status.result.message,
           "The queued result is no longer available. Do not retry it; inspect Activity and Logs."
         ),
-        requestId
+        requestId,
+        expectedOperation
       );
     }
     if (status.state !== "complete"
@@ -827,11 +939,13 @@ async function pollJobResult(
       || typeof status.result !== "object"
       || Array.isArray(status.result)
       || status.result.schema !== RESULT_SCHEMA
+      || (validClientRequestId(requestId) && status.client_request_id !== requestId)
       || (status.result.ok !== true && status.result.ok !== false)) {
       throw new QueuedOutcomeUnknownError(
         jobId,
         "The queued operation is outcome-unknown because DSM returned an invalid terminal result. Do not retry it; inspect Activity and Logs.",
-        requestId
+        requestId,
+        expectedOperation
       );
     }
     if (status.result.ok === false) {
@@ -849,6 +963,9 @@ async function pollJobResult(
       failure.trustedJobId = true;
       failure.trustedRequestId = Boolean(failure.requestId);
       failure.accepted = true;
+      failure.operation = typeof expectedOperation === "string" && ARGUMENT_KEYS[expectedOperation]
+        ? expectedOperation
+        : "";
       throw failure;
     }
     return status.result;
@@ -876,11 +993,249 @@ function isExplicitCsrfRejection(error) {
     || /\bcsrf\b|cross[- ]site request forgery|mutation token/.test(message);
 }
 
-function dispatchedOutcomeUnknown(id) {
+function dispatchedOutcomeUnknown(id, operation = "", stage = "post_dispatch_observation") {
   return new MutationOutcomeUnknownError(
     id,
-    `Automatic exact-request recovery for client request ${id} could not obtain a trustworthy rejection or queue acknowledgement. DSM may already have accepted it; do not start a new request, and inspect Activity and Logs using this request ID.`
+    `Automatic exact-request recovery for client request ${id} could not obtain a trustworthy rejection or queue acknowledgement. DSM may already have accepted it; do not start a new request, and inspect Activity and Logs using this request ID.`,
+    operation,
+    stage
   );
+}
+
+function exactRequestStatusKeys(model, expected) {
+  if (!model || typeof model !== "object" || Array.isArray(model)) return false;
+  const actual = Object.keys(model).sort();
+  const keys = expected.slice().sort();
+  return actual.length === keys.length && actual.every((key, index) => key === keys[index]);
+}
+
+function trustedRequestStatus(model, requestId, expectedOperation) {
+  if (model.schema !== REQUEST_STATUS_SCHEMA || model.request_id !== requestId) return null;
+  if (model.state === "unresolved"
+    && exactRequestStatusKeys(model, ["request_id", "schema", "state"])) {
+    return { state: "unresolved" };
+  }
+  if (!["pending", "complete"].includes(model.state)
+    || !exactRequestStatusKeys(model, ["job_id", "operation", "request_id", "schema", "state"])
+    || !validJobId(model.job_id)
+    || model.operation !== expectedOperation) {
+    return null;
+  }
+  return {
+    state: model.state,
+    jobId: model.job_id,
+    operation: model.operation
+  };
+}
+
+async function requestStatusOnce(
+  auth,
+  requestId,
+  expectedOperation,
+  dsmAuth,
+  limits,
+  observation = null
+) {
+  const attempt = linkedAbortAttempt(auth && auth.signal);
+  try {
+    const model = await withinLimit(
+      apiGetWithDsmAuth(
+        auth,
+        "request-status",
+        { request_id: requestId },
+        dsmAuth,
+        true,
+        attempt.signal
+      ),
+      limits.readTimeoutMs,
+      limits,
+      () => dispatchedOutcomeUnknown(requestId, expectedOperation, "request_reconciliation"),
+      attempt.abort,
+      observation
+    );
+    const status = trustedRequestStatus(model, requestId, expectedOperation);
+    if (!status) {
+      const invalid = dispatchedOutcomeUnknown(requestId, expectedOperation, "request_reconciliation");
+      invalid.invalidReconciliationDocument = true;
+      throw invalid;
+    }
+    return status;
+  } finally {
+    attempt.release();
+  }
+}
+
+async function pollRequestStatus(
+  auth,
+  requestId,
+  expectedOperation,
+  dsmAuth,
+  limits,
+  observation
+) {
+  for (;;) {
+    if (observation.expired) {
+      throw dispatchedOutcomeUnknown(requestId, expectedOperation, "request_reconciliation");
+    }
+    let model;
+    try {
+      model = await requestStatusOnce(
+        auth,
+        requestId,
+        expectedOperation,
+        dsmAuth,
+        limits,
+        observation
+      );
+    } catch (error) {
+      if ((auth && auth.signal && auth.signal.aborted) || observation.expired) {
+        throw dispatchedOutcomeUnknown(requestId, expectedOperation, "request_reconciliation");
+      }
+      if ((error && error.invalidReconciliationDocument === true)
+        || (error instanceof DsmApiError && error.status >= 200 && error.status < 500)) {
+        throw dispatchedOutcomeUnknown(requestId, expectedOperation, "request_reconciliation");
+      }
+      await delay(
+        limits.requestReconciliationPollIntervalMs,
+        auth && auth.signal,
+        limits,
+        observation
+      );
+      continue;
+    }
+
+    if (model.state !== "unresolved") return model;
+    await delay(
+      limits.requestReconciliationPollIntervalMs,
+      auth && auth.signal,
+      limits,
+      observation
+    );
+  }
+}
+
+async function recoverQueuedRequest(auth, requestId, expectedOperation, dsmAuth, limits) {
+  const observation = { expired: false, cancelCurrent: null };
+  return withinLimit(
+    pollRequestStatus(auth, requestId, expectedOperation, dsmAuth, limits, observation),
+    limits.requestReconciliationTimeoutMs,
+    limits,
+    () => dispatchedOutcomeUnknown(requestId, expectedOperation, "request_reconciliation"),
+    () => {
+      observation.expired = true;
+      if (observation.cancelCurrent) observation.cancelCurrent();
+    }
+  );
+}
+
+async function awaitQueuedResult(
+  auth,
+  queued,
+  dsmAuth,
+  pollIntervalMs,
+  requestId,
+  operation,
+  limits,
+  boundedObservationLimits
+) {
+  if (!boundedObservationLimits) {
+    return pollJobResult(
+      auth,
+      queued.job_id,
+      dsmAuth,
+      pollIntervalMs,
+      requestId,
+      limits,
+      null,
+      operation
+    );
+  }
+  const observation = { expired: false, cancelCurrent: null };
+  return withinLimit(
+    pollJobResult(
+      auth,
+      queued.job_id,
+      dsmAuth,
+      pollIntervalMs,
+      requestId,
+      limits,
+      observation,
+      operation
+    ),
+    limits.resultObservationTimeoutMs,
+    limits,
+    () => queuedObservationTimeout(
+      queued.job_id,
+      requestId,
+      "DSM accepted the operation, but terminal result observation exceeded the autosave limit.",
+      operation
+    ),
+    () => {
+      observation.expired = true;
+      if (observation.cancelCurrent) observation.cancelCurrent();
+    }
+  );
+}
+
+export async function reconcileMutationRequest(
+  auth,
+  requestId,
+  expectedOperation,
+  pollIntervalMs = RESULT_POLL_INTERVAL_MS,
+  options = undefined
+) {
+  const trustedRequestId = validClientRequestId(requestId);
+  if (!trustedRequestId || !ARGUMENT_KEYS[expectedOperation]) {
+    throw new TypeError("Mutation reconciliation requires a trusted request ID and operation");
+  }
+  const boundedObservationLimits = normalizedRequestLimits(options);
+  const limits = boundedObservationLimits || terminalAttemptLimits();
+  let requestDsmAuth = rememberedReconciliationAuth(auth, trustedRequestId);
+  if (!requestDsmAuth) {
+    await ensureDsmToken();
+    requestDsmAuth = dsmAuthSnapshot();
+  }
+  try {
+    const recovered = await recoverQueuedRequest(
+      auth,
+      trustedRequestId,
+      expectedOperation,
+      requestDsmAuth,
+      limits
+    );
+    const queued = {
+      schema: QUEUED_SCHEMA,
+      state: "queued",
+      request_id: trustedRequestId,
+      job_id: recovered.jobId
+    };
+    const result = await awaitQueuedResult(
+      auth,
+      queued,
+      requestDsmAuth,
+      pollIntervalMs,
+      trustedRequestId,
+      expectedOperation,
+      limits,
+      boundedObservationLimits
+    );
+    forgetReconciliationAuth(auth, trustedRequestId);
+    return {
+      schema: "sdsync.dsm-reconciled-result.v1",
+      request_id: trustedRequestId,
+      job_id: recovered.jobId,
+      operation: expectedOperation,
+      result
+    };
+  } catch (error) {
+    if (error
+      && error.accepted === true
+      && error.outcomeUnknown !== true
+      && error.trustedJobId === true) {
+      forgetReconciliationAuth(auth, trustedRequestId);
+    }
+    throw error;
+  }
 }
 
 async function csrfForCurrentAuthGeneration(auth, csrfToken, dsmAuth, limits = null) {
@@ -949,8 +1304,14 @@ export async function apiPost(
     operation: action,
     arguments: payload
   });
+  // Manual recovery must retain the exact DSM token generation used when the
+  // browser dispatched this request. The backend separately binds the stable
+  // DSM session cookie. Keep the token snapshot only in this AppWindow's
+  // memory and never copy it into an error, incident, log, or rendered status.
+  rememberReconciliationAuth(auth, id, requestDsmAuth);
   let queued;
   let dispatchAmbiguous = false;
+  let dispatchStage = "post_dispatch_observation";
   for (let attempt = 0; attempt < POST_DISPATCH_MAX_ATTEMPTS; attempt += 1) {
     const requestAttempt = linkedAbortAttempt(auth && auth.signal);
     let response;
@@ -974,12 +1335,13 @@ export async function apiPost(
             dispatched,
             limits.postRequestTimeoutMs,
             limits,
-            () => dispatchedOutcomeUnknown(id),
+            () => dispatchedOutcomeUnknown(id, action, "post_dispatch_observation"),
             requestAttempt.abort
           )
           : await dispatched;
       } catch (_error) {
         dispatchAmbiguous = true;
+        dispatchStage = "post_dispatch_observation";
       }
 
       if (response) {
@@ -990,11 +1352,12 @@ export async function apiPost(
               body,
               limits.postResponseTimeoutMs,
               limits,
-              () => dispatchedOutcomeUnknown(id),
+              () => dispatchedOutcomeUnknown(id, action, "post_ack_body_observation"),
               requestAttempt.abort
             )
             : await body;
         } catch (error) {
+          dispatchStage = "post_ack_body_observation";
           if (!dispatchAmbiguous
             && error instanceof DsmApiError
             && error.trustedRejection === true) {
@@ -1002,12 +1365,13 @@ export async function apiPost(
             error.requestId = id;
             error.trustedRequestId = true;
             if (isExplicitCsrfRejection(error)) error.csrfRejected = true;
+            forgetReconciliationAuth(auth, id);
             throw error;
           }
           if (dispatchAmbiguous
             && error instanceof DsmApiError
             && error.trustedRejection === true) {
-            throw dispatchedOutcomeUnknown(id);
+            throw dispatchedOutcomeUnknown(id, action, dispatchStage);
           }
           dispatchAmbiguous = true;
         }
@@ -1025,9 +1389,46 @@ export async function apiPost(
     }
     queued = null;
     dispatchAmbiguous = true;
-    if (attempt + 1 >= POST_DISPATCH_MAX_ATTEMPTS
-      || (auth && auth.signal && auth.signal.aborted)) {
-      throw dispatchedOutcomeUnknown(id);
+    if (auth && auth.signal && auth.signal.aborted) {
+      throw dispatchedOutcomeUnknown(id, action, dispatchStage);
+    }
+
+    // A response can be lost after DSM durably queued the request. Before
+    // replaying the exact serialized body, ask the authenticated private queue
+    // for the server job that owns this client request ID.
+    let recovered;
+    try {
+      recovered = await requestStatusOnce(
+        auth,
+        id,
+        action,
+        requestDsmAuth,
+        limits
+      );
+    } catch (_error) {
+      if (auth && auth.signal && auth.signal.aborted) {
+        throw dispatchedOutcomeUnknown(id, action, "request_reconciliation");
+      }
+      // A malformed, mismatched, rejected, or unavailable lookup is not an
+      // authenticated negative acknowledgement. Stop replaying and let the
+      // bounded read-only reconciliation loop settle or fail closed.
+      break;
+    }
+
+    // Only this exact, schema-validated negative mapping authorizes replay of
+    // the byte-identical request body.
+    if (recovered.state !== "unresolved") {
+      queued = {
+        schema: QUEUED_SCHEMA,
+        state: "queued",
+        request_id: id,
+        job_id: recovered.jobId
+      };
+      break;
+    }
+
+    if (attempt + 1 >= POST_DISPATCH_MAX_ATTEMPTS) {
+      break;
     }
     try {
       await delay(
@@ -1036,26 +1437,45 @@ export async function apiPost(
         limits
       );
     } catch (_error) {
-      throw dispatchedOutcomeUnknown(id);
+      throw dispatchedOutcomeUnknown(id, action, dispatchStage);
     }
   }
-  if (!awaitTerminal) return queued;
-  if (!boundedObservationLimits) {
-    return pollJobResult(auth, queued.job_id, requestDsmAuth, pollIntervalMs, id, limits, null);
-  }
-  const observation = { expired: false, cancelCurrent: null };
-  return withinLimit(
-    pollJobResult(auth, queued.job_id, requestDsmAuth, pollIntervalMs, id, limits, observation),
-    limits.resultObservationTimeoutMs,
-    limits,
-    () => queuedObservationTimeout(
-      queued.job_id,
+  if (!queued) {
+    const recovered = await recoverQueuedRequest(
+      auth,
       id,
-      "DSM accepted the operation, but terminal result observation exceeded the autosave limit."
-    ),
-    () => {
-      observation.expired = true;
-      if (observation.cancelCurrent) observation.cancelCurrent();
+      action,
+      requestDsmAuth,
+      limits
+    );
+    queued = {
+      schema: QUEUED_SCHEMA,
+      state: "queued",
+      request_id: id,
+      job_id: recovered.jobId
+    };
+  }
+  if (!awaitTerminal) {
+    forgetReconciliationAuth(auth, id);
+    return queued;
+  }
+  try {
+    const result = await awaitQueuedResult(
+      auth,
+      queued,
+      requestDsmAuth,
+      pollIntervalMs,
+      id,
+      action,
+      limits,
+      boundedObservationLimits
+    );
+    forgetReconciliationAuth(auth, id);
+    return result;
+  } catch (error) {
+    if (!error || (error.outcomeUnknown !== true && error.requiresInspection !== true)) {
+      forgetReconciliationAuth(auth, id);
     }
-  );
+    throw error;
+  }
 }

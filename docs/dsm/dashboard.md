@@ -108,9 +108,11 @@ profile mutation scope and its autosave are paused; independent configuration sc
 available, while routine changes and Run/Doctor stay paused because they depend on settled profile
 state. Reopen the AppWindow to clear the affected scope only after reconciling authoritative profile
 and credential-presence state. Authentication testing and target browsing use an independent
-incident scope and permit a deliberate new request for the current draft. The new result provides
-fresh evidence but does not erase the earlier request/job correlation; retain it until explicit
-reconciliation or a fresh AppWindow session.
+incident scope, but an unresolved request blocks another authentication or File Station request so
+two temporary sessions cannot overlap. The affected profile and credential fields are also frozen so
+the exact submitted draft cannot drift. **Reconcile connection request** performs a read-only lookup
+of the exact request/job/operation result. An exactly correlated terminal result unlocks the draft;
+unresolved or mismatched evidence keeps it locked without submitting another request.
 
 ## Routines
 
@@ -232,11 +234,12 @@ result. Plan and Run remain asynchronous. Therefore:
    observers have no overall deadline and report outcome-unknown after five consecutive observation
    failures, invalid evidence, `expired_or_missing`, or AppWindow shutdown.
 4. Outcome-unknown pauses its affected mutation/autosave scope and operations that depend on it;
-   independent controls remain available. Connection-test and remote-browser incidents are
-   independent and permit a deliberate new request for the current draft. A new trusted success is
-   fresh evidence, not proof of the earlier job's terminal state or cleanup, so the earlier
-   correlation remains until explicit reconciliation or a fresh AppWindow. Closing the AppWindow
-   stops observation, not the queued server job.
+   independent controls remain available. Connection-test and remote-browser incidents use an
+   independent scope, but block another authentication or File Station request until **Reconcile
+   connection request** obtains the exact request/job/operation result. The affected profile and
+   credential fields remain frozen so that submitted draft cannot drift. Unresolved or mismatched
+   evidence remains locked without dispatching a replacement. Closing the AppWindow stops observation,
+   not the queued server job.
 5. A multi-stage profile save can be partially applied when configuration or an earlier secret stage
    completed before a later failure or outcome-unknown result. The preserved form and unapplied
    secrets remain visible while Activity, Logs, and a fresh snapshot are inspected without

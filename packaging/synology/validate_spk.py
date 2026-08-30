@@ -460,6 +460,12 @@ def validate_native_api_source(payload: bytes) -> None:
         "const RESULT_POLL_OBSERVATION_FAILURES = 5;",
         "const POST_DISPATCH_REPLAY_DELAYS_MS = Object.freeze([250, 1000]);",
         "const POST_DISPATCH_MAX_ATTEMPTS = POST_DISPATCH_REPLAY_DELAYS_MS.length + 1;",
+        'export const REQUEST_STATUS_SCHEMA = "sdsync.dsm-request-status.v1";',
+        '"request-status": Object.freeze(["request_id"])',
+        "const RECONCILIATION_AUTH_TTL_MS = 5 * 60 * 1000;",
+        "const reconciliationAuthByOwner = new WeakMap();",
+        "export function purgeReconciliationAuth(auth)",
+        "export async function reconcileMutationRequest(",
         "class QueuedOutcomeUnknownError extends Error",
         "this.outcomeUnknown = true;",
     ):
@@ -471,7 +477,7 @@ def validate_native_api_source(payload: bytes) -> None:
         )
     if (
         source.count("function linkedAbortAttempt(parentSignal)") != 1
-        or source.count("linkedAbortAttempt(auth && auth.signal)") != 3
+        or source.count("linkedAbortAttempt(auth && auth.signal)") != 4
         or source.count("linkedAbortAttempt(auth.signal)") != 1
         or source.count("signal: requestSignal") != 1
         or source.count("signal: requestAttempt.signal") != 1
@@ -495,6 +501,34 @@ def validate_native_api_source(payload: bytes) -> None:
             raise ValidationError(
                 "native DSM API must not derive authentication from launch state or persistent storage"
             )
+
+    auth_cache_start = source.find("const reconciliationAuthByOwner = new WeakMap();")
+    auth_cache_end = source.find("\nexport class QueuedOutcomeUnknownError", auth_cache_start)
+    if auth_cache_start < 0 or auth_cache_end < 0:
+        raise ValidationError("native DSM API source is missing scoped reconciliation authentication")
+    auth_cache_source = source[auth_cache_start:auth_cache_end]
+    for marker in (
+        "function reconciliationAuthOwner(auth)",
+        "function reconciliationAuthExpired(remembered, now)",
+        "function clearReconciliationAuthEntry(entries, requestId)",
+        'remembered.token = "";',
+        "function rememberReconciliationAuth(auth, requestId, dsmAuth)",
+        "reconciliationAuthByOwner.get(owner)",
+        "expiresAt: now + RECONCILIATION_AUTH_TTL_MS",
+        "function rememberedReconciliationAuth(auth, requestId)",
+        "function forgetReconciliationAuth(auth, requestId)",
+        "export function purgeReconciliationAuth(auth)",
+        "for (const requestId of [...entries.keys()])",
+        "reconciliationAuthByOwner.delete(owner);",
+    ):
+        if marker not in auth_cache_source:
+            raise ValidationError(
+                f"native DSM reconciliation authentication cache is missing {marker!r}"
+            )
+    if "reconciliationAuthByRequestId" in source or "localStorage" in auth_cache_source:
+        raise ValidationError(
+            "native DSM reconciliation authentication must remain owner-scoped and memory-only"
+        )
 
     bootstrap_start = source.find("async function bootstrapDsmToken()")
     bootstrap_end = source.find("\nfunction authenticatedHeaders(", bootstrap_start)
@@ -748,6 +782,7 @@ def validate_native_api_source(payload: bytes) -> None:
         "status.state === \"expired_or_missing\"",
         "status.result.ok === false",
         "status.result.ok !== true && status.result.ok !== false",
+        "status.client_request_id !== requestId",
         "failure.resultOutput = boundedText(",
         "status.result.output",
     ):
@@ -781,12 +816,54 @@ def validate_native_api_source(payload: bytes) -> None:
                 "native DSM queued-result observer must not invent a client terminal horizon"
             )
 
+    request_status_start = source.find("function exactRequestStatusKeys(")
+    request_status_end = source.find("\nasync function csrfForCurrentAuthGeneration(", request_status_start)
+    if request_status_start < 0 or request_status_end < 0:
+        raise ValidationError("native DSM API source is missing authenticated request reconciliation")
+    request_status_source = source[request_status_start:request_status_end]
+    for marker in (
+        "function trustedRequestStatus(model, requestId, expectedOperation)",
+        "model.schema !== REQUEST_STATUS_SCHEMA || model.request_id !== requestId",
+        'model.state === "unresolved"',
+        '["request_id", "schema", "state"]',
+        '["job_id", "operation", "request_id", "schema", "state"]',
+        "model.operation !== expectedOperation",
+        "const attempt = linkedAbortAttempt(auth && auth.signal);",
+        '"request-status",\n        { request_id: requestId },',
+        "dsmAuth,\n        true,\n        attempt.signal",
+        "limits.readTimeoutMs",
+        "attempt.abort",
+        "attempt.release();",
+        "if (model.state !== \"unresolved\") return model;",
+        "limits.requestReconciliationPollIntervalMs",
+        "limits.requestReconciliationTimeoutMs",
+        "export async function reconcileMutationRequest(",
+        "rememberedReconciliationAuth(auth, trustedRequestId)",
+        "const recovered = await recoverQueuedRequest(",
+        "const result = await awaitQueuedResult(",
+        'schema: "sdsync.dsm-reconciled-result.v1"',
+        "operation: expectedOperation",
+        "forgetReconciliationAuth(auth, trustedRequestId);",
+    ):
+        if marker not in request_status_source:
+            raise ValidationError(
+                f"native DSM request reconciliation is missing {marker!r}"
+            )
+    if (
+        request_status_source.count('"request-status"') != 1
+        or "fetch(API_URL" in request_status_source
+        or "apiPost(" in request_status_source
+    ):
+        raise ValidationError(
+            "native DSM request reconciliation must be a single authenticated read path"
+        )
+
     post_start = source.find("export async function apiPost(")
     post_source = source[post_start:] if post_start >= 0 else ""
     for marker in (
         "const TERMINAL_API_ATTEMPT_TIMEOUTS = Object.freeze({",
         "csrfReissueTimeoutMs: 10000",
-        "postRequestTimeoutMs: 15000",
+        "postRequestTimeoutMs: 45000",
         "postResponseTimeoutMs: 10000",
         "readTimeoutMs: 10000",
         "resultRequestTimeoutMs: 10000",
@@ -800,15 +877,13 @@ def validate_native_api_source(payload: bytes) -> None:
                 f"native DSM terminal POST attempt bounds are missing {marker!r}"
             )
     if post_start < 0 or (
-        "if (!awaitTerminal) return queued;" not in post_source
-        or "if (!boundedObservationLimits) {" not in post_source
-        or "return pollJobResult(auth, queued.job_id, requestDsmAuth, pollIntervalMs, id, limits, null);"
-        not in post_source
-        or "pollJobResult(auth, queued.job_id, requestDsmAuth, pollIntervalMs, id, limits, observation)"
-        not in post_source
+        "if (!awaitTerminal) {" not in post_source
+        or "const result = await awaitQueuedResult(" not in post_source
+        or "forgetReconciliationAuth(auth, id);" not in post_source
+        or "error.outcomeUnknown !== true && error.requiresInspection !== true" not in post_source
     ):
         raise ValidationError(
-            "native DSM POST must explicitly choose terminal observation or queued return"
+            "native DSM POST must choose terminal observation and retain recoverable inspection authentication"
         )
     auth_snapshot = post_source.find("const requestDsmAuth = dsmAuthSnapshot();")
     csrf_refresh = post_source.find(
@@ -844,13 +919,13 @@ def validate_native_api_source(payload: bytes) -> None:
         "queued.request_id === id",
         "validJobId(queued.job_id)",
         "dispatchAmbiguous = true;",
+        "recovered = await requestStatusOnce(",
+        "const recovered = await recoverQueuedRequest(",
         "POST_DISPATCH_REPLAY_DELAYS_MS[attempt]",
         "requestAttempt.release();",
-        "throw dispatchedOutcomeUnknown(id);",
-        "const observation = { expired: false, cancelCurrent: null };",
-        "limits.resultObservationTimeoutMs",
-        "observation.expired = true;",
-        "if (observation.cancelCurrent) observation.cancelCurrent();",
+        "throw dispatchedOutcomeUnknown(id, action, dispatchStage);",
+        "rememberReconciliationAuth(auth, id, requestDsmAuth);",
+        "const result = await awaitQueuedResult(",
     ):
         if marker not in post_source:
             raise ValidationError(
@@ -1000,6 +1075,7 @@ def validate_native_build_contract(
         "this.abortController.abort();",
         "this.toastTimers.forEach((timer) => window.clearTimeout(timer))",
         "this.removeConfirmationKeyHandler();",
+        "purgeReconciliationAuth(this.auth);",
         "this.confirmationPriorFocus = null;",
         "this.clearSecrets();", 'this.csrfToken = "";',
     ):
@@ -1027,7 +1103,10 @@ def validate_native_build_contract(
         'if (this.profileSaveState === "saving" || this.profileConnectionState === "testing") {',
         'this.toast("Profile operation in progress",',
         'closeProfile(options = undefined) {',
-        'if (this.profileSaveState === "saving" || this.profileConnectionState === "testing") return;',
+        'this.hasCapability("request_reconciliation")',
+        'reconcileMutationRequest(',
+        'Reconcile profile request',
+        'Reconcile connection request',
         '{ id: "about", title: "About", icon: "about" }',
         '<action-icon :name="item.icon" :size="18" />',
         'import { ActionIcon } from "./ActionIcon";',
@@ -1042,6 +1121,106 @@ def validate_native_build_contract(
             raise ValidationError(
                 f"native DSM component is missing AppWindow interaction contract {marker!r}"
             )
+
+    protected_close_binding = (
+        ':disabled="profileSaveState === \'saving\' || profileConnectionState === \'testing\' '
+        '|| profileReconciliationState === \'checking\' || profileOutcomeUnresolved '
+        '|| connectionOutcomeUnresolved"'
+    )
+    if app.count(protected_close_binding) != 2:
+        raise ValidationError(
+            "native DSM profile Close and Cancel must both preserve unresolved drafts"
+        )
+    close_start = app.find("closeProfile(options = undefined) {")
+    close_end = app.find("\n    clearSecrets()", close_start)
+    close_source = app[close_start:close_end] if close_start >= 0 and close_end >= 0 else ""
+    close_guard = close_source.find("|| this.profileOutcomeUnresolved")
+    connection_guard = close_source.find("|| this.connectionOutcomeUnresolved) return;", close_guard)
+    secret_clear = close_source.find("this.clearSecrets();", connection_guard)
+    if not (0 <= close_guard < connection_guard < secret_clear):
+        raise ValidationError(
+            "native DSM profile close must fail closed before clearing an unresolved draft"
+        )
+
+    for marker in (
+        "canChangeProfiles() { return this.canMutate && !this.operationBusy && !this.profileOutcomeUnresolved && !this.connectionOutcomeUnresolved",
+        "canManageSecrets() { return this.canMutate && !this.operationBusy && !this.profileOutcomeUnresolved && !this.connectionOutcomeUnresolved",
+    ):
+        if marker not in app:
+            raise ValidationError(
+                "native DSM unresolved recovery must freeze profile and protected-secret inputs"
+            )
+    visibility_start = app.find("this.visibilityHandler = () => {")
+    visibility_end = app.find(
+        'document.addEventListener("visibilitychange", this.visibilityHandler);',
+        visibility_start,
+    )
+    visibility_source = (
+        app[visibility_start:visibility_end]
+        if visibility_start >= 0 and visibility_end >= 0
+        else ""
+    )
+    for marker in (
+        "const protectedProfileDraft = this.profileEditorOpen === true",
+        'this.profileSaveState === "saving"',
+        'this.profileConnectionState === "testing"',
+        'this.profileReconciliationState === "checking"',
+        "|| this.profileOutcomeUnresolved",
+        "|| this.connectionOutcomeUnresolved);",
+        "if (!protectedProfileDraft) this.clearSecrets();",
+    ):
+        if marker not in visibility_source:
+            raise ValidationError(
+                "native DSM visibility cleanup must preserve protected recovery drafts"
+            )
+
+    connection_test_start = app.find("async testProfileAuthentication(event) {")
+    connection_test_end = app.find("\n    openLocalSourceBrowser(", connection_test_start)
+    connection_test_source = (
+        app[connection_test_start:connection_test_end]
+        if connection_test_start >= 0 and connection_test_end >= 0
+        else ""
+    )
+    remote_open_start = app.find("openRemotePathBrowser(event) {")
+    remote_open_end = app.find("\n    showPathBrowser(", remote_open_start)
+    remote_open_source = (
+        app[remote_open_start:remote_open_end]
+        if remote_open_start >= 0 and remote_open_end >= 0
+        else ""
+    )
+    if (
+        'isolatedIncidentUnresolved(this, "connection")' not in connection_test_source
+        or "apiPost(" not in connection_test_source
+        or connection_test_source.find('isolatedIncidentUnresolved(this, "connection")')
+        > connection_test_source.find("apiPost(")
+        or 'isolatedIncidentUnresolved(this, "connection")' not in remote_open_source
+        or "showPathBrowser(" not in remote_open_source
+        or remote_open_source.find('isolatedIncidentUnresolved(this, "connection")')
+        > remote_open_source.find("showPathBrowser(")
+        or "!this.connectionOutcomeUnresolved" not in app
+    ):
+        raise ValidationError(
+            "native DSM connection recovery must block overlapping authentication and browse requests"
+        )
+
+    reconcile_start = app.find("async reconcileProfileIncident(event) {")
+    reconcile_end = app.find("\n    hasCapability(name)", reconcile_start)
+    reconcile_source = app[reconcile_start:reconcile_end] if reconcile_start >= 0 and reconcile_end >= 0 else ""
+    for marker, expected_count in (
+        ("reconcileMutationRequest(", 2),
+        ("recovered.request_id !== requestId", 2),
+        ("recovered.operation !== operation", 2),
+        ("recovered.job_id !== incident.jobId", 2),
+        ("caught.requestId === requestId", 2),
+        ("caught.operation === operation", 2),
+        ("caught.jobId === incident.jobId", 2),
+    ):
+        if reconcile_source.count(marker) != expected_count:
+            raise ValidationError(
+                "native DSM reconciliation must correlate the exact request, job, and operation"
+            )
+    if "apiPost(" in reconcile_source:
+        raise ValidationError("native DSM manual reconciliation must remain read-only")
 
     route_icons = {
         "overview", "profiles", "routines", "health", "activity",
@@ -1336,6 +1515,10 @@ def validate_native_bundle(script_payload: bytes, style_payload: bytes) -> None:
     for marker in (
         APP_ID, "v-app-instance", "v-app-window", CANONICAL_API,
         DSM_TOKEN_API, "X-SDSYNC-Request", "X-SDSYNC-CSRF", "X-SYNO-TOKEN",
+        "sdsync.dsm-request-status.v1", "request-status", "request_reconciliation",
+        "Reconcile profile request", "Reconcile connection request",
+        "DSM returned an invalid reconciled connection result. The preserved request remains locked.",
+        "Test the current draft once more to unlock File Station browsing.",
         "same-origin", "beforeDestroy",
         "https://github.com/supermarsx/synology-drive-sync/releases",
         "https://supermarsx.github.io/synology-drive-sync/release-selector.html",

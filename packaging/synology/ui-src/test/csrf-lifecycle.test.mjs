@@ -587,14 +587,27 @@ test("an explicit pre-acceptance CSRF 403 clears the token and never retries POS
   }
 });
 
-test("repeatedly lost 202 acknowledgements remain outcome-unknown with one client request ID", async () => {
+test("a malformed request-status after a lost 202 acknowledgement fails closed without replay", async () => {
   const restore = installBrowserGlobals();
   try {
     const api = await loadApi();
     const dispatchedBodies = [];
+    let requestStatusReads = 0;
     let fetchCount = 0;
-    globalThis.fetch = async (_url, options) => {
+    globalThis.fetch = async (url, options) => {
       fetchCount += 1;
+      if (options.method !== "POST") {
+        const requestId = new URL(url, "https://nas.example.invalid").searchParams.get("request_id");
+        requestStatusReads += 1;
+        return jsonResponse({
+          schema: api.REQUEST_STATUS_SCHEMA,
+          request_id: requestId,
+          state: "pending",
+          job_id: "f".repeat(48),
+          operation: api.ACTIONS.clientEvent,
+          unexpected: true
+        });
+      }
       dispatchedBodies.push(options.body);
       return {
         redirected: false,
@@ -619,6 +632,8 @@ test("repeatedly lost 202 acknowledgements remain outcome-unknown with one clien
         assert.equal(error.acceptanceUnknown, true);
         assert.equal(error.requestId, dispatchedRequestId);
         assert.equal(error.trustedRequestId, true);
+        assert.equal(error.operation, api.ACTIONS.clientEvent);
+        assert.equal(error.stage, "request_reconciliation");
         assert.match(error.requestId, /^[0-9a-f]{32}$/);
         assert.match(error.message, new RegExp(dispatchedRequestId));
         assert.match(error.message, /Automatic exact-request recovery/);
@@ -626,12 +641,9 @@ test("repeatedly lost 202 acknowledgements remain outcome-unknown with one clien
         return true;
       }
     );
-    assert.equal(fetchCount, 3, "ambiguous dispatch recovery must remain strictly bounded");
-    assert.deepEqual(
-      dispatchedBodies,
-      [dispatchedBodies[0], dispatchedBodies[0], dispatchedBodies[0]],
-      "every recovery attempt must reuse the exact serialized request"
-    );
+    assert.equal(fetchCount, 3, "token bootstrap, one dispatch, and one recovery lookup must remain bounded");
+    assert.equal(requestStatusReads, 2, "the token bootstrap fallback and one exact lookup are the only reads");
+    assert.equal(dispatchedBodies.length, 1, "malformed recovery evidence must never authorize replay");
   } finally {
     restore();
   }
