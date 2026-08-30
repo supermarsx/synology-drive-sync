@@ -503,6 +503,27 @@ printf '%s\n' "$queued_job_id" | awk '
     exit 1
 }
 
+# A client that loses the first 202 response must be able to retry the exact
+# body under the same authenticated AppWindow session without publishing a
+# second job or audit transaction.
+set +e
+fallback_replayed_response=$(cgi_https=off cgi_port=$user_service_port \
+    run_package_cgi_post "$mutation_body" "$fallback_csrf_token")
+fallback_replayed_status=$?
+set -e
+fallback_auth_requests=$((fallback_auth_requests + 1))
+fallback_replayed_response=$(printf '%s' "$fallback_replayed_response" | tr -d '\r')
+require_cgi_json_response "replayed fallback-authenticated client event" \
+    "$fallback_replayed_status" "202 Accepted" sdsync.dsm-queued.v1 \
+    "$fallback_replayed_response"
+if ! { printf '%s\n' "$fallback_replayed_response" | grep -Fq "\"request_id\":\"$mutation_request_id\"" \
+    && printf '%s\n' "$fallback_replayed_response" | grep -Fq "\"job_id\":\"$queued_job_id\"" \
+    && printf '%s\n' "$fallback_replayed_response" | grep -Fq '"state":"queued"' \
+    && printf '%s\n' "$fallback_replayed_response" | grep -Fq '"replayed":true'; }; then
+    echo "exact fallback-authenticated replay did not return the original queued job" >&2
+    exit 1
+fi
+
 fallback_result_complete=false
 fallback_result_attempt=0
 while [ "$fallback_result_attempt" -lt 45 ]; do

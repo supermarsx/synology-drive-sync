@@ -7301,6 +7301,7 @@ mod linux_files {
             | "remove-totp"
             | "set-remote-log-token"
             | "remove-remote-log-token" => "secrets",
+            "test-profile-auth" | "browse-remote" => "authentication",
             "routine" | "remove-routine" => "routines",
             "security-policy" => "security",
             "rejected-post" => "bridge",
@@ -15029,6 +15030,87 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn remote_connection_mutations_publish_authentication_audit_before_enqueue() {
+        let fixture = TestControlFixture::new("remote-connection-authentication-audit");
+        let paths = fixture.paths();
+        let package_uid = TestControlFixture::package_uid();
+        let session = [7_u8; 32];
+        let connection = ConnectionJobArgs {
+            profile: Some("nightly".to_owned()),
+            url: "https://nas.example.invalid".to_owned(),
+            username: "backup-user".to_owned(),
+            allow_http: false,
+            danger_accept_invalid_certs: false,
+            ca_certificate: None,
+            connect_timeout_seconds: 15,
+            timeout_seconds: 120,
+            retries: 2,
+            password_source: CredentialSource::Stored,
+            totp_source: CredentialSource::None,
+        };
+        let proof = format!("v1.10300.{}.{}", "b".repeat(64), "c".repeat(64));
+        let mutations = [
+            Mutation::TestProfileAuth(connection.clone()),
+            Mutation::BrowseRemote(BrowseRemoteJobArgs {
+                connection,
+                parent: "/".to_owned(),
+                connection_proof: proof,
+            }),
+        ];
+
+        for (index, mutation) in mutations.iter().enumerate() {
+            let client_request_id = format!("{:032x}", index + 1);
+            let audit_transaction = format!("{:048x}", index + 1);
+            let fingerprint = mutation_request_fingerprint(&[9_u8; 32], mutation, None).unwrap();
+            let expected_operation = mutation.operation_id();
+            let outcome = linux_files::enqueue(
+                &paths,
+                EnqueueRequest {
+                    package_uid,
+                    client_request_id: &client_request_id,
+                    requested_by: "admin",
+                    requested_uid: package_uid.max(1),
+                    session_binding: &session,
+                    audit_transaction: &audit_transaction,
+                    request_fingerprint: &fingerprint,
+                    issued_at_epoch: current_epoch().unwrap(),
+                    mutation,
+                    secret: None,
+                },
+                mutations.len(),
+                |record, state| {
+                    assert_eq!(record.operation, expected_operation);
+                    assert_eq!(state, "requested");
+                    let audit_line = serde_json::to_vec(&json!({
+                        "epoch": 10_000,
+                        "level": "info",
+                        "configured_level": "info",
+                        "subject_level": "warn",
+                        "mandatory": true,
+                        "category": "audit",
+                        "subject_category": "authentication",
+                        "operation": record.operation,
+                        "state": state,
+                        "transaction": record.transaction,
+                        "origin": record.origin,
+                        "actor": record.actor,
+                        "actor_uid": record.actor_uid,
+                        "profile": record.profile,
+                        "client_request_id": record.client_request_id,
+                    }))
+                    .unwrap();
+                    linux_files::validate_audit_log_line(&audit_line).map(|_| ())
+                },
+            )
+            .unwrap();
+            assert!(matches!(outcome, EnqueueOutcome::Published { .. }));
+        }
+
+        assert_eq!(fs::read_dir(&fixture.requests).unwrap().count(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn lost_202_replay_returns_original_job_and_keeps_audit_client_correlation() {
         let fixture = TestControlFixture::new("idempotent-replay");
         let paths = fixture.paths();
@@ -16591,6 +16673,35 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_audit_verifier_accepts_remote_connection_authentication_category() {
+        let actor_uid = TestControlFixture::package_uid().max(1);
+        for operation in ["test-profile-auth", "browse-remote"] {
+            let audit = serde_json::to_vec(&json!({
+                "epoch": 10_000,
+                "level": "info",
+                "configured_level": "info",
+                "subject_level": "warn",
+                "mandatory": true,
+                "category": "audit",
+                "subject_category": "authentication",
+                "operation": operation,
+                "state": "requested",
+                "transaction": JOB_ID,
+                "origin": "bridge",
+                "actor": "DSM Administrator",
+                "actor_uid": actor_uid,
+                "profile": "nightly",
+                "client_request_id": REQUEST_ID,
+            }))
+            .unwrap();
+            let parsed = linux_files::validate_audit_log_line(&audit).unwrap();
+            assert_eq!(parsed.operation, operation);
+            assert_eq!(parsed.subject_category, "authentication");
+        }
     }
 
     #[test]
