@@ -822,6 +822,92 @@ test("closing and reopening the folder explorer fences a late listing from the p
   ]);
 });
 
+test("closing a remote explorer preserves late cleanup evidence without repainting modal state", async () => {
+  const pending = deferred();
+  const api = await loadApi();
+  const requestId = "c".repeat(32);
+  const component = loadAppComponent({ post: async () => pending.promise });
+  const context = connectionContext(component.methods, {
+    selectedProfile: "nightly",
+    connectionTestReady: true,
+    connectionProof: `v1.${Math.floor(Date.now() / 1000) + 300}.${"a".repeat(64)}.${"b".repeat(64)}`,
+    connectionProofExpires: Math.floor(Date.now() / 1000) + 300,
+    pathBrowserPriorFocus: null,
+    pathBrowserKeyHandler: null,
+    pathBrowser: {
+      visible: true, kind: "remote", current: "/home/Drive", parent: "/home",
+      directories: [], truncated: false, loading: false, error: "", request: 0
+    }
+  });
+  context.browserParent = (...args) => component.methods.browserParent.call(context, ...args);
+  context.removePathBrowserKeyHandler = (...args) => component.methods.removePathBrowserKeyHandler.call(context, ...args);
+
+  const browse = component.methods.browsePath.call(context, "/home/Drive");
+  assert.equal(context.pathBrowser.loading, true);
+  component.methods.closePathBrowser.call(context);
+  context.selectedProfile = "different-draft";
+  assert.deepEqual(context.pathBrowser, {
+    visible: false, kind: "", current: "/", parent: null, directories: [],
+    loading: false, error: "", truncated: false, request: 2
+  });
+
+  pending.reject(Object.assign(
+    new api.DsmApiError(
+      "The File Station listing failed and its temporary session could not be closed.",
+      502,
+      "file_station_listing_logout_failed",
+      "file_station_logout"
+    ),
+    { trustedRequestId: true, requestId }
+  ));
+  await browse;
+
+  assert.deepEqual(context.pathBrowser, {
+    visible: false, kind: "", current: "/", parent: null, directories: [],
+    loading: false, error: "", truncated: false, request: 2
+  });
+  assert.equal(context.isolatedIncidents.connection.active, true);
+  assert.equal(context.isolatedIncidents.connection.requiresInspection, true);
+  assert.equal(context.isolatedIncidents.connection.requestId, requestId);
+  assert.equal(context.isolatedIncidents.connection.subject, "nightly · /home/Drive");
+  assert.equal(context.toasts.at(-1).title, "File Station browse cleanup needs inspection");
+  assert.equal(context.operationBusy, false);
+  assert.equal(context.profileConnectionAutosaveHeld, false);
+});
+
+test("closing a remote explorer ignores a late ordinary rejection but releases its operation hold", async () => {
+  const pending = deferred();
+  const component = loadAppComponent({ post: async () => pending.promise });
+  const context = connectionContext(component.methods, {
+    connectionTestReady: true,
+    connectionProof: `v1.${Math.floor(Date.now() / 1000) + 300}.${"a".repeat(64)}.${"b".repeat(64)}`,
+    connectionProofExpires: Math.floor(Date.now() / 1000) + 300,
+    pathBrowserPriorFocus: null,
+    pathBrowserKeyHandler: null,
+    pathBrowser: {
+      visible: true, kind: "remote", current: "/home/Drive", parent: "/home",
+      directories: [], truncated: false, loading: false, error: "", request: 0
+    }
+  });
+  context.browserParent = (...args) => component.methods.browserParent.call(context, ...args);
+  context.removePathBrowserKeyHandler = (...args) => component.methods.removePathBrowserKeyHandler.call(context, ...args);
+
+  const browse = component.methods.browsePath.call(context, "/home/Drive");
+  assert.equal(context.profileConnectionAutosaveHeld, true);
+  component.methods.closePathBrowser.call(context);
+  pending.reject(new Error("The folder is not available to this account."));
+  await browse;
+
+  assert.deepEqual(context.pathBrowser, {
+    visible: false, kind: "", current: "/", parent: null, directories: [],
+    loading: false, error: "", truncated: false, request: 2
+  });
+  assert.equal(context.toasts.length, 0);
+  assert.equal(context.isolatedIncidents.connection.active, false);
+  assert.equal(context.operationBusy, false);
+  assert.equal(context.profileConnectionAutosaveHeld, false);
+});
+
 test("closing an editor always requests one fresh snapshot and active operations block navigation", () => {
   const component = loadAppComponent();
   const refreshes = [];

@@ -2322,6 +2322,9 @@ export default {
         remotePayload = Object.assign({}, remoteConnection, { parent: path, connection_proof: this.connectionProof });
       }
       const priorEvidence = kind === "remote" ? (this.connectionIncidentEvidence || "") : "";
+      const remoteIncidentSubject = kind === "remote"
+        ? `${this.selectedProfile || "New profile"} · ${path}`
+        : "";
       if (kind === "remote") {
         this.holdProfileAutosaveForConnection();
         this.operationBusy = true;
@@ -2358,10 +2361,14 @@ export default {
             : "";
         }
       } catch (error) {
-        if (this.disposed || !this.pathBrowser.visible || request !== this.pathBrowser.request) return;
+        if (this.disposed) return;
+        const presentationCurrent = this.pathBrowser.visible
+          && request === this.pathBrowser.request
+          && kind === this.pathBrowser.kind;
         const detail = boundedText(error && error.message, "Directory listing failed.");
         if (kind === "remote") {
           const uncertain = Boolean(error && (error.outcomeUnknown === true || error.requiresInspection === true));
+          if (!presentationCurrent && !uncertain) return;
           const retryable = Boolean(error && error.outcomeUnknown === true && error.requiresInspection !== true);
           const retryGuidance = retryable
             ? "Keep this evidence while inspecting Activity / Logs. A deliberate new browse request remains available and produces fresh evidence without erasing this correlation; profile saves and unrelated autosave remain available."
@@ -2374,11 +2381,12 @@ export default {
             uncertain ? { inspectionGuidance: retryGuidance, unknownGuidance: retryGuidance } : undefined
           );
           recordIsolatedIncident(this, "connection", "File Station browse", error, report, {
-            subject: `${this.selectedProfile || "New profile"} · ${path}`,
+            subject: remoteIncidentSubject,
             retryable
           });
-          this.pathBrowser.error = report.message;
+          if (presentationCurrent) this.pathBrowser.error = report.message;
         } else {
+          if (!presentationCurrent) return;
           this.pathBrowser.error = `${detail} Confirm the folder exists, is a canonical non-symlink DSM volume path, is not DSM-managed, and the package identity can read and traverse it.`;
         }
       } finally {
