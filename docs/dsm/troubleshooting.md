@@ -369,11 +369,13 @@ the CSRF key.
 
 ## A queued action remains pending or becomes outcome-unknown
 
-Configuration, secret, routine, and alert-policy saves plus Doctor observe a server job result with
-no client pending-state deadline. A healthy pending response continues to be observed until the
-controller returns terminal or `expired_or_missing` evidence. Five consecutive result-observation
-failures or an invalid result document instead produce a typed outcome-unknown result. Closing the
-AppWindow aborts browser observation but does not cancel a job already accepted by the server.
+Each mutation uses one serialized body and client request ID. When POST delivery or acknowledgement
+is ambiguous, the AppWindow automatically replays that exact request at most twice; an already
+accepted replay resolves to the same job. Profile saves, authentication/remote-browser probes, and
+autosave mutations then retry transient result reads within explicit overall limits. Other terminal
+observers continue while pending but produce a typed outcome-unknown result after five consecutive
+result-observation failures, invalid or `expired_or_missing` evidence, or AppWindow shutdown. Closing
+the AppWindow aborts browser observation but does not cancel a job already accepted by the server.
 
 1. Refresh the dashboard snapshot.
 2. Inspect structured Activity and bounded logs.
@@ -381,7 +383,13 @@ AppWindow aborts browser observation but does not cancel a job already accepted 
 4. Confirm whether the intended profile/routine/policy is now visible.
 5. For a profile save, inspect configuration and every credential-presence marker: configuration and
    earlier secret stages may have applied before a later stage failed or became outcome-unknown.
-6. Resubmit only after deciding the first job did not apply.
+6. Note the request and job correlation shown by the UI, when available.
+7. Only the affected UI scope and dependent operations are paused; use independent controls normally.
+   Authentication testing and remote browsing permit a deliberate new request for the current
+   profile draft. A new trusted success supplies fresh evidence but does not erase the earlier
+   request/job correlation; retain it until explicit reconciliation or a fresh AppWindow.
+8. Reopen the AppWindow to clear a persistent mutation scope only after deciding the first job did
+   not apply or after reconciling the resulting state. Do not blindly create a new request.
 
 The bridge caps the queue at 256 outstanding safe entries. Request/secret artifacts retain for up to
 24 hours; completed responses and unrecoverable processing-orphan artifacts retain for one hour,

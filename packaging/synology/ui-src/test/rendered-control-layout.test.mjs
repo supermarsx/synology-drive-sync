@@ -1130,3 +1130,131 @@ test("resizable AppWindow bounds its shell, owned overlays, tooltips, and secret
     await rm(temporaryDirectory, { recursive: true, force: true });
   }
 });
+
+test("file-explorer folder picker stays contained and scrollable across DSM AppWindow sizes", {
+  skip: browserPolicy.skipReason || false
+}, async () => {
+  assert.ok(chrome, `Chrome/Chromium is required on ${process.platform}/${process.arch} CI`);
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "sdsync-folder-explorer-"));
+  try {
+    const folderRows = Array.from({ length: 18 }, (_, index) => `
+      <div class="sdsync-path-browser-row" role="listitem">
+        <button class="sdsync-path-browser-open" type="button" aria-label="Open folder Archive ${index + 1}">
+          <span class="sdsync-path-browser-folder-icon" aria-hidden="true">F</span>
+          <span class="sdsync-path-browser-folder-copy">
+            <strong class="sdsync-path-browser-folder-name">Archive ${index + 1}</strong>
+            <code class="sdsync-path-browser-folder-path">/volume1/Shared/Department/Long project name/Archive ${index + 1}</code>
+          </span>
+          <span aria-hidden="true">&gt;</span>
+        </button>
+        <button class="fixture-button" type="button" aria-label="Select folder Archive ${index + 1}">Select</button>
+      </div>`).join("");
+    const html = `<!doctype html>
+      <meta charset="utf-8">
+      <style>
+        html, body { margin: 0; width: 1100px; height: 1000px; overflow: hidden; }
+        ${baselineCss}
+        #folder-app { position: relative; display: block !important; margin: 12px; }
+        .fixture-button { min-width: 0; min-height: 30px; padding: 5px 8px; border: 1px solid var(--sdsync-control-border); color: var(--sdsync-text); background: var(--sdsync-control); }
+      </style>
+      <body>
+        <div id="folder-app" class="sdsync-app is-dark">
+          <div id="folder-backdrop" class="sdsync-modal-backdrop sdsync-path-browser-backdrop">
+            <div id="folder-dialog" class="sdsync-modal sdsync-path-browser" role="dialog" aria-modal="true" aria-labelledby="folder-title" aria-describedby="folder-description" tabindex="-1">
+              <header class="sdsync-path-browser-header">
+                <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Folder explorer</p><h2 id="folder-title">Choose a local NAS source</h2></div><button class="fixture-button" type="button">Close</button></div>
+              </header>
+              <p id="folder-description" class="sdsync-path-browser-intro">Only canonical NAS directories readable and traversable by the package identity are shown.</p>
+              <div id="folder-toolbar" class="sdsync-path-browser-toolbar">
+                <button class="fixture-button" type="button">Parent folder</button>
+                <nav id="folder-breadcrumbs" class="sdsync-path-browser-breadcrumbs" aria-label="Current folder"><ol>
+                  <li><button class="sdsync-path-browser-crumb" type="button">NAS</button><span class="sdsync-path-browser-separator" aria-hidden="true">/</span></li>
+                  <li><button class="sdsync-path-browser-crumb" type="button">volume1</button><span class="sdsync-path-browser-separator" aria-hidden="true">/</span></li>
+                  <li><button class="sdsync-path-browser-crumb" type="button">Shared</button><span class="sdsync-path-browser-separator" aria-hidden="true">/</span></li>
+                  <li><button class="sdsync-path-browser-crumb" type="button">Department</button><span class="sdsync-path-browser-separator" aria-hidden="true">/</span></li>
+                  <li><button class="sdsync-path-browser-crumb" type="button" aria-current="location" disabled>Long project name</button></li>
+                </ol></nav>
+              </div>
+              <section id="folder-main" class="sdsync-path-browser-main" aria-label="Folder contents">
+                <div class="sdsync-path-browser-current" aria-live="polite"><span aria-hidden="true">F</span><span class="sdsync-path-browser-current-copy"><span class="sdsync-path-browser-current-label">Current folder</span><code>/volume1/Shared/Department/Long project name</code></span></div>
+                <div class="sdsync-path-browser-columns" aria-hidden="true"><span>Name</span><span>Choose</span></div>
+                <div id="folder-list" class="sdsync-path-browser-list" role="list" aria-busy="false">${folderRows}</div>
+              </section>
+              <footer id="folder-footer" class="sdsync-path-browser-footer">
+                <span class="sdsync-path-browser-summary"><span>18 folders visible</span><code>/volume1/Shared/Department/Long project name</code></span>
+                <span class="sdsync-path-browser-footer-actions"><button class="fixture-button" type="button">Cancel</button><button class="fixture-button" type="button">Select this folder</button></span>
+              </footer>
+            </div>
+          </div>
+        </div>
+        <script>
+          ${inlineControlLayout}
+          const parameters = new URLSearchParams(location.search);
+          const app = document.getElementById("folder-app");
+          app.style.width = (Number(parameters.get("width")) || 760) + "px";
+          app.style.height = (Number(parameters.get("height")) || 480) + "px";
+          installControlLayout(app);
+          const rect = (id) => {
+            const value = document.getElementById(id).getBoundingClientRect();
+            return { left: value.left, right: value.right, top: value.top, bottom: value.bottom, width: value.width, height: value.height };
+          };
+          const overflow = (id) => {
+            const value = document.getElementById(id);
+            const style = getComputedStyle(value);
+            return { clientWidth: value.clientWidth, scrollWidth: value.scrollWidth, clientHeight: value.clientHeight, scrollHeight: value.scrollHeight, overflowX: style.overflowX, overflowY: style.overflowY };
+          };
+          setTimeout(() => {
+            document.body.setAttribute("data-layout", btoa(JSON.stringify({
+              compact: app.classList.contains("sdsync-compact-shell"),
+              app: { rect: rect("folder-app"), overflow: overflow("folder-app") },
+              backdrop: rect("folder-backdrop"),
+              dialog: { rect: rect("folder-dialog"), overflow: overflow("folder-dialog") },
+              toolbar: { rect: rect("folder-toolbar"), overflow: overflow("folder-toolbar") },
+              breadcrumbs: { rect: rect("folder-breadcrumbs"), overflow: overflow("folder-breadcrumbs") },
+              main: rect("folder-main"),
+              list: { rect: rect("folder-list"), overflow: overflow("folder-list") },
+              footer: rect("folder-footer")
+            })));
+          }, 80);
+        </script>
+      </body>`;
+    const htmlPath = join(temporaryDirectory, "folder-explorer.html");
+    await writeFile(htmlPath, html, "utf8");
+    const url = pathToFileURL(htmlPath).href;
+    const browserRender = { retry: false, timeoutMs: 15000 };
+    const wide = render(chrome, `${url}?width=760&height=480`, join(temporaryDirectory, "folder-wide"), browserRender);
+    const compact = render(chrome, `${url}?width=500&height=360`, join(temporaryDirectory, "folder-compact"), browserRender);
+    const narrow = render(chrome, `${url}?width=390&height=360`, join(temporaryDirectory, "folder-narrow"), browserRender);
+
+    assert.equal(wide.compact, false);
+    assert.equal(compact.compact, true);
+    assert.equal(narrow.compact, true);
+    for (const result of [wide, compact, narrow]) {
+      assert.ok(result.app.overflow.scrollWidth <= result.app.overflow.clientWidth,
+        `folder picker created AppWindow horizontal overflow: ${JSON.stringify(result)}`);
+      assert.ok(result.dialog.overflow.scrollWidth <= result.dialog.overflow.clientWidth,
+        `folder dialog created horizontal overflow: ${JSON.stringify(result.dialog)}`);
+      assert.ok(result.dialog.rect.left >= result.backdrop.left - 0.1);
+      assert.ok(result.dialog.rect.right <= result.backdrop.right + 0.1);
+      assert.ok(result.dialog.rect.top >= result.backdrop.top - 0.1);
+      assert.ok(result.dialog.rect.bottom <= result.backdrop.bottom + 0.1);
+      assert.ok(result.main.bottom <= result.footer.top + 0.1,
+        `folder contents overlaid the selection footer: ${JSON.stringify({ main: result.main, footer: result.footer, dialog: result.dialog })}`);
+      assert.ok(result.list.rect.bottom <= result.footer.top + 0.1,
+        `scrolling folder list escaped below the footer: ${JSON.stringify({ list: result.list, footer: result.footer, main: result.main, dialog: result.dialog })}`);
+      assert.ok(result.list.overflow.scrollWidth <= result.list.overflow.clientWidth,
+        "long folder paths caused horizontal list overflow");
+      assert.ok(result.list.overflow.scrollHeight > result.list.overflow.clientHeight,
+        "folder fixture did not prove independent vertical scrolling");
+      assert.equal(result.list.overflow.overflowX, "hidden");
+      assert.equal(result.list.overflow.overflowY, "auto");
+      assert.equal(result.breadcrumbs.overflow.overflowX, "auto");
+      assert.ok(result.toolbar.overflow.scrollWidth <= result.toolbar.overflow.clientWidth,
+        "toolbar escaped its compact picker width");
+    }
+    assert.ok(narrow.breadcrumbs.overflow.scrollWidth > narrow.breadcrumbs.overflow.clientWidth,
+      "long compact breadcrumbs did not remain independently horizontally scrollable");
+  } finally {
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});

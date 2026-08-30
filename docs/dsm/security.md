@@ -230,9 +230,12 @@ DSM cookie authentication is necessary but not sufficient for POST. An authentic
 The signing key is a package-owned private file. Mutation POSTs require the token in
 `X-SDSYNC-CSRF`; expired, malformed, replayed in another session, or incorrectly signed values are
 rejected with the stable pre-acceptance code `csrf_rejected`. The UI holds it only in memory and
-never automatically retries an outcome-uncertain POST. If a bounded token-bootstrap retry changes
+automatically replays ambiguous POST delivery at most twice with the identical serialized body,
+client request ID, DSM authentication snapshot, and CSRF token. After that exact-request recovery is
+exhausted, it never invents a new request automatically. If a bounded token-bootstrap retry changes
 the AppWindow's DSM authentication generation, the client first reissues CSRF under that exact
-generation, replaces its module-memory token, and only then dispatches the first POST once.
+generation, replaces its module-memory token, and only then serializes the mutation and begins its
+bounded exact-delivery recovery.
 
 ## Exact HTTP surface
 
@@ -316,14 +319,20 @@ dangerous than leaving its outcome indeterminate. Inspect snapshot, Activity, he
 state, then explicitly repeat the operation only when it is safe.
 
 Configuration and secret saves, routine/policy changes, and Doctor observe terminal results before
-the UI reports success. Pending observations have no client deadline: they continue until terminal
-or `expired_or_missing` evidence, five consecutive result-observation failures, invalid result
-evidence, or AppWindow shutdown. Repeated observation failures and invalid/expired evidence produce
-a typed outcome-unknown result that carries the client request ID because the accepted server job
-may still have applied. Replaying the exact same authenticated request ID and payload returns the
-original job ID; reusing it for a different payload is a conflict. Plan and Run
-remain asynchronous: the UI retains their job IDs only in memory and follows normal run, Activity,
-and log evidence.
+the UI reports success. The AppWindow serializes each POST once and, when delivery or acknowledgement
+is ambiguous, makes no more than two automatic replays with the identical body, client request ID,
+DSM authentication snapshot, and CSRF token. Replaying the same authenticated request ID and payload
+returns the original job ID; reusing it for a different payload is a conflict.
+
+Profile saves, connection probes, and autosave mutations have explicit overall observation limits;
+transient result-read failures remain retryable until that limit. Unbounded terminal observers report
+outcome-unknown after `expired_or_missing` evidence, five consecutive result-observation failures,
+invalid evidence, or AppWindow shutdown. The typed error carries the client request ID and, after an
+accepted acknowledgement, the job ID because the server job may still have applied. Only the
+affected UI scope and operations that depend on it are paused: profile, routine, alerts, security,
+interface, or Run/Doctor. Connection probes use a separate deliberately retryable incident. Plan and
+Run remain asynchronous: the UI retains their job IDs only in memory and follows normal run,
+Activity, and log evidence.
 
 ## Mandatory audit and log policy
 

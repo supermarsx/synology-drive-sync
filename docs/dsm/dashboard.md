@@ -95,18 +95,27 @@ and three secret-state editors. See:
 
 The underlying save is queued, but the page polls its sanitized result and reports success only after
 the controller completes it. Configuration is applied first, followed by each requested secret
-operation in order. If a later stage fails or becomes outcome-unknown, the page reports the profile
-as partially applied when an earlier stage completed and preserves the editor for recovery. Only
-confirmed secret stages are cleared; unapplied values remain available while Activity and Logs are
-inspected. The current AppWindow then locks every mutation and all autosave work, even if a later
-snapshot reconciles one scope. Preserve the draft, inspect authoritative package state, Activity, and
-Logs, then reopen the AppWindow before making another change. Status refresh is fenced until the
-editor closes, then one fresh snapshot is requested.
+operation in order. A lost POST acknowledgement is recovered by replaying the exact serialized
+request, request ID, authentication snapshot, and CSRF token up to two times; the package returns the
+same job instead of creating a duplicate. Configuration and secret stages also have bounded result
+observation so the editor cannot stay busy indefinitely.
+
+If a later stage fails or remains outcome-unknown after recovery, the page reports the profile as
+partially applied when an earlier stage completed and preserves the editor. Only confirmed secret
+stages are cleared; unapplied values remain available while Activity, Logs, and a fresh package
+snapshot are inspected. The preserved form is not overwritten by that evidence refresh. Only the
+profile mutation scope and its autosave are paused; independent configuration scopes remain
+available, while routine changes and Run/Doctor stay paused because they depend on settled profile
+state. Reopen the AppWindow to clear the affected scope only after reconciling authoritative profile
+and credential-presence state. Authentication testing and target browsing use an independent
+incident scope and permit a deliberate new request for the current draft. The new result provides
+fresh evidence but does not erase the earlier request/job correlation; retain it until explicit
+reconciliation or a fresh AppWindow session.
 
 ## Routines
 
-Routines uses two keyboard-accessible subtabs. **Configured profiles** is first and shows each
-saved routine; selecting one opens the **New routine** subtab's routine editor with that profile's
+Routines opens on a catalog of configured per-profile automation. **New routine** opens a dedicated
+editor beside the catalog; selecting a saved routine opens that same editor with the profile's
 automation policy loaded. The page shows each routine's requested
 mode, effective backend, state, next run, and last success. The Overview realtime card makes an
 `inotify` backend or `polling` fallback visible rather than implying that a native watcher exists on
@@ -126,11 +135,11 @@ nearest writable ancestor without changing target contents.
 **Disposable write test** is separately capability-gated and requires an explicit confirmation. It
 briefly creates, uploads, verifies, may exercise same-target copy, and removes a unique probe. Use it
 only in a prepared non-critical destination. The API initially queues the action, then the page polls
-its sanitized terminal result before reporting the Doctor verdict. Pending observations have no
-client deadline. An `expired_or_missing` result, an invalid result document, or five consecutive result
-observation failures yield outcome-unknown; inspect Activity and refreshed cached health evidence
-to determine what completed. The current AppWindow locks every mutation and autosave after that
-result; reopen it only after reconciliation instead of resubmitting from the uncertain session.
+its sanitized terminal result before reporting the Doctor verdict. Pending Doctor observations have
+no overall client deadline. An `expired_or_missing` result, an invalid result document, or five
+consecutive result-observation failures yields outcome-unknown; inspect Activity and refreshed cached
+health evidence to determine what completed. Only the Run/Doctor operation scope is then paused in
+that AppWindow. Profile, routine, notification, security, and interface work remains available.
 
 The target-health table never fabricates evidence. Missing reachability, authentication,
 writability, latency, or timestamp data is shown as **Unavailable**. Free space is displayed only
@@ -211,19 +220,28 @@ the job, runs the package manager under a clean package identity, and writes a p
 Configuration/secret/routine/policy calls and Doctor poll that response before reporting a terminal
 result. Plan and Run remain asynchronous. Therefore:
 
-1. A configuration success toast proves a sanitized terminal manager result, but the refreshed
+1. Before declaring a POST outcome unknown, the AppWindow makes at most two automatic replays of the
+   exact original request body, client request ID, DSM authentication snapshot, and CSRF token. An
+   accepted replay returns the original job ID. No retry creates a new request identity or changes the
+   payload.
+2. A configuration success toast proves a sanitized terminal manager result, but the refreshed
    snapshot remains the authoritative displayed state.
-2. Pending result observations have no client deadline. They continue until a terminal or
-   `expired_or_missing` response, five consecutive observation failures, an invalid result document,
-   or AppWindow shutdown aborts observation.
-3. `expired_or_missing`, invalid result evidence, and repeated observation failures make the accepted
-   job outcome unknown. The current AppWindow locks every mutation and autosave; inspect the
-   refreshed snapshot, structured Activity, and bounded logs, then reopen the AppWindow before any
-   new action. Closing the AppWindow stops observation, not the queued server job.
-4. A multi-stage profile save can be partially applied when configuration or an earlier secret stage
-   completed before a later failure or outcome-unknown result. The draft remains visible, but the
-   current AppWindow cannot resubmit it. Inspect configuration and every credential-presence marker,
-   then reopen the AppWindow after reconciliation.
-5. For Plan and Run, “queued” is not success; follow run state, Activity, and logs.
-6. Investigate a failed or stale job through the [CLI recovery path](cli-parity.md), not browser
+3. Profile saves, profile-connection probes, and autosave calls use explicit overall observation
+   limits. Transient result-read failures remain retryable until the applicable limit; the UI then
+   reports outcome-unknown with both request and job correlation when available. Other terminal
+   observers have no overall deadline and report outcome-unknown after five consecutive observation
+   failures, invalid evidence, `expired_or_missing`, or AppWindow shutdown.
+4. Outcome-unknown pauses its affected mutation/autosave scope and operations that depend on it;
+   independent controls remain available. Connection-test and remote-browser incidents are
+   independent and permit a deliberate new request for the current draft. A new trusted success is
+   fresh evidence, not proof of the earlier job's terminal state or cleanup, so the earlier
+   correlation remains until explicit reconciliation or a fresh AppWindow. Closing the AppWindow
+   stops observation, not the queued server job.
+5. A multi-stage profile save can be partially applied when configuration or an earlier secret stage
+   completed before a later failure or outcome-unknown result. The preserved form and unapplied
+   secrets remain visible while Activity, Logs, and a fresh snapshot are inspected without
+   overwriting the draft. Reopen the AppWindow to clear that profile scope only after reconciling
+   configuration and every credential-presence marker.
+6. For Plan and Run, “queued” is not success; follow run state, Activity, and logs.
+7. Investigate a failed or stale job through the [CLI recovery path](cli-parity.md), not browser
    developer tools containing session material.

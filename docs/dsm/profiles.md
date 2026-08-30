@@ -43,6 +43,13 @@ path is canonicalized and checked again under the package service identity immed
 configuration mutation. If browsing is unavailable, the text field remains an explicit manual-entry
 fallback within the same DSM storage-root boundary.
 
+Before selecting a source inside a DSM shared folder, open **Control Panel > Shared Folder**, edit
+that share, select **Permissions > System internal user**, and grant the actual Synology Drive Sync
+package identity read-only access. Include list, traverse, and read permissions when Windows ACLs
+are enabled. DSM can collision-rename a package account, so select the identity shown by DSM instead
+of assuming its literal NSS name. The package only lists and accepts folders that identity can list,
+traverse, and read; it never grants itself access and does not need source write permission.
+
 **Browse target** remains locked until **Test authentication** succeeds for the exact URL, account,
 TLS settings, and stored or transient credential draft. The package discovers `SYNO.API.Auth` and
 `SYNO.FileStation.List` through `SYNO.API.Info`, opens a temporary `FileStation` session, uses

@@ -31,10 +31,12 @@ and observes each requested secret operation in order. These direct dashboard st
 request and terminal-observation periods so the editor cannot remain indefinitely busy. If
 configuration or an earlier secret stage completed before a later failure or outcome-unknown result,
 the page reports the profile as partially applied, preserves unapplied draft values, and requires the
-operator to inspect Activity, Logs, and authoritative profile and credential-presence state. Every
-mutation and autosave is locked for the rest of that AppWindow session; the preserved draft is for
-reconciliation, not resubmission. Close and reopen the AppWindow only after inspection. A fresh
-snapshot is requested after the editor is closed.
+operator to inspect Activity, Logs, and authoritative profile and credential-presence state. The page
+can refresh that evidence without overwriting the preserved profile or secret draft. Only profile
+mutations and profile autosave are paused; independent configuration scopes remain usable, while
+routine changes and Run/Doctor wait for settled profile state. The preserved draft is for
+reconciliation, not blind resubmission. Reopen the AppWindow to clear the profile scope only after
+inspection shows whether each stage applied.
 
 ## Password
 

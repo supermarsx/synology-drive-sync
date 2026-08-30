@@ -20,10 +20,13 @@ The default diagnostic:
 6. reports success or a nonzero exit without changing target contents.
 
 The dashboard's **Run doctor** action is initially queued, then the page polls the controller's
-sanitized result to a terminal verdict without a client pending-state deadline. An
-`expired_or_missing` response, invalid result evidence, or five consecutive result observation
-failures make the accepted job outcome-unknown; inspect refreshed health, Activity, and logs before
-retrying. Closing the AppWindow aborts observation but does not cancel the queued job.
+sanitized result to a terminal verdict without an overall client pending-state deadline. A lost POST
+acknowledgement is first recovered with at most two exact replays of the same serialized request and
+client request ID, which resolves to the same queued job. An `expired_or_missing` response, invalid
+result evidence, or five consecutive result-observation failures makes the accepted job
+outcome-unknown. Inspect refreshed health, Activity, and logs before another Doctor request. Only the
+Run/Doctor scope is paused; unrelated configuration remains available. Closing the AppWindow aborts
+observation but does not cancel the queued job.
 
 ### Disposable write test
 

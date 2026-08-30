@@ -89,7 +89,8 @@ On the source NAS:
 1. Open **Control Panel > Shared Folder**.
 2. Edit the intended source share and open **Permissions**.
 3. Change the user selector to **System internal user**.
-4. Grant `synology-drive-sync` read-only access.
+4. Grant the actual Synology Drive Sync package identity shown by DSM read-only access. DSM may
+   collision-rename its NSS account, so do not rely on a guessed literal username.
 5. Apply it only to the required descendants.
 6. If Windows ACLs are enabled, verify inherited list, traverse, and read permission.
 
@@ -117,11 +118,11 @@ URL, target DSM username, and File Station logical destination. Keep **Mirror re
 **Allow an empty source**, **Allow plain HTTP**, and **Accept invalid TLS certificates** off.
 
 Choose **Replace securely** for Password and enter the value. Save observes the queued configuration
-and each secret job to a sanitized terminal result, without a client pending-state deadline; then
-confirm the profile and password-presence marker in a refreshed snapshot. If a later stage fails or
-becomes outcome-unknown after an earlier stage completed, the UI reports the profile as partially
-applied—inspect all configuration and credential-presence markers before retrying. Run non-writing
-Doctor and Plan only after that evidence appears. See
+and each secret job to a sanitized terminal result within an explicit overall observation limit;
+then confirm the profile and password-presence marker in a refreshed snapshot. If a later stage
+fails or becomes outcome-unknown after an earlier stage completed, the UI reports the profile as
+partially applied—inspect all configuration and credential-presence markers before retrying. Run
+non-writing Doctor and Plan only after that evidence appears. See
 [Profiles and destinations](profiles.md) and
 [Secrets and protected values](secrets.md).
 

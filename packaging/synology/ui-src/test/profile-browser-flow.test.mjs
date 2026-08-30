@@ -80,14 +80,27 @@ function connectionContext(methods, overrides = {}) {
     profileForm: connectionForm(),
     secretModes: { password: "replace", totp: "keep", remote_log_token: "keep" },
     secretValues: { password: "fixture-password", totp: "", remote_log_token: "" },
-    profileConnectionRequest: 0, profileConnectionState: "idle", profileConnectionMessage: "",
+    profileConnectionRequest: 0, profileConnectionState: "idle", profileConnectionMessage: "", profileConnectionAutosaveHeld: false,
     connectionProof: "", connectionProofExpires: 0, connectionProofTimer: 0, auth: {}, csrfToken: "csrf",
-    mutationSessionBarrier: { active: false, kind: "", outcomeUnknown: false, requiresInspection: false },
+    isolatedIncidents: {
+      connection: { active: false, kind: "", outcomeUnknown: false, requiresInspection: false, message: "", requestId: "", jobId: "" },
+      operations: { active: false, kind: "", outcomeUnknown: false, requiresInspection: false, message: "", requestId: "", jobId: "" }
+    },
+    autosaveCoordinator: null, autosavePhase: "saved", autosaveMessage: "All changes saved",
+    autosaveFailureScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
+    autosaveOutcomeUnknownScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
+    autosaveInspectionScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
+    bridgeIssue: { title: "", message: "" }, connectionLabel: "Authenticated package bridge",
     pathBrowser: { visible: false, kind: "", current: "/", parent: null, directories: [], truncated: false, loading: false, error: "", request: 0 },
     toasts,
     toast(title, message, error = false) { toasts.push({ title, message, error }); },
     ...overrides
-  }, methods, ["strictDraftInteger", "between", "clearConnectionProofTimer", "scheduleConnectionProofExpiry", "invalidateConnectionTest", "connectionRequestPayload"]);
+  }, methods, [
+    "strictDraftInteger", "between", "clearConnectionProofTimer", "scheduleConnectionProofExpiry",
+    "invalidateConnectionTest", "connectionRequestPayload", "cancelAutosave", "autosaveChanged",
+    "refreshAutosaveStatus", "holdProfileAutosaveForConnection", "releaseProfileAutosaveFromConnection",
+    "reportMutationError"
+  ]);
 }
 
 test("stored-auth testing follows operational policy while secret writes remain frozen", () => {
@@ -154,6 +167,36 @@ test("authentication rejects a response whose proof epoch and expiry field disag
   assert.match(context.profileConnectionMessage, /invalid authentication proof/);
 });
 
+test("ordinary authentication rejection is retryable without changing the profile or secret draft", async () => {
+  let posts = 0;
+  const expires = Math.floor(Date.now() / 1000) + 300;
+  const proof = `v1.${expires}.${"e".repeat(64)}.${"f".repeat(64)}`;
+  const component = loadAppComponent({
+    post: async () => {
+      posts += 1;
+      if (posts === 1) throw new Error("DSM rejected these credentials");
+      return { connection_proof: proof, connection_proof_expires_at_epoch: expires };
+    }
+  });
+  const context = connectionContext(component.methods);
+  const formBefore = structuredClone(context.profileForm);
+  const modesBefore = structuredClone(context.secretModes);
+  const valuesBefore = structuredClone(context.secretValues);
+
+  await component.methods.testProfileAuthentication.call(context, { preventDefault() {} });
+  assert.equal(context.profileConnectionState, "error");
+  assert.equal(context.isolatedIncidents.connection.active, false);
+  assert.deepEqual(context.profileForm, formBefore);
+  assert.deepEqual(context.secretModes, modesBefore);
+  assert.deepEqual(context.secretValues, valuesBefore);
+
+  await component.methods.testProfileAuthentication.call(context, { preventDefault() {} });
+  assert.equal(posts, 2);
+  assert.equal(context.profileConnectionState, "success");
+  assert.deepEqual(context.profileForm, formBefore);
+  assert.deepEqual(context.secretValues, valuesBefore);
+});
+
 test("authentication owns the operation boundary and serializes secret save and profile deletion", async () => {
   const response = deferred();
   const posts = [];
@@ -187,25 +230,42 @@ test("authentication owns the operation boundary and serializes secret save and 
   assert.equal(context.profileConnectionState, "success");
 });
 
-test("unknown authentication outcome latches and cannot be redispatched", async () => {
+test("unknown authentication evidence stays connection-scoped and correlated after deliberate retry", async () => {
   let posts = 0;
-  const unknown = Object.assign(new Error("Authentication outcome is unknown"), { outcomeUnknown: true });
+  const expires = Math.floor(Date.now() / 1000) + 300;
+  const proof = `v1.${expires}.${"a".repeat(64)}.${"b".repeat(64)}`;
+  const requestId = "1".repeat(32);
+  const jobId = "2".repeat(48);
+  const unknown = Object.assign(new Error("Authentication outcome is unknown"), {
+    outcomeUnknown: true, trustedRequestId: true, requestId, trustedJobId: true, jobId
+  });
   const component = loadAppComponent({
-    post: async () => { posts += 1; throw unknown; }
+    post: async () => {
+      posts += 1;
+      if (posts === 1) throw unknown;
+      return { connection_proof: proof, connection_proof_expires_at_epoch: expires };
+    }
   });
   const context = connectionContext(component.methods);
 
   await component.methods.testProfileAuthentication.call(context, { preventDefault() {} });
+  assert.equal(context.isolatedIncidents.connection.active, true);
+  assert.match(context.profileConnectionMessage, new RegExp(requestId));
+  assert.match(context.profileConnectionMessage, new RegExp(jobId));
+  assert.equal(context.autosaveFailureScopes.profile, false, "a connection incident must not poison profile autosave");
+  context.connectionIncidentEvidence = component.computed.connectionIncidentEvidence.call(context);
   await component.methods.testProfileAuthentication.call(context, { preventDefault() {} });
 
-  assert.equal(posts, 1);
-  assert.equal(context.mutationSessionBarrier.active, true);
+  assert.equal(posts, 2);
+  assert.equal(context.isolatedIncidents.connection.active, true);
+  assert.equal(context.isolatedIncidents.connection.requestId, requestId);
+  assert.equal(context.isolatedIncidents.connection.jobId, jobId);
+  assert.match(context.profileConnectionMessage, /prior unresolved connection evidence remains/i);
   assert.equal(context.operationBusy, false);
-  assert.match(context.profileConnectionMessage, /All mutations and autosave are locked/);
-  assert.equal(context.toasts.at(-1).title, "Authentication test locked");
+  assert.equal(context.profileConnectionState, "success");
 });
 
-test("known File Station logout failures require inspection and latch auth or browse retries", async () => {
+test("cleanup-required File Station evidence survives later success until explicit reconciliation", async () => {
   const api = await loadApi();
   const codes = [
     "file_station_logout_failed",
@@ -220,28 +280,39 @@ test("known File Station logout failures require inspection and latch auth or br
   }
 
   let authenticationPosts = 0;
+  const expires = Math.floor(Date.now() / 1000) + 300;
+  const proof = `v1.${expires}.${"c".repeat(64)}.${"d".repeat(64)}`;
+  const cleanupRequestId = "7".repeat(32);
   const authentication = loadAppComponent({
     post: async () => {
       authenticationPosts += 1;
-      throw new api.DsmApiError("Temporary session logout failed", 502, codes[0]);
+      if (authenticationPosts === 1) {
+        throw Object.assign(new api.DsmApiError("Temporary session logout failed", 502, codes[0]), {
+          trustedRequestId: true, requestId: cleanupRequestId
+        });
+      }
+      return { connection_proof: proof, connection_proof_expires_at_epoch: expires };
     }
   });
   const authenticationContext = connectionContext(authentication.methods);
   await authentication.methods.testProfileAuthentication.call(authenticationContext, { preventDefault() {} });
-  await authentication.methods.testProfileAuthentication.call(authenticationContext, { preventDefault() {} });
-  assert.equal(authenticationPosts, 1);
-  assert.equal(authenticationContext.mutationSessionBarrier.active, true);
-  assert.equal(authenticationContext.mutationSessionBarrier.outcomeUnknown, false);
-  assert.equal(authenticationContext.mutationSessionBarrier.requiresInspection, true);
+  assert.equal(authenticationContext.isolatedIncidents.connection.requiresInspection, true);
   assert.equal(authenticationContext.toasts[0].title, "Authentication cleanup needs inspection");
-  assert.equal(authenticationContext.toasts.at(-1).title, "Authentication test locked");
+  authenticationContext.connectionIncidentEvidence = authentication.computed.connectionIncidentEvidence.call(authenticationContext);
+  await authentication.methods.testProfileAuthentication.call(authenticationContext, { preventDefault() {} });
+  assert.equal(authenticationPosts, 2);
+  assert.equal(authenticationContext.isolatedIncidents.connection.active, true);
+  assert.equal(authenticationContext.isolatedIncidents.connection.requestId, cleanupRequestId);
+  assert.match(authentication.computed.incidentGuidance.call(authenticationContext), new RegExp(cleanupRequestId));
+  assert.match(authenticationContext.profileConnectionMessage, /prior unresolved connection evidence remains/i);
 
   for (const code of codes.slice(1)) {
     let browsePosts = 0;
     const component = loadAppComponent({
       post: async () => {
         browsePosts += 1;
-        throw new api.DsmApiError("Temporary session logout failed", 502, code);
+        if (browsePosts === 1) throw new api.DsmApiError("Temporary session logout failed", 502, code);
+        return { directory_schema: "sdsync.dsm-remote-directories.v1", current: "/home/Drive", directories: [], truncated: false };
       }
     });
     const context = connectionContext(component.methods, {
@@ -252,10 +323,13 @@ test("known File Station logout failures require inspection and latch auth or br
     });
     context.browserParent = (...args) => component.methods.browserParent.call(context, ...args);
     await component.methods.browsePath.call(context, "/home/Drive");
+    assert.equal(context.isolatedIncidents.connection.requiresInspection, true);
+    assert.match(context.pathBrowser.error, /logout failed|cleanup/i);
+    context.connectionIncidentEvidence = component.computed.connectionIncidentEvidence.call(context);
     await component.methods.browsePath.call(context, "/home/Drive");
-    assert.equal(browsePosts, 1, `${code} must latch before a second browse`);
-    assert.equal(context.mutationSessionBarrier.requiresInspection, true);
-    assert.match(context.pathBrowser.error, /cleanup failed/);
+    assert.equal(browsePosts, 2, `${code} must permit a deliberate connection-only retry`);
+    assert.equal(context.isolatedIncidents.connection.active, true, `${code} cleanup evidence must outlive an unrelated later success`);
+    assert.match(context.pathBrowser.error, /prior unresolved connection evidence remains/i);
   }
 });
 
@@ -293,11 +367,15 @@ test("remote browsing is auth-gated and sends the proof with the exact transient
   assert.deepEqual(context.pathBrowser.directories, [{ name: "Child", path: "/home/Drive/Child" }]);
 });
 
-test("unknown File Station browse outcome latches before a second remote request", async () => {
+test("unknown File Station browse evidence remains isolated after a trusted new retry", async () => {
   let posts = 0;
   const unknown = Object.assign(new Error("Browse outcome is unknown"), { outcomeUnknown: true });
   const component = loadAppComponent({
-    post: async () => { posts += 1; throw unknown; }
+    post: async (_auth, _csrf, _action, payload) => {
+      posts += 1;
+      if (posts === 1) throw unknown;
+      return { directory_schema: "sdsync.dsm-remote-directories.v1", current: payload.parent, directories: [], truncated: false };
+    }
   });
   const context = connectionContext(component.methods, {
     connectionTestReady: true,
@@ -308,11 +386,14 @@ test("unknown File Station browse outcome latches before a second remote request
   context.browserParent = (...args) => component.methods.browserParent.call(context, ...args);
 
   await component.methods.browsePath.call(context, "/home/Drive");
+  assert.equal(context.isolatedIncidents.connection.active, true);
+  assert.equal(context.autosaveFailureScopes.profile, false);
+  context.connectionIncidentEvidence = component.computed.connectionIncidentEvidence.call(context);
   await component.methods.browsePath.call(context, "/home/Drive");
 
-  assert.equal(posts, 1);
-  assert.equal(context.mutationSessionBarrier.active, true);
-  assert.match(context.pathBrowser.error, /All mutations and autosave are locked/);
+  assert.equal(posts, 2);
+  assert.equal(context.isolatedIncidents.connection.active, true);
+  assert.match(context.pathBrowser.error, /prior unresolved connection evidence remains/i);
 });
 
 test("authentication proof expiry closes remote browsing and prevents another browse dispatch", async () => {
@@ -536,6 +617,209 @@ test("profile-owned drafts block manual refresh and fence an already in-flight s
     if (previousDocument === undefined) delete globalThis.document;
     else globalThis.document = previousDocument;
   }
+});
+
+test("profile recovery preserves the editor and transient secrets across Activity evidence reads", async () => {
+  const freshSnapshot = {
+    schema: "sdsync.dsm-api.v1",
+    profiles: [{ name: "nightly", source: "/volume1/authoritative" }],
+    capabilities: { mutations: true }
+  };
+  const component = loadAppComponent({ get: async () => freshSnapshot });
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
+  globalThis.document = { hidden: false };
+  globalThis.window = { clearTimeout() {} };
+  try {
+    const profileForm = { ...connectionForm(), name: "nightly", source: "/volume1/draft" };
+    const secretValues = { password: "draft-password", totp: "JBSWY3DPEHPK3PXP", remote_log_token: "draft-token" };
+    const secretModes = { password: "replace", totp: "replace", remote_log_token: "replace" };
+    const refreshContext = {
+      disposed: false, snapshotRefreshBlocked: false, snapshotPromise: null,
+      snapshotRefreshQueued: false, snapshotLoading: false, snapshotGeneration: 4,
+      csrfToken: "csrf", auth: {}, snapshot: null, connected: false, canMutate: true,
+      profileEditorOpen: true, profileForm, secretValues, secretModes,
+      bridgeIssue: { title: "", message: "" }, connectionLabel: "", freshness: "",
+      hydrateAlerts() {}, hydrateSecurityPolicy() {}, maybeNotifyFailure() {}, scheduleSnapshot() {}, toast() {}
+    };
+
+    assert.equal(await component.methods.refreshSnapshot.call(refreshContext, true, true), true);
+    assert.equal(refreshContext.snapshot, freshSnapshot);
+    assert.equal(refreshContext.profileForm, profileForm, "snapshot evidence must not replace the editor-owned form object");
+    assert.equal(refreshContext.secretValues, secretValues, "snapshot evidence must not replace transient secret values");
+    assert.deepEqual(refreshContext.secretValues, {
+      password: "draft-password", totp: "JBSWY3DPEHPK3PXP", remote_log_token: "draft-token"
+    });
+
+    const navigation = {
+      routes: [{ id: "profiles" }, { id: "activity" }], route: "profiles",
+      profileSaveState: "error", profileConnectionState: "idle", profileRecoveryActive: true,
+      profileEditorOpen: true, profileForm, secretValues, secretModes, logTimer: 0,
+      autosaveOutcomeUnknownScopes: { profile: true, routine: false, alerts: false, security: false, interface: false },
+      autosaveInspectionScopes: { profile: true, routine: false, alerts: false, security: false, interface: false },
+      autosaveIncidents: {
+        profile: { active: true, outcomeUnknown: true, requiresInspection: true, message: "uncertain", requestId: "8".repeat(32), jobId: "9".repeat(48), subject: "nightly" }
+      },
+      isolatedIncidents: {
+        connection: { active: false }, operations: { active: false }
+      },
+      closeProfile() { assert.fail("recovery navigation must not close or clear the profile editor"); },
+      closeRoutine() {}, refreshLogsCalls: 0, refreshes: 0,
+      refreshLogs() { this.refreshLogsCalls += 1; },
+      refreshSnapshot() { this.refreshes += 1; return Promise.resolve(true); },
+      toast() {}
+    };
+    const correlationBefore = component.computed.incidentGuidance.call(navigation);
+    component.methods.navigate.call(navigation, "activity");
+    assert.equal(navigation.route, "activity");
+    assert.equal(navigation.refreshLogsCalls, 1, "Activity and Logs reads remain available");
+    assert.equal(navigation.refreshes, 1, "entering Activity requests fresh package evidence");
+    assert.equal(navigation.profileForm, profileForm);
+    assert.equal(navigation.secretValues, secretValues);
+    assert.equal(component.computed.incidentGuidance.call(navigation), correlationBefore);
+    assert.match(correlationBefore, new RegExp("8".repeat(32)));
+    assert.match(correlationBefore, new RegExp("9".repeat(48)));
+
+    component.methods.navigate.call(navigation, "profiles");
+    assert.equal(navigation.route, "profiles");
+    assert.equal(navigation.profileEditorOpen, true);
+    assert.equal(navigation.profileForm.source, "/volume1/draft");
+    assert.equal(navigation.secretValues.password, "draft-password");
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  }
+});
+
+test("Local source visibly explains DSM system-internal-user permissions", () => {
+  assert.match(appSource, /class="sdsync-permission-callout span-2"/);
+  assert.match(appSource, /Control Panel → Shared Folder → Permissions → System internal user/);
+  assert.match(appSource, /grant list, traverse, and read access to the exact package identity DSM displays/);
+  assert.match(appSource, /DSM can collision-rename that identity/);
+  assert.match(appSource, /package cannot grant itself access/);
+});
+
+test("folder explorer exposes breadcrumbs, explicit current-folder selection, and complete async states", () => {
+  assert.match(appSource, /class="sdsync-path-browser-breadcrumbs" aria-label="Current folder"/);
+  assert.match(appSource, /:aria-current="crumb\.current \? 'location' : null"/);
+  assert.match(appSource, />Up one level<\/v-button>/);
+  assert.match(appSource, /class="sdsync-path-browser-current" aria-live="polite"/);
+  assert.match(appSource, /class="sdsync-path-browser-folder-icon"/);
+  assert.match(appSource, /:aria-label="'Open folder ' \+ directory\.name"/);
+  assert.match(appSource, /:aria-label="'Select folder ' \+ directory\.name"/);
+  assert.match(appSource, /<strong>Opening folder<\/strong>/);
+  assert.match(appSource, /<strong>Folder listing unavailable<\/strong>/);
+  assert.match(appSource, /<strong>No child folders visible<\/strong>/);
+  assert.match(appSource, />Select this folder<\/v-button>/);
+
+  const component = loadAppComponent();
+  const local = component.methods.pathBrowserBreadcrumbs.call(
+    { pathBrowser: { kind: "local" } },
+    "/volume1/Shared/Project"
+  );
+  assert.deepEqual(local, [
+    { label: "NAS", path: "/", current: false },
+    { label: "volume1", path: "/volume1", current: false },
+    { label: "Shared", path: "/volume1/Shared", current: false },
+    { label: "Project", path: "/volume1/Shared/Project", current: true }
+  ]);
+  const remoteRoot = component.methods.pathBrowserBreadcrumbs.call(
+    { pathBrowser: { kind: "remote" } },
+    "/"
+  );
+  assert.deepEqual(remoteRoot, [{ label: "File Station", path: "/", current: true }]);
+});
+
+test("starting folder navigation clears stale rows before awaiting the bounded listing", async () => {
+  const pending = deferred();
+  const component = loadAppComponent({ get: async () => pending.promise });
+  const context = {
+    disposed: false,
+    auth: {},
+    connectionTestReady: false,
+    pathBrowser: {
+      visible: true, kind: "local", current: "/volume1/Old", parent: "/volume1",
+      directories: [{ name: "Stale", path: "/volume1/Old/Stale" }], truncated: true,
+      loading: false, error: "", request: 0
+    }
+  };
+  context.browserParent = (...args) => component.methods.browserParent.call(context, ...args);
+
+  const navigation = component.methods.browsePath.call(context, "/volume1/New");
+  assert.equal(context.pathBrowser.loading, true);
+  assert.deepEqual(context.pathBrowser.directories, []);
+  assert.equal(context.pathBrowser.truncated, false);
+  pending.resolve({
+    schema: "sdsync.dsm-source-directories.v1",
+    current: "/volume1/New",
+    parent: "/volume1",
+    directories: [{ name: "Fresh", path: "/volume1/New/Fresh" }],
+    truncated: false
+  });
+  await navigation;
+  assert.equal(context.pathBrowser.loading, false);
+  assert.deepEqual(context.pathBrowser.directories, [{ name: "Fresh", path: "/volume1/New/Fresh" }]);
+});
+
+test("closing and reopening the folder explorer fences a late listing from the prior dialog", async () => {
+  const firstListing = deferred();
+  let reads = 0;
+  const component = loadAppComponent({
+    get: async (_auth, _action, parameters) => {
+      reads += 1;
+      if (reads === 1) return firstListing.promise;
+      return {
+        schema: "sdsync.dsm-source-directories.v1",
+        current: parameters.parent,
+        parent: "/",
+        directories: [{ name: "Current child", path: `${parameters.parent}/Current child` }],
+        truncated: false
+      };
+    }
+  });
+  const context = bind({
+    disposed: false,
+    auth: {},
+    pathBrowserPriorFocus: null,
+    pathBrowserKeyHandler: null,
+    pathBrowser: {
+      visible: false, kind: "", current: "/", parent: null,
+      directories: [], truncated: false, loading: false, error: "", request: 0
+    }
+  }, component.methods, [
+    "removePathBrowserKeyHandler", "handlePathBrowserKeydown", "browserParent", "browsePath"
+  ]);
+
+  const staleRequest = component.methods.showPathBrowser.call(context, "local", "/volume1/Old");
+  assert.equal(context.pathBrowser.request, 1);
+  component.methods.closePathBrowser.call(context);
+  assert.equal(context.pathBrowser.request, 2);
+  assert.equal(context.pathBrowser.visible, false);
+
+  await component.methods.showPathBrowser.call(context, "local", "/volume2/New");
+  assert.equal(context.pathBrowser.request, 3);
+  assert.equal(context.pathBrowser.current, "/volume2/New");
+  assert.deepEqual(context.pathBrowser.directories, [
+    { name: "Current child", path: "/volume2/New/Current child" }
+  ]);
+
+  firstListing.resolve({
+    schema: "sdsync.dsm-source-directories.v1",
+    current: "/volume1/Old",
+    parent: "/volume1",
+    directories: [{ name: "Stale child", path: "/volume1/Old/Stale child" }],
+    truncated: false
+  });
+  await staleRequest;
+
+  assert.equal(context.pathBrowser.request, 3);
+  assert.equal(context.pathBrowser.current, "/volume2/New");
+  assert.equal(context.pathBrowser.loading, false);
+  assert.deepEqual(context.pathBrowser.directories, [
+    { name: "Current child", path: "/volume2/New/Current child" }
+  ]);
 });
 
 test("closing an editor always requests one fresh snapshot and active operations block navigation", () => {

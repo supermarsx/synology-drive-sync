@@ -51,7 +51,7 @@
               <v-button
                 type="border"
                 display="icon-text"
-                :tooltip="snapshotRefreshBlocked ? 'Close the profile editor before refreshing package status' : 'Refresh current data'"
+                :tooltip="snapshotRefreshTooltip"
                 :disabled="snapshotLoading || snapshotRefreshBlocked"
                 @click="refreshSnapshot(true)"
               ><template #icon><action-icon name="refresh" /></template>Refresh</v-button>
@@ -66,10 +66,10 @@
             </div>
           </div>
 
-          <div v-if="mutationOutcomeUnresolved" class="sdsync-banner sdsync-mutation-barrier" role="alert" aria-live="assertive">
+          <div v-if="incidentOutcomeUnresolved" class="sdsync-banner sdsync-mutation-barrier" role="alert" aria-live="assertive">
             <div>
-              <strong>Mutation outcome needs reconciliation</strong>
-              <span>{{ mutationOutcomeGuidance }}</span>
+              <strong>Scoped outcome needs reconciliation</strong>
+              <span>{{ incidentGuidance }}</span>
             </div>
           </div>
 
@@ -84,8 +84,8 @@
                 <small>{{ overviewSummary }}</small>
               </div>
               <div class="sdsync-action-row">
-                <v-button suffix="grey" display="icon-text" tooltip="Preview every configured profile without changing destination files" :disabled="!canRunOperations || !profiles.length || operationBusy" @click="quickPlan"><template #icon><action-icon name="plan" /></template>Plan all profiles</v-button>
-                <v-button suffix="main" display="icon-text" tooltip="Start a real sync for every configured profile with deletion disabled" :disabled="!canRunOperations || !profiles.length || operationBusy" @click="quickRun"><template #icon><action-icon name="run" /></template>Run all profiles</v-button>
+                <v-button suffix="grey" display="icon-text" :tooltip="operationMutationGuidance || 'Preview every configured profile without changing destination files'" :disabled="!canRunOperations || !profiles.length || operationBusy" @click="quickPlan"><template #icon><action-icon name="plan" /></template>Plan all profiles</v-button>
+                <v-button suffix="main" display="icon-text" :tooltip="operationMutationGuidance || 'Start a real sync for every configured profile with deletion disabled'" :disabled="!canRunOperations || !profiles.length || operationBusy" @click="quickRun"><template #icon><action-icon name="run" /></template>Run all profiles</v-button>
               </div>
             </div>
 
@@ -152,9 +152,13 @@
                 <div class="sdsync-form-grid">
                   <v-form-item class="sdsync-form-item" label="Name" prop="name"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-name" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.name" :readonly="Boolean(selectedProfile)" maxlength="64" placeholder="office_nas" aria-describedby="sdsync-help-profile-name" :disabled="!canChangeProfiles" /></v-form-item>
                   <v-form-item class="sdsync-form-item" label="Local source" prop="source"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-source" /></template><div class="sdsync-path-control"><v-input class="sdsync-input-control" v-model.trim="profileForm.source" maxlength="4096" placeholder="/volume1/Source" aria-describedby="sdsync-help-profile-source" :disabled="!canChangeProfiles" /><v-button type="border" display="icon-text" html-type="button" tooltip="Browse only NAS folders the package identity can read and traverse" :disabled="!canChangeProfiles || pathBrowser.loading" @click="openLocalSourceBrowser"><template #icon><action-icon name="folder" /></template>Browse NAS</v-button></div></v-form-item>
+                  <aside class="sdsync-permission-callout span-2" role="note" aria-label="DSM shared-folder permission required">
+                    <span class="sdsync-permission-callout-icon" aria-hidden="true"><span>!</span></span>
+                    <span class="sdsync-permission-callout-copy"><strong>Shared-folder access must be granted first</strong>In DSM, open <code>Control Panel → Shared Folder → Permissions → System internal user</code>, then grant list, traverse, and read access to the exact package identity DSM displays. DSM can collision-rename that identity; the package cannot grant itself access.</span>
+                  </aside>
                   <v-form-item class="sdsync-form-item span-2" label="File Station URL" prop="url"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-url" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.url" maxlength="2048" placeholder="https://files.example.com" aria-describedby="sdsync-help-profile-url" :disabled="!canChangeProfiles" /></v-form-item>
                   <v-form-item class="sdsync-form-item" label="DSM username" prop="username"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-username" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.username" maxlength="256" autocomplete="username" aria-describedby="sdsync-help-profile-username" :disabled="!canChangeProfiles" /></v-form-item>
-                  <v-form-item class="sdsync-form-item" label="Remote logical path" prop="remote"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-remote" /></template><div class="sdsync-path-control"><v-input class="sdsync-input-control" v-model.trim="profileForm.remote" maxlength="247" placeholder="/home/Drive/NAS Backup" aria-describedby="sdsync-help-profile-remote" :disabled="!canChangeProfiles" /><v-button type="border" display="icon-text" html-type="button" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : (connectionTestReady ? 'Browse directories returned by the authenticated File Station account' : 'Test authentication successfully before browsing File Station')" :disabled="!canChangeProfiles || mutationOutcomeUnresolved || !connectionTestReady || pathBrowser.loading" @click="openRemotePathBrowser"><template #icon><action-icon name="folder" /></template>{{ mutationOutcomeUnresolved ? 'Browse locked' : 'Browse target' }}</v-button></div></v-form-item>
+                  <v-form-item class="sdsync-form-item" label="Remote logical path" prop="remote"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-remote" /></template><div class="sdsync-path-control"><v-input class="sdsync-input-control" v-model.trim="profileForm.remote" maxlength="247" placeholder="/home/Drive/NAS Backup" aria-describedby="sdsync-help-profile-remote" :disabled="!canChangeProfiles" /><v-button type="border" display="icon-text" html-type="button" :tooltip="profileConnectionActionGuidance || (connectionTestReady ? 'Browse directories returned by the authenticated File Station account' : 'Test authentication successfully before browsing File Station')" :disabled="!canChangeProfiles || profileConnectionBlocked || !connectionTestReady || pathBrowser.loading" @click="openRemotePathBrowser"><template #icon><action-icon name="folder" /></template>{{ profileConnectionBlocked ? 'Browse locked' : (connectionOutcomeUnresolved ? 'Retry target browse' : 'Browse target') }}</v-button></div></v-form-item>
                   <v-form-item class="sdsync-form-item" label="Comparison"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-compare" /></template><v-single-select class="sdsync-select-control" v-model="profileForm.compare" :options="compareOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-compare" :disabled="!canChangeProfiles"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
                   <v-form-item class="sdsync-form-item" label="Concurrent uploads"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-jobs" /></template><v-input class="sdsync-input-control" v-model="profileForm.jobs" number-only aria-describedby="sdsync-help-profile-jobs" :disabled="!canChangeProfiles" /></v-form-item>
                   <div class="sdsync-toggle-row span-2"><span class="sdsync-toggle-label">Allow plain HTTP for controlled LAN testing <control-help help-key="profile-http" /></span><v-checkbox class="sdsync-checkbox-control" v-model="profileForm.allow_http" aria-label="Allow plain HTTP for controlled LAN testing" aria-describedby="sdsync-help-profile-http" :disabled="!canEditHttpException" /></div>
@@ -208,21 +212,21 @@
                     <v-input class="sdsync-input-control sdsync-secret-value" v-if="secretModes.totp === 'replace'" v-model="secretValues.totp" type="password" maxlength="4096" autocomplete="off" placeholder="Base32 seed or otpauth URI" aria-describedby="sdsync-help-secret-totp-value" :disabled="!canManageSecrets" /><control-help class="sdsync-secret-value-help" v-if="secretModes.totp === 'replace'" help-key="secret-totp-value" />
                   </div>
                   <div class="sdsync-connection-test span-2">
-                    <v-button type="border" display="icon-text" html-type="button" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : 'Authenticate with this draft without storing it, then close the temporary File Station session'" :disabled="!canTestProfileAuthentication" :aria-busy="profileConnectionState === 'testing' ? 'true' : 'false'" @click="testProfileAuthentication"><template #icon><action-icon :class="{ 'sdsync-is-spinning': profileConnectionState === 'testing' }" :name="profileConnectionState === 'testing' ? 'refresh' : 'doctor'" /></template>{{ profileConnectionState === 'testing' ? 'Testing authentication…' : (mutationOutcomeUnresolved ? 'Authentication locked' : 'Test authentication') }}</v-button>
+                    <v-button type="border" display="icon-text" html-type="button" :tooltip="profileConnectionActionGuidance || 'Authenticate with this draft without storing it, then close the temporary File Station session'" :disabled="!canTestProfileAuthentication" :aria-busy="profileConnectionState === 'testing' ? 'true' : 'false'" @click="testProfileAuthentication"><template #icon><action-icon :class="{ 'sdsync-is-spinning': profileConnectionState === 'testing' }" :name="profileConnectionState === 'testing' ? 'refresh' : 'doctor'" /></template>{{ profileConnectionState === 'testing' ? 'Testing authentication…' : (profileConnectionBlocked ? 'Authentication locked' : (connectionOutcomeUnresolved ? 'Retry authentication' : 'Test authentication')) }}</v-button>
                     <span :class="['sdsync-connection-state', 'is-' + profileConnectionState]" role="status" aria-live="polite">{{ profileConnectionMessage }}</span>
                   </div>
                   <p class="sdsync-field-note">Secret values are sent only in the protected request body. They are never returned to this window.</p>
                   <div v-if="selectedProfile" class="sdsync-secret-actions">
-                    <v-button suffix="main" display="icon-text" html-type="button" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : 'Apply only changed password, TOTP, and remote-log token operations without rewriting profile configuration'" :disabled="!canSubmitProfileSecrets" :aria-busy="profileSaveState === 'saving' ? 'true' : 'false'" @click="saveProfileSecrets"><template #icon><action-icon :class="{ 'sdsync-is-spinning': profileSaveState === 'saving' }" :name="profileSaveState === 'saving' ? 'refresh' : 'save'" /></template>{{ profileSaveState === 'saving' ? 'Saving changed secrets…' : (mutationOutcomeUnresolved ? 'Secrets locked' : 'Save changed secrets') }}</v-button>
+                    <v-button suffix="main" display="icon-text" html-type="button" :tooltip="profileOutcomeUnresolved ? profileOutcomeGuidance : 'Apply only changed password, TOTP, and remote-log token operations without rewriting profile configuration'" :disabled="!canSubmitProfileSecrets" :aria-busy="profileSaveState === 'saving' ? 'true' : 'false'" @click="saveProfileSecrets"><template #icon><action-icon :class="{ 'sdsync-is-spinning': profileSaveState === 'saving' }" :name="profileSaveState === 'saving' ? 'refresh' : 'save'" /></template>{{ profileSaveState === 'saving' ? 'Saving changed secrets…' : (profileOutcomeUnresolved ? 'Secrets locked' : 'Save changed secrets') }}</v-button>
                   </div>
                 </fieldset>
 
                 <div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Use as default profile <control-help help-key="profile-default" /></span><v-checkbox class="sdsync-checkbox-control" v-model="profileForm.make_default" aria-label="Use as default profile" aria-describedby="sdsync-help-profile-default" :disabled="!canChangeProfiles" /></div>
                 <div class="sdsync-form-actions">
-                  <v-button v-if="selectedProfile" suffix="red" display="icon-text" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : 'Remove package configuration and stored credentials, not synchronized files'" :disabled="!canRemoveProfile" @click="removeProfile"><template #icon><action-icon name="delete" /></template>Delete profile</v-button>
+                  <v-button v-if="selectedProfile" suffix="red" display="icon-text" :tooltip="profileOutcomeUnresolved ? profileOutcomeGuidance : 'Remove package configuration and stored credentials, not synchronized files'" :disabled="!canRemoveProfile" @click="removeProfile"><template #icon><action-icon name="delete" /></template>Delete profile</v-button>
                   <span class="sdsync-field-note">Existing safe profile changes autosave after 1.3 seconds. Creation, secrets, and new risk approvals stay explicit.</span>
                   <v-button suffix="cancel" display="icon-text" tooltip="Discard unsaved editor values and clear secret fields" :disabled="profileSaveState === 'saving' || profileConnectionState === 'testing'" @click="closeProfile"><template #icon><action-icon name="close" /></template>Cancel</v-button>
-                  <v-button suffix="main" display="icon-text" html-type="submit" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : 'Validate and apply configuration immediately, then process explicit secret operations'" :disabled="!canSubmitProfile" :aria-busy="profileSaveState === 'saving' ? 'true' : 'false'"><template #icon><action-icon :class="{ 'sdsync-is-spinning': profileSaveState === 'saving' }" :name="profileSaveState === 'saving' ? 'refresh' : 'save'" /></template>{{ profileSaveButtonText }}</v-button>
+                  <v-button suffix="main" display="icon-text" html-type="submit" :tooltip="profileOutcomeUnresolved ? profileOutcomeGuidance : 'Validate and apply configuration immediately, then process explicit secret operations'" :disabled="!canSubmitProfile" :aria-busy="profileSaveState === 'saving' ? 'true' : 'false'"><template #icon><action-icon :class="{ 'sdsync-is-spinning': profileSaveState === 'saving' }" :name="profileSaveState === 'saving' ? 'refresh' : 'save'" /></template>{{ profileSaveButtonText }}</v-button>
                 </div>
                 <p v-if="profileSaveMessage" :class="['sdsync-save-state', 'is-' + profileSaveState]" role="status" aria-live="polite">{{ profileSaveMessage }}</p>
               </v-form>
@@ -264,7 +268,7 @@
                     </div>
                     <fieldset v-if="routineForm.mode === 'daily'" class="sdsync-weekday-fieldset" aria-describedby="sdsync-help-routine-weekdays" :disabled="!canChangeRoutines"><legend>Active weekdays <control-help help-key="routine-weekdays" /></legend><div class="sdsync-weekdays"><label v-for="day in weekdayOptions" :key="day.value"><input v-model="routineForm.weekdays" type="checkbox" :value="day.value" :disabled="!canChangeRoutines"><span>{{ day.label }}</span></label></div></fieldset>
                     <fieldset class="sdsync-danger-fieldset"><legend>Routine deletion guard</legend><div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Permit profile deletion rules <control-help help-key="routine-delete" /></span><v-checkbox class="sdsync-checkbox-control" v-model="routineForm.allow_delete" aria-label="Permit profile deletion rules" aria-describedby="sdsync-help-routine-delete" :disabled="!canEditRoutineDeletion" /></div><v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Routine deletion approval ceiling"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-max-delete" /></template><v-input class="sdsync-input-control" v-model="routineForm.max_total_delete" number-only aria-describedby="sdsync-help-routine-max-delete" :disabled="!canChangeRoutines" /></v-form-item></fieldset>
-                    <div class="sdsync-form-actions"><v-button suffix="red" display="icon-text" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : 'Remove this automation policy without deleting its profile'" :disabled="!canRemoveRoutine" @click="removeRoutine"><template #icon><action-icon name="delete" /></template>Remove routine</v-button><span class="sdsync-field-note">Existing safe routine changes autosave after 1.3 seconds. Creation and deletion approval stay explicit.</span><v-button suffix="cancel" display="icon-text" tooltip="Discard unsaved routine values" @click="closeRoutine"><template #icon><action-icon name="close" /></template>Cancel</v-button><v-button suffix="main" display="icon-text" html-type="submit" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : 'Validate and apply this per-profile automation policy immediately'" :disabled="!canSubmitRoutine"><template #icon><action-icon name="save" /></template>{{ mutationOutcomeUnresolved ? 'Save locked' : 'Save now' }}</v-button></div>
+                    <div class="sdsync-form-actions"><v-button suffix="red" display="icon-text" :tooltip="routineMutationBlocked ? routineMutationGuidance : 'Remove this automation policy without deleting its profile'" :disabled="!canRemoveRoutine" @click="removeRoutine"><template #icon><action-icon name="delete" /></template>Remove routine</v-button><span class="sdsync-field-note">Existing safe routine changes autosave after 1.3 seconds. Creation and deletion approval stay explicit.</span><v-button suffix="cancel" display="icon-text" tooltip="Discard unsaved routine values" @click="closeRoutine"><template #icon><action-icon name="close" /></template>Cancel</v-button><v-button suffix="main" display="icon-text" html-type="submit" :tooltip="routineMutationBlocked ? routineMutationGuidance : 'Validate and apply this per-profile automation policy immediately'" :disabled="!canSubmitRoutine"><template #icon><action-icon name="save" /></template>{{ routineMutationBlocked ? 'Save locked' : 'Save now' }}</v-button></div>
               </v-form>
             </div>
           </section>
@@ -276,7 +280,7 @@
                 <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Scope" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="doctor-scope" /></template><v-single-select class="sdsync-select-control" v-model="doctorForm.scope" :options="scopeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-doctor-scope" :disabled="!canRunOperations"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
                 <div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Disposable write test <control-help help-key="doctor-write" /></span><v-checkbox class="sdsync-checkbox-control" v-model="doctorForm.write_test" aria-label="Disposable write test" aria-describedby="sdsync-help-doctor-write" :disabled="!canRunOperations || !canRunDoctorWrite || !hasCapability('write_test')" /></div>
                 <div v-if="doctorForm.write_test" class="sdsync-warning"><strong>This mutates the selected target briefly.</strong><div class="sdsync-toggle-row"><span class="sdsync-toggle-label">I prepared a non-critical destination and approve probe cleanup <control-help help-key="doctor-write-confirm" /></span><v-checkbox class="sdsync-checkbox-control" v-model="doctorForm.write_confirm" aria-label="Approve disposable probe cleanup" aria-describedby="sdsync-help-doctor-write-confirm" :disabled="!canRunOperations || !canRunDoctorWrite" /></div></div>
-                <div class="sdsync-submit-row"><v-button suffix="main" display="icon-text" html-type="submit" tooltip="Run preflight checks and wait for bounded terminal Doctor evidence" :disabled="!canRunOperations || operationBusy"><template #icon><action-icon name="doctor" /></template>Run doctor</v-button></div>
+                <div class="sdsync-submit-row"><v-button suffix="main" display="icon-text" html-type="submit" :tooltip="operationMutationGuidance || 'Run preflight checks and wait for bounded terminal Doctor evidence'" :disabled="!canRunOperations || operationBusy"><template #icon><action-icon name="doctor" /></template>Run doctor</v-button></div>
               </v-form>
               <article class="sdsync-panel sdsync-diagnostic" aria-live="polite"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Latest diagnostic</p><h3>{{ diagnostic.title }}</h3></div><span class="sdsync-pulse" /></div><pre>{{ diagnostic.output }}</pre></article>
             </div>
@@ -314,7 +318,7 @@
                     <div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Notify on failure <control-help help-key="alerts-failure" /></span><v-checkbox class="sdsync-checkbox-control" v-model="alertForm.on_failure" aria-label="Notify on failure" aria-describedby="sdsync-help-alerts-failure" :disabled="!canChangeNotifications" /></div>
                     <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Failures before alert" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="alerts-threshold" /></template><v-input class="sdsync-input-control" v-model="alertForm.failure_threshold" number-only :disabled="!canChangeNotifications" aria-describedby="sdsync-help-alerts-threshold" /></v-form-item>
                     <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Cooldown (seconds)" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="alerts-cooldown" /></template><v-input class="sdsync-input-control" v-model="alertForm.cooldown_seconds" number-only :disabled="!canChangeNotifications" aria-describedby="sdsync-help-alerts-cooldown" /></v-form-item>
-                    <div class="sdsync-submit-row"><span class="sdsync-field-note">Valid changes autosave after 1.3 seconds.</span><v-button suffix="main" display="icon-text" html-type="submit" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : 'Validate and persist the package-level DSM alert policy immediately'" :disabled="!canSubmitAlerts"><template #icon><action-icon name="save" /></template>{{ mutationOutcomeUnresolved ? 'Save locked' : 'Save now' }}</v-button></div>
+                    <div class="sdsync-submit-row"><span class="sdsync-field-note">Valid changes autosave after 1.3 seconds.</span><v-button suffix="main" display="icon-text" html-type="submit" :tooltip="alertsOutcomeUnresolved ? alertsOutcomeGuidance : 'Validate and persist the package-level DSM alert policy immediately'" :disabled="!canSubmitAlerts"><template #icon><action-icon name="save" /></template>{{ alertsOutcomeUnresolved ? 'Save locked' : 'Save now' }}</v-button></div>
                   </v-form>
                 </div>
                 <div v-else id="sdsync-notifications-panel-session-preferences" key="session-preferences" class="sdsync-subtab-panel" data-subtab-panel="session-preferences" role="tabpanel" aria-labelledby="sdsync-notifications-tab-session-preferences" tabindex="0">
@@ -322,7 +326,7 @@
                     <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Open-session signal</p><h3>Browser fallback</h3></div><span :class="pillClass(notificationPermission)">{{ notificationPermission }}</span></div>
                     <div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Notify while this app is open <control-help help-key="session-notify" /></span><v-checkbox class="sdsync-checkbox-control" v-model="notificationForm.desktop_notifications" aria-label="Notify while this app is open" aria-describedby="sdsync-help-session-notify" :disabled="!canChangeNotifications" /></div>
                     <div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Audible cue <control-help help-key="session-audible" /></span><v-checkbox class="sdsync-checkbox-control" v-model="notificationForm.audible" aria-label="Use an audible cue" aria-describedby="sdsync-help-session-audible" :disabled="!canChangeNotifications" /></div>
-                    <div class="sdsync-submit-row"><v-button suffix="grey" display="icon-text" html-type="submit" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : 'Save and audit non-secret notification preferences in this browser'" :disabled="!canSubmitNotificationPreferences"><template #icon><action-icon name="save" /></template>{{ mutationOutcomeUnresolved ? 'Save locked' : 'Save session preferences' }}</v-button></div>
+                    <div class="sdsync-submit-row"><v-button suffix="grey" display="icon-text" html-type="submit" :tooltip="interfaceOutcomeUnresolved ? interfaceOutcomeGuidance : 'Save and audit non-secret notification preferences in this browser'" :disabled="!canSubmitNotificationPreferences"><template #icon><action-icon name="save" /></template>{{ interfaceOutcomeUnresolved ? 'Save locked' : 'Save session preferences' }}</v-button></div>
                   </v-form>
                 </div>
               </transition>
@@ -330,11 +334,11 @@
           </section>
 
           <section v-else-if="route === 'security'" class="sdsync-page" aria-labelledby="sdsync-page-title">
-            <security-panel :value="securityForm" :disabled="!canMutate" :busy="operationBusy" :dirty="securityDirty" :save-blocked="mutationOutcomeUnresolved" :save-blocked-message="mutationOutcomeGuidance" :theme-class="themeClass" :log-level-options="logLevelOptions" @input="updateSecurityForm" @save="saveSecurityPolicy" />
+            <security-panel :value="securityForm" :disabled="!canMutate" :busy="operationBusy" :dirty="securityDirty" :save-blocked="securityOutcomeUnresolved" :save-blocked-message="securityOutcomeGuidance" :theme-class="themeClass" :log-level-options="logLevelOptions" @input="updateSecurityForm" @save="saveSecurityPolicy" />
           </section>
 
           <section v-else-if="route === 'settings'" class="sdsync-page" aria-labelledby="sdsync-page-title">
-            <v-form v-model="settings" class="sdsync-panel sdsync-settings-panel" direction="horizontal" @submit="saveInterfaceSettings"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Display and refresh</p><h3>Interface</h3></div></div><v-form-item class="sdsync-form-item" label="Theme"><template #label-after><control-help class="sdsync-form-label-help" help-key="settings-theme" /></template><v-single-select class="sdsync-select-control" v-model="settings.theme" :options="themeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-theme" :disabled="!canChangeInterface"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item><v-form-item class="sdsync-form-item" label="Status refresh"><template #label-after><control-help class="sdsync-form-label-help" help-key="settings-status-refresh" /></template><v-single-select class="sdsync-select-control" v-model="settings.status_refresh" :options="statusRefreshOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-status-refresh" :disabled="!canChangeInterface"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item><v-form-item class="sdsync-form-item" label="Log refresh"><template #label-after><control-help class="sdsync-form-label-help" help-key="settings-log-refresh" /></template><v-single-select class="sdsync-select-control" v-model="settings.log_refresh" :options="logRefreshOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-log-refresh" :disabled="!canChangeInterface"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item><div class="sdsync-form-actions sdsync-settings-actions"><span /><span class="sdsync-field-note">Valid changes autosave after 1.3 seconds.</span><v-button suffix="main" display="icon-text" html-type="submit" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : 'Apply, persist, and audit this browser AppWindow preferences immediately'" :disabled="!canSubmitInterface"><template #icon><action-icon name="save" /></template>{{ mutationOutcomeUnresolved ? 'Save locked' : 'Save now' }}</v-button></div></v-form>
+            <v-form v-model="settings" class="sdsync-panel sdsync-settings-panel" direction="horizontal" @submit="saveInterfaceSettings"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Display and refresh</p><h3>Interface</h3></div></div><v-form-item class="sdsync-form-item" label="Theme"><template #label-after><control-help class="sdsync-form-label-help" help-key="settings-theme" /></template><v-single-select class="sdsync-select-control" v-model="settings.theme" :options="themeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-theme" :disabled="!canChangeInterface"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item><v-form-item class="sdsync-form-item" label="Status refresh"><template #label-after><control-help class="sdsync-form-label-help" help-key="settings-status-refresh" /></template><v-single-select class="sdsync-select-control" v-model="settings.status_refresh" :options="statusRefreshOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-status-refresh" :disabled="!canChangeInterface"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item><v-form-item class="sdsync-form-item" label="Log refresh"><template #label-after><control-help class="sdsync-form-label-help" help-key="settings-log-refresh" /></template><v-single-select class="sdsync-select-control" v-model="settings.log_refresh" :options="logRefreshOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-log-refresh" :disabled="!canChangeInterface"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item><div class="sdsync-form-actions sdsync-settings-actions"><span /><span class="sdsync-field-note">Valid changes autosave after 1.3 seconds.</span><v-button suffix="main" display="icon-text" html-type="submit" :tooltip="interfaceOutcomeUnresolved ? interfaceOutcomeGuidance : 'Apply, persist, and audit this browser AppWindow preferences immediately'" :disabled="!canSubmitInterface"><template #icon><action-icon name="save" /></template>{{ interfaceOutcomeUnresolved ? 'Save locked' : 'Save now' }}</v-button></div></v-form>
           </section>
 
           <section v-else-if="route === 'about'" class="sdsync-page" aria-labelledby="sdsync-page-title">
@@ -392,18 +396,37 @@
             </div>
           </div>
         </div>
-        <div v-if="pathBrowser.visible" class="sdsync-modal-backdrop" role="presentation" @click.self="closePathBrowser">
-          <div ref="pathBrowserDialog" class="sdsync-modal sdsync-path-browser" role="dialog" aria-modal="true" aria-labelledby="sdsync-path-browser-title" tabindex="-1">
-            <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Interactive path chooser</p><h2 id="sdsync-path-browser-title">{{ pathBrowser.kind === 'local' ? 'Choose a local NAS source' : 'Choose a File Station target' }}</h2></div><v-button ref="pathBrowserClose" type="border" display="icon-text" tooltip="Close the chooser and keep manual path entry" @click="closePathBrowser"><template #icon><action-icon name="close" /></template>Close</v-button></div>
-            <p class="sdsync-field-note">{{ pathBrowser.kind === 'local' ? 'Only canonical internal, USB, and SATA DSM volume directories readable and traversable by the package identity are shown.' : 'Only directories returned to the successfully authenticated DSM account are shown.' }}</p>
-            <div class="sdsync-path-browser-location"><code>{{ pathBrowser.current }}</code><span v-if="pathBrowser.loading" role="status">Loading…</span></div>
-            <div v-if="pathBrowser.error" class="sdsync-inline-error" role="alert">{{ pathBrowser.error }}</div>
-            <div class="sdsync-path-browser-actions"><v-button type="border" display="icon-text" tooltip="Open the parent directory" :disabled="pathBrowser.loading || !pathBrowser.parent" @click="browsePath(pathBrowser.parent)"><template #icon><action-icon name="up" /></template>Up</v-button><v-button suffix="main" display="icon-text" tooltip="Use the currently displayed directory" :disabled="pathBrowser.loading || pathBrowser.current === '/'" @click="selectPath(pathBrowser.current)"><template #icon><action-icon name="confirm" /></template>Use current</v-button></div>
-            <div class="sdsync-path-browser-list" role="list" :aria-busy="pathBrowser.loading ? 'true' : 'false'">
-              <div v-for="directory in pathBrowser.directories" :key="directory.path" class="sdsync-path-browser-row" role="listitem"><button type="button" @click="browsePath(directory.path)"><action-icon name="folder" /><span>{{ directory.name }}</span><action-icon name="navigate" /></button><v-button type="border" display="icon-text" tooltip="Select this directory" :disabled="pathBrowser.loading" @click="selectPath(directory.path)"><template #icon><action-icon name="confirm" /></template>Select</v-button></div>
-              <p v-if="!pathBrowser.loading && !pathBrowser.directories.length && !pathBrowser.error" class="sdsync-empty">No child directories are visible here.</p>
+        <div v-if="pathBrowser.visible" class="sdsync-modal-backdrop sdsync-path-browser-backdrop" role="presentation" @click.self="closePathBrowser">
+          <div ref="pathBrowserDialog" class="sdsync-modal sdsync-path-browser" role="dialog" aria-modal="true" aria-labelledby="sdsync-path-browser-title" aria-describedby="sdsync-path-browser-description" tabindex="-1">
+            <header class="sdsync-path-browser-header">
+              <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Folder explorer</p><h2 id="sdsync-path-browser-title">{{ pathBrowser.kind === 'local' ? 'Choose a local NAS source' : 'Choose a File Station target' }}</h2></div><v-button ref="pathBrowserClose" type="border" display="icon-text" tooltip="Close the folder explorer and keep manual path entry" @click="closePathBrowser"><template #icon><action-icon name="close" /></template>Close</v-button></div>
+            </header>
+            <p id="sdsync-path-browser-description" class="sdsync-path-browser-intro">{{ pathBrowser.kind === 'local' ? 'Only canonical internal, USB, and SATA DSM volume folders readable and traversable by the package identity are shown.' : 'Only folders returned to the successfully authenticated DSM account are shown.' }}</p>
+            <div class="sdsync-path-browser-toolbar">
+              <v-button type="border" display="icon-text" tooltip="Go up to the parent folder" aria-label="Go up to the parent folder" :disabled="pathBrowser.loading || !pathBrowser.parent" @click="browsePath(pathBrowser.parent)"><template #icon><action-icon name="up" /></template>Up one level</v-button>
+              <nav class="sdsync-path-browser-breadcrumbs" aria-label="Current folder">
+                <ol>
+                  <li v-for="crumb in pathBrowserBreadcrumbs(pathBrowser.current)" :key="crumb.path"><button type="button" class="sdsync-path-browser-crumb" :aria-label="'Open ' + crumb.label" :aria-current="crumb.current ? 'location' : null" :disabled="pathBrowser.loading || crumb.current" @click="browsePath(crumb.path)">{{ crumb.label }}</button><span v-if="!crumb.current" class="sdsync-path-browser-separator" aria-hidden="true">/</span></li>
+                </ol>
+              </nav>
             </div>
-            <p v-if="pathBrowser.truncated" class="sdsync-field-note">The bounded result was truncated. Open a narrower directory or enter the exact path manually.</p>
+            <section class="sdsync-path-browser-main" aria-label="Folder contents">
+              <div class="sdsync-path-browser-current" aria-live="polite"><action-icon name="folder" size="20" /><span class="sdsync-path-browser-current-copy"><span class="sdsync-path-browser-current-label">Current folder</span><code>{{ pathBrowser.current }}</code></span></div>
+              <div class="sdsync-path-browser-columns" aria-hidden="true"><span>Name</span><span>Choose</span></div>
+              <div class="sdsync-path-browser-list" :aria-busy="pathBrowser.loading ? 'true' : 'false'">
+                <div v-if="pathBrowser.loading" class="sdsync-path-browser-state" role="status" aria-live="polite"><action-icon class="sdsync-is-spinning" name="refresh" size="22" /><strong>Opening folder</strong><span>Reading the folders visible at <code>{{ pathBrowser.current }}</code>…</span></div>
+                <div v-else-if="pathBrowser.error && !pathBrowser.directories.length" class="sdsync-path-browser-state sdsync-path-browser-error" role="alert"><action-icon name="about" size="22" /><strong>Folder listing unavailable</strong><span>{{ pathBrowser.error }}</span><v-button type="border" display="icon-text" tooltip="Retry this exact folder listing" :disabled="pathBrowser.kind === 'remote' && profileConnectionBlocked" @click="browsePath(pathBrowser.current)"><template #icon><action-icon name="refresh" /></template>Retry current folder</v-button></div>
+                <div v-else class="sdsync-path-browser-entries" role="list">
+                  <div v-if="pathBrowser.error" class="sdsync-path-browser-evidence" role="listitem"><span role="alert">{{ pathBrowser.error }}</span></div>
+                  <div v-for="directory in pathBrowser.directories" :key="directory.path" class="sdsync-path-browser-row" role="listitem"><button type="button" class="sdsync-path-browser-open" :aria-label="'Open folder ' + directory.name" @click="browsePath(directory.path)"><span class="sdsync-path-browser-folder-icon"><action-icon name="folder" size="18" /></span><span class="sdsync-path-browser-folder-copy"><strong class="sdsync-path-browser-folder-name">{{ directory.name }}</strong><code class="sdsync-path-browser-folder-path">{{ directory.path }}</code></span><action-icon name="navigate" /></button><v-button type="border" display="icon-text" :aria-label="'Select folder ' + directory.name" tooltip="Select this folder without opening it" :disabled="pathBrowser.loading" @click.stop="selectPath(directory.path)"><template #icon><action-icon name="confirm" /></template>Select</v-button></div>
+                  <div v-if="!pathBrowser.directories.length" class="sdsync-path-browser-state" role="listitem"><action-icon name="folder" size="22" /><strong>No child folders visible</strong><span>{{ pathBrowser.kind === 'local' ? 'Grant the package identity access in DSM or choose the current folder.' : 'Choose the current folder or navigate up to another location.' }}</span></div>
+                </div>
+              </div>
+            </section>
+            <footer class="sdsync-path-browser-footer">
+              <span class="sdsync-path-browser-summary"><span v-if="pathBrowser.loading">Reading folder…</span><span v-else-if="pathBrowser.error && !pathBrowser.directories.length">Listing unavailable</span><span v-else>{{ pathBrowser.directories.length }} child folder{{ pathBrowser.directories.length === 1 ? '' : 's' }} visible<span v-if="pathBrowser.truncated"> · bounded result truncated</span></span><code>{{ pathBrowser.current }}</code></span>
+              <span class="sdsync-path-browser-footer-actions"><v-button suffix="cancel" display="icon-text" tooltip="Close without changing the profile path" @click="closePathBrowser"><template #icon><action-icon name="close" /></template>Cancel</v-button><v-button suffix="main" display="icon-text" tooltip="Use the current folder in this profile" :disabled="pathBrowser.loading || pathBrowser.current === '/'" @click="selectPath(pathBrowser.current)"><template #icon><action-icon name="confirm" /></template>Select this folder</v-button></span>
+            </footer>
           </div>
         </div>
       </div>
@@ -435,6 +458,15 @@ import SecurityPanel from "./SecurityPanel.vue";
 
 const SETTINGS_KEY = "sdsync.ui.settings.v1";
 const AUTOSAVE_SCOPES = Object.freeze(["profile", "routine", "alerts", "security", "interface"]);
+const INCIDENT_SCOPE_LABELS = Object.freeze({
+  profile: "Profile configuration and secrets",
+  routine: "Routines",
+  alerts: "Package alerts",
+  security: "Security policy",
+  interface: "Interface and session preferences",
+  connection: "Authentication testing and File Station browsing",
+  operations: "Run and Doctor operations"
+});
 const PROFILE_SECRET_KINDS = Object.freeze(["password", "totp", "remote-log-token"]);
 const PROFILE_CONNECTION_API_LIMITS = Object.freeze({
   csrfReissueTimeoutMs: 10000,
@@ -477,69 +509,147 @@ function scopeMutationOutcomeUnresolved(component, scope) {
   );
 }
 
-function sessionMutationOutcomeUnresolved(component) {
-  const barrier = component && component.mutationSessionBarrier;
-  return Boolean(barrier && barrier.active === true
-    && (barrier.outcomeUnknown === true || barrier.requiresInspection === true));
+function emptyIsolatedIncident() {
+  return { active: false, kind: "", outcomeUnknown: false, requiresInspection: false, message: "", requestId: "", jobId: "", subject: "", retryable: false };
 }
 
-function hasUnresolvedMutationOutcome(component) {
-  return AUTOSAVE_SCOPES.some((scope) => scopeMutationOutcomeUnresolved(component, scope))
-    || sessionMutationOutcomeUnresolved(component);
+function emptyScopeIncident() {
+  return { active: false, outcomeUnknown: false, requiresInspection: false, message: "", requestId: "", jobId: "", subject: "" };
 }
 
-function unresolvedMutationGuidance(component) {
-  const hasUnknown = AUTOSAVE_SCOPES.some((scope) => Boolean(
-    component.autosaveOutcomeUnknownScopes
-    && component.autosaveOutcomeUnknownScopes[scope] === true
-  )) || Boolean(component.mutationSessionBarrier
-    && component.mutationSessionBarrier.outcomeUnknown === true);
-  return hasUnknown
-    ? "Previous mutation outcome unknown: it may already have been accepted. All mutations and autosave are locked in this AppWindow. Keep the draft open, reconcile Activity / Logs and current package state, then reopen the AppWindow before changing anything else."
-    : "Previous operation state may need inspection because cleanup failed or a mutation was only partially applied. All mutations and autosave are locked in this AppWindow. Keep the draft open, reconcile Activity / Logs and current package state, then reopen the AppWindow before changing anything else.";
+function isolatedIncidentUnresolved(component, scope) {
+  const incident = component && component.isolatedIncidents && component.isolatedIncidents[scope];
+  return Boolean(incident && incident.active === true
+    && (incident.outcomeUnknown === true || incident.requiresInspection === true));
 }
 
-function unresolvedMutationError(component) {
-  const error = new Error(unresolvedMutationGuidance(component));
+function unresolvedScopeNames(component) {
+  const names = AUTOSAVE_SCOPES
+    .filter((scope) => scopeMutationOutcomeUnresolved(component, scope))
+    .map((scope) => INCIDENT_SCOPE_LABELS[scope]);
+  for (const scope of ["connection", "operations"]) {
+    if (isolatedIncidentUnresolved(component, scope)) names.push(INCIDENT_SCOPE_LABELS[scope]);
+  }
+  return names;
+}
+
+function hasAnyUnresolvedIncident(component) {
+  return unresolvedScopeNames(component).length > 0;
+}
+
+function scopeMutationGuidance(component, scope) {
+  const unknown = Boolean(component && component.autosaveOutcomeUnknownScopes
+    && component.autosaveOutcomeUnknownScopes[scope] === true);
+  const label = INCIDENT_SCOPE_LABELS[scope] || scope;
+  const reason = unknown
+    ? "Its previous request may already have been accepted."
+    : "Its previous request was only partially applied and needs inspection.";
+  const incident = component && component.autosaveIncidents && component.autosaveIncidents[scope];
+  const correlation = incident && incident.active === true
+    ? [incident.subject ? `Subject: ${incident.subject}.` : "", incident.requestId ? `Client request ID: ${incident.requestId}.` : "", incident.jobId ? `Queued job ID: ${incident.jobId}.` : ""].filter(Boolean).join(" ")
+    : "";
+  const availability = scope === "profile"
+    ? "Independent configuration scopes and their autosave remain available; routine changes and Run / Doctor stay paused because they depend on settled profile state."
+    : "Unrelated controls and autosave remain available.";
+  return `${label} is locked in this AppWindow. ${reason} ${correlation} Preserve the draft and inspect Activity / Logs plus current package state before reconciling it. ${availability}`.replace(/\s+/g, " ").trim();
+}
+
+function isolatedIncidentGuidance(component, scope) {
+  const incident = component && component.isolatedIncidents && component.isolatedIncidents[scope];
+  const label = INCIDENT_SCOPE_LABELS[scope] || scope;
+  const reason = incident && incident.outcomeUnknown === true
+    ? "The previous request may already have been accepted."
+    : "The previous request or cleanup needs inspection.";
+  const correlation = incident
+    ? [incident.subject ? `Subject: ${incident.subject}.` : "", incident.requestId ? `Client request ID: ${incident.requestId}.` : "", incident.jobId ? `Queued job ID: ${incident.jobId}.` : ""].filter(Boolean).join(" ")
+    : "";
+  if (scope === "connection") {
+    const retry = incident && incident.retryable === true
+      ? "A deliberate new request for the current connection draft remains available and produces fresh evidence; it does not erase this earlier correlation."
+      : "This cleanup-required evidence remains until explicit reconciliation or a fresh AppWindow session.";
+    return `${label} has unresolved evidence. ${reason} ${correlation} ${retry} Profile saves and unrelated controls and autosave remain available.`.replace(/\s+/g, " ").trim();
+  }
+  return `${label} is locked in this AppWindow. ${reason} ${correlation} Inspect Activity / Logs and current package state before another request in this scope. Profile saves and unrelated controls and autosave remain available.`.replace(/\s+/g, " ").trim();
+}
+
+function unresolvedIncidentGuidance(component) {
+  const scopes = unresolvedScopeNames(component);
+  if (!scopes.length) return "No unresolved operation outcomes.";
+  const listed = scopes.length === 1 ? scopes[0] : `${scopes.slice(0, -1).join(", ")} and ${scopes[scopes.length - 1]}`;
+  const evidence = [];
+  for (const scope of AUTOSAVE_SCOPES) {
+    const incident = component.autosaveIncidents && component.autosaveIncidents[scope];
+    if (!incident || incident.active !== true) continue;
+    evidence.push([incident.subject ? `${INCIDENT_SCOPE_LABELS[scope]} subject: ${incident.subject}.` : "", incident.requestId ? `Client request ID: ${incident.requestId}.` : "", incident.jobId ? `Queued job ID: ${incident.jobId}.` : ""].filter(Boolean).join(" "));
+  }
+  for (const scope of ["connection", "operations"]) {
+    const incident = component.isolatedIncidents && component.isolatedIncidents[scope];
+    if (!incident || incident.active !== true) continue;
+    evidence.push([incident.subject ? `${INCIDENT_SCOPE_LABELS[scope]} subject: ${incident.subject}.` : "", incident.requestId ? `Client request ID: ${incident.requestId}.` : "", incident.jobId ? `Queued job ID: ${incident.jobId}.` : ""].filter(Boolean).join(" "));
+  }
+  const correlation = evidence.filter(Boolean).join(" ");
+  return `${listed} ${scopes.length === 1 ? "needs" : "need"} reconciliation. Only the named scope${scopes.length === 1 ? " and its dependent operations are" : "s and their dependent operations are"} affected; independent controls and autosave remain available. ${correlation} Preserve any open draft and inspect Activity / Logs plus current package state before reconciling.`.replace(/\s+/g, " ").trim();
+}
+
+function unresolvedScopeError(component, scope) {
+  const error = new Error(scopeMutationGuidance(component, scope));
   error.outcomeUnknown = true;
   error.requiresInspection = true;
   return error;
 }
 
-function blockEveryAutosaveScope(component) {
-  if (!component || !component.autosaveCoordinator) return;
-  for (const scope of AUTOSAVE_SCOPES) {
-    const state = component.autosaveCoordinator.getState(scope);
-    if (state.registered) component.autosaveCoordinator.setScopeBlocked(scope, true);
-  }
-}
-
-function recordMutationSessionBarrier(component, kind, error, report = null) {
+function recordIsolatedIncident(component, scope, kind, error, report = null, metadata = undefined) {
   const outcomeUnknown = Boolean(report ? report.unknown === true : error && error.outcomeUnknown === true);
   const requiresInspection = Boolean(
     outcomeUnknown
     || (report ? report.inspection === true : error && error.requiresInspection === true)
   );
   if (!outcomeUnknown && !requiresInspection) return false;
-  const previous = component.mutationSessionBarrier || {};
-  component.mutationSessionBarrier = {
+  const incidents = component.isolatedIncidents && typeof component.isolatedIncidents === "object"
+    ? component.isolatedIncidents
+    : { connection: emptyIsolatedIncident(), operations: emptyIsolatedIncident() };
+  const previous = incidents[scope] || emptyIsolatedIncident();
+  const details = metadata && typeof metadata === "object" ? metadata : {};
+  const preserve = previous.active === true;
+  incidents[scope] = {
     active: true,
-    kind: previous.active === true ? previous.kind : kind,
+    kind: preserve ? previous.kind : kind,
     outcomeUnknown: previous.outcomeUnknown === true || outcomeUnknown,
-    requiresInspection: previous.requiresInspection === true || requiresInspection
+    requiresInspection: previous.requiresInspection === true || requiresInspection,
+    message: preserve ? previous.message : boundedText((report && report.message) || (error && error.message), "Operation evidence needs inspection.").slice(0, MUTATION_MESSAGE_LIMIT),
+    requestId: preserve ? previous.requestId : ((report && report.requestId) || ""),
+    jobId: preserve ? previous.jobId : ((report && report.jobId) || ""),
+    subject: preserve ? previous.subject : boundedText(details.subject, "").slice(0, 256),
+    retryable: preserve ? previous.retryable === true : details.retryable === true
   };
-  blockEveryAutosaveScope(component);
-  component.autosavePhase = "blocked";
-  component.autosaveMessage = unresolvedMutationGuidance(component);
+  component.isolatedIncidents = incidents;
   return true;
 }
 
-function mutationAwareAutosaveStatus(component, status) {
-  if (!hasUnresolvedMutationOutcome(component)) return status;
-  return {
-    phase: "blocked",
-    message: unresolvedMutationGuidance(component)
+function recordScopeIncident(component, scope, error, subject = "") {
+  const outcomeUnknown = Boolean(error && error.outcomeUnknown === true);
+  const requiresInspection = Boolean(error && (error.requiresInspection === true || outcomeUnknown));
+  if (!outcomeUnknown && !requiresInspection) return false;
+  if (!component.autosaveIncidents || typeof component.autosaveIncidents !== "object") {
+    component.autosaveIncidents = Object.fromEntries(AUTOSAVE_SCOPES.map((name) => [name, emptyScopeIncident()]));
+  }
+  const previous = component.autosaveIncidents[scope] || emptyScopeIncident();
+  if (previous.active === true) return true;
+  component.autosaveIncidents[scope] = {
+    active: true,
+    outcomeUnknown,
+    requiresInspection,
+    message: boundedText(error && error.message, "Mutation evidence needs inspection.").slice(0, MUTATION_MESSAGE_LIMIT),
+    requestId: error && error.trustedRequestId === true ? validatedClientRequestId(error.requestId) : "",
+    jobId: error && error.trustedJobId === true ? validatedJobId(error.jobId) : "",
+    subject: boundedText(subject, "").slice(0, 256)
   };
+  return true;
+}
+
+function clearScopeIncident(component, scope) {
+  if (!component.autosaveIncidents || typeof component.autosaveIncidents !== "object") return;
+  component.autosaveIncidents[scope] = emptyScopeIncident();
 }
 
 function currentAutosaveStatus(
@@ -977,12 +1087,13 @@ export default {
       autosaveFailureScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
       autosaveOutcomeUnknownScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
       autosaveInspectionScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
+      autosaveIncidents: Object.fromEntries(AUTOSAVE_SCOPES.map((scope) => [scope, emptyScopeIncident()])),
       profileFailureRecords: emptyProfileFailureRecords(),
-      mutationSessionBarrier: { active: false, kind: "", outcomeUnknown: false, requiresInspection: false },
+      isolatedIncidents: { connection: emptyIsolatedIncident(), operations: emptyIsolatedIncident() },
       settings, profileFilter: "", profileFilterStatus: "all", profileEditorOpen: false, selectedProfile: "", profileForm: emptyProfile(),
       secretModes: { password: "keep", totp: "keep", remote_log_token: "keep" },
       secretValues: { password: "", totp: "", remote_log_token: "" },
-      profileConnectionState: "idle", profileConnectionMessage: "Test authentication to unlock the File Station browser.", connectionProof: "", connectionProofExpires: 0, connectionProofTimer: 0, profileConnectionRequest: 0,
+      profileConnectionState: "idle", profileConnectionMessage: "Test authentication to unlock the File Station browser.", connectionProof: "", connectionProofExpires: 0, connectionProofTimer: 0, profileConnectionRequest: 0, profileConnectionAutosaveHeld: false,
       profileSaveState: "idle", profileSaveMessage: "", pathBrowser: emptyPathBrowser(),
       routineEditorOpen: false, routineForm: emptyRoutine(), doctorForm: { scope: "all", write_test: false, write_confirm: false },
       alertForm: { enabled: false, on_success: false, on_failure: true, failure_threshold: 1, cooldown_seconds: 3600 },
@@ -1035,24 +1146,47 @@ export default {
     securityPolicy() { return normalizedSecurityPolicy(this.snapshot && this.snapshot.security_policy); },
     installedPackageVersion() { return boundedText(this.snapshot && this.snapshot.package && this.snapshot.package.version, "Not reported by package API"); },
     canMutate() { return this.capabilities.mutations === true && Boolean(this.csrfToken); },
-    snapshotRefreshBlocked() { return this.profileEditorOpen === true || this.profileSaveState === "saving"; },
+    profileOutcomeUnresolved() { return scopeMutationOutcomeUnresolved(this, "profile"); },
+    routineOutcomeUnresolved() { return scopeMutationOutcomeUnresolved(this, "routine"); },
+    alertsOutcomeUnresolved() { return scopeMutationOutcomeUnresolved(this, "alerts"); },
+    securityOutcomeUnresolved() { return scopeMutationOutcomeUnresolved(this, "security"); },
+    interfaceOutcomeUnresolved() { return scopeMutationOutcomeUnresolved(this, "interface"); },
+    connectionOutcomeUnresolved() { return isolatedIncidentUnresolved(this, "connection"); },
+    operationOutcomeUnresolved() { return isolatedIncidentUnresolved(this, "operations"); },
+    incidentOutcomeUnresolved() { return hasAnyUnresolvedIncident(this); },
+    incidentGuidance() { return unresolvedIncidentGuidance(this); },
+    profileOutcomeGuidance() { return scopeMutationGuidance(this, "profile"); },
+    routineOutcomeGuidance() { return scopeMutationGuidance(this, "routine"); },
+    alertsOutcomeGuidance() { return scopeMutationGuidance(this, "alerts"); },
+    securityOutcomeGuidance() { return scopeMutationGuidance(this, "security"); },
+    interfaceOutcomeGuidance() { return scopeMutationGuidance(this, "interface"); },
+    connectionOutcomeGuidance() { return isolatedIncidentGuidance(this, "connection"); },
+    operationOutcomeGuidance() { return isolatedIncidentGuidance(this, "operations"); },
+    profileConnectionBlocked() { return this.profileOutcomeUnresolved; },
+    profileConnectionBlockedGuidance() { return this.profileOutcomeGuidance; },
+    profileConnectionActionGuidance() { return this.profileOutcomeUnresolved ? this.profileOutcomeGuidance : (this.connectionOutcomeUnresolved ? this.connectionOutcomeGuidance : ""); },
+    routineMutationBlocked() { return this.profileOutcomeUnresolved || this.routineOutcomeUnresolved; },
+    routineMutationGuidance() { return this.profileOutcomeUnresolved ? this.profileOutcomeGuidance : this.routineOutcomeGuidance; },
+    operationMutationGuidance() { return this.profileOutcomeUnresolved ? this.profileOutcomeGuidance : (this.operationOutcomeUnresolved ? this.operationOutcomeGuidance : ""); },
+    connectionIncidentEvidence() { const incident = this.isolatedIncidents && this.isolatedIncidents.connection; return boundedText(incident && incident.message, ""); },
+    profileRecoveryActive() { return this.profileEditorOpen === true && this.profileOutcomeUnresolved && this.profileSaveState !== "saving" && this.profileConnectionState !== "testing"; },
+    snapshotRefreshBlocked() { return this.profileSaveState === "saving" || this.profileConnectionState === "testing" || (this.profileEditorOpen === true && !this.profileRecoveryActive); },
+    snapshotRefreshTooltip() { return this.snapshotRefreshBlocked ? "Close the profile editor before refreshing package status" : (this.profileRecoveryActive ? "Read fresh package evidence without overwriting the preserved profile or secret draft" : "Refresh current data"); },
     canChangeInterface() { return this.canMutate && !this.operationBusy && this.securityPolicy.allow_interface_changes !== false; },
     canChangeProfiles() { return this.canMutate && !this.operationBusy && this.securityPolicy.allow_profile_changes !== false; },
     canManageSecrets() { return this.canMutate && !this.operationBusy && this.capabilities.secrets === true && this.securityPolicy.allow_secret_changes !== false; },
-    canTestProfileAuthentication() { return this.profileEditorOpen && this.canMutate && !this.operationBusy && !this.mutationOutcomeUnresolved && this.capabilities.profile_connection_test === true && this.securityPolicy.allow_operational_actions !== false && this.profileConnectionState !== "testing" && this.profileSaveState !== "saving"; },
+    canTestProfileAuthentication() { return this.profileEditorOpen && this.canMutate && !this.operationBusy && !this.profileOutcomeUnresolved && this.capabilities.profile_connection_test === true && this.securityPolicy.allow_operational_actions !== false && this.profileConnectionState !== "testing" && this.profileSaveState !== "saving"; },
     connectionTestReady() { return this.profileConnectionState === "success" && Boolean(this.connectionProof) && this.connectionProofExpires > 0; },
-    mutationOutcomeUnresolved() { return hasUnresolvedMutationOutcome(this); },
-    mutationOutcomeGuidance() { return unresolvedMutationGuidance(this); },
-    canSubmitProfile() { return this.profileEditorOpen && this.canChangeProfiles && !this.mutationOutcomeUnresolved && this.profileSaveState !== "saving" && this.profileConnectionState !== "testing"; },
-    canSubmitProfileSecrets() { return Boolean(this.selectedProfile) && this.canManageSecrets && this.hasPendingSecretOperations && !this.mutationOutcomeUnresolved && this.profileSaveState !== "saving" && this.profileConnectionState !== "testing"; },
-    canRemoveProfile() { return Boolean(this.selectedProfile) && this.canChangeProfiles && !this.mutationOutcomeUnresolved && this.profileConnectionState !== "testing"; },
-    canSubmitRoutine() { return this.canChangeRoutines && Boolean(this.routineForm.profile) && !this.mutationOutcomeUnresolved; },
-    canRemoveRoutine() { return this.canChangeRoutines && Boolean(this.selectedRoutine) && !this.mutationOutcomeUnresolved; },
-    canSubmitAlerts() { return this.canChangeNotifications && !this.mutationOutcomeUnresolved; },
-    canSubmitNotificationPreferences() { return this.canChangeNotifications && !this.mutationOutcomeUnresolved; },
-    canSubmitSecurity() { return this.canMutate && this.securityDirty && !this.operationBusy && !this.mutationOutcomeUnresolved; },
-    canSubmitInterface() { return this.canChangeInterface && !this.mutationOutcomeUnresolved; },
-    profileSaveButtonText() { return this.profileSaveState === "saving" ? (this.selectedProfile ? "Saving profile…" : "Creating profile…") : (this.mutationOutcomeUnresolved ? "Save locked" : (this.selectedProfile ? "Save now" : "Create profile")); },
+    canSubmitProfile() { return this.profileEditorOpen && this.canChangeProfiles && !this.profileOutcomeUnresolved && this.profileSaveState !== "saving" && this.profileConnectionState !== "testing" && !(this.pathBrowser.visible && this.pathBrowser.kind === "remote" && this.pathBrowser.loading); },
+    canSubmitProfileSecrets() { return Boolean(this.selectedProfile) && this.canManageSecrets && this.hasPendingSecretOperations && !this.profileOutcomeUnresolved && this.profileSaveState !== "saving" && this.profileConnectionState !== "testing" && !(this.pathBrowser.visible && this.pathBrowser.kind === "remote" && this.pathBrowser.loading); },
+    canRemoveProfile() { return Boolean(this.selectedProfile) && this.canChangeProfiles && !this.profileOutcomeUnresolved && this.profileConnectionState !== "testing" && !(this.pathBrowser.visible && this.pathBrowser.kind === "remote" && this.pathBrowser.loading); },
+    canSubmitRoutine() { return this.canChangeRoutines && Boolean(this.routineForm.profile) && !this.profileOutcomeUnresolved && !this.routineOutcomeUnresolved; },
+    canRemoveRoutine() { return this.canChangeRoutines && Boolean(this.selectedRoutine) && !this.profileOutcomeUnresolved && !this.routineOutcomeUnresolved; },
+    canSubmitAlerts() { return this.canChangeNotifications && !this.alertsOutcomeUnresolved; },
+    canSubmitNotificationPreferences() { return this.canChangeNotifications && !this.interfaceOutcomeUnresolved; },
+    canSubmitSecurity() { return this.canMutate && this.securityDirty && !this.operationBusy && !this.securityOutcomeUnresolved; },
+    canSubmitInterface() { return this.canChangeInterface && !this.interfaceOutcomeUnresolved; },
+    profileSaveButtonText() { return this.profileSaveState === "saving" ? (this.selectedProfile ? "Saving profile…" : "Creating profile…") : (this.profileOutcomeUnresolved ? "Save locked" : (this.selectedProfile ? "Save now" : "Create profile")); },
     canAllowHttp() { return this.canChangeProfiles && this.securityPolicy.allow_http_targets !== false; },
     canAllowEmptySource() { return this.canChangeProfiles && this.securityPolicy.allow_empty_source !== false; },
     canAllowInvalidTls() { return this.canChangeProfiles && this.securityPolicy.allow_invalid_tls !== false; },
@@ -1065,9 +1199,9 @@ export default {
     canEditProfileDeletion() { return this.canChangeProfiles && (this.securityPolicy.allow_destructive_sync !== false || this.profileForm.delete === true); },
     canEditRoutineDeletion() { return this.canChangeRoutines && (this.securityPolicy.allow_destructive_sync !== false || this.routineForm.allow_delete === true); },
     canEditRemoteLogging() { return this.canChangeProfiles && (this.securityPolicy.allow_remote_logging !== false || Boolean(this.profileForm.remote_log_url)); },
-    canChangeRoutines() { return this.canMutate && !this.operationBusy && this.securityPolicy.allow_routine_changes !== false; },
+    canChangeRoutines() { return this.canMutate && !this.operationBusy && !this.profileOutcomeUnresolved && this.securityPolicy.allow_routine_changes !== false; },
     canChangeNotifications() { return this.canMutate && !this.operationBusy && this.securityPolicy.allow_notification_changes !== false; },
-    canRunOperations() { return this.canMutate && !this.operationBusy && !this.mutationOutcomeUnresolved && this.securityPolicy.allow_operational_actions !== false; },
+    canRunOperations() { return this.canMutate && !this.operationBusy && !this.profileOutcomeUnresolved && !this.operationOutcomeUnresolved && this.securityPolicy.allow_operational_actions !== false; },
     canRunDoctorWrite() { return this.securityPolicy.allow_doctor_write_test !== false; },
     selectedProfileModel() { return this.profiles.find((profile) => String(profile.name) === String(this.selectedProfile)) || null; },
     profileLogFile() { return boundedText(this.selectedProfileModel && this.selectedProfileModel.log_file, "Package-managed sync.log"); },
@@ -1337,21 +1471,34 @@ export default {
       const anyFailurePaused = AUTOSAVE_SCOPES.some((candidateScope) => (
         this.autosaveFailureScopes && this.autosaveFailureScopes[candidateScope] === true
       ));
-      this.autosaveCoordinator.setScopeBlocked(scope, hasUnresolvedMutationOutcome(this) || failurePaused || Boolean(candidate.manual));
+      const connectionHeld = scope === "profile" && this.profileConnectionAutosaveHeld === true;
+      const profileDependencyBlocked = scope === "routine" && scopeMutationOutcomeUnresolved(this, "profile");
+      this.autosaveCoordinator.setScopeBlocked(scope, scopeMutationOutcomeUnresolved(this, scope) || failurePaused || connectionHeld || profileDependencyBlocked || Boolean(candidate.manual));
       if (scope === "alerts") this.alertDirty = next.dirty;
-      const status = mutationAwareAutosaveStatus(this, currentAutosaveStatus(
+      const status = currentAutosaveStatus(
         this.autosaveCoordinator,
         this.autosaveFailureScopes,
         "All changes saved",
         this.autosaveOutcomeUnknownScopes,
         this.autosaveInspectionScopes
-      ));
+      );
       this.autosavePhase = status.phase;
       this.autosaveMessage = status.phase === "blocked" && candidate.manual && !anyFailurePaused ? candidate.manual : status.message;
     },
     async dispatchAutosave(task) {
-      if (hasUnresolvedMutationOutcome(this)) throw unresolvedMutationError(this);
+      if (scopeMutationOutcomeUnresolved(this, task.scope)) throw unresolvedScopeError(this, task.scope);
+      if (task.scope === "routine" && scopeMutationOutcomeUnresolved(this, "profile")) {
+        const deferred = unresolvedScopeError(this, "profile");
+        deferred.autosaveDeferred = true;
+        throw deferred;
+      }
       if (this.disposed || !this.csrfToken) throw new Error("The authenticated package bridge is unavailable.");
+      if (task.scope === "profile" && (this.profileConnectionState === "testing"
+        || (this.pathBrowser && this.pathBrowser.visible && this.pathBrowser.kind === "remote" && this.pathBrowser.loading))) {
+        const deferred = new Error("Profile autosave is held until the active connection request settles.");
+        deferred.autosaveDeferred = true;
+        throw deferred;
+      }
       this.autosavePhase = "saving";
       this.autosaveMessage = "Saving changes…";
       this.operationBusy = true;
@@ -1415,21 +1562,27 @@ export default {
         if (this.autosaveFailureScopes) this.autosaveFailureScopes[task.scope] = false;
         if (this.autosaveOutcomeUnknownScopes) this.autosaveOutcomeUnknownScopes[task.scope] = false;
         if (this.autosaveInspectionScopes) this.autosaveInspectionScopes[task.scope] = false;
+        clearScopeIncident(this, task.scope);
       }
       const state = this.autosaveCoordinator ? this.autosaveCoordinator.getState(task.scope) : null;
       if (task.scope === "alerts" && state && !state.dirty) this.alertDirty = false;
       if (task.scope === "security" && state && !state.dirty) this.securityDirty = false;
-      const status = mutationAwareAutosaveStatus(this, currentAutosaveStatus(
+      const status = currentAutosaveStatus(
         this.autosaveCoordinator,
         this.autosaveFailureScopes,
         "Changes autosaved",
         this.autosaveOutcomeUnknownScopes,
         this.autosaveInspectionScopes
-      ));
+      );
       this.autosavePhase = status.phase;
       this.autosaveMessage = status.message;
     },
     autosaveFailed(error, task) {
+      if (error && error.autosaveDeferred === true) {
+        if (this.autosaveCoordinator) this.autosaveCoordinator.setScopeBlocked(task.scope, true);
+        this.refreshAutosaveStatus("Profile autosave held for the active connection request");
+        return;
+      }
       this.pauseAutosave(task.scope, error);
     },
     hydrateAutosave(scope, payload, authoritative = true) {
@@ -1452,29 +1605,29 @@ export default {
         this.autosaveFailureScopes[scope] = preserveFailure;
         if (!preserveFailure) this.autosaveOutcomeUnknownScopes[scope] = false;
         if (!preserveFailure) this.autosaveInspectionScopes[scope] = false;
+        if (!preserveFailure) clearScopeIncident(this, scope);
         if (preserveFailure) this.autosaveCoordinator.setScopeBlocked(scope, true);
       }
       if (scope === "alerts") this.alertDirty = false;
       if (scope === "security") this.securityDirty = false;
-      if (hasUnresolvedMutationOutcome(this)) blockEveryAutosaveScope(this);
-      const status = mutationAwareAutosaveStatus(this, currentAutosaveStatus(
+      const status = currentAutosaveStatus(
         this.autosaveCoordinator,
         this.autosaveFailureScopes,
         "All changes saved",
         this.autosaveOutcomeUnknownScopes,
         this.autosaveInspectionScopes
-      ));
+      );
       this.autosavePhase = status.phase;
       this.autosaveMessage = status.message;
     },
     refreshAutosaveStatus(savedMessage = "All changes saved") {
-      const status = mutationAwareAutosaveStatus(this, currentAutosaveStatus(
+      const status = currentAutosaveStatus(
         this.autosaveCoordinator,
         this.autosaveFailureScopes,
         savedMessage,
         this.autosaveOutcomeUnknownScopes,
         this.autosaveInspectionScopes
-      ));
+      );
       this.autosavePhase = status.phase;
       this.autosaveMessage = status.message;
       return status;
@@ -1482,6 +1635,26 @@ export default {
     cancelAutosave(scope, refreshStatus = true) {
       if (this.autosaveCoordinator) this.autosaveCoordinator.cancel(scope);
       if (refreshStatus) this.refreshAutosaveStatus();
+    },
+    holdProfileAutosaveForConnection() {
+      this.profileConnectionAutosaveHeld = true;
+      this.cancelAutosave("profile", false);
+      if (!this.autosaveCoordinator) return;
+      const state = this.autosaveCoordinator.getState("profile");
+      if (state.registered) this.autosaveCoordinator.setScopeBlocked("profile", true);
+    },
+    releaseProfileAutosaveFromConnection() {
+      this.profileConnectionAutosaveHeld = false;
+      if (this.disposed) return;
+      if (this.autosaveCoordinator) {
+        const state = this.autosaveCoordinator.getState("profile");
+        if (state.registered) {
+          const blocked = Boolean(this.autosaveFailureScopes && this.autosaveFailureScopes.profile === true)
+            || scopeMutationOutcomeUnresolved(this, "profile");
+          this.autosaveCoordinator.setScopeBlocked("profile", blocked);
+        }
+      }
+      this.refreshAutosaveStatus();
     },
     ensureProfileFailureRecords() {
       const records = this.profileFailureRecords;
@@ -1506,11 +1679,11 @@ export default {
       this.autosaveFailureScopes.profile = summary.active;
       this.autosaveOutcomeUnknownScopes.profile = summary.outcomeUnknown;
       this.autosaveInspectionScopes.profile = summary.requiresInspection;
+      if (!summary.active) clearScopeIncident(this, "profile");
       if (this.autosaveCoordinator) {
         const state = this.autosaveCoordinator.getState("profile");
-        if (state.registered) this.autosaveCoordinator.setScopeBlocked("profile", summary.active || hasUnresolvedMutationOutcome(this));
+        if (state.registered) this.autosaveCoordinator.setScopeBlocked("profile", summary.active || this.profileConnectionAutosaveHeld === true);
       }
-      if (hasUnresolvedMutationOutcome(this)) blockEveryAutosaveScope(this);
       if (refreshStatus) this.refreshAutosaveStatus();
       return summary;
     },
@@ -1545,9 +1718,12 @@ export default {
     },
     pauseAutosave(scope, error = null, profileSecretKind = "") {
       this.cancelAutosave(scope, false);
+      const subject = scope === "profile"
+        ? boundedText(this.selectedProfile || (this.profileForm && this.profileForm.name), "")
+        : (scope === "routine" ? boundedText(this.routineForm && this.routineForm.profile, "") : INCIDENT_SCOPE_LABELS[scope]);
+      recordScopeIncident(this, scope, error, subject);
       if (scope === "profile") {
         this.recordProfileFailure(profileSecretKind, error);
-        recordMutationSessionBarrier(this, "Profile mutation", error);
         return;
       }
       if (!this.autosaveFailureScopes || typeof this.autosaveFailureScopes !== "object") {
@@ -1568,8 +1744,6 @@ export default {
         const state = this.autosaveCoordinator.getState(scope);
         if (state.registered) this.autosaveCoordinator.setScopeBlocked(scope, true);
       }
-      recordMutationSessionBarrier(this, `${scope.charAt(0).toUpperCase()}${scope.slice(1)} mutation`, error);
-      if (hasUnresolvedMutationOutcome(this)) blockEveryAutosaveScope(this);
       this.refreshAutosaveStatus();
     },
     clearAutosaveFailure(scope) {
@@ -1581,6 +1755,7 @@ export default {
       if (this.autosaveFailureScopes) this.autosaveFailureScopes[scope] = false;
       if (this.autosaveOutcomeUnknownScopes) this.autosaveOutcomeUnknownScopes[scope] = false;
       if (this.autosaveInspectionScopes) this.autosaveInspectionScopes[scope] = false;
+      clearScopeIncident(this, scope);
       this.refreshAutosaveStatus();
     },
     describeBridgeError(error, phase = "status") {
@@ -1674,11 +1849,14 @@ export default {
           this.toast("Profile operation in progress", "Wait for the active save or authentication test to settle before leaving Profiles.", true);
           return;
         }
-        this.closeProfile();
+        if (!this.profileRecoveryActive) this.closeProfile();
       }
       if (this.route === "routines" && route !== "routines") this.closeRoutine();
       this.route = route;
-      if (route === "activity") this.refreshLogs();
+      if (route === "activity") {
+        this.refreshLogs();
+        if (this.profileRecoveryActive) void this.refreshSnapshot(false, true);
+      }
       else window.clearTimeout(this.logTimer);
     },
     moveSubtab(stateKey, tabs, event) {
@@ -1701,7 +1879,8 @@ export default {
     pillClass(state) { const value = String(state || "unknown").toLowerCase(); return ["sdsync-pill", { failed: ["failed", "error", "untrusted", "denied"].includes(value), neutral: ["disabled", "stopped", "unknown", "default", "unsupported", "unavailable"].includes(value) }]; },
     healthClass(value) { return value === true ? "sdsync-health-ok" : (value === false ? "sdsync-health-bad" : "sdsync-health-unknown"); },
     booleanEvidence(value) { return value === true ? "Yes" : (value === false ? "No" : "Unavailable"); },
-    reportMutationError(error, failedTitle, unknownTitle, fallback) {
+    reportMutationError(error, failedTitle, unknownTitle, fallback, options = undefined) {
+      const formatting = options && typeof options === "object" ? options : {};
       const unknown = Boolean(error && error.outcomeUnknown === true);
       const inspection = Boolean(error && error.requiresInspection === true);
       const observed = boundedText(error && error.message, fallback).slice(0, MUTATION_MESSAGE_LIMIT / 2);
@@ -1733,15 +1912,17 @@ export default {
       }
       const message = inspection
         ? withCorrelation(
-          `${observed} This multi-stage save is only partially applied. Do not submit it again; inspect Activity and Logs before reconciling the current profile and credential state.`,
-          "The operation was only partially applied. Do not retry it; inspect Activity and Logs."
+          `${observed} ${formatting.inspectionGuidance || "This multi-stage save is only partially applied. Do not submit it again; inspect Activity and Logs before reconciling the current profile and credential state."}`,
+          formatting.inspectionFallback || "The operation was only partially applied. Do not retry it; inspect Activity and Logs."
         )
         : unknown
           ? withCorrelation(
-            error && error.acceptanceUnknown === true
-            ? `${observed} Preserve the client request ID and inspect Activity and Logs before taking any further action.`
-            : `${observed} The request was already queued; do not retry it or create a duplicate. Inspect Activity and Logs for the eventual outcome.`,
-            "The operation outcome is unknown. Do not retry it; inspect Activity and Logs."
+            formatting.unknownGuidance
+              ? `${observed} ${formatting.unknownGuidance}`
+              : (error && error.acceptanceUnknown === true
+                ? `${observed} Preserve the client request ID and inspect Activity and Logs before taking any further action.`
+                : `${observed} The request was already queued; do not retry it or create a duplicate. Inspect Activity and Logs for the eventual outcome.`),
+            formatting.unknownFallback || "The operation outcome is unknown. Do not retry it; inspect Activity and Logs."
           )
           : withCorrelation(observed, fallback);
       this.toast(unknown || inspection ? unknownTitle : failedTitle, message, !unknown && !inspection);
@@ -1758,7 +1939,7 @@ export default {
     async refreshSnapshot(manual, requirePostMutationRead = false) {
       if (this.disposed || document.hidden) return false;
       if (this.snapshotRefreshBlocked) {
-        if (manual) this.toast("Status refresh paused", "Close the profile editor to refresh package status. The active draft will not be overwritten.");
+        if (manual) this.toast("Status refresh paused", "Close the profile editor to refresh package status. The active profile and secret draft will not be overwritten.");
         return false;
       }
       if (this.snapshotPromise) {
@@ -1867,7 +2048,7 @@ export default {
     },
     async saveSecurityPolicy(event) {
       if (event && event.preventDefault) event.preventDefault();
-      if (hasUnresolvedMutationOutcome(this)) return this.toast("Mutations locked", unresolvedMutationGuidance(this), true);
+      if (scopeMutationOutcomeUnresolved(this, "security")) return this.toast("Security policy save locked", scopeMutationGuidance(this, "security"), true);
       if (!this.canMutate || !this.securityDirty || this.operationBusy) return;
       this.cancelAutosave("security");
       const payload = this.securityPayload();
@@ -2006,16 +2187,20 @@ export default {
     },
     async testProfileAuthentication(event) {
       if (event && event.preventDefault) event.preventDefault();
-      if (hasUnresolvedMutationOutcome(this)) return this.toast("Authentication test locked", unresolvedMutationGuidance(this), true);
+      if (scopeMutationOutcomeUnresolved(this, "profile")) return this.toast("Authentication test locked", scopeMutationGuidance(this, "profile"), true);
       if (!this.canTestProfileAuthentication) return this.toast("Authentication test unavailable", "Wait for the current profile operation to finish and confirm that operational actions are permitted.", true);
       const payload = this.connectionRequestPayload();
       if (payload.error) return this.toast("Authentication not tested", payload.error, true);
+      const priorEvidence = this.connectionIncidentEvidence || "";
+      this.holdProfileAutosaveForConnection();
       const request = ++this.profileConnectionRequest;
       this.operationBusy = true;
       this.connectionProof = "";
       this.connectionProofExpires = 0;
       this.profileConnectionState = "testing";
-      this.profileConnectionMessage = "Discovering File Station and testing this draft…";
+      this.profileConnectionMessage = priorEvidence
+        ? `Testing the current draft again. Prior unresolved evidence remains available for explicit reconciliation: ${priorEvidence}`
+        : "Discovering File Station and testing this draft…";
       try {
         const result = await apiPost(this.auth, this.csrfToken, ACTIONS.testProfileAuth, payload, true, undefined, PROFILE_CONNECTION_API_LIMITS);
         if (this.disposed || request !== this.profileConnectionRequest || !this.profileEditorOpen) return;
@@ -2027,21 +2212,39 @@ export default {
         this.connectionProofExpires = expires;
         this.scheduleConnectionProofExpiry(expires);
         this.profileConnectionState = "success";
-        this.profileConnectionMessage = "Authentication succeeded. File Station browsing is unlocked for this unchanged draft.";
-        this.toast("Authentication succeeded", "The temporary File Station session was closed; no draft credential was stored by the test.");
+        this.profileConnectionMessage = isolatedIncidentUnresolved(this, "connection")
+          ? `Authentication succeeded, but prior unresolved connection evidence remains: ${isolatedIncidentGuidance(this, "connection")}`
+          : "Authentication succeeded. File Station browsing is unlocked for this unchanged draft.";
+        if (isolatedIncidentUnresolved(this, "connection")) {
+          this.toast("Authentication succeeded · prior evidence remains", isolatedIncidentGuidance(this, "connection"), true);
+        } else {
+          this.toast("Authentication succeeded", "The temporary File Station session was closed; no draft credential was stored by the test.");
+        }
       } catch (error) {
         if (this.disposed || request !== this.profileConnectionRequest || !this.profileEditorOpen) return;
         this.profileConnectionState = "error";
-        const unresolved = recordMutationSessionBarrier(this, "Authentication test", error);
-        this.profileConnectionMessage = unresolved
-          ? unresolvedMutationGuidance(this)
-          : boundedText(error && error.message, "Authentication failed.");
-        const title = unresolved
-          ? (error && error.outcomeUnknown === true ? "Authentication outcome unknown" : "Authentication cleanup needs inspection")
-          : "Authentication failed";
-        this.toast(title, this.profileConnectionMessage, true);
+        const uncertain = Boolean(error && (error.outcomeUnknown === true || error.requiresInspection === true));
+        const retryable = Boolean(error && error.outcomeUnknown === true && error.requiresInspection !== true);
+        const retryGuidance = retryable
+          ? "Keep this evidence while inspecting Activity / Logs. A deliberate new authentication test for the current draft remains available and produces fresh evidence without erasing this correlation; profile saves and unrelated autosave remain available."
+          : "Keep this cleanup evidence while inspecting Activity / Logs. It remains until explicit reconciliation or a fresh AppWindow session; profile saves and unrelated autosave remain available.";
+        const report = this.reportMutationError(
+          error,
+          "Authentication failed",
+          error && error.outcomeUnknown === true ? "Authentication outcome unknown" : "Authentication cleanup needs inspection",
+          "Authentication failed.",
+          uncertain ? { inspectionGuidance: retryGuidance, unknownGuidance: retryGuidance } : undefined
+        );
+        recordIsolatedIncident(this, "connection", "Authentication test", error, report, {
+          subject: `${this.selectedProfile || "New profile"} · ${this.profileForm.url}`,
+          retryable
+        });
+        this.profileConnectionMessage = report.message;
       } finally {
-        if (!this.disposed) this.operationBusy = false;
+        if (!this.disposed) {
+          this.operationBusy = false;
+          this.releaseProfileAutosaveFromConnection();
+        }
       }
     },
     openLocalSourceBrowser(event) {
@@ -2052,18 +2255,19 @@ export default {
     },
     openRemotePathBrowser(event) {
       if (event && event.preventDefault) event.preventDefault();
-      if (hasUnresolvedMutationOutcome(this)) return this.toast("File Station browse locked", unresolvedMutationGuidance(this), true);
+      if (scopeMutationOutcomeUnresolved(this, "profile")) return this.toast("File Station browse locked", scopeMutationGuidance(this, "profile"), true);
       if (this.connectionProofExpires <= Math.floor(Date.now() / 1000)) this.invalidateConnectionTest();
       if (!this.connectionTestReady) return this.toast("Test authentication first", "The File Station browser unlocks only after this exact connection and credential draft authenticates successfully.", true);
       const initial = this.profileForm.remote && this.profileForm.remote.startsWith("/") ? this.profileForm.remote : "/";
       return this.showPathBrowser("remote", initial);
     },
     showPathBrowser(kind, initial) {
+      const requestGeneration = (this.pathBrowser && Number(this.pathBrowser.request)) || 0;
       this.removePathBrowserKeyHandler();
       this.pathBrowserPriorFocus = typeof document !== "undefined" ? document.activeElement : null;
       this.pathBrowserKeyHandler = (event) => this.handlePathBrowserKeydown(event);
       if (typeof document !== "undefined") document.addEventListener("keydown", this.pathBrowserKeyHandler, true);
-      this.pathBrowser = Object.assign(emptyPathBrowser(), { visible: true, kind, current: initial, parent: this.browserParent(initial) });
+      this.pathBrowser = Object.assign(emptyPathBrowser(), { visible: true, kind, current: initial, parent: this.browserParent(initial), request: requestGeneration });
       if (typeof this.$nextTick === "function") {
         this.$nextTick(() => {
           if (!this.pathBrowser.visible || this.disposed) return;
@@ -2078,11 +2282,27 @@ export default {
       const index = path.lastIndexOf("/");
       return index <= 0 ? "/" : path.slice(0, index);
     },
+    pathBrowserBreadcrumbs(path) {
+      const supplied = typeof path === "string" && path.startsWith("/") ? path : "/";
+      const current = supplied.length > 1 ? supplied.replace(/\/+$/, "") : "/";
+      const parts = current.split("/").filter(Boolean);
+      const breadcrumbs = [{
+        label: this.pathBrowser.kind === "remote" ? "File Station" : "NAS",
+        path: "/",
+        current: parts.length === 0
+      }];
+      let cursor = "";
+      for (const part of parts) {
+        cursor += `/${part}`;
+        breadcrumbs.push({ label: part, path: cursor, current: cursor === current });
+      }
+      return breadcrumbs;
+    },
     async browsePath(path) {
       if (!this.pathBrowser.visible || this.pathBrowser.loading || !path) return;
       const kind = this.pathBrowser.kind;
-      if (kind === "remote" && hasUnresolvedMutationOutcome(this)) {
-        this.pathBrowser.error = unresolvedMutationGuidance(this);
+      if (kind === "remote" && scopeMutationOutcomeUnresolved(this, "profile")) {
+        this.pathBrowser.error = scopeMutationGuidance(this, "profile");
         return;
       }
       if (kind === "remote" && this.connectionProofExpires <= Math.floor(Date.now() / 1000)) {
@@ -2094,20 +2314,34 @@ export default {
         return this.toast("Authentication expired", "Test authentication again before browsing File Station.", true);
       }
       const request = this.pathBrowser.request + 1;
+      let remoteConnection = null;
+      let remotePayload = null;
+      if (kind === "remote") {
+        remoteConnection = this.connectionRequestPayload();
+        if (remoteConnection.error) return this.toast("File Station browse unavailable", remoteConnection.error, true);
+        remotePayload = Object.assign({}, remoteConnection, { parent: path, connection_proof: this.connectionProof });
+      }
+      const priorEvidence = kind === "remote" ? (this.connectionIncidentEvidence || "") : "";
+      if (kind === "remote") {
+        this.holdProfileAutosaveForConnection();
+        this.operationBusy = true;
+      }
       this.pathBrowser.request = request;
       this.pathBrowser.current = path;
       this.pathBrowser.parent = this.browserParent(path);
+      this.pathBrowser.directories = [];
+      this.pathBrowser.truncated = false;
       this.pathBrowser.loading = true;
-      this.pathBrowser.error = "";
+      this.pathBrowser.error = priorEvidence
+        ? `Issuing a new browse request while prior unresolved evidence remains visible for explicit reconciliation: ${priorEvidence}`
+        : "";
       try {
         let result;
         if (kind === "local") {
           result = await apiGet(this.auth, "source-directories", { parent: path });
           if (result.schema !== "sdsync.dsm-source-directories.v1") throw new Error("The package returned an unsupported source-browser document.");
         } else {
-          const connection = this.connectionRequestPayload();
-          if (connection.error) throw new Error(connection.error);
-          result = await apiPost(this.auth, this.csrfToken, ACTIONS.browseRemote, Object.assign({}, connection, { parent: path, connection_proof: this.connectionProof }), true, undefined, PROFILE_CONNECTION_API_LIMITS);
+          result = await apiPost(this.auth, this.csrfToken, ACTIONS.browseRemote, remotePayload, true, undefined, PROFILE_CONNECTION_API_LIMITS);
           if (result.directory_schema !== "sdsync.dsm-remote-directories.v1") throw new Error("The package returned an unsupported File Station browser document.");
         }
         if (this.disposed || !this.pathBrowser.visible || request !== this.pathBrowser.request || kind !== this.pathBrowser.kind) return;
@@ -2118,15 +2352,41 @@ export default {
         this.pathBrowser.parent = kind === "local" ? (result.parent === null ? null : boundedText(result.parent, "")) : this.browserParent(current);
         this.pathBrowser.directories = directories;
         this.pathBrowser.truncated = result.truncated === true;
+        if (kind === "remote") {
+          this.pathBrowser.error = isolatedIncidentUnresolved(this, "connection")
+            ? `Directory listing succeeded, but prior unresolved connection evidence remains: ${isolatedIncidentGuidance(this, "connection")}`
+            : "";
+        }
       } catch (error) {
         if (this.disposed || !this.pathBrowser.visible || request !== this.pathBrowser.request) return;
         const detail = boundedText(error && error.message, "Directory listing failed.");
-        if (kind === "remote") recordMutationSessionBarrier(this, "File Station browse", error);
-        this.pathBrowser.error = kind === "local"
-          ? `${detail} Confirm the folder exists, is a canonical non-symlink DSM volume path, is not DSM-managed, and the package identity can read and traverse it.`
-          : detail;
+        if (kind === "remote") {
+          const uncertain = Boolean(error && (error.outcomeUnknown === true || error.requiresInspection === true));
+          const retryable = Boolean(error && error.outcomeUnknown === true && error.requiresInspection !== true);
+          const retryGuidance = retryable
+            ? "Keep this evidence while inspecting Activity / Logs. A deliberate new browse request remains available and produces fresh evidence without erasing this correlation; profile saves and unrelated autosave remain available."
+            : "Keep this cleanup evidence while inspecting Activity / Logs. It remains until explicit reconciliation or a fresh AppWindow session; profile saves and unrelated autosave remain available.";
+          const report = this.reportMutationError(
+            error,
+            "File Station browse failed",
+            error && error.outcomeUnknown === true ? "File Station browse outcome unknown" : "File Station browse cleanup needs inspection",
+            detail,
+            uncertain ? { inspectionGuidance: retryGuidance, unknownGuidance: retryGuidance } : undefined
+          );
+          recordIsolatedIncident(this, "connection", "File Station browse", error, report, {
+            subject: `${this.selectedProfile || "New profile"} · ${path}`,
+            retryable
+          });
+          this.pathBrowser.error = report.message;
+        } else {
+          this.pathBrowser.error = `${detail} Confirm the folder exists, is a canonical non-symlink DSM volume path, is not DSM-managed, and the package identity can read and traverse it.`;
+        }
       } finally {
         if (!this.disposed && this.pathBrowser.visible && request === this.pathBrowser.request) this.pathBrowser.loading = false;
+        if (!this.disposed && kind === "remote") {
+          this.operationBusy = false;
+          this.releaseProfileAutosaveFromConnection();
+        }
       }
     },
     selectPath(path) {
@@ -2304,7 +2564,7 @@ export default {
     async saveProfile(event) {
       if (event && event.preventDefault) event.preventDefault();
       if (!this.profileEditorOpen) return;
-      if (hasUnresolvedMutationOutcome(this)) return this.toast("Profile save locked", unresolvedMutationGuidance(this), true);
+      if (scopeMutationOutcomeUnresolved(this, "profile")) return this.toast("Profile save locked", scopeMutationGuidance(this, "profile"), true);
       if (!this.canChangeProfiles || this.operationBusy || this.profileSaveState === "saving") return this.toast("Profile save unavailable", "Wait for the active package operation or restore the authenticated mutation bridge, then try again.", true);
       this.cancelAutosave("profile");
       const payload = this.profileAutosavePayload();
@@ -2384,7 +2644,7 @@ export default {
     async saveProfileSecrets(event) {
       if (event && event.preventDefault) event.preventDefault();
       const profile = this.selectedProfile;
-      if (hasUnresolvedMutationOutcome(this)) return this.toast("Secret save locked", unresolvedMutationGuidance(this), true);
+      if (scopeMutationOutcomeUnresolved(this, "profile")) return this.toast("Secret save locked", scopeMutationGuidance(this, "profile"), true);
       if (!profile || !this.canManageSecrets || this.operationBusy) return;
       const secrets = this.secretOperations(profile);
       if (!secrets.length) return this.toast("No secret changes", "Choose Replace securely or Clear stored value for at least one protected secret.");
@@ -2441,7 +2701,7 @@ export default {
       }
     },
     async removeProfile() {
-      if (hasUnresolvedMutationOutcome(this)) return this.toast("Profile deletion locked", unresolvedMutationGuidance(this), true);
+      if (scopeMutationOutcomeUnresolved(this, "profile")) return this.toast("Profile deletion locked", scopeMutationGuidance(this, "profile"), true);
       if (!this.canChangeProfiles || !this.selectedProfile || this.operationBusy) return;
       const name = this.selectedProfile;
       if (!await this.confirmAction(`Delete profile ${name}?`, "This removes package-owned configuration and protected credentials. Synced files are not deleted.", "Delete profile")) return;
@@ -2473,7 +2733,8 @@ export default {
     },
     async saveRoutine(event) {
       if (event && event.preventDefault) event.preventDefault();
-      if (hasUnresolvedMutationOutcome(this)) return this.toast("Routine save locked", unresolvedMutationGuidance(this), true);
+      if (scopeMutationOutcomeUnresolved(this, "profile")) return this.toast("Routine save locked", scopeMutationGuidance(this, "profile"), true);
+      if (scopeMutationOutcomeUnresolved(this, "routine")) return this.toast("Routine save locked", scopeMutationGuidance(this, "routine"), true);
       if (!this.canChangeRoutines || !this.routineForm.profile || this.operationBusy) return;
       this.cancelAutosave("routine");
       const payload = this.routineAutosavePayload();
@@ -2499,7 +2760,8 @@ export default {
     },
     async removeRoutine() {
       const profile = this.routineForm.profile;
-      if (hasUnresolvedMutationOutcome(this)) return this.toast("Routine removal locked", unresolvedMutationGuidance(this), true);
+      if (scopeMutationOutcomeUnresolved(this, "profile")) return this.toast("Routine removal locked", scopeMutationGuidance(this, "profile"), true);
+      if (scopeMutationOutcomeUnresolved(this, "routine")) return this.toast("Routine removal locked", scopeMutationGuidance(this, "routine"), true);
       if (!this.canChangeRoutines || !profile || !this.selectedRoutine || this.operationBusy) return;
       if (!await this.confirmAction(`Remove routine for ${profile}?`, "The profile remains configured, but package automation for it will stop.", "Remove routine")) return;
       this.operationBusy = true;
@@ -2520,7 +2782,7 @@ export default {
     },
     async saveAlerts(event) {
       if (event && event.preventDefault) event.preventDefault();
-      if (hasUnresolvedMutationOutcome(this)) return this.toast("Alert policy save locked", unresolvedMutationGuidance(this), true);
+      if (scopeMutationOutcomeUnresolved(this, "alerts")) return this.toast("Alert policy save locked", scopeMutationGuidance(this, "alerts"), true);
       if (!this.canChangeNotifications || this.operationBusy) return;
       this.cancelAutosave("alerts");
       const payload = this.alertPayload();
@@ -2543,7 +2805,8 @@ export default {
       }
     },
     async executeOperation(kind, payload) {
-      if (hasUnresolvedMutationOutcome(this)) return this.toast("Operation locked", unresolvedMutationGuidance(this), true);
+      if (scopeMutationOutcomeUnresolved(this, "profile")) return this.toast("Operation locked", scopeMutationGuidance(this, "profile"), true);
+      if (isolatedIncidentUnresolved(this, "operations")) return this.toast("Operation locked", isolatedIncidentGuidance(this, "operations"), true);
       if (!this.canRunOperations || this.operationBusy || this.disposed) return;
       if (payload && payload.allow_delete === true && !this.canAllowDestructive) return;
       if (kind === "doctor" && payload && payload.write_test === true && (!this.canRunDoctorWrite || !this.hasCapability("write_test"))) return;
@@ -2579,7 +2842,7 @@ export default {
           `${operation} outcome unknown`,
           "The package rejected the operation."
         );
-        recordMutationSessionBarrier(this, operation, error, report);
+        recordIsolatedIncident(this, "operations", operation, error, report, { subject: boundedText(payload && payload.scope, operation) });
         if (kind === "doctor") {
           this.diagnostic = {
             title: report.unknown ? "Doctor outcome unknown" : "Doctor failed",
@@ -2599,7 +2862,7 @@ export default {
     clearLogView() { this.logOutput = "View cleared. The package log was not deleted."; },
     async saveNotificationPreferences(event) {
       if (event && event.preventDefault) event.preventDefault();
-      if (hasUnresolvedMutationOutcome(this)) return this.toast("Session preference save locked", unresolvedMutationGuidance(this), true);
+      if (scopeMutationOutcomeUnresolved(this, "interface")) return this.toast("Session preference save locked", scopeMutationGuidance(this, "interface"), true);
       if (!this.canChangeNotifications || this.operationBusy) return;
       this.operationBusy = true;
       let transaction = null;
@@ -2642,7 +2905,7 @@ export default {
     },
     async saveInterfaceSettings(event) {
       if (event && event.preventDefault) event.preventDefault();
-      if (hasUnresolvedMutationOutcome(this)) return this.toast("Interface save locked", unresolvedMutationGuidance(this), true);
+      if (scopeMutationOutcomeUnresolved(this, "interface")) return this.toast("Interface save locked", scopeMutationGuidance(this, "interface"), true);
       if (!this.canChangeInterface || this.operationBusy) return;
       this.cancelAutosave("interface");
       const candidate = this.interfaceSettingsPayload();

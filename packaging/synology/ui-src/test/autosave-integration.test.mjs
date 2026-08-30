@@ -92,7 +92,7 @@ function loadAppComponent(
     ACTIONS: {
       configureProfile: "configure-profile", setSecret: "set-secret", routine: "routine", alertPolicy: "alert-policy",
       securityPolicy: "security-policy", clientEvent: "client-event", removeProfile: "remove-profile",
-      removeRoutine: "remove-routine", execute: "execute"
+      removeRoutine: "remove-routine", execute: "execute", testProfileAuth: "test-profile-auth", browseRemote: "browse-remote"
     },
     AUTOSAVE_API_LIMITS: Object.freeze({
       csrfReissueTimeoutMs: 10000,
@@ -153,7 +153,13 @@ async function coordinatorRuntime(postSpy, getSpy = async () => ({})) {
     autosaveFailureScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
     autosaveOutcomeUnknownScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
     autosaveInspectionScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
-    mutationSessionBarrier: { active: false, kind: "", outcomeUnknown: false, requiresInspection: false },
+    autosaveIncidents: Object.fromEntries(["profile", "routine", "alerts", "security", "interface"].map((name) => [name, { active: false, outcomeUnknown: false, requiresInspection: false, message: "", requestId: "", jobId: "", subject: "" }])),
+    isolatedIncidents: {
+      connection: { active: false, kind: "", outcomeUnknown: false, requiresInspection: false, message: "", requestId: "", jobId: "" },
+      operations: { active: false, kind: "", outcomeUnknown: false, requiresInspection: false, message: "", requestId: "", jobId: "" }
+    },
+    profileConnectionState: "idle", profileConnectionAutosaveHeld: false,
+    pathBrowser: { visible: false, kind: "", loading: false },
     profileFailureRecords: emptyProfileFailureRecordsState(),
     autosaveCoordinator: null,
     alertDirty: false,
@@ -177,7 +183,7 @@ async function coordinatorRuntime(postSpy, getSpy = async () => ({})) {
     onSuperseded: () => context.refreshAutosaveStatus()
   });
   context.autosaveCoordinator.hydrate("alerts", { enabled: false });
-  return { clock, context };
+  return { clock, context, component };
 }
 
 function manualFailureContext(methods, scope, overrides = {}) {
@@ -196,7 +202,13 @@ function manualFailureContext(methods, scope, overrides = {}) {
     autosaveFailureScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
     autosaveOutcomeUnknownScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
     autosaveInspectionScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
-    mutationSessionBarrier: { active: false, kind: "", outcomeUnknown: false, requiresInspection: false },
+    autosaveIncidents: Object.fromEntries(["profile", "routine", "alerts", "security", "interface"].map((name) => [name, { active: false, outcomeUnknown: false, requiresInspection: false, message: "", requestId: "", jobId: "", subject: "" }])),
+    isolatedIncidents: {
+      connection: { active: false, kind: "", outcomeUnknown: false, requiresInspection: false, message: "", requestId: "", jobId: "" },
+      operations: { active: false, kind: "", outcomeUnknown: false, requiresInspection: false, message: "", requestId: "", jobId: "" }
+    },
+    profileConnectionState: "idle", profileConnectionAutosaveHeld: false,
+    pathBrowser: { visible: false, kind: "", loading: false },
     profileFailureRecords: emptyProfileFailureRecordsState(),
     reports: [],
     toasts: [],
@@ -695,6 +707,126 @@ test("real coordinator blocks outcome-unknown autosave without retry or Save-now
   assert.equal(attempts, 1, "an outcome-unknown mutation must never retry automatically");
 });
 
+test("authentication cancels a pending profile autosave and a failed probe never releases it", async () => {
+  let authenticationPosts = 0;
+  let profilePosts = 0;
+  const unknown = Object.assign(new Error("Authentication result could not be observed"), {
+    outcomeUnknown: true,
+    trustedRequestId: true,
+    requestId: "9".repeat(32)
+  });
+  const { clock, context, component } = await coordinatorRuntime(async (_auth, _csrf, action) => {
+    if (action === "test-profile-auth") {
+      authenticationPosts += 1;
+      throw unknown;
+    }
+    if (action === "configure-profile") profilePosts += 1;
+    return { ok: true };
+  });
+  Object.assign(context, {
+    profileEditorOpen: true,
+    canTestProfileAuthentication: true,
+    profileSaveState: "idle",
+    profileForm: {
+      name: "nightly", source: "/volume1/source", url: "https://nas.example.invalid",
+      username: "sync-user", allow_http: false, danger_invalid_certs: false,
+      ca_certificate: "", connect_timeout: 15, timeout: 120, retries: 2
+    },
+    selectedProfile: "nightly",
+    selectedProfileModel: { name: "nightly", has_password: true, has_totp: false },
+    secretModes: { password: "keep", totp: "keep", remote_log_token: "keep" },
+    secretValues: { password: "", totp: "", remote_log_token: "" },
+    profileConnectionRequest: 0,
+    profileConnectionMessage: "",
+    connectionIncidentEvidence: "",
+    connectionProof: "",
+    connectionProofExpires: 0,
+    connectionProofTimer: 0,
+    bridgeIssue: { title: "", message: "" },
+    connectionLabel: "Authenticated package bridge",
+    toasts: [],
+    toast(title, message, error = false) { this.toasts.push({ title, message, error }); }
+  });
+  for (const name of [
+    "strictDraftInteger", "between", "clearConnectionProofTimer", "scheduleConnectionProofExpiry",
+    "connectionRequestPayload", "holdProfileAutosaveForConnection", "releaseProfileAutosaveFromConnection",
+    "autosaveChanged", "reportMutationError", "ensureProfileFailureRecords",
+    "syncProfileFailureState", "clearProfileConfigurationFailure"
+  ]) context[name] = (...args) => component.methods[name].apply(context, args);
+
+  context.autosaveCoordinator.hydrate("profile", { name: "nightly", source: "/volume1/source" });
+  context.autosaveCoordinator.update("profile", { name: "nightly", source: "/volume1/pending" });
+  assert.equal(context.autosaveCoordinator.getState("profile").scheduled, true);
+
+  await component.methods.testProfileAuthentication.call(context, { preventDefault() {} });
+  await clock.advance(5000);
+
+  assert.equal(authenticationPosts, 1);
+  assert.equal(profilePosts, 0, "the canceled pre-test draft must not fire after a failed or unknown auth probe");
+  assert.equal(context.isolatedIncidents.connection.active, true);
+  assert.equal(context.autosaveFailureScopes.profile, false);
+
+  context.autosaveCoordinator.update("profile", { name: "nightly", source: "/volume1/later-edit" });
+  await clock.advance(1300);
+  assert.equal(profilePosts, 1, "a later profile edit remains autosavable despite connection-only evidence");
+});
+
+test("remote browsing cancels a pending profile autosave and a failed browse never releases it", async () => {
+  let browsePosts = 0;
+  let profilePosts = 0;
+  const unknown = Object.assign(new Error("Browse result could not be observed"), { outcomeUnknown: true });
+  const { clock, context, component } = await coordinatorRuntime(async (_auth, _csrf, action) => {
+    if (action === "browse-remote") {
+      browsePosts += 1;
+      throw unknown;
+    }
+    if (action === "configure-profile") profilePosts += 1;
+    return { ok: true };
+  });
+  Object.assign(context, {
+    profileEditorOpen: true,
+    profileSaveState: "idle",
+    profileForm: {
+      name: "nightly", source: "/volume1/source", url: "https://nas.example.invalid",
+      username: "sync-user", allow_http: false, danger_invalid_certs: false,
+      ca_certificate: "", connect_timeout: 15, timeout: 120, retries: 2
+    },
+    selectedProfile: "nightly",
+    selectedProfileModel: { name: "nightly", has_password: true, has_totp: false },
+    secretModes: { password: "keep", totp: "keep", remote_log_token: "keep" },
+    secretValues: { password: "", totp: "", remote_log_token: "" },
+    profileConnectionState: "success",
+    connectionTestReady: true,
+    connectionIncidentEvidence: "",
+    connectionProof: `v1.${Math.floor(Date.now() / 1000) + 300}.${"1".repeat(64)}.${"2".repeat(64)}`,
+    connectionProofExpires: Math.floor(Date.now() / 1000) + 300,
+    pathBrowser: { visible: true, kind: "remote", current: "/home/Drive", parent: "/home", directories: [], truncated: false, loading: false, error: "", request: 0 },
+    bridgeIssue: { title: "", message: "" },
+    connectionLabel: "Authenticated package bridge",
+    toasts: [],
+    toast(title, message, error = false) { this.toasts.push({ title, message, error }); }
+  });
+  for (const name of [
+    "strictDraftInteger", "between", "connectionRequestPayload", "browserParent",
+    "holdProfileAutosaveForConnection", "releaseProfileAutosaveFromConnection",
+    "autosaveChanged", "reportMutationError", "ensureProfileFailureRecords",
+    "syncProfileFailureState", "clearProfileConfigurationFailure"
+  ]) context[name] = (...args) => component.methods[name].apply(context, args);
+
+  context.autosaveCoordinator.hydrate("profile", { name: "nightly", source: "/volume1/source" });
+  context.autosaveCoordinator.update("profile", { name: "nightly", source: "/volume1/pending" });
+  await component.methods.browsePath.call(context, "/home/Drive");
+  await clock.advance(5000);
+
+  assert.equal(browsePosts, 1);
+  assert.equal(profilePosts, 0, "the canceled pre-browse draft must not fire after an unknown browse");
+  assert.equal(context.isolatedIncidents.connection.active, true);
+
+  context.autosaveCoordinator.update("profile", { name: "nightly", source: "/volume1/later-edit" });
+  await clock.advance(1300);
+  assert.equal(profilePosts, 1, "a later edit remains autosavable after connection-only browse evidence");
+});
+
 test("security autosave never invites a duplicate after terminal success and CSRF refresh failure", async () => {
   let posts = 0;
   const refreshFailure = new Error("DSM CSRF refresh returned an invalid document");
@@ -731,7 +863,7 @@ test("security autosave never invites a duplicate after terminal success and CSR
   assert.equal(posts, 1, "the failed CSRF observation must never redispatch the applied policy");
 });
 
-test("manual mutation outcome-unknown errors block every autosave scope without Save-now guidance", async () => {
+test("manual mutation outcome-unknown errors block only their own scope without Save-now guidance", async () => {
   const unknown = Object.assign(new Error("DSM may have accepted this mutation"), {
     outcomeUnknown: true,
     acceptanceUnknown: true,
@@ -749,7 +881,9 @@ test("manual mutation outcome-unknown errors block every autosave scope without 
     assert.match(context.autosaveMessage, /Activity \/ Logs/);
     assert.doesNotMatch(context.autosaveMessage, /Save now/i);
     assert.deepEqual(context.reports, [unknown]);
-    assert.equal(context.mutationSessionBarrier.active, true);
+    for (const other of ["profile", "routine", "alerts", "security", "interface"].filter((candidate) => candidate !== scope)) {
+      assert.equal(context.autosaveOutcomeUnknownScopes[other], false, `${scope} must not poison ${other}`);
+    }
   }
 
   assert.equal(posts.length, cases.length);
@@ -757,6 +891,95 @@ test("manual mutation outcome-unknown errors block every autosave scope without 
     await actions[index].call(cases[index].context, { preventDefault() {} });
   }
   assert.equal(posts.length, cases.length, "a second click must not redispatch any mutation family after an unknown outcome");
+});
+
+test("scope incidents preserve the first trusted correlation and profile subject", () => {
+  const component = loadAppComponent();
+  const methods = component.methods;
+  const { context } = manualFailureContext(methods, "profile", {
+    selectedProfile: "nightly",
+    profileForm: { name: "nightly" }
+  });
+  const first = Object.assign(new Error("first uncertain result"), {
+    outcomeUnknown: true,
+    trustedRequestId: true,
+    requestId: "a".repeat(32),
+    trustedJobId: true,
+    jobId: "b".repeat(48)
+  });
+  const later = Object.assign(new Error("later retry also uncertain"), {
+    outcomeUnknown: true,
+    trustedRequestId: true,
+    requestId: "c".repeat(32),
+    trustedJobId: true,
+    jobId: "d".repeat(48)
+  });
+
+  methods.pauseAutosave.call(context, "profile", first);
+  methods.pauseAutosave.call(context, "profile", later);
+
+  assert.equal(context.autosaveIncidents.profile.requestId, first.requestId);
+  assert.equal(context.autosaveIncidents.profile.jobId, first.jobId);
+  assert.equal(context.autosaveIncidents.profile.subject, "nightly");
+  const guidance = component.computed.profileOutcomeGuidance.call(context);
+  assert.match(guidance, new RegExp(first.requestId));
+  assert.match(guidance, new RegExp(first.jobId));
+  assert.doesNotMatch(guidance, new RegExp(later.requestId));
+});
+
+test("an unresolved profile blocks dependent routines and operations but not unrelated alerts", async () => {
+  const posts = [];
+  const component = loadAppComponent(async (_auth, _csrf, action) => {
+    posts.push(action);
+    return { ok: true };
+  });
+  const methods = component.methods;
+  const profileUnknown = {
+    autosaveFailureScopes: { profile: true, routine: false, alerts: false, security: false, interface: false },
+    autosaveOutcomeUnknownScopes: { profile: true, routine: false, alerts: false, security: false, interface: false },
+    autosaveInspectionScopes: { profile: true, routine: false, alerts: false, security: false, interface: false }
+  };
+  const routine = manualFailureContext(methods, "routine", {
+    ...profileUnknown,
+    canChangeRoutines: true,
+    routineForm: { profile: "nightly" },
+    routineAutosavePayload: () => ({ profile: "nightly", allow_delete: false }),
+    validateRoutinePayload: () => "",
+    routineAutosaveNeedsReview: () => false
+  }).context;
+  const operation = manualFailureContext(methods, "security", {
+    ...profileUnknown,
+    canRunOperations: true,
+    canAllowDestructive: true,
+    diagnostic: { title: "", output: "" }
+  }).context;
+  const alerts = manualFailureContext(methods, "alerts", {
+    ...profileUnknown,
+    canChangeNotifications: true,
+    alertPayload: () => ({ enabled: true }),
+    validateAlertPayload: () => "",
+    alertDirty: true
+  }).context;
+
+  await methods.saveRoutine.call(routine, { preventDefault() {} });
+  await methods.executeOperation.call(operation, "run", { scope: "all", allow_delete: false });
+  await methods.saveAlerts.call(alerts, { preventDefault() {} });
+
+  assert.deepEqual(posts, ["alert-policy"]);
+  assert.equal(routine.toasts.at(-1).title, "Routine save locked");
+  assert.equal(operation.toasts.at(-1).title, "Operation locked");
+  assert.equal(component.computed.canChangeRoutines.call({
+    canMutate: true,
+    operationBusy: false,
+    profileOutcomeUnresolved: true,
+    securityPolicy: { allow_routine_changes: true }
+  }), false, "dependent routine controls must disable while profile state is unresolved");
+  assert.equal(component.computed.canChangeRoutines.call({
+    canMutate: true,
+    operationBusy: false,
+    profileOutcomeUnresolved: false,
+    securityPolicy: { allow_routine_changes: true }
+  }), true, "routine controls must recover when profile state is settled");
 });
 
 test("trusted pre-acceptance manual rejections retain Save-now recovery guidance", async () => {
@@ -776,7 +999,8 @@ test("trusted pre-acceptance manual rejections retain Save-now recovery guidance
     assert.match(context.autosaveMessage, /use Save now/i);
     assert.doesNotMatch(context.autosaveMessage, /outcome unknown|Activity \/ Logs/i);
     assert.deepEqual(context.reports, [rejected]);
-    assert.equal(context.mutationSessionBarrier.active, false);
+    assert.equal(context.isolatedIncidents.connection.active, false);
+    assert.equal(context.isolatedIncidents.operations.active, false);
   }
 
   for (let index = 0; index < cases.length; index += 1) {
@@ -991,7 +1215,7 @@ test("zero-applied profile and secret rejections retain ordinary Save-now recove
   assert.deepEqual(secretsCase.context.reports, [rejected]);
 });
 
-test("authoritative hydration cannot clear the session latch; a fresh AppWindow can", () => {
+test("authoritative hydration reconciles only its named scope", () => {
   const methods = loadAppComponent().methods;
   const coordinator = {
     hydrate() {},
@@ -1000,30 +1224,29 @@ test("authoritative hydration cannot clear the session latch; a fresh AppWindow 
   };
   const latched = manualFailureContext(methods, "security", {
     autosaveCoordinator: coordinator,
-    autosaveFailureScopes: { profile: false, routine: false, alerts: false, security: true, interface: false },
-    autosaveOutcomeUnknownScopes: { profile: false, routine: false, alerts: false, security: true, interface: false },
-    autosaveInspectionScopes: { profile: false, routine: false, alerts: false, security: true, interface: false },
-    mutationSessionBarrier: { active: true, kind: "Security mutation", outcomeUnknown: true, requiresInspection: true }
+    autosaveFailureScopes: { profile: true, routine: false, alerts: false, security: true, interface: false },
+    autosaveOutcomeUnknownScopes: { profile: true, routine: false, alerts: false, security: true, interface: false },
+    autosaveInspectionScopes: { profile: true, routine: false, alerts: false, security: true, interface: false }
   });
 
   methods.hydrateAutosave.call(latched.context, "security", { require_https: true }, true);
 
   assert.equal(latched.context.autosaveOutcomeUnknownScopes.security, false, "the observed scope may reconcile");
-  assert.equal(latched.context.mutationSessionBarrier.active, true, "authoritative hydration must not silently unlock the AppWindow");
+  assert.equal(latched.context.autosaveOutcomeUnknownScopes.profile, true, "reconciling security must not clear profile evidence");
   assert.equal(latched.context.autosavePhase, "blocked");
-  assert.equal(loadAppComponent().computed.mutationOutcomeUnresolved.call(latched.context), true);
+  assert.equal(loadAppComponent().computed.profileOutcomeUnresolved.call(latched.context), true);
+  assert.equal(loadAppComponent().computed.securityOutcomeUnresolved.call(latched.context), false);
 
   const fresh = manualFailureContext(methods, "security", {
     canMutate: true,
     securityDirty: true
   }).context;
-  assert.equal(loadAppComponent().computed.mutationOutcomeUnresolved.call(fresh), false);
   assert.equal(loadAppComponent().computed.canSubmitSecurity.call({
     canMutate: true,
     securityDirty: true,
     operationBusy: false,
-    mutationOutcomeUnresolved: false
-  }), true, "a new AppWindow instance starts from authoritative state without the prior session latch");
+    securityOutcomeUnresolved: false
+  }), true, "an unrelated or reconciled security scope remains usable");
 });
 
 test("unknown removals, operations, and notification audits latch before a second dispatch", async () => {
@@ -1078,24 +1301,32 @@ test("unknown removals, operations, and notification audits latch before a secon
   await methods.saveNotificationPreferences.call(notifications, { preventDefault() {} });
   assert.equal(posts.length, 4, "each unknown family must reject a second direct invocation before transport");
   assert.equal(confirmations, 2, "a locked destructive retry must not reach confirmation");
-  for (const context of [profile, routine, operation, notifications]) {
-    assert.equal(context.mutationSessionBarrier.active, true);
-  }
+  assert.equal(profile.autosaveOutcomeUnknownScopes.profile, true);
+  assert.equal(routine.autosaveOutcomeUnknownScopes.routine, true);
+  assert.equal(notifications.autosaveOutcomeUnknownScopes.interface, true);
+  assert.equal(operation.isolatedIncidents.operations.active, true);
+  assert.equal(profile.autosaveOutcomeUnknownScopes.routine, false);
+  assert.equal(routine.autosaveOutcomeUnknownScopes.profile, false);
 });
 
-test("a latched mutation outcome blocks autosave dispatch before transport", async () => {
+test("a scoped mutation outcome blocks only matching autosave dispatch before transport", async () => {
   let posts = 0;
   const methods = loadAppComponent(async () => { posts += 1; return { ok: true }; }).methods;
   const context = manualFailureContext(methods, "alerts", {
-    mutationSessionBarrier: { active: true, kind: "Alert mutation", outcomeUnknown: true, requiresInspection: true }
+    autosaveFailureScopes: { profile: false, routine: false, alerts: true, security: false, interface: false },
+    autosaveOutcomeUnknownScopes: { profile: false, routine: false, alerts: true, security: false, interface: false },
+    autosaveInspectionScopes: { profile: false, routine: false, alerts: true, security: false, interface: false }
   }).context;
 
   await assert.rejects(
-    methods.dispatchAutosave.call(context, { scope: "alerts", payload: { enabled: true } }),
-    /mutation outcome unknown.*may already have been accepted/i
+    methods.dispatchAutosave.call(context, { scope: "alerts", value: { enabled: true } }),
+    /Package alerts is locked.*may already have been accepted/i
   );
   assert.equal(posts, 0);
   assert.equal(context.operationBusy, false);
+
+  await methods.dispatchAutosave.call(context, { scope: "routine", value: { profile: "nightly" } });
+  assert.equal(posts, 1, "an alerts incident must not block routine autosave transport");
 });
 
 test("manual security success followed by CSRF refresh failure remains applied and non-repeatable", async () => {

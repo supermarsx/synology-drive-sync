@@ -399,24 +399,35 @@ class DsmUiContractTests(unittest.TestCase):
             api,
         )
         self.assertIn(
-            "async function apiGetWithDsmAuth(auth, action, parameters, dsmAuth, "
-            "rememberGeneration = true)",
+            "requestSignal = auth && auth.signal ? auth.signal : undefined",
             api,
         )
+        self.assertIn("function linkedAbortAttempt(parentSignal)", api)
+        self.assertIn('parentSignal.addEventListener("abort", abort, { once: true });', api)
+        self.assertIn('parentSignal.removeEventListener("abort", abort);', api)
         self.assertIn(
-            'const request = apiGetWithDsmAuth(auth, "csrf", {}, dsmAuth, false);',
+            'apiGetWithDsmAuth(auth, "csrf", {}, dsmAuth, false, attempt.signal)',
             api,
         )
         get_source = api[
             api.index("export async function apiGet(") : api.index("\nfunction delay(")
         ]
         self.assertIn(
-            'const deferredCsrfGeneration = Boolean(limits && action === "csrf");',
+            "const configuredLimits = normalizedRequestLimits(options);",
             get_source,
         )
+        self.assertIn(
+            "const limits = configuredLimits || terminalAttemptLimits();",
+            get_source,
+        )
+        self.assertIn(
+            'const deferredCsrfGeneration = action === "csrf";',
+            get_source,
+        )
+        self.assertNotIn("if (!limits)", get_source)
         self.assertIn("!deferredCsrfGeneration", get_source)
         self.assertLess(
-            get_source.index("const model = await withinLimit("),
+            get_source.index("model = await withinLimit("),
             get_source.index(
                 "rememberCsrfGeneration(auth, model, requestDsmAuth.generation)"
             ),
@@ -424,16 +435,34 @@ class DsmUiContractTests(unittest.TestCase):
         post_source = api[api.index("export async function apiPost(") :]
         self.assertEqual(post_source.count("fetch(API_URL, {"), 1)
         self.assertEqual(post_source.count("apiPost("), 1)
+        self.assertEqual(post_source.count("const id = requestId();"), 1)
+        self.assertIn(
+            "const POST_DISPATCH_REPLAY_DELAYS_MS = Object.freeze([250, 1000]);",
+            api,
+        )
+        self.assertIn(
+            "for (let attempt = 0; attempt < POST_DISPATCH_MAX_ATTEMPTS; attempt += 1) {",
+            post_source,
+        )
+        self.assertIn("POST_DISPATCH_REPLAY_DELAYS_MS[attempt]", post_source)
+        self.assertIn("queued.request_id === id", post_source)
+        self.assertIn("signal: requestAttempt.signal", post_source)
+        self.assertEqual(post_source.count("requestAttempt.abort"), 2)
+        self.assertIn("requestAttempt.release();", post_source)
         self.assertLess(
             post_source.index("const requestDsmAuth = dsmAuthSnapshot();"),
             post_source.index("const effectiveCsrfToken = await csrfForCurrentAuthGeneration"),
         )
         self.assertLess(
             post_source.index("const effectiveCsrfToken = await csrfForCurrentAuthGeneration"),
+            post_source.index("const id = requestId();"),
+        )
+        self.assertLess(
+            post_source.index("const id = requestId();"),
             post_source.index("const dispatched = fetch(API_URL, {"),
         )
         self.assertIn(
-            'apiGetWithDsmAuth(auth, "result", { job_id: jobId }, dsmAuth)',
+            '"result",\n          { job_id: jobId },',
             api,
         )
         self.assertIn(
@@ -521,7 +550,8 @@ global.fetch = async function (url, options) {
 
 (async function () {
   const cookieOnly = {};
-  const signalMarker = { aborted: false };
+  const appCancellation = new AbortController();
+  const signalMarker = appCancellation.signal;
   const adversarialFields = { token: "must-be-ignored", invalid: true, signal: signalMarker };
 
   await apiGet(cookieOnly, "snapshot");
@@ -554,7 +584,9 @@ global.fetch = async function (url, options) {
       "X-SYNO-TOKEN": dsmToken
     });
   }
-  assert.equal(getAdversarial.options.signal, signalMarker);
+  assert.notEqual(getAdversarial.options.signal, signalMarker);
+  assert.equal(getAdversarial.options.signal instanceof AbortSignal, true);
+  assert.equal(getAdversarial.options.signal.aborted, false);
 
   for (const request of [postCookieOnly, postAdversarial]) {
     assert.equal(request.options.method, "POST");
@@ -567,7 +599,13 @@ global.fetch = async function (url, options) {
       "X-SYNO-TOKEN": dsmToken
     });
   }
-  assert.equal(postAdversarial.options.signal, signalMarker);
+  assert.notEqual(postAdversarial.options.signal, signalMarker);
+  assert.equal(postAdversarial.options.signal instanceof AbortSignal, true);
+  assert.equal(postAdversarial.options.signal.aborted, false);
+  appCancellation.abort();
+  assert.equal(signalMarker.aborted, true);
+  assert.equal(getAdversarial.options.signal.aborted, false);
+  assert.equal(postAdversarial.options.signal.aborted, false);
   for (const request of requests) {
     assert.equal(request.url.includes(dsmTokenRaw), false);
     assert.equal(request.url.includes(dsmToken), false);
@@ -1353,20 +1391,20 @@ function bind(context, names) {
 
         with self.assertRaisesRegex(validate_spk.ValidationError, "AppWindow structure"):
             validate_build(app=source["app"].replace(b"<v-app-window", b"<section", 1))
-        profile_latch = (
-            b'if (hasUnresolvedMutationOutcome(this)) return this.toast('
-            b'"Profile save locked", unresolvedMutationGuidance(this), true);'
+        profile_scope_guard = (
+            b'if (scopeMutationOutcomeUnresolved(this, "profile")) return this.toast('
+            b'"Profile save locked", scopeMutationGuidance(this, "profile"), true);'
         )
-        self.assertIn(profile_latch, source["app"])
+        self.assertIn(profile_scope_guard, source["app"])
         with self.assertRaisesRegex(
             validate_spk.ValidationError,
-            "session-latched mutation guard",
+            "scope-isolated mutation guard",
         ):
             validate_build(
                 app=source["app"].replace(
-                    profile_latch,
+                    profile_scope_guard,
                     b'if (false) return this.toast('
-                    b'"Profile save locked", unresolvedMutationGuidance(this), true);',
+                    b'"Profile save locked", scopeMutationGuidance(this, "profile"), true);',
                     1,
                 )
             )
@@ -1430,7 +1468,7 @@ function bind(context, names) {
                 )
             )
         late_csrf_request = (
-            b'const request = apiGetWithDsmAuth(auth, "csrf", {}, dsmAuth, false);'
+            b'apiGetWithDsmAuth(auth, "csrf", {}, dsmAuth, false, attempt.signal)'
         )
         self.assertIn(late_csrf_request, source["api"])
         with self.assertRaisesRegex(
@@ -1444,7 +1482,7 @@ function bind(context, names) {
                 )
             )
         with self.assertRaisesRegex(
-            validate_spk.ValidationError, "bounded CSRF reads"
+            validate_spk.ValidationError, "bounded GET reads"
         ):
             validate_build(
                 api=source["api"].replace(
@@ -1456,7 +1494,7 @@ function bind(context, names) {
         csrf_helper = source["api"].index(
             b"async function csrfForCurrentAuthGeneration("
         )
-        bounded_acceptance = source["api"].index(b"  const model = limits", csrf_helper)
+        bounded_acceptance = source["api"].index(b"  if (limits) {", csrf_helper)
         generation_commit = (
             b"  rememberCsrfGeneration(auth, model, dsmAuth.generation);\n"
         )
@@ -1512,14 +1550,29 @@ function bind(context, names) {
             )
         with self.assertRaisesRegex(validate_spk.ValidationError, "external network endpoint"):
             validate_build(api=source["api"] + b'\nfetch("https://evil.invalid/");\n')
-        with self.assertRaisesRegex(validate_spk.ValidationError, "AppWindow cancellation"):
-            validate_build(
-                api=source["api"].replace(
-                    b"signal: auth && auth.signal ? auth.signal : undefined,",
-                    b"signal: undefined,",
-                    1,
-                )
-            )
+        cancellation_tampers = (
+            (
+                "POST attempt signal",
+                b"signal: requestAttempt.signal,",
+                b"signal: undefined,",
+            ),
+            (
+                "parent abort forwarding",
+                b'parentSignal.addEventListener("abort", abort, { once: true });',
+                b'parentSignal.addEventListener("ignored", abort, { once: true });',
+            ),
+            (
+                "parent listener release",
+                b'parentSignal.removeEventListener("abort", abort);',
+                b'parentSignal.removeEventListener("ignored", abort);',
+            ),
+        )
+        for name, original, tampered in cancellation_tampers:
+            with self.subTest(name=name), self.assertRaisesRegex(
+                validate_spk.ValidationError, "AppWindow cancellation|linked|security contract"
+            ):
+                self.assertIn(original, source["api"])
+                validate_build(api=source["api"].replace(original, tampered, 1))
         with self.assertRaisesRegex(
             validate_spk.ValidationError, "queued-result observer|terminal horizon"
         ):
@@ -1535,6 +1588,14 @@ function bind(context, names) {
                 api=source["api"].replace(
                     b"await delay(interval, auth && auth.signal, limits, observation);",
                     b"await Promise.resolve();",
+                    1,
+                )
+            )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "queued-result observer"):
+            validate_build(
+                api=source["api"].replace(
+                    b"if (!observation && consecutiveObservationFailures >= RESULT_POLL_OBSERVATION_FAILURES)",
+                    b"if (consecutiveObservationFailures >= RESULT_POLL_OBSERVATION_FAILURES)",
                     1,
                 )
             )
@@ -1580,7 +1641,7 @@ function bind(context, names) {
                 "interaction contract",
             ),
             (
-                "global mutation guard",
+                "operationBusy guard",
                 b"openProfile(name) {\n      if (this.operationBusy) return;",
                 b"openProfile(name) {",
                 "operationBusy guard",

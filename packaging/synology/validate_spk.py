@@ -440,7 +440,12 @@ def validate_native_api_source(payload: bytes) -> None:
         "const csrfGenerationByAuth = new WeakMap();",
         "dsmAuthGeneration += 1;",
         "function dsmAuthSnapshot()",
-        "async function apiGetWithDsmAuth(auth, action, parameters, dsmAuth, rememberGeneration = true)",
+        "function linkedAbortAttempt(parentSignal)",
+        "const controller = new AbortControllerClass();",
+        'parentSignal.addEventListener("abort", abort, { once: true });',
+        'parentSignal.removeEventListener("abort", abort);',
+        "requestSignal = auth && auth.signal ? auth.signal : undefined",
+        "signal: requestSignal",
         "async function csrfForCurrentAuthGeneration(auth, csrfToken, dsmAuth, limits = null)",
         "const requestDsmAuth = dsmAuthSnapshot();",
         "const effectiveCsrfToken = await csrfForCurrentAuthGeneration(auth, csrfToken, requestDsmAuth, limits);",
@@ -448,12 +453,13 @@ def validate_native_api_source(payload: bytes) -> None:
         "request_id: id",
         "operation: action",
         "arguments: payload",
-        "signal: auth && auth.signal ? auth.signal : undefined",
         "signal.addEventListener(\"abort\", cancel, { once: true })",
         "signal.removeEventListener(\"abort\", cancel)",
         "window.clearTimeout(timer)",
         "const RESULT_POLL_INTERVAL_MS = 2000;",
         "const RESULT_POLL_OBSERVATION_FAILURES = 5;",
+        "const POST_DISPATCH_REPLAY_DELAYS_MS = Object.freeze([250, 1000]);",
+        "const POST_DISPATCH_MAX_ATTEMPTS = POST_DISPATCH_REPLAY_DELAYS_MS.length + 1;",
         "class QueuedOutcomeUnknownError extends Error",
         "this.outcomeUnknown = true;",
     ):
@@ -463,8 +469,17 @@ def validate_native_api_source(payload: bytes) -> None:
         raise ValidationError(
             "native DSM token bootstrap, GET, and POST must all use same-origin credentials"
         )
-    if source.count("signal: auth && auth.signal ? auth.signal : undefined") != 2:
-        raise ValidationError("native DSM GET and POST must both support AppWindow cancellation")
+    if (
+        source.count("function linkedAbortAttempt(parentSignal)") != 1
+        or source.count("linkedAbortAttempt(auth && auth.signal)") != 3
+        or source.count("linkedAbortAttempt(auth.signal)") != 1
+        or source.count("signal: requestSignal") != 1
+        or source.count("signal: requestAttempt.signal") != 1
+        or source.count("if (onTimeout) onTimeout();") != 3
+    ):
+        raise ValidationError(
+            "native DSM bounded requests must link, abort, and release AppWindow cancellation attempts"
+        )
     for forbidden in (
         r"consumeLaunchToken",
         r"\bwindow\.location\b",
@@ -547,26 +562,40 @@ def validate_native_api_source(payload: bytes) -> None:
                 f"native DSM {method} requests must await the shared DSM token bootstrap"
             )
         if method == "GET":
+            configured_limits = request_source.find(
+                "const configuredLimits = normalizedRequestLimits(options);"
+            )
+            default_limits = request_source.find(
+                "const limits = configuredLimits || terminalAttemptLimits();",
+                configured_limits,
+            )
             auth_snapshot = request_source.find(
                 "const requestDsmAuth = dsmAuthSnapshot();"
             )
             deferred_generation = request_source.find(
-                'const deferredCsrfGeneration = Boolean(limits && action === "csrf");'
+                'const deferredCsrfGeneration = action === "csrf";'
             )
-            get_request = request_source.find(
-                "const request = apiGetWithDsmAuth("
-            )
-            suppressed_generation = request_source.find(
-                "!deferredCsrfGeneration", get_request
-            )
-            unbounded_return = request_source.find(
-                "if (!limits) return request;", suppressed_generation
+            bounded_attempt = request_source.find(
+                "const attempt = linkedAbortAttempt(auth && auth.signal);",
+                deferred_generation,
             )
             bounded_acceptance = request_source.find(
-                "const model = await withinLimit(", unbounded_return
+                "model = await withinLimit(", bounded_attempt
+            )
+            bounded_request = request_source.find(
+                "apiGetWithDsmAuth(", bounded_acceptance
+            )
+            bounded_signal = request_source.find(
+                "attempt.signal", bounded_request
+            )
+            bounded_abort = request_source.find(
+                "attempt.abort", bounded_signal
+            )
+            bounded_release = request_source.find(
+                "attempt.release();", bounded_abort
             )
             deferred_commit_guard = request_source.find(
-                "if (deferredCsrfGeneration) {", bounded_acceptance
+                "if (deferredCsrfGeneration) {", bounded_release
             )
             deferred_commit = request_source.find(
                 "rememberCsrfGeneration(auth, model, requestDsmAuth.generation)",
@@ -576,28 +605,35 @@ def validate_native_api_source(payload: bytes) -> None:
             if (
                 "export async function apiGet(auth, action, parameters = {}, options = undefined)"
                 not in request_source
-                or "const limits = normalizedRequestLimits(options);" not in request_source
                 or request_source.count("apiGetWithDsmAuth(") != 1
+                or request_source.count("!deferredCsrfGeneration") != 1
                 or request_source.count(
                     "rememberCsrfGeneration(auth, model, requestDsmAuth.generation)"
                 )
                 != 1
                 or "limits.readTimeoutMs" not in request_source
+                or '"read_observation"' not in request_source
+                or "client read limit" not in request_source
+                or "if (!limits)" in request_source
                 or not (
                     0
-                    <= auth_snapshot
+                    <= configured_limits
+                    < default_limits
+                    < auth_snapshot
                     < deferred_generation
-                    < get_request
-                    < suppressed_generation
-                    < unbounded_return
+                    < bounded_attempt
                     < bounded_acceptance
+                    < bounded_request
+                    < bounded_signal
+                    < bounded_abort
+                    < bounded_release
                     < deferred_commit_guard
                     < deferred_commit
                     < model_return
                 )
             ):
                 raise ValidationError(
-                    "native DSM bounded CSRF reads must suppress detached generation writes and commit only after accepted observation"
+                    "native DSM bounded GET reads must abort linked fetches and suppress detached CSRF generation writes"
                 )
         elif len(re.findall(r"\bheaders\s*:\s*authenticatedHeaders\s*\(", request_source)) != 1:
             raise ValidationError(
@@ -610,9 +646,10 @@ def validate_native_api_source(payload: bytes) -> None:
         raise ValidationError("native DSM API source is missing exact-snapshot GET dispatch")
     get_dispatch_source = source[get_dispatch_start:get_dispatch_end]
     if (
-        "async function apiGetWithDsmAuth(auth, action, parameters, dsmAuth, rememberGeneration = true)"
+        "requestSignal = auth && auth.signal ? auth.signal : undefined"
         not in get_dispatch_source
         or get_dispatch_source.count("fetch(endpoint(action, parameters), {") != 1
+        or get_dispatch_source.count("signal: requestSignal") != 1
         or get_dispatch_source.count("headers: authenticatedHeaders(") != 1
         or "{ Accept: \"application/json\" }, dsmAuth" not in get_dispatch_source
         or 'if (rememberGeneration && action === "csrf") {' not in get_dispatch_source
@@ -631,13 +668,25 @@ def validate_native_api_source(payload: bytes) -> None:
     if csrf_reissue_start < 0 or csrf_reissue_end < 0:
         raise ValidationError("native DSM API source is missing bounded CSRF generation reissue")
     csrf_reissue_source = source[csrf_reissue_start:csrf_reissue_end]
-    csrf_request = csrf_reissue_source.find(
-        'const request = apiGetWithDsmAuth(auth, "csrf", {}, dsmAuth, false);'
+    bounded_branch = csrf_reissue_source.find("if (limits) {")
+    bounded_attempt = csrf_reissue_source.find(
+        "const attempt = linkedAbortAttempt(auth.signal);", bounded_branch
     )
-    bounded_acceptance = csrf_reissue_source.find("const model = limits")
-    bounded_wait = csrf_reissue_source.find("? await withinLimit(", bounded_acceptance)
-    unbounded_wait = csrf_reissue_source.find(": await request;", bounded_wait)
-    model_validation = csrf_reissue_source.find("if (!validCsrfModel(model))", unbounded_wait)
+    bounded_wait = csrf_reissue_source.find("model = await withinLimit(", bounded_attempt)
+    bounded_request = csrf_reissue_source.find(
+        'apiGetWithDsmAuth(auth, "csrf", {}, dsmAuth, false, attempt.signal)',
+        bounded_wait,
+    )
+    bounded_abort = csrf_reissue_source.find("attempt.abort", bounded_request)
+    bounded_release = csrf_reissue_source.find("attempt.release();", bounded_abort)
+    unbounded_branch = csrf_reissue_source.find("} else {", bounded_release)
+    unbounded_request = csrf_reissue_source.find(
+        'model = await apiGetWithDsmAuth(auth, "csrf", {}, dsmAuth, false);',
+        unbounded_branch,
+    )
+    model_validation = csrf_reissue_source.find(
+        "if (!validCsrfModel(model))", unbounded_request
+    )
     generation_commit = csrf_reissue_source.find(
         "rememberCsrfGeneration(auth, model, dsmAuth.generation)", model_validation
     )
@@ -647,26 +696,30 @@ def validate_native_api_source(payload: bytes) -> None:
     if (
         "async function csrfForCurrentAuthGeneration(auth, csrfToken, dsmAuth, limits = null)"
         not in csrf_reissue_source
-        or csrf_reissue_source.count("apiGetWithDsmAuth(") != 1
+        or csrf_reissue_source.count("apiGetWithDsmAuth(") != 2
         or csrf_reissue_source.count(
             "rememberCsrfGeneration(auth, model, dsmAuth.generation)"
         )
         != 1
         or "limits.csrfReissueTimeoutMs" not in csrf_reissue_source
-        or 'safeReadTimeout(\n        "csrf_reissue",' not in csrf_reissue_source
+        or '"csrf_reissue"' not in csrf_reissue_source
         or not (
             0
-            <= csrf_request
-            < bounded_acceptance
+            <= bounded_branch
+            < bounded_attempt
             < bounded_wait
-            < unbounded_wait
+            < bounded_request
+            < bounded_abort
+            < bounded_release
+            < unbounded_branch
+            < unbounded_request
             < model_validation
             < generation_commit
             < replacement_publish
         )
     ):
         raise ValidationError(
-            "native DSM bounded CSRF reissue must suppress detached generation writes and commit only after an accepted valid response"
+            "native DSM bounded CSRF reissue must abort its linked read and commit only after an accepted valid response"
         )
 
     poll_start = source.find("async function pollJobResult(")
@@ -676,7 +729,11 @@ def validate_native_api_source(payload: bytes) -> None:
     poll_source = source[poll_start:poll_end]
     for marker in (
         "pollIntervalMs = RESULT_POLL_INTERVAL_MS",
-        'apiGetWithDsmAuth(auth, "result", { job_id: jobId }, dsmAuth)',
+        "const attempt = linkedAbortAttempt(auth && auth.signal);",
+        '"result",\n          { job_id: jobId },',
+        "attempt.signal",
+        "attempt.abort",
+        "attempt.release();",
         "limits = null",
         "observation = null",
         "limits.resultRequestTimeoutMs",
@@ -685,7 +742,7 @@ def validate_native_api_source(payload: bytes) -> None:
         "for (;;)",
         "if (auth && auth.signal && auth.signal.aborted) throw error;",
         "consecutiveObservationFailures += 1;",
-        "consecutiveObservationFailures >= RESULT_POLL_OBSERVATION_FAILURES",
+        "if (!observation && consecutiveObservationFailures >= RESULT_POLL_OBSERVATION_FAILURES)",
         "consecutiveObservationFailures = 0;",
         "status.state === \"pending\"",
         "status.state === \"expired_or_missing\"",
@@ -698,6 +755,10 @@ def validate_native_api_source(payload: bytes) -> None:
             raise ValidationError(
                 f"native DSM queued-result observer is missing {marker!r}"
             )
+    if poll_source.count("apiGetWithDsmAuth(") != 1:
+        raise ValidationError(
+            "native DSM queued-result observer must use one linked GET attempt per poll"
+        )
     if poll_source.count(
         "await delay(interval, auth && auth.signal, limits, observation);"
     ) != 2:
@@ -722,9 +783,26 @@ def validate_native_api_source(payload: bytes) -> None:
 
     post_start = source.find("export async function apiPost(")
     post_source = source[post_start:] if post_start >= 0 else ""
+    for marker in (
+        "const TERMINAL_API_ATTEMPT_TIMEOUTS = Object.freeze({",
+        "csrfReissueTimeoutMs: 10000",
+        "postRequestTimeoutMs: 15000",
+        "postResponseTimeoutMs: 10000",
+        "readTimeoutMs: 10000",
+        "resultRequestTimeoutMs: 10000",
+        "function terminalAttemptLimits()",
+        "resultObservationTimeoutMs: null",
+        "setTimer: (callback, milliseconds) => window.setTimeout(callback, milliseconds)",
+        "clearTimer: (timer) => window.clearTimeout(timer)",
+    ):
+        if marker not in source:
+            raise ValidationError(
+                f"native DSM terminal POST attempt bounds are missing {marker!r}"
+            )
     if post_start < 0 or (
         "if (!awaitTerminal) return queued;" not in post_source
-        or "if (!limits) return pollJobResult(auth, queued.job_id, requestDsmAuth, pollIntervalMs, id);"
+        or "if (!boundedObservationLimits) {" not in post_source
+        or "return pollJobResult(auth, queued.job_id, requestDsmAuth, pollIntervalMs, id, limits, null);"
         not in post_source
         or "pollJobResult(auth, queued.job_id, requestDsmAuth, pollIntervalMs, id, limits, observation)"
         not in post_source
@@ -737,14 +815,56 @@ def validate_native_api_source(payload: bytes) -> None:
         "const effectiveCsrfToken = await csrfForCurrentAuthGeneration(auth, csrfToken, requestDsmAuth, limits);"
     )
     request_identity = post_source.find("const id = requestId();")
+    serialized_request = post_source.find("const request = JSON.stringify({", request_identity)
+    replay_loop = post_source.find(
+        "for (let attempt = 0; attempt < POST_DISPATCH_MAX_ATTEMPTS; attempt += 1) {",
+        serialized_request,
+    )
     post_dispatch = post_source.find("const dispatched = fetch(API_URL, {")
-    if not (0 <= auth_snapshot < csrf_refresh < request_identity < post_dispatch):
+    if not (
+        0
+        <= auth_snapshot
+        < csrf_refresh
+        < request_identity
+        < serialized_request
+        < replay_loop
+        < post_dispatch
+    ):
         raise ValidationError(
-            "native DSM POST must pin authentication before refreshing CSRF and dispatching"
+            "native DSM POST must pin authentication and one request identity before exact replay"
         )
-    if post_source.count("fetch(API_URL, {") != 1 or post_source.count("apiPost(") != 1:
+    for marker in (
+        "const boundedObservationLimits = normalizedRequestLimits(options);",
+        "const limits = boundedObservationLimits || terminalAttemptLimits();",
+        "let dispatchAmbiguous = false;",
+        "attempt < POST_DISPATCH_MAX_ATTEMPTS",
+        "const requestAttempt = linkedAbortAttempt(auth && auth.signal);",
+        "signal: requestAttempt.signal",
+        "body: request",
+        "queued.request_id === id",
+        "validJobId(queued.job_id)",
+        "dispatchAmbiguous = true;",
+        "POST_DISPATCH_REPLAY_DELAYS_MS[attempt]",
+        "requestAttempt.release();",
+        "throw dispatchedOutcomeUnknown(id);",
+        "const observation = { expired: false, cancelCurrent: null };",
+        "limits.resultObservationTimeoutMs",
+        "observation.expired = true;",
+        "if (observation.cancelCurrent) observation.cancelCurrent();",
+    ):
+        if marker not in post_source:
+            raise ValidationError(
+                f"native DSM POST exact-request recovery is missing {marker!r}"
+            )
+    if (
+        post_source.count("fetch(API_URL, {") != 1
+        or post_source.count("apiPost(") != 1
+        or post_source.count("const id = requestId();") != 1
+        or post_source.count("body: request") != 1
+        or post_source.count("requestAttempt.abort") != 2
+    ):
         raise ValidationError(
-            "native DSM POST must have exactly one package dispatch and must never retry itself"
+            "native DSM POST must have exactly one package dispatch implementation and one bounded exact-request replay identity"
         )
     if re.search(
         r"(?:fetch\s*\(|new\s+(?:WebSocket|EventSource)\s*\()\s*['\"](?:https?:)?//",
@@ -970,8 +1090,8 @@ def validate_native_build_contract(
         r"async saveProfileSecrets\(event\)\s*\{.{0,500}?if \(!profile \|\| !this\.canManageSecrets \|\| this\.operationBusy\) return;",
         r"async removeProfile\(\)\s*\{.{0,400}?if \(!this\.canChangeProfiles \|\| !this\.selectedProfile \|\| this\.operationBusy\) return;",
         r'openRoutine\(profile = ""\)\s*\{\s*if \(this\.operationBusy \|\| \(!profile && !this\.canChangeRoutines\)\) return;',
-        r"async saveRoutine\(event\)\s*\{.{0,400}?this\.operationBusy\) return;",
-        r"async removeRoutine\(\)\s*\{.{0,400}?this\.operationBusy\) return;",
+        r"async saveRoutine\(event\)\s*\{.{0,700}?this\.operationBusy\) return;",
+        r"async removeRoutine\(\)\s*\{.{0,700}?this\.operationBusy\) return;",
         r"async saveAlerts\(event\)\s*\{.{0,400}?this\.operationBusy\) return;",
         r"async saveSecurityPolicy\(event\)\s*\{.{0,400}?if \(!this\.canMutate \|\| !this\.securityDirty \|\| this\.operationBusy\) return;",
         r"async executeOperation\(kind, payload\)\s*\{.{0,400}?if \(!this\.canRunOperations \|\| this\.operationBusy \|\| this\.disposed\) return;",
@@ -981,20 +1101,28 @@ def validate_native_build_contract(
     for guard in operation_guards:
         if not re.search(guard, app, re.DOTALL):
             raise ValidationError("native DSM mutation surface is missing a global operationBusy guard")
-    mutation_latch_guards = (
-        "saveSecurityPolicy", "testProfileAuthentication", "openRemotePathBrowser",
-        "saveProfile", "saveProfileSecrets", "removeProfile", "saveRoutine",
-        "removeRoutine", "saveAlerts", "executeOperation", "saveNotificationPreferences",
-        "saveInterfaceSettings",
-    )
-    for method in mutation_latch_guards:
+    mutation_scope_guards = {
+        "saveSecurityPolicy": 'scopeMutationOutcomeUnresolved\\(this, "security"\\)',
+        "testProfileAuthentication": 'scopeMutationOutcomeUnresolved\\(this, "profile"\\)',
+        "openRemotePathBrowser": 'scopeMutationOutcomeUnresolved\\(this, "profile"\\)',
+        "saveProfile": 'scopeMutationOutcomeUnresolved\\(this, "profile"\\)',
+        "saveProfileSecrets": 'scopeMutationOutcomeUnresolved\\(this, "profile"\\)',
+        "removeProfile": 'scopeMutationOutcomeUnresolved\\(this, "profile"\\)',
+        "saveRoutine": 'scopeMutationOutcomeUnresolved\\(this, "routine"\\)',
+        "removeRoutine": 'scopeMutationOutcomeUnresolved\\(this, "routine"\\)',
+        "saveAlerts": 'scopeMutationOutcomeUnresolved\\(this, "alerts"\\)',
+        "executeOperation": 'isolatedIncidentUnresolved\\(this, "operations"\\)',
+        "saveNotificationPreferences": 'scopeMutationOutcomeUnresolved\\(this, "interface"\\)',
+        "saveInterfaceSettings": 'scopeMutationOutcomeUnresolved\\(this, "interface"\\)',
+    }
+    for method, scoped_guard in mutation_scope_guards.items():
         guard = (
             rf"(?:async\s+)?{re.escape(method)}\([^)]*\)\s*\{{"
-            rf".{{0,420}}?hasUnresolvedMutationOutcome\(this\)"
+            rf".{{0,420}}?{scoped_guard}"
         )
         if not re.search(guard, app, re.DOTALL):
             raise ValidationError(
-                f"native DSM mutation surface method {method} is missing the session-latched mutation guard"
+                f"native DSM mutation surface method {method} is missing its scope-isolated mutation guard"
             )
     for marker in (
         'const awaitTerminal = kind === "doctor";',
