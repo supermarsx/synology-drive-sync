@@ -120,6 +120,48 @@ test("stored-auth testing follows operational policy while secret writes remain 
   assert.equal(component.computed.canTestProfileAuthentication.call(context), false);
 });
 
+test("profile live operation is limited to authentication and genuine creation state", () => {
+  const component = loadAppComponent();
+  const context = {
+    disposed: false,
+    profileEditorOpen: true,
+    profileConnectionState: "testing",
+    profileConnectionMessage: "Discovering File Station and testing this draft…",
+    profileSaveState: "idle",
+    profileSaveMessage: "",
+    selectedProfile: ""
+  };
+
+  assert.deepEqual(component.computed.profileLiveOperation.call(context), {
+    title: "Testing profile authentication",
+    message: "Discovering File Station and testing this draft…"
+  });
+
+  context.profileConnectionState = "idle";
+  context.profileSaveState = "saving";
+  context.profileSaveMessage = "Validating the local source with the package identity…";
+  assert.equal(component.computed.profileLiveOperation.call(context).title, "Creating profile");
+
+  context.selectedProfile = "nightly";
+  context.profileSaveMessage = "Saving profile configuration…";
+  assert.equal(component.computed.profileLiveOperation.call(context), null, "existing profile updates must not be presented as creation");
+
+  context.profileSaveMessage = "Applying changed protected credentials…";
+  assert.equal(component.computed.profileLiveOperation.call(context), null, "secret-only saves must not be presented as creation");
+
+  context.selectedProfile = "";
+  context.profileEditorOpen = false;
+  assert.equal(component.computed.profileLiveOperation.call(context), null, "a closed editor cannot retain profile progress");
+
+  context.profileEditorOpen = true;
+  context.disposed = true;
+  assert.equal(component.computed.profileLiveOperation.call(context), null, "a disposed AppWindow cannot retain profile progress");
+
+  context.disposed = false;
+  context.profileSaveState = "success";
+  assert.equal(component.computed.profileLiveOperation.call(context), null);
+});
+
 test("new-profile authentication uses transient credentials and unlocks only the unchanged draft", async () => {
   const posts = [];
   const expires = Math.floor(Date.now() / 1000) + 300;
@@ -165,6 +207,8 @@ test("authentication rejects a response whose proof epoch and expiry field disag
   assert.equal(context.profileConnectionState, "error");
   assert.equal(context.connectionProof, "");
   assert.match(context.profileConnectionMessage, /invalid authentication proof/);
+  assert.equal(context.operationBusy, false);
+  assert.equal(component.computed.profileLiveOperation.call(context), null);
 });
 
 test("ordinary authentication rejection is retryable without changing the profile or secret draft", async () => {
@@ -185,6 +229,8 @@ test("ordinary authentication rejection is retryable without changing the profil
 
   await component.methods.testProfileAuthentication.call(context, { preventDefault() {} });
   assert.equal(context.profileConnectionState, "error");
+  assert.equal(context.operationBusy, false);
+  assert.equal(component.computed.profileLiveOperation.call(context), null);
   assert.equal(context.isolatedIncidents.connection.active, false);
   assert.deepEqual(context.profileForm, formBefore);
   assert.deepEqual(context.secretModes, modesBefore);
@@ -219,6 +265,9 @@ test("authentication owns the operation boundary and serializes secret save and 
 
   const authentication = component.methods.testProfileAuthentication.call(context, { preventDefault() {} });
   assert.equal(context.operationBusy, true);
+  assert.equal(context.toasts[0].title, "Authentication test started");
+  assert.match(context.toasts[0].message, /temporary session cleanup finishes/);
+  assert.equal(component.computed.profileLiveOperation.call(context).title, "Testing profile authentication");
   await component.methods.saveProfileSecrets.call(context, { preventDefault() {} });
   await component.methods.removeProfile.call(context);
   assert.equal(posts.length, 1, "concurrent profile mutations must stop before transport");
@@ -228,6 +277,25 @@ test("authentication owns the operation boundary and serializes secret save and 
   await authentication;
   assert.equal(context.operationBusy, false);
   assert.equal(context.profileConnectionState, "success");
+  assert.equal(component.computed.profileLiveOperation.call(context), null);
+});
+
+test("pending authentication progress is hidden when its editor closes or AppWindow is disposed", async () => {
+  for (const terminalState of ["closed", "disposed"]) {
+    const response = deferred();
+    const component = loadAppComponent({ post: async () => response.promise });
+    const context = connectionContext(component.methods);
+    const authentication = component.methods.testProfileAuthentication.call(context, { preventDefault() {} });
+
+    assert.equal(component.computed.profileLiveOperation.call(context).title, "Testing profile authentication");
+    if (terminalState === "closed") context.profileEditorOpen = false;
+    else context.disposed = true;
+    response.reject(new Error("late authentication rejection"));
+    await authentication;
+
+    assert.equal(component.computed.profileLiveOperation.call(context), null);
+    if (terminalState === "closed") assert.equal(context.operationBusy, false, "a live closed editor must release the operation boundary");
+  }
 });
 
 test("unknown authentication evidence stays connection-scoped and correlated after deliberate retry", async () => {
@@ -297,7 +365,7 @@ test("cleanup-required File Station evidence survives later success until explic
   const authenticationContext = connectionContext(authentication.methods);
   await authentication.methods.testProfileAuthentication.call(authenticationContext, { preventDefault() {} });
   assert.equal(authenticationContext.isolatedIncidents.connection.requiresInspection, true);
-  assert.equal(authenticationContext.toasts[0].title, "Authentication cleanup needs inspection");
+  assert.equal(authenticationContext.toasts.at(-1).title, "Authentication cleanup needs inspection");
   authenticationContext.connectionIncidentEvidence = authentication.computed.connectionIncidentEvidence.call(authenticationContext);
   await authentication.methods.testProfileAuthentication.call(authenticationContext, { preventDefault() {} });
   assert.equal(authenticationPosts, 2);
@@ -471,6 +539,7 @@ function saveContext(methods, secretModes, secretValues) {
     allow_empty_source: false, danger_accept_invalid_certs: false, delete: false
   };
   const reports = [];
+  const toasts = [];
   const context = bind({
     profileEditorOpen: true, canChangeProfiles: true, operationBusy: false, disposed: false,
     profileSaveState: "idle", profileSaveMessage: "", selectedProfile: "",
@@ -479,27 +548,41 @@ function saveContext(methods, secretModes, secretValues) {
     cancelAutosave() {}, profileAutosavePayload: () => payload, validateProfile: () => "",
     confirmAction: async () => true, clearProfileConfigurationFailure() {}, hydrateAutosave() {},
     pauseAutosave() {}, reportMutationError(error) { reports.push(error); },
-    toast() {}, clearSecrets() { this.secretValues = { password: "", totp: "", remote_log_token: "" }; },
+    toast(title, message, error = false) { toasts.push({ title, message, error }); }, clearSecrets() { this.secretValues = { password: "", totp: "", remote_log_token: "" }; },
     closeProfile(options) { this.closed = options; },
     refreshSnapshot: async function () { this.refreshed += 1; return true; },
     clearProfileSecretFailures() {}, refreshAutosaveStatus() {}
   }, methods, ["secretOperations", "applyTrustedSecretPresence"]);
-  return { context, payload };
+  return { context, payload, toasts };
 }
 
 test("profile creation dispatches and settles with visible progress", async () => {
   const posts = [];
+  const validation = deferred();
   const component = loadAppComponent({
-    get: async (_auth, action, query) => ({
-      schema: "sdsync.dsm-source-path.v1", path: query.path, valid: true
-    }),
+    get: async (_auth, action, query) => {
+      await validation.promise;
+      return { schema: "sdsync.dsm-source-path.v1", path: query.path, valid: true };
+    },
     post: async (_auth, _csrf, action, payload) => { posts.push({ action, payload }); return { ok: true }; }
   });
-  const { context } = saveContext(component.methods,
+  const { context, toasts } = saveContext(component.methods,
     { password: "replace", totp: "keep", remote_log_token: "keep" },
     { password: "fixture-password", totp: "", remote_log_token: "" });
 
-  await component.methods.saveProfile.call(context, { preventDefault() {} });
+  const creation = component.methods.saveProfile.call(context, { preventDefault() {} });
+
+  assert.equal(context.operationBusy, true);
+  assert.equal(context.profileSaveState, "saving");
+  assert.equal(toasts[0].title, "Profile creation started");
+  assert.match(toasts[0].message, /before creating the profile/);
+  assert.deepEqual(component.computed.profileLiveOperation.call(context), {
+    title: "Creating profile",
+    message: "Validating the local source with the package identity…"
+  });
+
+  validation.resolve();
+  await creation;
 
   assert.deepEqual(posts.map((entry) => entry.action), ["configure-profile", "set-secret"]);
   assert.equal(context.operationBusy, false);
@@ -507,6 +590,7 @@ test("profile creation dispatches and settles with visible progress", async () =
   assert.match(context.profileSaveMessage, /successfully/);
   assert.deepEqual(context.closed, { refresh: false });
   assert.equal(context.refreshed, 1);
+  assert.equal(component.computed.profileLiveOperation.call(context), null);
 });
 
 test("trusted secret-only success refreshes stored-presence state for immediate authentication", async () => {
@@ -553,6 +637,8 @@ test("configure rejection keeps every draft secret and leaves the editor recover
   await component.methods.saveProfile.call(context, { preventDefault() {} });
 
   assert.equal(context.profileSaveState, "error");
+  assert.equal(context.operationBusy, false);
+  assert.equal(component.computed.profileLiveOperation.call(context), null);
   assert.equal(context.closed, false);
   assert.deepEqual(context.secretModes, { password: "replace", totp: "replace", remote_log_token: "keep" });
   assert.equal(context.secretValues.password, "fixture-password");

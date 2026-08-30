@@ -56,6 +56,12 @@
                 @click="refreshSnapshot(true)"
               ><template #icon><action-icon name="refresh" /></template>Refresh</v-button>
             </div>
+            <transition name="sdsync-live-operation">
+              <div v-if="profileLiveOperation" class="sdsync-live-operation" aria-hidden="true">
+                <span class="sdsync-live-operation-indicator"><action-icon class="sdsync-is-spinning" name="refresh" size="22" /></span>
+                <span class="sdsync-live-operation-copy"><strong>{{ profileLiveOperation.title }}</strong><span>{{ profileLiveOperation.message }}</span></span>
+              </div>
+            </transition>
           </header>
 
           <div v-if="!canMutate" class="sdsync-banner" role="status">
@@ -1187,6 +1193,22 @@ export default {
     canSubmitSecurity() { return this.canMutate && this.securityDirty && !this.operationBusy && !this.securityOutcomeUnresolved; },
     canSubmitInterface() { return this.canChangeInterface && !this.interfaceOutcomeUnresolved; },
     profileSaveButtonText() { return this.profileSaveState === "saving" ? (this.selectedProfile ? "Saving profile…" : "Creating profile…") : (this.profileOutcomeUnresolved ? "Save locked" : (this.selectedProfile ? "Save now" : "Create profile")); },
+    profileLiveOperation() {
+      if (this.disposed || !this.profileEditorOpen) return null;
+      if (this.profileConnectionState === "testing") {
+        return {
+          title: "Testing profile authentication",
+          message: boundedText(this.profileConnectionMessage, "Discovering File Station and testing this connection draft…")
+        };
+      }
+      if (this.profileSaveState === "saving" && !this.selectedProfile) {
+        return {
+          title: "Creating profile",
+          message: boundedText(this.profileSaveMessage, "Validating and creating the profile…")
+        };
+      }
+      return null;
+    },
     canAllowHttp() { return this.canChangeProfiles && this.securityPolicy.allow_http_targets !== false; },
     canAllowEmptySource() { return this.canChangeProfiles && this.securityPolicy.allow_empty_source !== false; },
     canAllowInvalidTls() { return this.canChangeProfiles && this.securityPolicy.allow_invalid_tls !== false; },
@@ -2201,6 +2223,12 @@ export default {
       this.profileConnectionMessage = priorEvidence
         ? `Testing the current draft again. Prior unresolved evidence remains available for explicit reconciliation: ${priorEvidence}`
         : "Discovering File Station and testing this draft…";
+      this.toast(
+        "Authentication test started",
+        priorEvidence
+          ? "Testing the current connection draft while preserving prior unresolved evidence for explicit reconciliation."
+          : "Discovering File Station and testing the current connection draft. Success is reported only after temporary session cleanup finishes."
+      );
       try {
         const result = await apiPost(this.auth, this.csrfToken, ACTIONS.testProfileAuth, payload, true, undefined, PROFILE_CONNECTION_API_LIMITS);
         if (this.disposed || request !== this.profileConnectionRequest || !this.profileEditorOpen) return;
@@ -2582,9 +2610,15 @@ export default {
       if (!this.selectedProfile && !secrets.some((secret) => secret.kind === "password" && secret.mode === "replace")) return this.toast("Profile not saved", "A new profile requires a password. Choose Replace securely, enter it, and save again.", true);
       const risky = payload.allow_http || payload.allow_empty_source || payload.danger_accept_invalid_certs || payload.delete;
       if (risky && !await this.confirmAction("Save dangerous profile settings?", "Review plain-HTTP, deletion, empty-source, and TLS settings before continuing.", "Save profile")) return;
+      const creatingProfile = !this.selectedProfile;
       this.profileSaveState = "saving";
       this.profileSaveMessage = "Validating the local source with the package identity…";
-      this.toast("Saving profile", "Validating the local source before the configuration and protected credential stages are applied.");
+      this.toast(
+        creatingProfile ? "Profile creation started" : "Profile save started",
+        creatingProfile
+          ? "Validating the local source before creating the profile and applying its protected credentials."
+          : "Validating the local source before saving profile changes and applying explicit protected credential operations."
+      );
       this.operationBusy = true;
       let configurationApplied = false;
       let activeSecretKind = "";
@@ -2598,7 +2632,7 @@ export default {
         }
         if (sourceValidation.schema !== "sdsync.dsm-source-path.v1" || sourceValidation.path !== payload.source || sourceValidation.valid !== true) throw new Error("The package could not validate the exact local source path.");
         if (this.disposed) return;
-        this.profileSaveMessage = this.selectedProfile ? "Saving profile configuration…" : "Creating profile configuration…";
+        this.profileSaveMessage = creatingProfile ? "Creating profile configuration…" : "Saving profile configuration…";
         await apiPost(this.auth, this.csrfToken, ACTIONS.configureProfile, payload, true, undefined, AUTOSAVE_API_LIMITS);
         configurationApplied = true;
         this.clearProfileConfigurationFailure(false);
