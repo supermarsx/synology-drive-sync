@@ -195,6 +195,7 @@ function manualFailureContext(methods, scope, overrides = {}) {
     profileEditorOpen: true,
     profileSaveState: "idle",
     profileSaveMessage: "",
+    profileCreationProgress: { active: false, current: 0, total: 0, message: "" },
     auth: {},
     csrfToken: "csrf",
     connected: false,
@@ -227,7 +228,7 @@ function manualFailureContext(methods, scope, overrides = {}) {
     "refreshAutosaveStatus", "cancelAutosave", "pauseAutosave", "hydrateAutosave",
     "clearAutosaveFailure", "ensureProfileFailureRecords", "syncProfileFailureState",
     "recordProfileFailure", "clearProfileConfigurationFailure", "clearProfileSecretFailures",
-    "applyTrustedSecretPresence"
+    "applyTrustedSecretPresence", "setProfileCreationStage", "clearProfileCreationProgress"
   ]) context[name] = (...args) => methods[name].apply(context, args);
   return { context, scope };
 }

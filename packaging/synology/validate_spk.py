@@ -456,6 +456,7 @@ def validate_native_api_source(payload: bytes) -> None:
         "signal.addEventListener(\"abort\", cancel, { once: true })",
         "signal.removeEventListener(\"abort\", cancel)",
         "window.clearTimeout(timer)",
+        "const RESULT_INITIAL_POLL_INTERVAL_MS = 500;",
         "const RESULT_POLL_INTERVAL_MS = 2000;",
         "const RESULT_POLL_OBSERVATION_FAILURES = 5;",
         "const POST_DISPATCH_REPLAY_DELAYS_MS = Object.freeze([250, 1000]);",
@@ -794,9 +795,14 @@ def validate_native_api_source(payload: bytes) -> None:
         raise ValidationError(
             "native DSM queued-result observer must use one linked GET attempt per poll"
         )
-    if poll_source.count(
-        "await delay(interval, auth && auth.signal, limits, observation);"
-    ) != 2:
+    if (
+        poll_source.count(
+            "await delay(interval, auth && auth.signal, limits, observation);"
+        ) != 1
+        or poll_source.count(
+            "await delay(pendingInterval, auth && auth.signal, limits, observation);"
+        ) != 1
+    ):
         raise ValidationError(
             "native DSM queued-result observer must retry pending and transport observations"
         )
@@ -1068,6 +1074,7 @@ def validate_native_build_contract(
     for marker in (
         "beforeDestroy()", "this.stopTimers();",
         'document.removeEventListener("visibilitychange", this.visibilityHandler)',
+        'window.removeEventListener("beforeunload", this.beforeUnloadHandler)',
         'this.mediaQuery.removeEventListener("change", this.mediaHandler)',
         "window.clearTimeout(this.snapshotTimer)",
         "window.clearTimeout(this.logTimer)",
@@ -1100,9 +1107,15 @@ def validate_native_build_contract(
         'event.key !== "Tab"',
         "priorFocus && priorFocus.isConnected && priorFocus.focus",
         'if (this.route === "profiles" && route !== "profiles") {',
-        'if (this.profileSaveState === "saving" || this.profileConnectionState === "testing") {',
+        'if (this.profileSaveState === "saving" || this.profileConnectionState === "testing" || this.profileReconciliationState === "checking") {',
         'this.toast("Profile operation in progress",',
         'closeProfile(options = undefined) {',
+        'class="sdsync-live-operation" aria-hidden="true"',
+        'class="sdsync-live-operation-stage"',
+        'class="sdsync-live-operation-warning"',
+        'Keep this AppWindow open; do not navigate away until profile creation finishes.',
+        'window.addEventListener("beforeunload", this.beforeUnloadHandler)',
+        'event.returnValue = "";',
         'this.hasCapability("request_reconciliation")',
         'reconcileMutationRequest(',
         'Reconcile profile request',
@@ -1121,6 +1134,18 @@ def validate_native_build_contract(
             raise ValidationError(
                 f"native DSM component is missing AppWindow interaction contract {marker!r}"
             )
+
+    live_operation_tag = re.search(
+        r'<div\b[^>]*\bclass="sdsync-live-operation"[^>]*>', app
+    )
+    if live_operation_tag is None or 'aria-hidden="true"' not in live_operation_tag.group(0):
+        raise ValidationError(
+            "native DSM floating operation card must remain an aria-hidden visual duplicate"
+        )
+    if re.search(r'\b(?:role|aria-live)\s*=', live_operation_tag.group(0)):
+        raise ValidationError(
+            "native DSM floating operation card must not duplicate the profile form live region"
+        )
 
     protected_close_binding = (
         ':disabled="profileSaveState === \'saving\' || profileConnectionState === \'testing\' '
@@ -1246,7 +1271,9 @@ def validate_native_build_contract(
         for marker in (
             "export const ActionIcon = {",
             'name: "ActionIcon"',
-            'class: "sdsync-action-icon"',
+            "const inherited = context.data || {};",
+            "...forwarded",
+            'class: ["sdsync-action-icon", inheritedClass]',
             '"aria-hidden": "true"',
         ):
             if marker not in action_icon:
@@ -1337,6 +1364,30 @@ def validate_native_build_contract(
     if "@media (prefers-reduced-motion:" not in css or ":focus-visible" not in css:
         raise ValidationError(
             "native DSM styles must provide reduced-motion and keyboard-focus treatment"
+        )
+    for marker in (
+        ".sdsync-app .sdsync-action-icon.sdsync-is-spinning",
+        "animation: sdsync-spin 0.8s linear infinite;",
+        "transform-box: fill-box;",
+        "stroke-dasharray: 3 2;",
+        ".sdsync-live-operation-warning",
+    ):
+        if marker not in css:
+            raise ValidationError(
+                f"native DSM styles are missing busy-operation contract {marker!r}"
+            )
+    button_icon_start = css.find(
+        ".sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row) > .sdsync-action-icon,"
+    )
+    button_icon_end = css.find("}", button_icon_start)
+    button_icon_source = (
+        css[button_icon_start:button_icon_end]
+        if button_icon_start >= 0 and button_icon_end >= 0
+        else ""
+    )
+    if not button_icon_source or "transform: none !important" in button_icon_source:
+        raise ValidationError(
+            "native DSM button normalization must not suppress busy icon transforms"
         )
     if re.search(r"(^|[},])\s*(?::root|html\b|body\b)", css, re.IGNORECASE):
         raise ValidationError("native DSM styles must not mutate DSM document-level selectors")
@@ -1519,6 +1570,8 @@ def validate_native_bundle(script_payload: bytes, style_payload: bytes) -> None:
         "Reconcile profile request", "Reconcile connection request",
         "DSM returned an invalid reconciled connection result. The preserved request remains locked.",
         "Test the current draft once more to unlock File Station browsing.",
+        "Keep this AppWindow open; do not navigate away until profile creation finishes.",
+        "beforeunload",
         "same-origin", "beforeDestroy",
         "https://github.com/supermarsx/synology-drive-sync/releases",
         "https://supermarsx.github.io/synology-drive-sync/release-selector.html",
@@ -1552,6 +1605,9 @@ def validate_native_bundle(script_payload: bytes, style_payload: bytes) -> None:
         ".sdsync-app" not in style
         or "@media (prefers-reduced-motion:" not in style
         or ":focus-visible" not in style
+        or ".sdsync-action-icon.sdsync-is-spinning" not in style
+        or not re.search(r"stroke-dasharray:\s*3\s+2(?:\s*!important)?", style)
+        or ".sdsync-live-operation-warning" not in style
         or re.search(
             r"(^|[},])\s*(?::root|html\b|body\b)", style, re.IGNORECASE
         )

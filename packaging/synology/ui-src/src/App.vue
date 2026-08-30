@@ -59,7 +59,12 @@
             <transition name="sdsync-live-operation">
               <div v-if="profileLiveOperation" class="sdsync-live-operation" aria-hidden="true">
                 <span class="sdsync-live-operation-indicator"><action-icon class="sdsync-is-spinning" name="refresh" size="22" /></span>
-                <span class="sdsync-live-operation-copy"><strong>{{ profileLiveOperation.title }}</strong><span>{{ profileLiveOperation.message }}</span></span>
+                <span class="sdsync-live-operation-copy">
+                  <strong>{{ profileLiveOperation.title }}</strong>
+                  <span v-if="profileLiveOperation.stage" class="sdsync-live-operation-stage">{{ profileLiveOperation.stage }}</span>
+                  <span>{{ profileLiveOperation.message }}</span>
+                  <span v-if="profileLiveOperation.warning" class="sdsync-live-operation-warning">{{ profileLiveOperation.warning }}</span>
+                </span>
               </div>
             </transition>
           </header>
@@ -494,6 +499,7 @@ const INCIDENT_SCOPE_LABELS = Object.freeze({
   operations: "Run and Doctor operations"
 });
 const PROFILE_SECRET_KINDS = Object.freeze(["password", "totp", "remote-log-token"]);
+const PROFILE_CREATION_WINDOW_WARNING = "Keep this AppWindow open; do not navigate away until profile creation finishes.";
 const PROFILE_CONNECTION_API_LIMITS = Object.freeze({
   csrfReissueTimeoutMs: 10000,
   postRequestTimeoutMs: 45000,
@@ -514,6 +520,10 @@ function emptyProfileFailureRecords() {
       "remote-log-token": { active: false, outcomeUnknown: false, requiresInspection: false }
     }
   };
+}
+
+function emptyProfileCreationProgress() {
+  return { active: false, current: 0, total: 0, message: "" };
 }
 
 function profileFailureSummary(records) {
@@ -1200,7 +1210,7 @@ export default {
       secretModes: { password: "keep", totp: "keep", remote_log_token: "keep" },
       secretValues: { password: "", totp: "", remote_log_token: "" },
       profileConnectionState: "idle", profileConnectionMessage: "Test authentication to unlock the File Station browser.", connectionProof: "", connectionProofExpires: 0, connectionProofTimer: 0, profileConnectionRequest: 0, profileConnectionAutosaveHeld: false,
-      profileSaveState: "idle", profileSaveMessage: "", profileReconciliationState: "idle", pathBrowser: emptyPathBrowser(),
+      profileSaveState: "idle", profileSaveMessage: "", profileCreationProgress: emptyProfileCreationProgress(), profileReconciliationState: "idle", pathBrowser: emptyPathBrowser(),
       routineEditorOpen: false, routineForm: emptyRoutine(), doctorForm: { scope: "all", write_test: false, write_confirm: false },
       alertForm: { enabled: false, on_success: false, on_failure: true, failure_threshold: 1, cooldown_seconds: 3600 },
       notificationTabs: [
@@ -1219,7 +1229,7 @@ export default {
       confirmation: { visible: false, title: "", message: "", button: "Confirm", resolve: null },
       confirmationPriorFocus: null, confirmationKeyHandler: null,
       pathBrowserPriorFocus: null, pathBrowserKeyHandler: null,
-      systemLight: false, visibilityHandler: null, mediaQuery: null, mediaHandler: null,
+      systemLight: false, visibilityHandler: null, beforeUnloadHandler: null, mediaQuery: null, mediaHandler: null,
       toastTimers: [], abortController: null, connectionWatchCleanups: [], disposed: false
     };
   },
@@ -1325,6 +1335,18 @@ export default {
     canSubmitSecurity() { return this.canMutate && this.securityDirty && !this.operationBusy && !this.securityOutcomeUnresolved; },
     canSubmitInterface() { return this.canChangeInterface && !this.interfaceOutcomeUnresolved; },
     profileSaveButtonText() { return this.profileSaveState === "saving" ? (this.selectedProfile ? "Saving profile…" : "Creating profile…") : (this.profileOutcomeUnresolved ? "Save locked" : (this.selectedProfile ? "Save now" : "Create profile")); },
+    profileOperationInProgress() {
+      return this.profileEditorOpen === true
+        && (this.profileSaveState === "saving"
+          || this.profileConnectionState === "testing"
+          || this.profileReconciliationState === "checking");
+    },
+    profileWindowGuardActive() {
+      return this.profileEditorOpen === true
+        && (this.profileOperationInProgress
+          || this.profileOutcomeUnresolved
+          || this.connectionOutcomeUnresolved);
+    },
     profileLiveOperation() {
       if (this.disposed || !this.profileEditorOpen) return null;
       if (this.profileConnectionState === "testing") {
@@ -1340,9 +1362,16 @@ export default {
         };
       }
       if (this.profileSaveState === "saving" && !this.selectedProfile) {
+        const progress = this.profileCreationProgress && this.profileCreationProgress.active === true
+          ? this.profileCreationProgress
+          : null;
         return {
           title: "Creating profile",
-          message: boundedText(this.profileSaveMessage, "Validating and creating the profile…")
+          stage: progress ? `Step ${progress.current} of ${progress.total}` : "",
+          message: progress
+            ? boundedText(progress.message, "Validating and creating the profile…")
+            : boundedText(this.profileSaveMessage, "Validating and creating the profile…"),
+          warning: PROFILE_CREATION_WINDOW_WARNING
         };
       }
       return null;
@@ -1477,6 +1506,7 @@ export default {
       }
     };
     document.addEventListener("visibilitychange", this.visibilityHandler);
+    this.installProfileWindowGuard();
     let csrfReady = false;
     try {
       await this.refreshCsrf();
@@ -1502,6 +1532,7 @@ export default {
     this.toastTimers.forEach((timer) => window.clearTimeout(timer));
     this.toastTimers = [];
     if (this.visibilityHandler) document.removeEventListener("visibilitychange", this.visibilityHandler);
+    this.removeProfileWindowGuard();
     if (this.mediaQuery && this.mediaQuery.removeEventListener && this.mediaHandler) this.mediaQuery.removeEventListener("change", this.mediaHandler);
     if (this.controlLayoutCleanup) this.controlLayoutCleanup();
     this.connectionWatchCleanups.forEach((cleanup) => { if (typeof cleanup === "function") cleanup(); });
@@ -2020,8 +2051,8 @@ export default {
     navigate(route) {
       if (!this.routes.some((item) => item.id === route)) return;
       if (this.route === "profiles" && route !== "profiles") {
-        if (this.profileSaveState === "saving" || this.profileConnectionState === "testing") {
-          this.toast("Profile operation in progress", "Wait for the active save or authentication test to settle before leaving Profiles.", true);
+        if (this.profileSaveState === "saving" || this.profileConnectionState === "testing" || this.profileReconciliationState === "checking") {
+          this.toast("Profile operation in progress", "Keep this AppWindow open and wait for the active save, authentication test, or reconciliation to settle before leaving Profiles.", true);
           return;
         }
         if (!this.profileRecoveryActive) this.closeProfile();
@@ -2372,6 +2403,29 @@ export default {
     integer(value, fallback) { const parsed = Number(value); return Number.isInteger(parsed) ? parsed : fallback; },
     between(value, minimum, maximum) { const parsed = Number(value); return Number.isInteger(parsed) && parsed >= minimum && parsed <= maximum; },
     toast(title, message, error = false) { if (this.disposed) return; const item = { id: ++this.toastSequence, title, message, error }; this.toasts.push(item); const timer = window.setTimeout(() => { if (this.disposed) return; const index = this.toasts.findIndex((candidate) => candidate.id === item.id); if (index >= 0) this.toasts.splice(index, 1); this.toastTimers = this.toastTimers.filter((candidate) => candidate !== timer); }, 6000); this.toastTimers.push(timer); },
+    installProfileWindowGuard() {
+      if (this.beforeUnloadHandler) return;
+      this.beforeUnloadHandler = (event) => {
+        if (!this.profileWindowGuardActive) return undefined;
+        event.preventDefault();
+        event.returnValue = "";
+        return "";
+      };
+      window.addEventListener("beforeunload", this.beforeUnloadHandler);
+    },
+    removeProfileWindowGuard() {
+      if (!this.beforeUnloadHandler) return;
+      window.removeEventListener("beforeunload", this.beforeUnloadHandler);
+      this.beforeUnloadHandler = null;
+    },
+    setProfileCreationStage(current, total, message) {
+      const boundedTotal = Math.max(1, Number(total) || 1);
+      const boundedCurrent = Math.min(boundedTotal, Math.max(1, Number(current) || 1));
+      const stageMessage = boundedText(message, "Creating the profile…");
+      this.profileCreationProgress = { active: true, current: boundedCurrent, total: boundedTotal, message: stageMessage };
+      this.profileSaveMessage = `Step ${boundedCurrent} of ${boundedTotal}: ${stageMessage} ${PROFILE_CREATION_WINDOW_WARNING}`;
+    },
+    clearProfileCreationProgress() { this.profileCreationProgress = emptyProfileCreationProgress(); },
     stopTimers() { window.clearTimeout(this.snapshotTimer); window.clearTimeout(this.logTimer); this.snapshotTimer = 0; this.logTimer = 0; },
     scheduleSnapshot() { window.clearTimeout(this.snapshotTimer); this.snapshotTimer = 0; const interval = Number(this.settings.status_refresh); if (interval > 0 && !this.disposed && !document.hidden && !this.snapshotRefreshBlocked) this.snapshotTimer = window.setTimeout(() => this.refreshSnapshot(false), interval); },
     scheduleLogs() { window.clearTimeout(this.logTimer); this.logTimer = 0; const interval = Number(this.settings.log_refresh); if (interval > 0 && !this.disposed && !document.hidden && this.route === "activity" && !this.logsPaused) this.logTimer = window.setTimeout(() => this.refreshLogs(), interval); },
@@ -2908,6 +2962,7 @@ export default {
       this.clearConnectionProofTimer();
       this.profileSaveState = "idle";
       this.profileSaveMessage = "";
+      this.profileCreationProgress = emptyProfileCreationProgress();
       this.profileReconciliationState = "idle";
       this.closePathBrowser();
       this.profileEditorOpen = true;
@@ -2934,6 +2989,7 @@ export default {
       this.clearConnectionProofTimer();
       this.profileSaveState = "idle";
       this.profileSaveMessage = "";
+      this.profileCreationProgress = emptyProfileCreationProgress();
       this.profileReconciliationState = "idle";
       this.profileEditorOpen = false;
       this.selectedProfile = "";
@@ -3035,12 +3091,17 @@ export default {
       const risky = payload.allow_http || payload.allow_empty_source || payload.danger_accept_invalid_certs || payload.delete;
       if (risky && !await this.confirmAction("Save dangerous profile settings?", "Review plain-HTTP, deletion, empty-source, and TLS settings before continuing.", "Save profile")) return;
       const creatingProfile = !this.selectedProfile;
+      const creationStageTotal = secrets.length + 2;
       this.profileSaveState = "saving";
-      this.profileSaveMessage = "Validating the local source with the package identity…";
+      if (creatingProfile) this.setProfileCreationStage(1, creationStageTotal, "Validating the local source with the package identity…");
+      else {
+        this.clearProfileCreationProgress();
+        this.profileSaveMessage = "Validating the local source with the package identity…";
+      }
       this.toast(
         creatingProfile ? "Profile creation started" : "Profile save started",
         creatingProfile
-          ? "Validating the local source before creating the profile and applying its protected credentials."
+          ? `Validating the local source before creating the profile and applying its protected credentials. ${PROFILE_CREATION_WINDOW_WARNING}`
           : "Validating the local source before saving profile changes and applying explicit protected credential operations."
       );
       this.operationBusy = true;
@@ -3056,14 +3117,17 @@ export default {
         }
         if (sourceValidation.schema !== "sdsync.dsm-source-path.v1" || sourceValidation.path !== payload.source || sourceValidation.valid !== true) throw new Error("The package could not validate the exact local source path.");
         if (this.disposed) return;
-        this.profileSaveMessage = creatingProfile ? "Creating profile configuration…" : "Saving profile configuration…";
+        if (creatingProfile) this.setProfileCreationStage(2, creationStageTotal, "Queueing and applying the profile configuration…");
+        else this.profileSaveMessage = "Saving profile configuration…";
         await apiPost(this.auth, this.csrfToken, ACTIONS.configureProfile, payload, true, undefined, AUTOSAVE_API_LIMITS);
         configurationApplied = true;
         this.clearProfileConfigurationFailure(false);
         if (this.disposed) return;
-        for (const secret of secrets) {
+        for (const [secretIndex, secret] of secrets.entries()) {
           activeSecretKind = secret.kind;
-          this.profileSaveMessage = `Applying protected ${secret.kind} operation…`;
+          const secretLabel = secret.kind === "remote-log-token" ? "remote log token" : secret.kind;
+          if (creatingProfile) this.setProfileCreationStage(secretIndex + 3, creationStageTotal, `Queueing and applying the protected ${secretLabel} credential…`);
+          else this.profileSaveMessage = `Applying protected ${secret.kind} operation…`;
           const secretResult = await apiPost(this.auth, this.csrfToken, ACTIONS.setSecret, secret, true, undefined, AUTOSAVE_API_LIMITS);
           this.applyTrustedSecretPresence(secretResult);
           appliedSecretKinds.push(secret.kind);
@@ -3107,7 +3171,10 @@ export default {
           ? "The profile editor was preserved, but the outcome needs Activity / Logs inspection before another save."
           : boundedText(caught && caught.message, "The package rejected the profile. Correct the draft and try again.");
       } finally {
-        if (!this.disposed) this.operationBusy = false;
+        if (!this.disposed) {
+          this.clearProfileCreationProgress();
+          this.operationBusy = false;
+        }
       }
     },
     async saveProfileSecrets(event) {

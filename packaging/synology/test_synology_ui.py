@@ -366,6 +366,8 @@ class DsmUiContractTests(unittest.TestCase):
             "this.disposed = true;", "this.abortController.abort();",
             "this.toastTimers.forEach((timer) => window.clearTimeout(timer))",
             'document.removeEventListener("visibilitychange", this.visibilityHandler)',
+            'window.addEventListener("beforeunload", this.beforeUnloadHandler)',
+            'window.removeEventListener("beforeunload", this.beforeUnloadHandler)',
             'this.mediaQuery.removeEventListener("change", this.mediaHandler)',
             ':aria-label="item.title"', ':title="item.title"',
             'type="time" aria-label="Window starts"',
@@ -375,8 +377,10 @@ class DsmUiContractTests(unittest.TestCase):
             'document.addEventListener("keydown", this.confirmationKeyHandler, true)',
             'document.removeEventListener("keydown", this.confirmationKeyHandler, true)',
             'if (this.route === "profiles" && route !== "profiles") {',
-            'if (this.profileSaveState === "saving" || this.profileConnectionState === "testing") {',
+            'if (this.profileSaveState === "saving" || this.profileConnectionState === "testing" || this.profileReconciliationState === "checking") {',
             'closeProfile(options = undefined) {',
+            'class="sdsync-live-operation" aria-hidden="true"',
+            'Keep this AppWindow open; do not navigate away until profile creation finishes.',
             'const awaitTerminal = kind === "doctor";',
             'title="Synology Drive Sync"',
             'this.snapshot && this.snapshot.package && this.snapshot.package.version',
@@ -1543,6 +1547,19 @@ function bind(context, names) {
                     b"overview: [", b"overview_removed: [", 1
                 )
             )
+        inherited_icon_data = b"const inherited = context.data || {};"
+        self.assertIn(inherited_icon_data, source["action_icon"])
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError,
+            "shared ActionIcon source is missing contract",
+        ):
+            validate_build(
+                action_icon=source["action_icon"].replace(
+                    inherited_icon_data,
+                    b"const inherited = {};",
+                    1,
+                )
+            )
         security_import = b'import { ActionIcon } from "./ActionIcon";'
         self.assertIn(security_import, source["security_panel"])
         with self.assertRaisesRegex(
@@ -1559,6 +1576,19 @@ function bind(context, names) {
 
         with self.assertRaisesRegex(validate_spk.ValidationError, "AppWindow structure"):
             validate_build(app=source["app"].replace(b"<v-app-window", b"<section", 1))
+        visual_operation_card = b'class="sdsync-live-operation" aria-hidden="true"'
+        self.assertIn(visual_operation_card, source["app"])
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError,
+            "must not duplicate the profile form live region",
+        ):
+            validate_build(
+                app=source["app"].replace(
+                    visual_operation_card,
+                    visual_operation_card + b' role="status" aria-live="polite"',
+                    1,
+                )
+            )
         profile_scope_guard = (
             b'if (scopeMutationOutcomeUnresolved(this, "profile")) return this.toast('
             b'"Profile save locked", scopeMutationGuidance(this, "profile"), true);'
@@ -1598,6 +1628,36 @@ function bind(context, names) {
             validate_build(
                 app=source["app"].replace(
                     b"purgeReconciliationAuth(this.auth);", b"", 1
+                )
+            )
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError,
+            "button normalization must not suppress busy icon transforms",
+        ):
+            button_icon_marker = (
+                b"  stroke-linejoin: miter !important;\n"
+                b"}\n\n.sdsync-app [class*=\"button\"] [class*=\"icon\"]"
+            )
+            self.assertIn(button_icon_marker, source["css"])
+            validate_build(
+                css=source["css"].replace(
+                    button_icon_marker,
+                    b"  stroke-linejoin: miter !important;\n"
+                    b"  transform: none !important;\n"
+                    b"}\n\n.sdsync-app [class*=\"button\"] [class*=\"icon\"]",
+                    1,
+                )
+            )
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError,
+            "busy-operation contract",
+        ):
+            self.assertIn(b"stroke-dasharray: 3 2;", source["css"])
+            validate_build(
+                css=source["css"].replace(
+                    b"stroke-dasharray: 3 2;",
+                    b"stroke-dasharray: none;",
+                    1,
                 )
             )
         protected_close_binding = (

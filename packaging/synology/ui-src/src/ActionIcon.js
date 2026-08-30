@@ -39,9 +39,19 @@ export const ActionIcon = {
     size: { type: [Number, String], default: 16 }
   },
   render(createElement, context) {
+    const inherited = context.data || {};
+    const {
+      attrs: inheritedAttrs = {},
+      class: inheritedClass,
+      style: inheritedStyle,
+      props: _componentProps,
+      ...forwarded
+    } = inherited;
     return createElement("svg", {
-      class: "sdsync-action-icon",
+      ...forwarded,
+      class: ["sdsync-action-icon", inheritedClass],
       attrs: {
+        ...inheritedAttrs,
         xmlns: "http://www.w3.org/2000/svg",
         width: context.props.size,
         height: context.props.size,
@@ -54,7 +64,10 @@ export const ActionIcon = {
         "aria-hidden": "true",
         focusable: "false"
       },
-      style: { display: "inline-block", verticalAlign: "-0.15em", flex: "0 0 auto" }
+      style: [
+        { display: "inline-block", verticalAlign: "-0.15em", flex: "0 0 auto" },
+        inheritedStyle
+      ]
     }, ACTION_ICON_PATHS[context.props.name].map((path, index) => createElement("path", {
       key: index,
       attrs: { d: path }

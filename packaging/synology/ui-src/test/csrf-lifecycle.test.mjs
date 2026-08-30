@@ -156,6 +156,8 @@ test("failed initial CSRF bootstrap is reported once before the scheduled retry"
   try {
     globalThis.window = {
       AbortController: globalThis.AbortController,
+      addEventListener() {},
+      removeEventListener() {},
       matchMedia: () => ({
         matches: false,
         addEventListener() {},
@@ -195,6 +197,8 @@ test("failed initial CSRF bootstrap is reported once before the scheduled retry"
       scheduleSnapshot() { scheduledRetries += 1; },
       stopTimers() {}
     };
+    context.installProfileWindowGuard = (...args) => component.methods.installProfileWindowGuard.apply(context, args);
+    context.removeProfileWindowGuard = (...args) => component.methods.removeProfileWindowGuard.apply(context, args);
 
     await component.mounted.call(context);
 

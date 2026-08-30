@@ -308,6 +308,77 @@ function limits(api, clock, overrides = {}) {
   };
 }
 
+test("default terminal polling uses one fast observation before returning to 2s", async () => {
+  const clock = new FakeClock();
+  const jobId = "a".repeat(48);
+  let requestId = "";
+  let resultReads = 0;
+  const restore = installBrowser((url, options) => {
+    if (options.method === "POST") {
+      requestId = JSON.parse(options.body).request_id;
+      return Promise.resolve(jsonResponse({
+        schema: "sdsync.dsm-queued.v1",
+        ok: true,
+        state: "queued",
+        request_id: requestId,
+        job_id: jobId
+      }, 202));
+    }
+    const action = new URL(url, "https://nas.example.invalid").searchParams.get("action");
+    assert.equal(action, "result");
+    resultReads += 1;
+    if (resultReads <= 2) {
+      return Promise.resolve(jsonResponse({
+        schema: "sdsync.dsm-result-status.v1",
+        ok: true,
+        state: "pending",
+        job_id: jobId
+      }));
+    }
+    return Promise.resolve(jsonResponse({
+      schema: "sdsync.dsm-result-status.v1",
+      ok: true,
+      state: "complete",
+      job_id: jobId,
+      client_request_id: requestId,
+      result: { schema: "sdsync.dsm-result.v1", ok: true, observed: true }
+    }));
+  });
+  try {
+    const api = await loadApi();
+    const pending = api.apiPost(
+      {},
+      "csrf-token",
+      api.ACTIONS.clientEvent,
+      { event: "interface-settings" },
+      true,
+      undefined,
+      limits(api, clock)
+    );
+    await clock.settleUntil(
+      () => resultReads === 1 && clock.hasTimerIn(500),
+      "default 500ms terminal result poll"
+    );
+    await clock.advance(499);
+    assert.equal(resultReads, 1, "the result observer must not busy-spin");
+    await clock.advance(1);
+    assert.equal(resultReads, 2);
+    await clock.settleUntil(
+      () => clock.hasTimerIn(2000),
+      "default 2s long-operation result poll"
+    );
+    await clock.advance(1999);
+    assert.equal(resultReads, 2, "long operations must retain the bounded 2s cadence");
+    await clock.advance(1);
+    const result = await pending;
+    assert.equal(result.observed, true);
+    assert.equal(resultReads, 3);
+    assert.equal(clock.timers.size, 0);
+  } finally {
+    restore();
+  }
+});
+
 test("autosave bounds exact replay of a hung dispatched POST as acceptance-unknown", async () => {
   const bodies = [];
   const postSignals = [];

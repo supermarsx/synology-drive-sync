@@ -752,7 +752,6 @@
   stroke-width: 1.8px !important;
   stroke-linecap: square !important;
   stroke-linejoin: miter !important;
-  transform: none !important;
 }
 
 .sdsync-app [class*="button"] [class*="icon"]:not(.sdsync-action-icon) {
@@ -2602,12 +2601,15 @@
 }
 
 @keyframes sdsync-spin {
+  from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
 }
 
-.sdsync-is-spinning {
+.sdsync-app .sdsync-action-icon.sdsync-is-spinning {
   animation: sdsync-spin 0.8s linear infinite;
   transform-origin: center;
+  transform-box: fill-box;
+  will-change: transform;
 }
 
 .sdsync-secret-summary {
@@ -3084,6 +3086,20 @@
   font-size: 11px;
   line-height: 1.45;
   overflow-wrap: anywhere;
+}
+
+.sdsync-live-operation-copy > .sdsync-live-operation-stage {
+  color: var(--sdsync-fire);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.sdsync-live-operation-copy > .sdsync-live-operation-warning {
+  margin-top: 3px;
+  padding-top: 5px;
+  border-top: 1px solid var(--sdsync-trace);
+  color: var(--sdsync-text);
+  font-weight: 650;
 }
 
 .sdsync-live-operation-enter-active,
@@ -3721,6 +3737,19 @@
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+
+  .sdsync-app .sdsync-action-icon.sdsync-is-spinning {
+    animation: none !important;
+    transform: none !important;
+    stroke-dasharray: 3 2;
+    opacity: 1 !important;
+    will-change: auto;
+  }
+
+  .sdsync-live-operation-indicator {
+    border-style: dashed;
+    box-shadow: inset 3px 0 0 var(--sdsync-fire);
   }
 
   .sdsync-page-swap-enter-active,

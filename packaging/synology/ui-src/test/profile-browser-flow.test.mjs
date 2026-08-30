@@ -1099,6 +1099,7 @@ function saveContext(methods, secretModes, secretValues) {
   const context = bind({
     profileEditorOpen: true, canChangeProfiles: true, operationBusy: false, disposed: false,
     profileSaveState: "idle", profileSaveMessage: "", selectedProfile: "",
+    profileCreationProgress: { active: false, current: 0, total: 0, message: "" },
     secretModes: { ...secretModes }, secretValues: { ...secretValues },
     auth: {}, csrfToken: "csrf", reports, closed: false, refreshed: 0,
     cancelAutosave() {}, profileAutosavePayload: () => payload, validateProfile: () => "",
@@ -1108,23 +1109,34 @@ function saveContext(methods, secretModes, secretValues) {
     closeProfile(options) { this.closed = options; },
     refreshSnapshot: async function () { this.refreshed += 1; return true; },
     clearProfileSecretFailures() {}, refreshAutosaveStatus() {}
-  }, methods, ["secretOperations", "applyTrustedSecretPresence"]);
+  }, methods, [
+    "secretOperations", "applyTrustedSecretPresence",
+    "setProfileCreationStage", "clearProfileCreationProgress"
+  ]);
   return { context, payload, toasts };
 }
 
 test("profile creation dispatches and settles with visible progress", async () => {
   const posts = [];
+  const stagesAtDispatch = [];
   const validation = deferred();
+  let context;
   const component = loadAppComponent({
     get: async (_auth, action, query) => {
       await validation.promise;
       return { schema: "sdsync.dsm-source-path.v1", path: query.path, valid: true };
     },
-    post: async (_auth, _csrf, action, payload) => { posts.push({ action, payload }); return { ok: true }; }
+    post: async (_auth, _csrf, action, payload) => {
+      posts.push({ action, payload });
+      stagesAtDispatch.push({ ...context.profileCreationProgress });
+      return { ok: true };
+    }
   });
-  const { context, toasts } = saveContext(component.methods,
+  const saved = saveContext(component.methods,
     { password: "replace", totp: "keep", remote_log_token: "keep" },
     { password: "fixture-password", totp: "", remote_log_token: "" });
+  context = saved.context;
+  const { toasts } = saved;
 
   const creation = component.methods.saveProfile.call(context, { preventDefault() {} });
 
@@ -1132,20 +1144,30 @@ test("profile creation dispatches and settles with visible progress", async () =
   assert.equal(context.profileSaveState, "saving");
   assert.equal(toasts[0].title, "Profile creation started");
   assert.match(toasts[0].message, /before creating the profile/);
+  assert.match(toasts[0].message, /Keep this AppWindow open; do not navigate away/);
+  assert.match(context.profileSaveMessage, /^Step 1 of 3:/);
+  assert.match(context.profileSaveMessage, /Keep this AppWindow open; do not navigate away/);
   assert.deepEqual(component.computed.profileLiveOperation.call(context), {
     title: "Creating profile",
-    message: "Validating the local source with the package identity…"
+    stage: "Step 1 of 3",
+    message: "Validating the local source with the package identity…",
+    warning: "Keep this AppWindow open; do not navigate away until profile creation finishes."
   });
 
   validation.resolve();
   await creation;
 
   assert.deepEqual(posts.map((entry) => entry.action), ["configure-profile", "set-secret"]);
+  assert.deepEqual(stagesAtDispatch, [
+    { active: true, current: 2, total: 3, message: "Queueing and applying the profile configuration…" },
+    { active: true, current: 3, total: 3, message: "Queueing and applying the protected password credential…" }
+  ]);
   assert.equal(context.operationBusy, false);
   assert.equal(context.profileSaveState, "success");
   assert.match(context.profileSaveMessage, /successfully/);
   assert.deepEqual(context.closed, { refresh: false });
   assert.equal(context.refreshed, 1);
+  assert.deepEqual(context.profileCreationProgress, { active: false, current: 0, total: 0, message: "" });
   assert.equal(component.computed.profileLiveOperation.call(context), null);
 });
 
@@ -1557,8 +1579,9 @@ test("closing an editor always requests one fresh snapshot and active operations
     profileSaveState: "idle", profileConnectionState: "idle", profileEditorOpen: true,
     selectedProfile: "nightly", snapshotGeneration: 1, profileConnectionRequest: 1,
     secretModes: {}, secretValues: {}, connectionProof: "proof", connectionProofExpires: 1, connectionProofTimer: 0,
-    profileSaveMessage: "", pathBrowser: { request: 0 }, disposed: false,
+    profileSaveMessage: "", profileCreationProgress: { active: false }, pathBrowser: { request: 0 }, disposed: false,
     cancelAutosave() {}, closePathBrowser() {}, clearSecrets() {}, clearConnectionProofTimer() {},
+    clearProfileCreationProgress() { this.profileCreationProgress = { active: false }; },
     refreshSnapshot(...args) { refreshes.push(args); }
   };
   component.methods.closeProfile.call(context);
@@ -1567,13 +1590,82 @@ test("closing an editor always requests one fresh snapshot and active operations
   const toasts = [];
   const navigating = {
     routes: [{ id: "profiles" }, { id: "activity" }], route: "profiles",
-    profileSaveState: "saving", profileConnectionState: "idle",
+    profileSaveState: "saving", profileConnectionState: "idle", profileReconciliationState: "idle",
     toast(title, message, error) { toasts.push({ title, message, error }); },
     closeProfile() { assert.fail("an active save must not hide the editor"); }
   };
   component.methods.navigate.call(navigating, "activity");
   assert.equal(navigating.route, "profiles");
   assert.equal(toasts[0].error, true);
+
+  navigating.profileSaveState = "idle";
+  navigating.profileReconciliationState = "checking";
+  component.methods.navigate.call(navigating, "activity");
+  assert.equal(navigating.route, "profiles", "active reconciliation must keep the editor route open");
+  assert.match(toasts.at(-1).message, /reconciliation/);
+});
+
+test("AppWindow close guard covers active work and unresolved sensitive drafts", () => {
+  const component = loadAppComponent();
+  assert.match(appSource, /window\.addEventListener\("beforeunload", this\.beforeUnloadHandler\)/);
+  assert.match(appSource, /window\.removeEventListener\("beforeunload", this\.beforeUnloadHandler\)/);
+  assert.match(appSource, /event\.preventDefault\(\);\s*event\.returnValue = "";/);
+
+  const previousWindow = globalThis.window;
+  let installed = null;
+  let removed = null;
+  globalThis.window = {
+    addEventListener(type, listener) { installed = { type, listener }; },
+    removeEventListener(type, listener) { removed = { type, listener }; }
+  };
+  try {
+    const listenerContext = bind({
+      beforeUnloadHandler: null,
+      profileWindowGuardActive: false
+    }, component.methods, ["installProfileWindowGuard", "removeProfileWindowGuard"]);
+    listenerContext.installProfileWindowGuard();
+    assert.equal(installed.type, "beforeunload");
+    assert.strictEqual(installed.listener, listenerContext.beforeUnloadHandler);
+
+    const settledEvent = { prevented: false, preventDefault() { this.prevented = true; } };
+    assert.equal(installed.listener(settledEvent), undefined);
+    assert.equal(settledEvent.prevented, false);
+
+    listenerContext.profileWindowGuardActive = true;
+    const protectedEvent = { prevented: false, returnValue: null, preventDefault() { this.prevented = true; } };
+    assert.equal(installed.listener(protectedEvent), "");
+    assert.equal(protectedEvent.prevented, true);
+    assert.equal(protectedEvent.returnValue, "");
+
+    listenerContext.removeProfileWindowGuard();
+    assert.equal(removed.type, "beforeunload");
+    assert.strictEqual(removed.listener, installed.listener);
+    assert.equal(listenerContext.beforeUnloadHandler, null);
+  } finally {
+    globalThis.window = previousWindow;
+  }
+
+  const activeCreation = {
+    profileEditorOpen: true,
+    profileSaveState: "saving",
+    profileConnectionState: "idle",
+    profileReconciliationState: "idle",
+    profileOutcomeUnresolved: false,
+    connectionOutcomeUnresolved: false
+  };
+  activeCreation.profileOperationInProgress = component.computed.profileOperationInProgress.call(activeCreation);
+  assert.equal(activeCreation.profileOperationInProgress, true);
+  assert.equal(component.computed.profileWindowGuardActive.call(activeCreation), true);
+
+  const settled = { ...activeCreation, profileSaveState: "success", profileOperationInProgress: false };
+  assert.equal(component.computed.profileWindowGuardActive.call(settled), false);
+
+  const unresolved = { ...settled, profileOutcomeUnresolved: true };
+  assert.equal(
+    component.computed.profileWindowGuardActive.call(unresolved),
+    true,
+    "an unresolved accepted mutation must retain the same close protection as in-window Close"
+  );
 });
 
 test("unresolved profile or connection outcomes preserve the complete editor draft", () => {
@@ -1667,6 +1759,8 @@ test("visibility loss retains recovery secrets and clears ordinary transient sec
   };
   globalThis.window = {
     AbortController: globalThis.AbortController,
+    addEventListener() {},
+    removeEventListener() {},
     matchMedia: () => ({
       matches: false,
       addEventListener() {},
@@ -1708,6 +1802,8 @@ test("visibility loss retains recovery secrets and clears ordinary transient sec
         component.methods.clearSecrets.call(this);
       }
     };
+    context.installProfileWindowGuard = (...args) => component.methods.installProfileWindowGuard.call(context, ...args);
+    context.removeProfileWindowGuard = (...args) => component.methods.removeProfileWindowGuard.call(context, ...args);
 
     await component.mounted.call(context);
     assert.equal(typeof visibilityHandler, "function");

@@ -81,7 +81,7 @@ test("toast surfaces stay opaque despite host DSM styling", async () => {
   assertSolidToastContract(distCss, "built CSS");
 });
 
-test("profile progress is an opaque floating live region with a visible spinner", async () => {
+test("profile progress is an opaque visual duplicate of the in-form live status", async () => {
   const [appSource, sourceCss, distCss] = await Promise.all([
     readFile(appSourceUrl, "utf8"),
     readFile(sourceCssUrl, "utf8"),
@@ -96,6 +96,9 @@ test("profile progress is an opaque floating live region with a visible spinner"
     appSource,
     /class="sdsync-live-operation-indicator"><action-icon class="sdsync-is-spinning" name="refresh" size="22"/,
   );
+  assert.match(appSource, /class="sdsync-live-operation-stage">\{\{ profileLiveOperation\.stage \}\}/);
+  assert.match(appSource, /class="sdsync-live-operation-warning">\{\{ profileLiveOperation\.warning \}\}/);
+  assert.match(appSource, /Keep this AppWindow open; do not navigate away until profile creation finishes\./);
   assert.doesNotMatch(appSource, /class="sdsync-live-operation"[^>]*(?:role="status"|aria-live=)/);
   assert.match(appSource, /:class="\['sdsync-connection-state'[^>]*role="status" aria-live="polite"/);
   assert.match(appSource, /:class="\['sdsync-save-state'[^>]*role="status" aria-live="polite"/);

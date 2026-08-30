@@ -31,6 +31,10 @@ const TERMINAL_API_ATTEMPT_TIMEOUTS = Object.freeze({
 });
 
 const CSRF_SCHEMA = "sdsync.dsm-csrf.v1";
+// Terminal reads are side-effect free. Observe the first pending result quickly
+// so a freshly-woken controller feels responsive, then return to the bounded
+// long-operation cadence used by Doctor and other potentially slow jobs.
+const RESULT_INITIAL_POLL_INTERVAL_MS = 500;
 const RESULT_POLL_INTERVAL_MS = 2000;
 const RESULT_POLL_OBSERVATION_FAILURES = 5;
 const POST_DISPATCH_REPLAY_DELAYS_MS = Object.freeze([250, 1000]);
@@ -834,6 +838,7 @@ async function pollJobResult(
   const interval = Number.isFinite(Number(pollIntervalMs)) && Number(pollIntervalMs) >= 0
     ? Number(pollIntervalMs)
     : RESULT_POLL_INTERVAL_MS;
+  let pendingResultReads = 0;
   let consecutiveObservationFailures = 0;
   for (;;) {
     if (observation && observation.expired) {
@@ -920,7 +925,11 @@ async function pollJobResult(
       );
     }
     if (status.state === "pending") {
-      await delay(interval, auth && auth.signal, limits, observation);
+      const pendingInterval = pendingResultReads === 0 && interval === RESULT_POLL_INTERVAL_MS
+        ? RESULT_INITIAL_POLL_INTERVAL_MS
+        : interval;
+      pendingResultReads += 1;
+      await delay(pendingInterval, auth && auth.signal, limits, observation);
       continue;
     }
     if (status.state === "expired_or_missing") {

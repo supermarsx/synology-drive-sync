@@ -261,7 +261,7 @@ test("native single selects use one stable package-owned arrow", () => {
 test("action buttons retain visible labels and meaningful icon coverage", () => {
   const buttons = [...actionableButtons(app), ...actionableButtons(security)];
   assert.ok(buttons.length >= 20, "fixture no longer covers the AppWindow action surface");
-  assert.match(actionIcons, /class:\s*"sdsync-action-icon"/, "icons need a stable package-owned class");
+  assert.match(actionIcons, /class:\s*\[\s*"sdsync-action-icon"/, "icons need a stable package-owned class");
   assert.match(actionIcons, /"aria-hidden":\s*"true"/, "decorative icons must stay out of the accessibility tree");
   assert.match(actionIcons, /focusable:\s*"false"/, "decorative SVGs must not become extra tab stops");
 
