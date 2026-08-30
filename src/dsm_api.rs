@@ -5091,8 +5091,33 @@ mod linux_process {
                 {
                     return completed_output(status, stdout_bytes);
                 }
-                // A descendant retained a pipe, or the helper exited before it
-                // consumed the complete bounded input. Do not wait on either.
+                if input_offset != input_bytes.len() || stdin.is_some() {
+                    return Err(BridgeError::new(ErrorKind::Unavailable));
+                }
+
+                // waitpid can become observable just before the final pipe
+                // hangup on some kernels. Poll once, within both the existing
+                // deadline and one ordinary I/O slice, then perform the final
+                // bounded drain. A descendant that retained either descriptor
+                // still fails closed after that single grace slice.
+                let now = Instant::now();
+                if now < deadline {
+                    poll_child_io(
+                        &stdout,
+                        stdout_eof,
+                        &stderr,
+                        stderr_eof,
+                        None,
+                        deadline.duration_since(now).min(POLL_SLICE),
+                    )?;
+                    stdout_eof |= drain_pipe(&mut stdout, &mut stdout_bytes, maximum_stdout)?;
+                    stderr_eof |= drain_pipe(&mut stderr, &mut stderr_bytes, maximum_stderr)?;
+                    if stdout_eof && stderr_eof {
+                        return completed_output(status, stdout_bytes);
+                    }
+                }
+                // A descendant retained a pipe, or the hangup did not settle
+                // within the single grace slice. Do not wait any further.
                 return Err(BridgeError::new(ErrorKind::Unavailable));
             }
 
@@ -14234,17 +14259,24 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn helper_capture_bounds_input_output_and_stderr_without_leaking() {
-        let mut command = Command::new("/bin/sh");
-        command.args([
-            "-c",
-            "IFS= read -r value; printf '%s' \"$value\"; printf 'discarded' >&2",
-        ]);
         let secret = Zeroizing::new(b"bounded-input".to_vec());
-        let output =
-            capture_bounded_command(&mut command, 64, 64, Duration::from_secs(2), Some(&secret))
-                .unwrap();
-        assert!(output.status_success);
-        assert_eq!(&output.stdout[..], b"bounded-input");
+        for _ in 0..32 {
+            let mut command = Command::new("/bin/sh");
+            command.args([
+                "-c",
+                "IFS= read -r value; printf '%s' \"$value\"; printf 'discarded' >&2",
+            ]);
+            let output = capture_bounded_command(
+                &mut command,
+                64,
+                64,
+                Duration::from_secs(2),
+                Some(&secret),
+            )
+            .unwrap();
+            assert!(output.status_success);
+            assert_eq!(&output.stdout[..], b"bounded-input");
+        }
 
         let oversized_input = Zeroizing::new(vec![b'x'; MAX_SECRET_BYTES + 1]);
         let mut rejected_input = Command::new("/bin/true");
