@@ -707,7 +707,7 @@
   color: var(--sdsync-amber) !important;
 }
 
-.sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row),
+.sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):not(.sdsync-path-browser-open),
 .sdsync-app [role="button"]:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row),
 .sdsync-app [class*="syno"][class*="button"]:is(button, [role="button"]) {
   display: inline-flex !important;
@@ -768,7 +768,7 @@
   box-shadow: none !important;
 }
 
-.sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):hover:not(:disabled),
+.sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):not(.sdsync-path-browser-open):hover:not(:disabled),
 .sdsync-app [role="button"]:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):hover:not([aria-disabled="true"]),
 .sdsync-app [class*="syno"][class*="button"]:is(button, [role="button"]):hover:not(.disabled) {
   border-color: var(--sdsync-focus) !important;
@@ -776,7 +776,7 @@
   background: var(--sdsync-control-hover) !important;
 }
 
-.sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):focus-visible,
+.sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):not(.sdsync-path-browser-open):focus-visible,
 .sdsync-app [role="button"]:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):focus-visible,
 .sdsync-app [class*="syno"][class*="button"]:is(button, [role="button"]).focused {
   border-color: var(--sdsync-focus) !important;
@@ -785,7 +785,7 @@
   box-shadow: none !important;
 }
 
-.sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):active:not(:disabled),
+.sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):not(.sdsync-path-browser-open):active:not(:disabled),
 .sdsync-app [role="button"]:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):active:not([aria-disabled="true"]),
 .sdsync-app [class*="syno"][class*="button"]:is(button, [role="button"]):active:not(.disabled) {
   transform: translate(1px, 1px);
@@ -3313,27 +3313,29 @@
   border-bottom: 0;
 }
 
-.sdsync-path-browser-open {
-  display: grid;
+.sdsync-app .sdsync-path-browser-open {
+  display: grid !important;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 9px;
+  justify-content: stretch !important;
+  gap: 9px !important;
   min-width: 0;
   min-height: 42px;
-  padding: 6px 8px;
-  border: 0;
+  padding: 6px 8px !important;
+  border: 0 !important;
   color: var(--sdsync-text);
-  background: transparent;
+  background: transparent !important;
   text-align: left;
+  white-space: normal;
   cursor: pointer;
 }
 
-.sdsync-path-browser-open:hover,
-.sdsync-path-browser-open:focus-visible {
+.sdsync-app .sdsync-path-browser-open:hover,
+.sdsync-app .sdsync-path-browser-open:focus-visible {
   color: var(--sdsync-fire);
-  background: var(--sdsync-control-hover);
-  outline: 2px solid var(--sdsync-focus);
-  outline-offset: -1px;
+  background: var(--sdsync-control-hover) !important;
+  outline: 2px solid var(--sdsync-focus) !important;
+  outline-offset: -1px !important;
 }
 
 .sdsync-path-browser-folder-icon {
@@ -3486,6 +3488,50 @@
 }
 
 .sdsync-app.sdsync-compact-shell .sdsync-path-browser-columns {
+  display: none;
+}
+
+/* A DSM AppWindow is an independently resizable container inside Webman, so
+ * viewport media queries alone cannot describe its available height. */
+.sdsync-app.sdsync-short-shell .sdsync-modal-backdrop {
+  padding: 8px;
+}
+
+.sdsync-app.sdsync-short-shell .sdsync-path-browser {
+  height: 100%;
+  max-height: 100%;
+}
+
+.sdsync-app.sdsync-short-shell .sdsync-path-browser-header {
+  padding-block: 9px;
+}
+
+.sdsync-app.sdsync-short-shell .sdsync-path-browser-intro {
+  display: none;
+}
+
+.sdsync-app.sdsync-short-shell .sdsync-path-browser-main {
+  padding: 7px;
+}
+
+.sdsync-app.sdsync-short-shell .sdsync-path-browser-state {
+  min-height: 90px;
+  padding: 12px;
+}
+
+.sdsync-app.sdsync-short-shell .sdsync-path-browser-current {
+  padding-block: 5px;
+}
+
+.sdsync-app.sdsync-short-shell .sdsync-path-browser-columns {
+  display: none;
+}
+
+.sdsync-app.sdsync-short-shell .sdsync-path-browser-footer {
+  padding-block: 7px;
+}
+
+.sdsync-app.sdsync-short-shell .sdsync-path-browser-summary > span:first-child {
   display: none;
 }
 

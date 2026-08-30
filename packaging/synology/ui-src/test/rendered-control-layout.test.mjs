@@ -1161,7 +1161,7 @@ test("file-explorer folder picker stays contained and scrollable across DSM AppW
         <div id="folder-app" class="sdsync-app is-dark">
           <div id="folder-backdrop" class="sdsync-modal-backdrop sdsync-path-browser-backdrop">
             <div id="folder-dialog" class="sdsync-modal sdsync-path-browser" role="dialog" aria-modal="true" aria-labelledby="folder-title" aria-describedby="folder-description" tabindex="-1">
-              <header class="sdsync-path-browser-header">
+              <header id="folder-header" class="sdsync-path-browser-header">
                 <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Folder explorer</p><h2 id="folder-title">Choose a local NAS source</h2></div><button class="fixture-button" type="button">Close</button></div>
               </header>
               <p id="folder-description" class="sdsync-path-browser-intro">Only canonical NAS directories readable and traversable by the package identity are shown.</p>
@@ -1176,7 +1176,7 @@ test("file-explorer folder picker stays contained and scrollable across DSM AppW
                 </ol></nav>
               </div>
               <section id="folder-main" class="sdsync-path-browser-main" aria-label="Folder contents">
-                <div class="sdsync-path-browser-current" aria-live="polite"><span aria-hidden="true">F</span><span class="sdsync-path-browser-current-copy"><span class="sdsync-path-browser-current-label">Current folder</span><code>/volume1/Shared/Department/Long project name</code></span></div>
+                <div id="folder-current" class="sdsync-path-browser-current" aria-live="polite"><span aria-hidden="true">F</span><span class="sdsync-path-browser-current-copy"><span class="sdsync-path-browser-current-label">Current folder</span><code>/volume1/Shared/Department/Long project name</code></span></div>
                 <div class="sdsync-path-browser-columns" aria-hidden="true"><span>Name</span><span>Choose</span></div>
                 <div id="folder-list" class="sdsync-path-browser-list" role="list" aria-busy="false">${folderRows}</div>
               </section>
@@ -1206,13 +1206,17 @@ test("file-explorer folder picker stays contained and scrollable across DSM AppW
           setTimeout(() => {
             document.body.setAttribute("data-layout", btoa(JSON.stringify({
               compact: app.classList.contains("sdsync-compact-shell"),
+              short: app.classList.contains("sdsync-short-shell"),
               app: { rect: rect("folder-app"), overflow: overflow("folder-app") },
               backdrop: rect("folder-backdrop"),
-              dialog: { rect: rect("folder-dialog"), overflow: overflow("folder-dialog") },
+              dialog: { rect: rect("folder-dialog"), overflow: overflow("folder-dialog"), gridTemplateRows: getComputedStyle(document.getElementById("folder-dialog")).gridTemplateRows },
+              header: rect("folder-header"),
               toolbar: { rect: rect("folder-toolbar"), overflow: overflow("folder-toolbar") },
               breadcrumbs: { rect: rect("folder-breadcrumbs"), overflow: overflow("folder-breadcrumbs") },
               main: rect("folder-main"),
+              current: rect("folder-current"),
               list: { rect: rect("folder-list"), overflow: overflow("folder-list") },
+              openDisplay: getComputedStyle(document.querySelector(".sdsync-path-browser-open")).display,
               footer: rect("folder-footer")
             })));
           }, 80);
@@ -1222,14 +1226,20 @@ test("file-explorer folder picker stays contained and scrollable across DSM AppW
     await writeFile(htmlPath, html, "utf8");
     const url = pathToFileURL(htmlPath).href;
     const browserRender = { retry: false, timeoutMs: 15000 };
+    const tall = render(chrome, `${url}?width=760&height=640`, join(temporaryDirectory, "folder-tall"), browserRender);
     const wide = render(chrome, `${url}?width=760&height=480`, join(temporaryDirectory, "folder-wide"), browserRender);
     const compact = render(chrome, `${url}?width=500&height=360`, join(temporaryDirectory, "folder-compact"), browserRender);
     const narrow = render(chrome, `${url}?width=390&height=360`, join(temporaryDirectory, "folder-narrow"), browserRender);
 
+    assert.equal(tall.compact, false);
+    assert.equal(tall.short, false);
     assert.equal(wide.compact, false);
+    assert.equal(wide.short, true);
     assert.equal(compact.compact, true);
+    assert.equal(compact.short, true);
     assert.equal(narrow.compact, true);
-    for (const result of [wide, compact, narrow]) {
+    assert.equal(narrow.short, true);
+    for (const result of [tall, wide, compact, narrow]) {
       assert.ok(result.app.overflow.scrollWidth <= result.app.overflow.clientWidth,
         `folder picker created AppWindow horizontal overflow: ${JSON.stringify(result)}`);
       assert.ok(result.dialog.overflow.scrollWidth <= result.dialog.overflow.clientWidth,
@@ -1242,12 +1252,17 @@ test("file-explorer folder picker stays contained and scrollable across DSM AppW
         `folder contents overlaid the selection footer: ${JSON.stringify({ main: result.main, footer: result.footer, dialog: result.dialog })}`);
       assert.ok(result.list.rect.bottom <= result.footer.top + 0.1,
         `scrolling folder list escaped below the footer: ${JSON.stringify({ list: result.list, footer: result.footer, main: result.main, dialog: result.dialog })}`);
+      assert.ok(result.list.rect.bottom <= result.main.bottom - 6.5,
+        `scrolling folder list escaped the padded content pane: ${JSON.stringify({ list: result.list, main: result.main })}`);
+      assert.ok(result.list.overflow.clientHeight >= 54,
+        `folder explorer did not preserve one visible folder row: ${JSON.stringify(result)}`);
       assert.ok(result.list.overflow.scrollWidth <= result.list.overflow.clientWidth,
         "long folder paths caused horizontal list overflow");
       assert.ok(result.list.overflow.scrollHeight > result.list.overflow.clientHeight,
         "folder fixture did not prove independent vertical scrolling");
       assert.equal(result.list.overflow.overflowX, "hidden");
       assert.equal(result.list.overflow.overflowY, "auto");
+      assert.equal(result.openDisplay, "grid", "folder rows must retain explorer columns instead of generic button layout");
       assert.equal(result.breadcrumbs.overflow.overflowX, "auto");
       assert.ok(result.toolbar.overflow.scrollWidth <= result.toolbar.overflow.clientWidth,
         "toolbar escaped its compact picker width");

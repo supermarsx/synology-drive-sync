@@ -58,6 +58,37 @@ test("nested fit-container textfield shells receive stable package-owned fill ma
   }
 });
 
+test("AppWindow shell state tracks height independently from browser viewport width", () => {
+  let rect = { width: 900, height: 520 };
+  const shell = {
+    classList: classList(),
+    getBoundingClientRect: () => rect
+  };
+  const context = vm.createContext({ Set });
+  vm.runInContext(`${source.replace(/^export\s+/gm, "")}\nthis.setShellState = setShellState; this.clearShellState = clearShellState;`, context);
+
+  context.setShellState(shell);
+  assert.equal(shell.classList.contains("sdsync-medium-shell"), true);
+  assert.equal(shell.classList.contains("sdsync-compact-shell"), false);
+  assert.equal(shell.classList.contains("sdsync-short-shell"), true,
+    "the inclusive 520px AppWindow height must activate short-shell layout");
+
+  rect = { width: 900, height: 521 };
+  context.setShellState(shell);
+  assert.equal(shell.classList.contains("sdsync-short-shell"), false,
+    "a shell one pixel above the short boundary must retain its full layout");
+
+  rect = { width: 600, height: 420 };
+  context.setShellState(shell);
+  assert.equal(shell.classList.contains("sdsync-compact-shell"), true);
+  assert.equal(shell.classList.contains("sdsync-short-shell"), true);
+
+  context.clearShellState(shell);
+  assert.equal(shell.classList.contains("sdsync-medium-shell"), false);
+  assert.equal(shell.classList.contains("sdsync-compact-shell"), false);
+  assert.equal(shell.classList.contains("sdsync-short-shell"), false);
+});
+
 test("responsive form observers release removed routes and cannot restart after cleanup", async () => {
   const resizeInstances = [];
   const mutationInstances = [];

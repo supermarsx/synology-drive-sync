@@ -11,6 +11,7 @@ const OWNED_OVERLAY_SELECTOR = ".sdsync-select-dropdown";
 const FIELD_TIP_SELECTOR = ".sdsync-field-tip";
 const SHELL_MEDIUM_WIDTH = 1100;
 const SHELL_COMPACT_WIDTH = 720;
+const SHELL_SHORT_HEIGHT = 520;
 const FORM_COMPACT_WIDTH = 520;
 const BOUNDARY_INSET = 8;
 const OVERLAY_STYLE_PROPERTIES = [
@@ -136,13 +137,14 @@ function matchingElements(root, selector) {
 }
 
 function setShellState(shell) {
-  const width = shell.getBoundingClientRect().width;
+  const { width, height } = shell.getBoundingClientRect();
   shell.classList.toggle("sdsync-medium-shell", width <= SHELL_MEDIUM_WIDTH);
   shell.classList.toggle("sdsync-compact-shell", width <= SHELL_COMPACT_WIDTH);
+  shell.classList.toggle("sdsync-short-shell", height <= SHELL_SHORT_HEIGHT);
 }
 
 function clearShellState(shell) {
-  shell.classList.remove("sdsync-medium-shell", "sdsync-compact-shell");
+  shell.classList.remove("sdsync-medium-shell", "sdsync-compact-shell", "sdsync-short-shell");
 }
 
 function clamp(value, minimum, maximum) {

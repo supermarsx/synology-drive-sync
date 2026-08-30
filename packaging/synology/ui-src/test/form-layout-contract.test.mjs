@@ -411,6 +411,9 @@ test("critical form layout has an explicit Chrome 88 compatibility path", () => 
   assert.match(controlLayout, /classList\.toggle\([\s\S]*?"sdsync-compact-form"/);
   assert.match(controlLayout, /classList\.toggle\("sdsync-medium-shell", width <= SHELL_MEDIUM_WIDTH\)/);
   assert.match(controlLayout, /classList\.toggle\("sdsync-compact-shell", width <= SHELL_COMPACT_WIDTH\)/);
+  assert.match(controlLayout, /classList\.toggle\("sdsync-short-shell", height <= SHELL_SHORT_HEIGHT\)/);
+  assert.match(controlLayout, /classList\.remove\("sdsync-medium-shell", "sdsync-compact-shell", "sdsync-short-shell"\)/);
+  assert.match(css, /\.sdsync-app\.sdsync-short-shell \.sdsync-path-browser-list|\.sdsync-app\.sdsync-short-shell \.sdsync-path-browser-main/);
   assert.match(controlLayout, /OWNED_OVERLAY_SELECTOR = "\.sdsync-select-dropdown"/);
   assert.match(controlLayout, /OVERLAY_STYLE_PROPERTIES = \[[\s\S]*"width"/);
   assert.match(controlLayout, /setImportantStyle\(overlay, "width", `\$\{boundedWidth\}px`\)/);

@@ -213,7 +213,8 @@ test("right-hand semantic toggles own every visible hellfire state", () => {
 
 test("keyboard focus remains visible on every actionable control family", () => {
   const focusContracts = [
-    ['.sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):focus-visible'],
+    ['.sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row):not(.sdsync-path-browser-open):focus-visible'],
+    [".sdsync-app .sdsync-path-browser-open:focus-visible"],
     [".sdsync-nav-item:focus-visible"],
     [".sdsync-profile-row:focus-visible", ".sdsync-routine-row:focus-visible"],
     [".sdsync-app .sdsync-toggle-row .sdsync-checkbox-input:focus-visible"],
