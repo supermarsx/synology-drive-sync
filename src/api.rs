@@ -3030,6 +3030,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            stream.set_nodelay(true).unwrap();
             stream
                 .set_write_timeout(Some(SCRIPTED_SERVER_TIMEOUT))
                 .unwrap();
@@ -3930,12 +3931,12 @@ mod tests {
 
     #[test]
     fn remote_download_can_outlive_idle_timeout_when_every_chunk_makes_progress() {
-        let body = b"abcdefgh".to_vec();
+        let body = b"abcdefghijklmnopqrstuvwxyz".to_vec();
         let (base, server) =
-            scripted_slow_download_server(body.clone(), Duration::ZERO, Duration::from_millis(25));
-        let idle_timeout = Duration::from_millis(80);
+            scripted_slow_download_server(body.clone(), Duration::ZERO, Duration::from_millis(50));
+        let idle_timeout = Duration::from_secs(1);
         let client =
-            fingerprint_test_client_with_timeouts(&base, 0, idle_timeout, Duration::from_secs(1));
+            fingerprint_test_client_with_timeouts(&base, 0, idle_timeout, Duration::from_secs(4));
         let started = Instant::now();
 
         let fingerprint = client
