@@ -6908,6 +6908,8 @@ fn run_queued_mutation_manager(
 mod linux_files {
     use super::*;
     use std::os::fd::AsRawFd;
+    #[cfg(test)]
+    use std::os::fd::{FromRawFd, OwnedFd};
     use std::os::linux::fs::MetadataExt;
     use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 
@@ -6917,6 +6919,37 @@ mod linux_files {
     pub(super) const MAX_API_LOG_BYTES: u64 = 10 * 1024 * 1024;
     pub(super) const API_LOG_ROTATIONS: usize = 5;
     const MAX_CGI_FAILURE_RECORD_BYTES: usize = 512;
+
+    struct StateFlock {
+        file: File,
+    }
+
+    impl StateFlock {
+        fn try_acquire(file: File) -> BridgeResult<Option<Self>> {
+            let lock_status =
+                unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if lock_status == 0 {
+                return Ok(Some(Self { file }));
+            }
+            match io::Error::last_os_error().raw_os_error() {
+                Some(libc::EAGAIN) => Ok(None),
+                _ => Err(BridgeError::unsafe_runtime()),
+            }
+        }
+    }
+
+    impl Drop for StateFlock {
+        fn drop(&mut self) {
+            // O_CLOEXEC closes the descriptor at exec, but a concurrently
+            // forked child can retain this open-file description until then.
+            // Explicitly unlocking releases the lock from that shared
+            // description before the next CGI attempts a nonblocking lock.
+            // SAFETY: the guard owns a live File that successfully acquired
+            // this flock. LOCK_UN is nonblocking, and the descriptor closes
+            // immediately afterward if the kernel reports an unexpected error.
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
     #[cfg(test)]
     thread_local! {
         static FAIL_AUDIT_READY_WRITE_ONCE: std::cell::Cell<bool> = const {
@@ -7051,7 +7084,7 @@ mod linux_files {
             .create(true)
             .mode(0o600)
             .custom_flags(NOFOLLOW_CLOEXEC);
-        let mut state = state_options
+        let state = state_options
             .open(state_path)
             .map_err(|_| BridgeError::unsafe_runtime())?;
         let state_metadata = state
@@ -7068,16 +7101,13 @@ mod linux_files {
         // A CGI must never wait behind another failing request. The state file
         // is both the nonblocking coalescing lock and the bounded last-record
         // cache; the existing activity sink retains its own event-log lock.
-        let lock_status = unsafe { libc::flock(state.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if lock_status != 0 {
-            return match io::Error::last_os_error().raw_os_error() {
-                Some(libc::EAGAIN) => Ok(false),
-                _ => Err(BridgeError::unsafe_runtime()),
-            };
-        }
+        let Some(mut state) = StateFlock::try_acquire(state)? else {
+            return Ok(false);
+        };
 
         let mut previous = String::new();
         state
+            .file
             .read_to_string(&mut previous)
             .map_err(|_| BridgeError::unsafe_runtime())?;
         if !previous.is_empty() {
@@ -7140,13 +7170,53 @@ mod linux_files {
             return Err(BridgeError::internal());
         }
         state
+            .file
             .set_len(0)
             .map_err(|_| BridgeError::unsafe_runtime())?;
         state
+            .file
             .seek(SeekFrom::Start(0))
             .map_err(|_| BridgeError::unsafe_runtime())?;
-        write_single_record(&state, state_record.as_bytes())?;
+        write_single_record(&state.file, state_record.as_bytes())?;
         Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(super) fn state_flock_unlocks_shared_description_at(path: &Path) -> BridgeResult<()> {
+        let open = || {
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .write(true)
+                .custom_flags(NOFOLLOW_CLOEXEC);
+            options
+                .open(path)
+                .map_err(|_| BridgeError::unsafe_runtime())
+        };
+        let lock = StateFlock::try_acquire(open()?)?.ok_or_else(BridgeError::unsafe_runtime)?;
+        // SAFETY: dup receives the live descriptor owned by the lock. A
+        // successful result is immediately wrapped in OwnedFd below.
+        let duplicated = unsafe { libc::dup(lock.file.as_raw_fd()) };
+        if duplicated < 0 {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        // SAFETY: duplicated is a fresh nonnegative descriptor returned by
+        // dup and has not been transferred or closed.
+        let duplicated = unsafe { OwnedFd::from_raw_fd(duplicated) };
+
+        drop(lock);
+        let contender = open()?;
+        let lock_status =
+            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        drop(duplicated);
+        if lock_status != 0 {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let unlock_status = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_UN) };
+        if unlock_status != 0 {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(())
     }
 
     fn rotated_path(base: &Path, index: usize) -> PathBuf {
@@ -13396,6 +13466,16 @@ mod tests {
             assert_eq!(failure.code, Some("dsm_authentication_helper_unavailable"));
             assert_eq!(*calls.borrow(), ["probe"], "errno {errno}");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pre_relay_state_lock_is_explicitly_released_from_shared_descriptors() {
+        let fixture = TestControlFixture::new("cgi-failure-lock-release");
+        let state = fixture.root.join("cgi-failure.state");
+        fixture.write_private(&state, b"");
+
+        linux_files::state_flock_unlocks_shared_description_at(&state).unwrap();
     }
 
     #[cfg(target_os = "linux")]
