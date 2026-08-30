@@ -324,7 +324,9 @@ class DsmUiContractTests(unittest.TestCase):
             'role="dialog" aria-modal="true"',
             'document.addEventListener("keydown", this.confirmationKeyHandler, true)',
             'document.removeEventListener("keydown", this.confirmationKeyHandler, true)',
-            'if (this.route === "profiles" && route !== "profiles") this.closeProfile();',
+            'if (this.route === "profiles" && route !== "profiles") {',
+            'if (this.profileSaveState === "saving" || this.profileConnectionState === "testing") {',
+            'closeProfile(options = undefined) {',
             'const awaitTerminal = kind === "doctor";',
             'title="Synology Drive Sync"',
             'this.snapshot && this.snapshot.package && this.snapshot.package.version',
@@ -365,7 +367,7 @@ class DsmUiContractTests(unittest.TestCase):
             "keep", "replace", "clear", "interval", "daily", "realtime",
             "Reachable", "Writable", "Latency", "Last success", "Free space",
             "failure_threshold", "cooldown_seconds",
-            "Apply, persist, and audit this browser's AppWindow preferences immediately",
+            "Apply, persist, and audit this browser AppWindow preferences immediately",
             "sdsync-settings-actions",
         ):
             self.assertIn(marker, app)
@@ -879,6 +881,10 @@ function bind(context, names) {
     routes: [{ id: "profiles" }, { id: "overview" }],
     route: "profiles",
     logTimer: 0,
+    snapshotGeneration: 0,
+    profileConnectionRequest: 0,
+    profileSaveState: "idle",
+    profileConnectionState: "idle",
     profileEditorOpen: true,
     selectedProfile: "private",
     autosaveCoordinator: null,
@@ -888,6 +894,9 @@ function bind(context, names) {
     secretValues: {
       password: "password", totp: "totp", remote_log_token: "token"
     },
+    closePathBrowserCalls: 0,
+    closePathBrowser: function () { this.closePathBrowserCalls += 1; },
+    clearConnectionProofTimer: function () {},
     refreshLogs: function () {}
   };
   bind(routeContext, ["refreshAutosaveStatus", "cancelAutosave", "clearSecrets", "closeProfile"]);
@@ -900,6 +909,7 @@ function bind(context, names) {
   });
   assert.equal(routeContext.profileEditorOpen, false);
   assert.equal(routeContext.selectedProfile, "");
+  assert.equal(routeContext.closePathBrowserCalls, 1);
 
   const focusLog = [];
   const listeners = [];
@@ -1343,6 +1353,23 @@ function bind(context, names) {
 
         with self.assertRaisesRegex(validate_spk.ValidationError, "AppWindow structure"):
             validate_build(app=source["app"].replace(b"<v-app-window", b"<section", 1))
+        profile_latch = (
+            b'if (hasUnresolvedMutationOutcome(this)) return this.toast('
+            b'"Profile save locked", unresolvedMutationGuidance(this), true);'
+        )
+        self.assertIn(profile_latch, source["app"])
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError,
+            "session-latched mutation guard",
+        ):
+            validate_build(
+                app=source["app"].replace(
+                    profile_latch,
+                    b'if (false) return this.toast('
+                    b'"Profile save locked", unresolvedMutationGuidance(this), true);',
+                    1,
+                )
+            )
         for name, marker in (
             ("iframe", b"<iframe"),
             ("legacy launcher", b"index.html"),
@@ -1548,8 +1575,8 @@ function bind(context, names) {
             ),
             (
                 "secret route cleanup",
-                b'if (this.route === "profiles" && route !== "profiles") this.closeProfile();',
-                b'if (false) this.closeProfile();',
+                b'if (this.route === "profiles" && route !== "profiles") {',
+                b'if (false) {',
                 "interaction contract",
             ),
             (

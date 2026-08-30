@@ -71,7 +71,12 @@ function emptyProfileFailureRecordsState() {
   };
 }
 
-function loadAppComponent(postSpy = async () => ({ ok: true }), getSpy = async () => ({})) {
+function loadAppComponent(
+  postSpy = async () => ({ ok: true }),
+  getSpy = async (_auth, action, query = {}) => action === "source-path"
+    ? { schema: "sdsync.dsm-source-path.v1", path: query.path, valid: true }
+    : {}
+) {
   const script = appSource.match(/<script>\s*([\s\S]*?)\s*<\/script>/);
   assert.ok(script, "App.vue script block is missing");
   let executable = script[1]
@@ -86,7 +91,8 @@ function loadAppComponent(postSpy = async () => ({ ok: true }), getSpy = async (
   const stubs = {
     ACTIONS: {
       configureProfile: "configure-profile", setSecret: "set-secret", routine: "routine", alertPolicy: "alert-policy",
-      securityPolicy: "security-policy", clientEvent: "client-event"
+      securityPolicy: "security-policy", clientEvent: "client-event", removeProfile: "remove-profile",
+      removeRoutine: "remove-routine", execute: "execute"
     },
     AUTOSAVE_API_LIMITS: Object.freeze({
       csrfReissueTimeoutMs: 10000,
@@ -147,6 +153,7 @@ async function coordinatorRuntime(postSpy, getSpy = async () => ({})) {
     autosaveFailureScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
     autosaveOutcomeUnknownScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
     autosaveInspectionScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
+    mutationSessionBarrier: { active: false, kind: "", outcomeUnknown: false, requiresInspection: false },
     profileFailureRecords: emptyProfileFailureRecordsState(),
     autosaveCoordinator: null,
     alertDirty: false,
@@ -177,6 +184,9 @@ function manualFailureContext(methods, scope, overrides = {}) {
   const context = Object.assign({
     disposed: false,
     operationBusy: false,
+    profileEditorOpen: true,
+    profileSaveState: "idle",
+    profileSaveMessage: "",
     auth: {},
     csrfToken: "csrf",
     connected: false,
@@ -186,6 +196,7 @@ function manualFailureContext(methods, scope, overrides = {}) {
     autosaveFailureScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
     autosaveOutcomeUnknownScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
     autosaveInspectionScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
+    mutationSessionBarrier: { active: false, kind: "", outcomeUnknown: false, requiresInspection: false },
     profileFailureRecords: emptyProfileFailureRecordsState(),
     reports: [],
     toasts: [],
@@ -201,16 +212,22 @@ function manualFailureContext(methods, scope, overrides = {}) {
   for (const name of [
     "refreshAutosaveStatus", "cancelAutosave", "pauseAutosave", "hydrateAutosave",
     "clearAutosaveFailure", "ensureProfileFailureRecords", "syncProfileFailureState",
-    "recordProfileFailure", "clearProfileConfigurationFailure", "clearProfileSecretFailures"
+    "recordProfileFailure", "clearProfileConfigurationFailure", "clearProfileSecretFailures",
+    "applyTrustedSecretPresence"
   ]) context[name] = (...args) => methods[name].apply(context, args);
   return { context, scope };
 }
 
 async function exerciseManualMutationFailures(failure) {
-  const methods = loadAppComponent(async () => { throw failure; }).methods;
+  const posts = [];
+  const methods = loadAppComponent(async (_auth, _csrf, action, payload) => {
+    posts.push({ action, payload });
+    throw failure;
+  }).methods;
   const event = { preventDefault() {} };
   const cases = [
     manualFailureContext(methods, "profile", {
+      selectedProfile: "nightly",
       canChangeProfiles: true,
       profileAutosavePayload: () => ({ name: "nightly" }),
       secretOperations: () => [],
@@ -266,7 +283,7 @@ async function exerciseManualMutationFailures(failure) {
   for (let index = 0; index < cases.length; index += 1) {
     await actions[index].call(cases[index].context, event);
   }
-  return cases;
+  return { actions, cases, methods, posts };
 }
 
 test("AppWindow registers the exact 1300ms autosave scopes and excludes secret and permission state", () => {
@@ -282,7 +299,8 @@ test("AppWindow registers the exact 1300ms autosave scopes and excludes secret a
 
   const notifications = methodSource("async saveNotificationPreferences", "async saveInterfaceSettings");
   assert.match(notifications, /Notification\.requestPermission\(\)/);
-  assert.doesNotMatch(notifications, /autosave|AUTOSAVE_SCOPES/i);
+  assert.doesNotMatch(notifications, /autosaveChanged|hydrateAutosave|AUTOSAVE_SCOPES/);
+  assert.match(notifications, /if \(report\.unknown \|\| report\.inspection\) this\.pauseAutosave\("interface", error\)/);
 });
 
 test("new profiles and routines plus risk-changing edits stay behind Save now", async () => {
@@ -313,6 +331,9 @@ test("new profiles and routines plus risk-changing edits stay behind Save now", 
 
   const confirmations = [];
   const manualProfile = {
+    profileEditorOpen: true,
+    selectedProfile: "existing-profile",
+    profileSaveState: "idle",
     canChangeProfiles: true,
     operationBusy: false,
     disposed: false,
@@ -359,6 +380,8 @@ test("manual profile and routine saves reject blank or non-canonical integer dra
   };
   const profileToasts = [];
   const profile = {
+    profileEditorOpen: true,
+    profileSaveState: "idle",
     canChangeProfiles: true,
     operationBusy: false,
     profileForm,
@@ -550,7 +573,7 @@ test("profile autosave serializes configuration only and manual saves reconcile 
   const securitySave = methodSource("async saveSecurityPolicy", "clearProfileFilters");
   const interfaceSave = methodSource("async saveInterfaceSettings", "persistSettings");
   assert.match(profileSave, /cancelAutosave\("profile"\)/);
-  assert.match(profileSave, /closeProfile\(\)/);
+  assert.match(profileSave, /closeProfile\(\{ refresh: false \}\)/);
   assert.match(routineSave, /cancelAutosave\("routine"\)/);
   assert.match(routineSave, /loadRoutine\(payload\.profile\)/);
   assert.match(alertSave, /cancelAutosave\("alerts"\)/);
@@ -715,7 +738,7 @@ test("manual mutation outcome-unknown errors block every autosave scope without 
     trustedRequestId: true,
     requestId: "a".repeat(32)
   });
-  const cases = await exerciseManualMutationFailures(unknown);
+  const { actions, cases, posts } = await exerciseManualMutationFailures(unknown);
 
   for (const { context, scope } of cases) {
     assert.equal(context.operationBusy, false, `${scope} must leave the manual operation boundary`);
@@ -726,7 +749,14 @@ test("manual mutation outcome-unknown errors block every autosave scope without 
     assert.match(context.autosaveMessage, /Activity \/ Logs/);
     assert.doesNotMatch(context.autosaveMessage, /Save now/i);
     assert.deepEqual(context.reports, [unknown]);
+    assert.equal(context.mutationSessionBarrier.active, true);
   }
+
+  assert.equal(posts.length, cases.length);
+  for (let index = 0; index < cases.length; index += 1) {
+    await actions[index].call(cases[index].context, { preventDefault() {} });
+  }
+  assert.equal(posts.length, cases.length, "a second click must not redispatch any mutation family after an unknown outcome");
 });
 
 test("trusted pre-acceptance manual rejections retain Save-now recovery guidance", async () => {
@@ -736,7 +766,7 @@ test("trusted pre-acceptance manual rejections retain Save-now recovery guidance
     trustedRequestId: true,
     requestId: "b".repeat(32)
   });
-  const cases = await exerciseManualMutationFailures(rejected);
+  const { actions, cases, posts } = await exerciseManualMutationFailures(rejected);
 
   for (const { context, scope } of cases) {
     assert.equal(context.operationBusy, false, `${scope} must leave the manual operation boundary`);
@@ -746,7 +776,13 @@ test("trusted pre-acceptance manual rejections retain Save-now recovery guidance
     assert.match(context.autosaveMessage, /use Save now/i);
     assert.doesNotMatch(context.autosaveMessage, /outcome unknown|Activity \/ Logs/i);
     assert.deepEqual(context.reports, [rejected]);
+    assert.equal(context.mutationSessionBarrier.active, false);
   }
+
+  for (let index = 0; index < cases.length; index += 1) {
+    await actions[index].call(cases[index].context, { preventDefault() {} });
+  }
+  assert.equal(posts.length, cases.length * 2, "a trusted pre-acceptance rejection remains manually retryable");
 });
 
 test("full profile save marks a later trusted rejection as durable partial application", async () => {
@@ -779,6 +815,8 @@ test("full profile save marks a later trusted rejection as durable partial appli
     secretOperations: () => [{ profile: "nightly", kind: "password", mode: "replace", value: "redacted" }],
     validateProfile: () => "",
     clearSecrets() {},
+    secretModes: { password: "replace", totp: "keep", remote_log_token: "keep" },
+    secretValues: { password: "redacted", totp: "", remote_log_token: "" },
     closeProfile() { closed += 1; },
     refreshSnapshot: async () => { refreshed += 1; }
   });
@@ -800,8 +838,9 @@ test("full profile save marks a later trusted rejection as durable partial appli
   assert.match(context.autosaveMessage, /need inspection/i);
   assert.match(context.autosaveMessage, /Activity \/ Logs/);
   assert.doesNotMatch(context.autosaveMessage, /Save now/i);
-  assert.equal(closed, 1);
-  assert.equal(refreshed, 1);
+  assert.equal(closed, 0, "partial application must preserve the editor for inspection");
+  assert.equal(refreshed, 0, "profile-owned state blocks observational refresh until the editor closes");
+  assert.equal(context.profileSaveState, "error");
   assert.equal(context.reports.length, 1);
   const failure = context.reports[0];
   assert.equal(failure.name, "PartialMutationInspectionRequiredError");
@@ -821,6 +860,12 @@ test("full profile save marks a later trusted rejection as durable partial appli
   assert.equal(failure.stage, "mutation_validation");
   assert.match(failure.message, /Earlier profile stages were applied/);
   assert.match(failure.message, /Do not retry/);
+
+  await methods.saveProfile.call(context, { preventDefault() {} });
+  assert.equal(posts.length, 2, "partial profile application must freeze a second manual submission");
+  assert.equal(context.secretModes.password, "replace", "the unapplied secret stage remains in the draft");
+  assert.equal(context.secretValues.password, "redacted");
+  assert.equal(context.profileEditorOpen, true, "the draft remains open for reconciliation");
 });
 
 test("secrets-only save blocks profile autosave after any earlier secret was applied", async () => {
@@ -871,8 +916,8 @@ test("secrets-only save blocks profile autosave after any earlier secret was app
   assert.match(context.autosaveMessage, /need inspection/i);
   assert.match(context.autosaveMessage, /Activity \/ Logs/);
   assert.doesNotMatch(context.autosaveMessage, /Save now/i);
-  assert.equal(refreshed, 1);
-  assert.deepEqual(context.secretModes, { password: "keep", totp: "keep", remote_log_token: "keep" });
+  assert.equal(refreshed, 0);
+  assert.deepEqual(context.secretModes, { password: "keep", totp: "replace", remote_log_token: "keep" });
   assert.equal(context.reports.length, 1);
   const failure = context.reports[0];
   assert.equal(failure.outcomeUnknown, false);
@@ -887,6 +932,10 @@ test("secrets-only save blocks profile autosave after any earlier secret was app
   assert.equal(failure.stage, "secret_write");
   assert.match(failure.message, /Earlier secret stages were applied/);
   assert.match(failure.message, /Do not retry/);
+
+  await methods.saveProfileSecrets.call(context, { preventDefault() {} });
+  assert.equal(posts.length, 2, "partial secret application must freeze a second manual submission");
+  assert.equal(context.secretModes.totp, "replace", "the unapplied secret draft remains available for inspection");
 });
 
 test("zero-applied profile and secret rejections retain ordinary Save-now recovery", async () => {
@@ -942,101 +991,111 @@ test("zero-applied profile and secret rejections retain ordinary Save-now recove
   assert.deepEqual(secretsCase.context.reports, [rejected]);
 });
 
-test("observed targeted secret success clears only a secrets-origin profile pause", async () => {
-  const rejected = Object.assign(new Error("The second credential mutation was rejected"), {
-    preAcceptance: true,
-    trustedRejection: true,
+test("authoritative hydration cannot clear the session latch; a fresh AppWindow can", () => {
+  const methods = loadAppComponent().methods;
+  const coordinator = {
+    hydrate() {},
+    getState() { return { registered: true, dirty: false, inFlight: false }; },
+    setScopeBlocked() {}
+  };
+  const latched = manualFailureContext(methods, "security", {
+    autosaveCoordinator: coordinator,
+    autosaveFailureScopes: { profile: false, routine: false, alerts: false, security: true, interface: false },
+    autosaveOutcomeUnknownScopes: { profile: false, routine: false, alerts: false, security: true, interface: false },
+    autosaveInspectionScopes: { profile: false, routine: false, alerts: false, security: true, interface: false },
+    mutationSessionBarrier: { active: true, kind: "Security mutation", outcomeUnknown: true, requiresInspection: true }
+  });
+
+  methods.hydrateAutosave.call(latched.context, "security", { require_https: true }, true);
+
+  assert.equal(latched.context.autosaveOutcomeUnknownScopes.security, false, "the observed scope may reconcile");
+  assert.equal(latched.context.mutationSessionBarrier.active, true, "authoritative hydration must not silently unlock the AppWindow");
+  assert.equal(latched.context.autosavePhase, "blocked");
+  assert.equal(loadAppComponent().computed.mutationOutcomeUnresolved.call(latched.context), true);
+
+  const fresh = manualFailureContext(methods, "security", {
+    canMutate: true,
+    securityDirty: true
+  }).context;
+  assert.equal(loadAppComponent().computed.mutationOutcomeUnresolved.call(fresh), false);
+  assert.equal(loadAppComponent().computed.canSubmitSecurity.call({
+    canMutate: true,
+    securityDirty: true,
+    operationBusy: false,
+    mutationOutcomeUnresolved: false
+  }), true, "a new AppWindow instance starts from authoritative state without the prior session latch");
+});
+
+test("unknown removals, operations, and notification audits latch before a second dispatch", async () => {
+  const unknown = Object.assign(new Error("DSM may have accepted the request"), {
+    outcomeUnknown: true,
     trustedRequestId: true,
-    requestId: "1".repeat(32),
-    status: 422,
-    code: "secret_rejected",
-    stage: "secret_write"
+    requestId: "2".repeat(32)
   });
-  let call = 0;
-  let operations = [
-    { profile: "nightly", kind: "password", mode: "replace", value: "redacted-one" },
-    { profile: "nightly", kind: "totp", mode: "replace", value: "redacted-two" }
-  ];
-  const methods = loadAppComponent(async () => {
-    call += 1;
-    if (call === 2) throw rejected;
-    return { ok: true };
+  const posts = [];
+  const methods = loadAppComponent(async (_auth, _csrf, action, payload) => {
+    posts.push({ action, payload });
+    throw unknown;
   }).methods;
-  let observation = 0;
-  const recovering = manualFailureContext(methods, "profile", {
+  let confirmations = 0;
+  const profile = manualFailureContext(methods, "profile", {
     selectedProfile: "nightly",
-    canManageSecrets: true,
-    connected: true,
-    snapshot: { revision: 0 },
-    secretOperations: () => operations,
-    validateSecretOperations: () => "",
-    clearSecrets() {},
-    secretModes: { password: "replace", totp: "replace", remote_log_token: "keep" },
-    refreshSnapshot: async function refreshSnapshot() {
-      observation += 1;
-      this.connected = true;
-      this.snapshot = { revision: observation };
-      return true;
-    }
-  });
+    canChangeProfiles: true,
+    confirmAction: async () => { confirmations += 1; return true; }
+  }).context;
+  const routine = manualFailureContext(methods, "routine", {
+    canChangeRoutines: true,
+    routineForm: { profile: "nightly" },
+    selectedRoutine: { profile: "nightly" },
+    confirmAction: async () => { confirmations += 1; return true; }
+  }).context;
+  const operation = manualFailureContext(methods, "security", {
+    canRunOperations: true,
+    canAllowDestructive: true,
+    canRunDoctorWrite: true,
+    hasCapability: () => true,
+    diagnostic: { title: "", output: "" }
+  }).context;
+  const notifications = manualFailureContext(methods, "interface", {
+    canChangeNotifications: true,
+    notificationForm: { desktop_notifications: false, audible: false },
+    captureSettingsTransaction: () => ({ settings: { desktop_notifications: true, audible: true } }),
+    persistSettings: () => true,
+    applySettingsState() {},
+    preferenceAuditWasRejected: () => false
+  }).context;
 
-  await methods.saveProfileSecrets.call(recovering.context, { preventDefault() {} });
-  assert.equal(recovering.context.autosaveFailureScopes.profile, true);
-  assert.equal(recovering.context.autosaveOutcomeUnknownScopes.profile, false);
-  assert.equal(recovering.context.autosaveInspectionScopes.profile, true);
-  assert.equal(recovering.context.profileFailureRecords.secrets.totp.active, true);
+  await methods.removeProfile.call(profile);
+  await methods.removeRoutine.call(routine);
+  await methods.executeOperation.call(operation, "run", { scope: "all", allow_delete: false });
+  await methods.saveNotificationPreferences.call(notifications, { preventDefault() {} });
+  assert.deepEqual(posts.map(({ action }) => action), ["remove-profile", "remove-routine", "execute", "client-event"]);
+  assert.equal(confirmations, 2);
 
-  operations = [{ profile: "nightly", kind: "password", mode: "replace", value: "redacted-three" }];
-  await methods.saveProfileSecrets.call(recovering.context, { preventDefault() {} });
-  assert.equal(recovering.context.autosaveFailureScopes.profile, true);
-  assert.equal(recovering.context.autosaveInspectionScopes.profile, true);
-  assert.equal(recovering.context.profileFailureRecords.secrets.totp.active, true);
-  assert.equal(recovering.context.autosavePhase, "blocked");
-  assert.match(recovering.context.autosaveMessage, /Activity \/ Logs/);
+  await methods.removeProfile.call(profile);
+  await methods.removeRoutine.call(routine);
+  await methods.executeOperation.call(operation, "run", { scope: "all", allow_delete: false });
+  await methods.saveNotificationPreferences.call(notifications, { preventDefault() {} });
+  assert.equal(posts.length, 4, "each unknown family must reject a second direct invocation before transport");
+  assert.equal(confirmations, 2, "a locked destructive retry must not reach confirmation");
+  for (const context of [profile, routine, operation, notifications]) {
+    assert.equal(context.mutationSessionBarrier.active, true);
+  }
+});
 
-  operations = [{ profile: "nightly", kind: "totp", mode: "replace", value: "redacted-four" }];
-  await methods.saveProfileSecrets.call(recovering.context, { preventDefault() {} });
-  assert.equal(recovering.context.autosaveFailureScopes.profile, false);
-  assert.equal(recovering.context.autosaveOutcomeUnknownScopes.profile, false);
-  assert.equal(recovering.context.autosaveInspectionScopes.profile, false);
-  assert.deepEqual(recovering.context.profileFailureRecords, emptyProfileFailureRecordsState());
-  assert.equal(recovering.context.autosavePhase, "saved");
-  assert.equal(observation, 3, "each recovery attempt must wait for a fresh snapshot after its secret write");
+test("a latched mutation outcome blocks autosave dispatch before transport", async () => {
+  let posts = 0;
+  const methods = loadAppComponent(async () => { posts += 1; return { ok: true }; }).methods;
+  const context = manualFailureContext(methods, "alerts", {
+    mutationSessionBarrier: { active: true, kind: "Alert mutation", outcomeUnknown: true, requiresInspection: true }
+  }).context;
 
-  const configRecords = emptyProfileFailureRecordsState();
-  configRecords.configuration = { active: true, outcomeUnknown: true, requiresInspection: true };
-
-  const preserved = manualFailureContext(methods, "profile", {
-    selectedProfile: "nightly",
-    canManageSecrets: true,
-    connected: true,
-    snapshot: { revision: 10 },
-    autosaveFailureScopes: { profile: true, routine: false, alerts: false, security: false, interface: false },
-    autosaveOutcomeUnknownScopes: { profile: true, routine: false, alerts: false, security: false, interface: false },
-    autosaveInspectionScopes: { profile: true, routine: false, alerts: false, security: false, interface: false },
-    profileFailureRecords: configRecords,
-    secretOperations: () => [{ profile: "nightly", kind: "password", mode: "replace", value: "redacted-five" }],
-    validateSecretOperations: () => "",
-    clearSecrets() {},
-    secretModes: { password: "replace", totp: "keep", remote_log_token: "keep" },
-    refreshSnapshot: async function refreshSnapshot() {
-      this.connected = true;
-      this.snapshot = { revision: 11 };
-      return true;
-    }
-  });
-
-  await methods.saveProfileSecrets.call(preserved.context, { preventDefault() {} });
-  assert.equal(preserved.context.autosaveFailureScopes.profile, true);
-  assert.equal(preserved.context.autosaveOutcomeUnknownScopes.profile, true);
-  assert.equal(preserved.context.autosaveInspectionScopes.profile, true);
-  assert.deepEqual(preserved.context.profileFailureRecords.configuration, {
-    active: true, outcomeUnknown: true, requiresInspection: true
-  });
-  assert.equal(preserved.context.profileFailureRecords.secrets.password.active, false);
-  assert.equal(preserved.context.autosavePhase, "blocked");
-  assert.match(preserved.context.autosaveMessage, /Activity \/ Logs/);
-  assert.doesNotMatch(preserved.context.autosaveMessage, /Save now/i);
+  await assert.rejects(
+    methods.dispatchAutosave.call(context, { scope: "alerts", payload: { enabled: true } }),
+    /mutation outcome unknown.*may already have been accepted/i
+  );
+  assert.equal(posts, 0);
+  assert.equal(context.operationBusy, false);
 });
 
 test("manual security success followed by CSRF refresh failure remains applied and non-repeatable", async () => {

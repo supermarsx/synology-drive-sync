@@ -474,12 +474,11 @@ test("requested DSM policy, routine, Doctor, and alert fields use SDK horizontal
     assert.match(app, new RegExp(`<span class="sdsync-filter-label">${label}<\\/span>`));
   }
   assert.equal((app.match(/class="sdsync-submit-row"/g) || []).length, 3);
-  for (const action of ["Run doctor", "Save session preferences"]) {
-    assert.match(app, new RegExp(`class="sdsync-submit-row"[\\s\\S]{0,500}>${action}<\\/v-button>`));
-  }
+  assert.match(app, /class="sdsync-submit-row"[\s\S]{0,500}>Run doctor<\/v-button>/);
+  assert.match(app, /class="sdsync-submit-row"[\s\S]{0,700}mutationOutcomeUnresolved \? 'Save locked' : 'Save session preferences'[\s\S]{0,80}<\/v-button>/);
   assert.match(
     app,
-    /class="sdsync-submit-row"[\s\S]{0,500}tooltip="Validate and persist the package-level DSM alert policy immediately"[\s\S]{0,350}>Save now<\/v-button>/,
+    /class="sdsync-submit-row"[\s\S]{0,650}'Validate and persist the package-level DSM alert policy immediately'[\s\S]{0,450}mutationOutcomeUnresolved \? 'Save locked' : 'Save now'[\s\S]{0,80}<\/v-button>/,
     "the DSM alert policy keeps its bounded action row after adopting autosave copy"
   );
 

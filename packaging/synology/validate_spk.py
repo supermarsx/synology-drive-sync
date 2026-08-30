@@ -903,8 +903,11 @@ def validate_native_build_contract(
         'event.key === "Escape"',
         'event.key !== "Tab"',
         "priorFocus && priorFocus.isConnected && priorFocus.focus",
-        'if (this.route === "profiles" && route !== "profiles") this.closeProfile();',
-        'closeProfile() { this.cancelAutosave("profile"); this.clearSecrets();',
+        'if (this.route === "profiles" && route !== "profiles") {',
+        'if (this.profileSaveState === "saving" || this.profileConnectionState === "testing") {',
+        'this.toast("Profile operation in progress",',
+        'closeProfile(options = undefined) {',
+        'if (this.profileSaveState === "saving" || this.profileConnectionState === "testing") return;',
         '{ id: "about", title: "About", icon: "about" }',
         '<action-icon :name="item.icon" :size="18" />',
         'import { ActionIcon } from "./ActionIcon";',
@@ -963,20 +966,36 @@ def validate_native_build_contract(
 
     operation_guards = (
         r"openProfile\(name\)\s*\{\s*if \(this\.operationBusy\) return;",
-        r"async saveProfile\(event\)\s*\{.{0,180}?if \(!this\.canChangeProfiles \|\| this\.operationBusy\) return;",
-        r"async removeProfile\(\)\s*\{\s*if \(!this\.canChangeProfiles \|\| !this\.selectedProfile \|\| this\.operationBusy\) return;",
+        r'async saveProfile\(event\)\s*\{.{0,600}?if \(!this\.canChangeProfiles \|\| this\.operationBusy \|\| this\.profileSaveState === "saving"\) return',
+        r"async saveProfileSecrets\(event\)\s*\{.{0,500}?if \(!profile \|\| !this\.canManageSecrets \|\| this\.operationBusy\) return;",
+        r"async removeProfile\(\)\s*\{.{0,400}?if \(!this\.canChangeProfiles \|\| !this\.selectedProfile \|\| this\.operationBusy\) return;",
         r'openRoutine\(profile = ""\)\s*\{\s*if \(this\.operationBusy \|\| \(!profile && !this\.canChangeRoutines\)\) return;',
-        r"async saveRoutine\(event\)\s*\{.{0,180}?this\.operationBusy\) return;",
-        r"async removeRoutine\(\)\s*\{.{0,180}?this\.operationBusy\) return;",
-        r"async saveAlerts\(event\)\s*\{.{0,180}?this\.operationBusy\) return;",
-        r"async saveSecurityPolicy\(event\)\s*\{.{0,180}?if \(!this\.canMutate \|\| !this\.securityDirty \|\| this\.operationBusy\) return;",
-        r"async executeOperation\(kind, payload\)\s*\{\s*if \(!this\.canRunOperations \|\| this\.operationBusy \|\| this\.disposed\) return;",
+        r"async saveRoutine\(event\)\s*\{.{0,400}?this\.operationBusy\) return;",
+        r"async removeRoutine\(\)\s*\{.{0,400}?this\.operationBusy\) return;",
+        r"async saveAlerts\(event\)\s*\{.{0,400}?this\.operationBusy\) return;",
+        r"async saveSecurityPolicy\(event\)\s*\{.{0,400}?if \(!this\.canMutate \|\| !this\.securityDirty \|\| this\.operationBusy\) return;",
+        r"async executeOperation\(kind, payload\)\s*\{.{0,400}?if \(!this\.canRunOperations \|\| this\.operationBusy \|\| this\.disposed\) return;",
         r"async quickRun\(\)\s*\{\s*if \(!this\.canRunOperations \|\| this\.operationBusy\) return;",
-        r"async runDoctor\(event\)\s*\{.{0,180}?if \(!this\.canRunOperations \|\| this\.operationBusy\) return;",
+        r"async runDoctor\(event\)\s*\{.{0,300}?if \(!this\.canRunOperations \|\| this\.operationBusy\) return;",
     )
     for guard in operation_guards:
         if not re.search(guard, app, re.DOTALL):
             raise ValidationError("native DSM mutation surface is missing a global operationBusy guard")
+    mutation_latch_guards = (
+        "saveSecurityPolicy", "testProfileAuthentication", "openRemotePathBrowser",
+        "saveProfile", "saveProfileSecrets", "removeProfile", "saveRoutine",
+        "removeRoutine", "saveAlerts", "executeOperation", "saveNotificationPreferences",
+        "saveInterfaceSettings",
+    )
+    for method in mutation_latch_guards:
+        guard = (
+            rf"(?:async\s+)?{re.escape(method)}\([^)]*\)\s*\{{"
+            rf".{{0,420}}?hasUnresolvedMutationOutcome\(this\)"
+        )
+        if not re.search(guard, app, re.DOTALL):
+            raise ValidationError(
+                f"native DSM mutation surface method {method} is missing the session-latched mutation guard"
+            )
     for marker in (
         'const awaitTerminal = kind === "doctor";',
         "Object.assign({ kind }, payload),\n          awaitTerminal",

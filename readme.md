@@ -84,7 +84,7 @@ cd synology-drive-sync
 cargo build --release --locked
 ```
 
-Validate the local source with exactly the exclusions used by sync. Add `--hash` to read every payload file and require a stable MD5 snapshot:
+Validate the local source with exactly the exclusions used by sync. Add `--hash` to read every payload file and require a stable MD5, IEEE CRC32, and SHA-256 fingerprint:
 
 ```bash
 synology-drive-sync doctor source ./project --hash
@@ -357,7 +357,7 @@ Independent guards include:
 - a source with no payload files cannot drive deletion without `--allow-empty-source`;
 - ignored, DSM-managed, and File Station-mounted paths are protected;
 - the local preflight, remote scan, directory creation, copies, and uploads must succeed before remote-only deletion;
-- immediately before a planned file deletion, the current remote kind, size, mtime, and—under content comparison—MD5 must still match the inventoried snapshot;
+- immediately before a planned file deletion, the current remote kind, size, mtime, and—under content comparison—MD5, IEEE CRC32, and SHA-256 must still match the inventoried snapshot;
 - a copied source is removed only after the local snapshot and copied destination are reverified;
 - remote-only directories are removed deepest-first and non-recursively, so a concurrent new child prevents their removal.
 
@@ -377,11 +377,11 @@ Hidden regular files are included. Symlinks, junctions/reparse points, special o
 
 Path checks and later file opens are not a transactional filesystem snapshot. Run under an unprivileged account that exclusively owns the source, keep the tree quiescent during synchronization, and never run elevated over a source that another user or less-trusted process can rename or replace. A concurrent path-component swap can otherwise race portable link/reparse checks and redirect a later traversal or upload outside the tree that was originally inspected. See [Security policy](security.md).
 
-The default `--compare content` requires matching byte length, MD5, and file mtime at File Station's one-second resolution. An upload is successful only after the local file is rehashed and the exact remote destination reports the expected bytes; a final rescan and replan also enforce the expected mtime before success. The correspondence is rebuilt from current local and NAS state on every run; there is no persistent path/hash database that can become stale.
+The default `--compare content` requires matching byte length, MD5, IEEE CRC32, SHA-256, and file mtime at File Station's one-second resolution. An upload is successful only after the local file is rehashed and the exact remote destination streams the same complete fingerprint; a final rescan and replan also enforce the expected mtime before success. The correspondence is rebuilt from current local and NAS state on every run; there is no persistent path/hash database that can become stale.
 
-When one missing local file has one unique remote-only counterpart with the same byte length, MD5, second-resolution mtime, and basename in a different directory, the plan can use File Station's non-overwriting server-side copy instead of retransmitting the bytes. Additive sync keeps the old remote path. Mirror mode removes it only after the local snapshot and new copy have been reverified. Ambiguous duplicate-content groups, same-parent renames, basename changes, unavailable copy support, and any unsafe case fall back to a normal verified upload. Inspect `server_copies` and `upload_bytes` in JSON/NDJSON plan output before execution.
+When one missing local file has one unique remote-only counterpart with the same byte length, complete MD5/CRC32/SHA-256 fingerprint, second-resolution mtime, and basename in a different directory, the plan can use File Station's non-overwriting server-side copy instead of retransmitting the upload. Additive sync keeps the old remote path. Mirror mode removes it only after the local snapshot and new copy have been reverified. Ambiguous duplicate-content groups, same-parent renames, basename changes, unavailable copy support, and any unsafe case fall back to a normal verified upload. Inspect `server_copies` and `upload_bytes` in JSON/NDJSON plan output before execution.
 
-MD5 is the strongest content digest exposed by the documented File Station API, but it is not collision-resistant against maliciously constructed files. Use an independently downloaded SHA-256 manifest for production acceptance. Explicit `--compare metadata` also compares length and modification time at File Station's one-second resolution but omits content hashing; `--compare size-only` checks length only. Those performance modes can miss changes and do not provide post-upload content verification.
+File Station's server-side checksum API exposes only MD5, so content mode uses the documented Download API to stream selected remote files and compute MD5, IEEE CRC32, and SHA-256 together. The configured account therefore needs permission to download every in-scope file, and remote verification consumes the corresponding read bandwidth on each selected pass. A match requires all three digests; MD5 remains in structured output for compatibility and is never sufficient by itself. Keep an independently generated and separately retained SHA-256 manifest for production acceptance because it provides an external recovery check rather than trusting the same live endpoint and process. Explicit `--compare metadata` also compares length and modification time at File Station's one-second resolution but omits content hashing; `--compare size-only` checks length only. Those performance modes can miss changes and do not provide post-upload content verification.
 
 Missing folders are planned shallowest-first and created before copies/uploads. The client also requests parent creation from File Station, while all generated remote paths remain contained under the configured logical root. This preserves the source hierarchy and empty directories; directory mtimes, ACLs, ownership, modes, xattrs, and other filesystem metadata remain outside the parity contract.
 
@@ -486,7 +486,7 @@ DSM often returns HTTP 200 with a JSON API error, so the CLI validates both laye
 - DSM `150`: login and later requests appear to originate from different client IPs;
 - DSM `1800`: multipart content length is absent or inconsistent.
 
-Transient transport, busy, 408/429, and 502/503/504 failures use bounded retry. File Station exposes no resumable upload protocol. In the default content mode, the client first checks whether a lost/retryable response nevertheless left the exact expected size and MD5 at the destination; it accepts that completed upload, otherwise the retry restarts the entire file. A source file that changes during transfer fails the run before remote-only deletion. Before reporting success, the client rescans and rehashes both sides and requires a fresh plan with no pending in-scope operation.
+Transient transport, busy, 408/429, and 502/503/504 failures use bounded retry. File Station exposes no resumable upload protocol. In the default content mode, the client first checks whether a lost/retryable response nevertheless left the exact expected size and complete MD5/CRC32/SHA-256 fingerprint at the destination; it accepts that completed upload, otherwise the retry restarts the entire file. A source file that changes during transfer fails the run before remote-only deletion. Before reporting success, the client rescans and rehashes both sides and requires a fresh plan with no pending in-scope operation.
 
 ## Deliberate limitations
 

@@ -26,7 +26,7 @@
   <p>The optional write test creates a unique probe, verifies it, and removes it. It requires package capability, an explicit checkbox, a second cleanup acknowledgement, and a confirmation dialog. Use only a non-critical destination. A cleanup failure is diagnostic failure evidence and must be investigated.</p>
 
   <h2>Terminal and unknown outcomes</h2>
-  <p><strong>Completed</strong> and <strong>failed</strong> are terminal package results. If a queued job can no longer be observed because status evidence is invalid, expired, or repeatedly unavailable, the UI reports <strong>outcome unknown</strong>. Do not immediately resubmit an unknown operation; inspect Activity and logs to avoid a duplicate.</p>
+  <p><strong>Completed</strong> and <strong>failed</strong> are terminal package results. If a queued job can no longer be observed because status evidence is invalid, expired, or repeatedly unavailable, the UI reports <strong>outcome unknown</strong>. Every mutation and autosave is then locked in the current AppWindow. Inspect authoritative package state, Activity, and logs to avoid a duplicate, then reopen the AppWindow before taking another action; do not resubmit from the uncertain session.</p>
 
   <h2>Cached target health</h2>
   <p>The table displays the newest package-reported evidence for reachability, authentication, writability, latency, Doctor status, last successful sync, and free space. <em>Unavailable</em> means evidence was not supplied; it is not equivalent to success or failure.</p>

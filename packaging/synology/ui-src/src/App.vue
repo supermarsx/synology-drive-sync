@@ -51,8 +51,8 @@
               <v-button
                 type="border"
                 display="icon-text"
-                tooltip="Refresh current data"
-                :disabled="snapshotLoading"
+                :tooltip="snapshotRefreshBlocked ? 'Close the profile editor before refreshing package status' : 'Refresh current data'"
+                :disabled="snapshotLoading || snapshotRefreshBlocked"
                 @click="refreshSnapshot(true)"
               ><template #icon><action-icon name="refresh" /></template>Refresh</v-button>
             </div>
@@ -62,7 +62,14 @@
             <div>
               <strong>{{ bridgeIssue.title || 'Read-only mode' }}</strong>
               <span>{{ bridgeIssue.message || 'Live status remains available, but changes stay disabled until the authenticated DSM bridge is ready.' }}</span>
-              <v-button type="border" display="icon-text" tooltip="Retry DSM authentication and reload package status" :disabled="snapshotLoading" @click="refreshSnapshot(true)"><template #icon><action-icon name="refresh" /></template>Retry</v-button>
+              <v-button type="border" display="icon-text" :tooltip="snapshotRefreshBlocked ? 'Close the profile editor before retrying package status' : 'Retry DSM authentication and reload package status'" :disabled="snapshotLoading || snapshotRefreshBlocked" @click="refreshSnapshot(true)"><template #icon><action-icon name="refresh" /></template>Retry</v-button>
+            </div>
+          </div>
+
+          <div v-if="mutationOutcomeUnresolved" class="sdsync-banner sdsync-mutation-barrier" role="alert" aria-live="assertive">
+            <div>
+              <strong>Mutation outcome needs reconciliation</strong>
+              <span>{{ mutationOutcomeGuidance }}</span>
             </div>
           </div>
 
@@ -140,14 +147,14 @@
               <v-form v-else key="profile-editor" v-model="profileForm" class="sdsync-panel sdsync-editor sdsync-profile-editor" direction="vertical" @submit="saveProfile">
                 <div class="sdsync-panel-heading">
                   <div><p class="sdsync-eyebrow">Profile editor</p><h3>{{ selectedProfile ? 'Edit ' + selectedProfile : 'New profile' }}</h3></div>
-                  <v-button type="border" display="icon-text" tooltip="Close the editor and clear unsubmitted secret fields" @click="closeProfile"><template #icon><action-icon name="close" /></template>Close</v-button>
+                  <v-button type="border" display="icon-text" tooltip="Close the editor and clear unsubmitted secret fields" :disabled="profileSaveState === 'saving' || profileConnectionState === 'testing'" @click="closeProfile"><template #icon><action-icon name="close" /></template>Close</v-button>
                 </div>
                 <div class="sdsync-form-grid">
                   <v-form-item class="sdsync-form-item" label="Name" prop="name"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-name" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.name" :readonly="Boolean(selectedProfile)" maxlength="64" placeholder="office_nas" aria-describedby="sdsync-help-profile-name" :disabled="!canChangeProfiles" /></v-form-item>
-                  <v-form-item class="sdsync-form-item" label="Local source" prop="source"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-source" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.source" maxlength="4096" placeholder="/volume1/Source" aria-describedby="sdsync-help-profile-source" :disabled="!canChangeProfiles" /></v-form-item>
+                  <v-form-item class="sdsync-form-item" label="Local source" prop="source"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-source" /></template><div class="sdsync-path-control"><v-input class="sdsync-input-control" v-model.trim="profileForm.source" maxlength="4096" placeholder="/volume1/Source" aria-describedby="sdsync-help-profile-source" :disabled="!canChangeProfiles" /><v-button type="border" display="icon-text" html-type="button" tooltip="Browse only NAS folders the package identity can read and traverse" :disabled="!canChangeProfiles || pathBrowser.loading" @click="openLocalSourceBrowser"><template #icon><action-icon name="folder" /></template>Browse NAS</v-button></div></v-form-item>
                   <v-form-item class="sdsync-form-item span-2" label="File Station URL" prop="url"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-url" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.url" maxlength="2048" placeholder="https://files.example.com" aria-describedby="sdsync-help-profile-url" :disabled="!canChangeProfiles" /></v-form-item>
                   <v-form-item class="sdsync-form-item" label="DSM username" prop="username"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-username" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.username" maxlength="256" autocomplete="username" aria-describedby="sdsync-help-profile-username" :disabled="!canChangeProfiles" /></v-form-item>
-                  <v-form-item class="sdsync-form-item" label="Remote logical path" prop="remote"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-remote" /></template><v-input class="sdsync-input-control" v-model.trim="profileForm.remote" maxlength="247" placeholder="/home/Drive/NAS Backup" aria-describedby="sdsync-help-profile-remote" :disabled="!canChangeProfiles" /></v-form-item>
+                  <v-form-item class="sdsync-form-item" label="Remote logical path" prop="remote"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-remote" /></template><div class="sdsync-path-control"><v-input class="sdsync-input-control" v-model.trim="profileForm.remote" maxlength="247" placeholder="/home/Drive/NAS Backup" aria-describedby="sdsync-help-profile-remote" :disabled="!canChangeProfiles" /><v-button type="border" display="icon-text" html-type="button" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : (connectionTestReady ? 'Browse directories returned by the authenticated File Station account' : 'Test authentication successfully before browsing File Station')" :disabled="!canChangeProfiles || mutationOutcomeUnresolved || !connectionTestReady || pathBrowser.loading" @click="openRemotePathBrowser"><template #icon><action-icon name="folder" /></template>{{ mutationOutcomeUnresolved ? 'Browse locked' : 'Browse target' }}</v-button></div></v-form-item>
                   <v-form-item class="sdsync-form-item" label="Comparison"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-compare" /></template><v-single-select class="sdsync-select-control" v-model="profileForm.compare" :options="compareOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-profile-compare" :disabled="!canChangeProfiles"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
                   <v-form-item class="sdsync-form-item" label="Concurrent uploads"><template #label-after><control-help class="sdsync-form-label-help" help-key="profile-jobs" /></template><v-input class="sdsync-input-control" v-model="profileForm.jobs" number-only aria-describedby="sdsync-help-profile-jobs" :disabled="!canChangeProfiles" /></v-form-item>
                   <div class="sdsync-toggle-row span-2"><span class="sdsync-toggle-label">Allow plain HTTP for controlled LAN testing <control-help help-key="profile-http" /></span><v-checkbox class="sdsync-checkbox-control" v-model="profileForm.allow_http" aria-label="Allow plain HTTP for controlled LAN testing" aria-describedby="sdsync-help-profile-http" :disabled="!canEditHttpException" /></div>
@@ -200,19 +207,24 @@
                     <v-single-select class="sdsync-select-control sdsync-secret-mode" v-model="secretModes.totp" :options="secretModeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-secret-totp-mode" :disabled="!canManageSecrets"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help class="sdsync-secret-mode-help" help-key="secret-totp-mode" />
                     <v-input class="sdsync-input-control sdsync-secret-value" v-if="secretModes.totp === 'replace'" v-model="secretValues.totp" type="password" maxlength="4096" autocomplete="off" placeholder="Base32 seed or otpauth URI" aria-describedby="sdsync-help-secret-totp-value" :disabled="!canManageSecrets" /><control-help class="sdsync-secret-value-help" v-if="secretModes.totp === 'replace'" help-key="secret-totp-value" />
                   </div>
+                  <div class="sdsync-connection-test span-2">
+                    <v-button type="border" display="icon-text" html-type="button" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : 'Authenticate with this draft without storing it, then close the temporary File Station session'" :disabled="!canTestProfileAuthentication" :aria-busy="profileConnectionState === 'testing' ? 'true' : 'false'" @click="testProfileAuthentication"><template #icon><action-icon :class="{ 'sdsync-is-spinning': profileConnectionState === 'testing' }" :name="profileConnectionState === 'testing' ? 'refresh' : 'doctor'" /></template>{{ profileConnectionState === 'testing' ? 'Testing authentication…' : (mutationOutcomeUnresolved ? 'Authentication locked' : 'Test authentication') }}</v-button>
+                    <span :class="['sdsync-connection-state', 'is-' + profileConnectionState]" role="status" aria-live="polite">{{ profileConnectionMessage }}</span>
+                  </div>
                   <p class="sdsync-field-note">Secret values are sent only in the protected request body. They are never returned to this window.</p>
                   <div v-if="selectedProfile" class="sdsync-secret-actions">
-                    <v-button suffix="main" display="icon-text" html-type="button" tooltip="Apply only changed password, TOTP, and remote-log token operations without rewriting profile configuration" :disabled="!canManageSecrets || !hasPendingSecretOperations || operationBusy" @click="saveProfileSecrets"><template #icon><action-icon name="save" /></template>Save changed secrets</v-button>
+                    <v-button suffix="main" display="icon-text" html-type="button" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : 'Apply only changed password, TOTP, and remote-log token operations without rewriting profile configuration'" :disabled="!canSubmitProfileSecrets" :aria-busy="profileSaveState === 'saving' ? 'true' : 'false'" @click="saveProfileSecrets"><template #icon><action-icon :class="{ 'sdsync-is-spinning': profileSaveState === 'saving' }" :name="profileSaveState === 'saving' ? 'refresh' : 'save'" /></template>{{ profileSaveState === 'saving' ? 'Saving changed secrets…' : (mutationOutcomeUnresolved ? 'Secrets locked' : 'Save changed secrets') }}</v-button>
                   </div>
                 </fieldset>
 
                 <div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Use as default profile <control-help help-key="profile-default" /></span><v-checkbox class="sdsync-checkbox-control" v-model="profileForm.make_default" aria-label="Use as default profile" aria-describedby="sdsync-help-profile-default" :disabled="!canChangeProfiles" /></div>
                 <div class="sdsync-form-actions">
-                  <v-button v-if="selectedProfile" suffix="red" display="icon-text" tooltip="Remove package configuration and stored credentials, not synchronized files" :disabled="!canChangeProfiles || operationBusy" @click="removeProfile"><template #icon><action-icon name="delete" /></template>Delete profile</v-button>
+                  <v-button v-if="selectedProfile" suffix="red" display="icon-text" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : 'Remove package configuration and stored credentials, not synchronized files'" :disabled="!canRemoveProfile" @click="removeProfile"><template #icon><action-icon name="delete" /></template>Delete profile</v-button>
                   <span class="sdsync-field-note">Existing safe profile changes autosave after 1.3 seconds. Creation, secrets, and new risk approvals stay explicit.</span>
-                  <v-button suffix="cancel" display="icon-text" tooltip="Discard unsaved editor values and clear secret fields" @click="closeProfile"><template #icon><action-icon name="close" /></template>Cancel</v-button>
-                  <v-button suffix="main" display="icon-text" html-type="submit" tooltip="Validate and apply configuration immediately, then process explicit secret operations" :disabled="!canChangeProfiles || operationBusy"><template #icon><action-icon name="save" /></template>{{ selectedProfile ? 'Save now' : 'Create profile' }}</v-button>
+                  <v-button suffix="cancel" display="icon-text" tooltip="Discard unsaved editor values and clear secret fields" :disabled="profileSaveState === 'saving' || profileConnectionState === 'testing'" @click="closeProfile"><template #icon><action-icon name="close" /></template>Cancel</v-button>
+                  <v-button suffix="main" display="icon-text" html-type="submit" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : 'Validate and apply configuration immediately, then process explicit secret operations'" :disabled="!canSubmitProfile" :aria-busy="profileSaveState === 'saving' ? 'true' : 'false'"><template #icon><action-icon :class="{ 'sdsync-is-spinning': profileSaveState === 'saving' }" :name="profileSaveState === 'saving' ? 'refresh' : 'save'" /></template>{{ profileSaveButtonText }}</v-button>
                 </div>
+                <p v-if="profileSaveMessage" :class="['sdsync-save-state', 'is-' + profileSaveState]" role="status" aria-live="polite">{{ profileSaveMessage }}</p>
               </v-form>
               </transition>
             </div>
@@ -252,7 +264,7 @@
                     </div>
                     <fieldset v-if="routineForm.mode === 'daily'" class="sdsync-weekday-fieldset" aria-describedby="sdsync-help-routine-weekdays" :disabled="!canChangeRoutines"><legend>Active weekdays <control-help help-key="routine-weekdays" /></legend><div class="sdsync-weekdays"><label v-for="day in weekdayOptions" :key="day.value"><input v-model="routineForm.weekdays" type="checkbox" :value="day.value" :disabled="!canChangeRoutines"><span>{{ day.label }}</span></label></div></fieldset>
                     <fieldset class="sdsync-danger-fieldset"><legend>Routine deletion guard</legend><div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Permit profile deletion rules <control-help help-key="routine-delete" /></span><v-checkbox class="sdsync-checkbox-control" v-model="routineForm.allow_delete" aria-label="Permit profile deletion rules" aria-describedby="sdsync-help-routine-delete" :disabled="!canEditRoutineDeletion" /></div><v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Routine deletion approval ceiling"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-max-delete" /></template><v-input class="sdsync-input-control" v-model="routineForm.max_total_delete" number-only aria-describedby="sdsync-help-routine-max-delete" :disabled="!canChangeRoutines" /></v-form-item></fieldset>
-                    <div class="sdsync-form-actions"><v-button suffix="red" display="icon-text" tooltip="Remove this automation policy without deleting its profile" :disabled="!canChangeRoutines || !selectedRoutine || operationBusy" @click="removeRoutine"><template #icon><action-icon name="delete" /></template>Remove routine</v-button><span class="sdsync-field-note">Existing safe routine changes autosave after 1.3 seconds. Creation and deletion approval stay explicit.</span><v-button suffix="cancel" display="icon-text" tooltip="Discard unsaved routine values" @click="closeRoutine"><template #icon><action-icon name="close" /></template>Cancel</v-button><v-button suffix="main" display="icon-text" html-type="submit" tooltip="Validate and apply this per-profile automation policy immediately" :disabled="!canChangeRoutines || !routineForm.profile || operationBusy"><template #icon><action-icon name="save" /></template>Save now</v-button></div>
+                    <div class="sdsync-form-actions"><v-button suffix="red" display="icon-text" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : 'Remove this automation policy without deleting its profile'" :disabled="!canRemoveRoutine" @click="removeRoutine"><template #icon><action-icon name="delete" /></template>Remove routine</v-button><span class="sdsync-field-note">Existing safe routine changes autosave after 1.3 seconds. Creation and deletion approval stay explicit.</span><v-button suffix="cancel" display="icon-text" tooltip="Discard unsaved routine values" @click="closeRoutine"><template #icon><action-icon name="close" /></template>Cancel</v-button><v-button suffix="main" display="icon-text" html-type="submit" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : 'Validate and apply this per-profile automation policy immediately'" :disabled="!canSubmitRoutine"><template #icon><action-icon name="save" /></template>{{ mutationOutcomeUnresolved ? 'Save locked' : 'Save now' }}</v-button></div>
               </v-form>
             </div>
           </section>
@@ -302,7 +314,7 @@
                     <div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Notify on failure <control-help help-key="alerts-failure" /></span><v-checkbox class="sdsync-checkbox-control" v-model="alertForm.on_failure" aria-label="Notify on failure" aria-describedby="sdsync-help-alerts-failure" :disabled="!canChangeNotifications" /></div>
                     <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Failures before alert" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="alerts-threshold" /></template><v-input class="sdsync-input-control" v-model="alertForm.failure_threshold" number-only :disabled="!canChangeNotifications" aria-describedby="sdsync-help-alerts-threshold" /></v-form-item>
                     <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Cooldown (seconds)" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="alerts-cooldown" /></template><v-input class="sdsync-input-control" v-model="alertForm.cooldown_seconds" number-only :disabled="!canChangeNotifications" aria-describedby="sdsync-help-alerts-cooldown" /></v-form-item>
-                    <div class="sdsync-submit-row"><span class="sdsync-field-note">Valid changes autosave after 1.3 seconds.</span><v-button suffix="main" display="icon-text" html-type="submit" tooltip="Validate and persist the package-level DSM alert policy immediately" :disabled="!canChangeNotifications || operationBusy"><template #icon><action-icon name="save" /></template>Save now</v-button></div>
+                    <div class="sdsync-submit-row"><span class="sdsync-field-note">Valid changes autosave after 1.3 seconds.</span><v-button suffix="main" display="icon-text" html-type="submit" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : 'Validate and persist the package-level DSM alert policy immediately'" :disabled="!canSubmitAlerts"><template #icon><action-icon name="save" /></template>{{ mutationOutcomeUnresolved ? 'Save locked' : 'Save now' }}</v-button></div>
                   </v-form>
                 </div>
                 <div v-else id="sdsync-notifications-panel-session-preferences" key="session-preferences" class="sdsync-subtab-panel" data-subtab-panel="session-preferences" role="tabpanel" aria-labelledby="sdsync-notifications-tab-session-preferences" tabindex="0">
@@ -310,7 +322,7 @@
                     <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Open-session signal</p><h3>Browser fallback</h3></div><span :class="pillClass(notificationPermission)">{{ notificationPermission }}</span></div>
                     <div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Notify while this app is open <control-help help-key="session-notify" /></span><v-checkbox class="sdsync-checkbox-control" v-model="notificationForm.desktop_notifications" aria-label="Notify while this app is open" aria-describedby="sdsync-help-session-notify" :disabled="!canChangeNotifications" /></div>
                     <div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Audible cue <control-help help-key="session-audible" /></span><v-checkbox class="sdsync-checkbox-control" v-model="notificationForm.audible" aria-label="Use an audible cue" aria-describedby="sdsync-help-session-audible" :disabled="!canChangeNotifications" /></div>
-                    <div class="sdsync-submit-row"><v-button suffix="grey" display="icon-text" html-type="submit" tooltip="Save and audit non-secret notification preferences in this browser" :disabled="!canChangeNotifications || operationBusy"><template #icon><action-icon name="save" /></template>Save session preferences</v-button></div>
+                    <div class="sdsync-submit-row"><v-button suffix="grey" display="icon-text" html-type="submit" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : 'Save and audit non-secret notification preferences in this browser'" :disabled="!canSubmitNotificationPreferences"><template #icon><action-icon name="save" /></template>{{ mutationOutcomeUnresolved ? 'Save locked' : 'Save session preferences' }}</v-button></div>
                   </v-form>
                 </div>
               </transition>
@@ -318,11 +330,11 @@
           </section>
 
           <section v-else-if="route === 'security'" class="sdsync-page" aria-labelledby="sdsync-page-title">
-            <security-panel :value="securityForm" :disabled="!canMutate" :busy="operationBusy" :dirty="securityDirty" :theme-class="themeClass" :log-level-options="logLevelOptions" @input="updateSecurityForm" @save="saveSecurityPolicy" />
+            <security-panel :value="securityForm" :disabled="!canMutate" :busy="operationBusy" :dirty="securityDirty" :save-blocked="mutationOutcomeUnresolved" :save-blocked-message="mutationOutcomeGuidance" :theme-class="themeClass" :log-level-options="logLevelOptions" @input="updateSecurityForm" @save="saveSecurityPolicy" />
           </section>
 
           <section v-else-if="route === 'settings'" class="sdsync-page" aria-labelledby="sdsync-page-title">
-            <v-form v-model="settings" class="sdsync-panel sdsync-settings-panel" direction="horizontal" @submit="saveInterfaceSettings"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Display and refresh</p><h3>Interface</h3></div></div><v-form-item class="sdsync-form-item" label="Theme"><template #label-after><control-help class="sdsync-form-label-help" help-key="settings-theme" /></template><v-single-select class="sdsync-select-control" v-model="settings.theme" :options="themeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-theme" :disabled="!canChangeInterface"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item><v-form-item class="sdsync-form-item" label="Status refresh"><template #label-after><control-help class="sdsync-form-label-help" help-key="settings-status-refresh" /></template><v-single-select class="sdsync-select-control" v-model="settings.status_refresh" :options="statusRefreshOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-status-refresh" :disabled="!canChangeInterface"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item><v-form-item class="sdsync-form-item" label="Log refresh"><template #label-after><control-help class="sdsync-form-label-help" help-key="settings-log-refresh" /></template><v-single-select class="sdsync-select-control" v-model="settings.log_refresh" :options="logRefreshOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-log-refresh" :disabled="!canChangeInterface"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item><div class="sdsync-form-actions sdsync-settings-actions"><span /><span class="sdsync-field-note">Valid changes autosave after 1.3 seconds.</span><v-button suffix="main" display="icon-text" html-type="submit" tooltip="Apply, persist, and audit this browser's AppWindow preferences immediately" :disabled="!canChangeInterface || operationBusy"><template #icon><action-icon name="save" /></template>Save now</v-button></div></v-form>
+            <v-form v-model="settings" class="sdsync-panel sdsync-settings-panel" direction="horizontal" @submit="saveInterfaceSettings"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Display and refresh</p><h3>Interface</h3></div></div><v-form-item class="sdsync-form-item" label="Theme"><template #label-after><control-help class="sdsync-form-label-help" help-key="settings-theme" /></template><v-single-select class="sdsync-select-control" v-model="settings.theme" :options="themeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-theme" :disabled="!canChangeInterface"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item><v-form-item class="sdsync-form-item" label="Status refresh"><template #label-after><control-help class="sdsync-form-label-help" help-key="settings-status-refresh" /></template><v-single-select class="sdsync-select-control" v-model="settings.status_refresh" :options="statusRefreshOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-status-refresh" :disabled="!canChangeInterface"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item><v-form-item class="sdsync-form-item" label="Log refresh"><template #label-after><control-help class="sdsync-form-label-help" help-key="settings-log-refresh" /></template><v-single-select class="sdsync-select-control" v-model="settings.log_refresh" :options="logRefreshOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-settings-log-refresh" :disabled="!canChangeInterface"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item><div class="sdsync-form-actions sdsync-settings-actions"><span /><span class="sdsync-field-note">Valid changes autosave after 1.3 seconds.</span><v-button suffix="main" display="icon-text" html-type="submit" :tooltip="mutationOutcomeUnresolved ? mutationOutcomeGuidance : 'Apply, persist, and audit this browser AppWindow preferences immediately'" :disabled="!canSubmitInterface"><template #icon><action-icon name="save" /></template>{{ mutationOutcomeUnresolved ? 'Save locked' : 'Save now' }}</v-button></div></v-form>
           </section>
 
           <section v-else-if="route === 'about'" class="sdsync-page" aria-labelledby="sdsync-page-title">
@@ -380,6 +392,20 @@
             </div>
           </div>
         </div>
+        <div v-if="pathBrowser.visible" class="sdsync-modal-backdrop" role="presentation" @click.self="closePathBrowser">
+          <div ref="pathBrowserDialog" class="sdsync-modal sdsync-path-browser" role="dialog" aria-modal="true" aria-labelledby="sdsync-path-browser-title" tabindex="-1">
+            <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Interactive path chooser</p><h2 id="sdsync-path-browser-title">{{ pathBrowser.kind === 'local' ? 'Choose a local NAS source' : 'Choose a File Station target' }}</h2></div><v-button ref="pathBrowserClose" type="border" display="icon-text" tooltip="Close the chooser and keep manual path entry" @click="closePathBrowser"><template #icon><action-icon name="close" /></template>Close</v-button></div>
+            <p class="sdsync-field-note">{{ pathBrowser.kind === 'local' ? 'Only canonical internal, USB, and SATA DSM volume directories readable and traversable by the package identity are shown.' : 'Only directories returned to the successfully authenticated DSM account are shown.' }}</p>
+            <div class="sdsync-path-browser-location"><code>{{ pathBrowser.current }}</code><span v-if="pathBrowser.loading" role="status">Loading…</span></div>
+            <div v-if="pathBrowser.error" class="sdsync-inline-error" role="alert">{{ pathBrowser.error }}</div>
+            <div class="sdsync-path-browser-actions"><v-button type="border" display="icon-text" tooltip="Open the parent directory" :disabled="pathBrowser.loading || !pathBrowser.parent" @click="browsePath(pathBrowser.parent)"><template #icon><action-icon name="up" /></template>Up</v-button><v-button suffix="main" display="icon-text" tooltip="Use the currently displayed directory" :disabled="pathBrowser.loading || pathBrowser.current === '/'" @click="selectPath(pathBrowser.current)"><template #icon><action-icon name="confirm" /></template>Use current</v-button></div>
+            <div class="sdsync-path-browser-list" role="list" :aria-busy="pathBrowser.loading ? 'true' : 'false'">
+              <div v-for="directory in pathBrowser.directories" :key="directory.path" class="sdsync-path-browser-row" role="listitem"><button type="button" @click="browsePath(directory.path)"><action-icon name="folder" /><span>{{ directory.name }}</span><action-icon name="navigate" /></button><v-button type="border" display="icon-text" tooltip="Select this directory" :disabled="pathBrowser.loading" @click="selectPath(directory.path)"><template #icon><action-icon name="confirm" /></template>Select</v-button></div>
+              <p v-if="!pathBrowser.loading && !pathBrowser.directories.length && !pathBrowser.error" class="sdsync-empty">No child directories are visible here.</p>
+            </div>
+            <p v-if="pathBrowser.truncated" class="sdsync-field-note">The bounded result was truncated. Open a narrower directory or enter the exact path manually.</p>
+          </div>
+        </div>
       </div>
     </v-app-window>
   </v-app-instance>
@@ -410,6 +436,14 @@ import SecurityPanel from "./SecurityPanel.vue";
 const SETTINGS_KEY = "sdsync.ui.settings.v1";
 const AUTOSAVE_SCOPES = Object.freeze(["profile", "routine", "alerts", "security", "interface"]);
 const PROFILE_SECRET_KINDS = Object.freeze(["password", "totp", "remote-log-token"]);
+const PROFILE_CONNECTION_API_LIMITS = Object.freeze({
+  csrfReissueTimeoutMs: 10000,
+  postRequestTimeoutMs: 30000,
+  postResponseTimeoutMs: 10000,
+  readTimeoutMs: 30000,
+  resultRequestTimeoutMs: 15000,
+  resultObservationTimeoutMs: 120000
+});
 
 function emptyProfileFailureRecords() {
   return {
@@ -430,6 +464,81 @@ function profileFailureSummary(records) {
     active: active.length > 0,
     outcomeUnknown: active.some((record) => record.outcomeUnknown === true),
     requiresInspection: active.some((record) => record.requiresInspection === true)
+  };
+}
+
+function scopeMutationOutcomeUnresolved(component, scope) {
+  return Boolean(
+    component
+    && ((component.autosaveOutcomeUnknownScopes
+      && component.autosaveOutcomeUnknownScopes[scope] === true)
+      || (component.autosaveInspectionScopes
+        && component.autosaveInspectionScopes[scope] === true))
+  );
+}
+
+function sessionMutationOutcomeUnresolved(component) {
+  const barrier = component && component.mutationSessionBarrier;
+  return Boolean(barrier && barrier.active === true
+    && (barrier.outcomeUnknown === true || barrier.requiresInspection === true));
+}
+
+function hasUnresolvedMutationOutcome(component) {
+  return AUTOSAVE_SCOPES.some((scope) => scopeMutationOutcomeUnresolved(component, scope))
+    || sessionMutationOutcomeUnresolved(component);
+}
+
+function unresolvedMutationGuidance(component) {
+  const hasUnknown = AUTOSAVE_SCOPES.some((scope) => Boolean(
+    component.autosaveOutcomeUnknownScopes
+    && component.autosaveOutcomeUnknownScopes[scope] === true
+  )) || Boolean(component.mutationSessionBarrier
+    && component.mutationSessionBarrier.outcomeUnknown === true);
+  return hasUnknown
+    ? "Previous mutation outcome unknown: it may already have been accepted. All mutations and autosave are locked in this AppWindow. Keep the draft open, reconcile Activity / Logs and current package state, then reopen the AppWindow before changing anything else."
+    : "Previous operation state may need inspection because cleanup failed or a mutation was only partially applied. All mutations and autosave are locked in this AppWindow. Keep the draft open, reconcile Activity / Logs and current package state, then reopen the AppWindow before changing anything else.";
+}
+
+function unresolvedMutationError(component) {
+  const error = new Error(unresolvedMutationGuidance(component));
+  error.outcomeUnknown = true;
+  error.requiresInspection = true;
+  return error;
+}
+
+function blockEveryAutosaveScope(component) {
+  if (!component || !component.autosaveCoordinator) return;
+  for (const scope of AUTOSAVE_SCOPES) {
+    const state = component.autosaveCoordinator.getState(scope);
+    if (state.registered) component.autosaveCoordinator.setScopeBlocked(scope, true);
+  }
+}
+
+function recordMutationSessionBarrier(component, kind, error, report = null) {
+  const outcomeUnknown = Boolean(report ? report.unknown === true : error && error.outcomeUnknown === true);
+  const requiresInspection = Boolean(
+    outcomeUnknown
+    || (report ? report.inspection === true : error && error.requiresInspection === true)
+  );
+  if (!outcomeUnknown && !requiresInspection) return false;
+  const previous = component.mutationSessionBarrier || {};
+  component.mutationSessionBarrier = {
+    active: true,
+    kind: previous.active === true ? previous.kind : kind,
+    outcomeUnknown: previous.outcomeUnknown === true || outcomeUnknown,
+    requiresInspection: previous.requiresInspection === true || requiresInspection
+  };
+  blockEveryAutosaveScope(component);
+  component.autosavePhase = "blocked";
+  component.autosaveMessage = unresolvedMutationGuidance(component);
+  return true;
+}
+
+function mutationAwareAutosaveStatus(component, status) {
+  if (!hasUnresolvedMutationOutcome(component)) return status;
+  return {
+    phase: "blocked",
+    message: unresolvedMutationGuidance(component)
   };
 }
 
@@ -501,6 +610,7 @@ const ABOUT_RUST_DEPENDENCIES = Object.freeze([
   { name: "clap", pin: "4.6.5", scope: "All platforms", url: "https://crates.io/crates/clap" },
   { name: "clap_complete", pin: "4.6.8", scope: "All platforms", url: "https://crates.io/crates/clap_complete" },
   { name: "clap_mangen", pin: "0.3.0", scope: "All platforms", url: "https://crates.io/crates/clap_mangen" },
+  { name: "crc32fast", pin: "1.5.1", scope: "All platforms", url: "https://crates.io/crates/crc32fast" },
   { name: "ctrlc", pin: "3.5.2", scope: "All platforms", url: "https://crates.io/crates/ctrlc" },
   { name: "ignore", pin: "0.4.31", scope: "All platforms", url: "https://crates.io/crates/ignore" },
   { name: "keyring-core", pin: "1.0.0", scope: "All platforms", url: "https://crates.io/crates/keyring-core" },
@@ -513,6 +623,7 @@ const ABOUT_RUST_DEPENDENCIES = Object.freeze([
   { name: "sha2", pin: "0.10.9", scope: "All platforms", url: "https://crates.io/crates/sha2" },
   { name: "subtle", pin: "2.6.1", scope: "All platforms", url: "https://crates.io/crates/subtle" },
   { name: "thiserror", pin: "2.0.19", scope: "All platforms", url: "https://crates.io/crates/thiserror" },
+  { name: "tokio", pin: "1.53.1", scope: "All platforms", url: "https://crates.io/crates/tokio" },
   { name: "toml", pin: "0.9.12+spec-1.1.0", scope: "All platforms", url: "https://crates.io/crates/toml" },
   { name: "totp-rs", pin: "5.7.2", scope: "All platforms", url: "https://crates.io/crates/totp-rs" },
   { name: "zeroize", pin: "1.9.0", scope: "All platforms", url: "https://crates.io/crates/zeroize" },
@@ -538,10 +649,10 @@ const CONTROL_HELP = Object.freeze({
   "profile-filter": "Search configured profiles by name, local source, File Station URL, DSM account, or destination path.",
   "profile-filter-status": "Limit the catalog to ready, missing-password, default, or automated profiles.",
   "profile-name": "Stable profile identifier; existing names cannot be changed.",
-  "profile-source": "Absolute NAS folder that supplies files for this one-way sync.",
+  "profile-source": "Absolute /volumeN source. Browse NAS shows only folders the package account can read and traverse; manual entry is still validated by the controller before save.",
   "profile-url": "HTTPS origin of the destination NAS File Station API.",
   "profile-username": "Destination DSM account used only by this profile.",
-  "profile-remote": "Logical File Station destination path, not a local mount path.",
+  "profile-remote": "Logical File Station destination path, not a local mount path. Test authentication before using the ACL-aware target browser.",
   "profile-compare": "Evidence used to decide whether a destination file needs upload.",
   "profile-jobs": "Parallel upload workers; accepted range is 1 through 16.",
   "profile-http": "Permit unencrypted HTTP only for an explicitly controlled LAN.",
@@ -675,6 +786,15 @@ function hasDotPathSegment(value) {
   return String(value || "").split("/").some((segment) => segment === "." || segment === "..");
 }
 
+function validLocalSourcePath(value) {
+  if (!validBoundedText(value, 4096) || value === "/" || !value.startsWith("/")
+    || value.endsWith("/") || value.includes("//") || value.includes("\\") || value.includes('"')) return false;
+  const components = value.slice(1).split("/");
+  if (!/^volume(?:USB|SATA)?[1-9][0-9]*$/.test(components[0])) return false;
+  const managed = new Set(["#recycle", "#snapshot", "@eadir", "@tmp", "@sharebin", "@apphome", "@appdata", "@appstore", "@apptemp", "@appconf", ".synologyworkingdirectory"]);
+  return components.every((component) => component && component !== "." && component !== ".." && !managed.has(component.toLowerCase()));
+}
+
 function emptyProfile() {
   return {
     name: "", source: "", url: "", username: "", remote: "", compare: "content", jobs: 2,
@@ -685,6 +805,10 @@ function emptyProfile() {
     verbosity: 0, quiet: false, log_level: "info", log_format: "json", progress: "never",
     output: "human", remote_log_url: "", remote_log_mode: "best-effort"
   };
+}
+
+function emptyPathBrowser() {
+  return { visible: false, kind: "", current: "/", parent: null, directories: [], loading: false, error: "", truncated: false, request: 0 };
 }
 
 function emptyRoutine(profile = "") {
@@ -848,15 +972,18 @@ export default {
       route: "overview", auth: { signal: undefined }, csrfToken: "", snapshot: null,
       connected: false, connectionLabel: "Connecting to package…", freshness: "Waiting for status",
       bridgeIssue: { title: "", message: "" },
-      snapshotTimer: 0, logTimer: 0, snapshotLoading: false, snapshotPromise: null, snapshotRefreshQueued: false, logsLoading: false, operationBusy: false,
+      snapshotTimer: 0, logTimer: 0, snapshotLoading: false, snapshotPromise: null, snapshotRefreshQueued: false, snapshotGeneration: 0, logsLoading: false, operationBusy: false,
       autosaveCoordinator: null, autosavePhase: "saved", autosaveMessage: "Autosave ready", alertDirty: false,
       autosaveFailureScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
       autosaveOutcomeUnknownScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
       autosaveInspectionScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
       profileFailureRecords: emptyProfileFailureRecords(),
+      mutationSessionBarrier: { active: false, kind: "", outcomeUnknown: false, requiresInspection: false },
       settings, profileFilter: "", profileFilterStatus: "all", profileEditorOpen: false, selectedProfile: "", profileForm: emptyProfile(),
       secretModes: { password: "keep", totp: "keep", remote_log_token: "keep" },
       secretValues: { password: "", totp: "", remote_log_token: "" },
+      profileConnectionState: "idle", profileConnectionMessage: "Test authentication to unlock the File Station browser.", connectionProof: "", connectionProofExpires: 0, connectionProofTimer: 0, profileConnectionRequest: 0,
+      profileSaveState: "idle", profileSaveMessage: "", pathBrowser: emptyPathBrowser(),
       routineEditorOpen: false, routineForm: emptyRoutine(), doctorForm: { scope: "all", write_test: false, write_confirm: false },
       alertForm: { enabled: false, on_success: false, on_failure: true, failure_threshold: 1, cooldown_seconds: 3600 },
       notificationTabs: [
@@ -874,8 +1001,9 @@ export default {
       lastFailureKey: "", toasts: [], toastSequence: 0,
       confirmation: { visible: false, title: "", message: "", button: "Confirm", resolve: null },
       confirmationPriorFocus: null, confirmationKeyHandler: null,
+      pathBrowserPriorFocus: null, pathBrowserKeyHandler: null,
       systemLight: false, visibilityHandler: null, mediaQuery: null, mediaHandler: null,
-      toastTimers: [], abortController: null, disposed: false
+      toastTimers: [], abortController: null, connectionWatchCleanups: [], disposed: false
     };
   },
   computed: {
@@ -907,9 +1035,24 @@ export default {
     securityPolicy() { return normalizedSecurityPolicy(this.snapshot && this.snapshot.security_policy); },
     installedPackageVersion() { return boundedText(this.snapshot && this.snapshot.package && this.snapshot.package.version, "Not reported by package API"); },
     canMutate() { return this.capabilities.mutations === true && Boolean(this.csrfToken); },
+    snapshotRefreshBlocked() { return this.profileEditorOpen === true || this.profileSaveState === "saving"; },
     canChangeInterface() { return this.canMutate && !this.operationBusy && this.securityPolicy.allow_interface_changes !== false; },
     canChangeProfiles() { return this.canMutate && !this.operationBusy && this.securityPolicy.allow_profile_changes !== false; },
     canManageSecrets() { return this.canMutate && !this.operationBusy && this.capabilities.secrets === true && this.securityPolicy.allow_secret_changes !== false; },
+    canTestProfileAuthentication() { return this.profileEditorOpen && this.canMutate && !this.operationBusy && !this.mutationOutcomeUnresolved && this.capabilities.profile_connection_test === true && this.securityPolicy.allow_operational_actions !== false && this.profileConnectionState !== "testing" && this.profileSaveState !== "saving"; },
+    connectionTestReady() { return this.profileConnectionState === "success" && Boolean(this.connectionProof) && this.connectionProofExpires > 0; },
+    mutationOutcomeUnresolved() { return hasUnresolvedMutationOutcome(this); },
+    mutationOutcomeGuidance() { return unresolvedMutationGuidance(this); },
+    canSubmitProfile() { return this.profileEditorOpen && this.canChangeProfiles && !this.mutationOutcomeUnresolved && this.profileSaveState !== "saving" && this.profileConnectionState !== "testing"; },
+    canSubmitProfileSecrets() { return Boolean(this.selectedProfile) && this.canManageSecrets && this.hasPendingSecretOperations && !this.mutationOutcomeUnresolved && this.profileSaveState !== "saving" && this.profileConnectionState !== "testing"; },
+    canRemoveProfile() { return Boolean(this.selectedProfile) && this.canChangeProfiles && !this.mutationOutcomeUnresolved && this.profileConnectionState !== "testing"; },
+    canSubmitRoutine() { return this.canChangeRoutines && Boolean(this.routineForm.profile) && !this.mutationOutcomeUnresolved; },
+    canRemoveRoutine() { return this.canChangeRoutines && Boolean(this.selectedRoutine) && !this.mutationOutcomeUnresolved; },
+    canSubmitAlerts() { return this.canChangeNotifications && !this.mutationOutcomeUnresolved; },
+    canSubmitNotificationPreferences() { return this.canChangeNotifications && !this.mutationOutcomeUnresolved; },
+    canSubmitSecurity() { return this.canMutate && this.securityDirty && !this.operationBusy && !this.mutationOutcomeUnresolved; },
+    canSubmitInterface() { return this.canChangeInterface && !this.mutationOutcomeUnresolved; },
+    profileSaveButtonText() { return this.profileSaveState === "saving" ? (this.selectedProfile ? "Saving profile…" : "Creating profile…") : (this.mutationOutcomeUnresolved ? "Save locked" : (this.selectedProfile ? "Save now" : "Create profile")); },
     canAllowHttp() { return this.canChangeProfiles && this.securityPolicy.allow_http_targets !== false; },
     canAllowEmptySource() { return this.canChangeProfiles && this.securityPolicy.allow_empty_source !== false; },
     canAllowInvalidTls() { return this.canChangeProfiles && this.securityPolicy.allow_invalid_tls !== false; },
@@ -924,7 +1067,7 @@ export default {
     canEditRemoteLogging() { return this.canChangeProfiles && (this.securityPolicy.allow_remote_logging !== false || Boolean(this.profileForm.remote_log_url)); },
     canChangeRoutines() { return this.canMutate && !this.operationBusy && this.securityPolicy.allow_routine_changes !== false; },
     canChangeNotifications() { return this.canMutate && !this.operationBusy && this.securityPolicy.allow_notification_changes !== false; },
-    canRunOperations() { return this.canMutate && !this.operationBusy && this.securityPolicy.allow_operational_actions !== false; },
+    canRunOperations() { return this.canMutate && !this.operationBusy && !this.mutationOutcomeUnresolved && this.securityPolicy.allow_operational_actions !== false; },
     canRunDoctorWrite() { return this.securityPolicy.allow_doctor_write_test !== false; },
     selectedProfileModel() { return this.profiles.find((profile) => String(profile.name) === String(this.selectedProfile)) || null; },
     profileLogFile() { return boundedText(this.selectedProfileModel && this.selectedProfileModel.log_file, "Package-managed sync.log"); },
@@ -960,7 +1103,7 @@ export default {
     },
     notificationPermission() { return window.Notification ? Notification.permission : "unsupported"; },
     themeClass() { const theme = this.settings.theme === "system" ? (this.systemLight ? "is-light" : "is-dark") : `is-${this.settings.theme}`; return theme; },
-    compareOptions() { return options([["content", "Content — size, MD5, mtime"], ["metadata", "Metadata — size and mtime"], ["size-only", "Size only"]]); },
+    compareOptions() { return options([["content", "Content — size, MD5, CRC32, SHA-256, mtime"], ["metadata", "Metadata — size and mtime"], ["size-only", "Size only"]]); },
     verbosityOptions() { return options([[0, "Normal"], [1, "Verbose"], [2, "Very verbose"]]); },
     logLevelOptions() { return options(["trace", "debug", "info", "warn", "error", "off"].map((value) => [value, value])); },
     logFormatOptions() { return options([["human", "Human readable"], ["json", "Structured JSON"]]); },
@@ -982,6 +1125,14 @@ export default {
   },
   watch: {
     profileForm: { deep: true, handler() { this.autosaveChanged("profile"); } },
+    "profileForm.url"() { this.invalidateConnectionTest(); },
+    "profileForm.username"() { this.invalidateConnectionTest(); },
+    "profileForm.allow_http"() { this.invalidateConnectionTest(); },
+    "profileForm.danger_invalid_certs"() { this.invalidateConnectionTest(); },
+    "profileForm.ca_certificate"() { this.invalidateConnectionTest(); },
+    "profileForm.connect_timeout"() { this.invalidateConnectionTest(); },
+    "profileForm.timeout"() { this.invalidateConnectionTest(); },
+    "profileForm.retries"() { this.invalidateConnectionTest(); },
     routineForm: { deep: true, handler() { this.autosaveChanged("routine"); } },
     alertForm: { deep: true, handler() { this.autosaveChanged("alerts"); } },
     securityForm: { deep: true, handler() { this.autosaveChanged("security"); } },
@@ -997,6 +1148,11 @@ export default {
       onSuperseded: () => this.refreshAutosaveStatus()
     });
     this.autosaveCoordinator.hydrate("interface", this.interfaceSettingsPayload());
+    this.connectionWatchCleanups = [
+      this.$watch("secretModes", () => this.invalidateConnectionTest(), { deep: true }),
+      this.$watch("secretValues.password", () => this.invalidateConnectionTest()),
+      this.$watch("secretValues.totp", () => this.invalidateConnectionTest())
+    ];
     this.controlLayoutCleanup = installControlLayout(this.$el);
     this.abortController = typeof window.AbortController === "function" ? new window.AbortController() : null;
     this.auth = {
@@ -1047,9 +1203,14 @@ export default {
     if (this.visibilityHandler) document.removeEventListener("visibilitychange", this.visibilityHandler);
     if (this.mediaQuery && this.mediaQuery.removeEventListener && this.mediaHandler) this.mediaQuery.removeEventListener("change", this.mediaHandler);
     if (this.controlLayoutCleanup) this.controlLayoutCleanup();
+    this.connectionWatchCleanups.forEach((cleanup) => { if (typeof cleanup === "function") cleanup(); });
+    this.connectionWatchCleanups = [];
+    this.clearConnectionProofTimer();
     this.removeConfirmationKeyHandler();
+    this.removePathBrowserKeyHandler();
     if (this.confirmation.resolve) this.confirmation.resolve(false);
     this.confirmationPriorFocus = null;
+    this.pathBrowserPriorFocus = null;
     this.clearSecrets();
     this.csrfToken = "";
     this.auth = { signal: undefined };
@@ -1176,19 +1337,20 @@ export default {
       const anyFailurePaused = AUTOSAVE_SCOPES.some((candidateScope) => (
         this.autosaveFailureScopes && this.autosaveFailureScopes[candidateScope] === true
       ));
-      this.autosaveCoordinator.setScopeBlocked(scope, failurePaused || Boolean(candidate.manual));
+      this.autosaveCoordinator.setScopeBlocked(scope, hasUnresolvedMutationOutcome(this) || failurePaused || Boolean(candidate.manual));
       if (scope === "alerts") this.alertDirty = next.dirty;
-      const status = currentAutosaveStatus(
+      const status = mutationAwareAutosaveStatus(this, currentAutosaveStatus(
         this.autosaveCoordinator,
         this.autosaveFailureScopes,
         "All changes saved",
         this.autosaveOutcomeUnknownScopes,
         this.autosaveInspectionScopes
-      );
+      ));
       this.autosavePhase = status.phase;
       this.autosaveMessage = status.phase === "blocked" && candidate.manual && !anyFailurePaused ? candidate.manual : status.message;
     },
     async dispatchAutosave(task) {
+      if (hasUnresolvedMutationOutcome(this)) throw unresolvedMutationError(this);
       if (this.disposed || !this.csrfToken) throw new Error("The authenticated package bridge is unavailable.");
       this.autosavePhase = "saving";
       this.autosaveMessage = "Saving changes…";
@@ -1257,13 +1419,13 @@ export default {
       const state = this.autosaveCoordinator ? this.autosaveCoordinator.getState(task.scope) : null;
       if (task.scope === "alerts" && state && !state.dirty) this.alertDirty = false;
       if (task.scope === "security" && state && !state.dirty) this.securityDirty = false;
-      const status = currentAutosaveStatus(
+      const status = mutationAwareAutosaveStatus(this, currentAutosaveStatus(
         this.autosaveCoordinator,
         this.autosaveFailureScopes,
         "Changes autosaved",
         this.autosaveOutcomeUnknownScopes,
         this.autosaveInspectionScopes
-      );
+      ));
       this.autosavePhase = status.phase;
       this.autosaveMessage = status.message;
     },
@@ -1294,24 +1456,25 @@ export default {
       }
       if (scope === "alerts") this.alertDirty = false;
       if (scope === "security") this.securityDirty = false;
-      const status = currentAutosaveStatus(
+      if (hasUnresolvedMutationOutcome(this)) blockEveryAutosaveScope(this);
+      const status = mutationAwareAutosaveStatus(this, currentAutosaveStatus(
         this.autosaveCoordinator,
         this.autosaveFailureScopes,
         "All changes saved",
         this.autosaveOutcomeUnknownScopes,
         this.autosaveInspectionScopes
-      );
+      ));
       this.autosavePhase = status.phase;
       this.autosaveMessage = status.message;
     },
     refreshAutosaveStatus(savedMessage = "All changes saved") {
-      const status = currentAutosaveStatus(
+      const status = mutationAwareAutosaveStatus(this, currentAutosaveStatus(
         this.autosaveCoordinator,
         this.autosaveFailureScopes,
         savedMessage,
         this.autosaveOutcomeUnknownScopes,
         this.autosaveInspectionScopes
-      );
+      ));
       this.autosavePhase = status.phase;
       this.autosaveMessage = status.message;
       return status;
@@ -1345,8 +1508,9 @@ export default {
       this.autosaveInspectionScopes.profile = summary.requiresInspection;
       if (this.autosaveCoordinator) {
         const state = this.autosaveCoordinator.getState("profile");
-        if (state.registered) this.autosaveCoordinator.setScopeBlocked("profile", summary.active);
+        if (state.registered) this.autosaveCoordinator.setScopeBlocked("profile", summary.active || hasUnresolvedMutationOutcome(this));
       }
+      if (hasUnresolvedMutationOutcome(this)) blockEveryAutosaveScope(this);
       if (refreshStatus) this.refreshAutosaveStatus();
       return summary;
     },
@@ -1383,6 +1547,7 @@ export default {
       this.cancelAutosave(scope, false);
       if (scope === "profile") {
         this.recordProfileFailure(profileSecretKind, error);
+        recordMutationSessionBarrier(this, "Profile mutation", error);
         return;
       }
       if (!this.autosaveFailureScopes || typeof this.autosaveFailureScopes !== "object") {
@@ -1403,6 +1568,8 @@ export default {
         const state = this.autosaveCoordinator.getState(scope);
         if (state.registered) this.autosaveCoordinator.setScopeBlocked(scope, true);
       }
+      recordMutationSessionBarrier(this, `${scope.charAt(0).toUpperCase()}${scope.slice(1)} mutation`, error);
+      if (hasUnresolvedMutationOutcome(this)) blockEveryAutosaveScope(this);
       this.refreshAutosaveStatus();
     },
     clearAutosaveFailure(scope) {
@@ -1500,7 +1667,20 @@ export default {
         this.toast("DSM Help unavailable", "Open DSM Help and select Synology Drive Sync.", true);
       }
     },
-    navigate(route) { if (!this.routes.some((item) => item.id === route)) return; if (this.route === "profiles" && route !== "profiles") this.closeProfile(); if (this.route === "routines" && route !== "routines") this.closeRoutine(); this.route = route; if (route === "activity") this.refreshLogs(); else window.clearTimeout(this.logTimer); },
+    navigate(route) {
+      if (!this.routes.some((item) => item.id === route)) return;
+      if (this.route === "profiles" && route !== "profiles") {
+        if (this.profileSaveState === "saving" || this.profileConnectionState === "testing") {
+          this.toast("Profile operation in progress", "Wait for the active save or authentication test to settle before leaving Profiles.", true);
+          return;
+        }
+        this.closeProfile();
+      }
+      if (this.route === "routines" && route !== "routines") this.closeRoutine();
+      this.route = route;
+      if (route === "activity") this.refreshLogs();
+      else window.clearTimeout(this.logTimer);
+    },
     moveSubtab(stateKey, tabs, event) {
       if (!event || !Array.isArray(tabs) || !tabs.length) return;
       const current = Math.max(0, tabs.findIndex((tab) => tab.id === this[stateKey]));
@@ -1572,24 +1752,29 @@ export default {
     between(value, minimum, maximum) { const parsed = Number(value); return Number.isInteger(parsed) && parsed >= minimum && parsed <= maximum; },
     toast(title, message, error = false) { if (this.disposed) return; const item = { id: ++this.toastSequence, title, message, error }; this.toasts.push(item); const timer = window.setTimeout(() => { if (this.disposed) return; const index = this.toasts.findIndex((candidate) => candidate.id === item.id); if (index >= 0) this.toasts.splice(index, 1); this.toastTimers = this.toastTimers.filter((candidate) => candidate !== timer); }, 6000); this.toastTimers.push(timer); },
     stopTimers() { window.clearTimeout(this.snapshotTimer); window.clearTimeout(this.logTimer); this.snapshotTimer = 0; this.logTimer = 0; },
-    scheduleSnapshot() { window.clearTimeout(this.snapshotTimer); this.snapshotTimer = 0; const interval = Number(this.settings.status_refresh); if (interval > 0 && !this.disposed && !document.hidden) this.snapshotTimer = window.setTimeout(() => this.refreshSnapshot(false), interval); },
+    scheduleSnapshot() { window.clearTimeout(this.snapshotTimer); this.snapshotTimer = 0; const interval = Number(this.settings.status_refresh); if (interval > 0 && !this.disposed && !document.hidden && !this.snapshotRefreshBlocked) this.snapshotTimer = window.setTimeout(() => this.refreshSnapshot(false), interval); },
     scheduleLogs() { window.clearTimeout(this.logTimer); this.logTimer = 0; const interval = Number(this.settings.log_refresh); if (interval > 0 && !this.disposed && !document.hidden && this.route === "activity" && !this.logsPaused) this.logTimer = window.setTimeout(() => this.refreshLogs(), interval); },
     async refreshCsrf(options = undefined) { if (this.disposed) return; this.csrfToken = ""; const model = await apiGet(this.auth, "csrf", {}, options); if (this.disposed) return; if (typeof model.csrf_token !== "string" || !model.csrf_token || model.csrf_token.length > 4096) throw new Error("Authenticated bridge did not issue a valid CSRF token"); this.csrfToken = model.csrf_token; },
     async refreshSnapshot(manual, requirePostMutationRead = false) {
       if (this.disposed || document.hidden) return false;
+      if (this.snapshotRefreshBlocked) {
+        if (manual) this.toast("Status refresh paused", "Close the profile editor to refresh package status. The active draft will not be overwritten.");
+        return false;
+      }
       if (this.snapshotPromise) {
         if (requirePostMutationRead) this.snapshotRefreshQueued = true;
         return this.snapshotPromise;
       }
       this.snapshotLoading = true;
+      const generation = this.snapshotGeneration;
       let cycle;
       cycle = (async () => {
         let succeeded = false;
         try {
           if (!this.csrfToken) await this.refreshCsrf();
-          if (this.disposed) return false;
+          if (this.disposed || generation !== this.snapshotGeneration || this.snapshotRefreshBlocked) return false;
           const snapshot = await apiGet(this.auth, "snapshot");
-          if (this.disposed) return false;
+          if (this.disposed || generation !== this.snapshotGeneration || this.snapshotRefreshBlocked) return false;
           if (snapshot.schema !== SNAPSHOT_SCHEMA) throw new Error("Unsupported DSM API schema");
           this.snapshot = snapshot;
           if (typeof snapshot.csrf_token === "string" && snapshot.csrf_token) this.csrfToken = snapshot.csrf_token;
@@ -1603,7 +1788,7 @@ export default {
           succeeded = true;
           if (manual) this.toast("Status refreshed", "The latest package snapshot is displayed.");
         } catch (error) {
-          if (this.disposed) return;
+          if (this.disposed || generation !== this.snapshotGeneration || this.snapshotRefreshBlocked) return false;
           this.csrfToken = "";
           this.connected = false;
           this.bridgeIssue = this.describeBridgeError(error, "status");
@@ -1616,7 +1801,7 @@ export default {
           const followUp = this.snapshotRefreshQueued;
           this.snapshotRefreshQueued = false;
           if (followUp) {
-            if (!this.disposed && !document.hidden) return this.refreshSnapshot(false, false);
+            if (!this.disposed && !document.hidden && !this.snapshotRefreshBlocked) return this.refreshSnapshot(false, false);
             return false;
           }
           if (!this.disposed) this.scheduleSnapshot();
@@ -1682,6 +1867,7 @@ export default {
     },
     async saveSecurityPolicy(event) {
       if (event && event.preventDefault) event.preventDefault();
+      if (hasUnresolvedMutationOutcome(this)) return this.toast("Mutations locked", unresolvedMutationGuidance(this), true);
       if (!this.canMutate || !this.securityDirty || this.operationBusy) return;
       this.cancelAutosave("security");
       const payload = this.securityPayload();
@@ -1737,9 +1923,236 @@ export default {
       }
     },
     clearProfileFilters() { this.profileFilter = ""; this.profileFilterStatus = "all"; },
+    clearConnectionProofTimer() {
+      if (this.connectionProofTimer && typeof window !== "undefined") window.clearTimeout(this.connectionProofTimer);
+      this.connectionProofTimer = 0;
+    },
+    scheduleConnectionProofExpiry(expires) {
+      this.clearConnectionProofTimer();
+      if (typeof window === "undefined" || !window.setTimeout) return;
+      const expire = () => {
+        this.connectionProofTimer = 0;
+        if (this.disposed || !this.connectionProof || this.connectionProofExpires !== expires) return;
+        const remaining = (expires * 1000) - Date.now();
+        if (remaining > 0) {
+          this.connectionProofTimer = window.setTimeout(expire, Math.min(remaining + 25, 2147483647));
+          return;
+        }
+        this.connectionProof = "";
+        this.connectionProofExpires = 0;
+        this.profileConnectionState = "expired";
+        this.profileConnectionMessage = "Authentication proof expired. Test this unchanged draft again to browse File Station.";
+        if (this.pathBrowser.visible && this.pathBrowser.kind === "remote") this.closePathBrowser();
+      };
+      this.connectionProofTimer = window.setTimeout(expire, Math.max(0, Math.min((expires * 1000) - Date.now() + 25, 2147483647)));
+    },
+    invalidateConnectionTest() {
+      this.profileConnectionRequest += 1;
+      this.clearConnectionProofTimer();
+      this.connectionProof = "";
+      this.connectionProofExpires = 0;
+      if (this.profileEditorOpen) {
+        this.profileConnectionState = "idle";
+        this.profileConnectionMessage = "Connection or credential draft changed. Test authentication again to browse File Station.";
+      }
+      if (this.pathBrowser.visible && this.pathBrowser.kind === "remote") this.closePathBrowser();
+    },
+    connectionRequestPayload() {
+      const existing = this.selectedProfileModel;
+      let passwordSource = "none";
+      let password = null;
+      if (this.secretModes.password === "replace") {
+        passwordSource = "provided";
+        password = this.secretValues.password;
+        if (!password) return { error: "Enter the DSM password before testing authentication." };
+      } else if (this.secretModes.password === "keep" && this.selectedProfile && existing && existing.has_password === true) {
+        passwordSource = "stored";
+      } else {
+        return { error: this.selectedProfile ? "This profile has no stored password. Choose Replace securely and enter one." : "A new profile needs a password. Enter it under Protected credentials." };
+      }
+      let totpSource = "none";
+      let totp = null;
+      if (this.secretModes.totp === "replace") {
+        totpSource = "provided";
+        totp = this.secretValues.totp;
+        if (!totp) return { error: "Enter the Base32 TOTP seed or otpauth URI, or choose Clear/Keep when TOTP is not required." };
+      } else if (this.secretModes.totp === "keep" && this.selectedProfile && existing && existing.has_totp === true) {
+        totpSource = "stored";
+      }
+      const connectTimeout = this.strictDraftInteger(this.profileForm.connect_timeout);
+      const timeout = this.strictDraftInteger(this.profileForm.timeout);
+      const retries = this.strictDraftInteger(this.profileForm.retries);
+      if (connectTimeout === null || timeout === null || retries === null) return { error: "Finish the connection timeout, upload timeout, and retries with whole numbers." };
+      if (!validBoundedText(this.profileForm.url, 2048)
+        || !(this.profileForm.url.startsWith("https://") || (this.profileForm.allow_http && this.profileForm.url.startsWith("http://")))) return { error: "Enter a valid HTTPS File Station URL, or explicitly allow HTTP for a controlled LAN target." };
+      if (!validBoundedText(this.profileForm.username, 256)) return { error: "Enter a valid DSM username." };
+      if (!this.between(connectTimeout, 1, 600) || !this.between(timeout, 1, 86400) || !this.between(retries, 0, 5)) return { error: "Connection timeout, upload timeout, or retries is outside the supported range." };
+      if (this.profileForm.ca_certificate && (!validBoundedText(this.profileForm.ca_certificate, 4096) || !this.profileForm.ca_certificate.startsWith("/") || hasDotPathSegment(this.profileForm.ca_certificate))) return { error: "CA certificate must be an absolute NAS path without dot segments." };
+      return {
+        profile: this.selectedProfile || null,
+        url: this.profileForm.url,
+        username: this.profileForm.username,
+        allow_http: this.profileForm.allow_http === true,
+        danger_accept_invalid_certs: this.profileForm.danger_invalid_certs === true,
+        ca_certificate: this.profileForm.ca_certificate || null,
+        connect_timeout_seconds: connectTimeout,
+        timeout_seconds: timeout,
+        retries,
+        password_source: passwordSource,
+        password,
+        totp_source: totpSource,
+        totp
+      };
+    },
+    async testProfileAuthentication(event) {
+      if (event && event.preventDefault) event.preventDefault();
+      if (hasUnresolvedMutationOutcome(this)) return this.toast("Authentication test locked", unresolvedMutationGuidance(this), true);
+      if (!this.canTestProfileAuthentication) return this.toast("Authentication test unavailable", "Wait for the current profile operation to finish and confirm that operational actions are permitted.", true);
+      const payload = this.connectionRequestPayload();
+      if (payload.error) return this.toast("Authentication not tested", payload.error, true);
+      const request = ++this.profileConnectionRequest;
+      this.operationBusy = true;
+      this.connectionProof = "";
+      this.connectionProofExpires = 0;
+      this.profileConnectionState = "testing";
+      this.profileConnectionMessage = "Discovering File Station and testing this draft…";
+      try {
+        const result = await apiPost(this.auth, this.csrfToken, ACTIONS.testProfileAuth, payload, true, undefined, PROFILE_CONNECTION_API_LIMITS);
+        if (this.disposed || request !== this.profileConnectionRequest || !this.profileEditorOpen) return;
+        const proof = boundedText(result.connection_proof, "");
+        const expires = Number(result.connection_proof_expires_at_epoch);
+        const proofExpires = Number(proof.split(".")[1]);
+        if (!/^v1\.[0-9]+\.[0-9a-f]{64}\.[0-9a-f]{64}$/.test(proof) || !Number.isSafeInteger(expires) || !Number.isSafeInteger(proofExpires) || proofExpires !== expires || expires <= Math.floor(Date.now() / 1000)) throw new Error("The package returned an invalid authentication proof.");
+        this.connectionProof = proof;
+        this.connectionProofExpires = expires;
+        this.scheduleConnectionProofExpiry(expires);
+        this.profileConnectionState = "success";
+        this.profileConnectionMessage = "Authentication succeeded. File Station browsing is unlocked for this unchanged draft.";
+        this.toast("Authentication succeeded", "The temporary File Station session was closed; no draft credential was stored by the test.");
+      } catch (error) {
+        if (this.disposed || request !== this.profileConnectionRequest || !this.profileEditorOpen) return;
+        this.profileConnectionState = "error";
+        const unresolved = recordMutationSessionBarrier(this, "Authentication test", error);
+        this.profileConnectionMessage = unresolved
+          ? unresolvedMutationGuidance(this)
+          : boundedText(error && error.message, "Authentication failed.");
+        const title = unresolved
+          ? (error && error.outcomeUnknown === true ? "Authentication outcome unknown" : "Authentication cleanup needs inspection")
+          : "Authentication failed";
+        this.toast(title, this.profileConnectionMessage, true);
+      } finally {
+        if (!this.disposed) this.operationBusy = false;
+      }
+    },
+    openLocalSourceBrowser(event) {
+      if (event && event.preventDefault) event.preventDefault();
+      if (!this.profileEditorOpen || !this.canChangeProfiles) return;
+      const initial = validLocalSourcePath(this.profileForm.source) ? this.profileForm.source : "/";
+      return this.showPathBrowser("local", initial);
+    },
+    openRemotePathBrowser(event) {
+      if (event && event.preventDefault) event.preventDefault();
+      if (hasUnresolvedMutationOutcome(this)) return this.toast("File Station browse locked", unresolvedMutationGuidance(this), true);
+      if (this.connectionProofExpires <= Math.floor(Date.now() / 1000)) this.invalidateConnectionTest();
+      if (!this.connectionTestReady) return this.toast("Test authentication first", "The File Station browser unlocks only after this exact connection and credential draft authenticates successfully.", true);
+      const initial = this.profileForm.remote && this.profileForm.remote.startsWith("/") ? this.profileForm.remote : "/";
+      return this.showPathBrowser("remote", initial);
+    },
+    showPathBrowser(kind, initial) {
+      this.removePathBrowserKeyHandler();
+      this.pathBrowserPriorFocus = typeof document !== "undefined" ? document.activeElement : null;
+      this.pathBrowserKeyHandler = (event) => this.handlePathBrowserKeydown(event);
+      if (typeof document !== "undefined") document.addEventListener("keydown", this.pathBrowserKeyHandler, true);
+      this.pathBrowser = Object.assign(emptyPathBrowser(), { visible: true, kind, current: initial, parent: this.browserParent(initial) });
+      if (typeof this.$nextTick === "function") {
+        this.$nextTick(() => {
+          if (!this.pathBrowser.visible || this.disposed) return;
+          const initialFocus = this.confirmationElement("pathBrowserClose") || this.confirmationElement("pathBrowserDialog");
+          if (initialFocus && initialFocus.focus) initialFocus.focus();
+        });
+      }
+      return this.browsePath(initial);
+    },
+    browserParent(path) {
+      if (!path || path === "/") return null;
+      const index = path.lastIndexOf("/");
+      return index <= 0 ? "/" : path.slice(0, index);
+    },
+    async browsePath(path) {
+      if (!this.pathBrowser.visible || this.pathBrowser.loading || !path) return;
+      const kind = this.pathBrowser.kind;
+      if (kind === "remote" && hasUnresolvedMutationOutcome(this)) {
+        this.pathBrowser.error = unresolvedMutationGuidance(this);
+        return;
+      }
+      if (kind === "remote" && this.connectionProofExpires <= Math.floor(Date.now() / 1000)) {
+        this.invalidateConnectionTest();
+        return this.toast("Authentication expired", "Test authentication again before browsing File Station.", true);
+      }
+      if (kind === "remote" && !this.connectionTestReady) {
+        this.closePathBrowser();
+        return this.toast("Authentication expired", "Test authentication again before browsing File Station.", true);
+      }
+      const request = this.pathBrowser.request + 1;
+      this.pathBrowser.request = request;
+      this.pathBrowser.current = path;
+      this.pathBrowser.parent = this.browserParent(path);
+      this.pathBrowser.loading = true;
+      this.pathBrowser.error = "";
+      try {
+        let result;
+        if (kind === "local") {
+          result = await apiGet(this.auth, "source-directories", { parent: path });
+          if (result.schema !== "sdsync.dsm-source-directories.v1") throw new Error("The package returned an unsupported source-browser document.");
+        } else {
+          const connection = this.connectionRequestPayload();
+          if (connection.error) throw new Error(connection.error);
+          result = await apiPost(this.auth, this.csrfToken, ACTIONS.browseRemote, Object.assign({}, connection, { parent: path, connection_proof: this.connectionProof }), true, undefined, PROFILE_CONNECTION_API_LIMITS);
+          if (result.directory_schema !== "sdsync.dsm-remote-directories.v1") throw new Error("The package returned an unsupported File Station browser document.");
+        }
+        if (this.disposed || !this.pathBrowser.visible || request !== this.pathBrowser.request || kind !== this.pathBrowser.kind) return;
+        const current = boundedText(result.current, "");
+        const directories = arrayOf(result.directories).filter((entry) => entry && typeof entry === "object" && validBoundedText(entry.name, 255) && validBoundedText(entry.path, kind === "local" ? 4096 : 247)).map((entry) => ({ name: entry.name, path: entry.path }));
+        if (current !== path || directories.length !== arrayOf(result.directories).length) throw new Error("The package returned an invalid directory listing.");
+        this.pathBrowser.current = current;
+        this.pathBrowser.parent = kind === "local" ? (result.parent === null ? null : boundedText(result.parent, "")) : this.browserParent(current);
+        this.pathBrowser.directories = directories;
+        this.pathBrowser.truncated = result.truncated === true;
+      } catch (error) {
+        if (this.disposed || !this.pathBrowser.visible || request !== this.pathBrowser.request) return;
+        const detail = boundedText(error && error.message, "Directory listing failed.");
+        if (kind === "remote") recordMutationSessionBarrier(this, "File Station browse", error);
+        this.pathBrowser.error = kind === "local"
+          ? `${detail} Confirm the folder exists, is a canonical non-symlink DSM volume path, is not DSM-managed, and the package identity can read and traverse it.`
+          : detail;
+      } finally {
+        if (!this.disposed && this.pathBrowser.visible && request === this.pathBrowser.request) this.pathBrowser.loading = false;
+      }
+    },
+    selectPath(path) {
+      if (!this.pathBrowser.visible || this.pathBrowser.loading || !path || path === "/") return;
+      if (this.pathBrowser.kind === "local") this.profileForm.source = path;
+      else this.profileForm.remote = path;
+      this.closePathBrowser();
+    },
+    closePathBrowser() {
+      const priorFocus = this.pathBrowserPriorFocus;
+      this.removePathBrowserKeyHandler();
+      this.pathBrowserPriorFocus = null;
+      const request = (this.pathBrowser && Number(this.pathBrowser.request)) || 0;
+      this.pathBrowser = Object.assign(emptyPathBrowser(), { request: request + 1 });
+      if (!this.disposed && typeof this.$nextTick === "function") {
+        this.$nextTick(() => {
+          if (priorFocus && priorFocus.isConnected && priorFocus.focus) priorFocus.focus();
+        });
+      }
+    },
     openProfile(name) {
       if (this.operationBusy) return;
       if (!name && !this.canChangeProfiles) return;
+      this.snapshotGeneration += 1;
+      if (typeof window !== "undefined" && typeof window.clearTimeout === "function") window.clearTimeout(this.snapshotTimer);
+      this.snapshotTimer = 0;
       const profile = name ? this.profiles.find((item) => String(item.name) === String(name)) : null;
       this.selectedProfile = profile ? String(profile.name) : "";
       this.profileForm = emptyProfile();
@@ -1767,12 +2180,58 @@ export default {
         remote_log_url: pick(profile, "remote_log_url") || "",
         remote_log_mode: pick(profile, "remote_log_mode") || "best-effort"
       });
-      this.secretModes = { password: "keep", totp: "keep", remote_log_token: "keep" }; this.clearSecrets(); this.profileEditorOpen = true;
+      this.clearSecrets();
+      this.secretModes = profile
+        ? { password: "keep", totp: "keep", remote_log_token: "keep" }
+        : { password: "replace", totp: "keep", remote_log_token: "keep" };
+      this.profileConnectionRequest += 1;
+      this.profileConnectionState = "idle";
+      this.profileConnectionMessage = profile
+        ? "Test the stored or replacement credentials to unlock File Station browsing."
+        : "Enter the new profile password, then test authentication to unlock File Station browsing.";
+      this.connectionProof = "";
+      this.connectionProofExpires = 0;
+      this.clearConnectionProofTimer();
+      this.profileSaveState = "idle";
+      this.profileSaveMessage = "";
+      this.closePathBrowser();
+      this.profileEditorOpen = true;
+      this.freshness = "Profile draft active · status refresh paused";
       this.hydrateAutosave("profile", this.profilePayload(), false);
       if (this.autosaveCoordinator) this.autosaveCoordinator.setScopeBlocked("profile", !profile);
     },
-    closeProfile() { this.cancelAutosave("profile"); this.clearSecrets(); this.secretModes = { password: "keep", totp: "keep", remote_log_token: "keep" }; this.profileEditorOpen = false; this.selectedProfile = ""; },
+    closeProfile(options = undefined) {
+      if (this.profileSaveState === "saving" || this.profileConnectionState === "testing") return;
+      this.cancelAutosave("profile");
+      this.snapshotGeneration += 1;
+      this.profileConnectionRequest += 1;
+      this.closePathBrowser();
+      this.clearSecrets();
+      this.secretModes = { password: "keep", totp: "keep", remote_log_token: "keep" };
+      this.profileConnectionState = "idle";
+      this.profileConnectionMessage = "Test authentication to unlock the File Station browser.";
+      this.connectionProof = "";
+      this.connectionProofExpires = 0;
+      this.clearConnectionProofTimer();
+      this.profileSaveState = "idle";
+      this.profileSaveMessage = "";
+      this.profileEditorOpen = false;
+      this.selectedProfile = "";
+      if (options && options.refresh === false) return;
+      if (typeof this.refreshSnapshot === "function") return this.refreshSnapshot(false, true);
+      if (typeof this.scheduleSnapshot === "function") this.scheduleSnapshot();
+    },
     clearSecrets() { this.secretValues = { password: "", totp: "", remote_log_token: "" }; },
+    applyTrustedSecretPresence(result) {
+      const profile = this.selectedProfileModel;
+      const fields = ["has_password", "has_totp", "has_remote_log_token"];
+      if (!profile || !result || fields.some((field) => typeof result[field] !== "boolean")) return false;
+      for (const field of fields) {
+        if (typeof this.$set === "function") this.$set(profile, field, result[field]);
+        else profile[field] = result[field];
+      }
+      return true;
+    },
     profilePayload() {
       const maxRate = this.integer(this.profileForm.max_rate, 0);
       return {
@@ -1810,7 +2269,7 @@ export default {
     validateProfile(payload, secrets) {
       if (!/^[A-Za-z0-9_-]{1,64}$/.test(payload.name)) return "Name must use letters, digits, underscore, or hyphen.";
       if (!payload.source || !payload.url || !payload.username || !payload.remote) return "Name, source, URL, username, and remote path are required.";
-      if (!validBoundedText(payload.source, 4096) || !payload.source.startsWith("/") || hasDotPathSegment(payload.source)) return "Local source must be an absolute NAS path without dot segments.";
+      if (!validLocalSourcePath(payload.source)) return "Local source must be a canonical internal, USB, or SATA DSM volume path outside DSM-managed folders.";
       if (!validBoundedText(payload.url, 2048) || !(payload.url.startsWith("https://") || (payload.allow_http && payload.url.startsWith("http://")))) return "File Station URL must use HTTPS, or HTTP only with the controlled-LAN exception enabled.";
       if (!validBoundedText(payload.username, 256)) return "DSM username must be 1 through 256 bytes without control characters.";
       if (!validBoundedText(payload.remote, 247) || !payload.remote.startsWith("/") || payload.remote === "/" || payload.remote.endsWith("/") || payload.remote.includes("//") || hasDotPathSegment(payload.remote)) return "Remote path must be an absolute non-root File Station path without trailing, empty, or dot segments.";
@@ -1844,33 +2303,56 @@ export default {
     },
     async saveProfile(event) {
       if (event && event.preventDefault) event.preventDefault();
-      if (!this.canChangeProfiles || this.operationBusy) return;
+      if (!this.profileEditorOpen) return;
+      if (hasUnresolvedMutationOutcome(this)) return this.toast("Profile save locked", unresolvedMutationGuidance(this), true);
+      if (!this.canChangeProfiles || this.operationBusy || this.profileSaveState === "saving") return this.toast("Profile save unavailable", "Wait for the active package operation or restore the authenticated mutation bridge, then try again.", true);
       this.cancelAutosave("profile");
       const payload = this.profileAutosavePayload();
       if (!payload) return this.toast("Profile not saved", "Finish every numeric profile value with a whole number before saving.", true);
       const secrets = this.secretOperations(payload.name); const error = this.validateProfile(payload, secrets);
       if (error) return this.toast("Profile not saved", error, true);
+      if (!this.selectedProfile && !secrets.some((secret) => secret.kind === "password" && secret.mode === "replace")) return this.toast("Profile not saved", "A new profile requires a password. Choose Replace securely, enter it, and save again.", true);
       const risky = payload.allow_http || payload.allow_empty_source || payload.danger_accept_invalid_certs || payload.delete;
       if (risky && !await this.confirmAction("Save dangerous profile settings?", "Review plain-HTTP, deletion, empty-source, and TLS settings before continuing.", "Save profile")) return;
-      this.operationBusy = true; this.clearSecrets();
+      this.profileSaveState = "saving";
+      this.profileSaveMessage = "Validating the local source with the package identity…";
+      this.toast("Saving profile", "Validating the local source before the configuration and protected credential stages are applied.");
+      this.operationBusy = true;
       let configurationApplied = false;
       let activeSecretKind = "";
       const appliedSecretKinds = [];
       try {
-        await apiPost(this.auth, this.csrfToken, ACTIONS.configureProfile, payload);
+        let sourceValidation;
+        try {
+          sourceValidation = await apiGet(this.auth, "source-path", { path: payload.source }, AUTOSAVE_API_LIMITS);
+        } catch (_sourceError) {
+          throw new Error("Local source validation failed. Confirm the folder exists, is a canonical non-symlink DSM volume path, is not DSM-managed, and the package identity can read and traverse it.");
+        }
+        if (sourceValidation.schema !== "sdsync.dsm-source-path.v1" || sourceValidation.path !== payload.source || sourceValidation.valid !== true) throw new Error("The package could not validate the exact local source path.");
+        if (this.disposed) return;
+        this.profileSaveMessage = this.selectedProfile ? "Saving profile configuration…" : "Creating profile configuration…";
+        await apiPost(this.auth, this.csrfToken, ACTIONS.configureProfile, payload, true, undefined, AUTOSAVE_API_LIMITS);
         configurationApplied = true;
         this.clearProfileConfigurationFailure(false);
         if (this.disposed) return;
         for (const secret of secrets) {
           activeSecretKind = secret.kind;
-          await apiPost(this.auth, this.csrfToken, ACTIONS.setSecret, secret);
+          this.profileSaveMessage = `Applying protected ${secret.kind} operation…`;
+          const secretResult = await apiPost(this.auth, this.csrfToken, ACTIONS.setSecret, secret, true, undefined, AUTOSAVE_API_LIMITS);
+          this.applyTrustedSecretPresence(secretResult);
           appliedSecretKinds.push(secret.kind);
+          const appliedField = secret.kind === "remote-log-token" ? "remote_log_token" : secret.kind;
+          if (this.secretModes && Object.prototype.hasOwnProperty.call(this.secretModes, appliedField)) this.secretModes[appliedField] = "keep";
+          if (this.secretValues && Object.prototype.hasOwnProperty.call(this.secretValues, appliedField)) this.secretValues[appliedField] = "";
           activeSecretKind = "";
           if (this.disposed) return;
         }
         this.hydrateAutosave("profile", payload);
+        this.profileSaveState = "success";
+        this.profileSaveMessage = "Profile saved successfully.";
         this.toast("Profile saved", "The controller applied the validated configuration and protected credential operations.");
-        this.closeProfile();
+        this.clearSecrets();
+        this.closeProfile({ refresh: false });
         const observed = await this.refreshSnapshot(false, true);
         if (!this.disposed && observed === true) {
           this.clearProfileSecretFailures(appliedSecretKinds);
@@ -1890,15 +2372,11 @@ export default {
           partiallyApplied ? "Profile partially applied · inspect state" : "Profile outcome unknown",
           "The package rejected the change."
         );
-        if (partiallyApplied || caught.outcomeUnknown === true) {
-          this.closeProfile();
-          const observed = await this.refreshSnapshot(false, true);
-          if (!this.disposed && observed === true) {
-            this.clearProfileSecretFailures(appliedSecretKinds);
-          } else if (!this.disposed) {
-            this.refreshAutosaveStatus();
-          }
-        }
+        if (configurationApplied && !this.selectedProfile) this.selectedProfile = payload.name;
+        this.profileSaveState = "error";
+        this.profileSaveMessage = partiallyApplied || caught.outcomeUnknown === true
+          ? "The profile editor was preserved, but the outcome needs Activity / Logs inspection before another save."
+          : boundedText(caught && caught.message, "The package rejected the profile. Correct the draft and try again.");
       } finally {
         if (!this.disposed) this.operationBusy = false;
       }
@@ -1906,6 +2384,7 @@ export default {
     async saveProfileSecrets(event) {
       if (event && event.preventDefault) event.preventDefault();
       const profile = this.selectedProfile;
+      if (hasUnresolvedMutationOutcome(this)) return this.toast("Secret save locked", unresolvedMutationGuidance(this), true);
       if (!profile || !this.canManageSecrets || this.operationBusy) return;
       const secrets = this.secretOperations(profile);
       if (!secrets.length) return this.toast("No secret changes", "Choose Replace securely or Clear stored value for at least one protected secret.");
@@ -1913,29 +2392,32 @@ export default {
       if (error) return this.toast("Secrets not saved", error, true);
       if (secrets.some((item) => item.mode === "clear")
         && !await this.confirmAction("Clear stored profile secrets?", "Only the selected password, TOTP, or remote-log token values will be removed. Profile configuration remains unchanged.", "Clear selected secrets")) return;
+      this.profileSaveState = "saving";
+      this.profileSaveMessage = "Applying changed protected credentials…";
+      this.toast("Saving changed secrets", "Applying the selected protected credential operations in order.");
       this.operationBusy = true;
-      this.clearSecrets();
       let activeSecretKind = "";
       const appliedSecretKinds = [];
       try {
         for (const secret of secrets) {
           activeSecretKind = secret.kind;
-          await apiPost(this.auth, this.csrfToken, ACTIONS.setSecret, secret);
+          this.profileSaveMessage = `Applying protected ${secret.kind} operation…`;
+          const secretResult = await apiPost(this.auth, this.csrfToken, ACTIONS.setSecret, secret, true, undefined, AUTOSAVE_API_LIMITS);
+          this.applyTrustedSecretPresence(secretResult);
           appliedSecretKinds.push(secret.kind);
+          const appliedField = secret.kind === "remote-log-token" ? "remote_log_token" : secret.kind;
+          if (this.secretModes && Object.prototype.hasOwnProperty.call(this.secretModes, appliedField)) this.secretModes[appliedField] = "keep";
+          if (this.secretValues && Object.prototype.hasOwnProperty.call(this.secretValues, appliedField)) this.secretValues[appliedField] = "";
           activeSecretKind = "";
           if (this.disposed) return;
         }
-        this.secretModes = { password: "keep", totp: "keep", remote_log_token: "keep" };
+        this.profileSaveState = "success";
+        this.profileSaveMessage = "Changed protected credentials saved successfully.";
         this.toast("Secrets saved", "The package applied and audited only the selected protected-secret operations.");
-        const observed = await this.refreshSnapshot(false, true);
-        if (!this.disposed && observed === true) {
-          this.clearProfileSecretFailures(appliedSecretKinds);
-        } else if (!this.disposed) {
-          this.refreshAutosaveStatus();
-        }
+        this.clearProfileSecretFailures(appliedSecretKinds);
+        this.refreshAutosaveStatus();
       } catch (caught) {
         if (this.disposed) return;
-        this.secretModes = { password: "keep", totp: "keep", remote_log_token: "keep" };
         const partiallyApplied = appliedSecretKinds.length > 0;
         const reportedError = partiallyApplied
           ? partialMutationInspectionRequired(caught, "A later secret stage failed.", "Earlier secret stages were applied.")
@@ -1949,17 +2431,17 @@ export default {
           partiallyApplied ? "Secrets partially applied · inspect state" : "Secret outcome unknown",
           "The package rejected the protected-secret operation."
         );
-        const observed = await this.refreshSnapshot(false, true);
-        if (!this.disposed && observed === true) {
-          this.clearProfileSecretFailures(appliedSecretKinds);
-        } else if (!this.disposed) {
-          this.refreshAutosaveStatus();
-        }
+        this.profileSaveState = "error";
+        this.profileSaveMessage = partiallyApplied || caught.outcomeUnknown === true
+          ? "Applied secret stages were cleared; unapplied draft values remain available while Activity / Logs are inspected."
+          : boundedText(caught && caught.message, "The package rejected the secret change. Correct the draft and try again.");
+        this.refreshAutosaveStatus();
       } finally {
         if (!this.disposed) this.operationBusy = false;
       }
     },
     async removeProfile() {
+      if (hasUnresolvedMutationOutcome(this)) return this.toast("Profile deletion locked", unresolvedMutationGuidance(this), true);
       if (!this.canChangeProfiles || !this.selectedProfile || this.operationBusy) return;
       const name = this.selectedProfile;
       if (!await this.confirmAction(`Delete profile ${name}?`, "This removes package-owned configuration and protected credentials. Synced files are not deleted.", "Delete profile")) return;
@@ -1969,10 +2451,11 @@ export default {
         if (this.disposed) return;
         this.clearAutosaveFailure("profile");
         this.toast("Profile deleted", `The controller removed ${name} and its stored credentials.`);
-        this.closeProfile();
+        this.closeProfile({ refresh: false });
         await this.refreshSnapshot(false, true);
       } catch (error) {
         if (this.disposed) return;
+        this.pauseAutosave("profile", error);
         this.reportMutationError(error, "Profile not deleted", "Profile deletion outcome unknown", "The package rejected the change.");
       } finally {
         if (!this.disposed) this.operationBusy = false;
@@ -1990,6 +2473,7 @@ export default {
     },
     async saveRoutine(event) {
       if (event && event.preventDefault) event.preventDefault();
+      if (hasUnresolvedMutationOutcome(this)) return this.toast("Routine save locked", unresolvedMutationGuidance(this), true);
       if (!this.canChangeRoutines || !this.routineForm.profile || this.operationBusy) return;
       this.cancelAutosave("routine");
       const payload = this.routineAutosavePayload();
@@ -2015,6 +2499,7 @@ export default {
     },
     async removeRoutine() {
       const profile = this.routineForm.profile;
+      if (hasUnresolvedMutationOutcome(this)) return this.toast("Routine removal locked", unresolvedMutationGuidance(this), true);
       if (!this.canChangeRoutines || !profile || !this.selectedRoutine || this.operationBusy) return;
       if (!await this.confirmAction(`Remove routine for ${profile}?`, "The profile remains configured, but package automation for it will stop.", "Remove routine")) return;
       this.operationBusy = true;
@@ -2027,6 +2512,7 @@ export default {
         await this.refreshSnapshot(false, true);
       } catch (error) {
         if (this.disposed) return;
+        this.pauseAutosave("routine", error);
         this.reportMutationError(error, "Routine not removed", "Routine removal outcome unknown", "The package rejected the change.");
       } finally {
         if (!this.disposed) this.operationBusy = false;
@@ -2034,6 +2520,7 @@ export default {
     },
     async saveAlerts(event) {
       if (event && event.preventDefault) event.preventDefault();
+      if (hasUnresolvedMutationOutcome(this)) return this.toast("Alert policy save locked", unresolvedMutationGuidance(this), true);
       if (!this.canChangeNotifications || this.operationBusy) return;
       this.cancelAutosave("alerts");
       const payload = this.alertPayload();
@@ -2056,6 +2543,7 @@ export default {
       }
     },
     async executeOperation(kind, payload) {
+      if (hasUnresolvedMutationOutcome(this)) return this.toast("Operation locked", unresolvedMutationGuidance(this), true);
       if (!this.canRunOperations || this.operationBusy || this.disposed) return;
       if (payload && payload.allow_delete === true && !this.canAllowDestructive) return;
       if (kind === "doctor" && payload && payload.write_test === true && (!this.canRunDoctorWrite || !this.hasCapability("write_test"))) return;
@@ -2091,6 +2579,7 @@ export default {
           `${operation} outcome unknown`,
           "The package rejected the operation."
         );
+        recordMutationSessionBarrier(this, operation, error, report);
         if (kind === "doctor") {
           this.diagnostic = {
             title: report.unknown ? "Doctor outcome unknown" : "Doctor failed",
@@ -2110,6 +2599,7 @@ export default {
     clearLogView() { this.logOutput = "View cleared. The package log was not deleted."; },
     async saveNotificationPreferences(event) {
       if (event && event.preventDefault) event.preventDefault();
+      if (hasUnresolvedMutationOutcome(this)) return this.toast("Session preference save locked", unresolvedMutationGuidance(this), true);
       if (!this.canChangeNotifications || this.operationBusy) return;
       this.operationBusy = true;
       let transaction = null;
@@ -2136,7 +2626,7 @@ export default {
         if (!this.disposed) {
           const rejected = this.preferenceAuditWasRejected(error);
           const restored = rejected && transaction ? this.restoreSettingsTransaction(transaction) : false;
-          this.reportMutationError(
+          const report = this.reportMutationError(
             error,
             rejected && restored ? "Session preferences not saved" : (rejected ? "Session preference rollback incomplete" : "Session preferences stored · audit failed"),
             "Session preferences stored · audit outcome unknown",
@@ -2144,6 +2634,7 @@ export default {
               ? "The package rejected the audit event and the prior browser preferences were restored."
               : "The browser preferences remain stored locally, but the package audit did not complete."
           );
+          if (report.unknown || report.inspection) this.pauseAutosave("interface", error);
         }
       } finally {
         if (!this.disposed) this.operationBusy = false;
@@ -2151,6 +2642,7 @@ export default {
     },
     async saveInterfaceSettings(event) {
       if (event && event.preventDefault) event.preventDefault();
+      if (hasUnresolvedMutationOutcome(this)) return this.toast("Interface save locked", unresolvedMutationGuidance(this), true);
       if (!this.canChangeInterface || this.operationBusy) return;
       this.cancelAutosave("interface");
       const candidate = this.interfaceSettingsPayload();
@@ -2257,6 +2749,45 @@ export default {
       if (!dialog || !dialog.querySelectorAll) return [];
       return Array.from(dialog.querySelectorAll("button, [href], input, select, textarea, [tabindex]"))
         .filter((element) => !element.disabled && element.getAttribute("tabindex") !== "-1" && element.getAttribute("aria-hidden") !== "true");
+    },
+    pathBrowserFocusables() {
+      const dialog = this.confirmationElement("pathBrowserDialog");
+      if (!dialog || !dialog.querySelectorAll) return [];
+      return Array.from(dialog.querySelectorAll("button, [href], input, select, textarea, [tabindex]"))
+        .filter((element) => !element.disabled && element.getAttribute("tabindex") !== "-1" && element.getAttribute("aria-hidden") !== "true");
+    },
+    handlePathBrowserKeydown(event) {
+      if (!this.pathBrowser.visible) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        this.closePathBrowser();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const dialog = this.confirmationElement("pathBrowserDialog");
+      const focusable = this.pathBrowserFocusables();
+      if (!dialog || !focusable.length) {
+        event.preventDefault();
+        if (dialog && dialog.focus) dialog.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey && (active === first || !dialog.contains(active))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (active === last || !dialog.contains(active))) {
+        event.preventDefault();
+        first.focus();
+      }
+    },
+    removePathBrowserKeyHandler() {
+      if (this.pathBrowserKeyHandler) {
+        if (typeof document !== "undefined") document.removeEventListener("keydown", this.pathBrowserKeyHandler, true);
+        this.pathBrowserKeyHandler = null;
+      }
     },
     handleConfirmationKeydown(event) {
       if (!this.confirmation.visible) return;

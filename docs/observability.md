@@ -170,7 +170,7 @@ Every `upload` and `create-directory` action carries the comparison that schedul
 plan renders the reason and its explanation after the action line:
 
 ```text
-  UPLOAD release.bin -> /team/export/release.bin (content-differs: size equal, MD5 did not match)
+  UPLOAD release.bin -> /team/export/release.bin (content-differs: size equal, complete MD5/CRC32/SHA-256 fingerprint did not match)
 ```
 
 | `reason` | Meaning | Emitted by |
@@ -183,7 +183,8 @@ plan renders the reason and its explanation after the action line:
 
 The reason never claims a comparison the selected mode did not make. `--compare size-only`
 therefore reports only `missing-remote`, `size-differs`, and `type-replaced`, and only
-`--compare content` can report `content-differs`. When content mode has no usable digest pair but
+`--compare content` can report `content-differs`. Equality requires the complete MD5, IEEE CRC32,
+and SHA-256 fingerprint. When content mode has no usable fingerprint pair but
 the modification times differ, it reports the difference it did observe, `mtime-differs`.
 
 `sync --output json` uses `sdsync.sync.v1`, retains the complete `plan`, and adds `result`. A changed
@@ -213,6 +214,12 @@ A plan-only NDJSON stream ends after its last action. An unchanged sync emits th
 by `{"schema":"sdsync.output.v1","kind":"completion","changed":false}`. Guarded delete records
 include their exact `snapshot_guard`; a post-delete also includes nullable `destination_guard`.
 The linked JSON Schema defines every single-profile plan/action/result variant strictly.
+
+`content_md5` remains the compatibility-stable digest field in existing `sdsync.*.v1` documents.
+Internally, content equality and safety guards require MD5, IEEE CRC32, and SHA-256 together; the
+additional proof is deliberately not added to the strict v1 JSON shape because old consumers may
+reject unknown properties. A future negotiated schema version can expose those fields without
+silently breaking v1 parsers.
 
 Plan results intentionally contain relative local paths and File Station logical remote paths so
 automation can review exact work. Treat stdout as path-sensitive operational data even though it

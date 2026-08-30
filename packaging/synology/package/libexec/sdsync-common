@@ -1965,6 +1965,7 @@ append_audit_event() {
     case $audit_operation in
         configure-profile|remove-profile|set-default|schedule|alert-policy|enable|disable) audit_category=configuration ;;
         set-secret|set-password|set-totp|set-remote-log-token|remove-password|remove-totp|remove-remote-log-token) audit_category=secrets ;;
+        test-profile-auth|browse-remote) audit_category=authentication ;;
         routine|configure-routine|remove-routine) audit_category=routines ;;
         security-policy) audit_category=security ;;
         rejected-post) audit_category=bridge ;;

@@ -13,7 +13,7 @@ Create a distinct profile, validate it, and remove the old one when a name must 
 | Dashboard field | Accepted value and behavior |
 | --- | --- |
 | Name | 1–64 ASCII letters, digits, `_`, or `-`; `all` is reserved |
-| Local source | Existing absolute physical path on this NAS, for example `/volume1/Photos`; canonicalized and validated immediately |
+| Local source | Existing canonical folder below `/volumeN`, `/volumeUSBN`, or `/volumeSATAN`, for example `/volume1/Photos`; selected interactively or entered manually, then validated as the package identity immediately before save |
 | File Station URL | HTTPS origin or HTTPS origin plus reverse-proxy prefix; up to 2,048 bytes |
 | DSM username | Target account name; up to 256 bytes; use a dedicated non-administrator account |
 | Remote logical path | Absolute File Station path such as `/home/Drive/Backup` or `/TeamShare/Backup`; never `/volumeN/...`; portability ceiling 247 characters |
@@ -24,7 +24,7 @@ Create a distinct profile, validate it, and remove the old one when a name must 
 
 Comparison behavior:
 
-- **Content** uses size, MD5, and mtime evidence and is the strongest normal correspondence mode.
+- **Content** requires size, MD5, IEEE CRC32, SHA-256, and mtime evidence and is the strongest normal correspondence mode.
 - **Metadata** uses size and mtime and can miss same-size/same-time content changes.
 - **Size only** is the weakest and should be reserved for a deliberately accepted workflow.
 
@@ -32,11 +32,40 @@ The destination's first component must be an existing share visible to the targe
 can create a missing selected directory and its descendants beneath an existing writable parent. It
 cannot manufacture a missing shared-folder root.
 
+## Interactive source and destination selection
+
+**Browse NAS** asks the package bridge for directories the package service can actually read and
+traverse. The root view exposes only canonical, non-symlink DSM storage roots named `/volumeN`,
+`/volumeUSBN`, or `/volumeSATAN`; it never exposes `/etc`, `/usr`, package-private state, or an
+arbitrary filesystem root. Unreadable, vanished, non-UTF-8, DSM-managed, and symlinked children are
+omitted. Selecting a folder does not bypass save validation: the exact selected or manually entered
+path is canonicalized and checked again under the package service identity immediately before the
+configuration mutation. If browsing is unavailable, the text field remains an explicit manual-entry
+fallback within the same DSM storage-root boundary.
+
+**Browse target** remains locked until **Test authentication** succeeds for the exact URL, account,
+TLS settings, and stored or transient credential draft. The package discovers `SYNO.API.Auth` and
+`SYNO.FileStation.List` through `SYNO.API.Info`, opens a temporary `FileStation` session, uses
+`list_share` for the root and `list` for descendants, returns only directories File Station exposes
+with usable list/read permissions, and always attempts logout. It does not guess share names and does
+not use the browser File API. A successful test issues a session-and-draft-bound proof for at most
+five minutes; changing the connection draft or reaching expiry closes the chooser and requires a new
+test. The test can use stored credentials while secret writes are disabled, provided operational
+actions remain allowed. Transient values are neither returned nor persisted by testing; creating a
+new profile persists its password only in the later protected-secret save stage.
+
+These selectors use documented File Station APIs and the package's authenticated bridge; they do
+not depend on an undocumented DSM JavaScript namespace. Manual entry remains available when the
+native chooser cannot load.
+
 ## Source and destination path rejection
 
-The local source cannot be `/`, a symlink, unreadable/untraversable, package-owned storage, or inside
-a DSM-managed directory. The remote destination cannot be `/`, end in `/`, contain `//`, `.` or
-`..` segments, or contain a DSM-managed component.
+The local source cannot be `/`, a symlink, unreadable/untraversable, package-owned storage, inside a
+DSM-managed directory, or outside the recognized internal/USB/SATA DSM storage roots. Arbitrary
+mount roots such as `/mnt/...` are intentionally not exposed or accepted by the DSM profile editor;
+mount them through a recognized DSM volume when they must be used as package sources. The remote
+destination cannot be `/`, end in `/`, contain `//`, `.` or `..` segments, or contain a DSM-managed
+component.
 
 Remote components also reject leading `~`, Windows-reserved device names, unsupported characters
 such as `* : ? " < > |`, trailing dots/spaces, and values that exceed Synology Drive portability
@@ -150,10 +179,14 @@ Profile configuration is validated, rendered into a strict non-secret fragment, 
 generated TOML, validated by the core, and atomically replaced. Existing protected credentials are
 retained unless their separate secret selector says replace or clear.
 
-Dashboard saves are published through the private queue and poll a sanitized terminal result before
-reporting success. Pending observations have no client deadline. An `expired_or_missing` response,
-invalid result evidence, or five consecutive observation failures make the accepted job
-outcome-unknown; treat the subsequent snapshot as authoritative and inspect it before retrying.
+Dashboard profile and credential saves are published through the private queue and poll a sanitized
+terminal result before reporting success. Their request and result-observation phases are bounded so
+the editor cannot remain stuck on **Saving** indefinitely. If a bound is reached after acceptance,
+the result is outcome-unknown and the editor preserves unapplied credential drafts for Activity and
+Logs inspection; it never silently retries. Each protected value is cleared only after its own
+terminal success. Status polling, including manual refresh, is suspended while the editor owns a
+draft or save, and late status responses are generation-fenced so they cannot overwrite it. Closing
+the editor performs one fresh status read even when periodic refresh is set to **Manual only**.
 Removing a profile also removes its package-owned password, TOTP,
 remote-log-token, routine, and cached state, then rebuilds the generated configuration. It does not
 touch local or remote data. Removing the final profile disables the legacy global schedule.

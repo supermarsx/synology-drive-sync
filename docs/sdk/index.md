@@ -31,7 +31,7 @@ and logout. It exposes:
 | `api` | Lower-level File Station discovery, login/logout, inventory, permission checks, verified upload/copy/delete, and explicit write probe used by the engine. |
 | `batch` | Complete job catalogs, deterministic batch selection, overlap checks, and aggregate deletion preflight. |
 | `cancel` | Cloneable cooperative cancellation token. |
-| `integrity` | Validated content-MD5 representation. |
+| `integrity` | Streaming MD5, IEEE CRC32, and SHA-256 content fingerprints, with an explicit MD5-only compatibility representation. |
 | `local` | Local scanner, portable entry model, and gitignore-style rules. |
 | `observability` | Structured event and redaction-oriented logging primitives. |
 | `path` | Logical remote-root parsing, containment, and portability validation. |
@@ -42,6 +42,14 @@ and logout. It exposes:
 | `vault` | Endpoint/account-scoped OS credential-store access. |
 
 The crate re-exports its shared `Error` and `Result` types.
+
+`ContentMd5` remains a source-compatible alias for `ContentFingerprint`, but direct derived equality
+is not behavior-compatible with the old MD5-only value: it compares the complete representation,
+including whether strong digests are present. Values parsed from the legacy File Station MD5 API
+intentionally contain only MD5 and cannot establish equality through `full_match`; fingerprints
+produced by the streaming hasher carry MD5, IEEE CRC32, and SHA-256, and all three must agree. Direct
+callers must use `md5_matches` when they explicitly want MD5-only compatibility and `full_match` when
+they need content proof. The explicit low-level MD5 helper remains available for compatibility only.
 
 ## Integration boundary
 

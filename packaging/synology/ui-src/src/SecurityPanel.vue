@@ -127,9 +127,9 @@
         suffix="main"
         display="icon-text"
         html-type="submit"
-        tooltip="Validate, persist, enforce, and audit this security and logging policy"
-        :disabled="disabled || busy || !dirty"
-      ><template #icon><action-icon name="save" /></template>Save now</v-button>
+        :tooltip="saveBlocked ? saveBlockedMessage : 'Validate, persist, enforce, and audit this security and logging policy'"
+        :disabled="disabled || busy || !dirty || saveBlocked"
+      ><template #icon><action-icon name="save" /></template>{{ saveBlocked ? 'Save locked' : 'Save now' }}</v-button>
     </div>
   </v-form>
 </template>
@@ -188,6 +188,8 @@ export default {
     disabled: { type: Boolean, default: false },
     busy: { type: Boolean, default: false },
     dirty: { type: Boolean, default: false },
+    saveBlocked: { type: Boolean, default: false },
+    saveBlockedMessage: { type: String, default: "Resolve the previous mutation outcome before saving again." },
     themeClass: { type: String, default: "is-dark" },
     logLevelOptions: { type: Array, required: true }
   },

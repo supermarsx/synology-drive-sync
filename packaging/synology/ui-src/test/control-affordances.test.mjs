@@ -286,7 +286,10 @@ test("action buttons retain visible labels and meaningful icon coverage", () => 
     "Run doctor",
     "Clear view"
   ]) {
-    const button = buttons.find((candidate) => buttonLabel(candidate).includes(label));
+    const button = buttons.find((candidate) => (
+      buttonLabel(candidate).includes(label)
+      || (label === "Save now" && candidate.includes("'Save now'"))
+    ));
     assert.ok(button, `missing critical action ${label}`);
     assert.ok(iconIdentity(button), `critical action ${label} lacks a meaningful package icon`);
   }

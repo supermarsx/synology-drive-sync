@@ -1337,7 +1337,7 @@ fn prepare_and_run_sync(
         )?;
 
         if compare_mode(settings.behavior.compare) == CompareMode::Content {
-            client.require_content_api()?;
+            client.require_content_fingerprint_api()?;
             local::populate_content_md5(&mut local, cancellation)?;
             let selected = plan::select_remote_content_hashes_for_plan(
                 &local,
@@ -1346,7 +1346,7 @@ fn prepare_and_run_sync(
                 server_copy,
                 settings.safety.delete,
             );
-            client.populate_remote_content_md5(&mut remote, &selected, cancellation)?;
+            client.populate_remote_content_fingerprints(&mut remote, &selected, cancellation)?;
         }
 
         let plan = plan::build_plan(
@@ -1481,7 +1481,7 @@ fn build_reconciliation_plan(
     let mut remote = client.remote_inventory(root)?;
     cancellation.check()?;
     if compare_mode(settings.behavior.compare) == CompareMode::Content {
-        client.require_content_api()?;
+        client.require_content_fingerprint_api()?;
         local::populate_content_md5(&mut local, cancellation)?;
         let selected = plan::select_remote_content_hashes_for_plan(
             &local,
@@ -1490,7 +1490,7 @@ fn build_reconciliation_plan(
             server_copy,
             settings.safety.delete,
         );
-        client.populate_remote_content_md5(&mut remote, &selected, cancellation)?;
+        client.populate_remote_content_fingerprints(&mut remote, &selected, cancellation)?;
     }
     let plan = plan::build_plan(
         root,
@@ -1616,13 +1616,13 @@ fn doctor_checks(
     )?;
     let mut client = connect_client(&settings.url, &settings.network)?;
     if settings.compare == cli::CompareArg::Content {
-        client.require_content_api()?;
+        client.require_content_fingerprint_api()?;
     }
     if settings.delete {
         client.require_delete_api()?;
     }
     if settings.write_test {
-        client.require_content_api()?;
+        client.require_content_fingerprint_api()?;
         client.require_delete_api()?;
     }
     cancellation.check()?;
@@ -3008,7 +3008,7 @@ fn write_plan_human_to<W: Write>(writer: &mut W, plan: &SyncPlan, detailed: bool
         if let Some(guard) = &action.destination_guard {
             writeln!(
                 writer,
-                "  DELETE {} (remote snapshot guarded; destination guarded by {} bytes+mtime+MD5 at {})",
+                "  DELETE {} (remote snapshot guarded; destination guarded by {} bytes+mtime+MD5+CRC32+SHA-256 at {})",
                 action.remote_path, guard.expected_size, guard.remote_path
             )
             .map_err(output_error)?;
@@ -3329,7 +3329,7 @@ fn doctor_human(result: &DoctorResult) -> String {
         } else if let Some(report) = &result.write_probe {
             writeln!(
                 human,
-                "Disposable write probe passed: directory creation, {}-byte upload with size/MD5/mtime verification{}; cleanup completed{}.",
+                "Disposable write probe passed: directory creation, {}-byte upload with size/MD5/CRC32/SHA-256/mtime verification{}; cleanup completed{}.",
                 report.uploaded_size,
                 if report.server_copy_supported {
                     ", and server-side copy verification"
@@ -3966,14 +3966,20 @@ mod tests {
             kind: local::EntryKind::File,
             size,
             mtime_ms,
-            content_md5: Some(synology_drive_sync::integrity::ContentMd5::from_bytes(
+            content_md5: Some(synology_drive_sync::integrity::ContentMd5::from_digests(
                 [0x2a; 16],
+                0x2a2a_2a2a,
+                [0x2a; 32],
             )),
         }
     }
 
     fn rich_plan() -> SyncPlan {
-        let digest = synology_drive_sync::integrity::ContentMd5::from_bytes([0x2a; 16]);
+        let digest = synology_drive_sync::integrity::ContentMd5::from_digests(
+            [0x2a; 16],
+            0x2a2a_2a2a,
+            [0x2a; 32],
+        );
         let copied = local_file("copied.bin", 7, 1_700_000_000_250);
         let uploaded = local_file("uploaded.bin", 11, 1_700_000_000_500);
         let guarded_local = local_file("guarded.bin", 13, 1_700_000_001_000);
@@ -4879,7 +4885,7 @@ mod tests {
             (
                 plan::ChangeReason::ContentDiffers,
                 "content-differs",
-                "size equal, MD5 did not match",
+                "size equal, complete MD5/CRC32/SHA-256 fingerprint did not match",
             ),
             (
                 plan::ChangeReason::TypeReplaced,
@@ -5468,9 +5474,9 @@ mod tests {
         ));
         assert!(detailed.contains("COPY   /share/root/source/copied.bin"));
         assert!(detailed.contains(
-            "UPLOAD uploaded.bin -> /share/root/uploaded.bin (content-differs: size equal, MD5 did not match)"
+            "UPLOAD uploaded.bin -> /share/root/uploaded.bin (content-differs: size equal, complete MD5/CRC32/SHA-256 fingerprint did not match)"
         ));
-        assert!(detailed.contains("destination guarded by 13 bytes+mtime+MD5"));
+        assert!(detailed.contains("destination guarded by 13 bytes+mtime+MD5+CRC32+SHA-256"));
         assert!(
             plan_human(&plan_with_deletions(1), true)
                 .contains("DELETE /share/root/stale-0 (remote snapshot guarded)")

@@ -4,13 +4,11 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::time::UNIX_EPOCH;
 
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use md5::{Digest, Md5};
-
 use crate::cancel::CancellationToken;
-use crate::integrity::ContentMd5;
+use crate::integrity::{ContentHasher, ContentMd5};
 use crate::path::{drive_path_issue, is_dsm_managed, path_for_match, validate_relative};
 use crate::{Error, Result};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 pub const DEFAULT_IGNORE_FILE: &str = ".sdsyncignore";
 
@@ -192,7 +190,7 @@ pub fn hash_file_snapshot(
     })?;
     verify_open_snapshot(entry, &file)?;
 
-    let mut hasher = Md5::new();
+    let mut hasher = ContentHasher::new();
     let mut buffer = [0_u8; 128 * 1024];
     loop {
         cancellation.check()?;
@@ -207,7 +205,7 @@ pub fn hash_file_snapshot(
     }
     verify_open_snapshot(entry, &file)?;
     verify_entry_snapshot(entry)?;
-    Ok(ContentMd5::from_bytes(hasher.finalize().into()))
+    Ok(hasher.finalize())
 }
 
 fn verify_entry_snapshot(entry: &LocalEntry) -> Result<()> {
@@ -827,9 +825,12 @@ mod tests {
         let mut inventory = scan(&root, &rules).unwrap();
 
         populate_content_md5(&mut inventory, &CancellationToken::default()).unwrap();
+        let fingerprint = inventory.entries["payload.bin"].content_md5.unwrap();
+        assert_eq!(fingerprint.to_string(), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(fingerprint.crc32_hex().as_deref(), Some("352441c2"));
         assert_eq!(
-            inventory.entries["payload.bin"].content_md5,
-            Some(ContentMd5::parse_hex("900150983cd24fb0d6963f7d28e17f72").unwrap())
+            fingerprint.sha256_hex().as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         );
         fs::remove_dir_all(root).unwrap();
     }

@@ -63,7 +63,7 @@ cooperative shutdown.
 
 `retries` defaults to 2 and accepts 0 through 5. Retryable transport, busy, HTTP 408/429, and
 502/503/504 failures are bounded. File Station has no resumable upload protocol. In content mode, a
-lost response first triggers an exact remote size/MD5 check; if completion cannot be proved, the
+lost response first triggers an exact remote size and MD5/CRC32/SHA-256 fingerprint check; if completion cannot be proved, the
 retry restarts the whole file.
 
 ## Upload rate limit

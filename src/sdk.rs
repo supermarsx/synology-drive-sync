@@ -204,7 +204,7 @@ pub type SdkResult<T> = std::result::Result<T, SdkError>;
 /// File comparison strategy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Comparison {
-    /// Compare size, File Station-resolution mtime, and MD5 content.
+    /// Compare size, File Station-resolution mtime, MD5, IEEE CRC32, and SHA-256 content.
     Content,
     /// Compare size and File Station-resolution mtime.
     Metadata,
@@ -829,7 +829,9 @@ impl Engine {
                         phase: Phase::ContentHashing,
                     },
                 )?;
-                client.require_content_api().map_err(SdkError::from_core)?;
+                client
+                    .require_content_fingerprint_api()
+                    .map_err(SdkError::from_core)?;
                 local::populate_content_md5(&mut local, cancellation)
                     .map_err(SdkError::from_core)?;
                 let selected = plan::select_remote_content_hashes_for_plan(
@@ -840,7 +842,7 @@ impl Engine {
                     request.deletion.enabled,
                 );
                 client
-                    .populate_remote_content_md5(&mut remote, &selected, cancellation)
+                    .populate_remote_content_fingerprints(&mut remote, &selected, cancellation)
                     .map_err(SdkError::from_core)?;
                 emit(
                     cancellation,
@@ -1137,7 +1139,9 @@ fn reconciliation_plan(
     let mut remote = client.remote_inventory(root).map_err(SdkError::from_core)?;
     check_cancellation(cancellation)?;
     if request.comparison == Comparison::Content {
-        client.require_content_api().map_err(SdkError::from_core)?;
+        client
+            .require_content_fingerprint_api()
+            .map_err(SdkError::from_core)?;
         local::populate_content_md5(&mut local, cancellation).map_err(SdkError::from_core)?;
         let selected = plan::select_remote_content_hashes_for_plan(
             &local,
@@ -1147,7 +1151,7 @@ fn reconciliation_plan(
             request.deletion.enabled,
         );
         client
-            .populate_remote_content_md5(&mut remote, &selected, cancellation)
+            .populate_remote_content_fingerprints(&mut remote, &selected, cancellation)
             .map_err(SdkError::from_core)?;
     }
     plan::build_plan(

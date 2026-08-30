@@ -36,13 +36,14 @@ per-platform paths, the share-root limitation, and expected SMB performance.
 
 Without `--hash`, the scanner validates names, types, metadata, case portability, link/reparse
 boundaries, and readability needed to enumerate the tree. With `--hash`, it additionally reads every
-payload file, records an MD5 digest, and verifies that each file still matches the size and mtime
+payload file, records MD5, IEEE CRC32, and SHA-256, and verifies that each file still matches the size and mtime
 snapshot taken by the scan. Cancellation or any scanner/read/snapshot failure returns no successful
 partial report. The diagnostic never writes to the source.
 
-MD5 here is a compatibility and accidental-corruption check because it is the digest exposed by
-File Station; it is not collision-resistant. Keep an independently generated SHA-256 manifest for
-release or production acceptance.
+The diagnostic computes all three digests in one read. MD5 is retained for File Station and output
+compatibility, while content equality requires CRC32 and SHA-256 as well. Keep an independently
+generated and separately retained SHA-256 manifest for release or production acceptance so the
+recovery check does not depend on the same live process or endpoint.
 
 Machine output for one source uses `sdsync.source-doctor.v1`. A selected source batch emits one
 `sdsync.source-doctor-job.v1` record per profile and an aggregate

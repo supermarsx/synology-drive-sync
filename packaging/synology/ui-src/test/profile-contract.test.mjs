@@ -27,6 +27,7 @@ function loadAppComponent(postSpy = async () => ({ ok: true })) {
       routine: "routine", removeRoutine: "remove-routine", alertPolicy: "alert-policy",
       securityPolicy: "security-policy", clientEvent: "client-event", execute: "action"
     },
+    AUTOSAVE_API_LIMITS: Object.freeze({}),
     MAX_RESPONSE_BYTES: 1024 * 1024,
     SNAPSHOT_SCHEMA: "sdsync.dsm-api.v1",
     apiGet: async () => ({}), apiPost: postSpy,
@@ -125,7 +126,10 @@ test("new profile defaults, explicit exclude clearing, snapshot hydration, and p
   const context = bind({
     operationBusy: false, canChangeProfiles: true, profiles: [], selectedProfile: "",
     profileForm: {}, profileEditorOpen: false, secretModes: {}, secretValues: {},
-    autosaveCoordinator: null
+    autosaveCoordinator: null, profileConnectionRequest: 0, profileConnectionState: "idle",
+    profileConnectionMessage: "", connectionProof: "", connectionProofExpires: 0,
+    profileSaveState: "idle", profileSaveMessage: "",
+    clearConnectionProofTimer() {}, closePathBrowser() {}
   }, methods, ["clearSecrets", "integer", "profilePayload", "hydrateAutosave"]);
 
   methods.openProfile.call(context, "");
@@ -191,6 +195,10 @@ test("profile catalog-to-editor state transitions preserve filters and close saf
     secretModes: {},
     secretValues: {},
     autosaveCoordinator: null,
+    profileConnectionRequest: 0, profileConnectionState: "idle", profileConnectionMessage: "",
+    connectionProof: "", connectionProofExpires: 0, profileSaveState: "idle",
+    profileSaveMessage: "", snapshotGeneration: 0,
+    clearConnectionProofTimer() {}, closePathBrowser() {}, refreshSnapshot() { return true; },
     cancelAutosave(scope) { cancelled.push(scope); }
   }, methods, ["clearSecrets", "integer", "profilePayload", "hydrateAutosave"]);
 
@@ -246,8 +254,10 @@ test("profile validation mirrors target, path, safety, output, and remote loggin
   const validate = (payload, secrets = []) => methods.validateProfile.call(context, payload, secrets);
 
   assert.equal(validate(validPayload()), "");
-  assert.match(validate(validPayload({ source: "volume1/source" })), /absolute NAS path/);
-  assert.match(validate(validPayload({ source: "/volume1/../source" })), /dot segments/);
+  assert.match(validate(validPayload({ source: "volume1/source" })), /canonical internal, USB, or SATA/);
+  assert.match(validate(validPayload({ source: "/volume1/../source" })), /canonical internal, USB, or SATA/);
+  assert.equal(validate(validPayload({ source: "/volumeUSB1/usbshare" })), "");
+  assert.equal(validate(validPayload({ source: "/volumeSATA2/satashare" })), "");
   assert.match(validate(validPayload({ url: "http://nas.example.invalid" })), /controlled-LAN exception/);
   assert.match(validate(validPayload({ remote: "/home//Backup" })), /Remote path/);
   assert.match(validate(validPayload({ ca_certificate: "relative/ca.pem" })), /CA certificate/);
@@ -290,7 +300,8 @@ test("secret-only save is independent of profile edits and remote-token clear re
       reportMutationError() { throw new Error("unexpected mutation failure"); }
     }, methods, [
       "secretOperations", "validateSecretOperations", "clearSecrets", "refreshAutosaveStatus",
-      "ensureProfileFailureRecords", "syncProfileFailureState", "clearProfileSecretFailures"
+      "ensureProfileFailureRecords", "syncProfileFailureState", "clearProfileSecretFailures",
+      "applyTrustedSecretPresence"
     ]);
   }
 

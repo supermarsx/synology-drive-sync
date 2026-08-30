@@ -227,17 +227,17 @@ test("AppWindow overlays, focus behavior, labels, secrets, and mutation guards r
   assert.match(source, /aria-label="Window starts"/);
   assert.match(source, /aria-label="Window ends"/);
   assert.match(source, /aria-label="Wait for routines"/);
-  assert.match(source, /this\.route === "profiles" && route !== "profiles"\) this\.closeProfile\(\)/);
+  assert.match(source, /this\.route === "profiles" && route !== "profiles"\) \{[\s\S]*?this\.profileSaveState === "saving" \|\| this\.profileConnectionState === "testing"[\s\S]*?return;[\s\S]*?this\.closeProfile\(\)/);
   assert.match(source, /clearSecrets\(\) \{ this\.secretValues = \{ password: "", totp: "", remote_log_token: "" \}; \}/);
   assert.match(source, /removeProfile\(\)[\s\S]*?this\.operationBusy\) return/);
   assert.match(source, /removeRoutine\(\)[\s\S]*?this\.operationBusy\) return/);
   assert.match(source, /:disabled="!canRunOperations \|\| !profiles\.length \|\| operationBusy"/);
   assert.match(source, /let configurationApplied = false;\s*let activeSecretKind = "";\s*const appliedSecretKinds = \[\];/);
-  assert.match(source, /ACTIONS\.configureProfile, payload\);\s*configurationApplied = true;/);
-  assert.match(source, /activeSecretKind = secret\.kind;\s*await apiPost[\s\S]*?ACTIONS\.setSecret, secret\);\s*appliedSecretKinds\.push\(secret\.kind\)/);
+  assert.match(source, /ACTIONS\.configureProfile, payload, true, undefined, AUTOSAVE_API_LIMITS\);\s*configurationApplied = true;/);
+  assert.match(source, /activeSecretKind = secret\.kind;[\s\S]*?const secretResult = await apiPost\([\s\S]*?ACTIONS\.setSecret, secret, true, undefined, AUTOSAVE_API_LIMITS\);\s*this\.applyTrustedSecretPresence\(secretResult\);\s*appliedSecretKinds\.push\(secret\.kind\)/);
   assert.match(source, /partiallyApplied \? "Profile partially applied" : "Profile not saved"/);
   assert.match(source, /Do not retry this multi-stage operation; inspect Activity and Logs/);
-  assert.match(source, /if \(partiallyApplied \|\| caught\.outcomeUnknown === true\)[\s\S]*?this\.closeProfile\(\);[\s\S]*?const observed = await this\.refreshSnapshot\(false, true\)/);
+  assert.match(source, /if \(configurationApplied && !this\.selectedProfile\) this\.selectedProfile = payload\.name;[\s\S]*?this\.profileSaveState = "error";[\s\S]*?profile editor was preserved/);
 });
 
 test("polling has no client deadline and toolkit make always rebuilds source", () => {

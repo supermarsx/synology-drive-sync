@@ -3,6 +3,7 @@ set -eu
 
 self_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 package_root=$(CDPATH='' cd -- "$self_dir/.." && pwd -P)
+dsm_system_root=/
 # shellcheck source=../libexec/sdsync-common
 . "$package_root/libexec/sdsync-common"
 umask 077
@@ -536,6 +537,11 @@ validate_source() {
     source_candidate=$1
     validate_toml_text source "$source_candidate"
     case $source_candidate in /*) ;; *) die "source must be an absolute local DSM path" ;; esac
+    case $source_candidate in
+        *//*|*/./*|*/../*|*/.|*/..)
+            die "source must be a canonical DSM volume path without empty or dot segments"
+            ;;
+    esac
     [ ! -L "$source_candidate" ] || die "source must not be a symlink: $source_candidate"
     if [ ! -d "$source_candidate" ] || [ ! -r "$source_candidate" ] || [ ! -x "$source_candidate" ]; then
         die "package identity cannot read/traverse source: $source_candidate"
@@ -547,6 +553,8 @@ validate_source() {
         *) die "resolved source is not an absolute local DSM path" ;;
     esac
     [ "$canonical_source" != / ] || die "source cannot resolve to the filesystem root"
+    [ "$canonical_source" = "$source_candidate" ] ||
+        die "source must not traverse symlinks or non-canonical path components: $source_candidate"
     validate_toml_text source "$canonical_source"
     source_lower=$(printf '%s' "$canonical_source" | tr '[:upper:]' '[:lower:]')
     case "$source_lower/" in
@@ -570,6 +578,27 @@ validate_source() {
                 ;;
         esac
     done
+    canonical_system_root=$(CDPATH='' cd -- "$dsm_system_root" 2>/dev/null && pwd -P) ||
+        die "cannot resolve the DSM filesystem root safely"
+    if [ "$canonical_system_root" = / ]; then
+        logical_source=$canonical_source
+    else
+        case $canonical_source in
+            "$canonical_system_root"/*) logical_source=/${canonical_source#"$canonical_system_root"/} ;;
+            *) die "source must be inside the DSM filesystem root" ;;
+        esac
+    fi
+    source_volume=${logical_source#/}
+    source_volume=${source_volume%%/*}
+    case $source_volume in
+        volumeUSB*) source_volume_number=${source_volume#volumeUSB} ;;
+        volumeSATA*) source_volume_number=${source_volume#volumeSATA} ;;
+        volume*) source_volume_number=${source_volume#volume} ;;
+        *) source_volume_number= ;;
+    esac
+    case $source_volume_number in
+        ''|0*|*[!0-9]*) die "source must be inside a canonical internal, USB, or SATA DSM volume tree" ;;
+    esac
 }
 
 require_private_readable_file() {
@@ -2333,7 +2362,7 @@ api_audit_event() {
     done
     case $audit_event_operation in
         configure-profile|remove-profile|set-default|set-secret|set-password|remove-password|set-totp|remove-totp|\
-        set-remote-log-token|remove-remote-log-token|schedule|routine|remove-routine|alert-policy|security-policy|\
+        set-remote-log-token|remove-remote-log-token|test-profile-auth|browse-remote|schedule|routine|remove-routine|alert-policy|security-policy|\
         interface-settings|session-notifications|doctor|plan|run) ;;
         *) api_error invalid_request "invalid audit-event operation" 64 ;;
     esac

@@ -532,6 +532,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32fast"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8498c871161e1742aaa9d52551b2d6ebdd4c3d45a3be423e3728f33b955be550"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2104,6 +2113,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
+ "crc32fast",
  "ctrlc",
  "hmac",
  "ignore",
@@ -2117,6 +2127,7 @@ dependencies = [
  "sha2",
  "subtle",
  "thiserror",
+ "tokio",
  "toml",
  "totp-rs",
  "windows-native-keyring-store",

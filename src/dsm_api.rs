@@ -40,6 +40,12 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(target_os = "linux")]
+use synology_drive_sync::Error as SyncError;
+#[cfg(target_os = "linux")]
+use synology_drive_sync::api::{ApiClient, ClientOptions};
+use synology_drive_sync::vault::{generate_totp, parse_totp_secret};
+
 const PACKAGE_ROOT: &str = "/var/packages/synology-drive-sync/target";
 const PACKAGE_HOME: &str = "/var/packages/synology-drive-sync/home";
 const PACKAGE_VAR: &str = "/var/packages/synology-drive-sync/var";
@@ -56,6 +62,7 @@ const RESPONSES_DIR: &str = "/var/packages/synology-drive-sync/var/control/respo
 const STAGING_DIR: &str = "/var/packages/synology-drive-sync/var/control/staging";
 const CSRF_KEY_PATH: &str = "/var/packages/synology-drive-sync/var/control/csrf.key";
 const SECURITY_POLICY_PATH: &str = "/var/packages/synology-drive-sync/home/config/security.conf";
+const PROFILE_SECRET_ROOT: &str = "/var/packages/synology-drive-sync/home/secrets";
 const ENQUEUE_LOCK_PATH: &str = "/var/packages/synology-drive-sync/var/control/enqueue.lock";
 const ENQUEUE_SEQUENCE_PATH: &str =
     "/var/packages/synology-drive-sync/var/control/enqueue.sequence";
@@ -155,6 +162,8 @@ const MAX_AUTHENTICATED_USERNAME_BYTES: usize = 256;
 const MAX_AUTH_OUTPUT_BYTES: usize = MAX_AUTHENTICATED_USERNAME_BYTES + 2;
 const MAX_DSM_USER_SERVICE_OUTPUT_BYTES: usize = MAX_MANAGER_OUTPUT_BYTES;
 const MAX_SECRET_BYTES: usize = 4096;
+const MAX_CONNECTION_SECRET_BYTES: usize = (MAX_SECRET_BYTES * 2) + 32;
+const CONNECTION_PROOF_LIFETIME_SECONDS: u64 = 5 * 60;
 const MAX_DSM_DELETE_BOUND: u64 = 2_147_483_647;
 const MAX_JOB_AGE_SECONDS: u64 = 24 * 60 * 60;
 const RESULT_RETENTION_SECONDS: u64 = 60 * 60;
@@ -185,6 +194,8 @@ const API_QUEUE_CAPACITY: usize = 16;
 
 type HmacSha256 = Hmac<Sha256>;
 type BridgeResult<T> = Result<T, BridgeError>;
+type DecodedConnectionSecrets = (Option<Zeroizing<Vec<u8>>>, Option<Zeroizing<Vec<u8>>>);
+type ResolvedConnectionSecrets = (Zeroizing<Vec<u8>>, Option<Zeroizing<Vec<u8>>>);
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
@@ -508,6 +519,8 @@ struct NativeAuthenticationContext {
 enum ReadAction {
     Csrf,
     Snapshot,
+    SourceDirectories { parent: String },
+    SourcePath { path: String },
     Logs { lines: u16, source: LogSource },
     Activity { lines: u16 },
     Result { job_id: String },
@@ -870,6 +883,7 @@ impl Drop for ParsedJob {
 struct RawQueuedResponse<'a> {
     schema: &'a str,
     job_id: &'a str,
+    operation: Option<&'a str>,
     client_request_id: &'a str,
     requested_by: &'a str,
     requested_uid: u32,
@@ -1069,6 +1083,72 @@ impl<'de> Deserialize<'de> for SecretString {
     {
         String::deserialize(deserializer).map(|value| Self(Zeroizing::new(value)))
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum CredentialSource {
+    Stored,
+    Provided,
+    None,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectionRequestArgs {
+    #[serde(default)]
+    profile: Option<String>,
+    url: String,
+    username: String,
+    allow_http: bool,
+    danger_accept_invalid_certs: bool,
+    #[serde(default)]
+    ca_certificate: Option<String>,
+    connect_timeout_seconds: u32,
+    timeout_seconds: u32,
+    retries: u8,
+    password_source: CredentialSource,
+    #[serde(default)]
+    password: Option<SecretString>,
+    totp_source: CredentialSource,
+    #[serde(default)]
+    totp: Option<SecretString>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectionJobArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
+    url: String,
+    username: String,
+    allow_http: bool,
+    danger_accept_invalid_certs: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ca_certificate: Option<String>,
+    connect_timeout_seconds: u32,
+    timeout_seconds: u32,
+    retries: u8,
+    password_source: CredentialSource,
+    totp_source: CredentialSource,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowseRemoteRequestArgs {
+    #[serde(flatten)]
+    connection: ConnectionRequestArgs,
+    parent: String,
+    connection_proof: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BrowseRemoteJobArgs {
+    #[serde(flatten)]
+    connection: ConnectionJobArgs,
+    parent: String,
+    connection_proof: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1370,6 +1450,8 @@ enum Mutation {
     RemoveProfile(NameArgs),
     SetDefault(NameArgs),
     SetSecret(SecretJobArgs),
+    TestProfileAuth(ConnectionJobArgs),
+    BrowseRemote(BrowseRemoteJobArgs),
     Schedule(ScheduleArgs),
     Routine(RoutineArgs),
     RemoveRoutine(NameArgs),
@@ -1410,6 +1492,8 @@ impl Mutation {
             Self::RemoveProfile(_) => "remove-profile",
             Self::SetDefault(_) => "set-default",
             Self::SetSecret(_) => "set-secret",
+            Self::TestProfileAuth(_) => "test-profile-auth",
+            Self::BrowseRemote(_) => "browse-remote",
             Self::Schedule(_) => "schedule",
             Self::Routine(_) => "routine",
             Self::RemoveRoutine(_) => "remove-routine",
@@ -1427,6 +1511,8 @@ impl Mutation {
                 serde_json::to_value(value)
             }
             Self::SetSecret(value) => serde_json::to_value(value),
+            Self::TestProfileAuth(value) => serde_json::to_value(value),
+            Self::BrowseRemote(value) => serde_json::to_value(value),
             Self::Schedule(value) => serde_json::to_value(value),
             Self::Routine(value) => serde_json::to_value(value),
             Self::AlertPolicy(value) => serde_json::to_value(value),
@@ -1704,6 +1790,20 @@ fn parse_read_action(mut query: BTreeMap<String, String>) -> BridgeResult<ReadAc
             require_empty_query(&query)?;
             ReadAction::Snapshot
         }
+        "source-directories" => {
+            let parent = query
+                .remove("parent")
+                .ok_or_else(BridgeError::bad_request)?;
+            validate_source_browser_path(&parent)?;
+            require_empty_query(&query)?;
+            ReadAction::SourceDirectories { parent }
+        }
+        "source-path" => {
+            let path = query.remove("path").ok_or_else(BridgeError::bad_request)?;
+            validate_source_path(&path)?;
+            require_empty_query(&query)?;
+            ReadAction::SourcePath { path }
+        }
         "logs" => {
             let lines = parse_lines(query.remove("lines"))?;
             let source = match query.remove("source").as_deref().unwrap_or("all") {
@@ -1759,6 +1859,239 @@ fn require_empty_query(query: &BTreeMap<String, String>) -> BridgeResult<()> {
     } else {
         Err(BridgeError::bad_request())
     }
+}
+
+fn is_positive_decimal_suffix(value: &str) -> bool {
+    !value.is_empty() && !value.starts_with('0') && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_dsm_volume_name(value: &str) -> bool {
+    value
+        .strip_prefix("volumeUSB")
+        .or_else(|| value.strip_prefix("volumeSATA"))
+        .or_else(|| value.strip_prefix("volume"))
+        .is_some_and(is_positive_decimal_suffix)
+}
+
+fn is_dsm_managed_source_name(value: &str) -> bool {
+    [
+        "#recycle",
+        "#snapshot",
+        "@eaDir",
+        "@tmp",
+        "@sharebin",
+        "@apphome",
+        "@appdata",
+        "@appstore",
+        "@apptemp",
+        "@appconf",
+        ".SynologyWorkingDirectory",
+    ]
+    .iter()
+    .any(|managed| value.eq_ignore_ascii_case(managed))
+}
+
+fn validate_source_browser_path(value: &str) -> BridgeResult<()> {
+    if value == "/" {
+        return Ok(());
+    }
+    if value.is_empty()
+        || value.len() > 4096
+        || !value.starts_with("/volume")
+        || value.ends_with('/')
+        || value.contains("//")
+        || value.contains('\\')
+        || value.contains('"')
+        || value.chars().any(char::is_control)
+    {
+        return Err(BridgeError::bad_request());
+    }
+    let components: Vec<_> = value[1..].split('/').collect();
+    if components.is_empty()
+        || !is_dsm_volume_name(components[0])
+        || components.iter().any(|component| {
+            component.is_empty()
+                || matches!(*component, "." | "..")
+                || is_dsm_managed_source_name(component)
+        })
+    {
+        return Err(BridgeError::bad_request());
+    }
+    Ok(())
+}
+
+fn validate_source_path(value: &str) -> BridgeResult<()> {
+    validate_bounded_text(value, 4096, false)?;
+    if value == "/"
+        || !value.starts_with('/')
+        || value.ends_with('/')
+        || value.contains("//")
+        || value.contains('\\')
+        || value.contains('"')
+        || contains_dot_segment(value)
+    {
+        return Err(BridgeError::bad_request());
+    }
+    let mut components = value[1..].split('/');
+    if !components.next().is_some_and(is_dsm_volume_name)
+        || components.any(is_dsm_managed_source_name)
+    {
+        return Err(BridgeError::bad_request());
+    }
+    Ok(())
+}
+
+fn source_browser_parent(value: &str) -> Option<String> {
+    if value == "/" {
+        return None;
+    }
+    let parent = value
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("");
+    Some(if parent.is_empty() { "/" } else { parent }.to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn package_identity_can_read_and_traverse(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // The service's real and effective identities are the package account.
+    // `access` therefore checks the exact R_OK/X_OK pair used by the manager's
+    // authoritative save-time source validation.
+    unsafe { libc::access(path.as_ptr(), libc::R_OK | libc::X_OK) == 0 }
+}
+
+#[cfg(target_os = "linux")]
+fn source_directories_document(system_root: &Path, parent: &str) -> BridgeResult<Vec<u8>> {
+    const MAX_DIRECTORY_RESULTS: usize = 500;
+    const MAX_SCANNED_ENTRIES: usize = 4096;
+
+    validate_source_browser_path(parent)?;
+    let system_root = fs::canonicalize(system_root).map_err(|_| BridgeError::unsafe_runtime())?;
+    let physical_parent = if parent == "/" {
+        system_root.clone()
+    } else {
+        system_root.join(parent.trim_start_matches('/'))
+    };
+    let metadata = fs::symlink_metadata(&physical_parent)
+        .map_err(|_| BridgeError::new(ErrorKind::Forbidden))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(BridgeError::new(ErrorKind::Forbidden));
+    }
+    let canonical_parent =
+        fs::canonicalize(&physical_parent).map_err(|_| BridgeError::new(ErrorKind::Forbidden))?;
+    if canonical_parent != physical_parent || !canonical_parent.starts_with(&system_root) {
+        return Err(BridgeError::new(ErrorKind::Forbidden));
+    }
+    if !package_identity_can_read_and_traverse(&canonical_parent) {
+        return Err(BridgeError::new(ErrorKind::Forbidden));
+    }
+
+    let mut directories = Vec::new();
+    let mut truncated = false;
+    let entries =
+        fs::read_dir(&canonical_parent).map_err(|_| BridgeError::new(ErrorKind::Forbidden))?;
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_SCANNED_ENTRIES {
+            truncated = true;
+            break;
+        }
+        let Ok(entry) = entry else {
+            // A child may disappear or become unreadable while the directory
+            // is being enumerated. The already-validated parent remains safe;
+            // omit only the unusable child from this bounded snapshot.
+            continue;
+        };
+        let Ok(name) = entry.file_name().into_string() else {
+            // DSM paths exposed to the JSON UI must be UTF-8. A non-UTF-8
+            // sibling must not make otherwise usable folders unselectable.
+            continue;
+        };
+        if (parent == "/" && !is_dsm_volume_name(&name))
+            || (parent != "/"
+                && (name.is_empty()
+                    || name.contains('"')
+                    || name.contains('\\')
+                    || name.chars().any(char::is_control)
+                    || is_dsm_managed_source_name(&name)))
+        {
+            continue;
+        }
+        let entry_path = entry.path();
+        let Ok(entry_metadata) = fs::symlink_metadata(&entry_path) else {
+            continue;
+        };
+        if !entry_metadata.file_type().is_dir() || entry_metadata.file_type().is_symlink() {
+            continue;
+        }
+        let canonical_entry = match fs::canonicalize(&entry_path) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if canonical_entry != entry_path
+            || !canonical_entry.starts_with(&system_root)
+            || !package_identity_can_read_and_traverse(&canonical_entry)
+            || fs::read_dir(&canonical_entry).is_err()
+        {
+            continue;
+        }
+        let logical_path = if parent == "/" {
+            format!("/{name}")
+        } else {
+            format!("{parent}/{name}")
+        };
+        validate_source_browser_path(&logical_path)?;
+        directories.push(json!({ "name": name, "path": logical_path }));
+        if directories.len() > MAX_DIRECTORY_RESULTS {
+            truncated = true;
+            break;
+        }
+    }
+    directories.sort_by(|left, right| {
+        left.get("name")
+            .and_then(Value::as_str)
+            .cmp(&right.get("name").and_then(Value::as_str))
+    });
+    directories.truncate(MAX_DIRECTORY_RESULTS);
+    serde_json::to_vec(&json!({
+        "schema": "sdsync.dsm-source-directories.v1",
+        "current": parent,
+        "parent": source_browser_parent(parent),
+        "directories": directories,
+        "truncated": truncated,
+    }))
+    .map_err(|_| BridgeError::internal())
+}
+
+#[cfg(target_os = "linux")]
+fn source_path_document(system_root: &Path, path: &str) -> BridgeResult<Vec<u8>> {
+    validate_source_path(path)?;
+    let system_root = fs::canonicalize(system_root).map_err(|_| BridgeError::unsafe_runtime())?;
+    let physical_path = system_root.join(path.trim_start_matches('/'));
+    let metadata =
+        fs::symlink_metadata(&physical_path).map_err(|_| BridgeError::new(ErrorKind::Forbidden))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(BridgeError::new(ErrorKind::Forbidden));
+    }
+    let canonical_path =
+        fs::canonicalize(&physical_path).map_err(|_| BridgeError::new(ErrorKind::Forbidden))?;
+    if canonical_path != physical_path
+        || !canonical_path.starts_with(&system_root)
+        || !package_identity_can_read_and_traverse(&canonical_path)
+        || fs::read_dir(&canonical_path).is_err()
+    {
+        return Err(BridgeError::new(ErrorKind::Forbidden));
+    }
+    serde_json::to_vec(&json!({
+        "schema": "sdsync.dsm-source-path.v1",
+        "path": path,
+        "valid": true,
+    }))
+    .map_err(|_| BridgeError::internal())
 }
 
 fn hex_nibble(value: u8) -> Option<u8> {
@@ -1844,6 +2177,27 @@ fn parse_mutation_request(body: &[u8]) -> BridgeResult<ParsedMutation> {
                     profile: arguments.profile,
                     kind: arguments.kind,
                     mode: arguments.mode,
+                }),
+                secret,
+            )
+        }
+        "test-profile-auth" => {
+            let arguments: ConnectionRequestArgs = parse_arguments(request.arguments)?;
+            let (arguments, secret) = parse_connection_request(arguments)?;
+            (Mutation::TestProfileAuth(arguments), secret)
+        }
+        "browse-remote" => {
+            let arguments: BrowseRemoteRequestArgs = parse_arguments(request.arguments)?;
+            validate_remote_browser_parent(&arguments.parent)?;
+            if !valid_connection_proof_syntax(&arguments.connection_proof) {
+                return Err(BridgeError::bad_request());
+            }
+            let (connection, secret) = parse_connection_request(arguments.connection)?;
+            (
+                Mutation::BrowseRemote(BrowseRemoteJobArgs {
+                    connection,
+                    parent: arguments.parent,
+                    connection_proof: arguments.connection_proof,
                 }),
                 secret,
             )
@@ -1934,6 +2288,20 @@ fn parse_job(body: &[u8]) -> BridgeResult<ParsedJob> {
             let value: SecretJobArgs = parse_arguments(job.arguments)?;
             validate_existing_name(&value.profile)?;
             Mutation::SetSecret(value)
+        }
+        "test-profile-auth" => {
+            let value: ConnectionJobArgs = parse_arguments(job.arguments)?;
+            validate_connection_job(&value)?;
+            Mutation::TestProfileAuth(value)
+        }
+        "browse-remote" => {
+            let value: BrowseRemoteJobArgs = parse_arguments(job.arguments)?;
+            validate_connection_job(&value.connection)?;
+            validate_remote_browser_parent(&value.parent)?;
+            if !valid_connection_proof_syntax(&value.connection_proof) {
+                return Err(BridgeError::bad_request());
+            }
+            Mutation::BrowseRemote(value)
         }
         "schedule" => {
             let value: ScheduleArgs = parse_arguments(job.arguments)?;
@@ -2068,12 +2436,178 @@ fn validate_secret(value: &str) -> BridgeResult<()> {
     Ok(())
 }
 
+fn validate_connection_job(value: &ConnectionJobArgs) -> BridgeResult<()> {
+    if let Some(profile) = &value.profile {
+        validate_existing_name(profile)?;
+    }
+    validate_bounded_text(&value.url, 2048, false)?;
+    if !(value.url.starts_with("https://")
+        || (value.allow_http && value.url.starts_with("http://")))
+    {
+        return Err(BridgeError::bad_request());
+    }
+    validate_bounded_text(&value.username, 256, false)?;
+    if value.connect_timeout_seconds == 0
+        || value.connect_timeout_seconds > 600
+        || value.timeout_seconds == 0
+        || value.timeout_seconds > 86_400
+        || value.retries > 5
+        || value.password_source == CredentialSource::None
+        || (matches!(value.password_source, CredentialSource::Stored) && value.profile.is_none())
+        || (matches!(value.totp_source, CredentialSource::Stored) && value.profile.is_none())
+    {
+        return Err(BridgeError::bad_request());
+    }
+    if let Some(certificate) = &value.ca_certificate {
+        validate_bounded_text(certificate, 4096, false)?;
+        if !certificate.starts_with('/') || contains_dot_segment(certificate) {
+            return Err(BridgeError::bad_request());
+        }
+    }
+    Ok(())
+}
+
+fn validate_remote_browser_parent(value: &str) -> BridgeResult<()> {
+    if value == "/" {
+        return Ok(());
+    }
+    validate_bounded_text(value, 247, false)?;
+    if !value.starts_with('/')
+        || value.ends_with('/')
+        || value.contains("//")
+        || value.contains('\\')
+        || contains_dot_segment(value)
+    {
+        return Err(BridgeError::bad_request());
+    }
+    Ok(())
+}
+
+fn valid_connection_proof_syntax(value: &str) -> bool {
+    let components: Vec<_> = value.split('.').collect();
+    components.len() == 4
+        && components[0] == "v1"
+        && parse_canonical_u64(components[1]).is_ok()
+        && components[2].len() == 64
+        && components[2].bytes().all(|byte| byte.is_ascii_hexdigit())
+        && components[3].len() == 64
+        && components[3].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn encode_connection_secret_envelope(
+    password: Option<SecretString>,
+    totp: Option<SecretString>,
+) -> BridgeResult<Option<Zeroizing<Vec<u8>>>> {
+    const MAGIC: &[u8] = b"sdsync-connection-secrets-v1\0";
+    if password.is_none() && totp.is_none() {
+        return Ok(None);
+    }
+    let mut encoded = Zeroizing::new(Vec::with_capacity(MAX_CONNECTION_SECRET_BYTES));
+    encoded.extend_from_slice(MAGIC);
+    for value in [password, totp] {
+        let bytes = value
+            .as_ref()
+            .map(|value| value.0.as_bytes())
+            .unwrap_or_default();
+        let length = u32::try_from(bytes.len()).map_err(|_| BridgeError::bad_request())?;
+        encoded.extend_from_slice(&length.to_be_bytes());
+        encoded.extend_from_slice(bytes);
+    }
+    if encoded.len() > MAX_CONNECTION_SECRET_BYTES {
+        return Err(BridgeError::new(ErrorKind::PayloadTooLarge));
+    }
+    Ok(Some(encoded))
+}
+
+fn decode_connection_secret_envelope(
+    encoded: Option<Zeroizing<Vec<u8>>>,
+) -> BridgeResult<DecodedConnectionSecrets> {
+    const MAGIC: &[u8] = b"sdsync-connection-secrets-v1\0";
+    let Some(encoded) = encoded else {
+        return Ok((None, None));
+    };
+    if encoded.len() > MAX_CONNECTION_SECRET_BYTES || !encoded.starts_with(MAGIC) {
+        return Err(BridgeError::bad_request());
+    }
+    let mut cursor = MAGIC.len();
+    let mut values = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let length_bytes: [u8; 4] = encoded
+            .get(cursor..cursor + 4)
+            .and_then(|value| value.try_into().ok())
+            .ok_or_else(BridgeError::bad_request)?;
+        cursor += 4;
+        let length = u32::from_be_bytes(length_bytes) as usize;
+        let value = encoded
+            .get(cursor..cursor + length)
+            .ok_or_else(BridgeError::bad_request)?;
+        cursor += length;
+        values.push((!value.is_empty()).then(|| Zeroizing::new(value.to_vec())));
+    }
+    if cursor != encoded.len() {
+        return Err(BridgeError::bad_request());
+    }
+    let totp = values.pop().ok_or_else(BridgeError::internal)?;
+    let password = values.pop().ok_or_else(BridgeError::internal)?;
+    Ok((password, totp))
+}
+
+fn parse_connection_request(
+    mut value: ConnectionRequestArgs,
+) -> BridgeResult<(ConnectionJobArgs, Option<Zeroizing<Vec<u8>>>)> {
+    let password = match value.password_source {
+        CredentialSource::Provided => {
+            let secret = value.password.take().ok_or_else(BridgeError::bad_request)?;
+            validate_secret(&secret.0)?;
+            Some(secret)
+        }
+        CredentialSource::Stored | CredentialSource::None => {
+            if value.password.is_some() {
+                return Err(BridgeError::bad_request());
+            }
+            None
+        }
+    };
+    let totp = match value.totp_source {
+        CredentialSource::Provided => {
+            let secret = value.totp.take().ok_or_else(BridgeError::bad_request)?;
+            validate_secret(&secret.0)?;
+            // Parse now as well as at execution so malformed provisioning
+            // material never enters the private queue.
+            parse_totp_secret(&secret.0).map_err(|_| BridgeError::bad_request())?;
+            Some(secret)
+        }
+        CredentialSource::Stored | CredentialSource::None => {
+            if value.totp.is_some() {
+                return Err(BridgeError::bad_request());
+            }
+            None
+        }
+    };
+    let job = ConnectionJobArgs {
+        profile: value.profile,
+        url: value.url,
+        username: value.username,
+        allow_http: value.allow_http,
+        danger_accept_invalid_certs: value.danger_accept_invalid_certs,
+        ca_certificate: value.ca_certificate,
+        connect_timeout_seconds: value.connect_timeout_seconds,
+        timeout_seconds: value.timeout_seconds,
+        retries: value.retries,
+        password_source: value.password_source,
+        totp_source: value.totp_source,
+    };
+    validate_connection_job(&job)?;
+    let envelope = encode_connection_secret_envelope(password, totp)?;
+    Ok((job, envelope))
+}
+
 fn validate_configure_profile(value: &ConfigureProfileArgs) -> BridgeResult<()> {
     const MAX_DSM_RATE_BYTES_PER_SECOND: u64 = 9_007_199_254_740_991;
 
     validate_name(&value.name)?;
     validate_bounded_text(&value.source, 4096, false)?;
-    if !value.source.starts_with('/') || contains_dot_segment(&value.source) {
+    if validate_source_path(&value.source).is_err() {
         return Err(BridgeError::bad_request());
     }
     validate_bounded_text(&value.url, 2048, false)?;
@@ -2465,6 +2999,14 @@ fn validate_mutation_against_security_policy(
                 && (policy.allow_remote_logging
                     || value.kind != SecretKind::RemoteLogToken
                     || value.mode == SecretMode::Clear)
+        }
+        Mutation::TestProfileAuth(value)
+        | Mutation::BrowseRemote(BrowseRemoteJobArgs {
+            connection: value, ..
+        }) => {
+            policy.allow_operational_actions
+                && (policy.allow_http_targets || !value.allow_http)
+                && (policy.allow_invalid_tls || !value.danger_accept_invalid_certs)
         }
         Mutation::Schedule(value) => {
             policy.allow_routine_changes && (policy.allow_destructive_sync || !value.allow_delete)
@@ -4881,7 +5423,12 @@ fn read_manager_arguments(action: &ReadAction) -> BridgeResult<Vec<OsString>> {
             "--lines".into(),
             lines.to_string().into(),
         ],
-        ReadAction::Csrf | ReadAction::Result { .. } => return Err(BridgeError::internal()),
+        ReadAction::Csrf
+        | ReadAction::SourceDirectories { .. }
+        | ReadAction::SourcePath { .. }
+        | ReadAction::Result { .. } => {
+            return Err(BridgeError::internal());
+        }
     };
     Ok(arguments)
 }
@@ -4964,6 +5511,11 @@ fn mutation_manager_arguments(mutation: &Mutation) -> Vec<OsString> {
             push_pair(&mut arguments, "--profile", &value.profile);
             push_pair(&mut arguments, "--kind", value.kind.as_str());
             push_pair(&mut arguments, "--mode", value.mode.as_str());
+        }
+        Mutation::TestProfileAuth(_) | Mutation::BrowseRemote(_) => {
+            // These operations execute inside the unprivileged Rust service so
+            // credentials never enter argv, environment, or manager output.
+            return Vec::new();
         }
         Mutation::Schedule(value) => {
             arguments.push("schedule".into());
@@ -5181,7 +5733,12 @@ fn parse_and_sanitize_manager_json(
         ReadAction::Snapshot => "sdsync.dsm-api.v1",
         ReadAction::Logs { .. } => "sdsync.dsm-logs.v1",
         ReadAction::Activity { .. } => "sdsync.dsm-activity.v1",
-        ReadAction::Csrf | ReadAction::Result { .. } => return Err(BridgeError::internal()),
+        ReadAction::Csrf
+        | ReadAction::SourceDirectories { .. }
+        | ReadAction::SourcePath { .. }
+        | ReadAction::Result { .. } => {
+            return Err(BridgeError::internal());
+        }
     };
     let root = value
         .as_object()
@@ -5208,6 +5765,9 @@ fn parse_and_sanitize_manager_json(
                     "secrets": true,
                     "write_test": true,
                     "private_queue": true,
+                    "source_browser": true,
+                    "profile_connection_test": true,
+                    "remote_browser": true,
                 }),
             );
             if let Some(policy) = runtime_policy {
@@ -5274,7 +5834,10 @@ fn parse_and_sanitize_manager_json(
                 });
             }
         }
-        ReadAction::Csrf | ReadAction::Result { .. } => {}
+        ReadAction::Csrf
+        | ReadAction::SourceDirectories { .. }
+        | ReadAction::SourcePath { .. }
+        | ReadAction::Result { .. } => {}
     }
     serde_json::to_vec(&value).map_err(|_| BridgeError::internal())
 }
@@ -5449,6 +6012,14 @@ fn validate_consumer_paths(request: &Path, response: &Path) -> BridgeResult<Stri
 }
 
 fn parse_manager_result(bytes: &[u8], exact_secret: Option<&[u8]>) -> BridgeResult<Value> {
+    parse_manager_result_for_operation(bytes, exact_secret, None)
+}
+
+fn parse_manager_result_for_operation(
+    bytes: &[u8],
+    exact_secret: Option<&[u8]>,
+    operation: Option<&str>,
+) -> BridgeResult<Value> {
     if bytes.is_empty() || bytes.len() > MAX_MANAGER_OUTPUT_BYTES {
         return Err(BridgeError::new(ErrorKind::Unavailable));
     }
@@ -5456,6 +6027,10 @@ fn parse_manager_result(bytes: &[u8], exact_secret: Option<&[u8]>) -> BridgeResu
         serde_json::from_slice(bytes).map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
     if json_contains_sensitive_value(&value, exact_secret) {
         return Err(BridgeError::new(ErrorKind::Unavailable));
+    }
+    if matches!(operation, Some("test-profile-auth" | "browse-remote")) {
+        validate_connection_manager_result(&value, operation.unwrap())?;
+        return Ok(value);
     }
     let root = value
         .as_object()
@@ -5573,6 +6148,170 @@ fn parse_manager_result(bytes: &[u8], exact_secret: Option<&[u8]>) -> BridgeResu
     Ok(value)
 }
 
+fn validate_connection_manager_result(value: &Value, operation: &str) -> BridgeResult<()> {
+    let root = value
+        .as_object()
+        .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+    if root.get("schema").and_then(Value::as_str) != Some("sdsync.dsm-result.v1") {
+        return Err(BridgeError::new(ErrorKind::Unavailable));
+    }
+    let ok = root
+        .get("ok")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+    let message = root
+        .get("message")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+    validate_result_text(message, 2048)?;
+
+    if !ok {
+        const FAILURE_FIELDS: &[&str] = &["schema", "ok", "message", "code"];
+        if root.len() != FAILURE_FIELDS.len()
+            || root
+                .keys()
+                .any(|key| !FAILURE_FIELDS.contains(&key.as_str()))
+        {
+            return Err(BridgeError::new(ErrorKind::Unavailable));
+        }
+        let code = root
+            .get("code")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+        let generic_internal_failure =
+            code == "operation_failed" && message == "Operation could not be completed.";
+        let valid_code = matches!(
+            code,
+            "file_station_connection_failed"
+                | "file_station_totp_required"
+                | "file_station_totp_rejected"
+                | "file_station_authentication_failed"
+                | "file_station_logout_failed"
+        ) || generic_internal_failure
+            || (operation == "browse-remote"
+                && matches!(
+                    code,
+                    "file_station_listing_denied"
+                        | "file_station_listing_failed"
+                        | "file_station_denied_logout_failed"
+                        | "file_station_listing_logout_failed"
+                        | "file_station_operation_logout_failed"
+                ));
+        if !valid_code {
+            return Err(BridgeError::new(ErrorKind::Unavailable));
+        }
+        return Ok(());
+    }
+
+    match operation {
+        "test-profile-auth" => {
+            const AUTH_FIELDS: &[&str] = &[
+                "schema",
+                "ok",
+                "message",
+                "connection_proof",
+                "connection_proof_expires_at_epoch",
+            ];
+            let proof = root.get("connection_proof").and_then(Value::as_str);
+            let expires = root
+                .get("connection_proof_expires_at_epoch")
+                .and_then(Value::as_u64);
+            let proof_expires = proof
+                .and_then(|value| value.split('.').nth(1))
+                .and_then(|value| value.parse::<u64>().ok());
+            if root.len() != AUTH_FIELDS.len()
+                || root.keys().any(|key| !AUTH_FIELDS.contains(&key.as_str()))
+                || message
+                    != "Authentication succeeded and the temporary File Station session was closed."
+                || !proof.is_some_and(valid_connection_proof_syntax)
+                || expires.is_none_or(|epoch| epoch == 0)
+                || proof_expires != expires
+            {
+                return Err(BridgeError::new(ErrorKind::Unavailable));
+            }
+        }
+        "browse-remote" => validate_remote_directory_result(root, message)?,
+        _ => return Err(BridgeError::new(ErrorKind::Unavailable)),
+    }
+    Ok(())
+}
+
+fn validate_remote_directory_result(
+    root: &serde_json::Map<String, Value>,
+    message: &str,
+) -> BridgeResult<()> {
+    const LIST_FIELDS: &[&str] = &[
+        "schema",
+        "ok",
+        "message",
+        "directory_schema",
+        "current",
+        "directories",
+        "truncated",
+    ];
+    if root.len() != LIST_FIELDS.len()
+        || root.keys().any(|key| !LIST_FIELDS.contains(&key.as_str()))
+        || message != "File Station directories loaded."
+        || root.get("directory_schema").and_then(Value::as_str)
+            != Some("sdsync.dsm-remote-directories.v1")
+        || root.get("truncated").and_then(Value::as_bool).is_none()
+    {
+        return Err(BridgeError::new(ErrorKind::Unavailable));
+    }
+    let current = root
+        .get("current")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+    validate_remote_browser_parent(current)
+        .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+    let directories = root
+        .get("directories")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() <= 500)
+        .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+    let mut seen = BTreeSet::new();
+    for directory in directories {
+        let directory = directory
+            .as_object()
+            .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+        if directory.len() != 2
+            || directory
+                .keys()
+                .any(|key| !matches!(key.as_str(), "name" | "path"))
+        {
+            return Err(BridgeError::new(ErrorKind::Unavailable));
+        }
+        let name = directory
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+        let path = directory
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+        if name.is_empty()
+            || name.len() > 255
+            || matches!(name, "." | "..")
+            || name.contains(['/', '\\'])
+            || name.chars().any(char::is_control)
+        {
+            return Err(BridgeError::new(ErrorKind::Unavailable));
+        }
+        let expected = if current == "/" {
+            format!("/{name}")
+        } else {
+            format!("{current}/{name}")
+        };
+        if path != expected
+            || validate_remote_browser_parent(path).is_err()
+            || !seen.insert(path.to_owned())
+        {
+            return Err(BridgeError::new(ErrorKind::Unavailable));
+        }
+    }
+    Ok(())
+}
+
 fn validate_set_secret_manager_result(value: &Value) -> BridgeResult<()> {
     let root = value
         .as_object()
@@ -5615,14 +6354,18 @@ fn canonical_queued_response_bytes(
     if completed_at_epoch < job.issued_at_epoch {
         return Err(BridgeError::new(ErrorKind::Unavailable));
     }
+    let result_bytes =
+        serde_json::to_vec(result).map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+    parse_manager_result_for_operation(&result_bytes, None, Some(job.mutation.operation_id()))?;
     let audit_terminal_state = if result.get("ok").and_then(Value::as_bool) == Some(true) {
         "succeeded"
     } else {
         "failed"
     };
     let bytes = serde_json::to_vec(&json!({
-        "schema": "sdsync.dsm-queued-response.v1",
+        "schema": "sdsync.dsm-queued-response.v2",
         "job_id": job.request_id,
+        "operation": job.mutation.operation_id(),
         "client_request_id": job.client_request_id,
         "requested_by": job.requested_by,
         "requested_uid": job.requested_uid,
@@ -5648,9 +6391,31 @@ fn parse_queued_response(
 ) -> BridgeResult<ParsedQueuedResponse> {
     let response: RawQueuedResponse<'_> =
         serde_json::from_slice(bytes).map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
-    if response.schema != "sdsync.dsm-queued-response.v1"
-        || response.job_id != expected_job_id
+    let operation = match (response.schema, response.operation) {
+        ("sdsync.dsm-queued-response.v1", None) => None,
+        ("sdsync.dsm-queued-response.v2", Some(operation)) => Some(operation),
+        _ => return Err(BridgeError::new(ErrorKind::Unavailable)),
+    };
+    if response.job_id != expected_job_id
         || !valid_server_job_id(response.job_id)
+        || operation.is_some_and(|operation| {
+            !matches!(
+                operation,
+                "configure-profile"
+                    | "remove-profile"
+                    | "set-default"
+                    | "set-secret"
+                    | "test-profile-auth"
+                    | "browse-remote"
+                    | "schedule"
+                    | "routine"
+                    | "remove-routine"
+                    | "alert-policy"
+                    | "security-policy"
+                    | "client-event"
+                    | "action"
+            )
+        })
         || !valid_client_request_id(response.client_request_id)
         || !valid_authenticated_username(response.requested_by)
         || response.requested_uid == 0
@@ -5663,7 +6428,8 @@ fn parse_queued_response(
     }
     let session_binding = hex_decode_exact::<32>(response.session_binding)
         .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
-    let result = parse_manager_result(response.result.get().as_bytes(), None)?;
+    let result =
+        parse_manager_result_for_operation(response.result.get().as_bytes(), None, operation)?;
     let expected_terminal = if result.get("ok").and_then(Value::as_bool) == Some(true) {
         "succeeded"
     } else {
@@ -5851,6 +6617,8 @@ fn mutation_audit_operation(mutation: &Mutation) -> &'static str {
             (SecretKind::RemoteLogToken, SecretMode::Replace) => "set-remote-log-token",
             (SecretKind::RemoteLogToken, SecretMode::Clear) => "remove-remote-log-token",
         },
+        Mutation::TestProfileAuth(_) => "test-profile-auth",
+        Mutation::BrowseRemote(_) => "browse-remote",
         Mutation::ClientEvent(value) => value.event.as_str(),
         Mutation::Action(value) => value.kind.as_str(),
         _ => mutation.operation_id(),
@@ -5862,6 +6630,8 @@ fn mutation_audit_profile(mutation: &Mutation) -> &str {
         Mutation::ConfigureProfile(value) => &value.name,
         Mutation::RemoveProfile(value) | Mutation::SetDefault(value) => &value.name,
         Mutation::SetSecret(value) => &value.profile,
+        Mutation::TestProfileAuth(value) => value.profile.as_deref().unwrap_or("none"),
+        Mutation::BrowseRemote(value) => value.connection.profile.as_deref().unwrap_or("none"),
         Mutation::Routine(value) => &value.profile,
         Mutation::RemoveRoutine(value) => &value.name,
         Mutation::Action(value) => &value.scope,
@@ -5893,6 +6663,8 @@ fn valid_audit_operation(value: &str) -> bool {
             | "remove-totp"
             | "set-remote-log-token"
             | "remove-remote-log-token"
+            | "test-profile-auth"
+            | "browse-remote"
             | "schedule"
             | "routine"
             | "remove-routine"
@@ -6969,7 +7741,8 @@ mod linux_files {
         if final_job.exists() || secret_path.exists() {
             return Err(BridgeError::new(ErrorKind::Conflict));
         }
-        if secret.is_some_and(|value| value.is_empty() || value.len() > MAX_SECRET_BYTES) {
+        if secret.is_some_and(|value| value.is_empty() || value.len() > MAX_CONNECTION_SECRET_BYTES)
+        {
             return Err(BridgeError::bad_request());
         }
         create_private_file(&temporary_job, package_uid, &job)?;
@@ -7161,6 +7934,68 @@ mod linux_files {
         let text = std::str::from_utf8(&line).map_err(|_| BridgeError::bad_request())?;
         validate_secret(text)?;
         drop(guard);
+        Ok(Some(line))
+    }
+
+    pub(super) fn read_claimed_connection_secret(
+        paths: &ControlPaths<'_>,
+        request_id: &str,
+        package_uid: u32,
+        required: bool,
+    ) -> BridgeResult<Option<Zeroizing<Vec<u8>>>> {
+        let path = paths.processing.join(format!("{request_id}.secret"));
+        let guard = SecretRemovalGuard { path: path.clone() };
+        if !path.exists() {
+            return if required {
+                Err(BridgeError::bad_request())
+            } else {
+                Ok(None)
+            };
+        }
+        if !required {
+            return Err(BridgeError::bad_request());
+        }
+        let mut value =
+            read_exact_private_file(&path, package_uid, MAX_CONNECTION_SECRET_BYTES + 1)?;
+        if value.last() != Some(&b'\n') {
+            return Err(BridgeError::bad_request());
+        }
+        value.pop();
+        if value.is_empty() || value.len() > MAX_CONNECTION_SECRET_BYTES {
+            return Err(BridgeError::bad_request());
+        }
+        drop(guard);
+        Ok(Some(value))
+    }
+
+    pub(super) fn read_profile_secret(
+        profile: &str,
+        kind: &str,
+        package_uid: u32,
+    ) -> BridgeResult<Option<Zeroizing<Vec<u8>>>> {
+        validate_existing_name(profile)?;
+        if !matches!(kind, "password" | "totp") {
+            return Err(BridgeError::bad_request());
+        }
+        let root = Path::new(PROFILE_SECRET_ROOT);
+        validate_private_directory(root, package_uid)?;
+        let path = root.join(format!("{profile}.{kind}"));
+        if !path.exists() {
+            if fs::symlink_metadata(&path).is_ok() {
+                return Err(BridgeError::unsafe_runtime());
+            }
+            return Ok(None);
+        }
+        let mut line = read_exact_private_file(&path, package_uid, MAX_SECRET_BYTES + 1)?;
+        if line.last() != Some(&b'\n')
+            || line[..line.len() - 1].contains(&b'\n')
+            || line[..line.len() - 1].contains(&b'\r')
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        line.pop();
+        let text = std::str::from_utf8(&line).map_err(|_| BridgeError::unsafe_runtime())?;
+        validate_secret(text).map_err(|_| BridgeError::unsafe_runtime())?;
         Ok(Some(line))
     }
 
@@ -7390,7 +8225,7 @@ mod linux_files {
         let (request_id, maximum) = if let Some(request_id) = name.strip_suffix(".job.tmp") {
             (request_id, MAX_JOB_BYTES)
         } else if let Some(request_id) = name.strip_suffix(".secret.tmp") {
-            (request_id, MAX_SECRET_BYTES + 1)
+            (request_id, MAX_CONNECTION_SECRET_BYTES + 1)
         } else {
             let request_id = name.strip_suffix(".response.tmp")?;
             (request_id, MAX_MANAGER_OUTPUT_BYTES)
@@ -7522,7 +8357,7 @@ mod linux_files {
                     || before.st_uid() != package_uid
                     || before.st_mode() & 0o777 != 0o600
                     || before.st_nlink() != 1
-                    || before.len() > (MAX_SECRET_BYTES + 1) as u64
+                    || before.len() > (MAX_CONNECTION_SECRET_BYTES + 1) as u64
                 {
                     return Err(BridgeError::unsafe_runtime());
                 }
@@ -7548,7 +8383,7 @@ mod linux_files {
                     || current.st_uid() != package_uid
                     || current.st_mode() & 0o777 != 0o600
                     || current.st_nlink() != 1
-                    || current.len() > (MAX_SECRET_BYTES + 1) as u64
+                    || current.len() > (MAX_CONNECTION_SECRET_BYTES + 1) as u64
                     || current.st_dev() != before.st_dev()
                     || current.st_ino() != before.st_ino()
                 {
@@ -7824,7 +8659,7 @@ mod linux_files {
                 let maximum = if is_job {
                     MAX_JOB_BYTES as u64
                 } else {
-                    (MAX_SECRET_BYTES + 1) as u64
+                    (MAX_CONNECTION_SECRET_BYTES + 1) as u64
                 };
                 if !metadata.file_type().is_file()
                     || metadata.st_uid() != package_uid
@@ -9543,6 +10378,13 @@ pub(crate) fn main_entry() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => ExitCode::FAILURE,
         }
+    } else if arguments.len() == 3 && arguments[0] == "--reject-job" {
+        let request = PathBuf::from(&arguments[1]);
+        let response = PathBuf::from(&arguments[2]);
+        match reject_claimed_job(&request, &response) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        }
     } else if arguments.len() == 1 && arguments[0] == "--cleanup-stale-api-socket" {
         #[cfg(target_os = "linux")]
         {
@@ -10680,6 +11522,14 @@ fn execute_read_action(
     action: &ReadAction,
     policy: &SecurityPolicyArgs,
 ) -> BridgeResult<CgiResponse> {
+    if let ReadAction::SourceDirectories { parent } = action {
+        let body = source_directories_document(Path::new("/"), parent)?;
+        return Ok(CgiResponse::success(body));
+    }
+    if let ReadAction::SourcePath { path } = action {
+        let body = source_path_document(Path::new("/"), path)?;
+        return Ok(CgiResponse::success(body));
+    }
     let arguments = read_manager_arguments(action)?;
     let output = run_read_manager(&arguments)?;
     if !output.status_success {
@@ -10778,6 +11628,63 @@ fn run_consumer(request: &Path, response: &Path) -> BridgeResult<()> {
     }
 }
 
+fn reject_claimed_job(request: &Path, response: &Path) -> BridgeResult<()> {
+    #[cfg(not(target_os = "linux"))]
+    return Err(BridgeError::unsafe_runtime());
+
+    #[cfg(target_os = "linux")]
+    {
+        if CGI_ORIGIN_VARIABLES
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let identity = linux_runtime::identity_state()?;
+        let package_uid = validate_package_identity(&identity)?;
+        let request_id = validate_consumer_paths(request, response)?;
+        linux_runtime::clear_environment()?;
+        let control_paths = ControlPaths::production();
+        let job = linux_files::read_job(&control_paths, request, package_uid)
+            .and_then(|bytes| parse_job(&bytes))?;
+        if job.request_id != request_id {
+            return Err(BridgeError::bad_request());
+        }
+        let audit_transaction = job.audit_transaction.clone();
+        let _ = linux_files::claim_queued_audit_transaction(
+            &control_paths.audit_outbox(),
+            package_uid,
+            &audit_transaction,
+            &request_id,
+        );
+        let result =
+            terminalize_consume_result(Err(BridgeError::new(ErrorKind::Unavailable)), |state| {
+                debug_assert_eq!(state, "failed");
+                linux_files::audit_transaction_complete(
+                    &control_paths.audit_outbox(),
+                    package_uid,
+                    &audit_transaction,
+                    AuditOutboxPhase::Failed,
+                    record_audit_event,
+                )
+            });
+        let response_bytes = canonical_queued_response_bytes(
+            &job,
+            current_epoch()?,
+            &result.value,
+            result.audit_pending,
+        )?;
+        linux_files::remove_claimed_secret(&control_paths, &request_id);
+        linux_files::write_response(
+            &control_paths,
+            response,
+            &request_id,
+            package_uid,
+            &response_bytes,
+        )
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn classify_consumer_subreaper_result(result: i32, errno: Option<i32>) -> BridgeResult<bool> {
     if result == 0 {
@@ -10819,6 +11726,397 @@ fn install_consumer_termination_handler() -> BridgeResult<Arc<AtomicBool>> {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteConnectionFailure {
+    Connect,
+    Authentication(Option<i64>),
+    Permission,
+    Listing,
+    Logout,
+    PermissionAndLogout,
+    ListingAndLogout,
+    OperationAndLogout,
+}
+
+#[cfg(target_os = "linux")]
+fn connection_failure_result(failure: RemoteConnectionFailure) -> Value {
+    let (code, message) = match failure {
+        RemoteConnectionFailure::Connect => (
+            "file_station_connection_failed",
+            "The File Station endpoint could not be reached with the current network and TLS settings.",
+        ),
+        RemoteConnectionFailure::Authentication(Some(403 | 406)) => (
+            "file_station_totp_required",
+            "DSM requires TOTP authentication. Provide a valid Base32 seed or otpauth URI and test again.",
+        ),
+        RemoteConnectionFailure::Authentication(Some(404)) => (
+            "file_station_totp_rejected",
+            "DSM rejected the generated TOTP code. Check the seed and NAS clock, then test again.",
+        ),
+        RemoteConnectionFailure::Authentication(_) => (
+            "file_station_authentication_failed",
+            "DSM rejected the username, password, account policy, or sign-in method.",
+        ),
+        RemoteConnectionFailure::Permission => (
+            "file_station_listing_denied",
+            "The authenticated DSM account cannot list that File Station location.",
+        ),
+        RemoteConnectionFailure::Listing => (
+            "file_station_listing_failed",
+            "File Station could not return a valid bounded directory listing.",
+        ),
+        RemoteConnectionFailure::Logout => (
+            "file_station_logout_failed",
+            "The temporary File Station session could not be closed safely.",
+        ),
+        RemoteConnectionFailure::PermissionAndLogout => (
+            "file_station_denied_logout_failed",
+            "The authenticated DSM account could not list that File Station location, and the temporary session could not be closed safely.",
+        ),
+        RemoteConnectionFailure::ListingAndLogout => (
+            "file_station_listing_logout_failed",
+            "File Station could not return a valid bounded directory listing, and the temporary session could not be closed safely.",
+        ),
+        RemoteConnectionFailure::OperationAndLogout => (
+            "file_station_operation_logout_failed",
+            "The File Station operation failed, and the temporary session could not be closed safely.",
+        ),
+    };
+    json!({
+        "schema": "sdsync.dsm-result.v1",
+        "ok": false,
+        "code": code,
+        "message": message,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn connection_secret_required(value: &ConnectionJobArgs) -> bool {
+    value.password_source == CredentialSource::Provided
+        || value.totp_source == CredentialSource::Provided
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_connection_secrets(
+    paths: &ControlPaths<'_>,
+    request_id: &str,
+    value: &ConnectionJobArgs,
+    package_uid: u32,
+) -> BridgeResult<ResolvedConnectionSecrets> {
+    let envelope = linux_files::read_claimed_connection_secret(
+        paths,
+        request_id,
+        package_uid,
+        connection_secret_required(value),
+    )?;
+    let (provided_password, provided_totp) = decode_connection_secret_envelope(envelope)?;
+    let password = match value.password_source {
+        CredentialSource::Provided => provided_password.ok_or_else(BridgeError::bad_request)?,
+        CredentialSource::Stored => {
+            if provided_password.is_some() {
+                return Err(BridgeError::bad_request());
+            }
+            linux_files::read_profile_secret(
+                value
+                    .profile
+                    .as_deref()
+                    .ok_or_else(BridgeError::bad_request)?,
+                "password",
+                package_uid,
+            )?
+            .ok_or_else(BridgeError::bad_request)?
+        }
+        CredentialSource::None => return Err(BridgeError::bad_request()),
+    };
+    let totp = match value.totp_source {
+        CredentialSource::Provided => Some(provided_totp.ok_or_else(BridgeError::bad_request)?),
+        CredentialSource::Stored => {
+            if provided_totp.is_some() {
+                return Err(BridgeError::bad_request());
+            }
+            linux_files::read_profile_secret(
+                value
+                    .profile
+                    .as_deref()
+                    .ok_or_else(BridgeError::bad_request)?,
+                "totp",
+                package_uid,
+            )?
+        }
+        CredentialSource::None => {
+            if provided_totp.is_some() {
+                return Err(BridgeError::bad_request());
+            }
+            None
+        }
+    };
+    Ok((password, totp))
+}
+
+#[cfg(target_os = "linux")]
+fn connection_fingerprint(
+    key: &[u8],
+    value: &ConnectionJobArgs,
+    password: &[u8],
+    totp: Option<&[u8]>,
+) -> BridgeResult<String> {
+    if key.len() != 32 || password.is_empty() {
+        return Err(BridgeError::unsafe_runtime());
+    }
+    let arguments = serde_json::to_vec(value).map_err(|_| BridgeError::internal())?;
+    let mut mac = HmacSha256::new_from_slice(key).map_err(|_| BridgeError::internal())?;
+    mac.update(b"sdsync-file-station-connection-v1\0");
+    mac.update(&(arguments.len() as u64).to_be_bytes());
+    mac.update(&arguments);
+    mac.update(&(password.len() as u64).to_be_bytes());
+    mac.update(password);
+    let totp = totp.unwrap_or_default();
+    mac.update(&(totp.len() as u64).to_be_bytes());
+    mac.update(totp);
+    Ok(hex_encode(&mac.finalize().into_bytes()))
+}
+
+fn connection_proof_message(expires: u64, session_binding: &[u8; 32], fingerprint: &str) -> String {
+    format!(
+        "sdsync-file-station-proof-v1\n{expires}\n{}\n{fingerprint}",
+        hex_encode(session_binding)
+    )
+}
+
+fn issue_connection_proof(
+    key: &[u8],
+    session_binding: &[u8; 32],
+    fingerprint: &str,
+    now: u64,
+) -> BridgeResult<(String, u64)> {
+    if key.len() != 32 || hex_decode_exact::<32>(fingerprint).is_none() {
+        return Err(BridgeError::unsafe_runtime());
+    }
+    let expires = now
+        .checked_add(CONNECTION_PROOF_LIFETIME_SECONDS)
+        .ok_or_else(BridgeError::internal)?;
+    let message = connection_proof_message(expires, session_binding, fingerprint);
+    let mut mac = HmacSha256::new_from_slice(key).map_err(|_| BridgeError::internal())?;
+    mac.update(message.as_bytes());
+    let signature = hex_encode(&mac.finalize().into_bytes());
+    Ok((format!("v1.{expires}.{fingerprint}.{signature}"), expires))
+}
+
+fn verify_connection_proof(
+    proof: &str,
+    key: &[u8],
+    session_binding: &[u8; 32],
+    fingerprint: &str,
+    now: u64,
+) -> BridgeResult<()> {
+    if !valid_connection_proof_syntax(proof) || key.len() != 32 {
+        return Err(BridgeError::new(ErrorKind::Forbidden));
+    }
+    let components: Vec<_> = proof.split('.').collect();
+    let expires =
+        parse_canonical_u64(components[1]).map_err(|_| BridgeError::new(ErrorKind::Forbidden))?;
+    if expires <= now
+        || expires > now.saturating_add(CONNECTION_PROOF_LIFETIME_SECONDS + CLOCK_SKEW_SECONDS)
+        || !constant_time_equal(components[2].as_bytes(), fingerprint.as_bytes())
+    {
+        return Err(BridgeError::new(ErrorKind::Forbidden));
+    }
+    let supplied = hex_decode_exact::<32>(components[3])
+        .ok_or_else(|| BridgeError::new(ErrorKind::Forbidden))?;
+    let message = connection_proof_message(expires, session_binding, fingerprint);
+    let mut mac =
+        HmacSha256::new_from_slice(key).map_err(|_| BridgeError::new(ErrorKind::Forbidden))?;
+    mac.update(message.as_bytes());
+    if !constant_time_equal(&mac.finalize().into_bytes(), &supplied) {
+        return Err(BridgeError::new(ErrorKind::Forbidden));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn authenticate_file_station(
+    value: &ConnectionJobArgs,
+    password: &[u8],
+    totp: Option<&[u8]>,
+) -> Result<ApiClient, RemoteConnectionFailure> {
+    let password =
+        std::str::from_utf8(password).map_err(|_| RemoteConnectionFailure::Authentication(None))?;
+    let parsed_totp = totp
+        .map(|secret| {
+            let secret = std::str::from_utf8(secret)
+                .map_err(|_| RemoteConnectionFailure::Authentication(None))?;
+            parse_totp_secret(secret).map_err(|_| RemoteConnectionFailure::Authentication(None))
+        })
+        .transpose()?;
+    let mut client = ApiClient::connect_for_browsing(&ClientOptions {
+        base_url: value.url.clone(),
+        allow_http: value.allow_http,
+        accept_invalid_certs: value.danger_accept_invalid_certs,
+        ca_certificate: value.ca_certificate.as_ref().map(PathBuf::from),
+        connect_timeout: Duration::from_secs(value.connect_timeout_seconds.into()),
+        request_timeout: Duration::from_secs(value.timeout_seconds.into()),
+        retries: value.retries.into(),
+    })
+    .map_err(|_| RemoteConnectionFailure::Connect)?;
+
+    match client.login(&value.username, password, None) {
+        Ok(()) => Ok(client),
+        Err(error) if matches!(error.api_code(), Some(403 | 406)) => {
+            let Some(secret) = parsed_totp else {
+                return Err(RemoteConnectionFailure::Authentication(error.api_code()));
+            };
+            let code = generate_totp(&secret)
+                .map_err(|_| RemoteConnectionFailure::Authentication(error.api_code()))?;
+            client
+                .login(&value.username, password, Some(&code))
+                .map_err(|error| RemoteConnectionFailure::Authentication(error.api_code()))?;
+            Ok(client)
+        }
+        Err(error) => Err(RemoteConnectionFailure::Authentication(error.api_code())),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn logout_result<T>(
+    client: &mut ApiClient,
+    result: Result<T, RemoteConnectionFailure>,
+) -> Result<T, RemoteConnectionFailure> {
+    logout_result_with(result, || {
+        client.logout().map_err(|_| RemoteConnectionFailure::Logout)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn logout_result_with<T, F>(
+    result: Result<T, RemoteConnectionFailure>,
+    logout: F,
+) -> Result<T, RemoteConnectionFailure>
+where
+    F: FnOnce() -> Result<(), RemoteConnectionFailure>,
+{
+    let logout = logout();
+    match (result, logout) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(failure)) => Err(failure),
+        (Err(RemoteConnectionFailure::Permission), Err(_)) => {
+            Err(RemoteConnectionFailure::PermissionAndLogout)
+        }
+        (Err(RemoteConnectionFailure::Listing), Err(_)) => {
+            Err(RemoteConnectionFailure::ListingAndLogout)
+        }
+        (Err(_), Err(_)) => Err(RemoteConnectionFailure::OperationAndLogout),
+        (Err(failure), Ok(())) => Err(failure),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn authentication_test_result_after_logout<F>(
+    logout: Result<(), RemoteConnectionFailure>,
+    issue_proof: F,
+) -> BridgeResult<Value>
+where
+    F: FnOnce() -> BridgeResult<(String, u64)>,
+{
+    match logout {
+        Ok(()) => {
+            let (proof, expires) = issue_proof()?;
+            Ok(json!({
+                "schema": "sdsync.dsm-result.v1",
+                "ok": true,
+                "message": "Authentication succeeded and the temporary File Station session was closed.",
+                "connection_proof": proof,
+                "connection_proof_expires_at_epoch": expires,
+            }))
+        }
+        Err(failure) => Ok(connection_failure_result(failure)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn execute_connection_mutation(
+    paths: &ControlPaths<'_>,
+    job: &ParsedJob,
+    package_uid: u32,
+) -> BridgeResult<Value> {
+    let connection = match &job.mutation {
+        Mutation::TestProfileAuth(value) => value,
+        Mutation::BrowseRemote(value) => &value.connection,
+        _ => return Err(BridgeError::internal()),
+    };
+    let (password, totp) =
+        resolve_connection_secrets(paths, &job.request_id, connection, package_uid)?;
+    let key = linux_files::load_or_create_csrf_key(paths, package_uid)?;
+    let fingerprint = connection_fingerprint(
+        &key[..],
+        connection,
+        &password[..],
+        totp.as_ref().map(|value| value.as_slice()),
+    )?;
+    let now = current_epoch()?;
+
+    if let Mutation::BrowseRemote(arguments) = &job.mutation {
+        verify_connection_proof(
+            &arguments.connection_proof,
+            &key[..],
+            &job.session_binding,
+            &fingerprint,
+            now,
+        )?;
+    }
+
+    let mut client = match authenticate_file_station(
+        connection,
+        &password,
+        totp.as_ref().map(|value| value.as_slice()),
+    ) {
+        Ok(client) => client,
+        Err(failure) => return Ok(connection_failure_result(failure)),
+    };
+
+    match &job.mutation {
+        Mutation::TestProfileAuth(_) => {
+            authentication_test_result_after_logout(logout_result(&mut client, Ok(())), || {
+                // Start the proof lifetime only after authentication and the
+                // mandatory logout have both completed. A slow target must not
+                // consume the chooser window before it is returned to the UI.
+                let proof_issued_at = current_epoch()?;
+                issue_connection_proof(
+                    &key[..],
+                    &job.session_binding,
+                    &fingerprint,
+                    proof_issued_at,
+                )
+            })
+        }
+        Mutation::BrowseRemote(arguments) => {
+            let listing =
+                client
+                    .browse_directories(&arguments.parent, 500)
+                    .map_err(|error: SyncError| {
+                        if matches!(error.api_code(), Some(105 | 407)) {
+                            RemoteConnectionFailure::Permission
+                        } else {
+                            RemoteConnectionFailure::Listing
+                        }
+                    });
+            match logout_result(&mut client, listing) {
+                Ok(page) => Ok(json!({
+                    "schema": "sdsync.dsm-result.v1",
+                    "ok": true,
+                    "message": "File Station directories loaded.",
+                    "directory_schema": "sdsync.dsm-remote-directories.v1",
+                    "current": page.parent,
+                    "directories": page.directories,
+                    "truncated": page.truncated,
+                })),
+                Err(failure) => Ok(connection_failure_result(failure)),
+            }
+        }
+        _ => Err(BridgeError::internal()),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn consume_job_inner(
     paths: &ControlPaths<'_>,
     job: &ParsedJob,
@@ -10830,6 +12128,12 @@ fn consume_job_inner(
     // administrator tightened policy after it was accepted.
     let current_policy = linux_files::load_security_policy(package_uid)?;
     validate_mutation_against_security_policy(&job.mutation, &current_policy)?;
+    if matches!(
+        &job.mutation,
+        Mutation::TestProfileAuth(_) | Mutation::BrowseRemote(_)
+    ) {
+        return execute_connection_mutation(paths, job, package_uid);
+    }
     let secret = match &job.mutation {
         Mutation::SetSecret(arguments) if arguments.mode == SecretMode::Replace => {
             linux_files::read_claimed_secret(paths, &job.request_id, package_uid, true)?
@@ -10903,6 +12207,8 @@ mod tests {
     use std::io::Cursor;
     #[cfg(target_os = "linux")]
     use std::os::linux::fs::MetadataExt;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::ffi::OsStringExt;
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::{PermissionsExt, symlink};
     #[cfg(target_os = "linux")]
@@ -13560,7 +14866,7 @@ mod tests {
             (
                 format!("{JOB_ID}.secret.tmp"),
                 fixture.processing.join(format!("{JOB_ID}.secret")),
-                MAX_SECRET_BYTES + 1,
+                MAX_CONNECTION_SECRET_BYTES + 1,
             ),
             (
                 format!("{JOB_ID}.response.tmp"),
@@ -15388,6 +16694,57 @@ mod tests {
         policy.allow_secret_changes = false;
         rejected(&clear_remote_token, &policy);
 
+        let stored_connection = json!({
+            "profile": "nightly",
+            "url": "https://nas.example.invalid",
+            "username": "browser-user",
+            "allow_http": false,
+            "danger_accept_invalid_certs": false,
+            "ca_certificate": null,
+            "connect_timeout_seconds": 15,
+            "timeout_seconds": 120,
+            "retries": 2,
+            "password_source": "stored",
+            "password": null,
+            "totp_source": "stored",
+            "totp": null
+        });
+        let auth_test = parsed("test-profile-auth", stored_connection.clone());
+        let mut browse_arguments = stored_connection.clone();
+        browse_arguments["parent"] = json!("/");
+        browse_arguments["connection_proof"] =
+            json!(format!("v1.10300.{}.{}", "b".repeat(64), "c".repeat(64)));
+        let browse = parsed("browse-remote", browse_arguments);
+        policy = SecurityPolicyArgs {
+            allow_profile_changes: false,
+            allow_secret_changes: false,
+            allow_operational_actions: true,
+            ..SecurityPolicyArgs::default()
+        };
+        assert!(validate_mutation_against_security_policy(&auth_test, &policy).is_ok());
+        assert!(validate_mutation_against_security_policy(&browse, &policy).is_ok());
+        rejected(
+            &parsed(
+                "set-secret",
+                json!({"profile":"nightly","kind":"password","mode":"clear","value":null}),
+            ),
+            &policy,
+        );
+        policy.allow_operational_actions = false;
+        rejected(&auth_test, &policy);
+        rejected(&browse, &policy);
+
+        let mut insecure_connection = stored_connection;
+        insecure_connection["url"] = json!("http://nas.example.invalid");
+        insecure_connection["allow_http"] = json!(true);
+        rejected(
+            &parsed("test-profile-auth", insecure_connection),
+            &SecurityPolicyArgs {
+                allow_http_targets: false,
+                ..SecurityPolicyArgs::default()
+            },
+        );
+
         policy = SecurityPolicyArgs {
             allow_routine_changes: false,
             ..SecurityPolicyArgs::default()
@@ -15720,6 +17077,257 @@ mod tests {
                 "{field} must remain exactly representable on every DSM target"
             );
         }
+
+        for source in [
+            "/",
+            "/etc",
+            "/volume01/source",
+            "/volumeUSB0/source",
+            "/volumeSATA01/source",
+            "/volume1/../etc",
+            "/volume1/@appdata/source",
+            "/volume1/source/",
+        ] {
+            let mut invalid = configure_arguments();
+            invalid["source"] = json!(source);
+            assert!(
+                parse_mutation_request(&request("configure-profile", invalid)).is_err(),
+                "source escaped the canonical DSM volume boundary: {source}"
+            );
+        }
+        for source in [
+            "/volume1/source",
+            "/volumeUSB1/usbshare",
+            "/volumeSATA2/satashare",
+        ] {
+            let mut valid = configure_arguments();
+            valid["source"] = json!(source);
+            assert!(
+                parse_mutation_request(&request("configure-profile", valid)).is_ok(),
+                "recognized DSM storage root must remain configurable: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_drafts_are_stripped_from_jobs_and_browse_requires_a_proof() {
+        let connection = json!({
+            "profile": null,
+            "url": "https://nas.example.invalid",
+            "username": "browser-user",
+            "allow_http": false,
+            "danger_accept_invalid_certs": false,
+            "ca_certificate": null,
+            "connect_timeout_seconds": 15,
+            "timeout_seconds": 120,
+            "retries": 2,
+            "password_source": "provided",
+            "password": "fixture-password-not-in-job",
+            "totp_source": "provided",
+            "totp": "JBSWY3DPEHPK3PXP"
+        });
+        let parsed =
+            parse_mutation_request(&request("test-profile-auth", connection.clone())).unwrap();
+        let envelope = parsed
+            .secret
+            .as_ref()
+            .expect("provided secrets need an envelope");
+        let (password, totp) =
+            decode_connection_secret_envelope(Some(Zeroizing::new(envelope.to_vec()))).unwrap();
+        assert_eq!(
+            password.as_ref().map(|value| value.as_slice()),
+            Some(b"fixture-password-not-in-job".as_slice())
+        );
+        assert_eq!(
+            totp.as_ref().map(|value| value.as_slice()),
+            Some(b"JBSWY3DPEHPK3PXP".as_slice())
+        );
+
+        let job = canonical_job_bytes(
+            JOB_ID,
+            &parsed.request_id,
+            "admin",
+            1000,
+            &[7_u8; 32],
+            JOB_ID,
+            &"a".repeat(64),
+            10_000,
+            &parsed.mutation,
+        )
+        .unwrap();
+        assert!(!contains_bytes(&job, b"fixture-password-not-in-job"));
+        assert!(!contains_bytes(&job, b"JBSWY3DPEHPK3PXP"));
+        let parsed_job = parse_job(&job).unwrap();
+        assert!(matches!(parsed_job.mutation, Mutation::TestProfileAuth(_)));
+
+        let mut browse = connection;
+        browse["parent"] = json!("/home/Drive");
+        browse["connection_proof"] =
+            json!(format!("v1.10300.{}.{}", "b".repeat(64), "c".repeat(64)));
+        let parsed = parse_mutation_request(&request("browse-remote", browse)).unwrap();
+        assert!(matches!(parsed.mutation, Mutation::BrowseRemote(_)));
+
+        let mut no_proof = json!({
+            "profile": null,
+            "url": "https://nas.example.invalid",
+            "username": "browser-user",
+            "allow_http": false,
+            "danger_accept_invalid_certs": false,
+            "ca_certificate": null,
+            "connect_timeout_seconds": 15,
+            "timeout_seconds": 120,
+            "retries": 2,
+            "password_source": "provided",
+            "password": "fixture-password-not-in-job",
+            "totp_source": "none",
+            "totp": null,
+            "parent": "/"
+        });
+        assert!(parse_mutation_request(&request("browse-remote", no_proof.clone())).is_err());
+        no_proof["connection_proof"] = json!("not-a-proof");
+        assert!(parse_mutation_request(&request("browse-remote", no_proof)).is_err());
+    }
+
+    #[test]
+    fn connection_proof_is_short_lived_and_bound_to_session_and_exact_draft() {
+        let key = [11_u8; 32];
+        let binding = [22_u8; 32];
+        let fingerprint = "ab".repeat(32);
+        let now = 10_000;
+        let (proof, expires) = issue_connection_proof(&key, &binding, &fingerprint, now).unwrap();
+        assert_eq!(expires, now + CONNECTION_PROOF_LIFETIME_SECONDS);
+        verify_connection_proof(&proof, &key, &binding, &fingerprint, now).unwrap();
+        assert!(verify_connection_proof(&proof, &key, &[23_u8; 32], &fingerprint, now).is_err());
+        assert!(verify_connection_proof(&proof, &key, &binding, &"cd".repeat(32), now).is_err());
+        assert!(verify_connection_proof(&proof, &key, &binding, &fingerprint, expires).is_err());
+        let mut tampered = proof.into_bytes();
+        let last = tampered.len() - 1;
+        tampered[last] = if tampered[last] == b'a' { b'b' } else { b'a' };
+        assert!(
+            verify_connection_proof(
+                std::str::from_utf8(&tampered).unwrap(),
+                &key,
+                &binding,
+                &fingerprint,
+                now
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn logout_is_always_attempted_and_proof_issuance_requires_logout_success() {
+        let mut logout_calls = 0;
+        let listing = logout_result_with::<(), _>(Err(RemoteConnectionFailure::Listing), || {
+            logout_calls += 1;
+            Err(RemoteConnectionFailure::Logout)
+        });
+        assert_eq!(logout_calls, 1);
+        assert_eq!(listing, Err(RemoteConnectionFailure::ListingAndLogout));
+        let listing_result = connection_failure_result(listing.unwrap_err());
+        assert_eq!(listing_result["code"], "file_station_listing_logout_failed");
+        validate_connection_manager_result(&listing_result, "browse-remote").unwrap();
+        assert!(validate_connection_manager_result(&listing_result, "test-profile-auth").is_err());
+
+        let permission =
+            logout_result_with::<(), _>(Err(RemoteConnectionFailure::Permission), || {
+                logout_calls += 1;
+                Err(RemoteConnectionFailure::Logout)
+            });
+        assert_eq!(logout_calls, 2);
+        assert_eq!(
+            permission,
+            Err(RemoteConnectionFailure::PermissionAndLogout)
+        );
+        let permission_result = connection_failure_result(permission.unwrap_err());
+        assert_eq!(
+            permission_result["code"],
+            "file_station_denied_logout_failed"
+        );
+        validate_connection_manager_result(&permission_result, "browse-remote").unwrap();
+
+        let logout = logout_result_with(Ok("listing"), || {
+            logout_calls += 1;
+            Err(RemoteConnectionFailure::Logout)
+        });
+        assert_eq!(logout_calls, 3);
+        assert_eq!(logout, Err(RemoteConnectionFailure::Logout));
+
+        let mut proof_calls = 0;
+        let rejected =
+            authentication_test_result_after_logout(Err(RemoteConnectionFailure::Logout), || {
+                proof_calls += 1;
+                Ok(("must-not-be-issued".to_owned(), 1))
+            })
+            .unwrap();
+        assert_eq!(proof_calls, 0);
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["code"], "file_station_logout_failed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_source_browser_exposes_only_canonical_readable_volume_directories() {
+        let fixture = TestControlFixture::new("source-browser");
+        let volume1 = fixture.root.join("volume1");
+        let volume2 = fixture.root.join("volume2");
+        let volume_usb = fixture.root.join("volumeUSB1");
+        let volume_sata = fixture.root.join("volumeSATA2");
+        let invalid_volume = fixture.root.join("volume01");
+        fs::create_dir(&volume1).unwrap();
+        fs::create_dir(&volume2).unwrap();
+        fs::create_dir(&volume_usb).unwrap();
+        fs::create_dir(&volume_sata).unwrap();
+        fs::create_dir(&invalid_volume).unwrap();
+        fs::create_dir(volume1.join("alpha")).unwrap();
+        fs::create_dir(volume1.join("zeta")).unwrap();
+        fs::create_dir(volume1.join("@appdata")).unwrap();
+        fs::write(volume1.join("plain-file"), b"not a directory").unwrap();
+        let non_utf8 = OsString::from_vec(vec![b'n', b'o', b'n', 0xff]);
+        fs::create_dir(volume1.join(non_utf8)).unwrap();
+        symlink(&volume2, volume1.join("linked-volume")).unwrap();
+        symlink(&volume2, fixture.root.join("volume3")).unwrap();
+
+        let root: Value =
+            serde_json::from_slice(&source_directories_document(&fixture.root, "/").unwrap())
+                .unwrap();
+        assert_eq!(
+            root["directories"],
+            json!([
+                {"name":"volume1","path":"/volume1"},
+                {"name":"volume2","path":"/volume2"},
+                {"name":"volumeSATA2","path":"/volumeSATA2"},
+                {"name":"volumeUSB1","path":"/volumeUSB1"}
+            ])
+        );
+        assert_eq!(root["parent"], Value::Null);
+
+        let children: Value = serde_json::from_slice(
+            &source_directories_document(&fixture.root, "/volume1").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            children["directories"],
+            json!([
+                {"name":"alpha","path":"/volume1/alpha"},
+                {"name":"zeta","path":"/volume1/zeta"}
+            ])
+        );
+        assert_eq!(children["parent"], "/");
+        let exact: Value =
+            serde_json::from_slice(&source_path_document(&fixture.root, "/volume1").unwrap())
+                .unwrap();
+        assert_eq!(exact["schema"], "sdsync.dsm-source-path.v1");
+        assert_eq!(exact["path"], "/volume1");
+        assert_eq!(exact["valid"], true);
+        assert!(source_directories_document(&fixture.root, "/volume3").is_err());
+        assert!(source_path_document(&fixture.root, "/volume3").is_err());
+        assert!(source_path_document(&fixture.root, "/volume1/linked-volume").is_err());
+        assert!(source_path_document(&fixture.root, "/volumeUSB1").is_ok());
+        assert!(source_path_document(&fixture.root, "/volumeSATA2").is_ok());
+        assert!(source_directories_document(&fixture.root, "/etc").is_err());
+        assert!(source_directories_document(&fixture.root, "/volume1/../volume2").is_err());
     }
 
     #[test]
@@ -16130,6 +17738,12 @@ mod tests {
         ));
         assert_eq!(parsed.completed_at_epoch, 10_005);
         assert_eq!(parsed.result["ok"], true);
+        let mut retained_v1: Value = serde_json::from_slice(&response).unwrap();
+        retained_v1["schema"] = json!("sdsync.dsm-queued-response.v1");
+        retained_v1.as_object_mut().unwrap().remove("operation");
+        assert!(parse_queued_response(&serde_json::to_vec(&retained_v1).unwrap(), JOB_ID).is_ok());
+        retained_v1["operation"] = json!("remove-profile");
+        assert!(parse_queued_response(&serde_json::to_vec(&retained_v1).unwrap(), JOB_ID).is_err());
         assert!(
             !String::from_utf8(response.clone())
                 .unwrap()
@@ -16146,6 +17760,125 @@ mod tests {
         let mut unknown: Value = serde_json::from_slice(&response).unwrap();
         unknown["path"] = json!("/bin/sh");
         assert!(parse_queued_response(&serde_json::to_vec(&unknown).unwrap(), JOB_ID).is_err());
+    }
+
+    #[test]
+    fn queued_connection_results_round_trip_only_their_exact_operation_schema() {
+        let connection = json!({
+            "profile": null,
+            "url": "https://nas.example.invalid",
+            "username": "browser-user",
+            "allow_http": false,
+            "danger_accept_invalid_certs": false,
+            "ca_certificate": null,
+            "connect_timeout_seconds": 10,
+            "timeout_seconds": 30,
+            "retries": 2,
+            "password_source": "provided",
+            "password": "fixture-password-not-in-result",
+            "totp_source": "none",
+            "totp": null
+        });
+        let auth = parse_mutation_request(&request("test-profile-auth", connection.clone()))
+            .unwrap()
+            .mutation;
+        let auth_job = parse_job(
+            &canonical_job_bytes(
+                JOB_ID,
+                REQUEST_ID,
+                "admin",
+                1000,
+                &[9_u8; 32],
+                JOB_ID,
+                &"a".repeat(64),
+                10_000,
+                &auth,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let proof = format!("v1.10300.{}.{}", "a".repeat(64), "b".repeat(64));
+        let auth_result = json!({
+            "schema": "sdsync.dsm-result.v1",
+            "ok": true,
+            "message": "Authentication succeeded and the temporary File Station session was closed.",
+            "connection_proof": proof,
+            "connection_proof_expires_at_epoch": 10_300,
+        });
+        let auth_response =
+            canonical_queued_response_bytes(&auth_job, 10_005, &auth_result, false).unwrap();
+        let parsed_auth = parse_queued_response(&auth_response, JOB_ID).unwrap();
+        assert_eq!(parsed_auth.result, auth_result);
+        let auth_text = String::from_utf8(auth_response).unwrap();
+        assert!(!auth_text.contains("fixture-password-not-in-result"));
+        let mut mismatched_expiry = auth_result.clone();
+        mismatched_expiry["connection_proof_expires_at_epoch"] = json!(10_301);
+        assert!(
+            canonical_queued_response_bytes(&auth_job, 10_005, &mismatched_expiry, false).is_err()
+        );
+
+        let mut browse = connection;
+        browse["profile"] = json!("nightly");
+        browse["password"] = Value::Null;
+        browse["password_source"] = json!("stored");
+        browse["connection_proof"] =
+            json!(format!("v1.10300.{}.{}", "c".repeat(64), "d".repeat(64)));
+        browse["parent"] = json!("/homes");
+        let browse = parse_mutation_request(&request("browse-remote", browse))
+            .unwrap()
+            .mutation;
+        let browse_job = parse_job(
+            &canonical_job_bytes(
+                JOB_ID,
+                REQUEST_ID,
+                "admin",
+                1000,
+                &[9_u8; 32],
+                JOB_ID,
+                &"b".repeat(64),
+                10_000,
+                &browse,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let browse_result = json!({
+            "schema": "sdsync.dsm-result.v1",
+            "ok": true,
+            "message": "File Station directories loaded.",
+            "directory_schema": "sdsync.dsm-remote-directories.v1",
+            "current": "/homes",
+            "directories": [{"name":"alice","path":"/homes/alice"}],
+            "truncated": false,
+        });
+        let browse_response =
+            canonical_queued_response_bytes(&browse_job, 10_006, &browse_result, false).unwrap();
+        assert_eq!(
+            parse_queued_response(&browse_response, JOB_ID)
+                .unwrap()
+                .result,
+            browse_result
+        );
+
+        let mut wrong_shape = browse_result;
+        wrong_shape["directories"][0]["path"] = json!("/homes/../etc");
+        assert!(canonical_queued_response_bytes(&browse_job, 10_006, &wrong_shape, false).is_err());
+        assert!(canonical_queued_response_bytes(&auth_job, 10_006, &wrong_shape, false).is_err());
+
+        for job in [&auth_job, &browse_job] {
+            let terminal =
+                terminalize_consume_result(Err(BridgeError::new(ErrorKind::Forbidden)), |_| {
+                    Ok(false)
+                });
+            let response = canonical_queued_response_bytes(job, 10_007, &terminal.value, false)
+                .expect("connection-internal failure remains a retrievable terminal result");
+            let parsed = parse_queued_response(&response, JOB_ID).unwrap();
+            assert_eq!(parsed.result["code"], "operation_failed");
+            assert_eq!(
+                parsed.result["message"],
+                "Operation could not be completed."
+            );
+        }
     }
 
     #[test]

@@ -5,22 +5,21 @@ use std::io::{Read, Write};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use md5::{Digest, Md5};
 use reqwest::blocking::multipart::{Form, Part};
 use reqwest::blocking::{Client as HttpClient, Response};
 use reqwest::redirect::Policy;
-use reqwest::{Certificate, StatusCode, Url};
-use serde::Deserialize;
+use reqwest::{Certificate, Client as AsyncHttpClient, StatusCode, Url};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zeroize::Zeroizing;
 
 use crate::cancel::CancellationToken;
-use crate::integrity::ContentMd5;
+use crate::integrity::{ContentHasher, ContentMd5};
 use crate::local::{EntryKind, LocalEntry};
 use crate::path::{RemoteRoot, parent_and_name};
 use crate::{Error, Result};
@@ -33,6 +32,7 @@ const DISCOVERY_APIS: &[&str] = &[
     "SYNO.FileStation.Upload",
     "SYNO.FileStation.Delete",
     "SYNO.FileStation.MD5",
+    "SYNO.FileStation.Download",
     "SYNO.FileStation.CopyMove",
     "SYNO.FileStation.CheckPermission",
 ];
@@ -42,6 +42,9 @@ const MAX_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// Longest a rate-limited reader sleeps before it looks at the cancellation token again.
 const RATE_LIMIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// A single shared I/O runtime keeps synchronous SDK calls safe even when their caller is already
+/// running on Tokio. Download futures never run on or block the caller's executor.
+const DOWNLOAD_RUNTIME_THREADS: usize = 1;
 /// Rate-limit tokens are held scaled by this factor so refill stays exact integer arithmetic.
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 const WRITE_PROBE_PAYLOAD: &[u8] = b"synology-drive-sync disposable write probe v1\n";
@@ -80,6 +83,7 @@ struct ApiSpec {
 #[derive(Clone)]
 pub struct ApiClient {
     http: HttpClient,
+    download_http: AsyncHttpClient,
     base: Url,
     apis: HashMap<String, ApiSpec>,
     session: Option<Session>,
@@ -101,6 +105,25 @@ pub struct RemoteEntry {
     /// Mounted directories are inventory boundaries and are never traversed or deleted.
     pub mount_point_type: Option<String>,
     pub content_md5: Option<ContentMd5>,
+}
+
+/// One File Station directory that the authenticated account may browse.
+///
+/// This deliberately contains only display/path metadata. File Station session
+/// identifiers, Synology tokens, credentials, and raw permission documents are
+/// never exposed to callers.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RemoteDirectory {
+    pub name: String,
+    pub path: String,
+}
+
+/// A single bounded page for an interactive File Station directory chooser.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RemoteDirectoryPage {
+    pub parent: String,
+    pub directories: Vec<RemoteDirectory>,
+    pub truncated: bool,
 }
 
 #[derive(Debug)]
@@ -185,15 +208,43 @@ pub type UploadObserver = Arc<dyn Fn(UploadTransferEvent) -> bool + Send + Sync>
 
 impl ApiClient {
     pub fn connect(options: &ClientOptions) -> Result<Self> {
+        Self::connect_with_requirements(
+            options,
+            &[
+                ("SYNO.FileStation.List", 2),
+                ("SYNO.FileStation.CreateFolder", 2),
+                ("SYNO.FileStation.Upload", 2),
+                ("SYNO.FileStation.CheckPermission", 3),
+            ],
+        )
+    }
+
+    /// Connect a least-privilege client for authentication tests and the
+    /// interactive directory chooser. Only Auth and List are required; sync
+    /// mutation APIs are neither assumed nor invoked by this client.
+    pub fn connect_for_browsing(options: &ClientOptions) -> Result<Self> {
+        Self::connect_with_requirements(options, &[("SYNO.FileStation.List", 2)])
+    }
+
+    fn connect_with_requirements(
+        options: &ClientOptions,
+        required_apis: &[(&str, u32)],
+    ) -> Result<Self> {
         let base = normalize_base_url(&options.base_url, options.allow_http)?;
         let mut builder = HttpClient::builder()
             .connect_timeout(options.connect_timeout)
-            .timeout(options.request_timeout)
+            .timeout(control_request_timeout(options.request_timeout))
+            .redirect(Policy::none())
+            .user_agent(concat!("synology-drive-sync/", env!("SDSYNC_VERSION")));
+        let mut download_builder = AsyncHttpClient::builder()
+            .connect_timeout(options.connect_timeout)
+            .read_timeout(control_request_timeout(options.request_timeout))
             .redirect(Policy::none())
             .user_agent(concat!("synology-drive-sync/", env!("SDSYNC_VERSION")));
 
         if options.accept_invalid_certs {
             builder = builder.danger_accept_invalid_certs(true);
+            download_builder = download_builder.danger_accept_invalid_certs(true);
         }
         if let Some(path) = &options.ca_certificate {
             let pem = fs::read(path).map_err(|source| Error::FileIo {
@@ -216,15 +267,21 @@ impl ApiClient {
                 operation: format!("loading CA certificate {path:?}"),
                 source,
             })?;
-            builder = builder.add_root_certificate(certificate);
+            builder = builder.add_root_certificate(certificate.clone());
+            download_builder = download_builder.add_root_certificate(certificate);
         }
         let http = builder.build().map_err(|source| Error::Http {
             operation: "building HTTP client".to_owned(),
             source,
         })?;
+        let download_http = download_builder.build().map_err(|source| Error::Http {
+            operation: "building streaming HTTP client".to_owned(),
+            source,
+        })?;
 
         let mut client = Self {
             http,
+            download_http,
             base,
             apis: HashMap::new(),
             session: None,
@@ -236,12 +293,7 @@ impl ApiClient {
         };
         client.apis = client.discover()?;
         client.validate_api("SYNO.API.Auth", 3)?;
-        for (api, version) in [
-            ("SYNO.FileStation.List", 2),
-            ("SYNO.FileStation.CreateFolder", 2),
-            ("SYNO.FileStation.Upload", 2),
-            ("SYNO.FileStation.CheckPermission", 3),
-        ] {
+        for &(api, version) in required_apis {
             client.validate_api(api, version)?;
         }
         Ok(client)
@@ -277,6 +329,14 @@ impl ApiClient {
 
     pub fn require_content_api(&self) -> Result<()> {
         self.validate_api("SYNO.FileStation.MD5", 2)
+    }
+
+    /// Require the File Station Download API used for complete MD5/CRC32/SHA-256 fingerprints.
+    ///
+    /// [`Self::require_content_api`] retains its original MD5 capability contract for existing
+    /// library callers; new content-mode execution must use this stronger gate.
+    pub fn require_content_fingerprint_api(&self) -> Result<()> {
+        self.validate_api("SYNO.FileStation.Download", 2)
     }
 
     pub fn supports_server_copy(&self) -> bool {
@@ -377,6 +437,96 @@ impl ApiClient {
                 return Err(error);
             }
         }
+    }
+
+    /// Populate collision-resistant content fingerprints for the selected files.
+    ///
+    /// File Station exposes only MD5 as a server-side calculation. Content mode therefore
+    /// streams each selected remote file through the documented Download API and computes MD5,
+    /// IEEE CRC32, and SHA-256 together without retaining the downloaded payload.
+    pub fn populate_remote_content_fingerprints(
+        &self,
+        inventory: &mut RemoteInventory,
+        selected_relative_paths: &BTreeSet<String>,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        self.require_content_fingerprint_api()?;
+        for relative in selected_relative_paths {
+            cancellation.check()?;
+            let entry = inventory.entries.get_mut(relative).ok_or_else(|| {
+                Error::Message(format!(
+                    "remote content selection referenced missing inventory path {relative:?}"
+                ))
+            })?;
+            if entry.kind != EntryKind::File {
+                return Err(Error::Message(format!(
+                    "remote content selection referenced non-file path {relative:?}"
+                )));
+            }
+            entry.content_md5 = Some(self.remote_content_fingerprint(
+                &entry.remote_path,
+                entry.size,
+                cancellation,
+            )?);
+        }
+        Ok(())
+    }
+
+    pub fn remote_content_fingerprint(
+        &self,
+        remote_path: &str,
+        expected_size: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<ContentMd5> {
+        self.require_content_fingerprint_api()?;
+        for attempt in 0..=self.retries {
+            cancellation.check()?;
+            match self.remote_content_fingerprint_once(remote_path, expected_size, cancellation) {
+                Err(error) if attempt < self.retries && retryable(&error) => {
+                    retry_pause_cancellable(attempt, cancellation)?;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("retry loop always returns")
+    }
+
+    fn remote_content_fingerprint_once(
+        &self,
+        remote_path: &str,
+        expected_size: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<ContentMd5> {
+        let fields = self.download_form_fields(remote_path)?;
+
+        let url = self.api_url("SYNO.FileStation.Download")?;
+        let request = self.download_http.post(url).form(&*fields);
+        // `form` has serialized its own request-body copy. Erase the caller-owned
+        // SID/SynoToken strings before the potentially long streaming download.
+        drop(fields);
+        run_download_request(
+            request,
+            remote_path.to_owned(),
+            expected_size,
+            self.operation_timeout,
+            cancellation.clone(),
+        )
+    }
+
+    fn download_form_fields(&self, remote_path: &str) -> Result<Zeroizing<Vec<(String, String)>>> {
+        let session = self.required_session()?;
+        let mut fields = Zeroizing::new(vec![
+            pair("api", "SYNO.FileStation.Download"),
+            pair("version", "2"),
+            pair("method", "download"),
+            pair("path", json_array([remote_path])?),
+            pair("mode", json_string("download")?),
+            pair("_sid", session.sid.to_string()),
+        ]);
+        if let Some(token) = &session.syno_token {
+            fields.push(pair("SynoToken", token.to_string()));
+        }
+        Ok(fields)
     }
 
     pub fn copy_file_verified(
@@ -499,7 +649,8 @@ impl ApiClient {
 
     /// Re-read one path without retry immediately before a mutation and require its metadata to
     /// match the inventory snapshot. File content, when required, is checked separately through
-    /// the MD5 API so a delayed successful response cannot hide a replacement.
+    /// the complete streamed fingerprint (or the explicit legacy MD5 helper) so a delayed
+    /// successful response cannot hide a replacement.
     pub fn verify_remote_metadata_snapshot(
         &self,
         remote_path: &str,
@@ -545,13 +696,17 @@ impl ApiClient {
         cancellation: &CancellationToken,
     ) -> Result<bool> {
         cancellation.check()?;
+        if !expected_md5.has_full_proof() {
+            return Ok(false);
+        }
         let Some(actual_size) = self.remote_file_size(remote_path)? else {
             return Ok(false);
         };
         if actual_size != expected_size {
             return Ok(false);
         }
-        Ok(self.remote_content_md5(remote_path, cancellation)? == expected_md5)
+        let actual = self.remote_content_fingerprint(remote_path, expected_size, cancellation)?;
+        Ok(content_evidence_matches(expected_md5, actual))
     }
 
     fn remote_file_size(&self, remote_path: &str) -> Result<Option<u64>> {
@@ -659,6 +814,135 @@ impl ApiClient {
         }
     }
 
+    /// List directories visible to the authenticated File Station account.
+    ///
+    /// `/` maps to File Station's real shared-folder listing. Every other
+    /// parent maps to `SYNO.FileStation.List.list`. The discovered API path and
+    /// supported version are used by the internal API dispatcher; neither is hard-coded.
+    /// Results are deliberately bounded for an interactive chooser and only
+    /// direct, normalized child directories are returned.
+    pub fn browse_directories(&self, parent: &str, maximum: usize) -> Result<RemoteDirectoryPage> {
+        const MAXIMUM_CHOOSER_DIRECTORIES: usize = 500;
+        if maximum == 0 || maximum > MAXIMUM_CHOOSER_DIRECTORIES {
+            return Err(Error::Message(format!(
+                "File Station directory browser limit must be between 1 and {MAXIMUM_CHOOSER_DIRECTORIES}"
+            )));
+        }
+        self.required_session()?;
+        let request_limit = maximum + 1;
+
+        let (mut directories, total) = if parent == "/" {
+            let parameters = vec![
+                pair("offset", "0"),
+                pair("limit", request_limit.to_string()),
+                pair("sort_by", json_string("name")?),
+                pair("sort_direction", json_string("asc")?),
+                pair("additional", json_array(["perm"])?),
+            ];
+            let data: ListShareData = self
+                .call("SYNO.FileStation.List", 2, "list_share", parameters, true)?
+                .ok_or_else(|| Error::InvalidResponse {
+                    operation: "SYNO.FileStation.List.list_share".to_owned(),
+                    message: "successful response contained no share list".to_owned(),
+                })?;
+            let total = data.total.unwrap_or(data.shares.len());
+            let mut output = Vec::new();
+            for share in data.shares {
+                if share.disable_list || permission_disables_listing(share.additional.as_ref()) {
+                    continue;
+                }
+                let root = RemoteRoot::parse(&share.path)?;
+                if root.as_str() != root.share_path() {
+                    return Err(Error::InvalidResponse {
+                        operation: "SYNO.FileStation.List.list_share".to_owned(),
+                        message: "shared-folder result was not a normalized root path".to_owned(),
+                    });
+                }
+                let name = share
+                    .name
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| root.share_name().to_owned());
+                if name != root.share_name() {
+                    return Err(Error::InvalidResponse {
+                        operation: "SYNO.FileStation.List.list_share".to_owned(),
+                        message: "shared-folder name did not match its path".to_owned(),
+                    });
+                }
+                output.push(RemoteDirectory {
+                    name,
+                    path: root.as_str().to_owned(),
+                });
+            }
+            (output, total)
+        } else {
+            let normalized_parent = RemoteRoot::parse(parent)?;
+            if normalized_parent.as_str() != parent {
+                return Err(Error::Message(
+                    "File Station directory browser parent was not normalized".to_owned(),
+                ));
+            }
+            let parameters = vec![
+                pair("folder_path", json_string(parent)?),
+                pair("offset", "0"),
+                pair("limit", request_limit.to_string()),
+                pair("sort_by", json_string("name")?),
+                pair("sort_direction", json_string("asc")?),
+                pair("filetype", json_string("dir")?),
+                pair("additional", json_array(["perm", "mount_point_type"])?),
+            ];
+            let data: ListData = self
+                .call("SYNO.FileStation.List", 2, "list", parameters, true)?
+                .ok_or_else(|| Error::InvalidResponse {
+                    operation: "SYNO.FileStation.List.list".to_owned(),
+                    message: "successful response contained no directory data".to_owned(),
+                })?;
+            let total = data.total;
+            let prefix = format!("{parent}/");
+            let mut output = Vec::new();
+            for item in data.files {
+                if !item.isdir
+                    || item.disable_list
+                    || permission_disables_listing(item.additional.as_ref())
+                    || item
+                        .additional
+                        .as_ref()
+                        .and_then(|additional| additional.mount_point_type.as_deref())
+                        .is_some_and(|value| !value.is_empty())
+                {
+                    continue;
+                }
+                let expected_path = format!("{prefix}{}", item.name);
+                if item.name.is_empty()
+                    || item.name.contains('/')
+                    || item.name.contains('\\')
+                    || item.name.chars().any(char::is_control)
+                    || item.path != expected_path
+                {
+                    return Err(Error::InvalidResponse {
+                        operation: "SYNO.FileStation.List.list".to_owned(),
+                        message: "directory result escaped its requested parent".to_owned(),
+                    });
+                }
+                let normalized = RemoteRoot::parse(&item.path)?;
+                output.push(RemoteDirectory {
+                    name: item.name,
+                    path: normalized.as_str().to_owned(),
+                });
+            }
+            (output, total)
+        };
+
+        directories.sort_by(|left, right| left.name.cmp(&right.name));
+        directories.dedup_by(|left, right| left.path == right.path);
+        let truncated = total > maximum || directories.len() > maximum;
+        directories.truncate(maximum);
+        Ok(RemoteDirectoryPage {
+            parent: parent.to_owned(),
+            directories,
+            truncated,
+        })
+    }
+
     /// Verify write permission at the configured destination without changing remote state.
     ///
     /// File Station's CheckPermission API checks permission to create a named child within an
@@ -732,15 +1016,15 @@ impl ApiClient {
     ) -> WriteProbeResult {
         let probe_name = write_probe_name();
         let probe_path = format!("{}/{}", root.as_str(), probe_name);
-        let expected_md5 = write_probe_md5();
-        let local = match ProbeLocalFile::create(expected_md5) {
+        let expected_fingerprint = write_probe_fingerprint();
+        let local = match ProbeLocalFile::create(expected_fingerprint) {
             Ok(local) => local,
             Err(cause) => {
                 let mut report = initial_write_probe_report(
                     root,
                     probe_path,
                     WRITE_PROBE_PAYLOAD.len() as u64,
-                    expected_md5,
+                    expected_fingerprint,
                     0,
                     self.supports_server_copy(),
                 );
@@ -783,7 +1067,7 @@ impl ApiClient {
         let operation: Result<()> = (|| {
             self.required_session()?;
             self.require_delete_api()?;
-            self.require_content_api()?;
+            self.require_content_fingerprint_api()?;
             cancellation.check()?;
             self.verify_existing_write_probe_target(root)?;
             report.target_verified = true;
@@ -1248,7 +1532,7 @@ impl ApiClient {
                     verify_local_snapshot(local)?;
                     if let Some(expected) = local.content_md5 {
                         let actual_local = crate::local::hash_file_snapshot(local, cancellation)?;
-                        if actual_local != expected {
+                        if !content_evidence_matches(expected, actual_local) {
                             return Err(Error::SourceChanged(local.full_path.clone()));
                         }
                         self.verify_remote_content(
@@ -1264,7 +1548,7 @@ impl ApiClient {
                     verify_local_snapshot(local)?;
                     if let Some(expected) = local.content_md5 {
                         let actual_local = crate::local::hash_file_snapshot(local, cancellation)?;
-                        if actual_local != expected {
+                        if !content_evidence_matches(expected, actual_local) {
                             return Err(Error::SourceChanged(local.full_path.clone()));
                         }
                         match self.remote_content_matches(
@@ -1299,10 +1583,11 @@ impl ApiClient {
             source,
         })?;
         verify_open_file_snapshot(local, &file)?;
-        if let Some(expected) = local.content_md5
-            && crate::local::hash_file_snapshot(local, cancellation)? != expected
-        {
-            return Err(Error::SourceChanged(local.full_path.clone()));
+        if let Some(expected) = local.content_md5 {
+            let actual = crate::local::hash_file_snapshot(local, cancellation)?;
+            if !content_evidence_matches(expected, actual) {
+                return Err(Error::SourceChanged(local.full_path.clone()));
+            }
         }
         Ok(())
     }
@@ -1579,12 +1864,20 @@ struct LoginData {
 #[derive(Debug, Deserialize)]
 struct ListShareData {
     #[serde(default)]
+    total: Option<usize>,
+    #[serde(default)]
     shares: Vec<ShareWire>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ShareWire {
     path: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    disable_list: bool,
+    #[serde(default)]
+    additional: Option<RemoteAdditionalWire>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1623,6 +1916,8 @@ struct RemoteItemWire {
     name: String,
     isdir: bool,
     #[serde(default)]
+    disable_list: bool,
+    #[serde(default)]
     additional: Option<RemoteAdditionalWire>,
 }
 
@@ -1634,6 +1929,45 @@ struct RemoteAdditionalWire {
     time: Option<RemoteTimeWire>,
     #[serde(default)]
     mount_point_type: Option<String>,
+    #[serde(default)]
+    perm: Option<RemotePermissionWire>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RemotePermissionWire {
+    #[serde(default)]
+    adv_right: Option<RemoteAdvancedRightWire>,
+    #[serde(default)]
+    acl: Option<RemoteAclWire>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RemoteAdvancedRightWire {
+    #[serde(default)]
+    disable_list: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RemoteAclWire {
+    #[serde(default)]
+    read: Option<bool>,
+    #[serde(default)]
+    exec: Option<bool>,
+}
+
+fn permission_disables_listing(additional: Option<&RemoteAdditionalWire>) -> bool {
+    additional
+        .and_then(|value| value.perm.as_ref())
+        .is_some_and(|permission| {
+            permission
+                .adv_right
+                .as_ref()
+                .is_some_and(|rights| rights.disable_list)
+                || permission
+                    .acl
+                    .as_ref()
+                    .is_some_and(|acl| acl.read == Some(false) || acl.exec == Some(false))
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1653,6 +1987,191 @@ struct ApiErrorWire {
     code: i64,
     #[serde(default)]
     errors: Value,
+}
+
+static DOWNLOAD_RUNTIME: OnceLock<std::result::Result<tokio::runtime::Runtime, String>> =
+    OnceLock::new();
+
+fn download_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    match DOWNLOAD_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(DOWNLOAD_RUNTIME_THREADS)
+            .thread_name("sdsync-download-io")
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(runtime) => Ok(runtime),
+        Err(reason) => Err(Error::Message(format!(
+            "failed to build the bounded download runtime: {reason}"
+        ))),
+    }
+}
+
+fn run_download_request(
+    request: reqwest::RequestBuilder,
+    remote_path: String,
+    expected_size: u64,
+    operation_timeout: Duration,
+    cancellation: CancellationToken,
+) -> Result<ContentMd5> {
+    cancellation.check()?;
+    let deadline = tokio::time::Instant::now()
+        .checked_add(operation_timeout)
+        .ok_or_else(|| Error::Message("operation timeout is too large".to_owned()))?;
+    let runtime = download_runtime()?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let _task = runtime.spawn(async move {
+        let result = download_content_fingerprint(
+            request,
+            &remote_path,
+            expected_size,
+            deadline,
+            &cancellation,
+        )
+        .await;
+        let _ = sender.send(result);
+    });
+    receiver.recv().map_err(|_| {
+        Error::Message("bounded download runtime stopped before returning a result".to_owned())
+    })?
+}
+
+async fn download_content_fingerprint(
+    request: reqwest::RequestBuilder,
+    remote_path: &str,
+    expected_size: u64,
+    deadline: tokio::time::Instant,
+    cancellation: &CancellationToken,
+) -> Result<ContentMd5> {
+    let mut response = await_download(request.send(), deadline, cancellation, remote_path).await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(Error::HttpStatus {
+            operation: "SYNO.FileStation.Download.download".to_owned(),
+            status,
+            message: withheld_response_message("SYNO.FileStation.Download").to_owned(),
+        });
+    }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if content_type.starts_with("application/json") {
+        let body =
+            read_download_json_body(&mut response, deadline, cancellation, remote_path).await?;
+        let decoded =
+            decode_response_body::<Value>(status, &body, "SYNO.FileStation.Download", "download");
+        return match decoded {
+            Err(error) => Err(error),
+            Ok(_) => Err(Error::InvalidResponse {
+                operation: "SYNO.FileStation.Download.download".to_owned(),
+                message: "successful download returned a JSON envelope instead of file bytes"
+                    .to_owned(),
+            }),
+        };
+    }
+    if !content_type.starts_with("application/octet-stream") {
+        return Err(Error::InvalidResponse {
+            operation: "SYNO.FileStation.Download.download".to_owned(),
+            message: "download response was not an octet stream".to_owned(),
+        });
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length != expected_size)
+    {
+        return Err(Error::RemoteSnapshotChanged(remote_path.to_owned()));
+    }
+
+    let mut hasher = ContentHasher::new();
+    let mut bytes_read = 0_u64;
+    while let Some(chunk) =
+        await_download(response.chunk(), deadline, cancellation, remote_path).await?
+    {
+        bytes_read = bytes_read
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| Error::RemoteSnapshotChanged(remote_path.to_owned()))?;
+        if bytes_read > expected_size {
+            return Err(Error::RemoteSnapshotChanged(remote_path.to_owned()));
+        }
+        hasher.update(&chunk);
+    }
+    cancellation.check()?;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(Error::OperationTimedOut {
+            operation: "remote content fingerprint download",
+        });
+    }
+    if bytes_read != expected_size {
+        return Err(Error::RemoteSnapshotChanged(remote_path.to_owned()));
+    }
+    Ok(hasher.finalize())
+}
+
+async fn read_download_json_body(
+    response: &mut reqwest::Response,
+    deadline: tokio::time::Instant,
+    cancellation: &CancellationToken,
+    remote_path: &str,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let mut body = Zeroizing::new(Vec::new());
+    while let Some(chunk) =
+        await_download(response.chunk(), deadline, cancellation, remote_path).await?
+    {
+        let remaining = (MAX_JSON_RESPONSE + 1).saturating_sub(body.len() as u64);
+        if chunk.len() as u64 > remaining {
+            return Err(Error::InvalidResponse {
+                operation: "SYNO.FileStation.Download.download".to_owned(),
+                message: "response exceeded the 32 MiB safety limit".to_owned(),
+            });
+        }
+        body.extend_from_slice(&chunk);
+        if body.len() as u64 > MAX_JSON_RESPONSE {
+            return Err(Error::InvalidResponse {
+                operation: "SYNO.FileStation.Download.download".to_owned(),
+                message: "response exceeded the 32 MiB safety limit".to_owned(),
+            });
+        }
+    }
+    Ok(body)
+}
+
+async fn await_download<T, F>(
+    future: F,
+    deadline: tokio::time::Instant,
+    cancellation: &CancellationToken,
+    remote_path: &str,
+) -> Result<T>
+where
+    F: std::future::Future<Output = reqwest::Result<T>>,
+{
+    tokio::pin!(future);
+    loop {
+        cancellation.check()?;
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(Error::OperationTimedOut {
+                operation: "remote content fingerprint download",
+            });
+        }
+        let poll_at = (now + RATE_LIMIT_POLL_INTERVAL).min(deadline);
+        if let Ok(result) = tokio::time::timeout_at(poll_at, &mut future).await {
+            cancellation.check()?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::OperationTimedOut {
+                    operation: "remote content fingerprint download",
+                });
+            }
+            return result.map_err(|source| Error::Http {
+                operation: format!("downloading {remote_path:?} for content verification"),
+                source,
+            });
+        }
+    }
 }
 
 /// Read the size and modified time a snapshot comparison depends on.
@@ -1691,11 +2210,6 @@ fn decode_response<T: DeserializeOwned>(
     method: &str,
 ) -> Result<Option<T>> {
     let status = response.status();
-    // API discovery is the only unauthenticated response decoded here. Every other API either
-    // receives login material or an authenticated SID/SynoToken. Default to withholding those
-    // response bodies so a diagnostic proxy cannot reflect request secrets into user-visible
-    // errors or logs.
-    let withhold_response_body = api != "SYNO.API.Info";
     // Successful authentication responses contain the SID and may contain a SynoToken;
     // challenge responses can contain a short-lived challenge token. Erase the raw response
     // allocation after decoding. Deserialized and reqwest-owned intermediary allocations are
@@ -1715,6 +2229,20 @@ fn decode_response<T: DeserializeOwned>(
             message: "response exceeded the 32 MiB safety limit".to_owned(),
         });
     }
+    decode_response_body(status, &body, api, method)
+}
+
+fn decode_response_body<T: DeserializeOwned>(
+    status: StatusCode,
+    body: &[u8],
+    api: &str,
+    method: &str,
+) -> Result<Option<T>> {
+    // API discovery is the only unauthenticated response decoded here. Every other API either
+    // receives login material or an authenticated SID/SynoToken. Default to withholding those
+    // response bodies so a diagnostic proxy cannot reflect request secrets into user-visible
+    // errors or logs.
+    let withhold_response_body = api != "SYNO.API.Info";
     if !status.is_success() {
         return Err(Error::HttpStatus {
             operation: format!("{api}.{method}"),
@@ -1722,18 +2250,18 @@ fn decode_response<T: DeserializeOwned>(
             message: if withhold_response_body {
                 withheld_response_message(api).to_owned()
             } else {
-                http_status_hint(status, &body)
+                http_status_hint(status, body)
             },
         });
     }
 
-    let envelope: Envelope<T> = serde_json::from_slice(&body).map_err(|error| {
+    let envelope: Envelope<T> = serde_json::from_slice(body).map_err(|error| {
         let snippet = if withhold_response_body {
             format!("[{}]", withheld_response_message(api))
         } else {
-            response_snippet(&body)
+            response_snippet(body)
         };
-        let route_hint = if looks_like_html(&body) {
+        let route_hint = if looks_like_html(body) {
             " (the proxy returned HTML, so /webapi/* is probably routed to the File Station UI instead of WebAPI)"
         } else {
             ""
@@ -2099,8 +2627,12 @@ fn write_probe_name() -> String {
     )
 }
 
-fn write_probe_md5() -> ContentMd5 {
-    ContentMd5::from_bytes(Md5::digest(WRITE_PROBE_PAYLOAD).into())
+fn write_probe_fingerprint() -> ContentMd5 {
+    ContentMd5::from_content(WRITE_PROBE_PAYLOAD)
+}
+
+fn content_evidence_matches(expected: ContentMd5, actual: ContentMd5) -> bool {
+    expected.full_match(&actual) == Some(true)
 }
 
 impl<R: Read> Read for ObservedReader<R> {
@@ -2454,6 +2986,158 @@ mod tests {
         (format!("http://{address}/prefix/"), handle)
     }
 
+    fn scripted_download_server_with_hook<F>(
+        responses: Vec<(StatusCode, &'static str, Vec<u8>)>,
+        mut before_response: F,
+    ) -> (String, JoinHandle<Vec<CapturedRequest>>)
+    where
+        F: FnMut(usize) + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (index, (status, content_type, body)) in responses.into_iter().enumerate() {
+                let mut stream = accept_scripted_connection(&listener, index);
+                requests.push(read_scripted_request(&mut stream, index));
+                before_response(index);
+                write_scripted_bytes_response(&mut stream, status, content_type, &body);
+            }
+            requests
+        });
+        (format!("http://{address}/prefix/"), handle)
+    }
+
+    fn scripted_slow_download_server(
+        body: Vec<u8>,
+        initial_delay: Duration,
+        inter_byte_delay: Duration,
+    ) -> (String, JoinHandle<Vec<CapturedRequest>>) {
+        scripted_slow_download_server_with_hook(body, initial_delay, inter_byte_delay, || {})
+    }
+
+    fn scripted_slow_download_server_with_hook<F>(
+        body: Vec<u8>,
+        initial_delay: Duration,
+        inter_byte_delay: Duration,
+        before_body: F,
+    ) -> (String, JoinHandle<Vec<CapturedRequest>>)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_write_timeout(Some(SCRIPTED_SERVER_TIMEOUT))
+                .unwrap();
+            let request = read_scripted_request(&mut stream, 0);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            before_body();
+            thread::sleep(initial_delay);
+            for byte in body {
+                if stream.write_all(&[byte]).is_err() || stream.flush().is_err() {
+                    break;
+                }
+                thread::sleep(inter_byte_delay);
+            }
+            vec![request]
+        });
+        (format!("http://{address}/prefix/"), handle)
+    }
+
+    fn scripted_delayed_download_headers_server(
+        delay: Duration,
+    ) -> (String, JoinHandle<Vec<CapturedRequest>>) {
+        scripted_delayed_download_headers_server_with_hook(delay, || {})
+    }
+
+    fn scripted_delayed_download_headers_server_with_hook<F>(
+        delay: Duration,
+        before_headers: F,
+    ) -> (String, JoinHandle<Vec<CapturedRequest>>)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_write_timeout(Some(SCRIPTED_SERVER_TIMEOUT))
+                .unwrap();
+            let request = read_scripted_request(&mut stream, 0);
+            before_headers();
+            thread::sleep(delay);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.flush();
+            vec![request]
+        });
+        (format!("http://{address}/prefix/"), handle)
+    }
+
+    fn fingerprint_test_client_with_timeouts(
+        base_url: &str,
+        retries: u32,
+        idle_timeout: Duration,
+        operation_timeout: Duration,
+    ) -> ApiClient {
+        let http = HttpClient::builder()
+            .timeout(idle_timeout.min(operation_timeout))
+            .redirect(Policy::none())
+            .build()
+            .unwrap();
+        let download_http = AsyncHttpClient::builder()
+            .connect_timeout(idle_timeout.min(operation_timeout))
+            .read_timeout(idle_timeout.min(operation_timeout))
+            .redirect(Policy::none())
+            .build()
+            .unwrap();
+        ApiClient {
+            http,
+            download_http,
+            base: normalize_base_url(base_url, true).unwrap(),
+            apis: HashMap::from([(
+                "SYNO.FileStation.Download".to_owned(),
+                ApiSpec {
+                    path: "entry.cgi".to_owned(),
+                    min_version: 1,
+                    max_version: 2,
+                    _request_format: None,
+                },
+            )]),
+            session: Some(Session {
+                sid: Zeroizing::new("download-test-session".to_owned()),
+                syno_token: Some(Zeroizing::new("download-test-token".to_owned())),
+            }),
+            retries,
+            control_timeout: idle_timeout,
+            upload_timeout: operation_timeout,
+            operation_timeout,
+            upload_rate_limit: None,
+        }
+    }
+
+    fn fingerprint_test_client(base_url: &str, retries: u32) -> ApiClient {
+        fingerprint_test_client_with_timeouts(
+            base_url,
+            retries,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        )
+    }
+
     fn scripted_server_monitoring_extra_requests(
         response: String,
     ) -> (
@@ -2576,6 +3260,21 @@ mod tests {
     }
 
     fn write_scripted_response(stream: &mut TcpStream, status: StatusCode, response_body: &str) {
+        if let Some(encoded) = response_body.strip_prefix("sdsync-test-binary:") {
+            let mut body = Vec::with_capacity(encoded.len() / 2);
+            for pair in encoded.as_bytes().chunks_exact(2) {
+                let high = char::from(pair[0])
+                    .to_digit(16)
+                    .expect("scripted binary high nibble") as u8;
+                let low = char::from(pair[1])
+                    .to_digit(16)
+                    .expect("scripted binary low nibble") as u8;
+                body.push((high << 4) | low);
+            }
+            assert_eq!(body.len() * 2, encoded.len(), "scripted binary hex length");
+            write_scripted_bytes_response(stream, status, "application/octet-stream", &body);
+            return;
+        }
         stream
             .set_write_timeout(Some(SCRIPTED_SERVER_TIMEOUT))
             .unwrap();
@@ -2588,6 +3287,36 @@ mod tests {
             response_body
         )
         .unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn scripted_binary_response(body: &[u8]) -> String {
+        let mut encoded = String::from("sdsync-test-binary:");
+        for byte in body {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "{byte:02x}").unwrap();
+        }
+        encoded
+    }
+
+    fn write_scripted_bytes_response(
+        stream: &mut TcpStream,
+        status: StatusCode,
+        content_type: &str,
+        body: &[u8],
+    ) {
+        stream
+            .set_write_timeout(Some(SCRIPTED_SERVER_TIMEOUT))
+            .unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 {} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("Unknown"),
+            body.len(),
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
         stream.flush().unwrap();
     }
 
@@ -2624,6 +3353,25 @@ mod tests {
         .to_string()
     }
 
+    fn browser_discovery() -> String {
+        serde_json::json!({
+            "success": true,
+            "data": {
+                "SYNO.API.Auth": {
+                    "path": "auth-route.cgi",
+                    "minVersion": 3,
+                    "maxVersion": 7
+                },
+                "SYNO.FileStation.List": {
+                    "path": "list-route.cgi",
+                    "minVersion": 1,
+                    "maxVersion": 2
+                }
+            }
+        })
+        .to_string()
+    }
+
     fn write_probe_discovery(server_copy: bool) -> String {
         let mut discovery = serde_json::json!({
             "success": true,
@@ -2634,6 +3382,7 @@ mod tests {
                 "SYNO.FileStation.Upload": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
                 "SYNO.FileStation.Delete": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
                 "SYNO.FileStation.MD5": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+                "SYNO.FileStation.Download": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
                 "SYNO.FileStation.CheckPermission": {"path": "entry.cgi", "minVersion": 3, "maxVersion": 3}
             }
         });
@@ -2696,8 +3445,551 @@ mod tests {
         r#"{"success":true,"data":{"sid":"test-session","synotoken":"test-token"}}"#.to_owned()
     }
 
+    #[test]
+    fn directory_browser_authenticates_before_listing_discovered_shared_folders_and_logs_out() {
+        let shares = serde_json::json!({
+            "success": true,
+            "data": {
+                "total": 5,
+                "shares": [
+                    {
+                        "name": "zeta",
+                        "path": "/zeta",
+                        "additional": {"perm": {"acl": {"read": true, "exec": true}}}
+                    },
+                    {
+                        "name": "blocked-special-right",
+                        "path": "/blocked-special-right",
+                        "additional": {"perm": {"adv_right": {"disable_list": true}}}
+                    },
+                    {
+                        "name": "blocked-read",
+                        "path": "/blocked-read",
+                        "additional": {"perm": {"acl": {"read": false, "exec": true}}}
+                    },
+                    {
+                        "name": "blocked-traverse",
+                        "path": "/blocked-traverse",
+                        "additional": {"perm": {"acl": {"read": true, "exec": false}}}
+                    },
+                    {"name": "alpha", "path": "/alpha"}
+                ]
+            }
+        })
+        .to_string();
+        let (url, server) = scripted_server(vec![
+            browser_discovery(),
+            login_response(),
+            shares,
+            r#"{"success":true}"#.to_owned(),
+        ]);
+        let mut client = ApiClient::connect_for_browsing(&ClientOptions {
+            base_url: url,
+            allow_http: true,
+            accept_invalid_certs: false,
+            ca_certificate: None,
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(5),
+            retries: 0,
+        })
+        .unwrap();
+
+        client
+            .login("browser-user", "fixture-password", None)
+            .unwrap();
+        let page = client.browse_directories("/", 10).unwrap();
+        client.logout().unwrap();
+
+        assert_eq!(
+            page.directories,
+            vec![
+                RemoteDirectory {
+                    name: "alpha".to_owned(),
+                    path: "/alpha".to_owned(),
+                },
+                RemoteDirectory {
+                    name: "zeta".to_owned(),
+                    path: "/zeta".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(page.parent, "/");
+        assert!(!page.truncated);
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests[1].request_line,
+            "POST /prefix/webapi/auth-route.cgi HTTP/1.1"
+        );
+        assert_eq!(
+            requests[2].request_line,
+            "POST /prefix/webapi/list-route.cgi HTTP/1.1"
+        );
+        assert_eq!(
+            requests[3].request_line,
+            "POST /prefix/webapi/auth-route.cgi HTTP/1.1"
+        );
+        let login = String::from_utf8_lossy(&requests[1].body);
+        let listing = String::from_utf8_lossy(&requests[2].body);
+        let logout = String::from_utf8_lossy(&requests[3].body);
+        assert!(login.contains("method=login"));
+        assert!(login.contains("session=FileStation"));
+        assert!(login.contains("passwd=fixture-password"));
+        assert!(listing.contains("method=list_share"));
+        assert!(listing.contains("additional=%5B%22perm%22%5D"));
+        assert!(logout.contains("method=logout"));
+        assert!(!listing.contains("fixture-password"));
+        assert!(!logout.contains("fixture-password"));
+    }
+
+    #[test]
+    fn directory_browser_descends_only_into_returned_acl_visible_direct_children() {
+        let children = serde_json::json!({
+            "success": true,
+            "data": {
+                "total": 6,
+                "files": [
+                    {"name": "zeta", "path": "/share/base/zeta", "isdir": true,
+                     "additional": {"perm": {"acl": {"read": true, "exec": true}}}},
+                    {"name": "file.txt", "path": "/share/base/file.txt", "isdir": false},
+                    {"name": "denied", "path": "/share/base/denied", "isdir": true,
+                     "additional": {"perm": {"acl": {"read": false, "exec": true}}}},
+                    {"name": "mounted", "path": "/share/base/mounted", "isdir": true,
+                     "additional": {"mount_point_type": "remote"}},
+                    {"name": "disabled", "path": "/share/base/disabled", "isdir": true,
+                     "disable_list": true},
+                    {"name": "alpha", "path": "/share/base/alpha", "isdir": true}
+                ]
+            }
+        })
+        .to_string();
+        let (url, server) = scripted_server(vec![
+            browser_discovery(),
+            login_response(),
+            children,
+            r#"{"success":true}"#.to_owned(),
+        ]);
+        let mut client = ApiClient::connect_for_browsing(&ClientOptions {
+            base_url: url,
+            allow_http: true,
+            accept_invalid_certs: false,
+            ca_certificate: None,
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(5),
+            retries: 0,
+        })
+        .unwrap();
+
+        client
+            .login("browser-user", "fixture-password", None)
+            .unwrap();
+        let page = client.browse_directories("/share/base", 10).unwrap();
+        client.logout().unwrap();
+
+        assert_eq!(
+            page.directories,
+            vec![
+                RemoteDirectory {
+                    name: "alpha".to_owned(),
+                    path: "/share/base/alpha".to_owned(),
+                },
+                RemoteDirectory {
+                    name: "zeta".to_owned(),
+                    path: "/share/base/zeta".to_owned(),
+                },
+            ]
+        );
+        let requests = server.join().unwrap();
+        let listing = String::from_utf8_lossy(&requests[2].body);
+        assert!(listing.contains("method=list"));
+        assert!(listing.contains("folder_path=%22%2Fshare%2Fbase%22"));
+        assert!(listing.contains("filetype=%22dir%22"));
+        assert!(listing.contains("perm"));
+        assert!(listing.contains("mount_point_type"));
+    }
+
+    #[test]
+    fn directory_browser_permission_failure_is_redacted_and_still_allows_logout() {
+        let reflected = "fixture-password-must-not-echo";
+        let denied = serde_json::json!({
+            "success": false,
+            "error": {"code": 105, "errors": [{"path": reflected}]}
+        })
+        .to_string();
+        let (url, server) = scripted_server(vec![
+            browser_discovery(),
+            login_response(),
+            denied,
+            r#"{"success":true}"#.to_owned(),
+        ]);
+        let mut client = ApiClient::connect_for_browsing(&ClientOptions {
+            base_url: url,
+            allow_http: true,
+            accept_invalid_certs: false,
+            ca_certificate: None,
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(5),
+            retries: 0,
+        })
+        .unwrap();
+        client
+            .login("browser-user", "fixture-password", None)
+            .unwrap();
+
+        let error = client.browse_directories("/share", 10).unwrap_err();
+        assert!(rendered_error(&error).contains("code 105"));
+        assert!(!rendered_error(&error).contains(reflected));
+        client.logout().unwrap();
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(String::from_utf8_lossy(&requests[2].body).contains("method=list"));
+        assert!(String::from_utf8_lossy(&requests[3].body).contains("method=logout"));
+    }
+
     fn task_start_response(taskid: &str) -> String {
         serde_json::json!({"success": true, "data": {"taskid": taskid}}).to_string()
+    }
+
+    #[test]
+    fn remote_download_builds_the_complete_fingerprint_without_secrets_in_the_url() {
+        let payload = b"abc".to_vec();
+        let (base, server) = scripted_download_server_with_hook(
+            vec![(StatusCode::OK, "application/octet-stream", payload.clone())],
+            |_| {},
+        );
+        let client = fingerprint_test_client(&base, 0);
+
+        let fingerprint = client
+            .remote_content_fingerprint(
+                "/share/payload.bin",
+                payload.len() as u64,
+                &CancellationToken::default(),
+            )
+            .unwrap();
+
+        assert_eq!(fingerprint.to_string(), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(fingerprint.crc32_hex().as_deref(), Some("352441c2"));
+        assert_eq!(
+            fingerprint.sha256_hex().as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].request_line,
+            "POST /prefix/webapi/entry.cgi HTTP/1.1"
+        );
+        assert!(!requests[0].request_line.contains("download-test-session"));
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert!(body.contains("api=SYNO.FileStation.Download"));
+        assert!(body.contains("_sid=download-test-session"));
+        assert!(body.contains("SynoToken=download-test-token"));
+        let form_url = Url::parse(&format!("http://form.invalid/?{body}")).unwrap();
+        let fields = form_url
+            .query_pairs()
+            .into_owned()
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(fields.get("mode").map(String::as_str), Some("\"download\""));
+        assert_eq!(
+            fields.get("path").map(String::as_str),
+            Some("[\"/share/payload.bin\"]")
+        );
+    }
+
+    #[test]
+    fn remote_download_keeps_caller_owned_session_fields_in_a_zeroizing_container() {
+        let client = fingerprint_test_client("http://files.example.test/prefix/", 0);
+        let fields: Zeroizing<Vec<(String, String)>> =
+            client.download_form_fields("/share/payload.bin").unwrap();
+        let value = |name: &str| {
+            fields
+                .iter()
+                .find(|(field, _)| field == name)
+                .map(|(_, value)| value.as_str())
+        };
+
+        assert_eq!(value("_sid"), Some("download-test-session"));
+        assert_eq!(value("SynoToken"), Some("download-test-token"));
+        assert_eq!(value("path"), Some("[\"/share/payload.bin\"]"));
+    }
+
+    #[test]
+    fn remote_download_rejects_non_binary_json_and_wrong_size_responses() {
+        let (html_base, html_server) = scripted_download_server_with_hook(
+            vec![(StatusCode::OK, "text/html", b"<html>proxy</html>".to_vec())],
+            |_| {},
+        );
+        let html_error = fingerprint_test_client(&html_base, 0)
+            .remote_content_fingerprint("/share/payload.bin", 18, &CancellationToken::default())
+            .unwrap_err();
+        assert!(matches!(
+            html_error,
+            Error::InvalidResponse { operation, message }
+                if operation == "SYNO.FileStation.Download.download"
+                    && message == "download response was not an octet stream"
+        ));
+        assert_eq!(html_server.join().unwrap().len(), 1);
+
+        let (json_base, json_server) = scripted_download_server_with_hook(
+            vec![(
+                StatusCode::OK,
+                "application/json; charset=utf-8",
+                br#"{"success":false,"error":{"code":408}}"#.to_vec(),
+            )],
+            |_| {},
+        );
+        let json_error = fingerprint_test_client(&json_base, 0)
+            .remote_content_fingerprint("/share/missing.bin", 1, &CancellationToken::default())
+            .unwrap_err();
+        assert!(matches!(json_error, Error::Api { code: 408, .. }));
+        assert_eq!(json_server.join().unwrap().len(), 1);
+
+        let (size_base, size_server) = scripted_download_server_with_hook(
+            vec![(StatusCode::OK, "application/octet-stream", b"abc".to_vec())],
+            |_| {},
+        );
+        let size_error = fingerprint_test_client(&size_base, 0)
+            .remote_content_fingerprint("/share/payload.bin", 4, &CancellationToken::default())
+            .unwrap_err();
+        assert!(matches!(
+            size_error,
+            Error::RemoteSnapshotChanged(path) if path == "/share/payload.bin"
+        ));
+        assert_eq!(size_server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn remote_download_honors_cancellation_before_reading_payload_bytes() {
+        let cancellation = CancellationToken::default();
+        let server_cancellation = cancellation.clone();
+        let (base, server) = scripted_download_server_with_hook(
+            vec![(
+                StatusCode::OK,
+                "application/octet-stream",
+                b"payload".to_vec(),
+            )],
+            move |_| server_cancellation.cancel(),
+        );
+
+        assert!(matches!(
+            fingerprint_test_client(&base, 0).remote_content_fingerprint(
+                "/share/payload.bin",
+                7,
+                &cancellation,
+            ),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn remote_download_retries_a_transient_status_then_hashes_the_single_complete_body() {
+        let (base, server) = scripted_download_server_with_hook(
+            vec![
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "text/plain",
+                    b"temporary".to_vec(),
+                ),
+                (StatusCode::OK, "application/octet-stream", b"abc".to_vec()),
+            ],
+            |_| {},
+        );
+
+        let fingerprint = fingerprint_test_client(&base, 1)
+            .remote_content_fingerprint("/share/payload.bin", 3, &CancellationToken::default())
+            .unwrap();
+        assert_eq!(fingerprint.crc32_hex().as_deref(), Some("352441c2"));
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn remote_download_stall_is_idle_bounded_and_observes_cancellation() {
+        let cancellation = CancellationToken::default();
+        let server_cancellation = cancellation.clone();
+        let (base, server) = scripted_slow_download_server_with_hook(
+            b"payload".to_vec(),
+            Duration::from_millis(120),
+            Duration::ZERO,
+            move || server_cancellation.cancel(),
+        );
+        let client = fingerprint_test_client_with_timeouts(
+            &base,
+            0,
+            Duration::from_millis(60),
+            Duration::from_secs(1),
+        );
+        let started = Instant::now();
+
+        assert!(matches!(
+            client.remote_content_fingerprint("/share/payload.bin", 7, &cancellation),
+            Err(Error::Cancelled)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn remote_download_idle_timeout_releases_the_bounded_runtime() {
+        let (base, server) = scripted_slow_download_server(
+            b"payload".to_vec(),
+            Duration::from_millis(150),
+            Duration::ZERO,
+        );
+        let client = fingerprint_test_client_with_timeouts(
+            &base,
+            0,
+            Duration::from_millis(60),
+            Duration::from_secs(1),
+        );
+        let started = Instant::now();
+
+        let error = client
+            .remote_content_fingerprint("/share/payload.bin", 7, &CancellationToken::default())
+            .unwrap_err();
+
+        assert!(matches!(error, Error::Http { source, .. } if source.is_timeout()));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn synchronous_download_is_panic_free_inside_a_tokio_runtime() {
+        let payload = b"nested-runtime".to_vec();
+        let (base, server) = scripted_download_server_with_hook(
+            vec![(StatusCode::OK, "application/octet-stream", payload.clone())],
+            |_| {},
+        );
+        let client = fingerprint_test_client(&base, 0);
+        let caller_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let fingerprint = caller_runtime.block_on(async move {
+            client.remote_content_fingerprint(
+                "/share/payload.bin",
+                payload.len() as u64,
+                &CancellationToken::default(),
+            )
+        });
+
+        assert_eq!(
+            fingerprint.unwrap(),
+            ContentMd5::from_content(b"nested-runtime")
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn remote_download_header_stall_observes_cancellation_before_transport_error() {
+        let cancellation = CancellationToken::default();
+        let server_cancellation = cancellation.clone();
+        let (base, server) = scripted_delayed_download_headers_server_with_hook(
+            Duration::from_millis(150),
+            move || server_cancellation.cancel(),
+        );
+        let client = fingerprint_test_client_with_timeouts(
+            &base,
+            0,
+            Duration::from_millis(60),
+            Duration::from_secs(1),
+        );
+
+        assert!(matches!(
+            client.remote_content_fingerprint("/share/payload.bin", 0, &cancellation),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn remote_download_header_stall_reports_the_total_deadline() {
+        let (base, server) = scripted_delayed_download_headers_server(Duration::from_millis(150));
+        let client = fingerprint_test_client_with_timeouts(
+            &base,
+            0,
+            Duration::from_millis(200),
+            Duration::from_millis(70),
+        );
+
+        assert!(matches!(
+            client.remote_content_fingerprint(
+                "/share/payload.bin",
+                0,
+                &CancellationToken::default()
+            ),
+            Err(Error::OperationTimedOut {
+                operation: "remote content fingerprint download"
+            })
+        ));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn remote_download_can_outlive_idle_timeout_when_every_chunk_makes_progress() {
+        let body = b"abcdefgh".to_vec();
+        let (base, server) =
+            scripted_slow_download_server(body.clone(), Duration::ZERO, Duration::from_millis(25));
+        let idle_timeout = Duration::from_millis(80);
+        let client =
+            fingerprint_test_client_with_timeouts(&base, 0, idle_timeout, Duration::from_secs(1));
+        let started = Instant::now();
+
+        let fingerprint = client
+            .remote_content_fingerprint(
+                "/share/payload.bin",
+                body.len() as u64,
+                &CancellationToken::default(),
+            )
+            .unwrap();
+
+        assert_eq!(fingerprint, ContentMd5::from_content(&body));
+        assert!(started.elapsed() > idle_timeout);
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn remote_download_drip_feed_cannot_extend_the_total_operation_deadline() {
+        let (base, server) = scripted_slow_download_server(
+            b"abcdef".to_vec(),
+            Duration::ZERO,
+            Duration::from_millis(30),
+        );
+        let client = fingerprint_test_client_with_timeouts(
+            &base,
+            0,
+            Duration::from_millis(100),
+            Duration::from_millis(70),
+        );
+        let started = Instant::now();
+
+        assert!(matches!(
+            client.remote_content_fingerprint(
+                "/share/payload.bin",
+                6,
+                &CancellationToken::default()
+            ),
+            Err(Error::OperationTimedOut {
+                operation: "remote content fingerprint download"
+            })
+        ));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn upload_and_copy_evidence_rejects_incomplete_or_collision_like_values() {
+        let expected = ContentMd5::from_digests([7_u8; 16], 42, [1_u8; 32]);
+        let legacy = ContentMd5::from_bytes([7_u8; 16]);
+        let different_sha = ContentMd5::from_digests([7_u8; 16], 42, [2_u8; 32]);
+
+        assert!(!content_evidence_matches(expected, legacy));
+        assert!(!content_evidence_matches(legacy, expected));
+        assert!(!content_evidence_matches(expected, different_sha));
+        assert!(content_evidence_matches(expected, expected));
     }
 
     #[test]
@@ -3139,6 +4431,7 @@ mod tests {
             size: Some(9),
             time: Some(RemoteTimeWire { mtime: 13 }),
             mount_point_type: None,
+            perm: None,
         };
         for kind in [EntryKind::File, EntryKind::Directory] {
             assert_eq!(
@@ -3355,7 +4648,7 @@ mod tests {
 
     #[test]
     fn remote_content_verification_fails_closed_for_missing_directory_and_size_mismatch() {
-        let root_digest = ContentMd5::from_bytes([0_u8; 16]);
+        let root_digest = ContentMd5::from_content(b"payload");
         let cases = [
             r#"{"success":false,"error":{"code":408}}"#.to_owned(),
             getinfo_directory("/share/file.bin"),
@@ -3799,6 +5092,7 @@ mod tests {
     fn worker_clones_report_and_share_one_budget() {
         let client = ApiClient {
             http: HttpClient::new(),
+            download_http: AsyncHttpClient::new(),
             base: Url::parse("https://files.example.test/webapi/").unwrap(),
             apis: HashMap::new(),
             session: None,
@@ -4233,7 +5527,7 @@ mod tests {
         let upload_path = format!("{probe_path}/{WRITE_PROBE_FILE_NAME}");
         let copy_directory = format!("{probe_path}/{WRITE_PROBE_COPY_DIRECTORY}");
         let copy_path = format!("{copy_directory}/{WRITE_PROBE_FILE_NAME}");
-        let local = ProbeLocalFile::create(write_probe_md5()).unwrap();
+        let local = ProbeLocalFile::create(write_probe_fingerprint()).unwrap();
         let local_path = local.entry.full_path.clone();
         let size = local.entry.size;
         let mtime_seconds = local.entry.mtime_ms.div_euclid(1000);
@@ -4249,8 +5543,7 @@ mod tests {
             r#"{"success":true,"data":{"total":0,"offset":0,"files":[]}}"#.to_owned(),
             r#"{"success":true}"#.to_owned(),
             getinfo_file(&upload_path, size, None),
-            r#"{"success":true,"data":{"taskid":"upload-md5"}}"#.to_owned(),
-            format!(r#"{{"success":true,"data":{{"finished":true,"md5":"{digest}"}}}}"#),
+            scripted_binary_response(WRITE_PROBE_PAYLOAD),
             getinfo_file(&upload_path, size, Some(mtime_seconds)),
             r#"{"success":true}"#.to_owned(),
             getinfo_directory(&copy_directory),
@@ -4259,8 +5552,7 @@ mod tests {
             r#"{"success":true,"data":{"taskid":"copy-task"}}"#.to_owned(),
             r#"{"success":true,"data":{"finished":true}}"#.to_owned(),
             getinfo_file(&copy_path, size, None),
-            r#"{"success":true,"data":{"taskid":"copy-md5"}}"#.to_owned(),
-            format!(r#"{{"success":true,"data":{{"finished":true,"md5":"{digest}"}}}}"#),
+            scripted_binary_response(WRITE_PROBE_PAYLOAD),
             getinfo_file(&copy_path, size, Some(mtime_seconds)),
             r#"{"success":true}"#.to_owned(),
             r#"{"success":true}"#.to_owned(),
@@ -4309,8 +5601,8 @@ mod tests {
         assert!(!local_path.exists());
 
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 29);
-        for index in [5, 13] {
+        assert_eq!(requests.len(), 27);
+        for index in [5, 12] {
             let create = String::from_utf8_lossy(&requests[index].body);
             assert!(create.contains("api=SYNO.FileStation.CreateFolder"));
             assert!(create.contains("force_parent=false"));
@@ -4319,11 +5611,11 @@ mod tests {
         assert!(find_bytes(&upload.body, b"name=\"overwrite\"").is_some());
         assert!(find_bytes(&upload.body, b"\r\n\r\nfalse\r\n").is_some());
         assert!(find_bytes(&upload.body, WRITE_PROBE_PAYLOAD).is_some());
-        let copy = String::from_utf8_lossy(&requests[17].body);
+        let copy = String::from_utf8_lossy(&requests[16].body);
         assert!(copy.contains("api=SYNO.FileStation.CopyMove"));
         assert!(copy.contains("remove_src=false"));
         assert!(!copy.contains("overwrite"));
-        for delete in &requests[23..=26] {
+        for delete in &requests[21..=24] {
             let body = String::from_utf8_lossy(&delete.body);
             assert!(body.contains("api=SYNO.FileStation.Delete"));
             assert!(body.contains("recursive=false"));
@@ -4335,7 +5627,7 @@ mod tests {
         let root = RemoteRoot::parse("/share/root").unwrap();
         let probe_path = "/share/root/.synology-drive-sync-probe-test-cancel";
         let copy_directory = format!("{probe_path}/{WRITE_PROBE_COPY_DIRECTORY}");
-        let local = ProbeLocalFile::create(write_probe_md5()).unwrap();
+        let local = ProbeLocalFile::create(write_probe_fingerprint()).unwrap();
         let cancellation = CancellationToken::default();
         let cancel_before_create_response = cancellation.clone();
         let responses = vec![
@@ -4425,7 +5717,7 @@ mod tests {
     fn write_probe_refuses_an_absent_target_before_any_remote_mutation() {
         let root = RemoteRoot::parse("/share/missing").unwrap();
         let probe_path = "/share/missing/.synology-drive-sync-probe-test-missing";
-        let local = ProbeLocalFile::create(write_probe_md5()).unwrap();
+        let local = ProbeLocalFile::create(write_probe_fingerprint()).unwrap();
         let responses = vec![
             write_probe_discovery(false),
             r#"{"success":true,"data":{"sid":"secret-sid"}}"#.to_owned(),
@@ -4481,7 +5773,8 @@ mod tests {
                 "SYNO.FileStation.CreateFolder": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2, "requestFormat": "JSON"},
                 "SYNO.FileStation.Upload": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
                 "SYNO.FileStation.CheckPermission": {"path": "entry.cgi", "minVersion": 3, "maxVersion": 3},
-                "SYNO.FileStation.MD5": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2}
+                "SYNO.FileStation.MD5": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+                "SYNO.FileStation.Download": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2}
             }
         })
         .to_string();
@@ -4496,8 +5789,7 @@ mod tests {
             r#"{"success":true,"data":{"total":2,"offset":1,"files":[{"path":"/share/root/b.txt","name":"b.txt","isdir":false,"additional":{"size":1,"time":{"mtime":1}}}]}}"#.to_owned(),
             r#"{"success":true}"#.to_owned(),
             r#"{"success":true,"data":{"files":[{"path":"/share/root/folder/upload.bin","name":"upload.bin","isdir":false,"additional":{"size":31}}]}}"#.to_owned(),
-            r#"{"success":true,"data":{"taskid":"upload-md5-task"}}"#.to_owned(),
-            r#"{"success":true,"data":{"finished":true,"md5":"28d24f2b9feacb26cfebfe4f01ba3aed"}}"#.to_owned(),
+            scripted_binary_response(b"\0multipart payload\r\nwith binary"),
             r#"{"success":true}"#.to_owned(),
         ];
         let (url, server) = scripted_server(responses);
@@ -4547,7 +5839,7 @@ mod tests {
             kind: EntryKind::File,
             size: metadata.len(),
             mtime_ms,
-            content_md5: Some(ContentMd5::parse_hex("28d24f2b9feacb26cfebfe4f01ba3aed").unwrap()),
+            content_md5: Some(ContentMd5::from_content(payload)),
         };
         client
             .upload(&local, "/share/root/folder/upload.bin")
@@ -4556,7 +5848,7 @@ mod tests {
         fs::remove_file(path).unwrap();
 
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 13);
+        assert_eq!(requests.len(), 12);
         assert!(
             requests
                 .iter()
@@ -4601,8 +5893,8 @@ mod tests {
         let payload_position = find_bytes(&upload.body, payload).unwrap();
         assert!(token_position < file_position && file_position < payload_position);
         let verification = String::from_utf8_lossy(&requests[10].body);
-        assert!(verification.contains("SYNO.FileStation.MD5"));
-        assert!(verification.contains("%2Fshare%2Froot%2Ffolder%2Fupload.bin"));
+        assert!(verification.contains("SYNO.FileStation.Download"));
+        assert!(verification.contains("%5B%22%2Fshare%2Froot%2Ffolder%2Fupload.bin%22%5D"));
     }
 
     #[test]
@@ -4615,7 +5907,8 @@ mod tests {
                 "SYNO.FileStation.CreateFolder": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
                 "SYNO.FileStation.Upload": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
                 "SYNO.FileStation.CheckPermission": {"path": "entry.cgi", "minVersion": 3, "maxVersion": 3},
-                "SYNO.FileStation.MD5": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2}
+                "SYNO.FileStation.MD5": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+                "SYNO.FileStation.Download": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2}
             }
         })
         .to_string();
@@ -4631,14 +5924,7 @@ mod tests {
                 StatusCode::OK,
                 r#"{"success":true,"data":{"files":[{"path":"/share/root/abc.bin","name":"abc.bin","isdir":false,"additional":{"size":3}}]}}"#.to_owned(),
             ),
-            (
-                StatusCode::OK,
-                r#"{"success":true,"data":{"taskid":"reconcile-md5"}}"#.to_owned(),
-            ),
-            (
-                StatusCode::OK,
-                r#"{"success":true,"data":{"finished":true,"md5":"900150983cd24fb0d6963f7d28e17f72"}}"#.to_owned(),
-            ),
+            (StatusCode::OK, scripted_binary_response(b"abc")),
             (StatusCode::OK, r#"{"success":true}"#.to_owned()),
         ];
         let (url, server) = scripted_server_with_status(responses);
@@ -4675,14 +5961,14 @@ mod tests {
                     .as_millis(),
             )
             .unwrap(),
-            content_md5: Some(ContentMd5::parse_hex("900150983cd24fb0d6963f7d28e17f72").unwrap()),
+            content_md5: Some(ContentMd5::from_content(b"abc")),
         };
         client.upload(&local, "/share/root/abc.bin").unwrap();
         client.logout().unwrap();
         fs::remove_file(path).unwrap();
 
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 7);
+        assert_eq!(requests.len(), 6);
         assert_eq!(
             requests
                 .iter()
@@ -4707,20 +5993,18 @@ mod tests {
                 "SYNO.FileStation.Upload": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
                 "SYNO.FileStation.CheckPermission": {"path": "entry.cgi", "minVersion": 3, "maxVersion": 3},
                 "SYNO.FileStation.MD5": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+                "SYNO.FileStation.Download": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
                 "SYNO.FileStation.CopyMove": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 3}
             }
         })
         .to_string();
-        let digest = "900150983cd24fb0d6963f7d28e17f72";
         let responses = vec![
             discovery,
             r#"{"success":true,"data":{"sid":"secret-sid","synotoken":"csrf-secret"}}"#.to_owned(),
             r#"{"success":true,"data":{"taskid":"copy-task"}}"#.to_owned(),
             r#"{"success":true,"data":{"finished":true}}"#.to_owned(),
             r#"{"success":true,"data":{"files":[{"path":"/share/root/new/report.bin","name":"report.bin","isdir":false,"additional":{"size":3}}]}}"#.to_owned(),
-            r#"{"success":true,"data":{"taskid":"md5-task"}}"#.to_owned(),
-            r#"{"success":true,"data":{"finished":false}}"#.to_owned(),
-            format!(r#"{{"success":true,"data":{{"finished":true,"md5":"{digest}"}}}}"#),
+            scripted_binary_response(b"abc"),
             r#"{"success":true}"#.to_owned(),
         ];
         let (url, server) = scripted_server(responses);
@@ -4741,23 +6025,23 @@ mod tests {
                 "/share/root/old/report.bin",
                 "/share/root/new/report.bin",
                 3,
-                ContentMd5::parse_hex(digest).unwrap(),
+                ContentMd5::from_content(b"abc"),
                 &CancellationToken::default(),
             )
             .unwrap();
         client.logout().unwrap();
 
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 9);
+        assert_eq!(requests.len(), 7);
         let copy_start = String::from_utf8_lossy(&requests[2].body);
         assert!(copy_start.contains("SYNO.FileStation.CopyMove"));
         assert!(copy_start.contains("remove_src=false"));
         assert!(!copy_start.contains("overwrite"));
         let size_check = String::from_utf8_lossy(&requests[4].body);
         assert!(size_check.contains("method=getinfo"));
-        let md5_start = String::from_utf8_lossy(&requests[5].body);
-        assert!(md5_start.contains("SYNO.FileStation.MD5"));
-        assert!(md5_start.contains("%2Fshare%2Froot%2Fnew%2Freport.bin"));
+        let download = String::from_utf8_lossy(&requests[5].body);
+        assert!(download.contains("SYNO.FileStation.Download"));
+        assert!(download.contains("%5B%22%2Fshare%2Froot%2Fnew%2Freport.bin%22%5D"));
     }
 
     #[test]
@@ -5323,7 +6607,7 @@ mod tests {
             kind: EntryKind::File,
             size: metadata.len(),
             mtime_ms,
-            content_md5: Some(ContentMd5::from_bytes(Md5::digest(b"payload").into())),
+            content_md5: Some(ContentMd5::from_content(b"payload")),
         };
         client
             .preflight_upload_source(&unchanged, &CancellationToken::default())
@@ -5348,7 +6632,7 @@ mod tests {
     fn write_probe_verifies_its_target_before_creating_anything() {
         let root = RemoteRoot::parse("/share/root").unwrap();
         let probe_path = "/share/root/.synology-drive-sync-probe-test-target";
-        let local = ProbeLocalFile::create(write_probe_md5()).unwrap();
+        let local = ProbeLocalFile::create(write_probe_fingerprint()).unwrap();
         let cancellation = CancellationToken::default();
 
         let cases: Vec<ProbeRefusalCase> = vec![
@@ -5455,7 +6739,7 @@ mod tests {
     fn write_probe_cleans_up_after_ambiguous_creation_but_never_after_a_collision() {
         let root = RemoteRoot::parse("/share/root").unwrap();
         let probe_path = "/share/root/.synology-drive-sync-probe-test-create";
-        let local = ProbeLocalFile::create(write_probe_md5()).unwrap();
+        let local = ProbeLocalFile::create(write_probe_fingerprint()).unwrap();
         let cancellation = CancellationToken::default();
         let preamble = || {
             vec![
@@ -5527,7 +6811,7 @@ mod tests {
     fn write_probe_refuses_a_directory_it_did_not_get_exclusively() {
         let root = RemoteRoot::parse("/share/root").unwrap();
         let probe_path = "/share/root/.synology-drive-sync-probe-test-exclusive";
-        let local = ProbeLocalFile::create(write_probe_md5()).unwrap();
+        let local = ProbeLocalFile::create(write_probe_fingerprint()).unwrap();
         let cancellation = CancellationToken::default();
         let preamble = || {
             vec![
@@ -5600,10 +6884,9 @@ mod tests {
         let root = RemoteRoot::parse("/share/root").unwrap();
         let probe_path = "/share/root/.synology-drive-sync-probe-test-leftover";
         let upload_path = format!("{probe_path}/{WRITE_PROBE_FILE_NAME}");
-        let local = ProbeLocalFile::create(write_probe_md5()).unwrap();
+        let local = ProbeLocalFile::create(write_probe_fingerprint()).unwrap();
         let size = local.entry.size;
         let mtime_seconds = local.entry.mtime_ms.div_euclid(1000);
-        let digest = local.entry.content_md5.unwrap().to_string();
         let responses = vec![
             write_probe_discovery(false),
             login_response(),
@@ -5615,8 +6898,7 @@ mod tests {
             r#"{"success":true,"data":{"total":0,"files":[]}}"#.to_owned(),
             r#"{"success":true}"#.to_owned(),
             getinfo_file(&upload_path, size, None),
-            task_start_response("leftover-md5"),
-            format!(r#"{{"success":true,"data":{{"finished":true,"md5":"{digest}"}}}}"#),
+            scripted_binary_response(WRITE_PROBE_PAYLOAD),
             getinfo_file(&upload_path, size, Some(mtime_seconds)),
             r#"{"success":false,"error":{"code":408}}"#.to_owned(),
             r#"{"success":false,"error":{"code":408}}"#.to_owned(),
@@ -5650,7 +6932,7 @@ mod tests {
             Some(probe_path)
         );
         assert!(failure.to_string().contains("inspect and remove leftover"));
-        assert_eq!(server.join().unwrap().len(), 18);
+        assert_eq!(server.join().unwrap().len(), 17);
     }
 
     fn temp_upload_source(tag: &str, contents: &[u8]) -> (PathBuf, LocalEntry) {
@@ -5675,7 +6957,7 @@ mod tests {
                     .as_millis(),
             )
             .unwrap(),
-            content_md5: Some(ContentMd5::from_bytes(Md5::digest(contents).into())),
+            content_md5: Some(ContentMd5::from_content(contents)),
         };
         (path, entry)
     }
@@ -5747,7 +7029,6 @@ mod tests {
     #[test]
     fn a_rate_limited_client_still_uploads_the_complete_file() {
         let (path, local) = temp_upload_source("throttled", b"abc");
-        let digest = local.content_md5.unwrap().to_string();
         let mut responses = upload_preamble();
         responses.extend([
             (StatusCode::OK, r#"{"success":true}"#.to_owned()),
@@ -5755,18 +7036,14 @@ mod tests {
                 StatusCode::OK,
                 getinfo_file("/share/root/abc.bin", local.size, None),
             ),
-            (StatusCode::OK, task_start_response("throttled-md5")),
-            (
-                StatusCode::OK,
-                format!(r#"{{"success":true,"data":{{"finished":true,"md5":"{digest}"}}}}"#),
-            ),
+            (StatusCode::OK, scripted_binary_response(b"abc")),
         ]);
         let (client, server) = upload_client(responses, 0);
         // A megabyte per second: the opening burst covers this payload outright, so the limited
         // path is exercised without the test depending on any wall-clock delay.
         let client = client.with_max_upload_rate(Some(1024 * 1024));
         client.upload(&local, "/share/root/abc.bin").unwrap();
-        assert_eq!(server.join().unwrap().len(), 6);
+        assert_eq!(server.join().unwrap().len(), 5);
         fs::remove_file(&path).unwrap();
     }
 
@@ -5838,7 +7115,6 @@ mod tests {
     fn a_retryable_upload_failure_reconciles_remote_state_before_deciding() {
         // The remote object is absent, so the upload genuinely has to be retransmitted.
         let (path, local) = temp_upload_source("absent", b"abc");
-        let digest = local.content_md5.unwrap().to_string();
         let mut responses = upload_preamble();
         responses.extend([
             (
@@ -5854,16 +7130,12 @@ mod tests {
                 StatusCode::OK,
                 getinfo_file("/share/root/abc.bin", local.size, None),
             ),
-            (StatusCode::OK, task_start_response("retry-md5")),
-            (
-                StatusCode::OK,
-                format!(r#"{{"success":true,"data":{{"finished":true,"md5":"{digest}"}}}}"#),
-            ),
+            (StatusCode::OK, scripted_binary_response(b"abc")),
         ]);
         let (client, server) = upload_client(responses, 1);
         client.upload(&local, "/share/root/abc.bin").unwrap();
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 8);
+        assert_eq!(requests.len(), 7);
         assert_eq!(
             requests
                 .iter()
@@ -5878,7 +7150,6 @@ mod tests {
 
         // The reconciliation probe itself fails transiently: retry rather than give up.
         let (path, local) = temp_upload_source("flaky-probe", b"abc");
-        let digest = local.content_md5.unwrap().to_string();
         let mut responses = upload_preamble();
         responses.extend([
             (
@@ -5891,15 +7162,11 @@ mod tests {
                 StatusCode::OK,
                 getinfo_file("/share/root/abc.bin", local.size, None),
             ),
-            (StatusCode::OK, task_start_response("flaky-md5")),
-            (
-                StatusCode::OK,
-                format!(r#"{{"success":true,"data":{{"finished":true,"md5":"{digest}"}}}}"#),
-            ),
+            (StatusCode::OK, scripted_binary_response(b"abc")),
         ]);
         let (client, server) = upload_client(responses, 1);
         client.upload(&local, "/share/root/abc.bin").unwrap();
-        assert_eq!(server.join().unwrap().len(), 8);
+        assert_eq!(server.join().unwrap().len(), 7);
         fs::remove_file(path).unwrap();
 
         // A permission failure during reconciliation is decisive and must surface immediately
@@ -6125,6 +7392,44 @@ mod tests {
     }
 
     #[test]
+    fn legacy_md5_and_complete_fingerprint_capability_gates_remain_distinct() {
+        let client_for = |api: &str| ApiClient {
+            http: HttpClient::new(),
+            download_http: AsyncHttpClient::new(),
+            base: Url::parse("https://files.example.test/webapi/").unwrap(),
+            apis: HashMap::from([(
+                api.to_owned(),
+                ApiSpec {
+                    path: "entry.cgi".to_owned(),
+                    min_version: 1,
+                    max_version: 2,
+                    _request_format: None,
+                },
+            )]),
+            session: None,
+            retries: 0,
+            control_timeout: Duration::from_secs(1),
+            upload_timeout: Duration::from_secs(1),
+            operation_timeout: Duration::from_secs(1),
+            upload_rate_limit: None,
+        };
+
+        let md5_only = client_for("SYNO.FileStation.MD5");
+        assert!(md5_only.require_content_api().is_ok());
+        assert!(matches!(
+            md5_only.require_content_fingerprint_api(),
+            Err(Error::MissingApi(api)) if api == "SYNO.FileStation.Download"
+        ));
+
+        let download_only = client_for("SYNO.FileStation.Download");
+        assert!(download_only.require_content_fingerprint_api().is_ok());
+        assert!(matches!(
+            download_only.require_content_api(),
+            Err(Error::MissingApi(api)) if api == "SYNO.FileStation.MD5"
+        ));
+    }
+
+    #[test]
     fn discovered_cgi_paths_that_change_origin_are_refused() {
         let base = Url::parse("http://files.example.test/prefix/").unwrap();
         let error = endpoint_url(&base, "a:b").unwrap_err();
@@ -6335,7 +7640,7 @@ FplE
     fn a_server_copy_is_polled_until_it_finishes_before_content_is_verified() {
         let root = RemoteRoot::parse("/share/root").unwrap();
         let destination = "/share/root/new/report.bin";
-        let digest = ContentMd5::from_bytes(Md5::digest(b"report").into());
+        let digest = ContentMd5::from_content(b"report");
         let (url, server) = scripted_server(vec![
             write_probe_discovery(true),
             login_response(),
@@ -6343,8 +7648,7 @@ FplE
             r#"{"success":true,"data":{"finished":false}}"#.to_owned(),
             r#"{"success":true,"data":{"finished":true}}"#.to_owned(),
             getinfo_file(destination, 6, None),
-            task_start_response("slow-copy-md5"),
-            format!(r#"{{"success":true,"data":{{"finished":true,"md5":"{digest}"}}}}"#),
+            scripted_binary_response(b"report"),
         ]);
         let mut client = connect_test_client(url);
         client.login("alice", "password", None).unwrap();
@@ -6359,7 +7663,7 @@ FplE
             )
             .unwrap();
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 8);
+        assert_eq!(requests.len(), 7);
         for index in [3, 4] {
             assert!(String::from_utf8_lossy(&requests[index].body).contains("method=status"));
         }
@@ -6374,16 +7678,13 @@ FplE
         let upload_path = format!("{probe_path}/{WRITE_PROBE_FILE_NAME}");
         let copy_directory = format!("{probe_path}/{WRITE_PROBE_COPY_DIRECTORY}");
         let copy_path = format!("{copy_directory}/{WRITE_PROBE_FILE_NAME}");
-        let local = ProbeLocalFile::create(write_probe_md5()).unwrap();
+        let local = ProbeLocalFile::create(write_probe_fingerprint()).unwrap();
         let size = local.entry.size;
         let mtime_seconds = local.entry.mtime_ms.div_euclid(1000);
-        let digest = local.entry.content_md5.unwrap().to_string();
-        let md5_finished =
-            format!(r#"{{"success":true,"data":{{"finished":true,"md5":"{digest}"}}}}"#);
         let missing = r#"{"success":false,"error":{"code":408}}"#.to_owned();
         let succeeded = r#"{"success":true}"#.to_owned();
 
-        // Responses 0..=11: everything up to and including the uploaded file's MD5 check.
+        // Responses 0..=10: everything up to and including the uploaded file's full fingerprint.
         let uploaded = || {
             vec![
                 write_probe_discovery(true),
@@ -6396,8 +7697,7 @@ FplE
                 r#"{"success":true,"data":{"total":0,"files":[]}}"#.to_owned(),
                 succeeded.clone(),
                 getinfo_file(&upload_path, size, None),
-                task_start_response("copy-phase-md5"),
-                md5_finished.clone(),
+                scripted_binary_response(WRITE_PROBE_PAYLOAD),
             ]
         };
         // Cleanup: four non-recursive deletes then a final absence check that succeeds.
@@ -6433,7 +7733,7 @@ FplE
         assert!(!failure.report.upload_verified);
         assert!(!failure.report.server_copy_attempted);
         assert!(failure.report.cleanup_completed);
-        assert_eq!(server.join().unwrap().len(), 18);
+        assert_eq!(server.join().unwrap().len(), 17);
 
         // The copy directory cannot be created.
         let mut responses = uploaded();
@@ -6456,7 +7756,7 @@ FplE
         assert!(failure.report.upload_verified);
         assert!(!failure.report.server_copy_attempted);
         assert!(failure.report.cleanup_completed);
-        assert_eq!(server.join().unwrap().len(), 19);
+        assert_eq!(server.join().unwrap().len(), 18);
 
         // The copy task itself fails after the destination was prepared.
         let mut responses = uploaded();
@@ -6485,7 +7785,7 @@ FplE
         assert!(failure.report.server_copy_attempted);
         assert!(!failure.report.server_copy_verified);
         assert!(failure.report.cleanup_completed);
-        assert_eq!(server.join().unwrap().len(), 23);
+        assert_eq!(server.join().unwrap().len(), 22);
 
         // The copy completes and its content matches, but its metadata does not.
         let mut responses = uploaded();
@@ -6498,8 +7798,7 @@ FplE
             task_start_response("probe-copy-task"),
             r#"{"success":true,"data":{"finished":true}}"#.to_owned(),
             getinfo_file(&copy_path, size, None),
-            task_start_response("probe-copy-md5"),
-            md5_finished.clone(),
+            scripted_binary_response(WRITE_PROBE_PAYLOAD),
             getinfo_file(&copy_path, size, Some(mtime_seconds + 60)),
         ]);
         responses.extend(cleanup());
@@ -6520,6 +7819,6 @@ FplE
         assert!(failure.report.server_copy_attempted);
         assert!(!failure.report.server_copy_verified);
         assert!(failure.report.cleanup_completed);
-        assert_eq!(server.join().unwrap().len(), 28);
+        assert_eq!(server.join().unwrap().len(), 26);
     }
 }

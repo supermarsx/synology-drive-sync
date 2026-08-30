@@ -96,8 +96,12 @@ and three secret-state editors. See:
 The underlying save is queued, but the page polls its sanitized result and reports success only after
 the controller completes it. Configuration is applied first, followed by each requested secret
 operation in order. If a later stage fails or becomes outcome-unknown, the page reports the profile
-as partially applied when an earlier stage completed, closes the editor, refreshes the snapshot, and
-requires credential-presence inspection before any retry.
+as partially applied when an earlier stage completed and preserves the editor for recovery. Only
+confirmed secret stages are cleared; unapplied values remain available while Activity and Logs are
+inspected. The current AppWindow then locks every mutation and all autosave work, even if a later
+snapshot reconciles one scope. Preserve the draft, inspect authoritative package state, Activity, and
+Logs, then reopen the AppWindow before making another change. Status refresh is fenced until the
+editor closes, then one fresh snapshot is requested.
 
 ## Routines
 
@@ -125,7 +129,8 @@ only in a prepared non-critical destination. The API initially queues the action
 its sanitized terminal result before reporting the Doctor verdict. Pending observations have no
 client deadline. An `expired_or_missing` result, an invalid result document, or five consecutive result
 observation failures yield outcome-unknown; inspect Activity and refreshed cached health evidence
-before retrying.
+to determine what completed. The current AppWindow locks every mutation and autosave after that
+result; reopen it only after reconciliation instead of resubmitting from the uncertain session.
 
 The target-health table never fabricates evidence. Missing reachability, authentication,
 writability, latency, or timestamp data is shown as **Unavailable**. Free space is displayed only
@@ -212,11 +217,13 @@ result. Plan and Run remain asynchronous. Therefore:
    `expired_or_missing` response, five consecutive observation failures, an invalid result document,
    or AppWindow shutdown aborts observation.
 3. `expired_or_missing`, invalid result evidence, and repeated observation failures make the accepted
-   job outcome unknown; inspect the refreshed snapshot, structured Activity, and bounded logs before
-   retrying. Closing the AppWindow stops observation, not the queued server job.
+   job outcome unknown. The current AppWindow locks every mutation and autosave; inspect the
+   refreshed snapshot, structured Activity, and bounded logs, then reopen the AppWindow before any
+   new action. Closing the AppWindow stops observation, not the queued server job.
 4. A multi-stage profile save can be partially applied when configuration or an earlier secret stage
-   completed before a later failure or outcome-unknown result. Inspect configuration and every
-   credential-presence marker before retrying.
+   completed before a later failure or outcome-unknown result. The draft remains visible, but the
+   current AppWindow cannot resubmit it. Inspect configuration and every credential-presence marker,
+   then reopen the AppWindow after reconciliation.
 5. For Plan and Run, “queued” is not success; follow run state, Activity, and logs.
 6. Investigate a failed or stale job through the [CLI recovery path](cli-parity.md), not browser
    developer tools containing session material.

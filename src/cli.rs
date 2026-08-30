@@ -624,7 +624,7 @@ pub struct DoctorSourceArgs {
     #[arg(value_name = "SOURCE", help_heading = "Source diagnostic")]
     pub source: Option<PathBuf>,
 
-    /// Read every payload file and verify a stable MD5 snapshot.
+    /// Read every payload file and verify a stable MD5/CRC32/SHA-256 snapshot.
     #[arg(long, help_heading = "Source diagnostic")]
     pub hash: bool,
 

@@ -25,6 +25,12 @@ const DSM_TOKEN_BOOTSTRAP_TIMEOUT_MS = 5000;
 const DSM_TOKEN_RETRY_DELAY_MS = 30000;
 const CLIENT_REQUEST_ID_PATTERN = /^[0-9a-f]{32}$/;
 const JOB_ID_PATTERN = /^[0-9a-f]{48}$/;
+const FILE_STATION_CLEANUP_INSPECTION_CODES = new Set([
+  "file_station_logout_failed",
+  "file_station_denied_logout_failed",
+  "file_station_listing_logout_failed",
+  "file_station_operation_logout_failed"
+]);
 
 let cachedDsmToken = "";
 let dsmTokenBootstrapPromise = null;
@@ -71,6 +77,7 @@ export class DsmApiError extends Error {
     this.status = Number.isInteger(Number(status)) ? Number(status) : 0;
     this.code = boundedText(code, "api_error").slice(0, 128);
     this.stage = boundedText(stage, "").slice(0, 128);
+    this.requiresInspection = FILE_STATION_CLEANUP_INSPECTION_CODES.has(this.code);
   }
 }
 
@@ -88,6 +95,8 @@ export const ACTIONS = Object.freeze({
   removeProfile: "remove-profile",
   setDefault: "set-default",
   setSecret: "set-secret",
+  testProfileAuth: "test-profile-auth",
+  browseRemote: "browse-remote",
   schedule: "schedule",
   routine: "routine",
   removeRoutine: "remove-routine",
@@ -97,10 +106,12 @@ export const ACTIONS = Object.freeze({
   execute: "action"
 });
 
-const GET_ACTIONS = Object.freeze(["csrf", "snapshot", "logs", "activity", "result"]);
+const GET_ACTIONS = Object.freeze(["csrf", "snapshot", "source-directories", "source-path", "logs", "activity", "result"]);
 const GET_ARGUMENT_KEYS = Object.freeze({
   csrf: Object.freeze([]),
   snapshot: Object.freeze([]),
+  "source-directories": Object.freeze(["parent"]),
+  "source-path": Object.freeze(["path"]),
   logs: Object.freeze(["lines", "source"]),
   activity: Object.freeze(["lines"]),
   result: Object.freeze(["job_id"])
@@ -118,6 +129,16 @@ export const ARGUMENT_KEYS = Object.freeze({
   "remove-profile": Object.freeze(["name"]),
   "set-default": Object.freeze(["name"]),
   "set-secret": Object.freeze(["kind", "mode", "profile", "value"]),
+  "test-profile-auth": Object.freeze([
+    "allow_http", "ca_certificate", "connect_timeout_seconds",
+    "danger_accept_invalid_certs", "password", "password_source", "profile",
+    "retries", "timeout_seconds", "totp", "totp_source", "url", "username"
+  ]),
+  "browse-remote": Object.freeze([
+    "allow_http", "ca_certificate", "connect_timeout_seconds", "connection_proof",
+    "danger_accept_invalid_certs", "parent", "password", "password_source", "profile",
+    "retries", "timeout_seconds", "totp", "totp_source", "url", "username"
+  ]),
   schedule: Object.freeze(["allow_delete", "enabled", "interval_seconds", "max_total_delete"]),
   routine: Object.freeze([
     "action", "allow_delete", "debounce_seconds", "depends_on", "enabled",

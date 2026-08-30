@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -901,7 +902,7 @@ def validate_synology_wrapper_argument_parsing() -> None:
         print("skipped Synology wrapper argument-parsing check: no built binary found")
         return
 
-    manager = ROOT / "packaging/synology/package/bin/sdsync-dsm"
+    production_manager = ROOT / "packaging/synology/package/bin/sdsync-dsm"
     runner = ROOT / "packaging/synology/package/libexec/sdsync-run"
 
     with tempfile.TemporaryDirectory(prefix="sdsync-dsm-argparse-") as raw_temp:
@@ -913,6 +914,33 @@ def validate_synology_wrapper_argument_parsing() -> None:
             path.mkdir(mode=0o700)
         (package_target / "bin").mkdir(parents=True, mode=0o700)
         (package_target / "libexec").mkdir(mode=0o700)
+        dsm_system_root = temporary / "dsm-system-root"
+        source = dsm_system_root / "volume1" / "source"
+        source.mkdir(parents=True, mode=0o700)
+        (source / "payload.txt").write_text("payload", encoding="utf-8")
+
+        manager = package_target / "bin/sdsync-dsm"
+        manager_source = production_manager.read_text(encoding="utf-8")
+        production_system_root = "dsm_system_root=/\n"
+        if manager_source.count(production_system_root) != 1:
+            raise AssertionError(
+                "Synology package manager must define exactly one canonical DSM system root"
+            )
+        manager.write_text(
+            manager_source.replace(
+                production_system_root,
+                f"dsm_system_root={shlex.quote(str(dsm_system_root))}\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        manager.chmod(0o755)
+        fixture_common = package_target / "libexec/sdsync-common"
+        shutil.copy2(
+            ROOT / "packaging/synology/package/libexec/sdsync-common",
+            fixture_common,
+        )
+        fixture_common.chmod(0o755)
         fixture_binary = package_target / "bin/synology-drive-sync"
         shutil.copy2(binary, fixture_binary)
         fixture_binary.chmod(0o755)
@@ -952,10 +980,6 @@ def validate_synology_wrapper_argument_parsing() -> None:
             encoding="utf-8",
         )
         fixture_controller.chmod(0o755)
-
-        source = temporary / "source"
-        source.mkdir(mode=0o700)
-        (source / "payload.txt").write_text("payload", encoding="utf-8")
 
         environment = {
             key: value for key, value in os.environ.items() if not key.startswith("SDSYNC_")

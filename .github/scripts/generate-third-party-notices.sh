@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version=0.9.1
+version=0.9.2
 target=x86_64-unknown-linux-musl
 archive_name="cargo-about-$version-$target.tar.gz"
 package_name="cargo-about-$version-$target"
-archive_sha256=c0e7dc6f5d74b0beec5c0053d39ab24514c717d19acd91886907a22457ea9e98
+archive_sha256=9099a59e820c38a68b9d65f300662a567d56562f9a10f6aa4c7e86c17c2566af
 download_url="https://github.com/EmbarkStudios/cargo-about/releases/download/$version/$archive_name"
 
 repository_root=$(git rev-parse --show-toplevel)

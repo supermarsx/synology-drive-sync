@@ -1342,6 +1342,23 @@ class RuntimeTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        # The production manager pins this to `/`; only the copied fixture is
+        # relocated so source admission still exercises canonical DSM volume
+        # roots without requiring host-level `/volume1` test directories.
+        self.dsm_system_root = self.root / "dsm-system-root"
+        (self.dsm_system_root / "volume1").mkdir(parents=True)
+        runtime_manager = self.real_target / "bin/sdsync-dsm"
+        runtime_manager_source = runtime_manager.read_text(encoding="utf-8")
+        production_system_root = "dsm_system_root=/\n"
+        self.assertEqual(runtime_manager_source.count(production_system_root), 1)
+        runtime_manager.write_text(
+            runtime_manager_source.replace(
+                production_system_root,
+                f"dsm_system_root={shlex.quote(str(self.dsm_system_root))}\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
         self.lifecycle_dir = self.root / "lifecycle"
         shutil.copytree(HERE / "scripts", self.lifecycle_dir)
         for path in self.real_target.rglob("*"):
@@ -1371,8 +1388,8 @@ class RuntimeTests(unittest.TestCase):
         self.write_api_mock()
         self.fake_system_bin = self.root / "fake-system-bin"
         self.fake_system_bin.mkdir(mode=0o700)
-        self.source_one = self.root / "Source Folder"
-        self.source_two = self.root / "Second Source"
+        self.source_one = self.dsm_system_root / "volume1" / "Source Folder"
+        self.source_two = self.dsm_system_root / "volume1" / "Second Source"
         self.source_one.mkdir()
         self.source_two.mkdir()
         self.environment = os.environ.copy()
@@ -1427,7 +1444,16 @@ class RuntimeTests(unittest.TestCase):
     with Path({str(queue_argv_capture)!r}).open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(sys.argv[2:], separators=(",", ":")) + "\\n")
 '''
-            consume = f'''\nif len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
+            consume = f'''\nif len(sys.argv) == 4 and sys.argv[1] == "--reject-job":
+    request = Path(sys.argv[2])
+    response = Path(sys.argv[3])
+    with Path({str(queue_capture)!r}).open("a", encoding="utf-8") as stream:
+        stream.write(f"rejected {{request.stem}}\\n")
+    response.write_text('{{"schema":"sdsync.dsm-result.v1","ok":false,"code":"operation_failed","message":"Operation could not be completed."}}\\n', encoding="utf-8")
+    response.chmod(0o600)
+    raise SystemExit(0)
+
+if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
     request = Path(sys.argv[2])
     response = Path(sys.argv[3])
 {argv_capture}
@@ -2250,6 +2276,13 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             f"{launch_line}\n"
             f'{indentation}while [ ! -e "${{SDSYNC_TEST_LAUNCH_READY:?}}" ]; do '
             "/bin/sleep 0.01; done\n"
+            f'{indentation}if [ -n "${{SDSYNC_TEST_VERIFIED_CONTROLLER_IDENTITY:-}}" ]; then\n'
+            f'{indentation}    controller_persisted_identity_status "$$"\n'
+            f'{indentation}    printf \'%s\\n%s\\n%s\\n\' "$persisted_controller_pid" '
+            '"$persisted_controller_start" "$persisted_controller_boot" '
+            '> "$SDSYNC_TEST_VERIFIED_CONTROLLER_IDENTITY"\n'
+            f'{indentation}    finish_private_file "$SDSYNC_TEST_VERIFIED_CONTROLLER_IDENTITY"\n'
+            f'{indentation}fi\n'
             f'{indentation}kill -TERM "$$"\n'
             f"{assignment_line}"
         )
@@ -2445,6 +2478,50 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                     os.kill(child_pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+
+    def wait_for_verified_process_exit(
+        self, identity_file: Path, *, timeout: float = 15.0
+    ) -> None:
+        identity_deadline = time.monotonic() + timeout
+        while not identity_file.is_file() and time.monotonic() < identity_deadline:
+            time.sleep(0.01)
+        self.assertTrue(identity_file.is_file(), "verified controller identity was not recorded")
+        identity = identity_file.read_text(encoding="ascii").splitlines()
+        self.assertEqual(len(identity), 3, "verified controller identity must have three lines")
+        pid_text, expected_start, expected_boot = identity
+        self.assertRegex(pid_text, r"^[1-9][0-9]*$")
+        self.assertRegex(expected_start, r"^[1-9][0-9]*$")
+        self.assertRegex(
+            expected_boot,
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        )
+        controller_pid = int(pid_text)
+
+        exit_deadline = time.monotonic() + timeout
+        while time.monotonic() < exit_deadline:
+            try:
+                current_boot = Path("/proc/sys/kernel/random/boot_id").read_text(
+                    encoding="ascii"
+                ).strip()
+                process_fields = (
+                    Path(f"/proc/{controller_pid}/stat")
+                    .read_text(encoding="ascii")
+                    .rsplit(") ", 1)[1]
+                    .split()
+                )
+            except (FileNotFoundError, ProcessLookupError):
+                return
+            if (
+                current_boot != expected_boot
+                or len(process_fields) <= 19
+                or process_fields[19] != expected_start
+                or process_fields[0] == "Z"
+            ):
+                return
+            time.sleep(0.01)
+        self.fail(
+            f"verified controller PID {controller_pid} did not exit after forwarded TERM"
+        )
 
     def configure(self, name: str, source: Path, remote: str, default: bool = False) -> subprocess.CompletedProcess[str]:
         arguments = [
@@ -5066,14 +5143,17 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         ready = self.root / "routine-launch.ready"
         pid_file = self.root / "routine-launch.pid"
         terminated = self.root / "routine-launch.term"
+        controller_identity = self.root / "routine-controller.identity"
         environment = {
             "SDSYNC_TEST_LAUNCH_READY": str(ready),
             "SDSYNC_TEST_LAUNCHED_PID": str(pid_file),
             "SDSYNC_TEST_TERM_OBSERVED": str(terminated),
+            "SDSYNC_TEST_VERIFIED_CONTROLLER_IDENTITY": str(controller_identity),
         }
         self.assert_injected_launch_is_reaped(
             self.lifecycle, ("start",), environment, pid_file, ready, terminated, 0
         )
+        self.wait_for_verified_process_exit(controller_identity)
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
         self.assertFalse((self.real_var / "run/controller.lock").exists())
@@ -5719,6 +5799,71 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             time.sleep(0.03)
         self.assertLessEqual(len(safe_responses), 256)
         self.assertIn("kind=processing_indeterminate", controller_log_path.read_text(encoding="utf-8"))
+
+    def test_controller_secret_claim_failure_never_dispatches_the_consumer(self) -> None:
+        bridge_capture = self.root / "secret-claim-bridge-capture"
+        bridge_lock = self.root / "secret-claim-bridge-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+
+        real_mv = shutil.which("mv")
+        self.assertIsNotNone(real_mv)
+        failing_mv = self.fake_system_bin / "mv"
+        failing_mv.write_text(
+            "#!/bin/sh\n"
+            "case ${1:-}:${2:-} in *.secret:*.secret) exit 74 ;; esac\n"
+            f"exec {shlex.quote(str(real_mv))} \"$@\"\n",
+            encoding="utf-8",
+        )
+        failing_mv.chmod(0o755)
+
+        job_id = "d" * 48
+        requests = self.real_var / "control/requests"
+        processing = self.real_var / "control/processing"
+        responses = self.real_var / "control/responses"
+        request = requests / f"{job_id}.json"
+        secret = requests / f"{job_id}.secret"
+        for path, payload in ((request, "{}\n"), (secret, "never-dispatch-this\n")):
+            path.write_text(payload, encoding="utf-8")
+            path.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(path, self.drop_uid, self.drop_gid)
+
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        response = responses / f"{job_id}.json"
+        for _ in range(500):
+            if response.is_file():
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("controller did not publish a terminal secret-claim rejection")
+
+        records = bridge_capture.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(records, [f"rejected {job_id}"])
+        self.assertFalse(request.exists())
+        self.assertFalse(secret.exists())
+        self.assertFalse((processing / f"{job_id}.json").exists())
+        self.assertFalse((processing / f"{job_id}.secret").exists())
+        controller_events = [
+            json.loads(line)
+            for line in (self.real_var / "log/controller.log")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        rejected = [
+            event
+            for event in controller_events
+            if event.get("event") == "control_secret_rejected"
+        ]
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0].get("level"), "error")
+        self.assertEqual(rejected[0].get("category"), "controller")
+        self.assertEqual(rejected[0].get("detail"), f"id={job_id} reason=claim_failed")
+        self.assertFalse(
+            any(event.get("event") == "control_request_dispatched" for event in controller_events)
+        )
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
 
     def test_controller_dispatches_physical_pkgvar_jobs_through_framework_aliases(self) -> None:
         runtime_common = self.real_target / "libexec/sdsync-common"
@@ -6830,23 +6975,48 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         config = self.real_home / "config/config.toml"
         self.assertFalse(config.exists())
 
-    def test_source_is_canonicalized_and_root_aliases_are_rejected(self) -> None:
-        aliased_source = f"{self.source_one}/../{self.source_one.name}"
+    def test_source_requires_a_canonical_path_and_rejects_root_aliases(self) -> None:
         configured = self.configure(
-            "canonical", Path(aliased_source), "/home/Drive/Canonical", True
+            "canonical", self.source_one, "/home/Drive/Canonical", True
         )
         self.assertEqual(configured.returncode, 0, configured.stderr)
         config = (self.real_home / "config/config.toml").read_text(encoding="utf-8")
         self.assertIn(f'source = "{self.source_one.resolve()}"', config)
-        self.assertNotIn("/../", config)
+
+        aliased_source = f"{self.source_one}/../{self.source_one.name}"
+        aliased = self.configure(
+            "aliased", Path(aliased_source), "/home/Drive/Aliased"
+        )
+        self.assertEqual(aliased.returncode, 64, aliased.stderr)
+        self.assertIn("without empty or dot segments", aliased.stderr)
 
         for index, source in enumerate(("/.", "//", "/tmp/../..")):
             result = self.configure(
                 f"root{index}", Path(source), f"/home/Drive/Root{index}"
             )
             self.assertEqual(result.returncode, 64, source)
-            self.assertIn("resolve to the filesystem root", result.stderr)
             self.assertFalse((self.real_home / f"config/profiles.d/root{index}.toml").exists())
+
+    def test_source_accepts_canonical_external_dsm_volumes_but_not_arbitrary_mount_roots(self) -> None:
+        usb_source = self.dsm_system_root / "volumeUSB1" / "usbshare"
+        sata_source = self.dsm_system_root / "volumeSATA2" / "satashare"
+        arbitrary = self.dsm_system_root / "mnt" / "source"
+        for source in (usb_source, sata_source, arbitrary):
+            source.mkdir(parents=True)
+
+        for name, source in (("usb", usb_source), ("sata", sata_source)):
+            result = self.configure(name, source, f"/home/Drive/{name}")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        rejected = self.configure("mounted", arbitrary, "/home/Drive/Mounted")
+        self.assertEqual(rejected.returncode, 64, rejected.stderr)
+        self.assertIn("internal, USB, or SATA DSM volume tree", rejected.stderr)
+
+        linked = self.dsm_system_root / "volumeUSB3"
+        linked.symlink_to(usb_source, target_is_directory=True)
+        symlinked = self.configure("linked", linked, "/home/Drive/Linked")
+        self.assertEqual(symlinked.returncode, 64, symlinked.stderr)
+        self.assertIn("must not be a symlink", symlinked.stderr)
 
     def test_source_rejects_package_storage_and_its_ancestors(self) -> None:
         candidates = (
@@ -6863,7 +7033,10 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 f"private{index}", source, f"/home/Drive/Private{index}"
             )
             self.assertEqual(result.returncode, 64, f"accepted package path {source}")
-            self.assertIn("package-owned DSM storage", result.stderr)
+            if index < 3:
+                self.assertIn("symlinks or non-canonical path components", result.stderr)
+            else:
+                self.assertIn("package-owned DSM storage", result.stderr)
             self.assertFalse(
                 (self.real_home / f"config/profiles.d/private{index}.toml").exists()
             )
@@ -7592,17 +7765,20 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         ready = self.root / "aggregate-launch.ready"
         pid_file = self.root / "aggregate-launch.pid"
         terminated = self.root / "aggregate-launch.term"
+        controller_identity = self.root / "aggregate-controller.identity"
         environment = self.fast_clock_environment(step=61)
         environment.update(
             {
                 "SDSYNC_TEST_LAUNCH_READY": str(ready),
                 "SDSYNC_TEST_LAUNCHED_PID": str(pid_file),
                 "SDSYNC_TEST_TERM_OBSERVED": str(terminated),
+                "SDSYNC_TEST_VERIFIED_CONTROLLER_IDENTITY": str(controller_identity),
             }
         )
         self.assert_injected_launch_is_reaped(
             self.lifecycle, ("start",), environment, pid_file, ready, terminated, 0
         )
+        self.wait_for_verified_process_exit(controller_identity)
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
         self.assertFalse((self.real_var / "run/controller.lock").exists())

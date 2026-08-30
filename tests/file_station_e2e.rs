@@ -467,7 +467,7 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
     assert_eq!(
         sync_requests
             .iter()
-            .filter(|request| request.operation() == "SYNO.FileStation.MD5.start")
+            .filter(|request| request.operation() == "SYNO.FileStation.Download.download")
             .count(),
         4,
         "each upload and each final reconciliation path must be content verified"
@@ -494,21 +494,17 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
             "SYNO.FileStation.CreateFolder.create",
             "SYNO.FileStation.Upload.upload",
             "SYNO.FileStation.List.getinfo",
-            "SYNO.FileStation.MD5.start",
-            "SYNO.FileStation.MD5.status",
+            "SYNO.FileStation.Download.download",
             "SYNO.FileStation.Upload.upload",
             "SYNO.FileStation.List.getinfo",
-            "SYNO.FileStation.MD5.start",
-            "SYNO.FileStation.MD5.status",
+            "SYNO.FileStation.Download.download",
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.List.list",
             "SYNO.FileStation.List.list",
             "SYNO.FileStation.List.list",
-            "SYNO.FileStation.MD5.start",
-            "SYNO.FileStation.MD5.status",
-            "SYNO.FileStation.MD5.start",
-            "SYNO.FileStation.MD5.status",
+            "SYNO.FileStation.Download.download",
+            "SYNO.FileStation.Download.download",
             "SYNO.API.Auth.logout",
         ]
     );
@@ -624,7 +620,7 @@ fn missing_home_destination_is_provisioned_below_the_existing_home_root() {
     assert!(
         requests[reconciliation_list_index + 1..]
             .iter()
-            .any(|request| request.operation() == "SYNO.FileStation.MD5.start"),
+            .any(|request| request.operation() == "SYNO.FileStation.Download.download"),
         "final reconciliation must content-verify the uploaded payload"
     );
     assert_eq!(
@@ -1583,12 +1579,12 @@ fn retryable_metadata_and_committed_upload_responses_recover_without_retransmiss
             .filter(|request| request.operation() == "SYNO.FileStation.Upload.upload")
             .count(),
         1,
-        "a landed upload must be reconciled by size and MD5 before any retransmission"
+        "a landed upload must be reconciled by size and the complete content fingerprint before any retransmission"
     );
     assert!(
         requests
             .iter()
-            .any(|request| request.operation() == "SYNO.FileStation.MD5.start"),
+            .any(|request| request.operation() == "SYNO.FileStation.Download.download"),
         "the ambiguous upload response must trigger content reconciliation"
     );
     let output_text = String::from_utf8_lossy(&output.stdout);

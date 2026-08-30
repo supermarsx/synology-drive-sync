@@ -6,7 +6,7 @@ conveniences.
 ## Client construction
 
 `SyncRequest::builder` requires endpoint, username, source, and logical remote root. Its defaults are
-HTTPS-only, certificate-validating, content comparison, two workers, bounded timeouts/retries, and
+HTTPS-only, certificate-validating, MD5/CRC32/SHA-256 content comparison, two workers, bounded timeouts/retries, and
 additive/update-only behavior. Optional builder methods add a private CA, rate cap, exclusions,
 comparison mode, worker count, or explicit `DeletionPolicy`.
 
@@ -16,8 +16,9 @@ application, and keep secrets and callbacks away from diagnostic formatting.
 ## Inventory and digest selection
 
 The engine builds local ignore rules/inventory and remote inventory beneath a validated `RemoteRoot`.
-Content-mode planning intentionally selects the minimum remote hashes needed for same-path comparison,
-safe server-copy candidates, and deletion guards.
+Content-mode planning intentionally selects the minimum remote files needed for same-path comparison,
+safe server-copy candidates, and deletion guards, then streams those files once to compute MD5,
+IEEE CRC32, and SHA-256 together.
 
 Never replace an unavailable digest with a zero, empty string, or assumed mismatch. The planner and
 executor fail closed when the safety decision depends on missing remote metadata.

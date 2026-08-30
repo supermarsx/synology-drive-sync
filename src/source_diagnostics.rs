@@ -13,8 +13,9 @@ pub struct SourceDiagnosticOptions {
 /// A successful, read-only diagnostic of one canonical local source tree.
 ///
 /// `entries` counts files and directories below the root; the root itself is not an entry.
-/// The retained inventory is ordered by relative path and contains each file's MD5 when
-/// `hash_content` was requested. No partial report is returned when scanning or hashing fails.
+/// The retained inventory is ordered by relative path and contains each file's MD5, IEEE CRC32,
+/// and SHA-256 fingerprint when `hash_content` was requested. No partial report is returned when
+/// scanning or hashing fails.
 #[derive(Debug)]
 pub struct SourceDiagnosticReport {
     pub canonical_root: PathBuf,
@@ -209,6 +210,22 @@ mod tests {
                 .unwrap()
                 .to_string(),
             "900150983cd24fb0d6963f7d28e17f72"
+        );
+        assert_eq!(
+            report.inventory.entries["abc.bin"]
+                .content_md5
+                .unwrap()
+                .crc32_hex()
+                .as_deref(),
+            Some("352441c2")
+        );
+        assert_eq!(
+            report.inventory.entries["abc.bin"]
+                .content_md5
+                .unwrap()
+                .sha256_hex()
+                .as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         );
         assert_eq!(
             report.inventory.entries["empty.bin"]

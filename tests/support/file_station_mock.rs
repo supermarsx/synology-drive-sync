@@ -327,6 +327,7 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
 enum MockResponse {
     Json(Value),
     Raw(String),
+    Bytes(Vec<u8>),
     HttpStatus { status: u16, body: String },
 }
 
@@ -497,6 +498,15 @@ fn route_request(
                 .collect::<String>();
             success(json!({"finished": true, "md5": digest}))
         }
+        ("SYNO.FileStation.Download", "download") => {
+            let Some(path) = first_json_string(fields.get("path")) else {
+                return api_error(101);
+            };
+            match state.files.get(&path) {
+                Some(file) => MockResponse::Bytes(file.contents.clone()),
+                None => api_error(408),
+            }
+        }
         ("SYNO.FileStation.CopyMove", "start") => {
             let Some(source) = first_json_string(fields.get("path")) else {
                 return api_error(101);
@@ -610,6 +620,7 @@ fn discovery() -> Value {
             "SYNO.FileStation.Upload": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
             "SYNO.FileStation.Delete": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
             "SYNO.FileStation.MD5": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+            "SYNO.FileStation.Download": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
             "SYNO.FileStation.CopyMove": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 3},
             "SYNO.FileStation.CheckPermission": {"path": "entry.cgi", "minVersion": 3, "maxVersion": 3}
         }
@@ -802,18 +813,25 @@ fn read_request(stream: &mut TcpStream) -> (String, BTreeMap<String, String>, Ve
 
 fn write_response(stream: &mut TcpStream, response: MockResponse) {
     let (status, reason, content_type, body) = match response {
-        MockResponse::Json(value) => (200, "OK", "application/json", value.to_string()),
-        MockResponse::Raw(body) => (200, "OK", "text/html", body),
+        MockResponse::Json(value) => (
+            200,
+            "OK",
+            "application/json",
+            value.to_string().into_bytes(),
+        ),
+        MockResponse::Raw(body) => (200, "OK", "text/html", body.into_bytes()),
+        MockResponse::Bytes(body) => (200, "OK", "application/octet-stream", body),
         MockResponse::HttpStatus { status, body } => {
-            (status, http_reason(status), "text/plain", body)
+            (status, http_reason(status), "text/plain", body.into_bytes())
         }
     };
     write!(
         stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )
     .expect("write mock response");
+    stream.write_all(&body).expect("write mock response body");
     stream.flush().expect("flush mock response");
 }
 

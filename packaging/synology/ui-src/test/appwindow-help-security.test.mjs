@@ -361,7 +361,8 @@ test("complete security policy, client-event auditing, activity filters, and sta
   ]) assert.ok(app.includes(marker), `App.vue lacks ${marker}`);
   assert.doesNotMatch(app, /this\.snapshot\s*=\s*null/);
   assert.match(app, /<v-button\b[^>]*@click="refreshSnapshot\(true\)"[^>]*>[\s\S]*?<action-icon name="refresh"\s*\/>[\s\S]*?Retry<\/v-button>/);
-  assert.match(panel, /:disabled="disabled \|\| busy \|\| !dirty"/);
+  assert.match(panel, /:disabled="disabled \|\| busy \|\| !dirty \|\| saveBlocked"/);
+  assert.match(panel, /saveBlocked \? saveBlockedMessage/);
   assert.match(panel, /@input="updateField\(control\.key, \$event === true\)"/);
   assert.match(panel, /<v-form-item\b[^>]*label="Policy version"[^>]*>[\s\S]*?:value="policyVersionLabel"[\s\S]*?readonly/);
   assert.match(panel, /updates are managed only by package migrations/);

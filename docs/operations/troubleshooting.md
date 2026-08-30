@@ -38,7 +38,7 @@ See [local, mapped-drive, and SMB sources](../local-and-smb-sources.md).
 ## Uploads retry from zero
 
 File Station exposes no resumable upload protocol. After a lost response, content mode checks whether
-the exact expected size and MD5 already arrived. If it cannot prove completion, the retry restarts the
+the exact expected size and complete MD5/CRC32/SHA-256 fingerprint already arrived. If it cannot prove completion, the retry restarts the
 whole file. Account for this in bandwidth, proxy, and scheduler limits.
 
 ## A plan changed before execution

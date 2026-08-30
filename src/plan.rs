@@ -38,7 +38,7 @@ pub enum ChangeReason {
     /// Sizes and modification times agree but the local file carries no digest, so no content
     /// comparison happened. The file is scheduled rather than assumed equal.
     LocalDigestUnavailable,
-    /// Sizes and modification times agree but no remote MD5 was retrieved, so no content
+    /// Sizes and modification times agree but no complete remote MD5/CRC32/SHA-256 fingerprint was retrieved, so no content
     /// comparison happened. The file is scheduled rather than assumed equal.
     RemoteDigestUnavailable,
     /// A remote entry of the other kind occupies the path and is replaced.
@@ -64,12 +64,14 @@ impl ChangeReason {
             Self::MissingRemote => "no remote entry at this path",
             Self::SizeDiffers => "local and remote sizes differ",
             Self::MtimeDiffers => "size equal, modification time differs",
-            Self::ContentDiffers => "size equal, MD5 did not match",
+            Self::ContentDiffers => {
+                "size equal, complete MD5/CRC32/SHA-256 fingerprint did not match"
+            }
             Self::LocalDigestUnavailable => {
-                "size and time equal, no local digest to compare, uploading unverified"
+                "size and time equal, no complete local MD5/CRC32/SHA-256 fingerprint, uploading unverified"
             }
             Self::RemoteDigestUnavailable => {
-                "size and time equal, no remote MD5 to compare, uploading unverified"
+                "size and time equal, no complete remote MD5/CRC32/SHA-256 fingerprint, uploading unverified"
             }
             Self::TypeReplaced => "remote entry has the conflicting kind",
         }
@@ -520,15 +522,22 @@ fn compare_files(
         CompareMode::SizeOnly => None,
         CompareMode::Metadata => mtime_differs.then_some(ChangeReason::MtimeDiffers),
         CompareMode::Content => match (local.content_md5, remote.content_md5) {
-            (Some(local_digest), Some(remote_digest)) if local_digest == remote_digest => {
-                mtime_differs.then_some(ChangeReason::MtimeDiffers)
+            (Some(local_digest), Some(remote_digest)) => {
+                match local_digest.full_match(&remote_digest) {
+                    Some(true) => mtime_differs.then_some(ChangeReason::MtimeDiffers),
+                    Some(false) => Some(ChangeReason::ContentDiffers),
+                    None if mtime_differs => Some(ChangeReason::MtimeDiffers),
+                    None if !local_digest.has_full_proof() => {
+                        Some(ChangeReason::LocalDigestUnavailable)
+                    }
+                    None => Some(ChangeReason::RemoteDigestUnavailable),
+                }
             }
-            (Some(_), Some(_)) => Some(ChangeReason::ContentDiffers),
             // A digest is unavailable, so content equality was never established. Name the
             // metadata difference when there is one rather than an unperformed content check.
             _ if mtime_differs => Some(ChangeReason::MtimeDiffers),
             // Nothing distinguishes the pair except an absent digest. Upload anyway, and name
-            // the side that could not be hashed instead of claiming the MD5s disagreed. A local
+            // the side that could not be hashed instead of claiming the fingerprints disagreed. A local
             // digest is the precondition for the remote lookup, so it is named first.
             (None, _) => Some(ChangeReason::LocalDigestUnavailable),
             (Some(_), None) => Some(ChangeReason::RemoteDigestUnavailable),
@@ -561,6 +570,11 @@ fn replace_uploads_with_server_copies(
         let digest = upload.local.content_md5.ok_or_else(|| {
             Error::Message("content comparison requires every local file digest".to_owned())
         })?;
+        if !digest.has_full_proof() {
+            return Err(Error::Message(
+                "content comparison requires every local MD5/CRC32/SHA-256 fingerprint".to_owned(),
+            ));
+        }
         local_by_content
             .entry((
                 upload.local.size,
@@ -584,6 +598,9 @@ fn replace_uploads_with_server_copies(
         let Some(digest) = entry.content_md5 else {
             continue;
         };
+        if !digest.has_full_proof() {
+            continue;
+        }
         remote_by_content
             .entry((entry.size, digest, entry.mtime_seconds))
             .or_default()
@@ -677,12 +694,19 @@ fn deletion_snapshot(
     compare: CompareMode,
 ) -> Result<RemoteSnapshot> {
     let content_md5 = if compare == CompareMode::Content && entry.kind == EntryKind::File {
-        Some(entry.content_md5.ok_or_else(|| {
+        let fingerprint = entry.content_md5.ok_or_else(|| {
             Error::Message(format!(
-                "content-mode deletion requires a plan-time MD5 snapshot for {:?}",
+                "content-mode deletion requires a plan-time MD5/CRC32/SHA-256 fingerprint for {:?}",
                 entry.remote_path
             ))
-        })?)
+        })?;
+        if !fingerprint.has_full_proof() {
+            return Err(Error::Message(format!(
+                "content-mode deletion requires a complete plan-time MD5/CRC32/SHA-256 fingerprint for {:?}",
+                entry.remote_path
+            )));
+        }
+        Some(fingerprint)
     } else {
         None
     };
@@ -825,7 +849,7 @@ mod tests {
     }
 
     fn digest(value: u8) -> ContentMd5 {
-        ContentMd5::from_bytes([value; 16])
+        ContentMd5::from_digests([value; 16], u32::from(value), [value; 32])
     }
 
     fn content_options(delete: bool, server_copy: bool) -> PlanOptions {
@@ -939,7 +963,7 @@ mod tests {
         );
 
         // A local file left unhashed - hashing skipped or cancelled - was never compared, so the
-        // conservative upload must say the local digest was missing, not that the MD5s disagreed.
+        // conservative upload must say the local fingerprint was missing, not that the hashes disagreed.
         let unhashed = local(&[("payload.bin", EntryKind::File, 4, 1_000)]);
         let mut hashed_remote = matched_remote();
         hashed_remote
@@ -959,7 +983,7 @@ mod tests {
             ChangeReason::LocalDigestUnavailable
         );
 
-        // The mirror image: the local file was hashed but the remote entry carries no MD5,
+        // The mirror image: the local file was hashed but the remote entry carries no fingerprint,
         // as happens when digest selection skipped it - a protected path, say.
         let mut hashed = local(&[("payload.bin", EntryKind::File, 4, 1_000)]);
         hashed.entries.get_mut("payload.bin").unwrap().content_md5 = Some(digest(1));
@@ -991,15 +1015,73 @@ mod tests {
     fn unverified_content_details_report_the_missing_digest_not_a_mismatch() {
         assert_eq!(
             ChangeReason::LocalDigestUnavailable.detail(),
-            "size and time equal, no local digest to compare, uploading unverified"
+            "size and time equal, no complete local MD5/CRC32/SHA-256 fingerprint, uploading unverified"
         );
         assert_eq!(
             ChangeReason::RemoteDigestUnavailable.detail(),
-            "size and time equal, no remote MD5 to compare, uploading unverified"
+            "size and time equal, no complete remote MD5/CRC32/SHA-256 fingerprint, uploading unverified"
         );
         assert_eq!(
             ChangeReason::ContentDiffers.detail(),
-            "size equal, MD5 did not match"
+            "size equal, complete MD5/CRC32/SHA-256 fingerprint did not match"
+        );
+    }
+
+    #[test]
+    fn content_mode_requires_crc32_and_sha256_even_when_md5_and_crc32_match() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let mut local = local(&[("payload.bin", EntryKind::File, 4, 1_000)]);
+        let mut remote = remote(&[("payload.bin", EntryKind::File, 4, 1)]);
+        let shared_md5 = [0x55; 16];
+        let shared_crc32 = 0xaabb_ccdd;
+        local.entries.get_mut("payload.bin").unwrap().content_md5 = Some(ContentMd5::from_digests(
+            shared_md5,
+            shared_crc32,
+            [0x11; 32],
+        ));
+        remote.entries.get_mut("payload.bin").unwrap().content_md5 = Some(
+            ContentMd5::from_digests(shared_md5, shared_crc32, [0x22; 32]),
+        );
+
+        let plan = build_plan(
+            &root,
+            &local,
+            &remote,
+            &rules(&[]),
+            &content_options(false, false),
+        )
+        .unwrap();
+        assert_eq!(plan.uploads.len(), 1);
+        assert_eq!(plan.uploads[0].reason, ChangeReason::ContentDiffers);
+    }
+
+    #[test]
+    fn content_mode_fails_closed_for_md5_only_legacy_values() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let legacy = ContentMd5::from_bytes([0x33; 16]);
+        let complete = ContentMd5::from_digests([0x33; 16], 0x1122_3344, [0x44; 32]);
+        let plan_for = |local_digest, remote_digest| {
+            let mut local = local(&[("payload.bin", EntryKind::File, 4, 1_000)]);
+            let mut remote = remote(&[("payload.bin", EntryKind::File, 4, 1)]);
+            local.entries.get_mut("payload.bin").unwrap().content_md5 = Some(local_digest);
+            remote.entries.get_mut("payload.bin").unwrap().content_md5 = Some(remote_digest);
+            build_plan(
+                &root,
+                &local,
+                &remote,
+                &rules(&[]),
+                &content_options(false, false),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            plan_for(legacy, complete).uploads[0].reason,
+            ChangeReason::LocalDigestUnavailable
+        );
+        assert_eq!(
+            plan_for(complete, legacy).uploads[0].reason,
+            ChangeReason::RemoteDigestUnavailable
         );
     }
 
@@ -1520,7 +1602,7 @@ mod tests {
         assert!(matches!(
             error,
             Error::Message(message)
-                if message.contains("plan-time MD5 snapshot")
+                if message.contains("plan-time MD5/CRC32/SHA-256 fingerprint")
                     && message.contains("/share/root/extra.bin")
         ));
     }

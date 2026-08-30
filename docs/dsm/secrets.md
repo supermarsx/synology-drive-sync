@@ -21,15 +21,20 @@ Every graphical secret editor has an explicit mode:
 | Clear stored value | Hidden/disabled | Enqueues removal; JSON carries `null`, never an empty substitute secret |
 
 No mode is inferred from an empty text box. Cancelling a dangerous profile confirmation leaves the
-entered replacement available for correction; once submission begins, secret inputs are cleared.
-They are also cleared on page exit and after an error.
+entered replacement available for correction. Once submission begins, each secret input is cleared
+only after that individual stage reaches terminal success. Unapplied inputs remain available after a
+failure; all transient values are cleared on page exit.
 
 For a new profile, configuration must be applied before a secret can reference it. The dashboard
 therefore queues profile configuration, observes its sanitized terminal success, and only then queues
-and observes each requested secret operation in order. There is no client pending-state deadline. If
+and observes each requested secret operation in order. These direct dashboard stages have bounded
+request and terminal-observation periods so the editor cannot remain indefinitely busy. If
 configuration or an earlier secret stage completed before a later failure or outcome-unknown result,
-the page reports the profile as partially applied, refreshes the snapshot, and requires the operator
-to inspect every credential-presence marker before retrying.
+the page reports the profile as partially applied, preserves unapplied draft values, and requires the
+operator to inspect Activity, Logs, and authoritative profile and credential-presence state. Every
+mutation and autosave is locked for the rest of that AppWindow session; the preserved draft is for
+reconciliation, not resubmission. Close and reopen the AppWindow only after inspection. A fresh
+snapshot is requested after the editor is closed.
 
 ## Password
 

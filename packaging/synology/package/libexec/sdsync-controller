@@ -101,22 +101,25 @@ process_control_queue() {
             continue
         }
         mv "$queued_request" "$processing_request" || continue
-        queued_secret=$control_requests/$queued_id.secret
-        processing_secret=$control_processing/$queued_id.secret
-        if [ -e "$queued_secret" ] || [ -L "$queued_secret" ]; then
-            if private_control_file "$queued_secret" && [ ! -e "$processing_secret" ] && [ ! -L "$processing_secret" ]; then
-                mv "$queued_secret" "$processing_secret" || true
-            else
-                controller_log_event error control_secret_rejected "id=$queued_id"
-            fi
-        fi
         response_final=$control_responses/$queued_id.json
         [ ! -e "$response_final" ] && [ ! -L "$response_final" ] || {
             controller_log_event error control_response_rejected "id=$queued_id"
             rm -f "$processing_request"
-            [ ! -L "$processing_secret" ] && rm -f "$processing_secret" 2>/dev/null || true
+            queued_secret=$control_requests/$queued_id.secret
+            processing_secret=$control_processing/$queued_id.secret
+            rm -f "$queued_secret" "$processing_secret" 2>/dev/null || true
             continue
         }
+        queued_secret=$control_requests/$queued_id.secret
+        processing_secret=$control_processing/$queued_id.secret
+        secret_claim_failed=false
+        if [ -e "$queued_secret" ] || [ -L "$queued_secret" ]; then
+            if private_control_file "$queued_secret" && [ ! -e "$processing_secret" ] && [ ! -L "$processing_secret" ]; then
+                mv "$queued_secret" "$processing_secret" || secret_claim_failed=true
+            else
+                secret_claim_failed=true
+            fi
+        fi
         # The package framework exposes @appdata through this stable alias even
         # when SYNOPKG_PKGVAR names its physical /volume*/@appdata location.
         # The native consumer deliberately accepts only these lexical parents;
@@ -124,6 +127,19 @@ process_control_queue() {
         # cross the executable trust boundary through the framework aliases.
         consumer_processing_request=$package_base/var/control/processing/$queued_name
         consumer_response_final=$package_base/var/control/responses/$queued_id.json
+        if [ "$secret_claim_failed" = true ]; then
+            controller_log_event error control_secret_rejected "id=$queued_id reason=claim_failed"
+            # The native rejection path parses the immutable job, finalizes its
+            # audit transaction, and publishes an exact terminal failure without
+            # invoking the profile manager or exposing the sidecar value.
+            if "$api_bridge" --reject-job "$consumer_processing_request" "$consumer_response_final"; then
+                controller_log_event debug control_request_rejected_terminal "id=$queued_id"
+            else
+                controller_log_event error control_request_rejection_failed "id=$queued_id"
+            fi
+            rm -f "$queued_secret" "$processing_secret" "$processing_request" 2>/dev/null || true
+            break
+        fi
         controller_log_event trace control_request_dispatched "id=$queued_id"
         "$api_bridge" --consume-job "$consumer_processing_request" "$consumer_response_final" &
         active_pid=$!

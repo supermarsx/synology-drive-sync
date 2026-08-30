@@ -15,13 +15,17 @@
 
   <h2>Required fields</h2>
   <dl>
-    <dt>Local source</dt><dd>An absolute folder on this NAS, such as <code>/volume1/Source</code>.</dd>
+    <dt>Local source</dt><dd>A canonical readable folder below an internal, USB, or SATA DSM storage root, such as <code>/volume1/Source</code>. Use <strong>Browse NAS</strong> or enter it manually.</dd>
     <dt>File Station URL</dt><dd>The HTTPS origin of the destination NAS. Plain HTTP requires the explicit controlled-LAN override.</dd>
     <dt>DSM username</dt><dd>The least-privileged destination account required to reach the configured path.</dd>
     <dt>Remote logical path</dt><dd>A File Station path such as <code>/home/Drive/NAS Backup</code>, not a local filesystem mount.</dd>
-    <dt>Comparison</dt><dd>Content compares size, MD5, and modification time; metadata compares size and time; size-only is the weakest evidence.</dd>
+    <dt>Comparison</dt><dd>Content requires size, MD5, IEEE CRC32, SHA-256, and modification time. It also requires File Station download permission and streams selected remote bytes for verification. Metadata compares size and time; size-only is the weakest evidence.</dd>
     <dt>Concurrent uploads</dt><dd>One through sixteen workers. Start low on memory-constrained NAS models.</dd>
   </dl>
+
+  <h2>Choose real folders</h2>
+  <p><strong>Browse NAS</strong> shows only canonical non-symlink DSM volume folders the package identity can read and traverse. DSM-managed, package-private, unreadable, and arbitrary filesystem roots are not exposed. The exact selected or manually entered path is checked again immediately before save.</p>
+  <p><strong>Browse target</strong> unlocks only after <strong>Test authentication</strong> succeeds for the unchanged connection and credential draft. The package discovers the documented File Station APIs, lists actual accessible shares and child directories, and closes the temporary File Station session. The short-lived proof expires after at most five minutes or immediately when the draft changes. Testing a stored credential is an operational action; replacing or clearing credentials remains governed separately by the secret-change policy.</p>
 
   <h2>Deletion and empty-source guards</h2>
   <p>Remote deletion requires approval in the saved profile and again for the operation or routine. The maximum-deletion value is a hard ceiling. An unexpectedly empty source fails closed unless <em>Allow an empty source</em> is enabled both by the global Security ceiling and by this profile. Review a plan after every exclusion or source-path change.</p>
@@ -33,7 +37,7 @@
   <p>Enter one exclusion pattern per line. Log format can be <code>human</code> or <code>json</code>; progress can be <code>auto</code>, <code>always</code>, or <code>never</code>; and command output can be <code>human</code>, <code>json</code>, or <code>ndjson</code>. Quiet suppresses terminal-style output independently, so nonzero verbosity can still raise durable log detail. Remote logging requires HTTPS; <em>required</em> mode can fail the operation when delivery fails, while <em>best effort</em> records the delivery problem without failing the sync.</p>
 
   <h2>Protected credentials</h2>
-  <p>Password, TOTP seed, and remote-log token have three independent operations: keep, replace, or clear. Replacement fields are write-only. Saving first applies profile configuration and then applies requested secret operations; if a later stage fails, inspect the refreshed credential-presence flags before retrying.</p>
+  <p>Password, TOTP seed, and remote-log token have three independent operations: keep, replace, or clear. Replacement fields are write-only. Saving first validates the exact source, then applies profile configuration and requested secret operations in order. A bounded save shows live progress; if a later stage fails or its accepted outcome becomes unknown, the editor stays recoverable, clears only confirmed stages, and retains unapplied draft values for Activity and Logs inspection. Every mutation and autosave is then locked in the current AppWindow. Preserve the draft, reconcile authoritative profile and credential-presence state, and reopen the AppWindow before making another change; do not resubmit from the uncertain session.</p>
 
   <h2>Remove a profile</h2>
   <p>Deleting a profile removes package-owned configuration and protected credentials. It does not delete local source files or already synchronized destination files.</p>

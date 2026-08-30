@@ -7,9 +7,13 @@ files, and preserves remote-only entries by default. Mirror behavior is opt-in.
 
 | Mode | Same-path file is unchanged when | Trade-off |
 | --- | --- | --- |
-| `content` | size, File Station MD5, and one-second mtime match | Safest and default; requires remote hashes. |
+| `content` | size, MD5, IEEE CRC32, SHA-256, and one-second mtime all match | Safest and default; streams selected remote files to compute the complete fingerprint. |
 | `metadata` | size and one-second mtime match | Avoids remote content hashes but cannot detect equal-size/equal-time byte changes. |
 | `size-only` | size matches | Fastest and weakest; use only when that correspondence is explicitly acceptable. |
+
+Content mode requires the File Station account to have download permission for every selected
+remote file. Each proof streams those bytes through the client, so include remote read traffic in
+bandwidth, reverse-proxy timeout, and scheduling estimates.
 
 Content correspondence is stateless. Every run rebuilds it from current local and remote state; no
 persistent path/hash database can become stale.

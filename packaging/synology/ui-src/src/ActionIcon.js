@@ -1,6 +1,8 @@
 const ACTION_ICON_PATHS = Object.freeze({
   overview: ["M4 4h6v6H4z", "M14 4h6v6h-6z", "M4 14h6v6H4z", "M14 14h6v6h-6z"],
   profiles: ["M3 7h7l2 2h9v10H3z", "M3 7V5h7l2 2"],
+  folder: ["M3 7h7l2 2h9v10H3z", "M3 7V5h7l2 2"],
+  up: ["M12 19V5", "M6 11l6-6 6 6"],
   routines: ["M12 3a9 9 0 1 0 9 9", "M12 7v5l3 2", "M17 3h4v4"],
   health: ["M3 12h4l2-5 4 10 2-5h6", "M20.8 5.7A5.5 5.5 0 0 0 12 7.1 5.5 5.5 0 0 0 3.2 5.7"],
   activity: ["M8 6h12", "M8 12h12", "M8 18h12", "M4 6h.01", "M4 12h.01", "M4 18h.01"],

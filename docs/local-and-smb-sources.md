@@ -84,7 +84,8 @@ tree on local disk. Where that cost comes from:
   the transfer opens it (the same TOCTOU guard, run a second time right before the mutation), and
   once more after the transfer completes, to prove the source did not change mid-transfer. A changed
   file can therefore have its local bytes read and hashed three times over the SMB connection for
-  one sync, before the destination copy is separately confirmed with a File Station MD5 request.
+  one sync, before the destination copy is separately streamed from File Station and confirmed with
+  its complete MD5/CRC32/SHA-256 fingerprint.
 
 **Recommendation**: for a large SMB source, prefer `--compare metadata` (matches on size and
 File Station's one-second mtime resolution, no content hashing) or `--compare size-only`. Both skip

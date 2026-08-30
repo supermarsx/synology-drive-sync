@@ -23,7 +23,7 @@ create a missing destination below an existing writable share.
 - The local source is opened read-only and is never intentionally modified.
 - Remote paths are normalized and kept beneath the configured destination root.
 - Missing directories are created shallowest-first, including empty directories.
-- Default content comparison uses size, MD5, and one-second-resolution modification time.
+- Default content comparison requires size, MD5, IEEE CRC32, SHA-256, and one-second-resolution modification time.
 - Uploads are verified against the local bytes and then checked again by a final rescan and replan.
 - Remote deletion is disabled by default and guarded by explicit per-profile and aggregate limits.
 - Cancellation requests cooperative shutdown and prevents the later deletion phase from starting.
