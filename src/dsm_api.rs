@@ -12075,7 +12075,7 @@ fn classify_queued_job(request_id: &str) -> BridgeResult<QueuedJobClass> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = request_id;
-        return Err(BridgeError::unsafe_runtime());
+        Err(BridgeError::unsafe_runtime())
     }
 
     #[cfg(target_os = "linux")]
