@@ -61,6 +61,16 @@ test. The test can use stored credentials while secret writes are disabled, prov
 actions remain allowed. Transient values are neither returned nor persisted by testing; creating a
 new profile persists its password only in the later protected-secret save stage.
 
+After controller dispatch, **Test authentication** gives API discovery and login, including an
+optional TOTP challenge, one shared 12-second probe budget and reserves a separate 3 seconds for
+logout. **Browse target** gives discovery, login, an optional TOTP challenge, and directory listing
+one shared 27-second budget, again with a separate 3 seconds reserved for logout. These are
+execution budgets, not end-to-end UI countdowns: FIFO queueing and result observation or
+reconciliation can leave an accepted request displayed as pending beyond 15 or 30 seconds.
+Interactive probes deliberately disable configured transport retries so one click cannot multiply
+that bounded wait. This exception applies only to authentication testing and remote browsing;
+normal sync operations retain the retry policy saved in the profile.
+
 These selectors use documented File Station APIs and the package's authenticated bridge; they do
 not depend on an undocumented DSM JavaScript namespace. Manual entry remains available when the
 native chooser cannot load.

@@ -300,6 +300,11 @@ Queue behavior:
   no-follow checks;
 - the controller claims jobs in server-ID order and invokes the ordinary `0755` consumer under the
   package identity;
+- while a routine or action is active, the controller may service connection-only **Test
+  authentication** or **Browse target** probes beside it, one at a time, but only when the next
+  probe is the current FIFO head;
+- it never scans past an earlier action or configuration mutation to reach a connection probe, and
+  it does not open the connection lane while a serialized mutation is active;
 - jobs older than the accepted window, malformed jobs, unexpected secret files, unsafe paths, and
   output containing sensitive material fail closed; and
 - the result endpoint returns only pending or a sanitized terminal manager result.
