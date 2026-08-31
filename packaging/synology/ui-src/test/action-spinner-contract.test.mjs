@@ -227,11 +227,152 @@ function browserCandidate() {
   return null;
 }
 
-const chrome = browserCandidate();
+function terminateOwnedBrowserProcesses(profileDirectory) {
+  if (!profileDirectory) return;
+  if (process.platform === "win32") {
+    spawnSync("powershell.exe", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "$needle = $env:SDSYNC_TEST_BROWSER_PROFILE; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($needle) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+    ], {
+      env: { ...process.env, SDSYNC_TEST_BROWSER_PROFILE: profileDirectory },
+      encoding: "utf8",
+      timeout: 5000,
+      windowsHide: true
+    });
+    return;
+  }
+  spawnSync("pkill", ["-TERM", "-f", profileDirectory], {
+    encoding: "utf8",
+    timeout: 5000,
+    windowsHide: true
+  });
+}
+
+function renderAttempt(chrome, url, profileDirectory, timeoutMs = 45000) {
+  const result = spawnSync(chrome, [
+    "--headless=new",
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--disable-background-networking",
+    "--disable-breakpad",
+    "--disable-component-update",
+    "--disable-crash-reporter",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--no-sandbox",
+    `--user-data-dir=${profileDirectory}`,
+    "--virtual-time-budget=500",
+    "--dump-dom",
+    url
+  ], {
+    encoding: "utf8",
+    maxBuffer: 8 * 1024 * 1024,
+    timeout: timeoutMs,
+    windowsHide: true
+  });
+  terminateOwnedBrowserProcesses(profileDirectory);
+  return result;
+}
+
+function renderAttemptSummary(result) {
+  return {
+    status: result.status,
+    signal: result.signal || null,
+    error: result.error ? String(result.error.code || result.error.message || result.error) : null,
+    stdoutBytes: Buffer.byteLength(result.stdout || "", "utf8"),
+    stderrTail: String(result.stderr || "").slice(-1200)
+  };
+}
+
+function shouldRetryRender(result) {
+  const timedOut = result.error && result.error.code === "ETIMEDOUT";
+  const missingEvidence = !/data-spinner="[A-Za-z0-9+/=]+"/.test(result.stdout || "");
+  return Boolean(timedOut || missingEvidence);
+}
+
+function renderSpinner(chrome, url, profileDirectory, { retry = true, timeoutMs = 45000 } = {}) {
+  const attempts = [renderAttempt(chrome, url, profileDirectory, timeoutMs)];
+  if (retry && shouldRetryRender(attempts[0])) {
+    attempts.push(renderAttempt(chrome, url, `${profileDirectory}-retry`, timeoutMs));
+  }
+  const result = attempts[attempts.length - 1];
+  const diagnostics = JSON.stringify(attempts.map(renderAttemptSummary));
+  assert.equal(result.status, 0, `headless browser failed after ${attempts.length} bounded attempt(s): ${diagnostics}`);
+  assert.match(result.stdout || "", /data-spinner="[A-Za-z0-9+/=]+"/,
+    `headless browser returned no computed spinner evidence after ${attempts.length} bounded attempt(s): ${diagnostics}`);
+  return result.stdout;
+}
+
+function browserProbePolicy({ chromeAvailable, ci, platform, arch, gate = "" }) {
+  if (!["", "required", "skip-synology-architecture-matrix"].includes(gate)) {
+    throw new Error(`unsupported SDSYNC_UI_BROWSER_GATE value: ${gate}`);
+  }
+  if (gate === "skip-synology-architecture-matrix" && ci) {
+    return {
+      mandatory: false,
+      skipReason: "Reviewed skip: computed animation is authoritative in the general x64 packaging job"
+    };
+  }
+  if (gate === "required") return { mandatory: true, skipReason: "" };
+  if (chromeAvailable) return { mandatory: true, skipReason: "" };
+  if (!ci) {
+    return {
+      mandatory: false,
+      skipReason: "Chrome/Chromium is unavailable for the computed-animation probe"
+    };
+  }
+  if (platform === "linux" && arch === "arm64") {
+    return {
+      mandatory: false,
+      skipReason: "Linux ARM64 CI image does not provide a supported Chrome/Chromium binary"
+    };
+  }
+  return { mandatory: true, skipReason: "" };
+}
+
+const browserGate = process.env.SDSYNC_UI_BROWSER_GATE || "";
+const runningInCi = /^(?:1|true)$/i.test(process.env.CI || "");
+const reviewedMatrixSkip = browserGate === "skip-synology-architecture-matrix" && runningInCi;
+const chrome = reviewedMatrixSkip ? null : browserCandidate();
+const browserPolicy = browserProbePolicy({
+  chromeAvailable: Boolean(chrome),
+  ci: runningInCi,
+  platform: process.platform,
+  arch: process.arch,
+  gate: browserGate
+});
+
+test("computed-animation browser gate has one authoritative CI lane and reviewed matrix skips", () => {
+  assert.equal(browserProbePolicy({
+    chromeAvailable: true,
+    ci: true,
+    platform: "linux",
+    arch: "x64",
+    gate: "skip-synology-architecture-matrix"
+  }).mandatory, false, "Synology architecture jobs skip the redundant probe even when Chrome is present");
+  assert.equal(browserProbePolicy({
+    chromeAvailable: false,
+    ci: true,
+    platform: "linux",
+    arch: "x64",
+    gate: "required"
+  }).mandatory, true, "the general x64 packaging gate must fail if its browser disappears");
+  assert.throws(
+    () => browserProbePolicy({ chromeAvailable: true, ci: true, platform: "linux", arch: "x64", gate: "skip" }),
+    /unsupported SDSYNC_UI_BROWSER_GATE/,
+    "an unreviewed workflow value cannot silently disable the animation gate"
+  );
+  assert.equal(shouldRetryRender({ error: { code: "ETIMEDOUT" }, stdout: "" }), true);
+  assert.equal(shouldRetryRender({ error: null, stdout: "" }), true);
+  assert.equal(shouldRetryRender({ error: null, stdout: 'data-spinner="e30="' }), false);
+});
 
 test("browser applies busy animation to the glyph while leaving a static icon untouched", {
-  skip: chrome ? false : "Chrome/Chromium is unavailable for the computed-animation probe"
+  skip: browserPolicy.skipReason || false
 }, async () => {
+  assert.ok(chrome, `Chrome/Chromium is required on ${process.platform}/${process.arch} CI`);
   const directory = await mkdtemp(join(tmpdir(), "sdsync-spinner-"));
   try {
     const css = await readFile(cssSourceUrl, "utf8");
@@ -265,13 +406,8 @@ test("browser applies busy animation to the glyph while leaving a static icon un
     const htmlPath = join(directory, "spinner.html");
     await writeFile(htmlPath, html, "utf8");
     const profile = join(directory, "profile");
-    const rendered = spawnSync(chrome, [
-      "--headless", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
-      `--user-data-dir=${profile}`, "--dump-dom", pathToFileURL(htmlPath).href
-    ], { encoding: "utf8", timeout: 15000, windowsHide: true });
-    assert.equal(rendered.status, 0, rendered.stderr || "headless browser failed");
-    const match = rendered.stdout.match(/data-spinner="([A-Za-z0-9+/=]+)"/);
-    assert.ok(match, `computed spinner evidence is missing: ${rendered.stdout.slice(-1000)}`);
+    const rendered = renderSpinner(chrome, pathToFileURL(htmlPath).href, profile);
+    const match = rendered.match(/data-spinner="([A-Za-z0-9+/=]+)"/);
     const result = JSON.parse(Buffer.from(match[1], "base64").toString("utf8"));
     assert.equal(result.busyAnimationCount, 1);
     assert.equal(result.busyAnimationName, result.reduced ? "sdsync-busy-pulse" : "sdsync-spin");
