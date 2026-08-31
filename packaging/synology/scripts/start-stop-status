@@ -319,6 +319,54 @@ signal_exact_controller_identity() {
     return 1
 }
 
+# Return 0 only for the same live controller tuple, 1 only when that exact
+# controller is absent or terminal, and 73 for unreadable or reused identity.
+# `kill -0` alone also succeeds for zombies, so lifecycle stop must inspect the
+# exact PID/start/boot/UID tuple and process state before consuming its deadline.
+exact_controller_process_status() {
+    exact_status_pid=$1
+    exact_status_start=$2
+    exact_status_boot=$3
+    case $exact_status_pid in ''|*[!0-9]*) return 73 ;; esac
+    [ "$exact_status_pid" -gt 1 ] 2>/dev/null || return 73
+    case $exact_status_start in ''|*[!0-9]*|0) return 73 ;; esac
+    valid_boot_identity "$exact_status_boot" || return 73
+    [ -e "/proc/$exact_status_pid" ] || return 1
+    exact_status_current_boot=$(boot_identity) || return 73
+    [ "$exact_status_current_boot" = "$exact_status_boot" ] || return 73
+    case ${path_owner:-} in ''|*[!0-9]*) return 73 ;; esac
+
+    exact_status_actual_start=$(process_start_time "$exact_status_pid" 2>/dev/null || true)
+    exact_status_actual_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "/proc/$exact_status_pid/status" 2>/dev/null | sed -n '1p')
+    exact_status_state=$(sed -n 's/^.*) \([^ ]\).*/\1/p' \
+        "/proc/$exact_status_pid/stat" 2>/dev/null || true)
+    if [ -z "$exact_status_actual_start" ] || [ -z "$exact_status_actual_uid" ] || \
+        [ -z "$exact_status_state" ]; then
+        [ -e "/proc/$exact_status_pid" ] || return 1
+        return 73
+    fi
+    [ "$exact_status_actual_start" = "$exact_status_start" ] && \
+        [ "$exact_status_actual_uid" = "$path_owner" ] || return 73
+
+    exact_status_start_recheck=$(process_start_time "$exact_status_pid" 2>/dev/null || true)
+    exact_status_uid_recheck=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "/proc/$exact_status_pid/status" 2>/dev/null | sed -n '1p')
+    exact_status_state_recheck=$(sed -n 's/^.*) \([^ ]\).*/\1/p' \
+        "/proc/$exact_status_pid/stat" 2>/dev/null || true)
+    if [ -z "$exact_status_start_recheck" ] || [ -z "$exact_status_uid_recheck" ] || \
+        [ -z "$exact_status_state_recheck" ]; then
+        [ -e "/proc/$exact_status_pid" ] || return 1
+        return 73
+    fi
+    [ "$exact_status_start_recheck" = "$exact_status_start" ] && \
+        [ "$exact_status_uid_recheck" = "$path_owner" ] || return 73
+    case $exact_status_state_recheck in
+        Z|X|x) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 read_failed_start_child_marker() {
     failed_marker_kind=$1
     failed_marker_output=$("$api_server" --failed-start-child status "$failed_marker_kind") || return $?
@@ -1368,7 +1416,7 @@ case ${1:-} in
             if [ "$controller_active" = true ]; then
                 if [ -n "${saved_controller_start:-}" ] && [ -n "${saved_controller_boot:-}" ]; then
                     controller_wait_status=0
-                    process_identity_is_live "$saved_pid" "$saved_controller_start" \
+                    exact_controller_process_status "$saved_pid" "$saved_controller_start" \
                         "$saved_controller_boot" || controller_wait_status=$?
                     case $controller_wait_status in
                         0) controller_still_active=true ;;

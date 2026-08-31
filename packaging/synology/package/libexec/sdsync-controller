@@ -72,11 +72,15 @@ prune_expired_control_files() {
 }
 
 process_control_queue() {
+    interactive_only=${1:-false}
     reconcile_audit_outbox || {
         controller_log_event error audit_reconcile_failed "phase=queue_turn" controller true >/dev/null 2>&1 || true
         return 73
     }
-    prune_expired_control_files
+    # A nested connection-only turn runs while a primary child may still own a
+    # processing request and secret. Never age-prune that active claim from the
+    # nested turn; primary controller turns retain the bounded cleanup policy.
+    [ "$interactive_only" = true ] || prune_expired_control_files
     [ -x "$api_bridge" ] && [ ! -L "$api_bridge" ] || return 0
     # The authenticated bridge generates lexically sortable server job IDs with
     # a persisted monotonic prefix.  Shell glob order therefore remains FIFO
@@ -98,9 +102,35 @@ process_control_queue() {
         processing_request=$control_processing/$queued_name
         [ ! -e "$processing_request" ] && [ ! -L "$processing_request" ] || {
             controller_log_event warn control_request_collision "id=$queued_id"
+            [ "$interactive_only" = true ] && break
             continue
         }
-        mv "$queued_request" "$processing_request" || continue
+        queued_classification=unknown
+        set +e
+        classification_output=$("$api_bridge" --classify-queued-job "$queued_id")
+        classification_exit=$?
+        set -e
+        if [ "$classification_exit" -eq 0 ]; then
+            case $classification_output in
+                connection|concurrent|serialized) queued_classification=$classification_output ;;
+                *) classification_exit=73 ;;
+            esac
+        fi
+        if [ "$interactive_only" = true ]; then
+            if [ "$classification_exit" -ne 0 ]; then
+                controller_log_event error control_request_classification_failed "id=$queued_id exit=$classification_exit"
+                break
+            fi
+            case $queued_classification in
+                connection) ;;
+                concurrent|serialized) break ;;
+            esac
+        fi
+        if ! mv "$queued_request" "$processing_request"; then
+            [ "$interactive_only" = true ] && break
+            continue
+        fi
+        control_queue_progress=true
         response_final=$control_responses/$queued_id.json
         [ ! -e "$response_final" ] && [ ! -L "$response_final" ] || {
             controller_log_event error control_response_rejected "id=$queued_id"
@@ -108,6 +138,7 @@ process_control_queue() {
             queued_secret=$control_requests/$queued_id.secret
             processing_secret=$control_processing/$queued_id.secret
             rm -f "$queued_secret" "$processing_secret" 2>/dev/null || true
+            [ "$interactive_only" = true ] && break
             continue
         }
         queued_secret=$control_requests/$queued_id.secret
@@ -141,17 +172,47 @@ process_control_queue() {
             break
         fi
         controller_log_event trace control_request_dispatched "id=$queued_id"
-        "$api_bridge" --consume-job "$consumer_processing_request" "$consumer_response_final" &
-        active_pid=$!
-        # TERM can be delivered after the asynchronous launch but before the
+        launched_control_slot=active
+        [ "$interactive_only" = true ] && launched_control_slot=control
+        if ! launch_admitted_child "$launched_control_slot" control \
+            "$api_bridge" --consume-job "$consumer_processing_request" "$consumer_response_final"; then
+            [ "$admitted_child_status" != cancelled ] || return 0
+            controller_log_event error child_identity_capture_failed "kind=control"
+            return 73
+        fi
+        launched_control_pid=$admitted_child_pid
+        if [ "$interactive_only" != true ]; then
+            active_control_classification=$queued_classification
+        fi
+        # TERM can be delivered after the asynchronous launch but before either
         # assignment above. Recheck the latched shutdown state so that window
         # cannot strand an un-signalled consumer before it creates a run lock.
-        if [ "$shutdown" = true ] && pid_is_live "$active_pid"; then
-            kill -TERM "$active_pid" 2>/dev/null || true
+        if [ "$shutdown" = true ]; then
+            stop_work_children_bounded
         fi
-        write_controller_state running "$$" "$next_run" "$active_pid"
-        wait_for_runner
-        control_exit=$scheduled_exit
+        controller_state_child=$launched_control_pid
+        [ -z "$active_pid" ] || controller_state_child=$active_pid
+        write_controller_state running "$$" "$next_run" "$controller_state_child"
+        if [ "$interactive_only" = true ]; then
+            wait_for_control_consumer
+            control_exit=$control_wait_exit
+        else
+            # `wait_for_runner` may service a connection-only queue turn while
+            # this primary consumer remains active. Shell variables are global,
+            # so preserve the primary claim before entering that nested turn.
+            primary_control_queued_id=$queued_id
+            primary_control_response_final=$response_final
+            primary_control_processing_request=$processing_request
+            primary_control_processing_secret=$processing_secret
+            primary_control_interactive_only=$interactive_only
+            wait_for_runner
+            control_exit=$scheduled_exit
+            queued_id=$primary_control_queued_id
+            response_final=$primary_control_response_final
+            processing_request=$primary_control_processing_request
+            processing_secret=$primary_control_processing_secret
+            interactive_only=$primary_control_interactive_only
+        fi
         response_size=0
         if private_control_file "$response_final"; then
             response_size=$(wc -c < "$response_final" | tr -d ' ')
@@ -172,6 +233,7 @@ process_control_queue() {
         controller_log_event error audit_reconcile_failed "phase=before_response_prune" controller true >/dev/null 2>&1 || true
         return 73
     }
+    [ "$interactive_only" = true ] && return 0
     response_count=0
     for old_response in "$control_responses"/*.json; do
         [ -e "$old_response" ] || [ -L "$old_response" ] || continue
@@ -389,19 +451,519 @@ write_routine_state() {
     mv -f "$routine_state_temp" "$routine_state_dir/$routine_state_profile.state"
 }
 
+capture_work_child_identity() {
+    captured_work_child_start=
+    captured_work_child_boot=
+    captured_work_child_pid=${1:-}
+    captured_work_child_boot=${2:-}
+    valid_boot_identity "$captured_work_child_boot" || return 1
+    captured_work_child_parent=
+    IFS=' ' read -r captured_work_child_parent _captured_work_child_parent_rest \
+        < /proc/self/stat || return 1
+    case $captured_work_child_parent in ''|*[!0-9]*|0) return 1 ;; esac
+    captured_work_child_attempt=0
+    while [ "$captured_work_child_attempt" -lt 10 ]; do
+        captured_work_child_start=$(process_start_time "$captured_work_child_pid" 2>/dev/null || true)
+        captured_work_child_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+            "/proc/$captured_work_child_pid/status" 2>/dev/null | sed -n '1p')
+        captured_work_child_ppid=$(sed -n 's/^PPid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+            "/proc/$captured_work_child_pid/status" 2>/dev/null | sed -n '1p')
+        case $captured_work_child_start in ''|*[!0-9]*|0) ;;
+            *)
+                if [ "$captured_work_child_uid" = "$path_owner" ] && \
+                    [ "$captured_work_child_ppid" = "$captured_work_child_parent" ]; then
+                    captured_work_child_start_recheck=$(process_start_time \
+                        "$captured_work_child_pid" 2>/dev/null || true)
+                    if [ "$captured_work_child_start_recheck" = "$captured_work_child_start" ]; then
+                        return 0
+                    fi
+                elif [ -n "$captured_work_child_ppid" ]; then
+                    break
+                fi
+                ;;
+        esac
+        captured_work_child_start=
+        captured_work_child_attempt=$((captured_work_child_attempt + 1))
+    done
+    captured_work_child_start=
+    captured_work_child_boot=
+    return 1
+}
+
+reap_direct_child_interruption_safe() {
+    while :; do
+        # Function positional parameters are restored across a nested trap
+        # handler, unlike global shell variables. Keep the epoch in $2 so a
+        # handler that interrupted wait cannot make us mistake that status for
+        # collection of the direct child.
+        set -- "$1" "$child_wait_interrupt_epoch"
+        set +e
+        wait "$1" 2>/dev/null
+        set -e
+        [ "$child_wait_interrupt_epoch" != "$2" ] || return 0
+    done
+}
+
+publish_child_admission() {
+    published_admission_path=$1
+    published_admission_value=$2
+    case $published_admission_value in go|abort) ;; *) return 73 ;; esac
+    published_admission_temp=$published_admission_path.$published_admission_value.tmp.$$
+    [ ! -e "$published_admission_path" ] && [ ! -L "$published_admission_path" ] || return 73
+    [ ! -e "$published_admission_temp" ] && [ ! -L "$published_admission_temp" ] || return 73
+    if ! printf '%s\n' "$published_admission_value" > "$published_admission_temp" || \
+        ! finish_private_file "$published_admission_temp" || \
+        [ -e "$published_admission_path" ] || [ -L "$published_admission_path" ] || \
+        ! mv "$published_admission_temp" "$published_admission_path"; then
+        rm -f "$published_admission_temp" 2>/dev/null || true
+        return 73
+    fi
+}
+
+wait_for_child_admission() {
+    waited_admission_path=$1
+    waited_admission_parent=$2
+    waited_admission_parent_start=$3
+    waited_admission_parent_boot=$4
+    waited_admission_round=0
+    while [ "$waited_admission_round" -lt 3 ]; do
+        process_identity_is_live "$waited_admission_parent" \
+            "$waited_admission_parent_start" "$waited_admission_parent_boot" || return 1
+        # Yield immediately while the parent captures/publishes. Integer zero
+        # is supported by DSM's BusyBox sleep and avoids a systematic one-second
+        # admission delay without depending on fractional sleep support.
+        waited_admission_yield=0
+        while [ "$waited_admission_yield" -lt 32 ]; do
+            if [ -e "$waited_admission_path" ] || [ -L "$waited_admission_path" ]; then
+                private_control_file "$waited_admission_path" || return 1
+                waited_admission_decision=
+                IFS= read -r waited_admission_decision < "$waited_admission_path" || return 1
+                rm -f "$waited_admission_path" 2>/dev/null || return 1
+                [ "$waited_admission_decision" = go ]
+                return $?
+            fi
+            /bin/sleep 0
+            waited_admission_yield=$((waited_admission_yield + 1))
+        done
+        /bin/sleep 1
+        waited_admission_round=$((waited_admission_round + 1))
+    done
+    return 1
+}
+
+work_child_identity_is_running() {
+    bounded_child_pid=${1:-}
+    bounded_child_start=${2:-}
+    bounded_child_boot=${3:-}
+    case $bounded_child_start in ''|*[!0-9]*|0) return 1 ;; esac
+    valid_boot_identity "$bounded_child_boot" || return 1
+    bounded_child_state=$(sed -n 's/^.*) \([^ ]\).*/\1/p' "/proc/$bounded_child_pid/stat" 2>/dev/null || true)
+    case $bounded_child_state in ''|Z|X|x) return 1 ;; esac
+    # Keep the exact PID/start/boot verification last so TERM/KILL follows it
+    # without another operation that could widen the PID-reuse race window.
+    process_identity_is_live "$bounded_child_pid" "$bounded_child_start" "$bounded_child_boot"
+}
+
+clear_admitted_child_slot() {
+    cleared_admission_slot=$1
+    cleared_admission_pid=$2
+    case $cleared_admission_slot in
+        active)
+            [ "$active_pid" = "$cleared_admission_pid" ] || return 0
+            active_pid=
+            active_pid_start=
+            active_pid_boot=
+            ;;
+        control)
+            [ "$control_pid" = "$cleared_admission_pid" ] || return 0
+            control_pid=
+            control_pid_start=
+            control_pid_boot=
+            ;;
+        sleep)
+            [ "$sleep_pid" = "$cleared_admission_pid" ] || return 0
+            sleep_pid=
+            sleep_pid_start=
+            sleep_pid_boot=
+            ;;
+        *) return 73 ;;
+    esac
+}
+
+admitted_child_launch_is_cancelled() {
+    cancelled_admission_slot=$1
+    if [ "$shutdown" = true ]; then return 0; fi
+    if [ "$cancelled_admission_slot" = sleep ] && \
+        { [ "$reload_requested" = true ] || [ "$queue_wake_requested" = true ]; }; then
+        return 0
+    fi
+    return 1
+}
+
+stop_exact_admitted_child() {
+    stopped_admission_pid=$1
+    stopped_admission_start=$2
+    stopped_admission_boot=$3
+    if work_child_identity_is_running "$stopped_admission_pid" \
+        "$stopped_admission_start" "$stopped_admission_boot"; then
+        kill -TERM "$stopped_admission_pid" 2>/dev/null || true
+    fi
+    reap_direct_child_interruption_safe "$stopped_admission_pid"
+}
+
+launch_admitted_child() {
+    admitted_child_status=preflight_failed
+    admitted_child_pid=
+    launched_admission_slot=$1
+    launched_admission_kind=$2
+    shift 2
+    case $launched_admission_slot in active|control|sleep) ;; *) return 73 ;; esac
+    case $launched_admission_kind in ''|*[!A-Za-z0-9_-]*) return 73 ;; esac
+    launched_admission_parent=$$
+    launched_admission_parent_start=$(process_start_time \
+        "$launched_admission_parent" 2>/dev/null || true)
+    case $launched_admission_parent_start in ''|*[!0-9]*|0) return 73 ;; esac
+    launched_admission_boot=$(boot_identity) || return 73
+    child_admission_sequence=$((child_admission_sequence + 1))
+    launched_admission_path=$runtime_root/.child-admission.${launched_admission_parent}.${launched_admission_parent_start}.${child_admission_sequence}
+    [ ! -e "$launched_admission_path" ] && [ ! -L "$launched_admission_path" ] || return 73
+    (
+        trap - TERM INT HUP USR1 USR2 ALRM
+        if wait_for_child_admission "$launched_admission_path" \
+            "$launched_admission_parent" "$launched_admission_parent_start" \
+            "$launched_admission_boot"; then
+            process_identity_is_live "$launched_admission_parent" \
+                "$launched_admission_parent_start" "$launched_admission_boot" || exit 0
+            exec "$@"
+        fi
+        exit 0
+    ) &
+    launched_admission_pid=$!
+    if ! capture_work_child_identity "$launched_admission_pid" "$launched_admission_boot"; then
+        # The unverified wrapper is still behind the gate. Abort is durable and
+        # atomic; never signal or publish a PID whose start tick was not captured.
+        publish_child_admission "$launched_admission_path" abort 2>/dev/null || true
+        reap_direct_child_interruption_safe "$launched_admission_pid"
+        rm -f "$launched_admission_path" \
+            "$launched_admission_path".*.tmp.$$ 2>/dev/null || true
+        captured_work_child_start=
+        captured_work_child_boot=
+        admitted_child_status=capture_failed
+        return 73
+    fi
+    launched_admission_start=$captured_work_child_start
+    launched_admission_boot=$captured_work_child_boot
+    case $launched_admission_slot in
+        active)
+            active_pid_start=$launched_admission_start
+            active_pid_boot=$launched_admission_boot
+            active_pid=$launched_admission_pid
+            ;;
+        control)
+            control_pid_start=$launched_admission_start
+            control_pid_boot=$launched_admission_boot
+            control_pid=$launched_admission_pid
+            ;;
+        sleep)
+            sleep_pid_start=$launched_admission_start
+            sleep_pid_boot=$launched_admission_boot
+            sleep_pid=$launched_admission_pid
+            ;;
+    esac
+    # Signal-handoff tests instrument this point. The exact tuple is published,
+    # but the real command remains unable to exec until the atomic go commit.
+    if admitted_child_launch_is_cancelled "$launched_admission_slot"; then
+        publish_child_admission "$launched_admission_path" abort 2>/dev/null || \
+            stop_exact_admitted_child "$launched_admission_pid" \
+                "$launched_admission_start" "$launched_admission_boot"
+        reap_direct_child_interruption_safe "$launched_admission_pid"
+        clear_admitted_child_slot "$launched_admission_slot" "$launched_admission_pid"
+        rm -f "$launched_admission_path" \
+            "$launched_admission_path".*.tmp.$$ 2>/dev/null || true
+        admitted_child_status=cancelled
+        return 75
+    fi
+    if ! publish_child_admission "$launched_admission_path" go; then
+        stop_exact_admitted_child "$launched_admission_pid" \
+            "$launched_admission_start" "$launched_admission_boot"
+        clear_admitted_child_slot "$launched_admission_slot" "$launched_admission_pid"
+        rm -f "$launched_admission_path" \
+            "$launched_admission_path".*.tmp.$$ 2>/dev/null || true
+        admitted_child_status=admission_failed
+        return 73
+    fi
+    admitted_child_pid=$launched_admission_pid
+    admitted_child_status=started
+    return 0
+}
+
+signal_controller_sleep() {
+    if [ -n "$sleep_pid" ] && work_child_identity_is_running \
+        "$sleep_pid" "$sleep_pid_start" "$sleep_pid_boot"; then
+        kill -TERM "$sleep_pid" 2>/dev/null || true
+    fi
+}
+
+stop_runner_guard_sleep() {
+    stopped_runner_guard_sleep_pid=$runner_guard_sleep_pid
+    stopped_runner_guard_sleep_start=$runner_guard_sleep_start
+    stopped_runner_guard_sleep_boot=$runner_guard_sleep_boot
+    runner_guard_sleep_pid=
+    runner_guard_sleep_start=
+    runner_guard_sleep_boot=
+    [ -n "$stopped_runner_guard_sleep_pid" ] || return 0
+    if work_child_identity_is_running "$stopped_runner_guard_sleep_pid" \
+        "$stopped_runner_guard_sleep_start" "$stopped_runner_guard_sleep_boot"; then
+        kill -TERM "$stopped_runner_guard_sleep_pid" 2>/dev/null || true
+    fi
+    reap_direct_child_interruption_safe "$stopped_runner_guard_sleep_pid"
+}
+
+start_runner_wait_guard() {
+    runner_guard_parent=$$
+    runner_guard_parent_start=$(process_start_time "$runner_guard_parent" 2>/dev/null || true)
+    case $runner_guard_parent_start in ''|*[!0-9]*|0) return 73 ;; esac
+    runner_guard_parent_boot=$(boot_identity) || return 73
+    child_admission_sequence=$((child_admission_sequence + 1))
+    runner_guard_admission=$runtime_root/.runner-wait-guard-admit.${runner_guard_parent}.${runner_guard_parent_start}.${child_admission_sequence}
+    [ ! -e "$runner_guard_admission" ] && [ ! -L "$runner_guard_admission" ] || return 73
+    (
+        runner_guard_sleep_pid=
+        runner_guard_sleep_start=
+        runner_guard_sleep_boot=
+        runner_guard_shutdown=false
+        request_runner_guard_shutdown() {
+            child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))
+            runner_guard_shutdown=true
+            stop_runner_guard_sleep
+        }
+        trap request_runner_guard_shutdown TERM INT HUP
+        trap '' USR1 USR2 ALRM
+        wait_for_child_admission "$runner_guard_admission" "$runner_guard_parent" \
+            "$runner_guard_parent_start" "$runner_guard_parent_boot" || exit 0
+        [ "$runner_guard_shutdown" = false ] || exit 0
+        while [ "$runner_guard_shutdown" = false ] && \
+            process_identity_is_live "$runner_guard_parent" \
+            "$runner_guard_parent_start" "$runner_guard_parent_boot"; do
+            /bin/sleep 1 &
+            launched_runner_guard_sleep_pid=$!
+            if ! capture_work_child_identity "$launched_runner_guard_sleep_pid" \
+                "$runner_guard_parent_boot"; then
+                # This helper is intrinsically bounded to one second. Without
+                # an exact identity, its direct child was reaped without a signal.
+                reap_direct_child_interruption_safe "$launched_runner_guard_sleep_pid"
+                exit 0
+            fi
+            runner_guard_sleep_start=$captured_work_child_start
+            runner_guard_sleep_boot=$captured_work_child_boot
+            runner_guard_sleep_pid=$launched_runner_guard_sleep_pid
+            # A shutdown trap can run after spawn but before this exact tuple is
+            # published. Its latch closes that handoff without PID-only signals.
+            if [ "$runner_guard_shutdown" = true ]; then
+                stop_runner_guard_sleep
+                exit 0
+            fi
+            wait "$runner_guard_sleep_pid" || exit 0
+            runner_guard_sleep_pid=
+            runner_guard_sleep_start=
+            runner_guard_sleep_boot=
+            # PID liveness alone is unsafe after abrupt controller death: the
+            # kernel may reuse that number. Recheck the exact PID/start/boot
+            # tuple immediately before every signal so an unrelated successor
+            # can never receive the watchdog ALRM.
+            process_identity_is_live "$runner_guard_parent" \
+                "$runner_guard_parent_start" "$runner_guard_parent_boot" || exit 0
+            kill -ALRM "$runner_guard_parent" 2>/dev/null || exit 0
+        done
+    ) &
+    launched_runner_wait_guard_pid=$!
+    if ! capture_work_child_identity "$launched_runner_wait_guard_pid" \
+        "$runner_guard_parent_boot"; then
+        publish_child_admission "$runner_guard_admission" abort 2>/dev/null || true
+        reap_direct_child_interruption_safe "$launched_runner_wait_guard_pid"
+        rm -f "$runner_guard_admission" \
+            "$runner_guard_admission".*.tmp.$$ 2>/dev/null || true
+        return 73
+    fi
+    runner_wait_guard_start=$captured_work_child_start
+    runner_wait_guard_boot=$captured_work_child_boot
+    runner_wait_guard_pid=$launched_runner_wait_guard_pid
+    runner_wait_guard_admission_path=$runner_guard_admission
+    # Runner-guard admission tests instrument this exact captured-before-go
+    # handoff. A wake here must abort the guard and skip the unguarded wait.
+    if [ "$shutdown" = true ] || [ "$wait_interrupted" = true ]; then
+        publish_child_admission "$runner_guard_admission" abort 2>/dev/null || \
+            stop_runner_wait_guard
+        reap_direct_child_interruption_safe "$launched_runner_wait_guard_pid"
+        runner_wait_guard_pid=
+        runner_wait_guard_start=
+        runner_wait_guard_boot=
+        runner_wait_guard_admission_path=
+        rm -f "$runner_guard_admission" \
+            "$runner_guard_admission".*.tmp.$$ 2>/dev/null || true
+        return 0
+    fi
+    if ! publish_child_admission "$runner_guard_admission" go; then
+        stop_runner_wait_guard
+        return 73
+    fi
+}
+
+stop_runner_wait_guard() {
+    runner_guard_pid=$runner_wait_guard_pid
+    runner_guard_start=$runner_wait_guard_start
+    runner_guard_boot=$runner_wait_guard_boot
+    runner_guard_admission_path=$runner_wait_guard_admission_path
+    runner_wait_guard_pid=
+    runner_wait_guard_start=
+    runner_wait_guard_boot=
+    runner_wait_guard_admission_path=
+    [ -n "$runner_guard_pid" ] || return 0
+    if work_child_identity_is_running "$runner_guard_pid" "$runner_guard_start" "$runner_guard_boot"; then
+        kill -TERM "$runner_guard_pid" 2>/dev/null || true
+    fi
+    reap_direct_child_interruption_safe "$runner_guard_pid"
+    [ -z "$runner_guard_admission_path" ] || rm -f "$runner_guard_admission_path" \
+        "$runner_guard_admission_path".*.tmp.$$ 2>/dev/null || true
+}
+
+stop_work_children_bounded() {
+    # Native consumers and runners receive a cooperative TERM first. Bound the
+    # controller's own shutdown responsibility so a blocked network syscall can
+    # never hold DSM package stop indefinitely, then reap both direct children
+    # through their normal wait paths (or cleanup_controller on unexpected EXIT).
+    if [ -n "$control_pid" ] && work_child_identity_is_running \
+        "$control_pid" "$control_pid_start" "$control_pid_boot"; then
+        kill -TERM "$control_pid" 2>/dev/null || true
+    fi
+    if [ -n "$active_pid" ] && work_child_identity_is_running \
+        "$active_pid" "$active_pid_start" "$active_pid_boot"; then
+        kill -TERM "$active_pid" 2>/dev/null || true
+    fi
+    bounded_stop_count=0
+    while [ "$bounded_stop_count" -lt 3 ]; do
+        bounded_child_live=false
+        if [ -n "$control_pid" ] && work_child_identity_is_running \
+            "$control_pid" "$control_pid_start" "$control_pid_boot"; then bounded_child_live=true; fi
+        if [ -n "$active_pid" ] && work_child_identity_is_running \
+            "$active_pid" "$active_pid_start" "$active_pid_boot"; then bounded_child_live=true; fi
+        [ "$bounded_child_live" = true ] || return 0
+        /bin/sleep 1
+        bounded_stop_count=$((bounded_stop_count + 1))
+    done
+    if [ -n "$control_pid" ] && work_child_identity_is_running \
+        "$control_pid" "$control_pid_start" "$control_pid_boot"; then
+        kill -KILL "$control_pid" 2>/dev/null || true
+    fi
+    if [ -n "$active_pid" ] && work_child_identity_is_running \
+        "$active_pid" "$active_pid_start" "$active_pid_boot"; then
+        kill -KILL "$active_pid" 2>/dev/null || true
+    fi
+}
+
+arm_connection_queue_from_backlog() {
+    case $active_control_classification in
+        runner|concurrent) ;;
+        *) return 0 ;;
+    esac
+    # A wake delivered before the primary worker was launched may already have
+    # been folded into the current controller turn. Reconstruct that evidence
+    # from the private FIFO so a pre-existing connection probe is not stranded.
+    # The nested turn still classifies the exact head and refuses to cross a
+    # serialized or concurrent barrier.
+    for connection_wake_request in "$control_requests"/*.json; do
+        [ -e "$connection_wake_request" ] || [ -L "$connection_wake_request" ] || continue
+        connection_wake_name=${connection_wake_request##*/}
+        connection_wake_id=${connection_wake_name%.json}
+        valid_request_id "$connection_wake_id" || continue
+        private_control_file "$connection_wake_request" || continue
+        connection_wake_processing=$control_processing/$connection_wake_name
+        [ ! -e "$connection_wake_processing" ] && [ ! -L "$connection_wake_processing" ] || continue
+        queue_wake_requested=true
+        break
+    done
+}
+
 wait_for_runner() {
     previous_wait_status=
+    arm_connection_queue_from_backlog
     while :; do
+        # Reset before inspecting the durable queue latch. A signal delivered
+        # from here onward either makes that inspection true, interrupts the
+        # active wait directly, or is recovered by the bounded ALRM guard.
         wait_interrupted=false
+        if [ "$shutdown" = false ] && [ "$queue_wake_requested" = true ]; then
+            case $active_control_classification in
+                runner|concurrent)
+                    queue_wake_requested=false
+                    primary_control_queue_progress=$control_queue_progress
+                    control_queue_progress=false
+                    process_control_queue true
+                    nested_control_queue_progress=$control_queue_progress
+                    control_queue_progress=$primary_control_queue_progress
+                    # Standard signals can coalesce. After a successful FIFO
+                    # claim, perform one more guarded connection-only turn so
+                    # a second pre-existing probe is not stranded behind the
+                    # primary worker. A mutation head, classification failure,
+                    # collision, or failed mv reports no progress and therefore
+                    # cannot create a zero-sleep retry loop.
+                    if [ "$nested_control_queue_progress" = true ]; then
+                        queue_wake_requested=true
+                    fi
+                    continue
+                    ;;
+            esac
+        fi
+        # POSIX shell cannot atomically unblock USR2 and enter `wait`. Keep a
+        # one-second watchdog published across that final handoff. It only
+        # interrupts the controller's wait; the primary child keeps running,
+        # its real exit status is collected by `wait`, and successful queue
+        # turns retain the existing FIFO/barrier rules above.
+        start_runner_wait_guard
+        if [ "$wait_interrupted" = true ]; then
+            stop_runner_wait_guard
+            continue
+        fi
+        # Guarded runner-wait handoff. Runtime tests instrument this comment in
+        # their private controller copy to deliver USR2 in the exact gap.
         set +e
         wait "$active_pid"
         current_wait_status=$?
         set -e
+        stop_runner_wait_guard
         if [ "$wait_interrupted" = true ]; then previous_wait_status=$current_wait_status; continue; fi
         if [ "$current_wait_status" -eq 127 ] && [ -n "$previous_wait_status" ]; then scheduled_exit=$previous_wait_status; else scheduled_exit=$current_wait_status; fi
         break
     done
+    stop_runner_wait_guard
     active_pid=
+    active_pid_start=
+    active_pid_boot=
+    active_control_classification=
+}
+
+wait_for_control_consumer() {
+    previous_control_wait_status=
+    while :; do
+        wait_interrupted=false
+        set +e
+        wait "$control_pid"
+        current_control_wait_status=$?
+        set -e
+        if [ "$wait_interrupted" = true ]; then
+            previous_control_wait_status=$current_control_wait_status
+            continue
+        fi
+        if [ "$current_control_wait_status" -eq 127 ] && [ -n "$previous_control_wait_status" ]; then
+            control_wait_exit=$previous_control_wait_status
+        else
+            control_wait_exit=$current_control_wait_status
+        fi
+        break
+    done
+    control_pid=
+    control_pid_start=
+    control_pid_boot=
 }
 
 process_routines() {
@@ -613,10 +1175,15 @@ process_routines() {
         routine_state_value=running
         routine_last_attempt_value=$routine_now
         write_routine_state "$routine_profile"
-        "$runner" "$routine_action" "$routine_profile" "$routine_delete" scheduled - &
-        active_pid=$!
-        if [ "$shutdown" = true ] && pid_is_live "$active_pid"; then
-            kill -TERM "$active_pid" 2>/dev/null || true
+        if ! launch_admitted_child active routine "$runner" "$routine_action" \
+            "$routine_profile" "$routine_delete" scheduled -; then
+            [ "$admitted_child_status" != cancelled ] || return 0
+            controller_log_event error child_identity_capture_failed "kind=routine"
+            return 73
+        fi
+        active_control_classification=runner
+        if [ "$shutdown" = true ]; then
+            stop_work_children_bounded
         fi
         write_controller_state running "$$" "$next_run" "$active_pid"
         wait_for_runner
@@ -652,13 +1219,54 @@ process_routines() {
 
 shutdown=false
 active_pid=
+active_pid_start=
+active_pid_boot=
+active_control_classification=
+control_pid=
+control_pid_start=
+control_pid_boot=
 sleep_pid=
+sleep_pid_start=
+sleep_pid_boot=
+runner_wait_guard_pid=
+runner_wait_guard_start=
+runner_wait_guard_boot=
+runner_wait_guard_admission_path=
+child_admission_sequence=0
+admitted_child_status=
+child_wait_interrupt_epoch=0
 next_run=0
 wait_interrupted=false
 reload_requested=false
 queue_wake_requested=false
 
 cleanup_controller() {
+    # EXIT can follow an unexpected shell failure as well as the normal stop
+    # path. Disable recursive traps, terminate both direct work children, and
+    # reap them before releasing controller ownership.
+    trap - 0
+    trap '' TERM INT HUP USR2 ALRM
+    stop_runner_wait_guard
+    if [ -n "$sleep_pid" ]; then
+        signal_controller_sleep
+        reap_direct_child_interruption_safe "$sleep_pid"
+        sleep_pid=
+        sleep_pid_start=
+        sleep_pid_boot=
+    fi
+    stop_work_children_bounded
+    if [ -n "$control_pid" ]; then
+        wait "$control_pid" 2>/dev/null || true
+        control_pid=
+        control_pid_start=
+        control_pid_boot=
+    fi
+    if [ -n "$active_pid" ]; then
+        wait "$active_pid" 2>/dev/null || true
+        active_pid=
+        active_pid_start=
+        active_pid_boot=
+    fi
     stop_realtime_watchers 2>/dev/null || true
     write_controller_state stopped 0 0 0 2>/dev/null || true
     remove_own_controller_ready 2>/dev/null || true
@@ -669,32 +1277,33 @@ cleanup_controller() {
     release_private_process_lock "$controller_lock" 2>/dev/null || true
 }
 request_shutdown() {
+    child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))
+    [ "$shutdown" = false ] || return 0
     shutdown=true
     wait_interrupted=true
-    if [ -n "$sleep_pid" ] && pid_is_live "$sleep_pid"; then
-        kill -TERM "$sleep_pid" 2>/dev/null || true
-    fi
-    if [ -n "$active_pid" ] && pid_is_live "$active_pid"; then
-        kill -TERM "$active_pid" 2>/dev/null || true
-    fi
+    signal_controller_sleep
+    stop_work_children_bounded
 }
 request_reload() {
+    child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))
     reload_requested=true
     wait_interrupted=true
-    if [ -n "$sleep_pid" ] && pid_is_live "$sleep_pid"; then
-        kill -TERM "$sleep_pid" 2>/dev/null || true
-    fi
+    signal_controller_sleep
 }
 request_queue_wake() {
+    child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))
     queue_wake_requested=true
     wait_interrupted=true
-    if [ -n "$sleep_pid" ] && pid_is_live "$sleep_pid"; then
-        kill -TERM "$sleep_pid" 2>/dev/null || true
-    fi
+    signal_controller_sleep
+}
+request_runner_wait_poll() {
+    child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))
+    wait_interrupted=true
 }
 trap request_shutdown TERM INT
 trap request_reload HUP
 trap request_queue_wake USR2
+trap request_runner_wait_poll ALRM
 trap cleanup_controller 0
 
 controller_start_lease_matches_parent || {
@@ -750,6 +1359,7 @@ while [ "$shutdown" = false ]; do
         stop_realtime_watchers 2>/dev/null || true
         reload_requested=false
     fi
+    control_queue_progress=false
     process_control_queue
     enabled=$(setting "$schedule_file" enabled false)
     interval=$(setting "$schedule_file" interval_seconds 3600)
@@ -786,31 +1396,19 @@ while [ "$shutdown" = false ]; do
         # post-assignment check closes the asynchronous launch window.
         [ "$shutdown" = false ] || break
         write_controller_state running "$$" "$next_run" 0
-        "$runner" sync all "$allow_delete" scheduled "$maximum_total" &
-        active_pid=$!
-        if [ "$shutdown" = true ] && pid_is_live "$active_pid"; then
-            kill -TERM "$active_pid" 2>/dev/null || true
+        if ! launch_admitted_child active schedule "$runner" sync all \
+            "$allow_delete" scheduled "$maximum_total"; then
+            [ "$admitted_child_status" != cancelled ] || continue
+            controller_log_event error child_identity_capture_failed "kind=schedule"
+            exit 73
+        fi
+        active_control_classification=runner
+        if [ "$shutdown" = true ]; then
+            stop_work_children_bounded
         fi
         write_controller_state running "$$" "$next_run" "$active_pid"
-        previous_wait_status=
-        while :; do
-            wait_interrupted=false
-            set +e
-            wait "$active_pid"
-            current_wait_status=$?
-            set -e
-            if [ "$wait_interrupted" = true ]; then
-                previous_wait_status=$current_wait_status
-                continue
-            fi
-            if [ "$current_wait_status" -eq 127 ] && [ -n "$previous_wait_status" ]; then
-                run_exit=$previous_wait_status
-            else
-                run_exit=$current_wait_status
-            fi
-            break
-        done
-        active_pid=
+        wait_for_runner
+        run_exit=$scheduled_exit
         now=$(epoch_now)
         next_run=$((now + interval))
         # Failure is recorded by sdsync-run and does not trigger an immediate retry.
@@ -823,6 +1421,27 @@ while [ "$shutdown" = false ]; do
     process_routines "$now"
 
     [ "$shutdown" = false ] || break
+
+    # A backlog already present on disk does not need another signal or the
+    # historical one-second polling fallback. Each loop still processes only
+    # one request and runs the schedule/routine admission checks above, so
+    # control work cannot starve those paths. Ignore malformed/unsafe entries
+    # here to avoid a tight loop around a request the consumer will reject.
+    control_backlog=false
+    for wake_request in "$control_requests"/*.json; do
+        [ -e "$wake_request" ] || [ -L "$wake_request" ] || continue
+        wake_name=${wake_request##*/}
+        wake_id=${wake_name%.json}
+        valid_request_id "$wake_id" && private_control_file "$wake_request" || continue
+        wake_processing=$control_processing/$wake_name
+        [ ! -e "$wake_processing" ] && [ ! -L "$wake_processing" ] || continue
+        control_backlog=true
+        break
+    done
+    if [ "$control_queue_progress" = true ] && [ "$control_backlog" = true ]; then
+        write_controller_state running "$$" "$next_run" 0
+        continue
+    fi
 
     write_controller_state running "$$" "$next_run" 0
     sleep_for=30
@@ -843,18 +1462,21 @@ while [ "$shutdown" = false ]; do
         fi
     fi
     [ "$sleep_for" -gt 0 ] || sleep_for=1
-    sleep "$sleep_for" &
-    sleep_pid=$!
-    # Close the signal-before-sleep race: USR2 either kills an already-published
-    # sleep PID in its handler or leaves this latch set so the new sleep is
-    # terminated here. FIFO ordering and one-request-per-turn remain unchanged.
-    if [ "$queue_wake_requested" = true ] && pid_is_live "$sleep_pid"; then
-        kill -TERM "$sleep_pid" 2>/dev/null || true
+    if ! launch_admitted_child sleep controller_sleep sleep "$sleep_for"; then
+        [ "$admitted_child_status" != cancelled ] || continue
+        controller_log_event error child_identity_capture_failed "kind=controller_sleep"
+        exit 73
     fi
-    set +e
-    wait "$sleep_pid"
-    set -e
+    # Close every signal-before-publication race: a handler either stops the
+    # fully published sleep tuple or leaves its latch set for this exact recheck.
+    if [ "$shutdown" = true ] || [ "$reload_requested" = true ] || \
+        [ "$queue_wake_requested" = true ]; then
+        signal_controller_sleep
+    fi
+    reap_direct_child_interruption_safe "$sleep_pid"
     sleep_pid=
+    sleep_pid_start=
+    sleep_pid_boot=
 done
 
 exit 0

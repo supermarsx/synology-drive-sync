@@ -89,6 +89,10 @@ pub struct ApiClient {
     session: Option<Session>,
     retries: u32,
     control_timeout: Duration,
+    /// Optional absolute budget shared by every control request made through
+    /// this client. Interactive callers use this so discovery fallbacks,
+    /// authentication challenges, and logout cannot each restart the clock.
+    control_deadline: Option<Instant>,
     upload_timeout: Duration,
     operation_timeout: Duration,
     upload_rate_limit: Option<Arc<Mutex<TokenBucket>>>,
@@ -216,6 +220,7 @@ impl ApiClient {
                 ("SYNO.FileStation.Upload", 2),
                 ("SYNO.FileStation.CheckPermission", 3),
             ],
+            None,
         )
     }
 
@@ -223,12 +228,35 @@ impl ApiClient {
     /// interactive directory chooser. Only Auth and List are required; sync
     /// mutation APIs are neither assumed nor invoked by this client.
     pub fn connect_for_browsing(options: &ClientOptions) -> Result<Self> {
-        Self::connect_with_requirements(options, &[("SYNO.FileStation.List", 2)])
+        Self::connect_with_requirements(options, &[("SYNO.FileStation.List", 2)], None)
+    }
+
+    /// Connect a least-privilege browsing client whose discovery and all
+    /// subsequent control requests share one absolute deadline.
+    ///
+    /// This is intended for bounded interactive probes. A discovery fallback,
+    /// a second login carrying an OTP, and directory listing all consume the
+    /// same budget; none of them can silently restart it. Callers that need a
+    /// separately reserved cleanup slice must opt into [`Self::logout_bounded`].
+    pub fn connect_for_browsing_bounded(
+        options: &ClientOptions,
+        total_timeout: Duration,
+    ) -> Result<Self> {
+        if total_timeout.is_zero() {
+            return Err(Error::Message(
+                "File Station control deadline must be greater than zero".to_owned(),
+            ));
+        }
+        let deadline = Instant::now().checked_add(total_timeout).ok_or_else(|| {
+            Error::Message("File Station control deadline is out of range".to_owned())
+        })?;
+        Self::connect_with_requirements(options, &[("SYNO.FileStation.List", 2)], Some(deadline))
     }
 
     fn connect_with_requirements(
         options: &ClientOptions,
         required_apis: &[(&str, u32)],
+        control_deadline: Option<Instant>,
     ) -> Result<Self> {
         let base = normalize_base_url(&options.base_url, options.allow_http)?;
         let mut builder = HttpClient::builder()
@@ -287,6 +315,7 @@ impl ApiClient {
             session: None,
             retries: options.retries,
             control_timeout: control_request_timeout(options.request_timeout),
+            control_deadline,
             upload_timeout: options.request_timeout,
             operation_timeout: options.request_timeout,
             upload_rate_limit: None,
@@ -792,6 +821,24 @@ impl ApiClient {
         let result = self.send_form_once::<Value>(url, fields, "SYNO.API.Auth", "logout");
         self.session = None;
         result.map(|_| ())
+    }
+
+    /// End the current session with a fresh, cleanup-only deadline.
+    ///
+    /// A bounded interactive caller can reserve this slice separately from its
+    /// discovery/login budget. Replacing an exhausted probe deadline here is
+    /// deliberate: once a login response has supplied a SID, attempting logout
+    /// is more important than preserving unused probe time.
+    pub fn logout_bounded(&mut self, timeout: Duration) -> Result<()> {
+        if timeout.is_zero() {
+            return Err(Error::Message(
+                "File Station logout deadline must be greater than zero".to_owned(),
+            ));
+        }
+        self.control_deadline = Some(Instant::now().checked_add(timeout).ok_or_else(|| {
+            Error::Message("File Station logout deadline is out of range".to_owned())
+        })?);
+        self.logout()
     }
 
     pub fn verify_share_writable(&self, root: &RemoteRoot) -> Result<()> {
@@ -1807,6 +1854,7 @@ impl ApiClient {
         method: &str,
         timeout: Duration,
     ) -> Result<Option<T>> {
+        let timeout = self.remaining_control_timeout(timeout)?;
         // Passwords, OTPs, and session values enter this owned form field list. reqwest must
         // still serialize its own request-body copy, but this caller-owned copy is short-lived
         // and explicitly erased.
@@ -1822,6 +1870,19 @@ impl ApiClient {
                 source,
             })?;
         decode_response(response, api, method)
+    }
+
+    fn remaining_control_timeout(&self, requested: Duration) -> Result<Duration> {
+        let Some(deadline) = self.control_deadline else {
+            return Ok(requested);
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::Message(
+                "File Station control operation exceeded its total deadline".to_owned(),
+            ));
+        }
+        Ok(requested.min(remaining))
     }
 
     fn validate_api(&self, api: &str, version: u32) -> Result<()> {
@@ -3124,6 +3185,7 @@ mod tests {
             }),
             retries,
             control_timeout: idle_timeout,
+            control_deadline: None,
             upload_timeout: operation_timeout,
             operation_timeout,
             upload_rate_limit: None,
@@ -3444,6 +3506,103 @@ mod tests {
 
     fn login_response() -> String {
         r#"{"success":true,"data":{"sid":"test-session","synotoken":"test-token"}}"#.to_owned()
+    }
+
+    #[test]
+    fn bounded_browser_deadline_is_shared_by_discovery_fallback_and_totp_login() {
+        let responses = vec![
+            (StatusCode::BAD_GATEWAY, "backend unavailable".to_owned()),
+            (StatusCode::OK, browser_discovery()),
+            (
+                StatusCode::OK,
+                r#"{"success":false,"error":{"code":403}}"#.to_owned(),
+            ),
+        ];
+        let (url, server) = scripted_server_with_status(responses);
+        let mut client = ApiClient::connect_for_browsing_bounded(
+            &ClientOptions {
+                base_url: url,
+                allow_http: true,
+                accept_invalid_certs: false,
+                ca_certificate: None,
+                connect_timeout: Duration::from_secs(2),
+                request_timeout: Duration::from_secs(2),
+                retries: 0,
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let shared_deadline = client
+            .control_deadline
+            .expect("bounded browsing client must retain its absolute deadline");
+        let first = client.login("alice", "password", None).unwrap_err();
+        assert_eq!(first.api_code(), Some(403));
+        assert_eq!(client.control_deadline, Some(shared_deadline));
+
+        // Deterministically model discovery and the first login consuming the
+        // shared budget. The TOTP attempt must consult that same absolute
+        // deadline instead of receiving a fresh per-request timeout.
+        let expired_deadline = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("monotonic clock must support a one-second lookback");
+        client.control_deadline = Some(expired_deadline);
+        let second = client
+            .login("alice", "password", Some("123456"))
+            .unwrap_err();
+        assert!(
+            rendered_error(&second).contains("exceeded its total deadline"),
+            "unexpected bounded-login error: {second:?}"
+        );
+        assert_eq!(client.control_deadline, Some(expired_deadline));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].request_line.contains("/webapi/entry.cgi"));
+        assert!(requests[1].request_line.contains("/webapi/query.cgi"));
+        assert!(!String::from_utf8_lossy(&requests[2].body).contains("otp_code"));
+    }
+
+    #[test]
+    fn bounded_logout_replaces_an_exhausted_probe_deadline_with_its_cleanup_slice() {
+        let responses = vec![
+            (StatusCode::OK, browser_discovery()),
+            (StatusCode::OK, login_response()),
+            (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+        ];
+        let (url, server) = scripted_server_with_status(responses);
+        let mut client = ApiClient::connect_for_browsing_bounded(
+            &ClientOptions {
+                base_url: url,
+                allow_http: true,
+                accept_invalid_certs: false,
+                ca_certificate: None,
+                connect_timeout: Duration::from_secs(2),
+                request_timeout: Duration::from_secs(2),
+                retries: 0,
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        client.login("alice", "password", None).unwrap();
+        let expired_probe_deadline = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("monotonic clock must support a one-second lookback");
+        client.control_deadline = Some(expired_probe_deadline);
+        let cleanup_timeout = Duration::from_secs(5);
+        let earliest_cleanup_deadline = Instant::now()
+            .checked_add(cleanup_timeout)
+            .expect("cleanup deadline must be representable");
+        client
+            .logout_bounded(cleanup_timeout)
+            .expect("reserved cleanup budget must close a session after probe exhaustion");
+        let cleanup_deadline = client
+            .control_deadline
+            .expect("bounded logout must retain its fresh cleanup deadline");
+        assert!(cleanup_deadline >= earliest_cleanup_deadline);
+        assert_ne!(cleanup_deadline, expired_probe_deadline);
+        assert!(client.session.is_none());
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(String::from_utf8_lossy(&requests[2].body).contains("method=logout"));
     }
 
     #[test]
@@ -5099,6 +5258,7 @@ mod tests {
             session: None,
             retries: 0,
             control_timeout: Duration::from_secs(1),
+            control_deadline: None,
             upload_timeout: Duration::from_secs(1),
             operation_timeout: Duration::from_secs(1),
             upload_rate_limit: None,
@@ -7410,6 +7570,7 @@ mod tests {
             session: None,
             retries: 0,
             control_timeout: Duration::from_secs(1),
+            control_deadline: None,
             upload_timeout: Duration::from_secs(1),
             operation_timeout: Duration::from_secs(1),
             upload_rate_limit: None,

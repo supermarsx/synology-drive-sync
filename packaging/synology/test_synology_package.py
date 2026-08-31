@@ -1472,24 +1472,44 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
     response = Path(sys.argv[3])
 {argv_capture}
     job_id = request.stem
+    try:
+        job_payload = json.loads(request.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        job_payload = {{}}
+    connection_job = job_payload.get("operation") in ("test-profile-auth", "browse-remote")
     capture = Path({str(queue_capture)!r})
     lock = Path({str(queue_lock)!r})
-    try:
-        lock.mkdir()
-    except FileExistsError:
-        with capture.open("a", encoding="utf-8") as stream:
-            stream.write("overlap\\n")
-        raise SystemExit(75)
+    lock_acquired = False
+    if not connection_job:
+        try:
+            lock.mkdir()
+            lock_acquired = True
+        except FileExistsError:
+            with capture.open("a", encoding="utf-8") as stream:
+                stream.write("overlap\\n")
+            raise SystemExit(75)
     try:
         secret = request.with_suffix(".secret")
         has_secret = "yes" if secret.is_file() else "no"
         with capture.open("a", encoding="utf-8") as stream:
-            stream.write(f"{{job_id}} {{int(time.time())}} {{os.getuid()}} {{os.getgid()}} {{has_secret}}\\n")
-        time.sleep(0.1)
+            stream.write(f"{{job_id}} {{time.monotonic_ns()}} {{os.getuid()}} {{os.getgid()}} {{has_secret}}\\n")
+        ready_value = job_payload.get("test_ready")
+        release_value = job_payload.get("test_release")
+        if isinstance(ready_value, str) and isinstance(release_value, str):
+            if job_payload.get("test_ignore_term") is True:
+                signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
+                signal.signal(signal.SIGINT, lambda _signum, _frame: None)
+            Path(ready_value).write_text(f"{{os.getpid()}}\\n", encoding="utf-8")
+            while not Path(release_value).exists():
+                time.sleep(0.02)
+        else:
+            time.sleep(0.1)
         secret.unlink(missing_ok=True)
         response.write_text('{{"schema":"sdsync.dsm-result.v1","ok":true,"message":"queued"}}\\n', encoding="utf-8")
+        response.chmod(0o600)
     finally:
-        lock.rmdir()
+        if lock_acquired:
+            lock.rmdir()
     raise SystemExit(0)
 '''
         consumer_tree = ""
@@ -2042,6 +2062,22 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "str(Path(os.environ['SYNOPKG_PKGDEST']) / 'libexec/sdsync-controller')\n"
             "    os.execv(controller, [controller])\n"
             "\n"
+            "if len(sys.argv) == 3 and sys.argv[1] == '--classify-queued-job':\n"
+            "    job_id = sys.argv[2]\n"
+            "    request = Path(os.environ['SYNOPKG_PKGVAR']) / 'control/requests' / f'{job_id}.json'\n"
+            "    try:\n"
+            "        payload = json.loads(request.read_text(encoding='utf-8'))\n"
+            "    except (OSError, json.JSONDecodeError):\n"
+            "        raise SystemExit(73)\n"
+            "    operation = payload.get('operation')\n"
+            "    if operation in ('test-profile-auth', 'browse-remote'):\n"
+            "        print('connection')\n"
+            "    elif operation == 'action':\n"
+            "        print('concurrent')\n"
+            "    else:\n"
+            "        print('serialized')\n"
+            "    raise SystemExit(0)\n"
+            "\n"
             f"{consumer_tree}"
             "if len(sys.argv) == 4 and sys.argv[1] == '--consume-job' and "
             "os.environ.get('SDSYNC_TEST_HOLD_CONSUMER') == 'true':\n"
@@ -2302,6 +2338,31 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         )
         script.write_text(source.replace(needle, replacement), encoding="utf-8")
 
+    def instrument_admitted_launch_signal(self, script: Path, kind: str) -> None:
+        source = script.read_text(encoding="utf-8")
+        marker = (
+            "    # Signal-handoff tests instrument this point. The exact tuple is published,\n"
+            "    # but the real command remains unable to exec until the atomic go commit.\n"
+        )
+        self.assertEqual(source.count(marker), 1, f"admission site changed in {script}")
+        injection = (
+            f'    if [ "$launched_admission_kind" = {kind} ]; then\n'
+            '        printf \'%s\\n\' "$launched_admission_pid" '
+            '> "$SDSYNC_TEST_LAUNCHED_PID"\n'
+            '        controller_persisted_identity_status "$$"\n'
+            '        printf \'%s\\n%s\\n%s\\n\' "$persisted_controller_pid" '
+            '"$persisted_controller_start" "$persisted_controller_boot" '
+            '> "$SDSYNC_TEST_VERIFIED_CONTROLLER_IDENTITY"\n'
+            '        finish_private_file "$SDSYNC_TEST_VERIFIED_CONTROLLER_IDENTITY"\n'
+            '        : > "$SDSYNC_TEST_LAUNCH_READY"\n'
+            '        while [ ! -e "$SDSYNC_TEST_LAUNCH_RELEASE" ]; do '
+            "/bin/sleep 0.01; done\n"
+            '        kill -TERM "$$"\n'
+            "    fi\n"
+            + marker
+        )
+        script.write_text(source.replace(marker, injection, 1), encoding="utf-8")
+
     def write_terminable_launch_child(self, path: Path, *, core: bool = False) -> None:
         validate = 'case " $* " in *" config validate "*) exit 0 ;; esac\n' if core else ""
         path.write_text(
@@ -2493,6 +2554,55 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 except ProcessLookupError:
                     pass
 
+    def assert_injected_admitted_launch_is_cancelled(
+        self,
+        script: Path,
+        arguments: tuple[str, ...],
+        environment: dict[str, str],
+        pid_file: Path,
+        ready_file: Path,
+        term_file: Path,
+        expected_exit: int,
+    ) -> None:
+        process = self.shell_process(script, *arguments, extra_environment=environment)
+        child_pid = None
+        try:
+            self.wait_for_path(
+                ready_file,
+                "admitted launch did not reach captured-before-go",
+                timeout=15,
+            )
+            child_pid = int(pid_file.read_text(encoding="ascii").strip())
+            stdout, stderr = process.communicate(timeout=8)
+            self.assertEqual(process.returncode, expected_exit, stdout + stderr)
+            Path(environment["SDSYNC_TEST_LAUNCH_RELEASE"]).write_text(
+                "release\n", encoding="ascii"
+            )
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("cancelled admitted wrapper remained live")
+            self.assertFalse(
+                term_file.exists(),
+                "real command execed before the captured wrapper received admission",
+            )
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=5)
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
     def wait_for_verified_process_exit(
         self, identity_file: Path, *, timeout: float = 15.0
     ) -> None:
@@ -2639,6 +2749,42 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "PATH": f"{fake_bin}:{self.environment['PATH']}",
             "SDSYNC_TEST_CLOCK": str(clock),
         }
+
+    def write_mock_control_job(
+        self,
+        job_id: str,
+        operation: str,
+        *,
+        ready: Path | None = None,
+        release: Path | None = None,
+        ignore_term: bool = False,
+    ) -> Path:
+        payload: dict[str, object] = {"operation": operation}
+        if ready is not None or release is not None:
+            self.assertIsNotNone(ready)
+            self.assertIsNotNone(release)
+            payload["test_ready"] = str(ready)
+            payload["test_release"] = str(release)
+        if ignore_term:
+            payload["test_ignore_term"] = True
+        request = self.real_var / f"control/requests/{job_id}.json"
+        request.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
+        request.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(request, self.drop_uid, self.drop_gid)
+        return request
+
+    def wait_for_path(self, path: Path, message: str, *, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(path.exists(), message)
+
+    def wait_for_absence(self, path: Path, message: str, *, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        while path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(path.exists(), message)
 
     def test_api_snapshot_advanced_config_order_and_secret_non_disclosure(self) -> None:
         ca_file = self.root / "trusted-ca.pem"
@@ -5138,23 +5284,20 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         runner = self.real_target / "libexec/sdsync-run"
         self.write_terminable_launch_child(runner)
         controller = self.real_target / "libexec/sdsync-controller"
-        self.instrument_launch_assignment_signal(
-            controller,
-            '        "$runner" "$routine_action" "$routine_profile" "$routine_delete" scheduled - &',
-            "        active_pid=$!",
-            "        ",
-        )
+        self.instrument_admitted_launch_signal(controller, "routine")
         ready = self.root / "routine-launch.ready"
         pid_file = self.root / "routine-launch.pid"
         terminated = self.root / "routine-launch.term"
+        release = self.root / "routine-launch.release"
         controller_identity = self.root / "routine-controller.identity"
         environment = {
             "SDSYNC_TEST_LAUNCH_READY": str(ready),
             "SDSYNC_TEST_LAUNCHED_PID": str(pid_file),
             "SDSYNC_TEST_TERM_OBSERVED": str(terminated),
+            "SDSYNC_TEST_LAUNCH_RELEASE": str(release),
             "SDSYNC_TEST_VERIFIED_CONTROLLER_IDENTITY": str(controller_identity),
         }
-        self.assert_injected_launch_is_reaped(
+        self.assert_injected_admitted_launch_is_cancelled(
             self.lifecycle, ("start",), environment, pid_file, ready, terminated, 0
         )
         self.wait_for_verified_process_exit(controller_identity)
@@ -5680,6 +5823,1827 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             )
         )
 
+    def test_controller_drains_existing_safe_queue_without_poll_sleep(self) -> None:
+        bridge_capture = self.root / "fast-queue-bridge-capture"
+        bridge_lock = self.root / "fast-queue-bridge-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        requests = self.real_var / "control/requests"
+        responses = self.real_var / "control/responses"
+        job_ids = ["2" * 48, "3" * 48]
+        for job_id in job_ids:
+            request = requests / f"{job_id}.json"
+            request.write_text("{}\n", encoding="utf-8")
+            request.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(request, self.drop_uid, self.drop_gid)
+
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        for _ in range(300):
+            if all((responses / f"{job_id}.json").is_file() for job_id in job_ids):
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("controller did not drain the existing two-job queue")
+
+        records = [line.split() for line in bridge_capture.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([record[0] for record in records], job_ids)
+        dispatch_gap_ns = int(records[1][1]) - int(records[0][1])
+        self.assertGreaterEqual(dispatch_gap_ns, 80_000_000)
+        self.assertLess(
+            dispatch_gap_ns,
+            900_000_000,
+            "a queued successor inherited the controller's fixed one-second poll tax",
+        )
+
+    def test_controller_undispatchable_backlog_never_spins(self) -> None:
+        requests = self.real_var / "control/requests"
+        processing = self.real_var / "control/processing"
+        collision_id = "1" * 48
+        failed_claim_id = "2" * 48
+        collision_request = self.write_mock_control_job(collision_id, "action")
+        collision_processing = processing / f"{collision_id}.json"
+        collision_processing.write_bytes(collision_request.read_bytes())
+        collision_processing.chmod(0o600)
+        self.write_mock_control_job(failed_claim_id, "action")
+
+        failed_claim_capture = self.root / "failed-queue-claims"
+        failed_claim_capture.write_text("", encoding="utf-8")
+        real_mv = shutil.which("mv")
+        self.assertIsNotNone(real_mv)
+        fake_mv = self.fake_system_bin / "mv"
+        fake_mv.write_text(
+            "#!/bin/sh\n"
+            "case ${1:-}:${2:-} in\n"
+            f"  */control/requests/{failed_claim_id}.json:*/control/processing/{failed_claim_id}.json)\n"
+            f"    printf 'attempt\\n' >> {shlex.quote(str(failed_claim_capture))}\n"
+            "    exit 74\n"
+            "    ;;\n"
+            "esac\n"
+            f"exec {shlex.quote(str(real_mv))} \"$@\"\n",
+            encoding="utf-8",
+        )
+        fake_mv.chmod(0o755)
+        if os.getuid() == 0:
+            for path in (collision_processing, failed_claim_capture, fake_mv):
+                os.chown(path, self.drop_uid, self.drop_gid)
+
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        time.sleep(0.35)
+        attempts = failed_claim_capture.read_text(encoding="utf-8").splitlines()
+        controller_events = [
+            json.loads(line)
+            for line in (self.real_var / "log/controller.log")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line
+        ]
+        collisions = [
+            event
+            for event in controller_events
+            if event.get("event") == "control_request_collision"
+            and f"id={collision_id}" in event.get("detail", "")
+        ]
+        self.assertGreaterEqual(len(attempts), 1)
+        self.assertLessEqual(len(attempts), 2, "failed queue claims entered a zero-sleep loop")
+        self.assertGreaterEqual(len(collisions), 1)
+        self.assertLessEqual(len(collisions), 2, "processing collisions entered a zero-sleep loop")
+
+    def test_connection_jobs_can_run_one_at_a_time_beside_primary_control_work(self) -> None:
+        bridge_capture = self.root / "concurrent-control-capture"
+        bridge_lock = self.root / "concurrent-control-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        responses = self.real_var / "control/responses"
+        processing = self.real_var / "control/processing"
+
+        primary_id = "2" * 48
+        first_connection_id = "3" * 48
+        second_connection_id = "4" * 48
+        primary_ready = self.root / "primary-control.ready"
+        primary_release = self.root / "primary-control.release"
+        first_ready = self.root / "first-connection.ready"
+        first_release = self.root / "first-connection.release"
+        second_ready = self.root / "second-connection.ready"
+        second_release = self.root / "second-connection.release"
+        self.write_mock_control_job(
+            primary_id,
+            "action",
+            ready=primary_ready,
+            release=primary_release,
+        )
+        primary_secret = self.real_var / f"control/requests/{primary_id}.secret"
+        primary_secret.write_text("primary-secret\n", encoding="utf-8")
+        primary_secret.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(primary_secret, self.drop_uid, self.drop_gid)
+
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.wait_for_path(primary_ready, "primary control consumer did not enter its held wait")
+        primary_processing = processing / f"{primary_id}.json"
+        primary_processing_secret = processing / f"{primary_id}.secret"
+        stale_processing_time = time.time() - 3700
+        os.utime(primary_processing, (stale_processing_time, stale_processing_time))
+        os.utime(primary_processing_secret, (stale_processing_time, stale_processing_time))
+        for index in range(1000, 1258):
+            overflow_response = responses / f"{index:048x}.json"
+            overflow_response.write_text("{}\n", encoding="utf-8")
+            overflow_response.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(overflow_response, self.drop_uid, self.drop_gid)
+        controller_pid = int(
+            (self.real_var / "run/controller.pid").read_text(encoding="ascii").strip()
+        )
+
+        self.write_mock_control_job(
+            first_connection_id,
+            "test-profile-auth",
+            ready=first_ready,
+            release=first_release,
+        )
+        self.write_mock_control_job(
+            second_connection_id,
+            "browse-remote",
+            ready=second_ready,
+            release=second_release,
+        )
+        # One signal must be enough for both pre-existing probes: standard
+        # signals may coalesce before the controller services the first one.
+        os.kill(controller_pid, signal.SIGUSR2)
+        self.wait_for_path(first_ready, "connection job did not run beside primary control work")
+        self.assertTrue((processing / f"{primary_id}.json").is_file())
+        self.assertTrue((processing / f"{first_connection_id}.json").is_file())
+
+        time.sleep(0.2)
+        self.assertFalse(
+            second_ready.exists(),
+            "a second connection consumer overlapped the first connection consumer",
+        )
+
+        first_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            responses / f"{first_connection_id}.json",
+            "first connection response was not published",
+        )
+        self.assertTrue(primary_processing.is_file())
+        self.assertTrue(
+            primary_processing_secret.is_file(),
+            "nested connection pruning deleted the primary consumer's active secret",
+        )
+        self.assertGreater(
+            len(list(responses.glob("*.json"))),
+            256,
+            "nested connection turn unexpectedly ran primary response pruning",
+        )
+        self.wait_for_path(
+            second_ready,
+            "latched USR2 did not dispatch the next connection after the first was reaped",
+        )
+        self.wait_for_absence(
+            processing / f"{first_connection_id}.json",
+            "first connection processing claim was not cleaned",
+        )
+        self.assertTrue((processing / f"{second_connection_id}.json").is_file())
+
+        second_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            responses / f"{second_connection_id}.json",
+            "second connection response was not published",
+        )
+        self.assertFalse((responses / f"{primary_id}.json").exists())
+        primary_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            responses / f"{primary_id}.json",
+            "primary control response was lost after nested connection work",
+        )
+        for job_id in (primary_id, first_connection_id, second_connection_id):
+            self.wait_for_absence(
+                processing / f"{job_id}.json",
+                f"processing claim was not cleaned for {job_id}",
+            )
+        response_prune_deadline = time.monotonic() + 5
+        while len(list(responses.glob("*.json"))) > 256 and time.monotonic() < response_prune_deadline:
+            time.sleep(0.01)
+        self.assertLessEqual(
+            len(list(responses.glob("*.json"))),
+            256,
+            "primary queue turn skipped response-retention pruning after nested work",
+        )
+        records = bridge_capture.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn("overlap", records)
+        self.assertEqual([record.split()[0] for record in records], [
+            primary_id,
+            first_connection_id,
+            second_connection_id,
+        ])
+
+    def test_preexisting_connection_runs_beside_action_without_a_second_wake(self) -> None:
+        bridge_capture = self.root / "preexisting-connection-capture"
+        bridge_lock = self.root / "preexisting-connection-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        primary_id = "2" * 48
+        connection_id = "3" * 48
+        primary_ready = self.root / "preexisting-primary.ready"
+        primary_release = self.root / "preexisting-primary.release"
+        connection_ready = self.root / "preexisting-connection.ready"
+        connection_release = self.root / "preexisting-connection.release"
+        self.write_mock_control_job(
+            primary_id,
+            "action",
+            ready=primary_ready,
+            release=primary_release,
+        )
+        self.write_mock_control_job(
+            connection_id,
+            "test-profile-auth",
+            ready=connection_ready,
+            release=connection_release,
+        )
+
+        # Both jobs exist before startup. No later USR2 is available to rescue
+        # a wake that the controller folded into its first primary queue turn.
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.wait_for_path(primary_ready, "pre-existing primary action did not start")
+        self.wait_for_path(
+            connection_ready,
+            "pre-existing connection remained pending behind the held action",
+            timeout=2.0,
+        )
+        processing = self.real_var / "control/processing"
+        self.assertTrue((processing / f"{primary_id}.json").is_file())
+        self.assertTrue((processing / f"{connection_id}.json").is_file())
+
+        connection_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            self.real_var / f"control/responses/{connection_id}.json",
+            "pre-existing connection response was not published",
+        )
+        self.assertFalse((self.real_var / f"control/responses/{primary_id}.json").exists())
+        primary_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            self.real_var / f"control/responses/{primary_id}.json",
+            "primary action response was not published",
+        )
+        records = bridge_capture.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn("overlap", records)
+        self.assertEqual(
+            [record.split()[0] for record in records],
+            [primary_id, connection_id],
+        )
+
+    def test_runner_wait_handoff_recovers_single_connection_wake(self) -> None:
+        bridge_capture = self.root / "runner-handoff-capture"
+        bridge_lock = self.root / "runner-handoff-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        controller = self.real_target / "libexec/sdsync-controller"
+        controller_source = controller.read_text(encoding="utf-8")
+        handoff_marker = (
+            "    # Runner-guard admission tests instrument this exact captured-before-go\n"
+            "    # handoff. A wake here must abort the guard and skip the unguarded wait.\n"
+        )
+        wake_needle = (
+            "request_queue_wake() {\n"
+            "    child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))\n"
+            "    queue_wake_requested=true\n"
+        )
+        self.assertEqual(controller_source.count(handoff_marker), 1)
+        self.assertEqual(controller_source.count(wake_needle), 1)
+        controller.write_text(
+            controller_source.replace(
+                handoff_marker,
+                '        if [ -n "${SDSYNC_TEST_RUNNER_HANDOFF_READY:-}" ] '
+                '&& [ ! -e "$SDSYNC_TEST_RUNNER_HANDOFF_READY" ]; then\n'
+                '            : > "$SDSYNC_TEST_RUNNER_HANDOFF_READY"\n'
+                '            while [ ! -e "$SDSYNC_TEST_RUNNER_HANDOFF_RELEASE" ]; do '
+                '/bin/sleep 0.01; done\n'
+                "        fi\n"
+                + handoff_marker,
+                1,
+            ).replace(
+                wake_needle,
+                wake_needle
+                + '    [ -z "${SDSYNC_TEST_RUNNER_HANDOFF_WAKE_OBSERVED:-}" ] || '
+                ': > "$SDSYNC_TEST_RUNNER_HANDOFF_WAKE_OBSERVED"\n',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        controller.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(controller, self.drop_uid, self.drop_gid)
+
+        primary_id = "2" * 48
+        connection_id = "3" * 48
+        primary_ready = self.root / "runner-handoff-primary.ready"
+        primary_release = self.root / "runner-handoff-primary.release"
+        connection_ready = self.root / "runner-handoff-connection.ready"
+        connection_release = self.root / "runner-handoff-connection.release"
+        handoff_ready = self.root / "runner-handoff.ready"
+        handoff_release = self.root / "runner-handoff.release"
+        wake_observed = self.root / "runner-handoff-wake.observed"
+        self.write_mock_control_job(
+            primary_id,
+            "action",
+            ready=primary_ready,
+            release=primary_release,
+        )
+        environment = {
+            "SDSYNC_TEST_RUNNER_HANDOFF_READY": str(handoff_ready),
+            "SDSYNC_TEST_RUNNER_HANDOFF_RELEASE": str(handoff_release),
+            "SDSYNC_TEST_RUNNER_HANDOFF_WAKE_OBSERVED": str(wake_observed),
+        }
+        started = self.shell(
+            self.lifecycle,
+            "start",
+            extra_environment=environment,
+            timeout=15,
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.wait_for_path(primary_ready, "primary action did not enter its held wait")
+        self.wait_for_path(
+            handoff_ready,
+            "controller did not enter the guarded signal-before-wait handoff",
+        )
+        controller_pid = int(
+            (self.real_var / "run/controller.pid").read_text(encoding="ascii").strip()
+        )
+        self.write_mock_control_job(
+            connection_id,
+            "test-profile-auth",
+            ready=connection_ready,
+            release=connection_release,
+        )
+
+        # Deliver exactly one wake after the durable latch was inspected but
+        # before the controller enters wait(2). Without the watchdog this trap
+        # is consumed in the handoff and the connection remains behind primary.
+        os.kill(controller_pid, signal.SIGUSR2)
+        self.wait_for_path(wake_observed, "controller did not run the injected USR2 trap")
+        recovery_started = time.monotonic()
+        handoff_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            connection_ready,
+            "one handoff wake did not dispatch the connection beside primary",
+            timeout=2.5,
+        )
+        self.assertLess(
+            time.monotonic() - recovery_started,
+            2.0,
+            "bounded runner-wait guard did not recover the handoff within one poll",
+        )
+        processing = self.real_var / "control/processing"
+        self.assertTrue((processing / f"{primary_id}.json").is_file())
+        self.assertTrue((processing / f"{connection_id}.json").is_file())
+
+        connection_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            self.real_var / f"control/responses/{connection_id}.json",
+            "handoff connection response was not published",
+        )
+        self.assertFalse((self.real_var / f"control/responses/{primary_id}.json").exists())
+        primary_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            self.real_var / f"control/responses/{primary_id}.json",
+            "primary response was not published after handoff recovery",
+        )
+        controller_events = [
+            json.loads(line)
+            for line in (self.real_var / "log/controller.log")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line
+        ]
+        self.assertFalse(
+            any(
+                event.get("event") == "control_consumer_failed"
+                and f"id={primary_id}" in event.get("detail", "")
+                for event in controller_events
+            ),
+            "runner wait interruptions did not preserve the primary exit status",
+        )
+        records = bridge_capture.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn("overlap", records)
+        self.assertEqual(
+            [record.split()[0] for record in records],
+            [primary_id, connection_id],
+        )
+
+    def test_runner_wait_guard_rejects_reused_pid_identity_before_alarm(self) -> None:
+        bridge_capture = self.root / "runner-guard-identity-capture"
+        bridge_lock = self.root / "runner-guard-identity-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        alarm_observed = self.root / "runner-guard-unrelated.alarm"
+        unrelated_ready = self.root / "runner-guard-unrelated.ready"
+        unrelated_script = self.root / "runner-guard-unrelated"
+        unrelated_script.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            'trap \': > "$SDSYNC_TEST_RUNNER_GUARD_ALARM"; exit 99\' ALRM\n'
+            ': > "$SDSYNC_TEST_RUNNER_GUARD_READY"\n'
+            "while :; do /bin/sleep 0.1; done\n",
+            encoding="utf-8",
+        )
+        unrelated_script.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(unrelated_script, self.drop_uid, self.drop_gid)
+        unrelated = self.shell_process(
+            unrelated_script,
+            extra_environment={
+                "SDSYNC_TEST_RUNNER_GUARD_ALARM": str(alarm_observed),
+                "SDSYNC_TEST_RUNNER_GUARD_READY": str(unrelated_ready),
+            },
+        )
+        try:
+            self.wait_for_path(unrelated_ready, "unrelated ALRM target did not start")
+            controller = self.real_target / "libexec/sdsync-controller"
+            controller_source = controller.read_text(encoding="utf-8")
+            identity_capture = (
+                "    runner_guard_parent=$$\n"
+                '    runner_guard_parent_start=$(process_start_time '
+                '"$runner_guard_parent" 2>/dev/null || true)\n'
+            )
+            self.assertEqual(controller_source.count(identity_capture), 1)
+            controller.write_text(
+                controller_source.replace(
+                    identity_capture,
+                    '    runner_guard_parent=${SDSYNC_TEST_RUNNER_GUARD_TARGET_PID:?}\n'
+                    "    runner_guard_parent_start=1\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            controller.chmod(0o755)
+            if os.getuid() == 0:
+                os.chown(controller, self.drop_uid, self.drop_gid)
+
+            primary_id = "2" * 48
+            primary_ready = self.root / "runner-guard-primary.ready"
+            primary_release = self.root / "runner-guard-primary.release"
+            self.write_mock_control_job(
+                primary_id,
+                "action",
+                ready=primary_ready,
+                release=primary_release,
+            )
+            started = self.shell(
+                self.lifecycle,
+                "start",
+                extra_environment={
+                    "SDSYNC_TEST_RUNNER_GUARD_TARGET_PID": str(unrelated.pid)
+                },
+                timeout=15,
+            )
+            self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+            self.wait_for_path(primary_ready, "held primary action did not start")
+
+            # Model a stored PID that now names a different process instance:
+            # the target is live, but start tick 1 cannot match it. A PID-only
+            # watchdog would deliver ALRM after one second and terminate it.
+            time.sleep(1.4)
+            self.assertIsNone(unrelated.poll(), "identity-mismatched target was signaled")
+            self.assertFalse(
+                alarm_observed.exists(),
+                "runner wait guard sent ALRM without an exact PID/start/boot match",
+            )
+            primary_release.write_text("release\n", encoding="utf-8")
+            self.wait_for_path(
+                self.real_var / f"control/responses/{primary_id}.json",
+                "primary response was not published after guard identity rejection",
+            )
+        finally:
+            if unrelated.poll() is None:
+                unrelated.terminate()
+            unrelated.communicate(timeout=5)
+
+    def test_connection_waits_for_an_active_serialized_mutation(self) -> None:
+        bridge_capture = self.root / "serialized-barrier-capture"
+        bridge_lock = self.root / "serialized-barrier-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        mutation_id = "2" * 48
+        connection_id = "3" * 48
+        mutation_ready = self.root / "serialized-mutation.ready"
+        mutation_release = self.root / "serialized-mutation.release"
+        connection_ready = self.root / "serialized-connection.ready"
+        connection_release = self.root / "serialized-connection.release"
+        self.write_mock_control_job(
+            mutation_id,
+            "security-policy",
+            ready=mutation_ready,
+            release=mutation_release,
+        )
+
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.wait_for_path(mutation_ready, "serialized mutation did not start")
+        controller_pid = int(
+            (self.real_var / "run/controller.pid").read_text(encoding="ascii").strip()
+        )
+        self.write_mock_control_job(
+            connection_id,
+            "test-profile-auth",
+            ready=connection_ready,
+            release=connection_release,
+        )
+        os.kill(controller_pid, signal.SIGUSR2)
+        time.sleep(0.25)
+        self.assertFalse(
+            connection_ready.exists(),
+            "connection probe observed a partially committed serialized mutation",
+        )
+
+        mutation_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            self.real_var / f"control/responses/{mutation_id}.json",
+            "serialized mutation response was not published",
+        )
+        self.wait_for_path(
+            connection_ready,
+            "connection probe did not start after the serialized mutation committed",
+        )
+        connection_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            self.real_var / f"control/responses/{connection_id}.json",
+            "connection response was not published after the mutation barrier",
+        )
+        records = bridge_capture.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn("overlap", records)
+        self.assertEqual(
+            [record.split()[0] for record in records],
+            [mutation_id, connection_id],
+        )
+
+    def test_connection_only_turn_never_claims_a_concurrent_action_head(self) -> None:
+        bridge_capture = self.root / "concurrent-head-capture"
+        bridge_lock = self.root / "concurrent-head-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        primary_id = "2" * 48
+        action_id = "3" * 48
+        connection_id = "4" * 48
+        primary_ready = self.root / "concurrent-head-primary.ready"
+        primary_release = self.root / "concurrent-head-primary.release"
+        action_ready = self.root / "concurrent-head-action.ready"
+        action_release = self.root / "concurrent-head-action.release"
+        connection_ready = self.root / "concurrent-head-connection.ready"
+        connection_release = self.root / "concurrent-head-connection.release"
+        self.write_mock_control_job(
+            primary_id,
+            "action",
+            ready=primary_ready,
+            release=primary_release,
+        )
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.wait_for_path(primary_ready, "primary action did not start")
+        controller_pid = int(
+            (self.real_var / "run/controller.pid").read_text(encoding="ascii").strip()
+        )
+        action_request = self.write_mock_control_job(
+            action_id,
+            "action",
+            ready=action_ready,
+            release=action_release,
+        )
+        connection_request = self.write_mock_control_job(
+            connection_id,
+            "test-profile-auth",
+            ready=connection_ready,
+            release=connection_release,
+        )
+        os.kill(controller_pid, signal.SIGUSR2)
+        time.sleep(0.25)
+        self.assertTrue(action_request.is_file())
+        self.assertTrue(connection_request.is_file())
+        self.assertFalse(action_ready.exists())
+        self.assertFalse(
+            connection_ready.exists(),
+            "connection-only servicing skipped an earlier operational action",
+        )
+
+        primary_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            self.real_var / f"control/responses/{primary_id}.json",
+            "primary action response was not published",
+        )
+        self.wait_for_path(action_ready, "queued action was not dispatched serially")
+        self.assertFalse(connection_ready.exists())
+        action_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            self.real_var / f"control/responses/{action_id}.json",
+            "queued action response was not published",
+        )
+        self.wait_for_path(connection_ready, "connection did not run after the action barrier")
+        connection_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            self.real_var / f"control/responses/{connection_id}.json",
+            "connection response was not published after the action barrier",
+        )
+        records = bridge_capture.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn("overlap", records)
+        self.assertEqual(
+            [record.split()[0] for record in records],
+            [primary_id, action_id, connection_id],
+        )
+
+    def test_primary_connection_never_overlaps_an_auxiliary_connection(self) -> None:
+        bridge_capture = self.root / "primary-connection-capture"
+        bridge_lock = self.root / "primary-connection-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        first_id = "2" * 48
+        second_id = "3" * 48
+        first_ready = self.root / "primary-connection.ready"
+        first_release = self.root / "primary-connection.release"
+        second_ready = self.root / "queued-connection.ready"
+        second_release = self.root / "queued-connection.release"
+        self.write_mock_control_job(
+            first_id,
+            "test-profile-auth",
+            ready=first_ready,
+            release=first_release,
+        )
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.wait_for_path(first_ready, "primary connection consumer did not start")
+        controller_pid = int(
+            (self.real_var / "run/controller.pid").read_text(encoding="ascii").strip()
+        )
+        self.write_mock_control_job(
+            second_id,
+            "browse-remote",
+            ready=second_ready,
+            release=second_release,
+        )
+        os.kill(controller_pid, signal.SIGUSR2)
+        time.sleep(0.25)
+        self.assertFalse(
+            second_ready.exists(),
+            "auxiliary connection overlapped a primary connection consumer",
+        )
+        first_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            self.real_var / f"control/responses/{first_id}.json",
+            "primary connection response was not published",
+        )
+        self.wait_for_path(
+            second_ready,
+            "second connection was not dispatched after the primary was reaped",
+        )
+        second_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            self.real_var / f"control/responses/{second_id}.json",
+            "second connection response was not published",
+        )
+        records = bridge_capture.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn("overlap", records)
+        self.assertEqual([record.split()[0] for record in records], [first_id, second_id])
+
+    def test_stop_bounds_and_reaps_primary_and_auxiliary_consumers(self) -> None:
+        bridge_capture = self.root / "dual-stop-capture"
+        bridge_lock = self.root / "dual-stop-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        primary_id = "2" * 48
+        connection_id = "3" * 48
+        primary_ready = self.root / "dual-stop-primary.ready"
+        primary_release = self.root / "dual-stop-primary.release"
+        connection_ready = self.root / "dual-stop-connection.ready"
+        connection_release = self.root / "dual-stop-connection.release"
+        self.write_mock_control_job(
+            primary_id,
+            "action",
+            ready=primary_ready,
+            release=primary_release,
+            ignore_term=True,
+        )
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.wait_for_path(primary_ready, "held primary consumer did not start")
+        controller_pid = int(
+            (self.real_var / "run/controller.pid").read_text(encoding="ascii").strip()
+        )
+        self.write_mock_control_job(
+            connection_id,
+            "test-profile-auth",
+            ready=connection_ready,
+            release=connection_release,
+            ignore_term=True,
+        )
+        os.kill(controller_pid, signal.SIGUSR2)
+        self.wait_for_path(connection_ready, "held auxiliary connection did not start")
+        child_pids = [
+            int(primary_ready.read_text(encoding="ascii").strip()),
+            int(connection_ready.read_text(encoding="ascii").strip()),
+        ]
+        stop_started = time.monotonic()
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        stop_elapsed = time.monotonic() - stop_started
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertLess(
+            stop_elapsed,
+            12,
+            "dual-child shutdown exceeded its 10-second lifecycle deadline plus CI margin",
+        )
+        for pid in (controller_pid, *child_pids):
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_controller_child_signals_require_exact_spawn_identity(self) -> None:
+        child = self.root / "pid-identity-child"
+        child.write_text(
+            f"#!{sys.executable}\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            "import signal\n"
+            "import sys\n"
+            "import time\n"
+            "mode, ready_value, term_value = sys.argv[1:]\n"
+            "ready = Path(ready_value)\n"
+            "term = Path(term_value)\n"
+            "def handle_term(_signum, _frame):\n"
+            "    term.write_text('term\\n', encoding='ascii')\n"
+            "    if mode != 'stubborn':\n"
+            "        raise SystemExit(143)\n"
+            "signal.signal(signal.SIGTERM, handle_term)\n"
+            "ready.write_text(f'{os.getpid()}\\n', encoding='ascii')\n"
+            "if mode == 'finite':\n"
+            "    time.sleep(0.5)\n"
+            "    raise SystemExit(0)\n"
+            "while True:\n"
+            "    time.sleep(0.05)\n",
+            encoding="utf-8",
+        )
+        child.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(child, self.drop_uid, self.drop_gid)
+
+        names = (
+            "mismatch_guard",
+            "matching_guard",
+            "mismatch_guard_sleep",
+            "matching_guard_sleep",
+            "mismatch_sleep",
+            "matching_sleep",
+            "mismatch_active",
+            "mismatch_control",
+            "matching_active",
+            "matching_control",
+        )
+        ready_paths = {name: self.root / f"{name}.ready" for name in names}
+        term_paths = {name: self.root / f"{name}.term" for name in names}
+        matching_stop_duration = self.root / "matching-stop-duration"
+        environment = {
+            "SDSYNC_TEST_PID_IDENTITY_CHILD": str(child),
+            "SDSYNC_TEST_MATCHING_STOP_DURATION": str(matching_stop_duration),
+        }
+        for name in names:
+            prefix = f"SDSYNC_TEST_{name.upper()}"
+            environment[f"{prefix}_READY"] = str(ready_paths[name])
+            environment[f"{prefix}_TERM"] = str(term_paths[name])
+
+        controller = self.real_target / "libexec/sdsync-controller"
+        controller_source = controller.read_text(encoding="utf-8")
+        self.assertEqual(
+            controller_source.count(
+                'if ! launch_admitted_child "$launched_control_slot" control \\\n'
+                '            "$api_bridge" --consume-job'
+            ),
+            1,
+        )
+        self.assertEqual(
+            controller_source.count(
+                'if ! launch_admitted_child active routine "$runner" "$routine_action" \\\n'
+            ),
+            1,
+        )
+        self.assertEqual(
+            controller_source.count(
+                'if ! launch_admitted_child active schedule "$runner" sync all \\\n'
+            ),
+            1,
+        )
+        self.assertEqual(
+            controller_source.count(
+                'if ! launch_admitted_child sleep controller_sleep sleep "$sleep_for"; then'
+            ),
+            1,
+        )
+        self.assertEqual(
+            controller_source.count(
+                'if ! capture_work_child_identity "$launched_runner_wait_guard_pid" \\\n'
+                '        "$runner_guard_parent_boot"; then'
+            ),
+            1,
+        )
+        self.assertEqual(
+            controller_source.count(
+                'if ! capture_work_child_identity "$launched_runner_guard_sleep_pid" \\\n'
+                '                "$runner_guard_parent_boot"; then'
+            ),
+            1,
+        )
+        probe_needle = "queue_wake_requested=false\n\ncleanup_controller() {\n"
+        self.assertEqual(controller_source.count(probe_needle), 1)
+        probe = r'''queue_wake_requested=false
+
+if [ "${SDSYNC_TEST_PID_IDENTITY_PROBE:-false}" = true ]; then
+    pid_probe_wait_ready() {
+        pid_probe_ready_path=$1
+        pid_probe_child_pid=$2
+        pid_probe_wait_count=0
+        while [ ! -f "$pid_probe_ready_path" ]; do
+            pid_is_live "$pid_probe_child_pid" || exit 80
+            [ "$pid_probe_wait_count" -lt 500 ] || exit 81
+            /bin/sleep 0.01
+            pid_probe_wait_count=$((pid_probe_wait_count + 1))
+        done
+    }
+    pid_probe_boot=$(boot_identity) || exit 79
+
+    "$SDSYNC_TEST_PID_IDENTITY_CHILD" finite \
+        "$SDSYNC_TEST_MISMATCH_GUARD_READY" "$SDSYNC_TEST_MISMATCH_GUARD_TERM" &
+    mismatch_guard_pid=$!
+    pid_probe_wait_ready "$SDSYNC_TEST_MISMATCH_GUARD_READY" "$mismatch_guard_pid"
+    capture_work_child_identity "$mismatch_guard_pid" "$pid_probe_boot" || exit 82
+    mismatch_guard_start=$captured_work_child_start
+    mismatch_guard_boot=$captured_work_child_boot
+    work_child_identity_is_running "$mismatch_guard_pid" \
+        "$mismatch_guard_start" "$mismatch_guard_boot" || exit 83
+    runner_wait_guard_start=$((mismatch_guard_start + 1))
+    runner_wait_guard_boot=$mismatch_guard_boot
+    runner_wait_guard_pid=$mismatch_guard_pid
+    stop_runner_wait_guard
+    [ ! -e "$SDSYNC_TEST_MISMATCH_GUARD_TERM" ] || exit 84
+    pid_is_live "$mismatch_guard_pid" && exit 85
+    [ -z "$runner_wait_guard_pid" ] && [ -z "$runner_wait_guard_start" ] \
+        && [ -z "$runner_wait_guard_boot" ] || exit 86
+
+    "$SDSYNC_TEST_PID_IDENTITY_CHILD" cooperative \
+        "$SDSYNC_TEST_MATCHING_GUARD_READY" "$SDSYNC_TEST_MATCHING_GUARD_TERM" &
+    matching_guard_pid=$!
+    pid_probe_wait_ready "$SDSYNC_TEST_MATCHING_GUARD_READY" "$matching_guard_pid"
+    capture_work_child_identity "$matching_guard_pid" "$pid_probe_boot" || exit 87
+    runner_wait_guard_start=$captured_work_child_start
+    runner_wait_guard_boot=$captured_work_child_boot
+    runner_wait_guard_pid=$matching_guard_pid
+    stop_runner_wait_guard
+    [ -f "$SDSYNC_TEST_MATCHING_GUARD_TERM" ] || exit 88
+    pid_is_live "$matching_guard_pid" && exit 89
+
+    "$SDSYNC_TEST_PID_IDENTITY_CHILD" finite \
+        "$SDSYNC_TEST_MISMATCH_GUARD_SLEEP_READY" "$SDSYNC_TEST_MISMATCH_GUARD_SLEEP_TERM" &
+    mismatch_guard_sleep_pid=$!
+    pid_probe_wait_ready "$SDSYNC_TEST_MISMATCH_GUARD_SLEEP_READY" "$mismatch_guard_sleep_pid"
+    capture_work_child_identity "$mismatch_guard_sleep_pid" "$pid_probe_boot" || exit 106
+    mismatch_guard_sleep_start=$captured_work_child_start
+    mismatch_guard_sleep_boot=$captured_work_child_boot
+    work_child_identity_is_running "$mismatch_guard_sleep_pid" \
+        "$mismatch_guard_sleep_start" "$mismatch_guard_sleep_boot" || exit 107
+    runner_guard_sleep_start=$((mismatch_guard_sleep_start + 1))
+    runner_guard_sleep_boot=$mismatch_guard_sleep_boot
+    runner_guard_sleep_pid=$mismatch_guard_sleep_pid
+    stop_runner_guard_sleep
+    [ ! -e "$SDSYNC_TEST_MISMATCH_GUARD_SLEEP_TERM" ] || exit 108
+    pid_is_live "$mismatch_guard_sleep_pid" && exit 109
+
+    "$SDSYNC_TEST_PID_IDENTITY_CHILD" cooperative \
+        "$SDSYNC_TEST_MATCHING_GUARD_SLEEP_READY" "$SDSYNC_TEST_MATCHING_GUARD_SLEEP_TERM" &
+    matching_guard_sleep_pid=$!
+    pid_probe_wait_ready "$SDSYNC_TEST_MATCHING_GUARD_SLEEP_READY" "$matching_guard_sleep_pid"
+    capture_work_child_identity "$matching_guard_sleep_pid" "$pid_probe_boot" || exit 110
+    runner_guard_sleep_start=$captured_work_child_start
+    runner_guard_sleep_boot=$captured_work_child_boot
+    runner_guard_sleep_pid=$matching_guard_sleep_pid
+    stop_runner_guard_sleep
+    [ -f "$SDSYNC_TEST_MATCHING_GUARD_SLEEP_TERM" ] || exit 111
+    pid_is_live "$matching_guard_sleep_pid" && exit 112
+
+    "$SDSYNC_TEST_PID_IDENTITY_CHILD" finite \
+        "$SDSYNC_TEST_MISMATCH_SLEEP_READY" "$SDSYNC_TEST_MISMATCH_SLEEP_TERM" &
+    mismatch_sleep_pid=$!
+    pid_probe_wait_ready "$SDSYNC_TEST_MISMATCH_SLEEP_READY" "$mismatch_sleep_pid"
+    capture_work_child_identity "$mismatch_sleep_pid" "$pid_probe_boot" || exit 113
+    mismatch_sleep_start=$captured_work_child_start
+    mismatch_sleep_boot=$captured_work_child_boot
+    work_child_identity_is_running "$mismatch_sleep_pid" \
+        "$mismatch_sleep_start" "$mismatch_sleep_boot" || exit 114
+    sleep_pid_start=$((mismatch_sleep_start + 1))
+    sleep_pid_boot=$mismatch_sleep_boot
+    sleep_pid=$mismatch_sleep_pid
+    signal_controller_sleep
+    [ ! -e "$SDSYNC_TEST_MISMATCH_SLEEP_TERM" ] || exit 115
+    pid_is_live "$mismatch_sleep_pid" || exit 116
+    wait "$mismatch_sleep_pid"
+    [ ! -e "$SDSYNC_TEST_MISMATCH_SLEEP_TERM" ] || exit 117
+    sleep_pid=
+    sleep_pid_start=
+    sleep_pid_boot=
+
+    "$SDSYNC_TEST_PID_IDENTITY_CHILD" cooperative \
+        "$SDSYNC_TEST_MATCHING_SLEEP_READY" "$SDSYNC_TEST_MATCHING_SLEEP_TERM" &
+    matching_sleep_pid=$!
+    pid_probe_wait_ready "$SDSYNC_TEST_MATCHING_SLEEP_READY" "$matching_sleep_pid"
+    capture_work_child_identity "$matching_sleep_pid" "$pid_probe_boot" || exit 118
+    sleep_pid_start=$captured_work_child_start
+    sleep_pid_boot=$captured_work_child_boot
+    sleep_pid=$matching_sleep_pid
+    signal_controller_sleep
+    wait "$matching_sleep_pid" 2>/dev/null || true
+    [ -f "$SDSYNC_TEST_MATCHING_SLEEP_TERM" ] || exit 119
+    pid_is_live "$matching_sleep_pid" && exit 120
+    sleep_pid=
+    sleep_pid_start=
+    sleep_pid_boot=
+
+    "$SDSYNC_TEST_PID_IDENTITY_CHILD" finite \
+        "$SDSYNC_TEST_MISMATCH_ACTIVE_READY" "$SDSYNC_TEST_MISMATCH_ACTIVE_TERM" &
+    mismatch_active_pid=$!
+    "$SDSYNC_TEST_PID_IDENTITY_CHILD" finite \
+        "$SDSYNC_TEST_MISMATCH_CONTROL_READY" "$SDSYNC_TEST_MISMATCH_CONTROL_TERM" &
+    mismatch_control_pid=$!
+    pid_probe_wait_ready "$SDSYNC_TEST_MISMATCH_ACTIVE_READY" "$mismatch_active_pid"
+    pid_probe_wait_ready "$SDSYNC_TEST_MISMATCH_CONTROL_READY" "$mismatch_control_pid"
+    capture_work_child_identity "$mismatch_active_pid" "$pid_probe_boot" || exit 90
+    mismatch_active_start=$captured_work_child_start
+    mismatch_active_boot=$captured_work_child_boot
+    capture_work_child_identity "$mismatch_control_pid" "$pid_probe_boot" || exit 91
+    mismatch_control_start=$captured_work_child_start
+    mismatch_control_boot=$captured_work_child_boot
+    work_child_identity_is_running "$mismatch_active_pid" \
+        "$mismatch_active_start" "$mismatch_active_boot" || exit 92
+    work_child_identity_is_running "$mismatch_control_pid" \
+        "$mismatch_control_start" "$mismatch_control_boot" || exit 93
+    active_pid_start=$((mismatch_active_start + 1))
+    active_pid_boot=$mismatch_active_boot
+    active_pid=$mismatch_active_pid
+    control_pid_start=$((mismatch_control_start + 1))
+    control_pid_boot=$mismatch_control_boot
+    control_pid=$mismatch_control_pid
+    stop_work_children_bounded
+    [ ! -e "$SDSYNC_TEST_MISMATCH_ACTIVE_TERM" ] || exit 94
+    [ ! -e "$SDSYNC_TEST_MISMATCH_CONTROL_TERM" ] || exit 95
+    pid_is_live "$mismatch_active_pid" || exit 96
+    pid_is_live "$mismatch_control_pid" || exit 97
+    wait "$mismatch_active_pid"
+    wait "$mismatch_control_pid"
+    [ ! -e "$SDSYNC_TEST_MISMATCH_ACTIVE_TERM" ] || exit 98
+    [ ! -e "$SDSYNC_TEST_MISMATCH_CONTROL_TERM" ] || exit 99
+    active_pid=
+    active_pid_start=
+    active_pid_boot=
+    control_pid=
+    control_pid_start=
+    control_pid_boot=
+
+    "$SDSYNC_TEST_PID_IDENTITY_CHILD" stubborn \
+        "$SDSYNC_TEST_MATCHING_ACTIVE_READY" "$SDSYNC_TEST_MATCHING_ACTIVE_TERM" &
+    matching_active_pid=$!
+    "$SDSYNC_TEST_PID_IDENTITY_CHILD" stubborn \
+        "$SDSYNC_TEST_MATCHING_CONTROL_READY" "$SDSYNC_TEST_MATCHING_CONTROL_TERM" &
+    matching_control_pid=$!
+    pid_probe_wait_ready "$SDSYNC_TEST_MATCHING_ACTIVE_READY" "$matching_active_pid"
+    pid_probe_wait_ready "$SDSYNC_TEST_MATCHING_CONTROL_READY" "$matching_control_pid"
+    capture_work_child_identity "$matching_active_pid" "$pid_probe_boot" || exit 100
+    active_pid_start=$captured_work_child_start
+    active_pid_boot=$captured_work_child_boot
+    active_pid=$matching_active_pid
+    capture_work_child_identity "$matching_control_pid" "$pid_probe_boot" || exit 101
+    control_pid_start=$captured_work_child_start
+    control_pid_boot=$captured_work_child_boot
+    control_pid=$matching_control_pid
+    matching_stop_started=$(date +%s)
+    stop_work_children_bounded
+    matching_stop_finished=$(date +%s)
+    printf '%s\n' "$((matching_stop_finished - matching_stop_started))" \
+        > "$SDSYNC_TEST_MATCHING_STOP_DURATION"
+    wait "$matching_active_pid" 2>/dev/null || true
+    wait "$matching_control_pid" 2>/dev/null || true
+    [ -f "$SDSYNC_TEST_MATCHING_ACTIVE_TERM" ] || exit 102
+    [ -f "$SDSYNC_TEST_MATCHING_CONTROL_TERM" ] || exit 103
+    pid_is_live "$matching_active_pid" && exit 104
+    pid_is_live "$matching_control_pid" && exit 105
+    exit 0
+fi
+
+cleanup_controller() {
+'''
+        controller.write_text(
+            controller_source.replace(probe_needle, probe, 1), encoding="utf-8"
+        )
+        controller.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(controller, self.drop_uid, self.drop_gid)
+        environment["SDSYNC_TEST_PID_IDENTITY_PROBE"] = "true"
+
+        process = self.shell_process(controller, extra_environment=environment)
+        started = time.monotonic()
+        try:
+            try:
+                stdout, stderr = process.communicate(timeout=12)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate(timeout=5)
+                self.fail(f"PID identity probe exceeded its bound: {stdout}{stderr}")
+            elapsed = time.monotonic() - started
+            self.assertEqual(process.returncode, 0, stdout + stderr)
+            self.assertLess(
+                elapsed,
+                11,
+                "identity probe exceeded bounded cleanup plus CI scheduling margin",
+            )
+            matching_stop_seconds = int(
+                matching_stop_duration.read_text(encoding="ascii").strip()
+            )
+            self.assertGreaterEqual(
+                matching_stop_seconds,
+                3,
+                "stubborn children did not receive the complete TERM grace",
+            )
+            self.assertLessEqual(
+                matching_stop_seconds,
+                4,
+                "stubborn-child TERM grace exceeded its direct four-second bound",
+            )
+            for name in (
+                "mismatch_guard",
+                "mismatch_guard_sleep",
+                "mismatch_sleep",
+                "mismatch_active",
+                "mismatch_control",
+            ):
+                self.assertFalse(
+                    term_paths[name].exists(),
+                    f"identity-mismatched {name} process received TERM",
+                )
+            for name in (
+                "matching_guard",
+                "matching_guard_sleep",
+                "matching_sleep",
+                "matching_active",
+                "matching_control",
+            ):
+                self.assertTrue(
+                    term_paths[name].is_file(),
+                    f"identity-matching {name} process did not receive TERM",
+                )
+            for ready in ready_paths.values():
+                pid = int(ready.read_text(encoding="ascii").strip())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=5)
+            for ready in ready_paths.values():
+                if not ready.is_file():
+                    continue
+                try:
+                    os.kill(int(ready.read_text(encoding="ascii").strip()), signal.SIGKILL)
+                except (ProcessLookupError, ValueError):
+                    pass
+
+    def test_controller_capture_failure_aborts_gated_children_before_exec(self) -> None:
+        command = self.root / "admission-real-command"
+        command.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            ': > "$1"\n'
+            'printf "%s\\n" "$$" > "$2"\n',
+            encoding="utf-8",
+        )
+        command.chmod(0o755)
+        mismatch_child = self.root / "admission-mismatch-child"
+        mismatch_child.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            'trap \': > "$2"; exit 143\' TERM\n'
+            ': > "$1"\n'
+            "/bin/sleep 3\n",
+            encoding="utf-8",
+        )
+        mismatch_child.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(command, self.drop_uid, self.drop_gid)
+            os.chown(mismatch_child, self.drop_uid, self.drop_gid)
+
+        controller = self.real_target / "libexec/sdsync-controller"
+        controller_source = controller.read_text(encoding="utf-8")
+        capture_definition = "capture_work_child_identity() {\n"
+        capture_read = (
+            '                IFS= read -r waited_admission_decision < '
+            '"$waited_admission_path" || return 1\n'
+        )
+        wrapper_assignment = "    launched_admission_pid=$!\n"
+        probe_needle = "trap cleanup_controller 0\n\n"
+        for needle in (
+            capture_definition,
+            capture_read,
+            wrapper_assignment,
+            probe_needle,
+        ):
+            self.assertEqual(controller_source.count(needle), 1, needle)
+        controller_source = controller_source.replace(
+            capture_definition,
+            "capture_work_child_identity_real() {\n",
+            1,
+        ).replace(
+            capture_read,
+            capture_read
+            + '                if [ "$waited_admission_decision" = abort ] '
+            + '&& [ -n "${SDSYNC_TEST_CAPTURE_ABORT_SEEN:-}" ]; then\n'
+            + '                    : > "$SDSYNC_TEST_CAPTURE_ABORT_SEEN"\n'
+            + '                    while [ ! -e "$SDSYNC_TEST_CAPTURE_ABORT_RELEASE" ]; do '
+            + "/bin/sleep 0; done\n"
+            + "                fi\n",
+            1,
+        ).replace(
+            wrapper_assignment,
+            wrapper_assignment
+            + '    [ -z "${SDSYNC_TEST_CAPTURE_WRAPPER_PID:-}" ] || '
+            + 'printf \'%s\\n\' "$launched_admission_pid" '
+            + '> "$SDSYNC_TEST_CAPTURE_WRAPPER_PID"\n',
+            1,
+        )
+        probe = r'''trap cleanup_controller 0
+
+if [ "${SDSYNC_TEST_CAPTURE_FAILURE_PROBE:-false}" = true ]; then
+    capture_work_child_identity() { return 1; }
+    capture_probe_slot=${SDSYNC_TEST_CAPTURE_SLOT:?}
+    if [ "$capture_probe_slot" = sleep ]; then
+        "$SDSYNC_TEST_CAPTURE_MISMATCH_CHILD" \
+            "$SDSYNC_TEST_CAPTURE_MISMATCH_READY" \
+            "$SDSYNC_TEST_CAPTURE_MISMATCH_TERM" &
+        capture_probe_mismatch_pid=$!
+        while [ ! -f "$SDSYNC_TEST_CAPTURE_MISMATCH_READY" ]; do /bin/sleep 0; done
+        capture_probe_boot=$(boot_identity) || exit 160
+        capture_work_child_identity_real "$capture_probe_mismatch_pid" \
+            "$capture_probe_boot" || exit 161
+        sleep_pid_start=$((captured_work_child_start + 1))
+        sleep_pid_boot=$captured_work_child_boot
+        sleep_pid=$capture_probe_mismatch_pid
+    fi
+    capture_probe_rc=0
+    launch_admitted_child "$capture_probe_slot" "forced_$capture_probe_slot" \
+        "$SDSYNC_TEST_CAPTURE_COMMAND" "$SDSYNC_TEST_CAPTURE_EXEC" \
+        "$SDSYNC_TEST_CAPTURE_EXEC_PID" || capture_probe_rc=$?
+    [ "$capture_probe_rc" -eq 73 ] || exit 162
+    [ "$admitted_child_status" = capture_failed ] || exit 163
+    [ ! -e "$SDSYNC_TEST_CAPTURE_EXEC" ] || exit 164
+    case $capture_probe_slot in
+        active) [ -z "$active_pid" ] && [ -z "$active_pid_start" ] && [ -z "$active_pid_boot" ] || exit 165 ;;
+        control) [ -z "$control_pid" ] && [ -z "$control_pid_start" ] && [ -z "$control_pid_boot" ] || exit 166 ;;
+        sleep)
+            [ "$sleep_pid" = "$capture_probe_mismatch_pid" ] || exit 167
+            wait "$capture_probe_mismatch_pid"
+            [ ! -e "$SDSYNC_TEST_CAPTURE_MISMATCH_TERM" ] || exit 168
+            sleep_pid=
+            sleep_pid_start=
+            sleep_pid_boot=
+            ;;
+        *) exit 169 ;;
+    esac
+    for capture_probe_gate in "$runtime_root"/.child-admission.*; do
+        [ -e "$capture_probe_gate" ] || [ -L "$capture_probe_gate" ] || continue
+        exit 170
+    done
+    trap - 0
+    exit 0
+fi
+
+'''
+        controller.write_text(
+            controller_source.replace(probe_needle, probe, 1), encoding="utf-8"
+        )
+        controller.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(controller, self.drop_uid, self.drop_gid)
+
+        for slot in ("control", "active", "sleep"):
+            exec_marker = self.root / f"capture-{slot}.exec"
+            exec_pid = self.root / f"capture-{slot}.exec-pid"
+            wrapper_pid_path = self.root / f"capture-{slot}.wrapper-pid"
+            environment = {
+                "SDSYNC_TEST_CAPTURE_FAILURE_PROBE": "true",
+                "SDSYNC_TEST_CAPTURE_SLOT": slot,
+                "SDSYNC_TEST_CAPTURE_COMMAND": str(command),
+                "SDSYNC_TEST_CAPTURE_EXEC": str(exec_marker),
+                "SDSYNC_TEST_CAPTURE_EXEC_PID": str(exec_pid),
+                "SDSYNC_TEST_CAPTURE_WRAPPER_PID": str(wrapper_pid_path),
+            }
+            process: subprocess.Popen[str] | None = None
+            if slot == "sleep":
+                abort_seen = self.root / "capture-sleep.abort-seen"
+                abort_release = self.root / "capture-sleep.abort-release"
+                mismatch_ready = self.root / "capture-sleep.mismatch-ready"
+                mismatch_term = self.root / "capture-sleep.mismatch-term"
+                environment.update(
+                    {
+                        "SDSYNC_TEST_CAPTURE_ABORT_SEEN": str(abort_seen),
+                        "SDSYNC_TEST_CAPTURE_ABORT_RELEASE": str(abort_release),
+                        "SDSYNC_TEST_CAPTURE_MISMATCH_CHILD": str(mismatch_child),
+                        "SDSYNC_TEST_CAPTURE_MISMATCH_READY": str(mismatch_ready),
+                        "SDSYNC_TEST_CAPTURE_MISMATCH_TERM": str(mismatch_term),
+                    }
+                )
+                process = self.shell_process(controller, extra_environment=environment)
+                self.wait_for_path(abort_seen, "capture failure did not commit abort")
+                os.kill(process.pid, signal.SIGUSR2)
+                time.sleep(0.05)
+                abort_release.write_text("release\n", encoding="ascii")
+                stdout, stderr = process.communicate(timeout=8)
+                self.assertEqual(process.returncode, 0, stdout + stderr)
+                self.assertFalse(mismatch_term.exists())
+            else:
+                completed = self.shell(
+                    controller, extra_environment=environment, timeout=8
+                )
+                self.assertEqual(
+                    completed.returncode, 0, completed.stdout + completed.stderr
+                )
+            self.assertFalse(exec_marker.exists(), f"{slot} command escaped its gate")
+            self.assertFalse(exec_pid.exists(), f"{slot} command published an exec PID")
+            wrapper_pid = int(wrapper_pid_path.read_text(encoding="ascii").strip())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(wrapper_pid, 0)
+            self.assertEqual(list((self.real_var / "run").glob(".child-admission.*")), [])
+
+    def test_controller_admission_preflight_retry_commit_and_exec_contract(self) -> None:
+        command = self.root / "admission-contract-command"
+        command.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            'printf "%s\\n" "$$" > "$1"\n'
+            ': > "$2"\n',
+            encoding="utf-8",
+        )
+        command.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(command, self.drop_uid, self.drop_gid)
+
+        controller = self.real_target / "libexec/sdsync-controller"
+        controller_source = controller.read_text(encoding="utf-8")
+        capture_attempt = (
+            '        captured_work_child_start=$(process_start_time '
+            '"$captured_work_child_pid" 2>/dev/null || true)\n'
+        )
+        publish_definition = "publish_child_admission() {\n"
+        wrapper_assignment = "    launched_admission_pid=$!\n"
+        stop_signal = (
+            '        kill -TERM "$stopped_admission_pid" 2>/dev/null || true\n'
+        )
+        probe_needle = "trap cleanup_controller 0\n\n"
+        for needle in (
+            capture_attempt,
+            publish_definition,
+            wrapper_assignment,
+            stop_signal,
+            probe_needle,
+        ):
+            self.assertEqual(controller_source.count(needle), 1, needle)
+        controller_source = controller_source.replace(
+            capture_attempt,
+            '        if [ "${SDSYNC_TEST_ADMISSION_MODE:-}" = retry ]; then\n'
+            + '            capture_test_count=0\n'
+            + '            [ ! -f "$SDSYNC_TEST_ADMISSION_CAPTURE_COUNT" ] || '
+            + 'IFS= read -r capture_test_count < "$SDSYNC_TEST_ADMISSION_CAPTURE_COUNT"\n'
+            + '            capture_test_count=$((capture_test_count + 1))\n'
+            + '            printf \'%s\\n\' "$capture_test_count" '
+            + '> "$SDSYNC_TEST_ADMISSION_CAPTURE_COUNT"\n'
+            + '            if [ "$capture_test_count" -lt 10 ]; then\n'
+            + '                captured_work_child_start=\n'
+            + "            else\n"
+            + capture_attempt
+            + "            fi\n"
+            + "        else\n"
+            + capture_attempt
+            + "        fi\n",
+            1,
+        ).replace(
+            publish_definition,
+            "publish_child_admission_real() {\n",
+            1,
+        ).replace(
+            wrapper_assignment,
+            wrapper_assignment
+            + '    [ -z "${SDSYNC_TEST_ADMISSION_WRAPPER_PID:-}" ] || '
+            + 'printf \'%s\\n\' "$launched_admission_pid" '
+            + '> "$SDSYNC_TEST_ADMISSION_WRAPPER_PID"\n',
+            1,
+        ).replace(
+            stop_signal,
+            '        [ -z "${SDSYNC_TEST_ADMISSION_TERM:-}" ] || '
+            + ': > "$SDSYNC_TEST_ADMISSION_TERM"\n'
+            + stop_signal,
+            1,
+        )
+        probe = r'''trap cleanup_controller 0
+
+if [ "${SDSYNC_TEST_ADMISSION_CONTRACT_PROBE:-false}" = true ]; then
+    admission_contract_mode=${SDSYNC_TEST_ADMISSION_MODE:?}
+    publish_child_admission() {
+        if [ "$admission_contract_mode" = commit_failure ] && [ "$2" = go ]; then
+            return 73
+        fi
+        publish_child_admission_real "$@"
+    }
+    if [ "$admission_contract_mode" = preflight ]; then
+        boot_identity() { return 73; }
+    fi
+    : > "$SDSYNC_TEST_ADMISSION_READY"
+    while [ ! -e "$SDSYNC_TEST_ADMISSION_RELEASE" ]; do /bin/sleep 0; done
+    admission_contract_rc=0
+    launch_admitted_child active "contract_$admission_contract_mode" \
+        "$SDSYNC_TEST_ADMISSION_COMMAND" "$SDSYNC_TEST_ADMISSION_EXEC_PID" \
+        "$SDSYNC_TEST_ADMISSION_EXEC" || admission_contract_rc=$?
+    case $admission_contract_mode in
+        success|retry)
+            [ "$admission_contract_rc" -eq 0 ] || exit 171
+            [ "$admitted_child_status" = started ] || exit 172
+            [ "$active_pid" = "$admitted_child_pid" ] || exit 173
+            [ "$active_pid_start" = "$launched_admission_start" ] || exit 174
+            [ "$active_pid_boot" = "$launched_admission_boot" ] || exit 175
+            reap_direct_child_interruption_safe "$active_pid"
+            [ "$(cat "$SDSYNC_TEST_ADMISSION_EXEC_PID")" = "$active_pid" ] || exit 176
+            active_pid=
+            active_pid_start=
+            active_pid_boot=
+            ;;
+        preflight)
+            [ "$admission_contract_rc" -eq 73 ] || exit 177
+            [ "$admitted_child_status" = preflight_failed ] || exit 178
+            [ ! -e "$SDSYNC_TEST_ADMISSION_WRAPPER_PID" ] || exit 179
+            [ ! -e "$SDSYNC_TEST_ADMISSION_EXEC" ] || exit 180
+            ;;
+        commit_failure)
+            [ "$admission_contract_rc" -eq 73 ] || exit 181
+            [ "$admitted_child_status" = admission_failed ] || exit 182
+            [ -z "$active_pid" ] && [ -z "$active_pid_start" ] \
+                && [ -z "$active_pid_boot" ] || exit 183
+            [ -f "$SDSYNC_TEST_ADMISSION_TERM" ] || exit 184
+            [ ! -e "$SDSYNC_TEST_ADMISSION_EXEC" ] || exit 185
+            ;;
+        *) exit 186 ;;
+    esac
+    for admission_contract_gate in "$runtime_root"/.child-admission.*; do
+        [ -e "$admission_contract_gate" ] || [ -L "$admission_contract_gate" ] || continue
+        exit 187
+    done
+    trap - 0
+    exit 0
+fi
+
+'''
+        controller.write_text(
+            controller_source.replace(probe_needle, probe, 1), encoding="utf-8"
+        )
+        controller.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(controller, self.drop_uid, self.drop_gid)
+
+        for mode in ("preflight", "success", "retry", "commit_failure"):
+            ready = self.root / f"admission-{mode}.ready"
+            release = self.root / f"admission-{mode}.release"
+            exec_marker = self.root / f"admission-{mode}.exec"
+            exec_pid = self.root / f"admission-{mode}.exec-pid"
+            wrapper_pid_path = self.root / f"admission-{mode}.wrapper-pid"
+            term_marker = self.root / f"admission-{mode}.term"
+            capture_count = self.root / f"admission-{mode}.capture-count"
+            environment = {
+                "SDSYNC_TEST_ADMISSION_CONTRACT_PROBE": "true",
+                "SDSYNC_TEST_ADMISSION_MODE": mode,
+                "SDSYNC_TEST_ADMISSION_COMMAND": str(command),
+                "SDSYNC_TEST_ADMISSION_READY": str(ready),
+                "SDSYNC_TEST_ADMISSION_RELEASE": str(release),
+                "SDSYNC_TEST_ADMISSION_EXEC": str(exec_marker),
+                "SDSYNC_TEST_ADMISSION_EXEC_PID": str(exec_pid),
+                "SDSYNC_TEST_ADMISSION_WRAPPER_PID": str(wrapper_pid_path),
+                "SDSYNC_TEST_ADMISSION_TERM": str(term_marker),
+                "SDSYNC_TEST_ADMISSION_CAPTURE_COUNT": str(capture_count),
+            }
+            process = self.shell_process(controller, extra_environment=environment)
+            self.wait_for_path(ready, f"{mode} admission probe did not reach launch")
+            launch_started = time.monotonic()
+            release.write_text("release\n", encoding="ascii")
+            stdout, stderr = process.communicate(timeout=8)
+            launch_elapsed = time.monotonic() - launch_started
+            self.assertEqual(process.returncode, 0, stdout + stderr)
+            if mode in {"success", "retry", "commit_failure"}:
+                wrapper_pid = int(wrapper_pid_path.read_text(encoding="ascii").strip())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(wrapper_pid, 0)
+            if mode == "success":
+                self.assertLess(
+                    launch_elapsed,
+                    0.9,
+                    "ordinary gate admission fell into the one-second fallback",
+                )
+            if mode == "retry":
+                self.assertEqual(capture_count.read_text(encoding="ascii").strip(), "10")
+            self.assertEqual(list((self.real_var / "run").glob(".child-admission.*")), [])
+
+    def test_runner_guard_capture_and_atomic_admission_fail_closed(self) -> None:
+        controller = self.real_target / "libexec/sdsync-controller"
+        controller_source = controller.read_text(encoding="utf-8")
+        capture_definition = "capture_work_child_identity() {\n"
+        publish_definition = "publish_child_admission() {\n"
+        guard_assignment = "    launched_runner_wait_guard_pid=$!\n"
+        guard_admitted = (
+            '        wait_for_child_admission "$runner_guard_admission" '
+            '"$runner_guard_parent" \\\n'
+            '            "$runner_guard_parent_start" '
+            '"$runner_guard_parent_boot" || exit 0\n'
+        )
+        guard_signal = '        kill -TERM "$runner_guard_pid" 2>/dev/null || true\n'
+        poll_handler = (
+            "request_runner_wait_poll() {\n"
+            "    child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))\n"
+        )
+        probe_needle = "trap cleanup_controller 0\n\n"
+        for needle in (
+            capture_definition,
+            publish_definition,
+            guard_assignment,
+            guard_admitted,
+            guard_signal,
+            poll_handler,
+            probe_needle,
+        ):
+            self.assertEqual(controller_source.count(needle), 1, needle)
+        controller_source = controller_source.replace(
+            capture_definition,
+            "capture_work_child_identity_real() {\n",
+            1,
+        ).replace(
+            publish_definition,
+            "publish_child_admission_real() {\n",
+            1,
+        ).replace(
+            guard_assignment,
+            guard_assignment
+            + '    printf \'%s\\n\' "$launched_runner_wait_guard_pid" '
+            + '> "$SDSYNC_TEST_GUARD_WRAPPER_PID"\n',
+            1,
+        ).replace(
+            guard_admitted,
+            guard_admitted + '        : > "$SDSYNC_TEST_GUARD_ADMITTED"\n',
+            1,
+        ).replace(
+            guard_signal,
+            '        : > "$SDSYNC_TEST_GUARD_TERM"\n' + guard_signal,
+            1,
+        ).replace(
+            poll_handler,
+            poll_handler + '    : > "$SDSYNC_TEST_GUARD_ALARM"\n',
+            1,
+        )
+        probe = r'''trap cleanup_controller 0
+
+if [ "${SDSYNC_TEST_GUARD_FAILURE_PROBE:-false}" = true ]; then
+    guard_failure_mode=${SDSYNC_TEST_GUARD_FAILURE_MODE:?}
+    capture_work_child_identity() {
+        [ "$guard_failure_mode" != capture ] || return 1
+        capture_work_child_identity_real "$@"
+    }
+    publish_child_admission() {
+        if [ "$guard_failure_mode" = commit ] && [ "$2" = go ]; then return 73; fi
+        publish_child_admission_real "$@"
+    }
+    guard_failure_rc=0
+    start_runner_wait_guard || guard_failure_rc=$?
+    [ "$guard_failure_rc" -eq 73 ] || exit 188
+    [ -z "$runner_wait_guard_pid" ] && [ -z "$runner_wait_guard_start" ] \
+        && [ -z "$runner_wait_guard_boot" ] \
+        && [ -z "$runner_wait_guard_admission_path" ] || exit 189
+    [ ! -e "$SDSYNC_TEST_GUARD_ADMITTED" ] || exit 190
+    [ ! -e "$SDSYNC_TEST_GUARD_ALARM" ] || exit 191
+    for guard_failure_gate in "$runtime_root"/.runner-wait-guard-admit.*; do
+        [ -e "$guard_failure_gate" ] || [ -L "$guard_failure_gate" ] || continue
+        exit 192
+    done
+    case $guard_failure_mode in
+        capture) [ ! -e "$SDSYNC_TEST_GUARD_TERM" ] || exit 193 ;;
+        commit) [ -f "$SDSYNC_TEST_GUARD_TERM" ] || exit 194 ;;
+        *) exit 195 ;;
+    esac
+    trap - 0
+    exit 0
+fi
+
+'''
+        controller.write_text(
+            controller_source.replace(probe_needle, probe, 1), encoding="utf-8"
+        )
+        controller.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(controller, self.drop_uid, self.drop_gid)
+
+        for mode in ("capture", "commit"):
+            wrapper_pid_path = self.root / f"guard-{mode}.wrapper-pid"
+            admitted = self.root / f"guard-{mode}.admitted"
+            term = self.root / f"guard-{mode}.term"
+            alarm = self.root / f"guard-{mode}.alarm"
+            completed = self.shell(
+                controller,
+                extra_environment={
+                    "SDSYNC_TEST_GUARD_FAILURE_PROBE": "true",
+                    "SDSYNC_TEST_GUARD_FAILURE_MODE": mode,
+                    "SDSYNC_TEST_GUARD_WRAPPER_PID": str(wrapper_pid_path),
+                    "SDSYNC_TEST_GUARD_ADMITTED": str(admitted),
+                    "SDSYNC_TEST_GUARD_TERM": str(term),
+                    "SDSYNC_TEST_GUARD_ALARM": str(alarm),
+                },
+                timeout=8,
+            )
+            self.assertEqual(
+                completed.returncode, 0, completed.stdout + completed.stderr
+            )
+            wrapper_pid = int(wrapper_pid_path.read_text(encoding="ascii").strip())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(wrapper_pid, 0)
+            self.assertFalse(admitted.exists())
+            self.assertFalse(alarm.exists())
+            self.assertEqual(
+                list((self.real_var / "run").glob(".runner-wait-guard-admit.*")),
+                [],
+            )
+
+    def test_unexpected_controller_exit_exact_stops_and_reaps_admitted_sleep(self) -> None:
+        child = self.root / "cleanup-admitted-sleep"
+        child.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            'trap \': > "$2"; exit 143\' TERM\n'
+            'printf "%s\\n" "$$" > "$1"\n'
+            "while :; do /bin/sleep 1; done\n",
+            encoding="utf-8",
+        )
+        child.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(child, self.drop_uid, self.drop_gid)
+
+        controller = self.real_target / "libexec/sdsync-controller"
+        controller_source = controller.read_text(encoding="utf-8")
+        probe_needle = "trap cleanup_controller 0\n\n"
+        self.assertEqual(controller_source.count(probe_needle), 1)
+        self.assertIn(
+            '    if [ -n "$sleep_pid" ]; then\n'
+            "        signal_controller_sleep\n"
+            '        reap_direct_child_interruption_safe "$sleep_pid"\n',
+            controller_source,
+        )
+        probe = r'''trap cleanup_controller 0
+
+if [ "${SDSYNC_TEST_UNEXPECTED_SLEEP_EXIT:-false}" = true ]; then
+    launch_admitted_child sleep unexpected_exit "$SDSYNC_TEST_UNEXPECTED_SLEEP_CHILD" \
+        "$SDSYNC_TEST_UNEXPECTED_SLEEP_READY" "$SDSYNC_TEST_UNEXPECTED_SLEEP_TERM" \
+        || exit 196
+    [ "$sleep_pid" = "$admitted_child_pid" ] || exit 197
+    while [ ! -f "$SDSYNC_TEST_UNEXPECTED_SLEEP_READY" ]; do /bin/sleep 0; done
+    exit 42
+fi
+
+'''
+        controller.write_text(
+            controller_source.replace(probe_needle, probe, 1), encoding="utf-8"
+        )
+        controller.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(controller, self.drop_uid, self.drop_gid)
+
+        ready = self.root / "unexpected-sleep.ready"
+        term = self.root / "unexpected-sleep.term"
+        completed = self.shell(
+            controller,
+            extra_environment={
+                "SDSYNC_TEST_UNEXPECTED_SLEEP_EXIT": "true",
+                "SDSYNC_TEST_UNEXPECTED_SLEEP_CHILD": str(child),
+                "SDSYNC_TEST_UNEXPECTED_SLEEP_READY": str(ready),
+                "SDSYNC_TEST_UNEXPECTED_SLEEP_TERM": str(term),
+            },
+            timeout=8,
+        )
+        self.assertEqual(completed.returncode, 42, completed.stdout + completed.stderr)
+        self.assertTrue(term.is_file(), "unexpected EXIT did not TERM the exact sleep")
+        child_pid = int(ready.read_text(encoding="ascii").strip())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(child_pid, 0)
+        self.assertEqual(list((self.real_var / "run").glob(".child-admission.*")), [])
+
+    def test_connection_job_runs_during_a_held_scheduled_sync(self) -> None:
+        bridge_capture = self.root / "scheduled-connection-capture"
+        bridge_lock = self.root / "scheduled-connection-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode,
+            0,
+        )
+        password = self.root / "scheduled-connection-password"
+        password.write_text("test-password\n", encoding="utf-8")
+        self.assertEqual(
+            self.shell(
+                self.manager,
+                "set-password",
+                "personal",
+                "--from-file",
+                str(password),
+            ).returncode,
+            0,
+        )
+        self.assertEqual(
+            self.shell(self.manager, "enable", "--interval", "60").returncode,
+            0,
+        )
+        core_pid_file = self.root / "scheduled-connection-core.pid"
+        fast_environment = self.fast_clock_environment(step=61)
+        fast_environment.update(
+            {
+                "SDSYNC_TEST_HOLD": "true",
+                "SDSYNC_TEST_CORE_PID_FILE": str(core_pid_file),
+            }
+        )
+        started = self.shell(
+            self.lifecycle,
+            "start",
+            extra_environment=fast_environment,
+            timeout=15,
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.wait_for_path(core_pid_file, "scheduled sync did not enter its held core wait")
+        core_pid = int(core_pid_file.read_text(encoding="ascii").strip())
+        controller_pid = int(
+            (self.real_var / "run/controller.pid").read_text(encoding="ascii").strip()
+        )
+        job_id = "3" * 48
+        self.write_mock_control_job(job_id, "test-profile-auth")
+        os.kill(controller_pid, signal.SIGUSR2)
+        response = self.real_var / f"control/responses/{job_id}.json"
+        self.wait_for_path(
+            response,
+            "connection job remained pending behind a scheduled sync",
+            timeout=2.0,
+        )
+        os.kill(core_pid, 0)
+        self.wait_for_absence(
+            self.real_var / f"control/processing/{job_id}.json",
+            "scheduled connection processing claim was not cleaned",
+        )
+        stopped = self.shell(
+            self.lifecycle,
+            "stop",
+            extra_environment=fast_environment,
+            timeout=15,
+        )
+        if stopped.returncode != 0:
+            state_path = self.real_var / "state/controller.state"
+            state_text = (
+                state_path.read_text(encoding="utf-8") if state_path.is_file() else "missing"
+            )
+            candidate_pids = {"controller": controller_pid, "core": core_pid}
+            for label, pid_path in (
+                ("api", self.real_var / "run/api.pid"),
+                ("runner", self.real_var / "run/run.pid"),
+            ):
+                if pid_path.is_file():
+                    try:
+                        candidate_pids[label] = int(
+                            pid_path.read_text(encoding="ascii").strip()
+                        )
+                    except ValueError:
+                        pass
+            for line in state_text.splitlines():
+                if line.startswith("active_pid="):
+                    try:
+                        candidate_pids["state_active"] = int(line.split("=", 1)[1])
+                    except ValueError:
+                        pass
+            topology = []
+            for label, pid in candidate_pids.items():
+                try:
+                    stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+                    status_text = Path(f"/proc/{pid}/status").read_text(encoding="ascii")
+                    state = stat_text.rsplit(") ", 1)[1].split()[0]
+                    ppid = next(
+                        line.split(":", 1)[1].strip()
+                        for line in status_text.splitlines()
+                        if line.startswith("PPid:")
+                    )
+                    topology.append(f"{label}={pid}:live:state={state}:ppid={ppid}")
+                except (FileNotFoundError, ProcessLookupError, StopIteration):
+                    topology.append(f"{label}={pid}:absent")
+            controller_log = self.real_var / "log/controller.log"
+            log_text = (
+                controller_log.read_text(encoding="utf-8")[-12000:]
+                if controller_log.is_file()
+                else "missing"
+            )
+            self.fail(
+                f"stop failed: {stopped.stdout}{stopped.stderr}\n"
+                f"state:\n{state_text}\n"
+                f"topology: {'; '.join(topology)}\n"
+                f"controller.log tail:\n{log_text}"
+            )
+        with self.assertRaises(ProcessLookupError):
+            os.kill(core_pid, 0)
+
+    def test_routine_wait_services_connections_without_skipping_a_mutation_head(self) -> None:
+        bridge_capture = self.root / "routine-connection-capture"
+        bridge_lock = self.root / "routine-connection-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode,
+            0,
+        )
+        password = self.root / "routine-connection-password"
+        password.write_text("test-password\n", encoding="utf-8")
+        self.assertEqual(
+            self.shell(
+                self.manager,
+                "set-password",
+                "personal",
+                "--from-file",
+                str(password),
+            ).returncode,
+            0,
+        )
+        routine, _ = self.api(
+            "routine",
+            "--profile",
+            "personal",
+            "--enabled",
+            "true",
+            "--action",
+            "sync",
+            "--mode",
+            "daily",
+            "--weekdays",
+            "1,2,3,4,5,6,7",
+            "--time-window-start",
+            "00:00",
+            "--time-window-end",
+            "23:59",
+            "--retry-count",
+            "1",
+            "--retry-backoff-seconds",
+            "30",
+            "--retry-exponential",
+            "true",
+            "--allow-delete",
+            "false",
+            "--max-total-delete",
+            "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stdout + routine.stderr)
+        core_pid_file = self.root / "routine-connection-core.pid"
+        held_environment = {
+            "SDSYNC_TEST_HOLD": "true",
+            "SDSYNC_TEST_CORE_PID_FILE": str(core_pid_file),
+        }
+        started = self.shell(
+            self.lifecycle,
+            "start",
+            extra_environment=held_environment,
+            timeout=15,
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.wait_for_path(core_pid_file, "routine did not enter its held core wait")
+        core_pid = int(core_pid_file.read_text(encoding="ascii").strip())
+        controller_pid = int(
+            (self.real_var / "run/controller.pid").read_text(encoding="ascii").strip()
+        )
+
+        first_connection_id = "3" * 48
+        self.write_mock_control_job(first_connection_id, "browse-remote")
+        os.kill(controller_pid, signal.SIGUSR2)
+        self.wait_for_path(
+            self.real_var / f"control/responses/{first_connection_id}.json",
+            "connection job remained pending behind a routine",
+            timeout=2.0,
+        )
+        os.kill(core_pid, 0)
+
+        mutation_id = "4" * 48
+        blocked_connection_id = "5" * 48
+        mutation_request = self.write_mock_control_job(mutation_id, "security-policy")
+        blocked_request = self.write_mock_control_job(blocked_connection_id, "test-profile-auth")
+        os.kill(controller_pid, signal.SIGUSR2)
+        time.sleep(0.25)
+        self.assertTrue(mutation_request.is_file())
+        self.assertTrue(blocked_request.is_file())
+        self.assertFalse(
+            (self.real_var / f"control/responses/{blocked_connection_id}.json").exists(),
+            "interactive servicing skipped an earlier serialized mutation",
+        )
+        records = bridge_capture.read_text(encoding="utf-8").splitlines()
+        self.assertEqual([record.split()[0] for record in records], [first_connection_id])
+        stopped = self.shell(
+            self.lifecycle,
+            "stop",
+            extra_environment=held_environment,
+            timeout=15,
+        )
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(core_pid, 0)
+
     def test_controller_private_queue_is_sequential_bounded_and_rejects_unsafe_entries(self) -> None:
         bridge_capture = self.root / "bridge-capture"
         bridge_lock = self.root / "bridge-lock"
@@ -5766,7 +7730,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertFalse(any(record == "overlap" for record in records))
         parsed = [record.split() for record in records]
         self.assertEqual([record[0] for record in parsed[:2]], [first_id, secret_id])
-        self.assertGreaterEqual(int(parsed[1][1]) - int(parsed[0][1]), 1)
+        dispatch_gap_ns = int(parsed[1][1]) - int(parsed[0][1])
+        self.assertGreaterEqual(dispatch_gap_ns, 80_000_000)
         self.assertEqual(parsed[1][-1], "yes")
         if os.getuid() == 0:
             self.assertEqual(parsed[0][2], str(self.drop_uid))
@@ -7531,6 +9496,140 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         # tearDown exercises lifecycle stop, so restore its marker-capable API mock.
         self.write_api_mock()
 
+    def test_controller_stop_identity_treats_only_exact_zombie_as_terminal(self) -> None:
+        controller = self.real_target / "libexec/sdsync-controller"
+        controller.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            ': > "$SDSYNC_TEST_EXACT_STATUS_READY"\n'
+            'while [ ! -e "$SDSYNC_TEST_EXACT_STATUS_RELEASE" ]; do /bin/sleep 0; done\n',
+            encoding="utf-8",
+        )
+        controller.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(controller, self.drop_uid, self.drop_gid)
+
+        zombie_parent = self.root / "exact-status-zombie-parent"
+        zombie_parent.write_text(
+            f"#!{sys.executable}\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            "import sys\n"
+            "import time\n"
+            "ready, release = map(Path, sys.argv[1:])\n"
+            "child = os.fork()\n"
+            "if child == 0:\n"
+            "    os._exit(0)\n"
+            "for _ in range(1000):\n"
+            "    try:\n"
+            "        state = Path(f'/proc/{child}/stat').read_text(encoding='ascii').rsplit(') ', 1)[1][0]\n"
+            "    except FileNotFoundError:\n"
+            "        raise SystemExit(80)\n"
+            "    if state in {'Z', 'X', 'x'}:\n"
+            "        break\n"
+            "    time.sleep(0.001)\n"
+            "else:\n"
+            "    raise SystemExit(81)\n"
+            "ready.write_text(f'{child}\\n', encoding='ascii')\n"
+            "while not release.exists():\n"
+            "    time.sleep(0.001)\n"
+            "os.waitpid(child, 0)\n",
+            encoding="utf-8",
+        )
+        zombie_parent.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(zombie_parent, self.drop_uid, self.drop_gid)
+
+        lifecycle_source = self.lifecycle.read_text(encoding="utf-8")
+        self.assertEqual(
+            lifecycle_source.count(
+                '                    exact_controller_process_status "$saved_pid" '
+                '"$saved_controller_start" \\\n'
+                '                        "$saved_controller_boot" || '
+                "controller_wait_status=$?"
+            ),
+            1,
+            "the production controller stop loop must classify the exact tuple",
+        )
+        helper_start = lifecycle_source.index("exact_controller_process_status() {\n")
+        helper_end = lifecycle_source.index(
+            "\n}\n\nread_failed_start_child_marker() {", helper_start
+        ) + len("\n}\n")
+        helper_source = lifecycle_source[helper_start:helper_end]
+        self.assertIn('case $exact_status_state_recheck in', helper_source)
+        self.assertIn('Z|X|x) return 1', helper_source)
+
+        harness = self.root / "exact-controller-status.sh"
+        harness.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            '. "$SDSYNC_TEST_COMMON"\n'
+            '. "$SDSYNC_TEST_RUNTIME_COMMON"\n'
+            "require_package_identity\n"
+            + helper_source
+            + "\n"
+            "status_mode=$1\n"
+            'if [ "$status_mode" = exact_zombie ] || [ "$status_mode" = reused_zombie ]; then\n'
+            '  "$SDSYNC_TEST_ZOMBIE_PARENT" "$SDSYNC_TEST_EXACT_STATUS_READY" '
+            '"$SDSYNC_TEST_EXACT_STATUS_RELEASE" &\n'
+            "  status_owner_pid=$!\n"
+            '  while [ ! -s "$SDSYNC_TEST_EXACT_STATUS_READY" ]; do /bin/sleep 0; done\n'
+            '  IFS= read -r status_pid < "$SDSYNC_TEST_EXACT_STATUS_READY"\n'
+            "else\n"
+            '  "$controller" &\n'
+            "  status_pid=$!\n"
+            '  while [ ! -e "$SDSYNC_TEST_EXACT_STATUS_READY" ]; do /bin/sleep 0; done\n'
+            "fi\n"
+            'status_start=$(process_start_time "$status_pid")\n'
+            "status_boot=$(boot_identity)\n"
+            "status_result=0\n"
+            "case $status_mode in\n"
+            '  reused_live|reused_zombie) status_argument_start=$((status_start + 1)) ;;\n'
+            "  malformed) status_argument_start=invalid ;;\n"
+            "  *) status_argument_start=$status_start ;;\n"
+            "esac\n"
+            'exact_controller_process_status "$status_pid" "$status_argument_start" '
+            '"$status_boot" || status_result=$?\n'
+            "case $status_mode in\n"
+            "  live) [ \"$status_result\" -eq 0 ] || exit 199 ;;\n"
+            "  exact_zombie) [ \"$status_result\" -eq 1 ] || exit 200 ;;\n"
+            "  reused_live|reused_zombie|malformed) "
+            '[ "$status_result" -eq 73 ] || exit 201 ;;\n'
+            "  absent) [ \"$status_result\" -eq 1 ] || exit 202 ;;\n"
+            "  *) exit 203 ;;\n"
+            "esac\n"
+            '  : > "$SDSYNC_TEST_EXACT_STATUS_RELEASE"\n'
+            'case $status_mode in\n'
+            '  exact_zombie|reused_zombie) wait "$status_owner_pid" ;;\n'
+            '  *) wait "$status_pid" ;;\n'
+            'esac\n',
+            encoding="utf-8",
+        )
+        harness.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(harness, self.drop_uid, self.drop_gid)
+
+        for mode in ("live", "exact_zombie", "reused_live", "reused_zombie", "malformed"):
+            ready = self.root / f"exact-status-{mode}.ready"
+            release = self.root / f"exact-status-{mode}.release"
+            result = self.shell(
+                harness,
+                mode,
+                extra_environment={
+                    "SDSYNC_TEST_COMMON": str(self.lifecycle_dir / "common"),
+                    "SDSYNC_TEST_RUNTIME_COMMON": str(
+                        self.real_target / "libexec/sdsync-common"
+                    ),
+                    "SDSYNC_TEST_EXACT_STATUS_READY": str(ready),
+                    "SDSYNC_TEST_EXACT_STATUS_RELEASE": str(release),
+                    "SDSYNC_TEST_ZOMBIE_PARENT": str(zombie_parent),
+                },
+                timeout=8,
+            )
+            self.assertEqual(
+                result.returncode, 0, (mode, result.stdout, result.stderr)
+            )
+
     def test_package_stop_waits_for_a_manual_foreground_run(self) -> None:
         self.assertEqual(
             self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode,
@@ -7651,7 +9750,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         controller_source = controller.read_text(encoding="utf-8")
         self.assertIn("trap request_queue_wake USR2", controller_source)
         self.assertIn(
-            'if [ "$queue_wake_requested" = true ] && pid_is_live "$sleep_pid"; then',
+            'if [ "$shutdown" = true ] || [ "$reload_requested" = true ] || \\\n'
+            '        [ "$queue_wake_requested" = true ]; then\n'
+            "        signal_controller_sleep",
             controller_source,
         )
         queue_function = controller_source[
@@ -7700,10 +9801,31 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         wake_observed = self.root / "controller-wake.observed"
         reload_observed = self.root / "controller-wake.reload"
         loop_needle = 'while [ "$shutdown" = false ]; do\n'
-        sleep_handoff_needle = '    sleep "$sleep_for" &\n    sleep_pid=$!\n'
-        wake_needle = "request_queue_wake() {\n    queue_wake_requested=true\n"
-        reload_needle = "request_reload() {\n    reload_requested=true\n"
-        for needle in (loop_needle, sleep_handoff_needle, wake_needle, reload_needle):
+        admission_handoff_needle = (
+            "    # Signal-handoff tests instrument this point. The exact tuple is published,\n"
+            "    # but the real command remains unable to exec until the atomic go commit.\n"
+        )
+        idle_needle = (
+            "    # Close every signal-before-publication race: a handler either stops the\n"
+            "    # fully published sleep tuple or leaves its latch set for this exact recheck.\n"
+        )
+        wake_needle = (
+            "request_queue_wake() {\n"
+            "    child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))\n"
+            "    queue_wake_requested=true\n"
+        )
+        reload_needle = (
+            "request_reload() {\n"
+            "    child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))\n"
+            "    reload_requested=true\n"
+        )
+        for needle in (
+            loop_needle,
+            admission_handoff_needle,
+            idle_needle,
+            wake_needle,
+            reload_needle,
+        ):
             self.assertEqual(controller_source.count(needle), 1, needle)
         controller.write_text(
             controller_source.replace(
@@ -7714,15 +9836,20 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 1,
             )
             .replace(
-                sleep_handoff_needle,
-                '    sleep "$sleep_for" &\n'
-                + '    if [ -n "${SDSYNC_TEST_QUEUE_WAKE_HANDOFF_READY:-}" ] '
+                admission_handoff_needle,
+                admission_handoff_needle
+                + '    if [ "$launched_admission_slot" = sleep ] '
+                + '&& [ -n "${SDSYNC_TEST_QUEUE_WAKE_HANDOFF_READY:-}" ] '
                 + '&& [ ! -e "$SDSYNC_TEST_QUEUE_WAKE_HANDOFF_READY" ]; then\n'
                 + '        : > "$SDSYNC_TEST_QUEUE_WAKE_HANDOFF_READY"\n'
                 + '        while [ ! -e "$SDSYNC_TEST_QUEUE_WAKE_HANDOFF_RELEASE" ]; do '
                 + '/bin/sleep 0.01; done\n'
-                + '    fi\n'
-                + '    sleep_pid=$!\n'
+                + '    fi\n',
+                1,
+            )
+            .replace(
+                idle_needle,
+                idle_needle
                 + '    [ -z "${SDSYNC_TEST_QUEUE_WAKE_IDLE:-}" ] || '
                 + ': > "$SDSYNC_TEST_QUEUE_WAKE_IDLE"\n',
                 1,
@@ -7812,7 +9939,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 time.sleep(0.01)
             self.assertTrue(
                 wake_observed.is_file(),
-                "USR2 was not handled while sleep_pid was still unpublished",
+                "USR2 was not handled before the admitted sleep received go",
             )
             self.assertFalse(idle_ready.exists(), "controller crossed the handoff too early")
             handoff_release.touch()
@@ -8075,15 +10202,11 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         runner = self.real_target / "libexec/sdsync-run"
         self.write_terminable_launch_child(runner)
         controller = self.real_target / "libexec/sdsync-controller"
-        self.instrument_launch_assignment_signal(
-            controller,
-            '        "$runner" sync all "$allow_delete" scheduled "$maximum_total" &',
-            "        active_pid=$!",
-            "        ",
-        )
+        self.instrument_admitted_launch_signal(controller, "schedule")
         ready = self.root / "aggregate-launch.ready"
         pid_file = self.root / "aggregate-launch.pid"
         terminated = self.root / "aggregate-launch.term"
+        release = self.root / "aggregate-launch.release"
         controller_identity = self.root / "aggregate-controller.identity"
         environment = self.fast_clock_environment(step=61)
         environment.update(
@@ -8091,10 +10214,11 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 "SDSYNC_TEST_LAUNCH_READY": str(ready),
                 "SDSYNC_TEST_LAUNCHED_PID": str(pid_file),
                 "SDSYNC_TEST_TERM_OBSERVED": str(terminated),
+                "SDSYNC_TEST_LAUNCH_RELEASE": str(release),
                 "SDSYNC_TEST_VERIFIED_CONTROLLER_IDENTITY": str(controller_identity),
             }
         )
-        self.assert_injected_launch_is_reaped(
+        self.assert_injected_admitted_launch_is_cancelled(
             self.lifecycle, ("start",), environment, pid_file, ready, terminated, 0
         )
         self.wait_for_verified_process_exit(controller_identity)

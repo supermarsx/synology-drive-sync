@@ -188,6 +188,14 @@ const READ_MANAGER_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(target_os = "linux")]
 const CONTROLLER_WAKE_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "linux")]
+const INTERACTIVE_AUTH_TEST_PROBE_TIMEOUT: Duration = Duration::from_secs(12);
+#[cfg(target_os = "linux")]
+const INTERACTIVE_AUTH_TEST_LOGOUT_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(target_os = "linux")]
+const INTERACTIVE_REMOTE_BROWSE_PROBE_TIMEOUT: Duration = Duration::from_secs(27);
+#[cfg(target_os = "linux")]
+const INTERACTIVE_REMOTE_BROWSE_LOGOUT_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(target_os = "linux")]
 const MAX_HELPER_STDERR_BYTES: usize = 64 * 1024;
 #[cfg(target_os = "linux")]
 const API_WORKER_COUNT: usize = 4;
@@ -888,6 +896,23 @@ struct ParsedJob {
     request_fingerprint: String,
     issued_at_epoch: u64,
     mutation: Mutation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueuedJobClass {
+    Connection,
+    Concurrent,
+    Serialized,
+}
+
+impl QueuedJobClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Connection => "connection",
+            Self::Concurrent => "concurrent",
+            Self::Serialized => "serialized",
+        }
+    }
 }
 
 impl Drop for ParsedJob {
@@ -2378,6 +2403,18 @@ fn parse_job(body: &[u8]) -> BridgeResult<ParsedJob> {
         issued_at_epoch: job.issued_at_epoch,
         mutation,
     })
+}
+
+fn queued_job_class(job: &ParsedJob) -> QueuedJobClass {
+    match &job.mutation {
+        Mutation::TestProfileAuth(_) | Mutation::BrowseRemote(_) => QueuedJobClass::Connection,
+        // Operational actions may be long-running, but they do not commit
+        // profile, credential, policy, or scheduler state. A bounded
+        // connection probe can therefore run beside them without observing a
+        // partially committed configuration mutation.
+        Mutation::Action(_) => QueuedJobClass::Concurrent,
+        _ => QueuedJobClass::Serialized,
+    }
 }
 
 fn valid_client_request_id(value: &str) -> bool {
@@ -10678,6 +10715,18 @@ pub(crate) fn main_entry() -> ExitCode {
         {
             ExitCode::FAILURE
         }
+    } else if arguments.len() == 2 && arguments[0] == "--classify-queued-job" {
+        let Some(request_id) = arguments[1].to_str() else {
+            return ExitCode::from(64);
+        };
+        match classify_queued_job(request_id) {
+            Ok(classification) => {
+                println!("{}", classification.as_str());
+                ExitCode::SUCCESS
+            }
+            Err(error) if error.kind == ErrorKind::BadRequest => ExitCode::from(64),
+            Err(_) => ExitCode::from(73),
+        }
     } else if arguments.len() == 3 && arguments[0] == "--consume-job" {
         let request = PathBuf::from(&arguments[1]);
         let response = PathBuf::from(&arguments[2]);
@@ -12022,6 +12071,60 @@ fn run_consumer(request: &Path, response: &Path) -> BridgeResult<()> {
     }
 }
 
+fn classify_queued_job(request_id: &str) -> BridgeResult<QueuedJobClass> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = request_id;
+        return Err(BridgeError::unsafe_runtime());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        validate_queued_job_classifier_request(
+            request_id,
+            CGI_ORIGIN_VARIABLES
+                .iter()
+                .any(|name| std::env::var_os(name).is_some()),
+        )?;
+        let identity = linux_runtime::identity_state()?;
+        let package_uid = validate_package_identity(&identity)?;
+        linux_runtime::clear_environment()?;
+        let control_paths = ControlPaths::production();
+        classify_queued_job_from_paths(&control_paths, request_id, package_uid)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_queued_job_classifier_request(
+    request_id: &str,
+    cgi_origin_present: bool,
+) -> BridgeResult<()> {
+    if !valid_server_job_id(request_id) {
+        return Err(BridgeError::bad_request());
+    }
+    if cgi_origin_present {
+        return Err(BridgeError::unsafe_runtime());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn classify_queued_job_from_paths(
+    control_paths: &ControlPaths<'_>,
+    request_id: &str,
+    package_uid: u32,
+) -> BridgeResult<QueuedJobClass> {
+    validate_queued_job_classifier_request(request_id, false)?;
+    let bytes =
+        linux_files::read_optional_pending_job(control_paths, request_id, package_uid, false)?
+            .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+    let job = parse_job(&bytes).map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+    if job.request_id != request_id {
+        return Err(BridgeError::new(ErrorKind::Unavailable));
+    }
+    Ok(queued_job_class(&job))
+}
+
 fn reject_claimed_job(request: &Path, response: &Path) -> BridgeResult<()> {
     #[cfg(not(target_os = "linux"))]
     return Err(BridgeError::unsafe_runtime());
@@ -12332,6 +12435,7 @@ fn authenticate_file_station(
     value: &ConnectionJobArgs,
     password: &[u8],
     totp: Option<&[u8]>,
+    total_timeout: Duration,
 ) -> Result<ApiClient, RemoteConnectionFailure> {
     let password =
         std::str::from_utf8(password).map_err(|_| RemoteConnectionFailure::Authentication(None))?;
@@ -12342,16 +12446,22 @@ fn authenticate_file_station(
             parse_totp_secret(secret).map_err(|_| RemoteConnectionFailure::Authentication(None))
         })
         .transpose()?;
-    let mut client = ApiClient::connect_for_browsing(&ClientOptions {
+    let options = ClientOptions {
         base_url: value.url.clone(),
         allow_http: value.allow_http,
         accept_invalid_certs: value.danger_accept_invalid_certs,
         ca_certificate: value.ca_certificate.as_ref().map(PathBuf::from),
         connect_timeout: Duration::from_secs(value.connect_timeout_seconds.into()),
         request_timeout: Duration::from_secs(value.timeout_seconds.into()),
-        retries: value.retries.into(),
-    })
-    .map_err(|_| RemoteConnectionFailure::Connect)?;
+        // One absolute probe deadline is shared by discovery, login (including
+        // a challenged TOTP login), and any subsequent directory listing.
+        // Retrying inside that interactive UI probe could otherwise turn one
+        // request into minutes of waiting. Normal sync clients are constructed
+        // elsewhere and retain their configured retry policy.
+        retries: 0,
+    };
+    let mut client = ApiClient::connect_for_browsing_bounded(&options, total_timeout)
+        .map_err(|_| RemoteConnectionFailure::Connect)?;
 
     match client.login(&value.username, password, None) {
         Ok(()) => Ok(client),
@@ -12368,16 +12478,6 @@ fn authenticate_file_station(
         }
         Err(error) => Err(RemoteConnectionFailure::Authentication(error.api_code())),
     }
-}
-
-#[cfg(target_os = "linux")]
-fn logout_result<T>(
-    client: &mut ApiClient,
-    result: Result<T, RemoteConnectionFailure>,
-) -> Result<T, RemoteConnectionFailure> {
-    logout_result_with(result, || {
-        client.logout().map_err(|_| RemoteConnectionFailure::Logout)
-    })
 }
 
 #[cfg(target_os = "linux")]
@@ -12400,6 +12500,28 @@ where
         }
         (Err(_), Err(_)) => Err(RemoteConnectionFailure::OperationAndLogout),
         (Err(failure), Ok(())) => Err(failure),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InteractiveConnectionBudget {
+    probe: Duration,
+    logout: Duration,
+}
+
+#[cfg(target_os = "linux")]
+fn interactive_connection_budget(mutation: &Mutation) -> Option<InteractiveConnectionBudget> {
+    match mutation {
+        Mutation::TestProfileAuth(_) => Some(InteractiveConnectionBudget {
+            probe: INTERACTIVE_AUTH_TEST_PROBE_TIMEOUT,
+            logout: INTERACTIVE_AUTH_TEST_LOGOUT_TIMEOUT,
+        }),
+        Mutation::BrowseRemote(_) => Some(InteractiveConnectionBudget {
+            probe: INTERACTIVE_REMOTE_BROWSE_PROBE_TIMEOUT,
+            logout: INTERACTIVE_REMOTE_BROWSE_LOGOUT_TIMEOUT,
+        }),
+        _ => None,
     }
 }
 
@@ -12432,6 +12554,7 @@ fn execute_connection_mutation(
     job: &ParsedJob,
     package_uid: u32,
 ) -> BridgeResult<Value> {
+    let budget = interactive_connection_budget(&job.mutation).ok_or_else(BridgeError::internal)?;
     let connection = match &job.mutation {
         Mutation::TestProfileAuth(value) => value,
         Mutation::BrowseRemote(value) => &value.connection,
@@ -12462,6 +12585,7 @@ fn execute_connection_mutation(
         connection,
         &password,
         totp.as_ref().map(|value| value.as_slice()),
+        budget.probe,
     ) {
         Ok(client) => client,
         Err(failure) => return Ok(connection_failure_result(failure)),
@@ -12469,7 +12593,12 @@ fn execute_connection_mutation(
 
     match &job.mutation {
         Mutation::TestProfileAuth(_) => {
-            authentication_test_result_after_logout(logout_result(&mut client, Ok(())), || {
+            let logout = logout_result_with(Ok(()), || {
+                client
+                    .logout_bounded(budget.logout)
+                    .map_err(|_| RemoteConnectionFailure::Logout)
+            });
+            authentication_test_result_after_logout(logout, || {
                 // Start the proof lifetime only after authentication and the
                 // mandatory logout have both completed. A slow target must not
                 // consume the chooser window before it is returned to the UI.
@@ -12493,7 +12622,12 @@ fn execute_connection_mutation(
                             RemoteConnectionFailure::Listing
                         }
                     });
-            match logout_result(&mut client, listing) {
+            let listing = logout_result_with(listing, || {
+                client
+                    .logout_bounded(budget.logout)
+                    .map_err(|_| RemoteConnectionFailure::Logout)
+            });
+            match listing {
                 Ok(page) => Ok(json!({
                     "schema": "sdsync.dsm-result.v1",
                     "ok": true,
@@ -12988,6 +13122,131 @@ mod tests {
         assert_eq!(
             Path::new(API_SOCKET_PATH),
             Path::new(PACKAGE_VAR).join("run/api.sock")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn queued_job_classifier_is_strict_and_fail_closed() {
+        let fixture = TestControlFixture::new("queued-job-classifier");
+        let paths = fixture.paths();
+        let package_uid = TestControlFixture::package_uid();
+        assert_eq!(
+            validate_queued_job_classifier_request("not-a-job-id", false)
+                .unwrap_err()
+                .kind,
+            ErrorKind::BadRequest
+        );
+        assert_eq!(
+            validate_queued_job_classifier_request(JOB_ID, true)
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnsafeRuntime
+        );
+
+        let connection = ConnectionJobArgs {
+            profile: Some("nightly".to_owned()),
+            url: "https://nas.example.invalid".to_owned(),
+            username: "backup-user".to_owned(),
+            allow_http: false,
+            danger_accept_invalid_certs: false,
+            ca_certificate: None,
+            connect_timeout_seconds: 15,
+            timeout_seconds: 120,
+            retries: 2,
+            password_source: CredentialSource::Stored,
+            totp_source: CredentialSource::None,
+        };
+        let mutations = [
+            (
+                Mutation::TestProfileAuth(connection.clone()),
+                QueuedJobClass::Connection,
+            ),
+            (
+                Mutation::BrowseRemote(BrowseRemoteJobArgs {
+                    connection,
+                    parent: "/".to_owned(),
+                    connection_proof: format!("v1.10300.{}.{}", "b".repeat(64), "c".repeat(64)),
+                }),
+                QueuedJobClass::Connection,
+            ),
+            (
+                Mutation::RemoveProfile(NameArgs {
+                    name: "nightly".to_owned(),
+                }),
+                QueuedJobClass::Serialized,
+            ),
+            (
+                Mutation::Action(OperationalActionArgs {
+                    kind: OperationalActionKind::Plan,
+                    scope: "nightly".to_owned(),
+                    write_test: None,
+                    allow_delete: Some(false),
+                    max_total_delete: None,
+                }),
+                QueuedJobClass::Concurrent,
+            ),
+        ];
+        for (index, (mutation, expected)) in mutations.into_iter().enumerate() {
+            let request_id = format!("{:048x}", index + 1);
+            let job = canonical_job_bytes(
+                &request_id,
+                REQUEST_ID,
+                "admin",
+                package_uid.max(1),
+                &[7_u8; 32],
+                &request_id,
+                &"a".repeat(64),
+                10_000,
+                &mutation,
+            )
+            .unwrap();
+            let request = fixture.requests.join(format!("{request_id}.json"));
+            fixture.write_private(&request, &job);
+            assert_eq!(
+                classify_queued_job_from_paths(&paths, &request_id, package_uid).unwrap(),
+                expected
+            );
+            fs::remove_file(request).unwrap();
+        }
+
+        let malformed_id = "d".repeat(48);
+        fixture.write_private(
+            &fixture.requests.join(format!("{malformed_id}.json")),
+            b"{}\n",
+        );
+        assert_eq!(
+            classify_queued_job_from_paths(&paths, &malformed_id, package_uid)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Unavailable
+        );
+
+        let mismatched_file_id = "e".repeat(48);
+        let embedded_id = "f".repeat(48);
+        let mismatch = canonical_job_bytes(
+            &embedded_id,
+            REQUEST_ID,
+            "admin",
+            package_uid.max(1),
+            &[7_u8; 32],
+            &embedded_id,
+            &"a".repeat(64),
+            10_000,
+            &Mutation::RemoveProfile(NameArgs {
+                name: "nightly".to_owned(),
+            }),
+        )
+        .unwrap();
+        fixture.write_private(
+            &fixture.requests.join(format!("{mismatched_file_id}.json")),
+            &mismatch,
+        );
+        assert_eq!(
+            classify_queued_job_from_paths(&paths, &mismatched_file_id, package_uid)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Unavailable
         );
     }
 
@@ -15437,6 +15696,49 @@ mod tests {
         ] {
             assert_eq!(fs::read_dir(directory).unwrap().count(), 0, "{directory:?}");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interactive_connection_budgets_are_operation_specific_and_bounded() {
+        let connection = ConnectionJobArgs {
+            profile: Some("nightly".to_owned()),
+            url: "https://nas.example.invalid".to_owned(),
+            username: "backup-user".to_owned(),
+            allow_http: false,
+            danger_accept_invalid_certs: false,
+            ca_certificate: None,
+            connect_timeout_seconds: 15,
+            timeout_seconds: 120,
+            retries: 5,
+            password_source: CredentialSource::Stored,
+            totp_source: CredentialSource::None,
+        };
+        let authentication = Mutation::TestProfileAuth(connection.clone());
+        let browsing = Mutation::BrowseRemote(BrowseRemoteJobArgs {
+            connection,
+            parent: "/".to_owned(),
+            connection_proof: format!("v1.10300.{}.{}", "b".repeat(64), "c".repeat(64)),
+        });
+        let serialized = Mutation::RemoveProfile(NameArgs {
+            name: "nightly".to_owned(),
+        });
+
+        assert_eq!(
+            interactive_connection_budget(&authentication),
+            Some(InteractiveConnectionBudget {
+                probe: Duration::from_secs(12),
+                logout: Duration::from_secs(3),
+            })
+        );
+        assert_eq!(
+            interactive_connection_budget(&browsing),
+            Some(InteractiveConnectionBudget {
+                probe: Duration::from_secs(27),
+                logout: Duration::from_secs(3),
+            })
+        );
+        assert_eq!(interactive_connection_budget(&serialized), None);
     }
 
     #[cfg(target_os = "linux")]
@@ -17990,6 +18292,7 @@ mod tests {
         assert!(!contains_bytes(&job, b"JBSWY3DPEHPK3PXP"));
         let parsed_job = parse_job(&job).unwrap();
         assert!(matches!(parsed_job.mutation, Mutation::TestProfileAuth(_)));
+        assert_eq!(queued_job_class(&parsed_job), QueuedJobClass::Connection);
 
         let mut browse = connection;
         browse["parent"] = json!("/home/Drive");
@@ -18438,6 +18741,7 @@ mod tests {
         assert_eq!(parsed_job.requested_by, "admin");
         assert_eq!(parsed_job.session_binding, [7_u8; 32]);
         assert_eq!(parsed_job.mutation.operation_id(), "remove-profile");
+        assert_eq!(queued_job_class(&parsed_job), QueuedJobClass::Serialized);
         assert!(validate_job_freshness(parsed_job.issued_at_epoch, 10_001).is_ok());
         assert!(
             validate_job_freshness(parsed_job.issued_at_epoch, 10_000 + MAX_JOB_AGE_SECONDS + 1)
