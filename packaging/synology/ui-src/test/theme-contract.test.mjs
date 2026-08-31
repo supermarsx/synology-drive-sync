@@ -234,7 +234,7 @@ test("hellfire palette and pixel-sharp trace geometry stay coherent", () => {
 test("Refresh uses a compact rectangular border control", () => {
   assert.match(
     app,
-    /<v-button\s+type="border"[\s\S]{0,280}>[\s\S]*?<template #icon><action-icon name="refresh"\s*\/><\/template>Refresh<\/v-button>/
+    /<v-button\s+type="border"[\s\S]{0,280}>[\s\S]*?<template #icon><action-icon\s+:class="\{ 'sdsync-is-spinning': snapshotLoading \}"\s+name="refresh"\s*\/><\/template>Refresh<\/v-button>/
   );
   const topbarTheme = declarations(".sdsync-app .sdsync-topbar-actions > [class*=\"button\"],\n.sdsync-app .sdsync-topbar-actions button,\n.sdsync-app .sdsync-topbar-actions [role=\"button\"]");
   assert.match(topbarTheme, /min-width:\s*76px\s*!important/);

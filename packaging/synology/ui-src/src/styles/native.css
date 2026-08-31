@@ -2605,11 +2605,16 @@
   to { transform: rotate(360deg); }
 }
 
-.sdsync-app .sdsync-action-icon.sdsync-is-spinning {
-  animation: sdsync-spin 0.8s linear infinite;
-  transform-origin: center;
-  transform-box: fill-box;
+.sdsync-app .sdsync-action-icon.sdsync-is-spinning > .sdsync-action-icon-glyph {
+  animation: sdsync-spin 0.8s linear infinite !important;
+  transform-origin: 12px 12px !important;
+  transform-box: view-box;
   will-change: transform;
+}
+
+@keyframes sdsync-busy-pulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
 }
 
 .sdsync-secret-summary {
@@ -2948,7 +2953,8 @@
 
 .sdsync-activity-feed li {
   display: grid;
-  grid-template-columns: 150px minmax(150px, 1fr) minmax(120px, 1fr);
+  grid-template-columns: 150px minmax(150px, 1fr) minmax(120px, 1fr) auto;
+  align-items: start;
   gap: 13px;
   padding: 10px 0;
   border-top: 1px solid var(--sdsync-border-soft);
@@ -2989,6 +2995,21 @@
   margin-top: 16px;
 }
 
+.sdsync-evidence-heading-actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+
+.sdsync-app .sdsync-evidence-copy {
+  align-self: start;
+  min-height: 28px !important;
+  padding: 3px 7px !important;
+}
+
 .sdsync-log-toolbar {
   flex-wrap: wrap;
   justify-content: flex-end;
@@ -3008,6 +3029,57 @@
 .sdsync-log-panel pre {
   min-height: 280px;
   max-height: 470px;
+}
+
+.sdsync-log-records {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.sdsync-log-record {
+  min-width: 0;
+  border: 1px solid var(--sdsync-border-soft);
+  background: var(--sdsync-panel-strong);
+}
+
+.sdsync-log-record > header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 9px;
+  border-bottom: 1px solid var(--sdsync-border-soft);
+}
+
+.sdsync-log-record > header > span {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.sdsync-log-record > header strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--sdsync-text);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sdsync-log-record > header small {
+  color: var(--sdsync-muted);
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.sdsync-log-record pre {
+  min-height: 96px;
+  max-height: 300px;
+  margin: 0;
+  border: 0;
 }
 
 .sdsync-app pre:focus-visible {
@@ -3740,11 +3812,18 @@
   }
 
   .sdsync-app .sdsync-action-icon.sdsync-is-spinning {
-    animation: none !important;
     transform: none !important;
     stroke-dasharray: 3 2;
     opacity: 1 !important;
-    will-change: auto;
+  }
+
+  .sdsync-app .sdsync-action-icon.sdsync-is-spinning > .sdsync-action-icon-glyph {
+    animation: sdsync-busy-pulse 1.6s ease-in-out infinite !important;
+    transform: none !important;
+    transform-origin: 12px 12px !important;
+    transform-box: view-box;
+    opacity: 1;
+    will-change: opacity;
   }
 
   .sdsync-live-operation-indicator {
@@ -3914,6 +3993,22 @@
   gap: 3px;
 }
 
+.sdsync-app.sdsync-medium-shell:not(.sdsync-compact-shell) .sdsync-activity-feed li {
+  grid-template-columns: minmax(112px, 0.72fr) minmax(0, 1.4fr);
+}
+
+.sdsync-app.sdsync-medium-shell:not(.sdsync-compact-shell) .sdsync-activity-feed .sdsync-evidence-copy {
+  grid-column: 2;
+  grid-row: 2;
+  justify-self: end;
+}
+
+.sdsync-app.sdsync-compact-shell .sdsync-activity-feed .sdsync-evidence-copy {
+  grid-column: 1;
+  justify-self: start;
+  margin-top: 5px !important;
+}
+
 .sdsync-app.sdsync-compact-shell :where(.sdsync-workspace, .sdsync-page-stage, .sdsync-page-frame, .sdsync-page, .sdsync-panel, .sdsync-subtab-stage, .sdsync-subtab-panel, .sdsync-form-grid, .sdsync-secret-editor) {
   max-width: 100%;
   min-width: 0;
@@ -3940,6 +4035,16 @@
   .sdsync-routine-catalog {
     position: static;
     max-height: 280px;
+  }
+
+  .sdsync-activity-feed li {
+    grid-template-columns: minmax(112px, 0.72fr) minmax(0, 1.4fr);
+  }
+
+  .sdsync-activity-feed .sdsync-evidence-copy {
+    grid-column: 2;
+    grid-row: 2;
+    justify-self: end;
   }
 }
 
@@ -4019,6 +4124,13 @@
   .sdsync-activity-feed li {
     grid-template-columns: 1fr;
     gap: 3px;
+  }
+
+  .sdsync-activity-feed .sdsync-evidence-copy {
+    grid-column: 1;
+    grid-row: auto;
+    justify-self: start;
+    margin-top: 5px !important;
   }
 }
 

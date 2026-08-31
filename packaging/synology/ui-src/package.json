@@ -9,7 +9,7 @@
     "build": "webpack --mode production",
     "build:dev": "webpack --mode development",
     "check": "webpack --mode production",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test --test-concurrency=1 test/*.test.mjs"
   },
   "devDependencies": {
     "@babel/core": "7.18.6",

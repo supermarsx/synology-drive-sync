@@ -23,6 +23,7 @@ const ACTION_ICON_PATHS = Object.freeze({
   doctor: ["M4 5v5a4 4 0 0 0 8 0V5", "M7 3v3", "M10 3v3", "M12 10v3a4 4 0 0 0 8 0v-1", "M20 9a3 3 0 1 0 0 6"],
   pause: ["M8 5v14", "M16 5v14"],
   clear: ["M4 16l9-11 7 6-8 10H7z", "M10 19h10"],
+  copy: ["M9 9h10v10H9z", "M5 15V5h10"],
   confirm: ["M5 12l4 4L19 6"],
   "chevron-down": ["M6 9l6 6 6-6"]
 });
@@ -68,10 +69,12 @@ export const ActionIcon = {
         { display: "inline-block", verticalAlign: "-0.15em", flex: "0 0 auto" },
         inheritedStyle
       ]
+    }, [createElement("g", {
+      class: "sdsync-action-icon-glyph"
     }, ACTION_ICON_PATHS[context.props.name].map((path, index) => createElement("path", {
       key: index,
       attrs: { d: path }
-    })));
+    })))]);
   }
 };
 

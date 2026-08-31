@@ -961,6 +961,144 @@ def validate_native_api_source(payload: bytes) -> None:
             raise ValidationError(f"native DSM API source contains forbidden construct {forbidden}")
 
 
+def _css_rule_declarations(source: str, selector: str, start: int = 0) -> str:
+    match = re.search(
+        rf"{re.escape(selector)}\s*\{{([^{{}}]*)\}}",
+        source[start:],
+        re.DOTALL,
+    )
+    return match.group(1) if match else ""
+
+
+def _validate_busy_operation_styles(css: str) -> None:
+    glyph_selector = (
+        ".sdsync-app .sdsync-action-icon.sdsync-is-spinning "
+        "> .sdsync-action-icon-glyph"
+    )
+    normal = _css_rule_declarations(css, glyph_selector)
+    normal_contract = (
+        (r"animation:\s*sdsync-spin\s+0\.8s\s+linear\s+infinite\s*!important", normal),
+        (r"transform-origin:\s*12px\s+12px\s*!important", normal),
+        (r"transform-box:\s*view-box", normal),
+        (r"will-change:\s*transform", normal),
+    )
+    if not normal or any(re.search(pattern, declarations) is None for pattern, declarations in normal_contract):
+        raise ValidationError(
+            "native DSM busy-operation contract must animate the isolated inner icon glyph"
+        )
+
+    spin_start = css.find("@keyframes sdsync-spin")
+    spin = css[spin_start:spin_start + 260] if spin_start >= 0 else ""
+    if (
+        re.search(r"transform:\s*rotate\(0deg\)", spin) is None
+        or re.search(r"transform:\s*rotate\(360deg\)", spin) is None
+    ):
+        raise ValidationError(
+            "native DSM busy-operation contract is missing the reviewed rotation keyframes"
+        )
+
+    reduced_start = css.find("@media (prefers-reduced-motion: reduce)")
+    if reduced_start < 0:
+        raise ValidationError(
+            "native DSM busy-operation contract is missing reduced-motion treatment"
+        )
+    reduced_outer = _css_rule_declarations(
+        css,
+        ".sdsync-app .sdsync-action-icon.sdsync-is-spinning",
+        reduced_start,
+    )
+    reduced_glyph = _css_rule_declarations(css, glyph_selector, reduced_start)
+    if (
+        re.search(r"transform:\s*none\s*!important", reduced_outer) is None
+        or re.search(r"stroke-dasharray:\s*3\s+2", reduced_outer) is None
+        or re.search(
+            r"animation:\s*sdsync-busy-pulse\s+1\.6s\s+ease-in-out\s+infinite\s*!important",
+            reduced_glyph,
+        ) is None
+        or re.search(r"transform:\s*none\s*!important", reduced_glyph) is None
+        or re.search(r"transform-origin:\s*12px\s+12px\s*!important", reduced_glyph) is None
+        or re.search(r"transform-box:\s*view-box", reduced_glyph) is None
+        or re.search(r"will-change:\s*opacity", reduced_glyph) is None
+    ):
+        raise ValidationError(
+            "native DSM busy-operation contract must keep a visible isolated reduced-motion pulse"
+        )
+
+    pulse_start = css.find("@keyframes sdsync-busy-pulse")
+    pulse = css[pulse_start:pulse_start + 220] if pulse_start >= 0 else ""
+    if (
+        re.search(r"opacity:\s*0\.5", pulse) is None
+        or re.search(r"opacity:\s*1", pulse) is None
+    ):
+        raise ValidationError(
+            "native DSM busy-operation contract is missing the reviewed pulse keyframes"
+        )
+
+
+def _action_icon_source_map(source: str) -> list[tuple[str, list[str]]]:
+    match = re.search(
+        r"const ACTION_ICON_PATHS = Object\.freeze\(\{(.*?)\}\);",
+        source,
+        re.DOTALL,
+    )
+    if match is None:
+        raise ValidationError("shared ActionIcon source is missing its canonical path map")
+    entries: list[tuple[str, list[str]]] = []
+    for line in match.group(1).splitlines():
+        candidate = line.strip().removesuffix(",")
+        if not candidate:
+            continue
+        entry = re.fullmatch(r'(?:"([^"]+)"|([A-Za-z_$][\w$]*)):\s*(\[.*\])', candidate)
+        if entry is None:
+            raise ValidationError("shared ActionIcon source has an unreadable canonical path entry")
+        name = entry.group(1) or entry.group(2)
+        try:
+            paths = json.loads(entry.group(3))
+        except json.JSONDecodeError as error:
+            raise ValidationError("shared ActionIcon source has an invalid canonical path entry") from error
+        if not isinstance(paths, list) or not paths or not all(isinstance(path, str) and path for path in paths):
+            raise ValidationError("shared ActionIcon source has an empty canonical icon")
+        entries.append((name, paths))
+    if not entries or len({name for name, _paths in entries}) != len(entries):
+        raise ValidationError("shared ActionIcon source must define unique canonical icons")
+    return entries
+
+
+def _validate_bundled_action_icon(script: str, action_icon_source: str | None = None) -> None:
+    wrapper = 'class:"sdsync-action-icon-glyph"'
+    if script.count(wrapper) != 1:
+        raise ValidationError(
+            "native DSM built ActionIcon must render exactly one isolated glyph wrapper"
+        )
+    wrapper_start = script.index(wrapper)
+    rendered = script[max(0, wrapper_start - 160):wrapper_start + 360]
+    for pattern in (
+        r'\(["\']g["\']\s*,\s*\{\s*class:["\']sdsync-action-icon-glyph["\']\s*\}',
+        r'\.props\.name\]\s*\.map\(',
+        r'\(["\']path["\']\s*,\s*\{\s*key:',
+        r'attrs:\s*\{\s*d:',
+    ):
+        if re.search(pattern, rendered) is None:
+            raise ValidationError(
+                "native DSM built ActionIcon glyph wrapper is not connected to rendered paths"
+            )
+
+    if action_icon_source is None:
+        return
+    entries = _action_icon_source_map(action_icon_source)
+    compiled_entries = []
+    for name, paths in entries:
+        key = name if re.fullmatch(r"[A-Za-z_$][\w$]*", name) else json.dumps(name)
+        compiled_entries.append(
+            f"{key}:{json.dumps(paths, ensure_ascii=False, separators=(',', ':'))}"
+        )
+    compiled_map = "Object.freeze({" + ",".join(compiled_entries) + "})"
+    if compiled_map not in script:
+        raise ValidationError(
+            "native DSM built ActionIcon path map does not match the reviewed source"
+        )
+
+
 def validate_native_build_contract(
     main_payload: bytes,
     app_payload: bytes,
@@ -1274,6 +1412,8 @@ def validate_native_build_contract(
             "const inherited = context.data || {};",
             "...forwarded",
             'class: ["sdsync-action-icon", inheritedClass]',
+            'createElement("g", {',
+            'class: "sdsync-action-icon-glyph"',
             '"aria-hidden": "true"',
         ):
             if marker not in action_icon:
@@ -1365,30 +1505,12 @@ def validate_native_build_contract(
         raise ValidationError(
             "native DSM styles must provide reduced-motion and keyboard-focus treatment"
         )
-    for marker in (
-        ".sdsync-app .sdsync-action-icon.sdsync-is-spinning",
-        "animation: sdsync-spin 0.8s linear infinite;",
-        "transform-box: fill-box;",
-        "stroke-dasharray: 3 2;",
-        ".sdsync-live-operation-warning",
-    ):
+    for marker in (".sdsync-live-operation-warning",):
         if marker not in css:
             raise ValidationError(
                 f"native DSM styles are missing busy-operation contract {marker!r}"
             )
-    button_icon_start = css.find(
-        ".sdsync-app button:not(.sdsync-nav-item):not(.sdsync-profile-row):not(.sdsync-routine-row) > .sdsync-action-icon,"
-    )
-    button_icon_end = css.find("}", button_icon_start)
-    button_icon_source = (
-        css[button_icon_start:button_icon_end]
-        if button_icon_start >= 0 and button_icon_end >= 0
-        else ""
-    )
-    if not button_icon_source or "transform: none !important" in button_icon_source:
-        raise ValidationError(
-            "native DSM button normalization must not suppress busy icon transforms"
-        )
+    _validate_busy_operation_styles(css)
     if re.search(r"(^|[},])\s*(?::root|html\b|body\b)", css, re.IGNORECASE):
         raise ValidationError("native DSM styles must not mutate DSM document-level selectors")
     for line in css.splitlines():
@@ -1560,7 +1682,11 @@ def _validate_runtime_style_bundle(script: str, style: str) -> None:
         )
 
 
-def validate_native_bundle(script_payload: bytes, style_payload: bytes) -> None:
+def validate_native_bundle(
+    script_payload: bytes,
+    style_payload: bytes,
+    action_icon_payload: bytes | None = None,
+) -> None:
     script = script_payload.decode("utf-8")
     style = style_payload.decode("utf-8")
     for marker in (
@@ -1605,14 +1731,17 @@ def validate_native_bundle(script_payload: bytes, style_payload: bytes) -> None:
         ".sdsync-app" not in style
         or "@media (prefers-reduced-motion:" not in style
         or ":focus-visible" not in style
-        or ".sdsync-action-icon.sdsync-is-spinning" not in style
-        or not re.search(r"stroke-dasharray:\s*3\s+2(?:\s*!important)?", style)
         or ".sdsync-live-operation-warning" not in style
         or re.search(
             r"(^|[},])\s*(?::root|html\b|body\b)", style, re.IGNORECASE
         )
     ):
         raise ValidationError("native DSM style bundle is not isolated to the AppWindow")
+    _validate_bundled_action_icon(
+        script,
+        action_icon_payload.decode("utf-8") if action_icon_payload is not None else None,
+    )
+    _validate_busy_operation_styles(style)
     _validate_runtime_style_bundle(script, style)
 
 
@@ -1741,6 +1870,7 @@ def validate_source() -> None:
     validate_native_bundle(
         (UI_SOURCE / "dist/SynologyDriveSync.js").read_bytes(),
         (UI_SOURCE / "dist/style.css").read_bytes(),
+        (UI_SOURCE / "src/ActionIcon.js").read_bytes(),
     )
     validate_ui_texts((HERE / "package/ui/texts/enu/strings").read_bytes())
     validate_dsm_help(

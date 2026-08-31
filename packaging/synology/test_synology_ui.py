@@ -1632,19 +1632,58 @@ function bind(context, names) {
             )
         with self.assertRaisesRegex(
             validate_spk.ValidationError,
-            "button normalization must not suppress busy icon transforms",
+            "animate the isolated inner icon glyph",
         ):
-            button_icon_marker = (
-                b"  stroke-linejoin: miter !important;\n"
-                b"}\n\n.sdsync-app [class*=\"button\"] [class*=\"icon\"]"
+            isolated_spinner_selector = (
+                b".sdsync-app .sdsync-action-icon.sdsync-is-spinning "
+                b"> .sdsync-action-icon-glyph {"
             )
-            self.assertIn(button_icon_marker, source["css"])
+            self.assertEqual(source["css"].count(isolated_spinner_selector), 2)
             validate_build(
                 css=source["css"].replace(
-                    button_icon_marker,
-                    b"  stroke-linejoin: miter !important;\n"
-                    b"  transform: none !important;\n"
-                    b"}\n\n.sdsync-app [class*=\"button\"] [class*=\"icon\"]",
+                    isolated_spinner_selector,
+                    b".sdsync-app .sdsync-action-icon.sdsync-is-spinning {",
+                    1,
+                )
+            )
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError,
+            "animate the isolated inner icon glyph",
+        ):
+            normal_animation = b"animation: sdsync-spin 0.8s linear infinite !important;"
+            self.assertEqual(source["css"].count(normal_animation), 1)
+            validate_build(
+                css=source["css"].replace(
+                    normal_animation,
+                    b"animation: sdsync-spin 0.8s linear infinite;",
+                    1,
+                )
+            )
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError,
+            "visible isolated reduced-motion pulse",
+        ):
+            reduced_animation = (
+                b"animation: sdsync-busy-pulse 1.6s ease-in-out infinite !important;"
+            )
+            self.assertEqual(source["css"].count(reduced_animation), 1)
+            validate_build(
+                css=source["css"].replace(
+                    reduced_animation,
+                    b"animation: none !important;",
+                    1,
+                )
+            )
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError,
+            "shared ActionIcon source is missing contract",
+        ):
+            glyph_group = b'class: "sdsync-action-icon-glyph"'
+            self.assertEqual(source["action_icon"].count(glyph_group), 1)
+            validate_build(
+                action_icon=source["action_icon"].replace(
+                    glyph_group,
+                    b'class: "removed-action-icon-glyph"',
                     1,
                 )
             )
@@ -2010,7 +2049,34 @@ function bind(context, names) {
 
         script = (UI_SOURCE / "dist/SynologyDriveSync.js").read_bytes()
         style = (UI_SOURCE / "dist/style.css").read_bytes()
-        validate_spk.validate_native_bundle(script, style)
+        action_icon = (UI_SOURCE / "src/ActionIcon.js").read_bytes()
+        validate_spk.validate_native_bundle(script, style, action_icon)
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError,
+            "built ActionIcon must render exactly one isolated glyph wrapper",
+        ):
+            validate_spk.validate_native_bundle(
+                script.replace(
+                    b'class:"sdsync-action-icon-glyph"',
+                    b'class:"removed-action-icon-glyph"',
+                    1,
+                ),
+                style,
+                action_icon,
+            )
+        with self.assertRaisesRegex(
+            validate_spk.ValidationError,
+            "built ActionIcon path map does not match the reviewed source",
+        ):
+            validate_spk.validate_native_bundle(
+                script,
+                style,
+                action_icon.replace(
+                    b'"M9 9h10v10H9z"',
+                    b'"M9 9h9v9H9z"',
+                    1,
+                ),
+            )
         for name, suffix, pattern in (
             ("eval", b"\neval('bad')", "forbidden runtime"),
             ("source map", b"\n//# sourceMappingURL=bad.map", "forbidden runtime"),

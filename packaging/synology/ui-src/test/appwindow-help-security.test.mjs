@@ -360,7 +360,7 @@ test("complete security policy, client-event auditing, activity filters, and sta
     "Stale · last successful snapshot retained", "this.snapshot ?"
   ]) assert.ok(app.includes(marker), `App.vue lacks ${marker}`);
   assert.doesNotMatch(app, /this\.snapshot\s*=\s*null/);
-  assert.match(app, /<v-button\b[^>]*@click="refreshSnapshot\(true\)"[^>]*>[\s\S]*?<action-icon name="refresh"\s*\/>[\s\S]*?Retry<\/v-button>/);
+  assert.match(app, /<v-button\b[^>]*@click="refreshSnapshot\(true\)"[^>]*>[\s\S]*?<action-icon\s+:class="\{ 'sdsync-is-spinning': snapshotLoading \}"\s+name="refresh"\s*\/>[\s\S]*?Retry<\/v-button>/);
   assert.match(panel, /:disabled="disabled \|\| busy \|\| !dirty \|\| saveBlocked"/);
   assert.match(panel, /saveBlocked \? saveBlockedMessage/);
   assert.match(panel, /@input="updateField\(control\.key, \$event === true\)"/);

@@ -54,7 +54,8 @@
                 :tooltip="snapshotRefreshTooltip"
                 :disabled="snapshotLoading || snapshotRefreshBlocked"
                 @click="refreshSnapshot(true)"
-              ><template #icon><action-icon name="refresh" /></template>Refresh</v-button>
+                :aria-busy="snapshotLoading ? 'true' : 'false'"
+              ><template #icon><action-icon :class="{ 'sdsync-is-spinning': snapshotLoading }" name="refresh" /></template>Refresh</v-button>
             </div>
             <transition name="sdsync-live-operation">
               <div v-if="profileLiveOperation" class="sdsync-live-operation" aria-hidden="true">
@@ -73,7 +74,7 @@
             <div>
               <strong>{{ bridgeIssue.title || 'Read-only mode' }}</strong>
               <span>{{ bridgeIssue.message || 'Live status remains available, but changes stay disabled until the authenticated DSM bridge is ready.' }}</span>
-              <v-button type="border" display="icon-text" :tooltip="snapshotRefreshBlocked ? 'Close the profile editor before retrying package status' : 'Retry DSM authentication and reload package status'" :disabled="snapshotLoading || snapshotRefreshBlocked" @click="refreshSnapshot(true)"><template #icon><action-icon name="refresh" /></template>Retry</v-button>
+              <v-button type="border" display="icon-text" :tooltip="snapshotRefreshBlocked ? 'Close the profile editor before retrying package status' : 'Retry DSM authentication and reload package status'" :disabled="snapshotLoading || snapshotRefreshBlocked" :aria-busy="snapshotLoading ? 'true' : 'false'" @click="refreshSnapshot(true)"><template #icon><action-icon :class="{ 'sdsync-is-spinning': snapshotLoading }" name="refresh" /></template>Retry</v-button>
             </div>
           </div>
 
@@ -321,16 +322,21 @@
             <article class="sdsync-panel">
               <div class="sdsync-panel-heading">
                 <div><p class="sdsync-eyebrow">Structured activity</p><h3>Recent package events</h3></div>
-                <span class="sdsync-freshness">{{ reversedActivity.length }} of {{ activityEvents.length }} event{{ activityEvents.length === 1 ? '' : 's' }}</span>
+                <div class="sdsync-evidence-heading-actions"><span class="sdsync-freshness">{{ reversedActivity.length }} of {{ activityEvents.length }} event{{ activityEvents.length === 1 ? '' : 's' }}</span><v-button type="border" display="icon-text" aria-label="Copy all visible activity events" tooltip="Copy the filtered activity events as bounded, sanitized troubleshooting text" :disabled="!reversedActivity.length" @click="copyVisibleActivity"><template #icon><action-icon name="copy" /></template>Copy visible</v-button></div>
               </div>
               <div class="sdsync-filter-list" aria-label="Activity filters">
                 <div class="sdsync-filter-row"><span class="sdsync-filter-label">Search</span><div class="sdsync-filter-control"><v-input v-model.trim="activitySearch" class="sdsync-input-control sdsync-activity-search" maxlength="128" placeholder="Search event text or request ID" aria-label="Search activity text or client request ID" aria-describedby="sdsync-help-activity-search" /><control-help help-key="activity-search" /></div></div>
                 <div class="sdsync-filter-row"><span class="sdsync-filter-label">Category</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityCategory" :options="activityCategoryOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity category" aria-describedby="sdsync-help-activity-category"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-category" /></div></div>
                 <div class="sdsync-filter-row"><span class="sdsync-filter-label">Level</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityLevel" :options="activityLevelOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity level" aria-describedby="sdsync-help-activity-level"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-level" /></div></div>
               </div>
-              <ol class="sdsync-activity-feed"><li v-if="!reversedActivity.length" class="sdsync-empty">No package events match these filters.</li><li v-for="event in reversedActivity" :key="[event.epoch, event.code, event.profile, event.category, event.level, event.client_request_id].join(':')"><time>{{ formatDate(event.epoch) }}</time><div class="sdsync-activity-detail"><strong>{{ event.code }}</strong><p v-if="event.message">{{ event.message }}</p><code v-if="event.client_request_id">Client request ID: {{ event.client_request_id }}</code></div><small>{{ event.profile }} · {{ event.state }} · {{ event.category }} / {{ event.level }}</small></li></ol>
+              <ol class="sdsync-activity-feed"><li v-if="!reversedActivity.length" class="sdsync-empty">No package events match these filters.</li><li v-for="event in reversedActivity" :key="[event.epoch, event.code, event.profile, event.category, event.level, event.client_request_id].join(':')"><time>{{ formatDate(event.epoch) }}</time><div class="sdsync-activity-detail"><strong>{{ event.code }}</strong><p v-if="event.message">{{ event.message }}</p><code v-if="event.client_request_id">Client request ID: {{ event.client_request_id }}</code></div><small>{{ event.profile }} · {{ event.state }} · {{ event.category }} / {{ event.level }}</small><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy activity event ' + event.code" tooltip="Copy this event as bounded, sanitized troubleshooting text" @click="copyActivityEvent(event)"><template #icon><action-icon name="copy" /></template>Copy</v-button></li></ol>
             </article>
-            <article class="sdsync-panel sdsync-log-panel"><div class="sdsync-filter-list sdsync-log-filters" aria-label="Log filters"><div class="sdsync-filter-row"><span class="sdsync-filter-label">Source</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="logSource" :options="logSourceOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Log source" aria-describedby="sdsync-help-log-source" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-source" /></div></div><div class="sdsync-filter-row"><span class="sdsync-filter-label">Lines</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="logLines" :options="logLineOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Log line count" aria-describedby="sdsync-help-log-lines" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-lines" /></div></div><span class="sdsync-log-state">{{ logState }}</span></div><pre tabindex="0">{{ logOutput }}</pre></article>
+            <article class="sdsync-panel sdsync-log-panel">
+              <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Bounded package logs</p><h3>Troubleshooting evidence</h3></div><div class="sdsync-evidence-heading-actions"><span class="sdsync-log-state">{{ logState }}</span><v-button type="border" display="icon-text" aria-label="Copy all visible package logs" tooltip="Copy the selected log sources as bounded, sanitized troubleshooting text" :disabled="!logRecords.length" @click="copyVisibleLogs"><template #icon><action-icon name="copy" /></template>Copy visible</v-button></div></div>
+              <div class="sdsync-filter-list sdsync-log-filters" aria-label="Log filters"><div class="sdsync-filter-row"><span class="sdsync-filter-label">Source</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="logSource" :options="logSourceOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Log source" aria-describedby="sdsync-help-log-source" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-source" /></div></div><div class="sdsync-filter-row"><span class="sdsync-filter-label">Lines</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="logLines" :options="logLineOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Log line count" aria-describedby="sdsync-help-log-lines" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-lines" /></div></div></div>
+              <p v-if="!logRecords.length" class="sdsync-empty">{{ logOutput }}</p>
+              <div v-else class="sdsync-log-records"><section v-for="record in logRecords" :key="record.id" class="sdsync-log-record"><header><span><strong>{{ record.source }}</strong><small>{{ record.lineCount }} line{{ record.lineCount === 1 ? '' : 's' }}</small></span><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy ' + record.source + ' log evidence'" tooltip="Copy this log record as bounded, sanitized troubleshooting text" @click="copyLogRecord(record)"><template #icon><action-icon name="copy" /></template>Copy</v-button></header><pre tabindex="0">{{ record.text }}</pre></section></div>
+            </article>
           </section>
 
           <section v-else-if="route === 'notifications'" class="sdsync-page" aria-labelledby="sdsync-page-title">
@@ -500,6 +506,7 @@ const INCIDENT_SCOPE_LABELS = Object.freeze({
 });
 const PROFILE_SECRET_KINDS = Object.freeze(["password", "totp", "remote-log-token"]);
 const PROFILE_CREATION_WINDOW_WARNING = "Keep this AppWindow open; do not navigate away until profile creation finishes.";
+const PROFILE_CONNECTION_HEALTHY_TIMING = "On a healthy path, allow up to 15 seconds once dispatched; queued-result polling can continue shortly after. Controller or service failures may settle differently.";
 const PROFILE_CONNECTION_API_LIMITS = Object.freeze({
   csrfReissueTimeoutMs: 10000,
   postRequestTimeoutMs: 45000,
@@ -1011,6 +1018,349 @@ const JOB_ID_PATTERN = /^[0-9a-f]{48}$/;
 const ACTIVITY_MESSAGE_LIMIT = 2048;
 const ACTIVITY_FIELD_LIMIT = 128;
 const MUTATION_MESSAGE_LIMIT = 4096;
+const TROUBLESHOOTING_RECORD_LIMIT = 64 * 1024;
+const TROUBLESHOOTING_VISIBLE_LIMIT = 256 * 1024;
+const TROUBLESHOOTING_CREDENTIAL_KEY_SOURCE = [
+  "password", "passwd", "passphrase", "secret[_-]?value", "totp[_-]?secret", "secret", "totp", "otp[_-]?code",
+  "proxy[_-]?authorization", "authorization",
+  "x[_-]?sdsync[_-]?csrf", "connection[_-]?proof", "csrf[_-]?(?:header|key|token)", "csrf",
+  "sdsync[_-]?(?:password|otp|totp|remote[_-]?log[_-]?token)",
+  "http[_-]?(?:authorization|proxy[_-]?authorization|cookie|x[_-]?syno[_-]?token|x[_-]?sdsync[_-]?csrf)",
+  "syno[_-]?token", "token",
+  "access[_-]?token", "refresh[_-]?token", "session[_-]?(?:id|token)",
+  "api[_-]?(?:key|token)", "remote[_-]?log[_-]?token",
+  "x[_-]?syno[_-]?(?:token|sid)", "x[_-]?api[_-]?key",
+  "_?s{1,2}id", "cookie", "set[_-]?cookie"
+].join("|");
+const TROUBLESHOOTING_BARE_ENCODED_QUOTE_SOURCE = String.raw`%(?:25){0,2}(?:22|27)`;
+// Percent-encoded structural boundaries mirror the raw `[^a-z0-9_-]`
+// boundary without accidentally treating encoded letters, digits, `_`, or
+// `-` as separators inside a longer metadata key.
+const TROUBLESHOOTING_ENCODED_BOUNDARY_SOURCE = String.raw`%(?:25){0,2}(?:0[0-9a-f]|1[0-9a-f]|2[0-9a-c]|2[e-f]|3[a-f]|40|5[b-e]|60|7[b-f])`;
+const TROUBLESHOOTING_WRAPPED_ENCODED_QUOTE_SOURCE = [
+  String.raw`(?:(?:%5c)(?:(?:%5c){2})*)?%(?:22|27)`,
+  String.raw`(?:(?:%255c)(?:(?:%255c){2})*)?%(?:2522|2527)`,
+  String.raw`(?:(?:%25255c)(?:(?:%25255c){2})*)?%(?:252522|252527)`
+].join("|");
+const TROUBLESHOOTING_CREDENTIAL_FIELD_PATTERN = new RegExp(
+  // Start at the final opening quote itself. Consuming an arbitrary encoded
+  // backslash run in this unanchored prefix makes a no-quote `%5c` run
+  // quadratic; wrapper consumption is needed only after an exact key match.
+  String.raw`((?:^|(?:${TROUBLESHOOTING_BARE_ENCODED_QUOTE_SOURCE})|(?:${TROUBLESHOOTING_ENCODED_BOUNDARY_SOURCE})|[^a-z0-9_-])(?:${TROUBLESHOOTING_CREDENTIAL_KEY_SOURCE})(?:\\*["']|(?:${TROUBLESHOOTING_WRAPPED_ENCODED_QUOTE_SOURCE}))?[ \t]*(?::|=|%(?:25){0,2}(?:3a|3d))[ \t]*)`,
+  "gim"
+);
+const TROUBLESHOOTING_NEXT_FIELD_PATTERN = new RegExp(
+  String.raw`[ \t]*(?:(?:\\*["'])|(?:${TROUBLESHOOTING_WRAPPED_ENCODED_QUOTE_SOURCE}))?[a-z_][a-z0-9_.-]*(?:(?:\\*["'])|(?:${TROUBLESHOOTING_WRAPPED_ENCODED_QUOTE_SOURCE}))?[ \t]*(?::|=|%(?:25){0,2}(?:3a|3d))[ \t]*`,
+  "iy"
+);
+const TROUBLESHOOTING_ENCODED_QUOTE_LEVELS = Object.freeze([
+  Object.freeze({ backslash: "%5c", quotes: Object.freeze(["%22", "%27"]) }),
+  Object.freeze({ backslash: "%255c", quotes: Object.freeze(["%2522", "%2527"]) }),
+  Object.freeze({ backslash: "%25255c", quotes: Object.freeze(["%252522", "%252527"]) })
+]);
+const TROUBLESHOOTING_URL_COLON_TOKENS = Object.freeze(["%25253a", "%253a", "%3a", ":"]);
+const TROUBLESHOOTING_URL_SLASH_TOKENS = Object.freeze(["%25252f", "%252f", "%2f", "/"]);
+const TROUBLESHOOTING_URL_AT_TOKENS = Object.freeze(["%252540", "%2540", "%40", "@"]);
+const TROUBLESHOOTING_COOKIE_EQUALS_TOKENS = Object.freeze(["%25253d", "%253d", "%3d", "="]);
+const TROUBLESHOOTING_COOKIE_SEMICOLON_TOKENS = Object.freeze(["%25253b", "%253b", "%3b", ";"]);
+const TROUBLESHOOTING_COOKIE_SPACE_TOKENS = Object.freeze(["%252520", "%2520", "%20"]);
+
+function troubleshootingBackslashCountBefore(value, offset) {
+  let count = 0;
+  for (let index = offset - 1; index >= 0 && value[index] === "\\"; index -= 1) count += 1;
+  return count;
+}
+
+function troubleshootingTokenLengthAt(lowercaseValue, offset, tokens) {
+  for (const token of tokens) {
+    if (lowercaseValue.startsWith(token, offset)) return token.length;
+  }
+  return 0;
+}
+
+function troubleshootingLineEnd(value, start, lineState) {
+  if (lineState.end === value.length || start < lineState.end) return lineState.end;
+  const lineBreak = value.indexOf("\n", start);
+  lineState.end = lineBreak < 0 ? value.length : lineBreak;
+  return lineState.end;
+}
+
+function troubleshootingNextFieldStartsAt(value, start) {
+  TROUBLESHOOTING_NEXT_FIELD_PATTERN.lastIndex = start;
+  const match = TROUBLESHOOTING_NEXT_FIELD_PATTERN.exec(value);
+  TROUBLESHOOTING_NEXT_FIELD_PATTERN.lastIndex = 0;
+  return Boolean(match);
+}
+
+function troubleshootingCredentialValueEnd(value, lowercaseValue, start, lineState) {
+  let contentStart = start;
+  while (contentStart < value.length) {
+    const character = value.charCodeAt(contentStart);
+    if (character !== 9 && character !== 10 && character !== 13 && character !== 32) break;
+    contentStart += 1;
+  }
+  let lineEnd = troubleshootingLineEnd(value, contentStart, lineState);
+  let rawQuoteStart = contentStart;
+  while (value[rawQuoteStart] === "\\") rawQuoteStart += 1;
+  const rawQuote = value[rawQuoteStart];
+  if (rawQuote === "\"" || rawQuote === "'") {
+    const openingBackslashes = rawQuoteStart - contentStart;
+    for (let index = rawQuoteStart + 1; index < lineEnd; index += 1) {
+      if (value[index] !== rawQuote) continue;
+      const precedingBackslashes = troubleshootingBackslashCountBefore(value, index);
+      const closesValue = openingBackslashes === 0
+        ? precedingBackslashes % 2 === 0
+        : precedingBackslashes === openingBackslashes;
+      if (closesValue) return index + 1;
+    }
+    return lineEnd;
+  }
+
+  for (const level of TROUBLESHOOTING_ENCODED_QUOTE_LEVELS) {
+    let quoteStart = contentStart;
+    let openingBackslashes = 0;
+    while (lowercaseValue.startsWith(level.backslash, quoteStart)) {
+      openingBackslashes += 1;
+      quoteStart += level.backslash.length;
+    }
+    const delimiter = level.quotes.find((candidate) => lowercaseValue.startsWith(candidate, quoteStart));
+    if (!delimiter) continue;
+    for (let closing = lowercaseValue.indexOf(delimiter, quoteStart + delimiter.length);
+      closing >= 0 && closing < lineEnd;
+      closing = lowercaseValue.indexOf(delimiter, closing + delimiter.length)) {
+      let precedingBackslashes = 0;
+      for (let cursor = closing - level.backslash.length;
+        cursor >= contentStart && lowercaseValue.startsWith(level.backslash, cursor);
+        cursor -= level.backslash.length) precedingBackslashes += 1;
+      const closesValue = openingBackslashes === 0
+        ? precedingBackslashes % 2 === 0
+        : precedingBackslashes === openingBackslashes;
+      if (closesValue) return closing + delimiter.length;
+    }
+    return lineEnd;
+  }
+
+  while (lineEnd < value.length) {
+    let nextLineStart = lineEnd + 1;
+    while (value[nextLineStart] === " " || value[nextLineStart] === "\t") nextLineStart += 1;
+    if (troubleshootingNextFieldStartsAt(value, nextLineStart)) return lineEnd;
+    lineEnd = troubleshootingLineEnd(value, nextLineStart, lineState);
+  }
+  return lineEnd;
+}
+
+function redactTroubleshootingCredentialFields(value) {
+  const lowercaseValue = value.toLowerCase();
+  const output = [];
+  let cursor = 0;
+  const lineState = { end: -1 };
+  TROUBLESHOOTING_CREDENTIAL_FIELD_PATTERN.lastIndex = 0;
+  for (let match = TROUBLESHOOTING_CREDENTIAL_FIELD_PATTERN.exec(value); match; match = TROUBLESHOOTING_CREDENTIAL_FIELD_PATTERN.exec(value)) {
+    const valueStart = TROUBLESHOOTING_CREDENTIAL_FIELD_PATTERN.lastIndex;
+    const valueEnd = troubleshootingCredentialValueEnd(value, lowercaseValue, valueStart, lineState);
+    output.push(value.slice(cursor, valueStart), "[redacted]");
+    cursor = valueEnd;
+    TROUBLESHOOTING_CREDENTIAL_FIELD_PATTERN.lastIndex = valueEnd;
+  }
+  TROUBLESHOOTING_CREDENTIAL_FIELD_PATTERN.lastIndex = 0;
+  output.push(value.slice(cursor));
+  return output.join("");
+}
+
+function troubleshootingUrlPrefixEnd(lowercaseValue, start) {
+  let cursor = start;
+  let schemeLength = 0;
+  for (const scheme of ["https", "http", "ftp"]) {
+    if (lowercaseValue.startsWith(scheme, start)) {
+      schemeLength = scheme.length;
+      break;
+    }
+  }
+  if (schemeLength > 0 && (start === 0 || !/[a-z0-9+.-]/.test(lowercaseValue[start - 1]))) {
+    cursor += schemeLength;
+    const colonLength = troubleshootingTokenLengthAt(lowercaseValue, cursor, TROUBLESHOOTING_URL_COLON_TOKENS);
+    if (colonLength > 0) cursor += colonLength;
+    else schemeLength = 0;
+  } else schemeLength = 0;
+  if (schemeLength === 0) cursor = start;
+  const firstSlash = troubleshootingTokenLengthAt(lowercaseValue, cursor, TROUBLESHOOTING_URL_SLASH_TOKENS);
+  if (firstSlash === 0) return 0;
+  cursor += firstSlash;
+  const secondSlash = troubleshootingTokenLengthAt(lowercaseValue, cursor, TROUBLESHOOTING_URL_SLASH_TOKENS);
+  return secondSlash > 0 ? cursor + secondSlash : 0;
+}
+
+function redactTroubleshootingUrlUserinfo(value) {
+  const lowercaseValue = value.toLowerCase();
+  const output = [];
+  let copyStart = 0;
+  let index = 0;
+  while (index < value.length) {
+    const prefixEnd = troubleshootingUrlPrefixEnd(lowercaseValue, index);
+    if (prefixEnd === 0) {
+      index += 1;
+      continue;
+    }
+    let authorityEnd = prefixEnd;
+    let atEnd = 0;
+    while (authorityEnd < value.length) {
+      const character = value[authorityEnd];
+      if (/\s/.test(character) || character === "/" || character === "?" || character === "#") break;
+      const atLength = troubleshootingTokenLengthAt(lowercaseValue, authorityEnd, TROUBLESHOOTING_URL_AT_TOKENS);
+      if (atLength > 0) {
+        atEnd = authorityEnd + atLength;
+        authorityEnd = atEnd;
+        continue;
+      }
+      authorityEnd += 1;
+    }
+    if (atEnd > 0) {
+      output.push(value.slice(copyStart, prefixEnd), "[redacted]@");
+      copyStart = atEnd;
+      index = atEnd;
+    } else index = Math.max(index + 1, authorityEnd);
+  }
+  output.push(value.slice(copyStart));
+  return output.join("");
+}
+
+function troubleshootingCookieSkipSpace(line, lowercaseLine, start, end) {
+  let cursor = start;
+  while (cursor < end) {
+    if (line[cursor] === " " || line[cursor] === "\t") {
+      cursor += 1;
+      continue;
+    }
+    const encodedSpaceLength = troubleshootingTokenLengthAt(
+      lowercaseLine,
+      cursor,
+      TROUBLESHOOTING_COOKIE_SPACE_TOKENS
+    );
+    if (encodedSpaceLength > 0) {
+      cursor += encodedSpaceLength;
+      continue;
+    }
+    break;
+  }
+  return cursor;
+}
+
+function troubleshootingCookieValueStart(line, lowercaseLine, start, end, key) {
+  let cursor = troubleshootingCookieSkipSpace(line, lowercaseLine, start, end);
+  if (!lowercaseLine.startsWith(key, cursor)) return -1;
+  cursor += key.length;
+  cursor = troubleshootingCookieSkipSpace(line, lowercaseLine, cursor, end);
+  const equalsLength = troubleshootingTokenLengthAt(
+    lowercaseLine,
+    cursor,
+    TROUBLESHOOTING_COOKIE_EQUALS_TOKENS
+  );
+  if (equalsLength === 0) return -1;
+  cursor += equalsLength;
+  return troubleshootingCookieSkipSpace(line, lowercaseLine, cursor, end);
+}
+
+function troubleshootingCookieFieldRanges(lowercaseLine) {
+  const ranges = [];
+  let start = 0;
+  let cursor = 0;
+  while (cursor < lowercaseLine.length) {
+    const separatorLength = troubleshootingTokenLengthAt(
+      lowercaseLine,
+      cursor,
+      TROUBLESHOOTING_COOKIE_SEMICOLON_TOKENS
+    );
+    if (separatorLength === 0) {
+      cursor += 1;
+      continue;
+    }
+    ranges.push([start, cursor]);
+    cursor += separatorLength;
+    start = cursor;
+  }
+  ranges.push([start, lowercaseLine.length]);
+  return ranges;
+}
+
+function redactTroubleshootingDsmSessionCookieIds(value) {
+  return value.split("\n").map((sourceLine) => {
+    const lowercaseLine = sourceLine.toLowerCase();
+    const fields = troubleshootingCookieFieldRanges(lowercaseLine);
+    const hasStayLogin = fields.some(([start, end]) => {
+      const valueStart = troubleshootingCookieValueStart(
+        sourceLine,
+        lowercaseLine,
+        start,
+        end,
+        "stay_login"
+      );
+      if (valueStart < 0 || lowercaseLine[valueStart] !== "1") return false;
+      return troubleshootingCookieSkipSpace(sourceLine, lowercaseLine, valueStart + 1, end) === end;
+    });
+    if (!hasStayLogin) return sourceLine;
+    const idRanges = fields.map(([start, end]) => [
+      troubleshootingCookieValueStart(sourceLine, lowercaseLine, start, end, "id"), end
+    ]).filter(([start]) => start >= 0);
+    if (!idRanges.length) return sourceLine;
+    const output = [];
+    let cursor = 0;
+    for (const [start, end] of idRanges) {
+      output.push(sourceLine.slice(cursor, start), "[redacted]");
+      cursor = end;
+    }
+    output.push(sourceLine.slice(cursor));
+    return output.join("");
+  }).join("\n");
+}
+
+function boundedSanitizedTroubleshootingText(value, limit = TROUBLESHOOTING_RECORD_LIMIT) {
+  const maximum = Math.max(128, Math.min(TROUBLESHOOTING_VISIBLE_LIMIT, Number(limit) || TROUBLESHOOTING_RECORD_LIMIT));
+  const text = typeof value === "string" ? value : "";
+  if (text.length <= maximum) return text.trim();
+  const suffix = "\n[truncated: bounded troubleshooting copy]";
+  return `${text.slice(0, Math.max(0, maximum - suffix.length)).trimEnd()}${suffix}`;
+}
+
+function redactedTroubleshootingText(value) {
+  let text = typeof value === "string" ? value : "";
+  text = text
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ")
+    .replace(/\b(authorization|proxy-authorization|cookie|set-cookie)\s*:[^\n]*/gi, "$1: [redacted]")
+    .replace(/\b(bearer|basic)\s+[a-z0-9._~+/=-]+/gi, "$1 [redacted]");
+  text = redactTroubleshootingUrlUserinfo(text);
+  text = redactTroubleshootingDsmSessionCookieIds(text);
+  text = redactTroubleshootingCredentialFields(text);
+  return text;
+}
+
+function sanitizedTroubleshootingText(value, limit = TROUBLESHOOTING_RECORD_LIMIT) {
+  return boundedSanitizedTroubleshootingText(redactedTroubleshootingText(value), limit);
+}
+
+function troubleshootingField(value, fallback) {
+  return sanitizedTroubleshootingText(String(value || fallback || ""), ACTIVITY_FIELD_LIMIT)
+    .replace(/\s+/g, " ")
+    .trim() || fallback;
+}
+
+function activityTroubleshootingText(value) {
+  const event = normalizedActivityEvent(value);
+  if (!event) return "";
+  const lines = [
+    "Synology Drive Sync activity event",
+    `Time: ${troubleshootingField(formatDate(event.epoch), "Unavailable")}`,
+    `Epoch: ${event.epoch || "Unavailable"}`,
+    `Code: ${troubleshootingField(event.code, "unknown.event")}`,
+    `Profile: ${troubleshootingField(event.profile, "none")}`,
+    `State: ${troubleshootingField(event.state, "unknown")}`,
+    `Category: ${troubleshootingField(event.category, "operations")}`,
+    `Level: ${troubleshootingField(event.level, "info")}`
+  ];
+  if (event.client_request_id) lines.push(`Client request ID: ${event.client_request_id}`);
+  if (event.message) lines.push(`Message:\n${event.message}`);
+  return boundedSanitizedTroubleshootingText(lines.join("\n"), TROUBLESHOOTING_RECORD_LIMIT);
+}
 
 function defaultSecurityPolicy() {
   return {
@@ -1118,7 +1468,13 @@ function partialMutationInspectionRequired(caught, fallback, appliedDetail) {
 
 function normalizedActivityEvent(event) {
   if (!event || typeof event !== "object" || Array.isArray(event)) return null;
-  const field = (value, fallback) => boundedText(value, fallback).slice(0, ACTIVITY_FIELD_LIMIT);
+  // Activity values arrive inside a response that is already globally bounded,
+  // but credential terminators may sit beyond the much smaller display limits.
+  // Redact the complete API field first so slicing cannot preserve a partial
+  // URL userinfo or contextual cookie secret after discarding its terminator.
+  const field = (value, fallback, limit = ACTIVITY_FIELD_LIMIT) => redactedTroubleshootingText(
+    typeof value === "string" ? value : fallback
+  ).slice(0, limit);
   return {
     epoch: numberOr(event.epoch, 0),
     code: field(event.code, "unknown.event"),
@@ -1126,7 +1482,7 @@ function normalizedActivityEvent(event) {
     state: field(event.state, "unknown"),
     category: field(event.category, "operations"),
     level: field(event.level, "info"),
-    message: boundedText(event.message, "").slice(0, ACTIVITY_MESSAGE_LIMIT),
+    message: field(event.message, "", ACTIVITY_MESSAGE_LIMIT),
     client_request_id: validatedClientRequestId(event.client_request_id)
   };
 }
@@ -1224,7 +1580,7 @@ export default {
       aboutRustDependencies: ABOUT_RUST_DEPENDENCIES,
       aboutUiDependencies: ABOUT_UI_DEPENDENCIES,
       diagnostic: { title: "Not run in this session", output: "No diagnostic output yet." },
-      logsPaused: false, logSource: "all", logLines: 200, logState: "Waiting for logs", logOutput: "No log data yet.", activityEvents: [], activitySearch: "", activityCategory: "all", activityLevel: "all",
+      logsPaused: false, logSource: "all", logLines: 200, logState: "Waiting for logs", logOutput: "No log data yet.", logRecords: [], activityEvents: [], activitySearch: "", activityCategory: "all", activityLevel: "all",
       lastFailureKey: "", toasts: [], toastSequence: 0,
       confirmation: { visible: false, title: "", message: "", button: "Confirm", resolve: null },
       confirmationPriorFocus: null, confirmationKeyHandler: null,
@@ -2694,13 +3050,13 @@ export default {
       this.connectionProofExpires = 0;
       this.profileConnectionState = "testing";
       this.profileConnectionMessage = priorEvidence
-        ? `Testing the current draft again. Prior unresolved evidence remains available for explicit reconciliation: ${priorEvidence}`
-        : "Discovering File Station and testing this draft…";
+        ? `Testing the current draft again. ${PROFILE_CONNECTION_HEALTHY_TIMING} Prior unresolved evidence remains available for explicit reconciliation: ${priorEvidence}`
+        : `Discovering File Station and testing this draft. ${PROFILE_CONNECTION_HEALTHY_TIMING}`;
       this.toast(
         "Authentication test started",
         priorEvidence
-          ? "Testing the current connection draft while preserving prior unresolved evidence for explicit reconciliation."
-          : "Discovering File Station and testing the current connection draft. Success is reported only after temporary session cleanup finishes."
+          ? `${PROFILE_CONNECTION_HEALTHY_TIMING} Prior unresolved evidence remains preserved for explicit reconciliation.`
+          : `${PROFILE_CONNECTION_HEALTHY_TIMING} Success is reported only after temporary session cleanup finishes.`
       );
       try {
         const result = await apiPost(this.auth, this.csrfToken, ACTIONS.testProfileAuth, payload, true, undefined, PROFILE_CONNECTION_API_LIMITS);
@@ -3392,10 +3748,196 @@ export default {
     quickPlan() { return this.executeOperation("plan", { scope: "all", write_test: null, allow_delete: false, max_total_delete: 0 }); },
     async quickRun() { if (!this.canRunOperations || this.operationBusy) return; if (await this.confirmAction("Run all configured profiles?", "This starts a real one-way sync. Remote deletion stays disabled for this quick action.", "Run all")) return this.executeOperation("run", { scope: "all", write_test: null, allow_delete: false, max_total_delete: 0 }); },
     async runDoctor(event) { if (event && event.preventDefault) event.preventDefault(); if (!this.canRunOperations || this.operationBusy) return; if (this.doctorForm.write_test && (!this.canRunDoctorWrite || !this.hasCapability("write_test"))) return this.toast("Doctor write test blocked", "The package capability or security policy does not permit disposable destination probes.", true); if (this.doctorForm.write_test && !this.doctorForm.write_confirm) return this.toast("Write-test confirmation required", "Approve the disposable probe and cleanup before running.", true); if (this.doctorForm.write_test && !await this.confirmAction("Run the disposable target probe?", "The doctor briefly creates, verifies, and removes a unique probe in the selected destination.", "Run write test")) return; this.diagnostic = { title: "Doctor running", output: "Waiting for the package controller…" }; return this.executeOperation("doctor", { scope: this.doctorForm.scope, write_test: this.doctorForm.write_test, allow_delete: null, max_total_delete: null }); },
-    logsFrom(model) { if (Array.isArray(model.logs)) return model.logs.map((entry) => { if (typeof entry === "string") return entry; if (entry && typeof entry === "object") { if (Array.isArray(entry.lines)) return entry.lines.map((line) => `[${boundedText(entry.source, "log")}] ${boundedText(line, "")}`).join("\n"); return `${entry.timestamp ? `[${entry.timestamp}] ` : ""}${entry.source ? `[${entry.source}] ` : ""}${boundedText(entry.message, "")}`; } return ""; }).join("\n"); return boundedText(model.text || model.output, "No log data yet."); },
-    async refreshLogs() { if (this.disposed || this.logsLoading || this.logsPaused || document.hidden || this.route !== "activity") return; this.logsLoading = true; try { const lines = Math.min(1000, Math.max(1, Number(this.logLines) || 200)); const [logs, activity] = await Promise.all([apiGet(this.auth, "logs", { lines, source: this.logSource }), apiGet(this.auth, "activity", { lines })]); if (this.disposed) return; this.logOutput = this.logsFrom(logs).slice(0, MAX_RESPONSE_BYTES); this.activityEvents = arrayOf(activity.events); this.logState = `Live · ${lines} line limit`; } catch (_error) { if (!this.disposed) this.logState = "Logs unavailable"; } finally { this.logsLoading = false; if (!this.disposed) this.scheduleLogs(); } },
+    activityEvidence(event) { return activityTroubleshootingText(event); },
+    logEvidence(record) {
+      if (!record || typeof record !== "object") return "";
+      const source = typeof record.troubleshootingSource === "string"
+        ? record.troubleshootingSource
+        : troubleshootingField(record.source, "log");
+      const text = typeof record.troubleshootingText === "string"
+        ? record.troubleshootingText
+        : redactedTroubleshootingText(typeof record.text === "string" ? record.text : "");
+      return boundedSanitizedTroubleshootingText([
+        "Synology Drive Sync package log",
+        `Source: ${source}`,
+        `Visible lines: ${Math.max(0, Number(record.lineCount) || 0)}`,
+        "",
+        text
+      ].join("\n"), TROUBLESHOOTING_RECORD_LIMIT);
+    },
+    async writeTroubleshootingClipboard(text) {
+      const browserWindow = typeof window === "object" ? window : null;
+      const browserDocument = typeof document === "object" ? document : null;
+      const clipboard = browserWindow && browserWindow.navigator && browserWindow.navigator.clipboard;
+      if (clipboard && typeof clipboard.writeText === "function") {
+        try {
+          await clipboard.writeText(text);
+          return;
+        } catch (_error) { /* Fall through to the synchronous DSM-compatible path. */ }
+      }
+      if (!browserDocument || !browserDocument.body || typeof browserDocument.createElement !== "function") {
+        throw new Error("Clipboard API unavailable");
+      }
+      const active = browserDocument.activeElement;
+      const textarea = browserDocument.createElement("textarea");
+      textarea.value = text;
+      textarea.setAttribute("readonly", "");
+      textarea.setAttribute("aria-hidden", "true");
+      textarea.style.cssText = "position:fixed;left:-10000px;top:0;width:1px;height:1px;opacity:0;pointer-events:none";
+      browserDocument.body.appendChild(textarea);
+      try {
+        textarea.focus();
+        textarea.select();
+        if (typeof textarea.setSelectionRange === "function") textarea.setSelectionRange(0, textarea.value.length);
+        if (typeof browserDocument.execCommand !== "function" || browserDocument.execCommand("copy") !== true) {
+          throw new Error("Clipboard copy was rejected");
+        }
+      } finally {
+        if (textarea.parentNode) textarea.parentNode.removeChild(textarea);
+        if (active && typeof active.focus === "function") active.focus();
+      }
+    },
+    async copyTroubleshootingText(value, label, limit = TROUBLESHOOTING_RECORD_LIMIT, sanitized = false) {
+      const text = sanitized
+        ? boundedSanitizedTroubleshootingText(value, limit)
+        : sanitizedTroubleshootingText(value, limit);
+      const subject = troubleshootingField(label, "Evidence");
+      if (!text) {
+        this.toast("Nothing to copy", `${subject} has no visible troubleshooting evidence yet.`, true);
+        return false;
+      }
+      try {
+        await this.writeTroubleshootingClipboard(text);
+        this.toast(`${subject} copied`, "Known DSM session and credential field shapes were redacted. Review the bounded text before sharing.");
+        return true;
+      } catch (_error) {
+        this.toast("Copy failed", "DSM or the browser denied clipboard access. Select the visible evidence and copy it manually.", true);
+        return false;
+      }
+    },
+    copyActivityEvent(event) {
+      return this.copyTroubleshootingText(
+        this.activityEvidence(event),
+        "Activity event",
+        TROUBLESHOOTING_RECORD_LIMIT,
+        true
+      );
+    },
+    copyVisibleActivity() {
+      const events = this.reversedActivity;
+      const header = [
+        "Synology Drive Sync filtered activity",
+        `Visible events: ${events.length}`,
+        `Category filter: ${troubleshootingField(this.activityCategory, "all")}`,
+        `Level filter: ${troubleshootingField(this.activityLevel, "all")}`,
+        `Search filter: ${troubleshootingField(this.activitySearch, "none")}`
+      ].join("\n");
+      const body = events.map((event, index) => `\n--- Event ${index + 1} ---\n${this.activityEvidence(event)}`).join("\n");
+      return this.copyTroubleshootingText(
+        `${header}\n${body}`,
+        "Visible activity",
+        TROUBLESHOOTING_VISIBLE_LIMIT,
+        true
+      );
+    },
+    copyLogRecord(record) {
+      return this.copyTroubleshootingText(
+        this.logEvidence(record),
+        `${troubleshootingField(record && record.source, "Log")} log`,
+        TROUBLESHOOTING_RECORD_LIMIT,
+        true
+      );
+    },
+    copyVisibleLogs() {
+      const header = [
+        "Synology Drive Sync visible package logs",
+        `Source filter: ${troubleshootingField(this.logSource, "all")}`,
+        `Line limit: ${Math.min(1000, Math.max(1, Number(this.logLines) || 200))}`,
+        `Visible records: ${this.logRecords.length}`
+      ].join("\n");
+      const body = this.logRecords.map((record, index) => `\n--- Log record ${index + 1} ---\n${this.logEvidence(record)}`).join("\n");
+      return this.copyTroubleshootingText(
+        `${header}\n${body}`,
+        "Visible logs",
+        TROUBLESHOOTING_VISIBLE_LIMIT,
+        true
+      );
+    },
+    logRecordsFrom(model) {
+      const records = [];
+      let remaining = MAX_RESPONSE_BYTES;
+      const append = (sourceValue, textValue) => {
+        if (remaining <= 0) return;
+        const source = troubleshootingField(sourceValue, "log");
+        // Sanitize the complete response field before applying the existing
+        // aggregate display ceiling. Otherwise a URL/cookie terminator just
+        // beyond that cutoff can leave its leading secret in
+        // the stored record and therefore in every later copy path.
+        const sanitized = redactedTroubleshootingText(typeof textValue === "string" ? textValue : "");
+        const candidate = sanitized.slice(0, remaining);
+        if (!candidate) return;
+        remaining -= candidate.length;
+        records.push({
+          id: `${records.length}:${source}`,
+          source,
+          text: candidate,
+          troubleshootingSource: source,
+          troubleshootingText: candidate,
+          lineCount: candidate.split("\n").length
+        });
+      };
+      if (model && Array.isArray(model.logs)) {
+        model.logs.forEach((entry) => {
+          if (typeof entry === "string") return append("log", entry);
+          if (!entry || typeof entry !== "object") return;
+          const source = typeof entry.source === "string" ? entry.source : "log";
+          if (Array.isArray(entry.lines)) {
+            append(source, entry.lines.map((line) => typeof line === "string" ? line : "").join("\n"));
+            return;
+          }
+          const timestamp = typeof entry.timestamp === "string" ? entry.timestamp : "";
+          const safeTimestamp = timestamp ? troubleshootingField(timestamp, "") : "";
+          const safeSource = entry.source ? troubleshootingField(source, "log") : "";
+          const prefix = `${safeTimestamp ? `[${safeTimestamp}] ` : ""}${safeSource ? `[${safeSource}] ` : ""}`;
+          append(source, `${prefix}${typeof entry.message === "string" ? entry.message : ""}`);
+        });
+      } else if (model && typeof (model.text || model.output) === "string") {
+        append("log", model.text || model.output);
+      }
+      return records;
+    },
+    logsFrom(model) {
+      const records = this.logRecordsFrom(model);
+      return records.length
+        ? records.map((record) => `[${record.source}] ${record.text}`).join("\n").slice(0, MAX_RESPONSE_BYTES)
+        : "No log data yet.";
+    },
+    async refreshLogs() {
+      if (this.disposed || this.logsLoading || this.logsPaused || document.hidden || this.route !== "activity") return;
+      this.logsLoading = true;
+      try {
+        const lines = Math.min(1000, Math.max(1, Number(this.logLines) || 200));
+        const [logs, activity] = await Promise.all([
+          apiGet(this.auth, "logs", { lines, source: this.logSource }),
+          apiGet(this.auth, "activity", { lines })
+        ]);
+        if (this.disposed) return;
+        const records = this.logRecordsFrom(logs);
+        this.logRecords = records;
+        this.logOutput = records.length
+          ? records.map((record) => `[${record.source}] ${record.text}`).join("\n").slice(0, MAX_RESPONSE_BYTES)
+          : "No log data yet.";
+        this.activityEvents = arrayOf(activity.events);
+        this.logState = `Live · ${lines} line limit`;
+      } catch (_error) {
+        if (!this.disposed) this.logState = "Logs unavailable";
+      } finally {
+        this.logsLoading = false;
+        if (!this.disposed) this.scheduleLogs();
+      }
+    },
     toggleLogs() { this.logsPaused = !this.logsPaused; this.logState = this.logsPaused ? "Paused" : "Resuming"; if (!this.logsPaused) this.refreshLogs(); else window.clearTimeout(this.logTimer); },
-    clearLogView() { this.logOutput = "View cleared. The package log was not deleted."; },
+    clearLogView() { this.logRecords = []; this.logOutput = "View cleared. The package log was not deleted."; },
     async saveNotificationPreferences(event) {
       if (event && event.preventDefault) event.preventDefault();
       if (scopeMutationOutcomeUnresolved(this, "interface")) return this.toast("Session preference save locked", scopeMutationGuidance(this, "interface"), true);
