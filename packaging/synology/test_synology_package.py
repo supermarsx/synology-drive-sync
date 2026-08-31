@@ -12136,9 +12136,9 @@ fi
 
         controller_source = physical_controller.read_text(encoding="utf-8")
         ready_call = "publish_controller_ready\n"
-        reload_call = "request_reload() {\n    reload_requested=true\n"
+        reload_latch = "    reload_requested=true\n"
         self.assertEqual(controller_source.count(ready_call), 1)
-        self.assertEqual(controller_source.count(reload_call), 1)
+        self.assertEqual(controller_source.count(reload_latch), 1)
         reload_observed = self.root / "physical-controller-reload.observed"
         physical_controller.write_text(
             controller_source.replace(
@@ -12148,8 +12148,8 @@ fi
                 + '    /bin/sh "$SDSYNC_TEST_RUNTIME_CONTROLLER_IDENTITY_PROBE" runtime-parent "$$"\n'
                 + "fi\n",
             ).replace(
-                reload_call,
-                reload_call
+                reload_latch,
+                reload_latch
                 + '    [ -z "${SDSYNC_TEST_CONTROLLER_RELOAD_OBSERVED:-}" ] || '
                 + ': > "$SDSYNC_TEST_CONTROLLER_RELOAD_OBSERVED"\n',
             ),
