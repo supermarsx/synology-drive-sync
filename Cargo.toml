@@ -39,7 +39,7 @@ crc32fast = "1.5.1"
 ignore = "0.4.31"
 keyring-core = "1.0.0"
 md-5 = { version = "0.11.0", default-features = false }
-hmac = "0.12.1"
+hmac = "0.13.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "form", "multipart", "rustls"] }
 rpassword = "7.5.4"
 serde = { version = "1.0", features = ["derive"] }
