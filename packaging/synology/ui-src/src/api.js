@@ -278,7 +278,7 @@ export const ARGUMENT_KEYS = Object.freeze({
     "secrets_log_level", "security_log_level", "sync_log_level"
   ]),
   "client-event": Object.freeze(["event"]),
-  action: Object.freeze(["allow_delete", "kind", "max_total_delete", "scope", "write_test"])
+  action: Object.freeze(["allow_delete", "kind", "level", "max_total_delete", "scope", "write_test"])
 });
 
 const ROUTINE_COMMON_ARGUMENT_KEYS = Object.freeze([
@@ -294,6 +294,14 @@ const ROUTINE_MODE_ARGUMENT_KEYS = Object.freeze({
 export function boundedText(value, fallback = "") {
   const text = typeof value === "string" ? value : fallback;
   return String(text || fallback || "").slice(0, 65536);
+}
+
+function boundedTerminalOutput(value, fallback = "") {
+  const text = typeof value === "string" ? value : fallback;
+  // responseJson already enforces the one-MiB response contract before this
+  // value is reachable. Keep terminal machine evidence intact up to that same
+  // boundary instead of applying the much smaller general-purpose UI text cap.
+  return String(text || fallback || "").slice(0, MAX_RESPONSE_BYTES);
 }
 
 export function arrayOf(value) {
@@ -963,7 +971,7 @@ async function pollJobResult(
         200,
         boundedText(status.result.code, "operation_failed")
       );
-      failure.resultOutput = boundedText(
+      failure.resultOutput = boundedTerminalOutput(
         status.result.output,
         failure.message
       );

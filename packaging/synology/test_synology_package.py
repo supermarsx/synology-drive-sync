@@ -1389,6 +1389,12 @@ class RuntimeTests(unittest.TestCase):
             "#!/bin/sh\n"
             ': "${SDSYNC_TEST_CAPTURE:?}"\n'
             'printf \'%s\\n\' "$*" >> "$SDSYNC_TEST_CAPTURE"\n'
+            'case " $* " in *" source "*) '
+            '[ -z "${SDSYNC_TEST_SOURCE_OUTPUT_FILE:-}" ] || '
+            'cat "$SDSYNC_TEST_SOURCE_OUTPUT_FILE" ;; esac\n'
+            'case " $* " in *" target "*) '
+            '[ -z "${SDSYNC_TEST_TARGET_OUTPUT_FILE:-}" ] || '
+            'cat "$SDSYNC_TEST_TARGET_OUTPUT_FILE" ;; esac\n'
             'case " $* " in *" config validate "*) exit 0 ;; esac\n'
             'if [ "${SDSYNC_TEST_HOLD:-false}" = true ]; then '
             '[ -z "${SDSYNC_TEST_CORE_PID_FILE:-}" ] || '
@@ -4741,6 +4747,204 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             terminal_profiles.append(str(transaction_records[0]["profile"]))
         self.assertCountEqual(terminal_profiles, ["archive", "personal", "all"])
 
+    def test_direct_doctor_levels_select_expected_source_and_target_core_checks(self) -> None:
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Personal", True).returncode,
+            0,
+        )
+
+        for level in ("quick", "standard", "extensive"):
+            with self.subTest(level=level):
+                self.capture.write_text("", encoding="utf-8")
+                result = self.shell(
+                    self.manager, "doctor", "personal", "--level", level
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                core_calls = self.capture.read_text(encoding="utf-8").splitlines()
+                expected_count = 1 if level == "quick" else 2
+                self.assertEqual(len(core_calls), expected_count, core_calls)
+                self.assertIn(
+                    f"doctor --profile personal --level {level} target",
+                    core_calls[-1],
+                )
+                if level == "quick":
+                    self.assertNotIn(" source", core_calls[0])
+                else:
+                    self.assertIn("doctor --profile personal source", core_calls[0])
+                    self.assertEqual(
+                        "--hash" in core_calls[0],
+                        level == "extensive",
+                        core_calls[0],
+                    )
+
+                snapshot, snapshot_payload = self.api("snapshot")
+                self.assertEqual(snapshot.returncode, 0, snapshot.stderr)
+                health = snapshot_payload["profiles"][0]["health"]
+                self.assertEqual(health["state"], "succeeded")
+                self.assertEqual(health["level"], level)
+                self.assertFalse(health["write_test"])
+
+        self.capture.write_text("", encoding="utf-8")
+        extensive_write = self.shell(
+            self.manager,
+            "doctor",
+            "personal",
+            "--level",
+            "extensive",
+            "--write-test",
+        )
+        self.assertEqual(
+            extensive_write.returncode,
+            0,
+            extensive_write.stdout + extensive_write.stderr,
+        )
+        extensive_calls = self.capture.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(extensive_calls), 2, extensive_calls)
+        self.assertIn("doctor --profile personal source --hash", extensive_calls[0])
+        self.assertIn(
+            "doctor --profile personal --level extensive target --write-test",
+            extensive_calls[1],
+        )
+
+        for level in ("quick", "standard"):
+            with self.subTest(rejected_write_level=level):
+                self.capture.write_text("", encoding="utf-8")
+                rejected = self.shell(
+                    self.manager,
+                    "doctor",
+                    "personal",
+                    "--level",
+                    level,
+                    "--write-test",
+                )
+                self.assertEqual(rejected.returncode, 64, rejected.stdout + rejected.stderr)
+                self.assertIn("write tests require the extensive level", rejected.stderr)
+                self.assertEqual(self.capture.read_text(encoding="utf-8"), "")
+
+    def test_api_doctor_prioritizes_complete_target_records_and_keeps_terminal_warnings(self) -> None:
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Personal", True).returncode,
+            0,
+        )
+        source_output = self.root / "doctor-source-noise.ndjson"
+        source_output.write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "schema": "sdsync.source-doctor-job.v1",
+                        "profile": f"source-{index:05d}",
+                        "status": "success",
+                        "source": {"entries": 1, "padding": "s" * 96},
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+                for index in range(3000)
+            ),
+            encoding="utf-8",
+        )
+        target_document = {
+            "schema": "sdsync.doctor.v1",
+            "level": "standard",
+            "status": "pass",
+            "sections": [
+                {
+                    "id": "destination_inventory",
+                    "label": "Destination inventory",
+                    "status": "pass",
+                    "detail": "bounded target proof",
+                    "elapsed_ms": 12,
+                    "timing_scope": "section",
+                }
+            ],
+        }
+        target_output = self.root / "doctor-target.ndjson"
+        target_output.write_text(
+            json.dumps(target_document, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+        common = self.real_target / "libexec/sdsync-common"
+        common_source = common.read_text(encoding="utf-8")
+        audit_function = "audit_outbox_complete() {\n"
+        self.assertEqual(common_source.count(audit_function), 1)
+        common.write_text(
+            common_source.replace(
+                audit_function,
+                audit_function
+                + '    [ "${SDSYNC_TEST_FAIL_AUDIT_COMPLETE:-false}" != true ] || return 1\n',
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        environment = {
+            "SDSYNC_TEST_SOURCE_OUTPUT_FILE": str(source_output),
+            "SDSYNC_TEST_TARGET_OUTPUT_FILE": str(target_output),
+            "SDSYNC_TEST_FAIL_AUDIT_COMPLETE": "true",
+        }
+        result = self.shell(
+            self.manager,
+            "api",
+            "action",
+            "--kind",
+            "doctor",
+            "--scope",
+            "personal",
+            "--level",
+            "standard",
+            extra_environment=environment,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        output = str(payload["output"])
+        self.assertIn('"schema":"sdsync.doctor.v1"', output)
+        self.assertIn("bounded target proof", output)
+        self.assertIn("terminal audit is pending durable reconciliation", output)
+        self.assertNotIn("sdsync.source-doctor-job.v1", output)
+
+        large_target = self.root / "doctor-target-large.ndjson"
+        large_target.write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "schema": "sdsync.doctor-job.v1",
+                        "profile": f"target-{index:05d}",
+                        "status": "success",
+                        "doctor": target_document,
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+                for index in range(1800)
+            ),
+            encoding="utf-8",
+        )
+        environment["SDSYNC_TEST_TARGET_OUTPUT_FILE"] = str(large_target)
+        capped = self.shell(
+            self.manager,
+            "api",
+            "action",
+            "--kind",
+            "doctor",
+            "--scope",
+            "personal",
+            "--level",
+            "standard",
+            extra_environment=environment,
+        )
+        self.assertEqual(capped.returncode, 0, capped.stdout + capped.stderr)
+        capped_payload = json.loads(capped.stdout)
+        capped_output = str(capped_payload["output"])
+        records = [json.loads(line) for line in capped_output.splitlines() if line]
+        self.assertGreater(len(records), 1)
+        self.assertEqual(records[0]["schema"], "sdsync.doctor-job.v1")
+        self.assertEqual(records[-1], {
+            "schema": "sdsync.dsm-output-truncated.v1",
+            "truncated": True,
+        })
+        self.assertLessEqual(len(capped_output.encode("utf-8")), 327680)
+
     def test_direct_routine_enable_and_disable_use_canonical_audit_operations(self) -> None:
         self.assertEqual(
             self.configure("personal", self.source_one, "/home/Drive/Personal", True).returncode,
@@ -4847,15 +5051,100 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             input_text="test-password\n",
         )
         self.assertEqual(secret.returncode, 0, secret.stderr)
+
+        for level in ("quick", "standard", "extensive"):
+            with self.subTest(api_level=level):
+                self.capture.write_text("", encoding="utf-8")
+                doctor, doctor_payload = self.api(
+                    "action",
+                    "--kind",
+                    "doctor",
+                    "--scope",
+                    "personal",
+                    "--level",
+                    level,
+                )
+                self.assertEqual(doctor.returncode, 0, doctor.stderr)
+                self.assertEqual(doctor_payload["status"], "succeeded")
+                core_calls = self.capture.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(core_calls), 1 if level == "quick" else 2, core_calls)
+                self.assertIn(
+                    f"doctor --profile personal --level {level} target",
+                    core_calls[-1],
+                )
+                if level == "quick":
+                    self.assertFalse(any(" source" in call for call in core_calls))
+                else:
+                    self.assertIn("doctor --profile personal source", core_calls[0])
+                    self.assertEqual("--hash" in core_calls[0], level == "extensive")
+
+                snapshot, payload = self.api("snapshot")
+                self.assertEqual(snapshot.returncode, 0, snapshot.stderr)
+                health = payload["profiles"][0]["health"]
+                self.assertEqual(health["state"], "succeeded")
+                self.assertEqual(health["level"], level)
+                self.assertFalse(health["write_test"])
+
+        for level in ("quick", "standard"):
+            with self.subTest(api_rejected_write_level=level):
+                self.capture.write_text("", encoding="utf-8")
+                rejected_write, rejected_payload = self.api(
+                    "action",
+                    "--kind",
+                    "doctor",
+                    "--scope",
+                    "personal",
+                    "--level",
+                    level,
+                    "--write-test",
+                    "true",
+                )
+                self.assertEqual(rejected_write.returncode, 64)
+                self.assertEqual(rejected_payload["code"], "invalid_request")
+                self.assertEqual(self.capture.read_text(encoding="utf-8"), "")
+
+        self.capture.write_text("", encoding="utf-8")
+        explicit_write, explicit_write_payload = self.api(
+            "action",
+            "--kind",
+            "doctor",
+            "--scope",
+            "personal",
+            "--level",
+            "extensive",
+            "--write-test",
+            "true",
+        )
+        self.assertEqual(explicit_write.returncode, 0, explicit_write.stderr)
+        self.assertEqual(explicit_write_payload["status"], "succeeded")
+        explicit_calls = self.capture.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(explicit_calls), 2, explicit_calls)
+        self.assertIn("doctor --profile personal source --hash", explicit_calls[0])
+        self.assertIn(
+            "doctor --profile personal --level extensive target --write-test",
+            explicit_calls[1],
+        )
+
+        # The pre-level API contract remains accepted, but its effective depth must be
+        # unambiguously promoted to Extensive in both the core invocation and health snapshot.
+        self.capture.write_text("", encoding="utf-8")
         doctor, doctor_payload = self.api(
             "action", "--kind", "doctor", "--scope", "personal", "--write-test", "true"
         )
         self.assertEqual(doctor.returncode, 0, doctor.stderr)
         self.assertEqual(doctor_payload["status"], "succeeded")
+        legacy_calls = self.capture.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(legacy_calls), 2, legacy_calls)
+        self.assertIn("doctor --profile personal source --hash", legacy_calls[0])
+        self.assertIn(
+            "doctor --profile personal --level extensive target --write-test",
+            legacy_calls[1],
+        )
         snapshot, payload = self.api("snapshot")
         self.assertEqual(snapshot.returncode, 0, snapshot.stderr)
         self.assertEqual(payload["profiles"][0]["health"]["state"], "succeeded")
         self.assertTrue(payload["profiles"][0]["health"]["write_test"])
+        self.assertEqual(payload["profiles"][0]["health"]["level"], "extensive")
         rejected = self.shell(
             self.manager, "api", "snapshot", extra_environment={"REQUEST_METHOD": "GET"}
         )

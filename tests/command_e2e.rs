@@ -656,6 +656,15 @@ fn early_configuration_batch_and_redaction_failures_never_contact_a_server() {
         "doctor source cannot be combined with --routing-only",
     );
 
+    let mut command = fixture.command();
+    command
+        .args(["doctor", "--level", "quick", "source"])
+        .arg(&fixture.alpha_source);
+    assert_config_failure(
+        &Captured::run(command),
+        "doctor source cannot be combined with --level",
+    );
+
     let sensitive_url = "https://private-user:private-password@example.invalid";
     let redacted = fixture.run(&["doctor", "--routing-only", "--url", sensitive_url]);
     assert_config_failure(

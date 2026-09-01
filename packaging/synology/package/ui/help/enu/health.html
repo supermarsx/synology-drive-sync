@@ -11,22 +11,37 @@
 </head>
 <body>
   <h1>Health and Target Doctor</h1>
-  <p>Target Doctor performs bounded preflight diagnostics for all profiles or one selected profile. The AppWindow waits for terminal Doctor evidence rather than treating queue acceptance as success.</p>
+  <p>Target Doctor performs bounded diagnostics for all profiles or one selected profile. The AppWindow waits for terminal evidence rather than treating queue acceptance as success, and never marks missing or truncated evidence as healthy.</p>
 
-  <h2>Checks</h2>
+  <h2>Diagnostic levels</h2>
+  <dl>
+    <dt>Quick</dt><dd>Checks URL policy, TLS and reverse-proxy routing, and DSM/File Station discovery without resolving credentials or opening a session.</dd>
+    <dt>Standard</dt><dd>Adds the package-visible source scan, authentication, required File Station capabilities, destination permission, a bounded inventory sample, and logout. This is the default.</dd>
+    <dt>Extensive</dt><dd>Adds complete source MD5, CRC32, and SHA-256 hashing plus the deepest read-only target capability checks. Extensive does not write unless the separate disposable write test is enabled and confirmed.</dd>
+  </dl>
+
+  <h2>Target breakdown</h2>
   <ol>
-    <li><strong>Source integrity:</strong> walks the complete source and hashes payload files.</li>
-    <li><strong>Reverse-proxy routing:</strong> requires File Station API discovery instead of accepting an HTML login or portal fallback.</li>
-    <li><strong>Authentication:</strong> validates destination credentials without returning secrets to the AppWindow.</li>
-    <li><strong>Destination permission:</strong> checks the configured path or its nearest existing ancestor.</li>
-    <li><strong>Capacity and latency:</strong> reports only evidence actually returned by the target.</li>
+    <li>Routing and TLS negotiation</li>
+    <li>DSM API discovery</li>
+    <li>DSM session authentication</li>
+    <li>File Station capabilities</li>
+    <li>Destination permissions</li>
+    <li>Destination inventory</li>
+    <li>Disposable write, verify, and cleanup</li>
+    <li>Session logout</li>
   </ol>
+  <p>Every section is reported as OK, warning, not OK, or skipped with bounded detail and timing scope. Routing and discovery can share one connection measurement; the UI labels shared timing instead of counting it twice.</p>
+
+  <h2>Remote folder and file proof</h2>
+  <p>Standard and Extensive request one sorted, non-recursive direct-child page and display at most five folders or files. Each entry contains only bounded relative path and name, kind, file size and modified time when available, mount-boundary state, and explicit text-truncation flags. The total and truncated marker show when more entries exist. Doctor does not read those payloads or use this sample in place of Plan or Run's complete inventory.</p>
 
   <h2>Disposable write test</h2>
-  <p>The optional write test creates a unique probe, verifies it, and removes it. It requires package capability, an explicit checkbox, a second cleanup acknowledgement, and a confirmation dialog. Use only a non-critical destination. A cleanup failure is diagnostic failure evidence and must be investigated.</p>
+  <p>The optional write test is available only at Extensive depth. It creates a unique probe, verifies size, modified time, MD5, CRC32, and SHA-256, optionally exercises server-side copy, and removes the probe. It requires package capability, an explicit checkbox, a second cleanup acknowledgement, and a confirmation dialog. Use only a prepared non-critical existing destination. A cleanup failure or reported leftover path must be investigated before retrying.</p>
 
   <h2>Terminal and unknown outcomes</h2>
-  <p><strong>Completed</strong> and <strong>failed</strong> are terminal package results. A lost POST acknowledgement is recovered with at most two exact replays of the same body and client request ID, which resolve to the same queued job. If that job still cannot be observed because result evidence is invalid, expired, repeatedly unavailable, or exceeds a bounded operation's overall observation limit, the UI reports <strong>outcome unknown</strong> with request and job correlation when available. Only the affected scope and operations that depend on it are paused; independent configuration remains usable. Inspect authoritative package state, Activity, and logs before another request in that scope.</p>
+  <p><strong>Completed</strong> and <strong>failed</strong> are terminal package results. A package-level failure cannot be hidden by an independently successful target check. Complete structured output is accepted only inside the one-MiB API contract; malformed output, the package truncation marker, or the legacy 64-KiB boundary becomes a visible not-OK integrity result. Bounded trailing controller warnings remain visible.</p>
+  <p>A lost POST acknowledgement is recovered with at most two exact replays of the same body and client request ID, which resolve to the same queued job. If that job still cannot be observed because result evidence is invalid, expired, or repeatedly unavailable, the UI reports <strong>outcome unknown</strong> with request and job correlation when available. Only the affected scope and dependent operations are paused; independent configuration remains usable. Inspect authoritative package state, Activity, and logs before another request in that scope.</p>
 
   <h2>Cached target health</h2>
   <p>The table displays the newest package-reported evidence for reachability, authentication, writability, latency, Doctor status, last successful sync, and free space. <em>Unavailable</em> means evidence was not supplied; it is not equivalent to success or failure.</p>

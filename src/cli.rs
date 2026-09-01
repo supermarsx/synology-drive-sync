@@ -35,7 +35,7 @@ const PLAN_LONG_ABOUT: &str = "Discover and authenticate to File Station, scan b
 
 const PLAN_EXAMPLES: &str = "Examples:\n  synology-drive-sync plan ./export /team/export --profile nas\n  synology-drive-sync plan --profile production --delete --output json\n  synology-drive-sync plan ./export /team/export --compare size-only --exclude '*.tmp' --output ndjson\n  synology-drive-sync plan --profile production --exit-code || test $? -eq 10";
 
-const DOCTOR_LONG_ABOUT: &str = "Validate local sources, selected profiles, reverse-proxy routing, required DSM/File Station APIs, authentication, and remote destinations. The default and `target` checks are non-mutating. `target --write-test` is an explicit opt-in disposable create/upload/copy/verify/cleanup probe and must be used only on a prepared non-critical destination.\n\nUse `source` for a local-only scan, --routing-only when credentials are intentionally unavailable, or `target` for an exact destination check. Without --routing-only, normal password and TOTP resolution applies.";
+const DOCTOR_LONG_ABOUT: &str = "Validate local sources, selected profiles, reverse-proxy routing, required DSM/File Station APIs, authentication, and remote destinations. Target levels are quick (unauthenticated routing/TLS/API discovery), standard (authenticated capabilities/permission/bounded inventory), and extensive (the fullest capability report). The default is standard. Every level is non-mutating unless `target --write-test` is separately supplied; that explicit opt-in runs a disposable create/upload/copy/verify/cleanup probe and must be used only on a prepared non-critical destination.\n\nUse `source` for a local-only scan, --routing-only as the legacy quick check when credentials are intentionally unavailable, or `target` for an exact destination check. Standard and extensive checks use normal password and TOTP resolution.";
 
 const DOCTOR_EXAMPLES: &str = "Examples:\n  synology-drive-sync doctor source ./export --hash --output json\n  synology-drive-sync doctor --url https://files.example.com --username mirror-bot --routing-only\n  synology-drive-sync doctor --profile production target /team/export --output json\n  synology-drive-sync doctor --profile acceptance target --write-test\n  synology-drive-sync doctor --config ./config.toml --profiles nas-a,nas-b target --output ndjson";
 
@@ -606,6 +606,10 @@ pub struct DoctorArgs {
     #[arg(long, help_heading = "Safety")]
     pub routing_only: bool,
 
+    /// Select diagnostic depth. Extensive remains non-mutating unless --write-test is also set.
+    #[arg(long, value_enum, help_heading = "Target diagnostic")]
+    pub level: Option<DoctorLevel>,
+
     #[command(subcommand)]
     pub action: Option<DoctorAction>,
 }
@@ -647,6 +651,27 @@ pub struct DoctorTargetArgs {
     /// Create, upload, verify, optionally server-copy, and remove a unique disposable probe.
     #[arg(long, help_heading = "Target diagnostic")]
     pub write_test: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DoctorLevel {
+    /// Check routing, TLS policy, and DSM/File Station API discovery without authentication.
+    Quick,
+    /// Authenticate and inspect capabilities, destination permissions, and remote inventory.
+    Standard,
+    /// Add the fullest capability report; mutation still requires the separate --write-test flag.
+    Extensive,
+}
+
+impl DoctorLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Standard => "standard",
+            Self::Extensive => "extensive",
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -1245,6 +1270,23 @@ mod tests {
         };
         assert_eq!(target.remote.as_deref(), Some("/team/export"));
         assert!(target.write_test);
+        assert_eq!(target_doctor.level, None);
+
+        let quick_cli = Cli::try_parse_checked_from([
+            "synology-drive-sync",
+            "doctor",
+            "--url",
+            "https://files.example.test",
+            "--level",
+            "quick",
+            "target",
+            "/team/export",
+        ])
+        .unwrap();
+        let Invocation::Doctor(quick_doctor) = quick_cli.invocation() else {
+            panic!("expected doctor invocation");
+        };
+        assert_eq!(quick_doctor.level, Some(DoctorLevel::Quick));
     }
 
     #[test]

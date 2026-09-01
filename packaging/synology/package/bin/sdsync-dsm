@@ -1354,14 +1354,15 @@ write_health_cache() {
     health_status=$2
     health_exit=$3
     health_write_test=$4
+    health_level=$5
     case $health_scope in all) health_targets=$(sorted_fragments) ;; *) health_targets=$profiles_dir/$health_scope.toml ;; esac
     for health_fragment in $health_targets; do
         [ -f "$health_fragment" ] || continue
         health_profile=${health_fragment##*/}; health_profile=${health_profile%.toml}
         health_temp=$health_dir/.${health_profile}.state.$$
         {
-            printf 'state=%s\nchecked_epoch=%s\nexit_code=%s\nwrite_test=%s\n' \
-                "$health_status" "$(epoch_now)" "$health_exit" "$health_write_test"
+            printf 'state=%s\nchecked_epoch=%s\nexit_code=%s\nwrite_test=%s\nlevel=%s\n' \
+                "$health_status" "$(epoch_now)" "$health_exit" "$health_write_test" "$health_level"
         } > "$health_temp"
         finish_private_file "$health_temp"
         mv -f "$health_temp" "$health_dir/$health_profile.state"
@@ -1408,6 +1409,8 @@ selection() {
     scope_seen=false
     allow_selected_delete=false
     write_test=false
+    diagnostic_level=standard
+    diagnostic_level_seen=false
     selected_max_total=100
     max_total_seen=false
     while [ "$#" -gt 0 ]; do
@@ -1423,6 +1426,13 @@ selection() {
             --write-test)
                 [ "$selection_command" = doctor ] || die "--write-test is only valid for doctor"
                 write_test=true
+                ;;
+            --level)
+                [ "$selection_command" = doctor ] || die "--level is only valid for doctor"
+                need_value "$@"
+                diagnostic_level=$2
+                diagnostic_level_seen=true
+                shift
                 ;;
             --max-total-delete)
                 case $selection_command in plan|run) ;; *) die "--max-total-delete is only valid for plan or run" ;; esac
@@ -1444,6 +1454,14 @@ selection() {
         die "max-total-delete must be from 0 through 2147483647"
     if [ "$max_total_seen" = true ] && [ "$selected_scope" != all ]; then
         die "--max-total-delete is only valid with explicit --all"
+    fi
+    case $diagnostic_level in quick|standard|extensive) ;; *) die "doctor level must be quick, standard, or extensive" ;; esac
+    if [ "$write_test" = true ]; then
+        if [ "$diagnostic_level_seen" = false ]; then
+            diagnostic_level=extensive
+        elif [ "$diagnostic_level" != extensive ]; then
+            die "doctor write tests require the extensive level"
+        fi
     fi
 }
 
@@ -1507,9 +1525,12 @@ api_preflight_secret_material() {
 
 api_redact_file() {
     redact_path=$1
+    redact_limit=${2:-65536}
+    redact_truncation_marker=${3:-}
     [ -f "$redact_path" ] || return 0
     LC_ALL=C awk -v home="$package_home" -v var="$package_var" \
-        -v real_home="$package_home_real" -v real_var="$package_var_real" -v byte_limit=65536 '
+        -v real_home="$package_home_real" -v real_var="$package_var_real" \
+        -v byte_limit="$redact_limit" -v truncation_marker="$redact_truncation_marker" '
         function replace_literal(text, needle, replacement, at) {
             if (needle == "") return text
             while ((at = index(text, needle)) != 0)
@@ -1534,11 +1555,26 @@ api_redact_file() {
             line = replace_literal(line, real_home, "[package-home]")
             line = replace_literal(line, real_var, "[package-var]")
             gsub(/\[package-home\]\/secrets\/[^ ]+/, "[secret]", line)
+            if (truncation_marker != "") {
+                if (truncated) next
+                required = length(line) + 1
+                reserve = length(truncation_marker) + 1
+                if (emitted + required + reserve > byte_limit) {
+                    truncated = 1
+                    next
+                }
+                print line
+                emitted += required
+                next
+            }
             if (emitted >= byte_limit) next
             remaining = byte_limit - emitted
             if (length(line) > remaining) line = substr(line, 1, remaining)
             print line
             emitted += length(line) + 1
+        }
+        END {
+            if (truncated && truncation_marker != "") print truncation_marker
         }
     ' "$secret_root"/*.password "$secret_root"/*.totp "$secret_root"/*.remote-log-token "$redact_path"
 }
@@ -1549,7 +1585,8 @@ api_capture() {
     api_preflight_secret_material
     api_stdout=$state_root/.api.$$.stdout
     api_stderr=$state_root/.api.$$.stderr
-    [ ! -L "$api_stdout" ] && [ ! -L "$api_stderr" ] || api_error unsafe_state "unsafe API capture path" 73
+    api_combined=$state_root/.api.$$.combined
+    [ ! -L "$api_stdout" ] && [ ! -L "$api_stderr" ] && [ ! -L "$api_combined" ] || api_error unsafe_state "unsafe API capture path" 73
     umask 077
     set +e
     if [ "$api_exact_secret" = true ]; then
@@ -1561,9 +1598,24 @@ api_capture() {
     set -e
     finish_private_file "$api_stdout"
     finish_private_file "$api_stderr"
-    if [ -s "$api_stderr" ]; then api_output=$(api_redact_file "$api_stderr"); else api_output=$(api_redact_file "$api_stdout"); fi
-    rm -f "$api_stdout" "$api_stderr"
-    api_stdout= api_stderr=
+    : > "$api_combined"
+    [ ! -s "$api_stdout" ] || cat "$api_stdout" >> "$api_combined"
+    if [ -s "$api_stderr" ]; then
+        [ ! -s "$api_combined" ] || printf '\n' >> "$api_combined"
+        cat "$api_stderr" >> "$api_combined"
+    fi
+    finish_private_file "$api_combined"
+    api_redact_limit=65536
+    api_redact_marker=
+    if [ "${2:-}" = doctor ]; then
+        # The compiled bridge and browser both enforce a one-MiB response ceiling. Reserve ample
+        # JSON-escaping headroom while retaining complete NDJSON records for multi-profile Doctor.
+        api_redact_limit=327680
+        api_redact_marker='{"schema":"sdsync.dsm-output-truncated.v1","truncated":true}'
+    fi
+    api_output=$(api_redact_file "$api_combined" "$api_redact_limit" "$api_redact_marker")
+    rm -f "$api_stdout" "$api_stderr" "$api_combined"
+    api_stdout= api_stderr= api_combined=
 }
 
 api_capture_or_error() {
@@ -1994,10 +2046,12 @@ api_profile_json() {
     api_load_kv "$health_file" checked_epoch 0; health_epoch=$kv_value
     api_load_kv "$health_file" exit_code -1; health_exit=$kv_value
     api_load_kv "$health_file" write_test false; health_write=$kv_value
+    api_load_kv "$health_file" level standard; health_level=$kv_value
     case $health_state in unknown|succeeded|failed) ;; *) api_error corrupt_state "invalid cached health state" 73 ;; esac
     case $health_epoch in ''|*[!0-9]*) api_error corrupt_state "invalid cached health epoch" 73 ;; esac
     case $health_exit in -1|''|*[!0-9]*) [ "$health_exit" = -1 ] || api_error corrupt_state "invalid cached health exit" 73 ;; esac
     case $health_write in true|false) ;; *) api_error corrupt_state "invalid cached health write flag" 73 ;; esac
+    case $health_level in quick|standard|extensive) ;; *) api_error corrupt_state "invalid cached health doctor level" 73 ;; esac
     [ "$profile_name" = "$profile_default" ] && is_default=true || is_default=false
     if [ "$profile_max_rate" = 0 ]; then profile_max_rate_json=null; else profile_max_rate_json=$profile_max_rate; fi
     printf '{"name":%s,"default":%s,"source":%s,"url":%s,"username":%s,"remote":%s,' \
@@ -2016,7 +2070,7 @@ api_profile_json() {
     printf '"remote_log_url":%s,"remote_log_mode":%s,' "$(json_quote "$profile_remote_log_url")" "$(json_quote "$profile_remote_log_mode")"
     printf '"health":{"state":%s,"checked_epoch":%s,"exit_code":' "$(json_quote "$health_state")" "$health_epoch"
     if [ "$health_exit" = -1 ]; then printf 'null'; else printf '%s' "$health_exit"; fi
-    printf ',"write_test":%s}}' "$health_write"
+    printf ',"write_test":%s,"level":%s}}' "$health_write" "$(json_quote "$health_level")"
 }
 
 api_dependencies_json() {
@@ -2396,12 +2450,13 @@ api_audit_event() {
 }
 
 api_action() {
-    action_kind= action_scope= action_write=false action_delete=false action_max=100
-    action_write_seen=false action_delete_seen=false action_max_seen=false
+    action_kind= action_scope= action_level=standard action_write=false action_delete=false action_max=100
+    action_level_seen=false action_write_seen=false action_delete_seen=false action_max_seen=false
     while [ "$#" -gt 0 ]; do
         case $1 in
             --kind) api_need_value "$@"; action_kind=$2; shift 2 ;;
             --scope) api_need_value "$@"; action_scope=$2; shift 2 ;;
+            --level) api_need_value "$@"; action_level=$2; action_level_seen=true; shift 2 ;;
             --write-test) api_need_value "$@"; action_write=$2; action_write_seen=true; shift 2 ;;
             --allow-delete) api_need_value "$@"; action_delete=$2; action_delete_seen=true; shift 2 ;;
             --max-total-delete) api_need_value "$@"; action_max=$2; action_max_seen=true; shift 2 ;;
@@ -2414,9 +2469,16 @@ api_action() {
     case $action_max in ''|*[!0-9]*) api_error invalid_request "max-total-delete must be non-negative" 64 ;; esac
     if [ "$action_kind" = doctor ]; then
         [ "$action_delete_seen" = false ] && [ "$action_max_seen" = false ] || api_error invalid_request "delete options are not valid for doctor" 64
+        case $action_level in quick|standard|extensive) ;; *) api_error invalid_request "doctor level must be quick, standard, or extensive" 64 ;; esac
+        if [ "$action_write" = true ] && [ "$action_level" != extensive ]; then
+            [ "$action_level_seen" = false ] || api_error invalid_request "doctor write tests require the extensive level" 64
+            action_level=extensive
+        fi
         if [ "$action_scope" = all ]; then set -- "$manager" doctor --all; else set -- "$manager" doctor "$action_scope"; fi
+        set -- "$@" --level "$action_level"
         [ "$action_write" = false ] || set -- "$@" --write-test
     else
+        [ "$action_level_seen" = false ] || api_error invalid_request "level is only valid for doctor" 64
         [ "$action_write_seen" = false ] || api_error invalid_request "write-test is only valid for doctor" 64
         if [ "$action_scope" = all ]; then set -- "$manager" "$action_kind" --all; else set -- "$manager" "$action_kind" "$action_scope"; fi
         [ "$action_delete" = false ] || set -- "$@" --allow-delete
@@ -2630,24 +2692,47 @@ case $command_name in
             die "security policy blocks target doctor write tests"
         fi
         if [ "$selected_scope" = all ]; then set -- --all-profiles; else set -- --profile "$selected_scope"; fi
-        doctor_exit=0
+        source_doctor_exit=0
+        target_doctor_exit=0
+        source_doctor_output=$state_root/.doctor-source.$$.output
+        [ ! -L "$source_doctor_output" ] || die "unsafe Doctor source capture path"
+        umask 077
+        : > "$source_doctor_output"
+        finish_private_file "$source_doctor_output"
         mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
         set +e
-        "$binary" --config "$config_file" doctor "$@" source --hash
-        doctor_exit=$?
-        if [ "$doctor_exit" -eq 0 ]; then
-        if [ "$write_test" = true ]; then
-                "$binary" --config "$config_file" doctor "$@" target --write-test
-            else
-                "$binary" --config "$config_file" doctor "$@" target
-            fi
-            doctor_exit=$?
+        # Target Doctor must always reach its independent routing/authentication path. A local
+        # source failure is reported alongside it instead of short-circuiting remote evidence.
+        # Quick skips source work, standard inventories names/readability without hashing every
+        # payload, and extensive retains the complete source fingerprint pass.
+        if [ "$diagnostic_level" = standard ]; then
+            "$binary" --config "$config_file" --output ndjson doctor "$@" source > "$source_doctor_output" 2>&1
+            source_doctor_exit=$?
+        elif [ "$diagnostic_level" = extensive ]; then
+            "$binary" --config "$config_file" --output ndjson doctor "$@" source --hash > "$source_doctor_output" 2>&1
+            source_doctor_exit=$?
         fi
+        if [ "$write_test" = true ]; then
+            "$binary" --config "$config_file" --output ndjson doctor "$@" --level "$diagnostic_level" target --write-test 2>&1
+        else
+            "$binary" --config "$config_file" --output ndjson doctor "$@" --level "$diagnostic_level" target 2>&1
+        fi
+        target_doctor_exit=$?
         set -e
+        # Target evidence is the AppWindow's primary contract, so emit it before any failed local
+        # source detail. Successful source output is intentionally suppressed to keep all-profile
+        # target NDJSON inside the bounded authenticated bridge response.
+        if [ "$source_doctor_exit" -ne 0 ]; then
+            printf '{"schema":"sdsync.dsm-source-check.v1","status":"failed","exit_code":%s,"message":"package-local source diagnostic failed"}\n' "$source_doctor_exit"
+            [ ! -s "$source_doctor_output" ] || cat "$source_doctor_output"
+        fi
+        rm -f "$source_doctor_output"
+        source_doctor_output=
+        if [ "$target_doctor_exit" -ne 0 ]; then doctor_exit=$target_doctor_exit; else doctor_exit=$source_doctor_exit; fi
         if [ "$doctor_exit" -eq 0 ]; then doctor_status=succeeded; doctor_code=doctor.succeeded; else doctor_status=failed; doctor_code=doctor.failed; fi
-        write_health_cache "$selected_scope" "$doctor_status" "$doctor_exit" "$write_test"
+        write_health_cache "$selected_scope" "$doctor_status" "$doctor_exit" "$write_test" "$diagnostic_level"
         if [ "$doctor_status" = failed ]; then doctor_level=error; else doctor_level=info; fi
-        append_activity "$doctor_code" "$selected_scope" "$doctor_status" "Target doctor completed" operations "$doctor_level" 2>/dev/null || true
+        append_activity "$doctor_code" "$selected_scope" "$doctor_status" "Target doctor ($diagnostic_level) completed" operations "$doctor_level" 2>/dev/null || true
         if [ "$doctor_exit" -ne 0 ]; then
             handle_doctor_alert "$selected_scope" "$doctor_exit" 2>/dev/null || true
         fi

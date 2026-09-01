@@ -1465,9 +1465,28 @@ impl Default for SecurityPolicyArgs {
 struct OperationalActionArgs {
     kind: OperationalActionKind,
     scope: String,
+    level: Option<OperationalDoctorLevel>,
     write_test: Option<bool>,
     allow_delete: Option<bool>,
     max_total_delete: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum OperationalDoctorLevel {
+    Quick,
+    Standard,
+    Extensive,
+}
+
+impl OperationalDoctorLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Standard => "standard",
+            Self::Extensive => "extensive",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -3108,9 +3127,17 @@ fn validate_operational_action(value: &OperationalActionArgs) -> BridgeResult<()
             if value.allow_delete.is_some() || value.max_total_delete.is_some() {
                 return Err(BridgeError::bad_request());
             }
+            if value.write_test == Some(true)
+                && matches!(
+                    value.level,
+                    Some(OperationalDoctorLevel::Quick | OperationalDoctorLevel::Standard)
+                )
+            {
+                return Err(BridgeError::bad_request());
+            }
         }
         OperationalActionKind::Plan | OperationalActionKind::Run => {
-            if value.write_test.is_some() {
+            if value.level.is_some() || value.write_test.is_some() {
                 return Err(BridgeError::bad_request());
             }
             let _allow_delete = value.allow_delete.ok_or_else(BridgeError::bad_request)?;
@@ -5822,11 +5849,19 @@ fn mutation_manager_arguments(mutation: &Mutation) -> Vec<OsString> {
             push_pair(&mut arguments, "--kind", value.kind.as_str());
             push_pair(&mut arguments, "--scope", &value.scope);
             match value.kind {
-                OperationalActionKind::Doctor => push_pair(
-                    &mut arguments,
-                    "--write-test",
-                    bool_text(value.write_test.unwrap_or(false)),
-                ),
+                OperationalActionKind::Doctor => {
+                    let level = value.level.unwrap_or(if value.write_test == Some(true) {
+                        OperationalDoctorLevel::Extensive
+                    } else {
+                        OperationalDoctorLevel::Standard
+                    });
+                    push_pair(&mut arguments, "--level", level.as_str());
+                    push_pair(
+                        &mut arguments,
+                        "--write-test",
+                        bool_text(value.write_test.unwrap_or(false)),
+                    );
+                }
                 OperationalActionKind::Plan | OperationalActionKind::Run => {
                     push_pair(
                         &mut arguments,
@@ -13180,6 +13215,7 @@ mod tests {
                 Mutation::Action(OperationalActionArgs {
                     kind: OperationalActionKind::Plan,
                     scope: "nightly".to_owned(),
+                    level: None,
                     write_test: None,
                     allow_delete: Some(false),
                     max_total_delete: None,
@@ -18610,6 +18646,114 @@ mod tests {
             json!({"kind":"plan","scope":"all","write_test":null,"allow_delete":false,"max_total_delete":null}),
         ))
         .is_err());
+    }
+
+    #[test]
+    fn doctor_rejects_write_test_at_quick_and_standard_levels() {
+        for level in ["quick", "standard"] {
+            let error = parse_mutation_request(&request(
+                "action",
+                json!({
+                    "kind": "doctor",
+                    "scope": "nightly",
+                    "level": level,
+                    "write_test": true,
+                    "allow_delete": null,
+                    "max_total_delete": null
+                }),
+            ))
+            .err()
+            .expect("write testing below extensive must be rejected");
+            assert_eq!(error.kind, ErrorKind::BadRequest, "level={level}");
+        }
+    }
+
+    #[test]
+    fn plan_and_run_reject_doctor_levels() {
+        for arguments in [
+            json!({
+                "kind": "plan",
+                "scope": "all",
+                "level": "standard",
+                "write_test": null,
+                "allow_delete": false,
+                "max_total_delete": 100
+            }),
+            json!({
+                "kind": "run",
+                "scope": "nightly",
+                "level": "extensive",
+                "write_test": null,
+                "allow_delete": true,
+                "max_total_delete": null
+            }),
+        ] {
+            let error = parse_mutation_request(&request("action", arguments))
+                .err()
+                .expect("non-Doctor actions must reject Doctor levels");
+            assert_eq!(error.kind, ErrorKind::BadRequest);
+        }
+    }
+
+    #[test]
+    fn explicit_quick_doctor_dispatches_quick_without_write_test() {
+        let parsed = parse_mutation_request(&request(
+            "action",
+            json!({
+                "kind": "doctor",
+                "scope": "nightly",
+                "level": "quick",
+                "write_test": false,
+                "allow_delete": null,
+                "max_total_delete": null
+            }),
+        ))
+        .unwrap();
+        assert_eq!(
+            argument_strings(&parsed.mutation),
+            [
+                "api",
+                "action",
+                "--kind",
+                "doctor",
+                "--scope",
+                "nightly",
+                "--level",
+                "quick",
+                "--write-test",
+                "false",
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_doctor_write_test_dispatches_extensive_level() {
+        let parsed = parse_mutation_request(&request(
+            "action",
+            json!({
+                "kind": "doctor",
+                "scope": "nightly",
+                "write_test": true,
+                "allow_delete": null,
+                "max_total_delete": null
+            }),
+        ))
+        .unwrap();
+        assert_eq!(
+            argument_strings(&parsed.mutation),
+            [
+                "api",
+                "action",
+                "--kind",
+                "doctor",
+                "--scope",
+                "nightly",
+                "--level",
+                "extensive",
+                "--write-test",
+                "true",
+            ]
+        );
     }
 
     #[test]

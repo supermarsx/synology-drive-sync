@@ -52,48 +52,96 @@ the jobs in execution order and the summary last.
 
 ## Target diagnostics
 
-The normal target diagnostic is authenticated but non-mutating:
+`--level` selects target depth and belongs before the `target` subcommand. It does not alter
+`doctor source`, which is a separate command and rejects `--level`:
 
 ```bash
-synology-drive-sync doctor --profile production target
+synology-drive-sync doctor --profile production --level standard target
+synology-drive-sync doctor --url https://files.example.com --level quick target
 synology-drive-sync doctor \
   --url https://files.example.com \
   --username mirror-bot \
+  --level extensive \
   target /team-folder/project
 ```
 
-It checks TLS and reverse-proxy routing, required API versions, password and optional TOTP
-authentication, a File Station write-permission query, and recursive inventory of the logical
-destination. For an existing destination, permission is checked in that exact directory. For a
-missing destination, File Station can check only the first missing component under its nearest
-existing ancestor without creating anything; deeper missing components cannot have independent
-ACLs yet.
+| Level | Target checks | Authentication and destination access |
+| --- | --- | --- |
+| Quick | Endpoint policy, TCP/TLS and reverse-proxy route, DSM/File Station discovery, and the API surface required to establish the diagnostic client | None; it does not resolve credentials, create a session, inspect permissions, or list the destination |
+| Standard (default) | Quick plus the effective profile's required APIs | Password and challenge-driven optional TOTP, a temporary session, destination permission, bounded inventory, and logout |
+| Extensive | Standard plus content-fingerprint/download and delete capabilities, with optional server-side copy reported as a warning when absent | The same bounded destination checks; it still does not mutate the target or read/hash remote file payloads |
 
-`--routing-only` remains the unauthenticated TLS/proxy/API-discovery check and cannot be combined
-with `doctor source` or `doctor target`.
+Allowed HTTP or disabled certificate verification is visible as a warning, not silently treated as
+secure transport. For an existing destination, write permission is checked in that exact directory.
+For a missing destination, File Station can check only the first missing component under its
+nearest existing ancestor without creating anything; deeper missing components cannot have
+independent ACLs yet.
+
+### Bounded destination inventory
+
+Standard and Extensive use the same deliberately small inventory check. Doctor validates the exact
+root, then requests at most one direct-child page sorted by name. It asks File Station for at most
+six entries so it can emit a deterministic sample of no more than the first five. The result
+contains File Station's total direct-child count, `sample_count`, `sample_limit: 5`, `truncated`,
+and `truncated_count`. `truncated: true` means the display sample was capped; it is not itself a
+failed check. Extensive does not lift this bound.
+
+Sample entries contain only bounded relative name/path text, kind, file size and mtime when
+applicable, mount-boundary state, and explicit text-truncation flags. The sample contains no file
+payload, digest, ACL document, absolute sample path, credential, cookie, token, session identifier,
+or unbounded server detail. Doctor never follows those children, never requests a second listing
+page, and never substitutes this sample for the full recursive inventory used by Plan or Sync. The
+combined root/list inventory has a five-second deadline; its output records the page, depth, and
+deadline budget.
+
+### Section verdicts and timing
+
+A target report always carries the selected level, overall status, total elapsed time, counts, and
+these fixed sections: routing/TLS, API discovery, DSM session authentication, File Station
+capabilities, destination permissions, destination inventory, disposable write/verify/cleanup, and
+session logout. Each section is `pass`, `warn`, `fail`, or `skip`, with bounded detail,
+`elapsed_ms`, and `timing_scope`. Routing and discovery share one connection measurement and say so
+instead of presenting the same latency as two independent requests. Control-plane requests remain
+capped at ten seconds, connection setup uses the configured connect timeout, and the inventory has
+the stricter five-second bound above.
+
+Any HTTP or DSM response from either discovery route is evidence that the endpoint route and its
+transport negotiation worked, even when the response status or discovery payload is invalid. In
+that case routing is pass/warn and API discovery fails. A connection, TLS-handshake, or timeout
+failure that yields no response fails routing and leaves discovery skipped.
+
+Quick explicitly skips authentication, destination, write, and logout sections. Standard and
+read-only Extensive explicitly skip the write section. A warning alone still exits successfully;
+any failed operational section or cancellation emits the completed/skipped section report and then
+returns nonzero. Configuration rejected before execution may have no section report. Human, JSON,
+and NDJSON output carry the same verdicts. A single target document remains
+`sdsync.doctor.v1`; selected batches use `sdsync.doctor-job.v1` records and an
+`sdsync.doctor-batch.v1` summary.
+
+`--routing-only` remains a compatibility spelling for Quick when no source/target subcommand is
+present. It cannot be combined with `doctor source`, `doctor target`, Standard, or Extensive; new
+automation should use `--level quick target`.
 
 ### Disposable write test
 
-`doctor target --write-test` is deliberately different: it is an explicit remote mutation test.
-The logical target itself must already exist. Use it only inside a prepared, non-critical
-destination after the normal target diagnostic succeeds:
+`--write-test` is a second, independent opt-in and is valid only at Extensive depth. The logical
+target itself must already exist. Use it only inside a prepared, non-critical destination after a
+read-only Extensive diagnostic succeeds:
 
 ```bash
-synology-drive-sync doctor --profile acceptance \
+synology-drive-sync doctor --profile acceptance --level extensive \
   target /team-folder/sdsync-acceptance-UNIQUE --write-test
 ```
 
 The probe uses a unique disposable name, creates its own folder, uploads known content, verifies
-the remote bytes, exercises a server-side copy when the NAS advertises support, and removes only
-the probe artifacts it created. It must never use or replace an existing user path. A process crash,
-lost connection, DSM failure, or failed cleanup can leave a disposable artifact; inspect and remove
-that exact probe path manually before retrying. The write test is not appropriate as a routine
-production health check.
-
-A single target result uses `sdsync.doctor.v1`. The nested `write_test` object records whether the
-probe was requested, its success/failure status, each completed stage, cleanup state, and any
-leftover probe path. A selected target batch uses `sdsync.doctor-job.v1` records and an
-`sdsync.doctor-batch.v1` summary.
+the remote size, mtime, MD5, CRC32, and SHA-256, exercises server-side copy when supported (or the
+verified upload fallback), and removes only the probe artifacts it created. It must never use or
+replace an existing user path. A process crash, lost connection, DSM failure, or failed cleanup can
+leave a disposable artifact; inspect and remove the exact reported probe path manually before
+retrying. The nested `write_test` report distinguishes request, preflight, execution, verification,
+cleanup, and any leftover path. The write test is not appropriate as a routine production health
+check. For compatibility, omitting `--level` with `--write-test` auto-promotes to Extensive, but new
+automation should make both opt-ins explicit.
 
 ## Selecting complete profile jobs
 
@@ -112,7 +160,7 @@ synology-drive-sync doctor --config ./config.toml \
   --profiles photos,documents source --hash --output ndjson
 
 synology-drive-sync doctor --config ./config.toml \
-  --profiles nas-a,nas-b target --output json
+  --profiles nas-a,nas-b --level standard target --output json
 ```
 
 Each selected sync/plan profile must resolve a complete `source`, `remote`, reverse-proxy `url`,
@@ -171,18 +219,18 @@ fresh-plan breach denies mutation for that profile and stops later jobs, althoug
 jobs remain committed. Both cases are operational safety failures with exit `1`, not configuration
 errors with exit `2`.
 
-A target-diagnostic batch with `--write-test` follows the same mutation boundary: it first checks
-routing and discovery (including the required content and delete APIs), authentication, exact target
-existence, write permission, and inventory for every selected profile without mutation. No probe is
-started if any such preflight fails. Probes then run sequentially; a failed probe stops later
-probes. Successful earlier probes have already completed their own cleanup, while a cleanup failure
-reports the exact leftover probe path.
+An Extensive target-diagnostic batch with `--write-test` follows the same mutation boundary: it
+first checks routing and discovery (including content and delete APIs), authentication, exact target
+existence, write permission, and the bounded five-entry direct-child inventory for every selected
+profile without mutation. No probe is started if any such preflight fails. Probes then run
+sequentially; a failed probe stops later probes. Successful earlier probes have already completed
+their own cleanup, while a cleanup failure reports the exact leftover probe path.
 
 A target-diagnostic job is `partial` when its probe progressed far enough that remote mutation may
 have occurred before the reported failure; inspect the nested write-test report and leftover path
 even when cleanup appears complete. In the doctor aggregate,
 `all_targets_preflighted_before_mutation` is true only for a requested write-test batch whose every
-target produced preflight evidence; an interrupted or failed preflight reports false.
+target successfully completed preflight; an interrupted or failed preflight reports false.
 
 ## Aggregate results and partial failure
 
@@ -231,8 +279,8 @@ agents, or tasks exist.
 Size the outer scheduler timeout for the complete batch: every source scan/hash, every target
 preflight, all sequential uploads/copies/deletions and retries, final reconciliation, logging flush,
 and cleanup. A per-job timeout multiplied by the job count is only a starting estimate. Alert on any
-nonzero result and retain aggregate stdout plus stderr. Do not schedule `target --write-test` against
-a production destination.
+nonzero result and retain aggregate stdout plus stderr. Do not schedule
+`--level extensive target --write-test` against a production destination.
 
 The built-in overlap check cannot coordinate another host, container, manual invocation, Drive
 client, or File Station user. Keep mirror destinations in a documented single-writer window and use

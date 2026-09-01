@@ -8,16 +8,34 @@ Doctor and inspect its refreshed evidence.
 
 Doctor supports one named profile or `all`. SSH examples assume `$PACKAGE_USER` was resolved through
 the canonical [package-identity discovery](cli-parity.md#discover-the-actual-package-identity).
+Standard is the default; the AppWindow and manager also expose Quick and Extensive explicitly.
 
-The default diagnostic:
+| Level | Package-local source check | Independent File Station target check |
+| --- | --- | --- |
+| Quick | Skipped | Unauthenticated URL policy, TLS/reverse-proxy negotiation, DSM/File Station API discovery, and baseline capabilities |
+| Standard | Full source name, type, exclusion, boundary, metadata, and enumeration/readability scan without reading every payload for hashes | Quick plus password/optional TOTP authentication, temporary session, required capabilities, destination permission, bounded inventory, and logout |
+| Extensive | Standard source scan plus a complete payload pass computing MD5, CRC32, and SHA-256 | Standard plus the fullest content/download/delete/copy capability evidence; target contents remain unchanged |
 
-1. resolves the selected profile(s) under the package identity;
-2. walks and hashes the complete local source;
-3. performs File Station API discovery through the configured URL/prefix;
-4. authenticates with the protected credential and optional TOTP flow;
-5. inventories the exact destination when it exists, or checks the nearest existing ancestor when
-   the selected descendant is missing; and
-6. reports success or a nonzero exit without changing target contents.
+The manager runs the target check even when the separate Standard/Extensive source scan fails. This
+preserves routing and authentication evidence instead of hiding a target problem behind a local
+source problem. The final manager result is still nonzero when either side fails. For an existing
+destination, permission is checked at the exact path; for a missing destination, it checks the
+nearest existing ancestor's ability to create the first missing component.
+
+Standard and Extensive request only one direct-child inventory page and display at most five
+entries, deterministically sorted. Evidence includes the File Station-reported direct-child total,
+sample count, `truncated`/truncated count, and bounded safe metadata. It never recursively walks the
+destination, reads remote payloads, emits ACLs or secrets, or replaces the complete inventory used
+by Plan and Run. Extensive keeps the same bound. See
+[Bounded destination inventory](../diagnostics-and-batch.md#bounded-destination-inventory).
+
+The target result is broken down into routing/TLS, API discovery, authentication, File Station
+capabilities, destination permission, destination inventory, disposable write/verify/cleanup, and
+logout. Every section has an **OK**, **warning**, **not OK**, or **skipped** verdict and elapsed time;
+the whole result has an overall verdict and total duration. Shared routing/discovery latency is
+identified as shared rather than counted as two independent timings. A warning alone is not a
+failure. A failed operational section produces bounded evidence and a nonzero result; a rejected
+request can fail before execution and therefore have no section breakdown.
 
 The dashboard's **Run doctor** action is initially queued, then the page polls the controller's
 sanitized result to a terminal verdict without an overall client pending-state deadline. A lost POST
@@ -30,9 +48,11 @@ observation but does not cancel the queued job.
 
 ### Disposable write test
 
-**Disposable write test** is a mutating diagnostic and is disabled unless the authenticated API
-service grants `write_test`. It requires a separate checkbox and confirmation. It can create a
-unique probe, upload and verify it, exercise an optional same-target copy path, and remove the probe.
+**Disposable write test** is a mutating diagnostic available only at Extensive depth and disabled
+unless the authenticated API service grants `write_test`. It requires a separate checkbox and
+confirmation. Enabling it locks the level to Extensive. It can create a unique probe, upload and
+verify size, mtime, MD5, CRC32, and SHA-256, exercise an optional same-target copy path, and remove
+the probe.
 
 Run it only against a prepared non-critical existing destination. After a core diagnostic request
 timeout, terminal failure, or outcome-unknown result, inspect both target folders for leftovers
@@ -41,18 +61,25 @@ rather than assuming cleanup happened.
 CLI:
 
 ```bash
-sudo -u "$PACKAGE_USER" -- "$MANAGER" doctor personal
-sudo -u "$PACKAGE_USER" -- "$MANAGER" doctor personal --write-test
-sudo -u "$PACKAGE_USER" -- "$MANAGER" doctor --all
+sudo -u "$PACKAGE_USER" -- "$MANAGER" doctor personal --level quick
+sudo -u "$PACKAGE_USER" -- "$MANAGER" doctor personal --level standard
+sudo -u "$PACKAGE_USER" -- "$MANAGER" doctor personal --level extensive
+sudo -u "$PACKAGE_USER" -- "$MANAGER" doctor personal --level extensive --write-test
+sudo -u "$PACKAGE_USER" -- "$MANAGER" doctor --all --level standard
 ```
+
+For compatibility, a manager write test with no explicit level promotes itself to Extensive;
+automation should still pass both `--level extensive` and `--write-test` so the mutation boundary is
+visible in the command.
 
 ### Cached target-health table
 
 The table has columns for last check, reachability, authentication, writability, latency, last
 successful sync, Doctor status, and free space. The current manager persistently proves only an
-aggregate Doctor state, check time, exit code, and whether a write test was requested, plus routine
-last-success evidence. More granular cells remain **Unavailable** until a backend supplies explicit
-evidence.
+aggregate Doctor state, selected level, check time, exit code, and whether a write test was
+requested, plus routine last-success evidence. The complete section breakdown belongs to the
+terminal AppWindow result; more granular cached cells remain **Unavailable** until the snapshot
+supplies explicit evidence.
 
 Free space is never guessed from a share, volume, or unrelated API. It is shown only with a backend
 `free_space_proven` flag; otherwise it remains **Unavailable**.

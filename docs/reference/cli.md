@@ -8,9 +8,11 @@ The explicit command tree is preferred. Run `synology-drive-sync --help` and
 | `sync SOURCE REMOTE` | Apply one finite local-to-remote synchronization. Remote-only entries remain unless deletion is explicitly armed. |
 | `plan SOURCE REMOTE` | Build and print the same plan without mutation. `--exit-code` returns 10 when work is pending. |
 | `doctor source [SOURCE] [--hash]` | Local-only source validation; `--hash` reads and verifies every payload file. No DSM access. |
-| `doctor target [REMOTE]` | Authenticate, inventory, and non-mutatingly check the chosen File Station destination. |
-| `doctor target [REMOTE] --write-test` | Explicit disposable create/upload/copy/verify/cleanup probe. Mutating and never automatic. |
-| `doctor --routing-only` | Validate TLS, reverse-proxy routing, and API discovery without credentials. |
+| `doctor --level quick target [REMOTE]` | Validate endpoint policy, TLS, reverse-proxy routing, API discovery, and baseline capabilities without credentials or destination access. |
+| `doctor target [REMOTE]` | Run the default Standard authenticated permission, bounded-inventory, and logout checks without mutation. |
+| `doctor --level extensive target [REMOTE]` | Require the fullest target content/download/delete/copy capability evidence without mutation. |
+| `doctor --level extensive target [REMOTE] --write-test` | Explicit disposable create/upload/copy/MD5/CRC32/SHA-256 verify/cleanup probe. Mutating and never automatic. |
+| `doctor --routing-only` | Legacy Quick spelling without a source/target subcommand. |
 | `config path` | Print the platform default configuration path. |
 | `config init` | Write the complete non-secret starter; refuses replacement unless `--force` is used. |
 | `config validate` | Parse and validate the strict TOML schema and profile-local constraints. |
@@ -21,6 +23,12 @@ The explicit command tree is preferred. Run `synology-drive-sync --help` and
 | `credentials remove` | Remove `password`, `totp`, or `all` vault material for the endpoint/account. |
 | `completions SHELL` | Generate Bash, Zsh, Fish, PowerShell, or Elvish completion source. |
 | `manpage [--all DIRECTORY]` | Generate the root roff page on stdout or every nested command page in a directory. |
+
+Target Doctor reports fixed timed sections as `pass`, `warn`, `fail`, or `skip`. Standard and
+Extensive inventory never recurses: it emits File Station's direct-child total and a deterministic
+sample of at most five entries with explicit truncation state. Extensive is read-only unless the
+separate `--write-test` flag is present; Quick and Standard reject that flag. See
+[Diagnostics and multi-profile batches](../diagnostics-and-batch.md) for the complete contract.
 
 The legacy spelling without an explicit `sync` subcommand remains supported:
 

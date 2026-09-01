@@ -199,29 +199,102 @@ fn routing_only_doctor_stops_after_reverse_proxy_discovery() {
         "--routing-only",
     ]);
     assert_success(&output);
-    let mut actual = stdout_json(&output);
-    actual["elapsed_ms"] = Value::Null;
+    let actual = stdout_json(&output);
+    assert_eq!(actual["schema"], "sdsync.doctor.v1");
+    assert_eq!(actual["level"], "quick");
+    assert_eq!(actual["status"], "warn");
+    assert_eq!(actual["routing"], true);
+    assert_eq!(actual["api_discovery"], true);
+    assert_eq!(actual["authenticated"], false);
+    assert_eq!(actual["remote_checked"], false);
+    assert_eq!(actual["remote_inventory"], Value::Null);
     assert_eq!(
-        actual,
-        json!({
-            "schema": "sdsync.doctor.v1",
-            "routing": true,
-            "api_discovery": true,
-            "authenticated": false,
-            "remote_checked": false,
-            "remote_exists": null,
-            "remote_entries": null,
-            "write_permission_scope": null,
-            "write_permission_path": null,
-            "write_test": {"requested": false, "status": "not-requested", "report": null, "error": null},
-            "elapsed_ms": null
-        })
+        actual["summary"],
+        json!({"pass":2,"warn":1,"fail":0,"skip":5})
     );
+    let sections = actual["sections"].as_array().expect("section array");
+    assert_eq!(sections.len(), 8);
+    assert_eq!(sections[0]["id"], "routing_tls");
+    assert_eq!(sections[0]["status"], "warn");
+    assert_eq!(sections[1]["id"], "dsm_api_discovery");
+    assert_eq!(sections[1]["status"], "pass");
+    assert_eq!(sections[2]["id"], "dsm_session_auth");
+    assert_eq!(sections[2]["status"], "skip");
 
     let requests = server.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].request_path, "/prefix/webapi/entry.cgi");
     assert_eq!(requests[0].operation(), "SYNO.API.Info.query");
+}
+
+#[test]
+fn explicit_quick_target_level_is_unauthenticated_and_does_not_touch_the_destination() {
+    let server = MockFileStation::start();
+    server.add_directory("/team/target");
+    let output = run(&[
+        "--quiet",
+        "--output",
+        "json",
+        "doctor",
+        "--url",
+        server.base_url(),
+        "--allow-http",
+        "--level",
+        "quick",
+        "target",
+        "/team/target",
+    ]);
+    assert_success(&output);
+    let result = stdout_json(&output);
+    assert_eq!(result["level"], "quick");
+    assert_eq!(result["authenticated"], false);
+    assert_eq!(result["remote_checked"], false);
+    assert_eq!(result["sections"][2]["id"], "dsm_session_auth");
+    assert_eq!(result["sections"][2]["status"], "skip");
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .map(|request| request.operation())
+            .collect::<Vec<_>>(),
+        ["SYNO.API.Info.query"]
+    );
+}
+
+#[test]
+fn discovery_http_failure_keeps_routing_evidence_and_returns_nonzero() {
+    let server = MockFileStation::start();
+    server.fail_next_http_operation("SYNO.API.Info.query", 503);
+    server.fail_next_http_operation("SYNO.API.Info.query", 503);
+    let output = run(&[
+        "--quiet",
+        "--output",
+        "json",
+        "doctor",
+        "--url",
+        server.base_url(),
+        "--allow-http",
+        "--retries",
+        "0",
+        "--routing-only",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let result = stdout_json(&output);
+    assert_eq!(result["status"], "fail");
+    assert_eq!(result["level"], "quick");
+    assert_eq!(result["routing"], true);
+    assert_eq!(result["api_discovery"], false);
+    assert_eq!(result["sections"][0]["id"], "routing_tls");
+    assert_eq!(result["sections"][0]["status"], "warn");
+    assert_eq!(result["sections"][1]["id"], "dsm_api_discovery");
+    assert_eq!(result["sections"][1]["status"], "fail");
+    assert!(
+        result["sections"][3]["detail"]
+            .as_str()
+            .expect("dependent skip detail")
+            .contains("failed")
+    );
+    assert_eq!(server.requests().len(), 2);
 }
 
 #[test]
@@ -253,24 +326,28 @@ fn authenticated_target_doctor_checks_exact_destination_and_logs_out() {
         "/team/target",
     ]);
     assert_success(&output);
-    let mut actual = stdout_json(&output);
-    actual["elapsed_ms"] = Value::Null;
+    let actual = stdout_json(&output);
+    assert_eq!(actual["schema"], "sdsync.doctor.v1");
+    assert_eq!(actual["level"], "standard");
+    assert_eq!(actual["status"], "warn");
+    assert_eq!(actual["routing"], true);
+    assert_eq!(actual["api_discovery"], true);
+    assert_eq!(actual["authenticated"], true);
+    assert_eq!(actual["remote_checked"], true);
+    assert_eq!(actual["remote_exists"], true);
+    assert_eq!(actual["remote_entries"], 1);
+    assert_eq!(actual["write_permission_scope"], "exact_destination");
+    assert_eq!(actual["write_permission_path"], "/team/target");
+    assert_eq!(actual["remote_inventory"]["scope"], "direct_children");
+    assert_eq!(actual["remote_inventory"]["total_entries"], 1);
+    assert_eq!(actual["remote_inventory"]["sample_count"], 1);
+    assert_eq!(actual["remote_inventory"]["truncated"], false);
     assert_eq!(
-        actual,
-        json!({
-            "schema": "sdsync.doctor.v1",
-            "routing": true,
-            "api_discovery": true,
-            "authenticated": true,
-            "remote_checked": true,
-            "remote_exists": true,
-            "remote_entries": 1,
-            "write_permission_scope": "exact_destination",
-            "write_permission_path": "/team/target",
-            "write_test": {"requested": false, "status": "not-requested", "report": null, "error": null},
-            "elapsed_ms": null
-        })
+        actual["remote_inventory"]["sample"][0]["name"],
+        "existing.txt"
     );
+    assert_eq!(actual["remote_inventory"]["sample"][0]["kind"], "file");
+    assert_eq!(actual["write_test"]["status"], "not-requested");
 
     let requests = server.requests();
     let operations = requests
@@ -285,7 +362,6 @@ fn authenticated_target_doctor_checks_exact_destination_and_logs_out() {
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.CheckPermission.write",
-            "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.List.list",
             "SYNO.API.Auth.logout",
@@ -653,16 +729,27 @@ fn reflected_authentication_failure_is_redacted_and_never_logs_out() {
         "/team/target",
     ]);
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(output.stdout, b"");
+    let result = stdout_json(&output);
+    assert_eq!(result["status"], "fail");
+    assert_eq!(result["level"], "standard");
+    assert_eq!(result["authenticated"], false);
+    assert_eq!(result["sections"][2]["id"], "dsm_session_auth");
+    assert_eq!(result["sections"][2]["status"], "fail");
+    assert_eq!(result["sections"][4]["status"], "skip");
+    assert!(
+        result["sections"][4]["detail"]
+            .as_str()
+            .expect("skip detail")
+            .contains("failed")
+    );
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
     assert!(
-        stderr.starts_with("error: unexpected response during SYNO.API.Auth.login:"),
+        stderr.starts_with("error: target diagnostic failed; inspect the section breakdown:"),
         "unexpected stderr: {stderr:?}"
     );
-    assert!(stderr.contains("authentication response body withheld"));
-    assert!(stderr.contains("proxy returned HTML"));
-    assert!(!stderr.contains("correct horse battery staple"));
-    assert!(!stderr.contains("654321"));
+    let combined = format!("{}{}", String::from_utf8_lossy(&output.stdout), stderr);
+    assert!(!combined.contains("correct horse battery staple"));
+    assert!(!combined.contains("654321"));
     assert_eq!(stderr.lines().count(), 1);
     assert_eq!(
         server
@@ -671,6 +758,55 @@ fn reflected_authentication_failure_is_redacted_and_never_logs_out() {
             .map(|request| request.operation())
             .collect::<Vec<_>>(),
         ["SYNO.API.Info.query", "SYNO.API.Auth.login"]
+    );
+}
+
+#[test]
+fn failed_write_test_authentication_is_not_reported_as_preflighted() {
+    let fixture = TestDir::new("write-test-auth-failure");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.reflect_login_failure("write probe must not run");
+
+    let output = run(&[
+        "--quiet",
+        "--output",
+        "json",
+        "doctor",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password.to_str().expect("UTF-8 password path"),
+        "--no-vault",
+        "--allow-http",
+        "--level",
+        "extensive",
+        "target",
+        "/team/target",
+        "--write-test",
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let result = stdout_json(&output);
+    assert_eq!(result["status"], "fail");
+    assert_eq!(result["sections"][2]["id"], "dsm_session_auth");
+    assert_eq!(result["sections"][2]["status"], "fail");
+    assert_eq!(
+        result["sections"][6]["id"],
+        "disposable_write_verify_cleanup"
+    );
+    assert_eq!(result["sections"][6]["status"], "skip");
+    assert_eq!(result["write_test"]["requested"], true);
+    assert_eq!(result["write_test"]["status"], "failed");
+    assert!(result["write_test"]["report"].is_null());
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|request| !is_mutation(&request.operation())),
+        "failed authentication must not reach a disposable write probe"
     );
 }
 
@@ -749,6 +885,7 @@ fn target_write_test_exercises_copy_verification_and_removes_every_probe_path() 
     assert_success(&output);
     let result = stdout_json(&output);
     assert_eq!(result["write_test"]["requested"], true);
+    assert_eq!(result["level"], "extensive");
     assert_eq!(result["write_test"]["status"], "success");
     assert!(result["write_test"]["error"].is_null());
     let report = &result["write_test"]["report"];
@@ -756,11 +893,22 @@ fn target_write_test_exercises_copy_verification_and_removes_every_probe_path() 
     assert_eq!(report["directory_created"], true);
     assert_eq!(report["upload_attempted"], true);
     assert_eq!(report["upload_verified"], true);
+    assert_eq!(report["fingerprint_complete"], true);
+    assert_eq!(report["uploaded_crc32"].as_str().expect("CRC32").len(), 8);
+    assert_eq!(
+        report["uploaded_sha256"].as_str().expect("SHA-256").len(),
+        64
+    );
     assert_eq!(report["server_copy_supported"], true);
     assert_eq!(report["server_copy_attempted"], true);
     assert_eq!(report["server_copy_verified"], true);
     assert_eq!(report["cleanup_completed"], true);
     assert!(report["leftover_remote_probe_path"].is_null());
+    assert_eq!(
+        result["sections"][6]["id"],
+        "disposable_write_verify_cleanup"
+    );
+    assert_eq!(result["sections"][6]["status"], "pass");
     let probe_path = report["probe_path"].as_str().expect("probe path");
     assert!(probe_path.starts_with("/team/probe/.synology-drive-sync-probe-"));
     assert!(
@@ -820,6 +968,56 @@ fn target_write_test_exercises_copy_verification_and_removes_every_probe_path() 
             probe_path.to_owned(),
         ]
     );
+}
+
+#[test]
+fn extensive_level_without_write_test_remains_non_mutating() {
+    let fixture = TestDir::new("extensive-no-write");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/extensive");
+    server.add_file("/team/extensive/example.bin", b"example", 1_700_000_000);
+
+    let output = run(&[
+        "--quiet",
+        "--output",
+        "json",
+        "doctor",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password.to_str().expect("UTF-8 password path"),
+        "--no-vault",
+        "--allow-http",
+        "--level",
+        "extensive",
+        "target",
+        "/team/extensive",
+    ]);
+    assert_success(&output);
+    let result = stdout_json(&output);
+    assert_eq!(result["level"], "extensive");
+    assert_eq!(result["write_test"]["requested"], false);
+    assert_eq!(result["sections"][6]["status"], "skip");
+    assert!(
+        result["sections"][6]["detail"]
+            .as_str()
+            .expect("write-test skip detail")
+            .contains("separate --write-test opt-in")
+    );
+    let operations = server
+        .requests()
+        .iter()
+        .map(|request| request.operation())
+        .collect::<Vec<_>>();
+    assert!(!operations.iter().any(|operation| matches!(
+        operation.as_str(),
+        "SYNO.FileStation.CreateFolder.create"
+            | "SYNO.FileStation.Upload.upload"
+            | "SYNO.FileStation.Delete.delete"
+    )));
 }
 
 #[test]
@@ -1109,12 +1307,83 @@ allow-http = true
         "SYNO.FileStation.List.getinfo",
         "SYNO.FileStation.CheckPermission.write",
         "SYNO.FileStation.List.getinfo",
-        "SYNO.FileStation.List.getinfo",
         "SYNO.FileStation.List.list",
         "SYNO.API.Auth.logout",
     ];
     assert_eq!(operations[..one_target.len()], one_target);
     assert_eq!(operations[one_target.len()..], one_target);
+}
+
+#[test]
+fn write_test_batch_rejects_a_missing_destination_during_non_mutating_preflight() {
+    let fixture = TestDir::new("doctor-batch-missing-destination");
+    let alpha_source = fixture.child("sources/alpha");
+    let beta_source = fixture.child("sources/beta");
+    fs::create_dir_all(&alpha_source).expect("create alpha source");
+    fs::create_dir_all(&beta_source).expect("create beta source");
+    let password = fixture.write("secrets/password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team");
+    server.add_directory("/team/alpha");
+    let config = write_two_profile_config(
+        &fixture,
+        &password,
+        &alpha_source,
+        server.base_url(),
+        "/team/alpha",
+        &beta_source,
+        server.base_url(),
+        "/team/missing",
+        "metadata",
+        false,
+        0,
+    );
+
+    let output = run(&[
+        "--config",
+        config.to_str().expect("UTF-8 config path"),
+        "--quiet",
+        "--output",
+        "ndjson",
+        "doctor",
+        "--all-profiles",
+        "--level",
+        "extensive",
+        "target",
+        "--write-test",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let records = stdout_ndjson(&output);
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0]["profile"], "alpha");
+    assert_eq!(records[0]["status"], "preflighted");
+    assert_eq!(records[1]["profile"], "beta");
+    assert_eq!(records[1]["status"], "failed");
+    assert_eq!(records[1]["doctor"]["remote_exists"], false);
+    assert_eq!(
+        records[1]["doctor"]["sections"][6]["id"],
+        "disposable_write_verify_cleanup"
+    );
+    assert_eq!(records[1]["doctor"]["sections"][6]["status"], "fail");
+    assert!(
+        records[1]["doctor"]["sections"][6]["detail"]
+            .as_str()
+            .expect("probe section detail")
+            .contains("requires an existing destination")
+    );
+    assert_eq!(records[2]["schema"], "sdsync.doctor-batch.v1");
+    assert_eq!(records[2]["status"], "failed");
+    assert_eq!(records[2]["write_tests_requested"], true);
+    assert_eq!(records[2]["all_targets_preflighted_before_mutation"], false);
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|request| !is_mutation(&request.operation())),
+        "a missing write-test destination must abort the batch before any disposable probe mutates a target"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    assert!(stderr.contains("no disposable write probes were attempted"));
 }
 
 #[test]

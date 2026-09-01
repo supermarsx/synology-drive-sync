@@ -130,18 +130,43 @@ schedule, and per-profile routines share one host-local run lock. See
 
 ## Health / Doctor
 
-Doctor can target one named profile or all profiles. Its default diagnostic hashes the complete
-source and checks File Station discovery, authentication, inventory, and the exact destination or
-nearest writable ancestor without changing target contents.
+Doctor can target one named profile or all profiles. The level selector is explicit:
 
-**Disposable write test** is separately capability-gated and requires an explicit confirmation. It
-briefly creates, uploads, verifies, may exercise same-target copy, and removes a unique probe. Use it
-only in a prepared non-critical destination. The API initially queues the action, then the page polls
-its sanitized terminal result before reporting the Doctor verdict. Pending Doctor observations have
-no overall client deadline. An `expired_or_missing` result, an invalid result document, or five
-consecutive result-observation failures yields outcome-unknown; inspect Activity and refreshed cached
-health evidence to determine what completed. Only the Run/Doctor operation scope is then paused in
-that AppWindow. Profile, routine, notification, security, and interface work remains available.
+- **Quick** skips the source and performs unauthenticated routing, TLS, reverse-proxy, and DSM/File
+  Station discovery checks.
+- **Standard** (the default) scans source names, metadata, boundaries, exclusions, and enumeration
+  readability without hashing payloads, then authenticates and checks target capabilities,
+  permission, bounded inventory, and logout.
+- **Extensive** additionally hashes every source payload with MD5, CRC32, and SHA-256 and requires
+  the fullest target capability evidence. It remains read-only by itself.
+
+The package runs the target side independently even when the Standard/Extensive source scan fails,
+then returns nonzero if either failed. This lets the AppWindow retain useful negotiation or
+authentication evidence instead of stopping at the first local-source problem.
+
+Each target result is shown as an overall verdict and a negotiation-to-target breakdown. Routing,
+API discovery, authentication, File Station capabilities, destination permission, destination
+inventory, write/verify/cleanup, and logout each show **OK**, **warning**, **not OK**, or **skipped**,
+with elapsed time and bounded detail. The copy action exports the same credential-redacted evidence
+for troubleshooting. A warning does not count as success for a missing check, and a skipped check is
+never presented as healthy.
+
+Standard and Extensive destination inventory displays no more than five deterministically selected
+direct children plus File Station's total count and an explicit truncated marker. It is one bounded,
+non-recursive page with safe metadata only: it does not read or hash remote payloads, expose ACLs or
+secrets, or replace the full Plan/Run inventory. Extensive does not expand that listing.
+
+**Disposable write test** is a separate, capability-gated mutation opt-in. Enabling it locks the
+level to Extensive and requires confirmation. It briefly creates and uploads a unique probe,
+verifies size, mtime, MD5, CRC32, and SHA-256, may exercise same-target copy, and removes the probe.
+Use it only in a prepared non-critical existing destination.
+
+The API initially queues the action, then the page polls its sanitized terminal result before
+reporting the Doctor verdict. Pending Doctor observations have no overall client deadline. An
+`expired_or_missing` result, an invalid result document, or five consecutive result-observation
+failures yields outcome-unknown; inspect Activity and refreshed cached health evidence to determine
+what completed. Only the Run/Doctor operation scope is then paused in that AppWindow. Profile,
+routine, notification, security, and interface work remains available.
 
 The target-health table never fabricates evidence. Missing reachability, authentication,
 writability, latency, or timestamp data is shown as **Unavailable**. Free space is displayed only

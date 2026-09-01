@@ -74,11 +74,19 @@ routines, state, and logs.
 | Operation | Remote effect | Use it for |
 | --- | --- | --- |
 | `doctor source [SOURCE] [--hash]` | None | Validate readability, names, exclusions, and optionally every payload fingerprint |
-| `doctor target [REMOTE]` | None | Validate TLS, routing, authentication, permissions, and inventory |
-| `doctor target [REMOTE] --write-test` | Disposable probe and cleanup only | Exercise live create, upload, copy, verify, and cleanup behavior |
+| `doctor --level quick target [REMOTE]` | None | Check TLS, reverse-proxy routing, and API discovery without authenticating |
+| `doctor target [REMOTE]` | None | Run the default Standard check: authenticate, inspect permissions, sample at most five direct children, and log out |
+| `doctor --level extensive target [REMOTE]` | None | Require the fullest target API/capability evidence; still read-only |
+| `doctor --level extensive target [REMOTE] --write-test` | Disposable probe and cleanup only | Exercise live create, upload, copy, MD5/CRC32/SHA-256 verification, and cleanup |
 | `plan` | None | Review the exact pending work; `--exit-code` returns `10` when changes exist |
 | `sync` | Creates and updates | Safe default; remote-only entries remain |
 | `sync` with effective deletion enabled | Creates, updates, and guarded removals | Deliberate one-way mirror after separate recovery testing |
+
+Every target level reports an overall verdict plus timed, per-section `PASS`, `WARN`, `FAIL`, or
+`SKIP` evidence. Standard and Extensive inventory is a deterministic, non-recursive sample, not a
+full sync scan. Extensive never writes unless the separate `--write-test` opt-in is present. See
+[Diagnostics and multi-profile batches](https://supermarsx.github.io/synology-drive-sync/diagnostics-and-batch.html)
+for the exact checks, bounds, and limitations.
 
 Comparison is independent of the operation:
 
@@ -120,13 +128,14 @@ failure-before-delete ordering.
      --url https://files.example.com --username mirror-bot
    ```
 
-4. **Diagnose and plan without changing the destination.** Add `--hash` to the source diagnostic
-   when you want every local payload read and fingerprinted.
+4. **Diagnose and plan without changing the destination.** Add `--hash` to the separate source
+   diagnostic when you want every local payload read and fingerprinted. Target Doctor defaults to
+   Standard and remains non-mutating.
 
    ```bash
    synology-drive-sync doctor source ./project --hash
    synology-drive-sync doctor --url https://files.example.com --username mirror-bot \
-     target /TeamShare/project
+     --level standard target /TeamShare/project
    synology-drive-sync plan ./project /TeamShare/project \
      --url https://files.example.com --username mirror-bot
    ```

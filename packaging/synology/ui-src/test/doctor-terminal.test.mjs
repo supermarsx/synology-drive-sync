@@ -44,7 +44,7 @@ test("Doctor awaits terminal bridge evidence while plan and run remain queued", 
     source,
     /ACTIONS\.execute,[\s\S]*?Object\.assign\(\{ kind \}, payload\),[\s\S]*?awaitTerminal/
   );
-  assert.match(source, /this\.diagnostic = \{ title: "Doctor completed", output: message \}/);
+  assert.match(source, /this\.diagnostic = \{ title: "Doctor completed", output: operationMessage \}/);
   assert.match(source, /result\.output \|\| result\.message/);
   assert.match(source, /error\.resultOutput \|\| report\.message/);
   assert.match(source, /title: report\.unknown \? "Doctor outcome unknown" : "Doctor failed"/);
@@ -106,7 +106,7 @@ test("queued terminal polling outlives the former two-minute attempt horizon", a
       { signal: new AbortController().signal },
       "csrf-token",
       api.ACTIONS.execute,
-      { allow_delete: null, kind: "doctor", max_total_delete: null, scope: "all", write_test: false },
+      { allow_delete: null, kind: "doctor", level: "standard", max_total_delete: null, scope: "all", write_test: false },
       true,
       0
     );
@@ -158,7 +158,7 @@ test("only an actual terminal failure is reported as failed and its output is pr
         { signal: new AbortController().signal },
         "csrf-token",
         api.ACTIONS.execute,
-        { allow_delete: null, kind: "doctor", max_total_delete: null, scope: "all", write_test: false },
+        { allow_delete: null, kind: "doctor", level: "standard", max_total_delete: null, scope: "all", write_test: false },
         true,
         0
       ),

@@ -304,16 +304,42 @@
           </section>
 
           <section v-else-if="route === 'health'" class="sdsync-page" aria-labelledby="sdsync-page-title">
-            <div class="sdsync-two-column">
+            <div class="sdsync-doctor-layout">
               <v-form v-model="doctorForm" class="sdsync-panel sdsync-horizontal-form sdsync-doctor-form" direction="horizontal" @submit="runDoctor">
-                <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Target doctor</p><h3>Run a diagnostic</h3></div><span class="sdsync-pill neutral">Manual</span></div>
+                <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Target doctor</p><h3>Choose diagnostic depth</h3></div><span class="sdsync-pill neutral">Manual</span></div>
                 <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Scope" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="doctor-scope" /></template><v-single-select class="sdsync-select-control" v-model="doctorForm.scope" :options="scopeOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-doctor-scope" :disabled="!canRunOperations"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
-                <div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Disposable write test <control-help help-key="doctor-write" /></span><v-checkbox class="sdsync-checkbox-control" v-model="doctorForm.write_test" aria-label="Disposable write test" aria-describedby="sdsync-help-doctor-write" :disabled="!canRunOperations || !canRunDoctorWrite || !hasCapability('write_test')" /></div>
-                <div v-if="doctorForm.write_test" class="sdsync-warning"><strong>This mutates the selected target briefly.</strong><div class="sdsync-toggle-row"><span class="sdsync-toggle-label">I prepared a non-critical destination and approve probe cleanup <control-help help-key="doctor-write-confirm" /></span><v-checkbox class="sdsync-checkbox-control" v-model="doctorForm.write_confirm" aria-label="Approve disposable probe cleanup" aria-describedby="sdsync-help-doctor-write-confirm" :disabled="!canRunOperations || !canRunDoctorWrite" /></div></div>
-                <div class="sdsync-submit-row"><v-button suffix="main" display="icon-text" html-type="submit" :tooltip="operationMutationGuidance || 'Run preflight checks and wait for bounded terminal Doctor evidence'" :disabled="!canRunOperations || operationBusy"><template #icon><action-icon name="doctor" /></template>Run doctor</v-button></div>
+                <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Test level" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="doctor-level" /></template><v-single-select class="sdsync-select-control" v-model="doctorForm.level" :options="doctorLevelOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-doctor-level" :disabled="!canRunOperations || doctorForm.write_test"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
+                <aside :class="['sdsync-doctor-level-note', 'is-' + doctorForm.level]" role="note"><strong>{{ doctorLevelTitle }}</strong><span>{{ doctorLevelGuidance }}</span><small v-if="doctorForm.level === 'extensive'">Extensive remains read-only unless the separate disposable write probe is enabled and confirmed.</small></aside>
+                <div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Disposable write test <control-help help-key="doctor-write" /></span><v-checkbox class="sdsync-checkbox-control" v-model="doctorForm.write_test" aria-label="Disposable write test" aria-describedby="sdsync-help-doctor-write" :disabled="!canRunOperations || !canRunDoctorWrite || !hasCapability('write_test')" @input="onDoctorWriteTestChanged" /></div>
+                <div v-if="doctorForm.write_test" class="sdsync-warning"><strong>Write probe enabled; test level is locked to Extensive.</strong><span>A unique probe is created, verified, and removed. All other Extensive checks remain non-mutating.</span><div class="sdsync-toggle-row"><span class="sdsync-toggle-label">I prepared a non-critical destination and approve probe cleanup <control-help help-key="doctor-write-confirm" /></span><v-checkbox class="sdsync-checkbox-control" v-model="doctorForm.write_confirm" aria-label="Approve disposable probe cleanup" aria-describedby="sdsync-help-doctor-write-confirm" :disabled="!canRunOperations || !canRunDoctorWrite" /></div></div>
+                <div v-if="doctorProgress.active" class="sdsync-doctor-progress" role="status" aria-live="polite" aria-label="Target Doctor progress">
+                  <div class="sdsync-doctor-progress-heading"><action-icon class="sdsync-is-spinning" name="refresh" :size="20" /><span><strong>Doctor is running</strong><small>Keep this AppWindow open while terminal evidence is collected.</small></span></div>
+                  <div class="sdsync-doctor-progress-track" aria-hidden="true"><span /></div>
+                  <ol><li v-for="stage in doctorProgressStages" :key="stage.id" :class="'is-' + stage.state"><span class="sdsync-doctor-state-dot" />{{ stage.label }}<small>{{ doctorStatusLabel(stage.state) }}</small></li></ol>
+                </div>
+                <div class="sdsync-submit-row"><v-button suffix="main" display="icon-text" html-type="submit" :tooltip="operationMutationGuidance || 'Run bounded target checks and wait for terminal evidence'" :disabled="!canRunOperations || operationBusy" :aria-busy="doctorProgress.active ? 'true' : 'false'"><template #icon><action-icon :class="{ 'sdsync-is-spinning': doctorProgress.active }" name="doctor" /></template>Run doctor</v-button></div>
               </v-form>
-              <article class="sdsync-panel sdsync-diagnostic" aria-live="polite"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Latest diagnostic</p><h3>{{ diagnostic.title }}</h3></div><span class="sdsync-pulse" /></div><pre>{{ diagnostic.output }}</pre></article>
+              <article class="sdsync-panel sdsync-doctor-session" aria-live="polite">
+                <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Latest diagnostic</p><h3>{{ diagnostic.title }}</h3></div><v-button type="border" display="icon-text" aria-label="Copy Target Doctor diagnostics" tooltip="Copy this bounded, credential-redacted diagnostic breakdown" :disabled="!doctorCopyAvailable" @click="copyDoctorDiagnostics"><template #icon><action-icon name="copy" /></template>Copy diagnostics</v-button></div>
+                <div :class="['sdsync-doctor-overall', doctorStatusClass(doctorReport.state)]"><span class="sdsync-doctor-state-dot" /><div><strong>{{ doctorStatusLabel(doctorReport.state) }}</strong><small>{{ doctorReport.structured ? 'Structured section evidence' : 'Legacy terminal output fallback' }} · {{ doctorReport.level }} level<span v-if="doctorReport.duration_ms !== null"> · {{ formatDuration(doctorReport.duration_ms) }}</span></small></div></div>
+                <dl class="sdsync-doctor-summary" aria-label="Diagnostic result counts"><div v-for="item in doctorSummaryCards" :key="item.state" :class="doctorStatusClass(item.state)"><dt>{{ item.label }}</dt><dd>{{ item.count }}</dd></div></dl>
+                <p class="sdsync-doctor-session-note">{{ doctorReportNote }}</p>
+              </article>
             </div>
+            <article class="sdsync-panel sdsync-doctor-breakdown" aria-labelledby="sdsync-doctor-breakdown-title">
+              <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Section evidence</p><h3 id="sdsync-doctor-breakdown-title">Negotiation-to-target breakdown</h3></div><span class="sdsync-freshness">{{ doctorReport.sections.length }} section{{ doctorReport.sections.length === 1 ? '' : 's' }}</span></div>
+              <div v-if="doctorCleanupWarning" class="sdsync-warning sdsync-doctor-cleanup-warning" role="alert"><strong>Disposable probe cleanup needs attention.</strong><span>{{ doctorCleanupWarning }}</span></div>
+              <p v-if="!doctorReport.sections.length" class="sdsync-empty">Run Target Doctor to see OK, warning, not OK, and skipped evidence for each diagnostic area.</p>
+              <ol v-else class="sdsync-doctor-sections">
+                <li v-for="(section, sectionIndex) in doctorReport.sections" :key="[section.profile, section.id, sectionIndex].join(':')" :class="doctorStatusClass(section.state)">
+                  <div class="sdsync-doctor-section-heading"><span class="sdsync-doctor-state-dot" /><div><strong>{{ section.label }}</strong><small v-if="section.profile">Profile: {{ section.profile }}</small><small v-if="section.timing_scope">Timing scope: {{ section.timing_scope }}</small></div><span class="sdsync-doctor-state-label">{{ doctorStatusLabel(section.state) }}</span><time v-if="section.duration_ms !== null">{{ formatDuration(section.duration_ms) }}</time></div>
+                  <p>{{ section.detail }}</p>
+                  <ul v-if="section.checks.length" class="sdsync-doctor-checks"><li v-for="check in section.checks" :key="check.id" :class="doctorStatusClass(check.state)"><span class="sdsync-doctor-state-dot" /><strong>{{ check.label }}</strong><span>{{ check.detail }}</span><time v-if="check.duration_ms !== null">{{ formatDuration(check.duration_ms) }}</time><small>{{ doctorStatusLabel(check.state) }}</small></li></ul>
+                  <div v-if="section.inventory" class="sdsync-doctor-inventory"><div class="sdsync-doctor-inventory-summary"><strong>{{ section.inventory.total }} remote entr{{ section.inventory.total === 1 ? 'y' : 'ies' }} reported</strong><span>{{ section.inventory.entries.length }} displayed<span v-if="section.inventory.truncated"> · bounded sample truncated</span></span></div><ul><li v-for="(entry, entryIndex) in section.inventory.entries" :key="entry.path + ':' + entryIndex"><span class="sdsync-doctor-entry-kind">{{ entry.kind }}</span><div><strong>{{ entry.path }}</strong><small>{{ doctorInventoryMetadata(entry) }}</small></div></li></ul></div>
+                </li>
+              </ol>
+              <details v-if="diagnostic.output" class="sdsync-doctor-raw"><summary>{{ doctorReport.structured ? 'Structured terminal summary' : 'Raw terminal evidence' }}</summary><pre>{{ diagnostic.output }}</pre></details>
+            </article>
             <article class="sdsync-panel"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Cached per-profile evidence</p><h3>Target health</h3></div><span class="sdsync-freshness">{{ healthFreshness }}</span></div><div class="sdsync-table-wrap"><table><thead><tr><th>Profile</th><th>Last check</th><th>Reachable</th><th>Auth</th><th>Writable</th><th>Latency</th><th>Last success</th><th>Doctor</th><th>Free space</th></tr></thead><tbody><tr v-if="!healthRows.length"><td colspan="9">No cached target-health evidence.</td></tr><tr v-for="health in healthRows" :key="health.profile"><td>{{ health.profile || 'Unknown' }}</td><td>{{ formatDate(health.last_check_epoch || health.checked_at_epoch || health.checked_epoch) }}</td><td :class="healthClass(health.reachable)">{{ booleanEvidence(health.reachable) }}</td><td :class="healthClass(health.authenticated !== undefined ? health.authenticated : health.auth)">{{ booleanEvidence(health.authenticated !== undefined ? health.authenticated : health.auth) }}</td><td :class="healthClass(health.writable)">{{ booleanEvidence(health.writable) }}</td><td>{{ formatDuration(health.latency_ms) }}</td><td>{{ formatDate(health.last_success_epoch || health.last_successful_sync_epoch) }}</td><td>{{ health.doctor_status || health.last_doctor_status || health.state || 'Unavailable' }}</td><td>{{ health.free_space_proven === true ? formatBytes(health.free_space_bytes) : 'Unavailable' }}</td></tr></tbody></table></div></article>
           </section>
 
@@ -516,6 +542,26 @@ const PROFILE_CONNECTION_API_LIMITS = Object.freeze({
   resultObservationTimeoutMs: 120000,
   requestReconciliationTimeoutMs: 45000,
   requestReconciliationPollIntervalMs: 1000
+});
+const DOCTOR_LEVELS = Object.freeze(["quick", "standard", "extensive"]);
+const DOCTOR_OUTPUT_LIMIT_BYTES = 1024 * 1024;
+const DOCTOR_SECTION_CATALOG = Object.freeze([
+  Object.freeze({ id: "routing_tls", label: "Routing and TLS negotiation", minimum: "quick", detail: "Resolve the endpoint and negotiate the configured HTTPS transport." }),
+  Object.freeze({ id: "dsm_api_discovery", label: "DSM API discovery", minimum: "quick", detail: "Negotiate a compatible DSM and File Station API surface." }),
+  Object.freeze({ id: "dsm_session_auth", label: "DSM session authentication", minimum: "standard", detail: "Authenticate a temporary target session without exposing credentials." }),
+  Object.freeze({ id: "file_station_capabilities", label: "File Station capabilities", minimum: "standard", detail: "Check the target operations required by this profile." }),
+  Object.freeze({ id: "destination_permissions", label: "Destination permissions", minimum: "standard", detail: "Verify child-create/write permission at the exact destination or its nearest existing ancestor." }),
+  Object.freeze({ id: "destination_inventory", label: "Destination inventory", minimum: "standard", detail: "Inspect a bounded direct-child sample without changing the target." }),
+  Object.freeze({ id: "disposable_write_verify_cleanup", label: "Disposable write, verify, and cleanup", minimum: "write", detail: "Create, verify, and remove one explicitly approved probe." }),
+  Object.freeze({ id: "session_logout", label: "Session logout", minimum: "standard", detail: "Confirm that the temporary DSM target session is closed." })
+]);
+const DOCTOR_STATE_ALIASES = Object.freeze({
+  pass: "ok", passed: "ok", success: "ok", succeeded: "ok", healthy: "ok", ready: "ok", ok: "ok",
+  warning: "warn", warned: "warn", degraded: "warn", warn: "warn",
+  error: "failed", fail: "failed", failure: "failed", failed: "failed", unhealthy: "failed", not_ok: "failed",
+  partial: "warn", preflighted: "warn",
+  ignored: "skipped", not_run: "skipped", omitted: "skipped", unsupported: "skipped", not_applicable: "skipped", skip: "skipped", skipped: "skipped",
+  queued: "pending", waiting: "pending", pending: "pending", active: "running", executing: "running", running: "running"
 });
 
 function emptyProfileFailureRecords() {
@@ -887,6 +933,7 @@ const CONTROL_HELP = Object.freeze({
   "routine-delete": "Permit this routine to use the profile's separately approved deletion policy.",
   "routine-max-delete": "Additional routine-level ceiling for destination deletions.",
   "doctor-scope": "Run diagnostics for every profile or one selected profile.",
+  "doctor-level": "Quick performs unauthenticated routing, TLS, and DSM API discovery only. Standard adds authentication, File Station capabilities, destination permissions, bounded inventory, and logout. Extensive deepens those checks without writing to the target.",
   "doctor-write": "Create, verify, and remove one disposable destination probe.",
   "doctor-write-confirm": "Confirm that the selected destination is non-critical and cleanup is approved.",
   "activity-search": "Search the rendered event text, metadata, or an exact client request ID.",
@@ -1362,6 +1409,685 @@ function activityTroubleshootingText(value) {
   return boundedSanitizedTroubleshootingText(lines.join("\n"), TROUBLESHOOTING_RECORD_LIMIT);
 }
 
+function normalizedDoctorLevel(value) {
+  const level = String(value || "").trim().toLowerCase();
+  return DOCTOR_LEVELS.includes(level) ? level : "standard";
+}
+
+function doctorLevelRank(value) {
+  return { quick: 0, standard: 1, extensive: 2 }[normalizedDoctorLevel(value)];
+}
+
+function expectedDoctorSections(level, writeTest, state = "pending") {
+  const rank = doctorLevelRank(level);
+  return DOCTOR_SECTION_CATALOG.filter((section) => {
+    if (section.minimum === "write") return writeTest === true;
+    return doctorLevelRank(section.minimum) <= rank;
+  }).map((section) => ({
+    id: section.id,
+    label: section.label,
+    state,
+    detail: state === "skipped"
+      ? "The installed package returned no structured evidence for this diagnostic area."
+      : section.detail,
+    duration_ms: null,
+    timing_scope: "",
+    checks: [],
+    inventory: null,
+    profile: ""
+  }));
+}
+
+function emptyDoctorProgress() {
+  return { active: false, phase: "idle", level: "standard", started_epoch: 0 };
+}
+
+function doctorSummary(sections) {
+  const summary = { ok: 0, warn: 0, failed: 0, skipped: 0, pending: 0, running: 0, total: 0 };
+  for (const section of Array.isArray(sections) ? sections : []) {
+    const state = Object.prototype.hasOwnProperty.call(summary, section.state) ? section.state : "warn";
+    summary[state] += 1;
+    summary.total += 1;
+  }
+  return summary;
+}
+
+function doctorState(value, fallback = "warn") {
+  const normalized = String(value === true ? "ok" : (value === false ? "failed" : value || ""))
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  return DOCTOR_STATE_ALIASES[normalized] || (DOCTOR_STATE_ALIASES[fallback] || fallback);
+}
+
+function aggregateDoctorState(items, fallback = "warn") {
+  const states = (Array.isArray(items) ? items : []).map((item) => doctorState(item && item.state, "warn"));
+  for (const state of ["failed", "warn", "running", "pending", "ok", "skipped"]) {
+    if (states.includes(state)) return state;
+  }
+  return doctorState(fallback, "warn");
+}
+
+function doctorDuration(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? Math.round(number) : null;
+}
+
+function doctorText(value, fallback = "", limit = 4096) {
+  return boundedSanitizedTroubleshootingText(
+    redactedTroubleshootingText(typeof value === "string" || typeof value === "number" ? String(value) : fallback),
+    Math.max(128, Math.min(8192, Number(limit) || 4096))
+  ).replace(/\s+/g, " ").trim() || fallback;
+}
+
+function doctorIdentifier(value, fallback) {
+  const identifier = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 64);
+  return identifier || fallback;
+}
+
+function boundedDoctorOutput(value) {
+  const source = typeof value === "string" ? value : "";
+  const receivedBytes = utf8ByteLength(source);
+  if (receivedBytes <= DOCTOR_OUTPUT_LIMIT_BYTES) {
+    return { text: source, received_bytes: receivedBytes, contract_truncated: false };
+  }
+  let bytes = 0;
+  let text = "";
+  for (const character of source) {
+    const point = character.codePointAt(0);
+    const width = point <= 0x7f ? 1 : (point <= 0x7ff ? 2 : (point <= 0xffff ? 3 : 4));
+    if (bytes + width > DOCTOR_OUTPUT_LIMIT_BYTES) break;
+    text += character;
+    bytes += width;
+  }
+  return { text, received_bytes: receivedBytes, contract_truncated: true };
+}
+
+function doctorOutputEnvelope(result) {
+  const value = result && typeof result === "object" && !Array.isArray(result)
+    ? (typeof result.output === "string" && result.output.length ? result.output : result.message)
+    : result;
+  const bounded = boundedDoctorOutput(value);
+  let malformedNdjson = false;
+  let sawJsonLine = false;
+  let lastJsonLine = -1;
+  let packageTruncationMarker = false;
+  const lines = bounded.text.split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        sawJsonLine = true;
+        lastJsonLine = index;
+        if (String(parsed.schema || "").toLowerCase() === "sdsync.dsm-output-truncated.v1"
+          && parsed.truncated === true) packageTruncationMarker = true;
+      }
+    } catch (_error) {
+      malformedNdjson = true;
+    }
+  }
+  const explicitTruncation = Boolean(result && typeof result === "object" && !Array.isArray(result)
+    && (result.output_truncated === true || result.terminal_output_truncated === true || result.output_complete === false))
+    || packageTruncationMarker;
+  const legacyBoundary = !bounded.contract_truncated
+    && !explicitTruncation
+    && bounded.received_bytes === 64 * 1024;
+  const truncated = bounded.contract_truncated || explicitTruncation || legacyBoundary;
+  const incomplete = truncated || malformedNdjson;
+  const reasons = [];
+  if (bounded.contract_truncated) reasons.push("output exceeded the one-MiB DSM API response contract");
+  if (explicitTruncation) reasons.push("the package marked terminal output as truncated");
+  if (legacyBoundary) reasons.push("output ended exactly at the legacy 64-KiB capture boundary");
+  if (malformedNdjson) reasons.push("at least one NDJSON record was incomplete or malformed");
+  const trailingText = lastJsonLine < 0
+    ? ""
+    : doctorText(
+      lines.slice(lastJsonLine + 1)
+        .map((line) => line.trim())
+        .filter((line) => line && !line.startsWith("{"))
+        .slice(0, 8)
+        .join(" · "),
+      "",
+      4096
+    );
+  return {
+    text: bounded.text,
+    received_bytes: bounded.received_bytes,
+    truncated,
+    incomplete,
+    saw_json_line: sawJsonLine,
+    trailing_text: trailingText,
+    detail: reasons.join("; ")
+  };
+}
+
+function doctorInventoryEntry(value, index) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const rawKind = String(value.kind || value.type || value.entry_type || "entry").toLowerCase();
+  const kind = rawKind.includes("dir") || rawKind === "folder"
+    ? "folder"
+    : (rawKind.includes("file") || rawKind === "regular" ? "file" : (rawKind === "symlink" ? "link" : "entry"));
+  const path = doctorText(
+    value.relative_path || value.relative || value.path || value.name,
+    `Entry ${index + 1}`,
+    512
+  );
+  const name = doctorText(value.name || value.basename, path.split("/").filter(Boolean).pop() || path, 256);
+  const sizeCandidate = value.size_bytes !== undefined ? value.size_bytes : value.size;
+  const parsedSize = Number(sizeCandidate);
+  const modified = value.modified_epoch !== undefined
+    ? value.modified_epoch
+    : (value.mtime_epoch !== undefined ? value.mtime_epoch : (value.mtime_seconds !== undefined ? value.mtime_seconds : (value.modified_at || value.mtime || "")));
+  return {
+    path,
+    name,
+    kind,
+    size_bytes: Number.isFinite(parsedSize) && parsedSize >= 0 ? Math.round(parsedSize) : null,
+    modified: typeof modified === "number" || typeof modified === "string" ? modified : "",
+    relative_path_truncated: value.relative_path_truncated === true,
+    name_truncated: value.name_truncated === true,
+    mount_boundary: value.mount_boundary === true
+  };
+}
+
+function normalizedDoctorInventory(value, fallbackTotal = null) {
+  const inventory = Array.isArray(value) ? { entries: value } : value;
+  if (!inventory || typeof inventory !== "object") return null;
+  const candidates = Array.isArray(inventory.entries)
+    ? inventory.entries
+    : (Array.isArray(inventory.sample) ? inventory.sample : (Array.isArray(inventory.items) ? inventory.items : []));
+  const entries = candidates.map(doctorInventoryEntry).filter(Boolean).slice(0, 5);
+  const totalCandidate = inventory.total !== undefined
+    ? inventory.total
+    : (inventory.total_entries !== undefined ? inventory.total_entries : (inventory.total_count !== undefined ? inventory.total_count : (inventory.count !== undefined ? inventory.count : fallbackTotal)));
+  const parsedTotal = Number(totalCandidate);
+  const total = Number.isFinite(parsedTotal) && parsedTotal >= 0 ? Math.max(entries.length, Math.round(parsedTotal)) : candidates.length;
+  if (!entries.length && total === 0 && inventory.truncated !== true) return null;
+  return {
+    entries,
+    total,
+    truncated: inventory.truncated === true || candidates.length > 5 || total > entries.length
+  };
+}
+
+function normalizedDoctorCheck(value, index) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const id = doctorIdentifier(value.id || value.code || value.name || value.label, `check_${index + 1}`);
+  return {
+    id,
+    label: doctorText(value.label || value.title || value.name || value.code, `Check ${index + 1}`, 256),
+    state: doctorState(value.state || value.status || value.result || value.ok, "warn"),
+    detail: doctorText(value.detail || value.message || value.summary || value.reason || value.output, "No detail was reported."),
+    duration_ms: doctorDuration(value.duration_ms !== undefined ? value.duration_ms : value.elapsed_ms)
+  };
+}
+
+function normalizedDoctorSection(value, index, profile = "") {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const id = doctorIdentifier(value.id || value.code || value.name || value.label || value.area, `section_${index + 1}`);
+  const checksSource = Array.isArray(value.checks)
+    ? value.checks
+    : (Array.isArray(value.tests) ? value.tests : (Array.isArray(value.results) ? value.results : []));
+  const checks = checksSource.map(normalizedDoctorCheck).filter(Boolean);
+  const explicitState = value.state !== undefined
+    ? value.state
+    : (value.status !== undefined ? value.status : (value.result !== undefined ? value.result : value.ok));
+  const inventorySource = value.remote_inventory !== undefined
+    ? value.remote_inventory
+    : (value.inventory !== undefined ? value.inventory : (id.includes("inventory") ? value.entries : null));
+  return {
+    id,
+    label: doctorText(value.label || value.title || value.name || value.area || value.code, `Diagnostic section ${index + 1}`, 256),
+    state: explicitState === undefined || explicitState === null || explicitState === ""
+      ? aggregateDoctorState(checks, "warn")
+      : doctorState(explicitState, "warn"),
+    detail: doctorText(value.detail || value.message || value.summary || value.reason || value.output, checks.length ? "See the individual checks below." : "No detail was reported."),
+    duration_ms: doctorDuration(value.duration_ms !== undefined ? value.duration_ms : value.elapsed_ms),
+    timing_scope: doctorText(value.timing_scope || value.timingScope, "", 64),
+    checks,
+    inventory: normalizedDoctorInventory(inventorySource, value.remote_total || value.entry_count),
+    profile: doctorText(value.profile || profile, "", 128)
+  };
+}
+
+function doctorDocumentSignal(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const schema = String(value.schema || "").toLowerCase();
+  return schema === "sdsync.doctor.v1"
+    || ["sections", "stages", "diagnostics", "profiles"].some((key) => Array.isArray(value[key]))
+    || (value.remote_inventory && typeof value.remote_inventory === "object")
+    || String(value.kind || value.operation || "").toLowerCase() === "doctor";
+}
+
+function doctorDocumentFromCandidate(value, depth = 0) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || depth > 3) return null;
+  const schema = String(value.schema || "").toLowerCase();
+  if (schema === "sdsync.doctor-job.v1") return doctorDocumentFromCandidate(value.doctor, depth + 1);
+  if (schema.includes("source") && schema.includes("doctor")) return null;
+  if (doctorDocumentSignal(value)) return value;
+  for (const key of ["doctor", "diagnostic", "report", "result", "data"]) {
+    const nested = doctorDocumentFromCandidate(value[key], depth + 1);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+function parsedJsonCandidates(value) {
+  const text = boundedDoctorOutput(value).text.trim();
+  if (!text) return [];
+  const candidates = [];
+  const serialized = new Set();
+  const remember = (candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return;
+    let signature = "";
+    try { signature = JSON.stringify(candidate); } catch (_error) { return; }
+    if (!signature || serialized.has(signature)) return;
+    serialized.add(signature);
+    candidates.push(candidate);
+  };
+  try { remember(JSON.parse(text)); } catch (_error) { /* Terminal output may surround the JSON record. */ }
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) continue;
+    try { remember(JSON.parse(trimmed)); } catch (_error) { /* Continue to the balanced-object scan. */ }
+  }
+  let start = -1;
+  let depth = 0;
+  let quoted = false;
+  let escaped = false;
+  for (let index = 0; index < text.length && candidates.length < 128; index += 1) {
+    const character = text[index];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === "\"") quoted = false;
+      continue;
+    }
+    if (character === "\"") { quoted = true; continue; }
+    if (character === "{") {
+      if (depth === 0) start = index;
+      depth += 1;
+    } else if (character === "}" && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        try { remember(JSON.parse(text.slice(start, index + 1))); } catch (_error) { /* Ignore non-JSON braces. */ }
+        start = -1;
+      }
+    }
+  }
+  return candidates;
+}
+
+function doctorDocumentFromResult(result, outputOverride = undefined) {
+  if (result && typeof result === "object" && !Array.isArray(result)) {
+    for (const candidate of [result.doctor, result.diagnostic, result.report, result]) {
+      const document = doctorDocumentFromCandidate(candidate);
+      if (document) return document;
+    }
+  }
+  const output = outputOverride !== undefined
+    ? outputOverride
+    : (result && typeof result === "object" ? result.output : result);
+  const candidates = parsedJsonCandidates(output);
+  const batch = candidates.slice().reverse().find((candidate) => String(candidate.schema || "").toLowerCase() === "sdsync.doctor-batch.v1") || null;
+  const jobs = candidates.filter((candidate) => String(candidate.schema || "").toLowerCase() === "sdsync.doctor-job.v1")
+    .map((candidate) => {
+      const doctor = doctorDocumentFromCandidate(candidate.doctor);
+      const profile = doctorText(candidate.profile || candidate.name || (doctor && doctor.profile), "Unknown profile", 128);
+      if (doctor) return Object.assign({}, doctor, { profile });
+      const state = doctorState(candidate.status, candidate.error ? "failed" : "skipped");
+      return {
+        schema: "sdsync.doctor.v1",
+        level: (batch && batch.level) || "standard",
+        status: state,
+        profile,
+        sections: [{
+          id: "doctor_job",
+          label: "Profile Doctor execution",
+          status: state,
+          detail: doctorText(candidate.error, state === "skipped" ? "The profile was not run." : "The profile Doctor did not return a structured report.")
+        }]
+      };
+    }).filter(Boolean);
+  if (jobs.length) return Object.assign({}, batch || {}, { schema: "sdsync.doctor-batch.v1", level: (batch && batch.level) || jobs[0].level, profiles: jobs });
+  if (batch) return batch;
+  for (let index = candidates.length - 1; index >= 0; index -= 1) {
+    const document = doctorDocumentFromCandidate(candidates[index]);
+    if (document) return document;
+  }
+  return null;
+}
+
+function sectionsFromDoctorDocument(document) {
+  if (!document || typeof document !== "object") return [];
+  const sections = [];
+  const append = (values, profile = "") => {
+    if (!Array.isArray(values)) return;
+    for (const value of values) {
+      const section = normalizedDoctorSection(value, sections.length, profile);
+      if (section) sections.push(section);
+    }
+  };
+  append(document.sections || document.stages || document.diagnostics || document.areas);
+  if (Array.isArray(document.profiles)) {
+    for (const profile of document.profiles) {
+      if (!profile || typeof profile !== "object" || Array.isArray(profile)) continue;
+      const evidence = profile.doctor && typeof profile.doctor === "object" && !Array.isArray(profile.doctor) ? profile.doctor : profile;
+      const profileName = profile.profile || profile.name || evidence.profile;
+      const firstSection = sections.length;
+      append(evidence.sections || evidence.stages || evidence.diagnostics || evidence.areas, profileName);
+      const profileInventory = normalizedDoctorInventory(
+        evidence.remote_inventory || evidence.inventory,
+        evidence.remote_total || evidence.entry_count
+      );
+      if (profileInventory) {
+        const inventorySection = sections.slice(firstSection).find((section) => section.id.includes("inventory"));
+        if (inventorySection) inventorySection.inventory = profileInventory;
+      }
+    }
+  }
+  if (!sections.length && Array.isArray(document.checks)) append(document.checks);
+  const topInventory = normalizedDoctorInventory(
+    document.remote_inventory || document.inventory,
+    document.remote_total || document.entry_count
+  );
+  if (topInventory) {
+    const inventorySection = sections.find((section) => section.id.includes("inventory"));
+    if (inventorySection) inventorySection.inventory = topInventory;
+    else sections.push({
+      id: "inventory",
+      label: "Remote inventory sample",
+      state: doctorState((document.remote_inventory || {}).state || document.status, "ok"),
+      detail: "Bounded remote discovery evidence returned by the target.",
+      duration_ms: null,
+      timing_scope: "",
+      checks: [],
+      inventory: topInventory,
+      profile: ""
+    });
+  }
+  return sections;
+}
+
+function doctorOperationFailureDetail(result, rawOutput) {
+  const evidence = [];
+  const remember = (value) => {
+    const detail = doctorText(value, "", 2048);
+    if (detail && !evidence.includes(detail)) evidence.push(detail);
+  };
+  if (result && typeof result === "object" && !Array.isArray(result)) {
+    for (const key of ["message", "error", "detail", "reason"]) remember(result[key]);
+  }
+  for (const candidate of parsedJsonCandidates(rawOutput)) {
+    const schema = String(candidate.schema || "").toLowerCase();
+    const failed = candidate.ok === false || doctorState(candidate.status || candidate.state, "skipped") === "failed";
+    if (!failed && !(schema.includes("source") && schema.includes("doctor"))) continue;
+    for (const key of ["message", "error", "detail", "reason", "code", "stage"]) remember(candidate[key]);
+    const sections = Array.isArray(candidate.sections) ? candidate.sections : [];
+    for (const section of sections) {
+      if (doctorState(section && (section.status || section.state), "skipped") !== "failed") continue;
+      remember(section.detail || section.message || section.reason || section.error);
+    }
+  }
+  for (const line of String(rawOutput || "").split("\n").slice(-256)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("{")) continue;
+    remember(trimmed);
+  }
+  return doctorText(
+    evidence.slice(0, 8).join(" · "),
+    "The package or DSM API reported that the Target Doctor operation did not complete successfully.",
+    4096
+  );
+}
+
+function doctorSourceFailureDetail(rawOutput) {
+  const evidence = [];
+  let sourceFailed = false;
+  const remember = (value) => {
+    const detail = doctorText(value, "", 2048);
+    if (detail && !evidence.includes(detail)) evidence.push(detail);
+  };
+  for (const candidate of parsedJsonCandidates(rawOutput)) {
+    const schema = String(candidate.schema || "").toLowerCase();
+    const sourceCandidate = schema === "sdsync.dsm-source-check.v1"
+      || (schema.includes("source") && schema.includes("doctor"));
+    if (!sourceCandidate) continue;
+    const status = String(candidate.status || candidate.state || "").trim().toLowerCase();
+    const failedSections = (Array.isArray(candidate.sections) ? candidate.sections : [])
+      .filter((section) => doctorState(section && (section.status || section.state), "skipped") === "failed");
+    const failed = schema === "sdsync.dsm-source-check.v1"
+      || candidate.ok === false
+      || ["error", "fail", "failed", "failure", "partial"].includes(status)
+      || Boolean(candidate.error)
+      || failedSections.length > 0;
+    if (!failed) continue;
+    sourceFailed = true;
+    for (const key of ["message", "error", "detail", "reason", "code", "stage"]) remember(candidate[key]);
+    for (const section of failedSections) remember(section.detail || section.message || section.reason || section.error);
+  }
+  if (!sourceFailed) return "";
+  return doctorText(
+    evidence.slice(0, 8).join(" · "),
+    "The package-local source diagnostic failed.",
+    4096
+  );
+}
+
+function doctorReportFromResult(result, successful, requestedLevel, writeTest, startedEpoch = 0) {
+  const level = normalizedDoctorLevel(requestedLevel);
+  const outputEnvelope = doctorOutputEnvelope(result);
+  const rawOutput = outputEnvelope.text;
+  const document = doctorDocumentFromResult(result, rawOutput);
+  let sections = sectionsFromDoctorDocument(document);
+  const hasProfileGroups = Boolean(document && Array.isArray(document.profiles) && document.profiles.length);
+  if (document && !hasProfileGroups) {
+    const returnedIds = new Set(sections.map((section) => section.id));
+    for (const expected of expectedDoctorSections(level, writeTest, "skipped")) {
+      if (!returnedIds.has(expected.id)) sections.push(expected);
+    }
+  } else if (!document) {
+    sections = expectedDoctorSections(level, writeTest, "skipped");
+    sections.push({
+      id: "terminal_evidence",
+      label: "Legacy terminal evidence",
+      state: successful ? "ok" : "failed",
+      detail: doctorText(rawOutput, successful ? "Doctor completed." : "Doctor failed."),
+      duration_ms: null,
+      timing_scope: "operation",
+      checks: [],
+      inventory: null,
+      profile: ""
+    });
+  }
+  const sourceFailureDetail = doctorSourceFailureDetail(rawOutput);
+  if (sourceFailureDetail) {
+    sections.push({
+      id: "package_source_diagnostic",
+      label: "Package-local source diagnostic",
+      state: "failed",
+      detail: sourceFailureDetail,
+      duration_ms: null,
+      timing_scope: "operation",
+      checks: [],
+      inventory: null,
+      profile: ""
+    });
+  }
+  if (!successful && document && !sections.some((section) => doctorState(section.state, "warn") === "failed")) {
+    sections.push({
+      id: "package_operation",
+      label: "Package Doctor operation",
+      state: "failed",
+      detail: doctorOperationFailureDetail(result, rawOutput),
+      duration_ms: null,
+      timing_scope: "operation",
+      checks: [],
+      inventory: null,
+      profile: ""
+    });
+  }
+  if (outputEnvelope.incomplete) {
+    sections.push({
+      id: "terminal_output_integrity",
+      label: "Terminal output integrity",
+      state: "failed",
+      detail: doctorText(
+        `The returned Doctor evidence is incomplete and must not be treated as a complete result${outputEnvelope.detail ? `: ${outputEnvelope.detail}` : "."}`,
+        "The returned Doctor evidence is incomplete.",
+        4096
+      ),
+      duration_ms: null,
+      timing_scope: "transport",
+      checks: [],
+      inventory: null,
+      profile: ""
+    });
+  }
+  if (document && outputEnvelope.trailing_text) {
+    sections.push({
+      id: "terminal_warning",
+      label: "Terminal warning evidence",
+      state: "warn",
+      detail: outputEnvelope.trailing_text,
+      duration_ms: null,
+      timing_scope: "transport",
+      checks: [],
+      inventory: null,
+      profile: ""
+    });
+  }
+  const summary = doctorSummary(sections);
+  const started = Number(document && (document.started_epoch || document.started_at_epoch)) || Number(startedEpoch) || 0;
+  const finished = Number(document && (document.finished_epoch || document.finished_at_epoch)) || 0;
+  const reportedDuration = doctorDuration(document && (document.duration_ms !== undefined ? document.duration_ms : document.elapsed_ms));
+  const inferredDuration = started > 0 && finished >= started ? (finished - started) * 1000 : null;
+  return {
+    schema: doctorText(document && document.schema, document ? "sdsync.doctor.v1" : "legacy-output", 128),
+    structured: Boolean(document),
+    level: normalizedDoctorLevel(document && document.level ? document.level : level),
+    state: !successful || summary.failed
+      ? "failed"
+      : (summary.warn
+        ? "warn"
+        : (document && (document.status !== undefined || document.state !== undefined)
+          ? doctorState(document.status !== undefined ? document.status : document.state, "ok")
+          : "ok")),
+    started_epoch: started,
+    finished_epoch: finished,
+    duration_ms: reportedDuration === null ? inferredDuration : reportedDuration,
+    summary,
+    sections,
+    raw_output: rawOutput,
+    output_incomplete: outputEnvelope.incomplete,
+    output_truncated: outputEnvelope.truncated,
+    output_received_bytes: outputEnvelope.received_bytes,
+    terminal_warning: outputEnvelope.trailing_text
+  };
+}
+
+function runningDoctorReport(level, writeTest, startedEpoch) {
+  const sections = expectedDoctorSections(level, writeTest, "pending");
+  return {
+    schema: "sdsync.doctor.v1",
+    structured: true,
+    level: normalizedDoctorLevel(level),
+    state: "running",
+    started_epoch: startedEpoch,
+    finished_epoch: 0,
+    duration_ms: null,
+    summary: doctorSummary(sections),
+    sections,
+    raw_output: "",
+    output_incomplete: false,
+    output_truncated: false,
+    output_received_bytes: 0,
+    terminal_warning: ""
+  };
+}
+
+function idleDoctorReport() {
+  return {
+    schema: "sdsync.doctor.v1",
+    structured: true,
+    level: "standard",
+    state: "skipped",
+    started_epoch: 0,
+    finished_epoch: 0,
+    duration_ms: null,
+    summary: doctorSummary([]),
+    sections: [],
+    raw_output: "",
+    output_incomplete: false,
+    output_truncated: false,
+    output_received_bytes: 0,
+    terminal_warning: ""
+  };
+}
+
+function doctorDisplayOutput(report, fallback) {
+  if (!report || report.structured !== true) return boundedText(fallback, "No diagnostic output was returned.");
+  const summary = report.summary || doctorSummary(report.sections);
+  return [
+    `${String(report.level || "standard").toUpperCase()} Target Doctor returned structured evidence for ${summary.total || 0} section${summary.total === 1 ? "" : "s"}.`,
+    `${summary.ok || 0} OK · ${summary.warn || 0} warning · ${summary.failed || 0} not OK · ${summary.skipped || 0} skipped.`,
+    report.output_incomplete ? "Terminal output was incomplete; displayed sections are partial and must not be treated as a complete Doctor result." : "Terminal output integrity was preserved within the DSM API response contract.",
+    "Raw NDJSON is not rendered; use the bounded section breakdown or Copy diagnostics."
+  ].join("\n");
+}
+
+function doctorTroubleshootingText(report, title, output) {
+  const model = report && typeof report === "object" ? report : runningDoctorReport("standard", false, 0);
+  const summary = model.summary || doctorSummary(model.sections);
+  const lines = [
+    "Synology Drive Sync Target Doctor",
+    `Title: ${doctorText(title, "Diagnostic", 256)}`,
+    `Schema: ${doctorText(model.schema, "Unavailable", 128)}`,
+    `Level: ${normalizedDoctorLevel(model.level)}`,
+    `Status: ${doctorState(model.state, "warn")}`,
+    `Summary: ${summary.ok || 0} OK, ${summary.warn || 0} warning, ${summary.failed || 0} not OK, ${summary.skipped || 0} skipped`,
+    model.duration_ms === null || model.duration_ms === undefined ? "Duration: unavailable" : `Duration: ${model.duration_ms} ms`,
+    `Terminal output complete: ${model.output_incomplete === true ? "no" : "yes"}`,
+    `Terminal output truncated: ${model.output_truncated === true ? "yes" : "no"}`
+  ];
+  for (const section of Array.isArray(model.sections) ? model.sections : []) {
+    lines.push("", `[${doctorState(section.state, "warn").toUpperCase()}] ${doctorText(section.label, section.id, 256)}`);
+    if (section.profile) lines.push(`Profile: ${doctorText(section.profile, "", 128)}`);
+    if (section.duration_ms !== null && section.duration_ms !== undefined) lines.push(`Duration: ${section.duration_ms} ms`);
+    if (section.timing_scope) lines.push(`Timing scope: ${doctorText(section.timing_scope, "unavailable", 64)}`);
+    lines.push(doctorText(section.detail, "No detail was reported."));
+    for (const check of Array.isArray(section.checks) ? section.checks : []) {
+      lines.push(`- ${doctorState(check.state, "warn").toUpperCase()}: ${doctorText(check.label, check.id, 256)} — ${doctorText(check.detail, "No detail was reported.")}`);
+    }
+    if (section.inventory) {
+      lines.push(`Remote entries: ${section.inventory.total}; displayed: ${section.inventory.entries.length}${section.inventory.truncated ? "; sample truncated" : ""}`);
+      for (const entry of section.inventory.entries.slice(0, 5)) {
+        const metadata = [
+          `name=${doctorText(entry.name, "entry", 256)}`,
+          `kind=${entry.kind}`,
+          `relative_path_truncated=${entry.relative_path_truncated === true}`,
+          `name_truncated=${entry.name_truncated === true}`,
+          entry.size_bytes === null ? "" : `size_bytes=${entry.size_bytes}`,
+          entry.modified ? `modified=${entry.modified}` : "",
+          `mount_boundary=${entry.mount_boundary === true}`
+        ].filter(Boolean).join("; ");
+        lines.push(`- relative_path=${doctorText(entry.path || entry.name, "entry", 512)}; ${metadata}`);
+      }
+    }
+  }
+  const terminalOutput = model.structured === true ? "" : boundedText(output || model.raw_output, "");
+  if (terminalOutput) lines.push("", "Raw terminal output", terminalOutput);
+  return sanitizedTroubleshootingText(lines.join("\n"), TROUBLESHOOTING_RECORD_LIMIT);
+}
+
 function defaultSecurityPolicy() {
   return {
     policy_version: null,
@@ -1567,7 +2293,7 @@ export default {
       secretValues: { password: "", totp: "", remote_log_token: "" },
       profileConnectionState: "idle", profileConnectionMessage: "Test authentication to unlock the File Station browser.", connectionProof: "", connectionProofExpires: 0, connectionProofTimer: 0, profileConnectionRequest: 0, profileConnectionAutosaveHeld: false,
       profileSaveState: "idle", profileSaveMessage: "", profileCreationProgress: emptyProfileCreationProgress(), profileReconciliationState: "idle", pathBrowser: emptyPathBrowser(),
-      routineEditorOpen: false, routineForm: emptyRoutine(), doctorForm: { scope: "all", write_test: false, write_confirm: false },
+      routineEditorOpen: false, routineForm: emptyRoutine(), doctorForm: { scope: "all", level: "standard", write_test: false, write_confirm: false },
       alertForm: { enabled: false, on_success: false, on_failure: true, failure_threshold: 1, cooldown_seconds: 3600 },
       notificationTabs: [
         { id: "package-alerts", label: "Package alerts" },
@@ -1579,7 +2305,7 @@ export default {
       aboutMetadata: ABOUT_METADATA,
       aboutRustDependencies: ABOUT_RUST_DEPENDENCIES,
       aboutUiDependencies: ABOUT_UI_DEPENDENCIES,
-      diagnostic: { title: "Not run in this session", output: "No diagnostic output yet." },
+      diagnostic: { title: "Not run in this session", output: "No diagnostic output yet." }, doctorReport: idleDoctorReport(), doctorProgress: emptyDoctorProgress(),
       logsPaused: false, logSource: "all", logLines: 200, logState: "Waiting for logs", logOutput: "No log data yet.", logRecords: [], activityEvents: [], activitySearch: "", activityCategory: "all", activityLevel: "all",
       lastFailureKey: "", toasts: [], toastSequence: 0,
       confirmation: { visible: false, title: "", message: "", button: "Confirm", resolve: null },
@@ -1755,6 +2481,43 @@ export default {
     dependencyProfiles() { return this.profiles.filter((profile) => String(profile.name) !== String(this.routineForm.profile)); },
     profileOptions() { return options([["", "Choose a profile"], ...this.profiles.map((profile) => [String(profile.name), String(profile.name)])]); },
     scopeOptions() { return options([["all", "All profiles"], ...this.profiles.map((profile) => [String(profile.name), String(profile.name)])]); },
+    doctorLevelOptions() { return options([["quick", "Quick — unauthenticated negotiation"], ["standard", "Standard — complete readiness (recommended)"], ["extensive", "Extensive — deep read-only target inspection"]]); },
+    doctorLevelTitle() { return { quick: "Quick · lowest target load", standard: "Standard · complete readiness", extensive: "Extensive · deepest read-only inspection" }[normalizedDoctorLevel(this.doctorForm.level)]; },
+    doctorLevelGuidance() { return {
+      quick: "Checks routing, TLS negotiation, and DSM API discovery without sending credentials or opening a target session.",
+      standard: "Adds authentication, File Station capabilities, destination permissions, a bounded direct-child inventory sample, and verified logout. This is the balanced default.",
+      extensive: "Deepens the same target checks and evidence collection. The direct-child inventory sample never renders more than five entries."
+    }[normalizedDoctorLevel(this.doctorForm.level)]; },
+    doctorProgressStages() {
+      return [
+        { id: "validation", label: "Safety and request validation", state: "ok" },
+        { id: "execution", label: "Controller and target checks", state: this.doctorProgress.active ? "running" : "pending" },
+        { id: "evidence", label: "Terminal evidence breakdown", state: "pending" }
+      ];
+    },
+    doctorSummaryCards() {
+      const summary = this.doctorReport && this.doctorReport.summary ? this.doctorReport.summary : doctorSummary([]);
+      return [
+        { state: "ok", label: "OK", count: Number(summary.ok) || 0 },
+        { state: "warn", label: "Warnings", count: Number(summary.warn) || 0 },
+        { state: "failed", label: "Not OK", count: Number(summary.failed) || 0 },
+        { state: "skipped", label: "Skipped", count: Number(summary.skipped) || 0 }
+      ];
+    },
+    doctorReportNote() {
+      if (!this.doctorReport || !this.doctorReport.sections.length) return "No diagnostic has completed in this AppWindow session.";
+      if (this.doctorReport.output_incomplete) return "Terminal NDJSON was incomplete or truncated. Displayed sections are retained only as partial troubleshooting evidence and are not a complete Doctor result.";
+      if (!this.doctorReport.structured) return "This installed package returned legacy terminal text. Upgrade to a structured Doctor build for authoritative per-area evidence.";
+      if (this.doctorReport.summary.pending || this.doctorReport.summary.running) return "Checks are still in progress; pending areas are not counted as successful.";
+      return "Each status below is based on returned target evidence; missing areas are marked skipped rather than assumed healthy.";
+    },
+    doctorCopyAvailable() { return Boolean(this.doctorReport && this.doctorReport.sections && this.doctorReport.sections.length); },
+    doctorCleanupWarning() {
+      const section = this.doctorReport && Array.isArray(this.doctorReport.sections)
+        ? this.doctorReport.sections.find((item) => item.id === "disposable_write_verify_cleanup" && ["warn", "failed"].includes(doctorState(item.state, "warn")))
+        : null;
+      return section ? `${section.profile ? `Profile ${section.profile}: ` : ""}${section.detail} Inspect the named target before running another write probe.` : "";
+    },
     run() { return this.snapshot && this.snapshot.run && typeof this.snapshot.run === "object" ? this.snapshot.run : ((this.snapshot && this.snapshot.last_run) || {}); },
     runStatus() { return boundedText(pick(this.run, "status", "state", "result"), "Unavailable"); },
     runScope() { return boundedText(this.run.scope, "Unavailable"); },
@@ -2441,6 +3204,37 @@ export default {
     pillClass(state) { const value = String(state || "unknown").toLowerCase(); return ["sdsync-pill", { failed: ["failed", "error", "untrusted", "denied"].includes(value), neutral: ["disabled", "stopped", "unknown", "default", "unsupported", "unavailable"].includes(value) }]; },
     healthClass(value) { return value === true ? "sdsync-health-ok" : (value === false ? "sdsync-health-bad" : "sdsync-health-unknown"); },
     booleanEvidence(value) { return value === true ? "Yes" : (value === false ? "No" : "Unavailable"); },
+    doctorStatusClass(value) { return `is-${doctorState(value, "warn")}`; },
+    doctorStatusLabel(value) { return { ok: "OK", warn: "Warning", failed: "Not OK", skipped: "Skipped", pending: "Pending", running: "Running" }[doctorState(value, "warn")]; },
+    doctorInventoryMetadata(entry) {
+      if (!entry || typeof entry !== "object") return "Safe metadata unavailable";
+      const metadata = [
+        `Name ${doctorText(entry.name, "entry", 256)}`,
+        `relative path ${entry.relative_path_truncated === true ? "truncated" : "complete"}`,
+        `name ${entry.name_truncated === true ? "truncated" : "complete"}`,
+        `mount boundary ${entry.mount_boundary === true ? "yes" : "no"}`
+      ];
+      if (entry.size_bytes !== null && entry.size_bytes !== undefined) metadata.push(formatBytes(entry.size_bytes));
+      if (entry.modified) {
+        const numeric = Number(entry.modified);
+        metadata.push(`Modified ${Number.isFinite(numeric) && numeric > 0 ? formatDate(numeric) : doctorText(entry.modified, "Unavailable", 128)}`);
+      }
+      return metadata.join(" · ") || "Safe metadata unavailable";
+    },
+    onDoctorWriteTestChanged(value) {
+      const enabled = value === true;
+      this.doctorForm.write_test = enabled;
+      this.doctorForm.write_confirm = false;
+      if (enabled) this.doctorForm.level = "extensive";
+    },
+    copyDoctorDiagnostics() {
+      return this.copyTroubleshootingText(
+        doctorTroubleshootingText(this.doctorReport, this.diagnostic.title, this.diagnostic.output),
+        "Target Doctor diagnostics",
+        TROUBLESHOOTING_RECORD_LIMIT,
+        true
+      );
+    },
     reportMutationError(error, failedTitle, unknownTitle, fallback, options = undefined) {
       const formatting = options && typeof options === "object" ? options : {};
       const unknown = Boolean(error && error.outcomeUnknown === true);
@@ -3702,6 +4496,13 @@ export default {
       if (!this.canRunOperations || this.operationBusy || this.disposed) return;
       if (payload && payload.allow_delete === true && !this.canAllowDestructive) return;
       if (kind === "doctor" && payload && payload.write_test === true && (!this.canRunDoctorWrite || !this.hasCapability("write_test"))) return;
+      const doctorLevel = normalizedDoctorLevel(payload && payload.level);
+      const doctorStartedEpoch = Math.floor(Date.now() / 1000);
+      if (kind === "doctor") {
+        this.doctorProgress = { active: true, phase: "execution", level: doctorLevel, started_epoch: doctorStartedEpoch };
+        this.doctorReport = runningDoctorReport(doctorLevel, payload && payload.write_test === true, doctorStartedEpoch);
+        this.diagnostic = { title: "Doctor running", output: "Waiting for bounded terminal evidence from the package controller…" };
+      }
       this.operationBusy = true;
       const awaitTerminal = kind === "doctor";
       try {
@@ -3719,11 +4520,15 @@ export default {
             ? "Doctor completed without additional output."
             : "Queued safely; follow Activity and Logs for the final result."
         );
+        let operationMessage = message;
         if (awaitTerminal) {
-          this.diagnostic = { title: "Doctor completed", output: message };
+          this.doctorReport = doctorReportFromResult(result, true, doctorLevel, payload && payload.write_test === true, doctorStartedEpoch);
+          operationMessage = doctorDisplayOutput(this.doctorReport, message);
+          this.diagnostic = { title: "Doctor completed", output: operationMessage };
+          this.doctorProgress = { active: false, phase: "complete", level: doctorLevel, started_epoch: doctorStartedEpoch };
         }
         const operation = `${kind.charAt(0).toUpperCase()}${kind.slice(1)}`;
-        this.toast(`${operation} ${awaitTerminal ? "completed" : "queued"}`, message);
+        this.toast(`${operation} ${awaitTerminal ? "completed" : "queued"}`, operationMessage);
         await this.refreshSnapshot(false, true);
       } catch (error) {
         if (this.disposed) return;
@@ -3736,18 +4541,38 @@ export default {
         );
         recordIsolatedIncident(this, "operations", operation, error, report, { subject: boundedText(payload && payload.scope, operation) });
         if (kind === "doctor") {
+          this.doctorReport = doctorReportFromResult(
+            { output: error.resultOutput || report.message, message: report.message },
+            false,
+            doctorLevel,
+            payload && payload.write_test === true,
+            doctorStartedEpoch
+          );
           this.diagnostic = {
             title: report.unknown ? "Doctor outcome unknown" : "Doctor failed",
-            output: boundedText(error.resultOutput || report.message, "Diagnostic failed.")
+            output: doctorDisplayOutput(this.doctorReport, error.resultOutput || report.message)
           };
+          this.doctorProgress = { active: false, phase: report.unknown ? "unknown" : "failed", level: doctorLevel, started_epoch: doctorStartedEpoch };
         }
       } finally {
-        if (!this.disposed) this.operationBusy = false;
+        if (!this.disposed) {
+          this.operationBusy = false;
+          if (kind === "doctor" && this.doctorProgress.active) this.doctorProgress = { active: false, phase: "unknown", level: doctorLevel, started_epoch: doctorStartedEpoch };
+        }
       }
     },
-    quickPlan() { return this.executeOperation("plan", { scope: "all", write_test: null, allow_delete: false, max_total_delete: 0 }); },
-    async quickRun() { if (!this.canRunOperations || this.operationBusy) return; if (await this.confirmAction("Run all configured profiles?", "This starts a real one-way sync. Remote deletion stays disabled for this quick action.", "Run all")) return this.executeOperation("run", { scope: "all", write_test: null, allow_delete: false, max_total_delete: 0 }); },
-    async runDoctor(event) { if (event && event.preventDefault) event.preventDefault(); if (!this.canRunOperations || this.operationBusy) return; if (this.doctorForm.write_test && (!this.canRunDoctorWrite || !this.hasCapability("write_test"))) return this.toast("Doctor write test blocked", "The package capability or security policy does not permit disposable destination probes.", true); if (this.doctorForm.write_test && !this.doctorForm.write_confirm) return this.toast("Write-test confirmation required", "Approve the disposable probe and cleanup before running.", true); if (this.doctorForm.write_test && !await this.confirmAction("Run the disposable target probe?", "The doctor briefly creates, verifies, and removes a unique probe in the selected destination.", "Run write test")) return; this.diagnostic = { title: "Doctor running", output: "Waiting for the package controller…" }; return this.executeOperation("doctor", { scope: this.doctorForm.scope, write_test: this.doctorForm.write_test, allow_delete: null, max_total_delete: null }); },
+    quickPlan() { return this.executeOperation("plan", { scope: "all", level: null, write_test: null, allow_delete: false, max_total_delete: 0 }); },
+    async quickRun() { if (!this.canRunOperations || this.operationBusy) return; if (await this.confirmAction("Run all configured profiles?", "This starts a real one-way sync. Remote deletion stays disabled for this quick action.", "Run all")) return this.executeOperation("run", { scope: "all", level: null, write_test: null, allow_delete: false, max_total_delete: 0 }); },
+    async runDoctor(event) {
+      if (event && event.preventDefault) event.preventDefault();
+      if (!this.canRunOperations || this.operationBusy) return;
+      const level = normalizedDoctorLevel(this.doctorForm.level);
+      if (this.doctorForm.write_test && level !== "extensive") return this.toast("Extensive level required", "Disposable write verification is available only after the full Extensive read-only checks.", true);
+      if (this.doctorForm.write_test && (!this.canRunDoctorWrite || !this.hasCapability("write_test"))) return this.toast("Doctor write test blocked", "The package capability or security policy does not permit disposable destination probes.", true);
+      if (this.doctorForm.write_test && !this.doctorForm.write_confirm) return this.toast("Write-test confirmation required", "Approve the disposable probe and cleanup before running.", true);
+      if (this.doctorForm.write_test && !await this.confirmAction("Run the disposable target probe?", "The doctor briefly creates, verifies, and removes a unique probe in the selected destination after Extensive read-only checks.", "Run write test")) return;
+      return this.executeOperation("doctor", { scope: this.doctorForm.scope, level, write_test: this.doctorForm.write_test, allow_delete: null, max_total_delete: null });
+    },
     activityEvidence(event) { return activityTroubleshootingText(event); },
     logEvidence(record) {
       if (!record || typeof record !== "object") return "";

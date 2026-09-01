@@ -50,7 +50,23 @@ const NANOS_PER_SECOND: u128 = 1_000_000_000;
 const WRITE_PROBE_PAYLOAD: &[u8] = b"synology-drive-sync disposable write probe v1\n";
 const WRITE_PROBE_FILE_NAME: &str = "probe.bin";
 const WRITE_PROBE_COPY_DIRECTORY: &str = "copy";
+const DIAGNOSTIC_INVENTORY_SAMPLE_LIMIT: usize = 5;
+const DIAGNOSTIC_INVENTORY_REQUEST_LIMIT: usize = DIAGNOSTIC_INVENTORY_SAMPLE_LIMIT + 1;
+const DIAGNOSTIC_INVENTORY_TIMEOUT: Duration = Duration::from_secs(5);
+const DIAGNOSTIC_RELATIVE_PATH_MAX_CHARS: usize = 512;
+const DIAGNOSTIC_NAME_MAX_CHARS: usize = 255;
+const DISCOVERY_FAILURE_OPERATION: &str = "File Station API discovery";
 static WRITE_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Return whether a failed client connection still received an HTTP/DSM response from at least
+/// one discovery route. Doctor uses this evidence to keep transport negotiation distinct from an
+/// invalid or unavailable API-discovery response.
+pub fn is_discovery_response_failure(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::InvalidResponse { operation, .. } if operation == DISCOVERY_FAILURE_OPERATION
+    )
+}
 
 #[derive(Clone, Debug)]
 pub struct ClientOptions {
@@ -134,6 +150,38 @@ pub struct RemoteDirectoryPage {
 pub struct RemoteInventory {
     pub root_exists: bool,
     pub entries: BTreeMap<String, RemoteEntry>,
+}
+
+/// A bounded, display-safe direct child returned by a target diagnostic.
+///
+/// This deliberately contains no absolute remote path, content digest, ACL document, session
+/// identifier, or server-provided free-form detail. Long names are truncated on a character
+/// boundary and explicitly marked so diagnostic output stays bounded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagnosticRemoteEntry {
+    pub relative_path: String,
+    pub relative_path_truncated: bool,
+    pub name: String,
+    pub name_truncated: bool,
+    pub kind: EntryKind,
+    pub size_bytes: Option<u64>,
+    pub mtime_seconds: Option<i64>,
+    pub mount_boundary: bool,
+}
+
+/// One non-recursive, single-page File Station diagnostic inventory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagnosticRemoteInventory {
+    pub root_exists: bool,
+    /// Total direct children reported by File Station for this destination.
+    pub total_entries: usize,
+    pub sample: Vec<DiagnosticRemoteEntry>,
+    pub truncated: bool,
+    pub truncated_count: usize,
+    pub truncated_reason: Option<&'static str>,
+    pub pages_requested: u8,
+    pub traversal_depth: u8,
+    pub deadline_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1009,6 +1057,17 @@ impl ApiClient {
                             "remote destination ancestor {path} exists but is not a directory"
                         )));
                     }
+                    if let Some(mount_type) = item
+                        .additional
+                        .as_ref()
+                        .and_then(|additional| additional.mount_point_type.as_deref())
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        return Err(Error::RemoteMountRoot {
+                            path,
+                            mount_type: mount_type.to_owned(),
+                        });
+                    }
                     nearest_existing = Some(path);
                 }
                 Err(error) if error.api_code() == Some(408) => {
@@ -1442,6 +1501,189 @@ impl ApiClient {
         })
     }
 
+    /// Inspect one destination with a hard diagnostic budget.
+    ///
+    /// Unlike [`Self::remote_inventory`], this never recursively walks the target. It performs at
+    /// most one bounded `getinfo` request and one bounded list page, examines at most six direct
+    /// children, and returns at most five deterministic samples. Sync planning continues to use
+    /// the complete recursive inventory; Doctor uses this narrow path so an unexpectedly large
+    /// tree cannot turn an interactive health check into an unbounded scan.
+    pub fn diagnostic_remote_inventory(
+        &self,
+        root: &RemoteRoot,
+    ) -> Result<DiagnosticRemoteInventory> {
+        self.required_session()?;
+        let started = Instant::now();
+        let remaining = || {
+            DIAGNOSTIC_INVENTORY_TIMEOUT
+                .checked_sub(started.elapsed())
+                .filter(|duration| !duration.is_zero())
+                .ok_or(Error::OperationTimedOut {
+                    operation: "bounded target diagnostic inventory",
+                })
+        };
+
+        let info_parameters = vec![
+            pair("path", json_array([root.as_str()])?),
+            pair(
+                "additional",
+                json_array(["size", "time", "mount_point_type"])?,
+            ),
+        ];
+        let mut info: GetInfoData = match self.call_bounded(
+            "SYNO.FileStation.List",
+            2,
+            "getinfo",
+            info_parameters,
+            remaining()?,
+        ) {
+            Ok(Some(info)) => info,
+            Ok(None) => {
+                return Err(Error::InvalidResponse {
+                    operation: "SYNO.FileStation.List.getinfo".to_owned(),
+                    message: "successful response contained no path information".to_owned(),
+                });
+            }
+            Err(error) if error.api_code() == Some(408) => {
+                return Ok(DiagnosticRemoteInventory {
+                    root_exists: false,
+                    total_entries: 0,
+                    sample: Vec::new(),
+                    truncated: false,
+                    truncated_count: 0,
+                    truncated_reason: None,
+                    pages_requested: 0,
+                    traversal_depth: 0,
+                    deadline_ms: duration_millis_saturating(DIAGNOSTIC_INVENTORY_TIMEOUT),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        if info.files.len() != 1 {
+            return Err(Error::InvalidResponse {
+                operation: "SYNO.FileStation.List.getinfo".to_owned(),
+                message: "target diagnostic expected exactly one path result".to_owned(),
+            });
+        }
+        let root_item = info.files.pop().expect("length checked");
+        if root_item.path != root.as_str() || !root_item.isdir {
+            return Err(Error::InvalidResponse {
+                operation: "SYNO.FileStation.List.getinfo".to_owned(),
+                message: "target diagnostic result was not the requested directory".to_owned(),
+            });
+        }
+        if let Some(mount_type) = root_item
+            .additional
+            .and_then(|additional| additional.mount_point_type)
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Err(Error::RemoteMountRoot {
+                path: root.as_str().to_owned(),
+                mount_type,
+            });
+        }
+
+        let parameters = vec![
+            pair("folder_path", json_string(root.as_str())?),
+            pair("offset", "0"),
+            pair("limit", DIAGNOSTIC_INVENTORY_REQUEST_LIMIT.to_string()),
+            pair("sort_by", json_string("name")?),
+            pair("sort_direction", json_string("asc")?),
+            pair("filetype", json_string("all")?),
+            pair(
+                "additional",
+                json_array(["size", "time", "mount_point_type"])?,
+            ),
+        ];
+        let mut data: ListData = self
+            .call_bounded("SYNO.FileStation.List", 2, "list", parameters, remaining()?)?
+            .ok_or_else(|| Error::InvalidResponse {
+                operation: "SYNO.FileStation.List.list".to_owned(),
+                message: "successful response contained no directory data".to_owned(),
+            })?;
+        if data.files.len() > DIAGNOSTIC_INVENTORY_REQUEST_LIMIT || data.total < data.files.len() {
+            return Err(Error::InvalidResponse {
+                operation: "SYNO.FileStation.List.list".to_owned(),
+                message: "bounded diagnostic page exceeded its declared item budget".to_owned(),
+            });
+        }
+
+        data.files.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        let mut validated = Vec::with_capacity(data.files.len());
+        let mut observed_paths = BTreeSet::new();
+        for item in data.files {
+            let (actual_parent, actual_name) = parent_and_name(&item.path)?;
+            if actual_parent != root.as_str()
+                || actual_name != item.name
+                || item.name.is_empty()
+                || item.name.contains('/')
+                || item.name.contains('\\')
+                || item.name.chars().any(char::is_control)
+            {
+                return Err(Error::InvalidResponse {
+                    operation: "SYNO.FileStation.List.list".to_owned(),
+                    message: "bounded diagnostic child escaped its requested parent".to_owned(),
+                });
+            }
+            let relative = root.relative(&item.path)?;
+            if relative.is_empty() {
+                return Err(Error::InvalidResponse {
+                    operation: "SYNO.FileStation.List.list".to_owned(),
+                    message: "bounded diagnostic listing included its own root".to_owned(),
+                });
+            }
+            if !observed_paths.insert(relative.clone()) {
+                return Err(Error::InvalidResponse {
+                    operation: "SYNO.FileStation.List.list".to_owned(),
+                    message: "bounded diagnostic page contained a duplicate child".to_owned(),
+                });
+            }
+            let kind = if item.isdir {
+                EntryKind::Directory
+            } else {
+                EntryKind::File
+            };
+            let additional = item.additional.unwrap_or_default();
+            let (size, mtime_seconds) =
+                file_metadata("SYNO.FileStation.List.list", kind, &additional)?;
+            let mount_boundary = additional
+                .mount_point_type
+                .is_some_and(|value| !value.trim().is_empty());
+            let (relative_path, relative_path_truncated) =
+                bounded_diagnostic_text(&relative, DIAGNOSTIC_RELATIVE_PATH_MAX_CHARS);
+            let (name, name_truncated) =
+                bounded_diagnostic_text(&item.name, DIAGNOSTIC_NAME_MAX_CHARS);
+            validated.push(DiagnosticRemoteEntry {
+                relative_path,
+                relative_path_truncated,
+                name,
+                name_truncated,
+                kind,
+                size_bytes: (kind == EntryKind::File).then_some(size),
+                mtime_seconds: (kind == EntryKind::File).then_some(mtime_seconds),
+                mount_boundary,
+            });
+        }
+        validated.truncate(DIAGNOSTIC_INVENTORY_SAMPLE_LIMIT);
+        let sample = validated;
+        let truncated_count = data.total.saturating_sub(sample.len());
+        Ok(DiagnosticRemoteInventory {
+            root_exists: true,
+            total_entries: data.total,
+            sample,
+            truncated: truncated_count > 0,
+            truncated_count,
+            truncated_reason: (truncated_count > 0).then_some("sample_limit"),
+            pages_requested: 1,
+            traversal_depth: 1,
+            deadline_ms: duration_millis_saturating(DIAGNOSTIC_INVENTORY_TIMEOUT),
+        })
+    }
+
     pub fn create_folder(&self, remote_path: &str) -> Result<()> {
         let (parent, name) = parent_and_name(remote_path)?;
         let parameters = vec![
@@ -1655,9 +1897,21 @@ impl ApiClient {
             Ok(apis) => Ok(apis),
             Err(first_error) => match self.discover_at("query.cgi") {
                 Ok(apis) => Ok(apis),
-                Err(second_error) => Err(Error::Message(format!(
-                    "File Station API discovery failed through the reverse proxy; entry.cgi: {first_error}; query.cgi fallback: {second_error}"
-                ))),
+                Err(second_error) => {
+                    let message = format!(
+                        "File Station API discovery failed through the reverse proxy; entry.cgi: {first_error}; query.cgi fallback: {second_error}"
+                    );
+                    if discovery_route_returned_response(&first_error)
+                        || discovery_route_returned_response(&second_error)
+                    {
+                        Err(Error::InvalidResponse {
+                            operation: DISCOVERY_FAILURE_OPERATION.to_owned(),
+                            message,
+                        })
+                    } else {
+                        Err(Error::Message(message))
+                    }
+                }
             },
         }
     }
@@ -2265,6 +2519,17 @@ fn file_metadata(
     })
 }
 
+fn bounded_diagnostic_text(value: &str, maximum_chars: usize) -> (String, bool) {
+    let mut characters = value.chars();
+    let bounded = characters.by_ref().take(maximum_chars).collect::<String>();
+    let truncated = characters.next().is_some();
+    (bounded, truncated)
+}
+
+fn duration_millis_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn decode_response<T: DeserializeOwned>(
     mut response: Response,
     api: &str,
@@ -2857,6 +3122,16 @@ fn json_array<'a>(values: impl IntoIterator<Item = &'a str>) -> Result<String> {
 
 fn pair(key: impl Into<String>, value: impl Into<String>) -> (String, String) {
     (key.into(), value.into())
+}
+
+fn discovery_route_returned_response(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::HttpBody { .. }
+            | Error::HttpStatus { .. }
+            | Error::InvalidResponse { .. }
+            | Error::Api { .. }
+    )
 }
 
 fn retryable(error: &Error) -> bool {
@@ -4447,6 +4722,79 @@ mod tests {
         assert_eq!(server.join().unwrap().len(), 6);
     }
 
+    #[test]
+    fn diagnostic_inventory_is_single_page_non_recursive_and_samples_five_deterministically() {
+        let list = serde_json::json!({
+            "success": true,
+            "data": {
+                "total": 9,
+                "files": [
+                    {"path":"/share/root/zeta.bin","name":"zeta.bin","isdir":false,"additional":{"size":6,"time":{"mtime":106}}},
+                    {"path":"/share/root/beta","name":"beta","isdir":true,"additional":{}},
+                    {"path":"/share/root/epsilon.bin","name":"epsilon.bin","isdir":false,"additional":{"size":5,"time":{"mtime":105}}},
+                    {"path":"/share/root/alpha.bin","name":"alpha.bin","isdir":false,"additional":{"size":1,"time":{"mtime":101}}},
+                    {"path":"/share/root/delta.bin","name":"delta.bin","isdir":false,"additional":{"size":4,"time":{"mtime":104}}},
+                    {"path":"/share/root/gamma.bin","name":"gamma.bin","isdir":false,"additional":{"size":3,"time":{"mtime":103}}}
+                ]
+            }
+        })
+        .to_string();
+        let responses = vec![
+            write_probe_discovery(false),
+            login_response(),
+            getinfo_directory("/share/root"),
+            list,
+        ];
+        let (url, server) = scripted_server(responses);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+
+        let report = client
+            .diagnostic_remote_inventory(&RemoteRoot::parse("/share/root").unwrap())
+            .unwrap();
+        assert!(report.root_exists);
+        assert_eq!(report.total_entries, 9);
+        assert_eq!(report.sample.len(), 5);
+        assert!(report.truncated);
+        assert_eq!(report.truncated_count, 4);
+        assert_eq!(report.truncated_reason, Some("sample_limit"));
+        assert_eq!(report.pages_requested, 1);
+        assert_eq!(report.traversal_depth, 1);
+        assert_eq!(report.deadline_ms, 5_000);
+        assert_eq!(
+            report
+                .sample
+                .iter()
+                .map(|entry| entry.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha.bin", "beta", "delta.bin", "epsilon.bin", "gamma.bin"]
+        );
+        assert_eq!(report.sample[0].size_bytes, Some(1));
+        assert_eq!(report.sample[0].mtime_seconds, Some(101));
+        assert_eq!(report.sample[1].kind, EntryKind::Directory);
+        assert_eq!(report.sample[1].size_bytes, None);
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 4);
+        let list_body = String::from_utf8_lossy(&requests[3].body);
+        assert!(list_body.contains("limit=6"));
+        assert!(list_body.contains("offset=0"));
+        assert!(!list_body.contains("offset=6"));
+    }
+
+    #[test]
+    fn diagnostic_inventory_display_fields_are_character_bounded() {
+        let value = format!("{}é{}", "a".repeat(511), "z".repeat(32));
+        let (bounded, truncated) = bounded_diagnostic_text(&value, 512);
+        assert!(truncated);
+        assert_eq!(bounded.chars().count(), 512);
+        assert!(bounded.ends_with('é'));
+
+        let (complete, truncated) = bounded_diagnostic_text("alpha", 512);
+        assert_eq!(complete, "alpha");
+        assert!(!truncated);
+    }
+
     /// A snapshot is only worth taking if it can disagree with what is on the NAS later. An
     /// absent `size` or `time` on a file must therefore be rejected outright rather than stored
     /// as `0`, which would compare equal to the same coercion at delete time and wave through a
@@ -5554,6 +5902,34 @@ mod tests {
         assert!(permission.contains("filename=%22.synology-drive-sync-write-check-"));
         assert!(permission.contains("create_only=true"));
         assert!(!permission.contains("list_share"));
+    }
+
+    #[test]
+    fn destination_permission_rejects_a_mounted_ancestor_before_the_write_check() {
+        let responses = vec![
+            required_discovery(),
+            r#"{"success":true,"data":{"sid":"secret-sid"}}"#.to_owned(),
+            r#"{"success":true,"data":{"files":[{"path":"/share","name":"share","isdir":true,"additional":{"mount_point_type":"cifs"}}]}}"#.to_owned(),
+            r#"{"success":true}"#.to_owned(),
+        ];
+        let (url, server) = scripted_server(responses);
+        let mut client = connect_test_client(url);
+        client.login("mirror-user", "password", None).unwrap();
+        assert!(matches!(
+            client.verify_destination_writable(
+                &RemoteRoot::parse("/share/nested/destination").unwrap()
+            ),
+            Err(Error::RemoteMountRoot { path, mount_type })
+                if path == "/share" && mount_type == "cifs"
+        ));
+        client.logout().unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(
+            requests.iter().all(|request| {
+                !String::from_utf8_lossy(&request.body).contains("method=write")
+            })
+        );
     }
 
     #[test]
@@ -7430,10 +7806,11 @@ mod tests {
         }) else {
             panic!("a discovery response with no API map must not produce a client");
         };
+        assert!(is_discovery_response_failure(&error));
         let rendered = error.to_string();
-        assert!(
-            rendered.starts_with("File Station API discovery failed through the reverse proxy")
-        );
+        assert!(rendered.starts_with(
+            "unexpected response during File Station API discovery: File Station API discovery failed through the reverse proxy"
+        ));
         assert!(rendered.contains("entry.cgi: unexpected response during SYNO.API.Info.query"));
         assert!(rendered.contains("query.cgi fallback:"));
         assert_eq!(
@@ -7472,6 +7849,7 @@ mod tests {
         }) else {
             panic!("a non-JSON discovery response must not produce a client");
         };
+        assert!(is_discovery_response_failure(&error));
         let rendered = error.to_string();
         assert!(rendered.contains("expected a DSM JSON envelope"));
         assert!(rendered.contains("response: not json at all"));
@@ -7509,7 +7887,12 @@ mod tests {
                 .to_string()
                 .contains("code 102: requested API does not exist")
         );
+        assert!(is_discovery_response_failure(&error));
         server.join().unwrap();
+
+        assert!(!is_discovery_response_failure(&Error::Message(
+            "both discovery routes failed before receiving a response".to_owned()
+        )));
     }
 
     #[test]

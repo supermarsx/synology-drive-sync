@@ -63,16 +63,19 @@ Headless services may instead use protected `password-file` and `totp-secret-fil
 ```bash
 synology-drive-sync config validate
 synology-drive-sync doctor source --profile production --hash
-synology-drive-sync doctor --profile production target
+synology-drive-sync doctor --profile production --level standard target
 synology-drive-sync plan --profile production
 ```
 
-The target diagnostic authenticates, inventories the chosen destination, and performs a
-non-mutating permission check. `plan` prints what a sync would do but does not mutate the NAS.
+Standard Target Doctor authenticates, checks permission, samples no more than five deterministic
+direct children with the total/truncated state, and logs out. Its timed section breakdown remains
+non-mutating. Use `--level quick` for unauthenticated TLS/routing/discovery only or
+`--level extensive` for the fullest read-only target capability evidence. `plan` prints the complete
+work a sync would do but does not mutate the NAS.
 
 > [!WARNING]
-> `doctor target --write-test` is intentionally mutating. Use it only against the prepared,
-> disposable destination required by the production acceptance runbook.
+> `doctor --level extensive target --write-test` is a separate mutation opt-in. Use it only against
+> the prepared, disposable destination required by the production acceptance runbook.
 
 ## 5. Run one additive sync
 

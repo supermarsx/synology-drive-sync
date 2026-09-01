@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use clap::CommandFactory;
 use serde_json::{Value, json};
 use synology_drive_sync::api::{
-    ApiClient, ClientOptions, UploadObserver, UploadTransferEvent, WriteProbeReport,
+    ApiClient, ClientOptions, DiagnosticRemoteInventory, UploadObserver, UploadTransferEvent,
+    WriteProbeReport, is_discovery_response_failure,
 };
 use synology_drive_sync::batch::{BatchJob, ValidatedBatch};
 use synology_drive_sync::cancel::CancellationToken;
@@ -193,6 +194,12 @@ fn dispatch(arguments: &cli::Cli) -> Result<ExitCode> {
                     if doctor.routing_only {
                         return Err(Error::Configuration(
                             "doctor source cannot be combined with --routing-only".to_owned(),
+                        ));
+                    }
+                    if doctor.level.is_some() {
+                        return Err(Error::Configuration(
+                            "doctor source cannot be combined with --level; target diagnostic levels do not alter local source checks"
+                                .to_owned(),
                         ));
                     }
                     validate_batch_source_override(
@@ -1524,8 +1531,12 @@ fn run_doctor(settings: config::ResolvedDoctor) -> Result<ExitCode> {
     install_cancellation_handler(cancellation.clone())?;
     let timed = run_doctor_job(&settings, &cancellation, true)?;
     write_doctor_output(&timed.result, timed.elapsed, &settings.output)?;
-    if cancellation.is_cancelled() || timed.result.write_probe_cancelled {
+    if cancellation.is_cancelled() || timed.result.cancelled || timed.result.write_probe_cancelled {
         Err(Error::Cancelled)
+    } else if let Some(error) = timed.result.failure {
+        Err(Error::Message(format!(
+            "target diagnostic failed; inspect the section breakdown: {error}"
+        )))
     } else if let Some(error) = timed.result.write_probe_error {
         Err(Error::Message(error))
     } else {
@@ -1556,7 +1567,7 @@ fn run_doctor_job(
         Err(error) => Err(error),
     };
     let final_log = match &operation {
-        Ok(result) if result.write_probe_error.is_none() => log_event(
+        Ok(result) if !result.failed() => log_event(
             logger.as_ref(),
             LogEvent::new(EventLogLevel::Info, EventCode::RunCompleted).metrics(EventMetrics {
                 elapsed_ms: duration_millis(started.elapsed()),
@@ -1590,10 +1601,15 @@ fn run_doctor_job(
 
 #[derive(Clone, Debug)]
 struct DoctorResult {
+    level: cli::DoctorLevel,
+    sections: Vec<DoctorSection>,
+    failure: Option<String>,
+    cancelled: bool,
     authenticated: bool,
     remote_checked: bool,
     remote_exists: Option<bool>,
     remote_entries: Option<usize>,
+    remote_inventory: Option<DiagnosticRemoteInventory>,
     write_permission_scope: Option<&'static str>,
     write_permission_path: Option<String>,
     write_probe_requested: bool,
@@ -1603,152 +1619,747 @@ struct DoctorResult {
     write_probe_cancelled: bool,
 }
 
-fn doctor_checks(
-    settings: &config::ResolvedDoctor,
-    logger: Option<Arc<EventLogger>>,
-    cancellation: &CancellationToken,
-    perform_write_probe: bool,
-) -> Result<DoctorResult> {
-    cancellation.check()?;
-    log_event(
-        logger.as_ref(),
-        LogEvent::new(EventLogLevel::Info, EventCode::ApiDiscoveryStarted),
-    )?;
-    let mut client = connect_client(&settings.url, &settings.network)?;
-    if settings.compare == cli::CompareArg::Content {
-        client.require_content_fingerprint_api()?;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DoctorSectionStatus {
+    Pass,
+    Warn,
+    Fail,
+    Skip,
+}
+
+impl DoctorSectionStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+            Self::Skip => "skip",
+        }
     }
-    if settings.delete {
-        client.require_delete_api()?;
-    }
-    if settings.write_test {
-        client.require_content_fingerprint_api()?;
-        client.require_delete_api()?;
-    }
-    cancellation.check()?;
-    log_event(
-        logger.as_ref(),
-        LogEvent::new(EventLogLevel::Info, EventCode::ApiDiscoveryCompleted),
-    )?;
-    if settings.routing_only {
-        return Ok(DoctorResult {
+}
+
+#[derive(Clone, Debug)]
+struct DoctorSection {
+    id: &'static str,
+    label: &'static str,
+    status: DoctorSectionStatus,
+    detail: String,
+    elapsed: Duration,
+    timing_scope: &'static str,
+}
+
+const DOCTOR_SECTION_SPECS: [(&str, &str); 8] = [
+    ("routing_tls", "Routing and TLS negotiation"),
+    ("dsm_api_discovery", "DSM API discovery"),
+    ("dsm_session_auth", "DSM session authentication"),
+    ("file_station_capabilities", "File Station capabilities"),
+    ("destination_permissions", "Destination permissions"),
+    ("destination_inventory", "Destination inventory"),
+    (
+        "disposable_write_verify_cleanup",
+        "Disposable write, verify, and cleanup",
+    ),
+    ("session_logout", "DSM session logout"),
+];
+
+impl DoctorResult {
+    fn new(settings: &config::ResolvedDoctor, perform_write_probe: bool) -> Self {
+        let mut result = Self {
+            level: settings.level,
+            sections: DOCTOR_SECTION_SPECS
+                .iter()
+                .map(|&(id, label)| DoctorSection {
+                    id,
+                    label,
+                    status: DoctorSectionStatus::Skip,
+                    detail: "not reached".to_owned(),
+                    elapsed: Duration::ZERO,
+                    timing_scope: "section",
+                })
+                .collect(),
+            failure: None,
+            cancelled: false,
             authenticated: false,
             remote_checked: false,
             remote_exists: None,
             remote_entries: None,
+            remote_inventory: None,
             write_permission_scope: None,
             write_permission_path: None,
-            write_probe_requested: false,
-            write_probe_performed: false,
-            write_probe: None,
-            write_probe_error: None,
-            write_probe_cancelled: false,
-        });
-    }
-
-    let username = settings.username.as_deref().ok_or_else(|| {
-        Error::Configuration("--username is required for authenticated doctor checks".to_owned())
-    })?;
-    log_event(
-        logger.as_ref(),
-        LogEvent::new(EventLogLevel::Info, EventCode::AuthenticationStarted),
-    )?;
-    let mut vault = credentials::VaultSession::new(
-        !settings.authentication.no_vault,
-        &settings.url,
-        username,
-        settings.network.allow_http,
-    );
-    let password = credentials::read_password_with_file(
-        settings.authentication.password_stdin,
-        settings.authentication.password_file.as_deref(),
-        &mut vault,
-    )?;
-    credentials::authenticate_with_sources(
-        &mut client,
-        username,
-        &password,
-        &mut vault,
-        settings.authentication.totp_secret_file.as_deref(),
-    )?;
-    drop(password);
-
-    let operation = (|| {
-        cancellation.check()?;
-        log_event(
-            logger.as_ref(),
-            LogEvent::new(EventLogLevel::Info, EventCode::AuthenticationCompleted),
-        )?;
-        let Some(remote) = settings.remote.as_deref() else {
-            return Ok(DoctorResult {
-                authenticated: true,
-                remote_checked: false,
-                remote_exists: None,
-                remote_entries: None,
-                write_permission_scope: None,
-                write_permission_path: None,
-                write_probe_requested: false,
-                write_probe_performed: false,
-                write_probe: None,
-                write_probe_error: None,
-                write_probe_cancelled: false,
-            });
-        };
-        let root = RemoteRoot::parse(remote)?;
-        cancellation.check()?;
-        let write_check = client.verify_destination_writable(&root)?;
-        log_event(
-            logger.as_ref(),
-            LogEvent::new(EventLogLevel::Info, EventCode::RemoteScanStarted),
-        )?;
-        let inventory = client.remote_inventory(&root)?;
-        cancellation.check()?;
-        log_event(
-            logger.as_ref(),
-            LogEvent::new(EventLogLevel::Info, EventCode::RemoteScanCompleted).metrics(
-                EventMetrics {
-                    operations: inventory.entries.len() as u64,
-                    ..EventMetrics::default()
-                },
-            ),
-        )?;
-        if settings.write_test && !inventory.root_exists {
-            return Err(Error::Message(format!(
-                "disposable write probe requires the configured target {:?} to already exist",
-                root.as_str()
-            )));
-        }
-        let mut result = DoctorResult {
-            authenticated: true,
-            remote_checked: true,
-            remote_exists: Some(inventory.root_exists),
-            remote_entries: Some(inventory.entries.len()),
-            write_permission_scope: Some(if write_check.destination_exists {
-                "exact_destination"
-            } else {
-                "nearest_existing_ancestor"
-            }),
-            write_permission_path: Some(write_check.checked_directory),
             write_probe_requested: settings.write_test,
             write_probe_performed: false,
             write_probe: None,
             write_probe_error: None,
             write_probe_cancelled: false,
         };
-        if settings.write_test && perform_write_probe {
-            result.write_probe_performed = true;
-            match client.run_write_probe(&root, cancellation) {
-                Ok(report) => result.write_probe = Some(report),
-                Err(failure) => {
-                    result.write_probe_cancelled = matches!(&failure.cause, Error::Cancelled);
-                    result.write_probe_error = Some(failure.to_string());
-                    result.write_probe = Some(failure.report);
+        if settings.level == cli::DoctorLevel::Quick {
+            result.set_section(
+                "dsm_session_auth",
+                DoctorSectionStatus::Skip,
+                "quick level is deliberately unauthenticated",
+                Duration::ZERO,
+                "section",
+            );
+            result.set_section(
+                "destination_permissions",
+                DoctorSectionStatus::Skip,
+                "quick level does not inspect a destination",
+                Duration::ZERO,
+                "section",
+            );
+            result.set_section(
+                "destination_inventory",
+                DoctorSectionStatus::Skip,
+                "quick level does not enumerate remote entries",
+                Duration::ZERO,
+                "section",
+            );
+            result.set_section(
+                "session_logout",
+                DoctorSectionStatus::Skip,
+                "no DSM session was created",
+                Duration::ZERO,
+                "section",
+            );
+        }
+        let probe_detail = if !settings.write_test {
+            "not requested; remote mutation requires the separate --write-test opt-in"
+        } else if !perform_write_probe {
+            "preflight only; mutation was deliberately disabled"
+        } else {
+            "not reached"
+        };
+        result.set_section(
+            "disposable_write_verify_cleanup",
+            DoctorSectionStatus::Skip,
+            probe_detail,
+            Duration::ZERO,
+            "section",
+        );
+        result
+    }
+
+    fn set_section(
+        &mut self,
+        id: &str,
+        status: DoctorSectionStatus,
+        detail: impl Into<String>,
+        elapsed: Duration,
+        timing_scope: &'static str,
+    ) {
+        let section = self
+            .sections
+            .iter_mut()
+            .find(|section| section.id == id)
+            .expect("Doctor section ID is fixed by the report contract");
+        section.status = status;
+        section.detail = bounded_doctor_detail(&detail.into());
+        section.elapsed = elapsed;
+        section.timing_scope = timing_scope;
+    }
+
+    fn fail_section(&mut self, id: &str, error: &Error, elapsed: Duration) {
+        let detail = safe_doctor_error(error);
+        self.set_section(
+            id,
+            DoctorSectionStatus::Fail,
+            detail.clone(),
+            elapsed,
+            "section",
+        );
+        self.failure.get_or_insert(detail);
+        self.cancelled |= matches!(error, Error::Cancelled);
+        self.explain_dependent_skips(id);
+    }
+
+    fn explain_dependent_skips(&mut self, failed_id: &str) {
+        let Some(failed_index) = self
+            .sections
+            .iter()
+            .position(|section| section.id == failed_id)
+        else {
+            return;
+        };
+        let failed_label = self.sections[failed_index].label;
+        for section in self.sections.iter_mut().skip(failed_index + 1) {
+            if section.status == DoctorSectionStatus::Skip && section.detail == "not reached" {
+                section.detail =
+                    bounded_doctor_detail(&format!("not run because {failed_label} failed"));
+            }
+        }
+    }
+
+    fn failed(&self) -> bool {
+        self.failure.is_some()
+            || self
+                .sections
+                .iter()
+                .any(|section| section.status == DoctorSectionStatus::Fail)
+            || self.write_probe_error.is_some()
+    }
+
+    fn section_succeeded(&self, id: &str) -> bool {
+        self.sections.iter().any(|section| {
+            section.id == id
+                && matches!(
+                    section.status,
+                    DoctorSectionStatus::Pass | DoctorSectionStatus::Warn
+                )
+        })
+    }
+}
+
+fn bounded_doctor_detail(detail: &str) -> String {
+    const MAX_CHARS: usize = 512;
+    let mut characters = detail.chars();
+    let mut bounded = characters.by_ref().take(MAX_CHARS).collect::<String>();
+    if characters.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn safe_doctor_error(error: &Error) -> String {
+    match error {
+        Error::InvalidUrl(_) => "reverse-proxy URL is invalid".to_owned(),
+        Error::HttpsRequired => "HTTPS is required by the configured transport policy".to_owned(),
+        Error::Http { operation, source } if source.is_timeout() => {
+            format!("{operation} timed out")
+        }
+        Error::Http { operation, .. } => format!("{operation} could not reach the DSM endpoint"),
+        Error::HttpBody { operation, .. } => {
+            format!("{operation} returned an unreadable response body")
+        }
+        Error::HttpStatus {
+            operation, status, ..
+        } => format!("reverse proxy returned HTTP {status} during {operation}"),
+        Error::InvalidResponse { operation, .. } => {
+            format!("DSM returned an invalid response during {operation}")
+        }
+        Error::Api {
+            api,
+            operation,
+            code,
+            description,
+            ..
+        } => format!("{api}.{operation} failed with code {code}{description}"),
+        Error::UnsupportedApiVersion {
+            api,
+            version,
+            min,
+            max,
+        } => format!("{api} version {version} is required; DSM reported {min}..={max}"),
+        Error::MissingApi(api) => format!("DSM API discovery did not report {api}"),
+        Error::ShareNotWritable(_) => {
+            "the destination shared folder is unavailable or not writable by this account"
+                .to_owned()
+        }
+        Error::UnsafeRemotePath { reason, .. } => {
+            format!("destination path is unsafe: {reason}")
+        }
+        Error::RemoteEscape(_) => {
+            "File Station returned an entry outside the selected destination".to_owned()
+        }
+        Error::RemoteMountRoot { .. } => {
+            "the destination is a mounted filesystem boundary and cannot be tested safely"
+                .to_owned()
+        }
+        Error::OperationTimedOut { operation } => format!("{operation} timed out"),
+        Error::Cancelled => "operation cancelled".to_owned(),
+        Error::Vault { operation, reason } => {
+            format!("OS credential vault {operation} failed: {reason}")
+        }
+        Error::FileIo { .. } => "a configured local file could not be read".to_owned(),
+        Error::Configuration(_) => "diagnostic configuration was rejected".to_owned(),
+        Error::Message(message)
+            if message.starts_with(
+                "File Station API discovery failed through the reverse proxy;",
+            ) =>
+        {
+            "DSM API discovery failed on both entry.cgi and query.cgi routes; inspect the protected logs"
+                .to_owned()
+        }
+        Error::Message(_) => "diagnostic operation failed; inspect the protected logs".to_owned(),
+        _ => "File Station rejected the diagnostic operation".to_owned(),
+    }
+}
+
+fn doctor_requires_content_fingerprint(level: cli::DoctorLevel, compare: cli::CompareArg) -> bool {
+    level != cli::DoctorLevel::Quick
+        && (compare == cli::CompareArg::Content || level == cli::DoctorLevel::Extensive)
+}
+
+fn doctor_requires_delete_capability(level: cli::DoctorLevel, delete: bool) -> bool {
+    level != cli::DoctorLevel::Quick && (delete || level == cli::DoctorLevel::Extensive)
+}
+
+fn doctor_checks(
+    settings: &config::ResolvedDoctor,
+    logger: Option<Arc<EventLogger>>,
+    cancellation: &CancellationToken,
+    perform_write_probe: bool,
+) -> Result<DoctorResult> {
+    let mut result = DoctorResult::new(settings, perform_write_probe);
+    if let Err(error) = cancellation.check() {
+        result.fail_section("routing_tls", &error, Duration::ZERO);
+        return Ok(result);
+    }
+    log_event(
+        logger.as_ref(),
+        LogEvent::new(EventLogLevel::Info, EventCode::ApiDiscoveryStarted),
+    )?;
+    let connection_started = Instant::now();
+    let mut client = match connect_client(&settings.url, &settings.network) {
+        Ok(client) => client,
+        Err(error) => {
+            let elapsed = connection_started.elapsed();
+            if matches!(
+                &error,
+                Error::MissingApi(_) | Error::UnsupportedApiVersion { .. }
+            ) || is_discovery_response_failure(&error)
+            {
+                let warning = settings.network.danger_accept_invalid_certs
+                    || (settings.network.allow_http
+                        && settings
+                            .url
+                            .trim_start()
+                            .get(..7)
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://")));
+                result.set_section(
+                    "routing_tls",
+                    if warning {
+                        DoctorSectionStatus::Warn
+                    } else {
+                        DoctorSectionStatus::Pass
+                    },
+                    "the DSM discovery route responded; transport and discovery shared this timing",
+                    elapsed,
+                    "shared_connection",
+                );
+                result.fail_section("dsm_api_discovery", &error, elapsed);
+            } else {
+                result.fail_section("routing_tls", &error, elapsed);
+                result.set_section(
+                    "dsm_api_discovery",
+                    DoctorSectionStatus::Skip,
+                    "the DSM route did not yield a validated discovery response",
+                    elapsed,
+                    "shared_connection",
+                );
+            }
+            return Ok(result);
+        }
+    };
+    let connection_elapsed = connection_started.elapsed();
+    let insecure_http = settings.network.allow_http
+        && settings
+            .url
+            .trim_start()
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"));
+    let transport_warning = insecure_http || settings.network.danger_accept_invalid_certs;
+    let transport_detail = match (
+        insecure_http,
+        settings.network.danger_accept_invalid_certs,
+        settings.network.ca_certificate.is_some(),
+    ) {
+        (true, true, _) => {
+            "DSM discovery route responded over explicitly allowed HTTP with certificate verification disabled"
+        }
+        (true, false, _) => {
+            "DSM discovery route responded over explicitly allowed HTTP; use only on a trusted test or LAN endpoint"
+        }
+        (false, true, _) => {
+            "HTTPS route responded, but certificate verification is explicitly disabled"
+        }
+        (false, false, true) => {
+            "HTTPS route and TLS negotiation succeeded with the configured CA certificate"
+        }
+        (false, false, false) => {
+            "HTTPS route and TLS negotiation succeeded with certificate verification enabled"
+        }
+    };
+    result.set_section(
+        "routing_tls",
+        if transport_warning {
+            DoctorSectionStatus::Warn
+        } else {
+            DoctorSectionStatus::Pass
+        },
+        transport_detail,
+        connection_elapsed,
+        "shared_connection",
+    );
+    result.set_section(
+        "dsm_api_discovery",
+        DoctorSectionStatus::Pass,
+        "DSM Auth and baseline File Station API versions were validated from the discovery response",
+        connection_elapsed,
+        "shared_connection",
+    );
+
+    let capability_started = Instant::now();
+    let capability_result = (|| {
+        if doctor_requires_content_fingerprint(settings.level, settings.compare) {
+            client.require_content_fingerprint_api()?;
+        }
+        if doctor_requires_delete_capability(settings.level, settings.delete) {
+            client.require_delete_api()?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = capability_result {
+        result.fail_section(
+            "file_station_capabilities",
+            &error,
+            capability_started.elapsed(),
+        );
+        if settings.level != cli::DoctorLevel::Quick {
+            result.set_section(
+                "dsm_session_auth",
+                DoctorSectionStatus::Skip,
+                "authentication was not attempted because required File Station capabilities are unavailable",
+                Duration::ZERO,
+                "section",
+            );
+        }
+        return Ok(result);
+    }
+    let copy_supported = client.supports_server_copy();
+    let copy_warning = settings.level == cli::DoctorLevel::Extensive && !copy_supported;
+    let capability_detail = if copy_warning {
+        "required List/Create/Upload/Permission/Download/Delete APIs are available; optional server-side copy is unavailable and verified upload fallback will be used"
+    } else if settings.level == cli::DoctorLevel::Extensive {
+        "required List/Create/Upload/Permission/Download/Delete APIs and optional server-side copy are available"
+    } else {
+        "the APIs required by the selected quick or standard diagnostic are available"
+    };
+    result.set_section(
+        "file_station_capabilities",
+        if copy_warning {
+            DoctorSectionStatus::Warn
+        } else {
+            DoctorSectionStatus::Pass
+        },
+        capability_detail,
+        capability_started.elapsed(),
+        "section",
+    );
+
+    if let Err(error) = cancellation.check() {
+        result.fail_section("dsm_session_auth", &error, Duration::ZERO);
+        return Ok(result);
+    }
+    log_event(
+        logger.as_ref(),
+        LogEvent::new(EventLogLevel::Info, EventCode::ApiDiscoveryCompleted),
+    )?;
+    if settings.level == cli::DoctorLevel::Quick {
+        return Ok(result);
+    }
+
+    let Some(username) = settings.username.as_deref() else {
+        let error = Error::Configuration(
+            "--username is required for standard and extensive doctor checks".to_owned(),
+        );
+        result.fail_section("dsm_session_auth", &error, Duration::ZERO);
+        return Ok(result);
+    };
+    log_event(
+        logger.as_ref(),
+        LogEvent::new(EventLogLevel::Info, EventCode::AuthenticationStarted),
+    )?;
+    let authentication_started = Instant::now();
+    let authentication = (|| {
+        let mut vault = credentials::VaultSession::new(
+            !settings.authentication.no_vault,
+            &settings.url,
+            username,
+            settings.network.allow_http,
+        );
+        let password = credentials::read_password_with_file(
+            settings.authentication.password_stdin,
+            settings.authentication.password_file.as_deref(),
+            &mut vault,
+        )?;
+        let authenticated = credentials::authenticate_with_sources(
+            &mut client,
+            username,
+            &password,
+            &mut vault,
+            settings.authentication.totp_secret_file.as_deref(),
+        );
+        drop(password);
+        authenticated
+    })();
+    if let Err(error) = authentication {
+        result.fail_section("dsm_session_auth", &error, authentication_started.elapsed());
+        result.set_section(
+            "session_logout",
+            DoctorSectionStatus::Skip,
+            "authentication did not create a confirmed DSM session",
+            Duration::ZERO,
+            "section",
+        );
+        return Ok(result);
+    }
+    result.authenticated = true;
+    result.set_section(
+        "dsm_session_auth",
+        DoctorSectionStatus::Pass,
+        "DSM credentials were accepted and an authenticated File Station session was established",
+        authentication_started.elapsed(),
+        "section",
+    );
+    if let Err(error) = log_event(
+        logger.as_ref(),
+        LogEvent::new(EventLogLevel::Info, EventCode::AuthenticationCompleted),
+    ) {
+        result.fail_section("dsm_session_auth", &error, authentication_started.elapsed());
+    }
+
+    if result.failed() {
+        result.set_section(
+            "destination_permissions",
+            DoctorSectionStatus::Skip,
+            "not run because authenticated-session completion logging failed",
+            Duration::ZERO,
+            "section",
+        );
+        result.set_section(
+            "destination_inventory",
+            DoctorSectionStatus::Skip,
+            "not run because authenticated-session completion logging failed",
+            Duration::ZERO,
+            "section",
+        );
+    } else if let Some(remote) = settings.remote.as_deref() {
+        match RemoteRoot::parse(remote) {
+            Err(error) => {
+                result.fail_section("destination_permissions", &error, Duration::ZERO);
+                result.set_section(
+                    "destination_inventory",
+                    DoctorSectionStatus::Skip,
+                    "the destination path was rejected before enumeration",
+                    Duration::ZERO,
+                    "section",
+                );
+            }
+            Ok(root) => {
+                let permission_started = Instant::now();
+                match cancellation
+                    .check()
+                    .and_then(|()| client.verify_destination_writable(&root))
+                {
+                    Ok(write_check) => {
+                        result.write_permission_scope = Some(if write_check.destination_exists {
+                            "exact_destination"
+                        } else {
+                            "nearest_existing_ancestor"
+                        });
+                        result.write_permission_path = Some(write_check.checked_directory);
+                        result.set_section(
+                            "destination_permissions",
+                            DoctorSectionStatus::Pass,
+                            if write_check.destination_exists {
+                                "the authenticated account can create a child in the exact destination"
+                            } else {
+                                "the destination is absent; its nearest existing ancestor permits creating the first missing component"
+                            },
+                            permission_started.elapsed(),
+                            "section",
+                        );
+                    }
+                    Err(error) => result.fail_section(
+                        "destination_permissions",
+                        &error,
+                        permission_started.elapsed(),
+                    ),
+                }
+
+                let inventory_started = Instant::now();
+                let inventory_start_log = log_event(
+                    logger.as_ref(),
+                    LogEvent::new(EventLogLevel::Info, EventCode::RemoteScanStarted),
+                );
+                if let Err(error) = inventory_start_log {
+                    result.fail_section(
+                        "destination_inventory",
+                        &error,
+                        inventory_started.elapsed(),
+                    );
+                } else {
+                    match cancellation
+                        .check()
+                        .and_then(|()| client.diagnostic_remote_inventory(&root))
+                    {
+                        Ok(inventory) => {
+                            result.remote_checked = true;
+                            result.remote_exists = Some(inventory.root_exists);
+                            result.remote_entries = Some(inventory.total_entries);
+                            let inventory_detail = if inventory.root_exists {
+                                format!(
+                                    "one direct-child page was inspected without recursion; {} total entries, {} sampled, {} truncated",
+                                    inventory.total_entries,
+                                    inventory.sample.len(),
+                                    inventory.truncated_count
+                                )
+                            } else {
+                                "the destination does not yet exist; no entries were enumerated"
+                                    .to_owned()
+                            };
+                            let inventory_log = log_event(
+                                logger.as_ref(),
+                                LogEvent::new(EventLogLevel::Info, EventCode::RemoteScanCompleted)
+                                    .metrics(EventMetrics {
+                                        operations: inventory.total_entries as u64,
+                                        ..EventMetrics::default()
+                                    }),
+                            );
+                            result.remote_inventory = Some(inventory);
+                            match inventory_log {
+                                Ok(()) => result.set_section(
+                                    "destination_inventory",
+                                    DoctorSectionStatus::Pass,
+                                    inventory_detail,
+                                    inventory_started.elapsed(),
+                                    "section",
+                                ),
+                                Err(error) => result.fail_section(
+                                    "destination_inventory",
+                                    &error,
+                                    inventory_started.elapsed(),
+                                ),
+                            }
+                        }
+                        Err(error) => result.fail_section(
+                            "destination_inventory",
+                            &error,
+                            inventory_started.elapsed(),
+                        ),
+                    }
+                }
+
+                if settings.write_test && result.remote_exists == Some(false) {
+                    let detail = "the disposable probe requires an existing destination; no mutation was attempted";
+                    result.set_section(
+                        "disposable_write_verify_cleanup",
+                        DoctorSectionStatus::Fail,
+                        detail,
+                        Duration::ZERO,
+                        "section",
+                    );
+                    result.failure.get_or_insert_with(|| detail.to_owned());
+                }
+
+                if settings.write_test && perform_write_probe && result.remote_exists != Some(false)
+                {
+                    let probe_started = Instant::now();
+                    let probe_prerequisites_pass = result
+                        .section_succeeded("destination_permissions")
+                        && result.section_succeeded("destination_inventory")
+                        && result.remote_exists == Some(true);
+                    if !probe_prerequisites_pass {
+                        let detail = if result.remote_exists == Some(false) {
+                            "the disposable probe requires an existing destination; no mutation was attempted"
+                        } else {
+                            "permission or bounded inventory prerequisites failed; no mutation was attempted"
+                        };
+                        result.set_section(
+                            "disposable_write_verify_cleanup",
+                            DoctorSectionStatus::Fail,
+                            detail,
+                            probe_started.elapsed(),
+                            "section",
+                        );
+                        result.failure.get_or_insert_with(|| detail.to_owned());
+                    } else {
+                        result.write_probe_performed = true;
+                        match client.run_write_probe(&root, cancellation) {
+                            Ok(report) => {
+                                let copy_detail = if report.server_copy_supported {
+                                    "including server-side copy verification"
+                                } else {
+                                    "using verified upload because server-side copy is unavailable"
+                                };
+                                result.set_section(
+                                    "disposable_write_verify_cleanup",
+                                    DoctorSectionStatus::Pass,
+                                    format!(
+                                        "unique create-only probe uploaded and verified with MD5/CRC32/SHA-256 and mtime, {copy_detail}; cleanup confirmed"
+                                    ),
+                                    probe_started.elapsed(),
+                                    "section",
+                                );
+                                result.write_probe = Some(report);
+                            }
+                            Err(failure) => {
+                                let mut detail = safe_doctor_error(&failure.cause);
+                                if failure.cleanup_error.is_some()
+                                    || !failure.report.cleanup_completed
+                                {
+                                    detail.push_str("; cleanup could not be fully confirmed");
+                                }
+                                if failure.report.leftover_remote_probe_path.is_some() {
+                                    detail.push_str("; inspect the reported leftover probe path");
+                                }
+                                result.set_section(
+                                    "disposable_write_verify_cleanup",
+                                    DoctorSectionStatus::Fail,
+                                    detail.clone(),
+                                    probe_started.elapsed(),
+                                    "section",
+                                );
+                                result.failure.get_or_insert(detail);
+                                result.write_probe_cancelled =
+                                    matches!(&failure.cause, Error::Cancelled);
+                                result.cancelled |= result.write_probe_cancelled;
+                                result.write_probe_error = Some(failure.to_string());
+                                result.write_probe = Some(failure.report);
+                            }
+                        }
+                    }
                 }
             }
         }
-        Ok(result)
-    })();
-    finish_doctor_authenticated_operation(&mut client, operation)
+    } else {
+        result.set_section(
+            "destination_permissions",
+            DoctorSectionStatus::Skip,
+            "no destination was selected",
+            Duration::ZERO,
+            "section",
+        );
+        result.set_section(
+            "destination_inventory",
+            DoctorSectionStatus::Skip,
+            "no destination was selected",
+            Duration::ZERO,
+            "section",
+        );
+    }
+
+    let logout_started = Instant::now();
+    match client.logout() {
+        Ok(()) => result.set_section(
+            "session_logout",
+            DoctorSectionStatus::Pass,
+            "the authenticated DSM session was closed",
+            logout_started.elapsed(),
+            "section",
+        ),
+        Err(error) => {
+            result.fail_section("session_logout", &error, logout_started.elapsed());
+            if result.write_probe_performed {
+                append_doctor_failure_context(
+                    &mut result,
+                    "File Station logout also failed",
+                    &safe_doctor_error(&error),
+                );
+            }
+        }
+    }
+    Ok(result)
 }
 
 fn append_doctor_failure_context(result: &mut DoctorResult, context: &str, error: &str) {
@@ -1759,30 +2370,6 @@ fn append_doctor_failure_context(result: &mut DoctorResult, context: &str, error
             existing.push_str(&detail);
         }
         None => result.write_probe_error = Some(detail),
-    }
-}
-
-fn finish_doctor_authenticated_operation(
-    client: &mut ApiClient,
-    operation: Result<DoctorResult>,
-) -> Result<DoctorResult> {
-    let logout = client.logout();
-    match (operation, logout) {
-        (Err(error), Err(logout_error)) => {
-            eprintln!("warning: File Station logout also failed: {logout_error}");
-            Err(error)
-        }
-        (Err(error), _) => Err(error),
-        (Ok(mut result), Err(error)) if result.write_probe_performed => {
-            append_doctor_failure_context(
-                &mut result,
-                "File Station logout also failed",
-                &error.to_string(),
-            );
-            Ok(result)
-        }
-        (Ok(_), Err(error)) => Err(error),
-        (Ok(result), Ok(())) => Ok(result),
     }
 }
 
@@ -1839,12 +2426,20 @@ fn run_doctor_batch(mut jobs: Vec<NamedDoctorSettings>) -> Result<ExitCode> {
                 continue;
             }
             match run_doctor_job(&job.settings, &cancellation, false) {
-                Ok(result) => outcomes.push(DoctorBatchOutcome {
-                    name: job.name.clone(),
-                    status: DoctorBatchStatus::Preflighted,
-                    result: Some(result),
-                    error: None,
-                }),
+                Ok(result) => {
+                    let error = doctor_result_error(&result.result);
+                    cancelled |= result.result.cancelled;
+                    outcomes.push(DoctorBatchOutcome {
+                        name: job.name.clone(),
+                        status: if error.is_some() {
+                            DoctorBatchStatus::Failed
+                        } else {
+                            DoctorBatchStatus::Preflighted
+                        },
+                        result: Some(result),
+                        error,
+                    });
+                }
                 Err(error) => {
                     cancelled |= matches!(error, Error::Cancelled);
                     outcomes.push(DoctorBatchOutcome {
@@ -1861,6 +2456,8 @@ fn run_doctor_batch(mut jobs: Vec<NamedDoctorSettings>) -> Result<ExitCode> {
         Vec::with_capacity(jobs.len())
     };
     cancelled |= cancellation.is_cancelled();
+    let all_targets_preflighted_before_mutation =
+        write_tests && all_doctor_targets_preflighted(&outcomes, cancelled);
 
     if write_tests
         && (cancelled
@@ -1868,7 +2465,12 @@ fn run_doctor_batch(mut jobs: Vec<NamedDoctorSettings>) -> Result<ExitCode> {
                 .iter()
                 .any(|outcome| outcome.status == DoctorBatchStatus::Failed))
     {
-        write_doctor_batch_output(&outcomes, &output, true)?;
+        write_doctor_batch_output(
+            &outcomes,
+            &output,
+            true,
+            all_targets_preflighted_before_mutation,
+        )?;
         return if cancelled || cancellation.is_cancelled() {
             Err(Error::Cancelled)
         } else {
@@ -1893,18 +2495,19 @@ fn run_doctor_batch(mut jobs: Vec<NamedDoctorSettings>) -> Result<ExitCode> {
             }
             match run_doctor_job(&job.settings, &cancellation, true) {
                 Ok(result) => {
-                    let probe_error = result.result.write_probe_error.clone();
-                    let probe_cancelled = result.result.write_probe_cancelled;
+                    let diagnostic_error = doctor_result_error(&result.result);
+                    let diagnostic_cancelled =
+                        result.result.cancelled || result.result.write_probe_cancelled;
                     let may_have_mutated = doctor_result_may_have_mutated(&result.result);
                     outcome.result = Some(result);
-                    if let Some(error) = probe_error {
+                    if let Some(error) = diagnostic_error {
                         outcome.status = if may_have_mutated {
                             DoctorBatchStatus::Partial
                         } else {
                             DoctorBatchStatus::Failed
                         };
                         outcome.error = Some(error);
-                        cancelled |= probe_cancelled;
+                        cancelled |= diagnostic_cancelled;
                         stopped = true;
                     } else {
                         outcome.status = DoctorBatchStatus::Success;
@@ -1933,12 +2536,20 @@ fn run_doctor_batch(mut jobs: Vec<NamedDoctorSettings>) -> Result<ExitCode> {
                 continue;
             }
             match run_doctor_job(&job.settings, &cancellation, true) {
-                Ok(result) => outcomes.push(DoctorBatchOutcome {
-                    name: job.name.clone(),
-                    status: DoctorBatchStatus::Success,
-                    result: Some(result),
-                    error: None,
-                }),
+                Ok(result) => {
+                    let error = doctor_result_error(&result.result);
+                    cancelled |= result.result.cancelled;
+                    outcomes.push(DoctorBatchOutcome {
+                        name: job.name.clone(),
+                        status: if error.is_some() {
+                            DoctorBatchStatus::Failed
+                        } else {
+                            DoctorBatchStatus::Success
+                        },
+                        result: Some(result),
+                        error,
+                    });
+                }
                 Err(error) => {
                     cancelled |= matches!(error, Error::Cancelled);
                     outcomes.push(DoctorBatchOutcome {
@@ -1953,7 +2564,12 @@ fn run_doctor_batch(mut jobs: Vec<NamedDoctorSettings>) -> Result<ExitCode> {
     }
     cancelled |= cancellation.is_cancelled();
 
-    write_doctor_batch_output(&outcomes, &output, write_tests)?;
+    write_doctor_batch_output(
+        &outcomes,
+        &output,
+        write_tests,
+        all_targets_preflighted_before_mutation,
+    )?;
     doctor_batch_completion(&outcomes, cancelled || cancellation.is_cancelled())
 }
 
@@ -1974,6 +2590,14 @@ fn doctor_batch_completion(outcomes: &[DoctorBatchOutcome], cancelled: bool) -> 
     }
 }
 
+fn all_doctor_targets_preflighted(outcomes: &[DoctorBatchOutcome], cancelled: bool) -> bool {
+    !cancelled
+        && !outcomes.is_empty()
+        && outcomes
+            .iter()
+            .all(|outcome| outcome.status == DoctorBatchStatus::Preflighted)
+}
+
 fn doctor_result_may_have_mutated(result: &DoctorResult) -> bool {
     result.write_probe_performed
         && result.write_probe.as_ref().is_some_and(|report| {
@@ -1983,6 +2607,13 @@ fn doctor_result_may_have_mutated(result: &DoctorResult) -> bool {
                 || report.server_copy_attempted
                 || report.leftover_remote_probe_path.is_some()
         })
+}
+
+fn doctor_result_error(result: &DoctorResult) -> Option<String> {
+    result
+        .failure
+        .clone()
+        .or_else(|| result.write_probe_error.clone())
 }
 
 fn validate_doctor_batch(jobs: &[NamedDoctorSettings]) -> Result<()> {
@@ -3240,6 +3871,9 @@ fn write_probe_value(report: &WriteProbeReport) -> Value {
         "upload_verified": report.upload_verified,
         "uploaded_size": report.uploaded_size,
         "uploaded_md5": report.uploaded_md5.to_string(),
+        "uploaded_crc32": report.uploaded_md5.crc32_hex(),
+        "uploaded_sha256": report.uploaded_md5.sha256_hex(),
+        "fingerprint_complete": report.uploaded_md5.has_full_proof(),
         "uploaded_mtime_seconds": report.uploaded_mtime_seconds,
         "server_copy_supported": report.server_copy_supported,
         "server_copy_attempted": report.server_copy_attempted,
@@ -3249,25 +3883,92 @@ fn write_probe_value(report: &WriteProbeReport) -> Value {
     })
 }
 
+fn doctor_inventory_value(inventory: &DiagnosticRemoteInventory) -> Value {
+    json!({
+        "scope": "direct_children",
+        "root_exists": inventory.root_exists,
+        "total_entries": inventory.total_entries,
+        "sample_count": inventory.sample.len(),
+        "sample_limit": 5,
+        "truncated": inventory.truncated,
+        "truncated_count": inventory.truncated_count,
+        "truncated_reason": inventory.truncated_reason,
+        "budget": {
+            "pages_requested": inventory.pages_requested,
+            "traversal_depth": inventory.traversal_depth,
+            "deadline_ms": inventory.deadline_ms,
+        },
+        "sample": inventory.sample.iter().map(|entry| json!({
+            "relative_path": entry.relative_path,
+            "relative_path_truncated": entry.relative_path_truncated,
+            "name": entry.name,
+            "name_truncated": entry.name_truncated,
+            "kind": entry.kind.as_str(),
+            "size_bytes": entry.size_bytes,
+            "mtime_seconds": entry.mtime_seconds,
+            "mount_boundary": entry.mount_boundary,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn doctor_overall_status(result: &DoctorResult) -> &'static str {
+    if result.failed() {
+        "fail"
+    } else if result
+        .sections
+        .iter()
+        .any(|section| section.status == DoctorSectionStatus::Warn)
+    {
+        "warn"
+    } else {
+        "pass"
+    }
+}
+
 fn doctor_value(result: &DoctorResult, elapsed: Duration) -> Value {
+    let status_count = |status| {
+        result
+            .sections
+            .iter()
+            .filter(|section| section.status == status)
+            .count()
+    };
     json!({
         "schema": "sdsync.doctor.v1",
-        "routing": true,
-        "api_discovery": true,
+        "level": result.level.as_str(),
+        "status": doctor_overall_status(result),
+        "summary": {
+            "pass": status_count(DoctorSectionStatus::Pass),
+            "warn": status_count(DoctorSectionStatus::Warn),
+            "fail": status_count(DoctorSectionStatus::Fail),
+            "skip": status_count(DoctorSectionStatus::Skip),
+        },
+        "sections": result.sections.iter().map(|section| json!({
+            "id": section.id,
+            "label": section.label,
+            "status": section.status.as_str(),
+            "detail": section.detail,
+            "elapsed_ms": duration_millis(section.elapsed),
+            "timing_scope": section.timing_scope,
+        })).collect::<Vec<_>>(),
+        "error": result.failure,
+        "routing": result.section_succeeded("routing_tls"),
+        "api_discovery": result.section_succeeded("dsm_api_discovery"),
         "authenticated": result.authenticated,
         "remote_checked": result.remote_checked,
         "remote_exists": result.remote_exists,
         "remote_entries": result.remote_entries,
+        "remote_inventory": result.remote_inventory.as_ref().map(doctor_inventory_value),
         "write_permission_scope": result.write_permission_scope,
         "write_permission_path": result.write_permission_path,
         "write_test": {
             "requested": result.write_probe_requested,
             "status": if !result.write_probe_requested {
                 "not-requested"
+            } else if result.failed() {
+                "failed"
             } else if !result.write_probe_performed {
                 "preflighted"
-            } else if result.write_probe_error.is_some() {
-                "failed"
             } else {
                 "success"
             },
@@ -3280,11 +3981,68 @@ fn doctor_value(result: &DoctorResult, elapsed: Duration) -> Value {
 
 fn doctor_human(result: &DoctorResult) -> String {
     let mut human = String::new();
-    if result.authenticated {
+    writeln!(
+        human,
+        "Doctor {}: {}",
+        result.level.as_str(),
+        doctor_overall_status(result).to_ascii_uppercase()
+    )
+    .expect("writing to a String cannot fail");
+    for section in &result.sections {
+        writeln!(
+            human,
+            "  [{:>4}] {} ({} ms): {}",
+            section.status.as_str().to_ascii_uppercase(),
+            section.label,
+            duration_millis(section.elapsed),
+            section.detail,
+        )
+        .expect("writing to a String cannot fail");
+    }
+    if let Some(inventory) = &result.remote_inventory {
+        writeln!(
+            human,
+            "Remote inventory: {} direct children; {} sampled; {} truncated (one page, no recursion).",
+            inventory.total_entries,
+            inventory.sample.len(),
+            inventory.truncated_count,
+        )
+        .expect("writing to a String cannot fail");
+        for entry in &inventory.sample {
+            writeln!(
+                human,
+                "  - path={}{}; name={}{}; kind={}; size_bytes={}; mtime_seconds={}; mount_boundary={}",
+                entry.relative_path,
+                if entry.relative_path_truncated {
+                    " (truncated)"
+                } else {
+                    ""
+                },
+                entry.name,
+                if entry.name_truncated {
+                    " (truncated)"
+                } else {
+                    ""
+                },
+                entry.kind.as_str(),
+                entry
+                    .size_bytes
+                    .map(|size| size.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                entry
+                    .mtime_seconds
+                    .map(|mtime| mtime.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                entry.mount_boundary,
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
+    if !result.failed() && result.authenticated {
         if result.remote_checked {
             writeln!(
                 human,
-                "Doctor: routing, API discovery, authentication, and remote access are healthy ({} entries; destination {}; write permission checked at {} {}).",
+                "Doctor: routing, API discovery, authentication, and remote access are healthy ({} direct entries; destination {}; write permission checked at {} {}).",
                 result.remote_entries.unwrap_or(0),
                 if result.remote_exists == Some(true) {
                     "exists"
@@ -3309,7 +4067,7 @@ fn doctor_human(result: &DoctorResult) -> String {
             )
             .expect("writing to a String cannot fail");
         }
-    } else {
+    } else if !result.failed() {
         writeln!(
             human,
             "Doctor: reverse-proxy routing and File Station API discovery are healthy."
@@ -3318,13 +4076,21 @@ fn doctor_human(result: &DoctorResult) -> String {
     }
     if result.write_probe_requested {
         if !result.write_probe_performed {
-            writeln!(
-                human,
-                "Disposable write probe prerequisites passed; no remote probe mutation was attempted."
-            )
-            .expect("writing to a String cannot fail");
-        } else if let Some(error) = &result.write_probe_error {
-            writeln!(human, "Disposable write probe failed: {error}")
+            if !result.failed() {
+                writeln!(
+                    human,
+                    "Disposable write probe prerequisites passed; no remote probe mutation was attempted."
+                )
+                .expect("writing to a String cannot fail");
+            }
+        } else if result.write_probe_error.is_some() {
+            let detail = result
+                .sections
+                .iter()
+                .find(|section| section.id == "disposable_write_verify_cleanup")
+                .map(|section| section.detail.as_str())
+                .unwrap_or("probe failed");
+            writeln!(human, "Disposable write probe failed: {detail}")
                 .expect("writing to a String cannot fail");
         } else if let Some(report) = &result.write_probe {
             writeln!(
@@ -3407,7 +4173,11 @@ fn doctor_batch_status(outcomes: &[DoctorBatchOutcome]) -> &'static str {
     }
 }
 
-fn doctor_batch_summary_value(outcomes: &[DoctorBatchOutcome], write_tests: bool) -> Value {
+fn doctor_batch_summary_value(
+    outcomes: &[DoctorBatchOutcome],
+    write_tests: bool,
+    all_targets_preflighted_before_mutation: bool,
+) -> Value {
     let succeeded = outcomes
         .iter()
         .filter(|outcome| outcome.status == DoctorBatchStatus::Success)
@@ -3435,7 +4205,7 @@ fn doctor_batch_summary_value(outcomes: &[DoctorBatchOutcome], write_tests: bool
         "execution": "sequential",
         "write_tests_requested": write_tests,
         "all_targets_preflighted_before_mutation": write_tests
-            && outcomes.iter().all(|outcome| outcome.result.is_some()),
+            && all_targets_preflighted_before_mutation,
         "summary": {
             "jobs": outcomes.len(),
             "succeeded": succeeded,
@@ -3451,10 +4221,17 @@ fn write_doctor_batch_output(
     outcomes: &[DoctorBatchOutcome],
     output: &config::ResolvedOutput,
     write_tests: bool,
+    all_targets_preflighted_before_mutation: bool,
 ) -> Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    write_doctor_batch_output_to(&mut stdout, outcomes, output.output, write_tests)
+    write_doctor_batch_output_to(
+        &mut stdout,
+        outcomes,
+        output.output,
+        write_tests,
+        all_targets_preflighted_before_mutation,
+    )
 }
 
 fn write_doctor_batch_output_to<W: Write>(
@@ -3462,6 +4239,7 @@ fn write_doctor_batch_output_to<W: Write>(
     outcomes: &[DoctorBatchOutcome],
     format: cli::OutputFormat,
     write_tests: bool,
+    all_targets_preflighted_before_mutation: bool,
 ) -> Result<()> {
     let succeeded = outcomes
         .iter()
@@ -3484,7 +4262,11 @@ fn write_doctor_batch_output_to<W: Write>(
         .filter(|outcome| outcome.status == DoctorBatchStatus::NotRun)
         .count();
     let status = doctor_batch_status(outcomes);
-    let summary = doctor_batch_summary_value(outcomes, write_tests);
+    let summary = doctor_batch_summary_value(
+        outcomes,
+        write_tests,
+        all_targets_preflighted_before_mutation,
+    );
     match format {
         cli::OutputFormat::Human => {
             writeln!(
@@ -3527,10 +4309,17 @@ fn doctor_batch_output(
     outcomes: &[DoctorBatchOutcome],
     format: cli::OutputFormat,
     write_tests: bool,
+    all_targets_preflighted_before_mutation: bool,
 ) -> RenderedOutput {
     let mut buffer = Vec::new();
-    write_doctor_batch_output_to(&mut buffer, outcomes, format, write_tests)
-        .expect("writing rendered doctor batch output to a Vec cannot fail");
+    write_doctor_batch_output_to(
+        &mut buffer,
+        outcomes,
+        format,
+        write_tests,
+        all_targets_preflighted_before_mutation,
+    )
+    .expect("writing rendered doctor batch output to a Vec cannot fail");
     captured_rendered_output(format, buffer)
 }
 
@@ -3948,6 +4737,7 @@ mod tests {
         config::ResolvedDoctor {
             remote: remote.map(str::to_owned),
             routing_only: false,
+            level: cli::DoctorLevel::Standard,
             compare: cli::CompareArg::Content,
             delete: false,
             write_test: false,
@@ -4123,19 +4913,28 @@ mod tests {
         write_probe: Option<WriteProbeReport>,
         write_probe_error: Option<&str>,
     ) -> DoctorResult {
-        DoctorResult {
-            authenticated: true,
-            remote_checked: true,
-            remote_exists: Some(true),
-            remote_entries: Some(4),
-            write_permission_scope: Some("exact_destination"),
-            write_permission_path: Some("/share/acceptance".to_owned()),
-            write_probe_requested: true,
-            write_probe_performed,
-            write_probe,
-            write_probe_error: write_probe_error.map(str::to_owned),
-            write_probe_cancelled: false,
+        let mut result = DoctorResult::new(
+            &resolved_doctor(
+                "https://files.example.test",
+                Some("doctor-user"),
+                Some("/share/acceptance"),
+            ),
+            true,
+        );
+        result.authenticated = true;
+        result.remote_checked = true;
+        result.remote_exists = Some(true);
+        result.remote_entries = Some(4);
+        result.write_permission_scope = Some("exact_destination");
+        result.write_permission_path = Some("/share/acceptance".to_owned());
+        result.write_probe_requested = true;
+        result.write_probe_performed = write_probe_performed;
+        result.write_probe = write_probe;
+        result.write_probe_error = write_probe_error.map(str::to_owned);
+        if result.write_probe_error.is_some() {
+            result.failure = result.write_probe_error.clone();
         }
+        result
     }
 
     fn doctor_outcome(
@@ -4175,19 +4974,32 @@ mod tests {
     }
 
     fn routing_doctor_result() -> DoctorResult {
-        DoctorResult {
-            authenticated: false,
-            remote_checked: false,
-            remote_exists: None,
-            remote_entries: None,
-            write_permission_scope: None,
-            write_permission_path: None,
-            write_probe_requested: false,
-            write_probe_performed: false,
-            write_probe: None,
-            write_probe_error: None,
-            write_probe_cancelled: false,
-        }
+        let mut settings = resolved_doctor("https://files.example.test", None, None);
+        settings.routing_only = true;
+        settings.level = cli::DoctorLevel::Quick;
+        let mut result = DoctorResult::new(&settings, true);
+        result.set_section(
+            "routing_tls",
+            DoctorSectionStatus::Pass,
+            "HTTPS route responded",
+            Duration::from_millis(3),
+            "shared_connection",
+        );
+        result.set_section(
+            "dsm_api_discovery",
+            DoctorSectionStatus::Pass,
+            "DSM APIs discovered",
+            Duration::from_millis(3),
+            "shared_connection",
+        );
+        result.set_section(
+            "file_station_capabilities",
+            DoctorSectionStatus::Pass,
+            "baseline File Station APIs available",
+            Duration::ZERO,
+            "section",
+        );
+        result
     }
 
     fn rendered_human(output: RenderedOutput) -> String {
@@ -4209,6 +5021,40 @@ mod tests {
             RenderedOutput::Ndjson(values) => values,
             other => panic!("expected NDJSON output, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn quick_doctor_does_not_inherit_authenticated_profile_capabilities() {
+        assert!(!doctor_requires_content_fingerprint(
+            cli::DoctorLevel::Quick,
+            cli::CompareArg::Content
+        ));
+        assert!(!doctor_requires_delete_capability(
+            cli::DoctorLevel::Quick,
+            true
+        ));
+
+        assert!(doctor_requires_content_fingerprint(
+            cli::DoctorLevel::Standard,
+            cli::CompareArg::Content
+        ));
+        assert!(!doctor_requires_content_fingerprint(
+            cli::DoctorLevel::Standard,
+            cli::CompareArg::Metadata
+        ));
+        assert!(doctor_requires_delete_capability(
+            cli::DoctorLevel::Standard,
+            true
+        ));
+
+        assert!(doctor_requires_content_fingerprint(
+            cli::DoctorLevel::Extensive,
+            cli::CompareArg::Metadata
+        ));
+        assert!(doctor_requires_delete_capability(
+            cli::DoctorLevel::Extensive,
+            false
+        ));
     }
 
     #[test]
@@ -4545,7 +5391,7 @@ mod tests {
             ),
         ];
 
-        let summary = doctor_batch_summary_value(&outcomes, true);
+        let summary = doctor_batch_summary_value(&outcomes, true, true);
         assert_eq!(summary["schema"], "sdsync.doctor-batch.v1");
         assert_eq!(summary["status"], "partial");
         assert_eq!(summary["execution"], "sequential");
@@ -4555,12 +5401,17 @@ mod tests {
         assert_eq!(summary["summary"]["partial"], 1);
         assert_eq!(summary["summary"]["not_run"], 1);
 
-        let failed_preflight = vec![doctor_outcome("delta", DoctorBatchStatus::Failed, None)];
-        let summary = doctor_batch_summary_value(&failed_preflight, true);
+        let failed_preflight = vec![doctor_outcome(
+            "delta",
+            DoctorBatchStatus::Failed,
+            Some(doctor_result(true, None, Some("preflight failed"))),
+        )];
+        assert!(!all_doctor_targets_preflighted(&failed_preflight, false));
+        let summary = doctor_batch_summary_value(&failed_preflight, true, false);
         assert_eq!(summary["status"], "failed");
         assert_eq!(summary["all_targets_preflighted_before_mutation"], false);
 
-        let non_mutating = doctor_batch_summary_value(&outcomes, false);
+        let non_mutating = doctor_batch_summary_value(&outcomes, false, true);
         assert_eq!(
             non_mutating["all_targets_preflighted_before_mutation"],
             false
@@ -5672,6 +6523,33 @@ mod tests {
         assert!(preflight_human.contains("destination exists"));
         assert!(preflight_human.contains("probe prerequisites passed"));
 
+        let mut inventoried = preflight.clone();
+        inventoried.remote_inventory = Some(DiagnosticRemoteInventory {
+            root_exists: true,
+            total_entries: 8,
+            sample: vec![synology_drive_sync::api::DiagnosticRemoteEntry {
+                relative_path: "report.bin".to_owned(),
+                relative_path_truncated: false,
+                name: "report.bin".to_owned(),
+                name_truncated: false,
+                kind: local::EntryKind::File,
+                size_bytes: Some(23),
+                mtime_seconds: Some(1_700_000_000),
+                mount_boundary: false,
+            }],
+            truncated: true,
+            truncated_count: 7,
+            truncated_reason: Some("sample_limit"),
+            pages_requested: 1,
+            traversal_depth: 1,
+            deadline_ms: 5_000,
+        });
+        let inventory_human = doctor_human(&inventoried);
+        assert!(inventory_human.contains("8 direct children; 1 sampled; 7 truncated"));
+        assert!(inventory_human.contains("path=report.bin; name=report.bin; kind=file"));
+        assert!(inventory_human.contains("size_bytes=23; mtime_seconds=1700000000"));
+        assert!(inventory_human.contains("mount_boundary=false"));
+
         let mut ancestor = preflight.clone();
         ancestor.remote_exists = Some(false);
         ancestor.write_permission_scope = Some("nearest_existing_ancestor");
@@ -5732,6 +6610,7 @@ mod tests {
             &outcomes,
             cli::OutputFormat::Human,
             true,
+            false,
         ));
         assert!(batch_human.contains("Target diagnostic batch: status partial"));
         assert!(batch_human.contains("[alpha] success"));
@@ -5740,12 +6619,14 @@ mod tests {
             &outcomes,
             cli::OutputFormat::Json,
             true,
+            false,
         ));
         assert_eq!(batch_json["jobs"].as_array().unwrap().len(), 4);
         let batch_records = rendered_ndjson(doctor_batch_output(
             &outcomes,
             cli::OutputFormat::Ndjson,
             true,
+            false,
         ));
         assert_eq!(batch_records.len(), 5);
         assert_eq!(batch_records.last().unwrap()["kind"], "summary");

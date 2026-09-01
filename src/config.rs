@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::cli::{
-    AuthenticationArgs, CompareArg, ConnectionArgs, CredentialProfileArgs, DoctorArgs, LogFormat,
-    LogLevel, NetworkArgs, OutputArgs, OutputFormat, ProgressMode, REMOTE_LOG_TOKEN_ENV,
+    AuthenticationArgs, CompareArg, ConnectionArgs, CredentialProfileArgs, DoctorArgs, DoctorLevel,
+    LogFormat, LogLevel, NetworkArgs, OutputArgs, OutputFormat, ProgressMode, REMOTE_LOG_TOKEN_ENV,
     RemoteLogMode, SafetyArgs, SyncArgs, SyncBehaviorArgs,
 };
 
@@ -419,6 +419,7 @@ pub struct ResolvedSync {
 pub struct ResolvedDoctor {
     pub remote: Option<String>,
     pub routing_only: bool,
+    pub level: DoctorLevel,
     pub compare: CompareArg,
     pub delete: bool,
     pub write_test: bool,
@@ -503,9 +504,6 @@ pub fn resolve_doctor(
         .username
         .clone()
         .or_else(|| profile.username.clone());
-    if !arguments.routing_only && username.is_none() {
-        return Err(ConfigError::MissingValue("--username"));
-    }
     let (action_remote, write_test) = match arguments.action.as_ref() {
         Some(crate::cli::DoctorAction::Target(target)) => {
             (target.remote.clone(), target.write_test)
@@ -523,6 +521,34 @@ pub fn resolve_doctor(
                 .to_owned(),
         ));
     }
+    if arguments.routing_only
+        && arguments
+            .level
+            .is_some_and(|level| level != DoctorLevel::Quick)
+    {
+        return Err(ConfigError::Invalid(
+            "--routing-only is the legacy quick diagnostic and cannot be combined with --level standard or --level extensive"
+                .to_owned(),
+        ));
+    }
+    let level = if arguments.routing_only {
+        DoctorLevel::Quick
+    } else if write_test && arguments.level.is_none() {
+        // Preserve the historical `target --write-test` invocation while making its effective
+        // depth explicit in structured output.
+        DoctorLevel::Extensive
+    } else {
+        arguments.level.unwrap_or(DoctorLevel::Standard)
+    };
+    if write_test && level != DoctorLevel::Extensive {
+        return Err(ConfigError::Invalid(
+            "doctor target --write-test requires --level extensive (or omit --level for legacy compatibility)"
+                .to_owned(),
+        ));
+    }
+    if level != DoctorLevel::Quick && username.is_none() {
+        return Err(ConfigError::MissingValue("--username"));
+    }
     let remote = action_remote
         .or_else(|| arguments.remote.clone())
         .or_else(|| profile.remote.clone());
@@ -534,6 +560,7 @@ pub fn resolve_doctor(
     Ok(ResolvedDoctor {
         remote,
         routing_only: arguments.routing_only,
+        level,
         compare: profile.compare.unwrap_or(CompareArg::Content),
         delete: profile.delete.unwrap_or(false),
         write_test,
@@ -1407,6 +1434,7 @@ output = "json"
             resolve_doctor(Some(&profile), write_arguments, &write_cli.global.output).unwrap();
         assert_eq!(write.remote.as_deref(), Some("/team/profile"));
         assert!(write.write_test);
+        assert_eq!(write.level, DoctorLevel::Extensive);
 
         let explicit_cli =
             Cli::try_parse_from(["synology-drive-sync", "doctor", "target", "/team/explicit"])
@@ -1422,6 +1450,7 @@ output = "json"
         .unwrap();
         assert_eq!(explicit.remote.as_deref(), Some("/team/explicit"));
         assert!(!explicit.write_test);
+        assert_eq!(explicit.level, DoctorLevel::Standard);
 
         let default_cli = Cli::try_parse_from(["synology-drive-sync", "doctor"]).unwrap();
         let Invocation::Doctor(default_arguments) = default_cli.invocation() else {
@@ -1435,6 +1464,7 @@ output = "json"
         .unwrap();
         assert_eq!(default.remote.as_deref(), Some("/team/profile"));
         assert!(!default.write_test);
+        assert_eq!(default.level, DoctorLevel::Standard);
         assert_eq!(default.compare, CompareArg::Content);
         assert!(!default.delete);
     }
@@ -1493,6 +1523,71 @@ output = "json"
         };
         let error = resolve_doctor(None, arguments, &cli.global.output).unwrap_err();
         assert!(matches!(error, ConfigError::MissingValue("--username")));
+
+        let quick_cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "doctor",
+            "--url",
+            "https://files.example.test",
+            "--level",
+            "quick",
+        ])
+        .unwrap();
+        let Invocation::Doctor(quick_arguments) = quick_cli.invocation() else {
+            panic!("expected doctor");
+        };
+        let quick = resolve_doctor(None, quick_arguments, &quick_cli.global.output).unwrap();
+        assert_eq!(quick.level, DoctorLevel::Quick);
+        assert!(quick.username.is_none());
+    }
+
+    #[test]
+    fn target_doctor_levels_keep_mutation_a_separate_explicit_opt_in() {
+        let profile = Profile {
+            remote: Some("/team/profile".to_owned()),
+            url: Some("https://files.example.test".to_owned()),
+            username: Some("mirror-bot".to_owned()),
+            ..Profile::default()
+        };
+        let extensive_cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "doctor",
+            "--level",
+            "extensive",
+            "target",
+        ])
+        .unwrap();
+        let Invocation::Doctor(extensive_arguments) = extensive_cli.invocation() else {
+            panic!("expected doctor");
+        };
+        let extensive = resolve_doctor(
+            Some(&profile),
+            extensive_arguments,
+            &extensive_cli.global.output,
+        )
+        .unwrap();
+        assert_eq!(extensive.level, DoctorLevel::Extensive);
+        assert!(!extensive.write_test);
+
+        let invalid_cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "doctor",
+            "--level",
+            "standard",
+            "target",
+            "--write-test",
+        ])
+        .unwrap();
+        let Invocation::Doctor(invalid_arguments) = invalid_cli.invocation() else {
+            panic!("expected doctor");
+        };
+        let error = resolve_doctor(
+            Some(&profile),
+            invalid_arguments,
+            &invalid_cli.global.output,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires --level extensive"));
     }
 
     #[test]

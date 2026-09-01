@@ -233,11 +233,25 @@ NDJSON results plus human diagnostics, explicit and predictable.
 
 A single local source diagnostic uses `sdsync.source-doctor.v1`. A source-diagnostic batch uses
 `sdsync.source-doctor-job.v1` records and an `sdsync.source-doctor-batch.v1` summary. A single
-target diagnostic uses `sdsync.doctor.v1`; its `write_test` member distinguishes `not-requested`,
-`success`, and `failed` and retains the disposable-probe report, cleanup state, and any leftover
+target diagnostic uses `sdsync.doctor.v1`. It includes `level`, overall `status`, pass/warn/fail/skip
+counts, total `elapsed_ms`, and eight fixed `sections`; every section has an ID, label, status,
+bounded detail, `elapsed_ms`, and `timing_scope`. Shared routing/discovery timing is explicitly
+marked `shared_connection`.
+
+Standard and Extensive may include `remote_inventory`, a non-recursive `direct_children` record.
+It contains the File Station-reported total, sample count/limit, truncation state/count/reason, a
+five-second page/depth/deadline budget, and at most five deterministically sorted safe-metadata
+entries. Entry text is bounded and carries its own truncation flags. File payloads, remote content
+digests, ACL documents, absolute sample paths, credentials, cookies, tokens, session identifiers,
+and unbounded server detail are excluded.
+
+The `write_test` member distinguishes `not-requested`, `preflighted`, `success`, and `failed` and
+retains the disposable-probe report, full MD5/CRC32/SHA-256 proof, cleanup state, and any leftover
 probe path. Target-diagnostic batches use `sdsync.doctor-job.v1` and
 `sdsync.doctor-batch.v1`. A target job marked `partial` may have mutated before its probe failed;
-the report must be inspected even when cleanup appears complete.
+the report must be inspected even when cleanup appears complete. Completed/skipped Doctor evidence
+is emitted before an operational failure returns nonzero; configuration rejection can happen before
+a section document exists.
 
 Multi-profile plan and sync use one `sdsync.batch-job.v1` result per selected profile and one
 `sdsync.batch.v1` summary. JSON nests the ordered job objects under the summary. NDJSON writes the

@@ -955,13 +955,13 @@ function bind(context, names) {
 (async function () {
   const operation = operationContext();
   await methods.executeOperation.call(operation, "doctor", {
-    scope: "all", write_test: false, allow_delete: null, max_total_delete: null
+    scope: "all", level: "standard", write_test: false, allow_delete: null, max_total_delete: null
   });
   await methods.executeOperation.call(operation, "plan", {
-    scope: "all", write_test: null, allow_delete: false, max_total_delete: 0
+    scope: "all", level: null, write_test: null, allow_delete: false, max_total_delete: 0
   });
   await methods.executeOperation.call(operation, "run", {
-    scope: "all", write_test: null, allow_delete: false, max_total_delete: 0
+    scope: "all", level: null, write_test: null, allow_delete: false, max_total_delete: 0
   });
   assert.deepEqual(postCalls.map((call) => call.awaitTerminal), [true, false, false]);
   assert.deepEqual(
@@ -976,7 +976,7 @@ function bind(context, names) {
   postFailure = new Error("doctor failed");
   postFailure.resultOutput = "doctor preserved raw output";
   await methods.executeOperation.call(operation, "doctor", {
-    scope: "all", write_test: false, allow_delete: null, max_total_delete: null
+    scope: "all", level: "standard", write_test: false, allow_delete: null, max_total_delete: null
   });
   assert.deepEqual(operation.diagnostic, {
     title: "Doctor failed",
@@ -987,7 +987,7 @@ function bind(context, names) {
   const beforeBusy = postCalls.length;
   operation.operationBusy = true;
   await methods.executeOperation.call(operation, "doctor", {
-    scope: "all", write_test: false, allow_delete: null, max_total_delete: null
+    scope: "all", level: "standard", write_test: false, allow_delete: null, max_total_delete: null
   });
   assert.equal(postCalls.length, beforeBusy);
 
@@ -1928,8 +1928,8 @@ function bind(context, names) {
         with self.assertRaisesRegex(validate_spk.ValidationError, "resultOutput"):
             validate_build(
                 api=source["api"].replace(
-                    b"failure.resultOutput = boundedText(",
-                    b"failure.resultText = boundedText(",
+                    b"failure.resultOutput = boundedTerminalOutput(",
+                    b"failure.resultText = boundedTerminalOutput(",
                     1,
                 )
             )

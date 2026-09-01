@@ -784,12 +784,20 @@ def validate_native_api_source(payload: bytes) -> None:
         "status.result.ok === false",
         "status.result.ok !== true && status.result.ok !== false",
         "status.client_request_id !== requestId",
-        "failure.resultOutput = boundedText(",
+        "failure.resultOutput = boundedTerminalOutput(",
         "status.result.output",
     ):
         if marker not in poll_source:
             raise ValidationError(
                 f"native DSM queued-result observer is missing {marker!r}"
+            )
+    for marker in (
+        "function boundedTerminalOutput(",
+        ".slice(0, MAX_RESPONSE_BYTES)",
+    ):
+        if marker not in source:
+            raise ValidationError(
+                f"native DSM terminal result output is missing its response-bound contract {marker!r}"
             )
     if poll_source.count("apiGetWithDsmAuth(") != 1:
         raise ValidationError(

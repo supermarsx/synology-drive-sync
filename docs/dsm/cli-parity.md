@@ -43,7 +43,7 @@ administrator's ACL instead of the package user's real source access.
 | Save per-profile routine | `configure-routine --profile NAME ...` |
 | Remove routine | `remove-routine NAME` |
 | DSM notification policy | `configure-alerts ...` |
-| Doctor | `doctor [NAME|--all] [--write-test]` |
+| Doctor | `doctor [NAME|--all] [--level LEVEL] [--write-test]` |
 | Plan | `plan [NAME|--all] [--allow-delete] [--max-total-delete N]` |
 | Run | `run [NAME|--all] [--allow-delete] [--max-total-delete N]` |
 | Service/run snapshot | `status` |
@@ -51,9 +51,12 @@ administrator's ACL instead of the package user's real source access.
 | Package paths | `paths` |
 
 With no profile name, Doctor/Plan/Run uses the selected default. Only explicit `--all` selects every
-profile. `--write-test` applies only to Doctor. `--allow-delete` applies only to Plan/Run, and
-`--max-total-delete` applies to an all-profile deletion action. Inapplicable or trailing options are
-rejected rather than ignored.
+profile. Doctor `LEVEL` is `quick`, `standard` (the default), or `extensive`. `--write-test` applies
+only to Doctor at Extensive depth; omitting an explicit level with that legacy invocation promotes
+it to Extensive, but new automation should pass both flags. `--allow-delete` applies only to
+Plan/Run, and `--max-total-delete` applies to an all-profile deletion action. Inapplicable or
+trailing options are rejected rather than ignored. See [Health and Doctor](operations.md#health-and-doctor)
+for source behavior, independent target execution, and bounded section evidence.
 
 `configure-profile` is a complete replacement of the named profile's non-secret settings. It covers
 the dashboard's target, sync, safety, network, TLS, local-output, and remote-observability fields,
