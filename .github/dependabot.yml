@@ -16,3 +16,11 @@ updates:
     directory: /packaging/synology/ui-src
     schedule:
       interval: monthly
+    ignore:
+      # DSM supplies Vue 2 at runtime; these majors require a Vue 3 host ABI.
+      - dependency-name: vue
+        update-types:
+          - version-update:semver-major
+      - dependency-name: vue-loader
+        update-types:
+          - version-update:semver-major

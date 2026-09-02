@@ -1,5 +1,6 @@
 about.hbs text eol=lf
 about.toml text eol=lf
+license.md text eol=lf
 third_party_licenses.html -text -whitespace
 *.sh text eol=lf
 .config/*.env text eol=lf

@@ -499,7 +499,7 @@ fn untargeted_doctor_discovers_bounded_visible_shared_folders_without_selecting_
 
     let requests = server.requests();
     assert_eq!(requests.len(), 12);
-    for request_set in requests.chunks_exact(4) {
+    for request_set in requests.as_chunks::<4>().0 {
         assert_eq!(
             request_set
                 .iter()
