@@ -238,12 +238,24 @@ counts, total `elapsed_ms`, and eight fixed `sections`; every section has an ID,
 bounded detail, `elapsed_ms`, and `timing_scope`. Shared routing/discovery timing is explicitly
 marked `shared_connection`.
 
-Standard and Extensive may include `remote_inventory`, a non-recursive `direct_children` record.
-It contains the File Station-reported total, sample count/limit, truncation state/count/reason, a
-five-second page/depth/deadline budget, and at most five deterministically sorted safe-metadata
-entries. Entry text is bounded and carries its own truncation flags. File payloads, remote content
-digests, ACL documents, absolute sample paths, credentials, cookies, tokens, session identifiers,
-and unbounded server detail are excluded.
+Standard and Extensive include bounded `remote_inventory` evidence after authentication. Without a
+resolved remote, scope `visible_shared_folders` reports at most five File Station-visible
+shared-folder roots and never selects or descends into one. With a CLI or profile remote, scope
+`direct_children` reports at most five non-recursive folder/file entries beneath that exact root.
+For `visible_shared_folders`, a File Station-reported root is retained even when child listing is
+disabled; discovery alone does not assert browse, read, or write permission.
+Both scopes contain the reported total, sample count/limit, truncation state/count/reason, and a
+five-second page/depth/deadline budget. A successful zero-item result remains explicit as
+`sample_count: 0` and `sample: []`. Entry text is bounded and carries its own truncation flags. File
+payloads, remote content digests, ACL documents, absolute local volume paths, credentials, cookies,
+tokens, session identifiers, and unbounded server detail are excluded.
+
+This path-bearing Doctor evidence is not added to the generic `sdsync.log.v1` stream. When Doctor
+runs through the DSM package manager, that package writes a separate local/private history record
+with the same maximum-five structure for troubleshooting; the core CLI does not generally create
+this extra history. DSM Activity/Logs reads the private on-NAS evidence, and the package never
+forwards it through the remote log sink. Configuring a remote collector therefore does not disclose
+the discovered logical names or relative paths.
 
 The `write_test` member distinguishes `not-requested`, `preflighted`, `success`, and `failed` and
 retains the disposable-probe report, full MD5/CRC32/SHA-256 proof, cleanup state, and any leftover
@@ -433,23 +445,27 @@ process arguments, or access logs.
 
 ## Privacy and redaction guarantees
 
-Logging is redacted by construction rather than by searching arbitrary strings after formatting:
+Generic logging is redacted by construction rather than by searching arbitrary strings after
+formatting:
 
 - event codes are a closed enum;
 - event metadata is numeric only;
 - progress uses numeric operation IDs and counters;
-- no log or progress record accepts paths, usernames, URLs, headers, bearer tokens, passwords, OTP
-  codes, TOTP seeds, free-form messages, or arbitrary key/value fields;
+- no generic `sdsync.log.v1` or progress record accepts paths, usernames, URLs, headers, bearer
+  tokens, passwords, OTP codes, TOTP seeds, free-form messages, or arbitrary key/value fields;
 - remote transport errors are reduced to fixed categories and never include response bodies;
 - endpoint validation errors and token errors do not echo the offending value;
 - redirects are disabled so a bearer header cannot be forwarded by the client.
 
-Logs still disclose operational metadata: timestamps, event types, counts, byte volumes, durations,
-throughput, retry attempts, and numeric operation IDs. Treat them according to that metadata's
-sensitivity. This redaction-by-construction guarantee applies to log and progress schemas, not all
-command output. Plan/sync output deliberately identifies relative and remote paths; the effective
-configuration view likewise contains non-secret connection and path settings. None of these
-machine-output contracts includes password, OTP, TOTP-seed, bearer-token, session, or file-content
-fields. Operating-system errors, reverse-proxy access logs, crash dumps, and third-party collector
-software are outside the observability boundary. In particular, configure every proxy and collector
-to redact or omit the `Authorization` header.
+Generic logs still disclose operational metadata: timestamps, event types, counts, byte volumes,
+durations, throughput, retry attempts, and numeric operation IDs. Treat them according to that
+metadata's sensitivity. This redaction-by-construction guarantee applies to the generic log and
+progress schemas, not all command output or the explicitly local/private Doctor history described
+above. That history discloses at most five bounded logical names/relative paths and never an
+absolute local volume path; protect access to the package's Activity/Logs accordingly. Plan/sync
+output deliberately identifies relative and remote paths; the effective configuration view likewise
+contains non-secret connection and path settings. None of these machine-output contracts includes
+password, OTP, TOTP-seed, bearer-token, session, or file-content fields. Operating-system errors,
+reverse-proxy access logs, crash dumps, and third-party collector software are outside the
+observability boundary. In particular, configure every proxy and collector to redact or omit the
+`Authorization` header.

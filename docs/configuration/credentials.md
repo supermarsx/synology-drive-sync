@@ -14,6 +14,11 @@ The password is resolved in this order:
 4. the current user's OS vault, unless disabled;
 5. a masked interactive prompt when the command and terminal permit it.
 
+Interactive password and TOTP prompts print one `*` for each entered character. Backspace removes
+the corresponding marker, so the terminal confirms that input was received without exposing the
+secret itself. This feedback applies only to a terminal prompt; vault, file, environment, and
+standard-input sources remain silent.
+
 `--password-stdin` suppresses a lower-layer password file. Batch commands reject it because a single
 stream cannot safely distinguish independent profile credentials.
 

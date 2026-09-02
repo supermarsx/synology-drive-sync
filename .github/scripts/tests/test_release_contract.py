@@ -486,6 +486,39 @@ class AssetContractTests(unittest.TestCase):
 
 
 class WorkflowWiringTests(unittest.TestCase):
+    def test_dsm_ui_dependency_audit_is_single_ci_gate(self):
+        ci = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+        release = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        audit_command = "pnpm audit --audit-level high"
+        self.assertEqual(ci.count(audit_command), 1)
+        self.assertNotIn(audit_command, release)
+        packaging_install = ci.index(
+            "pnpm install --frozen-lockfile --ignore-scripts",
+            ci.index("Verify deterministic native DSM AppWindow build"),
+        )
+        packaging_audit = ci.index(audit_command, packaging_install)
+        packaging_test = ci.index("pnpm test", packaging_install)
+        self.assertLess(packaging_install, packaging_audit)
+        self.assertLess(packaging_audit, packaging_test)
+
+        workspace = (
+            REPOSITORY_ROOT / "packaging/synology/ui-src/pnpm-workspace.yaml"
+        ).read_text(encoding="utf-8")
+        lockfile = (
+            REPOSITORY_ROOT / "packaging/synology/ui-src/pnpm-lock.yaml"
+        ).read_text(encoding="utf-8")
+        override = r"(?m)^overrides:\n  postcss: 8\.5\.26$"
+        self.assertRegex(workspace, override)
+        self.assertRegex(lockfile, override)
+        self.assertEqual(
+            set(re.findall(r"(?m)^  postcss@([^:\s]+):$", lockfile)),
+            {"8.5.26"},
+        )
+
     def test_release_container_bases_are_current_and_immutable(self):
         dockerfile = (REPOSITORY_ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn(
@@ -532,7 +565,7 @@ class WorkflowWiringTests(unittest.TestCase):
             "dtolnay/rust-toolchain": "4360b52568e2003a75bf9bc1d59f33a8e3fc893c",
             "lycheeverse/lychee-action": "e7477775783ea5526144ba13e8db5eec57747ce8",
             "pnpm/action-setup": "0977fd99725f1db4007ccb2928dbb4e90d06cc86",
-            "taiki-e/install-action": "742a3317eac7bd62f91cd888b4eead5e784ba833",
+            "taiki-e/install-action": "0758d235715de2f3551eacc980d9ae8fce9342c3",
         }
         uses_values = re.findall(
             r"^\s*(?:-\s+)?uses:\s+([^#\s]+)(?:\s+#.*)?$",
@@ -700,7 +733,7 @@ class WorkflowWiringTests(unittest.TestCase):
         }
         zig_installer = "run: bash .github/scripts/install-zig.sh"
         installer_action = (
-            "taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833"
+            "taiki-e/install-action@0758d235715de2f3551eacc980d9ae8fce9342c3"
         )
         qemu_image = (
             "docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:"

@@ -33,7 +33,7 @@ use std::sync::{
 use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json, value::RawValue};
 use sha2::{Digest, Sha256};
@@ -4309,6 +4309,20 @@ mod linux_socket {
         pub(super) gid: u32,
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(super) struct TerminalProcessIdentity {
+        pub(super) pid: u32,
+        pub(super) start: u64,
+        pub(super) boot: String,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum ExactProcessState {
+        Absent,
+        Live,
+        Terminal,
+    }
+
     pub(super) fn peer_credentials(stream: &UnixStream) -> BridgeResult<PeerCredentials> {
         // SAFETY: getsockopt writes at most the supplied ucred-sized buffer and
         // receives a valid file descriptor owned by the live UnixStream.
@@ -4479,6 +4493,7 @@ mod linux_socket {
         socket_path: &Path,
         pid_path: &Path,
         package_uid: u32,
+        expected_terminal: Option<&TerminalProcessIdentity>,
     ) -> BridgeResult<()> {
         validate_socket_parent(socket_path, package_uid)?;
         let pid_metadata = match fs::symlink_metadata(pid_path) {
@@ -4526,20 +4541,46 @@ mod linux_socket {
                         !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
                     })
                     .and_then(|value| value.parse::<u32>().ok())
-                    .filter(|value| *value > 1)
+                    .filter(|value| *value > 1 && *value <= libc::pid_t::MAX as u32)
                     .ok_or_else(BridgeError::unsafe_runtime)?;
-                // SAFETY: signal zero performs only a liveness/permission probe.
-                if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
-                    return Err(BridgeError::new(ErrorKind::Conflict));
-                }
-                if io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
-                    return Err(BridgeError::unsafe_runtime());
+                if let Some(expected) = expected_terminal {
+                    if expected.pid != pid || !valid_boot_id(&expected.boot) {
+                        return Err(BridgeError::unsafe_runtime());
+                    }
+                    match exact_process_state(expected, package_uid)? {
+                        ExactProcessState::Absent | ExactProcessState::Terminal => {}
+                        ExactProcessState::Live => {
+                            return Err(BridgeError::new(ErrorKind::Conflict));
+                        }
+                    }
+                } else {
+                    // SAFETY: signal zero performs only a liveness/permission probe.
+                    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+                        return Err(BridgeError::new(ErrorKind::Conflict));
+                    }
+                    if io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                        return Err(BridgeError::unsafe_runtime());
+                    }
                 }
                 Some(opened)
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(_) => return Err(BridgeError::unsafe_runtime()),
         };
+        if expected_terminal.is_some() && pid_metadata.is_none() {
+            return match fs::symlink_metadata(socket_path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                _ => Err(BridgeError::unsafe_runtime()),
+            };
+        }
+        if let Some(expected) = expected_terminal {
+            match exact_process_state(expected, package_uid)? {
+                ExactProcessState::Absent | ExactProcessState::Terminal => {}
+                ExactProcessState::Live => {
+                    return Err(BridgeError::new(ErrorKind::Conflict));
+                }
+            }
+        }
 
         remove_stale_socket(socket_path, package_uid, pid_metadata.is_some())?;
         if let Some(before) = pid_metadata {
@@ -4555,6 +4596,145 @@ mod linux_socket {
                 .map_err(|_| BridgeError::unsafe_runtime())?;
         }
         Ok(())
+    }
+
+    pub(super) fn exact_process_state(
+        expected: &TerminalProcessIdentity,
+        package_uid: u32,
+    ) -> BridgeResult<ExactProcessState> {
+        if expected.pid <= 1
+            || expected.pid > libc::pid_t::MAX as u32
+            || expected.start == 0
+            || !valid_boot_id(&expected.boot)
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        if exact_current_boot_id()? != expected.boot {
+            return Err(BridgeError::unsafe_runtime());
+        }
+
+        let stat_path = PathBuf::from(format!("/proc/{}/stat", expected.pid));
+        let stat = match read_bounded_proc_file(&stat_path, 4096)? {
+            Some(value) => value,
+            None => {
+                return if proc_entry_absent(expected.pid)? {
+                    Ok(ExactProcessState::Absent)
+                } else {
+                    Err(BridgeError::unsafe_runtime())
+                };
+            }
+        };
+        let tail = stat
+            .rsplit_once(") ")
+            .map(|(_, tail)| tail)
+            .ok_or_else(BridgeError::unsafe_runtime)?;
+        let mut fields = tail.split_ascii_whitespace();
+        let state = fields
+            .next()
+            .filter(|value| value.len() == 1)
+            .ok_or_else(BridgeError::unsafe_runtime)?;
+        let start = fields
+            .nth(18)
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value != 0)
+            .ok_or_else(BridgeError::unsafe_runtime)?;
+
+        let status_path = PathBuf::from(format!("/proc/{}/status", expected.pid));
+        let Some(status) = read_bounded_proc_file(&status_path, 64 * 1024)? else {
+            return if proc_entry_absent(expected.pid)? {
+                Ok(ExactProcessState::Absent)
+            } else {
+                Err(BridgeError::unsafe_runtime())
+            };
+        };
+        let uid = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .and_then(|line| line.split_ascii_whitespace().next())
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or_else(BridgeError::unsafe_runtime)?;
+        if start != expected.start || uid != package_uid {
+            return Err(BridgeError::unsafe_runtime());
+        }
+
+        let state_recheck = read_bounded_proc_file(&stat_path, 4096)?;
+        let Some(state_recheck) = state_recheck else {
+            return if proc_entry_absent(expected.pid)? {
+                Ok(ExactProcessState::Absent)
+            } else {
+                Err(BridgeError::unsafe_runtime())
+            };
+        };
+        let tail_recheck = state_recheck
+            .rsplit_once(") ")
+            .map(|(_, tail)| tail)
+            .ok_or_else(BridgeError::unsafe_runtime)?;
+        let mut fields_recheck = tail_recheck.split_ascii_whitespace();
+        let state_recheck = fields_recheck
+            .next()
+            .filter(|value| value.len() == 1)
+            .ok_or_else(BridgeError::unsafe_runtime)?;
+        let start_recheck = fields_recheck
+            .nth(18)
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value != 0)
+            .ok_or_else(BridgeError::unsafe_runtime)?;
+        if start_recheck != expected.start || state_recheck != state {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(match state_recheck {
+            "Z" | "X" | "x" => ExactProcessState::Terminal,
+            _ => ExactProcessState::Live,
+        })
+    }
+
+    pub(super) fn proc_entry_absent(pid: u32) -> BridgeResult<bool> {
+        match fs::symlink_metadata(format!("/proc/{pid}")) {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(_) => Err(BridgeError::unsafe_runtime()),
+        }
+    }
+
+    fn exact_current_boot_id() -> BridgeResult<String> {
+        let path = Path::new("/proc/sys/kernel/random/boot_id");
+        let metadata = fs::symlink_metadata(path).map_err(|_| BridgeError::unsafe_runtime())?;
+        if !metadata.file_type().is_file() || metadata.st_uid() != 0 {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let value = read_bounded_proc_file(path, 64)?.ok_or_else(BridgeError::unsafe_runtime)?;
+        let value = value.strip_suffix('\n').unwrap_or(&value).to_owned();
+        if !valid_boot_id(&value) {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(value)
+    }
+
+    fn read_bounded_proc_file(path: &Path, maximum: u64) -> BridgeResult<Option<String>> {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let mut file = match options.open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(BridgeError::unsafe_runtime()),
+        };
+        let metadata = file.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
+        if !metadata.file_type().is_file() || metadata.len() > maximum {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        Read::by_ref(&mut file)
+            .take(maximum + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        if bytes.len() as u64 > maximum {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| BridgeError::unsafe_runtime())
     }
 
     pub(super) fn shutdown_write(stream: &UnixStream) -> BridgeResult<()> {
@@ -10776,10 +10956,30 @@ pub(crate) fn main_entry() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => ExitCode::FAILURE,
         }
-    } else if arguments.len() == 1 && arguments[0] == "--cleanup-stale-api-socket" {
+    } else if matches!(arguments.len(), 1 | 4) && arguments[0] == "--cleanup-stale-api-socket" {
         #[cfg(target_os = "linux")]
         {
             let result = (|| {
+                let expected_terminal = if arguments.len() == 4 {
+                    let pid = arguments[1]
+                        .to_str()
+                        .and_then(|value| value.parse::<u32>().ok())
+                        .filter(|value| *value > 1 && *value <= libc::pid_t::MAX as u32)
+                        .ok_or_else(BridgeError::bad_request)?;
+                    let start = arguments[2]
+                        .to_str()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .filter(|value| *value != 0)
+                        .ok_or_else(BridgeError::bad_request)?;
+                    let boot = arguments[3]
+                        .to_str()
+                        .filter(|value| valid_boot_id(value))
+                        .ok_or_else(BridgeError::bad_request)?
+                        .to_owned();
+                    Some(linux_socket::TerminalProcessIdentity { pid, start, boot })
+                } else {
+                    None
+                };
                 let identity = linux_runtime::identity_state()?;
                 let package_uid = validate_package_identity(&identity)?;
                 linux_runtime::clear_environment()?;
@@ -10787,6 +10987,7 @@ pub(crate) fn main_entry() -> ExitCode {
                     Path::new(API_SOCKET_PATH),
                     Path::new(API_PID_PATH),
                     package_uid,
+                    expected_terminal.as_ref(),
                 )
             })();
             match result {
@@ -14912,7 +15113,7 @@ mod tests {
         );
         assert!(socket.exists());
         fixture.write_private(&pid_file, b"2147483647\n");
-        linux_socket::cleanup_stale_service_socket(&socket, &pid_file, uid).unwrap();
+        linux_socket::cleanup_stale_service_socket(&socket, &pid_file, uid, None).unwrap();
         assert!(!socket.exists());
         assert!(!pid_file.exists());
 
@@ -14924,14 +15125,160 @@ mod tests {
         drop(recovered);
         fixture.write_private(&pid_file, format!("{}\n", std::process::id()).as_bytes());
         assert_eq!(
-            linux_socket::cleanup_stale_service_socket(&socket, &pid_file, uid)
+            linux_socket::cleanup_stale_service_socket(&socket, &pid_file, uid, None)
                 .unwrap_err()
                 .kind,
             ErrorKind::Conflict
         );
         assert!(socket.exists());
         assert!(pid_file.exists());
+        let own_start = fs::read_to_string(format!("/proc/{}/stat", std::process::id()))
+            .unwrap()
+            .rsplit_once(") ")
+            .unwrap()
+            .1
+            .split_ascii_whitespace()
+            .nth(19)
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+            .to_owned();
+        let own_identity = linux_socket::TerminalProcessIdentity {
+            pid: std::process::id(),
+            start: own_start,
+            boot: boot.clone(),
+        };
+        assert_eq!(
+            linux_socket::exact_process_state(&own_identity, uid).unwrap(),
+            linux_socket::ExactProcessState::Live
+        );
+        assert_eq!(
+            linux_socket::cleanup_stale_service_socket(
+                &socket,
+                &pid_file,
+                uid,
+                Some(&own_identity),
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::Conflict
+        );
+        assert_eq!(
+            linux_socket::exact_process_state(&own_identity, uid + 1)
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnsafeRuntime
+        );
+        assert!(!linux_socket::proc_entry_absent(std::process::id()).unwrap());
+        assert!(linux_socket::proc_entry_absent(libc::pid_t::MAX as u32).unwrap());
+        let wrong_pid = linux_socket::TerminalProcessIdentity {
+            pid: libc::pid_t::MAX as u32,
+            start: own_start,
+            boot: boot.clone(),
+        };
+        assert_eq!(
+            linux_socket::cleanup_stale_service_socket(&socket, &pid_file, uid, Some(&wrong_pid),)
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnsafeRuntime
+        );
+        let mut wrong_boot = boot.clone().into_bytes();
+        wrong_boot[0] = if wrong_boot[0] == b'0' { b'1' } else { b'0' };
+        let wrong_boot = linux_socket::TerminalProcessIdentity {
+            pid: std::process::id(),
+            start: own_start,
+            boot: String::from_utf8(wrong_boot).unwrap(),
+        };
+        assert_eq!(
+            linux_socket::cleanup_stale_service_socket(&socket, &pid_file, uid, Some(&wrong_boot),)
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnsafeRuntime
+        );
+        let reused = linux_socket::TerminalProcessIdentity {
+            pid: std::process::id(),
+            start: own_start + 1,
+            boot: boot.clone(),
+        };
+        assert_eq!(
+            linux_socket::cleanup_stale_service_socket(&socket, &pid_file, uid, Some(&reused),)
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnsafeRuntime
+        );
+        assert!(socket.exists());
+        assert!(pid_file.exists());
         fs::remove_file(&pid_file).unwrap();
+        fs::remove_file(&socket).unwrap();
+
+        let zombie_socket = linux_socket::bind(&socket, uid).unwrap();
+        drop(zombie_socket);
+        let mut zombie = Command::new("/bin/sh")
+            .args(["-c", "sleep 0.1"])
+            .spawn()
+            .unwrap();
+        let zombie_pid = zombie.id();
+        let zombie_start = fs::read_to_string(format!("/proc/{zombie_pid}/stat"))
+            .unwrap()
+            .rsplit_once(") ")
+            .unwrap()
+            .1
+            .split_ascii_whitespace()
+            .nth(19)
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        let zombie_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let state = fs::read_to_string(format!("/proc/{zombie_pid}/stat"))
+                .unwrap()
+                .rsplit_once(") ")
+                .unwrap()
+                .1
+                .split_ascii_whitespace()
+                .next()
+                .unwrap()
+                .to_owned();
+            if matches!(state.as_str(), "Z" | "X" | "x") {
+                break;
+            }
+            assert!(
+                Instant::now() < zombie_deadline,
+                "child did not become a zombie"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fixture.write_private(&pid_file, format!("{zombie_pid}\n").as_bytes());
+        let exact_zombie = linux_socket::TerminalProcessIdentity {
+            pid: zombie_pid,
+            start: zombie_start,
+            boot,
+        };
+        linux_socket::cleanup_stale_service_socket(&socket, &pid_file, uid, Some(&exact_zombie))
+            .unwrap();
+        assert!(!socket.exists());
+        assert!(!pid_file.exists());
+        zombie.wait().unwrap();
+        linux_socket::cleanup_stale_service_socket(&socket, &pid_file, uid, Some(&exact_zombie))
+            .unwrap();
+
+        let unbound_socket = linux_socket::bind(&socket, uid).unwrap();
+        drop(unbound_socket);
+        assert_eq!(
+            linux_socket::cleanup_stale_service_socket(
+                &socket,
+                &pid_file,
+                uid,
+                Some(&exact_zombie),
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::UnsafeRuntime
+        );
+        assert!(socket.exists());
         fs::remove_file(&socket).unwrap();
 
         let outside = fixture.root.join("outside");

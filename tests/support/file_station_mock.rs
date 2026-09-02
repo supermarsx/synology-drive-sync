@@ -37,6 +37,7 @@ struct FileNode {
 #[derive(Debug)]
 struct ServerState {
     directories: BTreeSet<String>,
+    list_disabled_directories: BTreeSet<String>,
     files: BTreeMap<String, FileNode>,
     requests: Vec<CapturedRequest>,
     expected_account: String,
@@ -95,6 +96,7 @@ impl MockFileStation {
         let address = listener.local_addr().expect("read mock address");
         let state = Arc::new(Mutex::new(ServerState {
             directories: BTreeSet::from(["/team".to_owned()]),
+            list_disabled_directories: BTreeSet::new(),
             files: BTreeMap::new(),
             requests: Vec::new(),
             expected_account: "e2e-user".to_owned(),
@@ -147,6 +149,22 @@ impl MockFileStation {
             .lock()
             .expect("mock state lock")
             .directories
+            .insert(path.to_owned());
+    }
+
+    pub fn remove_directory(&self, path: &str) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .directories
+            .remove(path);
+    }
+
+    pub fn disable_directory_listing(&self, path: &str) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .list_disabled_directories
             .insert(path.to_owned());
     }
 
@@ -383,6 +401,43 @@ fn route_request(
         return api_error(119);
     }
     match (api, method) {
+        ("SYNO.FileStation.List", "list_share") => {
+            let mut shares = state
+                .directories
+                .iter()
+                .filter_map(|path| {
+                    let name = path.strip_prefix('/')?;
+                    (!name.is_empty() && !name.contains('/')).then(|| {
+                        let disable_list = state.list_disabled_directories.contains(path);
+                        json!({
+                            "name": name,
+                            "path": path,
+                            "disable_list": disable_list,
+                            "additional": {"perm": {
+                                "adv_right": {"disable_list": disable_list},
+                                "acl": {"read": !disable_list, "exec": !disable_list}
+                            }}
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+            shares.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+            let total = shares.len();
+            let offset = fields
+                .get("offset")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let limit = fields
+                .get("limit")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(total);
+            let shares = shares
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .collect::<Vec<_>>();
+            success(json!({"total": total, "shares": shares}))
+        }
         ("SYNO.FileStation.List", "getinfo") => {
             let path = first_json_string(fields.get("path"));
             match path.and_then(|path| node_value(state, &path)) {

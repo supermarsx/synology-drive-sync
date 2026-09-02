@@ -22,12 +22,15 @@ source problem. The final manager result is still nonzero when either side fails
 destination, permission is checked at the exact path; for a missing destination, it checks the
 nearest existing ancestor's ability to create the first missing component.
 
-Standard and Extensive request only one direct-child inventory page and display at most five
-entries, deterministically sorted. Evidence includes the File Station-reported direct-child total,
-sample count, `truncated`/truncated count, and bounded safe metadata. It never recursively walks the
-destination, reads remote payloads, emits ACLs or secrets, or replaces the complete inventory used
-by Plan and Run. Extensive keeps the same bound. See
-[Bounded destination inventory](../diagnostics-and-batch.md#bounded-destination-inventory).
+Standard and Extensive request one bounded discovery page and retain at most five deterministically
+sorted entries. With a configured remote this is a direct-child sample beneath that exact logical
+root; without a remote it is a non-descending sample of visible shared-folder roots. Evidence
+includes the File Station-reported total, sample count, truncation state/count, and bounded safe
+metadata. A reported shared-folder root is discovery evidence, not proof of browse/read/write
+permission; permission is checked only when a destination is explicitly selected. It never
+recursively walks a destination, reads remote payloads, emits ACLs or secrets, or
+replaces the complete inventory used by Plan and Run. Extensive keeps the same bound. See
+[Bounded target discovery](../diagnostics-and-batch.md#bounded-target-discovery).
 
 The target result is broken down into routing/TLS, API discovery, authentication, File Station
 capabilities, destination permission, destination inventory, disposable write/verify/cleanup, and
@@ -114,29 +117,39 @@ codes are:
 | `routine.retry_scheduled` | A whole-action retry was scheduled |
 | `doctor.succeeded` | Doctor completed successfully |
 | `doctor.failed` | Doctor completed with a nonzero result |
+| `doctor.inventory` | The DSM package retained one bounded private Doctor discovery record |
 | `configuration.changed` | Profile, routine, alert, or schedule configuration changed |
 | `notification.unavailable` | The DSM desktop notification helper was unavailable or failed |
 
 Each event contains an epoch, fixed code, validated profile/`all`/`none` scope, fixed state, and
-bounded non-secret message. Activity rotates at 1 MiB with three backups. Browser clearing affects
-only the current view.
+bounded message. A `doctor.inventory` message embeds the corresponding private maximum-five record,
+including bounded logical names/relative paths and per-field truncation flags, but no credentials,
+tokens, ACLs, file payloads, or absolute local volume paths. Activity rotates at 1 MiB with three
+backups. Browser clearing affects only the current view.
 
 ## Bounded logs
 
 The dashboard reads `1..1000` lines and can filter:
 
 - API/CGI diagnostics;
+- private Doctor discovery evidence;
 - controller;
 - scheduler;
 - sync; or
 - mandatory audit history.
 
-API, controller, and scheduler logs rotate at 10 MiB with five backups. The core sync log uses its
-own 10 MiB, three-backup policy. Rotation rejects symlinks, hard links, and unsafe ownership/modes.
-Structured API failure lines obey their exact bridge/authentication/security category threshold.
-API output replaces private package paths with neutral labels and masks secret-file paths; secret
-values are never an allowed log field. Selecting one source reads only that source; `all` remains
-globally bounded below the API bridge's 1 MiB response-capture limit.
+API, controller, scheduler, and audit logs retain five rotations. The core sync log retains three.
+The DSM package's private Doctor discovery history uses a 1 MiB rotation threshold plus three
+rotations (`.1` through `.3`), all package-owned `0600` files. One final bounded record can cross
+the threshold before the next append rotates it. Structured Activity also retains three
+rotations. Reads inspect every retained file, reject symlinks, hard links, unsafe ownership/modes,
+or unreadable state, and traverse from the oldest rotation through the active file. The response is
+the newest requested suffix that fits its byte budget. Doctor discovery is available only through
+the local `doctor` Logs source and matching Activity events and is excluded from the core remote-log
+sink. Structured API failure lines obey their exact bridge/authentication/security category
+threshold. API output replaces private package paths with neutral labels and masks secret-file
+paths; secret values are never an allowed log field. Selecting one of the six sources reads only
+that source; `all` remains globally bounded below the API bridge's 1 MiB response-capture limit.
 
 The Activity page can pause refresh without changing package logging. Log refresh choices are
 **Manual only**, 5, 10, or 30 seconds. Manual-only mode clears the background log timer; selecting
@@ -147,6 +160,7 @@ recovery:
 sudo -u "$PACKAGE_USER" -- "$MANAGER" logs 200
 sudo tail -n 200 /var/log/packages/synology-drive-sync.log
 sudo tail -n 200 /var/packages/synology-drive-sync/var/log/api.log
+sudo tail -n 200 /var/packages/synology-drive-sync/var/log/doctor-inventory.log
 ```
 
 ## DSM desktop alert policy

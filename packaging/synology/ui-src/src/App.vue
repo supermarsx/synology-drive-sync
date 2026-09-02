@@ -335,7 +335,7 @@
                   <div class="sdsync-doctor-section-heading"><span class="sdsync-doctor-state-dot" /><div><strong>{{ section.label }}</strong><small v-if="section.profile">Profile: {{ section.profile }}</small><small v-if="section.timing_scope">Timing scope: {{ section.timing_scope }}</small></div><span class="sdsync-doctor-state-label">{{ doctorStatusLabel(section.state) }}</span><time v-if="section.duration_ms !== null">{{ formatDuration(section.duration_ms) }}</time></div>
                   <p>{{ section.detail }}</p>
                   <ul v-if="section.checks.length" class="sdsync-doctor-checks"><li v-for="check in section.checks" :key="check.id" :class="doctorStatusClass(check.state)"><span class="sdsync-doctor-state-dot" /><strong>{{ check.label }}</strong><span>{{ check.detail }}</span><time v-if="check.duration_ms !== null">{{ formatDuration(check.duration_ms) }}</time><small>{{ doctorStatusLabel(check.state) }}</small></li></ul>
-                  <div v-if="section.inventory" class="sdsync-doctor-inventory"><div class="sdsync-doctor-inventory-summary"><strong>{{ section.inventory.total }} remote entr{{ section.inventory.total === 1 ? 'y' : 'ies' }} reported</strong><span>{{ section.inventory.entries.length }} displayed<span v-if="section.inventory.truncated"> · bounded sample truncated</span></span></div><ul><li v-for="(entry, entryIndex) in section.inventory.entries" :key="entry.path + ':' + entryIndex"><span class="sdsync-doctor-entry-kind">{{ entry.kind }}</span><div><strong>{{ entry.path }}</strong><small>{{ doctorInventoryMetadata(entry) }}</small></div></li></ul></div>
+                  <div v-if="section.inventory" class="sdsync-doctor-inventory"><div class="sdsync-doctor-inventory-summary"><strong>{{ section.inventory.total }} remote entr{{ section.inventory.total === 1 ? 'y' : 'ies' }} reported</strong><span>{{ doctorInventoryScopeLabel(section.inventory.scope) }} · {{ section.inventory.entries.length }} displayed<span v-if="section.inventory.truncated"> · bounded sample truncated</span></span></div><p v-if="!section.inventory.entries.length" class="sdsync-doctor-inventory-empty">No logical entries were visible in this scope.</p><ul v-else><li v-for="(entry, entryIndex) in section.inventory.entries" :key="entry.path + ':' + entryIndex"><span class="sdsync-doctor-entry-kind">{{ entry.kind }}</span><div><strong>{{ entry.path }}</strong><small>{{ doctorInventoryMetadata(entry) }}</small></div></li></ul></div>
                 </li>
               </ol>
               <details v-if="diagnostic.output" class="sdsync-doctor-raw"><summary>{{ doctorReport.structured ? 'Structured terminal summary' : 'Raw terminal evidence' }}</summary><pre>{{ diagnostic.output }}</pre></details>
@@ -355,13 +355,13 @@
                 <div class="sdsync-filter-row"><span class="sdsync-filter-label">Category</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityCategory" :options="activityCategoryOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity category" aria-describedby="sdsync-help-activity-category"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-category" /></div></div>
                 <div class="sdsync-filter-row"><span class="sdsync-filter-label">Level</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityLevel" :options="activityLevelOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity level" aria-describedby="sdsync-help-activity-level"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-level" /></div></div>
               </div>
-              <ol class="sdsync-activity-feed"><li v-if="!reversedActivity.length" class="sdsync-empty">No package events match these filters.</li><li v-for="event in reversedActivity" :key="[event.epoch, event.code, event.profile, event.category, event.level, event.client_request_id].join(':')"><time>{{ formatDate(event.epoch) }}</time><div class="sdsync-activity-detail"><strong>{{ event.code }}</strong><p v-if="event.message">{{ event.message }}</p><code v-if="event.client_request_id">Client request ID: {{ event.client_request_id }}</code></div><small>{{ event.profile }} · {{ event.state }} · {{ event.category }} / {{ event.level }}</small><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy activity event ' + event.code" tooltip="Copy this event as bounded, sanitized troubleshooting text" @click="copyActivityEvent(event)"><template #icon><action-icon name="copy" /></template>Copy</v-button></li></ol>
+              <ol class="sdsync-activity-feed"><li v-if="!reversedActivity.length" class="sdsync-empty">No package events match these filters.</li><li v-for="event in reversedActivity" :key="[event.epoch, event.code, event.profile, event.category, event.level, event.client_request_id].join(':')"><time>{{ formatDate(event.epoch) }}</time><div class="sdsync-activity-detail"><strong>{{ event.code }}</strong><p v-if="event.message && !event.doctor_inventory">{{ event.message }}</p><div v-if="event.doctor_inventory" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ doctorInventoryScopeLabel(event.doctor_inventory.inventory.scope) }}</strong><span>{{ event.doctor_inventory.inventory.total }} total · {{ event.doctor_inventory.inventory.entries.length }} shown<span v-if="event.doctor_inventory.inventory.truncated"> · truncated</span></span></div><p v-if="!event.doctor_inventory.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in event.doctor_inventory.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div><code v-if="event.client_request_id">Client request ID: {{ event.client_request_id }}</code></div><small>{{ event.profile }} · {{ event.state }} · {{ event.category }} / {{ event.level }}</small><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy activity event ' + event.code" tooltip="Copy this event as bounded, sanitized troubleshooting text" @click="copyActivityEvent(event)"><template #icon><action-icon name="copy" /></template>Copy</v-button></li></ol>
             </article>
             <article class="sdsync-panel sdsync-log-panel">
               <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Bounded package logs</p><h3>Troubleshooting evidence</h3></div><div class="sdsync-evidence-heading-actions"><span class="sdsync-log-state">{{ logState }}</span><v-button type="border" display="icon-text" aria-label="Copy all visible package logs" tooltip="Copy the selected log sources as bounded, sanitized troubleshooting text" :disabled="!logRecords.length" @click="copyVisibleLogs"><template #icon><action-icon name="copy" /></template>Copy visible</v-button></div></div>
               <div class="sdsync-filter-list sdsync-log-filters" aria-label="Log filters"><div class="sdsync-filter-row"><span class="sdsync-filter-label">Source</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="logSource" :options="logSourceOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Log source" aria-describedby="sdsync-help-log-source" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-source" /></div></div><div class="sdsync-filter-row"><span class="sdsync-filter-label">Lines</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="logLines" :options="logLineOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Log line count" aria-describedby="sdsync-help-log-lines" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-lines" /></div></div></div>
               <p v-if="!logRecords.length" class="sdsync-empty">{{ logOutput }}</p>
-              <div v-else class="sdsync-log-records"><section v-for="record in logRecords" :key="record.id" class="sdsync-log-record"><header><span><strong>{{ record.source }}</strong><small>{{ record.lineCount }} line{{ record.lineCount === 1 ? '' : 's' }}</small></span><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy ' + record.source + ' log evidence'" tooltip="Copy this log record as bounded, sanitized troubleshooting text" @click="copyLogRecord(record)"><template #icon><action-icon name="copy" /></template>Copy</v-button></header><pre tabindex="0">{{ record.text }}</pre></section></div>
+              <div v-else class="sdsync-log-records"><section v-for="record in logRecords" :key="record.id" class="sdsync-log-record"><header><span><strong>{{ record.source }}</strong><small>{{ record.lineCount }} line{{ record.lineCount === 1 ? '' : 's' }}</small></span><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy ' + record.source + ' log evidence'" tooltip="Copy this log record as bounded, sanitized troubleshooting text" @click="copyLogRecord(record)"><template #icon><action-icon name="copy" /></template>Copy</v-button></header><div v-if="record.doctorInventories.length" class="sdsync-log-inventory-evidence"><div v-for="(inventoryRecord, recordIndex) in record.doctorInventories" :key="inventoryRecord.epoch + ':' + inventoryRecord.profile + ':' + recordIndex" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ inventoryRecord.profile }} · {{ doctorInventoryScopeLabel(inventoryRecord.inventory.scope) }}</strong><span>{{ inventoryRecord.inventory.total }} total · {{ inventoryRecord.inventory.entries.length }} shown<span v-if="inventoryRecord.inventory.truncated"> · truncated</span></span></div><p v-if="!inventoryRecord.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in inventoryRecord.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div></div><pre tabindex="0">{{ record.text }}</pre></section></div>
             </article>
           </section>
 
@@ -550,8 +550,8 @@ const DOCTOR_SECTION_CATALOG = Object.freeze([
   Object.freeze({ id: "dsm_api_discovery", label: "DSM API discovery", minimum: "quick", detail: "Negotiate a compatible DSM and File Station API surface." }),
   Object.freeze({ id: "dsm_session_auth", label: "DSM session authentication", minimum: "standard", detail: "Authenticate a temporary target session without exposing credentials." }),
   Object.freeze({ id: "file_station_capabilities", label: "File Station capabilities", minimum: "standard", detail: "Check the target operations required by this profile." }),
-  Object.freeze({ id: "destination_permissions", label: "Destination permissions", minimum: "standard", detail: "Verify child-create/write permission at the exact destination or its nearest existing ancestor." }),
-  Object.freeze({ id: "destination_inventory", label: "Destination inventory", minimum: "standard", detail: "Inspect a bounded direct-child sample without changing the target." }),
+  Object.freeze({ id: "destination_permissions", label: "Destination permissions", minimum: "standard", detail: "With a configured destination, verify child-create/write permission at the exact path or its nearest existing ancestor; otherwise skip this section." }),
+  Object.freeze({ id: "destination_inventory", label: "Destination inventory", minimum: "standard", detail: "With a configured destination, inspect a bounded direct-child sample; otherwise sample visible shared-folder roots without selecting or traversing a share." }),
   Object.freeze({ id: "disposable_write_verify_cleanup", label: "Disposable write, verify, and cleanup", minimum: "write", detail: "Create, verify, and remove one explicitly approved probe." }),
   Object.freeze({ id: "session_logout", label: "Session logout", minimum: "standard", detail: "Confirm that the temporary DSM target session is closed." })
 ]);
@@ -840,43 +840,43 @@ const ABOUT_METADATA = Object.freeze({
   releaseSelectorUrl: "https://supermarsx.github.io/synology-drive-sync/release-selector.html"
 });
 const ABOUT_RUST_DEPENDENCIES = Object.freeze([
-  { name: "clap", pin: "4.6.5", scope: "All platforms", url: "https://crates.io/crates/clap" },
-  { name: "clap_complete", pin: "4.6.8", scope: "All platforms", url: "https://crates.io/crates/clap_complete" },
-  { name: "clap_mangen", pin: "0.3.0", scope: "All platforms", url: "https://crates.io/crates/clap_mangen" },
+  { name: "clap", pin: "4.6.6", scope: "All platforms", url: "https://crates.io/crates/clap" },
+  { name: "clap_complete", pin: "4.6.9", scope: "All platforms", url: "https://crates.io/crates/clap_complete" },
+  { name: "clap_mangen", pin: "0.3.3", scope: "All platforms", url: "https://crates.io/crates/clap_mangen" },
   { name: "crc32fast", pin: "1.5.1", scope: "All platforms", url: "https://crates.io/crates/crc32fast" },
   { name: "ctrlc", pin: "3.5.2", scope: "All platforms", url: "https://crates.io/crates/ctrlc" },
-  { name: "ignore", pin: "0.4.31", scope: "All platforms", url: "https://crates.io/crates/ignore" },
+  { name: "ignore", pin: "0.4.33", scope: "All platforms", url: "https://crates.io/crates/ignore" },
   { name: "keyring-core", pin: "1.0.0", scope: "All platforms", url: "https://crates.io/crates/keyring-core" },
   { name: "md-5", pin: "0.11.0", scope: "All platforms", url: "https://crates.io/crates/md-5" },
-  { name: "hmac", pin: "0.12.1", scope: "All platforms", url: "https://crates.io/crates/hmac" },
+  { name: "hmac", pin: "0.13.0", scope: "All platforms", url: "https://crates.io/crates/hmac" },
   { name: "reqwest", pin: "0.13.4", scope: "All platforms", url: "https://crates.io/crates/reqwest" },
   { name: "rpassword", pin: "7.5.4", scope: "All platforms", url: "https://crates.io/crates/rpassword" },
   { name: "serde", pin: "1.0.229", scope: "All platforms", url: "https://crates.io/crates/serde" },
   { name: "serde_json", pin: "1.0.151", scope: "All platforms", url: "https://crates.io/crates/serde_json" },
-  { name: "sha2", pin: "0.10.9", scope: "All platforms", url: "https://crates.io/crates/sha2" },
+  { name: "sha2", pin: "0.11.0", scope: "All platforms", url: "https://crates.io/crates/sha2" },
   { name: "subtle", pin: "2.6.1", scope: "All platforms", url: "https://crates.io/crates/subtle" },
-  { name: "thiserror", pin: "2.0.19", scope: "All platforms", url: "https://crates.io/crates/thiserror" },
+  { name: "thiserror", pin: "2.0.20", scope: "All platforms", url: "https://crates.io/crates/thiserror" },
   { name: "tokio", pin: "1.53.1", scope: "All platforms", url: "https://crates.io/crates/tokio" },
-  { name: "toml", pin: "0.9.12+spec-1.1.0", scope: "All platforms", url: "https://crates.io/crates/toml" },
-  { name: "totp-rs", pin: "5.7.2", scope: "All platforms", url: "https://crates.io/crates/totp-rs" },
+  { name: "toml", pin: "1.1.4+spec-1.1.0", scope: "All platforms", url: "https://crates.io/crates/toml" },
+  { name: "totp-rs", pin: "6.0.0", scope: "All platforms", url: "https://crates.io/crates/totp-rs" },
   { name: "zeroize", pin: "1.9.0", scope: "All platforms", url: "https://crates.io/crates/zeroize" },
   { name: "windows-native-keyring-store", pin: "1.1.0", scope: "Windows", url: "https://crates.io/crates/windows-native-keyring-store" },
-  { name: "apple-native-keyring-store", pin: "1.0.1", scope: "macOS", url: "https://crates.io/crates/apple-native-keyring-store" },
+  { name: "apple-native-keyring-store", pin: "1.0.2", scope: "macOS", url: "https://crates.io/crates/apple-native-keyring-store" },
   { name: "libc", pin: "0.2.189", scope: "Linux", url: "https://crates.io/crates/libc" },
-  { name: "zbus-secret-service-keyring-store", pin: "1.0.0", scope: "Linux", url: "https://crates.io/crates/zbus-secret-service-keyring-store" }
+  { name: "zbus-secret-service-keyring-store", pin: "1.0.1", scope: "Linux", url: "https://crates.io/crates/zbus-secret-service-keyring-store" }
 ]);
 const ABOUT_UI_DEPENDENCIES = Object.freeze([
-  { name: "@babel/core", pin: "7.18.6", scope: "devDependency", url: "https://www.npmjs.com/package/@babel/core" },
-  { name: "@babel/preset-env", pin: "7.18.6", scope: "devDependency", url: "https://www.npmjs.com/package/@babel/preset-env" },
-  { name: "babel-loader", pin: "8.0.6", scope: "devDependency", url: "https://www.npmjs.com/package/babel-loader" },
-  { name: "css-loader", pin: "3.5.3", scope: "devDependency", url: "https://www.npmjs.com/package/css-loader" },
-  { name: "mini-css-extract-plugin", pin: "0.12.0", scope: "devDependency", url: "https://www.npmjs.com/package/mini-css-extract-plugin" },
-  { name: "vue", pin: "2.7.14", scope: "devDependency", url: "https://www.npmjs.com/package/vue" },
-  { name: "vue-loader", pin: "15.10.1", scope: "devDependency", url: "https://www.npmjs.com/package/vue-loader" },
-  { name: "vue-template-compiler", pin: "2.7.14", scope: "devDependency", url: "https://www.npmjs.com/package/vue-template-compiler" },
-  { name: "webpack", pin: "5.91.0", scope: "devDependency", url: "https://www.npmjs.com/package/webpack" },
-  { name: "webpack-cli", pin: "5.1.4", scope: "devDependency", url: "https://www.npmjs.com/package/webpack-cli" },
-  { name: "pnpm", pin: "pnpm@8.15.9", scope: "packageManager", url: "https://pnpm.io/" }
+  { name: "@babel/core", pin: "8.0.1", scope: "devDependency", url: "https://www.npmjs.com/package/@babel/core" },
+  { name: "@babel/preset-env", pin: "8.0.2", scope: "devDependency", url: "https://www.npmjs.com/package/@babel/preset-env" },
+  { name: "babel-loader", pin: "10.1.1", scope: "devDependency", url: "https://www.npmjs.com/package/babel-loader" },
+  { name: "css-loader", pin: "7.1.5", scope: "devDependency", url: "https://www.npmjs.com/package/css-loader" },
+  { name: "mini-css-extract-plugin", pin: "2.10.2", scope: "devDependency", url: "https://www.npmjs.com/package/mini-css-extract-plugin" },
+  { name: "vue", pin: "2.7.16", scope: "devDependency", url: "https://www.npmjs.com/package/vue" },
+  { name: "vue-loader", pin: "15.11.1", scope: "devDependency", url: "https://www.npmjs.com/package/vue-loader" },
+  { name: "vue-template-compiler", pin: "2.7.16", scope: "devDependency", url: "https://www.npmjs.com/package/vue-template-compiler" },
+  { name: "webpack", pin: "5.110.3", scope: "devDependency", url: "https://www.npmjs.com/package/webpack" },
+  { name: "webpack-cli", pin: "7.2.3", scope: "devDependency", url: "https://www.npmjs.com/package/webpack-cli" },
+  { name: "pnpm", pin: "pnpm@11.25.0", scope: "packageManager", url: "https://pnpm.io/" }
 ]);
 const CONTROL_HELP = Object.freeze({
   "profile-filter": "Search configured profiles by name, local source, File Station URL, DSM account, or destination path.",
@@ -933,7 +933,7 @@ const CONTROL_HELP = Object.freeze({
   "routine-delete": "Permit this routine to use the profile's separately approved deletion policy.",
   "routine-max-delete": "Additional routine-level ceiling for destination deletions.",
   "doctor-scope": "Run diagnostics for every profile or one selected profile.",
-  "doctor-level": "Quick performs unauthenticated routing, TLS, and DSM API discovery only. Standard adds authentication, File Station capabilities, destination permissions, bounded inventory, and logout. Extensive deepens those checks without writing to the target.",
+  "doctor-level": "Quick performs unauthenticated routing, TLS, and DSM API discovery only. Standard and Extensive authenticate and perform bounded inventory. With a configured destination, they check permission and sample its direct children. Without one, they skip permission and sample visible shared-folder roots without selecting or traversing a share. Extensive deepens the read-only checks.",
   "doctor-write": "Create, verify, and remove one disposable destination probe.",
   "doctor-write-confirm": "Confirm that the selected destination is non-critical and cleanup is approved.",
   "activity-search": "Search the rendered event text, metadata, or an exact client request ID.",
@@ -1405,7 +1405,17 @@ function activityTroubleshootingText(value) {
     `Level: ${troubleshootingField(event.level, "info")}`
   ];
   if (event.client_request_id) lines.push(`Client request ID: ${event.client_request_id}`);
-  if (event.message) lines.push(`Message:\n${event.message}`);
+  if (event.doctor_inventory) {
+    const evidence = event.doctor_inventory.inventory;
+    lines.push(`Doctor discovery scope: ${doctorInventoryScopeLabel(evidence.scope)}`);
+    if (evidence.scope === "visible_shared_folders") {
+      lines.push("Discovery only: File Station reported these roots; browse and write permission were not tested.");
+    }
+    lines.push(`Doctor discovery entries: ${evidence.total}; displayed: ${evidence.entries.length}${evidence.truncated ? "; sample truncated" : ""}`);
+    for (const entry of evidence.entries.slice(0, 5)) {
+      lines.push(`- ${doctorText(entry.kind, "entry", 16)}: ${doctorText(entry.path, "entry", 512)} (name=${doctorText(entry.name, "entry", 256)})`);
+    }
+  } else if (event.message) lines.push(`Message:\n${event.message}`);
   return boundedSanitizedTroubleshootingText(lines.join("\n"), TROUBLESHOOTING_RECORD_LIMIT);
 }
 
@@ -1610,12 +1620,65 @@ function normalizedDoctorInventory(value, fallbackTotal = null) {
     : (inventory.total_entries !== undefined ? inventory.total_entries : (inventory.total_count !== undefined ? inventory.total_count : (inventory.count !== undefined ? inventory.count : fallbackTotal)));
   const parsedTotal = Number(totalCandidate);
   const total = Number.isFinite(parsedTotal) && parsedTotal >= 0 ? Math.max(entries.length, Math.round(parsedTotal)) : candidates.length;
-  if (!entries.length && total === 0 && inventory.truncated !== true) return null;
+  const rawScope = String(inventory.scope || "").trim().toLowerCase();
+  const scope = ["direct_children", "visible_shared_folders"].includes(rawScope)
+    ? rawScope
+    : "direct_children";
   return {
     entries,
     total,
-    truncated: inventory.truncated === true || candidates.length > 5 || total > entries.length
+    truncated: inventory.truncated === true || candidates.length > 5 || total > entries.length,
+    scope
   };
+}
+
+function doctorInventoryScopeLabel(value) {
+  return value === "visible_shared_folders" ? "Visible shared folders" : "Direct children";
+}
+
+function normalizedDoctorInventoryRecord(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (String(value.schema || "").toLowerCase() !== "sdsync.dsm-doctor-inventory.v1") return null;
+  if (String(value.action || "").toLowerCase() !== "doctor") return null;
+  const nestedInventory = value.inventory && typeof value.inventory === "object" && !Array.isArray(value.inventory)
+    ? value.inventory
+    : null;
+  const inventory = normalizedDoctorInventory(nestedInventory || {
+    scope: value.scope,
+    total_entries: value.total_entries,
+    truncated: value.truncated,
+    sample: Array.isArray(value.sample) ? value.sample.slice(0, 5) : []
+  });
+  if (!inventory) return null;
+  return {
+    schema: "sdsync.dsm-doctor-inventory.v1",
+    epoch: numberOr(value.epoch, 0),
+    action: "doctor",
+    profile: doctorText(value.profile, "none", 128),
+    inventory
+  };
+}
+
+function doctorInventoryRecordsFromText(value, limit = 20) {
+  const records = [];
+  const maximum = Math.max(1, Math.min(50, Number(limit) || 20));
+  for (const line of String(value || "").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) continue;
+    try {
+      const record = normalizedDoctorInventoryRecord(JSON.parse(trimmed));
+      if (record) records.push(record);
+    } catch (_error) { /* Non-Doctor log lines remain plain troubleshooting evidence. */ }
+  }
+  return records.slice(-maximum);
+}
+
+function doctorInventoryRecordFromActivityMessage(value) {
+  const prefix = "Doctor inventory evidence ";
+  const message = typeof value === "string" ? value : "";
+  if (!message.startsWith(prefix)) return null;
+  try { return normalizedDoctorInventoryRecord(JSON.parse(message.slice(prefix.length))); }
+  catch (_error) { return null; }
 }
 
 function normalizedDoctorCheck(value, index) {
@@ -2068,6 +2131,10 @@ function doctorTroubleshootingText(report, title, output) {
       lines.push(`- ${doctorState(check.state, "warn").toUpperCase()}: ${doctorText(check.label, check.id, 256)} — ${doctorText(check.detail, "No detail was reported.")}`);
     }
     if (section.inventory) {
+      lines.push(`Discovery scope: ${doctorInventoryScopeLabel(section.inventory.scope)}`);
+      if (section.inventory.scope === "visible_shared_folders") {
+        lines.push("Discovery only: File Station reported these roots; browse and write permission were not tested.");
+      }
       lines.push(`Remote entries: ${section.inventory.total}; displayed: ${section.inventory.entries.length}${section.inventory.truncated ? "; sample truncated" : ""}`);
       for (const entry of section.inventory.entries.slice(0, 5)) {
         const metadata = [
@@ -2083,7 +2150,15 @@ function doctorTroubleshootingText(report, title, output) {
       }
     }
   }
-  const terminalOutput = model.structured === true ? "" : boundedText(output || model.raw_output, "");
+  // The display summary is intentionally capped at 64 KiB, but credential
+  // terminators can occur after that boundary. Prefer the report's complete
+  // one-MiB raw contract so redaction sees the whole value before the final
+  // troubleshooting-copy bound is applied.
+  const terminalOutput = model.structured === true
+    ? ""
+    : (typeof model.raw_output === "string" && model.raw_output.length
+      ? model.raw_output
+      : (typeof output === "string" ? output : ""));
   if (terminalOutput) lines.push("", "Raw terminal output", terminalOutput);
   return sanitizedTroubleshootingText(lines.join("\n"), TROUBLESHOOTING_RECORD_LIMIT);
 }
@@ -2201,6 +2276,16 @@ function normalizedActivityEvent(event) {
   const field = (value, fallback, limit = ACTIVITY_FIELD_LIMIT) => redactedTroubleshootingText(
     typeof value === "string" ? value : fallback
   ).slice(0, limit);
+  const rawMessage = typeof event.message === "string" ? event.message : "";
+  // Parse only the exact private Doctor prefix and strict nested schema before
+  // applying generic credential-field redaction. A legitimate logical name
+  // such as `/password:visible` otherwise looks like an unquoted credential
+  // field and can make the embedded JSON unparsable. The normalizer below
+  // still whitelists, bounds, and sanitizes every retained inventory field.
+  const doctorInventory = normalizedDoctorInventoryRecord(event.doctor_inventory)
+    || doctorInventoryRecordFromActivityMessage(rawMessage);
+  const completeMessage = redactedTroubleshootingText(rawMessage).slice(0, 4096);
+  const message = completeMessage.slice(0, ACTIVITY_MESSAGE_LIMIT);
   return {
     epoch: numberOr(event.epoch, 0),
     code: field(event.code, "unknown.event"),
@@ -2208,8 +2293,9 @@ function normalizedActivityEvent(event) {
     state: field(event.state, "unknown"),
     category: field(event.category, "operations"),
     level: field(event.level, "info"),
-    message: field(event.message, "", ACTIVITY_MESSAGE_LIMIT),
-    client_request_id: validatedClientRequestId(event.client_request_id)
+    message,
+    client_request_id: validatedClientRequestId(event.client_request_id),
+    doctor_inventory: doctorInventory
   };
 }
 
@@ -2485,8 +2571,8 @@ export default {
     doctorLevelTitle() { return { quick: "Quick · lowest target load", standard: "Standard · complete readiness", extensive: "Extensive · deepest read-only inspection" }[normalizedDoctorLevel(this.doctorForm.level)]; },
     doctorLevelGuidance() { return {
       quick: "Checks routing, TLS negotiation, and DSM API discovery without sending credentials or opening a target session.",
-      standard: "Adds authentication, File Station capabilities, destination permissions, a bounded direct-child inventory sample, and verified logout. This is the balanced default.",
-      extensive: "Deepens the same target checks and evidence collection. The direct-child inventory sample never renders more than five entries."
+      standard: "Authenticates and checks File Station capabilities, then performs bounded inventory. With a configured destination, it verifies permission and samples direct children; without one, it skips permission and samples visible shared-folder roots without selecting or traversing a share. This is the balanced default.",
+      extensive: "Deepens the same authenticated, read-only target checks and performs the same bounded inventory branch. A configured destination gets permission and direct-child checks; without one, permission is skipped and only visible shared-folder roots are sampled, without selecting or traversing a share. No sample renders more than five entries."
     }[normalizedDoctorLevel(this.doctorForm.level)]; },
     doctorProgressStages() {
       return [
@@ -2557,7 +2643,7 @@ export default {
     routineActionOptions() { return options([["sync", "Sync"], ["plan", "Plan only"]]); },
     routineModeOptions() { return options([["interval", "Interval"], ["daily", "Daily window"], ["realtime", "Realtime watcher"]]); },
     weekdayOptions() { return options([[1, "Mon"], [2, "Tue"], [3, "Wed"], [4, "Thu"], [5, "Fri"], [6, "Sat"], [7, "Sun"]]); },
-    logSourceOptions() { return options([["all", "All logs"], ["api", "DSM API"], ["audit", "Audit"], ["controller", "Controller"], ["scheduler", "Scheduler"], ["sync", "Sync"]]); },
+    logSourceOptions() { return options([["all", "All logs"], ["api", "DSM API"], ["doctor", "Doctor discovery"], ["audit", "Audit"], ["controller", "Controller"], ["scheduler", "Scheduler"], ["sync", "Sync"]]); },
     activityCategoryOptions() { return options([["all", "All categories"], ["audit", "Audit"], ["bridge", "Bridge"], ["authentication", "Authentication"], ["security", "Security"], ["configuration", "Configuration"], ["secrets", "Secrets"], ["routines", "Routines"], ["operations", "Operations"], ["notifications", "Notifications"], ["sync", "Sync"], ["controller", "Controller"], ["scheduler", "Scheduler"]]); },
     activityLevelOptions() { return options([["all", "All levels"], ...["trace", "debug", "info", "warn", "error"].map((level) => [level, level])]); },
     logLineOptions() { return options([[100, "100 lines"], [200, "200 lines"], [500, "500 lines"], [1000, "1000 lines"]]); },
@@ -3206,6 +3292,7 @@ export default {
     booleanEvidence(value) { return value === true ? "Yes" : (value === false ? "No" : "Unavailable"); },
     doctorStatusClass(value) { return `is-${doctorState(value, "warn")}`; },
     doctorStatusLabel(value) { return { ok: "OK", warn: "Warning", failed: "Not OK", skipped: "Skipped", pending: "Pending", running: "Running" }[doctorState(value, "warn")]; },
+    doctorInventoryScopeLabel(value) { return doctorInventoryScopeLabel(value); },
     doctorInventoryMetadata(entry) {
       if (!entry || typeof entry !== "object") return "Safe metadata unavailable";
       const metadata = [
@@ -4694,11 +4781,17 @@ export default {
       const append = (sourceValue, textValue) => {
         if (remaining <= 0) return;
         const source = troubleshootingField(sourceValue, "log");
+        const rawText = typeof textValue === "string" ? textValue : "";
+        // Parse the exact private Doctor schema before generic credential
+        // redaction for the same reason as Activity: safe logical names can
+        // resemble raw credential fields. The strict normalizer independently
+        // whitelists, bounds, and sanitizes every retained value.
+        const doctorInventories = doctorInventoryRecordsFromText(rawText);
         // Sanitize the complete response field before applying the existing
         // aggregate display ceiling. Otherwise a URL/cookie terminator just
         // beyond that cutoff can leave its leading secret in
         // the stored record and therefore in every later copy path.
-        const sanitized = redactedTroubleshootingText(typeof textValue === "string" ? textValue : "");
+        const sanitized = redactedTroubleshootingText(rawText);
         const candidate = sanitized.slice(0, remaining);
         if (!candidate) return;
         remaining -= candidate.length;
@@ -4708,7 +4801,8 @@ export default {
           text: candidate,
           troubleshootingSource: source,
           troubleshootingText: candidate,
-          lineCount: candidate.split("\n").length
+          lineCount: candidate.split("\n").length,
+          doctorInventories
         });
       };
       if (model && Array.isArray(model.logs)) {

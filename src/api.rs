@@ -152,11 +152,13 @@ pub struct RemoteInventory {
     pub entries: BTreeMap<String, RemoteEntry>,
 }
 
-/// A bounded, display-safe direct child returned by a target diagnostic.
+/// One bounded, display-safe entry returned by a target diagnostic.
 ///
-/// This deliberately contains no absolute remote path, content digest, ACL document, session
-/// identifier, or server-provided free-form detail. Long names are truncated on a character
-/// boundary and explicitly marked so diagnostic output stays bounded.
+/// An explicitly selected target uses a path relative to that target. Shared-folder discovery uses
+/// the absolute File Station logical root (for example `/team`), never a local DSM volume path.
+/// This deliberately contains no content digest, ACL document, session identifier, or
+/// server-provided free-form detail. Long names are truncated on a character boundary and
+/// explicitly marked so diagnostic output stays bounded.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiagnosticRemoteEntry {
     pub relative_path: String,
@@ -173,7 +175,7 @@ pub struct DiagnosticRemoteEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiagnosticRemoteInventory {
     pub root_exists: bool,
-    /// Total direct children reported by File Station for this destination.
+    /// Total entries reported by File Station for the selected diagnostic scope.
     pub total_entries: usize,
     pub sample: Vec<DiagnosticRemoteEntry>,
     pub truncated: bool,
@@ -1680,6 +1682,107 @@ impl ApiClient {
             truncated_reason: (truncated_count > 0).then_some("sample_limit"),
             pages_requested: 1,
             traversal_depth: 1,
+            deadline_ms: duration_millis_saturating(DIAGNOSTIC_INVENTORY_TIMEOUT),
+        })
+    }
+
+    /// Discover shared-folder roots visible to the authenticated account with a hard budget.
+    ///
+    /// This is the default Standard/Extensive Doctor inventory when no destination was selected.
+    /// It performs exactly one bounded `list_share` request, examines at most six wire entries,
+    /// and returns at most five deterministic, validated directory samples. It does not select a
+    /// destination and does not inspect or mutate any child of a returned shared folder.
+    pub fn diagnostic_visible_shared_folders(&self) -> Result<DiagnosticRemoteInventory> {
+        self.required_session()?;
+        let parameters = vec![
+            pair("offset", "0"),
+            pair("limit", DIAGNOSTIC_INVENTORY_REQUEST_LIMIT.to_string()),
+            pair("sort_by", json_string("name")?),
+            pair("sort_direction", json_string("asc")?),
+            pair("additional", json_array(["perm"])?),
+        ];
+        let data: ListShareData = self
+            .call_bounded(
+                "SYNO.FileStation.List",
+                2,
+                "list_share",
+                parameters,
+                DIAGNOSTIC_INVENTORY_TIMEOUT,
+            )?
+            .ok_or_else(|| Error::InvalidResponse {
+                operation: "SYNO.FileStation.List.list_share".to_owned(),
+                message: "successful response contained no shared-folder list".to_owned(),
+            })?;
+        let total = data.total.unwrap_or(data.shares.len());
+        if data.shares.len() > DIAGNOSTIC_INVENTORY_REQUEST_LIMIT || total < data.shares.len() {
+            return Err(Error::InvalidResponse {
+                operation: "SYNO.FileStation.List.list_share".to_owned(),
+                message: "bounded diagnostic page exceeded its declared item budget".to_owned(),
+            });
+        }
+
+        let mut validated = Vec::with_capacity(data.shares.len());
+        let mut observed_paths = BTreeSet::new();
+        for share in data.shares {
+            let root = RemoteRoot::parse(&share.path)?;
+            if root.as_str() != root.share_path() {
+                return Err(Error::InvalidResponse {
+                    operation: "SYNO.FileStation.List.list_share".to_owned(),
+                    message: "shared-folder diagnostic result was not a normalized root path"
+                        .to_owned(),
+                });
+            }
+            let name = share
+                .name
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| root.share_name().to_owned());
+            if name != root.share_name()
+                || name.contains('/')
+                || name.contains('\\')
+                || name.chars().any(char::is_control)
+            {
+                return Err(Error::InvalidResponse {
+                    operation: "SYNO.FileStation.List.list_share".to_owned(),
+                    message: "shared-folder diagnostic name did not match its root path".to_owned(),
+                });
+            }
+            if !observed_paths.insert(root.as_str().to_owned()) {
+                return Err(Error::InvalidResponse {
+                    operation: "SYNO.FileStation.List.list_share".to_owned(),
+                    message: "bounded diagnostic page contained a duplicate shared-folder root"
+                        .to_owned(),
+                });
+            }
+            let (relative_path, relative_path_truncated) =
+                bounded_diagnostic_text(root.as_str(), DIAGNOSTIC_RELATIVE_PATH_MAX_CHARS);
+            let (name, name_truncated) = bounded_diagnostic_text(&name, DIAGNOSTIC_NAME_MAX_CHARS);
+            validated.push(DiagnosticRemoteEntry {
+                relative_path,
+                relative_path_truncated,
+                name,
+                name_truncated,
+                kind: EntryKind::Directory,
+                size_bytes: None,
+                mtime_seconds: None,
+                mount_boundary: false,
+            });
+        }
+        validated.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.relative_path.cmp(&right.relative_path))
+        });
+        validated.truncate(DIAGNOSTIC_INVENTORY_SAMPLE_LIMIT);
+        let truncated_count = total.saturating_sub(validated.len());
+        Ok(DiagnosticRemoteInventory {
+            root_exists: true,
+            total_entries: total,
+            sample: validated,
+            truncated: truncated_count > 0,
+            truncated_count,
+            truncated_reason: (truncated_count > 0).then_some("sample_limit"),
+            pages_requested: 1,
+            traversal_depth: 0,
             deadline_ms: duration_millis_saturating(DIAGNOSTIC_INVENTORY_TIMEOUT),
         })
     }
@@ -4780,6 +4883,140 @@ mod tests {
         assert!(list_body.contains("limit=6"));
         assert!(list_body.contains("offset=0"));
         assert!(!list_body.contains("offset=6"));
+    }
+
+    #[test]
+    fn diagnostic_shared_folder_discovery_is_one_bounded_page_and_samples_five() {
+        let shares = serde_json::json!({
+            "success": true,
+            "data": {
+                "total": 8,
+                "shares": [
+                    {"path":"/zeta","name":"zeta"},
+                    {"path":"/beta","name":"beta"},
+                    {"path":"/epsilon","name":"epsilon"},
+                    {"path":"/alpha","name":"alpha"},
+                    {"path":"/delta","name":"delta"},
+                    {"path":"/gamma","name":"gamma"}
+                ]
+            }
+        })
+        .to_string();
+        let (url, server) =
+            scripted_server(vec![write_probe_discovery(false), login_response(), shares]);
+        let mut client = connect_test_client(url);
+        client
+            .login("diagnostic-user", "diagnostic-password", None)
+            .unwrap();
+
+        let report = client.diagnostic_visible_shared_folders().unwrap();
+
+        assert!(report.root_exists);
+        assert_eq!(report.total_entries, 8);
+        assert_eq!(report.sample.len(), 5);
+        assert!(report.truncated);
+        assert_eq!(report.truncated_count, 3);
+        assert_eq!(report.truncated_reason, Some("sample_limit"));
+        assert_eq!(report.pages_requested, 1);
+        assert_eq!(report.traversal_depth, 0);
+        assert_eq!(report.deadline_ms, 5_000);
+        assert_eq!(
+            report
+                .sample
+                .iter()
+                .map(|entry| (
+                    entry.relative_path.as_str(),
+                    entry.name.as_str(),
+                    entry.kind
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("/alpha", "alpha", EntryKind::Directory),
+                ("/beta", "beta", EntryKind::Directory),
+                ("/delta", "delta", EntryKind::Directory),
+                ("/epsilon", "epsilon", EntryKind::Directory),
+                ("/gamma", "gamma", EntryKind::Directory),
+            ]
+        );
+        assert!(report.sample.iter().all(|entry| {
+            entry.size_bytes.is_none() && entry.mtime_seconds.is_none() && !entry.mount_boundary
+        }));
+        let rendered = format!("{report:?}");
+        assert!(!rendered.contains("diagnostic-password"));
+        assert!(!rendered.contains("e2e-session-secret"));
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        let listing = String::from_utf8_lossy(&requests[2].body);
+        assert!(listing.contains("method=list_share"));
+        assert!(listing.contains("limit=6"));
+        assert!(listing.contains("offset=0"));
+        assert!(!listing.contains("method=getinfo"));
+        assert!(!listing.contains("method=list&"));
+        assert!(!listing.contains("diagnostic-password"));
+    }
+
+    #[test]
+    fn diagnostic_shared_folder_discovery_preserves_zero_entry_evidence() {
+        let shares = serde_json::json!({
+            "success": true,
+            "data": {"total": 0, "shares": []}
+        })
+        .to_string();
+        let (url, server) =
+            scripted_server(vec![write_probe_discovery(false), login_response(), shares]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+
+        let report = client.diagnostic_visible_shared_folders().unwrap();
+
+        assert!(report.root_exists);
+        assert_eq!(report.total_entries, 0);
+        assert!(report.sample.is_empty());
+        assert!(!report.truncated);
+        assert_eq!(report.truncated_count, 0);
+        assert_eq!(report.truncated_reason, None);
+        assert_eq!(report.pages_requested, 1);
+        assert_eq!(report.traversal_depth, 0);
+        assert_eq!(report.deadline_ms, 5_000);
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn diagnostic_shared_folder_discovery_retains_reported_roots_without_permission_claims() {
+        let shares = serde_json::json!({
+            "success": true,
+            "data": {
+                "total": 1,
+                "shares": [{
+                    "path": "/reported",
+                    "name": "reported",
+                    "disable_list": true,
+                    "additional": {
+                        "perm": {
+                            "adv_right": {"disable_list": true},
+                            "acl": {"read": false, "exec": false}
+                        }
+                    }
+                }]
+            }
+        })
+        .to_string();
+        let (url, server) =
+            scripted_server(vec![write_probe_discovery(false), login_response(), shares]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+
+        let report = client.diagnostic_visible_shared_folders().unwrap();
+
+        assert_eq!(report.total_entries, 1);
+        assert_eq!(report.sample.len(), 1);
+        assert_eq!(report.sample[0].relative_path, "/reported");
+        assert_eq!(report.sample[0].name, "reported");
+        assert!(!report.truncated);
+        assert_eq!(report.truncated_count, 0);
+        assert_eq!(report.truncated_reason, None);
+        assert_eq!(server.join().unwrap().len(), 3);
     }
 
     #[test]

@@ -151,6 +151,97 @@ test("actual Activity copy redacts complete API fields before display limits", a
   assert.match(writes[0], /https:\/\/\[redacted\]@nas\.invalid/);
 });
 
+test("Activity preserves strict Doctor inventory when a logical path resembles a credential field", async () => {
+  const record = {
+    schema: "sdsync.dsm-doctor-inventory.v1",
+    epoch: 123,
+    level: "info",
+    category: "operations",
+    event: "doctor_inventory",
+    action: "doctor",
+    profile: "office",
+    scope: "direct_children",
+    total_entries: 1,
+    truncated: false,
+    sample_count: 1,
+    sample: [{
+      path: "/password:visible",
+      name: "password:visible",
+      kind: "folder",
+      relative_path_truncated: false,
+      name_truncated: false
+    }]
+  };
+  const normalized = component.computed.reversedActivity.call({
+    activityEvents: [{
+      epoch: 123,
+      code: "doctor.inventory",
+      profile: "office",
+      state: "succeeded",
+      category: "operations",
+      level: "info",
+      message: `Doctor inventory evidence ${JSON.stringify(record)}`
+    }],
+    activitySearch: "",
+    activityCategory: "all",
+    activityLevel: "all"
+  });
+
+  assert.equal(normalized.length, 1);
+  assert.ok(normalized[0].doctor_inventory, "strict Doctor inventory disappeared after redaction");
+  assert.equal(normalized[0].doctor_inventory.inventory.entries.length, 1);
+  assert.equal(
+    normalized[0].doctor_inventory.inventory.entries[0].path,
+    "/password:[redacted]"
+  );
+
+  const writes = [];
+  const context = bind({
+    async writeTroubleshootingClipboard(value) { writes.push(value); },
+    toast() {}
+  }, methods, ["copyTroubleshootingText", "activityEvidence", "copyActivityEvent"]);
+  assert.equal(await context.copyActivityEvent(normalized[0]), true);
+  assert.equal(writes.length, 1);
+  assert.match(writes[0], /Doctor discovery scope: Direct children/);
+  assert.match(writes[0], /- folder: \/password:\[redacted\]/);
+  assert.doesNotMatch(writes[0], /password:visible/);
+});
+
+test("Logs preserve strict Doctor inventory when a logical path resembles a credential field", () => {
+  const record = {
+    schema: "sdsync.dsm-doctor-inventory.v1",
+    epoch: 123,
+    level: "info",
+    category: "operations",
+    event: "doctor_inventory",
+    action: "doctor",
+    profile: "office",
+    scope: "direct_children",
+    total_entries: 1,
+    truncated: false,
+    sample_count: 1,
+    sample: [{
+      path: "/password:visible",
+      name: "password:visible",
+      kind: "folder",
+      relative_path_truncated: false,
+      name_truncated: false
+    }]
+  };
+  const records = methods.logRecordsFrom.call({}, {
+    logs: [{ source: "doctor", lines: [JSON.stringify(record)] }]
+  });
+
+  assert.equal(records.length, 1);
+  assert.equal(records[0].doctorInventories.length, 1);
+  assert.equal(records[0].doctorInventories[0].inventory.entries.length, 1);
+  assert.equal(
+    records[0].doctorInventories[0].inventory.entries[0].path,
+    "/password:[redacted]"
+  );
+  assert.doesNotMatch(records[0].text, /password:visible/);
+});
+
 test("actual Log ingestion and copy sanitize before former field cutoffs", async () => {
   const exactLine = (prefix, length = 8192) => `${prefix}${"s".repeat(Math.max(0, length - prefix.length))}`.slice(0, length);
   const cutoffLine = (secret) => {
@@ -203,6 +294,39 @@ test("actual Log ingestion and copy sanitize before former field cutoffs", async
   for (const neighbor of [
     "retained-source-message", "retained-timestamp-message", "@h"
   ]) assert.match(writes[0], new RegExp(neighbor));
+});
+
+test("actual legacy Doctor copy redacts complete raw output before the display cutoff", async () => {
+  const secret = "doctor-copy-cutoff-secret";
+  const prefix = `https://user:${secret}`;
+  const rawOutput = `${prefix}${"x".repeat(70000 - prefix.length)}@nas.invalid/doctor`;
+  const displayOutput = rawOutput.slice(0, 64 * 1024);
+  assert.ok(!displayOutput.includes("@"), "fixture must put the userinfo terminator after the display cutoff");
+
+  const writes = [];
+  const context = bind({
+    doctorReport: {
+      schema: "legacy-output",
+      structured: false,
+      level: "standard",
+      state: "failed",
+      duration_ms: null,
+      summary: { ok: 0, warn: 0, failed: 1, skipped: 0, total: 1 },
+      sections: [],
+      raw_output: rawOutput,
+      output_incomplete: false,
+      output_truncated: false
+    },
+    diagnostic: { title: "Doctor failed", output: displayOutput },
+    async writeTroubleshootingClipboard(value) { writes.push(value); },
+    toast() {}
+  }, methods, ["copyTroubleshootingText", "copyDoctorDiagnostics"]);
+
+  assert.equal(await context.copyDoctorDiagnostics(), true);
+  assert.equal(writes.length, 1);
+  assert.doesNotMatch(writes[0], new RegExp(secret));
+  assert.match(writes[0], /https:\/\/\[redacted\]@nas\.invalid\/doctor/);
+  assert.ok(writes[0].length <= 64 * 1024);
 });
 
 test("hostile DSM session, encoded URL, and escaped JSON credential shapes are redacted", () => {

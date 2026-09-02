@@ -2,7 +2,7 @@ use std::fmt;
 
 use crc32fast::Hasher as Crc32Hasher;
 use md5::{Digest as _, Md5};
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 
 use crate::{Error, Result};
 

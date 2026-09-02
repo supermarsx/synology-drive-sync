@@ -39,6 +39,39 @@ ARM_EABI5_HARD_FLOAT = 0x05000400
 PACKAGE_TOOL_TIMEOUT_SECONDS = 120
 
 
+def select_validator_binary_path(
+    override: str | None, fallback_candidates: list[Path]
+) -> Path | None:
+    """Resolve the real-core test binary without weakening an explicit override."""
+    if override is not None:
+        return Path(override)
+    available = [
+        candidate
+        for candidate in fallback_candidates
+        if candidate.is_file() and os.access(candidate, os.X_OK)
+    ]
+    return max(available, key=lambda candidate: candidate.stat().st_mtime_ns, default=None)
+
+
+def bounded_file_tail(path: Path, limit: int = 2048) -> str:
+    """Return a bounded diagnostic tail without following an unexpected symlink."""
+    if path.is_symlink():
+        return "<symlink>"
+    try:
+        with path.open("rb") as stream:
+            size = os.fstat(stream.fileno()).st_size
+            truncated = size > limit
+            if truncated:
+                stream.seek(size - limit)
+            payload = stream.read(limit)
+    except FileNotFoundError:
+        return "<absent>"
+    except OSError as error:
+        return f"<unreadable: {error}>"
+    text = payload.decode("utf-8", errors="replace")
+    return ("<tail truncated>\n" if truncated else "") + text
+
+
 def git_show_repository_file(revision_path: str) -> bytes:
     """Read a tracked release file while trusting only this exact test checkout."""
     return subprocess.run(
@@ -298,6 +331,27 @@ class BuilderTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_validator_binary_override_is_authoritative_over_newer_fallbacks(self) -> None:
+        override = self.root / "explicit-validator"
+        fallback = self.root / "newer-fallback"
+        for candidate in (override, fallback):
+            candidate.write_text("validator fixture\n", encoding="utf-8")
+            candidate.chmod(0o755)
+        os.utime(override, ns=(1_700_000_000_000_000_000,) * 2)
+        os.utime(fallback, ns=(1_800_000_000_000_000_000,) * 2)
+
+        self.assertEqual(
+            select_validator_binary_path(str(override), [fallback]), override
+        )
+        self.assertEqual(
+            select_validator_binary_path(None, [override, fallback]), fallback
+        )
+        missing_override = self.root / "missing-explicit-validator"
+        self.assertEqual(
+            select_validator_binary_path(str(missing_override), [fallback]),
+            missing_override,
+        )
+
     def test_security_documentation_tracks_the_enforced_bridge_queue_and_audit_contract(self) -> None:
         text = (REPOSITORY / "docs/dsm/security.md").read_text(encoding="utf-8")
         normalized = " ".join(text.split())
@@ -342,9 +396,26 @@ class BuilderTests(unittest.TestCase):
             "65 through 255 safe ASCII bytes",
             "incomplete active final record is durably truncated",
             "malformed rotated history remain fail closed",
+            "budget across all six sources—API, private Doctor discovery, controller, "
+            "scheduler, sync, and audit—",
+            "package-owned `0600` file with a 1 MiB rotation threshold and three rotations",
+            "One final bounded record can cross the threshold before the next append rotates it",
+            "never forwarded through the core remote-log sink",
             "`SO_PEERCRED` binds both ends to the package's exact non-root UID",
         ):
             self.assertIn(required, normalized)
+        operations = (
+            REPOSITORY / "docs/dsm/operations.md"
+        ).read_text(encoding="utf-8")
+        normalized_operations = " ".join(operations.split())
+        for required in (
+            "`doctor.inventory`",
+            "private Doctor discovery history uses a 1 MiB rotation threshold plus three rotations",
+            "One final bounded record can cross the threshold before the next append rotates it",
+            "excluded from the core remote-log sink",
+            "Selecting one of the six sources",
+        ):
+            self.assertIn(required, normalized_operations)
         troubleshooting = (
             REPOSITORY / "docs/dsm/troubleshooting.md"
         ).read_text(encoding="utf-8")
@@ -681,9 +752,9 @@ class BuilderTests(unittest.TestCase):
             HERE / "licenses/DSM_UI_THIRD_PARTY_LICENSES.txt"
         ).read_bytes()
         for marker in (
-            b"vue-loader 15.10.1",
+            b"vue-loader 15.11.1",
             b"Copyright (c) 2015-present Yuxi (Evan) You",
-            b"webpack 5.91.0",
+            b"webpack 5.110.3",
             b"Copyright JS Foundation and other contributors",
             b"DSM supplies the global Vue runtime",
         ):
@@ -1658,10 +1729,36 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "        os.close(directory)\n"
             "    return True\n"
             "\n"
-            "def cleanup_mock_stale_api_socket():\n"
+            "def cleanup_mock_stale_api_socket(expected_identity=None):\n"
             "    root = Path(os.environ['SYNOPKG_PKGVAR'])\n"
             "    pid_path = root / 'run/api.pid'\n"
             "    socket_path = Path(os.environ['SDSYNC_TEST_API_SOCKET'])\n"
+            "    def exact_process_state(pid, start, boot):\n"
+            "        current_boot = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='ascii').strip()\n"
+            "        if boot != current_boot:\n"
+            "            raise SystemExit(73)\n"
+            "        try:\n"
+            "            stat_text = Path(f'/proc/{pid}/stat').read_text(encoding='ascii')\n"
+            "            status_text = Path(f'/proc/{pid}/status').read_text(encoding='ascii')\n"
+            "        except FileNotFoundError:\n"
+            "            if Path(f'/proc/{pid}').exists():\n"
+            "                raise SystemExit(73)\n"
+            "            return 'absent'\n"
+            "        stat_fields = stat_text.rsplit(') ', 1)[1].split()\n"
+            "        uid_fields = next((line.split() for line in status_text.splitlines() if line.startswith('Uid:')), None)\n"
+            "        if len(stat_fields) < 20 or uid_fields is None or len(uid_fields) < 2:\n"
+            "            raise SystemExit(73)\n"
+            "        if stat_fields[19] != start or int(uid_fields[1]) != os.getuid():\n"
+            "            raise SystemExit(73)\n"
+            "        try:\n"
+            "            recheck_fields = Path(f'/proc/{pid}/stat').read_text(encoding='ascii').rsplit(') ', 1)[1].split()\n"
+            "        except FileNotFoundError:\n"
+            "            if Path(f'/proc/{pid}').exists():\n"
+            "                raise SystemExit(73)\n"
+            "            return 'absent'\n"
+            "        if len(recheck_fields) < 20 or recheck_fields[19] != start or recheck_fields[0] != stat_fields[0]:\n"
+            "            raise SystemExit(73)\n"
+            "        return 'terminal' if recheck_fields[0] in {'Z', 'X', 'x'} else 'live'\n"
             "    pid_before = None\n"
             "    if pid_path.exists() or pid_path.is_symlink():\n"
             "        pid_before = os.lstat(pid_path)\n"
@@ -1672,14 +1769,32 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "        raw_pid = pid_path.read_text(encoding='ascii')\n"
             "        if not raw_pid.endswith('\\n') or not raw_pid[:-1].isdigit() or int(raw_pid[:-1]) <= 1:\n"
             "            raise SystemExit(73)\n"
-            "        try:\n"
-            "            os.kill(int(raw_pid[:-1]), 0)\n"
-            "        except ProcessLookupError:\n"
-            "            pass\n"
-            "        except OSError:\n"
+            "        saved_pid = int(raw_pid[:-1])\n"
+            "        if saved_pid > 2147483647:\n"
             "            raise SystemExit(73)\n"
+            "        if expected_identity is not None:\n"
+            "            if len(expected_identity) != 3 or not expected_identity[0].isdigit() or not expected_identity[1].isdigit():\n"
+            "                raise SystemExit(73)\n"
+            "            expected_pid, expected_start, expected_boot = expected_identity\n"
+            "            if int(expected_pid) != saved_pid or int(expected_start) <= 0:\n"
+            "                raise SystemExit(73)\n"
+            "            if exact_process_state(saved_pid, expected_start, expected_boot) == 'live':\n"
+            "                raise SystemExit(75)\n"
             "        else:\n"
-            "            raise SystemExit(75)\n"
+            "            try:\n"
+            "                os.kill(saved_pid, 0)\n"
+            "            except ProcessLookupError:\n"
+            "                pass\n"
+            "            except OSError:\n"
+            "                raise SystemExit(73)\n"
+            "            else:\n"
+            "                raise SystemExit(75)\n"
+            "    elif expected_identity is not None:\n"
+            "        if not socket_path.exists() and not socket_path.is_symlink():\n"
+            "            return\n"
+            "        raise SystemExit(73)\n"
+            "    if expected_identity is not None and exact_process_state(saved_pid, expected_start, expected_boot) == 'live':\n"
+            "        raise SystemExit(75)\n"
             "    if socket_path.exists() or socket_path.is_symlink():\n"
             "        socket_before = os.lstat(socket_path)\n"
             "        socket_mode = stat.S_IMODE(socket_before.st_mode)\n"
@@ -2038,6 +2153,10 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "    cleanup_mock_stale_api_socket()\n"
             "    raise SystemExit(0)\n"
             "\n"
+            "if len(sys.argv) == 5 and sys.argv[1] == '--cleanup-stale-api-socket':\n"
+            "    cleanup_mock_stale_api_socket(sys.argv[2:])\n"
+            "    raise SystemExit(0)\n"
+            "\n"
             "if len(sys.argv) >= 7 and sys.argv[1] == '--exec-supervised-core' and sys.argv[5] == '--':\n"
             "    expected_parent = int(sys.argv[2])\n"
             "    expected_start = sys.argv[3]\n"
@@ -2274,6 +2393,32 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 else None
             ),
         )
+
+    def lifecycle_failure_diagnostic(
+        self, result: subprocess.CompletedProcess[str]
+    ) -> str:
+        paths = {
+            "controller_log": self.real_var / "log/controller.log",
+            "api_log": self.real_var / "log/api.log",
+            "controller_state": self.real_var / "state/controller.state",
+            "controller_start": self.real_var / "run/controller.starting",
+            "controller_pid": self.real_var / "run/controller.pid",
+            "controller_ready": self.real_var / "run/controller.ready",
+            "api_pid": self.real_var / "run/api.pid",
+            "api_bound": self.real_var / "run/api.bound",
+            "api_ready": self.real_var / "run/api.ready",
+            "failed_start_api": self.real_var / "run/failed-start.api",
+            "failed_start_controller": self.real_var / "run/failed-start.controller",
+        }
+        diagnostics = [
+            f"lifecycle stdout:\n{result.stdout}",
+            f"lifecycle stderr:\n{result.stderr}",
+        ]
+        diagnostics.extend(
+            f"{label} ({path}):\n{bounded_file_tail(path)}"
+            for label, path in paths.items()
+        )
+        return "\n".join(diagnostics)
 
     def executable(
         self, executable: Path, *arguments: str,
@@ -2653,6 +2798,67 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             f"verified controller PID {controller_pid} did not exit after forwarded TERM"
         )
 
+    def capture_process_start_ticks(self, pid: int, *, label: str) -> str:
+        try:
+            stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        except OSError as error:
+            self.fail(f"could not capture {label} PID {pid} identity: {error}")
+        parts = stat_text.rsplit(") ", 1)
+        self.assertEqual(len(parts), 2, f"malformed /proc stat for {label} PID {pid}")
+        fields = parts[1].split()
+        self.assertGreater(len(fields), 19, f"short /proc stat for {label} PID {pid}")
+        self.assertRegex(fields[19], r"^[1-9][0-9]*$", f"invalid start ticks for {label} PID {pid}")
+        return fields[19]
+
+    def exact_process_state(
+        self, pid: int, expected_start: str, *, label: str
+    ) -> str | None:
+        proc_entry = Path(f"/proc/{pid}")
+        try:
+            stat_text = (proc_entry / "stat").read_text(encoding="ascii")
+        except FileNotFoundError:
+            try:
+                proc_entry.stat()
+            except FileNotFoundError:
+                return None
+            except OSError as error:
+                self.fail(f"could not inspect {label} PID {pid} entry: {error}")
+            self.fail(f"{label} PID {pid} stat disappeared while its proc entry remained")
+        except OSError as error:
+            self.fail(f"could not inspect {label} PID {pid}: {error}")
+        parts = stat_text.rsplit(") ", 1)
+        self.assertEqual(len(parts), 2, f"malformed /proc stat for {label} PID {pid}")
+        fields = parts[1].split()
+        self.assertGreater(len(fields), 19, f"short /proc stat for {label} PID {pid}")
+        self.assertEqual(
+            fields[19],
+            expected_start,
+            f"{label} PID {pid} was reused before terminal verification",
+        )
+        state = fields[0]
+        self.assertIn(
+            state,
+            {"R", "S", "D", "T", "t", "K", "W", "P", "I", "Z", "X", "x"},
+            f"unknown process state for {label} PID {pid}: {state}",
+        )
+        return state
+
+    def wait_for_exact_process_terminal(
+        self,
+        pid: int,
+        expected_start: str,
+        *,
+        label: str,
+        timeout: float = 6.0,
+    ) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = self.exact_process_state(pid, expected_start, label=label)
+            if state is None or state in {"Z", "X", "x"}:
+                return
+            time.sleep(0.01)
+        self.fail(f"{label} PID {pid} remained live past its terminal deadline")
+
     def configure(self, name: str, source: Path, remote: str, default: bool = False) -> subprocess.CompletedProcess[str]:
         arguments = [
             "configure-profile", "--name", name, "--source", str(source),
@@ -2854,21 +3060,46 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
 
     def test_real_core_profile_contract_and_remote_log_token_toggle(self) -> None:
         override = os.environ.get("SDSYNC_VALIDATOR_BINARY")
-        candidates = ([Path(override)] if override else []) + [
+        fallback_candidates = [
             REPOSITORY / "target/debug/synology-drive-sync",
             REPOSITORY / "target/release/synology-drive-sync",
         ]
-        built = [
-            candidate
-            for candidate in candidates
-            if candidate.is_file() and os.access(candidate, os.X_OK)
-        ]
-        self.assertTrue(
-            built,
+        real_core = select_validator_binary_path(override, fallback_candidates)
+        self.assertIsNotNone(
+            real_core,
             "real-core DSM profile regression requires `cargo build --locked` or "
             "SDSYNC_VALIDATOR_BINARY",
         )
-        real_core = max(built, key=lambda candidate: candidate.stat().st_mtime_ns)
+        assert real_core is not None
+        try:
+            real_core_metadata = real_core.stat()
+        except OSError as error:
+            self.fail(f"validator binary {real_core} cannot be inspected: {error}")
+        self.assertTrue(
+            stat.S_ISREG(real_core_metadata.st_mode) and os.access(real_core, os.X_OK),
+            f"validator binary is not a regular executable: {real_core}",
+        )
+        try:
+            validator_preflight = subprocess.run(
+                [str(real_core), "--version"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except OSError as error:
+            self.fail(f"validator binary {real_core} could not execute: {error}")
+        except subprocess.TimeoutExpired as error:
+            self.fail(
+                f"validator binary {real_core} --version timed out\n"
+                f"stdout: {error.stdout!r}\nstderr: {error.stderr!r}"
+            )
+        validator_diagnostic = (
+            f"validator path: {real_core}\n"
+            f"stdout:\n{validator_preflight.stdout}\n"
+            f"stderr:\n{validator_preflight.stderr}"
+        )
+        self.assertEqual(validator_preflight.returncode, 0, validator_diagnostic)
         installed_core = self.real_target / "bin/synology-drive-sync"
         shutil.copy2(real_core, installed_core)
         installed_core.chmod(0o755)
@@ -3147,6 +3378,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             + ("x" * 300_000) + "\n",
             encoding="utf-8",
         )
+        controller_log.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(controller_log, self.drop_uid, self.drop_gid)
         api_log = self.real_var / "log/api.log"
         api_records = [
             {
@@ -3192,6 +3426,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 encoding="utf-8",
             )
             path.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(path, self.drop_uid, self.drop_gid)
         logs, payload = self.api("logs", "--lines", "10")
         self.assertEqual(logs.returncode, 0, logs.stderr)
         self.assertEqual(payload["schema"], "sdsync.dsm-logs.v1")
@@ -3335,6 +3571,23 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 {"level": "info", "category": "bridge", "message": payload},
                 separators=(",", ":"),
             ),
+            "doctor-inventory.log": json.dumps(
+                {
+                    "schema": "sdsync.dsm-doctor-inventory.v1",
+                    "epoch": 10000,
+                    "level": "info",
+                    "category": "operations",
+                    "event": "doctor_inventory",
+                    "action": "doctor",
+                    "profile": "bounded",
+                    "scope": "direct_children",
+                    "total_entries": 0,
+                    "truncated": False,
+                    "sample_count": 0,
+                    "sample": [],
+                },
+                separators=(",", ":"),
+            ),
             "controller.log": json.dumps(
                 {"level": "info", "message": payload}, separators=(",", ":")
             ),
@@ -3353,6 +3606,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             path = self.real_var / "log" / name
             path.write_text((record + "\n") * 160, encoding="utf-8")
             path.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(path, self.drop_uid, self.drop_gid)
 
         all_logs, all_payload = self.api(
             "logs", "--lines", "1000", "--source", "all"
@@ -3361,7 +3616,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertLess(len(all_logs.stdout.encode("utf-8")), 1024 * 1024)
         self.assertEqual(
             [entry["source"] for entry in all_payload["logs"]],
-            ["api", "controller", "scheduler", "sync", "audit"],
+            ["api", "doctor", "controller", "scheduler", "sync", "audit"],
         )
         self.assertTrue(all(entry["lines"] for entry in all_payload["logs"]))
         self.assertTrue(all(len(entry["lines"]) <= 1000 for entry in all_payload["logs"]))
@@ -3392,6 +3647,180 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         )
         self.assertEqual(invalid.returncode, 64)
         self.assertEqual(invalid_payload["code"], "invalid_request")
+
+    def test_api_logs_and_activity_include_rotated_history_and_reject_unsafe_rotations(self) -> None:
+        self.assertEqual(
+            self.configure("history", self.source_one, "/home/Drive/History", True).returncode,
+            0,
+        )
+
+        def write_private(path: Path, text: str) -> None:
+            path.write_text(text, encoding="utf-8")
+            path.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(path, self.drop_uid, self.drop_gid)
+
+        source_contracts = {
+            "controller": (self.real_var / "log/controller.log", 5),
+            "scheduler": (self.real_var / "log/scheduler.log", 5),
+            "sync": (self.real_var / "log/sync.log", 3),
+            "audit": (self.real_var / "log/audit.log", 5),
+        }
+        for source, (active, oldest_index) in source_contracts.items():
+            for index in range(1, 6):
+                Path(f"{active}.{index}").unlink(missing_ok=True)
+            rotated_record = json.dumps(
+                {
+                    "epoch": 100,
+                    "level": "info",
+                    "category": source,
+                    "event": f"rotated-{source}",
+                },
+                separators=(",", ":"),
+            )
+            active_record = json.dumps(
+                {
+                    "epoch": 200,
+                    "level": "info",
+                    "category": source,
+                    "event": f"active-{source}",
+                },
+                separators=(",", ":"),
+            )
+            write_private(Path(f"{active}.{oldest_index}"), rotated_record + "\n")
+            write_private(active, active_record + "\n")
+
+        for source in source_contracts:
+            selected, selected_payload = self.api(
+                "logs", "--lines", "10", "--source", source
+            )
+            self.assertEqual(selected.returncode, 0, selected.stderr)
+            self.assertLess(len(selected.stdout.encode("utf-8")), 1024 * 1024)
+            self.assertEqual(
+                [json.loads(line)["event"] for line in selected_payload["logs"][0]["lines"]],
+                [f"rotated-{source}", f"active-{source}"],
+            )
+            latest, latest_payload = self.api(
+                "logs", "--lines", "1", "--source", source
+            )
+            self.assertEqual(latest.returncode, 0, latest.stderr)
+            self.assertEqual(
+                [json.loads(line)["event"] for line in latest_payload["logs"][0]["lines"]],
+                [f"active-{source}"],
+            )
+
+        aggregate, aggregate_payload = self.api(
+            "logs", "--lines", "10", "--source", "all"
+        )
+        self.assertEqual(aggregate.returncode, 0, aggregate.stderr)
+        self.assertLess(len(aggregate.stdout.encode("utf-8")), 1024 * 1024)
+        aggregate_by_source = {
+            entry["source"]: entry["lines"] for entry in aggregate_payload["logs"]
+        }
+        for source in source_contracts:
+            self.assertEqual(
+                [json.loads(line)["event"] for line in aggregate_by_source[source]],
+                [f"rotated-{source}", f"active-{source}"],
+            )
+
+        activity_log = self.real_var / "log/activity.log"
+        for index in range(1, 4):
+            Path(f"{activity_log}.{index}").unlink(missing_ok=True)
+        write_private(
+            Path(f"{activity_log}.3"),
+            "100|doctor.succeeded|history|succeeded|operations|info|rotated-activity\n",
+        )
+        active_activity_message = 'active-activity with "quote" and \\ slash'
+        write_private(
+            activity_log,
+            "200|doctor.succeeded|history|succeeded|operations|info|"
+            + active_activity_message
+            + "\n",
+        )
+        activity, activity_payload = self.api("activity", "--lines", "10")
+        self.assertEqual(activity.returncode, 0, activity.stderr)
+        self.assertEqual(
+            [event["message"] for event in activity_payload["events"]],
+            ["rotated-activity", active_activity_message],
+        )
+        latest_activity, latest_activity_payload = self.api("activity", "--lines", "1")
+        self.assertEqual(latest_activity.returncode, 0, latest_activity.stderr)
+        self.assertEqual(
+            [event["message"] for event in latest_activity_payload["events"]],
+            [active_activity_message],
+        )
+
+        rotated_activity_records = "".join(
+            f"{300 + index}|doctor.succeeded|history|succeeded|operations|info|"
+            f"rotated-{index:03d}-{'r' * 3900}\n"
+            for index in range(240)
+        )
+        active_activity_records = "".join(
+            f"{600 + index}|doctor.succeeded|history|succeeded|operations|info|"
+            f"active-{index:03d}-{'a' * 3900}\n"
+            for index in range(240)
+        )
+        write_private(Path(f"{activity_log}.3"), rotated_activity_records)
+        write_private(activity_log, active_activity_records)
+        bounded_activity, bounded_activity_payload = self.api(
+            "activity", "--lines", "1000"
+        )
+        self.assertEqual(bounded_activity.returncode, 0, bounded_activity.stderr)
+        self.assertLess(len(bounded_activity.stdout.encode("utf-8")), 1024 * 1024)
+        bounded_events = bounded_activity_payload["events"]
+        self.assertGreater(len(bounded_events), 0)
+        self.assertLess(len(bounded_events), 480)
+        expected_activity_messages = [
+            f"rotated-{index:03d}-{'r' * 3900}" for index in range(240)
+        ] + [f"active-{index:03d}-{'a' * 3900}" for index in range(240)]
+        self.assertEqual(
+            [event["message"] for event in bounded_events],
+            expected_activity_messages[-len(bounded_events) :],
+        )
+
+        hardlink_victim = self.real_var / "log/history-hardlink-victim"
+        write_private(hardlink_victim, "history-sentinel\n")
+        unsafe_controller = self.real_var / "log/controller.log.4"
+        os.link(hardlink_victim, unsafe_controller)
+        unsafe_logs, unsafe_logs_payload = self.api(
+            "logs", "--lines", "10", "--source", "controller"
+        )
+        self.assertEqual(unsafe_logs.returncode, 73)
+        self.assertEqual(unsafe_logs_payload["code"], "unsafe_state")
+        self.assertEqual(hardlink_victim.read_text(encoding="utf-8"), "history-sentinel\n")
+        unsafe_controller.unlink()
+
+        unsafe_activity = Path(f"{activity_log}.2")
+        os.link(hardlink_victim, unsafe_activity)
+        rejected_activity, rejected_activity_payload = self.api(
+            "activity", "--lines", "10"
+        )
+        self.assertEqual(rejected_activity.returncode, 73)
+        self.assertEqual(rejected_activity_payload["code"], "unsafe_state")
+        self.assertEqual(hardlink_victim.read_text(encoding="utf-8"), "history-sentinel\n")
+        unsafe_activity.unlink()
+
+        symlink_victim = self.real_var / "log/history-symlink-victim"
+        write_private(symlink_victim, "symlink-sentinel\n")
+        unsafe_scheduler = self.real_var / "log/scheduler.log.4"
+        unsafe_scheduler.symlink_to(symlink_victim)
+        symlink_logs, symlink_logs_payload = self.api(
+            "logs", "--lines", "10", "--source", "scheduler"
+        )
+        self.assertEqual(symlink_logs.returncode, 73)
+        self.assertEqual(symlink_logs_payload["code"], "unsafe_state")
+        self.assertEqual(symlink_victim.read_text(encoding="utf-8"), "symlink-sentinel\n")
+        unsafe_scheduler.unlink()
+
+        unsafe_activity_symlink = Path(f"{activity_log}.1")
+        unsafe_activity_symlink.symlink_to(symlink_victim)
+        rejected_activity, rejected_activity_payload = self.api(
+            "activity", "--lines", "10"
+        )
+        self.assertEqual(rejected_activity.returncode, 73)
+        self.assertEqual(rejected_activity_payload["code"], "unsafe_state")
+        self.assertEqual(symlink_victim.read_text(encoding="utf-8"), "symlink-sentinel\n")
+        unsafe_activity_symlink.unlink()
 
     def test_bridge_audit_correlation_is_exact_durable_and_activity_visible(self) -> None:
         emitter = self.root / "emit-bridge-audit.sh"
@@ -4431,7 +4860,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         )
         self.assertEqual(alert_result.returncode, 0, alert_result.stderr)
         started = self.shell(self.lifecycle, "start", timeout=15)
-        self.assertEqual(started.returncode, 0, started.stderr)
+        self.assertEqual(
+            started.returncode, 0, self.lifecycle_failure_diagnostic(started)
+        )
         doctor_result = self.shell(self.manager, "doctor", "personal")
         self.assertEqual(doctor_result.returncode, 0, doctor_result.stderr)
         run_result = self.shell(self.manager, "run", "personal")
@@ -4944,6 +5375,722 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "truncated": True,
         })
         self.assertLessEqual(len(capped_output.encode("utf-8")), 327680)
+
+    def test_doctor_inventory_evidence_is_private_bounded_redacted_rotated_and_visible(self) -> None:
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Personal", True).returncode,
+            0,
+        )
+        secret_literal = "doctor-credential-must-not-persist"
+        password = self.shell(
+            self.manager,
+            "set-password",
+            "personal",
+            input_text=secret_literal + "\n",
+        )
+        self.assertEqual(password.returncode, 0, password.stderr)
+        remote_entries = []
+        for index in range(7):
+            name = secret_literal if index == 0 else f"entry-{index + 1}"
+            remote_entries.append(
+                {
+                    "relative_path": f"/{name}",
+                    "name": name,
+                    "kind": "directory" if index % 2 == 0 else "file",
+                    "size_bytes": 100 + index,
+                    "mtime_seconds": 1_788_200_000 + index,
+                    "username": "must-not-persist-user",
+                    "password": "must-not-persist-password",
+                    "session": "must-not-persist-session",
+                    "url": "https://must-not-persist.invalid",
+                    "acl": "must-not-persist-acl",
+                    "digest": "must-not-persist-digest",
+                    "server_detail": "must-not-persist-server",
+                }
+            )
+        core_document = {
+            "schema": "sdsync.doctor.v1",
+            "level": "standard",
+            "status": "pass",
+            "sections": [
+                {
+                    "id": "destination_inventory",
+                    "status": "pass",
+                    "detail": "bounded discovery",
+                }
+            ],
+            "remote_inventory": {
+                "scope": "direct_children",
+                "root_exists": True,
+                "total_entries": 7,
+                "sample_count": 7,
+                "sample_limit": 5,
+                "truncated": True,
+                "sample": remote_entries,
+                "username": "outer-user-must-not-persist",
+                "session": "outer-session-must-not-persist",
+                "url": "https://outer-must-not-persist.invalid",
+            },
+        }
+        target_output = self.root / "doctor-inventory-target.ndjson"
+        target_output.write_text(
+            json.dumps(core_document, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        environment = {"SDSYNC_TEST_TARGET_OUTPUT_FILE": str(target_output)}
+        result = self.shell(
+            self.manager,
+            "doctor",
+            "personal",
+            "--level",
+            "standard",
+            extra_environment=environment,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        inventory_log = self.real_var / "log/doctor-inventory.log"
+        self.assertTrue(inventory_log.is_file(), result.stdout + result.stderr)
+        self.assertFalse(inventory_log.is_symlink())
+        self.assertEqual(stat.S_IMODE(inventory_log.stat().st_mode), 0o600)
+        records = [
+            json.loads(line)
+            for line in inventory_log.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(
+            set(record),
+            {
+                "schema", "epoch", "level", "category", "event", "action",
+                "profile", "scope", "total_entries", "truncated",
+                "sample_count", "sample",
+            },
+        )
+        self.assertEqual(record["schema"], "sdsync.dsm-doctor-inventory.v1")
+        self.assertEqual(record["action"], "doctor")
+        self.assertEqual(record["profile"], "personal")
+        self.assertEqual(record["scope"], "direct_children")
+        self.assertEqual(record["total_entries"], 7)
+        self.assertTrue(record["truncated"])
+        self.assertEqual(record["sample_count"], 5)
+        self.assertEqual(len(record["sample"]), 5)
+        self.assertEqual(
+            set(record["sample"][0]),
+            {
+                "path", "name", "kind", "relative_path_truncated",
+                "name_truncated",
+            },
+        )
+        self.assertFalse(record["sample"][0]["relative_path_truncated"])
+        self.assertFalse(record["sample"][0]["name_truncated"])
+        self.assertEqual({entry["kind"] for entry in record["sample"]}, {"folder", "file"})
+        persisted = inventory_log.read_text(encoding="utf-8")
+        for forbidden in (
+            secret_literal,
+            "must-not-persist-user",
+            "must-not-persist-password",
+            "must-not-persist-session",
+            "must-not-persist.invalid",
+            "must-not-persist-acl",
+            "must-not-persist-digest",
+            "must-not-persist-server",
+            "outer-user-must-not-persist",
+            "outer-session-must-not-persist",
+            "outer-must-not-persist.invalid",
+        ):
+            self.assertNotIn(forbidden, persisted)
+
+        activity, activity_payload = self.api("activity", "--lines", "100")
+        self.assertEqual(activity.returncode, 0, activity.stderr)
+        inventory_events = [
+            event
+            for event in activity_payload["events"]
+            if event["code"] == "doctor.inventory" and event["profile"] == "personal"
+        ]
+        self.assertEqual(len(inventory_events), 1)
+        prefix = "Doctor inventory evidence "
+        self.assertTrue(inventory_events[0]["message"].startswith(prefix))
+        activity_record = json.loads(inventory_events[0]["message"][len(prefix):])
+        self.assertEqual(activity_record, record)
+        self.assertNotIn(secret_literal, activity.stdout)
+
+        logs, logs_payload = self.api("logs", "--lines", "20", "--source", "doctor")
+        self.assertEqual(logs.returncode, 0, logs.stderr)
+        self.assertEqual(logs_payload["logs"][0]["source"], "doctor")
+        self.assertEqual(json.loads(logs_payload["logs"][0]["lines"][-1]), record)
+        self.assertNotIn(secret_literal, logs.stdout)
+        runner_source = (self.real_target / "libexec/sdsync-run").read_text(encoding="utf-8")
+        self.assertNotIn("doctor-inventory.log", runner_source)
+        self.assertNotIn("doctor_inventory_log", runner_source)
+
+        # An empty visible-share discovery remains durable evidence instead of disappearing.
+        empty_document = {
+            "schema": "sdsync.doctor.v1",
+            "level": "standard",
+            "status": "pass",
+            "sections": [{"id": "destination_inventory", "status": "pass"}],
+            "remote_inventory": {
+                "scope": "visible_shared_folders",
+                "root_exists": True,
+                "total_entries": 0,
+                "sample_count": 0,
+                "sample_limit": 5,
+                "truncated": False,
+                "sample": [],
+            },
+        }
+        target_output.write_text(
+            json.dumps(empty_document, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        inventory_log.write_text("x" * 1_048_576 + "\n", encoding="utf-8")
+        inventory_log.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(inventory_log, self.drop_uid, self.drop_gid)
+        empty_result = self.shell(
+            self.manager,
+            "doctor",
+            "personal",
+            "--level",
+            "standard",
+            extra_environment=environment,
+        )
+        self.assertEqual(empty_result.returncode, 0, empty_result.stdout + empty_result.stderr)
+        rotated = self.real_var / "log/doctor-inventory.log.1"
+        self.assertTrue(rotated.is_file())
+        self.assertEqual(stat.S_IMODE(rotated.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(inventory_log.stat().st_mode), 0o600)
+        empty_record = json.loads(inventory_log.read_text(encoding="utf-8").strip())
+        self.assertEqual(empty_record["scope"], "visible_shared_folders")
+        self.assertEqual(empty_record["total_entries"], 0)
+        self.assertEqual(empty_record["sample_count"], 0)
+        self.assertEqual(empty_record["sample"], [])
+        self.assertFalse(empty_record["truncated"])
+
+    def test_private_doctor_inventory_rejects_a_hardlinked_log_without_mutating_its_victim(self) -> None:
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Personal", True).returncode,
+            0,
+        )
+        target_output = self.root / "doctor-hardlink-target.ndjson"
+        target_output.write_text(
+            json.dumps(
+                {
+                    "schema": "sdsync.doctor.v1",
+                    "level": "standard",
+                    "status": "pass",
+                    "remote_inventory": {
+                        "scope": "direct_children",
+                        "total_entries": 1,
+                        "truncated": False,
+                        "sample": [
+                            {
+                                "relative_path": "/safe",
+                                "name": "safe",
+                                "kind": "directory",
+                            }
+                        ],
+                    },
+                },
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        victim = self.real_var / "log/doctor-hardlink-victim"
+        inventory_log = self.real_var / "log/doctor-inventory.log"
+        victim.write_text("sentinel\n", encoding="utf-8")
+        victim.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(victim, self.drop_uid, self.drop_gid)
+        os.link(victim, inventory_log)
+
+        try:
+            result = self.shell(
+                self.manager,
+                "doctor",
+                "personal",
+                "--level",
+                "standard",
+                extra_environment={"SDSYNC_TEST_TARGET_OUTPUT_FILE": str(target_output)},
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(
+                "private Doctor inventory evidence could not be recorded",
+                result.stderr,
+            )
+            self.assertEqual(victim.read_text(encoding="utf-8"), "sentinel\n")
+            self.assertTrue(os.path.samefile(victim, inventory_log))
+            self.assertEqual(victim.stat().st_nlink, 2)
+
+            logs, payload = self.api("logs", "--lines", "20", "--source", "doctor")
+            self.assertEqual(logs.returncode, 73, logs.stdout + logs.stderr)
+            self.assertEqual(payload["ok"], False)
+            self.assertEqual(payload["code"], "unsafe_state")
+            self.assertEqual(victim.read_text(encoding="utf-8"), "sentinel\n")
+        finally:
+            inventory_log.unlink(missing_ok=True)
+            victim.unlink(missing_ok=True)
+
+    def test_shared_rotating_log_append_rejects_unsafe_active_and_rotated_paths(self) -> None:
+        contract_root = self.real_var / "log/append-contract"
+        contract_root.mkdir(mode=0o700)
+        if os.getuid() == 0:
+            os.chown(contract_root, self.drop_uid, self.drop_gid)
+        harness = self.root / "append-log-contract.sh"
+        harness.write_text(
+            "#!/bin/sh\n"
+            + f". {shlex.quote(str(self.real_target / 'libexec/sdsync-common'))}\n"
+            + 'append_rotating_log "$1" 32 3 "new-record"\n',
+            encoding="utf-8",
+        )
+        harness.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(harness, self.drop_uid, self.drop_gid)
+
+        for source in ("activity", "controller", "audit", "doctor-inventory"):
+            with self.subTest(source=source, condition="active-hardlink"):
+                active = contract_root / f"{source}.log"
+                victim = contract_root / f"{source}.victim"
+                victim.write_text(f"{source}-sentinel\n", encoding="utf-8")
+                victim.chmod(0o600)
+                if os.getuid() == 0:
+                    os.chown(victim, self.drop_uid, self.drop_gid)
+                os.link(victim, active)
+                refused = self.shell(harness, str(active))
+                self.assertEqual(refused.returncode, 73, refused.stdout + refused.stderr)
+                self.assertEqual(victim.read_text(encoding="utf-8"), f"{source}-sentinel\n")
+                self.assertTrue(os.path.samefile(victim, active))
+                self.assertEqual(victim.stat().st_nlink, 2)
+                active.unlink()
+                victim.unlink()
+
+        active = contract_root / "rotation.log"
+        victim = contract_root / "rotation.victim"
+        active.write_text("a" * 64 + "\n", encoding="utf-8")
+        victim.write_text("rotation-sentinel\n", encoding="utf-8")
+        for path in (active, victim):
+            path.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(path, self.drop_uid, self.drop_gid)
+        rotated = contract_root / "rotation.log.1"
+        os.link(victim, rotated)
+        refused_rotation = self.shell(harness, str(active))
+        self.assertEqual(
+            refused_rotation.returncode,
+            73,
+            refused_rotation.stdout + refused_rotation.stderr,
+        )
+        self.assertEqual(active.read_text(encoding="utf-8"), "a" * 64 + "\n")
+        self.assertEqual(victim.read_text(encoding="utf-8"), "rotation-sentinel\n")
+        self.assertTrue(os.path.samefile(victim, rotated))
+        rotated.unlink()
+        victim.unlink()
+        active.unlink()
+
+        symlink_victim = contract_root / "symlink.victim"
+        symlink_victim.write_text("symlink-sentinel\n", encoding="utf-8")
+        symlink_victim.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(symlink_victim, self.drop_uid, self.drop_gid)
+        active_symlink = contract_root / "active-symlink.log"
+        os.symlink(symlink_victim, active_symlink)
+        refused_symlink = self.shell(harness, str(active_symlink))
+        self.assertEqual(refused_symlink.returncode, 73)
+        self.assertEqual(symlink_victim.read_text(encoding="utf-8"), "symlink-sentinel\n")
+        active_symlink.unlink()
+
+        active = contract_root / "rotated-symlink.log"
+        active.write_text("b" * 64 + "\n", encoding="utf-8")
+        active.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(active, self.drop_uid, self.drop_gid)
+        rotated_symlink = contract_root / "rotated-symlink.log.1"
+        os.symlink(symlink_victim, rotated_symlink)
+        refused_rotated_symlink = self.shell(harness, str(active))
+        self.assertEqual(refused_rotated_symlink.returncode, 73)
+        self.assertEqual(active.read_text(encoding="utf-8"), "b" * 64 + "\n")
+        self.assertEqual(symlink_victim.read_text(encoding="utf-8"), "symlink-sentinel\n")
+        rotated_symlink.unlink()
+        active.unlink()
+        symlink_victim.unlink()
+
+        wrong_mode = contract_root / "wrong-mode.log"
+        wrong_mode.write_text("mode-sentinel\n", encoding="utf-8")
+        wrong_mode.chmod(0o640)
+        if os.getuid() == 0:
+            os.chown(wrong_mode, self.drop_uid, self.drop_gid)
+        refused_mode = self.shell(harness, str(wrong_mode))
+        self.assertEqual(refused_mode.returncode, 73)
+        self.assertEqual(wrong_mode.read_text(encoding="utf-8"), "mode-sentinel\n")
+        wrong_mode.unlink()
+
+        if os.getuid() == 0:
+            wrong_owner = contract_root / "wrong-owner.log"
+            wrong_owner.write_text("owner-sentinel\n", encoding="utf-8")
+            wrong_owner.chmod(0o600)
+            os.chown(wrong_owner, 0, 0)
+            refused_owner = self.shell(harness, str(wrong_owner))
+            self.assertEqual(refused_owner.returncode, 73)
+            self.assertEqual(wrong_owner.read_text(encoding="utf-8"), "owner-sentinel\n")
+            wrong_owner.unlink()
+
+    def test_doctor_inventory_batch_uses_each_serde_ordered_job_profile(self) -> None:
+        self.assertEqual(
+            self.configure("alpha", self.source_one, "/home/Drive/Alpha", True).returncode,
+            0,
+        )
+        self.assertEqual(
+            self.configure("beta", self.source_two, "/home/Drive/Beta").returncode,
+            0,
+        )
+
+        jobs = []
+        for profile in ("alpha", "beta"):
+            jobs.append(
+                {
+                    "schema": "sdsync.doctor-job.v1",
+                    "profile": profile,
+                    "status": "success",
+                    "doctor": {
+                        "schema": "sdsync.doctor.v1",
+                        "level": "standard",
+                        "status": "pass",
+                        "remote_inventory": {
+                            "scope": "direct_children",
+                            "total_entries": 1,
+                            "sample_count": 1,
+                            "sample_limit": 5,
+                            "truncated": False,
+                            "sample": [
+                                {
+                                    "relative_path": f"/{profile}-path",
+                                    "name": f"{profile}-name",
+                                    "kind": "directory",
+                                    "relative_path_truncated": False,
+                                    "name_truncated": False,
+                                }
+                            ],
+                        },
+                    },
+                }
+            )
+        for invalid_profile in (None, "bad profile"):
+            invalid_job = copy.deepcopy(jobs[0])
+            invalid_job["doctor"]["remote_inventory"]["sample"][0]["relative_path"] = (
+                "/must-not-be-attributed-to-all"
+            )
+            if invalid_profile is None:
+                invalid_job.pop("profile")
+            else:
+                invalid_job["profile"] = invalid_profile
+            jobs.append(invalid_job)
+        target_output = self.root / "doctor-batch-serde-order.ndjson"
+        serialized_jobs = [
+            json.dumps(job, sort_keys=True, separators=(",", ":")) for job in jobs
+        ]
+        self.assertLess(serialized_jobs[0].index('"doctor"'), serialized_jobs[0].index('"schema"'))
+        target_output.write_text("\n".join(serialized_jobs) + "\n", encoding="utf-8")
+
+        result = self.shell(
+            self.manager,
+            "doctor",
+            "--all",
+            "--level",
+            "standard",
+            extra_environment={"SDSYNC_TEST_TARGET_OUTPUT_FILE": str(target_output)},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        inventory_log = self.real_var / "log/doctor-inventory.log"
+        records = [
+            json.loads(line)
+            for line in inventory_log.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        self.assertEqual([record["profile"] for record in records], ["alpha", "beta"])
+        self.assertEqual(
+            [record["sample"][0]["path"] for record in records],
+            ["/alpha-path", "/beta-path"],
+        )
+        self.assertNotIn("\"profile\":\"all\"", inventory_log.read_text(encoding="utf-8"))
+
+        activity, activity_payload = self.api("activity", "--lines", "100")
+        self.assertEqual(activity.returncode, 0, activity.stderr)
+        inventory_events = [
+            event for event in activity_payload["events"]
+            if event["code"] == "doctor.inventory"
+        ]
+        self.assertEqual(
+            [event["profile"] for event in inventory_events],
+            ["alpha", "beta"],
+        )
+        for event, record in zip(inventory_events, records):
+            self.assertEqual(
+                json.loads(event["message"].removeprefix("Doctor inventory evidence ")),
+                record,
+            )
+
+    def test_doctor_inventory_keeps_five_long_safe_entries_and_valid_json(self) -> None:
+        self.assertEqual(
+            self.configure("edge", self.source_one, "/home/Drive/Edge", True).returncode,
+            0,
+        )
+        secret_literal = 'pa"ss\\word'
+        def decoded_strings(value: object):
+            if isinstance(value, str):
+                yield value
+            elif isinstance(value, dict):
+                for child in value.values():
+                    yield from decoded_strings(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from decoded_strings(child)
+
+        password = self.shell(
+            self.manager,
+            "set-password",
+            "edge",
+            input_text=secret_literal + "\n",
+        )
+        self.assertEqual(password.returncode, 0, password.stderr)
+
+        pipe_and_quotes = 'pipe|quote-"back\\slash'
+        unicode_name = "é" * 200
+        escaped_long_name = 'quoted-"\\|雪' * 20
+        entries = [
+            {
+                "relative_path": f"/credentials/{secret_literal}",
+                "name": secret_literal,
+                "kind": "directory",
+                "relative_path_truncated": False,
+                "name_truncated": False,
+            },
+            {
+                "relative_path": f"/{pipe_and_quotes}",
+                "name": pipe_and_quotes,
+                "kind": "file",
+                "relative_path_truncated": False,
+                "name_truncated": False,
+            },
+            {
+                "relative_path": f"/{unicode_name}",
+                "name": unicode_name,
+                "kind": "directory",
+                "relative_path_truncated": False,
+                "name_truncated": False,
+            },
+            {
+                "relative_path": f"/{escaped_long_name}",
+                "name": escaped_long_name,
+                "kind": "file",
+                "relative_path_truncated": False,
+                "name_truncated": False,
+            },
+            {
+                "relative_path": "/" + ("p" * 511),
+                "name": "z" * 255,
+                "kind": "directory",
+                "relative_path_truncated": False,
+                "name_truncated": False,
+            },
+            {
+                "relative_path": "/sixth-not-retained",
+                "name": "sixth-not-retained",
+                "kind": "file",
+                "relative_path_truncated": False,
+                "name_truncated": False,
+            },
+        ]
+        for entry in entries:
+            entry.update(
+                {
+                    "username": "private-user-must-not-persist",
+                    "password": "private-password-must-not-persist",
+                    "session": "private-session-must-not-persist",
+                    "url": "https://private-must-not-persist.invalid",
+                    "acl": "private-acl-must-not-persist",
+                    "digest": "private-digest-must-not-persist",
+                    "server_detail": "private-detail-must-not-persist",
+                }
+            )
+        document = {
+            "schema": "sdsync.doctor.v1",
+            "level": "standard",
+            "status": "pass",
+            "remote_inventory": {
+                "scope": "direct_children",
+                "total_entries": 6,
+                "sample_count": 6,
+                "sample_limit": 5,
+                "truncated": True,
+                "sample": entries,
+                "username": "outer-private-user",
+                "session": "outer-private-session",
+                "url": "https://outer-private.invalid",
+            },
+        }
+        target_output = self.root / "doctor-inventory-long-utf8.ndjson"
+        target_output.write_text(
+            json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        environment = {"SDSYNC_TEST_TARGET_OUTPUT_FILE": str(target_output)}
+
+        result = self.shell(
+            self.manager,
+            "doctor",
+            "edge",
+            "--level",
+            "standard",
+            extra_environment=environment,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        inventory_log = self.real_var / "log/doctor-inventory.log"
+        persisted = inventory_log.read_text(encoding="utf-8")
+        self.assertLessEqual(len(persisted.encode("utf-8")), 4001)
+        self.assertNotIn("|", persisted)
+        record = json.loads(persisted.strip())
+        self.assertEqual(record["sample_count"], 5)
+        self.assertEqual(len(record["sample"]), 5)
+        self.assertTrue(record["truncated"])
+        self.assertEqual(record["sample"][0]["path"], "/credentials/[redacted]")
+        self.assertEqual(record["sample"][0]["name"], "[redacted]")
+        self.assertEqual(record["sample"][1]["name"], pipe_and_quotes)
+        self.assertFalse(record["sample"][1]["relative_path_truncated"])
+        self.assertFalse(record["sample"][1]["name_truncated"])
+        self.assertTrue(record["sample"][2]["name"].startswith("é"))
+        self.assertTrue(record["sample"][2]["name"].endswith("..."))
+        self.assertIn('quoted-"\\|雪', record["sample"][3]["name"])
+        self.assertTrue(record["sample"][3]["name"].endswith("..."))
+        self.assertTrue(record["sample"][4]["name"].endswith("..."))
+        for sample in record["sample"][2:]:
+            self.assertTrue(sample["relative_path_truncated"])
+            self.assertTrue(sample["name_truncated"])
+        self.assertNotIn("sixth-not-retained", persisted)
+        for value in decoded_strings(record):
+            self.assertNotIn(secret_literal, value)
+        for forbidden in (
+            "private-user-must-not-persist",
+            "private-password-must-not-persist",
+            "private-session-must-not-persist",
+            "private-must-not-persist.invalid",
+            "private-acl-must-not-persist",
+            "private-digest-must-not-persist",
+            "private-detail-must-not-persist",
+            "outer-private-user",
+            "outer-private-session",
+            "outer-private.invalid",
+        ):
+            self.assertNotIn(forbidden, persisted)
+
+        action = self.shell(
+            self.manager,
+            "api",
+            "action",
+            "--kind",
+            "doctor",
+            "--scope",
+            "edge",
+            "--level",
+            "standard",
+            extra_environment=environment,
+        )
+        self.assertEqual(action.returncode, 0, action.stdout + action.stderr)
+        action_payload = json.loads(action.stdout)
+        self.assertNotIn(secret_literal, action.stdout)
+        parsed_action_lines = [
+            json.loads(line) for line in str(action_payload["output"]).splitlines()
+        ]
+        for parsed_line in parsed_action_lines:
+            for value in decoded_strings(parsed_line):
+                self.assertNotIn(secret_literal, value)
+
+        logs, logs_payload = self.api("logs", "--lines", "20", "--source", "doctor")
+        self.assertEqual(logs.returncode, 0, logs.stderr)
+        log_records = [json.loads(line) for line in logs_payload["logs"][0]["lines"]]
+        self.assertGreaterEqual(len(log_records), 2)
+        self.assertTrue(all(item["sample_count"] == 5 for item in log_records[-2:]))
+        for log_record in log_records:
+            for value in decoded_strings(log_record):
+                self.assertNotIn(secret_literal, value)
+        self.assertNotIn(secret_literal, logs.stdout)
+
+        activity, activity_payload = self.api("activity", "--lines", "100")
+        self.assertEqual(activity.returncode, 0, activity.stderr)
+        inventory_events = [
+            event for event in activity_payload["events"]
+            if event["code"] == "doctor.inventory" and event["profile"] == "edge"
+        ]
+        self.assertGreaterEqual(len(inventory_events), 2)
+        for event in inventory_events:
+            nested = json.loads(
+                event["message"].removeprefix("Doctor inventory evidence ")
+            )
+            self.assertEqual(nested["sample_count"], 5)
+            for value in decoded_strings(nested):
+                self.assertNotIn(secret_literal, value)
+        self.assertNotIn(secret_literal, activity.stdout)
+
+    def test_common_json_quote_handles_controls_escapes_multiline_and_utf8(self) -> None:
+        harness = self.root / "json-quote-harness.sh"
+        harness.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            '. "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+            'json_quote "$1"\n'
+            "printf '\\n'\n",
+            encoding="utf-8",
+        )
+        harness.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(harness, self.drop_uid, self.drop_gid)
+
+        cases = (
+            ('quote " and slash \\ with tab\t and carriage\r',) * 2,
+            ("first line\nsecond line",) * 2,
+            ("café 雪",) * 2,
+            ("controls-\x01-\x0b-\x0c", "controls-?-?-?"),
+        )
+        for value, expected in cases:
+            with self.subTest(value=repr(value)):
+                encoded = self.shell(harness, value)
+                self.assertEqual(encoded.returncode, 0, encoded.stderr)
+                self.assertEqual(json.loads(encoded.stdout), expected)
+
+    def test_doctor_capture_temporaries_are_removed_by_exit_trap(self) -> None:
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Personal", True).returncode,
+            0,
+        )
+        manager = self.real_target / "bin/sdsync-dsm"
+        source = manager.read_text(encoding="utf-8")
+        needle = (
+            '        finish_private_file "$target_doctor_output"\n'
+            "        mark_mutation_commit_started || die \"mandatory audit execution phase could not be recorded\"\n"
+        )
+        self.assertEqual(source.count(needle), 1)
+        manager.write_text(
+            source.replace(
+                needle,
+                '        finish_private_file "$target_doctor_output"\n'
+                "        exit 99\n"
+                "        mark_mutation_commit_started || die \"mandatory audit execution phase could not be recorded\"\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        manager.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(manager, self.drop_uid, self.drop_gid)
+
+        interrupted = self.shell(self.manager, "doctor", "personal", "--level", "standard")
+        self.assertEqual(interrupted.returncode, 99, interrupted.stdout + interrupted.stderr)
+        state_root = self.real_var / "state"
+        self.assertEqual(list(state_root.glob(".doctor-source.*.output")), [])
+        self.assertEqual(list(state_root.glob(".doctor-target.*.output")), [])
 
     def test_direct_routine_enable_and_disable_use_canonical_audit_operations(self) -> None:
         self.assertEqual(
@@ -5919,19 +7066,23 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             time.sleep(0.03)
         else:
             self.fail("dependency did not defer the routine")
-        base_plan = self.shell(self.manager, "plan", "base")
-        self.assertEqual(base_plan.returncode, 0, base_plan.stderr)
-
         core = self.real_target / "bin/synology-drive-sync"
         retry_counter = self.root / "retry-counter"
         core.write_text(
             "#!/bin/sh\n"
             ': "${SDSYNC_TEST_CAPTURE:?}"\n'
             'printf \'%s\\n\' "$*" >> "$SDSYNC_TEST_CAPTURE"\n'
-            'case " $* " in *" config validate "*) exit 0 ;; esac\n'
+            'case " $* " in\n'
+            '  *" config validate "*) exit 0 ;;\n'
+            '  *" plan --profile base "*|*" sync --profile base "*) exit 0 ;;\n'
+            '  *" sync --profile dependent "*) ;;\n'
+            '  *) exit 0 ;;\n'
+            'esac\n'
             f'counter="{retry_counter}"\n'
+            'counter_temp="$counter.$$"\n'
             'count=0; [ ! -f "$counter" ] || IFS= read -r count < "$counter"\n'
-            'count=$((count + 1)); printf \'%s\\n\' "$count" > "$counter"\n'
+            'count=$((count + 1)); printf \'%s\\n\' "$count" > "$counter_temp"\n'
+            'mv "$counter_temp" "$counter"\n'
             '[ "$count" -gt 1 ] || exit 42\n'
             "exit 0\n",
             encoding="utf-8",
@@ -5939,17 +7090,63 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         core.chmod(0o755)
         if os.getuid() == 0:
             os.chown(core, self.drop_uid, self.drop_gid)
-        for _ in range(300):
+        base_plan = self.shell(self.manager, "plan", "base")
+        self.assertEqual(base_plan.returncode, 0, base_plan.stdout + base_plan.stderr)
+
+        def bounded_diagnostic(path: Path, limit: int = 4096) -> str:
+            try:
+                payload = path.read_bytes()
+            except FileNotFoundError:
+                return "<missing>"
+            except OSError as error:
+                return f"<unavailable:{type(error).__name__}>"
+            return payload[-limit:].decode("utf-8", errors="replace")
+
+        def retry_diagnostics() -> dict[str, str]:
+            return {
+                "base_profile_state": bounded_diagnostic(
+                    self.real_var / "state/profiles/base.state"
+                ),
+                "capture": bounded_diagnostic(self.capture),
+                "clock": bounded_diagnostic(Path(fast_environment["SDSYNC_TEST_CLOCK"])),
+                "controller_log": bounded_diagnostic(self.real_var / "log/controller.log"),
+                "dependent_routine_state": bounded_diagnostic(dependent_state),
+                "retry_counter": bounded_diagnostic(retry_counter),
+                "run_state": bounded_diagnostic(self.real_var / "state/run.state"),
+                "scheduler_log": bounded_diagnostic(self.real_var / "log/scheduler.log"),
+            }
+
+        retry_deadline = time.monotonic() + 15
+        while time.monotonic() < retry_deadline:
+            retry_value = 0
+            if retry_counter.is_file():
+                try:
+                    retry_value = int(retry_counter.read_text(encoding="utf-8").strip())
+                except (OSError, ValueError):
+                    retry_value = 0
+            if retry_value >= 2:
+                break
+            time.sleep(0.03)
+        else:
+            self.fail(
+                "failed routine did not execute its retry after backoff: "
+                + json.dumps(retry_diagnostics(), sort_keys=True)
+            )
+
+        completion_deadline = time.monotonic() + 15
+        while time.monotonic() < completion_deadline:
+            dependent_state_text = dependent_state.read_text(encoding="utf-8")
             if (
-                retry_counter.is_file()
-                and int(retry_counter.read_text(encoding="utf-8").strip()) >= 2
-                and "state=succeeded" in dependent_state.read_text(encoding="utf-8")
+                "state=succeeded" in dependent_state_text
+                and "retry_attempt=0" in dependent_state_text
             ):
                 break
             time.sleep(0.03)
         else:
-            self.fail("failed routine was not retried after its backoff")
-        self.assertIn("retry_attempt=0", dependent_state.read_text(encoding="utf-8"))
+            self.fail(
+                "successful retry did not commit its terminal routine state: "
+                + json.dumps(retry_diagnostics(), sort_keys=True)
+            )
 
     def test_routine_delete_ceiling_rejects_weaker_aggregate_bound(self) -> None:
         configured = self.shell(
@@ -6157,6 +7354,11 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.write_mock_control_job(failed_claim_id, "action")
 
         failed_claim_capture = self.root / "failed-queue-claims"
+        failed_claim_ready = self.root / "failed-queue-claim.ready"
+        failed_claim_release = self.root / "failed-queue-claim.release"
+        failed_claim_returned = self.root / "failed-queue-claim.returned"
+        controller_sleep_ready = self.root / "failed-backlog-sleep.ready"
+        controller_sleep_release = self.root / "failed-backlog-sleep.release"
         failed_claim_capture.write_text("", encoding="utf-8")
         real_mv = shutil.which("mv")
         self.assertIsNotNone(real_mv)
@@ -6166,6 +7368,11 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "case ${1:-}:${2:-} in\n"
             f"  */control/requests/{failed_claim_id}.json:*/control/processing/{failed_claim_id}.json)\n"
             f"    printf 'attempt\\n' >> {shlex.quote(str(failed_claim_capture))}\n"
+            f"    if [ \"$(wc -l < {shlex.quote(str(failed_claim_capture))} | tr -d ' ')\" -eq 1 ]; then\n"
+            f"      : > {shlex.quote(str(failed_claim_ready))}\n"
+            f"      while [ ! -e {shlex.quote(str(failed_claim_release))} ]; do /bin/sleep 0.01; done\n"
+            f"      : > {shlex.quote(str(failed_claim_returned))}\n"
+            "    fi\n"
             "    exit 74\n"
             "    ;;\n"
             "esac\n"
@@ -6173,31 +7380,72 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             encoding="utf-8",
         )
         fake_mv.chmod(0o755)
+        fake_sleep = self.fake_system_bin / "sleep"
+        fake_sleep.write_text(
+            "#!/bin/sh\n"
+            f"if [ \"${{1:-}}\" = 1 ] && [ -e {shlex.quote(str(failed_claim_returned))} ] "
+            f"&& [ ! -e {shlex.quote(str(controller_sleep_ready))} ]; then\n"
+            f"  : > {shlex.quote(str(controller_sleep_ready))}\n"
+            f"  while [ ! -e {shlex.quote(str(controller_sleep_release))} ]; do /bin/sleep 0.01; done\n"
+            "  exit 0\n"
+            "fi\n"
+            'exec /bin/sleep "$@"\n',
+            encoding="utf-8",
+        )
+        fake_sleep.chmod(0o755)
         if os.getuid() == 0:
-            for path in (collision_processing, failed_claim_capture, fake_mv):
+            for path in (collision_processing, failed_claim_capture, fake_mv, fake_sleep):
                 os.chown(path, self.drop_uid, self.drop_gid)
 
         started = self.shell(self.lifecycle, "start", timeout=15)
         self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
-        time.sleep(0.35)
-        attempts = failed_claim_capture.read_text(encoding="utf-8").splitlines()
-        controller_events = [
-            json.loads(line)
-            for line in (self.real_var / "log/controller.log")
-            .read_text(encoding="utf-8")
-            .splitlines()
-            if line
-        ]
-        collisions = [
-            event
-            for event in controller_events
-            if event.get("event") == "control_request_collision"
-            and f"id={collision_id}" in event.get("detail", "")
-        ]
-        self.assertGreaterEqual(len(attempts), 1)
-        self.assertLessEqual(len(attempts), 2, "failed queue claims entered a zero-sleep loop")
-        self.assertGreaterEqual(len(collisions), 1)
-        self.assertLessEqual(len(collisions), 2, "processing collisions entered a zero-sleep loop")
+        try:
+            self.wait_for_path(
+                failed_claim_ready,
+                "controller did not reach the phase-gated failed queue claim",
+            )
+        finally:
+            # Never strand the controller in the synthetic mv barrier when a
+            # readiness assertion fails; lifecycle teardown must remain bounded.
+            failed_claim_release.touch(exist_ok=True)
+        self.wait_for_path(
+            failed_claim_returned,
+            "phase-gated queue claim did not return its synthetic failure",
+        )
+        try:
+            self.wait_for_path(
+                controller_sleep_ready,
+                "undispatchable backlog did not enter its one-second backoff",
+            )
+            # Hold the exact controller sleep phase so scheduler descheduling
+            # cannot turn this sub-second observation into another queue turn.
+            time.sleep(0.35)
+            attempts = failed_claim_capture.read_text(encoding="utf-8").splitlines()
+            controller_events = [
+                json.loads(line)
+                for line in (self.real_var / "log/controller.log")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line
+            ]
+            collisions = [
+                event
+                for event in controller_events
+                if event.get("event") == "control_request_collision"
+                and f"id={collision_id}" in event.get("detail", "")
+            ]
+            self.assertEqual(
+                len(attempts),
+                1,
+                "failed queue claims entered a zero-sleep loop after the gated failure",
+            )
+            self.assertEqual(
+                len(collisions),
+                1,
+                "processing collisions entered a zero-sleep loop after the gated failure",
+            )
+        finally:
+            controller_sleep_release.touch(exist_ok=True)
 
     def test_connection_jobs_can_run_one_at_a_time_beside_primary_control_work(self) -> None:
         bridge_capture = self.root / "concurrent-control-capture"
@@ -6518,18 +7766,166 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             [record.split()[0] for record in records],
             [primary_id, connection_id],
         )
+        self.assertEqual(
+            list((self.real_var / "run").glob(".runner-wait-guard-admit.*")),
+            [],
+            "stop-before-admission left a guard channel behind",
+        )
+
+    def test_runner_wait_final_gap_repeats_alarm_until_connection_dispatch(self) -> None:
+        bridge_capture = self.root / "runner-final-gap-capture"
+        bridge_lock = self.root / "runner-final-gap-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        controller = self.real_target / "libexec/sdsync-controller"
+        controller_source = controller.read_text(encoding="utf-8")
+        handoff_marker = (
+            "        # Guarded runner-wait handoff. Runtime tests instrument this comment in\n"
+            "        # their private controller copy to deliver USR2 in the exact gap.\n"
+        )
+        wake_needle = (
+            "request_queue_wake() {\n"
+            "    child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))\n"
+            "    queue_wake_requested=true\n"
+        )
+        alarm_needle = (
+            "request_runner_wait_poll() {\n"
+            "    child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))\n"
+            "    wait_interrupted=true\n"
+        )
+        for needle in (handoff_marker, wake_needle, alarm_needle):
+            self.assertEqual(controller_source.count(needle), 1, needle)
+        controller.write_text(
+            controller_source.replace(
+                handoff_marker,
+                '        if [ -n "${SDSYNC_TEST_RUNNER_FINAL_GAP_READY:-}" ] '
+                '&& [ ! -e "$SDSYNC_TEST_RUNNER_FINAL_GAP_READY" ]; then\n'
+                '            : > "$SDSYNC_TEST_RUNNER_FINAL_GAP_READY"\n'
+                '            while [ ! -e "$SDSYNC_TEST_RUNNER_FINAL_GAP_RELEASE" ]; do '
+                '/bin/sleep 0.01; done\n'
+                "        fi\n"
+                + handoff_marker,
+                1,
+            ).replace(
+                wake_needle,
+                wake_needle
+                + '    [ -z "${SDSYNC_TEST_RUNNER_FINAL_GAP_WAKE:-}" ] || '
+                ': > "$SDSYNC_TEST_RUNNER_FINAL_GAP_WAKE"\n',
+                1,
+            ).replace(
+                alarm_needle,
+                alarm_needle
+                + '    [ -z "${SDSYNC_TEST_RUNNER_FINAL_GAP_ALARM:-}" ] || '
+                'printf \'alarm\\n\' >> "$SDSYNC_TEST_RUNNER_FINAL_GAP_ALARM"\n',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        controller.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(controller, self.drop_uid, self.drop_gid)
+
+        primary_id = "4" * 48
+        connection_id = "5" * 48
+        primary_ready = self.root / "runner-final-gap-primary.ready"
+        primary_release = self.root / "runner-final-gap-primary.release"
+        connection_ready = self.root / "runner-final-gap-connection.ready"
+        connection_release = self.root / "runner-final-gap-connection.release"
+        gap_ready = self.root / "runner-final-gap.ready"
+        gap_release = self.root / "runner-final-gap.release"
+        wake_observed = self.root / "runner-final-gap-wake.observed"
+        alarm_observed = self.root / "runner-final-gap-alarm.observed"
+        self.write_mock_control_job(
+            primary_id,
+            "action",
+            ready=primary_ready,
+            release=primary_release,
+        )
+        environment = {
+            "SDSYNC_TEST_RUNNER_FINAL_GAP_READY": str(gap_ready),
+            "SDSYNC_TEST_RUNNER_FINAL_GAP_RELEASE": str(gap_release),
+            "SDSYNC_TEST_RUNNER_FINAL_GAP_WAKE": str(wake_observed),
+            "SDSYNC_TEST_RUNNER_FINAL_GAP_ALARM": str(alarm_observed),
+        }
+        started = self.shell(
+            self.lifecycle,
+            "start",
+            extra_environment=environment,
+            timeout=15,
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.wait_for_path(primary_ready, "primary action did not enter its held wait")
+        self.wait_for_path(gap_ready, "controller did not enter the final guarded gap")
+        controller_pid = int(
+            (self.real_var / "run/controller.pid").read_text(encoding="ascii").strip()
+        )
+        self.write_mock_control_job(
+            connection_id,
+            "test-profile-auth",
+            ready=connection_ready,
+            release=connection_release,
+        )
+        os.kill(controller_pid, signal.SIGUSR2)
+        self.wait_for_path(wake_observed, "controller did not run the final-gap wake")
+        self.wait_for_path(
+            alarm_observed,
+            "first guard alarm did not fire while the final handoff was paused",
+            timeout=2.0,
+        )
+        self.assertFalse(
+            connection_ready.exists(),
+            "connection escaped while the controller was held before wait",
+        )
+
+        # The first alarm has already been consumed before wait(2). A one-shot
+        # guard loses this wake; the repeated guard emits a second bounded poll.
+        gap_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            connection_ready,
+            "second guard alarm did not recover the final-gap connection",
+            timeout=5.0,
+        )
+        alarm_count = len(alarm_observed.read_text(encoding="ascii").splitlines())
+        self.assertGreaterEqual(alarm_count, 2, "guard stopped after its first alarm")
+        self.assertFalse(
+            (self.real_var / f"control/responses/{primary_id}.json").exists(),
+            "primary action was not still held during final-gap recovery",
+        )
+
+        connection_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            self.real_var / f"control/responses/{connection_id}.json",
+            "final-gap connection response was not published",
+        )
+        primary_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            self.real_var / f"control/responses/{primary_id}.json",
+            "final-gap primary response was not published",
+        )
+        records = bridge_capture.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn("overlap", records)
+        self.assertEqual(
+            [record.split()[0] for record in records],
+            [primary_id, connection_id],
+        )
 
     def test_runner_wait_guard_rejects_reused_pid_identity_before_alarm(self) -> None:
         bridge_capture = self.root / "runner-guard-identity-capture"
         bridge_lock = self.root / "runner-guard-identity-lock"
         self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
         alarm_observed = self.root / "runner-guard-unrelated.alarm"
+        term_observed = self.root / "runner-guard-unrelated.term"
         unrelated_ready = self.root / "runner-guard-unrelated.ready"
+        identity_check_ready = self.root / "runner-guard-identity-check.ready"
+        identity_check_release = self.root / "runner-guard-identity-check.release"
+        identity_rejected = self.root / "runner-guard-identity.rejected"
+        identity_accepted = self.root / "runner-guard-identity.accepted"
+        pid_only_accepted = self.root / "runner-guard-pid-only.accepted"
         unrelated_script = self.root / "runner-guard-unrelated"
         unrelated_script.write_text(
             "#!/bin/sh\n"
             "set -eu\n"
             'trap \': > "$SDSYNC_TEST_RUNNER_GUARD_ALARM"; exit 99\' ALRM\n'
+            'trap \': > "$SDSYNC_TEST_RUNNER_GUARD_TERM"; exit 98\' TERM\n'
             ': > "$SDSYNC_TEST_RUNNER_GUARD_READY"\n'
             "while :; do /bin/sleep 0.1; done\n",
             encoding="utf-8",
@@ -6541,6 +7937,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             unrelated_script,
             extra_environment={
                 "SDSYNC_TEST_RUNNER_GUARD_ALARM": str(alarm_observed),
+                "SDSYNC_TEST_RUNNER_GUARD_TERM": str(term_observed),
                 "SDSYNC_TEST_RUNNER_GUARD_READY": str(unrelated_ready),
             },
         )
@@ -6548,17 +7945,45 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             self.wait_for_path(unrelated_ready, "unrelated ALRM target did not start")
             controller = self.real_target / "libexec/sdsync-controller"
             controller_source = controller.read_text(encoding="utf-8")
-            identity_capture = (
-                "    runner_guard_parent=$$\n"
-                '    runner_guard_parent_start=$(process_start_time '
-                '"$runner_guard_parent" 2>/dev/null || true)\n'
+            pre_alarm_identity_check = (
+                '            process_identity_is_live "$runner_guard_parent" \\\n'
+                '                "$runner_guard_parent_start" '
+                '"$runner_guard_parent_boot" || exit 0\n'
+                '            kill -ALRM "$runner_guard_parent" 2>/dev/null || exit 0\n'
             )
-            self.assertEqual(controller_source.count(identity_capture), 1)
+            self.assertEqual(controller_source.count(pre_alarm_identity_check), 1)
+            instrumented_identity_check = (
+                "            # Test-only phase gate: admission and the first bounded sleep\n"
+                "            # have completed before the stored tuple is made stale.\n"
+                "            runner_guard_parent=${SDSYNC_TEST_RUNNER_GUARD_TARGET_PID:?}\n"
+                "            runner_guard_parent_start=1\n"
+                '            : > "$SDSYNC_TEST_RUNNER_GUARD_IDENTITY_READY"\n'
+                "            runner_guard_identity_gate_round=0\n"
+                '            while [ ! -e "$SDSYNC_TEST_RUNNER_GUARD_IDENTITY_RELEASE" ] '
+                '&& [ "$runner_guard_shutdown" = false ] '
+                '&& [ "$runner_guard_identity_gate_round" -lt 100 ]; do\n'
+                "                /bin/sleep 0.1\n"
+                "                runner_guard_identity_gate_round=$((runner_guard_identity_gate_round + 1))\n"
+                "            done\n"
+                '            [ "$runner_guard_shutdown" = false ] || exit 0\n'
+                '            [ -e "$SDSYNC_TEST_RUNNER_GUARD_IDENTITY_RELEASE" ] || exit 73\n'
+                '            if pid_is_live "$runner_guard_parent"; then\n'
+                '                : > "$SDSYNC_TEST_RUNNER_GUARD_PID_ONLY_ACCEPTED"\n'
+                "            fi\n"
+                '            if process_identity_is_live "$runner_guard_parent" \\\n'
+                '                "$runner_guard_parent_start" '
+                '"$runner_guard_parent_boot"; then\n'
+                '                : > "$SDSYNC_TEST_RUNNER_GUARD_IDENTITY_ACCEPTED"\n'
+                '                kill -ALRM "$runner_guard_parent" 2>/dev/null || exit 0\n'
+                "            else\n"
+                '                : > "$SDSYNC_TEST_RUNNER_GUARD_IDENTITY_REJECTED"\n'
+                "                exit 0\n"
+                "            fi\n"
+            )
             controller.write_text(
                 controller_source.replace(
-                    identity_capture,
-                    '    runner_guard_parent=${SDSYNC_TEST_RUNNER_GUARD_TARGET_PID:?}\n'
-                    "    runner_guard_parent_start=1\n",
+                    pre_alarm_identity_check,
+                    instrumented_identity_check,
                     1,
                 ),
                 encoding="utf-8",
@@ -6580,18 +8005,56 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 self.lifecycle,
                 "start",
                 extra_environment={
-                    "SDSYNC_TEST_RUNNER_GUARD_TARGET_PID": str(unrelated.pid)
+                    "SDSYNC_TEST_RUNNER_GUARD_TARGET_PID": str(unrelated.pid),
+                    "SDSYNC_TEST_RUNNER_GUARD_IDENTITY_READY": str(identity_check_ready),
+                    "SDSYNC_TEST_RUNNER_GUARD_IDENTITY_RELEASE": str(
+                        identity_check_release
+                    ),
+                    "SDSYNC_TEST_RUNNER_GUARD_IDENTITY_REJECTED": str(
+                        identity_rejected
+                    ),
+                    "SDSYNC_TEST_RUNNER_GUARD_IDENTITY_ACCEPTED": str(
+                        identity_accepted
+                    ),
+                    "SDSYNC_TEST_RUNNER_GUARD_PID_ONLY_ACCEPTED": str(
+                        pid_only_accepted
+                    ),
                 },
                 timeout=15,
             )
             self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
             self.wait_for_path(primary_ready, "held primary action did not start")
 
-            # Model a stored PID that now names a different process instance:
-            # the target is live, but start tick 1 cannot match it. A PID-only
-            # watchdog would deliver ALRM after one second and terminate it.
-            time.sleep(1.4)
+            # Admission and capture use the real controller identity. Only the
+            # final pre-ALRM check sees a live PID with the deliberately stale
+            # start tick, so this exercises signal authorization without a
+            # child-exit race during guard startup.
+            self.wait_for_path(
+                identity_check_ready,
+                "runner wait guard did not reach the gated pre-ALRM identity check",
+                timeout=8.0,
+            )
             self.assertIsNone(unrelated.poll(), "identity-mismatched target was signaled")
+            self.assertFalse(term_observed.exists(), "runner wait guard sent TERM")
+            self.assertFalse(
+                alarm_observed.exists(),
+                "runner wait guard sent ALRM without an exact PID/start/boot match",
+            )
+            identity_check_release.write_text("release\n", encoding="utf-8")
+            self.wait_for_path(
+                pid_only_accepted,
+                "PID-only mutation control did not accept the live reused PID",
+            )
+            self.wait_for_path(
+                identity_rejected,
+                "exact pre-ALRM identity check did not reject the reused PID",
+            )
+            self.assertFalse(
+                identity_accepted.exists(),
+                "exact pre-ALRM identity check accepted the reused PID",
+            )
+            self.assertIsNone(unrelated.poll(), "identity-mismatched target was signaled")
+            self.assertFalse(term_observed.exists(), "runner wait guard sent TERM")
             self.assertFalse(
                 alarm_observed.exists(),
                 "runner wait guard sent ALRM without an exact PID/start/boot match",
@@ -6823,6 +8286,10 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             int(primary_ready.read_text(encoding="ascii").strip()),
             int(connection_ready.read_text(encoding="ascii").strip()),
         ]
+        process_starts = {
+            pid: self.capture_process_start_ticks(pid, label="bounded stop process")
+            for pid in (controller_pid, *child_pids)
+        }
         stop_started = time.monotonic()
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
         stop_elapsed = time.monotonic() - stop_started
@@ -6833,8 +8300,11 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "dual-child shutdown exceeded its 10-second lifecycle deadline plus CI margin",
         )
         for pid in (controller_pid, *child_pids):
-            with self.assertRaises(ProcessLookupError):
-                os.kill(pid, 0)
+            self.wait_for_exact_process_terminal(
+                pid,
+                process_starts[pid],
+                label="bounded stop process",
+            )
 
     def test_controller_child_signals_require_exact_spawn_identity(self) -> None:
         child = self.root / "pid-identity-child"
@@ -6854,8 +8324,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "        raise SystemExit(143)\n"
             "signal.signal(signal.SIGTERM, handle_term)\n"
             "ready.write_text(f'{os.getpid()}\\n', encoding='ascii')\n"
-            "if mode == 'finite':\n"
-            "    time.sleep(0.5)\n"
+            "if mode in {'finite', 'finite_slow'}:\n"
+            "    time.sleep(2.0 if mode == 'finite_slow' else 0.5)\n"
             "    raise SystemExit(0)\n"
             "while True:\n"
             "    time.sleep(0.05)\n",
@@ -6960,11 +8430,23 @@ if [ "${SDSYNC_TEST_PID_IDENTITY_PROBE:-false}" = true ]; then
     runner_wait_guard_start=$((mismatch_guard_start + 1))
     runner_wait_guard_boot=$mismatch_guard_boot
     runner_wait_guard_pid=$mismatch_guard_pid
-    stop_runner_wait_guard
+    runner_wait_guard_admission_path=
+    runner_wait_guard_stop_path=
+    runner_wait_guard_admitted=true
+    mismatch_guard_stop_rc=0
+    stop_runner_wait_guard || mismatch_guard_stop_rc=$?
+    [ "$mismatch_guard_stop_rc" -eq 73 ] || exit 84
     [ ! -e "$SDSYNC_TEST_MISMATCH_GUARD_TERM" ] || exit 84
-    pid_is_live "$mismatch_guard_pid" && exit 85
-    [ -z "$runner_wait_guard_pid" ] && [ -z "$runner_wait_guard_start" ] \
-        && [ -z "$runner_wait_guard_boot" ] || exit 86
+    pid_is_live "$mismatch_guard_pid" || exit 85
+    [ "$runner_wait_guard_pid" = "$mismatch_guard_pid" ] \
+        && [ "$runner_wait_guard_start" -ne "$mismatch_guard_start" ] || exit 86
+    wait "$mismatch_guard_pid"
+    runner_wait_guard_pid=
+    runner_wait_guard_start=
+    runner_wait_guard_boot=
+    runner_wait_guard_admission_path=
+    runner_wait_guard_stop_path=
+    runner_wait_guard_admitted=false
 
     "$SDSYNC_TEST_PID_IDENTITY_CHILD" cooperative \
         "$SDSYNC_TEST_MATCHING_GUARD_READY" "$SDSYNC_TEST_MATCHING_GUARD_TERM" &
@@ -6974,6 +8456,9 @@ if [ "${SDSYNC_TEST_PID_IDENTITY_PROBE:-false}" = true ]; then
     runner_wait_guard_start=$captured_work_child_start
     runner_wait_guard_boot=$captured_work_child_boot
     runner_wait_guard_pid=$matching_guard_pid
+    runner_wait_guard_admission_path=
+    runner_wait_guard_stop_path=$runtime_root/.matching-guard-stop.$$
+    runner_wait_guard_admitted=true
     stop_runner_wait_guard
     [ -f "$SDSYNC_TEST_MATCHING_GUARD_TERM" ] || exit 88
     pid_is_live "$matching_guard_pid" && exit 89
@@ -7043,10 +8528,10 @@ if [ "${SDSYNC_TEST_PID_IDENTITY_PROBE:-false}" = true ]; then
     sleep_pid_start=
     sleep_pid_boot=
 
-    "$SDSYNC_TEST_PID_IDENTITY_CHILD" finite \
+    "$SDSYNC_TEST_PID_IDENTITY_CHILD" finite_slow \
         "$SDSYNC_TEST_MISMATCH_ACTIVE_READY" "$SDSYNC_TEST_MISMATCH_ACTIVE_TERM" &
     mismatch_active_pid=$!
-    "$SDSYNC_TEST_PID_IDENTITY_CHILD" finite \
+    "$SDSYNC_TEST_PID_IDENTITY_CHILD" finite_slow \
         "$SDSYNC_TEST_MISMATCH_CONTROL_READY" "$SDSYNC_TEST_MISMATCH_CONTROL_TERM" &
     mismatch_control_pid=$!
     pid_probe_wait_ready "$SDSYNC_TEST_MISMATCH_ACTIVE_READY" "$mismatch_active_pid"
@@ -7536,12 +9021,9 @@ fi
         publish_definition = "publish_child_admission() {\n"
         guard_assignment = "    launched_runner_wait_guard_pid=$!\n"
         guard_admitted = (
-            '        wait_for_child_admission "$runner_guard_admission" '
-            '"$runner_guard_parent" \\\n'
-            '            "$runner_guard_parent_start" '
-            '"$runner_guard_parent_boot" || exit 0\n'
+            "        runner_guard_stop_requested && exit 0\n"
+            '        [ "$runner_guard_shutdown" = false ] || exit 0\n'
         )
-        guard_signal = '        kill -TERM "$runner_guard_pid" 2>/dev/null || true\n'
         poll_handler = (
             "request_runner_wait_poll() {\n"
             "    child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))\n"
@@ -7552,7 +9034,6 @@ fi
             publish_definition,
             guard_assignment,
             guard_admitted,
-            guard_signal,
             poll_handler,
             probe_needle,
         ):
@@ -7573,11 +9054,7 @@ fi
             1,
         ).replace(
             guard_admitted,
-            guard_admitted + '        : > "$SDSYNC_TEST_GUARD_ADMITTED"\n',
-            1,
-        ).replace(
-            guard_signal,
-            '        : > "$SDSYNC_TEST_GUARD_TERM"\n' + guard_signal,
+            '        : > "$SDSYNC_TEST_GUARD_ADMITTED"\n' + guard_admitted,
             1,
         ).replace(
             poll_handler,
@@ -7601,18 +9078,16 @@ if [ "${SDSYNC_TEST_GUARD_FAILURE_PROBE:-false}" = true ]; then
     [ "$guard_failure_rc" -eq 73 ] || exit 188
     [ -z "$runner_wait_guard_pid" ] && [ -z "$runner_wait_guard_start" ] \
         && [ -z "$runner_wait_guard_boot" ] \
-        && [ -z "$runner_wait_guard_admission_path" ] || exit 189
+        && [ -z "$runner_wait_guard_admission_path" ] \
+        && [ -z "$runner_wait_guard_stop_path" ] \
+        && [ "$runner_wait_guard_admitted" = false ] || exit 189
     [ ! -e "$SDSYNC_TEST_GUARD_ADMITTED" ] || exit 190
     [ ! -e "$SDSYNC_TEST_GUARD_ALARM" ] || exit 191
     for guard_failure_gate in "$runtime_root"/.runner-wait-guard-admit.*; do
         [ -e "$guard_failure_gate" ] || [ -L "$guard_failure_gate" ] || continue
         exit 192
     done
-    case $guard_failure_mode in
-        capture) [ ! -e "$SDSYNC_TEST_GUARD_TERM" ] || exit 193 ;;
-        commit) [ -f "$SDSYNC_TEST_GUARD_TERM" ] || exit 194 ;;
-        *) exit 195 ;;
-    esac
+    case $guard_failure_mode in capture|commit) ;; *) exit 195 ;; esac
     trap - 0
     exit 0
 fi
@@ -7628,7 +9103,6 @@ fi
         for mode in ("capture", "commit"):
             wrapper_pid_path = self.root / f"guard-{mode}.wrapper-pid"
             admitted = self.root / f"guard-{mode}.admitted"
-            term = self.root / f"guard-{mode}.term"
             alarm = self.root / f"guard-{mode}.alarm"
             completed = self.shell(
                 controller,
@@ -7637,7 +9111,6 @@ fi
                     "SDSYNC_TEST_GUARD_FAILURE_MODE": mode,
                     "SDSYNC_TEST_GUARD_WRAPPER_PID": str(wrapper_pid_path),
                     "SDSYNC_TEST_GUARD_ADMITTED": str(admitted),
-                    "SDSYNC_TEST_GUARD_TERM": str(term),
                     "SDSYNC_TEST_GUARD_ALARM": str(alarm),
                 },
                 timeout=8,
@@ -7654,6 +9127,607 @@ fi
                 list((self.real_var / "run").glob(".runner-wait-guard-admit.*")),
                 [],
             )
+
+    def test_runner_guard_stop_latch_bounds_identity_mismatch_without_term(self) -> None:
+        controller = self.real_target / "libexec/sdsync-controller"
+        controller_source = controller.read_text(encoding="utf-8")
+        sleep_handoff = (
+            "            # A shutdown trap can run after spawn but before this exact tuple is\n"
+            "            # published. Its latch closes that handoff without PID-only signals.\n"
+        )
+        term_handler = (
+            "        request_runner_guard_shutdown() {\n"
+            "            child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))\n"
+        )
+        poll_handler = (
+            "request_runner_wait_poll() {\n"
+            "    child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))\n"
+            "    wait_interrupted=true\n"
+        )
+        probe_needle = "trap cleanup_controller 0\n\n"
+        for needle in (sleep_handoff, term_handler, poll_handler, probe_needle):
+            self.assertEqual(controller_source.count(needle), 1, needle)
+        controller_source = controller_source.replace(
+            sleep_handoff,
+            '            if [ -n "${SDSYNC_TEST_GUARD_SLEEP_READY:-}" ] '
+            '&& [ ! -e "$SDSYNC_TEST_GUARD_SLEEP_READY" ]; then\n'
+            '                : > "$SDSYNC_TEST_GUARD_SLEEP_READY"\n'
+            '                while [ ! -e "$SDSYNC_TEST_GUARD_SLEEP_RELEASE" ]; do '
+            '/bin/sleep 0.01; done\n'
+            "            fi\n"
+            + sleep_handoff,
+            1,
+        ).replace(
+            term_handler,
+            term_handler
+            + '            [ -z "${SDSYNC_TEST_GUARD_TERM:-}" ] || '
+            ': > "$SDSYNC_TEST_GUARD_TERM"\n',
+            1,
+        ).replace(
+            poll_handler,
+            poll_handler
+            + '    [ -z "${SDSYNC_TEST_GUARD_ALARM:-}" ] || '
+            ': > "$SDSYNC_TEST_GUARD_ALARM"\n',
+            1,
+        )
+        probe = r'''trap cleanup_controller 0
+
+if [ "${SDSYNC_TEST_GUARD_LATCH_PROBE:-false}" = true ]; then
+    start_runner_wait_guard || exit 200
+    printf '%s\n' "$runner_wait_guard_pid" > "$SDSYNC_TEST_GUARD_WRAPPER_PID"
+    while [ ! -e "$SDSYNC_TEST_GUARD_SLEEP_READY" ]; do /bin/sleep 0; done
+    runner_wait_guard_start=$((runner_wait_guard_start + 1))
+    guard_latch_stop_rc=0
+    stop_runner_wait_guard || guard_latch_stop_rc=$?
+    [ "$guard_latch_stop_rc" -eq 0 ] || exit 201
+    [ ! -e "$SDSYNC_TEST_GUARD_TERM" ] || exit 202
+    [ ! -e "$SDSYNC_TEST_GUARD_ALARM" ] || exit 203
+    [ -z "$runner_wait_guard_pid" ] && [ -z "$runner_wait_guard_start" ] \
+        && [ -z "$runner_wait_guard_boot" ] \
+        && [ -z "$runner_wait_guard_admission_path" ] \
+        && [ -z "$runner_wait_guard_stop_path" ] \
+        && [ "$runner_wait_guard_admitted" = false ] || exit 204
+    stop_runner_wait_guard || exit 205
+    for guard_latch_path in "$runtime_root"/.runner-wait-guard-admit.*; do
+        [ -e "$guard_latch_path" ] || [ -L "$guard_latch_path" ] || continue
+        exit 206
+    done
+    trap - 0
+    exit 0
+fi
+
+'''
+        controller.write_text(
+            controller_source.replace(probe_needle, probe, 1), encoding="utf-8"
+        )
+        controller.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(controller, self.drop_uid, self.drop_gid)
+
+        sleep_ready = self.root / "guard-latch-sleep.ready"
+        sleep_release = self.root / "guard-latch-sleep.release"
+        wrapper_pid_path = self.root / "guard-latch-wrapper.pid"
+        term = self.root / "guard-latch.term"
+        alarm = self.root / "guard-latch.alarm"
+        process = self.shell_process(
+            controller,
+            extra_environment={
+                "SDSYNC_TEST_GUARD_LATCH_PROBE": "true",
+                "SDSYNC_TEST_GUARD_SLEEP_READY": str(sleep_ready),
+                "SDSYNC_TEST_GUARD_SLEEP_RELEASE": str(sleep_release),
+                "SDSYNC_TEST_GUARD_WRAPPER_PID": str(wrapper_pid_path),
+                "SDSYNC_TEST_GUARD_TERM": str(term),
+                "SDSYNC_TEST_GUARD_ALARM": str(alarm),
+            },
+        )
+        try:
+            self.wait_for_path(sleep_ready, "guard did not enter its bounded sleep")
+            wrapper_pid = int(wrapper_pid_path.read_text(encoding="ascii").strip())
+            sleep_release.write_text("release\n", encoding="utf-8")
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0, stdout + stderr)
+            self.assertFalse(term.exists(), "mismatched guard identity received TERM")
+            self.assertFalse(alarm.exists(), "stop latch did not win before ALRM")
+            with self.assertRaises(ProcessLookupError):
+                os.kill(wrapper_pid, 0)
+            self.assertEqual(
+                list((self.real_var / "run").glob(".runner-wait-guard-admit.*")),
+                [],
+            )
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.communicate(timeout=5)
+
+    def test_runner_guard_identity_verification_reentry_fails_closed(self) -> None:
+        controller = self.real_target / "libexec/sdsync-controller"
+        controller_source = controller.read_text(encoding="utf-8")
+        common = self.real_target / "libexec/sdsync-common"
+        common_source = common.read_text(encoding="utf-8")
+        identity_bound = (
+            "    process_identity_pid=$1\n"
+            "    process_identity_start=$2\n"
+            "    process_identity_boot=$3\n"
+        )
+        sleep_handoff = (
+            "            # A shutdown trap can run after spawn but before this exact tuple is\n"
+            "            # published. Its latch closes that handoff without PID-only signals.\n"
+        )
+        term_handler = (
+            "        request_runner_guard_shutdown() {\n"
+            "            child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))\n"
+        )
+        guard_reap = '    reap_direct_child_interruption_safe "$runner_guard_pid"\n'
+        probe_needle = "trap cleanup_controller 0\n\n"
+        self.assertEqual(common_source.count(identity_bound), 1)
+        for needle in (sleep_handoff, term_handler, guard_reap, probe_needle):
+            self.assertEqual(controller_source.count(needle), 1, needle)
+        common.write_text(
+            common_source.replace(
+                identity_bound,
+                identity_bound
+                + '    if [ "${SDSYNC_TEST_GUARD_REENTRY:-false}" = true ] '
+                '&& [ -f "$SDSYNC_TEST_GUARD_REENTRY_PID" ]; then\n'
+                '        runner_guard_reentry_expected=$(sed -n \'1p\' '
+                '"$SDSYNC_TEST_GUARD_REENTRY_PID")\n'
+                '        if [ "$process_identity_pid" = "$runner_guard_reentry_expected" ] '
+                '&& [ ! -e "$SDSYNC_TEST_GUARD_REENTRY_ONCE" ]; then\n'
+                '            : > "$SDSYNC_TEST_GUARD_REENTRY_ONCE"\n'
+                '            : > "$SDSYNC_TEST_GUARD_REENTRY_VERIFY_READY"\n'
+                '            while [ ! -e "$SDSYNC_TEST_GUARD_REENTRY_VERIFY_RELEASE" ]; do '
+                '/bin/sleep 0.01; done\n'
+                '        elif [ -e "$SDSYNC_TEST_GUARD_REENTRY_ONCE" ] '
+                '&& [ ! -e "$SDSYNC_TEST_GUARD_REENTRY_VERIFY_RELEASE" ]; then\n'
+                '            : > "$SDSYNC_TEST_GUARD_REENTRY_NESTED"\n'
+                "        fi\n"
+                "    fi\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        common.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(common, self.drop_uid, self.drop_gid)
+        controller_source = controller_source.replace(
+            sleep_handoff,
+            '            if [ "${SDSYNC_TEST_GUARD_REENTRY:-false}" = true ]; then\n'
+            '                : > "$SDSYNC_TEST_GUARD_REENTRY_SLEEP_READY"\n'
+            '                while [ "$runner_guard_shutdown" = false ] '
+            '&& [ ! -e "$SDSYNC_TEST_GUARD_REENTRY_SLEEP_RELEASE" ]; do '
+            '/bin/sleep 0.01; done\n'
+            "            fi\n"
+            + sleep_handoff,
+            1,
+        ).replace(
+            term_handler,
+            term_handler
+            + '            [ "${SDSYNC_TEST_GUARD_REENTRY:-false}" != true ] || '
+            ': > "$SDSYNC_TEST_GUARD_REENTRY_TERM"\n',
+            1,
+        ).replace(
+            guard_reap,
+            '    [ "${SDSYNC_TEST_GUARD_REENTRY:-false}" != true ] || '
+            ': > "$SDSYNC_TEST_GUARD_REENTRY_REAP_READY"\n'
+            + guard_reap,
+            1,
+        )
+        probe = r'''trap cleanup_controller 0
+
+if [ "${SDSYNC_TEST_GUARD_REENTRY:-false}" = true ]; then
+    launch_admitted_child sleep guard_reentry \
+        "$SDSYNC_TEST_GUARD_REENTRY_HELPER" \
+        "$SDSYNC_TEST_GUARD_REENTRY_HELPER_READY" || exit 232
+    while [ ! -e "$SDSYNC_TEST_GUARD_REENTRY_HELPER_READY" ]; do /bin/sleep 0; done
+    start_runner_wait_guard || exit 233
+    printf '%s\n' "$runner_wait_guard_pid" > "$SDSYNC_TEST_GUARD_REENTRY_PID"
+    while [ ! -e "$SDSYNC_TEST_GUARD_REENTRY_SLEEP_READY" ]; do /bin/sleep 0; done
+    runner_wait_guard_start=$((runner_wait_guard_start + 1))
+    : > "$SDSYNC_TEST_GUARD_REENTRY_PROBE_READY"
+    guard_reentry_stop_rc=0
+    stop_runner_wait_guard || guard_reentry_stop_rc=$?
+    [ "$guard_reentry_stop_rc" -eq 0 ] || exit 234
+    guard_reentry_term_seen=false
+    [ ! -e "$SDSYNC_TEST_GUARD_REENTRY_TERM" ] || guard_reentry_term_seen=true
+    [ -f "$SDSYNC_TEST_GUARD_REENTRY_NESTED" ] || exit 236
+    [ -z "$runner_wait_guard_pid" ] \
+        && [ -z "$runner_wait_guard_stop_path" ] || exit 237
+    if [ -n "$sleep_pid" ]; then
+        work_child_identity_is_running "$sleep_pid" \
+            "$sleep_pid_start" "$sleep_pid_boot" || exit 238
+        kill -KILL "$sleep_pid"
+        wait "$sleep_pid" 2>/dev/null || true
+        sleep_pid=
+        sleep_pid_start=
+        sleep_pid_boot=
+    fi
+    [ "$guard_reentry_term_seen" = false ] || exit 235
+    trap - 0
+    exit 0
+fi
+
+'''
+        controller.write_text(
+            controller_source.replace(probe_needle, probe, 1), encoding="utf-8"
+        )
+        controller.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(controller, self.drop_uid, self.drop_gid)
+
+        helper = self.root / "guard-reentry-stubborn-sleep"
+        helper.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "trap '' TERM\n"
+            'printf \'%s\\n\' "$$" > "$1"\n'
+            "while :; do /bin/sleep 1; done\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(helper, self.drop_uid, self.drop_gid)
+
+        def run_reentry_probe(suffix: str, expected_rc: int, expect_term: bool) -> None:
+            paths = {
+                name: self.root / f"guard-reentry-{suffix}-{name}"
+                for name in (
+                    "pid",
+                    "once",
+                    "verify-ready",
+                    "verify-release",
+                    "nested",
+                    "sleep-ready",
+                    "sleep-release",
+                    "helper-ready",
+                    "probe-ready",
+                    "reap-ready",
+                    "term",
+                )
+            }
+            environment = {
+                "SDSYNC_TEST_GUARD_REENTRY": "true",
+                "SDSYNC_TEST_GUARD_REENTRY_PID": str(paths["pid"]),
+                "SDSYNC_TEST_GUARD_REENTRY_ONCE": str(paths["once"]),
+                "SDSYNC_TEST_GUARD_REENTRY_VERIFY_READY": str(paths["verify-ready"]),
+                "SDSYNC_TEST_GUARD_REENTRY_VERIFY_RELEASE": str(
+                    paths["verify-release"]
+                ),
+                "SDSYNC_TEST_GUARD_REENTRY_NESTED": str(paths["nested"]),
+                "SDSYNC_TEST_GUARD_REENTRY_SLEEP_READY": str(paths["sleep-ready"]),
+                "SDSYNC_TEST_GUARD_REENTRY_SLEEP_RELEASE": str(
+                    paths["sleep-release"]
+                ),
+                "SDSYNC_TEST_GUARD_REENTRY_HELPER": str(helper),
+                "SDSYNC_TEST_GUARD_REENTRY_HELPER_READY": str(paths["helper-ready"]),
+                "SDSYNC_TEST_GUARD_REENTRY_PROBE_READY": str(paths["probe-ready"]),
+                "SDSYNC_TEST_GUARD_REENTRY_REAP_READY": str(paths["reap-ready"]),
+                "SDSYNC_TEST_GUARD_REENTRY_TERM": str(paths["term"]),
+            }
+            process = self.shell_process(controller, extra_environment=environment)
+            try:
+                self.wait_for_path(paths["probe-ready"], "reentry probe did not start")
+                self.wait_for_path(
+                    paths["verify-ready"], "outer guard identity check did not pause"
+                )
+                os.kill(process.pid, signal.SIGTERM)
+                self.wait_for_path(
+                    paths["nested"], "TERM did not re-enter the shared identity verifier"
+                )
+                paths["verify-release"].write_text("release\n", encoding="ascii")
+                self.wait_for_path(
+                    paths["reap-ready"], "guard stop did not reach latch-authorized reap"
+                )
+                if expect_term:
+                    self.wait_for_path(
+                        paths["term"],
+                        "raw re-entered verifier did not authorize guard TERM",
+                        timeout=2.0,
+                    )
+                else:
+                    time.sleep(0.2)
+                    self.assertFalse(
+                        paths["term"].exists(),
+                        "trap-safe wrapper authorized guard TERM",
+                    )
+                paths["sleep-release"].write_text("release\n", encoding="ascii")
+                stdout, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, expected_rc, stdout + stderr)
+                self.assertEqual(paths["term"].exists(), expect_term)
+                guard_pid = int(paths["pid"].read_text(encoding="ascii").strip())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(guard_pid, 0)
+                self.assertEqual(
+                    list((self.real_var / "run").glob(".runner-wait-guard-admit.*")),
+                    [],
+                )
+            finally:
+                if process.poll() is None:
+                    paths["verify-release"].touch()
+                    paths["sleep-release"].touch()
+                    if paths["helper-ready"].is_file():
+                        try:
+                            os.kill(
+                                int(
+                                    paths["helper-ready"]
+                                    .read_text(encoding="ascii")
+                                    .strip()
+                                ),
+                                signal.SIGKILL,
+                            )
+                        except (ProcessLookupError, ValueError):
+                            pass
+                    process.terminate()
+                    process.communicate(timeout=5)
+
+        run_reentry_probe("guarded", 0, False)
+        raw_guard_call = 'runner_guard_identity_is_live "$runner_guard_pid"'
+        instrumented_controller = controller.read_text(encoding="utf-8")
+        self.assertEqual(instrumented_controller.count(raw_guard_call), 2)
+        controller.write_text(
+            instrumented_controller.replace(
+                raw_guard_call,
+                'process_identity_is_live "$runner_guard_pid"',
+            ),
+            encoding="utf-8",
+        )
+        controller.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(controller, self.drop_uid, self.drop_gid)
+        run_reentry_probe("raw-control", 235, True)
+
+    def test_runner_guard_stop_channel_tamper_fails_closed(self) -> None:
+        controller = self.real_target / "libexec/sdsync-controller"
+        controller_source = controller.read_text(encoding="utf-8")
+        metadata_recheck = (
+            "    runner_guard_stop_recheck=$(stat -c '%d:%i:%u:%a' \\\n"
+            '        "$runner_guard_stop_checked" 2>/dev/null || true)\n'
+        )
+        term_handler = (
+            "        request_runner_guard_shutdown() {\n"
+            "            child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))\n"
+        )
+        sleep_handoff = (
+            "            # A shutdown trap can run after spawn but before this exact tuple is\n"
+            "            # published. Its latch closes that handoff without PID-only signals.\n"
+        )
+        probe_needle = "trap cleanup_controller 0\n\n"
+        for needle in (metadata_recheck, term_handler, sleep_handoff, probe_needle):
+            self.assertEqual(controller_source.count(needle), 1, needle)
+        controller_source = controller_source.replace(
+            metadata_recheck,
+            '    [ "${SDSYNC_TEST_GUARD_TAMPER_MODE:-}" != metadata ] || '
+            'chmod 0711 "$runner_guard_stop_checked"\n'
+            + metadata_recheck,
+            1,
+        ).replace(
+            term_handler,
+            term_handler
+            + '            [ -z "${SDSYNC_TEST_GUARD_TAMPER_TERM:-}" ] || '
+            ': > "$SDSYNC_TEST_GUARD_TAMPER_TERM"\n',
+            1,
+        ).replace(
+            sleep_handoff,
+            '            if [ "${SDSYNC_TEST_GUARD_TAMPER_MODE:-}" = runtime_exact ] '
+            '|| [ "${SDSYNC_TEST_GUARD_TAMPER_MODE:-}" = runtime_unknown ]; then\n'
+            '                : > "$SDSYNC_TEST_GUARD_TAMPER_SLEEP_READY"\n'
+            '                while [ "$runner_guard_shutdown" = false ] '
+            '&& [ ! -e "$SDSYNC_TEST_GUARD_TAMPER_SLEEP_RELEASE" ]; do '
+            '/bin/sleep 0.01; done\n'
+            "            fi\n"
+            + sleep_handoff,
+            1,
+        )
+        probe = r'''trap cleanup_controller 0
+
+if [ "${SDSYNC_TEST_GUARD_TAMPER_PROBE:-false}" = true ]; then
+    guard_tamper_mode=${SDSYNC_TEST_GUARD_TAMPER_MODE:?}
+    guard_tamper_parent=$$
+    guard_tamper_parent_start=$(process_start_time "$guard_tamper_parent") || exit 207
+    guard_tamper_sequence=$((child_admission_sequence + 1))
+    guard_tamper_admission=$runtime_root/.runner-wait-guard-admit.${guard_tamper_parent}.${guard_tamper_parent_start}.${guard_tamper_sequence}
+    guard_tamper_stop=$guard_tamper_admission.stop
+    case $guard_tamper_mode in
+        symlink)
+            ln -s "$SDSYNC_TEST_GUARD_TAMPER_VICTIM" "$guard_tamper_stop"
+            ;;
+        regular)
+            printf 'guard-victim\n' > "$guard_tamper_stop"
+            chmod 0600 "$guard_tamper_stop"
+            ;;
+        nonempty)
+            mkdir "$guard_tamper_stop"
+            chmod 0700 "$guard_tamper_stop"
+            printf 'guard-victim\n' > "$guard_tamper_stop/entry"
+            ;;
+        wrong_mode)
+            mkdir "$guard_tamper_stop"
+            chmod 0755 "$guard_tamper_stop"
+            ;;
+        metadata)
+            mkdir "$guard_tamper_stop"
+            chmod 0700 "$guard_tamper_stop"
+            guard_tamper_rc=0
+            runner_guard_stop_status "$guard_tamper_stop" || guard_tamper_rc=$?
+            [ "$guard_tamper_rc" -eq 73 ] || exit 208
+            guard_tamper_publish_rc=0
+            publish_runner_guard_stop "$guard_tamper_stop" || guard_tamper_publish_rc=$?
+            [ "$guard_tamper_publish_rc" -eq 73 ] || exit 209
+            [ "$(stat -c '%a' "$guard_tamper_stop")" = 711 ] || exit 210
+            chmod 0700 "$guard_tamper_stop"
+            rmdir "$guard_tamper_stop"
+            trap - 0
+            exit 0
+            ;;
+        runtime_exact|runtime_unknown)
+            start_runner_wait_guard || exit 211
+            guard_tamper_pid=$runner_wait_guard_pid
+            guard_tamper_real_start=$runner_wait_guard_start
+            guard_tamper_stop=$runner_wait_guard_stop_path
+            printf '%s\n' "$guard_tamper_pid" > "$SDSYNC_TEST_GUARD_TAMPER_PID"
+            while [ ! -e "$SDSYNC_TEST_GUARD_TAMPER_SLEEP_READY" ]; do /bin/sleep 0; done
+            printf 'guard-victim\n' > "$guard_tamper_stop"
+            chmod 0600 "$guard_tamper_stop"
+            if [ "$guard_tamper_mode" = runtime_unknown ]; then
+                runner_wait_guard_start=$((guard_tamper_real_start + 1))
+            fi
+            guard_tamper_rc=0
+            stop_runner_wait_guard || guard_tamper_rc=$?
+            [ "$guard_tamper_rc" -eq 73 ] || exit 212
+            [ -f "$guard_tamper_stop" ] && [ ! -L "$guard_tamper_stop" ] || exit 214
+            [ "$(sed -n '1p' "$guard_tamper_stop")" = guard-victim ] || exit 215
+            if [ "$guard_tamper_mode" = runtime_exact ]; then
+                [ -f "$SDSYNC_TEST_GUARD_TAMPER_TERM" ] || exit 216
+                [ -z "$runner_wait_guard_pid" ] \
+                    && [ -z "$runner_wait_guard_stop_path" ] || exit 218
+                pid_is_live "$guard_tamper_pid" && exit 231
+                rm -f "$guard_tamper_stop"
+            else
+                [ "$runner_wait_guard_pid" = "$guard_tamper_pid" ] || exit 213
+                [ ! -e "$SDSYNC_TEST_GUARD_TAMPER_TERM" ] || exit 216
+                : > "$SDSYNC_TEST_GUARD_TAMPER_RETURNED"
+                while [ ! -e "$SDSYNC_TEST_GUARD_TAMPER_RELEASE" ]; do /bin/sleep 0; done
+                : > "$SDSYNC_TEST_GUARD_TAMPER_SLEEP_RELEASE"
+                runner_wait_guard_start=$guard_tamper_real_start
+                rm -f "$guard_tamper_stop"
+                stop_runner_wait_guard || exit 217
+                [ -z "$runner_wait_guard_pid" ] \
+                    && [ -z "$runner_wait_guard_stop_path" ] || exit 218
+            fi
+            for guard_tamper_path in "$runtime_root"/.runner-wait-guard-admit.*; do
+                [ -e "$guard_tamper_path" ] || [ -L "$guard_tamper_path" ] || continue
+                exit 219
+            done
+            trap - 0
+            exit 0
+            ;;
+        *) exit 220 ;;
+    esac
+
+    guard_tamper_rc=0
+    start_runner_wait_guard || guard_tamper_rc=$?
+    [ "$guard_tamper_rc" -eq 73 ] || exit 221
+    [ -z "$runner_wait_guard_pid" ] && [ -z "$runner_wait_guard_stop_path" ] || exit 222
+    case $guard_tamper_mode in
+        symlink)
+            [ -L "$guard_tamper_stop" ] || exit 223
+            [ "$(sed -n '1p' "$SDSYNC_TEST_GUARD_TAMPER_VICTIM")" = survivor ] || exit 224
+            rm -f "$guard_tamper_stop"
+            ;;
+        regular)
+            [ -f "$guard_tamper_stop" ] && [ ! -L "$guard_tamper_stop" ] || exit 225
+            [ "$(sed -n '1p' "$guard_tamper_stop")" = guard-victim ] || exit 226
+            rm -f "$guard_tamper_stop"
+            ;;
+        nonempty)
+            [ -f "$guard_tamper_stop/entry" ] || exit 227
+            [ "$(sed -n '1p' "$guard_tamper_stop/entry")" = guard-victim ] || exit 228
+            rm -f "$guard_tamper_stop/entry"
+            rmdir "$guard_tamper_stop"
+            ;;
+        wrong_mode)
+            [ -d "$guard_tamper_stop" ] && [ ! -L "$guard_tamper_stop" ] || exit 229
+            [ "$(stat -c '%a' "$guard_tamper_stop")" = 755 ] || exit 230
+            chmod 0700 "$guard_tamper_stop"
+            rmdir "$guard_tamper_stop"
+            ;;
+    esac
+    trap - 0
+    exit 0
+fi
+
+'''
+        controller.write_text(
+            controller_source.replace(probe_needle, probe, 1), encoding="utf-8"
+        )
+        controller.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(controller, self.drop_uid, self.drop_gid)
+
+        victim = self.root / "guard-stop-symlink-victim"
+        victim.write_text("survivor\n", encoding="ascii")
+        if os.getuid() == 0:
+            os.chown(victim, self.drop_uid, self.drop_gid)
+        for mode in ("symlink", "regular", "nonempty", "wrong_mode", "metadata"):
+            with self.subTest(mode=mode):
+                completed = self.shell(
+                    controller,
+                    extra_environment={
+                        "SDSYNC_TEST_GUARD_TAMPER_PROBE": "true",
+                        "SDSYNC_TEST_GUARD_TAMPER_MODE": mode,
+                        "SDSYNC_TEST_GUARD_TAMPER_VICTIM": str(victim),
+                    },
+                    timeout=8,
+                )
+                self.assertEqual(
+                    completed.returncode, 0, completed.stdout + completed.stderr
+                )
+                self.assertEqual(victim.read_text(encoding="ascii"), "survivor\n")
+
+        exact_term = self.root / "guard-tamper-exact.term"
+        exact_ready = self.root / "guard-tamper-exact.ready"
+        exact_release = self.root / "guard-tamper-exact.release"
+        exact_pid = self.root / "guard-tamper-exact.pid"
+        exact = self.shell(
+            controller,
+            extra_environment={
+                "SDSYNC_TEST_GUARD_TAMPER_PROBE": "true",
+                "SDSYNC_TEST_GUARD_TAMPER_MODE": "runtime_exact",
+                "SDSYNC_TEST_GUARD_TAMPER_TERM": str(exact_term),
+                "SDSYNC_TEST_GUARD_TAMPER_SLEEP_READY": str(exact_ready),
+                "SDSYNC_TEST_GUARD_TAMPER_SLEEP_RELEASE": str(exact_release),
+                "SDSYNC_TEST_GUARD_TAMPER_PID": str(exact_pid),
+            },
+            timeout=8,
+        )
+        self.assertEqual(exact.returncode, 0, exact.stdout + exact.stderr)
+        self.assertTrue(exact_term.is_file(), "exact guard was not terminated")
+
+        returned = self.root / "guard-tamper-returned"
+        release = self.root / "guard-tamper-release"
+        sleep_ready = self.root / "guard-tamper-unknown.ready"
+        sleep_release = self.root / "guard-tamper-unknown.release"
+        wrapper_pid_path = self.root / "guard-tamper-wrapper.pid"
+        term = self.root / "guard-tamper.term"
+        process = self.shell_process(
+            controller,
+            extra_environment={
+                "SDSYNC_TEST_GUARD_TAMPER_PROBE": "true",
+                "SDSYNC_TEST_GUARD_TAMPER_MODE": "runtime_unknown",
+                "SDSYNC_TEST_GUARD_TAMPER_RETURNED": str(returned),
+                "SDSYNC_TEST_GUARD_TAMPER_RELEASE": str(release),
+                "SDSYNC_TEST_GUARD_TAMPER_PID": str(wrapper_pid_path),
+                "SDSYNC_TEST_GUARD_TAMPER_TERM": str(term),
+                "SDSYNC_TEST_GUARD_TAMPER_SLEEP_READY": str(sleep_ready),
+                "SDSYNC_TEST_GUARD_TAMPER_SLEEP_RELEASE": str(sleep_release),
+            },
+        )
+        try:
+            deadline = time.monotonic() + 5.0
+            while not returned.exists() and process.poll() is None:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
+            if not returned.exists() and process.poll() is not None:
+                stdout, stderr = process.communicate()
+                self.fail(
+                    "runtime-unknown guard probe exited before the bounded return: "
+                    f"{process.returncode}\n{stdout}{stderr}"
+                )
+            self.assertTrue(
+                returned.exists(),
+                "unsafe stop publication plus unknown identity waited on the PID",
+            )
+            self.assertIsNone(process.poll())
+            self.assertFalse(term.exists(), "unknown guard identity received TERM")
+            wrapper_pid = int(wrapper_pid_path.read_text(encoding="ascii").strip())
+            release.write_text("release\n", encoding="utf-8")
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0, stdout + stderr)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(wrapper_pid, 0)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.communicate(timeout=5)
 
     def test_unexpected_controller_exit_exact_stops_and_reaps_admitted_sleep(self) -> None:
         child = self.root / "cleanup-admitted-sleep"
@@ -8281,6 +10355,12 @@ fi
                 "fixture unexpectedly crossed into the runner-lock path",
             )
             self.assertTrue((processing / f"{job_id}.secret").is_file())
+            tree_starts = {
+                tree_pid: self.capture_process_start_ticks(
+                    tree_pid, label="queued consumer tree"
+                )
+                for tree_pid in tree_pids
+            }
 
             stopped = self.shell(self.lifecycle, "stop", timeout=15)
             self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
@@ -8292,8 +10372,11 @@ fi
                 else "controller log missing",
             )
             for tree_pid in tree_pids:
-                with self.assertRaises(ProcessLookupError):
-                    os.kill(tree_pid, 0)
+                self.wait_for_exact_process_terminal(
+                    tree_pid,
+                    tree_starts[tree_pid],
+                    label="queued consumer tree",
+                )
             self.assertFalse((processing / f"{job_id}.json").exists())
             self.assertFalse((processing / f"{job_id}.secret").exists())
             self.assertFalse(request.exists())
@@ -9201,6 +11284,141 @@ fi
                 (lock / "pid").unlink(missing_ok=True)
                 lock.rmdir()
 
+    def test_private_process_lock_reaps_exact_zombie_and_rejects_reuse_or_partial_procfs(self) -> None:
+        probe = self.root / "exact-lock-probe"
+        probe.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            '. "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+            "process_start_time() {\n"
+            "    inspected_pid=$1\n"
+            '    [ "$inspected_pid" != "${SDSYNC_TEST_PARTIAL_PID:-}" ] || return 1\n'
+            "    inspected_start=$(awk '{ print $22 }' \"/proc/$inspected_pid/stat\" 2>/dev/null || true)\n"
+            "    case $inspected_start in ''|*[!0-9]*|0) return 1 ;; esac\n"
+            "    printf '%s\\n' \"$inspected_start\"\n"
+            "}\n"
+            'if [ "$1" = status ]; then\n'
+            '    status=0; private_process_lock_is_live "$SDSYNC_TEST_LOCK" || status=$?\n'
+            '    exit "$status"\n'
+            "fi\n"
+            'acquire_private_process_lock "$SDSYNC_TEST_LOCK"\n'
+            'release_private_process_lock "$SDSYNC_TEST_LOCK"\n',
+            encoding="utf-8",
+        )
+        probe.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(probe, self.drop_uid, self.drop_gid)
+
+        lock = self.real_var / "run/exact-terminal.lock"
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+
+        def seed_owner(pid: int, start: str) -> None:
+            lock.mkdir(mode=0o700)
+            owner = lock / "pid"
+            owner.write_text(f"{pid}\n{start}\n{boot}\n", encoding="ascii")
+            owner.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(lock, self.drop_uid, self.drop_gid)
+                os.chown(owner, self.drop_uid, self.drop_gid)
+
+        def remove_lock() -> None:
+            if lock.is_dir():
+                for entry in lock.iterdir():
+                    entry.unlink(missing_ok=True)
+                lock.rmdir()
+
+        ready_read, ready_write = os.pipe()
+        release_read, release_write = os.pipe()
+        zombie_pid = os.fork()
+        if zombie_pid == 0:
+            try:
+                os.close(ready_read)
+                os.close(release_write)
+                if os.getuid() == 0:
+                    os.setgroups([])
+                    os.setgid(self.drop_gid)
+                    os.setuid(self.drop_uid)
+                os.write(ready_write, b"1")
+                os.read(release_read, 1)
+            finally:
+                os._exit(0)
+
+        os.close(ready_write)
+        os.close(release_read)
+        sleeper: subprocess.Popen[bytes] | None = None
+        try:
+            self.assertEqual(os.read(ready_read, 1), b"1")
+            zombie_start = self.capture_process_start_ticks(
+                zombie_pid, label="private-lock zombie"
+            )
+            os.write(release_write, b"1")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if self.exact_process_state(
+                    zombie_pid, zombie_start, label="private-lock zombie"
+                ) in {"Z", "X", "x"}:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("private-lock child did not become terminal")
+
+            seed_owner(zombie_pid, zombie_start)
+            environment = {"SDSYNC_TEST_LOCK": str(lock)}
+            terminal = self.shell(probe, "status", extra_environment=environment)
+            self.assertEqual(terminal.returncode, 1, terminal.stdout + terminal.stderr)
+            recovered = self.shell(probe, "acquire", extra_environment=environment)
+            self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+            self.assertFalse(lock.exists())
+
+            sleeper = subprocess.Popen(
+                ["/bin/sleep", "30"],
+                preexec_fn=(
+                    (lambda: (os.setgroups([]), os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
+                    if os.getuid() == 0
+                    else None
+                ),
+            )
+            sleeper_start = self.capture_process_start_ticks(
+                sleeper.pid, label="private-lock live process"
+            )
+            seed_owner(sleeper.pid, str(int(sleeper_start) + 1))
+            reused = self.shell(probe, "status", extra_environment=environment)
+            self.assertEqual(reused.returncode, 73, reused.stdout + reused.stderr)
+            refused_reuse = self.shell(probe, "acquire", extra_environment=environment)
+            self.assertEqual(refused_reuse.returncode, 73, refused_reuse.stdout + refused_reuse.stderr)
+            self.assertIsNone(sleeper.poll(), "PID-reuse guard signaled the unrelated process")
+            self.assertTrue((lock / "pid").is_file())
+            remove_lock()
+
+            seed_owner(sleeper.pid, sleeper_start)
+            partial_environment = {
+                **environment,
+                "SDSYNC_TEST_PARTIAL_PID": str(sleeper.pid),
+            }
+            partial = self.shell(probe, "status", extra_environment=partial_environment)
+            self.assertEqual(partial.returncode, 73, partial.stdout + partial.stderr)
+            refused_partial = self.shell(
+                probe, "acquire", extra_environment=partial_environment
+            )
+            self.assertEqual(
+                refused_partial.returncode,
+                73,
+                refused_partial.stdout + refused_partial.stderr,
+            )
+            self.assertIsNone(sleeper.poll(), "partial procfs guard signaled the live process")
+            self.assertTrue((lock / "pid").is_file())
+        finally:
+            os.close(ready_read)
+            os.close(release_write)
+            remove_lock()
+            try:
+                os.waitpid(zombie_pid, 0)
+            except ChildProcessError:
+                pass
+            if sleeper is not None and sleeper.poll() is None:
+                sleeper.terminate()
+                sleeper.wait(timeout=5)
+
     def test_remote_path_rejects_empty_dot_trailing_and_dsm_managed_components(self) -> None:
         invalid_paths = (
             "/home//Drive",
@@ -9709,6 +11927,12 @@ fi
             "  else\n"
             "    race_result=$?\n"
             "  fi\n"
+            'elif [ "$race_service" = api ]; then\n'
+            '  if signal_exact_api_identity "$race_pid" "$race_start" "$race_boot"; then\n'
+            "    race_result=0\n"
+            "  else\n"
+            "    race_result=$?\n"
+            "  fi\n"
             "else\n"
             '  if signal_verified_service "$race_service" "$race_pid" "$race_service"; then\n'
             "    race_result=0\n"
@@ -9722,7 +11946,7 @@ fi
             '  [ "$race_mode" != zombie ] || wait "$race_pid"\n'
             "else\n"
             '  [ "$race_result" -ne 0 ] || exit 84\n'
-            '  if [ "$race_service" = controller ]; then\n'
+            '  if [ "$race_service" = controller ] || [ "$race_service" = api ]; then\n'
             '    process_identity_is_live "$race_pid" "$race_start" "$race_boot" || exit 85\n'
             "  else\n"
             '    verified_service_pid_matches "$race_service" "$race_pid" || exit 85\n'
@@ -9744,7 +11968,8 @@ fi
             lifecycle_source,
         )
         self.assertIn(
-            'signal_verified_service api "$saved_api_pid" API',
+            'signal_exact_api_identity "$saved_api_pid" "$saved_api_start" \\\n'
+            '                "$saved_api_boot"',
             lifecycle_source,
         )
 
@@ -9777,6 +12002,11 @@ fi
                         if service == "controller":
                             self.assertIn(
                                 "failed to signal exact controller identity",
+                                result.stdout,
+                            )
+                        elif service == "api":
+                            self.assertIn(
+                                "failed to signal exact API process identity",
                                 result.stdout,
                             )
                         else:
@@ -10523,6 +12753,7 @@ fi
             f'. "{self.real_target / "libexec/sdsync-common"}"\n'
             "ensure_layout\n"
             "printf '0123456789012345678901234567890123456789' > \"$log_root/controller.log\"\n"
+            "finish_private_file \"$log_root/controller.log\"\n"
             "append_rotating_log \"$log_root/controller.log\" 32 2 'scheduled entry'\n",
             encoding="utf-8",
         )
@@ -10645,6 +12876,9 @@ fi
         start = self.shell_process(self.lifecycle, "start")
         wait_for(ready, start, "second start")
         controller_process = int(process_pid.read_text(encoding="utf-8").strip())
+        controller_start = self.capture_process_start_ticks(
+            controller_process, label="concurrent controller"
+        )
         self.assertFalse((self.real_var / "run/controller.pid").exists())
 
         stop = self.shell_process(self.lifecycle, "stop")
@@ -10658,14 +12892,11 @@ fi
         self.assertEqual(stop.returncode, 0, (stop_stdout, stop_stderr))
         self.assertFalse((self.real_var / "run/controller.ready").exists())
 
-        for _ in range(100):
-            try:
-                os.kill(controller_process, 0)
-            except ProcessLookupError:
-                break
-            time.sleep(0.02)
-        else:
-            self.fail("controller survived a successful concurrent stop")
+        self.wait_for_exact_process_terminal(
+            controller_process,
+            controller_start,
+            label="concurrent controller",
+        )
         self.assertFalse((self.real_var / "run/api.sock").exists())
         self.assertFalse((self.real_var / "run/api.pid").exists())
         self.assertFalse((self.real_var / "run/controller.pid").exists())
@@ -10693,6 +12924,12 @@ fi
                 self.fail("timed out waiting for controller pre-PID barrier")
             controller_pid = int(process_pid.read_text(encoding="ascii").strip())
             api_pid = int((self.real_var / "run/api.pid").read_text(encoding="ascii").strip())
+            captured_starts = {
+                captured: self.capture_process_start_ticks(
+                    captured, label="orphaned service"
+                )
+                for captured in (controller_pid, api_pid)
+            }
             owner = self.real_var / "run/controller.lock/pid"
             owner_fields = owner.read_text(encoding="ascii").splitlines()
             self.assertEqual(int(owner_fields[0]), controller_pid)
@@ -10709,14 +12946,11 @@ fi
             self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
             self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
             for captured in (controller_pid, api_pid):
-                for _ in range(200):
-                    try:
-                        os.kill(captured, 0)
-                    except ProcessLookupError:
-                        break
-                    time.sleep(0.01)
-                else:
-                    self.fail(f"orphaned service PID {captured} survived stop")
+                self.wait_for_exact_process_terminal(
+                    captured,
+                    captured_starts[captured],
+                    label="orphaned service",
+                )
             for path in (
                 self.real_var / "run/controller.pid",
                 self.real_var / "run/controller.ready",
@@ -10763,6 +12997,13 @@ fi
                 self.fail("timed out waiting for controller pre-lock barrier")
             controller_pid = int(process_pid.read_text(encoding="ascii").strip())
             api_pid = int((self.real_var / "run/api.pid").read_text(encoding="ascii").strip())
+            captured_starts = {
+                captured: Path(f"/proc/{captured}/stat")
+                .read_text(encoding="ascii")
+                .rsplit(") ", 1)[1]
+                .split()[19]
+                for captured in (controller_pid, api_pid)
+            }
             self.assertTrue((self.real_var / "run/controller.starting").is_file())
             self.assertFalse((self.real_var / "run/controller.lock").exists())
             self.assertFalse((self.real_var / "run/controller.pid").exists())
@@ -10775,8 +13016,20 @@ fi
             for captured in (controller_pid, api_pid):
                 for _ in range(200):
                     try:
-                        os.kill(captured, 0)
-                    except ProcessLookupError:
+                        fields = (
+                            Path(f"/proc/{captured}/stat")
+                            .read_text(encoding="ascii")
+                            .rsplit(") ", 1)[1]
+                            .split()
+                        )
+                    except FileNotFoundError:
+                        break
+                    self.assertEqual(
+                        fields[19],
+                        captured_starts[captured],
+                        f"pre-lock service PID {captured} was reused before verification",
+                    )
+                    if fields[0] in {"Z", "X", "x"}:
                         break
                     time.sleep(0.01)
                 else:
@@ -10861,6 +13114,7 @@ fi
             },
         )
         api_pid: int | None = None
+        api_start: str | None = None
         try:
             for _ in range(250):
                 if ready.exists():
@@ -10872,6 +13126,9 @@ fi
             else:
                 self.fail("timed out waiting for API pre-PID barrier")
             api_pid = int(ready.read_text(encoding="ascii").strip())
+            api_start = self.capture_process_start_ticks(
+                api_pid, label="pre-publication API"
+            )
             for path in (
                 self.real_var / "run/api.pid",
                 self.real_var / "run/api.bound",
@@ -10887,14 +13144,11 @@ fi
             stopped = self.shell(self.lifecycle, "stop", timeout=15)
             self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
             release.touch()
-            for _ in range(200):
-                try:
-                    os.kill(api_pid, 0)
-                except ProcessLookupError:
-                    break
-                time.sleep(0.01)
-            else:
-                self.fail("supervised API survived death of its pre-publication parent")
+            self.wait_for_exact_process_terminal(
+                api_pid,
+                api_start,
+                label="pre-publication API",
+            )
             time.sleep(0.1)
             for path in (
                 self.real_var / "run/api.pid",
@@ -10909,11 +13163,17 @@ fi
                 start.kill()
                 start.communicate(timeout=5)
             release.touch(exist_ok=True)
-            if api_pid is not None:
-                try:
+            if api_pid is not None and api_start is not None:
+                api_state = self.exact_process_state(
+                    api_pid, api_start, label="pre-publication API cleanup"
+                )
+                if api_state is not None and api_state not in {"Z", "X", "x"}:
                     os.kill(api_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                    self.wait_for_exact_process_terminal(
+                        api_pid,
+                        api_start,
+                        label="pre-publication API cleanup",
+                    )
 
     def test_failed_start_cleanup_catches_api_publishing_after_timeout(self) -> None:
         pre_pid_ready = self.root / "api-cleanup-pre-pid.ready"
@@ -11160,18 +13420,18 @@ fi
             else:
                 self.fail("API did not reach mismatched-identity barrier")
             api_pid = int(pre_pid_ready.read_text(encoding="ascii").strip())
+            api_start = self.capture_process_start_ticks(
+                api_pid, label="mismatched test child"
+            )
             stdout, stderr = start.communicate(timeout=10)
             self.assertEqual(start.returncode, 1, stdout + stderr)
             self.assertIn("live or uninspectable", stdout)
             self.assertFalse(term_observed.exists(), "mismatched PID identity was signaled")
-            for _ in range(300):
-                try:
-                    os.kill(api_pid, 0)
-                except ProcessLookupError:
-                    break
-                time.sleep(0.01)
-            else:
-                self.fail("parent-death supervision did not retire mismatched test child")
+            self.wait_for_exact_process_terminal(
+                api_pid,
+                api_start,
+                label="mismatched test child",
+            )
             self.assertFalse((self.real_var / "run/controller.starting").exists())
             self.assertFalse((self.real_var / "run/lifecycle.lock").exists())
         finally:
@@ -11287,19 +13547,20 @@ fi
             (self.real_var / "run/controller.pid").read_text(encoding="utf-8").strip()
         )
         api_pid = int((self.real_var / "run/api.pid").read_text(encoding="utf-8").strip())
+        captured_starts = {
+            captured: self.capture_process_start_ticks(
+                captured, label="externally killed service"
+            )
+            for captured in (controller_pid, api_pid)
+        }
         os.kill(controller_pid, signal.SIGKILL)
         os.kill(api_pid, signal.SIGKILL)
-        for _ in range(200):
-            live = []
-            for pid in (controller_pid, api_pid):
-                try:
-                    os.kill(pid, 0)
-                    live.append(pid)
-                except ProcessLookupError:
-                    pass
-            if not live:
-                break
-            time.sleep(0.01)
+        for captured in (controller_pid, api_pid):
+            self.wait_for_exact_process_terminal(
+                captured,
+                captured_starts[captured],
+                label="externally killed service",
+            )
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
         self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
@@ -11674,6 +13935,7 @@ fi
             ),
         )
         core_pid: int | None = None
+        core_start: str | None = None
         try:
             for _ in range(300):
                 if core_pid_file.is_file():
@@ -11685,6 +13947,9 @@ fi
                 time.sleep(0.02)
             else:
                 self.fail("legacy runner did not publish its core PID")
+            core_start = self.capture_process_start_ticks(
+                core_pid, label="legacy orphan core"
+            )
             os.kill(runner.pid, signal.SIGKILL)
             runner.communicate(timeout=5)
             old_stop = self.shell(old_scripts / "start-stop-status", "stop", timeout=15)
@@ -11696,12 +13961,11 @@ fi
             )
             self.assertNotEqual(blocked.returncode, 0, blocked.stdout + blocked.stderr)
             os.kill(core_pid, signal.SIGKILL)
-            for _ in range(300):
-                if not Path(f"/proc/{core_pid}").exists():
-                    break
-                time.sleep(0.02)
-            else:
-                self.fail("legacy orphan core did not terminate")
+            self.wait_for_exact_process_terminal(
+                core_pid,
+                core_start,
+                label="legacy orphan core",
+            )
             accepted = self.shell(
                 self.lifecycle_dir / "preupgrade",
                 extra_environment={"SYNOPKG_OLD_PKGVER": "26.10-1"},
@@ -11711,15 +13975,17 @@ fi
             if runner.poll() is None:
                 runner.kill()
                 runner.communicate(timeout=5)
-            if core_pid is not None and Path(f"/proc/{core_pid}").exists():
-                try:
+            if core_pid is not None and core_start is not None:
+                core_state = self.exact_process_state(
+                    core_pid, core_start, label="legacy orphan core cleanup"
+                )
+                if core_state is not None and core_state not in {"Z", "X", "x"}:
                     os.kill(core_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                for _ in range(300):
-                    if not Path(f"/proc/{core_pid}").exists():
-                        break
-                    time.sleep(0.02)
+                    self.wait_for_exact_process_terminal(
+                        core_pid,
+                        core_start,
+                        label="legacy orphan core cleanup",
+                    )
             core.write_bytes(saved_core)
             core.chmod(saved_core_mode)
             shutil.copy2(HERE / "package/libexec/sdsync-common", installed_common)
@@ -11930,12 +14196,30 @@ fi
             else:
                 self.fail("runner/core did not publish their test identities")
             self.assertEqual(runner_pid, running.pid)
+            core_start = (
+                Path(f"/proc/{core_pid}/stat")
+                .read_text(encoding="ascii")
+                .rsplit(") ", 1)[1]
+                .split()[19]
+            )
             os.kill(runner_pid, signal.SIGKILL)
             running.communicate(timeout=5)
             for _ in range(300):
                 try:
-                    os.kill(core_pid, 0)  # type: ignore[arg-type]
-                except ProcessLookupError:
+                    core_fields = (
+                        Path(f"/proc/{core_pid}/stat")
+                        .read_text(encoding="ascii")
+                        .rsplit(") ", 1)[1]
+                        .split()
+                    )
+                except FileNotFoundError:
+                    break
+                self.assertEqual(
+                    core_fields[19],
+                    core_start,
+                    f"core PID {core_pid} was reused before verification",
+                )
+                if core_fields[0] in {"Z", "X", "x"}:
                     break
                 time.sleep(0.02)
             else:

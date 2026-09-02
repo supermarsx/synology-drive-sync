@@ -1,10 +1,11 @@
 #[cfg(target_os = "windows")]
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use keyring_core::{CredentialStore, Entry, Error as KeyringError};
 use sha2::{Digest, Sha256};
-use totp_rs::{Algorithm, Secret, TOTP};
+use totp_rs::{Algorithm, Builder, Secret, Totp};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::api::normalize_base_url;
@@ -94,7 +95,7 @@ impl OsVault {
 
     pub fn store_totp_secret(&self, secret: &[u8]) -> Result<()> {
         validate_secret_length(secret.len())?;
-        let encoded = Zeroizing::new(synology_totp(secret).get_secret_base32());
+        let encoded = Zeroizing::new(synology_totp(secret).secret().to_base32());
         self.entry(CredentialKind::Totp, "initialization")?
             .set_password(&encoded)
             .map_err(|error| vault_error("TOTP seed storage", error))
@@ -188,14 +189,22 @@ pub fn parse_totp_secret(input: &str) -> Result<Zeroizing<Vec<u8>>> {
 pub fn generate_totp(secret: &[u8]) -> Result<Zeroizing<String>> {
     validate_secret_length(secret.len())?;
     let totp = synology_totp(secret);
-    let code = totp.generate_current().map_err(|_| {
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
         Error::Message("cannot generate TOTP because the system clock is invalid".to_owned())
     })?;
-    Ok(Zeroizing::new(code))
+    Ok(Zeroizing::new(
+        totp.generate(timestamp.as_secs()).to_string(),
+    ))
 }
 
-fn synology_totp(secret: &[u8]) -> TOTP {
-    TOTP::new_unchecked(Algorithm::SHA1, 6, 1, 30, secret.to_vec())
+fn synology_totp(secret: &[u8]) -> Totp {
+    Builder::new()
+        .with_algorithm(Algorithm::SHA1)
+        .with_digits(6)
+        .with_skew(1)
+        .with_step_duration(30)
+        .with_secret(secret.to_vec())
+        .build_noncompliant()
 }
 
 fn parse_totp_uri(input: &str) -> Result<Zeroizing<Vec<u8>>> {
@@ -290,10 +299,8 @@ fn decode_base32(input: &str) -> Result<Zeroizing<Vec<u8>>> {
     while encoded.ends_with('=') {
         encoded.pop();
     }
-    let secret = Secret::Encoded(encoded.to_string());
-    Ok(Zeroizing::new(
-        secret.to_bytes().map_err(|_| invalid_totp())?,
-    ))
+    let secret = Secret::try_from_base32(encoded.as_str()).map_err(|_| invalid_totp())?;
+    Ok(Zeroizing::new(secret.as_bytes().to_vec()))
 }
 
 fn profile_fingerprint(base_url: &str, username: &str) -> String {
@@ -485,10 +492,10 @@ mod tests {
     fn generates_rfc_6238_sha1_vectors() {
         let secret = parse_totp_secret(RFC_SECRET).unwrap();
         let totp = synology_totp(&secret);
-        assert_eq!(totp.generate(59), "287082");
-        assert_eq!(totp.generate(1_111_111_109), "081804");
-        assert_eq!(totp.generate(1_234_567_890), "005924");
-        assert_eq!(totp.generate(20_000_000_000), "353130");
+        assert_eq!(totp.generate(59).to_string(), "287082");
+        assert_eq!(totp.generate(1_111_111_109).to_string(), "081804");
+        assert_eq!(totp.generate(1_234_567_890).to_string(), "005924");
+        assert_eq!(totp.generate(20_000_000_000).to_string(), "353130");
     }
 
     #[test]

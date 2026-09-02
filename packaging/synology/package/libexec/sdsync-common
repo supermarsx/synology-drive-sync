@@ -38,6 +38,7 @@ log_root=$package_var/log
 controller_log=$log_root/controller.log
 activity_log=$log_root/activity.log
 audit_log=$log_root/audit.log
+doctor_inventory_log=$log_root/doctor-inventory.log
 doctor_state=$state_root/doctor.state
 alert_state=$state_root/alerts.state
 package_home_real=$(CDPATH='' cd -- "$package_home" 2>/dev/null && pwd -P || printf '%s' "$package_home")
@@ -353,12 +354,51 @@ controller_pid_file_safe() {
 }
 
 remove_stale_controller_pid_file() {
+    expected_stale_controller_pid=${1:-}
+    expected_stale_controller_start=${2:-}
+    expected_stale_controller_boot=${3:-}
     [ -e "$controller_pid_file" ] || [ -L "$controller_pid_file" ] || return 0
     controller_pid_file_safe || return $?
-    pid_is_live "$controller_pid_value" && return 75
+    if [ -n "$expected_stale_controller_pid" ] || \
+        [ -n "$expected_stale_controller_start" ] || \
+        [ -n "$expected_stale_controller_boot" ]; then
+        is_pid "$expected_stale_controller_pid" || return 73
+        case $expected_stale_controller_start in ''|*[!0-9]*|0) return 73 ;; esac
+        valid_boot_identity "$expected_stale_controller_boot" || return 73
+        [ "$controller_pid_value" = "$expected_stale_controller_pid" ] || return 73
+        stale_controller_process_status=0
+        process_identity_is_live "$expected_stale_controller_pid" \
+            "$expected_stale_controller_start" "$expected_stale_controller_boot" || \
+            stale_controller_process_status=$?
+        case $stale_controller_process_status in
+            0) return 75 ;;
+            1) ;;
+            *) return 73 ;;
+        esac
+    else
+        # A one-line PID file has no reusable process identity. It is removable
+        # only when that PID slot is absent; a zombie/live slot remains stale
+        # but unproven until matching readiness supplies start/boot evidence.
+        pid_is_live "$controller_pid_value" && return 75
+    fi
     stale_controller_pid_identity=$(stat -c '%d:%i' "$controller_pid_file" 2>/dev/null || true)
     [ -n "$stale_controller_pid_identity" ] || return 73
     controller_pid_file_safe || return 73
+    [ -z "$expected_stale_controller_pid" ] || \
+        [ "$controller_pid_value" = "$expected_stale_controller_pid" ] || return 73
+    if [ -n "$expected_stale_controller_pid" ]; then
+        stale_controller_process_status=0
+        process_identity_is_live "$expected_stale_controller_pid" \
+            "$expected_stale_controller_start" "$expected_stale_controller_boot" || \
+            stale_controller_process_status=$?
+        case $stale_controller_process_status in
+            0) return 75 ;;
+            1) ;;
+            *) return 73 ;;
+        esac
+    else
+        pid_is_live "$controller_pid_value" && return 75
+    fi
     stale_controller_pid_recheck=$(stat -c '%d:%i' "$controller_pid_file" 2>/dev/null || true)
     [ "$stale_controller_pid_recheck" = "$stale_controller_pid_identity" ] || return 73
     rm -f "$controller_pid_file"
@@ -670,6 +710,9 @@ remove_stale_controller_start_lease() {
 }
 
 remove_stale_controller_ready() {
+    stale_ready_pid=
+    stale_ready_start=
+    stale_ready_boot=
     [ -e "$controller_ready_file" ] || [ -L "$controller_ready_file" ] || return 0
     # The caller owns controller.lock here. That means a dead controller's
     # readiness tuple cannot satisfy controller_persisted_identity_status:
@@ -809,11 +852,43 @@ process_identity_is_live() {
     process_identity_boot=$3
     process_identity_current_boot=$(boot_identity) || return 73
     [ "$process_identity_current_boot" = "$process_identity_boot" ] || return 1
-    pid_is_live "$process_identity_pid" || return 1
-    process_identity_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "/proc/$process_identity_pid/status" 2>/dev/null | sed -n '1p')
-    [ "$process_identity_uid" = "$path_owner" ] || return 1
+    is_pid "$process_identity_pid" || return 73
+    case $process_identity_start in ''|*[!0-9]*|0) return 73 ;; esac
+    [ -e "/proc/$process_identity_pid" ] || return 1
+    case ${path_owner:-} in ''|*[!0-9]*) return 73 ;; esac
+
     process_identity_actual_start=$(process_start_time "$process_identity_pid" 2>/dev/null || true)
-    [ "$process_identity_actual_start" = "$process_identity_start" ]
+    process_identity_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "/proc/$process_identity_pid/status" 2>/dev/null | sed -n '1p')
+    process_identity_state=$(sed -n 's/^.*) \([^ ]\).*/\1/p' \
+        "/proc/$process_identity_pid/stat" 2>/dev/null || true)
+    if [ -z "$process_identity_actual_start" ] || [ -z "$process_identity_uid" ] || \
+        [ -z "$process_identity_state" ]; then
+        [ -e "/proc/$process_identity_pid" ] || return 1
+        return 73
+    fi
+    [ "$process_identity_actual_start" = "$process_identity_start" ] && \
+        [ "$process_identity_uid" = "$path_owner" ] || return 73
+
+    # Recheck the exact tuple immediately before classifying it. A stale lock
+    # may be recovered only after this process is absent or terminal; a reused,
+    # partially readable, or unknown PID remains fail closed.
+    process_identity_start_recheck=$(process_start_time "$process_identity_pid" 2>/dev/null || true)
+    process_identity_uid_recheck=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "/proc/$process_identity_pid/status" 2>/dev/null | sed -n '1p')
+    process_identity_state_recheck=$(sed -n 's/^.*) \([^ ]\).*/\1/p' \
+        "/proc/$process_identity_pid/stat" 2>/dev/null || true)
+    if [ -z "$process_identity_start_recheck" ] || [ -z "$process_identity_uid_recheck" ] || \
+        [ -z "$process_identity_state_recheck" ]; then
+        [ -e "/proc/$process_identity_pid" ] || return 1
+        return 73
+    fi
+    [ "$process_identity_start_recheck" = "$process_identity_start" ] && \
+        [ "$process_identity_uid_recheck" = "$path_owner" ] || return 73
+    case $process_identity_state_recheck in
+        Z|X|x) return 1 ;;
+        R|S|D|T|t|K|W|P|I) return 0 ;;
+        *) return 73 ;;
+    esac
 }
 
 read_private_lock_owner() {
@@ -1606,14 +1681,46 @@ write_run_state() {
     mv -f "$run_temp" "$run_state"
 }
 
+private_log_path_safe_or_absent() {
+    private_log_path=$1
+    if [ ! -e "$private_log_path" ] && [ ! -L "$private_log_path" ]; then
+        return 0
+    fi
+    case ${path_owner:-} in ''|*[!0-9]*) return 73 ;; esac
+    [ ! -L "$private_log_path" ] && [ -f "$private_log_path" ] || {
+        echo "refusing unsafe package log file: $private_log_path" >&2
+        return 73
+    }
+    private_log_contract=$(stat -c '%u:%a:%h' "$private_log_path" 2>/dev/null || true)
+    [ "$private_log_contract" = "$path_owner:600:1" ] || {
+        echo "refusing unsafe package log ownership, mode, or link count: $private_log_path" >&2
+        return 73
+    }
+}
+
 rotate_log() {
     rotate_path=$1
     rotate_limit=${2:-10485760}
     rotate_keep=${3:-5}
-    if [ -L "$rotate_path" ]; then
-        echo "refusing symlinked log file: $rotate_path" >&2
-        return 73
-    fi
+    case $rotate_limit in ''|*[!0-9]*|0) return 73 ;; esac
+    case $rotate_keep in ''|*[!0-9]*|0) return 73 ;; esac
+    [ "$rotate_keep" -le 64 ] 2>/dev/null || return 73
+
+    # Validate the complete active/rotation set before appending or moving any
+    # pathname. Package logs are private regular files; silently repairing an
+    # existing hard link, symlink, foreign owner, or permissive mode could
+    # modify or replace a different file.
+    rotate_contract_index=0
+    while [ "$rotate_contract_index" -le "$rotate_keep" ]; do
+        if [ "$rotate_contract_index" -eq 0 ]; then
+            rotate_contract_path=$rotate_path
+        else
+            rotate_contract_path=$rotate_path.$rotate_contract_index
+        fi
+        private_log_path_safe_or_absent "$rotate_contract_path" || return $?
+        rotate_contract_index=$((rotate_contract_index + 1))
+    done
+
     [ -f "$rotate_path" ] || return 0
     rotate_size=$(wc -c < "$rotate_path" | tr -d ' ')
     case $rotate_size in ''|*[!0-9]*) return 73 ;; esac
@@ -1644,6 +1751,9 @@ append_rotating_log() {
     if [ "$append_status" -eq 0 ]; then
         finish_private_file "$append_path" || append_status=$?
     fi
+    if [ "$append_status" -eq 0 ]; then
+        private_log_path_safe_or_absent "$append_path" || append_status=$?
+    fi
     umask "$append_old_umask"
     return "$append_status"
 }
@@ -1653,15 +1763,21 @@ json_quote() {
     # logs can still contain them.  Keep this encoder self-contained so the DSM
     # package does not depend on Python, jq, or a particular BusyBox extension.
     printf '%s' "${1:-}" | LC_ALL=C awk '
-        BEGIN { printf "\"" }
+        BEGIN {
+            slash = sprintf("%c", 92)
+            printf "\""
+        }
         {
-            if (NR > 1) printf "\\n"
-            gsub(/\\/, "\\\\")
-            gsub(/"/, "\\\"")
-            gsub(/\t/, "\\t")
-            gsub(/\r/, "\\r")
-            gsub(/[\001-\010\013\014\016-\037]/, "?")
-            printf "%s", $0
+            if (NR > 1) printf "%sn", slash
+            for (cursor = 1; cursor <= length($0); cursor++) {
+                character = substr($0, cursor, 1)
+                if (character == slash) printf "%s%s", slash, slash
+                else if (character == "\"") printf "%s\"", slash
+                else if (character == "\t") printf "%st", slash
+                else if (character == "\r") printf "%sr", slash
+                else if (character ~ /[\001-\010\013\014\016-\037]/) printf "?"
+                else printf "%s", character
+            }
         }
         END { printf "\"" }
     '
@@ -1679,7 +1795,7 @@ append_activity() {
     activity_actor=${9:-}
     case $activity_code in
         run.started|run.succeeded|run.failed|routine.deferred|routine.retry_scheduled|\
-        doctor.succeeded|doctor.failed|configuration.changed|notification.unavailable|\
+        doctor.succeeded|doctor.failed|doctor.inventory|configuration.changed|notification.unavailable|\
         audit.requested|audit.succeeded|audit.failed|audit.outcome_unknown|\
         module.requested|module.succeeded|module.failed|module.outcome_unknown|\
         security.policy_changed|security.log_tail_recovered|security.failed|\

@@ -520,13 +520,100 @@ publish_child_admission() {
     fi
 }
 
+runner_guard_stop_status() {
+    runner_guard_stop_checked=$1
+    [ -e "$runner_guard_stop_checked" ] || [ -L "$runner_guard_stop_checked" ] || return 1
+    [ -d "$runner_guard_stop_checked" ] && [ ! -L "$runner_guard_stop_checked" ] \
+        || return 73
+    runner_guard_stop_metadata=$(stat -c '%d:%i:%u:%a' \
+        "$runner_guard_stop_checked" 2>/dev/null || true)
+    case $runner_guard_stop_metadata in
+        *:"$path_owner":700) ;;
+        *) return 73 ;;
+    esac
+    for runner_guard_stop_entry in \
+        "$runner_guard_stop_checked"/* \
+        "$runner_guard_stop_checked"/.[!.]* \
+        "$runner_guard_stop_checked"/..?*; do
+        [ -e "$runner_guard_stop_entry" ] || [ -L "$runner_guard_stop_entry" ] || continue
+        return 73
+    done
+    runner_guard_stop_recheck=$(stat -c '%d:%i:%u:%a' \
+        "$runner_guard_stop_checked" 2>/dev/null || true)
+    [ "$runner_guard_stop_recheck" = "$runner_guard_stop_metadata" ] || return 73
+    return 0
+}
+
+publish_runner_guard_stop() {
+    runner_guard_stop_target=$1
+    runner_guard_existing_status=0
+    runner_guard_stop_status "$runner_guard_stop_target" || runner_guard_existing_status=$?
+    case $runner_guard_existing_status in
+        0) return 0 ;;
+        1) ;;
+        *) return 73 ;;
+    esac
+    (umask 077; mkdir "$runner_guard_stop_target") 2>/dev/null || \
+        runner_guard_stop_status "$runner_guard_stop_target" || return 73
+    runner_guard_stop_status "$runner_guard_stop_target"
+}
+
+cleanup_runner_guard_channels() {
+    runner_guard_cleanup_admission=$1
+    runner_guard_cleanup_stop=$2
+    runner_guard_cleanup_result=0
+    if [ -n "$runner_guard_cleanup_admission" ] \
+        && { [ -e "$runner_guard_cleanup_admission" ] \
+            || [ -L "$runner_guard_cleanup_admission" ]; }; then
+        runner_guard_cleanup_decision=
+        if private_control_file "$runner_guard_cleanup_admission" \
+            && IFS= read -r runner_guard_cleanup_decision < "$runner_guard_cleanup_admission" \
+            && { [ "$runner_guard_cleanup_decision" = go ] \
+                || [ "$runner_guard_cleanup_decision" = abort ]; }; then
+            rm -f "$runner_guard_cleanup_admission" || runner_guard_cleanup_result=73
+        else runner_guard_cleanup_result=73
+        fi
+    fi
+    if [ -n "$runner_guard_cleanup_stop" ] \
+        && { [ -e "$runner_guard_cleanup_stop" ] || [ -L "$runner_guard_cleanup_stop" ]; }; then
+        if runner_guard_stop_status "$runner_guard_cleanup_stop"; then
+            rmdir "$runner_guard_cleanup_stop" || runner_guard_cleanup_result=73
+        else runner_guard_cleanup_result=73
+        fi
+    fi
+    if [ -n "$runner_guard_cleanup_admission" ]; then
+        for runner_guard_cleanup_path in \
+            "$runner_guard_cleanup_admission.go.tmp.$$" \
+            "$runner_guard_cleanup_admission.abort.tmp.$$"; do
+            [ -e "$runner_guard_cleanup_path" ] \
+                || [ -L "$runner_guard_cleanup_path" ] || continue
+            if private_control_file "$runner_guard_cleanup_path"; then
+                rm -f "$runner_guard_cleanup_path" || runner_guard_cleanup_result=73
+            else runner_guard_cleanup_result=73
+            fi
+        done
+    fi
+    return "$runner_guard_cleanup_result"
+}
+
 wait_for_child_admission() {
     waited_admission_path=$1
     waited_admission_parent=$2
     waited_admission_parent_start=$3
     waited_admission_parent_boot=$4
+    waited_admission_stop=${5:-}
     waited_admission_round=0
     while [ "$waited_admission_round" -lt 3 ]; do
+        if [ -n "$waited_admission_stop" ]; then
+            waited_admission_stop_status=0
+            runner_guard_stop_status "$waited_admission_stop" \
+                || waited_admission_stop_status=$?
+            case $waited_admission_stop_status in
+                0) return 75 ;;
+                1) ;;
+                *) return 73 ;;
+            esac
+        fi
         process_identity_is_live "$waited_admission_parent" \
             "$waited_admission_parent_start" "$waited_admission_parent_boot" || return 1
         # Yield immediately while the parent captures/publishes. Integer zero
@@ -534,6 +621,16 @@ wait_for_child_admission() {
         # admission delay without depending on fractional sleep support.
         waited_admission_yield=0
         while [ "$waited_admission_yield" -lt 32 ]; do
+            if [ -n "$waited_admission_stop" ]; then
+                waited_admission_stop_status=0
+                runner_guard_stop_status "$waited_admission_stop" \
+                    || waited_admission_stop_status=$?
+                case $waited_admission_stop_status in
+                    0) return 75 ;;
+                    1) ;;
+                    *) return 73 ;;
+                esac
+            fi
             if [ -e "$waited_admission_path" ] || [ -L "$waited_admission_path" ]; then
                 private_control_file "$waited_admission_path" || return 1
                 waited_admission_decision=
@@ -726,7 +823,9 @@ start_runner_wait_guard() {
     runner_guard_parent_boot=$(boot_identity) || return 73
     child_admission_sequence=$((child_admission_sequence + 1))
     runner_guard_admission=$runtime_root/.runner-wait-guard-admit.${runner_guard_parent}.${runner_guard_parent_start}.${child_admission_sequence}
+    runner_guard_stop=$runner_guard_admission.stop
     [ ! -e "$runner_guard_admission" ] && [ ! -L "$runner_guard_admission" ] || return 73
+    [ ! -e "$runner_guard_stop" ] && [ ! -L "$runner_guard_stop" ] || return 73
     (
         runner_guard_sleep_pid=
         runner_guard_sleep_start=
@@ -737,14 +836,33 @@ start_runner_wait_guard() {
             runner_guard_shutdown=true
             stop_runner_guard_sleep
         }
+        runner_guard_stop_requested() {
+            runner_guard_child_stop_status=0
+            runner_guard_stop_status "$runner_guard_stop" \
+                || runner_guard_child_stop_status=$?
+            case $runner_guard_child_stop_status in
+                0) return 0 ;;
+                1) return 1 ;;
+                *) exit 73 ;;
+            esac
+        }
         trap request_runner_guard_shutdown TERM INT HUP
         trap '' USR1 USR2 ALRM
+        runner_guard_admission_status=0
         wait_for_child_admission "$runner_guard_admission" "$runner_guard_parent" \
-            "$runner_guard_parent_start" "$runner_guard_parent_boot" || exit 0
+            "$runner_guard_parent_start" "$runner_guard_parent_boot" \
+            "$runner_guard_stop" || runner_guard_admission_status=$?
+        case $runner_guard_admission_status in
+            0) ;;
+            73) exit 73 ;;
+            *) exit 0 ;;
+        esac
+        runner_guard_stop_requested && exit 0
         [ "$runner_guard_shutdown" = false ] || exit 0
         while [ "$runner_guard_shutdown" = false ] && \
             process_identity_is_live "$runner_guard_parent" \
             "$runner_guard_parent_start" "$runner_guard_parent_boot"; do
+            runner_guard_stop_requested && exit 0
             /bin/sleep 1 &
             launched_runner_guard_sleep_pid=$!
             if ! capture_work_child_identity "$launched_runner_guard_sleep_pid" \
@@ -767,6 +885,10 @@ start_runner_wait_guard() {
             runner_guard_sleep_pid=
             runner_guard_sleep_start=
             runner_guard_sleep_boot=
+            # The private stop latch is checked immediately before ALRM. This
+            # closes stop races even when exact procfs identity verification is
+            # transiently unavailable to the parent during guard teardown.
+            runner_guard_stop_requested && exit 0
             # PID liveness alone is unsafe after abrupt controller death: the
             # kernel may reuse that number. Recheck the exact PID/start/boot
             # tuple immediately before every signal so an unrelated successor
@@ -781,32 +903,47 @@ start_runner_wait_guard() {
         "$runner_guard_parent_boot"; then
         publish_child_admission "$runner_guard_admission" abort 2>/dev/null || true
         reap_direct_child_interruption_safe "$launched_runner_wait_guard_pid"
-        rm -f "$runner_guard_admission" \
-            "$runner_guard_admission".*.tmp.$$ 2>/dev/null || true
+        cleanup_runner_guard_channels "$runner_guard_admission" \
+            "$runner_guard_stop" 2>/dev/null || true
         return 73
     fi
     runner_wait_guard_start=$captured_work_child_start
     runner_wait_guard_boot=$captured_work_child_boot
     runner_wait_guard_pid=$launched_runner_wait_guard_pid
     runner_wait_guard_admission_path=$runner_guard_admission
+    runner_wait_guard_stop_path=$runner_guard_stop
+    runner_wait_guard_admitted=false
     # Runner-guard admission tests instrument this exact captured-before-go
     # handoff. A wake here must abort the guard and skip the unguarded wait.
     if [ "$shutdown" = true ] || [ "$wait_interrupted" = true ]; then
-        publish_child_admission "$runner_guard_admission" abort 2>/dev/null || \
-            stop_runner_wait_guard
-        reap_direct_child_interruption_safe "$launched_runner_wait_guard_pid"
-        runner_wait_guard_pid=
-        runner_wait_guard_start=
-        runner_wait_guard_boot=
-        runner_wait_guard_admission_path=
-        rm -f "$runner_guard_admission" \
-            "$runner_guard_admission".*.tmp.$$ 2>/dev/null || true
+        runner_guard_cancel_status=0
+        stop_runner_wait_guard || runner_guard_cancel_status=$?
+        [ "$runner_guard_cancel_status" -eq 0 ] || return 73
         return 0
     fi
     if ! publish_child_admission "$runner_guard_admission" go; then
-        stop_runner_wait_guard
+        stop_runner_wait_guard 2>/dev/null || true
         return 73
     fi
+    runner_wait_guard_admitted=true
+}
+
+runner_guard_identity_is_live() {
+    # TERM may interrupt the shared verifier and make request_shutdown verify
+    # an active work child with the same global scratch variables. Bind this
+    # guard tuple in wrapper-private names and reject a resumed result unless
+    # the shared verifier still describes the exact tuple it was asked to read.
+    runner_guard_verify_pid=$1
+    runner_guard_verify_start=$2
+    runner_guard_verify_boot=$3
+    runner_guard_verify_result=0
+    process_identity_is_live "$runner_guard_verify_pid" \
+        "$runner_guard_verify_start" "$runner_guard_verify_boot" \
+        || runner_guard_verify_result=$?
+    [ "$process_identity_pid" = "$runner_guard_verify_pid" ] \
+        && [ "$process_identity_start" = "$runner_guard_verify_start" ] \
+        && [ "$process_identity_boot" = "$runner_guard_verify_boot" ] || return 73
+    return "$runner_guard_verify_result"
 }
 
 stop_runner_wait_guard() {
@@ -814,17 +951,63 @@ stop_runner_wait_guard() {
     runner_guard_start=$runner_wait_guard_start
     runner_guard_boot=$runner_wait_guard_boot
     runner_guard_admission_path=$runner_wait_guard_admission_path
+    runner_guard_stop_path=$runner_wait_guard_stop_path
+    runner_guard_admitted=$runner_wait_guard_admitted
+    [ -n "$runner_guard_pid" ] || return 0
+
+    # One private latch belongs to each admitted guard. Publish it before the
+    # optional exact signal so a transient procfs read cannot strand teardown.
+    runner_guard_stop_published=false
+    runner_guard_stop_result=0
+    if [ -n "$runner_guard_stop_path" ] \
+        && publish_runner_guard_stop "$runner_guard_stop_path"; then
+        runner_guard_stop_published=true
+        if [ "$runner_guard_admitted" != true ]; then
+            # Abort reduces pre-admission latency. The guard also polls the stop
+            # latch while awaiting admission, so this best-effort hint is not
+            # the authorization or correctness boundary.
+            publish_child_admission "$runner_guard_admission_path" abort \
+                2>/dev/null || true
+        fi
+    else
+        runner_guard_stop_result=73
+    fi
+
+    runner_guard_reap_authorized=$runner_guard_stop_published
+    runner_guard_identity_status=0
+    runner_guard_identity_is_live "$runner_guard_pid" "$runner_guard_start" \
+        "$runner_guard_boot" || runner_guard_identity_status=$?
+    case $runner_guard_identity_status in
+        0)
+            if kill -TERM "$runner_guard_pid" 2>/dev/null; then
+                runner_guard_reap_authorized=true
+            elif [ "$runner_guard_stop_published" != true ]; then
+                runner_guard_identity_recheck=0
+                runner_guard_identity_is_live "$runner_guard_pid" "$runner_guard_start" \
+                    "$runner_guard_boot" || runner_guard_identity_recheck=$?
+                [ "$runner_guard_identity_recheck" -eq 1 ] \
+                    && runner_guard_reap_authorized=true
+            fi
+            ;;
+        1) runner_guard_reap_authorized=true ;;
+        *) ;;
+    esac
+    if [ "$runner_guard_reap_authorized" != true ]; then
+        # Publication and exact identity both failed closed. Retain the tuple
+        # for diagnosis/retry; never PID-only signal or synchronously wait.
+        return 73
+    fi
+
+    reap_direct_child_interruption_safe "$runner_guard_pid"
+    cleanup_runner_guard_channels "$runner_guard_admission_path" \
+        "$runner_guard_stop_path" || runner_guard_stop_result=73
     runner_wait_guard_pid=
     runner_wait_guard_start=
     runner_wait_guard_boot=
     runner_wait_guard_admission_path=
-    [ -n "$runner_guard_pid" ] || return 0
-    if work_child_identity_is_running "$runner_guard_pid" "$runner_guard_start" "$runner_guard_boot"; then
-        kill -TERM "$runner_guard_pid" 2>/dev/null || true
-    fi
-    reap_direct_child_interruption_safe "$runner_guard_pid"
-    [ -z "$runner_guard_admission_path" ] || rm -f "$runner_guard_admission_path" \
-        "$runner_guard_admission_path".*.tmp.$$ 2>/dev/null || true
+    runner_wait_guard_stop_path=
+    runner_wait_guard_admitted=false
+    return "$runner_guard_stop_result"
 }
 
 stop_work_children_bounded() {
@@ -1232,6 +1415,8 @@ runner_wait_guard_pid=
 runner_wait_guard_start=
 runner_wait_guard_boot=
 runner_wait_guard_admission_path=
+runner_wait_guard_stop_path=
+runner_wait_guard_admitted=false
 child_admission_sequence=0
 admitted_child_status=
 child_wait_interrupt_epoch=0
@@ -1246,7 +1431,7 @@ cleanup_controller() {
     # reap them before releasing controller ownership.
     trap - 0
     trap '' TERM INT HUP USR2 ALRM
-    stop_runner_wait_guard
+    stop_runner_wait_guard 2>/dev/null || true
     if [ -n "$sleep_pid" ]; then
         signal_controller_sleep
         reap_direct_child_interruption_safe "$sleep_pid"

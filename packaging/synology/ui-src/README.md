@@ -7,13 +7,23 @@ runtime entry registers `SYNO.SDS.App.SynologyDriveSync.Instance` with
 
 ## Reproducible host build
 
-The dependency pins match Synology's DSM 7.2.2 `ExamplePackage/ui` toolchain,
-including Vue 2.7.14 and pnpm 8.15.9's lockfile v6 format:
+The dependency pins retain Synology's required Vue 2 AppWindow ABI while using
+the latest compatible Vue 2.7, Vue Loader 15, webpack, Babel, and pnpm releases.
+Vue 3 is intentionally excluded because DSM supplies the Vue 2 global at runtime:
 
 ```sh
 pnpm install --frozen-lockfile
+pnpm audit --audit-level high
 pnpm build
 ```
+
+`pnpm-workspace.yaml` forces every build-tool consumer, including Vue Loader
+15's legacy component compiler helper, onto the audited PostCSS 8.5.26 release.
+The high-severity audit gate must remain clean. The registry still reports one
+low Vue 2 advisory and one moderate `vue-template-compiler` advisory with no
+Vue 2 patch; both packages are build-time-only here, source input is restricted
+to this repository, and the generated AppWindow externalizes Vue to DSM's
+required Vue 2 runtime ABI.
 
 The architecture-neutral outputs are:
 

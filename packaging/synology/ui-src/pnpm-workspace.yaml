@@ -1,0 +1,11 @@
+packages:
+  - .
+
+minimumReleaseAgeExclude:
+  - webpack@5.110.3
+
+# vue-loader 15's build-only compiler helper still requests PostCSS 7. Pin the
+# patched PostCSS 8 line for every build-tool consumer while DSM continues to
+# supply the required Vue 2 runtime ABI.
+overrides:
+  postcss: 8.5.26

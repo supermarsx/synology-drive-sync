@@ -9,19 +9,23 @@ use synology_drive_sync::sdk::{
 
 struct PromptSecrets;
 
+fn prompt_secret(prompt: &str) -> Result<Secret, SecretProviderError> {
+    let config = rpassword::ConfigBuilder::new()
+        .password_feedback_mask('*')
+        .build();
+    rpassword::prompt_password_with_config(prompt, config)
+        .map(Secret::new)
+        .map_err(|_| SecretProviderError::Unavailable)
+}
+
 impl SecretProvider for PromptSecrets {
     fn password(&mut self) -> Result<Secret, SecretProviderError> {
-        rpassword::prompt_password("DSM password: ")
-            .map(Secret::new)
-            .map_err(|_| SecretProviderError::Unavailable)
+        prompt_secret("DSM password: ")
     }
 
     fn otp(&mut self, challenge: OtpChallenge) -> Result<Option<Secret>, SecretProviderError> {
         eprintln!("DSM OTP challenge: {challenge:?}");
-        rpassword::prompt_password("DSM six-digit OTP: ")
-            .map(Secret::new)
-            .map(Some)
-            .map_err(|_| SecretProviderError::Unavailable)
+        prompt_secret("DSM six-digit OTP: ").map(Some)
     }
 }
 

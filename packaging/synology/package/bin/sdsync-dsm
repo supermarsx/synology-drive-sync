@@ -91,9 +91,16 @@ cleanup_manager_lock() {
     for cleanup_path in "${fragment_temp:-}" "${secret_temp:-}" "${candidate:-}" \
         "${schedule_temp:-}" "${routine_temp:-}" "${routine_graph_temp:-}" "${alert_temp:-}" \
         "${security_temp:-}" \
-        "${api_stdout:-}" "${api_stderr:-}" "${snapshot_json:-}" "${activity_json:-}"; do
+        "${api_stdout:-}" "${api_stderr:-}" "${snapshot_json:-}" "${activity_input:-}" \
+        "${activity_json:-}" \
+        "${source_doctor_output:-}" "${target_doctor_output:-}" \
+        "${doctor_inventory_records:-}"; do
         [ -n "$cleanup_path" ] || continue
-        case $cleanup_path in "$package_home"/*) [ -L "$cleanup_path" ] || rm -f "$cleanup_path" 2>/dev/null || true ;; esac
+        case $cleanup_path in
+            "$package_home"/*|"$package_var"/*)
+                [ -L "$cleanup_path" ] || rm -f "$cleanup_path" 2>/dev/null || true
+                ;;
+        esac
     done
     if [ "$manager_lock_acquired" = true ]; then
         release_private_process_lock "$management_lock" 2>/dev/null || true
@@ -1531,24 +1538,97 @@ api_redact_file() {
     LC_ALL=C awk -v home="$package_home" -v var="$package_var" \
         -v real_home="$package_home_real" -v real_var="$package_var_real" \
         -v byte_limit="$redact_limit" -v truncation_marker="$redact_truncation_marker" '
-        function replace_literal(text, needle, replacement, at) {
+        function replace_literal(text, needle, replacement, result, cursor, relative) {
             if (needle == "") return text
-            while ((at = index(text, needle)) != 0)
-                text = substr(text, 1, at - 1) replacement substr(text, at + length(needle))
-            return text
+            result = ""
+            cursor = 1
+            while ((relative = index(substr(text, cursor), needle)) != 0) {
+                result = result substr(text, cursor, relative - 1) replacement
+                cursor += relative - 1 + length(needle)
+            }
+            return result substr(text, cursor)
+        }
+        function json_escape_text(text, result, cursor, character, code, candidate_code, high, low) {
+            result = ""
+            for (cursor = 1; cursor <= length(text); cursor++) {
+                character = substr(text, cursor, 1)
+                if (character == slash) result = result slash slash
+                else if (character == "\"") result = result slash "\""
+                else if (character == sprintf("%c", 8)) result = result slash "b"
+                else if (character == "\t") result = result slash "t"
+                else if (character == "\n") result = result slash "n"
+                else if (character == sprintf("%c", 12)) result = result slash "f"
+                else if (character == "\r") result = result slash "r"
+                else {
+                    code = 0
+                    for (candidate_code = 1; candidate_code < 32; candidate_code++) {
+                        if (character == sprintf("%c", candidate_code)) { code = candidate_code; break }
+                    }
+                    if (code > 0) {
+                        high = int(code / 16)
+                        low = code % 16
+                        result = result slash "u00" substr(hex, high + 1, 1) substr(hex, low + 1, 1)
+                    } else result = result character
+                }
+            }
+            return result
+        }
+        function redact_json_strings(text, result, cursor, start, escaped, character, token, needle_index) {
+            result = ""
+            cursor = 1
+            while (cursor <= length(text)) {
+                if (substr(text, cursor, 1) != "\"") {
+                    result = result substr(text, cursor, 1)
+                    cursor++
+                    continue
+                }
+                start = cursor++
+                escaped = 0
+                while (cursor <= length(text)) {
+                    character = substr(text, cursor, 1)
+                    if (escaped) escaped = 0
+                    else if (character == slash) escaped = 1
+                    else if (character == "\"") break
+                    cursor++
+                }
+                if (cursor > length(text)) return result substr(text, start)
+                token = substr(text, start, cursor - start + 1)
+                for (needle_index = 1; needle_index <= needle_count; needle_index++)
+                    token = replace_literal(token, encoded_needles[needle_index], "[redacted]")
+                result = result token
+                cursor++
+            }
+            return result
         }
         BEGIN {
+            slash = sprintf("%c", 92)
+            hex = "0123456789abcdef"
             for (argument = 1; argument < ARGC - 1; argument++) {
                 secret = ""
-                if ((getline secret < ARGV[argument]) > 0 && secret != "") needles[++needle_count] = secret
+                if ((getline secret < ARGV[argument]) > 0 && secret != "") {
+                    needle_count++
+                    needles[needle_count] = secret
+                    encoded_needles[needle_count] = json_escape_text(secret)
+                }
                 close(ARGV[argument])
                 ARGV[argument] = ""
             }
         }
         {
             line = $0
-            for (needle_index = 1; needle_index <= needle_count; needle_index++)
-                line = replace_literal(line, needles[needle_index], "[redacted]")
+            first = 1
+            while (first <= length(line) && substr(line, first, 1) ~ /[ \t]/) first++
+            if (substr(line, first, 1) == "{" || substr(line, first, 1) == "[") {
+                # Structured output must stay syntactically valid even when a
+                # credential contains JSON punctuation. Redact only serialized
+                # string tokens, using the exact encoding emitted by serde_json.
+                line = redact_json_strings(line)
+            } else {
+                for (needle_index = 1; needle_index <= needle_count; needle_index++) {
+                    line = replace_literal(line, encoded_needles[needle_index], "[redacted]")
+                    line = replace_literal(line, needles[needle_index], "[redacted]")
+                }
+            }
             gsub(/\033\[[0-9;?]*[ -\/]*[@-~]/, "", line)
             line = replace_literal(line, home, "[package-home]")
             line = replace_literal(line, var, "[package-var]")
@@ -1577,6 +1657,366 @@ api_redact_file() {
             if (truncated && truncation_marker != "") print truncation_marker
         }
     ' "$secret_root"/*.password "$secret_root"/*.totp "$secret_root"/*.remote-log-token "$redact_path"
+}
+
+persist_doctor_inventory_records() {
+    doctor_inventory_source=$1
+    doctor_inventory_fallback_profile=$2
+    [ -f "$doctor_inventory_source" ] && [ ! -L "$doctor_inventory_source" ] || return 73
+    case $doctor_inventory_fallback_profile in
+        all|*[!A-Za-z0-9_-]*)
+            [ "$doctor_inventory_fallback_profile" = all ] || return 64
+            ;;
+    esac
+    for doctor_inventory_secret in "$secret_root"/*.password "$secret_root"/*.totp "$secret_root"/*.remote-log-token; do
+        [ -e "$doctor_inventory_secret" ] || [ -L "$doctor_inventory_secret" ] || continue
+        private_secret_file "$doctor_inventory_secret" || return 73
+    done
+
+    doctor_inventory_records=$state_root/.doctor-inventory.$$.records
+    [ ! -L "$doctor_inventory_records" ] || return 73
+    : > "$doctor_inventory_records" || return 73
+    finish_private_file "$doctor_inventory_records" || { rm -f "$doctor_inventory_records"; doctor_inventory_records=; return 73; }
+    LC_ALL=C awk -v fallback_profile="$doctor_inventory_fallback_profile" -v epoch="$(epoch_now)" '
+        function skip_space(text, cursor) {
+            while (cursor <= length(text) && substr(text, cursor, 1) ~ /[ \t\r\n]/) cursor++
+            return cursor
+        }
+        function value_start(text, key, cursor, quote_start, escaped, character, token, after) {
+            cursor = 1
+            while (cursor <= length(text)) {
+                character = substr(text, cursor, 1)
+                if (character != "\"") { cursor++; continue }
+                quote_start = cursor++
+                escaped = 0
+                while (cursor <= length(text)) {
+                    character = substr(text, cursor, 1)
+                    if (escaped) escaped = 0
+                    else if (character == "\\") escaped = 1
+                    else if (character == "\"") break
+                    cursor++
+                }
+                if (cursor > length(text)) return 0
+                token = substr(text, quote_start, cursor - quote_start + 1)
+                after = skip_space(text, cursor + 1)
+                if (token == "\"" key "\"" && substr(text, after, 1) == ":")
+                    return skip_space(text, after + 1)
+                cursor++
+            }
+            return 0
+        }
+        function object_value_start(text, key, cursor, brace_depth, array_depth, quote_start, escaped, character, token, after) {
+            cursor = skip_space(text, 1)
+            if (substr(text, cursor, 1) != "{") return 0
+            brace_depth = 0
+            array_depth = 0
+            while (cursor <= length(text)) {
+                character = substr(text, cursor, 1)
+                if (character == "\"") {
+                    quote_start = cursor++
+                    escaped = 0
+                    while (cursor <= length(text)) {
+                        character = substr(text, cursor, 1)
+                        if (escaped) escaped = 0
+                        else if (character == slash) escaped = 1
+                        else if (character == "\"") break
+                        cursor++
+                    }
+                    if (cursor > length(text)) return 0
+                    token = substr(text, quote_start, cursor - quote_start + 1)
+                    after = skip_space(text, cursor + 1)
+                    if (brace_depth == 1 && array_depth == 0 && token == "\"" key "\"" && substr(text, after, 1) == ":")
+                        return skip_space(text, after + 1)
+                    cursor++
+                    continue
+                }
+                if (character == "{") brace_depth++
+                else if (character == "}") brace_depth--
+                else if (character == "[") array_depth++
+                else if (character == "]") array_depth--
+                if (brace_depth < 0 || array_depth < 0) return 0
+                cursor++
+            }
+            return 0
+        }
+        function token_at(text, cursor, start, escaped, character) {
+            cursor = skip_space(text, cursor)
+            start = cursor
+            if (substr(text, cursor, 1) == "\"") {
+                cursor++
+                escaped = 0
+                while (cursor <= length(text)) {
+                    character = substr(text, cursor, 1)
+                    if (escaped) escaped = 0
+                    else if (character == "\\") escaped = 1
+                    else if (character == "\"") return substr(text, start, cursor - start + 1)
+                    cursor++
+                }
+                return ""
+            }
+            while (cursor <= length(text)) {
+                character = substr(text, cursor, 1)
+                if (character ~ /[ \t\r\n,}]/ || character == "]") break
+                cursor++
+            }
+            return substr(text, start, cursor - start)
+        }
+        function value_for(text, key, cursor) {
+            cursor = value_start(text, key)
+            return cursor ? token_at(text, cursor) : ""
+        }
+        function object_value_for(text, key, cursor) {
+            cursor = object_value_start(text, key)
+            return cursor ? token_at(text, cursor) : ""
+        }
+        function container_at(text, cursor, opening, closing, depth, quoted, escaped, character, start) {
+            cursor = skip_space(text, cursor)
+            opening = substr(text, cursor, 1)
+            if (opening != "{" && opening != "[") return ""
+            closing = opening == "{" ? "}" : "]"
+            start = cursor
+            depth = 0
+            quoted = 0
+            escaped = 0
+            while (cursor <= length(text)) {
+                character = substr(text, cursor, 1)
+                if (quoted) {
+                    if (escaped) escaped = 0
+                    else if (character == "\\") escaped = 1
+                    else if (character == "\"") quoted = 0
+                } else if (character == "\"") quoted = 1
+                else if (character == opening) depth++
+                else if (character == closing) {
+                    depth--
+                    if (depth == 0) return substr(text, start, cursor - start + 1)
+                }
+                cursor++
+            }
+            return ""
+        }
+        function safe_profile(token, fallback, value) {
+            if (length(token) >= 3 && substr(token, 1, 1) == "\"" &&
+                substr(token, length(token), 1) == "\"") {
+                value = substr(token, 2, length(token) - 2)
+                if (value != "all" && length(value) <= 255 && value ~ /^[A-Za-z0-9_-]+$/) return value
+            }
+            return fallback
+        }
+        function replace_literal(text, needle, replacement, result, cursor, relative) {
+            if (needle == "") return text
+            result = ""
+            cursor = 1
+            while ((relative = index(substr(text, cursor), needle)) != 0) {
+                result = result substr(text, cursor, relative - 1) replacement
+                cursor += relative - 1 + length(needle)
+            }
+            return result substr(text, cursor)
+        }
+        function json_escape_text(text, result, cursor, character, code, candidate_code, high, low) {
+            result = ""
+            for (cursor = 1; cursor <= length(text); cursor++) {
+                character = substr(text, cursor, 1)
+                if (character == slash) result = result slash slash
+                else if (character == "\"") result = result slash "\""
+                else if (character == sprintf("%c", 8)) result = result slash "b"
+                else if (character == "\t") result = result slash "t"
+                else if (character == "\n") result = result slash "n"
+                else if (character == sprintf("%c", 12)) result = result slash "f"
+                else if (character == "\r") result = result slash "r"
+                else {
+                    code = 0
+                    for (candidate_code = 1; candidate_code < 32; candidate_code++) {
+                        if (character == sprintf("%c", candidate_code)) { code = candidate_code; break }
+                    }
+                    if (code > 0) {
+                        high = int(code / 16)
+                        low = code % 16
+                        result = result slash "u00" substr(hex, high + 1, 1) substr(hex, low + 1, 1)
+                    } else result = result character
+                }
+            }
+            return result
+        }
+        function json_unit_length(text, cursor, ending, character, following, byte, needed, offset, continuation) {
+            character = substr(text, cursor, 1)
+            if (character == slash) {
+                if (cursor >= ending) return 0
+                following = substr(text, cursor + 1, 1)
+                if (following == "u") {
+                    if (cursor + 5 > ending ||
+                        substr(text, cursor + 2, 4) !~ /^[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]$/) return 0
+                    return 6
+                }
+                if (following == "\"" || following == slash || following == "/" || following ~ /^[bfnrt]$/) return 2
+                return 0
+            }
+            byte = byte_value[character]
+            if (byte >= 194 && byte <= 223) needed = 2
+            else if (byte >= 224 && byte <= 239) needed = 3
+            else if (byte >= 240 && byte <= 244) needed = 4
+            else if (byte >= 128) return 0
+            else needed = 1
+            if (cursor + needed - 1 > ending) return 0
+            for (offset = 1; offset < needed; offset++) {
+                continuation = byte_value[substr(text, cursor + offset, 1)]
+                if (continuation < 128 || continuation > 191) return 0
+            }
+            return needed
+        }
+        function truncate_json_string(token, maximum, result, cursor, ending, unit) {
+            result = "\""
+            cursor = 2
+            ending = length(token) - 1
+            while (cursor <= ending) {
+                unit = json_unit_length(token, cursor, ending)
+                if (unit < 1 || length(result) + unit + 4 > maximum) break
+                result = result substr(token, cursor, unit)
+                cursor += unit
+            }
+            return result "...\""
+        }
+        function safe_logical_string(token, wire_maximum, stored_maximum, needle_index, result, cursor, character) {
+            safe_logical_was_truncated = 0
+            if (length(token) < 2 || length(token) > wire_maximum || substr(token, 1, 1) != "\"" || substr(token, length(token), 1) != "\"") return ""
+            for (needle_index = 1; needle_index <= needle_count; needle_index++)
+                token = replace_literal(token, encoded_needles[needle_index], "[redacted]")
+            result = ""
+            for (cursor = 1; cursor <= length(token); cursor++) {
+                character = substr(token, cursor, 1)
+                if (character == "|") result = result slash "u007c"
+                else result = result character
+            }
+            if (length(result) > stored_maximum) {
+                result = truncate_json_string(result, stored_maximum)
+                safe_logical_was_truncated = 1
+            }
+            return result
+        }
+        function normalized_kind(token) {
+            if (token == "\"directory\"" || token == "\"folder\"") return "\"folder\""
+            if (token == "\"file\"") return "\"file\""
+            return ""
+        }
+        BEGIN {
+            slash = sprintf("%c", 92)
+            hex = "0123456789abcdef"
+            for (byte = 1; byte < 256; byte++) byte_value[sprintf("%c", byte)] = byte
+            for (argument = 1; argument < ARGC - 1; argument++) {
+                secret = ""
+                if ((getline secret < ARGV[argument]) > 0 && secret != "") {
+                    needle_count++
+                    encoded_needles[needle_count] = json_escape_text(secret)
+                }
+                close(ARGV[argument])
+                ARGV[argument] = ""
+            }
+        }
+        {
+            if (storage_full) next
+            schema = object_value_for($0, "schema")
+            if (schema == "\"sdsync.doctor.v1\"") {
+                doctor_document = $0
+                profile = fallback_profile
+            } else if (schema == "\"sdsync.doctor-job.v1\"") {
+                doctor_cursor = object_value_start($0, "doctor")
+                doctor_document = doctor_cursor ? container_at($0, doctor_cursor) : ""
+                if (doctor_document == "" || object_value_for(doctor_document, "schema") != "\"sdsync.doctor.v1\"") next
+                profile = safe_profile(object_value_for($0, "profile"), "")
+                if (profile == "") next
+            } else next
+            inventory_cursor = object_value_start(doctor_document, "remote_inventory")
+            if (!inventory_cursor) next
+            inventory = container_at(doctor_document, inventory_cursor)
+            if (inventory == "") next
+            scope = object_value_for(inventory, "scope")
+            if (scope != "\"direct_children\"" && scope != "\"visible_shared_folders\"") next
+            total = object_value_for(inventory, "total_entries")
+            if (total !~ /^[0-9]+$/ || length(total) > 15) next
+            source_truncated = object_value_for(inventory, "truncated")
+            if (source_truncated != "true" && source_truncated != "false") next
+            sample_cursor = object_value_start(inventory, "sample")
+            sample = sample_cursor ? container_at(inventory, sample_cursor) : "[]"
+            if (sample == "" || substr(sample, 1, 1) != "[") next
+
+            accepted = 0
+            candidates = 0
+            entries = ""
+            cursor = 2
+            while (cursor < length(sample)) {
+                cursor = skip_space(sample, cursor)
+                while (substr(sample, cursor, 1) == ",") cursor = skip_space(sample, cursor + 1)
+                if (substr(sample, cursor, 1) == "]") break
+                if (substr(sample, cursor, 1) != "{") break
+                entry = container_at(sample, cursor)
+                if (entry == "") break
+                candidates++
+                if (accepted < 5) {
+                    # Rust bounds these fields by Unicode scalar count (512/255),
+                    # so accept their complete UTF-8 wire tokens. The private
+                    # Activity schema keeps all five samples by shortening only
+                    # at a complete JSON escape or UTF-8 sequence boundary and by
+                    # carrying explicit per-field truncation evidence.
+                    path = safe_logical_string(object_value_for(entry, "relative_path"), 2050, 350)
+                    path_storage_truncated = safe_logical_was_truncated
+                    name = safe_logical_string(object_value_for(entry, "name"), 1022, 210)
+                    name_storage_truncated = safe_logical_was_truncated
+                    kind = normalized_kind(object_value_for(entry, "kind"))
+                    source_path_truncated = object_value_for(entry, "relative_path_truncated")
+                    source_name_truncated = object_value_for(entry, "name_truncated")
+                    if (source_path_truncated == "") source_path_truncated = "false"
+                    if (source_name_truncated == "") source_name_truncated = "false"
+                    if (source_path_truncated != "true" && source_path_truncated != "false") path = ""
+                    if (source_name_truncated != "true" && source_name_truncated != "false") name = ""
+                    if (path != "" && name != "" && kind != "") {
+                        path_truncated = source_path_truncated == "true" || path_storage_truncated ? "true" : "false"
+                        name_truncated = source_name_truncated == "true" || name_storage_truncated ? "true" : "false"
+                        candidate = "{\"path\":" path ",\"name\":" name ",\"kind\":" kind ",\"relative_path_truncated\":" path_truncated ",\"name_truncated\":" name_truncated "}"
+                        separator = entries != "" ? 1 : 0
+                        if (length(entries) + separator + length(candidate) <= 3400) {
+                            accepted++
+                            if (entries != "") entries = entries ","
+                            entries = entries candidate
+                        }
+                    }
+                }
+                cursor += length(entry)
+            }
+            truncated = source_truncated == "true" || candidates > accepted || (total + 0) > accepted ? "true" : "false"
+            record = sprintf("{\"schema\":\"sdsync.dsm-doctor-inventory.v1\",\"epoch\":%s,\"level\":\"info\",\"category\":\"operations\",\"event\":\"doctor_inventory\",\"action\":\"doctor\",\"profile\":\"%s\",\"scope\":%s,\"total_entries\":%s,\"truncated\":%s,\"sample_count\":%d,\"sample\":[%s]}", epoch, profile, scope, total, truncated, accepted, entries)
+            if (epoch !~ /^[0-9]+$/ || length(record) > 4000) next
+            if (emitted + length(record) + 1 > 1048576) { storage_full = 1; next }
+            print record
+            emitted += length(record) + 1
+        }
+    ' "$secret_root"/*.password "$secret_root"/*.totp "$secret_root"/*.remote-log-token \
+        "$doctor_inventory_source" > "$doctor_inventory_records" || {
+        rm -f "$doctor_inventory_records"
+        doctor_inventory_records=
+        return 73
+    }
+    finish_private_file "$doctor_inventory_records" || { rm -f "$doctor_inventory_records"; doctor_inventory_records=; return 73; }
+
+    doctor_inventory_status=0
+    while IFS= read -r doctor_inventory_record; do
+        [ -n "$doctor_inventory_record" ] || continue
+        [ "${#doctor_inventory_record}" -le 4000 ] || { doctor_inventory_status=73; break; }
+        case $doctor_inventory_record in *'|'*|*'
+'*) doctor_inventory_status=73; break ;; esac
+        doctor_inventory_profile=$(printf '%s\n' "$doctor_inventory_record" | sed -n 's/^.*"profile":"\([A-Za-z0-9_-]*\)","scope":.*$/\1/p')
+        [ -n "$doctor_inventory_profile" ] || { doctor_inventory_status=73; break; }
+        case $doctor_inventory_profile in
+            all|*[!A-Za-z0-9_-]*)
+                [ "$doctor_inventory_profile" = all ] || { doctor_inventory_status=73; break; }
+                ;;
+        esac
+        append_rotating_log "$doctor_inventory_log" 1048576 3 "$doctor_inventory_record" || { doctor_inventory_status=$?; break; }
+        append_activity doctor.inventory "$doctor_inventory_profile" succeeded \
+            "Doctor inventory evidence $doctor_inventory_record" operations info false \
+            >/dev/null 2>&1 || { doctor_inventory_status=$?; break; }
+    done < "$doctor_inventory_records"
+    rm -f "$doctor_inventory_records"
+    doctor_inventory_records=
+    return "$doctor_inventory_status"
 }
 
 api_capture() {
@@ -1718,7 +2158,9 @@ api_json_log_lines() {
     json_log_inputs=
     for json_log_candidate in "$json_log_path" "$@"; do
         [ -e "$json_log_candidate" ] || [ -L "$json_log_candidate" ] || continue
-        if [ -L "$json_log_candidate" ] || [ ! -f "$json_log_candidate" ] || [ ! -r "$json_log_candidate" ]; then
+        private_log_path_safe_or_absent "$json_log_candidate" || \
+            api_error unsafe_state "unsafe private package log file" 73
+        if [ ! -r "$json_log_candidate" ]; then
             api_error unsafe_state "unsafe package log file" 73
         fi
         json_log_inputs="$json_log_inputs $json_log_candidate"
@@ -1765,28 +2207,97 @@ api_json_log_lines() {
             if (category == "security") return security_threshold
             return "invalid"
         }
-        function replace_literal(text, needle, replacement, at) {
+        function replace_literal(text, needle, replacement, result, cursor, relative) {
             if (needle == "") return text
-            while ((at = index(text, needle)) != 0)
-                text = substr(text, 1, at - 1) replacement substr(text, at + length(needle))
-            return text
+            result = ""
+            cursor = 1
+            while ((relative = index(substr(text, cursor), needle)) != 0) {
+                result = result substr(text, cursor, relative - 1) replacement
+                cursor += relative - 1 + length(needle)
+            }
+            return result substr(text, cursor)
         }
-        function quote(text) {
+        function json_escape_text(text, result, cursor, character, code, candidate_code, high, low) {
+            result = ""
+            for (cursor = 1; cursor <= length(text); cursor++) {
+                character = substr(text, cursor, 1)
+                if (character == slash) result = result slash slash
+                else if (character == "\"") result = result slash "\""
+                else if (character == sprintf("%c", 8)) result = result slash "b"
+                else if (character == "\t") result = result slash "t"
+                else if (character == "\n") result = result slash "n"
+                else if (character == sprintf("%c", 12)) result = result slash "f"
+                else if (character == "\r") result = result slash "r"
+                else {
+                    code = 0
+                    for (candidate_code = 1; candidate_code < 32; candidate_code++) {
+                        if (character == sprintf("%c", candidate_code)) { code = candidate_code; break }
+                    }
+                    if (code > 0) {
+                        high = int(code / 16)
+                        low = code % 16
+                        result = result slash "u00" substr(hex, high + 1, 1) substr(hex, low + 1, 1)
+                    } else result = result character
+                }
+            }
+            return result
+        }
+        function redact_json_strings(text, result, cursor, start, escaped, character, token, needle_index) {
+            result = ""
+            cursor = 1
+            while (cursor <= length(text)) {
+                if (substr(text, cursor, 1) != "\"") {
+                    result = result substr(text, cursor, 1)
+                    cursor++
+                    continue
+                }
+                start = cursor++
+                escaped = 0
+                while (cursor <= length(text)) {
+                    character = substr(text, cursor, 1)
+                    if (escaped) escaped = 0
+                    else if (character == slash) escaped = 1
+                    else if (character == "\"") break
+                    cursor++
+                }
+                if (cursor > length(text)) return result substr(text, start)
+                token = substr(text, start, cursor - start + 1)
+                for (needle_index = 1; needle_index <= needle_count; needle_index++)
+                    token = replace_literal(token, encoded_needles[needle_index], "[redacted]")
+                result = result token
+                cursor++
+            }
+            return result
+        }
+        function quote(text, result, cursor, character) {
             gsub(/\033\[[0-9;?]*[ -\/]*[@-~]/, "", text)
             text = replace_literal(text, home, "[package-home]")
             text = replace_literal(text, var, "[package-var]")
             text = replace_literal(text, real_home, "[package-home]")
             text = replace_literal(text, real_var, "[package-var]")
             gsub(/\[package-home\]\/secrets\/[^ ]+/, "[secret]", text)
-            gsub(/\\/, "\\\\", text); gsub(/"/, "\\\"", text)
-            gsub(/\t/, "\\t", text); gsub(/\r/, "\\r", text)
-            gsub(/[\001-\010\013\014\016-\037]/, "?", text)
-            return "\"" text "\""
+            result = "\""
+            for (cursor = 1; cursor <= length(text); cursor++) {
+                character = substr(text, cursor, 1)
+                if (character == slash) result = result slash slash
+                else if (character == "\"") result = result slash "\""
+                else if (character == "\t") result = result slash "t"
+                else if (character == "\r") result = result slash "r"
+                else if (character ~ /[\001-\010\013\014\016-\037]/) result = result "?"
+                else result = result character
+            }
+            return result "\""
         }
         BEGIN {
+            slash = sprintf("%c", 92)
+            hex = "0123456789abcdef"
             for (argument = 1; argument < ARGC - log_path_count; argument++) {
                 secret = ""
-                if ((getline secret < ARGV[argument]) > 0 && secret != "") needles[++needle_count] = secret
+                if ((getline secret < ARGV[argument]) > 0 && secret != "") {
+                    needle_count++
+                    needles[needle_count] = secret
+                    encoded_needles[needle_count] = json_escape_text(secret)
+                }
                 close(ARGV[argument])
                 ARGV[argument] = ""
             }
@@ -1799,8 +2310,16 @@ api_json_log_lines() {
                 event_level = structured_level(line)
                 if (event_level == "invalid" || level_rank(event_level) < level_rank(line_threshold)) next
             }
-            for (needle_index = 1; needle_index <= needle_count; needle_index++)
-                line = replace_literal(line, needles[needle_index], "[redacted]")
+            first = 1
+            while (first <= length(line) && substr(line, first, 1) ~ /[ \t]/) first++
+            if (substr(line, first, 1) == "{" || substr(line, first, 1) == "[") {
+                line = redact_json_strings(line)
+            } else {
+                for (needle_index = 1; needle_index <= needle_count; needle_index++) {
+                    line = replace_literal(line, encoded_needles[needle_index], "[redacted]")
+                    line = replace_literal(line, needles[needle_index], "[redacted]")
+                }
+            }
             line = replace_literal(line, home, "[package-home]")
             line = replace_literal(line, var, "[package-var]")
             line = replace_literal(line, real_home, "[package-home]")
@@ -1845,43 +2364,60 @@ api_logs() {
     done
     case $log_lines in ''|*[!0-9]*) api_error invalid_request "lines must be an integer" 64 ;; esac
     [ "$log_lines" -ge 1 ] && [ "$log_lines" -le 1000 ] || api_error invalid_request "lines must be 1..1000" 64
-    case $log_source in all|api|controller|scheduler|sync|audit) ;; *) api_error invalid_request "invalid log source" 64 ;; esac
+    case $log_source in all|api|doctor|controller|scheduler|sync|audit) ;; *) api_error invalid_request "invalid log source" 64 ;; esac
     load_security_policy_runtime || api_error unsafe_state "security policy is unavailable" 73
     case $log_source in
         all) set -- "$log_root/api.log" "$log_root/api.log.1" "$log_root/api.log.2" \
             "$log_root/api.log.3" "$log_root/api.log.4" "$log_root/api.log.5" \
-            "$log_root/controller.log" "$log_root/scheduler.log" "$log_root/sync.log" "$audit_log" ;;
+            "$doctor_inventory_log" "$doctor_inventory_log.1" "$doctor_inventory_log.2" "$doctor_inventory_log.3" \
+            "$log_root/controller.log" "$log_root/controller.log.1" "$log_root/controller.log.2" \
+            "$log_root/controller.log.3" "$log_root/controller.log.4" "$log_root/controller.log.5" \
+            "$log_root/scheduler.log" "$log_root/scheduler.log.1" "$log_root/scheduler.log.2" \
+            "$log_root/scheduler.log.3" "$log_root/scheduler.log.4" "$log_root/scheduler.log.5" \
+            "$log_root/sync.log" "$log_root/sync.log.1" "$log_root/sync.log.2" "$log_root/sync.log.3" \
+            "$audit_log" "$audit_log.1" "$audit_log.2" "$audit_log.3" "$audit_log.4" "$audit_log.5" ;;
         api) set -- "$log_root/api.log" "$log_root/api.log.1" "$log_root/api.log.2" \
             "$log_root/api.log.3" "$log_root/api.log.4" "$log_root/api.log.5" ;;
-        controller) set -- "$log_root/controller.log" ;;
-        scheduler) set -- "$log_root/scheduler.log" ;;
-        sync) set -- "$log_root/sync.log" ;;
-        audit) set -- "$audit_log" ;;
+        doctor) set -- "$doctor_inventory_log" "$doctor_inventory_log.1" "$doctor_inventory_log.2" "$doctor_inventory_log.3" ;;
+        controller) set -- "$log_root/controller.log" "$log_root/controller.log.1" \
+            "$log_root/controller.log.2" "$log_root/controller.log.3" \
+            "$log_root/controller.log.4" "$log_root/controller.log.5" ;;
+        scheduler) set -- "$log_root/scheduler.log" "$log_root/scheduler.log.1" \
+            "$log_root/scheduler.log.2" "$log_root/scheduler.log.3" \
+            "$log_root/scheduler.log.4" "$log_root/scheduler.log.5" ;;
+        sync) set -- "$log_root/sync.log" "$log_root/sync.log.1" \
+            "$log_root/sync.log.2" "$log_root/sync.log.3" ;;
+        audit) set -- "$audit_log" "$audit_log.1" "$audit_log.2" \
+            "$audit_log.3" "$audit_log.4" "$audit_log.5" ;;
     esac
     for log_preflight in "$@"; do
         if [ -e "$log_preflight" ] || [ -L "$log_preflight" ]; then
-            [ ! -L "$log_preflight" ] && [ -f "$log_preflight" ] && [ -r "$log_preflight" ] || api_error unsafe_state "unsafe package log file" 73
-            case $log_preflight in
-                "$log_root/api.log"*)
-                    [ "$(stat -c '%u:%a:%h' "$log_preflight" 2>/dev/null || true)" = "$path_owner:600:1" ] \
-                        || api_error unsafe_state "unsafe API log file" 73
-                    ;;
-            esac
+            private_log_path_safe_or_absent "$log_preflight" || \
+                api_error unsafe_state "unsafe private package log file" 73
+            [ -r "$log_preflight" ] || api_error unsafe_state "unsafe package log file" 73
         fi
     done
     api_preflight_secret_material
     printf '{"schema":"sdsync.dsm-logs.v1","logs":['
     if [ "$log_source" = all ]; then
-        # Five encoded arrays plus the fixed envelope stay below the Rust
+        # Six encoded arrays plus the fixed envelope stay below the Rust
         # manager-output capture ceiling of 1 MiB.
-        log_byte_limit=196608
+        log_byte_limit=163840
         printf '{"source":"api","lines":'; api_json_log_lines "$log_root/api.log.5" "$log_lines" api "$security_runtime_bridge_level" "$log_byte_limit" \
             "$log_root/api.log.4" "$log_root/api.log.3" "$log_root/api.log.2" \
             "$log_root/api.log.1" "$log_root/api.log"; printf '},'
-        printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/controller.log" "$log_lines" controller "$security_runtime_controller_level" "$log_byte_limit"; printf '},'
-        printf '{"source":"scheduler","lines":'; api_json_log_lines "$log_root/scheduler.log" "$log_lines" scheduler "$security_runtime_scheduler_level" "$log_byte_limit"; printf '},'
-        printf '{"source":"sync","lines":'; api_json_log_lines "$log_root/sync.log" "$log_lines" sync "$security_runtime_sync_level" "$log_byte_limit"; printf '},'
-        printf '{"source":"audit","lines":'; api_json_log_lines "$audit_log" "$log_lines" audit trace "$log_byte_limit"; printf '}'
+        printf '{"source":"doctor","lines":'; api_json_log_lines "$doctor_inventory_log.3" "$log_lines" doctor "$security_runtime_operations_level" "$log_byte_limit" \
+            "$doctor_inventory_log.2" "$doctor_inventory_log.1" "$doctor_inventory_log"; printf '},'
+        printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/controller.log.5" "$log_lines" controller "$security_runtime_controller_level" "$log_byte_limit" \
+            "$log_root/controller.log.4" "$log_root/controller.log.3" "$log_root/controller.log.2" \
+            "$log_root/controller.log.1" "$log_root/controller.log"; printf '},'
+        printf '{"source":"scheduler","lines":'; api_json_log_lines "$log_root/scheduler.log.5" "$log_lines" scheduler "$security_runtime_scheduler_level" "$log_byte_limit" \
+            "$log_root/scheduler.log.4" "$log_root/scheduler.log.3" "$log_root/scheduler.log.2" \
+            "$log_root/scheduler.log.1" "$log_root/scheduler.log"; printf '},'
+        printf '{"source":"sync","lines":'; api_json_log_lines "$log_root/sync.log.3" "$log_lines" sync "$security_runtime_sync_level" "$log_byte_limit" \
+            "$log_root/sync.log.2" "$log_root/sync.log.1" "$log_root/sync.log"; printf '},'
+        printf '{"source":"audit","lines":'; api_json_log_lines "$audit_log.5" "$log_lines" audit trace "$log_byte_limit" \
+            "$audit_log.4" "$audit_log.3" "$audit_log.2" "$audit_log.1" "$audit_log"; printf '}'
     else
         # A selected source can use most of that ceiling while leaving fixed
         # headroom for its schema and source envelope.
@@ -1892,17 +2428,27 @@ api_logs() {
                     "$log_root/api.log.4" "$log_root/api.log.3" "$log_root/api.log.2" \
                     "$log_root/api.log.1" "$log_root/api.log"; printf '}'
                 ;;
+            doctor)
+                printf '{"source":"doctor","lines":'; api_json_log_lines "$doctor_inventory_log.3" "$log_lines" doctor "$security_runtime_operations_level" "$log_byte_limit" \
+                    "$doctor_inventory_log.2" "$doctor_inventory_log.1" "$doctor_inventory_log"; printf '}'
+                ;;
             controller)
-                printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/controller.log" "$log_lines" controller "$security_runtime_controller_level" "$log_byte_limit"; printf '}'
+                printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/controller.log.5" "$log_lines" controller "$security_runtime_controller_level" "$log_byte_limit" \
+                    "$log_root/controller.log.4" "$log_root/controller.log.3" "$log_root/controller.log.2" \
+                    "$log_root/controller.log.1" "$log_root/controller.log"; printf '}'
                 ;;
             scheduler)
-                printf '{"source":"scheduler","lines":'; api_json_log_lines "$log_root/scheduler.log" "$log_lines" scheduler "$security_runtime_scheduler_level" "$log_byte_limit"; printf '}'
+                printf '{"source":"scheduler","lines":'; api_json_log_lines "$log_root/scheduler.log.5" "$log_lines" scheduler "$security_runtime_scheduler_level" "$log_byte_limit" \
+                    "$log_root/scheduler.log.4" "$log_root/scheduler.log.3" "$log_root/scheduler.log.2" \
+                    "$log_root/scheduler.log.1" "$log_root/scheduler.log"; printf '}'
                 ;;
             sync)
-                printf '{"source":"sync","lines":'; api_json_log_lines "$log_root/sync.log" "$log_lines" sync "$security_runtime_sync_level" "$log_byte_limit"; printf '}'
+                printf '{"source":"sync","lines":'; api_json_log_lines "$log_root/sync.log.3" "$log_lines" sync "$security_runtime_sync_level" "$log_byte_limit" \
+                    "$log_root/sync.log.2" "$log_root/sync.log.1" "$log_root/sync.log"; printf '}'
                 ;;
             audit)
-                printf '{"source":"audit","lines":'; api_json_log_lines "$audit_log" "$log_lines" audit trace "$log_byte_limit"; printf '}'
+                printf '{"source":"audit","lines":'; api_json_log_lines "$audit_log.5" "$log_lines" audit trace "$log_byte_limit" \
+                    "$audit_log.4" "$audit_log.3" "$audit_log.2" "$audit_log.1" "$audit_log"; printf '}'
                 ;;
         esac
     fi
@@ -1916,19 +2462,73 @@ api_activity() {
     done
     case $activity_lines in ''|*[!0-9]*) api_error invalid_request "lines must be an integer" 64 ;; esac
     [ "$activity_lines" -ge 1 ] && [ "$activity_lines" -le 1000 ] || api_error invalid_request "lines must be 1..1000" 64
-    [ -e "$activity_log" ] || { printf '{"schema":"sdsync.dsm-activity.v1","events":[]}\n'; return; }
-    if [ -L "$activity_log" ] || [ ! -f "$activity_log" ] || [ ! -r "$activity_log" ]; then
-        api_error unsafe_state "unsafe activity log" 73
-    fi
+    activity_inputs=
+    for activity_source in "$activity_log.3" "$activity_log.2" "$activity_log.1" "$activity_log"; do
+        [ -e "$activity_source" ] || [ -L "$activity_source" ] || continue
+        private_log_path_safe_or_absent "$activity_source" || \
+            api_error unsafe_state "unsafe activity log" 73
+        [ -r "$activity_source" ] || api_error unsafe_state "unsafe activity log" 73
+        activity_inputs="$activity_inputs $activity_source"
+    done
+    [ -n "$activity_inputs" ] || { printf '{"schema":"sdsync.dsm-activity.v1","events":[]}\n'; return; }
+    # These are fixed package paths and cannot contain whitespace.
+    set -- $activity_inputs
+    activity_input=$state_root/.api.$$.activity-input
     activity_json=$state_root/.api.$$.activity
-    [ ! -L "$activity_json" ] || api_error unsafe_state "unsafe API activity path" 73
+    [ ! -L "$activity_input" ] && [ ! -L "$activity_json" ] || \
+        api_error unsafe_state "unsafe API activity path" 73
+    : > "$activity_input" || api_error unsafe_state "cannot create activity input" 73
+    finish_private_file "$activity_input" || api_error unsafe_state "cannot secure activity input" 73
+    for activity_source in "$@"; do
+        cat "$activity_source" >> "$activity_input" || \
+            api_error unsafe_state "cannot read activity history" 73
+    done
+    finish_private_file "$activity_input" || api_error unsafe_state "cannot secure activity input" 73
     set +e
-    tail -n "$activity_lines" "$activity_log" | LC_ALL=C awk -F'|' '
-        function quote(text) {
-            gsub(/\\/, "\\\\", text); gsub(/"/, "\\\"", text)
-            return "\"" text "\""
+    tail -n "$activity_lines" "$activity_input" | LC_ALL=C awk -F'|' \
+        -v requested="$activity_lines" -v byte_limit=1048000 '
+        function quote(text, result, special) {
+            result = quote_char
+            while (match(text, /[\\"]/)) {
+                special = substr(text, RSTART, 1)
+                result = result substr(text, 1, RSTART - 1) slash special
+                text = substr(text, RSTART + 1)
+            }
+            return result text quote_char
         }
-        BEGIN { printf "{\"schema\":\"sdsync.dsm-activity.v1\",\"events\":[" }
+        function quoted_length(text, copy, escape_count) {
+            copy = text
+            escape_count = gsub(/[\\"]/, "", copy)
+            return length(text) + escape_count + 2
+        }
+        function print_quote(text, slash_parts, quote_parts, slash_count, slash_index, quote_count, quote_index, chunk, fragment_count) {
+            printf "%s", quote_char
+            slash_count = split(text, slash_parts, /\\/)
+            for (slash_index = 1; slash_index <= slash_count; slash_index++) {
+                if (slash_index > 1) {
+                    chunk = chunk slash slash
+                    fragment_count++
+                }
+                quote_count = split(slash_parts[slash_index], quote_parts, /"/)
+                for (quote_index = 1; quote_index <= quote_count; quote_index++) {
+                    if (quote_index > 1) {
+                        chunk = chunk slash quote_char
+                        fragment_count++
+                    }
+                    chunk = chunk quote_parts[quote_index]
+                    if (fragment_count >= 64 || length(chunk) >= 8192) {
+                        printf "%s", chunk
+                        chunk = ""
+                        fragment_count = 0
+                    }
+                }
+            }
+            printf "%s%s", chunk, quote_char
+        }
+        BEGIN {
+            slash = sprintf("%c", 92)
+            quote_char = sprintf("%c", 34)
+        }
         {
             if ((NF != 5 && NF != 7 && NF != 9) || $1 !~ /^[0-9]+$/ || $2 !~ /^[a-z_]+\.[a-z_]+$/ ||
                 $3 !~ /^(none|all|[A-Za-z0-9_-]+)$/ ||
@@ -1938,7 +2538,6 @@ api_activity() {
                 (NF == 9 && ($7 !~ /^[1-9][0-9]*$/ || $7 > 4294967295 ||
                     length($8) < 1 || length($8) > 256 || $8 ~ /[\001-\037\177]/)) ||
                 length($(NF)) > 4096 || $(NF) ~ /[\001-\037\177]/) exit 73
-            if (seen++) printf ","
             category = NF >= 7 ? $5 : "operations"
             level = NF >= 7 ? $6 : "info"
             message = NF == 9 ? $9 : (NF == 7 ? $7 : $5)
@@ -1952,13 +2551,39 @@ api_activity() {
                 if (length(request_value) != 32 || request_value ~ /[^0-9a-f]/) exit 73
                 client_request_id = quote(request_value)
             }
-            printf "{\"epoch\":%s,\"code\":%s,\"profile\":%s,\"state\":%s,\"category\":%s,\"level\":%s,\"actor_uid\":%s,\"actor\":%s,\"client_request_id\":%s,\"message\":%s}",
-                $1, quote($2), quote($3), quote($4), quote(category), quote(level), actor_uid, actor, client_request_id, quote(message)
+            record_count++
+            slot = ((record_count - 1) % requested) + 1
+            prefixes[slot] = sprintf("{\"epoch\":%s,\"code\":%s,\"profile\":%s,\"state\":%s,\"category\":%s,\"level\":%s,\"actor_uid\":%s,\"actor\":%s,\"client_request_id\":%s,\"message\":", $1, quote($2), quote($3), quote($4), quote(category), quote(level), actor_uid, actor, client_request_id)
+            messages[slot] = message
         }
-        END { printf "]}\n" }
+        END {
+            available = record_count < requested ? record_count : requested
+            first_record = record_count - available + 1
+            selected_first = record_count + 1
+            selected_bytes = length("{\"schema\":\"sdsync.dsm-activity.v1\",\"events\":[]}")
+            for (record = record_count; record >= first_record; record--) {
+                slot = ((record - 1) % requested) + 1
+                cost = length(prefixes[slot]) + quoted_length(messages[slot]) + 1 + \
+                    (selected_first <= record_count ? 1 : 0)
+                if (selected_bytes + cost > byte_limit) break
+                selected_bytes += cost
+                selected_first = record
+            }
+            printf "{\"schema\":\"sdsync.dsm-activity.v1\",\"events\":["
+            for (record = selected_first; record <= record_count; record++) {
+                if (record > selected_first) printf ","
+                slot = ((record - 1) % requested) + 1
+                printf "%s", prefixes[slot]
+                print_quote(messages[slot])
+                printf "}"
+            }
+            printf "]}\n"
+        }
     ' > "$activity_json"
     activity_exit=$?
     set -e
+    rm -f "$activity_input"
+    activity_input=
     if [ "$activity_exit" -ne 0 ]; then rm -f "$activity_json"; api_error corrupt_state "activity feed is malformed" 73; fi
     finish_private_file "$activity_json"
     activity_size=$(wc -c < "$activity_json" | tr -d ' ')
@@ -2695,10 +3320,14 @@ case $command_name in
         source_doctor_exit=0
         target_doctor_exit=0
         source_doctor_output=$state_root/.doctor-source.$$.output
-        [ ! -L "$source_doctor_output" ] || die "unsafe Doctor source capture path"
+        target_doctor_output=$state_root/.doctor-target.$$.output
+        [ ! -L "$source_doctor_output" ] && [ ! -L "$target_doctor_output" ] \
+            || die "unsafe Doctor capture path"
         umask 077
         : > "$source_doctor_output"
+        : > "$target_doctor_output"
         finish_private_file "$source_doctor_output"
+        finish_private_file "$target_doctor_output"
         mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
         set +e
         # Target Doctor must always reach its independent routing/authentication path. A local
@@ -2713,21 +3342,25 @@ case $command_name in
             source_doctor_exit=$?
         fi
         if [ "$write_test" = true ]; then
-            "$binary" --config "$config_file" --output ndjson doctor "$@" --level "$diagnostic_level" target --write-test 2>&1
+            "$binary" --config "$config_file" --output ndjson doctor "$@" --level "$diagnostic_level" target --write-test > "$target_doctor_output" 2>&1
         else
-            "$binary" --config "$config_file" --output ndjson doctor "$@" --level "$diagnostic_level" target 2>&1
+            "$binary" --config "$config_file" --output ndjson doctor "$@" --level "$diagnostic_level" target > "$target_doctor_output" 2>&1
         fi
         target_doctor_exit=$?
         set -e
+        finish_private_file "$target_doctor_output"
         # Target evidence is the AppWindow's primary contract, so emit it before any failed local
         # source detail. Successful source output is intentionally suppressed to keep all-profile
         # target NDJSON inside the bounded authenticated bridge response.
+        [ ! -s "$target_doctor_output" ] || cat "$target_doctor_output"
+        persist_doctor_inventory_records "$target_doctor_output" "$selected_scope" || \
+            echo "warning: private Doctor inventory evidence could not be recorded" >&2
         if [ "$source_doctor_exit" -ne 0 ]; then
             printf '{"schema":"sdsync.dsm-source-check.v1","status":"failed","exit_code":%s,"message":"package-local source diagnostic failed"}\n' "$source_doctor_exit"
             [ ! -s "$source_doctor_output" ] || cat "$source_doctor_output"
         fi
-        rm -f "$source_doctor_output"
-        source_doctor_output=
+        rm -f "$source_doctor_output" "$target_doctor_output"
+        source_doctor_output= target_doctor_output=
         if [ "$target_doctor_exit" -ne 0 ]; then doctor_exit=$target_doctor_exit; else doctor_exit=$source_doctor_exit; fi
         if [ "$doctor_exit" -eq 0 ]; then doctor_status=succeeded; doctor_code=doctor.succeeded; else doctor_status=failed; doctor_code=doctor.failed; fi
         write_health_cache "$selected_scope" "$doctor_status" "$doctor_exit" "$write_test" "$diagnostic_level"
@@ -2825,7 +3458,7 @@ case $command_name in
         lines=${1:-100}; [ "$#" -le 1 ] || die "logs accepts one line count"
         case $lines in ''|*[!0-9]*) die "line count must be an integer" ;; esac
         [ "$lines" -le 1000 ] || die "line count cannot exceed 1000"
-        for log_file in "$log_root/controller.log" "$log_root/scheduler.log" "$log_root/sync.log"; do
+        for log_file in "$log_root/controller.log" "$log_root/scheduler.log" "$log_root/sync.log" "$doctor_inventory_log"; do
             require_private_readable_file "$log_file" "package log" || exit $?
             [ ! -f "$log_file" ] || { printf '\n==> %s <==\n' "$log_file"; tail -n "$lines" "$log_file"; }
         done

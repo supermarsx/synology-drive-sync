@@ -174,11 +174,13 @@ when the backend sets an explicit proof flag. See [Health and Doctor](operations
 
 ## Activity / Logs
 
-Activity presents structured, fixed-code events. Logs presents bounded lines from API/CGI,
-controller, scheduler, sync, and mandatory audit sources. The page supports `100`, `200`, `500`, or
-`1000` lines and can pause live updates without stopping package logging. A selected source is read
-alone; the `all` response is globally bounded below the bridge capture limit. **Clear view** clears
-only the browser presentation; it does not delete package logs.
+Activity presents structured, fixed-code events. Logs presents bounded lines from API/CGI, private
+Doctor discovery, controller, scheduler, sync, and mandatory audit sources. The page supports
+`100`, `200`, `500`, or `1000` lines and can pause live updates without stopping package logging.
+For each source, retained rotations are read oldest to newest before the active file; the newest
+requested suffix that fits the response budget is returned. A selected source is read alone; the
+`all` response is globally bounded below the bridge capture limit. **Clear view** clears only the
+browser presentation; it does not delete package logs.
 
 Snapshot polling pauses while the document is hidden. Log polling occurs only while Activity is
 open and not paused. Refresh intervals are controlled in Settings. **Manual only** cancels the

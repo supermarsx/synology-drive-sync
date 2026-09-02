@@ -4,6 +4,9 @@ import test from "node:test";
 
 const source = await readFile(new URL("../src/App.vue", import.meta.url), "utf8");
 const apiSource = await readFile(new URL("../src/api.js", import.meta.url), "utf8");
+const css = await readFile(new URL("../src/styles/native.css", import.meta.url), "utf8");
+const activityHelp = await readFile(new URL("../../package/ui/help/enu/activity.html", import.meta.url), "utf8");
+const healthHelp = await readFile(new URL("../../package/ui/help/enu/health.html", import.meta.url), "utf8");
 
 function sourceSlice(start, end) {
   const from = source.indexOf(start);
@@ -15,6 +18,8 @@ function sourceSlice(start, end) {
 async function loadDoctorHelpers() {
   const constants = sourceSlice("const DOCTOR_LEVELS", "function emptyProfileFailureRecords");
   const helpers = sourceSlice("function normalizedDoctorLevel", "function defaultSecurityPolicy");
+  const activityEvidence = sourceSlice("function activityTroubleshootingText", "function normalizedDoctorLevel");
+  const normalizedActivity = sourceSlice("function normalizedActivityEvent", "function canonicalProfileConfiguration");
   const moduleSource = `
     function boundedText(value, fallback = "") {
       const text = typeof value === "string" ? value : fallback;
@@ -32,11 +37,26 @@ async function loadDoctorHelpers() {
     function sanitizedTroubleshootingText(value, limit = 65536) {
       return boundedSanitizedTroubleshootingText(redactedTroubleshootingText(value), limit);
     }
+    function troubleshootingField(value, fallback) {
+      return sanitizedTroubleshootingText(String(value || fallback || ""), 128).replace(/\\s+/g, " ").trim() || fallback;
+    }
+    function numberOr(value, fallback = 0) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : fallback;
+    }
+    function validatedClientRequestId(value) {
+      return typeof value === "string" && /^[0-9a-f]{32}$/.test(value) ? value : "";
+    }
+    function formatDate(value) { return String(value || "Unavailable"); }
     const TROUBLESHOOTING_RECORD_LIMIT = 65536;
     const MAX_RESPONSE_BYTES = 1024 * 1024;
+    const ACTIVITY_MESSAGE_LIMIT = 2048;
+    const ACTIVITY_FIELD_LIMIT = 128;
     ${constants}
     ${helpers}
-    export { doctorDocumentFromResult, doctorOutputEnvelope, doctorReportFromResult, doctorTroubleshootingText, expectedDoctorSections, normalizedDoctorInventory, runningDoctorReport };
+    ${normalizedActivity}
+    ${activityEvidence}
+    export { activityTroubleshootingText, doctorDocumentFromResult, doctorInventoryRecordFromActivityMessage, doctorInventoryRecordsFromText, doctorOutputEnvelope, doctorReportFromResult, doctorTroubleshootingText, expectedDoctorSections, normalizedActivityEvent, normalizedDoctorInventory, runningDoctorReport };
   `;
   return import(`data:text/javascript;base64,${Buffer.from(moduleSource).toString("base64")}#${Date.now()}-${Math.random()}`);
 }
@@ -67,6 +87,33 @@ test("Doctor levels are explicit, standard by default, and quick never promises 
   assert.match(source, /doctorForm: \{ scope: "all", level: "standard"/);
   assert.match(source, /if \(enabled\) this\.doctorForm\.level = "extensive"/);
   assert.match(source, /write_test && level !== "extensive"/);
+});
+
+test("Doctor copy distinguishes configured-destination and no-destination inventory branches", () => {
+  const catalogCopy = sourceSlice(
+    'Object.freeze({ id: "destination_permissions"',
+    'Object.freeze({ id: "disposable_write_verify_cleanup"'
+  );
+  const tooltipCopy = sourceSlice('"doctor-level":', '"doctor-write":');
+  const guidanceCopy = sourceSlice("doctorLevelGuidance()", "doctorProgressStages()");
+
+  assert.match(tooltipCopy, /Standard and Extensive authenticate and perform bounded inventory/);
+  assert.match(healthHelp, /Standard and Extensive authenticate and request one sorted, non-recursive bounded inventory page/);
+  assert.match(guidanceCopy, /standard: "Authenticates[\s\S]*?performs bounded inventory/);
+  assert.match(guidanceCopy, /extensive: "Deepens the same authenticated, read-only target checks[\s\S]*?same bounded inventory branch/);
+
+  for (const [name, copy] of [
+    ["section catalog", catalogCopy],
+    ["level tooltip", tooltipCopy],
+    ["level guidance", guidanceCopy],
+    ["native Health help", healthHelp]
+  ]) {
+    assert.match(copy, /configured destination/i, `${name} must explain the configured-destination branch`);
+    assert.match(copy, /direct child|direct-child/i, `${name} must explain direct-child sampling`);
+    assert.match(copy, /skip(?:s|ped)? (?:this section|permission)/i, `${name} must explain that permission is skipped without a destination`);
+    assert.match(copy, /visible shared-folder roots/i, `${name} must explain visible-share-root sampling`);
+    assert.match(copy, /without selecting or traversing (?:a|any) share/i, `${name} must forbid implicit share selection or traversal`);
+  }
 });
 
 test("NDJSON Doctor jobs aggregate every profile and ignore successful source Doctor records", async () => {
@@ -183,6 +230,126 @@ test("NDJSON Doctor aggregation retains every complete profile under the respons
   assert.equal(profiles.length, 300);
   assert.equal(profiles[0], "profile-000");
   assert.equal(profiles.at(-1), "profile-299");
+});
+
+test("real core-shaped visible-share and empty inventories remain section evidence", async () => {
+  const doctor = await loadDoctorHelpers();
+  const document = {
+    schema: "sdsync.doctor.v1",
+    level: "standard",
+    status: "pass",
+    sections: [
+      {
+        id: "destination_inventory",
+        label: "Destination inventory",
+        status: "pass",
+        detail: "No visible shared folders were returned",
+        elapsed_ms: 9,
+        timing_scope: "section"
+      }
+    ],
+    remote_inventory: {
+      scope: "visible_shared_folders",
+      root_exists: true,
+      total_entries: 0,
+      sample_count: 0,
+      sample_limit: 5,
+      truncated: false,
+      truncated_count: 0,
+      budget: { pages_requested: 1, traversal_depth: 0, deadline_ms: 5000 },
+      sample: []
+    },
+    elapsed_ms: 11
+  };
+  const report = doctor.doctorReportFromResult({ output: JSON.stringify(document) }, true, "standard", false, 1);
+  const section = report.sections.find((item) => item.id === "destination_inventory");
+  assert.ok(section.inventory, "zero-entry discovery must remain visible evidence");
+  assert.equal(section.inventory.scope, "visible_shared_folders");
+  assert.equal(section.inventory.total, 0);
+  assert.equal(section.inventory.entries.length, 0);
+  assert.equal(section.inventory.truncated, false);
+  const copied = doctor.doctorTroubleshootingText(report, "Visible shares", JSON.stringify(document));
+  assert.match(copied, /Discovery scope: Visible shared folders/);
+  assert.match(copied, /Remote entries: 0; displayed: 0/);
+});
+
+test("private Doctor inventory records parse safely in Activity and Logs at the maximum activity length", async () => {
+  const doctor = await loadDoctorHelpers();
+  const sample = Array.from({ length: 5 }, (_, index) => ({
+    path: `/${String(index + 1).padStart(2, "0")}-${"p".repeat(230)}`,
+    name: `entry-${index + 1}-${"n".repeat(70)}`,
+    kind: index % 2 ? "file" : "folder",
+    username: "must-not-render-user",
+    password: "must-not-render-password",
+    session: "must-not-render-session",
+    url: "https://must-not-render.invalid",
+    acl: "must-not-render-acl",
+    digest: "must-not-render-digest",
+    server_detail: "must-not-render-server"
+  }));
+  const record = {
+    schema: "sdsync.dsm-doctor-inventory.v1",
+    epoch: 1788200000,
+    level: "info",
+    category: "operations",
+    event: "doctor_inventory",
+    action: "doctor",
+    profile: "office",
+    scope: "direct_children",
+    total_entries: 7,
+    truncated: true,
+    sample_count: 5,
+    sample,
+    username: "outer-user-must-not-render",
+    session: "outer-session-must-not-render"
+  };
+  const message = `Doctor inventory evidence ${JSON.stringify(record)}`;
+  assert.ok(message.length > 2048, "fixture must exceed the ordinary Activity display bound");
+  assert.ok(message.length < 4096, "fixture must remain inside the package Activity record bound");
+
+  const event = doctor.normalizedActivityEvent({
+    epoch: 1788200000,
+    code: "doctor.inventory",
+    profile: "office",
+    state: "succeeded",
+    category: "operations",
+    level: "info",
+    message
+  });
+  assert.equal(event.message.length, 2048, "ordinary message rendering remains bounded");
+  assert.ok(event.doctor_inventory, "structured evidence must be parsed before display truncation");
+  assert.equal(event.doctor_inventory.inventory.entries.length, 5);
+  assert.equal(event.doctor_inventory.inventory.total, 7);
+  assert.equal(event.doctor_inventory.inventory.scope, "direct_children");
+  assert.deepEqual(Object.keys(event.doctor_inventory.inventory.entries[0]).sort(), [
+    "kind", "modified", "mount_boundary", "name", "name_truncated", "path",
+    "relative_path_truncated", "size_bytes"
+  ]);
+  const copied = doctor.activityTroubleshootingText(event);
+  assert.match(copied, /Doctor discovery scope: Direct children/);
+  assert.match(copied, /Doctor discovery entries: 7; displayed: 5; sample truncated/);
+  assert.doesNotMatch(copied, /must-not-render-(?:user|password|session|acl|digest|server)|must-not-render\.invalid/);
+
+  const logRecords = doctor.doctorInventoryRecordsFromText([
+    JSON.stringify({ schema: "unrelated.log.v1", password: "ignore-me" }),
+    JSON.stringify(record)
+  ].join("\n"));
+  assert.equal(logRecords.length, 1);
+  assert.equal(logRecords[0].profile, "office");
+  assert.equal(logRecords[0].inventory.entries.length, 5);
+
+  const emptyRecord = Object.assign({}, record, {
+    scope: "visible_shared_folders",
+    total_entries: 0,
+    truncated: false,
+    sample_count: 0,
+    sample: []
+  });
+  const parsedEmpty = doctor.doctorInventoryRecordsFromText(JSON.stringify(emptyRecord));
+  assert.equal(parsedEmpty.length, 1);
+  assert.equal(parsedEmpty[0].inventory.scope, "visible_shared_folders");
+  assert.equal(parsedEmpty[0].inventory.total, 0);
+  assert.deepEqual(parsedEmpty[0].inventory.entries, []);
 });
 
 test("an unsuccessful package outcome cannot be masked by a successful target document", async () => {
@@ -381,4 +548,22 @@ test("Doctor surface renders section states, progress, timings, copy, and bounde
     "Raw terminal evidence"
   ]) assert.ok(source.includes(marker), `missing Doctor UI marker: ${marker}`);
   assert.doesNotMatch(source, /<[^>]+v-html/);
+});
+
+test("private discovery cards are dark, responsive, overflow-contained, and covered by DSM Help", () => {
+  for (const marker of [
+    "sdsync-inventory-evidence",
+    "sdsync-inventory-evidence-summary",
+    "sdsync-inventory-evidence-entry",
+    "sdsync-log-inventory-evidence",
+    "sdsync-doctor-inventory-empty",
+    '["doctor", "Doctor discovery"]'
+  ]) assert.ok(source.includes(marker) || css.includes(marker), `missing private discovery UI marker: ${marker}`);
+  assert.match(css, /\.sdsync-inventory-evidence\s*\{[^}]*min-width:\s*0[^}]*background:\s*var\(--sdsync-control\)/s);
+  assert.match(css, /\.sdsync-inventory-evidence-entry\s*\{[^}]*grid-template-columns:\s*48px minmax\(0, 1fr\) minmax\(72px, 0\.35fr\)[^}]*min-width:\s*0/s);
+  assert.match(css, /\.sdsync-inventory-evidence-entry > code,[\s\S]*?min-width:\s*0[\s\S]*?overflow:\s*hidden[\s\S]*?text-overflow:\s*ellipsis[\s\S]*?white-space:\s*nowrap/);
+  assert.match(css, /\.sdsync-app\.sdsync-compact-shell \.sdsync-inventory-evidence-entry\s*\{[^}]*grid-template-columns:\s*44px minmax\(0, 1fr\)/s);
+  assert.match(activityHelp, /Doctor discovery contains private, package-local structure evidence/);
+  assert.match(activityHelp, /at most five logical path\/name and folder\/file entries/);
+  assert.match(activityHelp, /not sent to a profile's generic remote log collector/);
 });

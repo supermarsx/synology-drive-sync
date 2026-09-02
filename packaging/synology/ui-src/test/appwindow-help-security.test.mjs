@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import test from "node:test";
 
 const appUrl = new URL("../src/App.vue", import.meta.url);
@@ -245,6 +246,15 @@ test("About metadata, dependency versions, and update links match repository sou
   assert.ok(!aboutHelp.includes("complete transitive license inventory ships as"));
 
   const normalizedNotice = dsmUiNotice.replace(/\r\n?/g, "\n").trim();
+  const testRequire = createRequire(import.meta.url);
+  const vueLoaderRequire = createRequire(testRequire.resolve("vue-loader/package.json"));
+  const compilerUtilsPackage = vueLoaderRequire.resolve("@vue/component-compiler-utils/package.json");
+  const compilerUtilsRequire = createRequire(compilerUtilsPackage);
+  assert.equal(
+    compilerUtilsRequire("postcss/package.json").version,
+    "8.5.26",
+    "Vue 2 compiler-utils must execute with the audited PostCSS override"
+  );
   for (const name of ["vue-loader", "webpack"]) {
     const pin = uiPackage.devDependencies[name];
     assert.match(pin, /^\d+\.\d+\.\d+$/, `${name} must have an exact package.json pin`);

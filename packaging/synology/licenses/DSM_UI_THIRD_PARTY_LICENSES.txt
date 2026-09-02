@@ -7,10 +7,10 @@ only to build the UI are not represented as shipped runtime code. The Vue npm
 package is externalized; DSM supplies the global Vue runtime. The Vue npm
 runtime is not copied into the AppWindow bundle.
 
-vue-loader 15.10.1
+vue-loader 15.11.1
 ------------------
 
-Source: https://github.com/vuejs/vue-loader/tree/v15.10.1
+Source: https://github.com/vuejs/vue-loader/tree/v15.11.1
 Bundled component: lib/runtime/componentNormalizer.js
 
 The MIT License (MIT)
@@ -35,10 +35,10 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-webpack 5.91.0
+webpack 5.110.3
 --------------
 
-Source: https://github.com/webpack/webpack/tree/v5.91.0
+Source: https://github.com/webpack/webpack/tree/v5.110.3
 Bundled components: generated runtime helpers from
 lib/runtime/CompatGetDefaultExportRuntimeModule.js,
 lib/runtime/DefinePropertyGettersRuntimeModule.js, and

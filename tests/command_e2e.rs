@@ -397,7 +397,7 @@ fn config_show_formats_effective_values_without_reading_secret_files() {
 fn every_completion_shell_emits_its_native_command_tree() {
     let fixture = Fixture::new();
     let cases = [
-        ("bash", "_synology-drive-sync()"),
+        ("bash", "_synology__drive__sync()"),
         ("zsh", "#compdef synology-drive-sync"),
         ("fish", "complete -c synology-drive-sync"),
         ("powershell", "Register-ArgumentCompleter"),

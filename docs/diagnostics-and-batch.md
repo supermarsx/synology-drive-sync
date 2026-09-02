@@ -68,8 +68,8 @@ synology-drive-sync doctor \
 | Level | Target checks | Authentication and destination access |
 | --- | --- | --- |
 | Quick | Endpoint policy, TCP/TLS and reverse-proxy route, DSM/File Station discovery, and the API surface required to establish the diagnostic client | None; it does not resolve credentials, create a session, inspect permissions, or list the destination |
-| Standard (default) | Quick plus the effective profile's required APIs | Password and challenge-driven optional TOTP, a temporary session, destination permission, bounded inventory, and logout |
-| Extensive | Standard plus content-fingerprint/download and delete capabilities, with optional server-side copy reported as a warning when absent | The same bounded destination checks; it still does not mutate the target or read/hash remote file payloads |
+| Standard (default) | Quick plus the effective profile's required APIs | Password and challenge-driven optional TOTP, a temporary session, bounded target discovery, destination permission when a remote is selected, and logout |
+| Extensive | Standard plus content-fingerprint/download and delete capabilities, with optional server-side copy reported as a warning when absent | The same bounded target discovery; it still does not mutate the target or read/hash remote file payloads |
 
 Allowed HTTP or disabled certificate verification is visible as a warning, not silently treated as
 secure transport. For an existing destination, write permission is checked in that exact directory.
@@ -77,33 +77,52 @@ For a missing destination, File Station can check only the first missing compone
 nearest existing ancestor without creating anything; deeper missing components cannot have
 independent ACLs yet.
 
-### Bounded destination inventory
+### Bounded target discovery
 
-Standard and Extensive use the same deliberately small inventory check. Doctor validates the exact
-root, then requests at most one direct-child page sorted by name. It asks File Station for at most
-six entries so it can emit a deterministic sample of no more than the first five. The result
-contains File Station's total direct-child count, `sample_count`, `sample_limit: 5`, `truncated`,
-and `truncated_count`. `truncated: true` means the display sample was capped; it is not itself a
-failed check. Extensive does not lift this bound.
+Standard and Extensive use the same deliberately small discovery check after authentication. Its
+scope depends only on whether the resolved invocation selected a remote:
 
-Sample entries contain only bounded relative name/path text, kind, file size and mtime when
+- Without `REMOTE` and without a profile remote, Doctor requests the File Station shared-folder
+  roots visible to that account. The result uses scope `visible_shared_folders` and contains at most
+  five directory entries. This is discovery evidence only: Doctor never selects a share, descends
+  into one, or treats any listed share as a synchronization destination. A root returned by the
+  authenticated `list_share` call is retained even when File Station marks child listing disabled;
+  its presence does not claim browse, read, or write permission.
+- With `REMOTE`, directly or through a profile, Doctor validates that exact logical root and requests
+  at most one direct-child page sorted by name. The result uses scope `direct_children` and contains
+  at most five folder/file entries. Doctor never follows those children.
+
+Both scopes request at most six entries so Doctor can emit a deterministic sample of no more than
+the first five and record whether more entries exist. The result contains the reported total,
+`sample_count`, `sample_limit: 5`, `truncated`, and `truncated_count`; `truncated: true` means only
+that the displayed evidence was capped. A valid response with no visible roots or no direct
+children is preserved as explicit evidence with `sample_count: 0` and an empty `sample`, rather than
+being omitted or inferred as a failure. Extensive does not lift these bounds.
+
+Sample entries contain only bounded logical name/relative-path text, kind, file size and mtime when
 applicable, mount-boundary state, and explicit text-truncation flags. The sample contains no file
-payload, digest, ACL document, absolute sample path, credential, cookie, token, session identifier,
-or unbounded server detail. Doctor never follows those children, never requests a second listing
-page, and never substitutes this sample for the full recursive inventory used by Plan or Sync. The
-combined root/list inventory has a five-second deadline; its output records the page, depth, and
-deadline budget.
+payload, digest, ACL document, absolute local volume path, credential, cookie, token, session
+identifier, or unbounded server detail. Doctor never requests a second listing page and never
+substitutes this evidence for the full recursive inventory used by Plan or Sync. Discovery has a
+five-second deadline; its output records the page, depth, and deadline budget.
+
+The command result retains this bounded `remote_inventory` object. When Doctor runs through the DSM
+package manager, the DSM package also writes a separate local/private history record with the same
+maximum-five structure for troubleshooting. That DSM-only history is exposed through Activity/Logs
+on the NAS and excluded from remote-log forwarding; the core CLI does not generally create this
+extra history file.
 
 ### Section verdicts and timing
 
 A target report always carries the selected level, overall status, total elapsed time, counts, and
 these fixed sections: routing/TLS, API discovery, DSM session authentication, File Station
 capabilities, destination permissions, destination inventory, disposable write/verify/cleanup, and
-session logout. Each section is `pass`, `warn`, `fail`, or `skip`, with bounded detail,
-`elapsed_ms`, and `timing_scope`. Routing and discovery share one connection measurement and say so
-instead of presenting the same latency as two independent requests. Control-plane requests remain
-capped at ten seconds, connection setup uses the configured connect timeout, and the inventory has
-the stricter five-second bound above.
+session logout. With no selected remote, destination permissions are explicitly skipped while
+visible shared-folder discovery still runs in the destination-inventory section. Each section is
+`pass`, `warn`, `fail`, or `skip`, with bounded detail, `elapsed_ms`, and `timing_scope`. Routing and
+discovery share one connection measurement and say so instead of presenting the same latency as two
+independent requests. Control-plane requests remain capped at ten seconds, connection setup uses the
+configured connect timeout, and the inventory has the stricter five-second bound above.
 
 Any HTTP or DSM response from either discovery route is evidence that the endpoint route and its
 transport negotiation worked, even when the response status or discovery payload is invalid. In

@@ -98,6 +98,7 @@ FIXED_INFO = {
 }
 REQUIRED_INFO = set(FIXED_INFO) | {"version", "arch", "extractsize", "checksum"}
 NOTIFICATION_KEYS = {"sync_succeeded", "sync_failed", "doctor_failed"}
+POSTCSS_BUILD_PIN = "8.5.26"
 
 
 class ValidationError(AssertionError):
@@ -149,6 +150,34 @@ def load_unique_json(payload: bytes, label: str) -> object:
         return result
 
     return json.loads(payload, object_pairs_hook=unique_object)
+
+
+def validate_ui_dependency_resolution(
+    workspace_payload: bytes, lock_payload: bytes
+) -> None:
+    """Enforce the audited PostCSS resolution used by the Vue 2 build chain."""
+    try:
+        workspace = workspace_payload.decode("utf-8")
+        lockfile = lock_payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValidationError("native DSM dependency manifests must be UTF-8") from error
+
+    exact_override = rf"(?m)^overrides:\r?$\n  postcss: {re.escape(POSTCSS_BUILD_PIN)}\r?$"
+    if not re.search(exact_override, workspace):
+        raise ValidationError(
+            f"pnpm workspace must override every PostCSS consumer to {POSTCSS_BUILD_PIN}"
+        )
+    if not re.search(exact_override, lockfile):
+        raise ValidationError(
+            f"pnpm lockfile must record the exact PostCSS {POSTCSS_BUILD_PIN} override"
+        )
+
+    resolved = set(re.findall(r"(?m)^  postcss@([^:\s]+):\r?$", lockfile))
+    if resolved != {POSTCSS_BUILD_PIN}:
+        raise ValidationError(
+            "pnpm lockfile must resolve every PostCSS consumer to the audited "
+            f"{POSTCSS_BUILD_PIN} build-tool release, found {sorted(resolved)}"
+        )
 
 
 def member_bytes(archive: tarfile.TarFile, member: tarfile.TarInfo) -> bytes:
@@ -1555,11 +1584,11 @@ def validate_native_build_contract(
     dev_dependencies = package.get("devDependencies")
     if dependencies not in ({}, None) or not isinstance(dev_dependencies, dict):
         raise ValidationError("native DSM UI may only use pinned build-time dependencies")
-    if dev_dependencies.get("vue") != "2.7.14" or any(
+    if dev_dependencies.get("vue") != "2.7.16" or any(
         not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version)
         for version in dev_dependencies.values()
     ):
-        raise ValidationError("native DSM UI build dependencies must be exact and use DSM Vue 2.7.14")
+        raise ValidationError("native DSM UI build dependencies must be exact and use DSM-compatible Vue 2.7.16")
 
     validate_native_api_source(api_payload)
 
@@ -1670,6 +1699,259 @@ def _javascript_string_literals(source: str):
             break
 
 
+def _javascript_code_mask(source: str) -> str:
+    """Preserve JavaScript code positions while blanking comments and literals."""
+    masked = list(source)
+    index = 0
+    length = len(source)
+    while index < length:
+        current = source[index]
+        following = source[index + 1] if index + 1 < length else ""
+        if current == "/" and following in ("/", "*"):
+            start = index
+            if following == "/":
+                newline = source.find("\n", index + 2)
+                index = length if newline < 0 else newline
+            else:
+                end = source.find("*/", index + 2)
+                index = length if end < 0 else end + 2
+            for offset in range(start, index):
+                if masked[offset] not in "\r\n":
+                    masked[offset] = " "
+            continue
+        if current not in ("'", '"', "`"):
+            index += 1
+            continue
+
+        quote = current
+        start = index
+        index += 1
+        while index < length:
+            if source[index] == "\\":
+                index = min(length, index + 2)
+                continue
+            if source[index] == quote:
+                index += 1
+                break
+            index += 1
+        for offset in range(start, index):
+            if masked[offset] not in "\r\n":
+                masked[offset] = " "
+    return "".join(masked)
+
+
+def _has_vue_destructuring_target(code: str) -> bool:
+    """Return whether a destructuring assignment/declaration contains ``Vue``."""
+    stack: list[list[object]] = []
+    index = 0
+    while index < len(code):
+        current = code[index]
+        if current in "{[":
+            stack.append([current, False])
+        elif current in "}]":
+            expected = "{" if current == "}" else "["
+            if stack and stack[-1][0] == expected:
+                _, contains_vue = stack.pop()
+                if contains_vue:
+                    cursor = index + 1
+                    while cursor < len(code) and code[cursor].isspace():
+                        cursor += 1
+                    if (
+                        cursor < len(code)
+                        and code[cursor] == "="
+                        and (cursor + 1 == len(code) or code[cursor + 1] not in "=>")
+                    ) or re.match(r"(?:of|in)\b", code[cursor:]):
+                        return True
+        elif (
+            code.startswith("Vue", index)
+            and (index == 0 or not (code[index - 1].isalnum() or code[index - 1] in "_$"))
+            and (
+                index + 3 == len(code)
+                or not (code[index + 3].isalnum() or code[index + 3] in "_$")
+            )
+        ):
+            for frame in stack:
+                frame[1] = True
+            index += 3
+            continue
+        index += 1
+    return False
+
+
+def _writes_bare_vue(code: str) -> bool:
+    """Return whether code can assign to or update the bare ``Vue`` binding."""
+    bare_vue = r"(?<![\w$.])Vue(?![\w$])"
+    assignment = r"(?:\*\*|>>>|<<|>>|&&|\|\||\?\?|[+\-*/%&|^])=|=(?!=|>)"
+    return bool(
+        re.search(rf"{bare_vue}\s*(?:\+\+|--|{assignment})", code)
+        or re.search(rf"(?:\+\+|--)\s*{bare_vue}", code)
+        or re.search(rf"\bfor(?:\s+await)?\s*\(\s*{bare_vue}\s+(?:of|in)\b", code)
+    )
+
+
+def _has_escaped_vue_identifier(code: str) -> bool:
+    """Reject an identifier whose JavaScript Unicode escapes decode to ``Vue``."""
+    unicode_escape = r"\\u(?:[0-9A-Fa-f]{4}|\{[0-9A-Fa-f]{1,6}\})"
+    identifier_unit = rf"(?:[A-Za-z0-9_$]|{unicode_escape})"
+    for match in re.finditer(rf"(?<![A-Za-z0-9_$]){identifier_unit}+(?![A-Za-z0-9_$])", code):
+        token = match.group(0)
+        if "\\u" not in token:
+            continue
+
+        def decode_escape(escaped: re.Match[str]) -> str:
+            digits = escaped.group(0)[2:]
+            if digits.startswith("{"):
+                digits = digits[1:-1]
+            try:
+                return chr(int(digits, 16))
+            except (ValueError, OverflowError):
+                return ""
+
+        if re.sub(unicode_escape, decode_escape, token) == "Vue":
+            return True
+    return False
+
+
+def _uses_dsm_global_vue(source: str) -> bool:
+    """Recognize the production bundle's direct binding to DSM's global Vue.
+
+    Webpack can place the external binding after another declarator, for example
+    ``const runtime = {...}, vueExternal = Vue;``.  This deliberately small
+    lexical check accepts that form at script scope (or the generated arrow-IIFE
+    scope), without treating strings, imports, a bundled local named ``Vue``,
+    member access, or a nested function binding as evidence.
+    """
+    code = _javascript_code_mask(source)
+    # JavaScript permits Unicode escapes inside identifiers.  A local binding
+    # such as ``V\u0075e`` is the same identifier as ``Vue`` and would otherwise
+    # evade every plain-text declaration/write check below.  The reviewed
+    # production bundle has no reason to spell this binding indirectly, so
+    # reject any escaped identifier that decodes to Vue.
+    if _has_escaped_vue_identifier(code):
+        return False
+    if re.search(r"\bimport\b[^;\r\n]*\bVue\b", code):
+        return False
+    if re.search(r"\b(?:const|let|var|class|function)\s+Vue\b", code) or re.search(
+        r"\bfunction\s*\*\s*Vue\b", code
+    ):
+        return False
+    # A destructuring target can introduce the same local binding without the
+    # simple ``const Vue = ...`` spelling above.  Reject every destructuring
+    # assignment that names Vue; this is deliberately conservative because a
+    # production bundle has no reason to destructure a property called Vue
+    # while proving that its runtime comes directly from DSM's global.
+    if _has_vue_destructuring_target(code):
+        return False
+    # Likewise, any assignment/update of the bare identifier could replace or
+    # mutate DSM's binding before a later ``const external = Vue`` declaration.
+    if _writes_bare_vue(code):
+        return False
+    if re.search(
+        r"\bfunction(?:\s+[A-Za-z_$][\w$]*)?\s*\([^)]*\bVue\b[^)]*\)", code
+    ) or re.search(r"(?:\([^()]*\bVue\b[^()]*\)|\bVue)\s*=>", code):
+        return False
+    if re.search(r"\bcatch\s*\([^)]*\bVue\b[^)]*\)", code):
+        return False
+    for module_load in re.finditer(r"\b(?:require|__webpack_require__)\s*\(", code):
+        cursor = module_load.end()
+        while cursor < len(source) and source[cursor].isspace():
+            cursor += 1
+        if cursor >= len(source) or source[cursor] not in ("'", '"'):
+            continue
+        quote = source[cursor]
+        end = cursor + 1
+        while end < len(source) and source[end] != quote:
+            end += 2 if source[end] == "\\" else 1
+        if source[cursor + 1:end] == "vue":
+            return False
+
+    wrapper = re.match(r"\s*\(\s*\(\s*\)\s*=>\s*\{", code)
+    allowed_depth = (1, 1, 0) if wrapper else (0, 0, 0)
+    brace_depth = 0
+    paren_depth = 0
+    bracket_depth = 0
+    index = 0
+    length = len(code)
+    while index < length:
+        current = code[index]
+        if current == "{":
+            brace_depth += 1
+            index += 1
+            continue
+        if current == "}":
+            brace_depth = max(0, brace_depth - 1)
+            index += 1
+            continue
+        if current == "(":
+            paren_depth += 1
+            index += 1
+            continue
+        if current == ")":
+            paren_depth = max(0, paren_depth - 1)
+            index += 1
+            continue
+        if current == "[":
+            bracket_depth += 1
+            index += 1
+            continue
+        if current == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+            index += 1
+            continue
+
+        if (
+            (brace_depth, paren_depth, bracket_depth) == allowed_depth
+            and code.startswith("const", index)
+            and (index == 0 or not (code[index - 1].isalnum() or code[index - 1] in "_$"))
+            and (
+                index + 5 == length
+                or not (code[index + 5].isalnum() or code[index + 5] in "_$")
+            )
+        ):
+            declarator_start = index + 5
+            cursor = declarator_start
+            local_brace = 0
+            local_paren = 0
+            local_bracket = 0
+            while cursor < length:
+                token = code[cursor]
+                if token == "{":
+                    local_brace += 1
+                elif token == "}":
+                    if local_brace == 0:
+                        break
+                    local_brace -= 1
+                elif token == "(":
+                    local_paren += 1
+                elif token == ")":
+                    if local_paren == 0:
+                        break
+                    local_paren -= 1
+                elif token == "[":
+                    local_bracket += 1
+                elif token == "]":
+                    if local_bracket == 0:
+                        break
+                    local_bracket -= 1
+                elif (
+                    token in ",;"
+                    and local_brace == 0
+                    and local_paren == 0
+                    and local_bracket == 0
+                ):
+                    declarator = code[declarator_start:cursor].strip()
+                    if re.fullmatch(r"[A-Za-z_$][\w$]*\s*=\s*Vue", declarator):
+                        return True
+                    declarator_start = cursor + 1
+                    if token == ";":
+                        break
+                cursor += 1
+            index = max(index + 5, cursor)
+            continue
+        index += 1
+    return False
+
+
 def _validate_runtime_style_bundle(script: str, style: str) -> None:
     for marker in (
         "sdsync-current-runtime-style",
@@ -1713,14 +1995,14 @@ def validate_native_bundle(
     ):
         if marker not in script:
             raise ValidationError(f"native DSM bundle is missing reviewed contract {marker!r}")
-    if not re.search(r"\b(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*Vue\b", script):
+    if not _uses_dsm_global_vue(script):
         raise ValidationError("native DSM bundle must consume Vue from the DSM global")
     for forbidden in (
         "<iframe", "createElement(\"iframe\")", "createElement('iframe')", "index.html",
         "document.documentElement", "window.location", "window.history", "history.replaceState",
         "location.hash", "hashchange",
         "sourceMappingURL", "eval(", "new Function(", "__VUE_DEVTOOLS_GLOBAL_HOOK__",
-        "You are running Vue in development mode", 'version:"2.7.14"',
+        "You are running Vue in development mode", 'version:"2.7.16"',
         "consumeLaunchToken", "launch token",
     ):
         if forbidden.lower() in script.lower():
@@ -1813,6 +2095,7 @@ def validate_source() -> None:
         UI_SOURCE / "config.define",
         UI_SOURCE / "Makefile",
         UI_SOURCE / "package.json",
+        UI_SOURCE / "pnpm-workspace.yaml",
         UI_SOURCE / "pnpm-lock.yaml",
         UI_SOURCE / "webpack.config.js",
         UI_SOURCE / "src/main.js",
@@ -1854,6 +2137,10 @@ def validate_source() -> None:
             )
     validate_privilege((HERE / "conf/privilege").read_bytes())
     validate_source_app_config((UI_SOURCE / "app.config").read_bytes())
+    validate_ui_dependency_resolution(
+        (UI_SOURCE / "pnpm-workspace.yaml").read_bytes(),
+        (UI_SOURCE / "pnpm-lock.yaml").read_bytes(),
+    )
     dist_members = {
         path.name
         for path in (UI_SOURCE / "dist").iterdir()

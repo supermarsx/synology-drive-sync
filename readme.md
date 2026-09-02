@@ -75,7 +75,7 @@ routines, state, and logs.
 | --- | --- | --- |
 | `doctor source [SOURCE] [--hash]` | None | Validate readability, names, exclusions, and optionally every payload fingerprint |
 | `doctor --level quick target [REMOTE]` | None | Check TLS, reverse-proxy routing, and API discovery without authenticating |
-| `doctor target [REMOTE]` | None | Run the default Standard check: authenticate, inspect permissions, sample at most five direct children, and log out |
+| `doctor target [REMOTE]` | None | Run the default Standard check: authenticate, then sample at most five visible share roots when no destination is selected or five direct children when one is selected, and log out |
 | `doctor --level extensive target [REMOTE]` | None | Require the fullest target API/capability evidence; still read-only |
 | `doctor --level extensive target [REMOTE] --write-test` | Disposable probe and cleanup only | Exercise live create, upload, copy, MD5/CRC32/SHA-256 verification, and cleanup |
 | `plan` | None | Review the exact pending work; `--exit-code` returns `10` when changes exist |
@@ -83,8 +83,12 @@ routines, state, and logs.
 | `sync` with effective deletion enabled | Creates, updates, and guarded removals | Deliberate one-way mirror after separate recovery testing |
 
 Every target level reports an overall verdict plus timed, per-section `PASS`, `WARN`, `FAIL`, or
-`SKIP` evidence. Standard and Extensive inventory is a deterministic, non-recursive sample, not a
-full sync scan. Extensive never writes unless the separate `--write-test` opt-in is present. See
+`SKIP` evidence. A bare Standard or Extensive target Doctor authenticates and reports no more than
+five File Station-reported shared-folder roots under `visible_shared_folders`; it never chooses one
+or treats discovery as proof of browse/read/write permission
+for the user. Supplying `REMOTE`, directly or through a profile, instead reports at most five
+non-recursive folder/file entries under `direct_children`. An empty sample is retained as explicit
+evidence. Extensive never writes unless the separate `--write-test` opt-in is present. See
 [Diagnostics and multi-profile batches](https://supermarsx.github.io/synology-drive-sync/diagnostics-and-batch.html)
 for the exact checks, bounds, and limitations.
 

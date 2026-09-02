@@ -380,6 +380,214 @@ fn authenticated_target_doctor_checks_exact_destination_and_logs_out() {
 }
 
 #[test]
+fn untargeted_doctor_discovers_bounded_visible_shared_folders_without_selecting_one() {
+    let fixture = TestDir::new("untargeted-doctor");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    for share in [
+        "alpha", "beta", "delta", "epsilon", "gamma", "omega", "zeta",
+    ] {
+        server.add_directory(&format!("/{share}"));
+    }
+    // list_share is authenticated discovery, not a browse/write permission
+    // assertion. Preserve a reported root even when File Station marks child
+    // listing unavailable.
+    server.disable_directory_listing("/alpha");
+    let password_path = password.to_str().expect("UTF-8 password path");
+    let invoke = |format| {
+        run(&[
+            "--quiet",
+            "--output",
+            format,
+            "doctor",
+            "--url",
+            server.base_url(),
+            "--username",
+            "e2e-user",
+            "--password-file",
+            password_path,
+            "--no-vault",
+            "--allow-http",
+            "target",
+        ])
+    };
+
+    let json_output = invoke("json");
+    assert_success(&json_output);
+    let actual = stdout_json(&json_output);
+    assert_eq!(actual["level"], "standard");
+    assert_eq!(actual["authenticated"], true);
+    assert_eq!(actual["remote_checked"], false);
+    assert_eq!(actual["remote_exists"], Value::Null);
+    assert_eq!(actual["remote_entries"], Value::Null);
+    assert_eq!(actual["write_permission_scope"], Value::Null);
+    assert_eq!(actual["write_permission_path"], Value::Null);
+    assert_eq!(actual["sections"][4]["id"], "destination_permissions");
+    assert_eq!(actual["sections"][4]["status"], "skip");
+    assert!(
+        actual["sections"][4]["detail"]
+            .as_str()
+            .expect("permission skip detail")
+            .contains("no destination was selected")
+    );
+    assert_eq!(actual["sections"][5]["id"], "destination_inventory");
+    assert_eq!(actual["sections"][5]["status"], "pass");
+    assert_eq!(
+        actual["remote_inventory"]["scope"],
+        "visible_shared_folders"
+    );
+    assert_eq!(actual["remote_inventory"]["root_exists"], true);
+    assert_eq!(actual["remote_inventory"]["total_entries"], 8);
+    assert_eq!(actual["remote_inventory"]["sample_count"], 5);
+    assert_eq!(actual["remote_inventory"]["sample_limit"], 5);
+    assert_eq!(actual["remote_inventory"]["truncated"], true);
+    assert_eq!(actual["remote_inventory"]["truncated_count"], 3);
+    assert_eq!(
+        actual["remote_inventory"]["truncated_reason"],
+        "sample_limit"
+    );
+    assert_eq!(actual["remote_inventory"]["budget"]["pages_requested"], 1);
+    assert_eq!(actual["remote_inventory"]["budget"]["traversal_depth"], 0);
+    assert_eq!(actual["remote_inventory"]["budget"]["deadline_ms"], 5_000);
+    assert_eq!(
+        actual["remote_inventory"]["sample"]
+            .as_array()
+            .expect("shared-folder sample")
+            .iter()
+            .map(|entry| entry["relative_path"].as_str().expect("logical share path"))
+            .collect::<Vec<_>>(),
+        ["/alpha", "/beta", "/delta", "/epsilon", "/gamma"]
+    );
+    assert!(
+        actual["remote_inventory"]["sample"]
+            .as_array()
+            .expect("shared-folder sample")
+            .iter()
+            .all(|entry| {
+                entry["kind"] == "directory"
+                    && entry["size_bytes"].is_null()
+                    && entry["mtime_seconds"].is_null()
+                    && entry["mount_boundary"] == false
+            })
+    );
+
+    let ndjson_output = invoke("ndjson");
+    assert_success(&ndjson_output);
+    let records = stdout_ndjson(&ndjson_output);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["remote_inventory"], actual["remote_inventory"]);
+    assert_eq!(records[0]["remote_checked"], false);
+    assert_eq!(records[0]["remote_exists"], Value::Null);
+
+    let human_output = invoke("human");
+    assert_success(&human_output);
+    let human = String::from_utf8(human_output.stdout.clone()).expect("human output is UTF-8");
+    assert!(human.contains("8 visible shared-folder roots; 5 sampled; 3 truncated"));
+    assert!(human.contains("path=/alpha; name=alpha; kind=directory"));
+    assert!(human.contains("no destination was selected or permission-checked"));
+
+    for output in [&json_output, &ndjson_output, &human_output] {
+        let rendered = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!rendered.contains("correct horse battery staple"));
+        assert!(!rendered.contains("e2e-session-secret"));
+        assert!(!rendered.contains("e2e-syno-token-secret"));
+    }
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 12);
+    for request_set in requests.chunks_exact(4) {
+        assert_eq!(
+            request_set
+                .iter()
+                .map(|request| request.operation())
+                .collect::<Vec<_>>(),
+            [
+                "SYNO.API.Info.query",
+                "SYNO.API.Auth.login",
+                "SYNO.FileStation.List.list_share",
+                "SYNO.API.Auth.logout",
+            ]
+        );
+        let listing = &request_set[2];
+        assert_eq!(listing.fields.get("offset").map(String::as_str), Some("0"));
+        assert_eq!(listing.fields.get("limit").map(String::as_str), Some("6"));
+        assert_eq!(
+            listing.fields.get("additional").map(String::as_str),
+            Some("[\"perm\"]")
+        );
+    }
+    assert!(
+        requests
+            .iter()
+            .all(|request| !is_mutation(&request.operation()))
+    );
+    assert!(requests.iter().all(|request| {
+        request.operation() != "SYNO.FileStation.List.getinfo"
+            && request.operation() != "SYNO.FileStation.List.list"
+    }));
+}
+
+#[test]
+fn untargeted_doctor_preserves_explicit_zero_shared_folder_evidence() {
+    let fixture = TestDir::new("untargeted-doctor-empty");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.remove_directory("/team");
+
+    let output = run(&[
+        "--quiet",
+        "--output",
+        "json",
+        "doctor",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password.to_str().expect("UTF-8 password path"),
+        "--no-vault",
+        "--allow-http",
+        "target",
+    ]);
+
+    assert_success(&output);
+    let actual = stdout_json(&output);
+    assert_eq!(actual["status"], "warn");
+    assert_eq!(actual["remote_checked"], false);
+    assert_eq!(actual["remote_exists"], Value::Null);
+    assert_eq!(actual["sections"][4]["status"], "skip");
+    assert_eq!(actual["sections"][5]["status"], "pass");
+    assert_eq!(
+        actual["remote_inventory"]["scope"],
+        "visible_shared_folders"
+    );
+    assert_eq!(actual["remote_inventory"]["total_entries"], 0);
+    assert_eq!(actual["remote_inventory"]["sample_count"], 0);
+    assert_eq!(actual["remote_inventory"]["sample"], json!([]));
+    assert_eq!(actual["remote_inventory"]["truncated"], false);
+    assert_eq!(actual["remote_inventory"]["truncated_count"], 0);
+    assert_eq!(actual["remote_inventory"]["truncated_reason"], Value::Null);
+
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .map(|request| request.operation())
+            .collect::<Vec<_>>(),
+        [
+            "SYNO.API.Info.query",
+            "SYNO.API.Auth.login",
+            "SYNO.FileStation.List.list_share",
+            "SYNO.API.Auth.logout",
+        ]
+    );
+}
+
+#[test]
 fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
     let fixture = TestDir::new("plan-sync");
     let source = fixture.child("source");

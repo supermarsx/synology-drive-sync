@@ -31,36 +31,36 @@ members = ["crates/synology-drive-sync-ffi"]
 resolver = "3"
 
 [dependencies]
-clap = { version = "4.6.5", features = ["derive", "env"] }
-clap_complete = "4.6.8"
-clap_mangen = "0.3.0"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+clap_complete = "4.6.9"
+clap_mangen = "0.3.3"
 ctrlc = { version = "3.5.2", features = ["termination"] }
 crc32fast = "1.5.1"
-ignore = "0.4.31"
+ignore = "0.4.33"
 keyring-core = "1.0.0"
 md-5 = { version = "0.11.0", default-features = false }
-hmac = "0.12.1"
+hmac = "0.13.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "form", "multipart", "rustls"] }
 rpassword = "7.5.4"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", features = ["raw_value"] }
-sha2 = "0.10.9"
-subtle = "2.6"
-thiserror = "2.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["raw_value"] }
+sha2 = "0.11.0"
+subtle = "2.6.1"
+thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "time"] }
-toml = "0.9.8"
-totp-rs = { version = "5.7.2", default-features = false, features = ["zeroize"] }
-zeroize = "1.8"
+toml = "1.1.4"
+totp-rs = { version = "6.0.0", default-features = false, features = ["std", "zeroize"] }
+zeroize = "1.9.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-native-keyring-store = { version = "1.1.0", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-apple-native-keyring-store = { version = "1.0.1", default-features = false, features = ["keychain"] }
+apple-native-keyring-store = { version = "1.0.2", default-features = false, features = ["keychain"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
-zbus-secret-service-keyring-store = { version = "1.0.0", default-features = false, features = ["crypto-rust"] }
+libc = "0.2.189"
+zbus-secret-service-keyring-store = { version = "1.0.1", default-features = false, features = ["crypto-rust"] }
 
 [profile.release]
 lto = "thin"

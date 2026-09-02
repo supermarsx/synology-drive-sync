@@ -9,7 +9,7 @@ The explicit command tree is preferred. Run `synology-drive-sync --help` and
 | `plan SOURCE REMOTE` | Build and print the same plan without mutation. `--exit-code` returns 10 when work is pending. |
 | `doctor source [SOURCE] [--hash]` | Local-only source validation; `--hash` reads and verifies every payload file. No DSM access. |
 | `doctor --level quick target [REMOTE]` | Validate endpoint policy, TLS, reverse-proxy routing, API discovery, and baseline capabilities without credentials or destination access. |
-| `doctor target [REMOTE]` | Run the default Standard authenticated permission, bounded-inventory, and logout checks without mutation. |
+| `doctor target [REMOTE]` | Run the default Standard authenticated discovery and logout checks without mutation. With no resolved remote it lists at most five File Station-reported shared-folder roots without claiming browse/write permission; with a remote it checks permission and at most five direct children. |
 | `doctor --level extensive target [REMOTE]` | Require the fullest target content/download/delete/copy capability evidence without mutation. |
 | `doctor --level extensive target [REMOTE] --write-test` | Explicit disposable create/upload/copy/MD5/CRC32/SHA-256 verify/cleanup probe. Mutating and never automatic. |
 | `doctor --routing-only` | Legacy Quick spelling without a source/target subcommand. |
@@ -17,7 +17,7 @@ The explicit command tree is preferred. Run `synology-drive-sync --help` and
 | `config init` | Write the complete non-secret starter; refuses replacement unless `--force` is used. |
 | `config validate` | Parse and validate the strict TOML schema and profile-local constraints. |
 | `config show` | Print one non-secret effective profile. |
-| `credentials set-password` | Prompt, read protected stdin/file input when selected, and store the password in the current user's OS vault. |
+| `credentials set-password` | Prompt with one opaque `*` per entered character, read protected stdin/file input when selected, and store the password in the current user's OS vault. |
 | `credentials set-totp` | Store a reusable Base32/otpauth seed in the OS vault; `--secret-stdin` reads it from the first line of standard input. |
 | `credentials status` | Report whether password and TOTP vault entries exist, without reading their values into output. |
 | `credentials remove` | Remove `password`, `totp`, or `all` vault material for the endpoint/account. |
@@ -25,8 +25,10 @@ The explicit command tree is preferred. Run `synology-drive-sync --help` and
 | `manpage [--all DIRECTORY]` | Generate the root roff page on stdout or every nested command page in a directory. |
 
 Target Doctor reports fixed timed sections as `pass`, `warn`, `fail`, or `skip`. Standard and
-Extensive inventory never recurses: it emits File Station's direct-child total and a deterministic
-sample of at most five entries with explicit truncation state. Extensive is read-only unless the
+Extensive discovery never recurses. Without a resolved remote it reports at most five visible
+shared-folder roots and does not choose or permission-check one; with a remote it emits File
+Station's direct-child total and a deterministic sample of at most five folder/file entries. Both
+scopes retain explicit zero-entry and truncation evidence. Extensive is read-only unless the
 separate `--write-test` flag is present; Quick and Standard reject that flag. See
 [Diagnostics and multi-profile batches](../diagnostics-and-batch.md) for the complete contract.
 

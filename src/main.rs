@@ -1609,7 +1609,7 @@ struct DoctorResult {
     remote_checked: bool,
     remote_exists: Option<bool>,
     remote_entries: Option<usize>,
-    remote_inventory: Option<DiagnosticRemoteInventory>,
+    remote_inventory: Option<(DoctorInventoryScope, DiagnosticRemoteInventory)>,
     write_permission_scope: Option<&'static str>,
     write_permission_path: Option<String>,
     write_probe_requested: bool,
@@ -1617,6 +1617,28 @@ struct DoctorResult {
     write_probe: Option<WriteProbeReport>,
     write_probe_error: Option<String>,
     write_probe_cancelled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DoctorInventoryScope {
+    DirectChildren,
+    VisibleSharedFolders,
+}
+
+impl DoctorInventoryScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectChildren => "direct_children",
+            Self::VisibleSharedFolders => "visible_shared_folders",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::DirectChildren => "direct children",
+            Self::VisibleSharedFolders => "visible shared-folder roots",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2216,7 +2238,8 @@ fn doctor_checks(
                                         ..EventMetrics::default()
                                     }),
                             );
-                            result.remote_inventory = Some(inventory);
+                            result.remote_inventory =
+                                Some((DoctorInventoryScope::DirectChildren, inventory));
                             match inventory_log {
                                 Ok(()) => result.set_section(
                                     "destination_inventory",
@@ -2326,17 +2349,62 @@ fn doctor_checks(
         result.set_section(
             "destination_permissions",
             DoctorSectionStatus::Skip,
-            "no destination was selected",
+            "no destination was selected; no write-permission check was attempted",
             Duration::ZERO,
             "section",
         );
-        result.set_section(
-            "destination_inventory",
-            DoctorSectionStatus::Skip,
-            "no destination was selected",
-            Duration::ZERO,
-            "section",
+        let inventory_started = Instant::now();
+        let inventory_start_log = log_event(
+            logger.as_ref(),
+            LogEvent::new(EventLogLevel::Info, EventCode::RemoteScanStarted),
         );
+        if let Err(error) = inventory_start_log {
+            result.fail_section("destination_inventory", &error, inventory_started.elapsed());
+        } else {
+            match cancellation
+                .check()
+                .and_then(|()| client.diagnostic_visible_shared_folders())
+            {
+                Ok(inventory) => {
+                    let inventory_detail = format!(
+                        "no destination was selected; one visible shared-folder page was inspected without choosing a target; {} reported roots, {} sampled, {} truncated",
+                        inventory.total_entries,
+                        inventory.sample.len(),
+                        inventory.truncated_count,
+                    );
+                    let inventory_log = log_event(
+                        logger.as_ref(),
+                        LogEvent::new(EventLogLevel::Info, EventCode::RemoteScanCompleted).metrics(
+                            EventMetrics {
+                                operations: inventory.total_entries as u64,
+                                ..EventMetrics::default()
+                            },
+                        ),
+                    );
+                    result.remote_inventory =
+                        Some((DoctorInventoryScope::VisibleSharedFolders, inventory));
+                    match inventory_log {
+                        Ok(()) => result.set_section(
+                            "destination_inventory",
+                            DoctorSectionStatus::Pass,
+                            inventory_detail,
+                            inventory_started.elapsed(),
+                            "section",
+                        ),
+                        Err(error) => result.fail_section(
+                            "destination_inventory",
+                            &error,
+                            inventory_started.elapsed(),
+                        ),
+                    }
+                }
+                Err(error) => result.fail_section(
+                    "destination_inventory",
+                    &error,
+                    inventory_started.elapsed(),
+                ),
+            }
+        }
     }
 
     let logout_started = Instant::now();
@@ -3883,9 +3951,12 @@ fn write_probe_value(report: &WriteProbeReport) -> Value {
     })
 }
 
-fn doctor_inventory_value(inventory: &DiagnosticRemoteInventory) -> Value {
+fn doctor_inventory_value(
+    scope: DoctorInventoryScope,
+    inventory: &DiagnosticRemoteInventory,
+) -> Value {
     json!({
-        "scope": "direct_children",
+        "scope": scope.as_str(),
         "root_exists": inventory.root_exists,
         "total_entries": inventory.total_entries,
         "sample_count": inventory.sample.len(),
@@ -3958,7 +4029,9 @@ fn doctor_value(result: &DoctorResult, elapsed: Duration) -> Value {
         "remote_checked": result.remote_checked,
         "remote_exists": result.remote_exists,
         "remote_entries": result.remote_entries,
-        "remote_inventory": result.remote_inventory.as_ref().map(doctor_inventory_value),
+        "remote_inventory": result.remote_inventory.as_ref().map(|(scope, inventory)| {
+            doctor_inventory_value(*scope, inventory)
+        }),
         "write_permission_scope": result.write_permission_scope,
         "write_permission_path": result.write_permission_path,
         "write_test": {
@@ -3999,10 +4072,11 @@ fn doctor_human(result: &DoctorResult) -> String {
         )
         .expect("writing to a String cannot fail");
     }
-    if let Some(inventory) = &result.remote_inventory {
+    if let Some((scope, inventory)) = &result.remote_inventory {
+        let scope_description = scope.description();
         writeln!(
             human,
-            "Remote inventory: {} direct children; {} sampled; {} truncated (one page, no recursion).",
+            "Remote inventory: {} {scope_description}; {} sampled; {} truncated (one page, no recursion).",
             inventory.total_entries,
             inventory.sample.len(),
             inventory.truncated_count,
@@ -4058,6 +4132,16 @@ fn doctor_human(result: &DoctorResult) -> String {
                     .write_permission_path
                     .as_deref()
                     .unwrap_or("<unknown>"),
+            )
+            .expect("writing to a String cannot fail");
+        } else if result
+            .remote_inventory
+            .as_ref()
+            .is_some_and(|(scope, _)| *scope == DoctorInventoryScope::VisibleSharedFolders)
+        {
+            writeln!(
+                human,
+                "Doctor: routing, API discovery, authentication, and shared-folder discovery are healthy; no destination was selected or permission-checked."
             )
             .expect("writing to a String cannot fail");
         } else {
@@ -6524,26 +6608,29 @@ mod tests {
         assert!(preflight_human.contains("probe prerequisites passed"));
 
         let mut inventoried = preflight.clone();
-        inventoried.remote_inventory = Some(DiagnosticRemoteInventory {
-            root_exists: true,
-            total_entries: 8,
-            sample: vec![synology_drive_sync::api::DiagnosticRemoteEntry {
-                relative_path: "report.bin".to_owned(),
-                relative_path_truncated: false,
-                name: "report.bin".to_owned(),
-                name_truncated: false,
-                kind: local::EntryKind::File,
-                size_bytes: Some(23),
-                mtime_seconds: Some(1_700_000_000),
-                mount_boundary: false,
-            }],
-            truncated: true,
-            truncated_count: 7,
-            truncated_reason: Some("sample_limit"),
-            pages_requested: 1,
-            traversal_depth: 1,
-            deadline_ms: 5_000,
-        });
+        inventoried.remote_inventory = Some((
+            DoctorInventoryScope::DirectChildren,
+            DiagnosticRemoteInventory {
+                root_exists: true,
+                total_entries: 8,
+                sample: vec![synology_drive_sync::api::DiagnosticRemoteEntry {
+                    relative_path: "report.bin".to_owned(),
+                    relative_path_truncated: false,
+                    name: "report.bin".to_owned(),
+                    name_truncated: false,
+                    kind: local::EntryKind::File,
+                    size_bytes: Some(23),
+                    mtime_seconds: Some(1_700_000_000),
+                    mount_boundary: false,
+                }],
+                truncated: true,
+                truncated_count: 7,
+                truncated_reason: Some("sample_limit"),
+                pages_requested: 1,
+                traversal_depth: 1,
+                deadline_ms: 5_000,
+            },
+        ));
         let inventory_human = doctor_human(&inventoried);
         assert!(inventory_human.contains("8 direct children; 1 sampled; 7 truncated"));
         assert!(inventory_human.contains("path=report.bin; name=report.bin; kind=file"));

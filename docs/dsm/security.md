@@ -245,7 +245,7 @@ Allowed authenticated GET actions are:
 | --- | --- |
 | `csrf` | none beyond `action` |
 | `snapshot` | none beyond `action` |
-| `logs` | `lines=1..1000`, optional fixed source `all`, `api`, `controller`, `scheduler`, `sync`, or `audit` |
+| `logs` | `lines=1..1000`, optional fixed source `all`, `api`, `doctor`, `controller`, `scheduler`, `sync`, or `audit` |
 | `activity` | `lines=1..1000` |
 | `result` | one 48-character lowercase hexadecimal server job ID |
 
@@ -365,9 +365,14 @@ stage-derived `bridge`, `authentication`, or `security` category; a corrupt or u
 closed without writing the record or its coalescing state. Log reads scan bounded rotated history and
 return up to the requested number of matching records, so newer trace/debug noise cannot hide an
 older allowed error. A selected log source is emitted alone; `all` divides a fixed encoded-output
-budget across all five sources so the complete JSON remains below the bridge's 1 MiB capture limit.
-Minimal mutation accountability records are mandatory and remain visible even when the optional
-`audit` category level is `off`.
+budget across all six sources—API, private Doctor discovery, controller, scheduler, sync, and
+audit—so the complete JSON remains below the bridge's 1 MiB capture limit. The DSM-only Doctor
+history uses a package-owned `0600` file with a 1 MiB rotation threshold and three rotations. One
+final bounded record can cross the threshold before the next append rotates it. The history contains
+at most five bounded logical names/relative paths per record, is shown only through local
+Activity/Logs, and is never forwarded through the core remote-log sink. Minimal mutation
+accountability records are mandatory and remain visible even when the optional `audit` category
+level is `off`.
 
 ## Secret and response non-disclosure
 

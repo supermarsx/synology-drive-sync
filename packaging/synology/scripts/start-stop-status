@@ -319,8 +319,8 @@ signal_exact_controller_identity() {
     return 1
 }
 
-# Return 0 only for the same live controller tuple, 1 only when that exact
-# controller is absent or terminal, and 73 for unreadable or reused identity.
+# Return 0 only for the same live package-process tuple, 1 only when that exact
+# process is absent or terminal, and 73 for unreadable or reused identity.
 # `kill -0` alone also succeeds for zombies, so lifecycle stop must inspect the
 # exact PID/start/boot/UID tuple and process state before consuming its deadline.
 exact_controller_process_status() {
@@ -365,6 +365,108 @@ exact_controller_process_status() {
         Z|X|x) return 1 ;;
         *) return 0 ;;
     esac
+}
+
+signal_exact_api_identity() {
+    exact_api_pid=$1
+    exact_api_start=$2
+    exact_api_boot=$3
+    exact_api_status=0
+    exact_controller_process_status "$exact_api_pid" "$exact_api_start" \
+        "$exact_api_boot" || exact_api_status=$?
+    case $exact_api_status in
+        0)
+            api_pid_matches "$exact_api_pid" || {
+                package_message "refusing changed API executable identity before signal"
+                return 1
+            }
+            ;;
+        1) return 0 ;;
+        *)
+            package_message "refusing unsafe API process identity before signal"
+            return 1
+            ;;
+    esac
+
+    kill -TERM "$exact_api_pid" 2>/dev/null && return 0
+    exact_api_status=0
+    exact_controller_process_status "$exact_api_pid" "$exact_api_start" \
+        "$exact_api_boot" || exact_api_status=$?
+    case $exact_api_status in
+        1) return 0 ;;
+        0)
+            api_pid_matches "$exact_api_pid" || {
+                package_message "API process identity changed after signal failure"
+                return 1
+            }
+            package_message "failed to signal exact API process identity"
+            return 1
+            ;;
+        *)
+            package_message "API process identity became unsafe after signal failure"
+            return 1
+            ;;
+    esac
+}
+
+remove_exact_terminal_api_record() {
+    exact_record_kind=$1
+    exact_record_pid=$2
+    exact_record_start=$3
+    exact_record_boot=$4
+    case $exact_record_kind in
+        ready)
+            exact_record_path=$api_ready_file
+            api_path_exists "$exact_record_path" || return 0
+            read_api_ready_identity || return $?
+            exact_record_saved_pid=$api_ready_pid
+            exact_record_saved_start=$api_ready_start
+            exact_record_saved_boot=$api_ready_boot
+            ;;
+        bound)
+            exact_record_path=$api_bound_file
+            api_path_exists "$exact_record_path" || return 0
+            read_api_bound_identity || return $?
+            exact_record_saved_pid=$api_bound_pid
+            exact_record_saved_start=$api_bound_start
+            exact_record_saved_boot=$api_bound_boot
+            ;;
+        *) return 73 ;;
+    esac
+    [ "$exact_record_saved_pid" = "$exact_record_pid" ] \
+        && [ "$exact_record_saved_start" = "$exact_record_start" ] \
+        && [ "$exact_record_saved_boot" = "$exact_record_boot" ] || return 73
+    exact_record_status=0
+    exact_controller_process_status "$exact_record_pid" "$exact_record_start" \
+        "$exact_record_boot" || exact_record_status=$?
+    [ "$exact_record_status" -eq 1 ] || return 73
+    exact_record_identity=$(stat -c '%d:%i' "$exact_record_path" 2>/dev/null || true)
+    case $exact_record_identity in ''|*[!0-9:]*|*:*:*) return 73 ;; esac
+
+    case $exact_record_kind in
+        ready)
+            read_api_ready_identity || return $?
+            exact_record_saved_pid=$api_ready_pid
+            exact_record_saved_start=$api_ready_start
+            exact_record_saved_boot=$api_ready_boot
+            ;;
+        bound)
+            read_api_bound_identity || return $?
+            exact_record_saved_pid=$api_bound_pid
+            exact_record_saved_start=$api_bound_start
+            exact_record_saved_boot=$api_bound_boot
+            ;;
+    esac
+    [ "$exact_record_saved_pid" = "$exact_record_pid" ] \
+        && [ "$exact_record_saved_start" = "$exact_record_start" ] \
+        && [ "$exact_record_saved_boot" = "$exact_record_boot" ] || return 73
+    exact_record_identity_recheck=$(stat -c '%d:%i' "$exact_record_path" 2>/dev/null || true)
+    [ "$exact_record_identity_recheck" = "$exact_record_identity" ] || return 73
+    exact_record_status=0
+    exact_controller_process_status "$exact_record_pid" "$exact_record_start" \
+        "$exact_record_boot" || exact_record_status=$?
+    [ "$exact_record_status" -eq 1 ] || return 73
+    rm -f "$exact_record_path"
 }
 
 read_failed_start_child_marker() {
@@ -846,7 +948,8 @@ cleanup_failed_start() {
         acquire_private_process_lock "$controller_lock" || cleanup_controller_lock_status=$?
         if [ "$cleanup_controller_lock_status" -eq 0 ]; then
             remove_stale_controller_ready >/dev/null 2>&1 || true
-            remove_stale_controller_pid_file >/dev/null 2>&1 || true
+            remove_stale_controller_pid_file "${stale_ready_pid:-}" \
+                "${stale_ready_start:-}" "${stale_ready_boot:-}" >/dev/null 2>&1 || true
             release_private_process_lock "$controller_lock" >/dev/null 2>&1 || true
         fi
     fi
@@ -1189,6 +1292,8 @@ case ${1:-} in
         fi
         run_pid=$(script_pid "$run_lock/pid" 2>/dev/null || true)
         saved_api_pid=
+        saved_api_start=
+        saved_api_boot=
         controller_active=false
         run_active=false
         api_active=false
@@ -1314,7 +1419,51 @@ case ${1:-} in
                         package_message "refusing to signal unverified API PID $saved_api_pid"
                         exit 1
                     fi
-                    api_stale_artifacts=true
+                    if api_path_exists "$api_ready_file"; then
+                        api_path_exists "$api_bound_file" && {
+                            package_message "refusing terminal API identity with conflicting readiness state"
+                            exit 1
+                        }
+                        read_api_ready_identity || {
+                            package_message "refusing unsafe terminal API readiness identity"
+                            exit 1
+                        }
+                        [ "$api_ready_pid" = "$saved_api_pid" ] || {
+                            package_message "refusing mismatched terminal API readiness identity"
+                            exit 1
+                        }
+                        saved_api_start=$api_ready_start
+                        saved_api_boot=$api_ready_boot
+                        api_terminal_admission_status=0
+                        exact_controller_process_status "$saved_api_pid" "$saved_api_start" \
+                            "$saved_api_boot" || api_terminal_admission_status=$?
+                        [ "$api_terminal_admission_status" -eq 1 ] || {
+                            package_message "refusing changed terminal API readiness identity"
+                            exit 1
+                        }
+                        api_active=true
+                    elif api_path_exists "$api_bound_file"; then
+                        read_api_bound_identity || {
+                            package_message "refusing unsafe terminal pre-commit API identity"
+                            exit 1
+                        }
+                        [ "$api_bound_pid" = "$saved_api_pid" ] || {
+                            package_message "refusing mismatched terminal pre-commit API identity"
+                            exit 1
+                        }
+                        saved_api_start=$api_bound_start
+                        saved_api_boot=$api_bound_boot
+                        api_terminal_admission_status=0
+                        exact_controller_process_status "$saved_api_pid" "$saved_api_start" \
+                            "$saved_api_boot" || api_terminal_admission_status=$?
+                        [ "$api_terminal_admission_status" -eq 1 ] || {
+                            package_message "refusing changed terminal pre-commit API identity"
+                            exit 1
+                        }
+                        api_active=true
+                    else
+                        api_stale_artifacts=true
+                    fi
                     if api_path_exists "$api_socket"; then
                         api_stale_socket_safe || exit 1
                     fi
@@ -1324,6 +1473,8 @@ case ${1:-} in
                             package_message "refusing unsafe or mismatched API readiness state"
                             exit 1
                         }
+                        saved_api_start=$api_ready_start
+                        saved_api_boot=$api_ready_boot
                         api_path_exists "$api_bound_file" && {
                             package_message "refusing final API readiness with a live pre-commit identity"
                             exit 1
@@ -1348,6 +1499,8 @@ case ${1:-} in
                                 package_message "refusing unsafe or mismatched pre-commit API identity"
                                 exit 1
                             }
+                            saved_api_start=$api_bound_start
+                            saved_api_boot=$api_bound_boot
                         fi
                         if api_path_exists "$api_socket"; then
                             api_socket_safe || exit 1
@@ -1355,6 +1508,19 @@ case ${1:-} in
                             [ -n "$api_socket_before_stop" ] || exit 1
                         fi
                     fi
+                    if [ -z "$saved_api_start" ] || [ -z "$saved_api_boot" ]; then
+                        saved_api_start=$(process_start_time "$saved_api_pid" 2>/dev/null || true)
+                        saved_api_boot=$(boot_identity 2>/dev/null || true)
+                    fi
+                    case $saved_api_start in ''|*[!0-9]*|0)
+                        package_message "cannot capture exact API process start identity"
+                        exit 1
+                        ;;
+                    esac
+                    valid_boot_identity "$saved_api_boot" || {
+                        package_message "cannot capture exact API process boot identity"
+                        exit 1
+                    }
                     api_active=true
                     stop_transitioned=true
                 fi
@@ -1404,7 +1570,8 @@ case ${1:-} in
             signal_verified_service runner "$run_pid" plan/sync || exit 1
         fi
         if [ "$api_active" = true ]; then
-            signal_verified_service api "$saved_api_pid" API || exit 1
+            signal_exact_api_identity "$saved_api_pid" "$saved_api_start" \
+                "$saved_api_boot" || exit 1
         fi
         timeout=${SDSYNC_DSM_STOP_TIMEOUT:-120}
         case $timeout in ''|*[!0-9]*) timeout=120 ;; esac
@@ -1434,8 +1601,18 @@ case ${1:-} in
             if [ "$run_active" = true ] && script_pid_matches "$run_pid" "$runner"; then
                 run_still_active=true
             fi
-            if [ "$api_active" = true ] && api_pid_matches "$saved_api_pid"; then
-                api_still_active=true
+            if [ "$api_active" = true ]; then
+                api_wait_status=0
+                exact_controller_process_status "$saved_api_pid" "$saved_api_start" \
+                    "$saved_api_boot" || api_wait_status=$?
+                case $api_wait_status in
+                    0) api_still_active=true ;;
+                    1) ;;
+                    *)
+                        package_message "API process identity became unsafe while stopping"
+                        exit 1
+                        ;;
+                esac
             fi
             [ "$controller_still_active" = true ] || [ "$run_still_active" = true ] || \
                 [ "$api_still_active" = true ] || break
@@ -1465,19 +1642,25 @@ case ${1:-} in
                 ;;
         esac
         if [ "$api_active" = true ]; then
-            if ! script_pid_absent_or_zombie "$saved_api_pid"; then
+            api_terminal_status=0
+            exact_controller_process_status "$saved_api_pid" "$saved_api_start" \
+                "$saved_api_boot" || api_terminal_status=$?
+            [ "$api_terminal_status" -eq 1 ] || {
                 package_message "API PID $saved_api_pid changed identity or remained live after stop"
                 exit 1
-            fi
-            "$api_server" --cleanup-stale-api-socket || {
+            }
+            "$api_server" --cleanup-stale-api-socket "$saved_api_pid" \
+                "$saved_api_start" "$saved_api_boot" || {
                 package_message "refusing to remove API crash artifacts after verified shutdown"
                 exit 1
             }
-            remove_stale_api_ready || {
+            remove_exact_terminal_api_record ready "$saved_api_pid" "$saved_api_start" \
+                "$saved_api_boot" || {
                 package_message "refusing unsafe stale API readiness state after stop"
                 exit 1
             }
-            remove_stale_api_bound || {
+            remove_exact_terminal_api_record bound "$saved_api_pid" "$saved_api_start" \
+                "$saved_api_boot" || {
                 package_message "refusing unsafe stale pre-commit API state after stop"
                 exit 1
             }
@@ -1517,7 +1700,8 @@ case ${1:-} in
             release_private_process_lock "$controller_lock" >/dev/null 2>&1 || true
             exit 1
         }
-        remove_stale_controller_pid_file || {
+        remove_stale_controller_pid_file "${stale_ready_pid:-}" \
+            "${stale_ready_start:-}" "${stale_ready_boot:-}" || {
             package_message "refusing unsafe stale controller PID state"
             release_private_process_lock "$controller_lock" >/dev/null 2>&1 || true
             exit 1

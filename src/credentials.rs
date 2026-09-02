@@ -477,8 +477,13 @@ fn read_secret_file(path: &Path, label: &str) -> Result<Zeroizing<String>> {
     Ok(line)
 }
 
+const INTERACTIVE_SECRET_MASK: char = '*';
+
 fn prompt_secret(prompt: &str, label: &str) -> Result<Zeroizing<String>> {
-    let value = rpassword::prompt_password(prompt)
+    let config = rpassword::ConfigBuilder::new()
+        .password_feedback_mask(INTERACTIVE_SECRET_MASK)
+        .build();
+    let value = rpassword::prompt_password_with_config(prompt, config)
         .map(Zeroizing::new)
         .map_err(|error| Error::Message(format!("failed to read {label}: {error}")))?;
     validate_secret_input(&value, label)?;
@@ -818,6 +823,11 @@ mod tests {
         let secret = read_secret_file(&path, "test secret").unwrap();
         fs::remove_file(path).unwrap();
         assert_eq!(secret.as_str(), "first-secret");
+    }
+
+    #[test]
+    fn interactive_secret_feedback_uses_an_opaque_star_per_character() {
+        assert_eq!(INTERACTIVE_SECRET_MASK, '*');
     }
 
     #[test]

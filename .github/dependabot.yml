@@ -12,3 +12,7 @@ updates:
     directory: /
     schedule:
       interval: monthly
+  - package-ecosystem: npm
+    directory: /packaging/synology/ui-src
+    schedule:
+      interval: monthly

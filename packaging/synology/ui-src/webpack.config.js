@@ -59,7 +59,10 @@ module.exports = {
             type: "asset/source"
           },
           {
-            use: [MiniCssExtractPlugin.loader, "css-loader"]
+            use: [
+              MiniCssExtractPlugin.loader,
+              { loader: "css-loader", options: { url: false } }
+            ]
           }
         ]
       }

@@ -16,8 +16,8 @@
   <h2>Diagnostic levels</h2>
   <dl>
     <dt>Quick</dt><dd>Checks URL policy, TLS and reverse-proxy routing, and DSM/File Station discovery without resolving credentials or opening a session.</dd>
-    <dt>Standard</dt><dd>Adds the package-visible source scan, authentication, required File Station capabilities, destination permission, a bounded inventory sample, and logout. This is the default.</dd>
-    <dt>Extensive</dt><dd>Adds complete source MD5, CRC32, and SHA-256 hashing plus the deepest read-only target capability checks. Extensive does not write unless the separate disposable write test is enabled and confirmed.</dd>
+    <dt>Standard</dt><dd>Adds the package-visible source scan, authentication, required File Station capabilities, bounded target inventory, and logout. With a configured destination, it checks permission and samples direct children. Without one, it skips permission and samples visible shared-folder roots without selecting or traversing a share. This is the default.</dd>
+    <dt>Extensive</dt><dd>Adds complete source MD5, CRC32, and SHA-256 hashing plus the deepest authenticated, read-only target capability checks and the same bounded inventory branch. Extensive does not write unless the separate disposable write test is enabled and confirmed.</dd>
   </dl>
 
   <h2>Target breakdown</h2>
@@ -34,7 +34,7 @@
   <p>Every section is reported as OK, warning, not OK, or skipped with bounded detail and timing scope. Routing and discovery can share one connection measurement; the UI labels shared timing instead of counting it twice.</p>
 
   <h2>Remote folder and file proof</h2>
-  <p>Standard and Extensive request one sorted, non-recursive direct-child page and display at most five folders or files. Each entry contains only bounded relative path and name, kind, file size and modified time when available, mount-boundary state, and explicit text-truncation flags. The total and truncated marker show when more entries exist. Doctor does not read those payloads or use this sample in place of Plan or Run's complete inventory.</p>
+  <p>Standard and Extensive authenticate and request one sorted, non-recursive bounded inventory page. With a configured destination, Doctor checks permission and samples its direct children. Without a destination, Doctor skips permission and samples visible shared-folder roots without selecting or traversing any share. Either branch displays at most five folders or files. Each entry contains only bounded relative path and name, kind, file size and modified time when available, mount-boundary state, and explicit text-truncation flags. The total and truncated marker show when more entries exist. Doctor does not read those payloads or use this sample in place of Plan or Run's complete inventory.</p>
 
   <h2>Disposable write test</h2>
   <p>The optional write test is available only at Extensive depth. It creates a unique probe, verifies size, modified time, MD5, CRC32, and SHA-256, optionally exercises server-side copy, and removes the probe. It requires package capability, an explicit checkbox, a second cleanup acknowledgement, and a confirmation dialog. Use only a prepared non-critical existing destination. A cleanup failure or reported leftover path must be investigated before retrying.</p>

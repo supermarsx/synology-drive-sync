@@ -32,6 +32,77 @@ UI_SOURCE = HERE / "ui-src"
 
 
 class DsmUiContractTests(unittest.TestCase):
+    def test_vue2_build_chain_resolves_only_patched_postcss(self) -> None:
+        workspace = (UI_SOURCE / "pnpm-workspace.yaml").read_bytes()
+        lockfile = (UI_SOURCE / "pnpm-lock.yaml").read_bytes()
+        validate_spk.validate_ui_dependency_resolution(workspace, lockfile)
+
+        with self.assertRaisesRegex(validate_spk.ValidationError, "workspace must override"):
+            validate_spk.validate_ui_dependency_resolution(
+                workspace.replace(b"postcss: 8.5.26", b"postcss: 8.5.17", 1),
+                lockfile,
+            )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "lockfile must record"):
+            validate_spk.validate_ui_dependency_resolution(
+                workspace,
+                lockfile.replace(b"postcss: 8.5.26", b"postcss: 8.5.17", 1),
+            )
+        with self.assertRaisesRegex(validate_spk.ValidationError, "resolve every PostCSS"):
+            validate_spk.validate_ui_dependency_resolution(
+                workspace,
+                lockfile.replace(
+                    b"  postcss@8.5.26:",
+                    b"  postcss@7.0.39:\n\n  postcss@8.5.26:",
+                    1,
+                ),
+            )
+
+    def test_native_bundle_vue_external_binding_is_lexically_verified(self) -> None:
+        self.assertTrue(
+            validate_spk._uses_dsm_global_vue(
+                '(()=>{"use strict";const runtime={load:()=>1},vueExternal=Vue;void vueExternal})()'
+            )
+        )
+        self.assertTrue(validate_spk._uses_dsm_global_vue("const vueExternal = Vue;"))
+        for name, source in (
+            ("imported Vue", 'import Vue from "vue"; const vueExternal = Vue;'),
+            ("named import", 'import { Vue } from "framework"; const vueExternal = Vue;'),
+            ("aliased named import", 'import { default as Vue } from "vue"; const vueExternal = Vue;'),
+            ("namespace import", 'import * as Vue from "vue"; const vueExternal = Vue;'),
+            ("bundled Vue", "const Vue = {version: '2.7.16'}, vueExternal = Vue;"),
+            ("named generator Vue", "function* Vue() {} const vueExternal = Vue;"),
+            ("escaped declaration Vue", r"const V\u0075e = framework; const vueExternal = Vue;"),
+            ("escaped braced declaration Vue", r"const \u{56}ue = framework; const vueExternal = Vue;"),
+            ("escaped function Vue", r"function Vu\u0065() {} const vueExternal = Vue;"),
+            ("object destructuring shorthand", "const {Vue} = framework; const vueExternal = Vue;"),
+            ("escaped object destructuring", r"const {V\u0075e} = framework; const vueExternal = Vue;"),
+            ("object destructuring alias", "const {runtime: Vue} = framework; const vueExternal = Vue;"),
+            ("nested object destructuring", "const {runtime: {Vue}} = framework; const vueExternal = Vue;"),
+            ("array destructuring", "const [Vue] = framework; const vueExternal = Vue;"),
+            ("nested array destructuring", "const [{Vue}] = framework; const vueExternal = Vue;"),
+            ("later declarator destructuring", "const runtime = {}, {Vue} = framework; const vueExternal = Vue;"),
+            ("destructuring loop assignment", "for ({Vue} of framework) {} const vueExternal = Vue;"),
+            ("bare Vue overwrite", "Vue = framework; const vueExternal = Vue;"),
+            ("bare Vue compound assignment", "Vue += framework; const vueExternal = Vue;"),
+            ("bare Vue logical assignment", "Vue ||= framework; const vueExternal = Vue;"),
+            ("bare Vue prefix update", "++Vue; const vueExternal = Vue;"),
+            ("bare Vue postfix update", "Vue--; const vueExternal = Vue;"),
+            ("bare Vue for-of write", "for (Vue of framework) {} const vueExternal = Vue;"),
+            ("bare Vue for-await write", "for await (Vue of framework) {} const vueExternal = Vue;"),
+            ("bare Vue for-in write", "for (Vue in framework) {} const vueExternal = Vue;"),
+            ("CommonJS Vue", 'const bundled = require("vue"), vueExternal = Vue;'),
+            ("webpack Vue", 'const bundled = __webpack_require__("vue"), vueExternal = Vue;'),
+            ("member access", "const vueExternal = window.Vue;"),
+            ("property access", "const vueExternal = runtime.Vue;"),
+            ("arbitrary text", 'const note = "const vueExternal = Vue;";'),
+            ("nested function", "(()=>{function load(){const vueExternal=Vue;}})()"),
+            ("function parameter", "function load(Vue){const vueExternal=Vue;}"),
+            ("arrow parameter", "((Vue)=>{const vueExternal=Vue;})(framework)"),
+            ("non-const declaration", "var vueExternal = Vue;"),
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(validate_spk._uses_dsm_global_vue(source))
+
     def test_source_validator_covers_rootless_ui_and_dsm_bounds(self) -> None:
         validate_spk.validate_source()
         info = (HERE / "INFO.template").read_text(encoding="utf-8")
@@ -2080,7 +2151,7 @@ function bind(context, names) {
         for name, suffix, pattern in (
             ("eval", b"\neval('bad')", "forbidden runtime"),
             ("source map", b"\n//# sourceMappingURL=bad.map", "forbidden runtime"),
-            ("bundled Vue", b'\nversion:"2.7.14"', "forbidden runtime"),
+            ("bundled Vue", b'\nversion:"2.7.16"', "forbidden runtime"),
             ("remote endpoint", b'\nfetch("https://evil.invalid/")', "external network endpoint"),
         ):
             with self.subTest(name=name), self.assertRaisesRegex(
