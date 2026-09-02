@@ -359,6 +359,7 @@ fn authenticated_target_doctor_checks_exact_destination_and_logs_out() {
         [
             "SYNO.API.Info.query",
             "SYNO.API.Auth.login",
+            "SYNO.FileStation.List.list_share",
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.CheckPermission.write",
@@ -377,6 +378,168 @@ fn authenticated_target_doctor_checks_exact_destination_and_logs_out() {
             .and_then(|request| request.fields.get("_sid")),
         Some(&"e2e-session-secret".to_owned())
     );
+}
+
+#[test]
+fn doctor_rejects_unusable_post_login_sessions_and_always_logs_out() {
+    for code in [106, 107, 119] {
+        let fixture = TestDir::new(&format!("target-doctor-session-rejection-{code}"));
+        let password = fixture.write("password", PASSWORD);
+        let server = MockFileStation::start();
+        server.add_directory("/team/target");
+        server.fail_next_api_operation("SYNO.FileStation.List.list_share", code);
+
+        let output = run(&[
+            "--quiet",
+            "--output",
+            "json",
+            "doctor",
+            "--url",
+            server.base_url(),
+            "--username",
+            "e2e-user",
+            "--password-file",
+            password.to_str().expect("UTF-8 password path"),
+            "--no-vault",
+            "--allow-http",
+            "target",
+            "/team/target",
+        ]);
+        assert_eq!(output.status.code(), Some(1));
+
+        let actual = stdout_json(&output);
+        assert_eq!(actual["status"], "fail");
+        assert_eq!(actual["authenticated"], false);
+        assert_eq!(actual["remote_checked"], false);
+        assert_eq!(actual["sections"][2]["id"], "dsm_session_auth");
+        assert_eq!(actual["sections"][2]["status"], "fail");
+        assert!(
+            actual["sections"][2]["detail"]
+                .as_str()
+                .expect("session confirmation detail")
+                .contains(&format!("code {code}"))
+        );
+        assert_eq!(actual["sections"][4]["status"], "skip");
+        assert_eq!(actual["sections"][5]["status"], "skip");
+        assert_eq!(actual["sections"][7]["id"], "session_logout");
+        assert_eq!(actual["sections"][7]["status"], "pass");
+
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .map(|request| request.operation())
+                .collect::<Vec<_>>(),
+            [
+                "SYNO.API.Info.query",
+                "SYNO.API.Auth.login",
+                "SYNO.FileStation.List.list_share",
+                "SYNO.API.Auth.logout",
+            ]
+        );
+    }
+}
+
+#[test]
+fn dsm7_reverse_proxy_receives_explicit_session_headers_and_body_fields() {
+    let fixture = TestDir::new("target-doctor-explicit-sid");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/target");
+    server.require_header_session_transport(
+        "id=proxy-cookie-must-not-be-used; Path=/; HttpOnly; SameSite=Strict",
+    );
+
+    let output = run(&[
+        "--quiet",
+        "--output",
+        "json",
+        "doctor",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password.to_str().expect("UTF-8 password path"),
+        "--no-vault",
+        "--allow-http",
+        "target",
+        "/team/target",
+        "--write-test",
+    ]);
+    assert_success(&output);
+
+    let requests = server.requests();
+    let login = requests
+        .iter()
+        .find(|request| request.operation() == "SYNO.API.Auth.login")
+        .expect("login request");
+    assert_eq!(
+        login.fields.get("session").map(String::as_str),
+        Some("FileStation")
+    );
+    assert_eq!(login.fields.get("format").map(String::as_str), Some("sid"));
+    assert_eq!(
+        login.fields.get("enable_syno_token").map(String::as_str),
+        Some("yes")
+    );
+    assert!(!login.fields.contains_key("_sid"));
+    assert!(!login.fields.contains_key("SynoToken"));
+    assert!(!login.headers.contains_key("cookie"));
+    assert!(!login.headers.contains_key("x-syno-token"));
+
+    let discovery = requests
+        .iter()
+        .find(|request| request.operation() == "SYNO.API.Info.query")
+        .expect("discovery request");
+    assert!(!discovery.headers.contains_key("cookie"));
+    assert!(!discovery.headers.contains_key("x-syno-token"));
+
+    let authenticated = requests
+        .iter()
+        .filter(|request| {
+            request.operation() != "SYNO.API.Info.query"
+                && request.operation() != "SYNO.API.Auth.login"
+        })
+        .collect::<Vec<_>>();
+    assert!(!authenticated.is_empty());
+    assert_eq!(
+        authenticated.last().map(|request| request.operation()),
+        Some("SYNO.API.Auth.logout".to_owned())
+    );
+    for operation in [
+        "SYNO.FileStation.Upload.upload",
+        "SYNO.FileStation.Download.download",
+        "SYNO.FileStation.Delete.delete",
+    ] {
+        assert!(
+            authenticated
+                .iter()
+                .any(|request| request.operation() == operation),
+            "extensive doctor must exercise {operation}"
+        );
+    }
+    assert!(authenticated.iter().all(|request| {
+        request.fields.get("_sid").map(String::as_str) == Some("e2e-session-secret")
+            && request.fields.get("SynoToken").map(String::as_str) == Some("e2e-syno-token-secret")
+            && request.headers.get("cookie").map(String::as_str) == Some("id=e2e-session-secret")
+            && request.headers.get("x-syno-token").map(String::as_str)
+                == Some("e2e-syno-token-secret")
+    }));
+
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for secret in [
+        "correct horse battery staple",
+        "e2e-session-secret",
+        "e2e-syno-token-secret",
+        "proxy-cookie-must-not-be-used",
+    ] {
+        assert!(!rendered.contains(secret));
+    }
 }
 
 #[test]
@@ -498,8 +661,8 @@ fn untargeted_doctor_discovers_bounded_visible_shared_folders_without_selecting_
     }
 
     let requests = server.requests();
-    assert_eq!(requests.len(), 12);
-    for request_set in requests.as_chunks::<4>().0 {
+    assert_eq!(requests.len(), 15);
+    for request_set in requests.as_chunks::<5>().0 {
         assert_eq!(
             request_set
                 .iter()
@@ -509,10 +672,20 @@ fn untargeted_doctor_discovers_bounded_visible_shared_folders_without_selecting_
                 "SYNO.API.Info.query",
                 "SYNO.API.Auth.login",
                 "SYNO.FileStation.List.list_share",
+                "SYNO.FileStation.List.list_share",
                 "SYNO.API.Auth.logout",
             ]
         );
-        let listing = &request_set[2];
+        let confirmation = &request_set[2];
+        assert_eq!(
+            confirmation.fields.get("offset").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            confirmation.fields.get("limit").map(String::as_str),
+            Some("1")
+        );
+        let listing = &request_set[3];
         assert_eq!(listing.fields.get("offset").map(String::as_str), Some("0"));
         assert_eq!(listing.fields.get("limit").map(String::as_str), Some("6"));
         assert_eq!(
@@ -581,6 +754,7 @@ fn untargeted_doctor_preserves_explicit_zero_shared_folder_evidence() {
         [
             "SYNO.API.Info.query",
             "SYNO.API.Auth.login",
+            "SYNO.FileStation.List.list_share",
             "SYNO.FileStation.List.list_share",
             "SYNO.API.Auth.logout",
         ]
@@ -1511,6 +1685,7 @@ allow-http = true
     let one_target = [
         "SYNO.API.Info.query",
         "SYNO.API.Auth.login",
+        "SYNO.FileStation.List.list_share",
         "SYNO.FileStation.List.getinfo",
         "SYNO.FileStation.List.getinfo",
         "SYNO.FileStation.CheckPermission.write",

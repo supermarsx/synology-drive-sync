@@ -22,7 +22,8 @@ DSM can return HTTP 200 with a JSON API failure, so both transport status and re
 | HTTP 504 or DSM `1801` | Proxy/File Station/application timeout | Long-upload timeout, rate cap, and largest file. |
 | DSM `150` | Requests appear from different client IPs | Proxy source-IP/session consistency. |
 | DSM `1800` | Multipart content length absent/inconsistent | Proxy buffering/body transformations and client version. |
-| Login succeeds but inventory fails | Account/package permission mismatch | File Station permission and exact destination ACL. |
+| DSM `106`, `107`, or `119` immediately after login | File Station rejected, expired, or lost the DSM session before evaluating the path | Use the current release; verify the proxy forwards `Cookie` and `X-SYNO-TOKEN` plus form bodies unchanged, and compare the same account through a direct LAN or tested custom-domain route. |
+| Login succeeds but inventory returns DSM `105` | Account or package permission mismatch | File Station application permission and the exact destination ACL. |
 | Destination missing | Root or ancestor is not writable/does not exist | Create/enable the share or user home in DSM; the client only creates below it. |
 
 ## Source failures

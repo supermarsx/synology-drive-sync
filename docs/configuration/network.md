@@ -27,6 +27,24 @@ synology-drive-sync doctor \
 The endpoint should return DSM JSON for WebAPI requests, not HTML, a login-portal redirect, or a
 proxy-branded error page.
 
+## Authenticated session handoff
+
+DSM returns a SID and, when CSRF protection is enabled, a SynoToken after login. Authenticated
+requests carry each value through both documented DSM representations: the SID is sent as the
+`id` cookie and `_sid` request parameter, while the token is sent as the `X-SYNO-TOKEN` header and
+`SynoToken` request parameter. This accommodates current `entry.cgi` handling without depending on
+one proxy-specific representation. Redirects stay disabled, every endpoint remains confined to the
+configured origin and path prefix, and cookies advertised by the reverse proxy are not retained or
+replayed.
+
+The Standard and Extensive target diagnostics do not treat a successful login response as final
+proof. Before reporting session authentication as healthy, they make one bounded, non-mutating File
+Station request. DSM code `119` at that boundary means the SID was not accepted; destination paths
+and permissions have not been evaluated yet. See Synology's
+[DSM Login Web API Guide](https://global.download.synology.com/download/Document/Software/DeveloperGuide/Os/DSM/All/enu/DSM_Login_Web_API_Guide_enu.pdf)
+and [File Station API Guide](https://global.download.synology.com/download/Document/Software/DeveloperGuide/Package/FileStation/All/enu/Synology_File_Station_API_Guide.pdf)
+for the upstream session and error-code contracts.
+
 ## URL validation
 
 `url` must be absolute and include a host. Embedded usernames/passwords, query strings, and

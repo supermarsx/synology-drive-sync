@@ -1915,6 +1915,33 @@ fn doctor_requires_delete_capability(level: cli::DoctorLevel, delete: bool) -> b
     level != cli::DoctorLevel::Quick && (delete || level == cli::DoctorLevel::Extensive)
 }
 
+fn record_doctor_logout(client: &mut ApiClient, result: &mut DoctorResult) {
+    let logout_started = Instant::now();
+    match client.logout() {
+        Ok(()) => result.set_section(
+            "session_logout",
+            DoctorSectionStatus::Pass,
+            if result.authenticated {
+                "the authenticated DSM session was closed"
+            } else {
+                "the unconfirmed DSM session was closed after File Station session confirmation failed"
+            },
+            logout_started.elapsed(),
+            "section",
+        ),
+        Err(error) => {
+            result.fail_section("session_logout", &error, logout_started.elapsed());
+            if result.write_probe_performed {
+                append_doctor_failure_context(
+                    result,
+                    "File Station logout also failed",
+                    &safe_doctor_error(&error),
+                );
+            }
+        }
+    }
+}
+
 fn doctor_checks(
     settings: &config::ResolvedDoctor,
     logger: Option<Arc<EventLogger>>,
@@ -2123,6 +2150,11 @@ fn doctor_checks(
             Duration::ZERO,
             "section",
         );
+        return Ok(result);
+    }
+    if let Err(error) = client.confirm_file_station_session() {
+        result.fail_section("dsm_session_auth", &error, authentication_started.elapsed());
+        record_doctor_logout(&mut client, &mut result);
         return Ok(result);
     }
     result.authenticated = true;
@@ -2407,26 +2439,7 @@ fn doctor_checks(
         }
     }
 
-    let logout_started = Instant::now();
-    match client.logout() {
-        Ok(()) => result.set_section(
-            "session_logout",
-            DoctorSectionStatus::Pass,
-            "the authenticated DSM session was closed",
-            logout_started.elapsed(),
-            "section",
-        ),
-        Err(error) => {
-            result.fail_section("session_logout", &error, logout_started.elapsed());
-            if result.write_probe_performed {
-                append_doctor_failure_context(
-                    &mut result,
-                    "File Station logout also failed",
-                    &safe_doctor_error(&error),
-                );
-            }
-        }
-    }
+    record_doctor_logout(&mut client, &mut result);
     Ok(result)
 }
 

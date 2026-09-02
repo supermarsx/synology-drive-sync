@@ -15,6 +15,7 @@ const SYNO_TOKEN: &str = "e2e-syno-token-secret";
 #[derive(Clone, Debug)]
 pub struct CapturedRequest {
     pub request_path: String,
+    pub headers: BTreeMap<String, String>,
     pub api: String,
     pub method: String,
     pub fields: BTreeMap<String, String>,
@@ -43,6 +44,8 @@ struct ServerState {
     expected_account: String,
     expected_password: String,
     reflected_login_failure: Option<String>,
+    login_cookie: Option<String>,
+    require_header_session_transport: bool,
     require_totp: bool,
     reject_next_valid_otp: bool,
     next_task: u64,
@@ -102,6 +105,8 @@ impl MockFileStation {
             expected_account: "e2e-user".to_owned(),
             expected_password: "correct horse battery staple".to_owned(),
             reflected_login_failure: None,
+            login_cookie: None,
+            require_header_session_transport: false,
             require_totp: false,
             reject_next_valid_otp: false,
             next_task: 1,
@@ -183,6 +188,15 @@ impl MockFileStation {
             .lock()
             .expect("mock state lock")
             .reflected_login_failure = Some(marker.to_owned());
+    }
+
+    /// Model DSM 7 behind a reverse proxy: the login response advertises a
+    /// misleading cookie, while every authenticated request must construct the
+    /// exact cookie and SynoToken header from the JSON login response.
+    pub fn require_header_session_transport(&self, advertised_cookie: &str) {
+        let mut state = self.state.lock().expect("mock state lock");
+        state.login_cookie = Some(advertised_cookie.to_owned());
+        state.require_header_session_transport = true;
     }
 
     pub fn require_totp(&self) {
@@ -326,6 +340,7 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
     let method = fields.get("method").cloned().unwrap_or_default();
     let captured = CapturedRequest {
         request_path,
+        headers: headers.clone(),
         api: api.clone(),
         method: method.clone(),
         fields: fields.clone(),
@@ -337,13 +352,22 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
         let mut state = state.lock().expect("mock state lock");
         let captured_path = captured.request_path.clone();
         state.requests.push(captured);
-        route_request(&mut state, &captured_path, &api, &method, &fields, upload)
+        route_request(
+            &mut state,
+            &captured_path,
+            &api,
+            &method,
+            &fields,
+            &headers,
+            upload,
+        )
     };
     write_response(&mut stream, response);
 }
 
 enum MockResponse {
     Json(Value),
+    JsonWithCookie { value: Value, cookie: String },
     Raw(String),
     Bytes(Vec<u8>),
     HttpStatus { status: u16, body: String },
@@ -355,6 +379,7 @@ fn route_request(
     api: &str,
     method: &str,
     fields: &BTreeMap<String, String>,
+    headers: &BTreeMap<String, String>,
     upload: Option<MultipartFile>,
 ) -> MockResponse {
     if let Some(response) = take_injected_fault(
@@ -391,13 +416,17 @@ fn route_request(
                 Some(_) => return api_error_with_marker(404, "rejected-otp-must-not-leak"),
             }
         }
-        return success(json!({"sid": SESSION_ID, "synotoken": SYNO_TOKEN}));
+        let data = json!({"sid": SESSION_ID, "synotoken": SYNO_TOKEN});
+        return match &state.login_cookie {
+            Some(cookie) => success_with_cookie(data, cookie),
+            None => success(data),
+        };
     }
     if api == "SYNO.API.Auth" && method == "logout" {
-        return authenticated(fields, || success(Value::Null));
+        return authenticated(state, fields, headers, || success(Value::Null));
     }
 
-    if !valid_session(fields) {
+    if !valid_session(state, fields, headers) {
         return api_error(119);
     }
     match (api, method) {
@@ -649,19 +678,29 @@ fn take_injected_fault(
 }
 
 fn authenticated(
+    state: &ServerState,
     fields: &BTreeMap<String, String>,
+    headers: &BTreeMap<String, String>,
     operation: impl FnOnce() -> MockResponse,
 ) -> MockResponse {
-    if valid_session(fields) {
+    if valid_session(state, fields, headers) {
         operation()
     } else {
         api_error(119)
     }
 }
 
-fn valid_session(fields: &BTreeMap<String, String>) -> bool {
-    fields.get("_sid").map(String::as_str) == Some(SESSION_ID)
-        && fields.get("SynoToken").map(String::as_str) == Some(SYNO_TOKEN)
+fn valid_session(
+    state: &ServerState,
+    fields: &BTreeMap<String, String>,
+    headers: &BTreeMap<String, String>,
+) -> bool {
+    let valid_fields = fields.get("_sid").map(String::as_str) == Some(SESSION_ID)
+        && fields.get("SynoToken").map(String::as_str) == Some(SYNO_TOKEN);
+    let valid_headers = !state.require_header_session_transport
+        || (headers.get("cookie").map(String::as_str) == Some("id=e2e-session-secret")
+            && headers.get("x-syno-token").map(String::as_str) == Some(SYNO_TOKEN));
+    valid_fields && valid_headers
 }
 
 fn discovery() -> Value {
@@ -684,6 +723,13 @@ fn discovery() -> Value {
 
 fn success(data: Value) -> MockResponse {
     MockResponse::Json(json!({"success": true, "data": data}))
+}
+
+fn success_with_cookie(data: Value, cookie: &str) -> MockResponse {
+    MockResponse::JsonWithCookie {
+        value: json!({"success": true, "data": data}),
+        cookie: cookie.to_owned(),
+    }
 }
 
 fn api_error(code: i64) -> MockResponse {
@@ -867,22 +913,37 @@ fn read_request(stream: &mut TcpStream) -> (String, BTreeMap<String, String>, Ve
 }
 
 fn write_response(stream: &mut TcpStream, response: MockResponse) {
-    let (status, reason, content_type, body) = match response {
+    let (status, reason, content_type, cookie, body) = match response {
         MockResponse::Json(value) => (
             200,
             "OK",
             "application/json",
+            None,
             value.to_string().into_bytes(),
         ),
-        MockResponse::Raw(body) => (200, "OK", "text/html", body.into_bytes()),
-        MockResponse::Bytes(body) => (200, "OK", "application/octet-stream", body),
-        MockResponse::HttpStatus { status, body } => {
-            (status, http_reason(status), "text/plain", body.into_bytes())
-        }
+        MockResponse::JsonWithCookie { value, cookie } => (
+            200,
+            "OK",
+            "application/json",
+            Some(cookie),
+            value.to_string().into_bytes(),
+        ),
+        MockResponse::Raw(body) => (200, "OK", "text/html", None, body.into_bytes()),
+        MockResponse::Bytes(body) => (200, "OK", "application/octet-stream", None, body),
+        MockResponse::HttpStatus { status, body } => (
+            status,
+            http_reason(status),
+            "text/plain",
+            None,
+            body.into_bytes(),
+        ),
     };
+    let cookie_header = cookie
+        .map(|cookie| format!("Set-Cookie: {cookie}\r\n"))
+        .unwrap_or_default();
     write!(
         stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{cookie_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )
     .expect("write mock response");

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use reqwest::blocking::multipart::{Form, Part};
 use reqwest::blocking::{Client as HttpClient, Response};
+use reqwest::header::{COOKIE, HeaderValue};
 use reqwest::redirect::Policy;
 use reqwest::{Certificate, Client as AsyncHttpClient, StatusCode, Url};
 use serde::de::DeserializeOwned;
@@ -53,9 +54,12 @@ const WRITE_PROBE_COPY_DIRECTORY: &str = "copy";
 const DIAGNOSTIC_INVENTORY_SAMPLE_LIMIT: usize = 5;
 const DIAGNOSTIC_INVENTORY_REQUEST_LIMIT: usize = DIAGNOSTIC_INVENTORY_SAMPLE_LIMIT + 1;
 const DIAGNOSTIC_INVENTORY_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
 const DIAGNOSTIC_RELATIVE_PATH_MAX_CHARS: usize = 512;
 const DIAGNOSTIC_NAME_MAX_CHARS: usize = 255;
 const DISCOVERY_FAILURE_OPERATION: &str = "File Station API discovery";
+const X_SYNO_TOKEN_HEADER: &str = "x-syno-token";
+const MAX_SESSION_HEADER_BYTES: usize = 4 * 1024;
 static WRITE_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Return whether a failed client connection still received an HTTP/DSM response from at least
@@ -83,6 +87,12 @@ pub struct ClientOptions {
 struct Session {
     sid: Zeroizing<String>,
     syno_token: Option<Zeroizing<String>>,
+}
+
+#[derive(Clone)]
+struct SessionHeaders {
+    cookie: HeaderValue,
+    syno_token: Option<HeaderValue>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -579,7 +589,9 @@ impl ApiClient {
         let fields = self.download_form_fields(remote_path)?;
 
         let url = self.api_url("SYNO.FileStation.Download")?;
-        let request = self.download_http.post(url).form(&*fields);
+        let request = self
+            .with_async_session_headers(self.download_http.post(url))?
+            .form(&*fields);
         // `form` has serialized its own request-body copy. Erase the caller-owned
         // SID/SynoToken strings before the potentially long streaming download.
         drop(fields);
@@ -849,10 +861,18 @@ impl ApiClient {
                 message: "successful response contained an empty SID".to_owned(),
             });
         }
-        self.session = Some(Session {
+        let session = Session {
             sid: Zeroizing::new(data.sid),
-            syno_token: data.synotoken.map(Zeroizing::new),
-        });
+            syno_token: data
+                .synotoken
+                .filter(|token| !token.is_empty())
+                .map(Zeroizing::new),
+        };
+        // DSM's documented entry.cgi transport uses the returned SID and optional
+        // SynoToken as sensitive headers. Validate that representation before a
+        // caller can mistake a syntactically successful login for a usable session.
+        session.request_headers()?;
+        self.session = Some(session);
         Ok(())
     }
 
@@ -889,6 +909,34 @@ impl ApiClient {
             Error::Message("File Station logout deadline is out of range".to_owned())
         })?);
         self.logout()
+    }
+
+    /// Confirm that File Station accepts the session returned by DSM authentication.
+    ///
+    /// A successful `SYNO.API.Auth.login` response proves the credentials were accepted, but it
+    /// does not prove that a reverse proxy will carry the returned session into File Station. This
+    /// bounded, non-mutating request asks for at most one visible shared-folder root and discards
+    /// it. Interactive authentication tests use it before reporting a usable target session.
+    pub fn confirm_file_station_session(&self) -> Result<()> {
+        let data: ListShareData = self
+            .call_bounded(
+                "SYNO.FileStation.List",
+                2,
+                "list_share",
+                vec![pair("offset", "0"), pair("limit", "1")],
+                SESSION_CONFIRMATION_TIMEOUT,
+            )?
+            .ok_or_else(|| Error::InvalidResponse {
+                operation: "SYNO.FileStation.List.list_share".to_owned(),
+                message: "session confirmation returned no shared-folder data".to_owned(),
+            })?;
+        if data.shares.len() > 1 || data.total.is_some_and(|total| total < data.shares.len()) {
+            return Err(Error::InvalidResponse {
+                operation: "SYNO.FileStation.List.list_share".to_owned(),
+                message: "session confirmation exceeded its one-item response bound".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     pub fn verify_share_writable(&self, root: &RemoteRoot) -> Result<()> {
@@ -1902,13 +1950,8 @@ impl ApiClient {
 
             let url = self.api_url("SYNO.FileStation.Upload")?;
             let operation = format!("uploading {}", local.relative);
-            let result = match self
-                .http
-                .post(url)
-                .timeout(self.upload_timeout)
-                .multipart(form)
-                .send()
-            {
+            let request = self.with_blocking_session_headers(self.http.post(url))?;
+            let result = match request.timeout(self.upload_timeout).multipart(form).send() {
                 Ok(response) => {
                     decode_response::<Value>(response, "SYNO.FileStation.Upload", "upload")
                         .map(|_| ())
@@ -2216,9 +2259,8 @@ impl ApiClient {
         // still serialize its own request-body copy, but this caller-owned copy is short-lived
         // and explicitly erased.
         let fields = Zeroizing::new(fields);
-        let response = self
-            .http
-            .post(url)
+        let request = self.with_blocking_session_headers(self.http.post(url))?;
+        let response = request
             .timeout(timeout)
             .form(&*fields)
             .send()
@@ -2267,8 +2309,69 @@ impl ApiClient {
             .ok_or_else(|| Error::Message("not authenticated to File Station".to_owned()))
     }
 
+    fn session_headers(&self) -> Result<Option<SessionHeaders>> {
+        self.session
+            .as_ref()
+            .map(Session::request_headers)
+            .transpose()
+    }
+
+    fn with_blocking_session_headers(
+        &self,
+        mut request: reqwest::blocking::RequestBuilder,
+    ) -> Result<reqwest::blocking::RequestBuilder> {
+        if let Some(headers) = self.session_headers()? {
+            request = request.header(COOKIE, headers.cookie);
+            if let Some(token) = headers.syno_token {
+                request = request.header(X_SYNO_TOKEN_HEADER, token);
+            }
+        }
+        Ok(request)
+    }
+
+    fn with_async_session_headers(
+        &self,
+        mut request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder> {
+        if let Some(headers) = self.session_headers()? {
+            request = request.header(COOKIE, headers.cookie);
+            if let Some(token) = headers.syno_token {
+                request = request.header(X_SYNO_TOKEN_HEADER, token);
+            }
+        }
+        Ok(request)
+    }
+
     fn api_url(&self, api: &str) -> Result<Url> {
         endpoint_url(&self.base, &self.required_spec(api)?.path)
+    }
+}
+
+impl Session {
+    fn request_headers(&self) -> Result<SessionHeaders> {
+        if self.sid.len() > MAX_SESSION_HEADER_BYTES || !valid_cookie_value(&self.sid) {
+            return Err(invalid_session_header("SID"));
+        }
+        let cookie = Zeroizing::new(format!("id={}", self.sid.as_str()));
+        let mut cookie =
+            HeaderValue::from_str(&cookie).map_err(|_| invalid_session_header("SID"))?;
+        cookie.set_sensitive(true);
+
+        let syno_token = self
+            .syno_token
+            .as_ref()
+            .map(|token| {
+                if token.is_empty() || token.len() > MAX_SESSION_HEADER_BYTES {
+                    return Err(invalid_session_header("SynoToken"));
+                }
+                let mut header = HeaderValue::from_str(token)
+                    .map_err(|_| invalid_session_header("SynoToken"))?;
+                header.set_sensitive(true);
+                Ok(header)
+            })
+            .transpose()?;
+
+        Ok(SessionHeaders { cookie, syno_token })
     }
 }
 
@@ -3225,6 +3328,25 @@ fn json_array<'a>(values: impl IntoIterator<Item = &'a str>) -> Result<String> {
 
 fn pair(key: impl Into<String>, value: impl Into<String>) -> (String, String) {
     (key.into(), value.into())
+}
+
+fn valid_cookie_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            matches!(
+                byte,
+                0x21 | 0x23..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E
+            )
+        })
+}
+
+fn invalid_session_header(component: &str) -> Error {
+    Error::InvalidResponse {
+        operation: "SYNO.API.Auth.login".to_owned(),
+        message: format!(
+            "successful response contained {component} data that cannot be used safely for authenticated DSM requests"
+        ),
+    }
 }
 
 fn discovery_route_returned_response(error: &Error) -> bool {
@@ -6030,6 +6152,63 @@ mod tests {
         assert!(normalize_base_url("http://nas.test", true).is_ok());
         assert!(normalize_base_url("https://user:pass@nas.test", false).is_err());
         assert!(normalize_base_url("https://nas.test/?x=1", false).is_err());
+    }
+
+    #[test]
+    fn session_headers_are_exact_sensitive_and_injection_safe() {
+        let session = Session {
+            sid: Zeroizing::new("sid-with_-safe.characters".to_owned()),
+            syno_token: Some(Zeroizing::new("token-with.+/=".to_owned())),
+        };
+        let headers = session.request_headers().unwrap();
+        assert_eq!(
+            headers.cookie.to_str().unwrap(),
+            "id=sid-with_-safe.characters"
+        );
+        assert_eq!(
+            headers.syno_token.as_ref().unwrap().to_str().unwrap(),
+            "token-with.+/="
+        );
+        assert!(headers.cookie.is_sensitive());
+        assert!(headers.syno_token.as_ref().unwrap().is_sensitive());
+        let rendered = format!(
+            "{:?}{:?}",
+            headers.cookie,
+            headers.syno_token.as_ref().unwrap()
+        );
+        assert!(!rendered.contains("sid-with"));
+        assert!(!rendered.contains("token-with"));
+
+        for sid in [
+            "sid; forged=value",
+            "sid,forged",
+            "sid\\forged",
+            "sid\r\nX-Forged: value",
+        ] {
+            let invalid = Session {
+                sid: Zeroizing::new(sid.to_owned()),
+                syno_token: None,
+            };
+            let error = invalid
+                .request_headers()
+                .err()
+                .expect("unsafe SID must be rejected");
+            let rendered = format!("{error:?}");
+            assert!(rendered.contains("cannot be used safely"));
+            assert!(!rendered.contains(sid));
+        }
+
+        let invalid_token = Session {
+            sid: Zeroizing::new("safe-sid".to_owned()),
+            syno_token: Some(Zeroizing::new("token\r\nX-Forged: value".to_owned())),
+        };
+        let error = invalid_token
+            .request_headers()
+            .err()
+            .expect("unsafe SynoToken must be rejected");
+        let rendered = format!("{error:?}");
+        assert!(rendered.contains("cannot be used safely"));
+        assert!(!rendered.contains("X-Forged"));
     }
 
     #[test]

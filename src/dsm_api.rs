@@ -6537,7 +6537,7 @@ fn validate_connection_manager_result(value: &Value, operation: &str) -> BridgeR
                 | "file_station_authentication_failed"
                 | "file_station_logout_failed"
         ) || generic_internal_failure
-            || (operation == "browse-remote"
+            || (matches!(operation, "browse-remote" | "test-profile-auth")
                 && matches!(
                     code,
                     "file_station_listing_denied"
@@ -12488,7 +12488,7 @@ fn connection_failure_result(failure: RemoteConnectionFailure) -> Value {
         ),
         RemoteConnectionFailure::Authentication(_) => (
             "file_station_authentication_failed",
-            "DSM rejected the username, password, account policy, or sign-in method.",
+            "DSM rejected the credentials, account policy, sign-in method, or returned File Station session.",
         ),
         RemoteConnectionFailure::Permission => (
             "file_station_listing_denied",
@@ -12717,6 +12717,15 @@ fn authenticate_file_station(
 }
 
 #[cfg(target_os = "linux")]
+fn classify_authenticated_file_station_failure(error: SyncError) -> RemoteConnectionFailure {
+    match error.api_code() {
+        Some(code @ (106 | 107 | 119)) => RemoteConnectionFailure::Authentication(Some(code)),
+        Some(105 | 407) => RemoteConnectionFailure::Permission,
+        _ => RemoteConnectionFailure::Listing,
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn logout_result_with<T, F>(
     result: Result<T, RemoteConnectionFailure>,
     logout: F,
@@ -12762,14 +12771,14 @@ fn interactive_connection_budget(mutation: &Mutation) -> Option<InteractiveConne
 }
 
 #[cfg(target_os = "linux")]
-fn authentication_test_result_after_logout<F>(
-    logout: Result<(), RemoteConnectionFailure>,
+fn authentication_test_result_after_confirmation_and_logout<F>(
+    confirmation_and_logout: Result<(), RemoteConnectionFailure>,
     issue_proof: F,
 ) -> BridgeResult<Value>
 where
     F: FnOnce() -> BridgeResult<(String, u64)>,
 {
-    match logout {
+    match confirmation_and_logout {
         Ok(()) => {
             let (proof, expires) = issue_proof()?;
             Ok(json!({
@@ -12829,35 +12838,39 @@ fn execute_connection_mutation(
 
     match &job.mutation {
         Mutation::TestProfileAuth(_) => {
-            let logout = logout_result_with(Ok(()), || {
+            // A successful login envelope is not enough: reverse proxies can
+            // accept credentials yet fail to carry the returned DSM session to
+            // File Station. Confirm the session with one bounded, read-only
+            // File Station request before issuing a connection proof.
+            let confirmation = client
+                .confirm_file_station_session()
+                .map_err(classify_authenticated_file_station_failure);
+            let confirmation_and_logout = logout_result_with(confirmation, || {
                 client
                     .logout_bounded(budget.logout)
                     .map_err(|_| RemoteConnectionFailure::Logout)
             });
-            authentication_test_result_after_logout(logout, || {
-                // Start the proof lifetime only after authentication and the
-                // mandatory logout have both completed. A slow target must not
-                // consume the chooser window before it is returned to the UI.
-                let proof_issued_at = current_epoch()?;
-                issue_connection_proof(
-                    &key[..],
-                    &job.session_binding,
-                    &fingerprint,
-                    proof_issued_at,
-                )
-            })
+            authentication_test_result_after_confirmation_and_logout(
+                confirmation_and_logout,
+                || {
+                    // Start the proof lifetime only after authentication and the
+                    // File Station confirmation and mandatory logout have both
+                    // completed. A slow target must not consume the chooser
+                    // window before it is returned to the UI.
+                    let proof_issued_at = current_epoch()?;
+                    issue_connection_proof(
+                        &key[..],
+                        &job.session_binding,
+                        &fingerprint,
+                        proof_issued_at,
+                    )
+                },
+            )
         }
         Mutation::BrowseRemote(arguments) => {
-            let listing =
-                client
-                    .browse_directories(&arguments.parent, 500)
-                    .map_err(|error: SyncError| {
-                        if matches!(error.api_code(), Some(105 | 407)) {
-                            RemoteConnectionFailure::Permission
-                        } else {
-                            RemoteConnectionFailure::Listing
-                        }
-                    });
+            let listing = client
+                .browse_directories(&arguments.parent, 500)
+                .map_err(classify_authenticated_file_station_failure);
             let listing = logout_result_with(listing, || {
                 client
                     .logout_bounded(budget.logout)
@@ -18734,6 +18747,91 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn session_rejection_codes_are_authentication_failures_and_never_issue_a_proof() {
+        for code in [106, 107, 119] {
+            let classified = classify_authenticated_file_station_failure(SyncError::Api {
+                api: "SYNO.FileStation.List".to_owned(),
+                operation: "list_share".to_owned(),
+                code,
+                description: String::new(),
+                details: Vec::new(),
+            });
+            assert_eq!(
+                classified,
+                RemoteConnectionFailure::Authentication(Some(code))
+            );
+
+            let mut proof_calls = 0;
+            let rejected =
+                authentication_test_result_after_confirmation_and_logout(Err(classified), || {
+                    proof_calls += 1;
+                    Ok(("must-not-be-issued".to_owned(), 1))
+                })
+                .unwrap();
+            assert_eq!(proof_calls, 0);
+            assert_eq!(rejected["ok"], false);
+            assert_eq!(rejected["code"], "file_station_authentication_failed");
+            validate_connection_manager_result(&rejected, "test-profile-auth").unwrap();
+        }
+
+        for code in [105, 407] {
+            let classified = classify_authenticated_file_station_failure(SyncError::Api {
+                api: "SYNO.FileStation.List".to_owned(),
+                operation: "list_share".to_owned(),
+                code,
+                description: String::new(),
+                details: Vec::new(),
+            });
+            assert_eq!(classified, RemoteConnectionFailure::Permission);
+        }
+
+        for (failure, expected_code) in [
+            (
+                RemoteConnectionFailure::Permission,
+                "file_station_listing_denied",
+            ),
+            (
+                RemoteConnectionFailure::Listing,
+                "file_station_listing_failed",
+            ),
+            (
+                RemoteConnectionFailure::PermissionAndLogout,
+                "file_station_denied_logout_failed",
+            ),
+            (
+                RemoteConnectionFailure::ListingAndLogout,
+                "file_station_listing_logout_failed",
+            ),
+            (
+                RemoteConnectionFailure::OperationAndLogout,
+                "file_station_operation_logout_failed",
+            ),
+        ] {
+            let mut proof_calls = 0;
+            let rejected =
+                authentication_test_result_after_confirmation_and_logout(Err(failure), || {
+                    proof_calls += 1;
+                    Ok(("must-not-be-issued".to_owned(), 1))
+                })
+                .unwrap();
+            assert_eq!(proof_calls, 0);
+            assert_eq!(rejected["code"], expected_code);
+            validate_connection_manager_result(&rejected, "test-profile-auth").unwrap();
+        }
+
+        let mut proof_calls = 0;
+        let accepted = authentication_test_result_after_confirmation_and_logout(Ok(()), || {
+            proof_calls += 1;
+            Ok((format!("v1.2.{}.{}", "a".repeat(64), "b".repeat(64)), 2))
+        })
+        .unwrap();
+        assert_eq!(proof_calls, 1);
+        assert_eq!(accepted["ok"], true);
+        validate_connection_manager_result(&accepted, "test-profile-auth").unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn logout_is_always_attempted_and_proof_issuance_requires_logout_success() {
         let mut logout_calls = 0;
         let listing = logout_result_with::<(), _>(Err(RemoteConnectionFailure::Listing), || {
@@ -18745,7 +18843,7 @@ mod tests {
         let listing_result = connection_failure_result(listing.unwrap_err());
         assert_eq!(listing_result["code"], "file_station_listing_logout_failed");
         validate_connection_manager_result(&listing_result, "browse-remote").unwrap();
-        assert!(validate_connection_manager_result(&listing_result, "test-profile-auth").is_err());
+        validate_connection_manager_result(&listing_result, "test-profile-auth").unwrap();
 
         let permission =
             logout_result_with::<(), _>(Err(RemoteConnectionFailure::Permission), || {
@@ -18763,6 +18861,7 @@ mod tests {
             "file_station_denied_logout_failed"
         );
         validate_connection_manager_result(&permission_result, "browse-remote").unwrap();
+        validate_connection_manager_result(&permission_result, "test-profile-auth").unwrap();
 
         let logout = logout_result_with(Ok("listing"), || {
             logout_calls += 1;
@@ -18772,15 +18871,29 @@ mod tests {
         assert_eq!(logout, Err(RemoteConnectionFailure::Logout));
 
         let mut proof_calls = 0;
-        let rejected =
-            authentication_test_result_after_logout(Err(RemoteConnectionFailure::Logout), || {
+        let rejected = authentication_test_result_after_confirmation_and_logout(
+            Err(RemoteConnectionFailure::Logout),
+            || {
                 proof_calls += 1;
                 Ok(("must-not-be-issued".to_owned(), 1))
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(proof_calls, 0);
         assert_eq!(rejected["ok"], false);
         assert_eq!(rejected["code"], "file_station_logout_failed");
+
+        let confirmation_and_logout = logout_result_with::<(), _>(
+            Err(RemoteConnectionFailure::Authentication(Some(119))),
+            || Err(RemoteConnectionFailure::Logout),
+        );
+        let rejected = authentication_test_result_after_confirmation_and_logout(
+            confirmation_and_logout,
+            || Ok(("must-not-be-issued".to_owned(), 1)),
+        )
+        .unwrap();
+        assert_eq!(rejected["code"], "file_station_operation_logout_failed");
+        validate_connection_manager_result(&rejected, "test-profile-auth").unwrap();
     }
 
     #[cfg(target_os = "linux")]
