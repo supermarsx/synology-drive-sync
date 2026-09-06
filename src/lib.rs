@@ -13,6 +13,7 @@ pub mod progress;
 pub mod sdk;
 pub mod source_diagnostics;
 pub mod sync;
+pub mod transport_diagnostics;
 pub mod vault;
 
 pub use error::{Error, Result};

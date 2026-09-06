@@ -119,18 +119,24 @@ pub enum LogFormat {
 /// Stable machine-readable event codes. Human messages are derived from these codes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventCode {
+    RunBuild,
     RunStarted,
     RunCompleted,
     RunFailed,
     LocalScanStarted,
     LocalScanCompleted,
+    ConnectionEstablished,
     ApiDiscoveryStarted,
     ApiDiscoveryCompleted,
     AuthenticationStarted,
+    SessionEstablished,
     AuthenticationCompleted,
     RemoteScanStarted,
     RemoteScanCompleted,
     PlanReady,
+    ApiCallStarted,
+    ApiCallCompleted,
+    ApiCallRedirected,
     UploadStarted,
     UploadAttemptStarted,
     UploadProgress,
@@ -143,20 +149,61 @@ pub enum EventCode {
 }
 
 impl EventCode {
+    /// Every event code, in emission order.
+    ///
+    /// Exhaustive by construction: a new variant that is not listed here fails
+    /// `every_event_code_has_a_stable_machine_and_human_name`, so no code can ship without a
+    /// stable machine name and human message.
+    pub const ALL: [Self; 27] = [
+        Self::RunBuild,
+        Self::RunStarted,
+        Self::RunCompleted,
+        Self::RunFailed,
+        Self::LocalScanStarted,
+        Self::LocalScanCompleted,
+        Self::ConnectionEstablished,
+        Self::ApiDiscoveryStarted,
+        Self::ApiDiscoveryCompleted,
+        Self::AuthenticationStarted,
+        Self::SessionEstablished,
+        Self::AuthenticationCompleted,
+        Self::RemoteScanStarted,
+        Self::RemoteScanCompleted,
+        Self::PlanReady,
+        Self::ApiCallStarted,
+        Self::ApiCallCompleted,
+        Self::ApiCallRedirected,
+        Self::UploadStarted,
+        Self::UploadAttemptStarted,
+        Self::UploadProgress,
+        Self::UploadCompleted,
+        Self::UploadFailed,
+        Self::DirectoryCreated,
+        Self::EntryDeleted,
+        Self::RetryScheduled,
+        Self::CancellationRequested,
+    ];
+
     fn as_str(self) -> &'static str {
         match self {
+            Self::RunBuild => "run.build",
             Self::RunStarted => "run.started",
             Self::RunCompleted => "run.completed",
             Self::RunFailed => "run.failed",
             Self::LocalScanStarted => "local_scan.started",
             Self::LocalScanCompleted => "local_scan.completed",
+            Self::ConnectionEstablished => "connection.established",
             Self::ApiDiscoveryStarted => "api_discovery.started",
             Self::ApiDiscoveryCompleted => "api_discovery.completed",
             Self::AuthenticationStarted => "authentication.started",
+            Self::SessionEstablished => "session.established",
             Self::AuthenticationCompleted => "authentication.completed",
             Self::RemoteScanStarted => "remote_scan.started",
             Self::RemoteScanCompleted => "remote_scan.completed",
             Self::PlanReady => "plan.ready",
+            Self::ApiCallStarted => "api_call.started",
+            Self::ApiCallCompleted => "api_call.completed",
+            Self::ApiCallRedirected => "api_call.redirected",
             Self::UploadStarted => "upload.started",
             Self::UploadAttemptStarted => "upload.attempt_started",
             Self::UploadProgress => "upload.progress",
@@ -171,18 +218,24 @@ impl EventCode {
 
     fn human(self) -> &'static str {
         match self {
+            Self::RunBuild => "build",
             Self::RunStarted => "sync run started",
             Self::RunCompleted => "sync run completed",
             Self::RunFailed => "sync run failed",
             Self::LocalScanStarted => "local scan started",
             Self::LocalScanCompleted => "local scan completed",
+            Self::ConnectionEstablished => "connection established",
             Self::ApiDiscoveryStarted => "API discovery started",
             Self::ApiDiscoveryCompleted => "API discovery completed",
             Self::AuthenticationStarted => "authentication started",
+            Self::SessionEstablished => "session established",
             Self::AuthenticationCompleted => "authentication completed",
             Self::RemoteScanStarted => "remote scan started",
             Self::RemoteScanCompleted => "remote scan completed",
             Self::PlanReady => "sync plan ready",
+            Self::ApiCallStarted => "API call started",
+            Self::ApiCallCompleted => "API call completed",
+            Self::ApiCallRedirected => "API call redirected",
             Self::UploadStarted => "upload started",
             Self::UploadAttemptStarted => "upload attempt started",
             Self::UploadProgress => "upload progress",
@@ -193,6 +246,800 @@ impl EventCode {
             Self::RetryScheduled => "retry scheduled",
             Self::CancellationRequested => "cancellation requested",
         }
+    }
+}
+
+/// Compile-time build identity.
+///
+/// Every member is a `&'static str` stamped by `build.rs`, so this type carries no runtime-derived
+/// text and cannot hold a secret by construction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BuildIdentity {
+    pub name: &'static str,
+    pub version: &'static str,
+    pub target: &'static str,
+    pub profile: &'static str,
+    pub commit: &'static str,
+}
+
+/// The identity of this binary, for the startup banner and the diagnostic report.
+pub const BUILD: BuildIdentity = BuildIdentity {
+    name: env!("CARGO_PKG_NAME"),
+    version: env!("SDSYNC_VERSION"),
+    target: env!("SDSYNC_BUILD_TARGET"),
+    profile: env!("SDSYNC_BUILD_PROFILE"),
+    commit: env!("SDSYNC_BUILD_COMMIT"),
+};
+
+impl BuildIdentity {
+    fn json_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "version": self.version,
+            "target": self.target,
+            "profile": self.profile,
+            "commit": self.commit,
+        })
+    }
+
+    fn human(self) -> String {
+        format!(
+            "{} {} ({}) {} {}",
+            self.name, self.version, self.commit, self.target, self.profile
+        )
+    }
+}
+
+/// Bounded, sanitized, inline ASCII text.
+///
+/// This is the only member of any log record that can hold runtime-derived text, and
+/// [`InlineAscii::sanitized`] is its only constructor. There is deliberately no `From<&str>`, no
+/// `new`, and no `Deref<Target = str>`, so a raw value cannot reach a record by accident. Being
+/// `Copy` and heap-free also keeps [`LogEvent`] `Copy`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InlineAscii<const N: usize> {
+    bytes: [u8; N],
+    length: u8,
+}
+
+impl<const N: usize> InlineAscii<N> {
+    /// Retain `[A-Za-z0-9]`, `.`, `-`, `_`, `/`, `:`, and `,`; replace every other byte with `_`.
+    ///
+    /// The comma is retained solely as a list separator for fields that report several names.
+    ///
+    /// Replacement rather than removal keeps the result the same shape as the input, so a
+    /// substituted byte is visible instead of silently closing a gap. Over-long input is truncated
+    /// and marked with a trailing `~`.
+    pub fn sanitized(input: &str) -> Self {
+        debug_assert!(
+            N <= u8::MAX as usize,
+            "InlineAscii capacity must fit its u8 length"
+        );
+        let mut bytes = [0_u8; N];
+        let mut length = 0_usize;
+        let mut truncated = false;
+        for byte in input.bytes() {
+            if length == N {
+                truncated = true;
+                break;
+            }
+            bytes[length] = if byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'-' | b'_' | b'/' | b':' | b',')
+            {
+                byte
+            } else {
+                b'_'
+            };
+            length += 1;
+        }
+        if truncated {
+            bytes[N - 1] = b'~';
+            length = N;
+        }
+        Self {
+            bytes,
+            length: u8::try_from(length).unwrap_or(u8::MAX),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        let end = usize::from(self.length).min(N);
+        // Every stored byte came from `sanitized`, which only ever writes ASCII.
+        std::str::from_utf8(&self.bytes[..end]).unwrap_or("")
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+}
+
+impl<const N: usize> Default for InlineAscii<N> {
+    /// The empty token, which is what "no value was observed" renders as.
+    fn default() -> Self {
+        Self::sanitized("")
+    }
+}
+
+impl<const N: usize> fmt::Display for InlineAscii<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A URL path or host, bounded to a length that cannot fill a log line.
+pub type BoundedText = InlineAscii<64>;
+
+/// Which session channels one request carried.
+///
+/// Presence only: no value of any channel is representable in this type. The four channels are
+/// tracked separately because DSM accepts several at once, and knowing which combination was on
+/// the wire is what distinguishes a rejected credential from a mis-carried session.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SessionTransport {
+    /// A `Cookie: id=<sid>` header this client synthesized.
+    pub cookie_header: bool,
+    /// The `X-SYNO-TOKEN` header.
+    pub syno_token_header: bool,
+    /// The `_sid` form field.
+    pub sid_field: bool,
+    /// The `SynoToken` form field.
+    pub syno_token_field: bool,
+}
+
+impl SessionTransport {
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+
+    fn json_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "cookie_header": self.cookie_header,
+            "syno_token_header": self.syno_token_header,
+            "sid_field": self.sid_field,
+            "syno_token_field": self.syno_token_field,
+        })
+    }
+
+    /// Name the attached channels, for a log line or a diagnostic report.
+    pub fn describe(self) -> String {
+        if self.is_empty() {
+            return "none".to_owned();
+        }
+        let mut parts = Vec::with_capacity(4);
+        if self.cookie_header {
+            parts.push("cookie");
+        }
+        if self.syno_token_header {
+            parts.push("token-header");
+        }
+        if self.sid_field {
+            parts.push("sid-field");
+        }
+        if self.syno_token_field {
+            parts.push("token-field");
+        }
+        parts.join("+")
+    }
+}
+
+/// How a request body was encoded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestTransport {
+    Form,
+    Multipart,
+    Download,
+}
+
+impl RequestTransport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Form => "form",
+            Self::Multipart => "multipart",
+            Self::Download => "download",
+        }
+    }
+}
+
+/// How one request finished.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestOutcome {
+    Ok,
+    DsmError,
+    HttpStatus,
+    Redirect,
+    Transport,
+    Decode,
+}
+
+impl RequestOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::DsmError => "dsm-error",
+            Self::HttpStatus => "http-status",
+            Self::Redirect => "redirect",
+            Self::Transport => "transport",
+            Self::Decode => "decode",
+        }
+    }
+
+    pub fn is_failure(self) -> bool {
+        self != Self::Ok
+    }
+}
+
+/// A cookie name or an intermediary banner, bounded to half a [`BoundedText`].
+///
+/// Shorter than [`BoundedText`] on purpose: several of these are carried per request record, and
+/// no cookie name or `Server`/`Via` banner worth reporting needs more room. Truncation is still
+/// marked, so a long value is visibly clipped rather than silently shortened.
+pub type ShortToken = InlineAscii<32>;
+
+/// How many cookies of one response are described in full.
+///
+/// DSM sets at most three (`id`, `smid`, `stay_login`); the fourth slot exists so a load
+/// balancer's own affinity cookie -- the single most useful intermediary fingerprint there is --
+/// still lands in the record rather than in the overflow count.
+pub const MAX_DESCRIBED_COOKIES: usize = 4;
+
+/// Whether a `Set-Cookie` creates a session cookie, a stored one, or clears one.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CookiePersistence {
+    /// Neither `Expires` nor `Max-Age`: the cookie lives only as long as the user agent does.
+    #[default]
+    Session,
+    /// `Expires` or a positive `Max-Age`: the user agent is asked to store it on disk.
+    Persistent,
+    /// An empty value with `Max-Age=0` or a negative `Max-Age`: the server is clearing it.
+    ///
+    /// Detected from `Max-Age` alone. An `Expires` date in the past also clears a cookie, but
+    /// dating it would mean parsing a server-supplied timestamp, so such a header is reported as
+    /// `Persistent` rather than guessed at.
+    Deletion,
+}
+
+impl CookiePersistence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Persistent => "persistent",
+            Self::Deletion => "deletion",
+        }
+    }
+}
+
+/// The `SameSite` attribute, which is a fixed enum rather than server-chosen text.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CookieSameSite {
+    #[default]
+    Absent,
+    Strict,
+    Lax,
+    None,
+    /// Present but not one of the three defined values.
+    Unrecognized,
+}
+
+impl CookieSameSite {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Strict => "strict",
+            Self::Lax => "lax",
+            Self::None => "none",
+            Self::Unrecognized => "unrecognized",
+        }
+    }
+}
+
+/// One `Set-Cookie` header, described without its value.
+///
+/// `fingerprint` is a salted 32-bit digest of the value and exists solely so two observations of
+/// the same cookie name can be compared for equality within one run. The salt is drawn once per
+/// process, so a digest is not even comparable between runs, and 32 bits of a keyed digest of a
+/// 40-plus character opaque identifier carries no recoverable information about it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CookieFact {
+    pub name: ShortToken,
+    /// Salted digest of the value. Never the value, and never comparable across processes.
+    pub fingerprint: u32,
+    /// How many bytes the value occupied. A length is not an identifier.
+    pub value_length: u16,
+    pub persistence: CookiePersistence,
+    pub secure: bool,
+    pub http_only: bool,
+    pub same_site: CookieSameSite,
+    /// Attribute *presence*. `Path` and `Domain` values are withheld: a `Domain` names the scope
+    /// the intermediary claims, and presence answers the diagnostic question without publishing
+    /// the operator's internal naming.
+    pub path_present: bool,
+    pub domain_present: bool,
+    pub expires_present: bool,
+    pub max_age_present: bool,
+}
+
+impl CookieFact {
+    fn json_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name.as_str(),
+            "fingerprint": format!("{:08x}", self.fingerprint),
+            "value_length": self.value_length,
+            "persistence": self.persistence.as_str(),
+            "secure": self.secure,
+            "http_only": self.http_only,
+            "same_site": self.same_site.as_str(),
+            "path_present": self.path_present,
+            "domain_present": self.domain_present,
+            "expires_present": self.expires_present,
+            "max_age_present": self.max_age_present,
+        })
+    }
+}
+
+/// Every cookie one response set, described but never quoted.
+///
+/// Fixed capacity keeps [`LogEvent`] `Copy` and heap-free. A response setting more cookies than
+/// there are slots reports the excess as a count, so the record never claims to be exhaustive
+/// when it is not.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CookieFacts {
+    described: [Option<CookieFact>; MAX_DESCRIBED_COOKIES],
+    /// `Set-Cookie` headers beyond the described capacity, or ones with no parseable name.
+    undescribed: u16,
+}
+
+impl CookieFacts {
+    /// Add one described cookie, or count it as undescribed when there is no room left.
+    pub fn push(&mut self, fact: CookieFact) {
+        if let Some(slot) = self.described.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(fact);
+        } else {
+            self.undescribed = self.undescribed.saturating_add(1);
+        }
+    }
+
+    /// Count a `Set-Cookie` header that could not be described at all.
+    pub fn push_undescribed(&mut self) {
+        self.undescribed = self.undescribed.saturating_add(1);
+    }
+
+    pub fn described(&self) -> impl Iterator<Item = CookieFact> + '_ {
+        self.described.iter().filter_map(|slot| *slot)
+    }
+
+    pub fn undescribed(self) -> u16 {
+        self.undescribed
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.undescribed == 0 && self.described.iter().all(Option::is_none)
+    }
+
+    fn json_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "described": self
+                .described()
+                .map(CookieFact::json_value)
+                .collect::<Vec<_>>(),
+            "undescribed": self.undescribed,
+        })
+    }
+}
+
+/// A content-delivery or caching intermediary recognised from response headers.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CdnMarker {
+    #[default]
+    None,
+    Cloudflare,
+    Fastly,
+    Akamai,
+    CloudFront,
+    Varnish,
+    /// A caching or proxy marker that is recognisably one, but not one of the named vendors.
+    Other,
+}
+
+impl CdnMarker {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Cloudflare => "cloudflare",
+            Self::Fastly => "fastly",
+            Self::Akamai => "akamai",
+            Self::CloudFront => "cloudfront",
+            Self::Varnish => "varnish",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// What one response says about the machinery between this client and DSM.
+///
+/// These are recorded per response rather than once per run on purpose. A relay that fans
+/// consecutive requests out to different DSM backends will change its `Server` banner, its `Via`
+/// chain, or its affinity cookie from one request to the next, and only a per-response record can
+/// show that.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IntermediaryFacts {
+    /// The `Via` chain, sanitized. Empty when the header was absent.
+    pub via: ShortToken,
+    /// The `Server` banner, sanitized. Empty when the header was absent.
+    pub server: ShortToken,
+    /// The `X-Powered-By` banner, sanitized. Empty when the header was absent.
+    pub powered_by: ShortToken,
+    /// A response carrying `X-Forwarded-For` or `Forwarded`, which is a request header reflected
+    /// back and therefore proof of a proxy that rewrites them.
+    pub forwarded_for_reflected: bool,
+    /// A response carrying `X-Real-IP`, reflected the same way.
+    pub real_ip_reflected: bool,
+    pub cdn_marker: CdnMarker,
+    /// `Set-Cookie` names this response carried that are not DSM's own.
+    pub foreign_cookie_count: u16,
+}
+
+impl IntermediaryFacts {
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+
+    fn json_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "via": self.via.as_str(),
+            "server": self.server.as_str(),
+            "powered_by": self.powered_by.as_str(),
+            "forwarded_for_reflected": self.forwarded_for_reflected,
+            "real_ip_reflected": self.real_ip_reflected,
+            "cdn_marker": self.cdn_marker.as_str(),
+            "foreign_cookie_count": self.foreign_cookie_count,
+        })
+    }
+}
+
+/// One HTTP round trip against the DSM WebAPI.
+///
+/// Every member is an enum, an integer, a boolean, a compile-time `&'static str`, or a sanitized
+/// [`BoundedText`]. A response body, header value, form-field value, credential, or session
+/// identifier is not representable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApiCallDetail {
+    /// DSM API name. Always a string literal at the call site.
+    pub api: &'static str,
+    /// DSM method name. Always a string literal at the call site.
+    pub method: &'static str,
+    pub version: u32,
+    /// The URL *path* only. Never a scheme, host, port, query, or fragment.
+    pub route: BoundedText,
+    pub transport: RequestTransport,
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub session: SessionTransport,
+    /// How many form fields were sent. Never their names or values.
+    pub request_fields: u16,
+    pub request_bytes: u64,
+    pub timeout_ms: u64,
+    pub outcome: RequestOutcome,
+    pub http_status: Option<u16>,
+    pub dsm_code: Option<i64>,
+    /// The operator-facing description for `dsm_code`. A compile-time string, never server text.
+    pub dsm_description: Option<&'static str>,
+    /// How many `Set-Cookie` headers the response carried.
+    pub set_cookie_count: u16,
+    /// The cookie *names* the response set, comma separated.
+    ///
+    /// Only the text before each header's first `=` is retained, so the live session value a
+    /// `Set-Cookie` carries is not representable here. Empty when the response set none.
+    pub set_cookie_names: BoundedText,
+    /// The same cookies as [`Self::set_cookie_names`], with their attributes and a value digest.
+    ///
+    /// This is what makes cookie *permanence* answerable: names alone cannot show that the server
+    /// re-set one under a changed value, which is the observation that separates a rotated
+    /// session from a rejected one.
+    pub cookies: CookieFacts,
+    /// What this response revealed about proxies, relays, and caches on the path.
+    pub intermediary: IntermediaryFacts,
+    pub response_bytes: u64,
+    pub elapsed_ms: u64,
+    /// The backoff about to be slept, when this attempt scheduled a retry.
+    pub retry_backoff_ms: Option<u64>,
+    /// The host of a refused redirect's `Location`. Host only; `None` for a relative target.
+    pub redirect_host: Option<BoundedText>,
+}
+
+impl ApiCallDetail {
+    /// A record for a request that has not been sent yet.
+    pub fn started(
+        api: &'static str,
+        method: &'static str,
+        version: u32,
+        route: BoundedText,
+        transport: RequestTransport,
+    ) -> Self {
+        Self {
+            api,
+            method,
+            version,
+            route,
+            transport,
+            attempt: 1,
+            max_attempts: 1,
+            session: SessionTransport::default(),
+            request_fields: 0,
+            request_bytes: 0,
+            timeout_ms: 0,
+            outcome: RequestOutcome::Ok,
+            http_status: None,
+            dsm_code: None,
+            dsm_description: None,
+            set_cookie_count: 0,
+            set_cookie_names: BoundedText::sanitized(""),
+            cookies: CookieFacts::default(),
+            intermediary: IntermediaryFacts::default(),
+            response_bytes: 0,
+            elapsed_ms: 0,
+            retry_backoff_ms: None,
+            redirect_host: None,
+        }
+    }
+
+    fn json_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "api": self.api,
+            "method": self.method,
+            "version": self.version,
+            "route": self.route.as_str(),
+            "transport": self.transport.as_str(),
+            "attempt": self.attempt,
+            "max_attempts": self.max_attempts,
+            "session": self.session.json_value(),
+            "request_fields": self.request_fields,
+            "request_bytes": self.request_bytes,
+            "timeout_ms": self.timeout_ms,
+            "outcome": self.outcome.as_str(),
+            "http_status": self.http_status,
+            "dsm_code": self.dsm_code,
+            "dsm_description": self.dsm_description,
+            "set_cookie_count": self.set_cookie_count,
+            "set_cookie_names": self.set_cookie_names.as_str(),
+            "cookies": self.cookies.json_value(),
+            "intermediary": self.intermediary.json_value(),
+            "response_bytes": self.response_bytes,
+            "elapsed_ms": self.elapsed_ms,
+            "retry_backoff_ms": self.retry_backoff_ms,
+            "redirect_host": self.redirect_host.map(|host| host.as_str().to_owned()),
+        })
+    }
+
+    fn human(self) -> String {
+        use std::fmt::Write as _;
+        let mut line = format!("{}.{} v{}", self.api, self.method, self.version);
+        if !self.route.is_empty() {
+            let _ = write!(line, " route={}", self.route);
+        }
+        if self.transport != RequestTransport::Form {
+            let _ = write!(line, " transport={}", self.transport.as_str());
+        }
+        let _ = write!(line, " attempt={}/{}", self.attempt, self.max_attempts);
+        let _ = write!(line, " session={}", self.session.describe());
+        if let Some(status) = self.http_status {
+            let _ = write!(line, " status={status}");
+        }
+        match self.dsm_code {
+            Some(code) => {
+                let _ = write!(line, " dsm={code}");
+            }
+            // Only once a response has actually come back. A request that has not been sent yet
+            // has no DSM verdict, and claiming one would be a lie in the common trace line.
+            None if self.outcome == RequestOutcome::Ok && self.http_status.is_some() => {
+                let _ = write!(line, " dsm=ok");
+            }
+            None => {}
+        }
+        if self.outcome.is_failure() {
+            let _ = write!(line, " outcome={}", self.outcome.as_str());
+        }
+        // Whether the server rotated the session on this response, and under which names. This
+        // is the discriminator between a session the client may keep reusing and one it has
+        // already invalidated by continuing to send the previous identifier.
+        if self.set_cookie_count > 0 {
+            let _ = write!(line, " set_cookie={}", self.set_cookie_names);
+        }
+        for cookie in self.cookies.described() {
+            // Name, digest, and attribute names only; the value never reaches this formatter.
+            let _ = write!(
+                line,
+                " cookie[{}]={:08x}/{}/{}{}{}",
+                cookie.name,
+                cookie.fingerprint,
+                cookie.persistence.as_str(),
+                cookie.same_site.as_str(),
+                if cookie.secure { "/secure" } else { "" },
+                if cookie.http_only { "/httponly" } else { "" },
+            );
+        }
+        if !self.intermediary.is_empty() {
+            let intermediary = self.intermediary;
+            let _ = write!(line, " intermediary=");
+            let mut parts: Vec<String> = Vec::new();
+            if !intermediary.via.is_empty() {
+                parts.push(format!("via:{}", intermediary.via));
+            }
+            if !intermediary.server.is_empty() {
+                parts.push(format!("server:{}", intermediary.server));
+            }
+            if !intermediary.powered_by.is_empty() {
+                parts.push(format!("powered_by:{}", intermediary.powered_by));
+            }
+            if intermediary.forwarded_for_reflected {
+                parts.push("forwarded-for-reflected".to_owned());
+            }
+            if intermediary.real_ip_reflected {
+                parts.push("real-ip-reflected".to_owned());
+            }
+            if intermediary.cdn_marker != CdnMarker::None {
+                parts.push(format!("cdn:{}", intermediary.cdn_marker.as_str()));
+            }
+            if intermediary.foreign_cookie_count > 0 {
+                parts.push(format!(
+                    "non-dsm-cookies:{}",
+                    intermediary.foreign_cookie_count
+                ));
+            }
+            let _ = write!(line, "{}", parts.join("+"));
+        }
+        if self.response_bytes > 0 {
+            let _ = write!(line, " bytes={}", self.response_bytes);
+        }
+        if self.elapsed_ms > 0 {
+            let _ = write!(line, " elapsed_ms={}", self.elapsed_ms);
+        }
+        if let Some(backoff) = self.retry_backoff_ms {
+            let _ = write!(line, " retry_backoff_ms={backoff}");
+        }
+        if let Some(host) = self.redirect_host {
+            let _ = write!(line, " redirect_host={host}");
+        }
+        if let Some(description) = self.dsm_description {
+            let _ = write!(line, " detail=\"{description}\"");
+        }
+        line
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UrlScheme {
+    Https,
+    Http,
+}
+
+impl UrlScheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Https => "https",
+            Self::Http => "http",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CertificateVerification {
+    Enabled,
+    CustomCa,
+    Disabled,
+}
+
+impl CertificateVerification {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::CustomCa => "custom-ca",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+/// The transport identity of a connected client.
+///
+/// This is the only record that names the endpoint, and it is deliberately emitted at debug level:
+/// a default-level run that ships events to a remote collector must not start disclosing a
+/// hostname it did not disclose before.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionDetail {
+    pub scheme: UrlScheme,
+    /// Host only, never userinfo, path, query, or fragment.
+    pub host: BoundedText,
+    pub port: Option<u16>,
+    pub base_path: BoundedText,
+    pub certificate_verification: CertificateVerification,
+}
+
+impl ConnectionDetail {
+    fn json_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "scheme": self.scheme.as_str(),
+            "host": self.host.as_str(),
+            "port": self.port,
+            "base_path": self.base_path.as_str(),
+            // Pinned into the record so relaxing the client's redirect policy fails the
+            // shipped-schema conformance test rather than passing unnoticed.
+            "redirects": "refused",
+            "certificate_verification": self.certificate_verification.as_str(),
+        })
+    }
+
+    fn human(self) -> String {
+        use std::fmt::Write as _;
+        let mut line = format!("scheme={} host={}", self.scheme.as_str(), self.host);
+        if let Some(port) = self.port {
+            let _ = write!(line, " port={port}");
+        }
+        let _ = write!(
+            line,
+            " base_path={} redirects=refused certificate_verification={}",
+            self.base_path,
+            self.certificate_verification.as_str()
+        );
+        line
+    }
+}
+
+/// The `format=` value requested from `SYNO.API.Auth.login`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoginFormat {
+    Sid,
+    Cookie,
+}
+
+impl LoginFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sid => "sid",
+            Self::Cookie => "cookie",
+        }
+    }
+}
+
+/// The shape of an established DSM session.
+///
+/// Lengths and presence only. A session identifier, a token, and any digest or fingerprint of
+/// either are all deliberately absent: a truncated hash of a live SID would be a credential
+/// correlation primitive shipped to a remote collector, and it answers nothing that `sid_length`
+/// and [`SessionTransport`] do not already answer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionShape {
+    pub sid_length: u16,
+    pub token_present: bool,
+    pub login_format: LoginFormat,
+    /// Whether the login response carried `Set-Cookie`.
+    pub server_set_cookie: bool,
+}
+
+impl SessionShape {
+    fn json_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "sid_length": self.sid_length,
+            "token_present": self.token_present,
+            "login_format": self.login_format.as_str(),
+            "server_set_cookie": self.server_set_cookie,
+        })
+    }
+
+    fn human(self) -> String {
+        format!(
+            "sid_length={} token={} login_format={} server_set_cookie={}",
+            self.sid_length,
+            if self.token_present {
+                "present"
+            } else {
+                "absent"
+            },
+            self.login_format.as_str(),
+            if self.server_set_cookie {
+                "present"
+            } else {
+                "absent"
+            },
+        )
     }
 }
 
@@ -208,6 +1055,10 @@ pub struct EventMetrics {
 }
 
 /// A log event with no free-form or secret-bearing fields.
+///
+/// The optional detail members are absent on every event that does not carry them, and are then
+/// omitted from the JSON object entirely, so records for the original event codes render exactly
+/// as they always have and existing `sdsync.log.v1` consumers keep working.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LogEvent {
     pub timestamp_ms: u64,
@@ -216,6 +1067,10 @@ pub struct LogEvent {
     pub operation_id: Option<u64>,
     pub attempt: Option<u32>,
     pub metrics: EventMetrics,
+    pub build: Option<BuildIdentity>,
+    pub call: Option<ApiCallDetail>,
+    pub connection: Option<ConnectionDetail>,
+    pub session: Option<SessionShape>,
 }
 
 impl LogEvent {
@@ -227,6 +1082,10 @@ impl LogEvent {
             operation_id: None,
             attempt: None,
             metrics: EventMetrics::default(),
+            build: None,
+            call: None,
+            connection: None,
+            session: None,
         }
     }
 
@@ -245,8 +1104,28 @@ impl LogEvent {
         self
     }
 
+    pub fn build(mut self, build: BuildIdentity) -> Self {
+        self.build = Some(build);
+        self
+    }
+
+    pub fn call(mut self, call: ApiCallDetail) -> Self {
+        self.call = Some(call);
+        self
+    }
+
+    pub fn connection(mut self, connection: ConnectionDetail) -> Self {
+        self.connection = Some(connection);
+        self
+    }
+
+    pub fn session(mut self, session: SessionShape) -> Self {
+        self.session = Some(session);
+        self
+    }
+
     fn json_value(self) -> serde_json::Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "schema": "sdsync.log.v1",
             "timestamp_ms": self.timestamp_ms,
             "level": self.level.as_str(),
@@ -261,7 +1140,23 @@ impl LogEvent {
                 "throughput_bytes_per_second": self.metrics.throughput_bytes_per_second,
                 "eta_ms": self.metrics.eta_ms,
             }
-        })
+        });
+        let object = value
+            .as_object_mut()
+            .expect("the record is constructed as a JSON object");
+        if let Some(build) = self.build {
+            object.insert("build".to_owned(), build.json_value());
+        }
+        if let Some(call) = self.call {
+            object.insert("call".to_owned(), call.json_value());
+        }
+        if let Some(connection) = self.connection {
+            object.insert("connection".to_owned(), connection.json_value());
+        }
+        if let Some(session) = self.session {
+            object.insert("session".to_owned(), session.json_value());
+        }
+        value
     }
 
     fn human_line(self) -> String {
@@ -294,6 +1189,22 @@ impl LogEvent {
         if self.metrics.elapsed_ms > 0 {
             use std::fmt::Write as _;
             let _ = write!(line, " elapsed_ms={}", self.metrics.elapsed_ms);
+        }
+        if let Some(build) = self.build {
+            use std::fmt::Write as _;
+            let _ = write!(line, " {}", build.human());
+        }
+        if let Some(connection) = self.connection {
+            use std::fmt::Write as _;
+            let _ = write!(line, " {}", connection.human());
+        }
+        if let Some(session) = self.session {
+            use std::fmt::Write as _;
+            let _ = write!(line, " {}", session.human());
+        }
+        if let Some(call) = self.call {
+            use std::fmt::Write as _;
+            let _ = write!(line, " {}", call.human());
         }
         line
     }
@@ -1096,6 +2007,309 @@ mod tests {
         assert!(!json.contains("url"));
     }
 
+    /// A populated record of every kind, for the leak and shape guards below.
+    fn fully_populated_details() -> (BuildIdentity, ApiCallDetail, ConnectionDetail, SessionShape) {
+        let mut call = ApiCallDetail::started(
+            "SYNO.FileStation.List",
+            "getinfo",
+            2,
+            BoundedText::sanitized("/webapi/entry.cgi"),
+            RequestTransport::Form,
+        );
+        call.attempt = 2;
+        call.max_attempts = 4;
+        call.session = SessionTransport {
+            cookie_header: true,
+            syno_token_header: true,
+            sid_field: true,
+            syno_token_field: true,
+        };
+        call.request_fields = 9;
+        call.request_bytes = 4096;
+        call.timeout_ms = 10_000;
+        call.outcome = RequestOutcome::DsmError;
+        call.http_status = Some(200);
+        call.dsm_code = Some(119);
+        call.dsm_description = Some("session is invalid; rerun to authenticate again");
+        call.set_cookie_count = 2;
+        call.set_cookie_names = BoundedText::sanitized("id,stay_login");
+        call.cookies.push(CookieFact {
+            name: ShortToken::sanitized("id"),
+            fingerprint: 0xdead_beef,
+            value_length: 43,
+            persistence: CookiePersistence::Session,
+            secure: true,
+            http_only: true,
+            same_site: CookieSameSite::Lax,
+            path_present: true,
+            domain_present: false,
+            expires_present: false,
+            max_age_present: false,
+        });
+        call.cookies.push(CookieFact {
+            name: ShortToken::sanitized("stay_login"),
+            fingerprint: 0x0000_0001,
+            value_length: 1,
+            persistence: CookiePersistence::Persistent,
+            secure: false,
+            http_only: false,
+            same_site: CookieSameSite::Absent,
+            path_present: true,
+            domain_present: true,
+            expires_present: true,
+            max_age_present: false,
+        });
+        call.cookies.push_undescribed();
+        call.intermediary = IntermediaryFacts {
+            via: ShortToken::sanitized("1.1 relay"),
+            server: ShortToken::sanitized("nginx"),
+            powered_by: ShortToken::sanitized("PHP/8.2"),
+            forwarded_for_reflected: true,
+            real_ip_reflected: true,
+            cdn_marker: CdnMarker::Cloudflare,
+            foreign_cookie_count: 1,
+        };
+        call.response_bytes = 88;
+        call.elapsed_ms = 79;
+        call.retry_backoff_ms = Some(500);
+        call.redirect_host = Some(BoundedText::sanitized("relay.example.test"));
+        (
+            BUILD,
+            call,
+            ConnectionDetail {
+                scheme: UrlScheme::Https,
+                host: BoundedText::sanitized("nas.example.test"),
+                port: Some(5001),
+                base_path: BoundedText::sanitized("/"),
+                certificate_verification: CertificateVerification::CustomCa,
+            },
+            SessionShape {
+                sid_length: 24,
+                token_present: true,
+                login_format: LoginFormat::Sid,
+                server_set_cookie: false,
+            },
+        )
+    }
+
+    /// The closed key set is the actual redaction guarantee, so it is asserted verbatim.
+    ///
+    /// A new member added to any detail type fails here, which forces a deliberate decision about
+    /// whether it can carry secret-bearing data before it can ever be emitted.
+    #[test]
+    fn every_log_record_key_is_in_the_documented_closed_set() {
+        // Arrays are walked as well as objects. A record member that holds a list of objects --
+        // the described cookies do -- would otherwise put its keys outside the closed set
+        // entirely, which is exactly the gap this test exists to close.
+        fn collect_keys(value: &serde_json::Value, into: &mut std::collections::BTreeSet<String>) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    for (key, nested) in object {
+                        into.insert(key.clone());
+                        collect_keys(nested, into);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        collect_keys(item, into);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let (build, call, connection, session) = fully_populated_details();
+        let mut keys = std::collections::BTreeSet::new();
+        for code in EventCode::ALL {
+            let event = LogEvent::new(LogLevel::Debug, code)
+                .operation(1)
+                .attempt(2)
+                .metrics(EventMetrics::default())
+                .build(build)
+                .call(call)
+                .connection(connection)
+                .session(session);
+            collect_keys(&event.json_value(), &mut keys);
+        }
+
+        let expected: std::collections::BTreeSet<String> = [
+            // Envelope.
+            "schema",
+            "timestamp_ms",
+            "level",
+            "event",
+            "operation_id",
+            "attempt",
+            "metrics",
+            "build",
+            "call",
+            "connection",
+            "session",
+            // Metrics.
+            "operations",
+            "files",
+            "bytes",
+            "elapsed_ms",
+            "throughput_bytes_per_second",
+            "eta_ms",
+            // Build identity.
+            "name",
+            "version",
+            "target",
+            "profile",
+            "commit",
+            // API call.
+            "api",
+            "method",
+            "route",
+            "transport",
+            "max_attempts",
+            "request_fields",
+            "request_bytes",
+            "timeout_ms",
+            "outcome",
+            "http_status",
+            "dsm_code",
+            "dsm_description",
+            "set_cookie_count",
+            "set_cookie_names",
+            "response_bytes",
+            "retry_backoff_ms",
+            "redirect_host",
+            // Described cookies. Names, a salted digest, and attribute presence; no value.
+            "cookies",
+            "described",
+            "undescribed",
+            "fingerprint",
+            "value_length",
+            "persistence",
+            "secure",
+            "http_only",
+            "same_site",
+            "path_present",
+            "domain_present",
+            "expires_present",
+            "max_age_present",
+            // Intermediary fingerprint.
+            "intermediary",
+            "via",
+            "server",
+            "powered_by",
+            "forwarded_for_reflected",
+            "real_ip_reflected",
+            "cdn_marker",
+            "foreign_cookie_count",
+            // Session transport.
+            "cookie_header",
+            "syno_token_header",
+            "sid_field",
+            "syno_token_field",
+            // Connection.
+            "scheme",
+            "host",
+            "port",
+            "base_path",
+            "redirects",
+            "certificate_verification",
+            // Session shape.
+            "sid_length",
+            "token_present",
+            "login_format",
+            "server_set_cookie",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+        assert_eq!(
+            keys, expected,
+            "the log record key set changed; confirm no new member can carry secret-bearing data"
+        );
+    }
+
+    /// No populated record of any kind may render credential material.
+    #[test]
+    fn populated_records_render_no_credential_material() {
+        let (build, call, connection, session) = fully_populated_details();
+        for code in EventCode::ALL {
+            let event = LogEvent::new(LogLevel::Trace, code)
+                .build(build)
+                .call(call)
+                .connection(connection)
+                .session(session);
+            for rendered in [event.json_value().to_string(), event.human_line()] {
+                for forbidden in [
+                    "passwd",
+                    "otp_code",
+                    "_sid",
+                    "SynoToken",
+                    "account",
+                    "Cookie:",
+                    "X-SYNO-TOKEN",
+                    "password",
+                ] {
+                    assert!(
+                        !rendered.contains(forbidden),
+                        "{code:?} rendered {forbidden:?}: {rendered}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The sanitizer is the only way runtime text enters a record, so its bounds are pinned here.
+    #[test]
+    fn inline_ascii_sanitizes_replaces_and_bounds() {
+        // Everything outside the retained set becomes `_`, so a substitution stays visible
+        // instead of silently closing a gap.
+        assert_eq!(
+            InlineAscii::<64>::sanitized("/webapi/entry.cgi?_sid=abc#frag").as_str(),
+            "/webapi/entry.cgi__sid_abc_frag"
+        );
+        assert_eq!(
+            InlineAscii::<64>::sanitized("nas.example.test:5001").as_str(),
+            "nas.example.test:5001"
+        );
+        // Control characters cannot forge a second log line.
+        assert_eq!(
+            InlineAscii::<32>::sanitized("a\r\nINFO fake").as_str(),
+            "a__INFO_fake"
+        );
+        // Non-ASCII is replaced byte by byte and never yields invalid UTF-8.
+        assert_eq!(InlineAscii::<16>::sanitized("héllo").as_str(), "h__llo");
+        assert!(InlineAscii::<16>::sanitized("").is_empty());
+        // Over-length input is truncated and explicitly marked.
+        let long = InlineAscii::<8>::sanitized("abcdefghijklmnop");
+        assert_eq!(long.as_str(), "abcdefg~");
+        assert_eq!(long.as_str().len(), 8);
+    }
+
+    /// Absent details must be omitted, not rendered as `null`.
+    ///
+    /// This is what keeps records for the original event codes byte-identical to the shape
+    /// `sdsync.log.v1` consumers already parse.
+    #[test]
+    fn events_without_details_render_exactly_as_before() {
+        let event = LogEvent::new(LogLevel::Info, EventCode::RunStarted);
+        let json = event.json_value();
+        let object = json.as_object().expect("a JSON object");
+        // serde_json orders object keys, so compare the set rather than an emission order the
+        // serializer does not preserve.
+        assert_eq!(
+            object.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "attempt",
+                "event",
+                "level",
+                "metrics",
+                "operation_id",
+                "schema",
+                "timestamp_ms",
+            ]
+        );
+        assert_eq!(event.human_line().split_whitespace().count(), 5);
+    }
+
     #[test]
     fn upload_progress_has_stable_machine_and_human_names() {
         let event = LogEvent::new(LogLevel::Trace, EventCode::UploadProgress).operation(9);
@@ -1105,92 +2319,63 @@ mod tests {
 
     #[test]
     fn every_event_code_has_a_stable_machine_and_human_name() {
-        for (code, machine, human) in [
-            (EventCode::RunStarted, "run.started", "sync run started"),
-            (
-                EventCode::RunCompleted,
-                "run.completed",
-                "sync run completed",
-            ),
-            (EventCode::RunFailed, "run.failed", "sync run failed"),
-            (
-                EventCode::LocalScanStarted,
-                "local_scan.started",
-                "local scan started",
-            ),
-            (
-                EventCode::LocalScanCompleted,
-                "local_scan.completed",
-                "local scan completed",
-            ),
-            (
-                EventCode::ApiDiscoveryStarted,
-                "api_discovery.started",
-                "API discovery started",
-            ),
-            (
-                EventCode::ApiDiscoveryCompleted,
-                "api_discovery.completed",
-                "API discovery completed",
-            ),
-            (
-                EventCode::AuthenticationStarted,
-                "authentication.started",
-                "authentication started",
-            ),
-            (
-                EventCode::AuthenticationCompleted,
-                "authentication.completed",
-                "authentication completed",
-            ),
-            (
-                EventCode::RemoteScanStarted,
-                "remote_scan.started",
-                "remote scan started",
-            ),
-            (
-                EventCode::RemoteScanCompleted,
-                "remote_scan.completed",
-                "remote scan completed",
-            ),
-            (EventCode::PlanReady, "plan.ready", "sync plan ready"),
-            (EventCode::UploadStarted, "upload.started", "upload started"),
-            (
-                EventCode::UploadAttemptStarted,
-                "upload.attempt_started",
-                "upload attempt started",
-            ),
-            (
-                EventCode::UploadProgress,
-                "upload.progress",
-                "upload progress",
-            ),
-            (
-                EventCode::UploadCompleted,
-                "upload.completed",
-                "upload completed",
-            ),
-            (EventCode::UploadFailed, "upload.failed", "upload failed"),
-            (
-                EventCode::DirectoryCreated,
-                "directory.created",
-                "directory created",
-            ),
-            (EventCode::EntryDeleted, "entry.deleted", "entry deleted"),
-            (
-                EventCode::RetryScheduled,
-                "retry.scheduled",
-                "retry scheduled",
-            ),
-            (
-                EventCode::CancellationRequested,
-                "cancellation.requested",
-                "cancellation requested",
-            ),
-        ] {
+        // Driven by `EventCode::ALL` rather than a hand-written list, so a new variant cannot be
+        // added without also being given both names: an omission fails the exhaustiveness check
+        // below instead of silently escaping this test the way a literal array allowed.
+        let mut machine_names = std::collections::BTreeSet::new();
+        let mut human_names = std::collections::BTreeSet::new();
+        for code in EventCode::ALL {
             let event = LogEvent::new(LogLevel::Info, code);
-            assert_eq!(event.json_value()["event"], machine);
-            assert!(event.human_line().contains(human), "{machine}");
+            let machine = event.json_value()["event"]
+                .as_str()
+                .expect("every event renders a machine name")
+                .to_owned();
+            assert!(!machine.is_empty(), "{code:?} has an empty machine name");
+            assert!(
+                machine
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'.' | b'_')),
+                "{code:?} machine name {machine:?} is not a stable lowercase identifier"
+            );
+            assert!(
+                machine_names.insert(machine.clone()),
+                "{code:?} reuses machine name {machine:?}"
+            );
+            let human = code.human().to_owned();
+            assert!(!human.is_empty(), "{code:?} has an empty human name");
+            assert!(
+                event.human_line().contains(&human),
+                "{machine} human line omits {human:?}"
+            );
+            human_names.insert(human);
+        }
+        assert_eq!(
+            machine_names.len(),
+            EventCode::ALL.len(),
+            "EventCode::ALL must list every variant exactly once"
+        );
+        // A representative sample is pinned verbatim so a rename is a deliberate, visible change
+        // to the published contract rather than a silently accepted one.
+        for expected in [
+            "run.build",
+            "run.started",
+            "run.completed",
+            "run.failed",
+            "connection.established",
+            "api_discovery.started",
+            "authentication.started",
+            "session.established",
+            "api_call.started",
+            "api_call.completed",
+            "api_call.redirected",
+            "upload.progress",
+            "retry.scheduled",
+            "cancellation.requested",
+        ] {
+            assert!(
+                machine_names.contains(expected),
+                "the published event name {expected:?} is gone"
+            );
         }
     }
 

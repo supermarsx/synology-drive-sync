@@ -97,6 +97,22 @@ fn validate(root: &Value, schema: &Value, instance: &Value, path: &str) -> Resul
                         .iter()
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
             }
+            // The sanitized token every runtime-derived string in a log record passes through.
+            // Enforcing it here is what proves the sanitizer actually ran: an unfiltered host,
+            // path, or redirect target would carry a character this rejects.
+            "^[A-Za-z0-9._/:~,-]{0,64}$" => {
+                value.len() <= 64
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric()
+                            || matches!(byte, b'.' | b'-' | b'_' | b'/' | b':' | b'~' | b',')
+                    })
+            }
+            "^[a-z_]{1,32}$" => {
+                (1..=32).contains(&value.len())
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            }
             other => return Err(format!("{path}: unsupported schema pattern {other:?}")),
         };
         if !matches {

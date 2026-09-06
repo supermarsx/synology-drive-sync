@@ -50,7 +50,7 @@ fn diagnose_source_with_rules(
     cancellation: &CancellationToken,
 ) -> Result<SourceDiagnosticReport> {
     cancellation.check()?;
-    let inventory = local::scan(source, rules)?;
+    let inventory = local::scan(source, rules, cancellation)?;
     cancellation.check()?;
     finish_diagnostic(inventory, options, cancellation)
 }
@@ -328,7 +328,7 @@ mod tests {
         let payload = root.path().join("payload.bin");
         fs::write(&payload, b"before").unwrap();
         let rules = IgnoreRules::build(root.path(), &[]).unwrap();
-        let inventory = local::scan(root.path(), &rules).unwrap();
+        let inventory = local::scan(root.path(), &rules, &CancellationToken::default()).unwrap();
         fs::write(&payload, b"after-with-a-different-size").unwrap();
 
         assert!(matches!(

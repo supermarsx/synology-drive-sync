@@ -6,7 +6,7 @@ use std::time::UNIX_EPOCH;
 
 use serde_json::{Value, json};
 use support::TestDir;
-use support::file_station_mock::MockFileStation;
+use support::file_station_mock::{CapturedRequest, MockFileStation};
 
 const PASSWORD: &[u8] = b"correct horse battery staple\n";
 
@@ -43,6 +43,21 @@ fn modified_seconds(path: &std::path::Path) -> i64 {
             .as_secs(),
     )
     .expect("fixture timestamp fits i64")
+}
+
+/// One section of a doctor document, addressed by its stable id rather than by its position.
+///
+/// Display order is part of the report contract, and it is pinned once and completely in
+/// `routing_only_doctor_stops_after_reverse_proxy_discovery`. Everywhere else, addressing a
+/// section by index only means every assertion in this file has to be renumbered whenever a
+/// section is added -- churn that hides which assertions actually changed meaning.
+fn section<'a>(document: &'a Value, id: &str) -> &'a Value {
+    document["sections"]
+        .as_array()
+        .expect("doctor document carries a section array")
+        .iter()
+        .find(|section| section["id"] == id)
+        .unwrap_or_else(|| panic!("doctor document has no {id} section"))
 }
 
 fn stdout_json(output: &Output) -> Value {
@@ -208,23 +223,135 @@ fn routing_only_doctor_stops_after_reverse_proxy_discovery() {
     assert_eq!(actual["authenticated"], false);
     assert_eq!(actual["remote_checked"], false);
     assert_eq!(actual["remote_inventory"], Value::Null);
+    // The three transport sections pass here: loopback resolves to one address, nothing
+    // announces itself in front of the mock, and no cookie is set. Capability enumeration passes
+    // too: it needs no session, which is exactly why it is the one new check quick still buys.
     assert_eq!(
         actual["summary"],
-        json!({"pass":2,"warn":1,"fail":0,"skip":5})
+        json!({"pass":6,"warn":1,"fail":0,"skip":9})
     );
     let sections = actual["sections"].as_array().expect("section array");
-    assert_eq!(sections.len(), 8);
-    assert_eq!(sections[0]["id"], "routing_tls");
-    assert_eq!(sections[0]["status"], "warn");
-    assert_eq!(sections[1]["id"], "dsm_api_discovery");
-    assert_eq!(sections[1]["status"], "pass");
-    assert_eq!(sections[2]["id"], "dsm_session_auth");
-    assert_eq!(sections[2]["status"], "skip");
+    // The whole display order is pinned here, so a section added or moved anywhere in the report
+    // has to be a deliberate change to this list rather than a silent reshuffle.
+    assert_eq!(
+        sections
+            .iter()
+            .map(|section| section["id"].as_str().expect("section id"))
+            .collect::<Vec<_>>(),
+        [
+            "network_reachability",
+            "routing_tls",
+            "dsm_api_discovery",
+            "capability_enumeration",
+            "intermediary_transport",
+            "dsm_session_auth",
+            "session_channel_ablation",
+            "session_concurrency",
+            "session_cookie_ledger",
+            "file_station_capabilities",
+            "capability_diagnosis",
+            "destination_path_resolution",
+            "destination_permissions",
+            "destination_inventory",
+            "disposable_write_verify_cleanup",
+            "session_logout",
+        ]
+    );
+    // Execution order is not display order, and the report states the real one.
+    assert_eq!(
+        sections
+            .iter()
+            .map(|section| section["step"].as_u64().expect("section step"))
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4, 15, 6, 7, 8, 16, 5, 9, 10, 11, 12, 13, 14]
+    );
+    assert_eq!(section(&actual, "network_reachability")["status"], "pass");
+    assert_eq!(section(&actual, "routing_tls")["status"], "warn");
+    assert_eq!(section(&actual, "dsm_api_discovery")["status"], "pass");
+    assert_eq!(section(&actual, "capability_enumeration")["status"], "pass");
+    assert_eq!(section(&actual, "intermediary_transport")["status"], "pass");
+    assert_eq!(section(&actual, "dsm_session_auth")["status"], "skip");
+    assert_eq!(section(&actual, "session_cookie_ledger")["status"], "pass");
+    // Quick is unauthenticated, so the session probes have nothing to present and say so.
+    assert_eq!(
+        section(&actual, "session_channel_ablation")["status"],
+        "skip"
+    );
+    assert_eq!(section(&actual, "capability_diagnosis")["status"], "skip");
+
+    // Every API DSM advertises, with the version this tool asks of each. No session was needed.
+    // The enumeration sees more than the ten-name discovery query does, which is the point of it.
+    let capabilities = &actual["capabilities"];
+    assert_eq!(capabilities["advertised_apis"], 16);
+    assert_eq!(capabilities["unusable_entries"], 0);
+    assert!(
+        capabilities["requirements"]
+            .as_array()
+            .expect("requirement matrix")
+            .iter()
+            .all(|verdict| verdict["satisfied"] == true),
+        "the mock advertises every version this tool asks for: {capabilities}"
+    );
+    // Tier 1 lists the File Station surface in full, including the APIs this tool never calls.
+    let file_station = capabilities["file_station"]
+        .as_array()
+        .expect("File Station tier");
+    assert_eq!(file_station.len(), 12);
+    let rename = file_station
+        .iter()
+        .find(|api| api["name"] == "SYNO.FileStation.Rename")
+        .expect("an advertised API this tool does not use");
+    assert_eq!(rename["used"], false);
+    assert_eq!(rename["required_version"], Value::Null);
+    // Tier 3 counts everything else by namespace rather than naming it.
+    assert_eq!(
+        capabilities["namespaces"]
+            .as_array()
+            .expect("namespace tier")
+            .iter()
+            .map(|namespace| (
+                namespace["namespace"].as_str().expect("namespace name"),
+                namespace["apis"].as_u64().expect("namespace count")
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("SYNO.Core.*", 2),
+            ("SYNO.API.*", 1),
+            ("SYNO.DownloadStation.*", 1)
+        ]
+    );
 
     let requests = server.requests();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].request_path, "/prefix/webapi/entry.cgi");
-    assert_eq!(requests[0].operation(), "SYNO.API.Info.query");
+    // Two: the ten-API discovery that feeds every later call, and the separate `query=all` read
+    // that feeds the report. They are deliberately not the same request.
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_eq!(request.request_path, "/prefix/webapi/entry.cgi");
+        assert_eq!(request.operation(), "SYNO.API.Info.query");
+    }
+    assert_eq!(
+        requests[1].fields.get("query").map(String::as_str),
+        Some("all")
+    );
+
+    // The unauthenticated transport probe really did run, and really did make its own requests
+    // against the discovery route rather than borrowing the client's.
+    let probes = server
+        .connections()
+        .into_iter()
+        .filter(|request| request.api.is_empty())
+        .collect::<Vec<_>>();
+    assert!(
+        !probes.is_empty(),
+        "the transport probe should have issued its own HTTP samples"
+    );
+    for probe in &probes {
+        assert!(
+            probe.request_path.starts_with("/prefix/webapi/query.cgi"),
+            "the probe should measure the discovery route, not {:?}",
+            probe.request_path
+        );
+    }
 }
 
 #[test]
@@ -249,15 +376,16 @@ fn explicit_quick_target_level_is_unauthenticated_and_does_not_touch_the_destina
     assert_eq!(result["level"], "quick");
     assert_eq!(result["authenticated"], false);
     assert_eq!(result["remote_checked"], false);
-    assert_eq!(result["sections"][2]["id"], "dsm_session_auth");
-    assert_eq!(result["sections"][2]["status"], "skip");
+    assert_eq!(section(&result, "dsm_session_auth")["status"], "skip");
+    // Two unauthenticated reads and nothing else: the ten-API discovery, and the `query=all`
+    // capability enumeration. Neither touches the destination, which is the point of quick.
     assert_eq!(
         server
             .requests()
             .iter()
             .map(|request| request.operation())
             .collect::<Vec<_>>(),
-        ["SYNO.API.Info.query"]
+        ["SYNO.API.Info.query", "SYNO.API.Info.query"]
     );
 }
 
@@ -284,12 +412,10 @@ fn discovery_http_failure_keeps_routing_evidence_and_returns_nonzero() {
     assert_eq!(result["level"], "quick");
     assert_eq!(result["routing"], true);
     assert_eq!(result["api_discovery"], false);
-    assert_eq!(result["sections"][0]["id"], "routing_tls");
-    assert_eq!(result["sections"][0]["status"], "warn");
-    assert_eq!(result["sections"][1]["id"], "dsm_api_discovery");
-    assert_eq!(result["sections"][1]["status"], "fail");
+    assert_eq!(section(&result, "routing_tls")["status"], "warn");
+    assert_eq!(section(&result, "dsm_api_discovery")["status"], "fail");
     assert!(
-        result["sections"][3]["detail"]
+        section(&result, "file_station_capabilities")["detail"]
             .as_str()
             .expect("dependent skip detail")
             .contains("failed")
@@ -354,12 +480,26 @@ fn authenticated_target_doctor_checks_exact_destination_and_logs_out() {
         .iter()
         .map(|request| request.operation())
         .collect::<Vec<_>>();
+    // The whole request sequence a standard run makes, in order. Reading top to bottom: the two
+    // unauthenticated discovery reads, login, the session confirmation, the four session-channel
+    // ablation variants, the capability diagnosis bracketed by its two host reads, the
+    // destination walk and permission check, the bounded inventory, and logout.
     assert_eq!(
         operations,
         [
             "SYNO.API.Info.query",
+            "SYNO.API.Info.query",
             "SYNO.API.Auth.login",
             "SYNO.FileStation.List.list_share",
+            "SYNO.FileStation.List.list_share",
+            "SYNO.FileStation.List.list_share",
+            "SYNO.FileStation.List.list_share",
+            "SYNO.FileStation.List.list_share",
+            "SYNO.FileStation.Info.get",
+            "SYNO.FileStation.List.list_share",
+            "SYNO.FileStation.VirtualFolder.list",
+            "SYNO.FileStation.BackgroundTask.list",
+            "SYNO.FileStation.Info.get",
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.CheckPermission.write",
@@ -369,8 +509,54 @@ fn authenticated_target_doctor_checks_exact_destination_and_logs_out() {
         ]
     );
     assert_eq!(
-        requests[1].fields.get("account").map(String::as_str),
+        requests[2].fields.get("account").map(String::as_str),
         Some("e2e-user")
+    );
+
+    // The destination walked one component at a time, and every capability probed for this
+    // account. Both come from requests the run was already making.
+    let resolution = &actual["path_resolution"];
+    assert_eq!(resolution["total_components"], 2);
+    assert_eq!(resolution["fully_resolved"], true);
+    assert_eq!(resolution["segments"][0]["path"], "/team");
+    assert_eq!(resolution["segments"][1]["path"], "/team/target");
+    assert_eq!(
+        section(&actual, "destination_path_resolution")["status"],
+        "pass"
+    );
+
+    let diagnosis = &actual["capability_diagnosis"];
+    assert_eq!(diagnosis["session_aborted"], false);
+    assert_eq!(diagnosis["hostname_changed"], false);
+    assert_eq!(diagnosis["host"], "MOCKSTATION");
+    assert!(
+        diagnosis["capabilities"]
+            .as_array()
+            .expect("capability matrix")
+            .iter()
+            .all(|record| record["verdict"] == "works"),
+        "every probed capability works against the mock: {diagnosis}"
+    );
+
+    // The ablation reproduces the client's own behaviour first, then removes one channel at a
+    // time. The mock resolves the session from `_sid`, so cookie-only is rejected.
+    let channels = actual["session_channels"]
+        .as_array()
+        .expect("session channel probes");
+    assert_eq!(
+        channels
+            .iter()
+            .map(|probe| probe["channels"].as_str().expect("channel name"))
+            .collect::<Vec<_>>(),
+        ["all", "sid-field-only", "cookie-only", "token-header-only"]
+    );
+    assert_eq!(channels[0]["outcome"], "ok");
+    assert_eq!(channels[1]["outcome"], "ok");
+    assert_eq!(channels[2]["dsm_code"], 119);
+    assert_eq!(channels[3]["dsm_code"], 119);
+    assert_eq!(
+        section(&actual, "session_channel_ablation")["status"],
+        "pass"
     );
     assert_eq!(
         requests
@@ -411,18 +597,19 @@ fn doctor_rejects_unusable_post_login_sessions_and_always_logs_out() {
         assert_eq!(actual["status"], "fail");
         assert_eq!(actual["authenticated"], false);
         assert_eq!(actual["remote_checked"], false);
-        assert_eq!(actual["sections"][2]["id"], "dsm_session_auth");
-        assert_eq!(actual["sections"][2]["status"], "fail");
+        assert_eq!(section(&actual, "dsm_session_auth")["status"], "fail");
         assert!(
-            actual["sections"][2]["detail"]
+            section(&actual, "dsm_session_auth")["detail"]
                 .as_str()
                 .expect("session confirmation detail")
                 .contains(&format!("code {code}"))
         );
-        assert_eq!(actual["sections"][4]["status"], "skip");
-        assert_eq!(actual["sections"][5]["status"], "skip");
-        assert_eq!(actual["sections"][7]["id"], "session_logout");
-        assert_eq!(actual["sections"][7]["status"], "pass");
+        assert_eq!(
+            section(&actual, "destination_permissions")["status"],
+            "skip"
+        );
+        assert_eq!(section(&actual, "destination_inventory")["status"], "skip");
+        assert_eq!(section(&actual, "session_logout")["status"], "pass");
 
         assert_eq!(
             server
@@ -432,12 +619,914 @@ fn doctor_rejects_unusable_post_login_sessions_and_always_logs_out() {
                 .collect::<Vec<_>>(),
             [
                 "SYNO.API.Info.query",
+                "SYNO.API.Info.query",
                 "SYNO.API.Auth.login",
                 "SYNO.FileStation.List.list_share",
                 "SYNO.API.Auth.logout",
             ]
         );
     }
+}
+
+/// A session DSM has already rejected must not be asked to enumerate.
+///
+/// This reproduces a reported live failure: `list_share` succeeds, the very next authenticated
+/// call returns 119, and the diagnostic used to fall through into the inventory anyway. That
+/// second request could never have succeeded, and reporting its failure separately presented one
+/// dead session as two independent problems.
+#[test]
+fn a_rejected_session_stops_the_diagnostic_instead_of_enumerating() {
+    for code in [106, 107, 119] {
+        let fixture = TestDir::new(&format!("target-doctor-permission-session-{code}"));
+        let password = fixture.write("password", PASSWORD);
+        let server = MockFileStation::start();
+        server.add_directory("/team/target");
+        // The permission check's first request, immediately after session confirmation passed.
+        server.fail_next_api_operation("SYNO.FileStation.List.getinfo", code);
+
+        let output = run(&[
+            "--quiet",
+            "--output",
+            "json",
+            "doctor",
+            "--url",
+            server.base_url(),
+            "--username",
+            "e2e-user",
+            "--password-file",
+            password.to_str().expect("UTF-8 password path"),
+            "--no-vault",
+            "--allow-http",
+            "target",
+            "/team/target",
+        ]);
+        assert_eq!(output.status.code(), Some(1));
+
+        let actual = stdout_json(&output);
+        assert_eq!(actual["status"], "fail");
+        assert_eq!(
+            section(&actual, "destination_permissions")["status"],
+            "fail"
+        );
+        assert_eq!(section(&actual, "destination_inventory")["status"], "skip");
+        assert_eq!(
+            section(&actual, "destination_inventory")["detail"],
+            "not attempted; the DSM session was already rejected by the permission check"
+        );
+        // The specific reason must survive `explain_dependent_skips`, which runs first and would
+        // otherwise leave the vaguer "not run because Destination permissions failed".
+        assert!(
+            !section(&actual, "destination_inventory")["detail"]
+                .as_str()
+                .expect("inventory detail")
+                .contains("not run because")
+        );
+        // Logout still happens, so the run leaves no session behind.
+        assert_eq!(section(&actual, "session_logout")["status"], "pass");
+
+        // The decisive assertion: no enumeration request was made after the rejection.
+        let operations = server
+            .requests()
+            .iter()
+            .map(|request| request.operation())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operations,
+            [
+                "SYNO.API.Info.query",
+                "SYNO.API.Info.query",
+                "SYNO.API.Auth.login",
+                "SYNO.FileStation.List.list_share",
+                "SYNO.FileStation.List.list_share",
+                "SYNO.FileStation.List.list_share",
+                "SYNO.FileStation.List.list_share",
+                "SYNO.FileStation.List.list_share",
+                "SYNO.FileStation.Info.get",
+                "SYNO.FileStation.List.list_share",
+                "SYNO.FileStation.VirtualFolder.list",
+                "SYNO.FileStation.BackgroundTask.list",
+                "SYNO.FileStation.Info.get",
+                "SYNO.FileStation.List.getinfo",
+                "SYNO.API.Auth.logout",
+            ],
+            "a rejected session must not be asked to enumerate"
+        );
+
+        // The report names a concrete next step rather than restating the code.
+        let remediation = section(&actual, "destination_permissions")["remediation"]
+            .as_str()
+            .expect("a rejected session has a remediation hint");
+        assert!(
+            remediation.contains("same DSM host"),
+            "unexpected remediation: {remediation}"
+        );
+
+        // Each section reports the requests it is responsible for.
+        let permission_calls = section(&actual, "destination_permissions")["calls"]
+            .as_array()
+            .expect("permission calls");
+        assert_eq!(permission_calls.len(), 1);
+        assert_eq!(permission_calls[0]["api"], "SYNO.FileStation.List");
+        assert_eq!(permission_calls[0]["method"], "getinfo");
+        assert_eq!(permission_calls[0]["dsm_code"], code);
+        assert_eq!(permission_calls[0]["outcome"], "dsm-error");
+
+        // The resolution section renders the walk the permission check performed rather than
+        // repeating it, so the report says exactly how far the path got before the session died.
+        let resolution = &actual["path_resolution"];
+        assert_eq!(resolution["total_components"], 2);
+        assert_eq!(resolution["fully_resolved"], false);
+        assert_eq!(resolution["first_missing"], Value::Null);
+        assert_eq!(resolution["segments"][0]["path"], "/team");
+        assert_eq!(resolution["segments"][0]["exists"], false);
+        assert_eq!(resolution["segments"][0]["dsm_code"], code);
+        assert!(
+            section(&actual, "destination_path_resolution")["calls"]
+                .as_array()
+                .expect("resolution calls")
+                .is_empty(),
+            "the walk's requests belong to the permission check that issued them"
+        );
+    }
+}
+
+/// The ablation settles the reported live failure: login works, the first authenticated call
+/// works, and everything after it answers 119.
+///
+/// This is the one diagnostic that can attribute that to the client rather than to the path. The
+/// mock models a DSM that discards a session presented as an `id` cookie -- which a `format=sid`
+/// login is documented never to have issued -- and the report has to name the cookie, not the
+/// network.
+#[test]
+fn the_channel_ablation_names_the_cookie_when_only_the_sid_field_is_accepted() {
+    let fixture = TestDir::new("target-doctor-cookie-poisons-session");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/target");
+    server.reject_cookie_sessions_after_first_use();
+
+    let output = run(&[
+        "--quiet",
+        "--output",
+        "json",
+        "doctor",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password.to_str().expect("UTF-8 password path"),
+        "--no-vault",
+        "--allow-http",
+        "target",
+        "/team/target",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let actual = stdout_json(&output);
+
+    // The session confirmation carries the cookie, so it is what kills the session. Everything
+    // after it fails, and the ablation is what says which channel did it.
+    let ablation = section(&actual, "session_channel_ablation");
+    assert_eq!(ablation["status"], "fail");
+    let detail = ablation["detail"].as_str().expect("ablation detail");
+    assert!(
+        detail.contains("accepted with the _sid request field alone"),
+        "the ablation must attribute the failure to the channel, not the path: {detail}"
+    );
+    let remediation = ablation["remediation"]
+        .as_str()
+        .expect("a confirmed cookie fault names its fix");
+    assert!(
+        remediation.contains("Stop sending the cookie header for sid-format logins"),
+        "unexpected remediation: {remediation}"
+    );
+
+    let channels = actual["session_channels"]
+        .as_array()
+        .expect("session channel probes");
+    assert_eq!(channels[0]["channels"], "all");
+    assert_eq!(channels[0]["dsm_code"], 119);
+    assert_eq!(channels[1]["channels"], "sid-field-only");
+    assert_eq!(channels[1]["outcome"], "ok");
+    assert_eq!(channels[2]["dsm_code"], 119);
+
+    // The capability matrix must not be painted red by a dead session: a 119 stops the probing
+    // and is reported as a session verdict, not as fifteen broken capabilities.
+    let diagnosis = &actual["capability_diagnosis"];
+    assert_eq!(diagnosis["session_aborted"], true);
+    assert_eq!(diagnosis["working"], 0);
+    assert_eq!(
+        diagnosis["capabilities"][0]["verdict"], "not probed",
+        "a session error is not a capability verdict"
+    );
+    let capability_section = section(&actual, "capability_diagnosis");
+    assert_eq!(capability_section["status"], "warn");
+    assert!(
+        capability_section["detail"]
+            .as_str()
+            .expect("capability detail")
+            .contains("describe the session rather than the capabilities")
+    );
+
+    let human = String::from_utf8(
+        run(&[
+            "--quiet",
+            "--output",
+            "human",
+            "doctor",
+            "--url",
+            server.base_url(),
+            "--username",
+            "e2e-user",
+            "--password-file",
+            password.to_str().expect("UTF-8 password path"),
+            "--no-vault",
+            "--allow-http",
+            "target",
+            "/team/target",
+        ])
+        .stdout,
+    )
+    .expect("UTF-8 human report");
+    assert!(
+        human.contains("DSM session channel ablation:"),
+        "the human report should carry the ablation block:\n{human}"
+    );
+    assert!(
+        human.contains("sid-field-only") && human.contains("cookie-only"),
+        "every variant should be named:\n{human}"
+    );
+    assert!(
+        !human.contains("e2e-session-secret") && !human.contains("e2e-syno-token-secret"),
+        "the ablation varies session channels and must still publish no session value"
+    );
+}
+
+/// Two host names inside one run is the only positive proof that requests reached two hosts.
+#[test]
+fn two_host_names_in_one_run_are_reported_as_a_path_that_does_not_reach_one_host() {
+    let fixture = TestDir::new("target-doctor-two-hosts");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/target");
+    server.change_hostname_after_next_info_read("OTHERSTATION");
+
+    let output = run(&[
+        "--quiet",
+        "--output",
+        "json",
+        "doctor",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password.to_str().expect("UTF-8 password path"),
+        "--no-vault",
+        "--allow-http",
+        "target",
+        "/team/target",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let actual = stdout_json(&output);
+
+    let diagnosis = &actual["capability_diagnosis"];
+    assert_eq!(diagnosis["hostname_changed"], true);
+    let capability_section = section(&actual, "capability_diagnosis");
+    assert_eq!(capability_section["status"], "fail");
+    assert!(
+        capability_section["detail"]
+            .as_str()
+            .expect("capability detail")
+            .contains("two different host names")
+    );
+    assert!(
+        capability_section["remediation"]
+            .as_str()
+            .expect("a two-host finding names its next step")
+            .contains("direct address"),
+        "the fix for a path that reaches two hosts is a different path"
+    );
+}
+
+/// A destination whose interior components are missing is a different fault from a missing share,
+/// and the report has to say which one it is.
+#[test]
+fn the_destination_walk_names_the_component_where_resolution_stops() {
+    let fixture = TestDir::new("target-doctor-missing-component");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/present");
+
+    let doctor = |remote: &str| {
+        let output = run(&[
+            "--quiet",
+            "--output",
+            "json",
+            "doctor",
+            "--url",
+            server.base_url(),
+            "--username",
+            "e2e-user",
+            "--password-file",
+            password.to_str().expect("UTF-8 password path"),
+            "--no-vault",
+            "--allow-http",
+            "target",
+            remote,
+        ]);
+        stdout_json(&output)
+    };
+
+    // The share and its child exist; only the last component does not. Sync can create that, so
+    // the section warns rather than failing and says so.
+    let missing_leaf = doctor("/team/present/absent");
+    let resolution = &missing_leaf["path_resolution"];
+    assert_eq!(resolution["total_components"], 3);
+    assert_eq!(resolution["first_missing"], 3);
+    assert_eq!(resolution["fully_resolved"], false);
+    assert_eq!(
+        resolution["segments"]
+            .as_array()
+            .expect("walked segments")
+            .iter()
+            .map(|segment| (
+                segment["path"].as_str().expect("segment path"),
+                segment["exists"].as_bool().expect("segment existence")
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("/team", true),
+            ("/team/present", true),
+            ("/team/present/absent", false)
+        ]
+    );
+    let leaf_section = section(&missing_leaf, "destination_path_resolution");
+    assert_eq!(leaf_section["status"], "warn");
+    assert!(
+        leaf_section["detail"]
+            .as_str()
+            .expect("resolution detail")
+            .contains("stops at component 3 of 3")
+    );
+
+    // The shared folder itself is absent. No amount of creating directories fixes that, and the
+    // remediation points at the account's visible roots instead.
+    let missing_share = doctor("/absent/target");
+    let share_section = section(&missing_share, "destination_path_resolution");
+    assert_eq!(share_section["status"], "fail");
+    assert_eq!(missing_share["path_resolution"]["first_missing"], 1);
+    assert!(
+        share_section["remediation"]
+            .as_str()
+            .expect("a missing share names its next step")
+            .contains("shared folder named by the first path component")
+    );
+}
+
+/// A malformed entry in `query=all` must cost its own line of output, not the enumeration.
+///
+/// `query=all` returns entries authored by whoever wrote each installed package. The strict type
+/// that feeds `required_spec` would fail the whole map on one bad entry, which is exactly why the
+/// diagnostic read has its own lenient one.
+#[test]
+fn capability_enumeration_survives_an_entry_the_documented_api_map_cannot_describe() {
+    let server = MockFileStation::start();
+    server.advertise_malformed_api();
+
+    let output = run(&[
+        "--quiet",
+        "--output",
+        "json",
+        "doctor",
+        "--url",
+        server.base_url(),
+        "--allow-http",
+        "--routing-only",
+    ]);
+    assert_success(&output);
+    let actual = stdout_json(&output);
+
+    let capabilities = &actual["capabilities"];
+    assert_eq!(capabilities["advertised_apis"], 16);
+    assert_eq!(capabilities["unusable_entries"], 1);
+    let enumeration = section(&actual, "capability_enumeration");
+    assert_eq!(enumeration["status"], "warn");
+    assert!(
+        enumeration["detail"]
+            .as_str()
+            .expect("enumeration detail")
+            .contains("1 advertised entries could not be read")
+    );
+    // The connection itself is untouched: discovery still validated its ten APIs strictly.
+    assert_eq!(actual["api_discovery"], true);
+    assert_eq!(section(&actual, "dsm_api_discovery")["status"], "pass");
+
+    let human = String::from_utf8(
+        run(&[
+            "--quiet",
+            "--output",
+            "human",
+            "doctor",
+            "--url",
+            server.base_url(),
+            "--allow-http",
+            "--routing-only",
+        ])
+        .stdout,
+    )
+    .expect("UTF-8 human report");
+    assert!(
+        human.contains("DSM capability enumeration:"),
+        "the human report should carry the enumeration block:\n{human}"
+    );
+    assert!(
+        human.contains("SYNO.FileStation.Rename") && human.contains("unused by this tool"),
+        "the File Station tier should name what DSM offers and this tool does not use:\n{human}"
+    );
+    assert!(
+        human.contains("SYNO.Core.* (2)"),
+        "other namespaces should be counted rather than listed:\n{human}"
+    );
+}
+
+/// A single trace-level run must explain a live failure without a second round trip.
+///
+/// This is the shape of log a user is asked to attach: it has to name the build, the endpoint,
+/// every request with its DSM code and latency, and which session channels were attached — while
+/// containing no credential material at all.
+#[test]
+fn one_trace_run_explains_a_rejected_session_without_leaking_credentials() {
+    let fixture = TestDir::new("target-doctor-trace-diagnostics");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/target");
+    server.fail_next_api_operation("SYNO.FileStation.List.getinfo", 119);
+
+    let output = run(&[
+        "--log-level",
+        "trace",
+        "--log-format",
+        "json",
+        "--output",
+        "json",
+        "doctor",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password.to_str().expect("UTF-8 password path"),
+        "--no-vault",
+        "--allow-http",
+        "target",
+        "/team/target",
+    ]);
+
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 diagnostics");
+    let records = stderr
+        .lines()
+        .filter(|line| line.starts_with('{'))
+        .map(|line| serde_json::from_str::<Value>(line).expect("one JSON record per line"))
+        .collect::<Vec<_>>();
+    let event_of = |name: &str| {
+        records
+            .iter()
+            .find(|record| record["event"] == name)
+            .unwrap_or_else(|| panic!("no {name} record in:\n{stderr}"))
+            .clone()
+    };
+
+    // The build banner is the very first thing any sink receives.
+    assert_eq!(records[0]["event"], "run.build");
+    assert_eq!(records[0]["build"]["name"], "synology-drive-sync");
+    assert_eq!(records[0]["build"]["version"], env!("SDSYNC_VERSION"));
+
+    // The endpoint is named once, with its redirect and certificate policy.
+    let connection = event_of("connection.established");
+    assert_eq!(connection["connection"]["scheme"], "http");
+    assert_eq!(connection["connection"]["host"], "127.0.0.1");
+    assert_eq!(connection["connection"]["redirects"], "refused");
+
+    // The login shape is what distinguishes a mis-carried session from a bad credential.
+    let session = event_of("session.established");
+    assert_eq!(session["session"]["login_format"], "sid");
+    assert!(
+        session["session"]["sid_length"]
+            .as_u64()
+            .is_some_and(|length| length > 0)
+    );
+
+    // Every request is attributable, and the failing one carries its DSM code and description.
+    let calls = records
+        .iter()
+        .filter(|record| record["event"] == "api_call.completed")
+        .collect::<Vec<_>>();
+    assert!(
+        calls.len() >= 4,
+        "expected a record per round trip, got {}:\n{stderr}",
+        calls.len()
+    );
+    let getinfo = calls
+        .iter()
+        .find(|record| record["call"]["method"] == "getinfo")
+        .expect("the failing call is recorded");
+    assert_eq!(getinfo["level"], "debug", "a failed call must reach debug");
+    assert_eq!(getinfo["call"]["api"], "SYNO.FileStation.List");
+    assert_eq!(getinfo["call"]["dsm_code"], 119);
+    assert_eq!(
+        getinfo["call"]["dsm_description"],
+        "session is invalid; rerun to authenticate again"
+    );
+    assert_eq!(getinfo["call"]["http_status"], 200);
+    assert_eq!(getinfo["call"]["outcome"], "dsm-error");
+    // Which session channels were on the wire, as booleans and never values.
+    assert_eq!(getinfo["call"]["session"]["cookie_header"], true);
+    assert_eq!(getinfo["call"]["session"]["sid_field"], true);
+
+    // The same session succeeded moments earlier; that contrast is the whole diagnosis.
+    let list_share = calls
+        .iter()
+        .find(|record| record["call"]["method"] == "list_share")
+        .expect("the preceding successful call is recorded");
+    assert_eq!(list_share["call"]["outcome"], "ok");
+    assert_eq!(
+        list_share["level"], "trace",
+        "a healthy call stays at trace"
+    );
+
+    // Nothing in the entire stream may carry credential material.
+    let secrets = [
+        "correct horse battery staple",
+        "e2e-session-secret",
+        "passwd",
+        "otp_code",
+        "SynoToken",
+    ];
+    for secret in secrets {
+        assert!(
+            !stderr.contains(secret),
+            "trace diagnostics leaked {secret:?}:\n{stderr}"
+        );
+    }
+}
+
+/// A response that sets a cookie is reported by name, never by value.
+///
+/// Whether DSM rotates the session on a *successful* response is the discriminator between a
+/// session the client may keep reusing and one it has already invalidated by continuing to send the
+/// previous identifier. The names make that visible; the values must never leave the process.
+#[test]
+fn responses_that_set_cookies_are_reported_by_name_only() {
+    let fixture = TestDir::new("target-doctor-set-cookie-names");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/target");
+    let cookie_value = "proxy-cookie-must-not-be-used";
+    server.require_header_session_transport(&format!(
+        "id={cookie_value}; Path=/; HttpOnly; SameSite=Strict"
+    ));
+
+    let output = run(&[
+        "--log-level",
+        "trace",
+        "--log-format",
+        "json",
+        "--output",
+        "json",
+        "doctor",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password.to_str().expect("UTF-8 password path"),
+        "--no-vault",
+        "--allow-http",
+        "target",
+        "/team/target",
+    ]);
+
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 diagnostics");
+    let records = stderr
+        .lines()
+        .filter(|line| line.starts_with('{'))
+        .map(|line| serde_json::from_str::<Value>(line).expect("one JSON record per line"))
+        .collect::<Vec<_>>();
+
+    // Completion records only: a start record is emitted before any response exists.
+    let completed = |method: &str| {
+        records
+            .iter()
+            .find(|record| {
+                record["event"] == "api_call.completed" && record["call"]["method"] == method
+            })
+            .unwrap_or_else(|| panic!("no completed {method} record in:\n{stderr}"))
+            .clone()
+    };
+
+    let login = completed("login");
+    assert_eq!(login["call"]["set_cookie_count"], 1);
+    assert_eq!(login["call"]["set_cookie_names"], "id");
+
+    // Calls that set nothing say so, which is what makes a rotation stand out.
+    let list_share = completed("list_share");
+    assert_eq!(list_share["call"]["set_cookie_count"], 0);
+    assert_eq!(list_share["call"]["set_cookie_names"], "");
+
+    // The value behind the reported name must not appear anywhere in the stream.
+    assert!(
+        !stderr.contains(cookie_value),
+        "cookie reporting leaked its value:\n{stderr}"
+    );
+}
+
+/// A session rotated on an ordinary authenticated response is reported on *that* response.
+///
+/// This is the decisive case. Capturing `Set-Cookie` only on the login response would leave the
+/// question unanswered, because the fact that matters is whether DSM rotates the session on a
+/// later successful call — after which a client still sending the previous identifier is stale.
+#[test]
+fn a_session_rotated_mid_run_is_reported_on_the_call_that_rotated_it() {
+    let fixture = TestDir::new("target-doctor-mid-run-rotation");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/target");
+    let rotated_value = "rotated-session-value-must-not-leak";
+    // Not the login response: an ordinary authenticated call, exactly as DSM would.
+    server.rotate_session_on(
+        "SYNO.FileStation.List.list_share",
+        &format!("id={rotated_value}; Path=/; HttpOnly"),
+    );
+
+    let output = run(&[
+        "--log-level",
+        "trace",
+        "--log-format",
+        "json",
+        "--output",
+        "json",
+        "doctor",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password.to_str().expect("UTF-8 password path"),
+        "--no-vault",
+        "--allow-http",
+        "target",
+        "/team/target",
+    ]);
+
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 diagnostics");
+    let records = stderr
+        .lines()
+        .filter(|line| line.starts_with('{'))
+        .map(|line| serde_json::from_str::<Value>(line).expect("one JSON record per line"))
+        .collect::<Vec<_>>();
+    let completed = |method: &str| {
+        records
+            .iter()
+            .find(|record| {
+                record["event"] == "api_call.completed" && record["call"]["method"] == method
+            })
+            .unwrap_or_else(|| panic!("no completed {method} record in:\n{stderr}"))
+            .clone()
+    };
+
+    // The rotation is attributed to the successful call that performed it.
+    let list_share = completed("list_share");
+    assert_eq!(list_share["call"]["outcome"], "ok");
+    assert_eq!(list_share["call"]["set_cookie_count"], 1);
+    assert_eq!(list_share["call"]["set_cookie_names"], "id");
+
+    // The login response set nothing, so the two are distinguishable in one log.
+    let login = completed("login");
+    assert_eq!(login["call"]["set_cookie_count"], 0);
+    assert_eq!(
+        records
+            .iter()
+            .find(|record| record["event"] == "session.established")
+            .expect("a session record")["session"]["server_set_cookie"],
+        false
+    );
+
+    // A later call still reports its own rotation state, so staleness is traceable forward.
+    let getinfo = completed("getinfo");
+    assert_eq!(getinfo["call"]["set_cookie_count"], 0);
+
+    assert!(
+        !stderr.contains(rotated_value),
+        "rotation reporting leaked the new session value:\n{stderr}"
+    );
+}
+
+/// The cookie ledger names the rotation loudly and still publishes no cookie value.
+///
+/// This is the whole point of the permanence check and of the redaction rule at once. A cookie
+/// re-issued on a *successful* call, by a client that keeps no cookie jar, is the observation that
+/// separates "this client is presenting the session wrongly" from "the path is not stable". The
+/// operator has to be able to read that off the report, and the report has to reach an issue
+/// tracker without carrying a live session identifier into it.
+#[test]
+fn a_rotated_cookie_is_reported_in_full_without_publishing_any_cookie_value() {
+    let fixture = TestDir::new("target-doctor-cookie-ledger");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/target");
+    let login_value = "hgU9TnMzBqXwLpR7vKd2eFsA4Yj6Nc1QoZi8Wm3Xb5";
+    let rotated_value = "Rk4pLs7Wq2Zx9Tb6Nv3Hc8Md1Ug5Yf0Ea7Jr4Ki2Po";
+    server.require_header_session_transport(&format!(
+        "id={login_value}; Path=/; HttpOnly; SameSite=Lax"
+    ));
+    server.rotate_session_on(
+        "SYNO.FileStation.List.list_share",
+        &format!("id={rotated_value}; Path=/; HttpOnly; SameSite=Lax"),
+    );
+
+    let arguments = |format: &str| {
+        vec![
+            "--log-level".to_owned(),
+            "trace".to_owned(),
+            "--log-format".to_owned(),
+            "json".to_owned(),
+            "--output".to_owned(),
+            format.to_owned(),
+            "doctor".to_owned(),
+            "--url".to_owned(),
+            server.base_url().to_owned(),
+            "--username".to_owned(),
+            "e2e-user".to_owned(),
+            "--password-file".to_owned(),
+            password.to_str().expect("UTF-8 password path").to_owned(),
+            "--no-vault".to_owned(),
+            "--allow-http".to_owned(),
+            "target".to_owned(),
+            "/team/target".to_owned(),
+        ]
+    };
+    let run_with = |format: &str| {
+        let owned = arguments(format);
+        let borrowed = owned.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = run(&borrowed);
+        (
+            String::from_utf8(output.stdout).expect("UTF-8 report"),
+            String::from_utf8(output.stderr).expect("UTF-8 diagnostics"),
+        )
+    };
+
+    let (json_stdout, json_stderr) = run_with("json");
+    let actual: Value = serde_json::from_str(&json_stdout).expect("a JSON doctor report");
+
+    let ledger_section = actual["sections"]
+        .as_array()
+        .expect("section array")
+        .iter()
+        .find(|section| section["id"] == "session_cookie_ledger")
+        .expect("the cookie ledger section")
+        .clone();
+    assert_eq!(ledger_section["status"], "warn");
+    let detail = ledger_section["detail"].as_str().expect("a ledger detail");
+    assert!(
+        detail.contains("NEW value for cookie id"),
+        "the rotation should be unmissable in the section detail: {detail}"
+    );
+    assert!(
+        ledger_section["remediation"]
+            .as_str()
+            .expect("a ledger remediation")
+            .contains("format=cookie"),
+        "the ledger should name the two coherent session transports"
+    );
+
+    let cookies = &actual["transport"]["cookies"];
+    assert_eq!(cookies["rotated_on_success"], "id");
+    // The client installs no cookie jar, so a rotated value is observed and then discarded. That
+    // fact is read from the code rather than asserted in prose, and the report carries it.
+    assert_eq!(cookies["client_maintains_cookie_jar"], false);
+    let id = cookies["cookies"]
+        .as_array()
+        .expect("cookie entries")
+        .iter()
+        .find(|entry| entry["name"] == "id")
+        .expect("the id cookie")
+        .clone();
+    assert_eq!(id["dsm_cookie"], true);
+    assert_eq!(id["set_count"], 2);
+    assert_eq!(id["distinct_values"], 2);
+    assert_eq!(id["rotated_on_success"], true);
+    // Attributes are reported by name; Path and Domain by presence only.
+    assert_eq!(id["persistence"], "session");
+    assert_eq!(id["http_only"], true);
+    assert_eq!(id["same_site"], "lax");
+    assert_eq!(id["path_present"], true);
+    assert_eq!(id["domain_present"], false);
+    assert_eq!(id["value_length"], rotated_value.len());
+    // The rotation is attributed to the successful call that carried it.
+    let rotation = id["rotations"]
+        .as_array()
+        .expect("rotation list")
+        .first()
+        .expect("one rotation")
+        .clone();
+    assert_eq!(rotation["on_success"], true);
+    assert_eq!(rotation["at"]["method"], "list_share");
+
+    // Reachability is TCP, and the payload says so rather than leaving "ping" to be read as ICMP.
+    assert_eq!(actual["transport"]["probe_method"], "tcp-connect");
+    assert_eq!(actual["transport"]["reachability"]["method"], "tcp-connect");
+
+    let (human_stdout, human_stderr) = run_with("human");
+    assert!(
+        human_stdout.contains("Cookie permanence across the run:"),
+        "the human report should carry the ledger:\n{human_stdout}"
+    );
+    assert!(
+        human_stdout.contains("ROTATED ON A SUCCESSFUL RESPONSE"),
+        "the human report should shout about the rotation:\n{human_stdout}"
+    );
+    assert!(
+        human_stdout.contains("keeps no cookie jar"),
+        "the human report should state what happened to the rotated value:\n{human_stdout}"
+    );
+    assert!(
+        human_stdout.contains("not by ICMP"),
+        "the human report should not let \"ping\" be read as ICMP:\n{human_stdout}"
+    );
+
+    // The decisive assertion, across every surface the report reaches: two renderers and the
+    // structured log stream, and neither cookie value anywhere in any of them.
+    for (label, rendered) in [
+        ("the JSON report", &json_stdout),
+        ("the JSON log stream", &json_stderr),
+        ("the human report", &human_stdout),
+        ("the human run's log stream", &human_stderr),
+    ] {
+        for secret in [login_value, rotated_value] {
+            assert!(
+                !rendered.contains(secret),
+                "{label} leaked a cookie value:\n{rendered}"
+            );
+        }
+        // Not just the whole value: no leading fragment of one either.
+        for secret in [&login_value[..12], &rotated_value[..12]] {
+            assert!(
+                !rendered.contains(secret),
+                "{label} leaked part of a cookie value:\n{rendered}"
+            );
+        }
+    }
+}
+
+/// A permission refusal is not a session failure, so enumeration still runs.
+///
+/// "Can read but cannot write" is a real and useful diagnosis, and stopping on every permission
+/// error would throw it away.
+#[test]
+fn a_permission_refusal_still_enumerates_the_destination() {
+    let fixture = TestDir::new("target-doctor-permission-refused");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/target");
+    // 105 is "session does not have permission": the session itself remains valid.
+    server.fail_next_api_operation("SYNO.FileStation.CheckPermission.write", 105);
+
+    let output = run(&[
+        "--quiet",
+        "--output",
+        "json",
+        "doctor",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password.to_str().expect("UTF-8 password path"),
+        "--no-vault",
+        "--allow-http",
+        "target",
+        "/team/target",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+
+    let actual = stdout_json(&output);
+    assert_eq!(
+        section(&actual, "destination_permissions")["status"],
+        "fail"
+    );
+    assert_eq!(
+        section(&actual, "destination_inventory")["status"],
+        "pass",
+        "a permission refusal must not suppress the inventory"
+    );
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|request| request.operation() == "SYNO.FileStation.List.list"),
+        "the destination should still have been enumerated"
+    );
 }
 
 #[test]
@@ -519,13 +1608,59 @@ fn dsm7_reverse_proxy_receives_explicit_session_headers_and_body_fields() {
             "extensive doctor must exercise {operation}"
         );
     }
-    assert!(authenticated.iter().all(|request| {
+    // The channel-ablation probe is the one place a request is *meant* to carry less than the
+    // full set of session channels: presenting them one at a time is the whole point of it. Those
+    // variants are identified by shape and pinned to the exact combinations the probe claims, so
+    // "some requests carry fewer channels" can never quietly become "the client stopped sending
+    // one". Every other authenticated request still carries all four, with the right values.
+    let channel_shape = |request: &CapturedRequest| {
+        (
+            request.fields.contains_key("_sid"),
+            request.fields.contains_key("SynoToken"),
+            request.headers.contains_key("cookie"),
+            request.headers.contains_key("x-syno-token"),
+        )
+    };
+    let (ablation, ordinary): (Vec<_>, Vec<_>) = authenticated
+        .iter()
+        .copied()
+        .partition(|request| channel_shape(request) != (true, true, true, true));
+    assert_eq!(
+        ablation
+            .iter()
+            .map(|request| channel_shape(request))
+            .collect::<Vec<_>>(),
+        [
+            (true, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ],
+        "only the three reduced ablation variants may present a partial session"
+    );
+    assert!(ordinary.iter().all(|request| {
         request.fields.get("_sid").map(String::as_str) == Some("e2e-session-secret")
             && request.fields.get("SynoToken").map(String::as_str) == Some("e2e-syno-token-secret")
             && request.headers.get("cookie").map(String::as_str) == Some("id=e2e-session-secret")
             && request.headers.get("x-syno-token").map(String::as_str)
                 == Some("e2e-syno-token-secret")
     }));
+
+    // A server that demands every channel at once rejects the documented `_sid` field on its own,
+    // and the ablation reports that rather than a healthy session.
+    let actual = stdout_json(&output);
+    assert_eq!(
+        section(&actual, "session_channel_ablation")["status"],
+        "warn"
+    );
+    assert_eq!(actual["session_channels"][0]["outcome"], "ok");
+    assert_eq!(actual["session_channels"][1]["dsm_code"], 119);
+    assert!(
+        section(&actual, "session_channel_ablation")["detail"]
+            .as_str()
+            .expect("ablation detail")
+            .contains("resolving the session from the cookie"),
+        "the ablation should name which channel the server actually honoured"
+    );
 
     let rendered = format!(
         "{}{}",
@@ -585,16 +1720,17 @@ fn untargeted_doctor_discovers_bounded_visible_shared_folders_without_selecting_
     assert_eq!(actual["remote_entries"], Value::Null);
     assert_eq!(actual["write_permission_scope"], Value::Null);
     assert_eq!(actual["write_permission_path"], Value::Null);
-    assert_eq!(actual["sections"][4]["id"], "destination_permissions");
-    assert_eq!(actual["sections"][4]["status"], "skip");
+    assert_eq!(
+        section(&actual, "destination_permissions")["status"],
+        "skip"
+    );
     assert!(
-        actual["sections"][4]["detail"]
+        section(&actual, "destination_permissions")["detail"]
             .as_str()
             .expect("permission skip detail")
             .contains("no destination was selected")
     );
-    assert_eq!(actual["sections"][5]["id"], "destination_inventory");
-    assert_eq!(actual["sections"][5]["status"], "pass");
+    assert_eq!(section(&actual, "destination_inventory")["status"], "pass");
     assert_eq!(
         actual["remote_inventory"]["scope"],
         "visible_shared_folders"
@@ -661,8 +1797,11 @@ fn untargeted_doctor_discovers_bounded_visible_shared_folders_without_selecting_
     }
 
     let requests = server.requests();
-    assert_eq!(requests.len(), 15);
-    for request_set in requests.as_chunks::<5>().0 {
+    // Three identical runs of fifteen requests each. The sequence is pinned once, in
+    // `authenticated_target_doctor_checks_exact_destination_and_logs_out`; what matters here is
+    // that all three runs make exactly the same requests in exactly the same order.
+    assert_eq!(requests.len(), 45);
+    for request_set in requests.as_chunks::<15>().0 {
         assert_eq!(
             request_set
                 .iter()
@@ -670,13 +1809,23 @@ fn untargeted_doctor_discovers_bounded_visible_shared_folders_without_selecting_
                 .collect::<Vec<_>>(),
             [
                 "SYNO.API.Info.query",
+                "SYNO.API.Info.query",
                 "SYNO.API.Auth.login",
                 "SYNO.FileStation.List.list_share",
+                "SYNO.FileStation.List.list_share",
+                "SYNO.FileStation.List.list_share",
+                "SYNO.FileStation.List.list_share",
+                "SYNO.FileStation.List.list_share",
+                "SYNO.FileStation.Info.get",
+                "SYNO.FileStation.List.list_share",
+                "SYNO.FileStation.VirtualFolder.list",
+                "SYNO.FileStation.BackgroundTask.list",
+                "SYNO.FileStation.Info.get",
                 "SYNO.FileStation.List.list_share",
                 "SYNO.API.Auth.logout",
             ]
         );
-        let confirmation = &request_set[2];
+        let confirmation = &request_set[3];
         assert_eq!(
             confirmation.fields.get("offset").map(String::as_str),
             Some("0")
@@ -685,7 +1834,7 @@ fn untargeted_doctor_discovers_bounded_visible_shared_folders_without_selecting_
             confirmation.fields.get("limit").map(String::as_str),
             Some("1")
         );
-        let listing = &request_set[3];
+        let listing = &request_set[13];
         assert_eq!(listing.fields.get("offset").map(String::as_str), Some("0"));
         assert_eq!(listing.fields.get("limit").map(String::as_str), Some("6"));
         assert_eq!(
@@ -732,8 +1881,11 @@ fn untargeted_doctor_preserves_explicit_zero_shared_folder_evidence() {
     assert_eq!(actual["status"], "warn");
     assert_eq!(actual["remote_checked"], false);
     assert_eq!(actual["remote_exists"], Value::Null);
-    assert_eq!(actual["sections"][4]["status"], "skip");
-    assert_eq!(actual["sections"][5]["status"], "pass");
+    assert_eq!(
+        section(&actual, "destination_permissions")["status"],
+        "skip"
+    );
+    assert_eq!(section(&actual, "destination_inventory")["status"], "pass");
     assert_eq!(
         actual["remote_inventory"]["scope"],
         "visible_shared_folders"
@@ -753,8 +1905,18 @@ fn untargeted_doctor_preserves_explicit_zero_shared_folder_evidence() {
             .collect::<Vec<_>>(),
         [
             "SYNO.API.Info.query",
+            "SYNO.API.Info.query",
             "SYNO.API.Auth.login",
             "SYNO.FileStation.List.list_share",
+            "SYNO.FileStation.List.list_share",
+            "SYNO.FileStation.List.list_share",
+            "SYNO.FileStation.List.list_share",
+            "SYNO.FileStation.List.list_share",
+            "SYNO.FileStation.Info.get",
+            "SYNO.FileStation.List.list_share",
+            "SYNO.FileStation.VirtualFolder.list",
+            "SYNO.FileStation.BackgroundTask.list",
+            "SYNO.FileStation.Info.get",
             "SYNO.FileStation.List.list_share",
             "SYNO.API.Auth.logout",
         ]
@@ -1115,11 +2277,13 @@ fn reflected_authentication_failure_is_redacted_and_never_logs_out() {
     assert_eq!(result["status"], "fail");
     assert_eq!(result["level"], "standard");
     assert_eq!(result["authenticated"], false);
-    assert_eq!(result["sections"][2]["id"], "dsm_session_auth");
-    assert_eq!(result["sections"][2]["status"], "fail");
-    assert_eq!(result["sections"][4]["status"], "skip");
+    assert_eq!(section(&result, "dsm_session_auth")["status"], "fail");
+    assert_eq!(
+        section(&result, "destination_permissions")["status"],
+        "skip"
+    );
     assert!(
-        result["sections"][4]["detail"]
+        section(&result, "destination_permissions")["detail"]
             .as_str()
             .expect("skip detail")
             .contains("failed")
@@ -1139,7 +2303,11 @@ fn reflected_authentication_failure_is_redacted_and_never_logs_out() {
             .iter()
             .map(|request| request.operation())
             .collect::<Vec<_>>(),
-        ["SYNO.API.Info.query", "SYNO.API.Auth.login"]
+        [
+            "SYNO.API.Info.query",
+            "SYNO.API.Info.query",
+            "SYNO.API.Auth.login"
+        ]
     );
 }
 
@@ -1173,13 +2341,11 @@ fn failed_write_test_authentication_is_not_reported_as_preflighted() {
     assert_eq!(output.status.code(), Some(1));
     let result = stdout_json(&output);
     assert_eq!(result["status"], "fail");
-    assert_eq!(result["sections"][2]["id"], "dsm_session_auth");
-    assert_eq!(result["sections"][2]["status"], "fail");
+    assert_eq!(section(&result, "dsm_session_auth")["status"], "fail");
     assert_eq!(
-        result["sections"][6]["id"],
-        "disposable_write_verify_cleanup"
+        section(&result, "disposable_write_verify_cleanup")["status"],
+        "skip"
     );
-    assert_eq!(result["sections"][6]["status"], "skip");
     assert_eq!(result["write_test"]["requested"], true);
     assert_eq!(result["write_test"]["status"], "failed");
     assert!(result["write_test"]["report"].is_null());
@@ -1224,11 +2390,13 @@ fn totp_is_generated_only_after_challenge_and_never_reaches_process_output() {
     assert_eq!(result["authenticated"], true);
     assert!(!String::from_utf8_lossy(&output.stdout).contains("challenge-token-must-not-leak"));
 
+    // Index 0 and 1 are the two unauthenticated discovery reads: the ten-name query and the
+    // `query=all` capability enumeration.
     let requests = server.requests();
-    assert_eq!(requests[1].operation(), "SYNO.API.Auth.login");
-    assert!(!requests[1].fields.contains_key("otp_code"));
     assert_eq!(requests[2].operation(), "SYNO.API.Auth.login");
-    let generated = requests[2]
+    assert!(!requests[2].fields.contains_key("otp_code"));
+    assert_eq!(requests[3].operation(), "SYNO.API.Auth.login");
+    let generated = requests[3]
         .fields
         .get("otp_code")
         .expect("second login carries generated TOTP");
@@ -1287,10 +2455,9 @@ fn target_write_test_exercises_copy_verification_and_removes_every_probe_path() 
     assert_eq!(report["cleanup_completed"], true);
     assert!(report["leftover_remote_probe_path"].is_null());
     assert_eq!(
-        result["sections"][6]["id"],
-        "disposable_write_verify_cleanup"
+        section(&result, "disposable_write_verify_cleanup")["status"],
+        "pass"
     );
-    assert_eq!(result["sections"][6]["status"], "pass");
     let probe_path = report["probe_path"].as_str().expect("probe path");
     assert!(probe_path.starts_with("/team/probe/.synology-drive-sync-probe-"));
     assert!(
@@ -1382,9 +2549,12 @@ fn extensive_level_without_write_test_remains_non_mutating() {
     let result = stdout_json(&output);
     assert_eq!(result["level"], "extensive");
     assert_eq!(result["write_test"]["requested"], false);
-    assert_eq!(result["sections"][6]["status"], "skip");
+    assert_eq!(
+        section(&result, "disposable_write_verify_cleanup")["status"],
+        "skip"
+    );
     assert!(
-        result["sections"][6]["detail"]
+        section(&result, "disposable_write_verify_cleanup")["detail"]
             .as_str()
             .expect("write-test skip detail")
             .contains("separate --write-test opt-in")
@@ -1684,8 +2854,18 @@ allow-http = true
         .collect::<Vec<_>>();
     let one_target = [
         "SYNO.API.Info.query",
+        "SYNO.API.Info.query",
         "SYNO.API.Auth.login",
         "SYNO.FileStation.List.list_share",
+        "SYNO.FileStation.List.list_share",
+        "SYNO.FileStation.List.list_share",
+        "SYNO.FileStation.List.list_share",
+        "SYNO.FileStation.List.list_share",
+        "SYNO.FileStation.Info.get",
+        "SYNO.FileStation.List.list_share",
+        "SYNO.FileStation.VirtualFolder.list",
+        "SYNO.FileStation.BackgroundTask.list",
+        "SYNO.FileStation.Info.get",
         "SYNO.FileStation.List.getinfo",
         "SYNO.FileStation.List.getinfo",
         "SYNO.FileStation.CheckPermission.write",
@@ -1744,12 +2924,11 @@ fn write_test_batch_rejects_a_missing_destination_during_non_mutating_preflight(
     assert_eq!(records[1]["status"], "failed");
     assert_eq!(records[1]["doctor"]["remote_exists"], false);
     assert_eq!(
-        records[1]["doctor"]["sections"][6]["id"],
-        "disposable_write_verify_cleanup"
+        section(&records[1]["doctor"], "disposable_write_verify_cleanup")["status"],
+        "fail"
     );
-    assert_eq!(records[1]["doctor"]["sections"][6]["status"], "fail");
     assert!(
-        records[1]["doctor"]["sections"][6]["detail"]
+        section(&records[1]["doctor"], "disposable_write_verify_cleanup")["detail"]
             .as_str()
             .expect("probe section detail")
             .contains("requires an existing destination")
@@ -1793,9 +2972,17 @@ fn discovery_falls_back_from_entry_cgi_to_query_cgi_without_authentication() {
     assert_eq!(report["authenticated"], false);
 
     let requests = server.requests();
-    assert_eq!(requests.len(), 2);
+    // Discovery falls back from entry.cgi to query.cgi, and the capability enumeration then takes
+    // entry.cgi again: it reuses the same fallback rather than assuming the route discovery
+    // settled on, because a proxy that misroutes one of these can misroute the other.
+    assert_eq!(requests.len(), 3);
     assert_eq!(requests[0].request_path, "/prefix/webapi/entry.cgi");
     assert_eq!(requests[1].request_path, "/prefix/webapi/query.cgi");
+    assert_eq!(requests[2].request_path, "/prefix/webapi/entry.cgi");
+    assert_eq!(
+        requests[2].fields.get("query").map(String::as_str),
+        Some("all")
+    );
     assert!(
         requests
             .iter()

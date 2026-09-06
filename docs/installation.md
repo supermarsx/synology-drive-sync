@@ -4,7 +4,10 @@ Release installers are the shortest path to a native workstation binary; use the
 SPK when the source is on a Synology NAS. Containers and scheduler examples are finite one-shot
 jobs: each invocation scans, plans, applies the requested operations, logs out of File Station, and
 exits. Ctrl+C/SIGINT and service or container SIGTERM request cooperative cancellation; a cancelled
-run exits with status `130`.
+run exits with status `130`. Cancellation is checked throughout the local scan, the remote scan, and
+every in-flight transfer, so it takes effect within the current operation rather than at the end of
+a phase. A second Ctrl+C or SIGTERM exits immediately with the same status, without the graceful
+File Station logout and remote-task cleanup the first one performs.
 
 Before scheduling anything, configure the File Station reverse proxy, use a dedicated DSM account, run `doctor`, and review a non-critical `plan`. Keep mirror deletion disabled until the complete deployment path has been tested.
 

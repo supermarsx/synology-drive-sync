@@ -104,8 +104,16 @@ remote URL is configured without either token-source option, the named source de
 `--log-format human` produces timestamped, single-line diagnostics. For example:
 
 ```text
+1785769200120 INFO  build synology-drive-sync 0.1.0 (43cc1d26b27a) x86_64-unknown-linux-gnu release
 1785769200123 INFO  sync run completed operations=14 files=10 bytes=5242880 elapsed_ms=8421
 ```
+
+Every run that logs at all opens with a `run.build` banner naming the binary, its version, the
+target triple, the cargo profile, and the commit it was built from, so a pasted log or a rotated
+log file always identifies the build that produced it. It is a log record, so it goes to standard
+error and to any file or remote sink — never to standard output, and never at `--log-level off`.
+The target diagnostic repeats the same identity at the top of its own report, which is the block
+users actually paste.
 
 `--log-format json` emits one `sdsync.log.v1` object per line to each enabled local sink:
 
@@ -116,21 +124,92 @@ remote URL is configured without either token-source option, the named source de
 The timestamp is Unix time in milliseconds. Event names are a closed set:
 
 ```text
+run.build
 run.started                    run.completed                  run.failed
 local_scan.started             local_scan.completed
+connection.established
 api_discovery.started          api_discovery.completed
-authentication.started         authentication.completed
+authentication.started         session.established             authentication.completed
 remote_scan.started            remote_scan.completed
 plan.ready
+api_call.started               api_call.completed              api_call.redirected
 upload.started                 upload.attempt_started          upload.progress
 upload.completed               upload.failed
 directory.created              entry.deleted
 retry.scheduled                cancellation.requested
 ```
 
-Every JSON log record has the same fields. `operation_id` and `attempt` are `null` when not
-applicable, and unused numeric metrics are zero. This stable shape is preferable to parsing human
-messages.
+Every JSON log record has the same seven base fields. `operation_id` and `attempt` are `null` when
+not applicable, and unused numeric metrics are zero. This stable shape is preferable to parsing
+human messages.
+
+Four optional members carry structured detail, and are **omitted entirely** from records that do
+not have them, so every record listed before this release renders byte for byte as it always did:
+
+| Member | Present on | Contents |
+| --- | --- | --- |
+| `build` | `run.build` | Name, version, target triple, cargo profile, and commit. |
+| `connection` | `connection.established` | Scheme, host, port, base path, redirect policy, certificate policy. |
+| `session` | `session.established` | SID length, whether a token was issued, the requested login format, and whether the server set a cookie. |
+| `call` | `api_call.*`, `retry.scheduled` | One HTTP round trip: see below. |
+
+## Request-level diagnostics
+
+`--log-level debug` and `--log-level trace` report every HTTP round trip the client makes. This is
+the difference between a failing run that can be diagnosed from one pasted log and one that needs
+another round of questions.
+
+| Level | What it adds |
+| --- | --- |
+| `debug` | The endpoint identity, the session shape after login, **every failed request** with its DSM code and latency, refused redirects, and each retry with the backoff it is about to sleep. |
+| `trace` | Additionally, every *successful* request, and a `api_call.started` line before each one so a hang is attributable to a specific call. |
+
+A failed call is reported at `debug` rather than `trace` deliberately: diagnosing a live failure
+must not require a second run at a higher verbosity.
+
+```text
+1788730847267 DEBUG connection established scheme=https host=nas.example.test port=5001 base_path=/ redirects=refused certificate_verification=enabled
+1788730847290 DEBUG session established sid_length=24 token=present login_format=sid server_set_cookie=absent
+1788730847294 TRACE API call completed SYNO.FileStation.List.list_share v2 route=/webapi/entry.cgi attempt=1/1 session=cookie+token-header+sid-field+token-field status=200 dsm=ok bytes=189 elapsed_ms=3
+1788730847299 DEBUG API call completed SYNO.FileStation.List.getinfo v2 route=/webapi/entry.cgi attempt=1/3 session=cookie+token-header+sid-field+token-field status=200 dsm=119 outcome=dsm-error bytes=88 elapsed_ms=4 detail="session is invalid; rerun to authenticate again"
+```
+
+`set_cookie=` names the cookies the **response** set, and is absent when it set none. Whether DSM
+rotates the session on a *successful* response is what distinguishes a session the client may keep
+reusing from one it has already invalidated by continuing to send the previous identifier, so this
+field is the one to read first when a later call returns `106`, `107`, or `119`. It is read from the
+response headers before the body is consumed, and only the names survive.
+
+The `session=` field names which credential channels were attached to that request — a synthesized
+`Cookie` header, the `X-SYNO-TOKEN` header, the `_sid` form field, and the `SynoToken` form field —
+as four booleans. It never contains a value. Together with `server_set_cookie` on
+`session.established`, it is what distinguishes a rejected credential from a session the client is
+carrying in a way the server does not expect.
+
+### What these records deliberately cannot contain
+
+The record types are closed. Every member is an enum, an integer, a boolean, a compile-time string,
+or a bounded token that has passed a sanitizer retaining only `A-Z a-z 0-9 . - _ / :`. There is no
+member capable of holding a password, an OTP code, a SID, a SynoToken, a cookie, a header value, a
+request-field value, or a response body — not because a filter removes them, but because no type in
+the record can represent them.
+
+Specifically:
+
+- form fields are reported as a **count**, never as names or values;
+- session identifiers appear only as a **length**, and no digest or fingerprint of one is emitted;
+- the DSM account name is never logged;
+- `Set-Cookie` is reduced to a **count** and the cookie **names** — the text before each header's
+  first `=` — so a rotated session identifier is never representable; `Location` is reduced to a
+  **host**;
+- response bodies are reduced to a byte count and the DSM error code, and the existing
+  withheld-response-body rule for authenticated APIs is unchanged.
+
+> **`--log-level debug` with `--remote-log-url` discloses the NAS hostname.** The
+> `connection.established` record contains the endpoint host and port, and `api_call.*` records
+> contain the WebAPI path. No record below `debug` contains either, so a default-level run ships
+> exactly what it always shipped. Review this before raising the level on a host that forwards logs
+> to a collector you do not control.
 
 ### Rotating file sink
 
@@ -234,9 +313,26 @@ NDJSON results plus human diagnostics, explicit and predictable.
 A single local source diagnostic uses `sdsync.source-doctor.v1`. A source-diagnostic batch uses
 `sdsync.source-doctor-job.v1` records and an `sdsync.source-doctor-batch.v1` summary. A single
 target diagnostic uses `sdsync.doctor.v1`. It includes `level`, overall `status`, pass/warn/fail/skip
-counts, total `elapsed_ms`, and eight fixed `sections`; every section has an ID, label, status,
-bounded detail, `elapsed_ms`, and `timing_scope`. Shared routing/discovery timing is explicitly
-marked `shared_connection`.
+counts, total `elapsed_ms`, a `build` identity, and sixteen fixed `sections`; every section has an
+ID, label, execution `step`, status, bounded detail, `elapsed_ms`, `timing_scope`, the `calls` it
+made, and a `remediation` hint when it failed. Shared routing/discovery timing is explicitly marked
+`shared_connection`, a section that reached its verdict without contacting the server is marked
+`local_only` rather than reporting a bare zero, and a section that summarises other sections'
+requests is marked `derived`.
+
+The same document also carries `capabilities` (what DSM advertises, folded into the three tiers the
+report prints, plus the requirement matrix), `session_channels` (one record per ablation variant:
+the channels it presented, the outcome, the DSM code, and the latency), `session_concurrency` (the
+fan-out counts and whether the sequential follow-up survived), `capability_diagnosis` (the
+per-capability verdicts, the File Station host identity, and whether the host name changed mid-run),
+and `path_resolution` (the destination walked one component at a time). No session identifier,
+cookie value, or token value is representable in any of them.
+
+The same document carries a `transport` object: `probe_method` (always `tcp-connect`, so "ping" is
+never read as ICMP), `reachability` with the DNS, TCP, and HTTP phase timings, `intermediary` with
+the proxy fingerprint and the QuickConnect relay/direct classification, and `cookies` with the
+run-wide cookie ledger. Cookie values appear nowhere in it: a cookie is identified by name, by a
+salted per-process digest of its value, and by which attributes were present.
 
 Standard and Extensive include bounded `remote_inventory` evidence after authentication. Without a
 resolved remote, scope `visible_shared_folders` reports at most five File Station-visible

@@ -12451,6 +12451,15 @@ fn install_consumer_termination_handler() -> BridgeResult<Arc<AtomicBool>> {
     // A controller-spawned background process may inherit ignored terminal
     // signals from its shell. This dedicated one-job process must own these
     // dispositions so TERM/HUP/INT always become cooperative cancellation.
+    //
+    // This is safe only because this module is compiled solely into the
+    // `sdsync-dsm-api` binary, which reaches this from one consumer role in a
+    // fresh process image; the CLI installs its own handler in `main.rs`.
+    // `ctrlc::set_handler` refuses a second installation for the life of a
+    // process, so merging the two binaries, or calling a dsm_api helper
+    // in-process from the CLI, would make whichever installs second fail.
+    // Escalation is also deliberately absent here: a forced exit would orphan
+    // the manager process group this role exists to tear down.
     ctrlc::set_handler(move || {
         handler_flag.store(true, AtomicOrdering::Release);
     })

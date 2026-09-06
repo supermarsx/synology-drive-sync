@@ -8,9 +8,9 @@ The explicit command tree is preferred. Run `synology-drive-sync --help` and
 | `sync SOURCE REMOTE` | Apply one finite local-to-remote synchronization. Remote-only entries remain unless deletion is explicitly armed. |
 | `plan SOURCE REMOTE` | Build and print the same plan without mutation. `--exit-code` returns 10 when work is pending. |
 | `doctor source [SOURCE] [--hash]` | Local-only source validation; `--hash` reads and verifies every payload file. No DSM access. |
-| `doctor --level quick target [REMOTE]` | Validate endpoint policy, TLS, reverse-proxy routing, API discovery, and baseline capabilities without credentials or destination access. |
-| `doctor target [REMOTE]` | Run the default Standard authenticated discovery and logout checks without mutation. With no resolved remote it lists at most five File Station-reported shared-folder roots without claiming browse/write permission; with a remote it checks permission and at most five direct children. |
-| `doctor --level extensive target [REMOTE]` | Require the fullest target content/download/delete/copy capability evidence without mutation. |
+| `doctor --level quick target [REMOTE]` | Validate endpoint policy, TLS, reverse-proxy routing, API discovery, and the full unauthenticated DSM capability enumeration, without credentials or destination access. |
+| `doctor target [REMOTE]` | Run the default Standard authenticated discovery, session-channel ablation, live capability diagnosis, destination walk, and logout checks without mutation. With no resolved remote it lists at most five File Station-reported shared-folder roots without claiming browse/write permission; with a remote it checks permission and at most five direct children. |
+| `doctor --level extensive target [REMOTE]` | Require the fullest target content/download/delete/copy capability evidence without mutation, and add the concurrent session fan-out probe. |
 | `doctor --level extensive target [REMOTE] --write-test` | Explicit disposable create/upload/copy/MD5/CRC32/SHA-256 verify/cleanup probe. Mutating and never automatic. |
 | `doctor --routing-only` | Legacy Quick spelling without a source/target subcommand. |
 | `config path` | Print the platform default configuration path. |
@@ -24,7 +24,12 @@ The explicit command tree is preferred. Run `synology-drive-sync --help` and
 | `completions SHELL` | Generate Bash, Zsh, Fish, PowerShell, or Elvish completion source. |
 | `manpage [--all DIRECTORY]` | Generate the root roff page on stdout or every nested command page in a directory. |
 
-Target Doctor reports fixed timed sections as `pass`, `warn`, `fail`, or `skip`. Standard and
+Target Doctor prints its build identity, then reports fixed timed sections as `pass`, `warn`,
+`fail`, or `skip`, each with the DSM calls it made and, for a failure, a concrete remediation hint.
+Sections carry an execution `step` because the report groups them for reading rather than listing
+them in the order they run. Every level, Quick included, measures TCP reachability and connect
+timing (never ICMP), fingerprints any reverse proxy or QuickConnect relay in the path, and reports
+what became of every cookie the server set, by name and attribute and never by value. Standard and
 Extensive discovery never recurses. Without a resolved remote it reports at most five visible
 shared-folder roots and does not choose or permission-check one; with a remote it emits File
 Station's direct-child total and a deterministic sample of at most five folder/file entries. Both
@@ -50,7 +55,7 @@ Legacy `--dry-run` is equivalent to planning. New scripts should use `plan`.
 | `10` | `plan --exit-code` found pending changes. |
 | `2` | Command-line usage or configuration error. |
 | `1` | Operational failure: filesystem, network, DSM, vault, deletion guard, or required-log delivery. |
-| `130` | Cooperative Ctrl+C/SIGINT or SIGTERM cancellation. |
+| `130` | Cooperative Ctrl+C/SIGINT or SIGTERM cancellation, and the immediate exit a repeated signal forces. |
 
 Treat every other nonzero value as failure and consume JSON/NDJSON output rather than parsing human
 diagnostic prose. An aggregate deletion-cap breach is an operational safety failure (`1`), not a
@@ -71,6 +76,13 @@ synology-drive-sync --config ./config.toml \
 
 `-v` and its long form `--verbose` raise diagnostics to debug. Repeat the option (`-vv` or
 `--verbose --verbose`) for trace. An explicit `--log-level` takes precedence.
+
+Every run that logs at all opens with a build banner on standard error naming the binary, version,
+target triple, profile, and commit, so a pasted log always identifies its build. `--log-level debug`
+adds the endpoint identity, the session shape, and one record per **failed** HTTP round trip with
+its DSM code and latency; `--log-level trace` adds the successful ones too. Attach `--log-level
+debug` output when reporting a problem. Debug-level records name the NAS host and the WebAPI paths;
+see the [observability contract](../observability.md) before forwarding them to a collector.
 
 Credential enrollment has separate non-secret input selectors: `credentials set-password
 --password-stdin` reads a password from the first line of standard input, while `credentials

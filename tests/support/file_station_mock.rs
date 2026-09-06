@@ -45,6 +45,12 @@ struct ServerState {
     expected_password: String,
     reflected_login_failure: Option<String>,
     login_cookie: Option<String>,
+    /// Operation whose *successful* response also sets a cookie, as DSM does when it rotates a
+    /// session mid-run.
+    rotate_session_on: Option<(String, String)>,
+    /// Whether the configured rotation is still owed. Armed by each login and spent by the first
+    /// matching response after it.
+    rotation_pending: bool,
     require_header_session_transport: bool,
     require_totp: bool,
     reject_next_valid_otp: bool,
@@ -53,6 +59,16 @@ struct ServerState {
     copy_tasks: BTreeSet<String>,
     mutation_after_listing: Option<PendingMutation>,
     faults: Vec<InjectedFault>,
+    /// What `SYNO.FileStation.Info.get` reports as the host serving the request.
+    hostname: String,
+    /// Whether `query=all` also advertises an entry the documented API map cannot describe.
+    advertise_malformed_api: bool,
+    /// Whether the cookie-borne session stops being resolvable after its first use.
+    reject_cookie_sessions: bool,
+    /// How many more cookie-borne requests this login may make. Re-armed by each login.
+    cookie_uses_remaining: u32,
+    /// Host name to switch to after the next `SYNO.FileStation.Info.get` is answered.
+    next_hostname: Option<String>,
 }
 
 #[derive(Debug)]
@@ -106,6 +122,8 @@ impl MockFileStation {
             expected_password: "correct horse battery staple".to_owned(),
             reflected_login_failure: None,
             login_cookie: None,
+            rotate_session_on: None,
+            rotation_pending: false,
             require_header_session_transport: false,
             require_totp: false,
             reject_next_valid_otp: false,
@@ -114,6 +132,11 @@ impl MockFileStation {
             copy_tasks: BTreeSet::new(),
             mutation_after_listing: None,
             faults: Vec::new(),
+            hostname: "MOCKSTATION".to_owned(),
+            advertise_malformed_api: false,
+            reject_cookie_sessions: false,
+            cookie_uses_remaining: 0,
+            next_hostname: None,
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_state = Arc::clone(&state);
@@ -203,6 +226,36 @@ impl MockFileStation {
         self.state.lock().expect("mock state lock").require_totp = true;
     }
 
+    /// Stop resolving the cookie-borne session after its first use.
+    ///
+    /// This reproduces the reported live failure exactly: login succeeds, the first authenticated
+    /// call succeeds, and every later call that presents the SID as an `id` cookie answers 119 --
+    /// while the documented `_sid` request field keeps working. Without a mode like this the
+    /// cookie can only ever *help*, so the whole bug class is untestable by construction.
+    pub fn reject_cookie_sessions_after_first_use(&self) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .reject_cookie_sessions = true;
+    }
+
+    /// Advertise an API entry the documented map cannot describe, in the `query=all` response
+    /// only. A strict decoder fails the whole map on one of these; the diagnostic read must not.
+    pub fn advertise_malformed_api(&self) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .advertise_malformed_api = true;
+    }
+
+    /// Answer the next `SYNO.FileStation.Info.get` under a different host name.
+    ///
+    /// This is what a path with no session affinity looks like from the client's side, and it is
+    /// the one observation that proves consecutive requests reached different DSM hosts.
+    pub fn change_hostname_after_next_info_read(&self, hostname: &str) {
+        self.state.lock().expect("mock state lock").next_hostname = Some(hostname.to_owned());
+    }
+
     #[allow(dead_code)]
     pub fn reject_next_valid_otp(&self) {
         self.state
@@ -240,6 +293,20 @@ impl MockFileStation {
             response: FaultResponse::HttpStatus(status),
             remaining: 1,
         });
+    }
+
+    /// Make `operation`'s successful response carry `cookie`, the way DSM rotates a session.
+    ///
+    /// This is the case that decides whether a client holding the previous identifier goes stale,
+    /// so instrumentation has to observe it on an ordinary authenticated call, not only on login.
+    /// Re-issue the session cookie once per login, on the first response to this operation.
+    ///
+    /// Once per login rather than on every matching response: DSM hands out a new identifier and
+    /// then stops setting one. Re-setting it on every later response would make the ledger's
+    /// counts a function of how many requests the diagnostic happens to make.
+    pub fn rotate_session_on(&self, operation: &str, cookie: &str) {
+        let mut state = self.state.lock().expect("mock state lock");
+        state.rotate_session_on = Some((operation.to_owned(), cookie.to_owned()));
     }
 
     pub fn fail_next_api_operation(&self, operation: &str, code: i64) {
@@ -280,7 +347,24 @@ impl MockFileStation {
             .sum()
     }
 
+    /// Every DSM API request this server answered.
+    ///
+    /// The doctor's transport probe issues plain HTTP requests that carry no DSM API fields, so
+    /// they are not DSM API requests and do not appear here. [`Self::connections`] returns the
+    /// unfiltered list for the checks that are about the probe itself.
     pub fn requests(&self) -> Vec<CapturedRequest> {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .requests
+            .iter()
+            .filter(|request| !request.api.is_empty())
+            .cloned()
+            .collect()
+    }
+
+    /// Every request this server answered, DSM API call and transport probe alike.
+    pub fn connections(&self) -> Vec<CapturedRequest> {
         self.state.lock().expect("mock state lock").requests.clone()
     }
 
@@ -324,7 +408,11 @@ impl Drop for MockFileStation {
 }
 
 fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
-    let (request_path, headers, body) = read_request(&mut stream);
+    // A connection that carried no request is not a request: it is recorded nowhere and answered
+    // with nothing, exactly as a real server would leave it.
+    let Some((request_path, headers, body)) = read_request(&mut stream) else {
+        return;
+    };
     let content_type = headers
         .get("content-type")
         .map(String::as_str)
@@ -352,7 +440,7 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
         let mut state = state.lock().expect("mock state lock");
         let captured_path = captured.request_path.clone();
         state.requests.push(captured);
-        route_request(
+        let routed = route_request(
             &mut state,
             &captured_path,
             &api,
@@ -360,7 +448,8 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
             &fields,
             &headers,
             upload,
-        )
+        );
+        rotate_session_if_configured(&mut state, &api, &method, routed)
     };
     write_response(&mut stream, response);
 }
@@ -392,7 +481,13 @@ fn route_request(
         return response;
     }
     if api == "SYNO.API.Info" && method == "query" {
-        return MockResponse::Json(discovery());
+        // `query=all` is a different question from the ten-name allowlist query, and this mock
+        // answers it differently so a test can tell which one the client asked.
+        return if fields.get("query").map(String::as_str) == Some("all") {
+            MockResponse::Json(full_api_map(state.advertise_malformed_api))
+        } else {
+            MockResponse::Json(discovery())
+        };
     }
     if api == "SYNO.API.Auth" && method == "login" {
         if let Some(marker) = &state.reflected_login_failure {
@@ -417,6 +512,8 @@ fn route_request(
             }
         }
         let data = json!({"sid": SESSION_ID, "synotoken": SYNO_TOKEN});
+        state.rotation_pending = state.rotate_session_on.is_some();
+        state.cookie_uses_remaining = 1;
         return match &state.login_cookie {
             Some(cookie) => success_with_cookie(data, cookie),
             None => success(data),
@@ -495,6 +592,20 @@ fn route_request(
             response
         }
         ("SYNO.FileStation.CheckPermission", "write") => success(Value::Null),
+        ("SYNO.FileStation.Info", "get") => {
+            let response = success(json!({
+                "hostname": state.hostname,
+                "is_manager": false,
+                "support_sharing": true,
+                "support_virtual_protocol": "cifs,nfs,iso",
+            }));
+            if let Some(hostname) = state.next_hostname.take() {
+                state.hostname = hostname;
+            }
+            response
+        }
+        ("SYNO.FileStation.VirtualFolder", "list") => success(json!({"total": 0, "folders": []})),
+        ("SYNO.FileStation.BackgroundTask", "list") => success(json!({"total": 0, "tasks": []})),
         ("SYNO.FileStation.CreateFolder", "create") => {
             let Some(parent) = first_json_string(fields.get("folder_path")) else {
                 return api_error(101);
@@ -678,7 +789,7 @@ fn take_injected_fault(
 }
 
 fn authenticated(
-    state: &ServerState,
+    state: &mut ServerState,
     fields: &BTreeMap<String, String>,
     headers: &BTreeMap<String, String>,
     operation: impl FnOnce() -> MockResponse,
@@ -690,11 +801,30 @@ fn authenticated(
     }
 }
 
+/// Whether this request presents a session the mock still recognises.
+///
+/// Takes `&mut` because rejecting a cookie-borne session is *destructive*: DSM deleting a session
+/// record is what makes the reported failure permanent for the rest of a run, and a mock that only
+/// ever answered one request badly could not reproduce it.
 fn valid_session(
-    state: &ServerState,
+    state: &mut ServerState,
     fields: &BTreeMap<String, String>,
     headers: &BTreeMap<String, String>,
 ) -> bool {
+    // The live-bug mode: a `format=sid` login is documented as "cookie will not be set", so a
+    // request that nonetheless carries an `id` cookie asks DSM to resolve a cookie session it
+    // never issued. This models a DSM that honours such a request once and then stops, which is
+    // the sequence actually observed against a real NAS.
+    if state.reject_cookie_sessions
+        && headers
+            .get("cookie")
+            .is_some_and(|cookie| cookie.starts_with("id="))
+    {
+        if state.cookie_uses_remaining == 0 {
+            return false;
+        }
+        state.cookie_uses_remaining -= 1;
+    }
     let valid_fields = fields.get("_sid").map(String::as_str) == Some(SESSION_ID)
         && fields.get("SynoToken").map(String::as_str) == Some(SYNO_TOKEN);
     let valid_headers = !state.require_header_session_transport
@@ -721,8 +851,59 @@ fn discovery() -> Value {
     })
 }
 
+/// The wider map DSM answers `query=all` with, as opposed to the ten-name allowlist query.
+///
+/// Deliberately a superset of [`discovery`]: it adds the File Station APIs this tool never calls,
+/// two other namespaces, and -- when a test asks for it -- one entry whose value is not an object
+/// at all, so the lenient enumeration path is exercised against a map a strict decoder would
+/// reject outright.
+fn full_api_map(advertise_malformed: bool) -> Value {
+    let mut map = discovery();
+    let entries = map["data"]
+        .as_object_mut()
+        .expect("discovery data is an object");
+    for (name, min, max) in [
+        ("SYNO.FileStation.Rename", 1, 2),
+        ("SYNO.FileStation.VirtualFolder", 1, 2),
+        ("SYNO.FileStation.BackgroundTask", 1, 3),
+        ("SYNO.Core.System", 1, 1),
+        ("SYNO.Core.Share", 1, 1),
+        ("SYNO.DownloadStation.Task", 1, 3),
+    ] {
+        entries.insert(
+            name.to_owned(),
+            json!({"path": "entry.cgi", "minVersion": min, "maxVersion": max}),
+        );
+    }
+    if advertise_malformed {
+        entries.insert("SYNO.Broken.Api".to_owned(), json!(42));
+    }
+    map
+}
+
 fn success(data: Value) -> MockResponse {
     MockResponse::Json(json!({"success": true, "data": data}))
+}
+
+/// Attach a `Set-Cookie` to the first response to this operation after each login.
+fn rotate_session_if_configured(
+    state: &mut ServerState,
+    api: &str,
+    method: &str,
+    response: MockResponse,
+) -> MockResponse {
+    let Some((operation, cookie)) = &state.rotate_session_on else {
+        return response;
+    };
+    if !state.rotation_pending || *operation != format!("{api}.{method}") {
+        return response;
+    }
+    let cookie = cookie.clone();
+    state.rotation_pending = false;
+    match response {
+        MockResponse::Json(value) => MockResponse::JsonWithCookie { value, cookie },
+        other => other,
+    }
 }
 
 fn success_with_cookie(data: Value, cookie: &str) -> MockResponse {
@@ -868,7 +1049,13 @@ fn split_bytes<'a>(haystack: &'a [u8], needle: &[u8]) -> Vec<&'a [u8]> {
     output
 }
 
-fn read_request(stream: &mut TcpStream) -> (String, BTreeMap<String, String>, Vec<u8>) {
+/// Read one request, or `None` when the peer opened a connection and sent nothing on it.
+///
+/// A transport reachability probe legitimately completes a TCP handshake and closes without
+/// writing a byte, and every real HTTP server tolerates that. Treating it as a protocol violation
+/// would model something no server does, and would make the mock fail on traffic the client is
+/// entitled to send.
+fn read_request(stream: &mut TcpStream) -> Option<(String, BTreeMap<String, String>, Vec<u8>)> {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("set mock read timeout");
@@ -876,7 +1063,13 @@ fn read_request(stream: &mut TcpStream) -> (String, BTreeMap<String, String>, Ve
     let header_end = loop {
         let mut buffer = [0_u8; 8192];
         let count = stream.read(&mut buffer).expect("read request headers");
-        assert!(count > 0, "client closed before request headers completed");
+        if count == 0 {
+            assert!(
+                received.is_empty(),
+                "client closed part-way through a request header block"
+            );
+            return None;
+        }
         received.extend_from_slice(&buffer[..count]);
         if let Some(position) = find_bytes(&received, b"\r\n\r\n") {
             break position + 4;
@@ -905,11 +1098,11 @@ fn read_request(stream: &mut TcpStream) -> (String, BTreeMap<String, String>, Ve
         assert!(count > 0, "client closed before request body completed");
         received.extend_from_slice(&buffer[..count]);
     }
-    (
+    Some((
         request_path,
         headers,
         received[header_end..header_end + content_length].to_vec(),
-    )
+    ))
 }
 
 fn write_response(stream: &mut TcpStream, response: MockResponse) {

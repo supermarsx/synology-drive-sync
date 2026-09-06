@@ -744,7 +744,8 @@ impl Engine {
         )?;
         let rules = IgnoreRules::build(&request.source, &request.exclusions)
             .map_err(SdkError::from_core)?;
-        let mut local = local::scan(&request.source, &rules).map_err(SdkError::from_core)?;
+        let mut local =
+            local::scan(&request.source, &rules, cancellation).map_err(SdkError::from_core)?;
         emit(
             cancellation,
             &mut on_event,
@@ -769,7 +770,11 @@ impl Engine {
             request_timeout: request.request_timeout,
             retries: request.retries,
         })
-        .map(|client| client.with_max_upload_rate(request.max_upload_rate))
+        .map(|client| {
+            client
+                .with_max_upload_rate(request.max_upload_rate)
+                .with_cancellation(cancellation)
+        })
         .map_err(SdkError::from_core)?;
         let server_copy = client.supports_server_copy();
         if request.deletion.enabled {
@@ -811,7 +816,7 @@ impl Engine {
                 },
             )?;
             let mut remote = client
-                .remote_inventory(&root)
+                .remote_inventory(&root, cancellation)
                 .map_err(SdkError::from_core)?;
             emit(
                 cancellation,
@@ -1134,9 +1139,12 @@ fn reconciliation_plan(
     cancellation: &CancellationToken,
 ) -> SdkResult<SyncPlan> {
     check_cancellation(cancellation)?;
-    let mut local = local::scan(&request.source, rules).map_err(SdkError::from_core)?;
+    let mut local =
+        local::scan(&request.source, rules, cancellation).map_err(SdkError::from_core)?;
     check_cancellation(cancellation)?;
-    let mut remote = client.remote_inventory(root).map_err(SdkError::from_core)?;
+    let mut remote = client
+        .remote_inventory(root, cancellation)
+        .map_err(SdkError::from_core)?;
     check_cancellation(cancellation)?;
     if request.comparison == Comparison::Content {
         client

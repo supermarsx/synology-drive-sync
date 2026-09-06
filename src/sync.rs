@@ -149,7 +149,7 @@ fn verify_api_remote_snapshot_batch(
         return Ok(());
     }
     cancellation.check()?;
-    let current_inventory = client.remote_inventory(root)?;
+    let current_inventory = client.remote_inventory(root, cancellation)?;
     cancellation.check()?;
     let deleting: std::collections::BTreeSet<&str> = checks
         .iter()
@@ -179,6 +179,21 @@ fn verify_api_remote_snapshot_batch(
     }
     cancellation.check()?;
     Ok(())
+}
+
+/// Keep the first reported upload failure, except that a substantive failure always outranks a
+/// cancellation.
+///
+/// Once one worker fails, the others abort their in-flight transfers and report `Cancelled`. The
+/// order those results reach the collector is not deterministic, so without this preference a
+/// real transport or DSM failure could be reported as "operation cancelled" and exit 130 instead
+/// of 1. A genuine Ctrl-C produces only `Cancelled` results and is unaffected.
+fn record_worker_error(first_error: &mut Option<Error>, error: Error) {
+    match first_error {
+        None => *first_error = Some(error),
+        Some(Error::Cancelled) if !matches!(error, Error::Cancelled) => *first_error = Some(error),
+        Some(_) => {}
+    }
 }
 
 fn delete_snapshot_check(action: &crate::plan::DeleteAction) -> SnapshotCheck {
@@ -508,11 +523,19 @@ fn execute_with_observer<O: SyncOperations>(
                         let size = action.local.size;
                         let user_observer = observer_factory(&action.local);
                         let cancellation_for_observer = cancellation.clone();
+                        // `thread::scope` cannot return until every in-flight upload finishes, so
+                        // the observer also watches `stop`: without it a cancelled run, or a run
+                        // whose peer worker already failed, would keep streaming this file until
+                        // the full `--timeout` elapsed. Returning `false` makes the body reader
+                        // fail with `Interrupted`, which aborts the request instead of waiting.
+                        let stop_for_observer = Arc::clone(&stop);
                         let observer: Option<UploadObserver> = Some(Arc::new(move |event| {
                             let user_continues = user_observer
                                 .as_ref()
                                 .is_none_or(|observer| observer(event));
-                            user_continues && !cancellation_for_observer.is_cancelled()
+                            user_continues
+                                && !cancellation_for_observer.is_cancelled()
+                                && !stop_for_observer.load(Ordering::Acquire)
                         }));
                         let result = worker_client.upload(
                             &action.local,
@@ -542,8 +565,7 @@ fn execute_with_observer<O: SyncOperations>(
                             bytes: size,
                         });
                     }
-                    Err(error) if first_error.is_none() => first_error = Some(error),
-                    Err(_) => {}
+                    Err(error) => record_worker_error(&mut first_error, error),
                 }
             }
             if let Some(error) = first_error {
@@ -631,6 +653,7 @@ fn execute_with_observer<O: SyncOperations>(
 mod tests {
     use std::path::PathBuf;
 
+    use crate::api::UploadTransferEvent;
     use crate::local::{EntryKind, LocalEntry};
     use crate::plan::{ChangeReason, CreateAction, DeleteAction, DestinationGuard, UploadAction};
 
@@ -650,7 +673,20 @@ mod tests {
         /// When set, `upload` blocks until every worker has entered the call, guaranteeing
         /// concurrent workers fail together instead of one racing ahead and stopping the rest.
         upload_barrier: Option<Arc<std::sync::Barrier>>,
+        /// When set, `upload` streams to its observer the way a real transfer does: the entry
+        /// named [`FAILING_UPLOAD`] fails at once, and every other entry keeps feeding the
+        /// observer until it declines. This is how an in-flight transfer is modelled.
+        stream_to_observer: bool,
+        /// Set once a streaming upload's observer declined and the transfer was abandoned.
+        observer_declined: Arc<AtomicBool>,
     }
+
+    /// The one entry a streaming [`MockOperations`] fails immediately.
+    const FAILING_UPLOAD: &str = "fails.txt";
+
+    /// Streaming stops here rather than spinning forever, so a regression that ignores the stop
+    /// flag fails the assertion instead of hanging the test run.
+    const MAX_STREAMED_EVENTS: usize = 1_000_000;
 
     impl MockOperations {
         fn event(&self, value: impl Into<String>) {
@@ -752,7 +788,7 @@ mod tests {
             &self,
             local: &LocalEntry,
             _remote_path: &str,
-            _observer: Option<UploadObserver>,
+            observer: Option<UploadObserver>,
             _cancellation: &CancellationToken,
         ) -> Result<()> {
             if let Some(barrier) = &self.upload_barrier {
@@ -760,10 +796,24 @@ mod tests {
             }
             self.event(format!("upload:{}", local.relative));
             if self.fail_upload {
-                Err(Error::Message("upload failed".to_owned()))
-            } else {
-                Ok(())
+                return Err(Error::Message("upload failed".to_owned()));
             }
+            if !self.stream_to_observer {
+                return Ok(());
+            }
+            if local.relative == FAILING_UPLOAD {
+                return Err(Error::Message("upload failed".to_owned()));
+            }
+            let observer = observer.expect("a streaming upload always receives an observer");
+            for _ in 0..MAX_STREAMED_EVENTS {
+                if !observer(UploadTransferEvent::Advanced { bytes: 1 }) {
+                    self.observer_declined.store(true, Ordering::Release);
+                    // The real reader answers a declining observer with an interrupted read,
+                    // which `ApiClient` reports as cancellation.
+                    return Err(Error::Cancelled);
+                }
+            }
+            Ok(())
         }
     }
 
@@ -1506,6 +1556,118 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// A peer worker's failure must abandon transfers that are already streaming. Without that,
+    /// `thread::scope` cannot return until every in-flight upload has run out its own `--timeout`,
+    /// which is what made a failed or cancelled run look hung for up to two hours.
+    #[test]
+    fn an_in_flight_upload_is_abandoned_once_a_peer_worker_fails() {
+        let client = MockOperations {
+            stream_to_observer: true,
+            upload_barrier: Some(Arc::new(std::sync::Barrier::new(2))),
+            ..MockOperations::default()
+        };
+        let mut plan = populated_plan();
+        plan.pre_deletes.clear();
+        plan.creates.clear();
+        plan.post_deletes.clear();
+        plan.uploads = vec![
+            UploadAction {
+                local: local(FAILING_UPLOAD),
+                remote_path: format!("/share/root/{FAILING_UPLOAD}"),
+                reason: ChangeReason::MissingRemote,
+            },
+            UploadAction {
+                local: local("streams.txt"),
+                remote_path: "/share/root/streams.txt".to_owned(),
+                reason: ChangeReason::MissingRemote,
+            },
+        ];
+
+        let error = execute_with(
+            &client,
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &plan,
+            ExecuteOptions {
+                jobs: 2,
+                dry_run: false,
+            },
+            |_| {},
+        )
+        .unwrap_err();
+
+        assert!(client.observer_declined.load(Ordering::Acquire));
+        // The abandoned transfer reports cancellation, but the failure that caused it is what
+        // the operator needs to see, so it must not be masked by the abort it triggered.
+        assert!(matches!(error, Error::Message(message) if message == "upload failed"));
+    }
+
+    /// Cancellation must reach a transfer that is already streaming, not just the queue.
+    #[test]
+    fn a_cancelled_run_abandons_an_upload_that_is_already_streaming() {
+        let client = MockOperations {
+            stream_to_observer: true,
+            ..MockOperations::default()
+        };
+        let mut plan = populated_plan();
+        plan.pre_deletes.clear();
+        plan.creates.clear();
+        plan.post_deletes.clear();
+        plan.uploads = vec![UploadAction {
+            local: local("streams.txt"),
+            remote_path: "/share/root/streams.txt".to_owned(),
+            reason: ChangeReason::MissingRemote,
+        }];
+
+        let cancellation = CancellationToken::default();
+        let observer_cancellation = cancellation.clone();
+        let result = execute_with_observer(
+            &client,
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &plan,
+            ExecuteOptions {
+                jobs: 1,
+                dry_run: false,
+            },
+            cancellation,
+            // Stand in for the operator's Ctrl-C: the token is set while the transfer is in
+            // flight, exactly as the signal handler would set it.
+            Arc::new(move |_| {
+                let cancellation = observer_cancellation.clone();
+                let observer: UploadObserver = Arc::new(move |_| {
+                    cancellation.cancel();
+                    true
+                });
+                Some(observer)
+            }),
+            |_| {},
+        );
+
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(client.observer_declined.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_substantive_upload_failure_outranks_the_cancellations_it_causes() {
+        let mut first = None;
+        record_worker_error(&mut first, Error::Cancelled);
+        assert!(matches!(first, Some(Error::Cancelled)));
+
+        record_worker_error(&mut first, Error::Message("upload failed".to_owned()));
+        assert!(matches!(&first, Some(Error::Message(message)) if message == "upload failed"));
+
+        // The substantive failure is kept: neither a later cancellation nor a later failure
+        // may displace the error that is already recorded.
+        record_worker_error(&mut first, Error::Cancelled);
+        record_worker_error(&mut first, Error::Message("second failure".to_owned()));
+        assert!(matches!(&first, Some(Error::Message(message)) if message == "upload failed"));
+
+        // A run that only ever reports cancellation still reports cancellation.
+        let mut cancelled_only = None;
+        record_worker_error(&mut cancelled_only, Error::Cancelled);
+        record_worker_error(&mut cancelled_only, Error::Cancelled);
+        assert!(matches!(cancelled_only, Some(Error::Cancelled)));
     }
 
     /// A minimal hand-rolled HTTP/1.1 server answering exactly one `SYNO.API.Info` discovery

@@ -18,7 +18,9 @@ Use the repository's complete, version-matched instructions and assets:
   credential mappings only when configured.
 - Keep `SDSYNC_LOCK_FILE` on a private writable local filesystem and share it across related units.
 - Use `systemctl start` for one immediate run and the timer only after a reviewed plan.
-- `systemctl stop` sends SIGTERM, which requests cooperative cancellation.
+- `systemctl stop` sends SIGTERM, which requests cooperative cancellation. A second SIGTERM exits
+  immediately with status `130`, skipping the graceful File Station logout and remote-task cleanup
+  the first one performs, so let the unit finish stopping rather than repeating the stop.
 - Keep the service-manager deadline above worst-case scan, transfer, retry, and shutdown time.
 
 Direct mode uses wrapper `SDSYNC_SOURCE`/`SDSYNC_REMOTE`; profile mode uses `SDSYNC_CONFIG` plus one

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use reqwest::blocking::multipart::{Form, Part};
 use reqwest::blocking::{Client as HttpClient, Response};
-use reqwest::header::{COOKIE, HeaderValue};
+use reqwest::header::{COOKIE, HeaderMap, HeaderValue, LOCATION, SET_COOKIE};
 use reqwest::redirect::Policy;
 use reqwest::{Certificate, Client as AsyncHttpClient, StatusCode, Url};
 use serde::de::DeserializeOwned;
@@ -22,6 +22,14 @@ use zeroize::Zeroizing;
 use crate::cancel::CancellationToken;
 use crate::integrity::{ContentHasher, ContentMd5};
 use crate::local::{EntryKind, LocalEntry};
+// Only the closed, secret-free value types are imported. Log levels, event codes, and the logger
+// itself deliberately stay out of the transport layer: this module reports what happened on the
+// wire, and the binary decides what that is worth logging.
+use crate::observability::{
+    ApiCallDetail, BoundedText, CdnMarker, CertificateVerification, ConnectionDetail, CookieFact,
+    CookieFacts, CookiePersistence, CookieSameSite, IntermediaryFacts, LoginFormat, RequestOutcome,
+    RequestTransport, SessionShape, SessionTransport, ShortToken, UrlScheme,
+};
 use crate::path::{RemoteRoot, parent_and_name};
 use crate::{Error, Result};
 
@@ -61,6 +69,35 @@ const DISCOVERY_FAILURE_OPERATION: &str = "File Station API discovery";
 const X_SYNO_TOKEN_HEADER: &str = "x-syno-token";
 const MAX_SESSION_HEADER_BYTES: usize = 4 * 1024;
 static WRITE_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Whether this client keeps a cookie jar and replays what a server sets.
+///
+/// It does not: no `reqwest` client built here enables `cookie_store`, so every `Set-Cookie` DSM
+/// or an intermediary sends is observed and then discarded. The only cookie that ever goes back
+/// out is the `id=<sid>` header synthesised from the login response. A diagnostic that reports on
+/// cookie permanence has to state that, and reading the fact from here rather than asserting it
+/// in prose means the report follows the code if a jar is ever enabled.
+pub const CLIENT_MAINTAINS_COOKIE_JAR: bool = false;
+
+/// Cookie names DSM itself is known to set. Anything else came from something in between.
+///
+/// `id` is the session identifier, `smid` its shared-folder sibling, `stay_login` the persistent
+/// login opt-in, and `did`/`device_id` the trusted-device marker set after a 2FA login.
+const DSM_COOKIE_NAMES: &[&str] = &[
+    "id",
+    "smid",
+    "stay_login",
+    "did",
+    "device_id",
+    "sharing_sid",
+];
+
+/// Whether a cookie name is one DSM sets itself, rather than one an intermediary added.
+pub(crate) fn is_dsm_cookie_name(name: &str) -> bool {
+    DSM_COOKIE_NAMES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(name))
+}
 
 /// Return whether a failed client connection still received an HTTP/DSM response from at least
 /// one discovery route. Doctor uses this evidence to keep transport negotiation distinct from an
@@ -122,6 +159,15 @@ pub struct ApiClient {
     upload_timeout: Duration,
     operation_timeout: Duration,
     upload_rate_limit: Option<Arc<Mutex<TokenBucket>>>,
+    /// The process cancellation token, shared by this client and every clone of it.
+    ///
+    /// Per-operation methods keep their explicit `&CancellationToken` parameter; this field
+    /// exists only for the waits the client performs on a caller's behalf deep inside
+    /// `send_form_with_retry`, where no per-operation token is in scope. Without it a control
+    /// request could stay parked in a backoff sleep for seconds after Ctrl-C.
+    cancellation: CancellationToken,
+    /// Optional transport instrumentation, shared by this client and every clone of it.
+    observer: Option<RequestObserver>,
 }
 
 #[derive(Clone, Debug)]
@@ -204,6 +250,327 @@ pub struct DestinationWriteCheck {
     pub destination_exists: bool,
 }
 
+/// One entry of DSM's full `SYNO.API.Info` map, read leniently.
+///
+/// Every field is optional, unlike the strict `ApiSpec` that feeds `required_spec`. `query=all`
+/// on a NAS with third-party packages returns hundreds of entries authored by whoever wrote those
+/// packages; a strict type would let one of them fail the whole enumeration.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct DiscoveredApi {
+    pub path: Option<String>,
+    #[serde(rename = "minVersion")]
+    pub min_version: Option<u32>,
+    #[serde(rename = "maxVersion")]
+    pub max_version: Option<u32>,
+    #[serde(default, rename = "requestFormat")]
+    pub request_format: Option<String>,
+}
+
+impl DiscoveredApi {
+    /// Whether this entry advertises a version range containing `version`.
+    ///
+    /// An entry that reported neither bound cannot answer the question, and says so rather than
+    /// defaulting to a reassuring `true`.
+    #[must_use]
+    pub fn offers_version(&self, version: u32) -> Option<bool> {
+        let (min, max) = (self.min_version?, self.max_version?);
+        Some((min..=max).contains(&version))
+    }
+}
+
+/// Everything DSM advertises, plus the entries it advertised unusably.
+#[derive(Clone, Debug, Default)]
+pub struct ApiCatalogue {
+    pub apis: BTreeMap<String, DiscoveredApi>,
+    /// Entries whose value did not decode into [`DiscoveredApi`]. Counted, never dropped silently.
+    pub unusable_entries: usize,
+}
+
+/// An API version this tool asks DSM for, and what depends on it.
+///
+/// Every member is a compile-time literal, so a requirement can be reported anywhere -- including
+/// beside a server-supplied name -- without carrying server text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApiRequirement {
+    pub api: &'static str,
+    pub version: u32,
+    /// Whether the tool has a working fallback when DSM does not offer it.
+    pub optional: bool,
+    /// What stops working without it. Rendered verbatim beside the API name.
+    pub purpose: &'static str,
+}
+
+/// The API versions this tool actually requests, with what each one buys.
+///
+/// This is the requirement half of the capability matrix. It deliberately mirrors the versions
+/// the call sites pass rather than the allowlist alone, because "DSM offers this API" and "DSM
+/// offers the version we ask for" are different questions and only the second one ambushes people
+/// at runtime.
+pub const API_REQUIREMENTS: &[ApiRequirement] = &[
+    // Login negotiates `min(6, maxVersion)` and refuses anything below 3, so 3 is the real floor
+    // and reporting 6 here would call a working DSM incompatible.
+    ApiRequirement {
+        api: "SYNO.API.Auth",
+        version: 3,
+        optional: false,
+        purpose: "authentication; login negotiates up to version 6 when DSM offers it",
+    },
+    ApiRequirement {
+        api: "SYNO.FileStation.Info",
+        version: 2,
+        optional: true,
+        purpose: "host identity and per-account capability report",
+    },
+    ApiRequirement {
+        api: "SYNO.FileStation.List",
+        version: 2,
+        optional: false,
+        purpose: "remote inventory and path resolution",
+    },
+    ApiRequirement {
+        api: "SYNO.FileStation.CreateFolder",
+        version: 2,
+        optional: false,
+        purpose: "creating destination directories",
+    },
+    ApiRequirement {
+        api: "SYNO.FileStation.Upload",
+        version: 2,
+        optional: false,
+        purpose: "uploading files",
+    },
+    ApiRequirement {
+        api: "SYNO.FileStation.CheckPermission",
+        version: 3,
+        optional: false,
+        purpose: "the non-mutating write pre-check",
+    },
+    ApiRequirement {
+        api: "SYNO.FileStation.Download",
+        version: 2,
+        optional: true,
+        purpose: "content-mode fingerprint verification",
+    },
+    ApiRequirement {
+        api: "SYNO.FileStation.MD5",
+        version: 2,
+        optional: true,
+        purpose: "remote MD5 comparison",
+    },
+    ApiRequirement {
+        api: "SYNO.FileStation.Delete",
+        version: 2,
+        optional: true,
+        purpose: "--delete and write-probe cleanup",
+    },
+    ApiRequirement {
+        api: "SYNO.FileStation.CopyMove",
+        version: 3,
+        optional: true,
+        purpose: "server-side copy; verified upload is used without it",
+    },
+];
+
+/// How many session-channel variants the ablation probe runs.
+pub const SESSION_CHANNEL_VARIANTS: usize = 4;
+
+/// Which channels carry the DSM session on one request.
+///
+/// DSM accepts a session through several channels at once and this client normally presents all
+/// of them, so a rejection cannot be attributed to any one. Naming the combination explicitly is
+/// what makes the attribution possible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionChannels {
+    /// Everything this client normally sends: the synthesised cookie, the token header, and both
+    /// request fields. Run first, so the probe reproduces today's behaviour before varying it.
+    All,
+    /// Only the documented `_sid` request field, which is what `format=sid` login promises.
+    SidFieldOnly,
+    /// Only the synthesised `Cookie: id=<sid>` header.
+    CookieOnly,
+    /// Only the `X-SYNO-TOKEN` header, with no session identifier at all.
+    TokenHeaderOnly,
+}
+
+impl SessionChannels {
+    /// Ablation order. `All` is first deliberately: a probe that changed a variable before
+    /// reproducing the observed behaviour would have nothing to compare against.
+    pub const ABLATION_ORDER: [Self; SESSION_CHANNEL_VARIANTS] = [
+        Self::All,
+        Self::SidFieldOnly,
+        Self::CookieOnly,
+        Self::TokenHeaderOnly,
+    ];
+
+    #[must_use]
+    pub fn sends_cookie_header(self) -> bool {
+        matches!(self, Self::All | Self::CookieOnly)
+    }
+
+    #[must_use]
+    pub fn sends_token_header(self) -> bool {
+        matches!(self, Self::All | Self::TokenHeaderOnly)
+    }
+
+    #[must_use]
+    pub fn sends_sid_field(self) -> bool {
+        matches!(self, Self::All | Self::SidFieldOnly)
+    }
+
+    #[must_use]
+    pub fn sends_token_field(self) -> bool {
+        matches!(self, Self::All | Self::SidFieldOnly)
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::SidFieldOnly => "sid-field-only",
+            Self::CookieOnly => "cookie-only",
+            Self::TokenHeaderOnly => "token-header-only",
+        }
+    }
+
+    /// How the variant reads in the report, in the same vocabulary the call lines use.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::All => "cookie + token-header + sid-field + token-field",
+            Self::SidFieldOnly => "sid-field + token-field",
+            Self::CookieOnly => "cookie only",
+            Self::TokenHeaderOnly => "token-header only",
+        }
+    }
+}
+
+/// One ablation variant's result. `Copy`, and carries no value of any channel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChannelProbe {
+    pub channels: SessionChannels,
+    pub outcome: RequestOutcome,
+    pub dsm_code: Option<i64>,
+    pub http_status: Option<u16>,
+    pub elapsed_ms: u64,
+}
+
+impl ChannelProbe {
+    /// A placeholder for a variant that has not run yet.
+    #[must_use]
+    pub fn unrun(channels: SessionChannels) -> Self {
+        Self {
+            channels,
+            outcome: RequestOutcome::Transport,
+            dsm_code: None,
+            http_status: None,
+            elapsed_ms: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn accepted(self) -> bool {
+        self.outcome == RequestOutcome::Ok
+    }
+
+    /// Whether DSM rejected the session itself, rather than refusing the operation.
+    #[must_use]
+    pub fn session_rejected(self) -> bool {
+        matches!(self.dsm_code, Some(106 | 107 | 119))
+    }
+}
+
+/// One safe, read-only capability probe to make.
+///
+/// `api`, `method`, and `cgi_path` are supplied by the caller. The first two are compile-time
+/// literals; the path is routed through [`endpoint_url`], which confines it to the configured
+/// origin and `webapi/` prefix, so a server-supplied path cannot redirect a probe elsewhere.
+#[derive(Clone, Debug)]
+pub struct CapabilityProbeSpec {
+    pub api: &'static str,
+    pub method: &'static str,
+    pub version: u32,
+    pub cgi_path: &'static str,
+    pub parameters: Vec<(String, String)>,
+}
+
+/// What one capability probe learned. `Copy`, and free of server-supplied text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapabilityProbe {
+    pub api: &'static str,
+    pub method: &'static str,
+    pub version: u32,
+    pub outcome: RequestOutcome,
+    pub dsm_code: Option<i64>,
+    pub http_status: Option<u16>,
+    pub elapsed_ms: u64,
+}
+
+/// File Station's own per-account capability report.
+///
+/// The two text fields are sanitized and bounded on the way in: `hostname` is DSM's own name for
+/// the host that served the request, and `support_virtual_protocol` is a comma-separated list of
+/// VFS types. Neither is a secret, and neither is trusted as free-form terminal output.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FileStationInfo {
+    pub hostname: Option<BoundedText>,
+    pub is_manager: bool,
+    pub support_sharing: bool,
+    pub support_virtual_protocol: Option<BoundedText>,
+}
+
+/// One component of a destination path, and what DSM said about it.
+///
+/// The path is built from the destination this run was given, never from a server response, so
+/// nothing here can carry text DSM chose.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PathSegmentProbe {
+    pub path: String,
+    pub depth: u8,
+    pub exists: bool,
+    pub is_directory: bool,
+    pub mount_boundary: bool,
+    pub dsm_code: Option<i64>,
+}
+
+/// The component-by-component walk of a destination path.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DestinationPathResolution {
+    pub segments: Vec<PathSegmentProbe>,
+    /// How many components the destination has, including the share root.
+    pub total_components: usize,
+    /// The first component that does not exist, as a 1-based position.
+    pub first_missing: Option<usize>,
+}
+
+impl DestinationPathResolution {
+    /// Whether every component of the destination was walked and every one of them exists.
+    ///
+    /// The per-segment check is not redundant with `first_missing`: a walk stopped by something
+    /// other than a 408 -- a rejected session, a refused permission -- records that component as
+    /// not existing without setting `first_missing`, and must not be reported as fully resolved.
+    #[must_use]
+    pub fn fully_resolved(&self) -> bool {
+        self.first_missing.is_none()
+            && self.segments.len() == self.total_components
+            && self.segments.iter().all(|segment| segment.exists)
+    }
+
+    /// Whether the share root itself -- the first component -- is absent or invisible.
+    ///
+    /// A different fault from a missing interior component, and it needs a different answer: the
+    /// account cannot see the shared folder at all, so no amount of creating directories helps.
+    #[must_use]
+    pub fn share_root_missing(&self) -> bool {
+        self.first_missing == Some(1)
+    }
+
+    /// The deepest component that does exist, when any does.
+    #[must_use]
+    pub fn nearest_existing(&self) -> Option<&PathSegmentProbe> {
+        self.segments.iter().rev().find(|segment| segment.exists)
+    }
+}
+
 /// Structured evidence from an explicitly requested, disposable remote write probe.
 ///
 /// The probe is never run implicitly. A caller must invoke [`ApiClient::run_write_probe`] and
@@ -270,8 +637,85 @@ pub enum UploadTransferEvent {
 /// Return `false` from an observer to cancel the transfer at the next safe read boundary.
 pub type UploadObserver = Arc<dyn Fn(UploadTransferEvent) -> bool + Send + Sync>;
 
+/// One instrumentation record from the transport layer.
+///
+/// Every variant is `Copy` and closed: an enum, an integer, a boolean, a compile-time
+/// `&'static str`, or a sanitized bounded token. A response body, header value, form-field value,
+/// credential, or session identifier is not representable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApiObservation {
+    /// The transport identity of a freshly connected client, replayed when an observer is
+    /// installed so the endpoint is named once per run rather than once per request.
+    Connected(ConnectionDetail),
+    /// A login response was accepted and produced a usable session.
+    SessionEstablished(SessionShape),
+    /// A request is about to go on the wire.
+    CallStarted(ApiCallDetail),
+    /// A request finished, successfully or not.
+    CallCompleted(ApiCallDetail),
+}
+
+/// Receives one record per HTTP round trip this client makes.
+///
+/// The observer runs on the calling thread inside the request path and must not block. It is
+/// shared by every clone of the client it was installed on.
+pub type RequestObserver = Arc<dyn Fn(ApiObservation) + Send + Sync>;
+
+/// Everything one request attempt needs to describe itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AttemptContext {
+    api: &'static str,
+    version: u32,
+    method: &'static str,
+    timeout: Duration,
+    attempt: u32,
+    max_attempts: u32,
+}
+
+impl AttemptContext {
+    /// One unretried attempt, which is what most control requests make.
+    fn single(api: &'static str, version: u32, method: &'static str, timeout: Duration) -> Self {
+        Self {
+            api,
+            version,
+            method,
+            timeout,
+            attempt: 1,
+            max_attempts: 1,
+        }
+    }
+}
+
+/// Response facts that are only observable before the body is consumed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ResponseFacts {
+    http_status: Option<u16>,
+    /// How many cookies the response set, and under which names. Never their values.
+    set_cookie_count: u16,
+    set_cookie_names: BoundedText,
+    /// The same cookies with their attributes and a salted digest of each value.
+    cookies: CookieFacts,
+    /// What the response headers revealed about proxies and relays on the path.
+    intermediary: IntermediaryFacts,
+    /// The host of a `Location` target, when the response redirected. Host only.
+    redirect_host: Option<BoundedText>,
+    response_bytes: u64,
+}
+
 impl ApiClient {
     pub fn connect(options: &ClientOptions) -> Result<Self> {
+        Self::connect_observed(options, None)
+    }
+
+    /// Connect while reporting every HTTP round trip, including API discovery.
+    ///
+    /// The observer is installed before discovery runs rather than afterwards, because discovery
+    /// is itself two requests and its `entry.cgi` to `query.cgi` fallback is exactly the sort of
+    /// reverse-proxy misrouting an operator needs to see.
+    pub fn connect_observed(
+        options: &ClientOptions,
+        observer: Option<RequestObserver>,
+    ) -> Result<Self> {
         Self::connect_with_requirements(
             options,
             &[
@@ -281,6 +725,7 @@ impl ApiClient {
                 ("SYNO.FileStation.CheckPermission", 3),
             ],
             None,
+            observer,
         )
     }
 
@@ -288,7 +733,7 @@ impl ApiClient {
     /// interactive directory chooser. Only Auth and List are required; sync
     /// mutation APIs are neither assumed nor invoked by this client.
     pub fn connect_for_browsing(options: &ClientOptions) -> Result<Self> {
-        Self::connect_with_requirements(options, &[("SYNO.FileStation.List", 2)], None)
+        Self::connect_with_requirements(options, &[("SYNO.FileStation.List", 2)], None, None)
     }
 
     /// Connect a least-privilege browsing client whose discovery and all
@@ -310,13 +755,19 @@ impl ApiClient {
         let deadline = Instant::now().checked_add(total_timeout).ok_or_else(|| {
             Error::Message("File Station control deadline is out of range".to_owned())
         })?;
-        Self::connect_with_requirements(options, &[("SYNO.FileStation.List", 2)], Some(deadline))
+        Self::connect_with_requirements(
+            options,
+            &[("SYNO.FileStation.List", 2)],
+            Some(deadline),
+            None,
+        )
     }
 
     fn connect_with_requirements(
         options: &ClientOptions,
         required_apis: &[(&str, u32)],
         control_deadline: Option<Instant>,
+        observer: Option<RequestObserver>,
     ) -> Result<Self> {
         let base = normalize_base_url(&options.base_url, options.allow_http)?;
         let mut builder = HttpClient::builder()
@@ -335,26 +786,7 @@ impl ApiClient {
             download_builder = download_builder.danger_accept_invalid_certs(true);
         }
         if let Some(path) = &options.ca_certificate {
-            let pem = fs::read(path).map_err(|source| Error::FileIo {
-                path: path.clone(),
-                source,
-            })?;
-            // The rustls backend only stores the PEM bytes here and parses them when the client
-            // is built, so a file holding no CERTIFICATE section at all -- an empty, truncated,
-            // or simply mistaken file -- would be accepted in silence and leave the operator
-            // believing a CA was pinned when nothing was added to the trust store. Counting the
-            // sections up front makes that loud; an unreadable payload is deliberately left to
-            // surface where reqwest actually rejects it, when the client is built.
-            if Certificate::from_pem_bundle(&pem).is_ok_and(|certificates| certificates.is_empty())
-            {
-                return Err(Error::Message(format!(
-                    "CA certificate file {path:?} contains no certificate; --ca-certificate must name a PEM file with at least one CERTIFICATE block"
-                )));
-            }
-            let certificate = Certificate::from_pem(&pem).map_err(|source| Error::Http {
-                operation: format!("loading CA certificate {path:?}"),
-                source,
-            })?;
+            let certificate = load_ca_certificate(path)?;
             builder = builder.add_root_certificate(certificate.clone());
             download_builder = download_builder.add_root_certificate(certificate);
         }
@@ -367,6 +799,9 @@ impl ApiClient {
             source,
         })?;
 
+        // Settled before `base` is moved into the client. The endpoint is named once per run
+        // rather than once per request.
+        let connection = connection_detail(&base, options);
         let mut client = Self {
             http,
             download_http,
@@ -379,7 +814,12 @@ impl ApiClient {
             upload_timeout: options.request_timeout,
             operation_timeout: options.request_timeout,
             upload_rate_limit: None,
+            cancellation: CancellationToken::default(),
+            observer,
         };
+        // Announced before discovery so the endpoint is named ahead of the first request it
+        // explains, which is the order a reader needs.
+        client.observe(ApiObservation::Connected(connection));
         client.apis = client.discover()?;
         client.validate_api("SYNO.API.Auth", 3)?;
         for &(api, version) in required_apis {
@@ -397,6 +837,38 @@ impl ApiClient {
     pub fn with_max_upload_rate(mut self, bytes_per_second: Option<u64>) -> Self {
         self.upload_rate_limit = upload_rate_bucket(bytes_per_second);
         self
+    }
+
+    /// Share `cancellation` with this client so its internal retry backoff wakes on Ctrl-C.
+    ///
+    /// Cancellation stays cooperative: this only shortens waits the client would otherwise sleep
+    /// through, and a request already in flight is still bounded by its own timeout. Every clone
+    /// of the returned client observes the same token.
+    #[must_use]
+    pub fn with_cancellation(mut self, cancellation: &CancellationToken) -> Self {
+        self.cancellation = cancellation.clone();
+        self
+    }
+
+    fn observe(&self, observation: ApiObservation) {
+        if let Some(observer) = &self.observer {
+            observer(observation);
+        }
+    }
+
+    /// Report which session channels a request carries.
+    ///
+    /// The header half mirrors what `with_blocking_session_headers` and
+    /// `with_async_session_headers` attach, derived from session state rather than by changing
+    /// their signatures. The field half reads form-field **names** only; no value is inspected.
+    fn session_transport(&self, fields: &[(String, String)]) -> SessionTransport {
+        let session = self.session.as_ref();
+        SessionTransport {
+            cookie_header: session.is_some(),
+            syno_token_header: session.is_some_and(|session| session.syno_token.is_some()),
+            sid_field: fields.iter().any(|(name, _)| name == "_sid"),
+            syno_token_field: fields.iter().any(|(name, _)| name == "SynoToken"),
+        }
     }
 
     /// The limit this client is pacing uploads against, or `None` when unlimited. This exists so
@@ -713,7 +1185,7 @@ impl ApiClient {
         self.verify_remote_content(destination_path, expected_size, expected, cancellation)
     }
 
-    fn stop_task(&self, api: &str, version: u32, taskid: &str) -> Result<()> {
+    fn stop_task(&self, api: &'static str, version: u32, taskid: &str) -> Result<()> {
         self.call_bounded::<Value>(
             api,
             version,
@@ -849,8 +1321,22 @@ impl ApiClient {
         }
 
         let url = self.api_url("SYNO.API.Auth")?;
+        // The login response is the only place `Set-Cookie` can be observed, and whether the
+        // server set one is exactly what distinguishes a session DSM expects us to carry in a
+        // cookie from one it expects only in the `_sid` field.
+        let mut facts = ResponseFacts::default();
         let data: LoginData = self
-            .send_form_once(url, fields, "SYNO.API.Auth", "login")?
+            .send_attempt(
+                url,
+                fields,
+                AttemptContext::single(
+                    "SYNO.API.Auth",
+                    auth_version,
+                    "login",
+                    self.control_timeout,
+                ),
+                &mut facts,
+            )?
             .ok_or_else(|| Error::InvalidResponse {
                 operation: "SYNO.API.Auth.login".to_owned(),
                 message: "successful response contained no session data".to_owned(),
@@ -872,6 +1358,12 @@ impl ApiClient {
         // SynoToken as sensitive headers. Validate that representation before a
         // caller can mistake a syntactically successful login for a usable session.
         session.request_headers()?;
+        self.observe(ApiObservation::SessionEstablished(SessionShape {
+            sid_length: u16::try_from(session.sid.len()).unwrap_or(u16::MAX),
+            token_present: session.syno_token.is_some(),
+            login_format: LoginFormat::Sid,
+            server_set_cookie: facts.set_cookie_count > 0,
+        }));
         self.session = Some(session);
         Ok(())
     }
@@ -888,7 +1380,7 @@ impl ApiClient {
             vec![pair("session", "FileStation")],
         )?;
         let url = self.api_url("SYNO.API.Auth")?;
-        let result = self.send_form_once::<Value>(url, fields, "SYNO.API.Auth", "logout");
+        let result = self.send_form_once::<Value>(url, fields, "SYNO.API.Auth", version, "logout");
         self.session = None;
         result.map(|_| ())
     }
@@ -1096,51 +1588,112 @@ impl ApiClient {
     /// path component in its nearest existing ancestor; later components do not exist yet and
     /// therefore cannot have independent ACLs to inspect without mutating the NAS.
     pub fn verify_destination_writable(&self, root: &RemoteRoot) -> Result<DestinationWriteCheck> {
-        self.validate_api("SYNO.FileStation.CheckPermission", 3)?;
+        self.verify_destination_writable_with_resolution(root).1
+    }
+
+    /// The same check, keeping the component-by-component walk it performs on the way.
+    ///
+    /// The walk is discarded by [`Self::verify_destination_writable`] because sync only needs the
+    /// verdict, but it is the whole answer a diagnostic wants: "neither the destination nor any
+    /// ancestor of it exists" and "only the last component is missing" are different problems with
+    /// different fixes, and only the walk separates them. Returning both means the resolution
+    /// costs no extra request -- these are the same `getinfo` calls, reported instead of dropped.
+    pub fn verify_destination_writable_with_resolution(
+        &self,
+        root: &RemoteRoot,
+    ) -> (DestinationPathResolution, Result<DestinationWriteCheck>) {
+        let prefixes = absolute_prefixes(root.as_str());
+        let mut resolution = DestinationPathResolution {
+            segments: Vec::with_capacity(prefixes.len()),
+            total_components: prefixes.len(),
+            first_missing: None,
+        };
+        if let Err(error) = self.validate_api("SYNO.FileStation.CheckPermission", 3) {
+            return (resolution, Err(error));
+        }
 
         let mut nearest_existing = None;
-        for path in absolute_prefixes(root.as_str()) {
+        for (index, path) in prefixes.into_iter().enumerate() {
+            let depth = u8::try_from(index + 1).unwrap_or(u8::MAX);
             match self.get_info(&path) {
                 Ok(item) => {
-                    if !item.isdir {
-                        return Err(Error::Message(format!(
-                            "remote destination ancestor {path} exists but is not a directory"
-                        )));
-                    }
-                    if let Some(mount_type) = item
+                    let mount_type = item
                         .additional
                         .as_ref()
                         .and_then(|additional| additional.mount_point_type.as_deref())
                         .filter(|value| !value.trim().is_empty())
-                    {
-                        return Err(Error::RemoteMountRoot {
-                            path,
-                            mount_type: mount_type.to_owned(),
-                        });
+                        .map(str::to_owned);
+                    resolution.segments.push(PathSegmentProbe {
+                        path: path.clone(),
+                        depth,
+                        exists: true,
+                        is_directory: item.isdir,
+                        mount_boundary: mount_type.is_some(),
+                        dsm_code: None,
+                    });
+                    if !item.isdir {
+                        return (
+                            resolution,
+                            Err(Error::Message(format!(
+                                "remote destination ancestor {path} exists but is not a directory"
+                            ))),
+                        );
+                    }
+                    if let Some(mount_type) = mount_type {
+                        return (resolution, Err(Error::RemoteMountRoot { path, mount_type }));
                     }
                     nearest_existing = Some(path);
                 }
                 Err(error) if error.api_code() == Some(408) => {
-                    let Some(existing) = nearest_existing else {
-                        return Err(Error::ShareNotWritable(root.share_name().to_owned()));
-                    };
-                    let (_, missing_name) = parent_and_name(&path)?;
-                    self.check_write_permission(&existing, missing_name)?;
-                    return Ok(DestinationWriteCheck {
-                        checked_directory: existing,
-                        destination_exists: false,
+                    resolution.segments.push(PathSegmentProbe {
+                        path: path.clone(),
+                        depth,
+                        exists: false,
+                        is_directory: false,
+                        mount_boundary: false,
+                        dsm_code: Some(408),
                     });
+                    resolution.first_missing = Some(index + 1);
+                    let Some(existing) = nearest_existing else {
+                        return (
+                            resolution,
+                            Err(Error::ShareNotWritable(root.share_name().to_owned())),
+                        );
+                    };
+                    let outcome = parent_and_name(&path).and_then(|(_, missing_name)| {
+                        self.check_write_permission(&existing, missing_name)
+                    });
+                    return (
+                        resolution,
+                        outcome.map(|()| DestinationWriteCheck {
+                            checked_directory: existing,
+                            destination_exists: false,
+                        }),
+                    );
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    resolution.segments.push(PathSegmentProbe {
+                        path,
+                        depth,
+                        exists: false,
+                        is_directory: false,
+                        mount_boundary: false,
+                        dsm_code: error.api_code(),
+                    });
+                    return (resolution, Err(error));
+                }
             }
         }
 
         let probe_name = permission_probe_name();
-        self.check_write_permission(root.as_str(), &probe_name)?;
-        Ok(DestinationWriteCheck {
-            checked_directory: root.as_str().to_owned(),
-            destination_exists: true,
-        })
+        let outcome = self.check_write_permission(root.as_str(), &probe_name);
+        (
+            resolution,
+            outcome.map(|()| DestinationWriteCheck {
+                checked_directory: root.as_str().to_owned(),
+                destination_exists: true,
+            }),
+        )
     }
 
     fn check_write_permission(&self, directory: &str, filename: &str) -> Result<()> {
@@ -1243,7 +1796,7 @@ impl ApiClient {
                 }
             }
             cancellation.check()?;
-            self.verify_empty_probe_directory(probe_path)?;
+            self.verify_empty_probe_directory(probe_path, cancellation)?;
             cancellation.check()?;
 
             report.upload_attempted = true;
@@ -1264,7 +1817,7 @@ impl ApiClient {
                     Ok(()) => {}
                     Err(error) => return Err(error),
                 }
-                self.verify_empty_probe_directory(&copy_directory)?;
+                self.verify_empty_probe_directory(&copy_directory, cancellation)?;
                 self.require_remote_absent(&copy_path)?;
                 report.server_copy_attempted = true;
                 self.copy_file_verified(
@@ -1367,14 +1920,18 @@ impl ApiClient {
         Ok(())
     }
 
-    fn verify_empty_probe_directory(&self, remote_path: &str) -> Result<()> {
+    fn verify_empty_probe_directory(
+        &self,
+        remote_path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
         let item = self.get_info_with_retry(remote_path, false)?;
         if !item.isdir {
             return Err(Error::Message(format!(
                 "write-probe path {remote_path:?} was not created as a directory"
             )));
         }
-        let children = self.list_directory(remote_path)?;
+        let children = self.list_directory(remote_path, cancellation)?;
         if !children.is_empty() {
             return Err(Error::Message(format!(
                 "write-probe directory {remote_path:?} was not empty after creation"
@@ -1453,7 +2010,16 @@ impl ApiClient {
         }
     }
 
-    pub fn remote_inventory(&self, root: &RemoteRoot) -> Result<RemoteInventory> {
+    /// Walk the destination into a complete recursive inventory.
+    ///
+    /// The traversal is unbounded by design, so `cancellation` is consulted before each ancestor
+    /// probe and before each directory in the breadth-first queue is listed. A cancelled walk
+    /// returns [`Error::Cancelled`] and no partial inventory.
+    pub fn remote_inventory(
+        &self,
+        root: &RemoteRoot,
+        cancellation: &CancellationToken,
+    ) -> Result<RemoteInventory> {
         let mut entries = BTreeMap::new();
         let mut pending = vec![root.as_str().to_owned()];
         let mut root_exists = true;
@@ -1461,6 +2027,7 @@ impl ApiClient {
         // Inspect every ancestor before traversing. This also catches a destination below
         // a mounted remote folder, including when the final destination does not exist yet.
         for path in absolute_prefixes(root.as_str()) {
+            cancellation.check()?;
             let info = match self.get_info(&path) {
                 Ok(info) => info,
                 Err(error) if error.api_code() == Some(408) => {
@@ -1486,7 +2053,8 @@ impl ApiClient {
         }
 
         while let Some(folder) = pending.pop() {
-            let files = match self.list_directory(&folder) {
+            cancellation.check()?;
+            let files = match self.list_directory(&folder, cancellation) {
                 Ok(files) => files,
                 Err(error) if folder == root.as_str() && error.api_code() == Some(408) => {
                     root_exists = false;
@@ -1835,6 +2403,276 @@ impl ApiClient {
         })
     }
 
+    /// Read everything DSM advertises, not merely the ten APIs this tool requires.
+    ///
+    /// Deliberately separate from [`Self::discover`]. Discovery feeds `required_spec` and
+    /// therefore every call this client makes, and its map is decoded all-or-nothing: one
+    /// third-party package advertising a malformed entry would break connection establishment
+    /// itself. This read decodes entry by entry into an all-optional type instead, so a bad entry
+    /// costs a line of output rather than the run.
+    ///
+    /// The `entry.cgi` to `query.cgi` fallback is reused rather than reimplemented: this request
+    /// is subject to exactly the same reverse-proxy misrouting the fallback exists to survive.
+    pub fn enumerate_all_apis(&self) -> Result<ApiCatalogue> {
+        let raw = match self.enumerate_all_apis_at("entry.cgi") {
+            Ok(raw) => raw,
+            Err(first_error) => match self.enumerate_all_apis_at("query.cgi") {
+                Ok(raw) => raw,
+                Err(second_error) => {
+                    return Err(Error::Message(format!(
+                        "DSM capability enumeration failed through the reverse proxy; \
+                         entry.cgi: {first_error}; query.cgi fallback: {second_error}"
+                    )));
+                }
+            },
+        };
+        let mut catalogue = ApiCatalogue::default();
+        for (name, value) in raw {
+            match serde_json::from_value::<DiscoveredApi>(value) {
+                Ok(api) => {
+                    catalogue.apis.insert(name, api);
+                }
+                // Counted, never dropped silently: a DSM advertising an API entry this shape
+                // cannot describe is itself worth a line of the report.
+                Err(_) => catalogue.unusable_entries += 1,
+            }
+        }
+        Ok(catalogue)
+    }
+
+    fn enumerate_all_apis_at(&self, cgi: &str) -> Result<BTreeMap<String, Value>> {
+        let url = endpoint_url(&self.base, cgi)?;
+        let fields = vec![
+            pair("api", "SYNO.API.Info"),
+            pair("version", "1"),
+            pair("method", "query"),
+            // Documented since DSM 4.0 and unauthenticated: the location of SYNO.API.Info is
+            // fixed precisely so a client can always ask this question.
+            pair("query", "all"),
+        ];
+        self.send_form_with_retry(url, fields, "SYNO.API.Info", 1, "query", true)?
+            .ok_or_else(|| Error::InvalidResponse {
+                operation: "SYNO.API.Info.query".to_owned(),
+                message: "successful response contained no API map".to_owned(),
+            })
+    }
+
+    /// Present the same read-only request four times, varying only how the session is carried.
+    ///
+    /// This is the one measurement that separates "the session is rejected because of how this
+    /// client presents it" from "the session is rejected because the path does not carry it".
+    /// Every variant is `list_share` with `limit=1` -- the same bounded, non-mutating call
+    /// [`Self::confirm_file_station_session`] already makes -- so the only variable is the
+    /// channel.
+    ///
+    /// The variants run in a fixed order with [`SessionChannels::All`] first, so the probe
+    /// reproduces the run's own behaviour before it starts changing anything.
+    pub fn probe_session_channels(&self) -> Result<[ChannelProbe; SESSION_CHANNEL_VARIANTS]> {
+        self.required_session()?;
+        self.validate_api("SYNO.FileStation.List", 2)?;
+        let mut probes = [ChannelProbe::unrun(SessionChannels::All); SESSION_CHANNEL_VARIANTS];
+        for (slot, channels) in SessionChannels::ABLATION_ORDER.iter().enumerate() {
+            self.cancellation.check()?;
+            probes[slot] = self.probe_one_session_channel(*channels)?;
+        }
+        Ok(probes)
+    }
+
+    /// One ablation variant: build the request by hand so the channel is explicit.
+    ///
+    /// The production header helpers are deliberately untouched. They derive what to attach from
+    /// session state, which is exactly the behaviour under test, so a probe that reused them
+    /// could not vary the thing it exists to vary.
+    fn probe_one_session_channel(&self, channels: SessionChannels) -> Result<ChannelProbe> {
+        let session = self.required_session()?;
+        let url = self.api_url("SYNO.FileStation.List")?;
+        let mut fields = vec![
+            pair("api", "SYNO.FileStation.List"),
+            pair("version", "2"),
+            pair("method", "list_share"),
+            pair("offset", "0"),
+            pair("limit", "1"),
+        ];
+        if channels.sends_sid_field() {
+            fields.push(pair("_sid", session.sid.to_string()));
+        }
+        if channels.sends_token_field()
+            && let Some(token) = &session.syno_token
+        {
+            fields.push(pair("SynoToken", token.to_string()));
+        }
+        let fields = Zeroizing::new(fields);
+
+        let mut record = ApiCallDetail::started(
+            "SYNO.FileStation.List",
+            "list_share",
+            2,
+            route_text(&url),
+            RequestTransport::Form,
+        );
+        // Reported from the selector rather than from session state: for this request the two
+        // deliberately disagree, and the selector is the truth on the wire.
+        record.session = SessionTransport {
+            cookie_header: channels.sends_cookie_header(),
+            syno_token_header: channels.sends_token_header() && session.syno_token.is_some(),
+            sid_field: channels.sends_sid_field(),
+            syno_token_field: channels.sends_token_field() && session.syno_token.is_some(),
+        };
+        record.request_fields = u16::try_from(fields.len()).unwrap_or(u16::MAX);
+        let timeout = self.remaining_control_timeout(SESSION_CONFIRMATION_TIMEOUT)?;
+        record.timeout_ms = duration_millis_saturating(timeout);
+        self.observe(ApiObservation::CallStarted(record));
+
+        let mut facts = ResponseFacts::default();
+        let started = Instant::now();
+        let outcome = self
+            .with_selected_session_headers(self.http.post(url), channels)?
+            .timeout(timeout)
+            .form(&*fields)
+            .send()
+            .map_err(|source| Error::Http {
+                operation: "SYNO.FileStation.List.list_share".to_owned(),
+                source,
+            })
+            .and_then(|response| {
+                decode_response_observed::<ListShareData>(
+                    response,
+                    "SYNO.FileStation.List",
+                    "list_share",
+                    &mut facts,
+                )
+            });
+        record.elapsed_ms = duration_millis_saturating(started.elapsed());
+        apply_response_facts(&mut record, facts);
+        apply_outcome(&mut record, &outcome, "SYNO.FileStation.List");
+        self.observe(ApiObservation::CallCompleted(record));
+        Ok(ChannelProbe {
+            channels,
+            outcome: record.outcome,
+            dsm_code: record.dsm_code,
+            http_status: record.http_status,
+            elapsed_ms: record.elapsed_ms,
+        })
+    }
+
+    /// Attach only the session headers a probe asked for.
+    ///
+    /// Separate from [`Self::with_blocking_session_headers`] on purpose: that one is the
+    /// production path and stays exactly as it is, so nothing sync does changes because a
+    /// diagnostic wanted a selector.
+    fn with_selected_session_headers(
+        &self,
+        mut request: reqwest::blocking::RequestBuilder,
+        channels: SessionChannels,
+    ) -> Result<reqwest::blocking::RequestBuilder> {
+        if let Some(headers) = self.session_headers()? {
+            if channels.sends_cookie_header() {
+                request = request.header(COOKIE, headers.cookie);
+            }
+            if channels.sends_token_header()
+                && let Some(token) = headers.syno_token
+            {
+                request = request.header(X_SYNO_TOKEN_HEADER, token);
+            }
+        }
+        Ok(request)
+    }
+
+    /// Read File Station's own per-account capability report.
+    ///
+    /// `SYNO.FileStation.Info` version 2 `get` takes no parameters and is documented since
+    /// DSM 6.0. It is the only documented, non-admin call that names the host serving the
+    /// request, which is why the diagnostic makes it twice: a hostname that differs between two
+    /// calls of one run is the only positive evidence of a path that does not reach one host.
+    pub fn file_station_info(&self) -> Result<FileStationInfo> {
+        let info: FileStationInfoWire = self
+            .call_bounded(
+                "SYNO.FileStation.Info",
+                2,
+                "get",
+                Vec::new(),
+                SESSION_CONFIRMATION_TIMEOUT,
+            )?
+            .ok_or_else(|| Error::InvalidResponse {
+                operation: "SYNO.FileStation.Info.get".to_owned(),
+                message: "successful response contained no File Station information".to_owned(),
+            })?;
+        Ok(FileStationInfo {
+            hostname: info
+                .hostname
+                .filter(|hostname| !hostname.is_empty())
+                .map(|hostname| BoundedText::sanitized(&hostname)),
+            is_manager: info.is_manager,
+            support_sharing: info.support_sharing,
+            support_virtual_protocol: info
+                .support_virtual_protocol
+                .filter(|protocols| !protocols.is_empty())
+                .map(|protocols| BoundedText::sanitized(&protocols)),
+        })
+    }
+
+    /// Exercise one advertised, read-only capability and report only how DSM answered.
+    ///
+    /// The API name, method, and version are compile-time literals from the caller, and the CGI
+    /// path is routed through [`endpoint_url`], which confines it to the configured origin and
+    /// `webapi/` prefix. Nothing here can reach an API the caller did not name.
+    pub fn probe_capability(&self, spec: CapabilityProbeSpec) -> Result<CapabilityProbe> {
+        let session = self.required_session()?;
+        let url = endpoint_url(&self.base, spec.cgi_path)?;
+        let mut fields = vec![
+            pair("api", spec.api),
+            pair("version", spec.version.to_string()),
+            pair("method", spec.method),
+        ];
+        fields.extend(spec.parameters.iter().cloned());
+        fields.push(pair("_sid", session.sid.to_string()));
+        if let Some(token) = &session.syno_token {
+            fields.push(pair("SynoToken", token.to_string()));
+        }
+        let fields = Zeroizing::new(fields);
+
+        let mut record = ApiCallDetail::started(
+            spec.api,
+            spec.method,
+            spec.version,
+            route_text(&url),
+            RequestTransport::Form,
+        );
+        record.session = self.session_transport(&fields);
+        record.request_fields = u16::try_from(fields.len()).unwrap_or(u16::MAX);
+        let timeout = self.remaining_control_timeout(SESSION_CONFIRMATION_TIMEOUT)?;
+        record.timeout_ms = duration_millis_saturating(timeout);
+        self.observe(ApiObservation::CallStarted(record));
+
+        let mut facts = ResponseFacts::default();
+        let started = Instant::now();
+        let outcome = self
+            .with_blocking_session_headers(self.http.post(url))?
+            .timeout(timeout)
+            .form(&*fields)
+            .send()
+            .map_err(|source| Error::Http {
+                operation: format!("{}.{}", spec.api, spec.method),
+                source,
+            })
+            .and_then(|response| {
+                decode_response_observed::<Value>(response, spec.api, spec.method, &mut facts)
+            });
+        record.elapsed_ms = duration_millis_saturating(started.elapsed());
+        apply_response_facts(&mut record, facts);
+        apply_outcome(&mut record, &outcome, spec.api);
+        self.observe(ApiObservation::CallCompleted(record));
+        Ok(CapabilityProbe {
+            api: spec.api,
+            method: spec.method,
+            version: spec.version,
+            outcome: record.outcome,
+            dsm_code: record.dsm_code,
+            http_status: record.http_status,
+            elapsed_ms: record.elapsed_ms,
+        })
+    }
+
     pub fn create_folder(&self, remote_path: &str) -> Result<()> {
         let (parent, name) = parent_and_name(remote_path)?;
         let parameters = vec![
@@ -1942,6 +2780,7 @@ impl ApiClient {
                 .text("overwrite", overwrite.to_string())
                 .text("mtime", local.mtime_ms.to_string())
                 .text("_sid", session.sid.to_string());
+            let syno_token_attached = session.syno_token.is_some();
             if let Some(token) = &session.syno_token {
                 form = form.text("SynoToken", token.to_string());
             }
@@ -1950,17 +2789,46 @@ impl ApiClient {
 
             let url = self.api_url("SYNO.FileStation.Upload")?;
             let operation = format!("uploading {}", local.relative);
+            let mut record = ApiCallDetail::started(
+                "SYNO.FileStation.Upload",
+                "upload",
+                2,
+                route_text(&url),
+                RequestTransport::Multipart,
+            );
+            record.attempt = attempt + 1;
+            record.max_attempts = self.retries + 1;
+            // The multipart form carries the same session material the form path does, built
+            // field by field just above; describe it the same way rather than re-deriving it.
+            record.session = SessionTransport {
+                cookie_header: true,
+                syno_token_header: syno_token_attached,
+                sid_field: true,
+                syno_token_field: syno_token_attached,
+            };
+            record.request_bytes = local.size;
+            record.timeout_ms = duration_millis_saturating(self.upload_timeout);
+            self.observe(ApiObservation::CallStarted(record));
+            let started = Instant::now();
             let request = self.with_blocking_session_headers(self.http.post(url))?;
+            let mut facts = ResponseFacts::default();
             let result = match request.timeout(self.upload_timeout).multipart(form).send() {
-                Ok(response) => {
-                    decode_response::<Value>(response, "SYNO.FileStation.Upload", "upload")
-                        .map(|_| ())
-                }
+                Ok(response) => decode_response_observed::<Value>(
+                    response,
+                    "SYNO.FileStation.Upload",
+                    "upload",
+                    &mut facts,
+                )
+                .map(|_| ()),
                 Err(source) => Err(Error::Http {
                     operation: operation.clone(),
                     source,
                 }),
             };
+            record.elapsed_ms = duration_millis_saturating(started.elapsed());
+            apply_response_facts(&mut record, facts);
+            apply_outcome(&mut record, &result, "SYNO.FileStation.Upload");
+            self.observe(ApiObservation::CallCompleted(record));
             let result = prioritize_observer_cancellation(&observer_cancelled, result);
             match result {
                 Ok(()) => {
@@ -2070,17 +2938,26 @@ impl ApiClient {
             pair("method", "query"),
             pair("query", DISCOVERY_APIS.join(",")),
         ];
-        self.send_form_with_retry(url, fields, "SYNO.API.Info", "query", true)?
+        self.send_form_with_retry(url, fields, "SYNO.API.Info", 1, "query", true)?
             .ok_or_else(|| Error::InvalidResponse {
                 operation: "SYNO.API.Info.query".to_owned(),
                 message: "successful response contained no API map".to_owned(),
             })
     }
 
-    fn list_directory(&self, folder: &str) -> Result<Vec<RemoteItemWire>> {
+    /// Read every page of one directory listing.
+    ///
+    /// A directory large enough to paginate is checked once per page so a Ctrl-C during the
+    /// remote scan is not held until the whole directory has been drained.
+    fn list_directory(
+        &self,
+        folder: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<RemoteItemWire>> {
         let mut offset = 0_usize;
         let mut output = Vec::new();
         loop {
+            cancellation.check()?;
             let parameters = vec![
                 pair("folder_path", json_string(folder)?),
                 pair("offset", offset.to_string()),
@@ -2166,30 +3043,30 @@ impl ApiClient {
 
     fn call<T: DeserializeOwned>(
         &self,
-        api: &str,
+        api: &'static str,
         version: u32,
-        method: &str,
+        method: &'static str,
         parameters: Vec<(String, String)>,
         allow_retry: bool,
     ) -> Result<Option<T>> {
         self.validate_api(api, version)?;
         let fields = self.authenticated_fields(api, version, method, parameters)?;
         let url = self.api_url(api)?;
-        self.send_form_with_retry(url, fields, api, method, allow_retry)
+        self.send_form_with_retry(url, fields, api, version, method, allow_retry)
     }
 
     fn call_bounded<T: DeserializeOwned>(
         &self,
-        api: &str,
+        api: &'static str,
         version: u32,
-        method: &str,
+        method: &'static str,
         parameters: Vec<(String, String)>,
         timeout: Duration,
     ) -> Result<Option<T>> {
         self.validate_api(api, version)?;
         let fields = self.authenticated_fields(api, version, method, parameters)?;
         let url = self.api_url(api)?;
-        self.send_form_once_with_timeout(url, fields, api, method, timeout)
+        self.send_form_once_with_timeout(url, fields, api, version, method, timeout)
     }
 
     fn authenticated_fields(
@@ -2217,8 +3094,9 @@ impl ApiClient {
         &self,
         url: Url,
         fields: Vec<(String, String)>,
-        api: &str,
-        method: &str,
+        api: &'static str,
+        version: u32,
+        method: &'static str,
         allow_retry: bool,
     ) -> Result<Option<T>> {
         // These owned copies can include SID/SynoToken values. Erase them after the final
@@ -2226,10 +3104,47 @@ impl ApiClient {
         let fields = Zeroizing::new(fields);
         let attempts = if allow_retry { self.retries } else { 0 };
         for attempt in 0..=attempts {
-            let result = self.send_form_once(url.clone(), fields.to_vec(), api, method);
+            let result = self.send_attempt(
+                url.clone(),
+                fields.to_vec(),
+                AttemptContext {
+                    api,
+                    version,
+                    method,
+                    timeout: self.control_timeout,
+                    attempt: attempt + 1,
+                    max_attempts: attempts + 1,
+                },
+                &mut ResponseFacts::default(),
+            );
             match result {
                 Ok(value) => return Ok(value),
-                Err(error) if attempt < attempts && retryable(&error) => retry_pause(attempt),
+                // The pause is this loop's cancellation point, and the only one it may have.
+                // `sleep_cancellable` checks the token before every slice and once more on the
+                // way out, so a cancelled run never reaches the next attempt. The check
+                // deliberately does not move to the top of the loop: `attempts` is zero whenever
+                // a caller passed `allow_retry: false` -- the non-recursive delete and the
+                // task-stop requests do -- and a guard there would refuse the single request
+                // those paths depend on, turning cancellation into abandoned remote state.
+                Err(error) if attempt < attempts && retryable(&error) => {
+                    // Report the wait that is about to happen, not merely that one will: a log
+                    // showing four attempts without their backoff cannot explain where the
+                    // wall-clock time went.
+                    let mut record = ApiCallDetail::started(
+                        api,
+                        method,
+                        version,
+                        route_text(&url),
+                        RequestTransport::Form,
+                    );
+                    record.attempt = attempt + 1;
+                    record.max_attempts = attempts + 1;
+                    record.retry_backoff_ms =
+                        Some(duration_millis_saturating(retry_backoff(attempt)));
+                    record.outcome = RequestOutcome::Transport;
+                    self.observe(ApiObservation::CallStarted(record));
+                    retry_pause_cancellable(attempt, &self.cancellation)?;
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -2240,35 +3155,93 @@ impl ApiClient {
         &self,
         url: Url,
         fields: Vec<(String, String)>,
-        api: &str,
-        method: &str,
+        api: &'static str,
+        version: u32,
+        method: &'static str,
     ) -> Result<Option<T>> {
-        self.send_form_once_with_timeout(url, fields, api, method, self.control_timeout)
+        self.send_form_once_with_timeout(url, fields, api, version, method, self.control_timeout)
     }
 
     fn send_form_once_with_timeout<T: DeserializeOwned>(
         &self,
         url: Url,
         fields: Vec<(String, String)>,
-        api: &str,
-        method: &str,
+        api: &'static str,
+        version: u32,
+        method: &'static str,
         timeout: Duration,
     ) -> Result<Option<T>> {
-        let timeout = self.remaining_control_timeout(timeout)?;
+        self.send_attempt(
+            url,
+            fields,
+            AttemptContext::single(api, version, method, timeout),
+            &mut ResponseFacts::default(),
+        )
+    }
+
+    /// Send one form request and report it to any installed observer.
+    ///
+    /// This is the single choke point every DSM control request passes through, so instrumenting
+    /// it here is what makes a whole failing run legible from one log instead of costing a round
+    /// trip per unanswered question.
+    fn send_attempt<T: DeserializeOwned>(
+        &self,
+        url: Url,
+        fields: Vec<(String, String)>,
+        context: AttemptContext,
+        facts: &mut ResponseFacts,
+    ) -> Result<Option<T>> {
+        let AttemptContext {
+            api,
+            version,
+            method,
+            attempt,
+            max_attempts,
+            ..
+        } = context;
+        let timeout = self.remaining_control_timeout(context.timeout)?;
+        // This blocking `send` is the one wait on the control plane that cancellation cannot
+        // shorten. It is self-bounded by `MAX_CONTROL_REQUEST_TIMEOUT`, and because retries now
+        // abandon their backoff on cancellation, a cancelled run waits out at most one of these
+        // windows rather than accumulating one per attempt. Slicing it would mean either moving
+        // every control call onto the async client or leaving a detached thread holding a live
+        // session and its zeroizing field copy; a second Ctrl-C exits immediately instead.
+        //
         // Passwords, OTPs, and session values enter this owned form field list. reqwest must
         // still serialize its own request-body copy, but this caller-owned copy is short-lived
         // and explicitly erased.
         let fields = Zeroizing::new(fields);
-        let request = self.with_blocking_session_headers(self.http.post(url))?;
-        let response = request
+
+        let mut record = ApiCallDetail::started(
+            api,
+            method,
+            version,
+            route_text(&url),
+            RequestTransport::Form,
+        );
+        record.attempt = attempt;
+        record.max_attempts = max_attempts;
+        record.session = self.session_transport(&fields);
+        record.request_fields = u16::try_from(fields.len()).unwrap_or(u16::MAX);
+        record.timeout_ms = duration_millis_saturating(timeout);
+        self.observe(ApiObservation::CallStarted(record));
+
+        let started = Instant::now();
+        let outcome = self
+            .with_blocking_session_headers(self.http.post(url))?
             .timeout(timeout)
             .form(&*fields)
             .send()
             .map_err(|source| Error::Http {
                 operation: format!("{api}.{method}"),
                 source,
-            })?;
-        decode_response(response, api, method)
+            })
+            .and_then(|response| decode_response_observed(response, api, method, facts));
+        record.elapsed_ms = duration_millis_saturating(started.elapsed());
+        apply_response_facts(&mut record, *facts);
+        apply_outcome(&mut record, &outcome, api);
+        self.observe(ApiObservation::CallCompleted(record));
+        outcome
     }
 
     fn remaining_control_timeout(&self, requested: Duration) -> Result<Duration> {
@@ -2380,6 +3353,23 @@ struct LoginData {
     sid: String,
     #[serde(default)]
     synotoken: Option<String>,
+}
+
+/// `SYNO.FileStation.Info` version 2 `get`.
+///
+/// Every field is optional. Synology's own guide is inconsistent between its prose
+/// (`support_virtual_protocol`) and its worked example (`support_virtual`), so both spellings are
+/// accepted rather than one of them being guessed at.
+#[derive(Debug, Deserialize)]
+struct FileStationInfoWire {
+    #[serde(default)]
+    hostname: Option<String>,
+    #[serde(default)]
+    is_manager: bool,
+    #[serde(default)]
+    support_sharing: bool,
+    #[serde(default, alias = "support_virtual")]
+    support_virtual_protocol: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2736,12 +3726,29 @@ fn duration_millis_saturating(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn decode_response<T: DeserializeOwned>(
+/// Decode a response and record the facts that stop being observable once the body is read.
+///
+/// `Set-Cookie` and `Location` are read as presence and host respectively, before the body is
+/// consumed. Neither header value is retained.
+fn decode_response_observed<T: DeserializeOwned>(
     mut response: Response,
     api: &str,
     method: &str,
+    facts: &mut ResponseFacts,
 ) -> Result<Option<T>> {
     let status = response.status();
+    facts.http_status = Some(status.as_u16());
+    // Read here rather than in `decode_response_body`, which receives only the status and the
+    // body bytes: by then the headers are gone. Whether DSM rotates the session on a *successful*
+    // response is the fact that distinguishes a stale client-held identifier from a rejected one.
+    (facts.set_cookie_count, facts.set_cookie_names) = set_cookie_names(response.headers());
+    facts.cookies = cookie_facts(response.headers());
+    facts.intermediary = intermediary_facts(response.headers());
+    facts.redirect_host = response
+        .headers()
+        .get(LOCATION)
+        .and_then(|location| location.to_str().ok())
+        .and_then(redirect_host);
     // Successful authentication responses contain the SID and may contain a SynoToken;
     // challenge responses can contain a short-lived challenge token. Erase the raw response
     // allocation after decoding. Deserialized and reqwest-owned intermediary allocations are
@@ -2755,6 +3762,7 @@ fn decode_response<T: DeserializeOwned>(
             operation: format!("{api}.{method}"),
             source,
         })?;
+    facts.response_bytes = body.len() as u64;
     if body.len() as u64 > MAX_JSON_RESPONSE {
         return Err(Error::InvalidResponse {
             operation: format!("{api}.{method}"),
@@ -2845,7 +3853,7 @@ fn error_details(value: Value) -> Vec<Value> {
     }
 }
 
-pub(crate) fn normalize_base_url(input: &str, allow_http: bool) -> Result<Url> {
+pub fn normalize_base_url(input: &str, allow_http: bool) -> Result<Url> {
     let raw = input.trim();
     let normalized = if raw.ends_with('/') {
         raw.to_owned()
@@ -2867,6 +3875,377 @@ pub(crate) fn normalize_base_url(input: &str, allow_http: bool) -> Result<Url> {
         ));
     }
     Ok(url)
+}
+
+/// Describe a connected client's transport identity.
+///
+/// `normalize_base_url` has already rejected credentials, a query, and a fragment, so only the
+/// host and path remain, and both still pass the record sanitizer on the way in.
+fn connection_detail(base: &Url, options: &ClientOptions) -> ConnectionDetail {
+    ConnectionDetail {
+        scheme: if base.scheme() == "http" {
+            UrlScheme::Http
+        } else {
+            UrlScheme::Https
+        },
+        host: BoundedText::sanitized(base.host_str().unwrap_or_default()),
+        port: base.port(),
+        base_path: BoundedText::sanitized(base.path()),
+        certificate_verification: if options.accept_invalid_certs {
+            CertificateVerification::Disabled
+        } else if options.ca_certificate.is_some() {
+            CertificateVerification::CustomCa
+        } else {
+            CertificateVerification::Enabled
+        },
+    }
+}
+
+/// Load the operator's pinned CA, rejecting a file that pins nothing.
+///
+/// The rustls backend only stores the PEM bytes here and parses them when the client is built, so
+/// a file holding no CERTIFICATE section at all -- an empty, truncated, or simply mistaken file --
+/// would be accepted in silence and leave the operator believing a CA was pinned when nothing was
+/// added to the trust store. Counting the sections up front makes that loud; an unreadable payload
+/// is deliberately left to surface where reqwest actually rejects it, when the client is built.
+fn load_ca_certificate(path: &std::path::Path) -> Result<Certificate> {
+    let pem = fs::read(path).map_err(|source| Error::FileIo {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if Certificate::from_pem_bundle(&pem).is_ok_and(|certificates| certificates.is_empty()) {
+        return Err(Error::Message(format!(
+            "CA certificate file {path:?} contains no certificate; --ca-certificate must name a PEM file with at least one CERTIFICATE block"
+        )));
+    }
+    Certificate::from_pem(&pem).map_err(|source| Error::Http {
+        operation: format!("loading CA certificate {path:?}"),
+        source,
+    })
+}
+
+/// Longest a transport probe request may run before it is abandoned.
+///
+/// Far shorter than the control-request timeout, and deliberately so. The probe measures latency;
+/// it does not need the answer. An endpoint that has not produced a first byte in this long has
+/// already told the probe everything a longer wait would, and every second past that is a second
+/// added to a diagnostic an operator is watching.
+const PROBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// A blocking client for transport probes, trusting exactly what the control client trusts.
+///
+/// Connection reuse is switched off so every request this client makes pays for a fresh DNS
+/// lookup, TCP connect, and TLS handshake. That is the opposite of what the control client wants
+/// and precisely what a latency measurement needs: a pooled second request would report the cost
+/// of an already-open socket and hide the very variance the probe exists to find.
+pub(crate) fn probe_client(options: &ClientOptions) -> Result<HttpClient> {
+    let mut builder = HttpClient::builder()
+        .connect_timeout(options.connect_timeout.min(PROBE_REQUEST_TIMEOUT))
+        .timeout(control_request_timeout(options.request_timeout).min(PROBE_REQUEST_TIMEOUT))
+        .redirect(Policy::none())
+        .pool_max_idle_per_host(0)
+        .user_agent(concat!("synology-drive-sync/", env!("SDSYNC_VERSION")));
+    if options.accept_invalid_certs {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    if let Some(path) = &options.ca_certificate {
+        builder = builder.add_root_certificate(load_ca_certificate(path)?);
+    }
+    builder.build().map_err(|source| Error::Http {
+        operation: "building transport probe client".to_owned(),
+        source,
+    })
+}
+
+/// The path component of a request URL, for instrumentation.
+///
+/// Deliberately the path alone: the host is reported once by [`connection_detail`], and a query
+/// string is never included because DSM control requests carry their parameters in the body.
+fn route_text(url: &Url) -> BoundedText {
+    BoundedText::sanitized(url.path())
+}
+
+/// The cookie *names* a response set, comma separated, with how many it set.
+///
+/// Only the text before the first `=` of each `Set-Cookie` header is kept. A cookie value -- which
+/// for DSM is a live session identifier -- is dropped with the rest of the header, along with every
+/// attribute after the first `;`. The result still passes the record sanitizer.
+fn set_cookie_names(headers: &HeaderMap) -> (u16, BoundedText) {
+    let mut count = 0_u16;
+    let mut names = String::new();
+    for header in headers.get_all(SET_COOKIE) {
+        count = count.saturating_add(1);
+        let Ok(text) = header.to_str() else {
+            continue;
+        };
+        let name = text
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .split('=')
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if name.is_empty() {
+            continue;
+        }
+        if !names.is_empty() {
+            names.push(',');
+        }
+        names.push_str(name);
+    }
+    (count, BoundedText::sanitized(&names))
+}
+
+/// Per-process salt for cookie value digests.
+///
+/// Drawn once at first use from the wall clock and the process id, which is enough that a digest
+/// printed by one run cannot be lined up against one printed by another. This is not the reason
+/// the digest is safe -- 32 bits folded out of a keyed hash of a forty-character opaque token is
+/// not invertible with or without a salt -- it simply removes the question entirely.
+fn cookie_fingerprint_salt() -> u64 {
+    static SALT: OnceLock<u64> = OnceLock::new();
+    *SALT.get_or_init(|| {
+        let nanos = UNIX_EPOCH
+            .elapsed()
+            .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
+            .unwrap_or(0x9e37_79b9_7f4a_7c15);
+        nanos.rotate_left(17).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ u64::from(std::process::id()).wrapping_mul(0xff51_afd7_ed55_8ccd)
+    })
+}
+
+/// A salted digest of a cookie value, for equality comparison and nothing else.
+///
+/// The value is read, folded, and dropped: no part of it is stored, returned, or recoverable from
+/// the result.
+fn cookie_fingerprint(value: &str) -> u32 {
+    // FNV-1a, seeded with the per-process salt rather than the published offset basis.
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ cookie_fingerprint_salt();
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // Folded to 32 bits because the report only compares digests for equality, and a short token
+    // is what an operator can actually scan down a column of call records.
+    (((hash >> 32) ^ hash) & 0xffff_ffff) as u32
+}
+
+/// Describe one `Set-Cookie` header: its name, its attributes, and a digest of its value.
+///
+/// The value is used to compute the digest and its length, and is then dropped. Attribute names
+/// are matched case-insensitively, as RFC 6265 requires. `Path` and `Domain` are recorded as
+/// presence only, because a `Domain` names the scope an intermediary claims and presence answers
+/// the diagnostic question without publishing it.
+fn describe_set_cookie(header: &str) -> Option<CookieFact> {
+    let mut parts = header.split(';');
+    let (name, value) = parts.next()?.trim().split_once('=')?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let value = value.trim();
+    let mut fact = CookieFact {
+        name: ShortToken::sanitized(name),
+        fingerprint: cookie_fingerprint(value),
+        value_length: u16::try_from(value.len()).unwrap_or(u16::MAX),
+        ..CookieFact::default()
+    };
+    let mut max_age: Option<i64> = None;
+    for attribute in parts {
+        let (key, attribute_value) = match attribute.trim().split_once('=') {
+            Some((key, attribute_value)) => (key.trim(), attribute_value.trim()),
+            None => (attribute.trim(), ""),
+        };
+        if key.eq_ignore_ascii_case("expires") {
+            fact.expires_present = true;
+        } else if key.eq_ignore_ascii_case("max-age") {
+            fact.max_age_present = true;
+            max_age = attribute_value.parse().ok();
+        } else if key.eq_ignore_ascii_case("secure") {
+            fact.secure = true;
+        } else if key.eq_ignore_ascii_case("httponly") {
+            fact.http_only = true;
+        } else if key.eq_ignore_ascii_case("path") {
+            fact.path_present = true;
+        } else if key.eq_ignore_ascii_case("domain") {
+            fact.domain_present = true;
+        } else if key.eq_ignore_ascii_case("samesite") {
+            fact.same_site = if attribute_value.eq_ignore_ascii_case("strict") {
+                CookieSameSite::Strict
+            } else if attribute_value.eq_ignore_ascii_case("lax") {
+                CookieSameSite::Lax
+            } else if attribute_value.eq_ignore_ascii_case("none") {
+                CookieSameSite::None
+            } else {
+                CookieSameSite::Unrecognized
+            };
+        }
+    }
+    fact.persistence = if max_age.is_some_and(|seconds| seconds <= 0)
+        || (value.is_empty() && (fact.expires_present || fact.max_age_present))
+    {
+        CookiePersistence::Deletion
+    } else if fact.expires_present || fact.max_age_present {
+        CookiePersistence::Persistent
+    } else {
+        CookiePersistence::Session
+    };
+    Some(fact)
+}
+
+/// Describe every cookie a response set, up to the record's fixed capacity.
+pub(crate) fn cookie_facts(headers: &HeaderMap) -> CookieFacts {
+    let mut facts = CookieFacts::default();
+    for header in headers.get_all(SET_COOKIE) {
+        match header.to_str().ok().and_then(describe_set_cookie) {
+            Some(fact) => facts.push(fact),
+            // A header that is not valid UTF-8, or carries no `name=`, is still evidence that
+            // something set a cookie. Counting it keeps the record from claiming to be complete.
+            None => facts.push_undescribed(),
+        }
+    }
+    facts
+}
+
+/// Recognise a caching or content-delivery intermediary from the headers it adds.
+fn cdn_marker(headers: &HeaderMap) -> CdnMarker {
+    let present = |name: &str| headers.contains_key(name);
+    let server_mentions = |needle: &str| {
+        headers
+            .get("server")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.to_ascii_lowercase().contains(needle))
+    };
+    if present("cf-ray") || present("cf-cache-status") || server_mentions("cloudflare") {
+        CdnMarker::Cloudflare
+    } else if present("x-amz-cf-id") || present("x-amz-cf-pop") || server_mentions("cloudfront") {
+        CdnMarker::CloudFront
+    } else if present("x-served-by") || present("fastly-io-info") || server_mentions("fastly") {
+        CdnMarker::Fastly
+    } else if present("x-akamai-transformed") || present("akamai-grn") {
+        CdnMarker::Akamai
+    } else if present("x-varnish") || server_mentions("varnish") {
+        CdnMarker::Varnish
+    } else if present("x-cache") || present("x-cache-hits") || present("x-proxy-cache") {
+        CdnMarker::Other
+    } else {
+        CdnMarker::None
+    }
+}
+
+/// How many cookies a response set under a name DSM itself never uses.
+///
+/// A load balancer's affinity cookie is the clearest single sign that requests are being pinned
+/// -- or, when it is absent from a relay, that nothing is pinning them at all.
+fn foreign_cookie_count(headers: &HeaderMap) -> u16 {
+    let mut count = 0_u16;
+    for header in headers.get_all(SET_COOKIE) {
+        let Ok(text) = header.to_str() else {
+            continue;
+        };
+        let name = text
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .split('=')
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if !name.is_empty()
+            && !DSM_COOKIE_NAMES
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(name))
+        {
+            count = count.saturating_add(1);
+        }
+    }
+    count
+}
+
+/// Fingerprint the machinery between this client and DSM from one response's headers.
+///
+/// Banner values are kept, bounded and sanitized: naming the proxy is the entire point of the
+/// check, and the same records already name a redirect's host. Nothing here reads a cookie value,
+/// a body, or a request header.
+pub(crate) fn intermediary_facts(headers: &HeaderMap) -> IntermediaryFacts {
+    let banner = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(ShortToken::sanitized)
+            .unwrap_or_default()
+    };
+    IntermediaryFacts {
+        via: banner("via"),
+        server: banner("server"),
+        powered_by: banner("x-powered-by"),
+        // These are request headers. Meeting one in a *response* means something on the path
+        // echoed it back, which only a proxy that rewrites them does.
+        forwarded_for_reflected: headers.contains_key("x-forwarded-for")
+            || headers.contains_key("forwarded"),
+        real_ip_reflected: headers.contains_key("x-real-ip") || headers.contains_key("x-client-ip"),
+        cdn_marker: cdn_marker(headers),
+        foreign_cookie_count: foreign_cookie_count(headers),
+    }
+}
+
+/// The host of a redirect target, or `None` when the target is relative.
+///
+/// Only the host is retained. A relay's `Location` can carry query parameters, and those are
+/// exactly the sort of reflected request state this crate withholds everywhere else.
+fn redirect_host(location: &str) -> Option<BoundedText> {
+    Url::parse(location)
+        .ok()
+        .and_then(|url| url.host_str().map(BoundedText::sanitized))
+}
+
+/// Fold the pre-body response facts into the record that will be reported.
+fn apply_response_facts(record: &mut ApiCallDetail, facts: ResponseFacts) {
+    record.http_status = facts.http_status;
+    record.set_cookie_count = facts.set_cookie_count;
+    record.set_cookie_names = facts.set_cookie_names;
+    record.cookies = facts.cookies;
+    record.intermediary = facts.intermediary;
+    record.redirect_host = facts.redirect_host;
+    record.response_bytes = facts.response_bytes;
+}
+
+/// Fold a decoded result into the record that will be reported.
+fn apply_outcome<T>(record: &mut ApiCallDetail, result: &Result<T>, api: &str) {
+    let (outcome, dsm_code, dsm_description) = classify_outcome(result, api);
+    record.outcome = outcome;
+    record.dsm_code = dsm_code;
+    record.dsm_description = dsm_description;
+}
+
+/// Classify a decoded response for instrumentation.
+///
+/// The DSM description is re-derived from [`api_error_description`] rather than parsed out of
+/// `Error::Api`'s pre-formatted string, so the record holds a compile-time literal.
+fn classify_outcome<T>(
+    result: &Result<T>,
+    api: &str,
+) -> (RequestOutcome, Option<i64>, Option<&'static str>) {
+    match result {
+        Ok(_) => (RequestOutcome::Ok, None, None),
+        Err(Error::Api { code, .. }) => (
+            RequestOutcome::DsmError,
+            Some(*code),
+            api_error_description(api, *code),
+        ),
+        Err(Error::HttpStatus { status, .. }) => (
+            if status.is_redirection() {
+                RequestOutcome::Redirect
+            } else {
+                RequestOutcome::HttpStatus
+            },
+            None,
+            None,
+        ),
+        Err(Error::InvalidResponse { .. }) => (RequestOutcome::Decode, None, None),
+        Err(_) => (RequestOutcome::Transport, None, None),
+    }
 }
 
 fn endpoint_url(base: &Url, discovered_path: &str) -> Result<Url> {
@@ -3326,6 +4705,14 @@ fn json_array<'a>(values: impl IntoIterator<Item = &'a str>) -> Result<String> {
         .map_err(|error| Error::Message(format!("failed to JSON-encode API parameter: {error}")))
 }
 
+/// Encode values as the JSON array File Station's list-shaped parameters expect.
+///
+/// Exposed so a caller assembling a [`CapabilityProbeSpec`] encodes a `path` exactly the way
+/// every other call site does, rather than hand-building a string that quotes differently.
+pub fn json_array_of<'a>(values: impl IntoIterator<Item = &'a str>) -> Result<String> {
+    json_array(values)
+}
+
 fn pair(key: impl Into<String>, value: impl Into<String>) -> (String, String) {
     (key.into(), value.into())
 }
@@ -3390,14 +4777,17 @@ fn control_request_timeout(upload_timeout: Duration) -> Duration {
     upload_timeout.min(MAX_CONTROL_REQUEST_TIMEOUT)
 }
 
-fn retry_pause(attempt: u32) {
+/// The backoff for one retry attempt.
+///
+/// Extracted from the pause itself so instrumentation can report the wait that is about to happen
+/// without duplicating the schedule.
+fn retry_backoff(attempt: u32) -> Duration {
     let multiplier = 1_u64 << attempt.min(4);
-    thread::sleep(Duration::from_millis(250 * multiplier));
+    Duration::from_millis(250 * multiplier)
 }
 
 fn retry_pause_cancellable(attempt: u32, cancellation: &CancellationToken) -> Result<()> {
-    let multiplier = 1_u64 << attempt.min(4);
-    sleep_cancellable(Duration::from_millis(250 * multiplier), cancellation)
+    sleep_cancellable(retry_backoff(attempt), cancellation)
 }
 
 fn looks_like_html(body: &[u8]) -> bool {
@@ -3413,14 +4803,23 @@ fn response_snippet(body: &[u8]) -> String {
         .collect()
 }
 
+/// Redirects are refused so credentials cannot cross an origin.
+pub const REDIRECT_REFUSED_HINT: &str = "redirects are disabled to prevent credentials crossing origins; expose /webapi/* directly at the configured HTTPS URL";
+/// The proxy rejected the body before File Station saw it.
+pub const BODY_TOO_LARGE_HINT: &str =
+    "request body is larger than the reverse proxy permits; raise its upload/body-size limit";
+/// The proxy answered, but could not reach DSM behind it.
+pub const BAD_GATEWAY_HINT: &str = "reverse proxy could not reach the File Station backend";
+/// The proxy gave up before DSM answered.
+pub const GATEWAY_TIMEOUT_HINT: &str =
+    "reverse proxy timed out; raise its send/read timeout for large uploads";
+
 fn http_status_hint(status: StatusCode, body: &[u8]) -> String {
     match status.as_u16() {
-        301 | 302 | 303 | 307 | 308 => {
-            "redirects are disabled to prevent credentials crossing origins; expose /webapi/* directly at the configured HTTPS URL".to_owned()
-        }
-        413 => "request body is larger than the reverse proxy permits; raise its upload/body-size limit".to_owned(),
-        502 => "reverse proxy could not reach the File Station backend".to_owned(),
-        504 => "reverse proxy timed out; raise its send/read timeout for large uploads".to_owned(),
+        301 | 302 | 303 | 307 | 308 => REDIRECT_REFUSED_HINT.to_owned(),
+        413 => BODY_TOO_LARGE_HINT.to_owned(),
+        502 => BAD_GATEWAY_HINT.to_owned(),
+        504 => GATEWAY_TIMEOUT_HINT.to_owned(),
         _ => {
             let snippet = response_snippet(body);
             if snippet.is_empty() {
@@ -3490,8 +4889,213 @@ mod tests {
     use std::time::SystemTime;
 
     use super::*;
+    use crate::observability::MAX_DESCRIBED_COOKIES;
 
     const SCRIPTED_SERVER_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Reporting that DSM rotated the session must never report *what it rotated it to*.
+    ///
+    /// A `Set-Cookie` value is a live session identifier, so this pins the split: names before the
+    /// first `=` are kept, and everything from that `=` onwards is dropped with the attributes.
+    #[test]
+    fn set_cookie_reporting_keeps_names_and_drops_every_value() {
+        let secret = "9c7f1d2e5b8a4f60ab3d";
+        let mut headers = HeaderMap::new();
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::from_str(&format!(
+                "id={secret}; Path=/; HttpOnly; SameSite=Strict; Max-Age=3600"
+            ))
+            .unwrap(),
+        );
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::from_str("stay_login=1; Path=/webapi").unwrap(),
+        );
+
+        let (count, names) = set_cookie_names(&headers);
+        assert_eq!(count, 2);
+        assert_eq!(names.as_str(), "id,stay_login");
+        // The decisive assertion: neither the value nor any attribute survives.
+        for leaked in [secret, "Path", "HttpOnly", "SameSite", "Max-Age", "="] {
+            assert!(
+                !names.as_str().contains(leaked),
+                "cookie reporting leaked {leaked:?}: {names}"
+            );
+        }
+
+        // A response that sets nothing reports nothing.
+        let (count, names) = set_cookie_names(&HeaderMap::new());
+        assert_eq!(count, 0);
+        assert!(names.is_empty());
+
+        // A malformed header still cannot smuggle a value through.
+        let mut headers = HeaderMap::new();
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::from_str("  spaced_name  =  value=with=equals  ").unwrap(),
+        );
+        let (count, names) = set_cookie_names(&headers);
+        assert_eq!(count, 1);
+        assert_eq!(names.as_str(), "spaced_name");
+    }
+
+    /// The described-cookie record must carry every attribute and none of the value.
+    #[test]
+    fn a_described_cookie_carries_its_attributes_and_never_its_value() {
+        let secret = "hgU9_TnMzBqXwLpR7vKd2eFsA4Yj6Nc1QoZi8Wm3Xb5";
+        let mut headers = HeaderMap::new();
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::from_str(&format!(
+                "id={secret}; Path=/; HttpOnly; Secure; SameSite=Lax; Domain=nas.example.test"
+            ))
+            .unwrap(),
+        );
+
+        let facts = cookie_facts(&headers);
+        let described = facts.described().collect::<Vec<_>>();
+        assert_eq!(described.len(), 1);
+        let cookie = described[0];
+        assert_eq!(cookie.name.as_str(), "id");
+        assert!(cookie.secure);
+        assert!(cookie.http_only);
+        assert_eq!(cookie.same_site, CookieSameSite::Lax);
+        assert!(cookie.path_present);
+        assert!(cookie.domain_present);
+        assert!(!cookie.expires_present);
+        assert!(!cookie.max_age_present);
+        // No expiry attribute at all: a session cookie, not a stored one.
+        assert_eq!(cookie.persistence, CookiePersistence::Session);
+        assert_eq!(usize::from(cookie.value_length), secret.len());
+
+        // The decisive assertion: nothing derived from the value is recoverable from the record,
+        // including through its own `Debug`, which the error paths could otherwise print.
+        let rendered = format!("{cookie:?}");
+        assert!(
+            !rendered.contains(secret),
+            "described cookie leaked its value: {rendered}"
+        );
+        for fragment in [&secret[..8], "nas.example.test"] {
+            assert!(
+                !rendered.contains(fragment),
+                "described cookie leaked {fragment:?}: {rendered}"
+            );
+        }
+
+        // The same value hashes the same way within a process, and a different value does not.
+        assert_eq!(cookie_fingerprint(secret), cookie_fingerprint(secret));
+        assert_ne!(
+            cookie_fingerprint(secret),
+            cookie_fingerprint("a-different-value")
+        );
+    }
+
+    #[test]
+    fn expiry_attributes_separate_session_persistent_and_cleared_cookies() {
+        let described = |header: &str| {
+            let mut headers = HeaderMap::new();
+            headers.append(SET_COOKIE, HeaderValue::from_str(header).unwrap());
+            cookie_facts(&headers)
+                .described()
+                .next()
+                .expect("one described cookie")
+        };
+
+        assert_eq!(
+            described("id=abc; Path=/").persistence,
+            CookiePersistence::Session
+        );
+        assert_eq!(
+            described("stay_login=1; Max-Age=604800").persistence,
+            CookiePersistence::Persistent
+        );
+        assert_eq!(
+            described("stay_login=1; Expires=Wed, 09 Jun 2027 10:18:14 GMT").persistence,
+            CookiePersistence::Persistent
+        );
+        // DSM clears a session on logout with either shape, and both are a deletion rather
+        // than a rotation.
+        assert_eq!(
+            described("id=; Max-Age=0; Path=/").persistence,
+            CookiePersistence::Deletion
+        );
+        assert_eq!(
+            described("id=; Expires=Thu, 01 Jan 1970 00:00:00 GMT").persistence,
+            CookiePersistence::Deletion
+        );
+        // Attribute names are case-insensitive, and SameSite is a closed set.
+        let mixed = described("id=abc; secure; HTTPONLY; samesite=STRICT");
+        assert!(mixed.secure);
+        assert!(mixed.http_only);
+        assert_eq!(mixed.same_site, CookieSameSite::Strict);
+        assert_eq!(
+            described("id=abc; SameSite=Weird").same_site,
+            CookieSameSite::Unrecognized
+        );
+
+        // A header with no `name=` at all is counted rather than described, so the record never
+        // claims a response set fewer cookies than it did.
+        let mut headers = HeaderMap::new();
+        headers.append(SET_COOKIE, HeaderValue::from_str("not-a-cookie").unwrap());
+        let facts = cookie_facts(&headers);
+        assert_eq!(facts.described().count(), 0);
+        assert_eq!(facts.undescribed(), 1);
+    }
+
+    #[test]
+    fn response_headers_fingerprint_the_machinery_in_front_of_dsm() {
+        let mut headers = HeaderMap::new();
+        headers.insert("via", HeaderValue::from_static("1.1 relay.example.test"));
+        headers.insert("server", HeaderValue::from_static("nginx/1.24.0"));
+        headers.insert("x-powered-by", HeaderValue::from_static("PHP/8.2.1"));
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
+        headers.insert("x-real-ip", HeaderValue::from_static("203.0.113.7"));
+        headers.insert("cf-ray", HeaderValue::from_static("8b0e0000abcd-CDG"));
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::from_static("id=session-value; Path=/"),
+        );
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::from_static("AWSALB=affinity-value; Path=/"),
+        );
+
+        let facts = intermediary_facts(&headers);
+        // Sanitized, so the space in the Via chain is substituted rather than dropped.
+        assert_eq!(facts.via.as_str(), "1.1_relay.example.test");
+        assert_eq!(facts.server.as_str(), "nginx/1.24.0");
+        assert_eq!(facts.powered_by.as_str(), "PHP/8.2.1");
+        assert!(facts.forwarded_for_reflected);
+        assert!(facts.real_ip_reflected);
+        assert_eq!(facts.cdn_marker, CdnMarker::Cloudflare);
+        // `id` is DSM's own; the load balancer's affinity cookie is not.
+        assert_eq!(facts.foreign_cookie_count, 1);
+
+        // Nothing announced means nothing is claimed.
+        let bare = intermediary_facts(&HeaderMap::new());
+        assert!(bare.is_empty());
+        assert_eq!(bare.cdn_marker, CdnMarker::None);
+
+        assert!(is_dsm_cookie_name("id"));
+        assert!(is_dsm_cookie_name("STAY_LOGIN"));
+        assert!(!is_dsm_cookie_name("AWSALB"));
+    }
+
+    /// Only the described capacity is described; the rest is counted, never dropped in silence.
+    #[test]
+    fn cookies_beyond_the_record_capacity_are_counted_rather_than_lost() {
+        let mut headers = HeaderMap::new();
+        for index in 0..(MAX_DESCRIBED_COOKIES + 2) {
+            headers.append(
+                SET_COOKIE,
+                HeaderValue::from_str(&format!("cookie{index}=value{index}; Path=/")).unwrap(),
+            );
+        }
+        let facts = cookie_facts(&headers);
+        assert_eq!(facts.described().count(), MAX_DESCRIBED_COOKIES);
+        assert_eq!(usize::from(facts.undescribed()), 2);
+    }
 
     #[derive(Debug)]
     struct CapturedRequest {
@@ -3689,6 +5293,8 @@ mod tests {
             upload_timeout: operation_timeout,
             operation_timeout,
             upload_rate_limit: None,
+            cancellation: CancellationToken::default(),
+            observer: None,
         }
     }
 
@@ -3893,7 +5499,9 @@ mod tests {
         let (base, server) = scripted_server_with_status(vec![(status, body)]);
         let url = Url::parse(&base).unwrap().join("webapi/entry.cgi").unwrap();
         let response = HttpClient::new().post(url).send().unwrap();
-        let error = decode_response::<Value>(response, api, method).unwrap_err();
+        let error =
+            decode_response_observed::<Value>(response, api, method, &mut ResponseFacts::default())
+                .unwrap_err();
         assert_eq!(server.join().unwrap().len(), 1);
         error
     }
@@ -4927,7 +6535,10 @@ mod tests {
         let mut client = connect_test_client(url);
         client.login("alice", "password", None).unwrap();
         let inventory = client
-            .remote_inventory(&RemoteRoot::parse("/share/root").unwrap())
+            .remote_inventory(
+                &RemoteRoot::parse("/share/root").unwrap(),
+                &CancellationToken::default(),
+            )
             .unwrap();
         assert!(inventory.root_exists);
         assert_eq!(inventory.entries.len(), 4);
@@ -5189,7 +6800,10 @@ mod tests {
             let mut client = connect_test_client(url);
             client.login("alice", "password", None).unwrap();
             let error = client
-                .remote_inventory(&RemoteRoot::parse("/share/root").unwrap())
+                .remote_inventory(
+                    &RemoteRoot::parse("/share/root").unwrap(),
+                    &CancellationToken::default(),
+                )
                 .expect_err("an unusable file snapshot must not be stored as zero");
             let Error::InvalidResponse { operation, message } = &error else {
                 panic!("expected a malformed-response error, got {error}");
@@ -5223,7 +6837,10 @@ mod tests {
         let mut client = connect_test_client(url);
         client.login("alice", "password", None).unwrap();
         let inventory = client
-            .remote_inventory(&RemoteRoot::parse("/share/root").unwrap())
+            .remote_inventory(
+                &RemoteRoot::parse("/share/root").unwrap(),
+                &CancellationToken::default(),
+            )
             .unwrap();
         for relative in ["sub", "plain"] {
             let entry = &inventory.entries[relative];
@@ -5339,11 +6956,121 @@ mod tests {
             let mut client = connect_test_client(url);
             client.login("alice", "password", None).unwrap();
             assert!(matches!(
-                client.remote_inventory(&RemoteRoot::parse("/share/root").unwrap()),
+                client.remote_inventory(
+                    &RemoteRoot::parse("/share/root").unwrap(),
+                    &CancellationToken::default()
+                ),
                 Err(Error::InvalidResponse { .. })
             ));
             assert_eq!(server.join().unwrap().len(), 5);
         }
+    }
+
+    /// A directory large enough to paginate used to be walked to completion no matter what, so a
+    /// Ctrl-C during the remote scan was swallowed until the whole listing had been drained.
+    #[test]
+    fn remote_inventory_stops_between_directory_pages_once_cancellation_arrives() {
+        let cancellation = CancellationToken::default();
+        let hook_cancellation = cancellation.clone();
+        let first_page = serde_json::json!({
+            "success": true,
+            "data": {"total": 2, "files": [
+                {"path":"/share/root/a","name":"a","isdir":false,"additional":{"size":1,"time":{"mtime":1}}}
+            ]}
+        })
+        .to_string();
+        let responses = vec![
+            (StatusCode::OK, required_discovery()),
+            (StatusCode::OK, login_response()),
+            (StatusCode::OK, getinfo_directory("/share")),
+            (StatusCode::OK, getinfo_directory("/share/root")),
+            (StatusCode::OK, first_page),
+        ];
+        // Cancel while the first page is being served, exactly as the signal handler would.
+        let (url, server) = scripted_server_with_status_hook(responses, move |index| {
+            if index == 4 {
+                hook_cancellation.cancel();
+            }
+        });
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+
+        assert!(matches!(
+            client.remote_inventory(&RemoteRoot::parse("/share/root").unwrap(), &cancellation),
+            Err(Error::Cancelled)
+        ));
+        // The server script holds no reply for a second page: the client never asked for one.
+        assert_eq!(server.join().unwrap().len(), 5);
+    }
+
+    /// Control-request backoff runs deep inside `send_form_with_retry`, where no per-operation
+    /// token is in scope. The client carries the process token so a cancelled run abandons the
+    /// pause instead of sleeping through it and retrying work nobody is waiting for.
+    #[test]
+    fn control_request_backoff_is_abandoned_once_the_client_is_cancelled() {
+        let (url, server) = scripted_server_with_status(vec![
+            (StatusCode::OK, required_discovery()),
+            (StatusCode::OK, login_response()),
+            (
+                StatusCode::BAD_GATEWAY,
+                "temporary proxy failure".to_owned(),
+            ),
+        ]);
+        let mut client = ApiClient::connect(&ClientOptions {
+            base_url: url,
+            allow_http: true,
+            accept_invalid_certs: false,
+            ca_certificate: None,
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(5),
+            retries: 1,
+        })
+        .unwrap();
+        client.login("alice", "password", None).unwrap();
+
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        let client = client.with_cancellation(&cancelled);
+
+        // The per-operation token stays live, so only the client-held one can end this call.
+        assert!(matches!(
+            client.remote_inventory(
+                &RemoteRoot::parse("/share/root").unwrap(),
+                &CancellationToken::default()
+            ),
+            Err(Error::Cancelled)
+        ));
+        // A retryable gateway failure would otherwise have been retransmitted after a pause.
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    /// Cancellation must stop retransmission without stopping the single request a cleanup path
+    /// depends on. A guard at the top of the retry loop would break exactly this: `allow_retry`
+    /// is false for the non-recursive delete and the task-stop requests, so their attempt budget
+    /// is zero and a loop-top check would abandon remote state instead of tidying it.
+    #[test]
+    fn a_cancelled_client_still_sends_the_one_request_a_non_retrying_call_owes() {
+        let (url, server) = scripted_server(vec![
+            write_probe_discovery(false),
+            login_response(),
+            r#"{"success":true}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        let client = client.with_cancellation(&cancelled);
+
+        client
+            .delete_non_recursive(
+                &RemoteRoot::parse("/share/root").unwrap(),
+                "/share/root/stale.bin",
+            )
+            .unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(String::from_utf8_lossy(&requests[2].body).contains("method=delete"));
     }
 
     #[test]
@@ -5357,7 +7084,10 @@ mod tests {
         let mut client = connect_test_client(url);
         client.login("alice", "password", None).unwrap();
         let inventory = client
-            .remote_inventory(&RemoteRoot::parse("/share/root").unwrap())
+            .remote_inventory(
+                &RemoteRoot::parse("/share/root").unwrap(),
+                &CancellationToken::default(),
+            )
             .unwrap();
         assert!(!inventory.root_exists && inventory.entries.is_empty());
         assert_eq!(server.join().unwrap().len(), 3);
@@ -5371,7 +7101,10 @@ mod tests {
         client.login("alice", "password", None).unwrap();
         assert!(
             client
-                .remote_inventory(&RemoteRoot::parse("/share/root").unwrap())
+                .remote_inventory(
+                    &RemoteRoot::parse("/share/root").unwrap(),
+                    &CancellationToken::default()
+                )
                 .unwrap_err()
                 .to_string()
                 .contains("not a directory")
@@ -5388,7 +7121,10 @@ mod tests {
         let mut client = connect_test_client(url);
         client.login("alice", "password", None).unwrap();
         let inventory = client
-            .remote_inventory(&RemoteRoot::parse("/share/root").unwrap())
+            .remote_inventory(
+                &RemoteRoot::parse("/share/root").unwrap(),
+                &CancellationToken::default(),
+            )
             .unwrap();
         assert!(!inventory.root_exists && inventory.entries.is_empty());
         assert_eq!(server.join().unwrap().len(), 5);
@@ -5969,6 +7705,8 @@ mod tests {
             upload_timeout: Duration::from_secs(1),
             operation_timeout: Duration::from_secs(1),
             upload_rate_limit: None,
+            cancellation: CancellationToken::default(),
+            observer: None,
         };
         assert_eq!(client.max_upload_rate(), None);
 
@@ -6765,7 +8503,9 @@ mod tests {
 
         let root = RemoteRoot::parse("/share/root").unwrap();
         client.verify_share_writable(&root).unwrap();
-        let inventory = client.remote_inventory(&root).unwrap();
+        let inventory = client
+            .remote_inventory(&root, &CancellationToken::default())
+            .unwrap();
         assert!(inventory.root_exists);
         assert_eq!(inventory.entries.len(), 2);
 
@@ -7043,7 +8783,10 @@ mod tests {
         .unwrap();
         client.login("user", "password", None).unwrap();
         let error = client
-            .remote_inventory(&RemoteRoot::parse("/share/mounted/child").unwrap())
+            .remote_inventory(
+                &RemoteRoot::parse("/share/mounted/child").unwrap(),
+                &CancellationToken::default(),
+            )
             .unwrap_err();
         assert!(matches!(error, Error::RemoteMountRoot { .. }));
         assert_eq!(server.join().unwrap().len(), 4);
@@ -7476,7 +9219,10 @@ mod tests {
         let mut client = connect_test_client(url);
         client.login("alice", "password", None).unwrap();
         let error = client
-            .remote_inventory(&RemoteRoot::parse("/share/root").unwrap())
+            .remote_inventory(
+                &RemoteRoot::parse("/share/root").unwrap(),
+                &CancellationToken::default(),
+            )
             .unwrap_err();
         assert_eq!(
             error.to_string(),
@@ -8373,6 +10119,8 @@ mod tests {
             upload_timeout: Duration::from_secs(1),
             operation_timeout: Duration::from_secs(1),
             upload_rate_limit: None,
+            cancellation: CancellationToken::default(),
+            observer: None,
         };
 
         let md5_only = client_for("SYNO.FileStation.MD5");
@@ -8567,7 +10315,10 @@ FplE
         let mut client = connect_test_client(url);
         client.login("alice", "password", None).unwrap();
         let error = client
-            .remote_inventory(&RemoteRoot::parse("/share/root").unwrap())
+            .remote_inventory(
+                &RemoteRoot::parse("/share/root").unwrap(),
+                &CancellationToken::default(),
+            )
             .unwrap_err();
         assert_eq!(
             error.to_string(),
@@ -8781,5 +10532,472 @@ FplE
         assert!(!failure.report.server_copy_verified);
         assert!(failure.report.cleanup_completed);
         assert_eq!(server.join().unwrap().len(), 26);
+    }
+
+    /// `query=all` returns entries authored by whoever wrote each installed package, so one bad
+    /// entry must cost a line of output rather than the whole enumeration.
+    #[test]
+    fn full_api_enumeration_skips_entries_it_cannot_read_instead_of_failing() {
+        let catalogue_body = serde_json::json!({
+            "success": true,
+            "data": {
+                "SYNO.API.Auth": {"path": "entry.cgi", "minVersion": 3, "maxVersion": 7},
+                "SYNO.FileStation.List": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+                // A third-party package advertising a shape the documented map does not use.
+                "SYNO.Third.Party": 42,
+                // Present, but with no version range: reportable, and honestly unanswerable.
+                "SYNO.Partial.Entry": {"path": "entry.cgi"},
+            }
+        })
+        .to_string();
+        let (url, server) = scripted_server(vec![browser_discovery(), catalogue_body]);
+        let client = browsing_test_client(url);
+
+        let catalogue = client.enumerate_all_apis().unwrap();
+        assert_eq!(catalogue.apis.len(), 3);
+        assert_eq!(catalogue.unusable_entries, 1);
+        assert_eq!(
+            catalogue.apis["SYNO.FileStation.List"].offers_version(2),
+            Some(true)
+        );
+        assert_eq!(
+            catalogue.apis["SYNO.FileStation.List"].offers_version(3),
+            Some(false)
+        );
+        // No range advertised is not the same answer as "no".
+        assert_eq!(catalogue.apis["SYNO.Partial.Entry"].offers_version(1), None);
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(String::from_utf8_lossy(&requests[1].body).contains("query=all"));
+    }
+
+    /// The enumeration reuses discovery's `entry.cgi` to `query.cgi` fallback: this request is
+    /// subject to exactly the same reverse-proxy misrouting the fallback exists to survive.
+    #[test]
+    fn full_api_enumeration_falls_back_to_query_cgi_and_reports_both_routes() {
+        let catalogue_body = serde_json::json!({
+            "success": true,
+            "data": {"SYNO.API.Auth": {"path": "entry.cgi", "minVersion": 3, "maxVersion": 7}}
+        })
+        .to_string();
+        let (url, server) = scripted_server_with_status(vec![
+            (StatusCode::OK, browser_discovery()),
+            (StatusCode::BAD_GATEWAY, "no route".to_owned()),
+            (StatusCode::OK, catalogue_body),
+        ]);
+        let client = browsing_test_client(url);
+        let catalogue = client.enumerate_all_apis().unwrap();
+        assert_eq!(catalogue.apis.len(), 1);
+        let requests = server.join().unwrap();
+        assert!(requests[1].request_line.contains("/webapi/entry.cgi"));
+        assert!(requests[2].request_line.contains("/webapi/query.cgi"));
+
+        // Both routes failing is reported as one message naming both, not as a bare timeout.
+        let (url, server) = scripted_server_with_status(vec![
+            (StatusCode::OK, browser_discovery()),
+            (StatusCode::BAD_GATEWAY, "no route".to_owned()),
+            (StatusCode::BAD_GATEWAY, "no route".to_owned()),
+        ]);
+        let client = browsing_test_client(url);
+        let error = client.enumerate_all_apis().unwrap_err();
+        let rendered = rendered_error(&error);
+        assert!(
+            rendered.contains("entry.cgi"),
+            "unexpected error: {rendered}"
+        );
+        assert!(
+            rendered.contains("query.cgi fallback"),
+            "unexpected error: {rendered}"
+        );
+        server.join().unwrap();
+    }
+
+    /// The ablation must vary only the channel, and it must vary it on the wire.
+    #[test]
+    fn the_session_channel_probe_presents_exactly_the_channels_it_names() {
+        let ok = r#"{"success":true,"data":{"total":0,"shares":[]}}"#.to_owned();
+        let rejected = r#"{"success":false,"error":{"code":119}}"#.to_owned();
+        let (url, server) = scripted_server(vec![
+            browser_discovery(),
+            login_response(),
+            ok.clone(),
+            ok,
+            rejected.clone(),
+            rejected,
+        ]);
+        let mut client = browsing_test_client(url);
+        client.login("alice", "password", None).unwrap();
+
+        let probes = client.probe_session_channels().unwrap();
+        assert_eq!(
+            probes.map(|probe| probe.channels),
+            SessionChannels::ABLATION_ORDER
+        );
+        assert!(probes[0].accepted() && probes[1].accepted());
+        assert!(!probes[2].accepted() && probes[2].session_rejected());
+        assert_eq!(probes[2].dsm_code, Some(119));
+        assert_eq!(probes[3].http_status, Some(200));
+
+        let requests = server.join().unwrap();
+        let shape = |request: &CapturedRequest| {
+            let body = String::from_utf8_lossy(&request.body).into_owned();
+            let header = |name: &str| {
+                request
+                    .headers
+                    .iter()
+                    .any(|(key, _)| key.eq_ignore_ascii_case(name))
+            };
+            (
+                body.contains("_sid="),
+                body.contains("SynoToken="),
+                header("cookie"),
+                header(X_SYNO_TOKEN_HEADER),
+            )
+        };
+        // All, then the SID field alone, then the cookie alone, then the token header alone.
+        assert_eq!(
+            requests[2..].iter().map(shape).collect::<Vec<_>>(),
+            [
+                (true, true, true, true),
+                (true, true, false, false),
+                (false, false, true, false),
+                (false, false, false, true),
+            ]
+        );
+        // No probe ever presents a session identifier the login did not produce.
+        for request in &requests[2..] {
+            let body = String::from_utf8_lossy(&request.body);
+            assert!(
+                body.contains("method=list_share"),
+                "unexpected body: {body}"
+            );
+            assert!(body.contains("limit=1"), "unexpected body: {body}");
+        }
+    }
+
+    #[test]
+    fn session_channel_selectors_and_probe_placeholders_are_self_consistent() {
+        for channels in SessionChannels::ABLATION_ORDER {
+            let probe = ChannelProbe::unrun(channels);
+            assert!(!probe.accepted());
+            assert!(!probe.session_rejected());
+            assert_eq!(probe.channels, channels);
+            assert!(!channels.as_str().is_empty());
+            assert!(!channels.describe().is_empty());
+        }
+        assert!(SessionChannels::All.sends_cookie_header());
+        assert!(SessionChannels::All.sends_token_header());
+        assert!(SessionChannels::All.sends_sid_field());
+        assert!(SessionChannels::All.sends_token_field());
+        assert!(SessionChannels::SidFieldOnly.sends_sid_field());
+        assert!(SessionChannels::SidFieldOnly.sends_token_field());
+        assert!(!SessionChannels::SidFieldOnly.sends_cookie_header());
+        assert!(!SessionChannels::SidFieldOnly.sends_token_header());
+        assert!(SessionChannels::CookieOnly.sends_cookie_header());
+        assert!(!SessionChannels::CookieOnly.sends_sid_field());
+        assert!(SessionChannels::TokenHeaderOnly.sends_token_header());
+        assert!(!SessionChannels::TokenHeaderOnly.sends_cookie_header());
+        // Every ablation variant has a distinct name, or the report could not tell them apart.
+        let names = SessionChannels::ABLATION_ORDER
+            .map(SessionChannels::as_str)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names.len(), SESSION_CHANNEL_VARIANTS);
+        // An unauthenticated client has no session to ablate and says so rather than sending one.
+        let (url, server) = scripted_server(vec![browser_discovery()]);
+        let client = browsing_test_client(url);
+        assert!(client.probe_session_channels().is_err());
+        server.join().unwrap();
+    }
+
+    /// `SYNO.FileStation.Info.get` is the only documented non-admin call that names the host.
+    #[test]
+    fn file_station_info_accepts_both_spellings_of_the_virtual_protocol_field() {
+        let documented = serde_json::json!({
+            "success": true,
+            "data": {
+                "hostname": "DiskStation",
+                "is_manager": true,
+                "support_sharing": true,
+                "support_virtual_protocol": "cifs,nfs,iso"
+            }
+        })
+        .to_string();
+        // Synology's own guide uses the other spelling in its worked example.
+        let worked_example = serde_json::json!({
+            "success": true,
+            "data": {"hostname": "Other Station", "support_virtual": "cifs"}
+        })
+        .to_string();
+        let (url, server) = scripted_server(vec![
+            info_discovery(),
+            login_response(),
+            documented,
+            worked_example,
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+
+        let first = client.file_station_info().unwrap();
+        assert_eq!(
+            first.hostname.map(|host| host.as_str().to_owned()),
+            Some("DiskStation".to_owned())
+        );
+        assert!(first.is_manager);
+        assert!(first.support_sharing);
+        assert_eq!(
+            first
+                .support_virtual_protocol
+                .map(|protocols| protocols.as_str().to_owned()),
+            Some("cifs,nfs,iso".to_owned())
+        );
+
+        let second = client.file_station_info().unwrap();
+        // Sanitized on the way in: a host name is server-supplied text, not terminal formatting.
+        assert_eq!(
+            second.hostname.map(|host| host.as_str().to_owned()),
+            Some("Other_Station".to_owned())
+        );
+        assert!(!second.is_manager);
+        assert!(!second.support_sharing);
+        server.join().unwrap();
+    }
+
+    /// A capability probe names its own API and reports how DSM answered, nothing more.
+    #[test]
+    fn a_capability_probe_reports_the_dsm_answer_without_interpreting_it() {
+        let (url, server) = scripted_server(vec![
+            info_discovery(),
+            login_response(),
+            r#"{"success":true,"data":{"total":0,"folders":[]}}"#.to_owned(),
+            r#"{"success":false,"error":{"code":105}}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+
+        let spec = || CapabilityProbeSpec {
+            api: "SYNO.FileStation.VirtualFolder",
+            method: "list",
+            version: 2,
+            cgi_path: "entry.cgi",
+            parameters: vec![pair("limit", "1")],
+        };
+        let works = client.probe_capability(spec()).unwrap();
+        assert_eq!(works.api, "SYNO.FileStation.VirtualFolder");
+        assert_eq!(works.method, "list");
+        assert_eq!(works.version, 2);
+        assert_eq!(works.outcome, RequestOutcome::Ok);
+        assert_eq!(works.dsm_code, None);
+
+        let refused = client.probe_capability(spec()).unwrap();
+        assert_eq!(refused.outcome, RequestOutcome::DsmError);
+        assert_eq!(refused.dsm_code, Some(105));
+
+        // A CGI path that would leave the configured origin is refused before any request.
+        let escaping = client.probe_capability(CapabilityProbeSpec {
+            api: "SYNO.FileStation.VirtualFolder",
+            method: "list",
+            version: 2,
+            cgi_path: "../../elsewhere.cgi",
+            parameters: Vec::new(),
+        });
+        assert!(escaping.is_err());
+        server.join().unwrap();
+    }
+
+    /// The permission check's walk is the resolution: reporting it costs no extra request.
+    #[test]
+    fn the_destination_walk_is_reported_component_by_component() {
+        let root = RemoteRoot::parse("/team/year/quarter").unwrap();
+
+        // Every component exists.
+        let (url, server) = scripted_server(vec![
+            write_probe_discovery(false),
+            login_response(),
+            getinfo_directory("/team"),
+            getinfo_directory("/team/year"),
+            getinfo_directory("/team/year/quarter"),
+            r#"{"success":true}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let (resolution, check) = client.verify_destination_writable_with_resolution(&root);
+        assert!(check.unwrap().destination_exists);
+        assert!(resolution.fully_resolved());
+        assert!(!resolution.share_root_missing());
+        assert_eq!(resolution.total_components, 3);
+        assert_eq!(
+            resolution
+                .segments
+                .iter()
+                .map(|segment| (segment.path.as_str(), segment.depth, segment.exists))
+                .collect::<Vec<_>>(),
+            [
+                ("/team", 1, true),
+                ("/team/year", 2, true),
+                ("/team/year/quarter", 3, true)
+            ]
+        );
+        assert_eq!(
+            resolution
+                .nearest_existing()
+                .map(|segment| segment.path.as_str()),
+            Some("/team/year/quarter")
+        );
+        server.join().unwrap();
+
+        // The last component is missing: the walk stops there and names it.
+        let (url, server) = scripted_server(vec![
+            write_probe_discovery(false),
+            login_response(),
+            getinfo_directory("/team"),
+            getinfo_directory("/team/year"),
+            r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+            r#"{"success":true}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let (resolution, check) = client.verify_destination_writable_with_resolution(&root);
+        assert!(!check.unwrap().destination_exists);
+        assert!(!resolution.fully_resolved());
+        assert_eq!(resolution.first_missing, Some(3));
+        assert!(!resolution.share_root_missing());
+        assert_eq!(resolution.segments.last().unwrap().dsm_code, Some(408));
+        assert_eq!(
+            resolution
+                .nearest_existing()
+                .map(|segment| segment.path.as_str()),
+            Some("/team/year")
+        );
+        server.join().unwrap();
+
+        // The share itself is missing: a different fault, and the walk says so.
+        let (url, server) = scripted_server(vec![
+            write_probe_discovery(false),
+            login_response(),
+            r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let (resolution, check) = client.verify_destination_writable_with_resolution(&root);
+        assert!(matches!(check.unwrap_err(), Error::ShareNotWritable(share) if share == "team"));
+        assert!(resolution.share_root_missing());
+        assert!(resolution.nearest_existing().is_none());
+        server.join().unwrap();
+    }
+
+    /// A mount boundary and a non-directory ancestor both stop the walk, and both are recorded.
+    #[test]
+    fn the_destination_walk_records_the_component_that_stopped_it() {
+        let root = RemoteRoot::parse("/team/mounted/child").unwrap();
+        let mounted = serde_json::json!({
+            "success": true,
+            "data": {"files": [{
+                "path": "/team/mounted",
+                "name": "mounted",
+                "isdir": true,
+                "additional": {"mount_point_type": "cifs"}
+            }]}
+        })
+        .to_string();
+        let (url, server) = scripted_server(vec![
+            write_probe_discovery(false),
+            login_response(),
+            getinfo_directory("/team"),
+            mounted,
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let (resolution, check) = client.verify_destination_writable_with_resolution(&root);
+        assert!(matches!(check.unwrap_err(), Error::RemoteMountRoot { .. }));
+        assert_eq!(resolution.segments.len(), 2);
+        assert!(resolution.segments[1].mount_boundary);
+        assert!(resolution.segments[1].exists);
+        server.join().unwrap();
+
+        // An ancestor that exists but is a file stops the walk too, and is recorded as existing
+        // and not a directory rather than as absent.
+        let (url, server) = scripted_server(vec![
+            write_probe_discovery(false),
+            login_response(),
+            getinfo_file("/team", 12, None),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let (resolution, check) = client.verify_destination_writable_with_resolution(&root);
+        assert!(check.is_err());
+        assert!(resolution.segments[0].exists);
+        assert!(!resolution.segments[0].is_directory);
+        assert_eq!(resolution.first_missing, None);
+        server.join().unwrap();
+
+        // A transport-shaped failure mid-walk records the component it stopped on.
+        let (url, server) = scripted_server(vec![
+            write_probe_discovery(false),
+            login_response(),
+            getinfo_directory("/team"),
+            r#"{"success":false,"error":{"code":105}}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let (resolution, check) = client.verify_destination_writable_with_resolution(&root);
+        assert_eq!(check.unwrap_err().api_code(), Some(105));
+        assert_eq!(resolution.segments.len(), 2);
+        assert_eq!(resolution.segments[1].dsm_code, Some(105));
+        assert!(!resolution.segments[1].exists);
+        server.join().unwrap();
+    }
+
+    /// Every requirement this tool declares is one it can actually name a version for.
+    #[test]
+    fn the_declared_api_requirements_are_coherent() {
+        let mut seen = BTreeSet::new();
+        for requirement in API_REQUIREMENTS {
+            assert!(
+                seen.insert(requirement.api),
+                "{} is declared twice",
+                requirement.api
+            );
+            assert!(requirement.version >= 1);
+            assert!(!requirement.purpose.is_empty());
+            assert!(
+                DISCOVERY_APIS.contains(&requirement.api),
+                "{} is required but never discovered",
+                requirement.api
+            );
+        }
+        // The allowlist and the requirement table describe the same set, so neither can drift.
+        assert_eq!(seen.len(), DISCOVERY_APIS.len());
+    }
+
+    /// A least-privilege client, for the diagnostics that need only Auth and List.
+    fn browsing_test_client(base_url: String) -> ApiClient {
+        ApiClient::connect_for_browsing(&ClientOptions {
+            base_url,
+            allow_http: true,
+            accept_invalid_certs: false,
+            ca_certificate: None,
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(5),
+            retries: 0,
+        })
+        .unwrap()
+    }
+
+    /// Discovery covering only the APIs the info and capability probes need.
+    fn info_discovery() -> String {
+        serde_json::json!({
+            "success": true,
+            "data": {
+                "SYNO.API.Auth": {"path": "entry.cgi", "minVersion": 3, "maxVersion": 7},
+                "SYNO.FileStation.Info": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+                "SYNO.FileStation.List": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+                "SYNO.FileStation.CreateFolder": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+                "SYNO.FileStation.Upload": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+                "SYNO.FileStation.CheckPermission": {"path": "entry.cgi", "minVersion": 3, "maxVersion": 3}
+            }
+        })
+        .to_string()
     }
 }

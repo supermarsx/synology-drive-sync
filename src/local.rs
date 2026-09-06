@@ -127,7 +127,17 @@ impl IgnoreRules {
     }
 }
 
-pub fn scan(source: &Path, rules: &IgnoreRules) -> Result<LocalInventory> {
+/// Walk `source` into a deterministic inventory.
+///
+/// A large tree is one of the longest uninterruptible phases a run has, so `cancellation` is
+/// consulted before every directory is opened and before every child entry is inspected. A
+/// cancelled scan returns [`Error::Cancelled`] and no partial inventory.
+pub fn scan(
+    source: &Path,
+    rules: &IgnoreRules,
+    cancellation: &CancellationToken,
+) -> Result<LocalInventory> {
+    cancellation.check()?;
     let source_metadata = fs::symlink_metadata(source).map_err(|source_error| Error::FileIo {
         path: source.to_owned(),
         source: source_error,
@@ -154,7 +164,7 @@ pub fn scan(source: &Path, rules: &IgnoreRules) -> Result<LocalInventory> {
     }
 
     let mut entries = BTreeMap::new();
-    scan_dir(&root, "", rules, &mut entries)?;
+    scan_dir(&root, "", rules, cancellation, &mut entries)?;
     if let Some((first, second)) = portable_case_collision(entries.keys()) {
         return Err(Error::UnsupportedLocalEntry {
             path: root.join(&second),
@@ -246,8 +256,10 @@ fn scan_dir(
     directory: &Path,
     relative_parent: &str,
     rules: &IgnoreRules,
+    cancellation: &CancellationToken,
     output: &mut BTreeMap<String, LocalEntry>,
 ) -> Result<()> {
+    cancellation.check()?;
     let reader = fs::read_dir(directory).map_err(|source| Error::FileIo {
         path: directory.to_owned(),
         source,
@@ -263,6 +275,7 @@ fn scan_dir(
     children.sort_by_key(|entry| entry.file_name());
 
     for child in children {
+        cancellation.check()?;
         let name = child
             .file_name()
             .into_string()
@@ -328,7 +341,7 @@ fn scan_dir(
                     content_md5: None,
                 },
             );
-            scan_dir(&full_path, &relative, rules, output)?;
+            scan_dir(&full_path, &relative, rules, cancellation, output)?;
         } else if metadata.is_file() {
             let full_path = child.path();
             let modified = metadata.modified().map_err(|source| Error::FileIo {
@@ -529,10 +542,64 @@ mod tests {
         writeln!(ignore, "*.tmp").unwrap();
 
         let rules = IgnoreRules::build(&root, &[]).unwrap();
-        let inventory = scan(&root, &rules).unwrap();
+        let inventory = scan(&root, &rules, &CancellationToken::default()).unwrap();
         let names: Vec<_> = inventory.entries.keys().cloned().collect();
         assert_eq!(names, ["a.txt", "keep", "keep/b.txt"]);
         assert_eq!(inventory.files(), 2);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A large tree is one of the longest phases a run has, and it used to be uninterruptible.
+    /// The guard has to sit on the recursive walker itself, not only on `scan`'s entry check,
+    /// or a Ctrl-C during the scan would be held until the whole tree had been read.
+    #[test]
+    fn scan_recursion_stops_at_the_next_directory_once_cancellation_arrives() {
+        let root = temp_dir("scan-cancellation");
+        fs::create_dir_all(root.join("alpha/nested")).unwrap();
+        fs::create_dir(root.join("beta")).unwrap();
+        fs::write(root.join("alpha/nested/a.txt"), b"a").unwrap();
+        fs::write(root.join("beta/b.txt"), b"b").unwrap();
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+
+        // A live token walks every level, so the tree itself is not what stops the scan below.
+        let inventory = scan(&root, &rules, &CancellationToken::default()).unwrap();
+        assert!(inventory.entries.contains_key("alpha/nested/a.txt"));
+        assert!(inventory.entries.contains_key("beta/b.txt"));
+
+        // Walk one subtree with a live token, then cancel and descend into the next exactly as
+        // the recursion does. The walker refuses the directory and adds nothing to the results.
+        let cancellation = CancellationToken::default();
+        let mut output = BTreeMap::new();
+        scan_dir(
+            &root.join("alpha"),
+            "alpha",
+            &rules,
+            &cancellation,
+            &mut output,
+        )
+        .unwrap();
+        let walked: Vec<_> = output.keys().cloned().collect();
+        assert_eq!(walked, ["alpha/nested", "alpha/nested/a.txt"]);
+
+        cancellation.cancel();
+        assert!(matches!(
+            scan_dir(
+                &root.join("beta"),
+                "beta",
+                &rules,
+                &cancellation,
+                &mut output
+            ),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(output.keys().cloned().collect::<Vec<_>>(), walked);
+
+        // The public entry point surfaces cancellation and never a partial inventory.
+        assert!(matches!(
+            scan(&root, &rules, &cancellation),
+            Err(Error::Cancelled)
+        ));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -552,7 +619,7 @@ mod tests {
         fs::write(root.join("@tmp"), b"administrative placeholder").unwrap();
 
         let rules = IgnoreRules::build(&root, &[]).unwrap();
-        let inventory = scan(&root, &rules).unwrap();
+        let inventory = scan(&root, &rules, &CancellationToken::default()).unwrap();
         assert_eq!(
             inventory.entries.keys().cloned().collect::<Vec<_>>(),
             ["album", "payload.txt"]
@@ -570,7 +637,7 @@ mod tests {
 
         let rules = IgnoreRules::build(&root, &[]).unwrap();
         assert!(matches!(
-            scan(&root, &rules),
+            scan(&root, &rules, &CancellationToken::default()),
             Err(Error::UnsupportedLocalEntry { path, reason })
                 if path == fs::canonicalize(&root).unwrap()
                     && reason.contains("source root")
@@ -596,7 +663,7 @@ mod tests {
                 if path == filesystem_root && reason.contains("filesystem root")
         ));
         assert!(matches!(
-            scan(&filesystem_root, &rules),
+            scan(&filesystem_root, &rules, &CancellationToken::default()),
             Err(Error::UnsupportedLocalEntry { path, reason })
                 if path == filesystem_root && reason.contains("filesystem root")
         ));
@@ -743,7 +810,7 @@ mod tests {
         ));
         let rules = IgnoreRules::build(&target, &[]).unwrap();
         assert!(matches!(
-            scan(&link, &rules),
+            scan(&link, &rules, &CancellationToken::default()),
             Err(Error::UnsupportedLocalEntry { path, reason })
                 if path == link && reason.contains("symbolic link")
         ));
@@ -769,7 +836,7 @@ mod tests {
 
         let rules = IgnoreRules::build(&root, &[]).unwrap();
         assert!(matches!(
-            scan(&root, &rules),
+            scan(&root, &rules, &CancellationToken::default()),
             Err(Error::UnsupportedLocalEntry { path, reason })
                 if path == expected_link_path && reason.contains("not followed")
         ));
@@ -793,7 +860,7 @@ mod tests {
 
         let rules = IgnoreRules::build(&root, &[]).unwrap();
         assert!(matches!(
-            scan(&root, &rules),
+            scan(&root, &rules, &CancellationToken::default()),
             Err(Error::UnsupportedLocalEntry { path, reason })
                 if path == expected_path && reason.contains("differ only by case")
         ));
@@ -822,7 +889,7 @@ mod tests {
         let root = temp_dir("content-md5");
         fs::write(root.join("payload.bin"), b"abc").unwrap();
         let rules = IgnoreRules::build(&root, &[]).unwrap();
-        let mut inventory = scan(&root, &rules).unwrap();
+        let mut inventory = scan(&root, &rules, &CancellationToken::default()).unwrap();
 
         populate_content_md5(&mut inventory, &CancellationToken::default()).unwrap();
         let fingerprint = inventory.entries["payload.bin"].content_md5.unwrap();
@@ -858,7 +925,7 @@ mod tests {
         let payload = root.join("payload.bin");
         fs::write(&payload, b"abc").unwrap();
         let rules = IgnoreRules::build(&root, &[]).unwrap();
-        let inventory = scan(&root, &rules).unwrap();
+        let inventory = scan(&root, &rules, &CancellationToken::default()).unwrap();
         let scanned = inventory.entries["payload.bin"].clone();
         let scanned_path = scanned.full_path.clone();
 
@@ -877,7 +944,7 @@ mod tests {
         fs::write(root.join("a.bin"), b"a").unwrap();
         fs::write(root.join("b.bin"), b"b").unwrap();
         let rules = IgnoreRules::build(&root, &[]).unwrap();
-        let mut inventory = scan(&root, &rules).unwrap();
+        let mut inventory = scan(&root, &rules, &CancellationToken::default()).unwrap();
         let cancellation = CancellationToken::default();
         cancellation.cancel();
 
@@ -903,7 +970,7 @@ mod tests {
         let expected = fs::canonicalize(&source_file).unwrap();
 
         assert!(matches!(
-            scan(&source_file, &rules),
+            scan(&source_file, &rules, &CancellationToken::default()),
             Err(Error::InvalidSource(path)) if path == expected
         ));
         fs::remove_dir_all(root).unwrap();
@@ -919,13 +986,16 @@ mod tests {
         ));
         let rules = IgnoreRules::build(&root, &[]).unwrap();
         assert!(matches!(
-            scan(&missing, &rules),
+            scan(&missing, &rules, &CancellationToken::default()),
             Err(Error::FileIo { path, .. }) if path == missing
         ));
 
         let payload = root.join("payload.bin");
         fs::write(&payload, b"payload").unwrap();
-        let entry = scan(&root, &rules).unwrap().entries["payload.bin"].clone();
+        let entry = scan(&root, &rules, &CancellationToken::default())
+            .unwrap()
+            .entries["payload.bin"]
+            .clone();
         let expected_entry_path = entry.full_path.clone();
         fs::remove_file(&payload).unwrap();
         assert!(matches!(
@@ -1024,7 +1094,7 @@ mod tests {
 
         let rules = IgnoreRules::build(&root, &[]).unwrap();
         assert!(matches!(
-            scan(&root, &rules),
+            scan(&root, &rules, &CancellationToken::default()),
             Err(Error::UnsupportedLocalEntry { reason, .. }) if reason.contains("UTF-8")
         ));
 
@@ -1039,7 +1109,13 @@ mod tests {
         let rules = IgnoreRules::build(&root, &[]).unwrap();
 
         assert!(matches!(
-            scan_dir(&missing, "does-not-exist", &rules, &mut output),
+            scan_dir(
+                &missing,
+                "does-not-exist",
+                &rules,
+                &CancellationToken::default(),
+                &mut output,
+            ),
             Err(Error::FileIo { path, .. }) if path == missing
         ));
         assert!(output.is_empty());
@@ -1054,7 +1130,10 @@ mod tests {
         let replaced = root.join("replaced.bin");
         fs::write(&replaced, b"payload").unwrap();
         let rules = IgnoreRules::build(&root, &[]).unwrap();
-        let entry = scan(&root, &rules).unwrap().entries["replaced.bin"].clone();
+        let entry = scan(&root, &rules, &CancellationToken::default())
+            .unwrap()
+            .entries["replaced.bin"]
+            .clone();
 
         fs::remove_file(&replaced).unwrap();
         if !try_make_link(&replaced, &target_dir) {
@@ -1097,7 +1176,7 @@ mod tests {
         let expected_path = fs::canonicalize(&target).unwrap();
         let rules = IgnoreRules::build(&root, &[]).unwrap();
         assert!(matches!(
-            scan(&root, &rules),
+            scan(&root, &rules, &CancellationToken::default()),
             Err(Error::UnsupportedLocalEntry { path, reason })
                 if path == expected_path && reason.contains("before the Unix epoch")
         ));
@@ -1127,7 +1206,7 @@ mod tests {
         let expected_path = fs::canonicalize(&target).unwrap();
         let rules = IgnoreRules::build(&root, &[]).unwrap();
         assert!(matches!(
-            scan(&root, &rules),
+            scan(&root, &rules, &CancellationToken::default()),
             Err(Error::UnsupportedLocalEntry { path, reason })
                 if path == expected_path && reason.contains("SYSTEM")
         ));
@@ -1144,7 +1223,10 @@ mod tests {
         let target = root.join("locked.bin");
         fs::write(&target, b"payload").unwrap();
         let rules = IgnoreRules::build(&root, &[]).unwrap();
-        let entry = scan(&root, &rules).unwrap().entries["locked.bin"].clone();
+        let entry = scan(&root, &rules, &CancellationToken::default())
+            .unwrap()
+            .entries["locked.bin"]
+            .clone();
 
         let lock = fs::OpenOptions::new()
             .read(true)
@@ -1181,7 +1263,10 @@ mod tests {
         let target = root.join("secret.bin");
         fs::write(&target, b"payload").unwrap();
         let rules = IgnoreRules::build(&root, &[]).unwrap();
-        let entry = scan(&root, &rules).unwrap().entries["secret.bin"].clone();
+        let entry = scan(&root, &rules, &CancellationToken::default())
+            .unwrap()
+            .entries["secret.bin"]
+            .clone();
 
         fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
         let result = hash_file_snapshot(&entry, &CancellationToken::default());
@@ -1222,7 +1307,7 @@ mod tests {
         let expected_path = fs::canonicalize(&fifo_path).unwrap();
         let rules = IgnoreRules::build(&root, &[]).unwrap();
         assert!(matches!(
-            scan(&root, &rules),
+            scan(&root, &rules, &CancellationToken::default()),
             Err(Error::UnsupportedLocalEntry { path, reason })
                 if path == expected_path && reason.contains("only regular files and directories")
         ));

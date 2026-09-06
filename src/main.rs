@@ -1,26 +1,29 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as FmtWrite;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use clap::CommandFactory;
 use serde_json::{Value, json};
 use synology_drive_sync::api::{
-    ApiClient, ClientOptions, DiagnosticRemoteInventory, UploadObserver, UploadTransferEvent,
-    WriteProbeReport, is_discovery_response_failure,
+    self, API_REQUIREMENTS, ApiCatalogue, ApiClient, ApiObservation, ApiRequirement,
+    CapabilityProbe, CapabilityProbeSpec, ChannelProbe, ClientOptions, DestinationPathResolution,
+    DiagnosticRemoteInventory, FileStationInfo, RequestObserver, SESSION_CHANNEL_VARIANTS,
+    UploadObserver, UploadTransferEvent, WriteProbeReport, is_discovery_response_failure,
 };
 use synology_drive_sync::batch::{BatchJob, ValidatedBatch};
 use synology_drive_sync::cancel::CancellationToken;
 use synology_drive_sync::local::{self, IgnoreRules, LocalEntry};
 use synology_drive_sync::observability::{
-    BearerTokenSource, EventCode, EventLogger, EventMetrics, FileLogConfig, LogEvent,
-    LogFormat as EventLogFormat, LogLevel as EventLogLevel, LoggerConfig, RemoteDelivery,
-    RemoteLogConfig,
+    BUILD, BearerTokenSource, BoundedText, EventCode, EventLogger, EventMetrics, FileLogConfig,
+    LogEvent, LogFormat as EventLogFormat, LogLevel as EventLogLevel, LoggerConfig, RemoteDelivery,
+    RemoteLogConfig, RequestOutcome, SessionTransport,
 };
 use synology_drive_sync::path::RemoteRoot;
 use synology_drive_sync::plan::{self, CompareMode, PlanOptions, RemoteSnapshot, SyncPlan};
@@ -34,6 +37,10 @@ use synology_drive_sync::source_diagnostics::{
 use synology_drive_sync::sync::{
     self, ExecuteOptions, ExecutionEvent, ExecutionReport, UploadObserverFactory,
 };
+use synology_drive_sync::transport_diagnostics::{
+    CookieLedger, IntermediarySummary, ProbeObservation, ReachabilityBudget, ReachabilityReport,
+    TransportTranscript, classify_endpoint, measure_reachability,
+};
 use synology_drive_sync::{Error, Result};
 
 mod cli;
@@ -45,7 +52,18 @@ const FILE_LOG_BACKUPS: usize = 3;
 const REMOTE_LOG_QUEUE_CAPACITY: usize = 1_024;
 const REMOTE_LOG_TIMEOUT: Duration = Duration::from_secs(10);
 const LOGGER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Flush window for a run that is already stopping because the operator asked it to.
+///
+/// The full [`LOGGER_SHUTDOWN_TIMEOUT`] is a delivery guarantee owed to a run that reached its
+/// own end. A cancelled run owes no such guarantee, and five more seconds of waiting after the
+/// cancellation has already been observed is exactly what Ctrl-C asked to avoid. Timing out here
+/// only adds a warning: the cancellation is what the caller receives either way, so the exit code
+/// stays 130.
+const CANCELLED_LOGGER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
 const PROGRESS_RENDER_INTERVAL: Duration = Duration::from_millis(100);
+/// The documented exit code for cooperative Ctrl+C/SIGINT/SIGTERM cancellation, used both by the
+/// ordinary error mapping and by the second-signal force exit.
+const CANCELLED_EXIT_CODE: u8 = 130;
 
 struct NamedProfile<'a> {
     name: String,
@@ -276,8 +294,7 @@ struct TimedSourceDiagnostic {
 }
 
 fn run_source_doctor(settings: config::ResolvedSourceDoctor) -> Result<ExitCode> {
-    let cancellation = CancellationToken::default();
-    install_cancellation_handler(cancellation.clone())?;
+    let cancellation = install_cancellation_handler()?;
     let result = diagnose_source_job(&settings, &cancellation)?;
     write_source_doctor_output(&result, &settings.output)?;
     if cancellation.is_cancelled() {
@@ -409,8 +426,7 @@ struct SourceBatchOutcome {
 fn run_source_doctor_batch(mut jobs: Vec<NamedSourceSettings>) -> Result<ExitCode> {
     jobs.sort_by(|left, right| left.name.cmp(&right.name));
     let output = common_batch_output(jobs.iter().map(|job| &job.settings.output))?;
-    let cancellation = CancellationToken::default();
-    install_cancellation_handler(cancellation.clone())?;
+    let cancellation = install_cancellation_handler()?;
     let mut outcomes = Vec::with_capacity(jobs.len());
     let mut cancelled = false;
     for job in jobs {
@@ -631,8 +647,7 @@ fn run_sync_batch(
     jobs.sort_by(|left, right| left.name.cmp(&right.name));
     let output = common_batch_output(jobs.iter().map(|job| &job.settings.output))?;
     let validated = validate_sync_batch(&jobs)?;
-    let cancellation = CancellationToken::default();
-    install_cancellation_handler(cancellation.clone())?;
+    let cancellation = install_cancellation_handler()?;
 
     // Every target must produce a complete, non-mutating plan before any target is allowed to
     // mutate. Ordinary failures do not prevent the remaining preflights; cancellation does.
@@ -1158,8 +1173,7 @@ fn run_sync(
     plan_only: bool,
     changes_exit_code: bool,
 ) -> Result<ExitCode> {
-    let cancellation = CancellationToken::default();
-    install_cancellation_handler(cancellation.clone())?;
+    let cancellation = install_cancellation_handler()?;
     let result = run_sync_job(&settings, plan_only, &cancellation, |_| Ok(()))?;
     write_sync_output(
         &result.plan,
@@ -1264,7 +1278,7 @@ fn prepare_and_run_sync(
         logger.as_ref(),
         LogEvent::new(EventLogLevel::Info, EventCode::LocalScanStarted),
     )?;
-    let mut local = local::scan(&settings.source, &rules)?;
+    let mut local = local::scan(&settings.source, &rules, cancellation)?;
     cancellation.check()?;
     log_event(
         logger.as_ref(),
@@ -1284,7 +1298,12 @@ fn prepare_and_run_sync(
         logger.as_ref(),
         LogEvent::new(EventLogLevel::Info, EventCode::ApiDiscoveryStarted),
     )?;
-    let mut client = connect_client(&settings.connection.url, &settings.network)?;
+    let mut client = connect_client(
+        &settings.connection.url,
+        &settings.network,
+        cancellation,
+        logger.as_ref().map(request_observer),
+    )?;
     let server_copy = client.supports_server_copy();
     if settings.safety.delete {
         client.require_delete_api()?;
@@ -1331,7 +1350,7 @@ fn prepare_and_run_sync(
             logger.as_ref(),
             LogEvent::new(EventLogLevel::Info, EventCode::RemoteScanStarted),
         )?;
-        let mut remote = client.remote_inventory(&root)?;
+        let mut remote = client.remote_inventory(&root, cancellation)?;
         cancellation.check()?;
         log_event(
             logger.as_ref(),
@@ -1483,9 +1502,9 @@ fn build_reconciliation_plan(
     cancellation: &CancellationToken,
 ) -> Result<SyncPlan> {
     cancellation.check()?;
-    let mut local = local::scan(&settings.source, rules)?;
+    let mut local = local::scan(&settings.source, rules, cancellation)?;
     cancellation.check()?;
-    let mut remote = client.remote_inventory(root)?;
+    let mut remote = client.remote_inventory(root, cancellation)?;
     cancellation.check()?;
     if compare_mode(settings.behavior.compare) == CompareMode::Content {
         client.require_content_fingerprint_api()?;
@@ -1527,8 +1546,7 @@ fn ensure_reconciled(plan: &SyncPlan) -> Result<()> {
 }
 
 fn run_doctor(settings: config::ResolvedDoctor) -> Result<ExitCode> {
-    let cancellation = CancellationToken::default();
-    install_cancellation_handler(cancellation.clone())?;
+    let cancellation = install_cancellation_handler()?;
     let timed = run_doctor_job(&settings, &cancellation, true)?;
     write_doctor_output(&timed.result, timed.elapsed, &settings.output)?;
     if cancellation.is_cancelled() || timed.result.cancelled || timed.result.write_probe_cancelled {
@@ -1617,6 +1635,24 @@ struct DoctorResult {
     write_probe: Option<WriteProbeReport>,
     write_probe_error: Option<String>,
     write_probe_cancelled: bool,
+    /// Requests made since the previous section closed, drained into each section as it records.
+    call_log: DoctorCallLog,
+    /// Unauthenticated transport measurement, taken before the client is built.
+    reachability: Option<ReachabilityReport>,
+    /// What sat between this client and DSM, folded over every response of the run.
+    intermediary: Option<IntermediarySummary>,
+    /// Every cookie the server set, followed across the whole run.
+    cookies: Option<CookieLedger>,
+    /// Everything DSM advertises, against everything this tool asks for.
+    capabilities: Option<CapabilityEnumeration>,
+    /// The same authenticated call, presented through one session channel at a time.
+    channel_ablation: Option<[ChannelProbe; SESSION_CHANNEL_VARIANTS]>,
+    /// What several simultaneous authenticated calls did to the session.
+    concurrency: Option<ConcurrencyReport>,
+    /// Which advertised File Station capabilities actually work for this account.
+    capability_diagnosis: Option<CapabilityDiagnosis>,
+    /// The destination path, walked one component at a time.
+    path_resolution: Option<DestinationPathResolution>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1660,45 +1696,205 @@ impl DoctorSectionStatus {
     }
 }
 
+/// One DSM request a diagnostic section actually made.
+#[derive(Clone, Copy, Debug)]
+struct DoctorCall {
+    /// 1-based position in the run's request sequence, shared with the transport transcript so a
+    /// cookie the ledger reports can be found in the section listing that made the request.
+    sequence: u32,
+    api: &'static str,
+    method: &'static str,
+    version: u32,
+    outcome: RequestOutcome,
+    dsm_code: Option<i64>,
+    http_status: Option<u16>,
+    session: SessionTransport,
+    elapsed_ms: u64,
+}
+
+/// Collects the DSM calls made since the previous section closed, and the run-wide transcript.
+///
+/// The pending list is drained by each section as it records its result, so a section reports the
+/// requests it is actually responsible for instead of a single undifferentiated run-wide list.
+/// The transcript is never drained: cookie permanence and the intermediary fingerprint are
+/// properties of the whole run, and neither can be answered from a list a section already took.
+#[derive(Clone, Debug, Default)]
+struct DoctorCallLog {
+    pending: Arc<Mutex<Vec<DoctorCall>>>,
+    transcript: Arc<Mutex<TransportTranscript>>,
+}
+
+impl DoctorCallLog {
+    /// An observer that both logs every round trip and retains the completed ones for the report.
+    fn observer(&self, logger: Option<&Arc<EventLogger>>) -> RequestObserver {
+        let pending = Arc::clone(&self.pending);
+        let transcript = Arc::clone(&self.transcript);
+        let logger = logger.cloned();
+        Arc::new(move |observation| {
+            if let Some(logger) = &logger {
+                let _ = logger.emit(observation_event(observation));
+            }
+            // Only completed calls are retained. A start record describes the same request, and a
+            // retry record describes a wait rather than a round trip.
+            if let ApiObservation::CallCompleted(call) = observation {
+                // The transcript assigns the sequence number, so the number a section prints and
+                // the number the cookie ledger cites are the same number by construction.
+                let Ok(mut transcript) = transcript.lock() else {
+                    return;
+                };
+                let sequence = transcript.record_call(&call);
+                drop(transcript);
+                if let Ok(mut pending) = pending.lock() {
+                    pending.push(DoctorCall {
+                        sequence,
+                        api: call.api,
+                        method: call.method,
+                        version: call.version,
+                        outcome: call.outcome,
+                        dsm_code: call.dsm_code,
+                        http_status: call.http_status,
+                        session: call.session,
+                        elapsed_ms: call.elapsed_ms,
+                    });
+                }
+            }
+        })
+    }
+
+    fn drain(&self) -> Vec<DoctorCall> {
+        self.pending
+            .lock()
+            .map(|mut calls| std::mem::take(&mut *calls))
+            .unwrap_or_default()
+    }
+
+    /// A snapshot of every response seen so far, for the cross-call transport checks.
+    fn transcript(&self) -> TransportTranscript {
+        self.transcript
+            .lock()
+            .map(|transcript| transcript.clone())
+            .unwrap_or_default()
+    }
+
+    /// Fold the unauthenticated transport probe's responses into the same transcript.
+    fn record_probes(&self, probes: Vec<ProbeObservation>) {
+        if let Ok(mut transcript) = self.transcript.lock() {
+            for probe in probes {
+                transcript.record_probe(probe);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct DoctorSection {
     id: &'static str,
     label: &'static str,
+    /// Position in *execution* order, which is not the display order.
+    step: u8,
     status: DoctorSectionStatus,
     detail: String,
     elapsed: Duration,
     timing_scope: &'static str,
+    calls: Vec<DoctorCall>,
+    remediation: Option<&'static str>,
 }
 
-const DOCTOR_SECTION_SPECS: [(&str, &str); 8] = [
-    ("routing_tls", "Routing and TLS negotiation"),
-    ("dsm_api_discovery", "DSM API discovery"),
-    ("dsm_session_auth", "DSM session authentication"),
-    ("file_station_capabilities", "File Station capabilities"),
-    ("destination_permissions", "Destination permissions"),
-    ("destination_inventory", "Destination inventory"),
+/// Report sections in display order, each with the step at which it actually runs.
+///
+/// Display order and execution order deliberately differ: File Station capabilities are settled
+/// from the cached discovery response *before* authentication, but reading it fourth in the report
+/// keeps the transport, session, and destination groups together. The step number is carried so
+/// the report can state the real order rather than implying the printed one.
+///
+/// The transport group is the same idea applied to the run's two ends. Reachability is measured
+/// at step 1, before any client exists, because a latency figure taken through a pooled
+/// connection measures nothing. The intermediary fingerprint and the cookie ledger are summaries
+/// of responses other sections produced, so they run last -- after logout, whose `Set-Cookie` is
+/// itself evidence -- and are displayed next to the checks they explain.
+const DOCTOR_SECTION_SPECS: [(&str, &str, u8); 16] = [
+    (
+        "network_reachability",
+        "Network reachability and connect timing",
+        1,
+    ),
+    ("routing_tls", "Routing and TLS negotiation", 2),
+    ("dsm_api_discovery", "DSM API discovery", 3),
+    ("capability_enumeration", "DSM capability enumeration", 4),
+    (
+        "intermediary_transport",
+        "Intermediaries and reverse proxies",
+        15,
+    ),
+    ("dsm_session_auth", "DSM session authentication", 6),
+    (
+        "session_channel_ablation",
+        "DSM session channel ablation",
+        7,
+    ),
+    ("session_concurrency", "Concurrent session fan-out", 8),
+    ("session_cookie_ledger", "Session cookie permanence", 16),
+    ("file_station_capabilities", "File Station capabilities", 5),
+    (
+        "capability_diagnosis",
+        "File Station capability diagnosis",
+        9,
+    ),
+    (
+        "destination_path_resolution",
+        "Destination path resolution",
+        10,
+    ),
+    ("destination_permissions", "Destination permissions", 11),
+    ("destination_inventory", "Destination inventory", 12),
     (
         "disposable_write_verify_cleanup",
         "Disposable write, verify, and cleanup",
+        13,
     ),
-    ("session_logout", "DSM session logout"),
+    ("session_logout", "DSM session logout", 14),
 ];
 
+/// Sections whose verdict is a summary of requests other sections already own.
+///
+/// They are recorded after the run finishes, so the generic "not run because X failed" placeholder
+/// must never be written over them: a run that failed at authentication still has a transcript
+/// worth reading, and saying otherwise would discard the evidence.
+const DOCTOR_DERIVED_SECTION_IDS: [&str; 3] = [
+    "network_reachability",
+    "intermediary_transport",
+    "session_cookie_ledger",
+];
+
+/// Timing scope for a section that reaches its verdict without contacting the server.
+const TIMING_SCOPE_LOCAL_ONLY: &str = "local_only";
+
+/// Timing scope for a section summarising requests other sections made and timed.
+const TIMING_SCOPE_DERIVED: &str = "derived";
+
 impl DoctorResult {
-    fn new(settings: &config::ResolvedDoctor, perform_write_probe: bool) -> Self {
+    fn new(
+        settings: &config::ResolvedDoctor,
+        perform_write_probe: bool,
+        call_log: DoctorCallLog,
+    ) -> Self {
         let mut result = Self {
             level: settings.level,
             sections: DOCTOR_SECTION_SPECS
                 .iter()
-                .map(|&(id, label)| DoctorSection {
+                .map(|&(id, label, step)| DoctorSection {
                     id,
                     label,
+                    step,
                     status: DoctorSectionStatus::Skip,
                     detail: "not reached".to_owned(),
                     elapsed: Duration::ZERO,
                     timing_scope: "section",
+                    calls: Vec::new(),
+                    remediation: None,
                 })
                 .collect(),
+            call_log,
             failure: None,
             cancelled: false,
             authenticated: false,
@@ -1713,12 +1909,52 @@ impl DoctorResult {
             write_probe: None,
             write_probe_error: None,
             write_probe_cancelled: false,
+            reachability: None,
+            intermediary: None,
+            cookies: None,
+            capabilities: None,
+            channel_ablation: None,
+            concurrency: None,
+            capability_diagnosis: None,
+            path_resolution: None,
         };
+        // The fan-out probe multiplies request load against a live NAS, so it stays behind the
+        // level an operator chooses when they have already decided to pay for depth.
+        if settings.level != cli::DoctorLevel::Extensive {
+            result.set_section(
+                "session_concurrency",
+                DoctorSectionStatus::Skip,
+                "the concurrent fan-out probe runs at the extensive level only",
+                Duration::ZERO,
+                "section",
+            );
+        }
         if settings.level == cli::DoctorLevel::Quick {
             result.set_section(
                 "dsm_session_auth",
                 DoctorSectionStatus::Skip,
                 "quick level is deliberately unauthenticated",
+                Duration::ZERO,
+                "section",
+            );
+            result.set_section(
+                "session_channel_ablation",
+                DoctorSectionStatus::Skip,
+                "quick level is deliberately unauthenticated; there is no session to present",
+                Duration::ZERO,
+                "section",
+            );
+            result.set_section(
+                "capability_diagnosis",
+                DoctorSectionStatus::Skip,
+                "quick level is deliberately unauthenticated; capabilities were enumerated but not exercised",
+                Duration::ZERO,
+                "section",
+            );
+            result.set_section(
+                "destination_path_resolution",
+                DoctorSectionStatus::Skip,
+                "quick level does not inspect a destination",
                 Duration::ZERO,
                 "section",
             );
@@ -1769,6 +2005,9 @@ impl DoctorResult {
         elapsed: Duration,
         timing_scope: &'static str,
     ) {
+        // Drained before the section is borrowed, and unconditionally: a section that made no
+        // request records an empty list, which is itself evidence.
+        let calls = self.call_log.drain();
         let section = self
             .sections
             .iter_mut()
@@ -1778,10 +2017,43 @@ impl DoctorResult {
         section.detail = bounded_doctor_detail(&detail.into());
         section.elapsed = elapsed;
         section.timing_scope = timing_scope;
+        section.calls = calls;
+    }
+
+    /// Record a section that summarises requests other sections already own.
+    ///
+    /// Deliberately not [`Self::set_section`]: that drains the pending call log, and a summary
+    /// section made no request of its own. Draining here would move another section's requests
+    /// onto this one and report them twice.
+    fn set_derived_section(
+        &mut self,
+        id: &str,
+        status: DoctorSectionStatus,
+        detail: impl Into<String>,
+        remediation: Option<&'static str>,
+    ) {
+        let section = self
+            .sections
+            .iter_mut()
+            .find(|section| section.id == id)
+            .expect("Doctor section ID is fixed by the report contract");
+        section.status = status;
+        section.detail = bounded_doctor_detail(&detail.into());
+        section.timing_scope = TIMING_SCOPE_DERIVED;
+        section.remediation = remediation;
+    }
+
+    /// Correct a section's timing scope after the fact, for a failure path that shares the
+    /// generic `fail_section` recording but did not perform a request.
+    fn set_timing_scope(&mut self, id: &str, timing_scope: &'static str) {
+        if let Some(section) = self.sections.iter_mut().find(|section| section.id == id) {
+            section.timing_scope = timing_scope;
+        }
     }
 
     fn fail_section(&mut self, id: &str, error: &Error, elapsed: Duration) {
         let detail = safe_doctor_error(error);
+        let remediation = doctor_remediation(id, error);
         self.set_section(
             id,
             DoctorSectionStatus::Fail,
@@ -1789,6 +2061,9 @@ impl DoctorResult {
             elapsed,
             "section",
         );
+        if let Some(section) = self.sections.iter_mut().find(|section| section.id == id) {
+            section.remediation = remediation;
+        }
         self.failure.get_or_insert(detail);
         self.cancelled |= matches!(error, Error::Cancelled);
         self.explain_dependent_skips(id);
@@ -1804,6 +2079,11 @@ impl DoctorResult {
         };
         let failed_label = self.sections[failed_index].label;
         for section in self.sections.iter_mut().skip(failed_index + 1) {
+            // A derived section is recorded after the run ends and still has something to say
+            // about a run that failed early, so it is never written off as unreached.
+            if DOCTOR_DERIVED_SECTION_IDS.contains(&section.id) {
+                continue;
+            }
             if section.status == DoctorSectionStatus::Skip && section.detail == "not reached" {
                 section.detail =
                     bounded_doctor_detail(&format!("not run because {failed_label} failed"));
@@ -1906,6 +2186,125 @@ fn safe_doctor_error(error: &Error) -> String {
     }
 }
 
+/// Next steps for the transport findings that are not failures but change what to try next.
+///
+/// These are the counterparts of the 106/107/119 hint in [`doctor_remediation`], reached by
+/// evidence rather than by an error code: the transport sections observe the same condition from
+/// the other side, before a session has had a chance to be rejected by it.
+const DOCTOR_MULTIPLE_PATH_HINT: &str = "consecutive requests do not all look like they reach the same DSM host. Compare this run \
+     against one made through a direct address: a LAN address, a Synology DDNS name, or the \
+     [alias].direct.quickconnect.to form. If the session errors disappear there, the path is the \
+     cause and no client-side change will fix it.";
+
+const DOCTOR_RELAY_HINT: &str = "a QuickConnect relay carries this run. The relay offers no session-affinity guarantee, so a \
+     DSM session accepted on one request can be presented to a different backend on the next. \
+     Re-run against [alias].direct.quickconnect.to, a Synology DDNS name, or the LAN address to \
+     establish whether the relay is what breaks the session.";
+
+/// The ablation finding that names a client-side fix, which is the only kind we can apply.
+const DOCTOR_COOKIE_CHANNEL_HINT: &str = "DSM accepted this session when it was presented only as the documented _sid request field, \
+     and rejected it once the synthesised Cookie: id=<sid> header was attached as well. Logging \
+     in with format=sid is defined as \"cookie will not be set\", so DSM never issued that cookie \
+     and is being asked to resolve a cookie session it does not have. Stop sending the cookie \
+     header for sid-format logins.";
+
+/// The ablation finding that names no client-side fix, and says so.
+const DOCTOR_SESSION_DEAD_HINT: &str = "every session channel was rejected, so the session identifier itself is no longer valid \
+     server-side rather than being mis-carried by one channel. That is consistent with a relay \
+     that re-establishes its tunnel between requests, or with a concurrent login on the same \
+     account. Connect directly, or through a single reverse-proxy origin, to establish which.";
+
+/// A required API DSM offers only at versions this tool cannot use.
+const DOCTOR_CAPABILITY_VERSION_HINT: &str = "this DSM does not offer an API version this tool requires. The capability enumeration block \
+     below names the required version and the range DSM advertised for each one. Updating DSM is \
+     the usual fix; where the API is optional, the feature that needs it is what stops working.";
+
+/// Discovery said an API exists and the call for it said otherwise.
+const DOCTOR_CAPABILITY_ROUTING_HINT: &str = "discovery advertised an API that the request for it answered with \"the requested API does \
+     not exist\". Discovery and the call went to the same origin, so this is a reverse-proxy path \
+     problem rather than a DSM one: the proxy is not forwarding that API's CGI path.";
+
+/// The destination's first component -- the shared folder -- is not there.
+const DOCTOR_MISSING_SHARE_HINT: &str = "the shared folder named by the first path component does not exist or is not visible to this \
+     account. Run doctor without a destination to list the shared-folder roots this account can \
+     actually see, then correct the remote path or grant access in DSM Control Panel.";
+
+/// Only later components of the destination are missing, which sync itself can fix.
+const DOCTOR_MISSING_COMPONENT_HINT: &str = "the destination's parent exists and is a directory; only components below it are missing. \
+     Create them, or let the first sync create them, once the write-permission check passes.";
+
+const DOCTOR_COOKIE_ROTATION_HINT: &str = "the server re-issued a session cookie on a call that succeeded, and this client keeps no \
+     cookie jar, so the new value was discarded and the previous one was sent again. If the calls \
+     after it fail with 106/107/119, this is the cause rather than the path. Log in with \
+     format=cookie and honour the cookie that comes back, or with format=sid and send _sid as a \
+     request parameter, but not the present mix of the two.";
+
+/// A concrete next step for a failed diagnostic section, when one can be named.
+///
+/// The transport hints are the constants the API layer already uses for the same conditions, so
+/// the two cannot drift into saying different things about one status code. Returning `None` is
+/// the honest answer whenever the failure does not imply a specific action.
+fn doctor_remediation(section_id: &str, error: &Error) -> Option<&'static str> {
+    if matches!(error, Error::Cancelled) {
+        return None;
+    }
+    if let Some(code) = error.api_code() {
+        return match code {
+            106 | 107 | 119 => Some(
+                "the DSM session was rejected after it had been accepted. Check that every \
+                 request reaches the same DSM host: a QuickConnect relay or a load balancer \
+                 without session affinity will send consecutive requests to different backends. \
+                 Connecting directly, or through a single reverse-proxy origin, rules this out.",
+            ),
+            150 => Some(
+                "DSM saw a different source IP than the one that logged in. Fix the reverse \
+                 proxy's X-Real-IP/X-Forwarded-For handling, or disable DSM's IP-checking for \
+                 this account.",
+            ),
+            105 => Some(
+                "the authenticated DSM account does not have File Station permission on this \
+                 shared folder. Grant it in DSM Control Panel, then rerun.",
+            ),
+            407 => Some(
+                "File Station refused the operation. Check the shared folder's permissions and \
+                 whether it is mounted read-only.",
+            ),
+            408 if section_id == "destination_permissions" => Some(
+                "neither the destination nor any ancestor of it exists. Create the shared folder \
+                 first, or correct the remote path.",
+            ),
+            411 => Some("the remote filesystem is mounted read-only."),
+            415 | 416 => Some("the destination is out of quota or out of space."),
+            _ => None,
+        };
+    }
+    match error {
+        Error::HttpStatus { status, .. } => match status.as_u16() {
+            301 | 302 | 303 | 307 | 308 => Some(api::REDIRECT_REFUSED_HINT),
+            413 => Some(api::BODY_TOO_LARGE_HINT),
+            502 => Some(api::BAD_GATEWAY_HINT),
+            504 => Some(api::GATEWAY_TIMEOUT_HINT),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Report whether an error proves the DSM session itself is no longer usable.
+///
+/// These are the codes for which every later authenticated request is guaranteed to fail, so a
+/// diagnostic must stop rather than issue a request that cannot succeed. A permission refusal
+/// (105, 407) is deliberately excluded: the session is still valid, and what the account *can*
+/// read remains worth reporting.
+fn session_is_unusable(error: &Error) -> bool {
+    matches!(error, Error::Cancelled)
+        || matches!(
+            error.api_code(),
+            // 106 session timeout, 107 duplicate-login interruption, 119 invalid session.
+            Some(106 | 107 | 119)
+        )
+}
+
 fn doctor_requires_content_fingerprint(level: cli::DoctorLevel, compare: cli::CompareArg) -> bool {
     level != cli::DoctorLevel::Quick
         && (compare == cli::CompareArg::Content || level == cli::DoctorLevel::Extensive)
@@ -1942,13 +2341,1227 @@ fn record_doctor_logout(client: &mut ApiClient, result: &mut DoctorResult) {
     }
 }
 
+/// How much unauthenticated probing each diagnostic level pays for.
+///
+/// Quick is the level an operator reaches for when something is already wrong, so it still
+/// measures -- just with fewer samples. Extensive buys enough samples that a bimodal connect time
+/// is unmistakable rather than merely suggestive.
+fn reachability_budget(level: cli::DoctorLevel) -> ReachabilityBudget {
+    match level {
+        cli::DoctorLevel::Quick => ReachabilityBudget::quick(),
+        cli::DoctorLevel::Standard => ReachabilityBudget::standard(),
+        cli::DoctorLevel::Extensive => ReachabilityBudget::extensive(),
+    }
+}
+
+/// Run the diagnostic, bracketed by the transport checks that span the whole of it.
+///
+/// The reachability probe runs first and outside the client, because a latency figure taken
+/// through an already-open pooled connection measures nothing. The intermediary fingerprint and
+/// the cookie ledger run last, over the transcript every request fed, because both are properties
+/// of the run rather than of any one section -- and because DSM's logout response sets a cookie
+/// too, which a summary taken before logout would miss.
 fn doctor_checks(
     settings: &config::ResolvedDoctor,
     logger: Option<Arc<EventLogger>>,
     cancellation: &CancellationToken,
     perform_write_probe: bool,
 ) -> Result<DoctorResult> {
-    let mut result = DoctorResult::new(settings, perform_write_probe);
+    let call_log = DoctorCallLog::default();
+    let reachability_started = Instant::now();
+    let (reachability, probes) = measure_reachability(
+        &client_options(&settings.url, &settings.network),
+        reachability_budget(settings.level),
+        cancellation,
+    );
+    let reachability_elapsed = reachability_started.elapsed();
+    // Recorded before the run so the probe responses keep the sequence numbers they earned: they
+    // happened first, and a ledger that renumbered them would misreport when a cookie first
+    // appeared.
+    call_log.record_probes(probes);
+
+    let mut result = doctor_run(
+        settings,
+        logger,
+        cancellation,
+        perform_write_probe,
+        call_log,
+    )?;
+    record_reachability_section(&mut result, reachability, reachability_elapsed);
+    record_transport_summary_sections(&mut result, &settings.url);
+    Ok(result)
+}
+
+/// Record the unauthenticated reachability measurement.
+///
+/// This section never fails the run. It measures; `routing_tls` is what gates. A probe that could
+/// not open a socket against a host the client then reached successfully is a transient artefact,
+/// and turning that into a failed diagnostic would be worse than useless.
+fn record_reachability_section(
+    result: &mut DoctorResult,
+    reachability: ReachabilityReport,
+    elapsed: Duration,
+) {
+    let multiple_paths = reachability.reached() && reachability.suggests_multiple_paths();
+    let (status, detail) = if reachability.cancelled {
+        (
+            DoctorSectionStatus::Skip,
+            "the transport probe stopped when the run was cancelled".to_owned(),
+        )
+    } else if !reachability.reached() {
+        (
+            DoctorSectionStatus::Warn,
+            format!(
+                "no TCP connection to {}:{} completed{}",
+                reachability.host,
+                reachability.port,
+                reachability
+                    .tcp_failure_reason
+                    .as_deref()
+                    .or(reachability.dns.error.as_deref())
+                    .map(|reason| format!("; {reason}"))
+                    .unwrap_or_default(),
+            ),
+        )
+    } else if reachability.connects_but_does_not_answer() {
+        (
+            DoctorSectionStatus::Warn,
+            format!(
+                "TCP connections to {}:{} succeed, but no HTTP sample completed{}",
+                reachability.host,
+                reachability.port,
+                reachability
+                    .http
+                    .failure_reason
+                    .as_deref()
+                    .map(|reason| format!("; {reason}"))
+                    .unwrap_or_default(),
+            ),
+        )
+    } else if reachability.suggests_multiple_paths() {
+        let mut reasons = Vec::new();
+        if reachability.dns.address_count > 1 {
+            reasons.push(format!(
+                "the hostname resolves to {} addresses",
+                reachability.dns.address_count
+            ));
+        }
+        if reachability.tcp_connect.is_widely_spread() {
+            reasons.push("TCP connect time varies more than a single path should".to_owned());
+        }
+        if reachability.http.first_byte.is_widely_spread() {
+            reasons.push("first-byte time varies more than a single path should".to_owned());
+        }
+        (
+            DoctorSectionStatus::Warn,
+            format!(
+                "the endpoint responded, but consecutive connections do not look like they reach \
+                 one host: {}",
+                reasons.join("; ")
+            ),
+        )
+    } else {
+        (
+            DoctorSectionStatus::Pass,
+            format!(
+                "TCP reachability is consistent: connect {}",
+                reachability.tcp_connect.describe()
+            ),
+        )
+    };
+    // Only the finding that earns it. A host that accepts connections and then answers nothing
+    // is a different fault, and pointing its reader at session affinity would be misdirection.
+    let remediation = multiple_paths.then_some(DOCTOR_MULTIPLE_PATH_HINT);
+    result.set_derived_section("network_reachability", status, detail, remediation);
+    if let Some(section) = result
+        .sections
+        .iter_mut()
+        .find(|section| section.id == "network_reachability")
+    {
+        // A real elapsed time, not a derived scope: this section did its own measuring.
+        section.elapsed = elapsed;
+        section.timing_scope = "section";
+    }
+    result.reachability = Some(reachability);
+}
+
+/// Record the two sections that summarise the run's whole transcript.
+fn record_transport_summary_sections(result: &mut DoctorResult, url: &str) {
+    let transcript = result.call_log.transcript();
+    let endpoint = classify_endpoint(&endpoint_host(url));
+    let relayed = endpoint.form.is_relayed();
+    let intermediary = transcript.intermediary_summary(endpoint);
+    let cookies = transcript.cookie_ledger();
+
+    let (status, detail, remediation) = if intermediary.responses_observed == 0 {
+        (
+            DoctorSectionStatus::Skip,
+            "no response reached this client, so nothing on the path could be fingerprinted"
+                .to_owned(),
+            None,
+        )
+    } else if intermediary.distinct_server_banners() > 1 {
+        (
+            DoctorSectionStatus::Warn,
+            format!(
+                "responses came back under {} different Server banners, so more than one origin \
+                 answered during this run",
+                intermediary.distinct_server_banners()
+            ),
+            Some(DOCTOR_MULTIPLE_PATH_HINT),
+        )
+    } else if relayed {
+        (
+            DoctorSectionStatus::Warn,
+            "this run goes through a QuickConnect relay, so Synology relay infrastructure is in \
+             the data path and nothing in the hostname pins consecutive requests to one DSM host"
+                .to_owned(),
+            Some(DOCTOR_RELAY_HINT),
+        )
+    } else if !intermediary.foreign_cookie_names.is_empty() {
+        (
+            DoctorSectionStatus::Warn,
+            format!(
+                "an intermediary set {} cookie(s) under names DSM does not use",
+                intermediary.foreign_cookie_names.len()
+            ),
+            None,
+        )
+    } else if intermediary.intermediary_detected() {
+        (
+            DoctorSectionStatus::Warn,
+            "a proxy or cache announced itself in front of DSM".to_owned(),
+            None,
+        )
+    } else {
+        (
+            DoctorSectionStatus::Pass,
+            "no proxy, relay, or cache announced itself on any response".to_owned(),
+            None,
+        )
+    };
+    result.set_derived_section("intermediary_transport", status, detail, remediation);
+
+    let (status, detail, remediation) = if let Some(rotated) = cookies.rotated_on_success() {
+        let at = rotated
+            .rotation_on_success()
+            .map(|rotation| rotation.at.describe())
+            .unwrap_or_else(|| "an unrecorded call".to_owned());
+        (
+            DoctorSectionStatus::Warn,
+            format!(
+                "the server issued a NEW value for cookie {} on {}, a call it also reported as \
+                 successful; this client keeps no cookie jar, so that value was discarded",
+                rotated.name, at
+            ),
+            Some(DOCTOR_COOKIE_ROTATION_HINT),
+        )
+    } else if cookies.is_empty() {
+        (
+            DoctorSectionStatus::Pass,
+            "the server set no cookies at any point in this run".to_owned(),
+            None,
+        )
+    } else {
+        (
+            DoctorSectionStatus::Pass,
+            format!(
+                "{} cookie name(s) were set and none was re-issued under a changed value on a \
+                 successful call",
+                cookies.entries.len()
+            ),
+            None,
+        )
+    };
+    result.set_derived_section("session_cookie_ledger", status, detail, remediation);
+
+    result.intermediary = Some(intermediary);
+    result.cookies = Some(cookies);
+}
+
+/// The host of a configured endpoint URL, for classification.
+///
+/// An unparseable URL yields an empty host, which classifies as an ordinary hostname and says
+/// nothing. The routing section reports the parse failure properly.
+fn endpoint_host(url: &str) -> String {
+    api::normalize_base_url(url, true)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// How many File Station APIs are listed individually, and how many namespaces are summarised.
+///
+/// A DSM with a full package set advertises several hundred APIs. Printing them all helps nobody,
+/// and the bound also means a server cannot make this report arbitrarily long.
+const DOCTOR_NAMESPACE_LIMIT: usize = 15;
+const DOCTOR_ADVERTISED_API_LIMIT: usize = 40;
+
+/// One API DSM advertises, with the version this tool asks of it when it asks for one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AdvertisedApi {
+    /// Sanitized for display. The wire name is chosen by whoever wrote the package that
+    /// advertises it, so it is never treated as trusted terminal output.
+    name: String,
+    min_version: Option<u32>,
+    max_version: Option<u32>,
+    /// The version this tool requests, when this is an API it uses.
+    required: Option<u32>,
+    optional: bool,
+}
+
+impl AdvertisedApi {
+    /// The offered range, or an honest note that DSM did not state one.
+    fn range(&self) -> String {
+        match (self.min_version, self.max_version) {
+            (Some(min), Some(max)) if min == max => format!("v{min}"),
+            (Some(min), Some(max)) => format!("v{min}-{max}"),
+            _ => "version range not advertised".to_owned(),
+        }
+    }
+}
+
+/// What this tool needs, measured against what DSM advertised.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RequirementVerdict {
+    requirement: ApiRequirement,
+    present: bool,
+    offered: Option<(u32, u32)>,
+    satisfied: bool,
+}
+
+impl RequirementVerdict {
+    fn evaluate(requirement: ApiRequirement, catalogue: &ApiCatalogue) -> Self {
+        let entry = catalogue.apis.get(requirement.api);
+        let offered = entry.and_then(|api| Some((api.min_version?, api.max_version?)));
+        let satisfied = entry
+            .and_then(|api| api.offers_version(requirement.version))
+            .unwrap_or(false);
+        Self {
+            requirement,
+            present: entry.is_some(),
+            offered,
+            satisfied,
+        }
+    }
+
+    /// Whether this verdict should fail the run: a required API that is absent or offered only at
+    /// versions this tool cannot use.
+    fn blocking(&self) -> bool {
+        !self.satisfied && !self.requirement.optional
+    }
+
+    fn describe(&self) -> String {
+        if self.satisfied {
+            return "ok".to_owned();
+        }
+        if !self.present {
+            return "NOT ADVERTISED".to_owned();
+        }
+        match self.offered {
+            Some((min, max)) => format!("INCOMPATIBLE (offered v{min}-{max})"),
+            None => "INCOMPATIBLE (no version range advertised)".to_owned(),
+        }
+    }
+}
+
+/// The three-tier view of what DSM offers, computed once and rendered twice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CapabilityEnumeration {
+    total: usize,
+    unusable_entries: usize,
+    file_station: Vec<AdvertisedApi>,
+    file_station_truncated: usize,
+    requirements: Vec<RequirementVerdict>,
+    /// Every namespace outside `SYNO.FileStation`, largest first.
+    namespaces: Vec<(String, usize)>,
+    /// APIs and namespaces beyond [`DOCTOR_NAMESPACE_LIMIT`], counted rather than listed.
+    namespace_overflow: Option<(usize, usize)>,
+}
+
+impl CapabilityEnumeration {
+    /// Fold DSM's advertised map into the three tiers the report prints.
+    fn from_catalogue(catalogue: &ApiCatalogue) -> Self {
+        let required: BTreeMap<&str, ApiRequirement> = API_REQUIREMENTS
+            .iter()
+            .map(|requirement| (requirement.api, *requirement))
+            .collect();
+        let mut file_station = Vec::new();
+        let mut namespace_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for (name, api) in &catalogue.apis {
+            if name.starts_with("SYNO.FileStation.") {
+                let requirement = required.get(name.as_str());
+                file_station.push(AdvertisedApi {
+                    name: BoundedText::sanitized(name).as_str().to_owned(),
+                    min_version: api.min_version,
+                    max_version: api.max_version,
+                    required: requirement.map(|requirement| requirement.version),
+                    optional: requirement.is_some_and(|requirement| requirement.optional),
+                });
+                continue;
+            }
+            *namespace_counts.entry(namespace_of(name)).or_default() += 1;
+        }
+        let file_station_truncated = file_station
+            .len()
+            .saturating_sub(DOCTOR_ADVERTISED_API_LIMIT);
+        file_station.truncate(DOCTOR_ADVERTISED_API_LIMIT);
+
+        let mut namespaces = namespace_counts.into_iter().collect::<Vec<_>>();
+        // Largest first, then alphabetically, so the order is stable across runs.
+        namespaces.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        let namespace_overflow = (namespaces.len() > DOCTOR_NAMESPACE_LIMIT).then(|| {
+            let tail = &namespaces[DOCTOR_NAMESPACE_LIMIT..];
+            (tail.iter().map(|(_, count)| count).sum(), tail.len())
+        });
+        namespaces.truncate(DOCTOR_NAMESPACE_LIMIT);
+
+        Self {
+            total: catalogue.apis.len(),
+            unusable_entries: catalogue.unusable_entries,
+            file_station,
+            file_station_truncated,
+            requirements: API_REQUIREMENTS
+                .iter()
+                .map(|requirement| RequirementVerdict::evaluate(*requirement, catalogue))
+                .collect(),
+            namespaces,
+            namespace_overflow,
+        }
+    }
+
+    fn blocking_requirements(&self) -> Vec<&RequirementVerdict> {
+        self.requirements
+            .iter()
+            .filter(|verdict| verdict.blocking())
+            .collect()
+    }
+
+    fn unsatisfied_optional(&self) -> usize {
+        self.requirements
+            .iter()
+            .filter(|verdict| !verdict.satisfied && verdict.requirement.optional)
+            .count()
+    }
+}
+
+/// The namespace an API name belongs to, as `SYNO.Core.*`.
+///
+/// Two components, because that is the level at which Synology's own naming separates products.
+/// A name with fewer components is its own namespace rather than being forced into a bucket.
+fn namespace_of(name: &str) -> String {
+    let sanitized = BoundedText::sanitized(name);
+    let sanitized = sanitized.as_str();
+    let mut components = sanitized.split('.');
+    match (components.next(), components.next()) {
+        (Some(first), Some(second)) => format!("{first}.{second}.*"),
+        _ => sanitized.to_owned(),
+    }
+}
+
+/// What several simultaneous authenticated calls did to one DSM session.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ConcurrencyReport {
+    parallel: usize,
+    succeeded: usize,
+    /// How many concurrent calls were answered with 106, 107, or 119.
+    session_rejected: usize,
+    other_failures: usize,
+    /// Whether one ordinary sequential call still worked after the burst.
+    follow_up_succeeded: bool,
+    follow_up_session_rejected: bool,
+    elapsed_ms: u64,
+}
+
+/// What one probed capability turned out to be, for this account, through this path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CapabilityVerdict {
+    Works,
+    /// DSM 102: discovery advertised it, the call said the API does not exist.
+    NotRoutable,
+    /// DSM 103: the API exists at a version without this method.
+    MethodUnavailable,
+    /// DSM 104: contradicts the discovery map outright.
+    VersionUnsupported,
+    /// DSM 105 or 407: the API works, this account may not use it here.
+    NoPermission,
+    /// The session died before this probe could run, or during it.
+    NotProbed,
+    /// Anything else: a transport failure, an HTTP status, an undecodable body.
+    Failed,
+}
+
+impl CapabilityVerdict {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Works => "works",
+            Self::NotRoutable => "advertised but not routable",
+            Self::MethodUnavailable => "method unavailable",
+            Self::VersionUnsupported => "version unsupported",
+            Self::NoPermission => "no permission for this account",
+            Self::NotProbed => "not probed",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Classify one probe's answer. Session codes are deliberately absent here: the caller stops
+    /// probing on them, so they can never reach this function as a capability verdict.
+    fn classify(probe: CapabilityProbe) -> Self {
+        if probe.outcome == RequestOutcome::Ok {
+            return Self::Works;
+        }
+        match probe.dsm_code {
+            // 408 is File Station answering the question asked: the path is not there. That is a
+            // fact about the path, which the resolution section reports, not about the API.
+            Some(408) => Self::Works,
+            Some(102) => Self::NotRoutable,
+            Some(103) => Self::MethodUnavailable,
+            Some(104) => Self::VersionUnsupported,
+            Some(105 | 407) => Self::NoPermission,
+            Some(106 | 107 | 119) => Self::NotProbed,
+            _ => Self::Failed,
+        }
+    }
+}
+
+/// One probed capability and its verdict.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CapabilityRecord {
+    api: &'static str,
+    method: &'static str,
+    version: u32,
+    verdict: CapabilityVerdict,
+    dsm_code: Option<i64>,
+    elapsed_ms: u64,
+    /// Whether this tool needs the capability to work, or merely reports on it.
+    required: bool,
+}
+
+/// Which advertised File Station capabilities actually work for this account.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CapabilityDiagnosis {
+    records: Vec<CapabilityRecord>,
+    info: Option<FileStationInfo>,
+    /// DSM's own name for the host, read at the start and again at the end of the section.
+    first_hostname: Option<BoundedText>,
+    last_hostname: Option<BoundedText>,
+    /// True only when both reads succeeded and disagreed. That is the one positive observation
+    /// that proves consecutive requests reached different hosts.
+    hostname_changed: bool,
+    /// Set when a session rejection stopped the remaining probes.
+    session_aborted: bool,
+    /// Advertised capabilities this diagnostic deliberately does not exercise.
+    unprobed: Vec<&'static str>,
+}
+
+impl CapabilityDiagnosis {
+    fn working(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|record| record.verdict == CapabilityVerdict::Works)
+            .count()
+    }
+
+    fn probed(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|record| record.verdict != CapabilityVerdict::NotProbed)
+            .count()
+    }
+
+    /// A required capability that is advertised and demonstrably non-functional. This is the only
+    /// condition that fails the section: a broken optional API must not fail a sync diagnostic.
+    fn broken_required(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|record| {
+                record.required
+                    && !matches!(
+                        record.verdict,
+                        CapabilityVerdict::Works | CapabilityVerdict::NotProbed
+                    )
+            })
+            .count()
+    }
+}
+
+/// Capabilities DSM advertises that this diagnostic will not exercise, and why not.
+///
+/// Stated in the report rather than left to inference: a matrix that silently omitted these would
+/// imply they had been verified.
+const DOCTOR_UNPROBED_CAPABILITIES: &[&str] = &[
+    "CreateFolder, Rename, Delete, CopyMove, Upload, Extract, Compress (mutating; the --write-test \
+     probe is where the ones sync uses get proven)",
+    "DirSize, MD5, Search (their start methods spawn background tasks that can walk a whole share)",
+    "Thumb, Download (need a real user file, which a diagnostic has no business choosing)",
+    "List.getinfo (the destination path resolution already exercises it against a real path)",
+    "Sharing (its list returns existing share links, which are credentials by URL)",
+];
+
+/// Read everything DSM advertises, and measure it against everything this tool asks for.
+///
+/// This never changes what the client requires. Discovery keeps its ten-entry allowlist and its
+/// strict wire type, because that map feeds every call the client makes; this is a separate,
+/// lenient read whose worst outcome is a warning on a diagnostic section.
+fn record_capability_enumeration(
+    result: &mut DoctorResult,
+    client: &ApiClient,
+    cancellation: &CancellationToken,
+) {
+    let started = Instant::now();
+    if let Err(error) = cancellation.check() {
+        result.fail_section("capability_enumeration", &error, started.elapsed());
+        return;
+    }
+    let catalogue = match client.enumerate_all_apis() {
+        Ok(catalogue) => catalogue,
+        Err(error) => {
+            // Never a failure. Discovery already validated the APIs this run depends on, so all
+            // that is lost here is the wider picture.
+            result.set_section(
+                "capability_enumeration",
+                DoctorSectionStatus::Warn,
+                format!(
+                    "DSM did not answer the full capability query, so only the APIs this tool \
+                     requires are known: {}",
+                    safe_doctor_error(&error)
+                ),
+                started.elapsed(),
+                "section",
+            );
+            return;
+        }
+    };
+    let enumeration = CapabilityEnumeration::from_catalogue(&catalogue);
+    let (status, detail, remediation) = capability_enumeration_verdict(&enumeration);
+    record_diagnostic_section(
+        result,
+        "capability_enumeration",
+        status,
+        detail,
+        started.elapsed(),
+        remediation,
+    );
+    result.capabilities = Some(enumeration);
+}
+
+/// Reach a verdict on what DSM advertises against what this tool asks for.
+fn capability_enumeration_verdict(
+    enumeration: &CapabilityEnumeration,
+) -> (DoctorSectionStatus, String, Option<&'static str>) {
+    let blocking = enumeration.blocking_requirements();
+    if !blocking.is_empty() {
+        let names = blocking
+            .iter()
+            .map(|verdict| verdict.requirement.api)
+            .collect::<Vec<_>>()
+            .join(", ");
+        (
+            DoctorSectionStatus::Fail,
+            format!(
+                "DSM advertises {} APIs; {} required API(s) are missing or version-incompatible: {}",
+                enumeration.total,
+                blocking.len(),
+                names
+            ),
+            Some(DOCTOR_CAPABILITY_VERSION_HINT),
+        )
+    } else if enumeration.unusable_entries > 0 || enumeration.unsatisfied_optional() > 0 {
+        (
+            DoctorSectionStatus::Warn,
+            format!(
+                "DSM advertises {} APIs; all required APIs are present with compatible versions, \
+                 but {} optional API(s) are unavailable and {} advertised entries could not be \
+                 read",
+                enumeration.total,
+                enumeration.unsatisfied_optional(),
+                enumeration.unusable_entries
+            ),
+            None,
+        )
+    } else {
+        (
+            DoctorSectionStatus::Pass,
+            format!(
+                "DSM advertises {} APIs; all {} APIs this tool uses are present with compatible \
+                 versions",
+                enumeration.total,
+                enumeration.requirements.len()
+            ),
+            None,
+        )
+    }
+}
+
+/// Record one diagnostic section that reaches a verdict without aborting the run.
+///
+/// Deliberately not [`DoctorResult::fail_section`]: these sections can legitimately fail --
+/// proving the session is mis-carried is the whole job of one of them -- and the run continues
+/// afterwards. Writing "not run because X failed" over the sections that follow would be false,
+/// because they do run and do record their own results.
+fn record_diagnostic_section(
+    result: &mut DoctorResult,
+    id: &'static str,
+    status: DoctorSectionStatus,
+    detail: String,
+    elapsed: Duration,
+    remediation: Option<&'static str>,
+) {
+    result.set_section(id, status, detail.clone(), elapsed, "section");
+    if let Some(section) = result.sections.iter_mut().find(|section| section.id == id) {
+        section.remediation = remediation;
+    }
+    if status == DoctorSectionStatus::Fail {
+        result.failure.get_or_insert(detail);
+    }
+}
+
+/// Present the same authenticated call through one session channel at a time.
+///
+/// The four variants run whatever they find: a `119` here is the observation, not an error, so
+/// this deliberately does not route through [`session_is_unusable`]. Aborting on the first
+/// rejection is exactly what would make the probe useless.
+fn record_session_channel_ablation(result: &mut DoctorResult, client: &ApiClient) {
+    let started = Instant::now();
+    let probes = match client.probe_session_channels() {
+        Ok(probes) => probes,
+        Err(error) => {
+            result.set_section(
+                "session_channel_ablation",
+                DoctorSectionStatus::Skip,
+                format!(
+                    "the ablation probe could not be issued: {}",
+                    safe_doctor_error(&error)
+                ),
+                started.elapsed(),
+                "section",
+            );
+            return;
+        }
+    };
+    let (status, detail, remediation) = ablation_verdict(&probes);
+    record_diagnostic_section(
+        result,
+        "session_channel_ablation",
+        status,
+        detail,
+        started.elapsed(),
+        remediation,
+    );
+    result.channel_ablation = Some(probes);
+}
+
+/// Reach a verdict from the four ablation variants.
+///
+/// Only the first three decide it. `TokenHeaderOnly` carries no session identifier at all, so DSM
+/// is *expected* to reject it; it is the control that proves the probe can tell acceptance from
+/// rejection, and treating its rejection as a finding would be a false alarm on every healthy NAS.
+fn ablation_verdict(
+    probes: &[ChannelProbe; SESSION_CHANNEL_VARIANTS],
+) -> (DoctorSectionStatus, String, Option<&'static str>) {
+    let all = probes[0];
+    let sid = probes[1];
+    let cookie = probes[2];
+    let control = probes[3];
+    let cookie_note = if cookie.accepted() {
+        "the synthesised cookie alone was also accepted"
+    } else {
+        "the synthesised cookie alone was rejected, which is what a format=sid login implies"
+    };
+    if all.accepted() && sid.accepted() {
+        (
+            DoctorSectionStatus::Pass,
+            format!(
+                "the session is accepted both as this client normally presents it and through the \
+                 documented _sid request field alone; {cookie_note}. Channel selection is not the \
+                 fault here"
+            ),
+            None,
+        )
+    } else if sid.accepted() {
+        (
+            DoctorSectionStatus::Fail,
+            format!(
+                "the session is accepted with the _sid request field alone and rejected \
+                 ({}) when this client's usual combination of channels is attached",
+                all.dsm_code
+                    .map(|code| format!("DSM {code}"))
+                    .unwrap_or_else(|| all.outcome.as_str().to_owned())
+            ),
+            Some(DOCTOR_COOKIE_CHANNEL_HINT),
+        )
+    } else if all.accepted() {
+        (
+            DoctorSectionStatus::Warn,
+            "DSM accepted this client's usual channel combination but rejected the documented \
+             _sid request field on its own, so DSM is resolving the session from the cookie \
+             rather than from the field its own guide specifies for a format=sid login"
+                .to_owned(),
+            None,
+        )
+    } else if !cookie.accepted() && !control.accepted() {
+        (
+            DoctorSectionStatus::Fail,
+            "every session channel was rejected, so the session identifier itself is no longer \
+             valid server-side rather than being mis-carried by one channel"
+                .to_owned(),
+            Some(DOCTOR_SESSION_DEAD_HINT),
+        )
+    } else {
+        (
+            DoctorSectionStatus::Warn,
+            format!(
+                "the session was rejected through this client's usual channels and through the \
+                 _sid request field, but {cookie_note}"
+            ),
+            None,
+        )
+    }
+}
+
+/// How many simultaneous authenticated calls the fan-out probe makes.
+///
+/// A constant rather than a flag: this is a diagnostic against someone's live NAS, and letting an
+/// operator dial it up turns a measurement into a load test.
+const DOCTOR_CONCURRENCY_FANOUT: usize = 4;
+
+/// Issue several authenticated calls at once, then one more on its own.
+///
+/// `reqwest`'s pool opens additional TCP connections under concurrency, so this is the closest
+/// available test of "a second connection loses the session". The sequential call afterwards is
+/// what separates "the burst was rejected" from "the burst invalidated the session".
+fn record_session_concurrency(result: &mut DoctorResult, client: &ApiClient) {
+    let started = Instant::now();
+    let mut outcomes = Vec::with_capacity(DOCTOR_CONCURRENCY_FANOUT);
+    std::thread::scope(|scope| {
+        let handles = (0..DOCTOR_CONCURRENCY_FANOUT)
+            .map(|_| {
+                let client = client.clone();
+                scope.spawn(move || client.confirm_file_station_session())
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            outcomes.push(handle.join().unwrap_or_else(|_| {
+                Err(Error::Message(
+                    "a concurrent session probe thread panicked".to_owned(),
+                ))
+            }));
+        }
+    });
+    let follow_up = client.confirm_file_station_session();
+
+    let mut report = ConcurrencyReport {
+        parallel: DOCTOR_CONCURRENCY_FANOUT,
+        follow_up_succeeded: follow_up.is_ok(),
+        follow_up_session_rejected: follow_up
+            .as_ref()
+            .err()
+            .is_some_and(|error| matches!(error.api_code(), Some(106 | 107 | 119))),
+        elapsed_ms: duration_millis(started.elapsed()),
+        ..ConcurrencyReport::default()
+    };
+    for outcome in &outcomes {
+        match outcome {
+            Ok(()) => report.succeeded += 1,
+            Err(error) if matches!(error.api_code(), Some(106 | 107 | 119)) => {
+                report.session_rejected += 1;
+            }
+            Err(_) => report.other_failures += 1,
+        }
+    }
+
+    let (status, detail, remediation) = concurrency_verdict(&report);
+    record_diagnostic_section(
+        result,
+        "session_concurrency",
+        status,
+        detail,
+        started.elapsed(),
+        remediation,
+    );
+    result.concurrency = Some(report);
+}
+
+/// Reach a verdict from the fan-out probe.
+///
+/// The sequential call after the burst is what separates "the burst was rejected" from "the burst
+/// invalidated the session", and those need different answers.
+fn concurrency_verdict(
+    report: &ConcurrencyReport,
+) -> (DoctorSectionStatus, String, Option<&'static str>) {
+    if report.succeeded == report.parallel && report.follow_up_succeeded {
+        (
+            DoctorSectionStatus::Pass,
+            format!(
+                "all {} concurrent requests succeeded and the sequential follow-up succeeded, so \
+                 the session tolerates being used from several connections at once",
+                report.parallel
+            ),
+            None,
+        )
+    } else if report.session_rejected > 0 {
+        (
+            DoctorSectionStatus::Warn,
+            format!(
+                "{} of {} concurrent requests succeeded and {} were rejected with a session \
+                 error; the sequential follow-up {}",
+                report.succeeded,
+                report.parallel,
+                report.session_rejected,
+                if report.follow_up_succeeded {
+                    "succeeded, so the session itself survived the burst"
+                } else {
+                    "also failed, so the burst left the session unusable"
+                }
+            ),
+            Some(DOCTOR_MULTIPLE_PATH_HINT),
+        )
+    } else if report.succeeded == report.parallel && !report.follow_up_succeeded {
+        (
+            DoctorSectionStatus::Warn,
+            "every concurrent request succeeded but the sequential call after them did not, so \
+             the burst itself is what invalidated the session"
+                .to_owned(),
+            Some(DOCTOR_MULTIPLE_PATH_HINT),
+        )
+    } else {
+        (
+            DoctorSectionStatus::Warn,
+            format!(
+                "{} of {} concurrent requests succeeded; {} failed for reasons other than a \
+                 rejected session",
+                report.succeeded, report.parallel, report.other_failures
+            ),
+            None,
+        )
+    }
+}
+
+/// Exercise the advertised File Station capabilities that are safe to exercise.
+///
+/// Advertised is not functional: an API can sit in the discovery map and still answer 105 for
+/// this account, or 102 because a proxy does not forward its CGI path. Only a live call separates
+/// those, and only for the account actually running.
+fn record_capability_diagnosis(result: &mut DoctorResult, client: &ApiClient) {
+    let started = Instant::now();
+    let mut diagnosis = CapabilityDiagnosis {
+        unprobed: DOCTOR_UNPROBED_CAPABILITIES.to_vec(),
+        ..CapabilityDiagnosis::default()
+    };
+
+    // The authoritative per-account report comes first: `is_manager` and the virtual-protocol
+    // list change what every other line of this section means.
+    let info_started = Instant::now();
+    let first_info = client.file_station_info();
+    diagnosis.records.push(CapabilityRecord {
+        api: "SYNO.FileStation.Info",
+        method: "get",
+        version: 2,
+        verdict: verdict_for(&first_info),
+        dsm_code: first_info.as_ref().err().and_then(Error::api_code),
+        elapsed_ms: duration_millis(info_started.elapsed()),
+        required: false,
+    });
+    match &first_info {
+        Ok(info) => {
+            diagnosis.info = Some(*info);
+            diagnosis.first_hostname = info.hostname;
+        }
+        Err(error) if session_is_unusable(error) => {
+            diagnosis.session_aborted = true;
+        }
+        Err(_) => {}
+    }
+
+    if !diagnosis.session_aborted {
+        for spec in capability_probe_specs(result.capabilities.as_ref()) {
+            let required = spec.api == "SYNO.FileStation.List";
+            match client.probe_capability(spec) {
+                Ok(probe) => {
+                    let verdict = CapabilityVerdict::classify(probe);
+                    diagnosis.records.push(CapabilityRecord {
+                        api: probe.api,
+                        method: probe.method,
+                        version: probe.version,
+                        verdict,
+                        dsm_code: probe.dsm_code,
+                        elapsed_ms: probe.elapsed_ms,
+                        required,
+                    });
+                    // A session code means the session died, not that the capability is missing.
+                    // Continuing would paint every remaining row red and tell the operator
+                    // nothing about their capabilities.
+                    if matches!(probe.dsm_code, Some(106 | 107 | 119)) {
+                        diagnosis.session_aborted = true;
+                        break;
+                    }
+                }
+                Err(error) => {
+                    diagnosis.session_aborted |= session_is_unusable(&error);
+                    if diagnosis.session_aborted {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // The second host read is the point of the whole section: a single NAS behind a relay has one
+    // hostname, so two different ones inside one run is the only positive proof that consecutive
+    // requests did not reach the same host.
+    if !diagnosis.session_aborted
+        && let Ok(info) = client.file_station_info()
+    {
+        diagnosis.last_hostname = info.hostname;
+        diagnosis.hostname_changed = match (diagnosis.first_hostname, info.hostname) {
+            (Some(first), Some(last)) => first.as_str() != last.as_str(),
+            _ => false,
+        };
+    }
+
+    let (status, detail, remediation) = capability_diagnosis_verdict(&diagnosis);
+    record_diagnostic_section(
+        result,
+        "capability_diagnosis",
+        status,
+        detail,
+        started.elapsed(),
+        remediation,
+    );
+    result.capability_diagnosis = Some(diagnosis);
+}
+
+/// Reach a verdict on what the probed capabilities said.
+///
+/// A rejected session is reported as a rejected session, never as a wall of broken capabilities,
+/// and only a *required* capability that is advertised and demonstrably non-functional fails the
+/// section: a broken optional API must not fail a sync diagnostic.
+fn capability_diagnosis_verdict(
+    diagnosis: &CapabilityDiagnosis,
+) -> (DoctorSectionStatus, String, Option<&'static str>) {
+    if diagnosis.hostname_changed {
+        (
+            DoctorSectionStatus::Fail,
+            "File Station reported two different host names inside this one run, so consecutive \
+             requests demonstrably reached different DSM hosts"
+                .to_owned(),
+            Some(DOCTOR_MULTIPLE_PATH_HINT),
+        )
+    } else if diagnosis.session_aborted {
+        (
+            DoctorSectionStatus::Warn,
+            "capability probing stopped after the DSM session was rejected; the results above \
+             describe the session rather than the capabilities, and the channel ablation section \
+             is where that verdict is reached"
+                .to_owned(),
+            None,
+        )
+    } else if diagnosis.broken_required() > 0 {
+        (
+            DoctorSectionStatus::Fail,
+            format!(
+                "{} of {} probed capabilities work; {} that this tool requires are advertised but \
+                 not functional",
+                diagnosis.working(),
+                diagnosis.probed(),
+                diagnosis.broken_required()
+            ),
+            diagnosis
+                .records
+                .iter()
+                .any(|record| record.verdict == CapabilityVerdict::NotRoutable)
+                .then_some(DOCTOR_CAPABILITY_ROUTING_HINT),
+        )
+    } else if diagnosis.working() < diagnosis.probed() {
+        (
+            DoctorSectionStatus::Warn,
+            format!(
+                "{} of {} probed capabilities work; the rest are optional for this tool",
+                diagnosis.working(),
+                diagnosis.probed()
+            ),
+            None,
+        )
+    } else {
+        (
+            DoctorSectionStatus::Pass,
+            format!(
+                "all {} probed capabilities work for this account",
+                diagnosis.probed()
+            ),
+            None,
+        )
+    }
+}
+
+fn verdict_for<T>(outcome: &Result<T>) -> CapabilityVerdict {
+    match outcome {
+        Ok(_) => CapabilityVerdict::Works,
+        Err(error) => match error.api_code() {
+            Some(102) => CapabilityVerdict::NotRoutable,
+            Some(103) => CapabilityVerdict::MethodUnavailable,
+            Some(104) => CapabilityVerdict::VersionUnsupported,
+            Some(105 | 407) => CapabilityVerdict::NoPermission,
+            Some(106 | 107 | 119) => CapabilityVerdict::NotProbed,
+            _ => CapabilityVerdict::Failed,
+        },
+    }
+}
+
+/// The read-only probes worth making, given what DSM advertised and what this run was pointed at.
+///
+/// Each entry is bounded, non-mutating, and free of side effects. An API advertised at a CGI path
+/// this client does not already use is deliberately left unprobed rather than followed: a
+/// diagnostic has no business being the first thing to request an unknown endpoint.
+fn capability_probe_specs(
+    capabilities: Option<&CapabilityEnumeration>,
+) -> Vec<CapabilityProbeSpec> {
+    // `getinfo` is deliberately absent: the destination path resolution exercises it against a
+    // real path on every run that has a destination, and probing it a second time here would buy
+    // nothing but another round trip.
+    let mut specs = vec![CapabilityProbeSpec {
+        api: "SYNO.FileStation.List",
+        method: "list_share",
+        version: 2,
+        cgi_path: "entry.cgi",
+        parameters: vec![
+            ("offset".to_owned(), "0".to_owned()),
+            ("limit".to_owned(), "1".to_owned()),
+        ],
+    }];
+    let advertised = |name: &str, version: u32| {
+        capabilities.is_some_and(|capabilities| {
+            capabilities.file_station.iter().any(|api| {
+                api.name == name
+                    && api.min_version.is_some_and(|min| min <= version)
+                    && api.max_version.is_some_and(|max| max >= version)
+            })
+        })
+    };
+    if advertised("SYNO.FileStation.VirtualFolder", 2) {
+        specs.push(CapabilityProbeSpec {
+            api: "SYNO.FileStation.VirtualFolder",
+            method: "list",
+            version: 2,
+            cgi_path: "entry.cgi",
+            parameters: vec![
+                ("type".to_owned(), "\"cifs\"".to_owned()),
+                ("offset".to_owned(), "0".to_owned()),
+                ("limit".to_owned(), "1".to_owned()),
+            ],
+        });
+    }
+    if advertised("SYNO.FileStation.BackgroundTask", 3) {
+        specs.push(CapabilityProbeSpec {
+            api: "SYNO.FileStation.BackgroundTask",
+            method: "list",
+            version: 3,
+            cgi_path: "entry.cgi",
+            parameters: vec![
+                ("offset".to_owned(), "0".to_owned()),
+                ("limit".to_owned(), "1".to_owned()),
+            ],
+        });
+    }
+    specs
+}
+
+/// Report the destination path one component at a time.
+///
+/// The walk already happens inside the permission check; this renders what that check discards.
+/// "Neither the destination nor any ancestor of it exists" and "only the last component is
+/// missing" are different problems with different fixes, and only the component list separates
+/// them.
+fn record_destination_path_resolution(
+    result: &mut DoctorResult,
+    resolution: &DestinationPathResolution,
+) {
+    let (status, detail, remediation) = path_resolution_verdict(resolution);
+    // Deliberately derived rather than a section of its own: the `getinfo` requests belong to the
+    // permission check that issued them, and draining them onto this section would report the
+    // same round trips twice.
+    result.set_derived_section(
+        "destination_path_resolution",
+        status,
+        detail.clone(),
+        remediation,
+    );
+    if status == DoctorSectionStatus::Fail {
+        result.failure.get_or_insert(detail);
+    }
+    result.path_resolution = Some(resolution.clone());
+}
+
+/// Reach a verdict from the destination walk.
+fn path_resolution_verdict(
+    resolution: &DestinationPathResolution,
+) -> (DoctorSectionStatus, String, Option<&'static str>) {
+    if resolution.segments.is_empty() {
+        (
+            DoctorSectionStatus::Skip,
+            "the destination path was not walked; the permission check could not start".to_owned(),
+            None,
+        )
+    } else if resolution.fully_resolved() {
+        (
+            DoctorSectionStatus::Pass,
+            format!(
+                "all {} components of the destination exist and are directories",
+                resolution.total_components
+            ),
+            None,
+        )
+    } else if resolution.share_root_missing() {
+        (
+            DoctorSectionStatus::Fail,
+            format!(
+                "resolution stops at the first component of {}: the shared folder itself is \
+                 absent or invisible to this account",
+                resolution.total_components
+            ),
+            Some(DOCTOR_MISSING_SHARE_HINT),
+        )
+    } else if let Some(missing) = resolution.first_missing {
+        (
+            DoctorSectionStatus::Warn,
+            format!(
+                "resolution stops at component {missing} of {}; every component before it exists \
+                 and is a directory",
+                resolution.total_components
+            ),
+            Some(DOCTOR_MISSING_COMPONENT_HINT),
+        )
+    } else {
+        // The walk stopped for a reason other than a component being absent -- a rejected
+        // session, a refused permission -- and saying "missing" would be a different diagnosis
+        // from the one the evidence supports.
+        let stopped_by = resolution
+            .segments
+            .last()
+            .and_then(|segment| segment.dsm_code)
+            .map(|code| format!(" after DSM answered {code}"))
+            .unwrap_or_default();
+        (
+            DoctorSectionStatus::Warn,
+            format!(
+                "the walk stopped at component {} of {}{stopped_by}, so the components below it \
+                 were never inspected and are not known to be missing",
+                resolution.segments.len(),
+                resolution.total_components
+            ),
+            None,
+        )
+    }
+}
+
+fn doctor_run(
+    settings: &config::ResolvedDoctor,
+    logger: Option<Arc<EventLogger>>,
+    cancellation: &CancellationToken,
+    perform_write_probe: bool,
+    call_log: DoctorCallLog,
+) -> Result<DoctorResult> {
+    let mut result = DoctorResult::new(settings, perform_write_probe, call_log);
     if let Err(error) = cancellation.check() {
         result.fail_section("routing_tls", &error, Duration::ZERO);
         return Ok(result);
@@ -1958,7 +3571,14 @@ fn doctor_checks(
         LogEvent::new(EventLogLevel::Info, EventCode::ApiDiscoveryStarted),
     )?;
     let connection_started = Instant::now();
-    let mut client = match connect_client(&settings.url, &settings.network) {
+    // The doctor's observer both logs each round trip and retains the completed ones, so every
+    // section can report the requests it is responsible for.
+    let mut client = match connect_client(
+        &settings.url,
+        &settings.network,
+        cancellation,
+        Some(result.call_log.observer(logger.as_ref())),
+    ) {
         Ok(client) => client,
         Err(error) => {
             let elapsed = connection_started.elapsed();
@@ -1974,6 +3594,10 @@ fn doctor_checks(
                             .trim_start()
                             .get(..7)
                             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://")));
+                // Discovery is recorded first so the discovery requests are attributed to it
+                // rather than to routing, which performs no request of its own. Display order is
+                // fixed by the section list and is unaffected.
+                result.fail_section("dsm_api_discovery", &error, elapsed);
                 result.set_section(
                     "routing_tls",
                     if warning {
@@ -1985,7 +3609,6 @@ fn doctor_checks(
                     elapsed,
                     "shared_connection",
                 );
-                result.fail_section("dsm_api_discovery", &error, elapsed);
             } else {
                 result.fail_section("routing_tls", &error, elapsed);
                 result.set_section(
@@ -2028,6 +3651,15 @@ fn doctor_checks(
             "HTTPS route and TLS negotiation succeeded with certificate verification enabled"
         }
     };
+    // Discovery is recorded first so the discovery requests are attributed to it rather than to
+    // routing, which performs no request of its own. Display order is fixed by the section list.
+    result.set_section(
+        "dsm_api_discovery",
+        DoctorSectionStatus::Pass,
+        "DSM Auth and baseline File Station API versions were validated from the discovery response",
+        connection_elapsed,
+        "shared_connection",
+    );
     result.set_section(
         "routing_tls",
         if transport_warning {
@@ -2039,13 +3671,11 @@ fn doctor_checks(
         connection_elapsed,
         "shared_connection",
     );
-    result.set_section(
-        "dsm_api_discovery",
-        DoctorSectionStatus::Pass,
-        "DSM Auth and baseline File Station API versions were validated from the discovery response",
-        connection_elapsed,
-        "shared_connection",
-    );
+
+    // Enumeration runs before the requirement check and before authentication: it needs no
+    // session, so an operator whose credentials are broken still learns exactly what their DSM
+    // offers, and every later section can name what it is working against.
+    record_capability_enumeration(&mut result, &client, cancellation);
 
     let capability_started = Instant::now();
     let capability_result = (|| {
@@ -2063,6 +3693,7 @@ fn doctor_checks(
             &error,
             capability_started.elapsed(),
         );
+        result.set_timing_scope("file_station_capabilities", TIMING_SCOPE_LOCAL_ONLY);
         if settings.level != cli::DoctorLevel::Quick {
             result.set_section(
                 "dsm_session_auth",
@@ -2092,7 +3723,9 @@ fn doctor_checks(
         },
         capability_detail,
         capability_started.elapsed(),
-        "section",
+        // No request is made: this compares the required APIs against the discovery response the
+        // connection already fetched, which is why it always reports near-zero time.
+        TIMING_SCOPE_LOCAL_ONLY,
     );
 
     if let Err(error) = cancellation.check() {
@@ -2165,14 +3798,33 @@ fn doctor_checks(
         authentication_started.elapsed(),
         "section",
     );
-    if let Err(error) = log_event(
+    // Tracked separately from `result.failed()`. The session diagnostics below can legitimately
+    // fail -- proving the session is mis-carried is their job -- and a run that reached a verdict
+    // about the session must still go on to inspect the destination.
+    let session_logging_failed = log_event(
         logger.as_ref(),
         LogEvent::new(EventLogLevel::Info, EventCode::AuthenticationCompleted),
-    ) {
-        result.fail_section("dsm_session_auth", &error, authentication_started.elapsed());
+    )
+    .inspect_err(|error| {
+        result.fail_section("dsm_session_auth", error, authentication_started.elapsed());
+    })
+    .is_err();
+
+    // The session diagnostics run immediately after the session is established and before
+    // anything else uses it, so their verdict is about the session rather than about whatever a
+    // later section happened to ask for. The ablation comes first because the capability
+    // diagnosis reads its verdict: without it, a dead session masquerades as broken capabilities.
+    if !session_logging_failed && cancellation.check().is_ok() {
+        record_session_channel_ablation(&mut result, &client);
+        if settings.level == cli::DoctorLevel::Extensive && cancellation.check().is_ok() {
+            record_session_concurrency(&mut result, &client);
+        }
+        if cancellation.check().is_ok() {
+            record_capability_diagnosis(&mut result, &client);
+        }
     }
 
-    if result.failed() {
+    if session_logging_failed {
         result.set_section(
             "destination_permissions",
             DoctorSectionStatus::Skip,
@@ -2187,9 +3839,23 @@ fn doctor_checks(
             Duration::ZERO,
             "section",
         );
+        result.set_section(
+            "destination_path_resolution",
+            DoctorSectionStatus::Skip,
+            "not run because authenticated-session completion logging failed",
+            Duration::ZERO,
+            "section",
+        );
     } else if let Some(remote) = settings.remote.as_deref() {
         match RemoteRoot::parse(remote) {
             Err(error) => {
+                result.set_section(
+                    "destination_path_resolution",
+                    DoctorSectionStatus::Skip,
+                    "the destination path was rejected before it could be walked",
+                    Duration::ZERO,
+                    "section",
+                );
                 result.fail_section("destination_permissions", &error, Duration::ZERO);
                 result.set_section(
                     "destination_inventory",
@@ -2201,10 +3867,19 @@ fn doctor_checks(
             }
             Ok(root) => {
                 let permission_started = Instant::now();
-                match cancellation
-                    .check()
-                    .and_then(|()| client.verify_destination_writable(&root))
-                {
+                // One walk, reported twice: the resolution section renders the components the
+                // permission check inspects, so naming exactly where the path stops existing
+                // costs no additional request.
+                let (resolution, write_result) = match cancellation.check() {
+                    Ok(()) => client.verify_destination_writable_with_resolution(&root),
+                    Err(error) => (DestinationPathResolution::default(), Err(error)),
+                };
+                // The permission section records first so the walk's requests are attributed to
+                // the check that made them; the resolution section then renders the same walk
+                // without claiming the requests a second time.
+                let session_was_rejected =
+                    write_result.as_ref().err().is_some_and(session_is_unusable);
+                match write_result {
                     Ok(write_check) => {
                         result.write_permission_scope = Some(if write_check.destination_exists {
                             "exact_destination"
@@ -2224,12 +3899,38 @@ fn doctor_checks(
                             "section",
                         );
                     }
-                    Err(error) => result.fail_section(
-                        "destination_permissions",
-                        &error,
-                        permission_started.elapsed(),
-                    ),
+                    Err(error) => {
+                        // A rejected session cannot enumerate either. Falling through would
+                        // issue a second request that cannot succeed and would report one dead
+                        // session as two independent failures. A permission-only refusal is
+                        // different: "can read but cannot write" is a real diagnosis, so the
+                        // inventory still runs for those.
+                        result.fail_section(
+                            "destination_permissions",
+                            &error,
+                            permission_started.elapsed(),
+                        );
+                        if session_was_rejected {
+                            record_destination_path_resolution(&mut result, &resolution);
+                            result.set_section(
+                                "destination_inventory",
+                                DoctorSectionStatus::Skip,
+                                if matches!(error, Error::Cancelled) {
+                                    "not attempted; the run was cancelled during the permission \
+                                     check"
+                                } else {
+                                    "not attempted; the DSM session was already rejected by the \
+                                     permission check"
+                                },
+                                Duration::ZERO,
+                                "section",
+                            );
+                            record_doctor_logout(&mut client, &mut result);
+                            return Ok(result);
+                        }
+                    }
                 }
+                record_destination_path_resolution(&mut result, &resolution);
 
                 let inventory_started = Instant::now();
                 let inventory_start_log = log_event(
@@ -2379,6 +4080,13 @@ fn doctor_checks(
         }
     } else {
         result.set_section(
+            "destination_path_resolution",
+            DoctorSectionStatus::Skip,
+            "no destination was selected; there was no path to walk",
+            Duration::ZERO,
+            "section",
+        );
+        result.set_section(
             "destination_permissions",
             DoctorSectionStatus::Skip,
             "no destination was selected; no write-permission check was attempted",
@@ -2486,8 +4194,7 @@ fn run_doctor_batch(mut jobs: Vec<NamedDoctorSettings>) -> Result<ExitCode> {
     jobs.sort_by(|left, right| left.name.cmp(&right.name));
     let output = common_batch_output(jobs.iter().map(|job| &job.settings.output))?;
     validate_doctor_batch(&jobs)?;
-    let cancellation = CancellationToken::default();
-    install_cancellation_handler(cancellation.clone())?;
+    let cancellation = install_cancellation_handler()?;
     let write_tests = jobs.iter().any(|job| job.settings.write_test);
     let mut cancelled = false;
 
@@ -2729,8 +4436,13 @@ fn validate_doctor_batch(jobs: &[NamedDoctorSettings]) -> Result<()> {
     Ok(())
 }
 
-fn connect_client(url: &str, network: &config::ResolvedNetwork) -> Result<ApiClient> {
-    ApiClient::connect(&ClientOptions {
+/// The transport options a run derives from its URL and resolved network settings.
+///
+/// Shared with the unauthenticated transport probe so the probe measures the same endpoint, under
+/// the same timeouts and the same certificate trust, that the run itself will use. A probe built
+/// from separately assembled options could report on a path the client never takes.
+fn client_options(url: &str, network: &config::ResolvedNetwork) -> ClientOptions {
+    ClientOptions {
         base_url: url.to_owned(),
         allow_http: network.allow_http,
         accept_invalid_certs: network.danger_accept_invalid_certs,
@@ -2738,10 +4450,26 @@ fn connect_client(url: &str, network: &config::ResolvedNetwork) -> Result<ApiCli
         connect_timeout: Duration::from_secs(network.connect_timeout),
         request_timeout: Duration::from_secs(network.timeout),
         retries: u32::from(network.retries),
-    })
-    // The limit is applied to the connected client rather than to the HTTP transport: it paces
-    // the upload body, and it is deliberately shared by every worker clone of this client.
-    .map(|client| client.with_max_upload_rate(network.max_rate))
+    }
+}
+
+fn connect_client(
+    url: &str,
+    network: &config::ResolvedNetwork,
+    cancellation: &CancellationToken,
+    observer: Option<RequestObserver>,
+) -> Result<ApiClient> {
+    // The observer is handed to `connect_observed` rather than applied afterwards so API
+    // discovery -- two requests, with a route fallback worth seeing -- is instrumented too.
+    ApiClient::connect_observed(&client_options(url, network), observer)
+        // The limit is applied to the connected client rather than to the HTTP transport: it paces
+        // the upload body, and it is deliberately shared by every worker clone of this client. The
+        // cancellation token rides along so control-request backoff wakes on Ctrl-C.
+        .map(|client| {
+            client
+                .with_max_upload_rate(network.max_rate)
+                .with_cancellation(cancellation)
+        })
 }
 
 fn finish_authenticated_operation<T>(client: &mut ApiClient, operation: Result<T>) -> Result<T> {
@@ -3066,9 +4794,57 @@ fn progress_metrics(snapshot: &synology_drive_sync::progress::ProgressSnapshot) 
     }
 }
 
-fn install_cancellation_handler(cancellation: CancellationToken) -> Result<()> {
-    ctrlc::set_handler(move || cancellation.cancel())
-        .map_err(|error| Error::Message(format!("failed to install Ctrl-C handler: {error}")))
+/// The one token every signal handler cancels, and every subcommand shares.
+///
+/// `ctrlc::set_handler` refuses a second installation for the life of the process, so the token
+/// is process-wide rather than per-subcommand. Only one subcommand runs per process today; this
+/// makes a future second call idempotent instead of a hard failure.
+static PROCESS_CANCELLATION: OnceLock<CancellationToken> = OnceLock::new();
+
+/// Signals received so far. The first requests cooperative cancellation; any later one force-exits.
+static SIGNALS_RECEIVED: AtomicUsize = AtomicUsize::new(0);
+
+const SECOND_SIGNAL_HINT: &[u8] =
+    b"\ncancelling; finishing the current operation. Press Ctrl-C again to exit immediately.\n";
+
+/// Install the escalating termination handler and return the process cancellation token.
+///
+/// The first SIGINT/SIGTERM/SIGHUP (and the Windows console control events the `termination`
+/// feature covers) sets the token so every phase unwinds cooperatively: in-flight uploads abort,
+/// remote state stays consistent, and the run exits 130. A second signal means the operator is
+/// no longer willing to wait, so the process exits immediately with the same code.
+///
+/// `ctrlc` runs this closure on its own dedicated thread rather than in an async-signal context,
+/// so allocation here would in fact be legal. It is still kept allocation-free and lock-free: a
+/// single `write_all` of a constant to stderr cannot deadlock against the progress renderer or a
+/// panicking main thread, and cannot break if the crate ever moves to a real signal handler.
+/// `std::process::exit` is used for the escalation because it is the only portable way to choose
+/// the documented exit code 130 without `unsafe`.
+///
+/// Only the subcommands that actually poll the token install this. `config`, `completions`,
+/// `manpage`, and `credentials` deliberately keep the default signal disposition, which already
+/// terminates them at once; taking the signal over for them would turn a working single Ctrl-C
+/// into a swallowed one on paths that have nothing to unwind.
+///
+/// The `sdsync-dsm-api` binary installs its own handler (`dsm_api::install_consumer_termination_handler`).
+/// The two never share a process: `dsm_api.rs` is compiled only into that binary and nothing here
+/// references it. Merging them would make whichever installs second fail.
+fn install_cancellation_handler() -> Result<CancellationToken> {
+    if let Some(cancellation) = PROCESS_CANCELLATION.get() {
+        return Ok(cancellation.clone());
+    }
+    let cancellation = CancellationToken::default();
+    let handler_token = cancellation.clone();
+    ctrlc::set_handler(move || {
+        if SIGNALS_RECEIVED.fetch_add(1, Ordering::AcqRel) == 0 {
+            handler_token.cancel();
+            let _ = io::stderr().write_all(SECOND_SIGNAL_HINT);
+        } else {
+            std::process::exit(CANCELLED_EXIT_CODE.into());
+        }
+    })
+    .map_err(|error| Error::Message(format!("failed to install Ctrl-C handler: {error}")))?;
+    Ok(PROCESS_CANCELLATION.get_or_init(|| cancellation).clone())
 }
 
 fn build_logger(output: &config::ResolvedOutput) -> Result<Option<Arc<EventLogger>>> {
@@ -3115,15 +4891,79 @@ fn build_logger(output: &config::ResolvedOutput) -> Result<Option<Arc<EventLogge
     if stderr.is_none() && file.is_none() && remote.is_none() {
         return Ok(None);
     }
-    EventLogger::new(LoggerConfig {
+    let logger = EventLogger::new(LoggerConfig {
         level,
         stderr,
         file,
         remote,
     })
     .map(Arc::new)
-    .map(Some)
-    .map_err(observability_error)
+    .map_err(observability_error)?;
+    // The first record every sink receives, so a pasted log or a rotated file always names the
+    // build that produced it. Emitting here rather than at each subcommand covers sync, plan,
+    // both doctors, and every batch job -- each of which builds its own logger and so wants its
+    // own file to be self-describing. `--log-level off` returned above and never reaches this.
+    logger
+        .emit(LogEvent::new(EventLogLevel::Info, EventCode::RunBuild).build(BUILD))
+        .map_err(observability_error)?;
+    Ok(Some(logger))
+}
+
+/// Turn one transport observation into a log event, or `None` when it is not worth a record.
+///
+/// The level policy lives here rather than in the API layer, and its most important choice is that
+/// a *failed* call is DEBUG while a successful one is TRACE: `--log-level debug` alone must be
+/// enough to diagnose a live failure, without asking the user for another run.
+fn observation_event(observation: ApiObservation) -> LogEvent {
+    match observation {
+        // The connection record names the endpoint host, so it is deliberately DEBUG: a
+        // default-level run that ships events to a remote collector must not begin disclosing a
+        // hostname it did not disclose before.
+        ApiObservation::Connected(connection) => {
+            LogEvent::new(EventLogLevel::Debug, EventCode::ConnectionEstablished)
+                .connection(connection)
+        }
+        ApiObservation::SessionEstablished(session) => {
+            LogEvent::new(EventLogLevel::Debug, EventCode::SessionEstablished).session(session)
+        }
+        ApiObservation::CallStarted(call) => {
+            let code = if call.retry_backoff_ms.is_some() {
+                EventCode::RetryScheduled
+            } else {
+                EventCode::ApiCallStarted
+            };
+            let level = if call.retry_backoff_ms.is_some() {
+                EventLogLevel::Debug
+            } else {
+                EventLogLevel::Trace
+            };
+            LogEvent::new(level, code).call(call)
+        }
+        ApiObservation::CallCompleted(call) => {
+            let redirected = call.outcome == RequestOutcome::Redirect;
+            let (level, code) = if redirected {
+                // Redirects are refused by policy, so meeting one is always a misconfiguration.
+                (EventLogLevel::Warn, EventCode::ApiCallRedirected)
+            } else if call.outcome.is_failure() {
+                (EventLogLevel::Debug, EventCode::ApiCallCompleted)
+            } else {
+                (EventLogLevel::Trace, EventCode::ApiCallCompleted)
+            };
+            LogEvent::new(level, code).call(call)
+        }
+    }
+}
+
+/// Build a transport observer that writes into `logger`.
+///
+/// Emission failures are deliberately swallowed: instrumentation must never be able to fail a
+/// sync or a diagnostic. A sink that is genuinely broken is still reported by the shutdown path,
+/// which is where a delivery failure belongs.
+fn request_observer(logger: &Arc<EventLogger>) -> RequestObserver {
+    let logger = Arc::clone(logger);
+    Arc::new(move |observation| {
+        let _ = logger.emit(observation_event(observation));
+    })
 }
 
 fn log_event(logger: Option<&Arc<EventLogger>>, event: LogEvent) -> Result<()> {
@@ -3133,13 +4973,26 @@ fn log_event(logger: Option<&Arc<EventLogger>>, event: LogEvent) -> Result<()> {
     Ok(())
 }
 
+/// How long to wait for observability delivery before giving up on it.
+///
+/// A cancelled run gets the short window: the operator has already asked the process to stop, and
+/// the shutdown result cannot change what they receive, because a failure on a cancelled run is
+/// reported as a warning while the cancellation itself is returned.
+fn logger_shutdown_timeout<T>(operation: &Result<T>) -> Duration {
+    if matches!(operation, Err(Error::Cancelled)) {
+        CANCELLED_LOGGER_SHUTDOWN_TIMEOUT
+    } else {
+        LOGGER_SHUTDOWN_TIMEOUT
+    }
+}
+
 fn finish_logger<T>(
     logger: Option<&Arc<EventLogger>>,
     operation: Result<T>,
     quiet: bool,
 ) -> Result<T> {
     let shutdown = logger
-        .map(|logger| logger.shutdown(LOGGER_SHUTDOWN_TIMEOUT))
+        .map(|logger| logger.shutdown(logger_shutdown_timeout(&operation)))
         .transpose()
         .map_err(observability_error);
     match (operation, shutdown) {
@@ -3170,7 +5023,7 @@ fn finish_doctor_logger(
     quiet: bool,
 ) -> Result<DoctorResult> {
     let shutdown = logger
-        .map(|logger| logger.shutdown(LOGGER_SHUTDOWN_TIMEOUT))
+        .map(|logger| logger.shutdown(logger_shutdown_timeout(&operation)))
         .transpose()
         .map_err(observability_error);
     match (operation, shutdown) {
@@ -4009,6 +5862,155 @@ fn doctor_overall_status(result: &DoctorResult) -> &'static str {
     }
 }
 
+/// Render one recorded DSM request.
+///
+/// Deliberately the same closed facts the log records carry: names, versions, a status, a code,
+/// which session channels were attached, and a duration. No response body or credential material
+/// is representable here.
+fn doctor_call_value(call: &DoctorCall) -> Value {
+    json!({
+        "sequence": call.sequence,
+        "api": call.api,
+        "method": call.method,
+        "version": call.version,
+        "outcome": call.outcome.as_str(),
+        "dsm_code": call.dsm_code,
+        "http_status": call.http_status,
+        "session": {
+            "cookie_header": call.session.cookie_header,
+            "syno_token_header": call.session.syno_token_header,
+            "sid_field": call.session.sid_field,
+            "syno_token_field": call.session.syno_token_field,
+        },
+        "elapsed_ms": call.elapsed_ms,
+    })
+}
+
+/// The machine-readable view of what DSM advertises.
+///
+/// Bounded in the same three tiers the human report prints, on purpose: `query=all` on a NAS with
+/// a full package set returns hundreds of entries, and a JSON document a server can make
+/// arbitrarily long is a denial-of-service surface rather than a diagnostic.
+fn capability_enumeration_value(capabilities: &CapabilityEnumeration) -> Value {
+    json!({
+        "advertised_apis": capabilities.total,
+        "unusable_entries": capabilities.unusable_entries,
+        "file_station": capabilities.file_station.iter().map(|api| json!({
+            "name": api.name,
+            "min_version": api.min_version,
+            "max_version": api.max_version,
+            "required_version": api.required,
+            "optional": api.optional,
+            "used": api.required.is_some(),
+        })).collect::<Vec<_>>(),
+        "file_station_not_listed": capabilities.file_station_truncated,
+        "requirements": capabilities.requirements.iter().map(|verdict| json!({
+            "api": verdict.requirement.api,
+            "required_version": verdict.requirement.version,
+            "optional": verdict.requirement.optional,
+            "purpose": verdict.requirement.purpose,
+            "advertised": verdict.present,
+            "offered_min": verdict.offered.map(|(min, _)| min),
+            "offered_max": verdict.offered.map(|(_, max)| max),
+            "satisfied": verdict.satisfied,
+        })).collect::<Vec<_>>(),
+        "namespaces": capabilities.namespaces.iter().map(|(name, count)| json!({
+            "namespace": name,
+            "apis": count,
+        })).collect::<Vec<_>>(),
+        "namespaces_not_listed": capabilities.namespace_overflow.map(|(apis, namespaces)| json!({
+            "apis": apis,
+            "namespaces": namespaces,
+        })),
+    })
+}
+
+fn channel_probe_value(probe: &ChannelProbe) -> Value {
+    json!({
+        "channels": probe.channels.as_str(),
+        "cookie_header": probe.channels.sends_cookie_header(),
+        "syno_token_header": probe.channels.sends_token_header(),
+        "sid_field": probe.channels.sends_sid_field(),
+        "syno_token_field": probe.channels.sends_token_field(),
+        "outcome": probe.outcome.as_str(),
+        "dsm_code": probe.dsm_code,
+        "http_status": probe.http_status,
+        "elapsed_ms": probe.elapsed_ms,
+    })
+}
+
+fn concurrency_value(report: &ConcurrencyReport) -> Value {
+    json!({
+        "parallel_requests": report.parallel,
+        "succeeded": report.succeeded,
+        "session_rejected": report.session_rejected,
+        "other_failures": report.other_failures,
+        "follow_up_succeeded": report.follow_up_succeeded,
+        "follow_up_session_rejected": report.follow_up_session_rejected,
+        "elapsed_ms": report.elapsed_ms,
+    })
+}
+
+fn capability_diagnosis_value(diagnosis: &CapabilityDiagnosis) -> Value {
+    json!({
+        "probed": diagnosis.probed(),
+        "working": diagnosis.working(),
+        "session_aborted": diagnosis.session_aborted,
+        "hostname_changed": diagnosis.hostname_changed,
+        "host": diagnosis.info.and_then(|info| info.hostname).map(|host| host.as_str().to_owned()),
+        "is_manager": diagnosis.info.map(|info| info.is_manager),
+        "supports_sharing": diagnosis.info.map(|info| info.support_sharing),
+        "virtual_protocols": diagnosis
+            .info
+            .and_then(|info| info.support_virtual_protocol)
+            .map(|protocols| protocols.as_str().to_owned()),
+        "capabilities": diagnosis.records.iter().map(|record| json!({
+            "api": record.api,
+            "method": record.method,
+            "version": record.version,
+            "verdict": record.verdict.as_str(),
+            "dsm_code": record.dsm_code,
+            "required": record.required,
+            "elapsed_ms": record.elapsed_ms,
+        })).collect::<Vec<_>>(),
+        "not_probed": diagnosis.unprobed,
+    })
+}
+
+fn path_resolution_value(resolution: &DestinationPathResolution) -> Value {
+    json!({
+        "total_components": resolution.total_components,
+        "first_missing": resolution.first_missing,
+        "fully_resolved": resolution.fully_resolved(),
+        "segments": resolution.segments.iter().map(|segment| json!({
+            "path": segment.path,
+            "depth": segment.depth,
+            "exists": segment.exists,
+            "is_directory": segment.is_directory,
+            "mount_boundary": segment.mount_boundary,
+            "dsm_code": segment.dsm_code,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Describe a section's timing in terms a reader can act on.
+///
+/// A bare `0 ms` on a section that never contacted the server reads as a broken measurement; it is
+/// in fact the correct answer to a question settled locally.
+fn doctor_section_timing(section: &DoctorSection) -> String {
+    match section.timing_scope {
+        TIMING_SCOPE_LOCAL_ONLY => "no request; answered from the discovery response".to_owned(),
+        TIMING_SCOPE_DERIVED => {
+            "no request of its own; summarised from the requests other sections made".to_owned()
+        }
+        "shared_connection" => format!(
+            "{} ms shared with routing and discovery",
+            duration_millis(section.elapsed)
+        ),
+        _ => format!("{} ms", duration_millis(section.elapsed)),
+    }
+}
+
 fn doctor_value(result: &DoctorResult, elapsed: Duration) -> Value {
     let status_count = |status| {
         result
@@ -4020,6 +6022,13 @@ fn doctor_value(result: &DoctorResult, elapsed: Duration) -> Value {
     json!({
         "schema": "sdsync.doctor.v1",
         "level": result.level.as_str(),
+        "build": {
+            "name": BUILD.name,
+            "version": BUILD.version,
+            "target": BUILD.target,
+            "profile": BUILD.profile,
+            "commit": BUILD.commit,
+        },
         "status": doctor_overall_status(result),
         "summary": {
             "pass": status_count(DoctorSectionStatus::Pass),
@@ -4030,12 +6039,30 @@ fn doctor_value(result: &DoctorResult, elapsed: Duration) -> Value {
         "sections": result.sections.iter().map(|section| json!({
             "id": section.id,
             "label": section.label,
+            "step": section.step,
             "status": section.status.as_str(),
             "detail": section.detail,
             "elapsed_ms": duration_millis(section.elapsed),
             "timing_scope": section.timing_scope,
+            "remediation": section.remediation,
+            "calls": section.calls.iter().map(doctor_call_value).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "error": result.failure,
+        "transport": {
+            // `tcp-connect` is stated in the payload as well as the prose: a consumer reading
+            // "ping" here must not assume ICMP, which this never uses.
+            "probe_method": "tcp-connect",
+            "reachability": result.reachability.as_ref().map(ReachabilityReport::json_value),
+            "intermediary": result.intermediary.as_ref().map(IntermediarySummary::json_value),
+            "cookies": result.cookies.as_ref().map(CookieLedger::json_value),
+        },
+        "capabilities": result.capabilities.as_ref().map(capability_enumeration_value),
+        "session_channels": result.channel_ablation.as_ref().map(|probes| {
+            probes.iter().map(channel_probe_value).collect::<Vec<_>>()
+        }),
+        "session_concurrency": result.concurrency.as_ref().map(concurrency_value),
+        "capability_diagnosis": result.capability_diagnosis.as_ref().map(capability_diagnosis_value),
+        "path_resolution": result.path_resolution.as_ref().map(path_resolution_value),
         "routing": result.section_succeeded("routing_tls"),
         "api_discovery": result.section_succeeded("dsm_api_discovery"),
         "authenticated": result.authenticated,
@@ -4065,8 +6092,206 @@ fn doctor_value(result: &DoctorResult, elapsed: Duration) -> Value {
     })
 }
 
+/// Write one transport block: a heading, then a bullet per fact.
+///
+/// A line the producer indented is a continuation of the bullet above it -- a per-address
+/// breakdown under its aggregate, a rotation under the cookie it happened to -- so it is indented
+/// further instead of being given a bullet of its own, which would read as a peer fact.
+fn write_transport_block(human: &mut String, heading: &str, lines: Vec<String>) {
+    writeln!(human, "{heading}").expect("writing to a String cannot fail");
+    for line in lines {
+        match line.strip_prefix("  ") {
+            Some(continuation) => writeln!(human, "      {continuation}"),
+            None => writeln!(human, "  - {line}"),
+        }
+        .expect("writing to a String cannot fail");
+    }
+}
+
+/// The enumeration block, in the three tiers a reader can actually use.
+///
+/// Tier 1 is the File Station surface the operator asked about, tier 2 is the requirement matrix
+/// that turns a runtime version surprise into something they saw coming, and tier 3 is a count per
+/// namespace. Dumping several hundred API names would be neither.
+fn capability_enumeration_lines(capabilities: &CapabilityEnumeration) -> Vec<String> {
+    let mut lines = vec![format!(
+        "DSM advertises {} APIs across every installed package",
+        capabilities.total
+    )];
+    if capabilities.unusable_entries > 0 {
+        lines.push(format!(
+            "{} advertised entries could not be read: DSM described them in a shape the \
+             documented API map does not use",
+            capabilities.unusable_entries
+        ));
+    }
+    lines.push(format!(
+        "File Station APIs offered ({}):",
+        capabilities.file_station.len() + capabilities.file_station_truncated
+    ));
+    for api in &capabilities.file_station {
+        let usage = match (api.required, api.optional) {
+            (Some(version), true) => format!("required v{version} when used (optional)"),
+            (Some(version), false) => format!("required v{version}"),
+            (None, _) => "unused by this tool".to_owned(),
+        };
+        lines.push(format!("  {:<34}{:<16}{usage}", api.name, api.range()));
+    }
+    if capabilities.file_station_truncated > 0 {
+        lines.push(format!(
+            "  {} further File Station APIs not listed",
+            capabilities.file_station_truncated
+        ));
+    }
+    lines.push("APIs this tool requires:".to_owned());
+    for verdict in &capabilities.requirements {
+        lines.push(format!(
+            "  {:<34}v{:<15}{:<14}{}",
+            verdict.requirement.api,
+            verdict.requirement.version,
+            verdict.describe(),
+            verdict.requirement.purpose,
+        ));
+    }
+    if !capabilities.namespaces.is_empty() {
+        lines.push("other namespaces, by API count:".to_owned());
+        for (namespace, count) in &capabilities.namespaces {
+            lines.push(format!("  {namespace} ({count})"));
+        }
+    }
+    if let Some((apis, namespaces)) = capabilities.namespace_overflow {
+        lines.push(format!(
+            "  others ({apis} APIs across {namespaces} further namespaces)"
+        ));
+    }
+    lines
+}
+
+/// The ablation block: one line per variant, then what the four together mean.
+fn channel_ablation_lines(probes: &[ChannelProbe; SESSION_CHANNEL_VARIANTS]) -> Vec<String> {
+    let mut lines = vec![
+        "the same read-only SYNO.FileStation.List.list_share request, varying only how the \
+         session is presented"
+            .to_owned(),
+    ];
+    for probe in probes {
+        let answer = match (probe.outcome, probe.dsm_code) {
+            (RequestOutcome::Ok, _) => "accepted".to_owned(),
+            (_, Some(code)) => format!("rejected with DSM {code}"),
+            (outcome, None) => format!("failed ({})", outcome.as_str()),
+        };
+        lines.push(format!(
+            "  {:<20}{:<48}{answer} in {} ms",
+            probe.channels.as_str(),
+            probe.channels.describe(),
+            probe.elapsed_ms,
+        ));
+    }
+    lines.push(
+        "the token-header-only variant carries no session identifier at all, so DSM is expected \
+         to reject it; it is the control that proves this probe can tell acceptance from rejection"
+            .to_owned(),
+    );
+    lines
+}
+
+fn capability_diagnosis_lines(diagnosis: &CapabilityDiagnosis) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(info) = diagnosis.info {
+        lines.push(format!(
+            "host {:?} -- this account {} a DSM administrator",
+            info.hostname
+                .map(|host| host.as_str().to_owned())
+                .unwrap_or_else(|| "(not reported)".to_owned()),
+            if info.is_manager { "is" } else { "is not" },
+        ));
+        lines.push(format!(
+            "sharing links: {}; mountable virtual filesystems: {}",
+            if info.support_sharing {
+                "supported for this account"
+            } else {
+                "not available to this account"
+            },
+            info.support_virtual_protocol
+                .map(|protocols| protocols.as_str().to_owned())
+                .unwrap_or_else(|| "none reported".to_owned()),
+        ));
+    }
+    for record in &diagnosis.records {
+        lines.push(format!(
+            "  {:<34}{:<12}v{:<4}{}{} in {} ms",
+            record.api,
+            record.method,
+            record.version,
+            record.verdict.as_str(),
+            record
+                .dsm_code
+                .map(|code| format!(" ({code})"))
+                .unwrap_or_default(),
+            record.elapsed_ms,
+        ));
+    }
+    lines.push(match (diagnosis.first_hostname, diagnosis.last_hostname) {
+        (Some(first), Some(last)) if first.as_str() == last.as_str() => {
+            "File Station reported the same host name at the first and last probe of this run. \
+             That is consistent with one DSM host, and it is also what a single NAS behind a \
+             relay looks like, so it excludes nothing on its own"
+                .to_owned()
+        }
+        (Some(_), Some(_)) => "File Station reported DIFFERENT host names at the first and last \
+             probe of this run: consecutive requests demonstrably reached different DSM hosts"
+            .to_owned(),
+        _ => "File Station's host name could not be read at both ends of this run, so the \
+             two-host comparison is unavailable"
+            .to_owned(),
+    });
+    lines.push("advertised but deliberately not probed:".to_owned());
+    for reason in &diagnosis.unprobed {
+        lines.push(format!("  {reason}"));
+    }
+    lines
+}
+
+fn path_resolution_lines(resolution: &DestinationPathResolution) -> Vec<String> {
+    let mut lines = Vec::new();
+    for segment in &resolution.segments {
+        let state = if !segment.exists {
+            match segment.dsm_code {
+                // 408 is the only code that means the component is not there. Any other one
+                // stopped the walk for a reason of its own, and calling that "absent" would
+                // report a dead session as a missing directory.
+                Some(408) => "absent (DSM 408)".to_owned(),
+                Some(code) => format!("not resolved; DSM {code} stopped the walk here"),
+                None => "not resolved".to_owned(),
+            }
+        } else if segment.mount_boundary {
+            "exists, mounted filesystem boundary".to_owned()
+        } else if segment.is_directory {
+            "exists, directory".to_owned()
+        } else {
+            "exists, not a directory".to_owned()
+        };
+        lines.push(format!("{:<48}{state}", segment.path));
+    }
+    if resolution.segments.len() < resolution.total_components {
+        lines.push(format!(
+            "{} further component(s) were not inspected: the walk stops at the first one it \
+             cannot confirm",
+            resolution.total_components - resolution.segments.len()
+        ));
+    }
+    lines
+}
+
 fn doctor_human(result: &DoctorResult) -> String {
     let mut human = String::new();
+    // The report is what users paste into an issue, so it names the build that produced it.
+    writeln!(
+        human,
+        "{} {} ({}) {}",
+        BUILD.name, BUILD.version, BUILD.commit, BUILD.target
+    )
+    .expect("writing to a String cannot fail");
     writeln!(
         human,
         "Doctor {}: {}",
@@ -4074,16 +6299,95 @@ fn doctor_human(result: &DoctorResult) -> String {
         doctor_overall_status(result).to_ascii_uppercase()
     )
     .expect("writing to a String cannot fail");
+    let total_steps = result.sections.len();
     for section in &result.sections {
+        // The step number is printed because sections are grouped for reading, not listed in the
+        // order they run: capabilities are settled from the discovery response before
+        // authentication, yet belong next to the other File Station checks.
         writeln!(
             human,
-            "  [{:>4}] {} ({} ms): {}",
+            "  [{:>4}] step {}/{} {} ({}): {}",
             section.status.as_str().to_ascii_uppercase(),
+            section.step,
+            total_steps,
             section.label,
-            duration_millis(section.elapsed),
+            doctor_section_timing(section),
             section.detail,
         )
         .expect("writing to a String cannot fail");
+        for call in &section.calls {
+            writeln!(
+                human,
+                "           #{} {}.{} v{} session={} -> {}{}{} in {} ms",
+                call.sequence,
+                call.api,
+                call.method,
+                call.version,
+                call.session.describe(),
+                call.outcome.as_str(),
+                call.http_status
+                    .map(|status| format!(" http {status}"))
+                    .unwrap_or_default(),
+                call.dsm_code
+                    .map(|code| format!(" dsm {code}"))
+                    .unwrap_or_default(),
+                call.elapsed_ms,
+            )
+            .expect("writing to a String cannot fail");
+        }
+        if let Some(remediation) = section.remediation {
+            writeln!(human, "         hint: {remediation}")
+                .expect("writing to a String cannot fail");
+        }
+    }
+    if let Some(reachability) = &result.reachability {
+        write_transport_block(
+            &mut human,
+            "Network reachability (TCP connect, not ICMP):",
+            reachability.human_lines(),
+        );
+    }
+    if let Some(intermediary) = &result.intermediary {
+        write_transport_block(
+            &mut human,
+            "Intermediaries between this client and DSM:",
+            intermediary.human_lines(),
+        );
+    }
+    if let Some(cookies) = &result.cookies {
+        write_transport_block(
+            &mut human,
+            "Cookie permanence across the run:",
+            cookies.human_lines(),
+        );
+    }
+    if let Some(capabilities) = &result.capabilities {
+        write_transport_block(
+            &mut human,
+            "DSM capability enumeration:",
+            capability_enumeration_lines(capabilities),
+        );
+    }
+    if let Some(probes) = &result.channel_ablation {
+        write_transport_block(
+            &mut human,
+            "DSM session channel ablation:",
+            channel_ablation_lines(probes),
+        );
+    }
+    if let Some(diagnosis) = &result.capability_diagnosis {
+        write_transport_block(
+            &mut human,
+            "File Station capability diagnosis:",
+            capability_diagnosis_lines(diagnosis),
+        );
+    }
+    if let Some(resolution) = &result.path_resolution {
+        write_transport_block(
+            &mut human,
+            "Destination path resolution:",
+            path_resolution_lines(resolution),
+        );
     }
     if let Some((scope, inventory)) = &result.remote_inventory {
         let scope_description = scope.description();
@@ -4666,7 +6970,7 @@ fn print_error(error: &Error) {
 
 fn error_exit_code(error: &Error) -> u8 {
     match error {
-        Error::Cancelled => 130,
+        Error::Cancelled => CANCELLED_EXIT_CODE,
         Error::Configuration(_)
         | Error::InvalidUrl(_)
         | Error::HttpsRequired
@@ -4677,9 +6981,10 @@ fn error_exit_code(error: &Error) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use synology_drive_sync::api::{DiscoveredApi, SessionChannels};
 
     use super::*;
 
@@ -4787,7 +7092,7 @@ mod tests {
             allow_http: true,
             ..resolved_network()
         };
-        let client = connect_client(&url, &limited).unwrap();
+        let client = connect_client(&url, &limited, &CancellationToken::default(), None).unwrap();
         assert_eq!(client.max_upload_rate(), Some(65536));
         server.join().unwrap();
 
@@ -4797,7 +7102,7 @@ mod tests {
             allow_http: true,
             ..resolved_network()
         };
-        let client = connect_client(&url, &unlimited).unwrap();
+        let client = connect_client(&url, &unlimited, &CancellationToken::default(), None).unwrap();
         assert_eq!(client.max_upload_rate(), None);
         server.join().unwrap();
     }
@@ -5005,6 +7310,194 @@ mod tests {
         }
     }
 
+    /// The transport report as it reads on a QuickConnect relay that rotates the session.
+    ///
+    /// This is the shape of the live investigation the transport checks were built for: a relay
+    /// hostname, a name that resolves to more than one address, a bimodal connect time, two
+    /// different `Server` banners inside one run, and a session cookie re-issued on a call that
+    /// succeeded. Every one of those is a separate piece of evidence, and the report has to put
+    /// all of them where an operator can read them in one pass.
+    #[test]
+    fn the_human_report_lays_out_the_relay_evidence_an_operator_needs() {
+        use synology_drive_sync::observability::{
+            ApiCallDetail, BoundedText, CdnMarker, CookieFact, CookieFacts, CookiePersistence,
+            CookieSameSite, IntermediaryFacts, RequestTransport, ShortToken,
+        };
+        use synology_drive_sync::transport_diagnostics::{
+            DnsObservation, EndpointForm, HttpTimingObservation, LatencySamples, ReachabilityReport,
+        };
+
+        let describe = |name: &str, fingerprint: u32| CookieFact {
+            name: ShortToken::sanitized(name),
+            fingerprint,
+            value_length: 43,
+            persistence: CookiePersistence::Session,
+            secure: true,
+            http_only: true,
+            same_site: CookieSameSite::Lax,
+            path_present: true,
+            domain_present: false,
+            expires_present: false,
+            max_age_present: false,
+        };
+        let call =
+            |api: &'static str, method: &'static str, banner: &str, cookie: Option<CookieFact>| {
+                let mut call = ApiCallDetail::started(
+                    api,
+                    method,
+                    2,
+                    BoundedText::sanitized("/webapi/entry.cgi"),
+                    RequestTransport::Form,
+                );
+                call.outcome = RequestOutcome::Ok;
+                call.http_status = Some(200);
+                call.intermediary = IntermediaryFacts {
+                    via: ShortToken::sanitized("1.1 quickconnect-relay"),
+                    server: ShortToken::sanitized(banner),
+                    forwarded_for_reflected: true,
+                    cdn_marker: CdnMarker::Other,
+                    ..IntermediaryFacts::default()
+                };
+                if let Some(cookie) = cookie {
+                    let mut cookies = CookieFacts::default();
+                    cookies.push(cookie);
+                    call.cookies = cookies;
+                }
+                call
+            };
+
+        let mut transcript = TransportTranscript::default();
+        transcript.record_call(&call("SYNO.API.Info", "query", "nginx", None));
+        transcript.record_call(&call(
+            "SYNO.API.Auth",
+            "login",
+            "nginx",
+            Some(describe("id", 0x1111_1111)),
+        ));
+        transcript.record_call(&call(
+            "SYNO.FileStation.List",
+            "list_share",
+            "nginx",
+            Some(describe("id", 0x2222_2222)),
+        ));
+        transcript.record_call(&call("SYNO.FileStation.List", "getinfo", "Apache", None));
+
+        let mut result = doctor_result(false, None, None);
+        // One address answers quickly and the other does not, which is what a name fanned out
+        // across two relays looks like from here.
+        let samples = |values: &[u64]| {
+            let mut samples = LatencySamples::default();
+            for micros in values {
+                samples.push(Duration::from_micros(*micros));
+            }
+            samples
+        };
+        let near = samples(&[23_100, 24_400, 23_800]);
+        let far = samples(&[118_900, 121_600]);
+        let tcp = samples(&[23_100, 24_400, 118_900, 23_800, 121_600]);
+        let mut first_byte = LatencySamples::default();
+        let mut body = LatencySamples::default();
+        let mut total = LatencySamples::default();
+        for (headers, payload) in [(96_200_u64, 3_100_u64), (191_400, 3_400), (98_700, 3_000)] {
+            first_byte.push(Duration::from_micros(headers));
+            body.push(Duration::from_micros(payload));
+            total.push(Duration::from_micros(headers + payload));
+        }
+        let reachability = ReachabilityReport {
+            host: "nascheckoffice.fr3.quickconnect.to".to_owned(),
+            port: 443,
+            tls: true,
+            dns: DnsObservation {
+                elapsed: Some(Duration::from_micros(18_400)),
+                address_count: 2,
+                ipv4_count: 2,
+                ipv6_count: 0,
+                literal: false,
+                error: None,
+            },
+            tcp_per_address: vec![near, far],
+            tcp_connect: tcp,
+            tcp_failures: 0,
+            tcp_failure_reason: None,
+            http: HttpTimingObservation {
+                first_byte,
+                body,
+                total,
+                statuses: [200].into_iter().collect(),
+                failures: 0,
+                failure_reason: None,
+            },
+            budget_exhausted: false,
+            cancelled: false,
+        };
+        assert_eq!(
+            classify_endpoint("nascheckoffice.fr3.quickconnect.to").form,
+            EndpointForm::QuickConnectRelay
+        );
+
+        // The real recorders, not hand-set fields: what the operator reads is what the run
+        // produces, including the statuses and hints the recorders decide on.
+        *result
+            .call_log
+            .transcript
+            .lock()
+            .expect("transport transcript lock") = transcript;
+        record_reachability_section(&mut result, reachability, Duration::from_millis(742));
+        record_transport_summary_sections(
+            &mut result,
+            "https://nascheckoffice.fr3.quickconnect.to/",
+        );
+
+        let reachability_section = result
+            .sections
+            .iter()
+            .find(|section| section.id == "network_reachability")
+            .expect("the reachability section");
+        assert_eq!(reachability_section.status, DoctorSectionStatus::Warn);
+        assert_eq!(reachability_section.step, 1);
+        let intermediary_section = result
+            .sections
+            .iter()
+            .find(|section| section.id == "intermediary_transport")
+            .expect("the intermediary section");
+        assert_eq!(intermediary_section.status, DoctorSectionStatus::Warn);
+        let ledger_section = result
+            .sections
+            .iter()
+            .find(|section| section.id == "session_cookie_ledger")
+            .expect("the ledger section");
+        assert_eq!(ledger_section.status, DoctorSectionStatus::Warn);
+
+        let human = doctor_human(&result);
+
+        // Reachability: TCP, said in those words, with the spread called out.
+        assert!(human.contains("Network reachability (TCP connect, not ICMP):"));
+        assert!(human.contains("2 addresses"));
+        assert!(human.contains("consecutive connections can therefore land on different hosts"));
+        assert!(human.contains("TCP connect: min 23.1 ms / median 24.4 ms / max 121.6 ms"));
+        // The per-address split is the shape of the answer: one relay near, one far.
+        assert!(human.contains("address 1 of 2: min 23.1 ms / median 23.8 ms / max 24.4 ms"));
+        assert!(human.contains("address 2 of 2: min 118.9 ms / median 120.2 ms / max 121.6 ms"));
+        // The unmeasurable phase is named rather than divided by a guess.
+        assert!(human.contains("not separable"));
+        assert!(human.contains("a derived remainder, not a measured phase"));
+
+        // Intermediary: the relay form, and two origins inside one run.
+        assert!(human.contains("QuickConnect relay hostname (relay id fr3)"));
+        assert!(human.contains("MORE THAN ONE Server banner across this run"));
+        assert!(human.contains("reflected client-address headers"));
+
+        // Cookies: the rotation, where it happened, and what became of the new value.
+        assert!(human.contains("ROTATED ON A SUCCESSFUL RESPONSE"));
+        assert!(human.contains("call 3 (SYNO.FileStation.List.list_share)"));
+        assert!(human.contains("a session cookie"));
+        assert!(human.contains("Secure, HttpOnly, SameSite=lax, Path"));
+        assert!(human.contains("keeps no cookie jar"));
+
+        // The digest is the only thing the report knows about a value, and it is not the value.
+        assert!(!human.contains("11111111"));
+    }
+
     fn doctor_result(
         write_probe_performed: bool,
         write_probe: Option<WriteProbeReport>,
@@ -5017,6 +7510,7 @@ mod tests {
                 Some("/share/acceptance"),
             ),
             true,
+            DoctorCallLog::default(),
         );
         result.authenticated = true;
         result.remote_checked = true;
@@ -5074,7 +7568,7 @@ mod tests {
         let mut settings = resolved_doctor("https://files.example.test", None, None);
         settings.routing_only = true;
         settings.level = cli::DoctorLevel::Quick;
-        let mut result = DoctorResult::new(&settings, true);
+        let mut result = DoctorResult::new(&settings, true, DoctorCallLog::default());
         result.set_section(
             "routing_tls",
             DoctorSectionStatus::Pass,
@@ -5184,6 +7678,48 @@ mod tests {
         assert_eq!(REMOTE_LOG_QUEUE_CAPACITY, 1_024);
         assert_eq!(REMOTE_LOG_TIMEOUT, Duration::from_secs(10));
         assert_eq!(LOGGER_SHUTDOWN_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(
+            CANCELLED_LOGGER_SHUTDOWN_TIMEOUT,
+            Duration::from_millis(500)
+        );
+    }
+
+    /// A run that completed keeps the full delivery window; one the operator stopped does not
+    /// get to spend another five seconds flushing after the cancellation was already observed.
+    #[test]
+    fn a_cancelled_run_shortens_the_observability_flush_window() {
+        assert_eq!(
+            logger_shutdown_timeout(&Ok::<u8, Error>(0)),
+            LOGGER_SHUTDOWN_TIMEOUT
+        );
+        assert_eq!(
+            logger_shutdown_timeout(&Err::<u8, Error>(Error::Message("failed".to_owned()))),
+            LOGGER_SHUTDOWN_TIMEOUT
+        );
+        assert_eq!(
+            logger_shutdown_timeout(&Err::<u8, Error>(Error::Cancelled)),
+            CANCELLED_LOGGER_SHUTDOWN_TIMEOUT
+        );
+    }
+
+    /// `ctrlc::set_handler` refuses a second installation for the life of the process, so every
+    /// subcommand has to share one handler and one token. A later call must hand back the token
+    /// the handler already cancels rather than failing or, worse, returning a token no signal
+    /// will ever reach.
+    #[test]
+    fn the_termination_handler_is_installed_once_and_shares_one_token() {
+        let first = install_cancellation_handler().expect("first installation succeeds");
+        assert!(!first.is_cancelled());
+        let second = install_cancellation_handler().expect("a second installation is a no-op");
+        assert!(!second.is_cancelled());
+
+        // What the handler cancels is what every subcommand polls, and it maps to exit 130.
+        first.cancel();
+        assert!(second.is_cancelled());
+        assert_eq!(
+            error_exit_code(&second.check().unwrap_err()),
+            CANCELLED_EXIT_CODE
+        );
     }
 
     #[test]
@@ -6934,5 +9470,668 @@ mod tests {
             ),
             Err(Error::Message(_))
         ));
+    }
+
+    fn probe(channels: SessionChannels, code: Option<i64>) -> ChannelProbe {
+        ChannelProbe {
+            channels,
+            outcome: if code.is_none() {
+                RequestOutcome::Ok
+            } else {
+                RequestOutcome::DsmError
+            },
+            dsm_code: code,
+            http_status: Some(200),
+            elapsed_ms: 12,
+        }
+    }
+
+    /// Four variants, ordered as the probe runs them.
+    fn ablation(all: Option<i64>, sid: Option<i64>, cookie: Option<i64>) -> [ChannelProbe; 4] {
+        [
+            probe(SessionChannels::All, all),
+            probe(SessionChannels::SidFieldOnly, sid),
+            probe(SessionChannels::CookieOnly, cookie),
+            // The control: no session identifier at all, so a healthy DSM rejects it.
+            probe(SessionChannels::TokenHeaderOnly, Some(119)),
+        ]
+    }
+
+    /// The ablation's verdict table is the whole diagnostic, so every row of it is pinned.
+    #[test]
+    fn the_ablation_verdict_separates_a_mis_carried_session_from_a_dead_one() {
+        // Healthy: the client's usual combination works, and so does the documented field alone.
+        let (status, detail, remediation) = ablation_verdict(&ablation(None, None, Some(119)));
+        assert_eq!(status, DoctorSectionStatus::Pass);
+        assert!(detail.contains("Channel selection is not the fault here"));
+        assert!(
+            detail.contains("which is what a format=sid login implies"),
+            "a rejected cookie-only variant is expected, not a finding: {detail}"
+        );
+        assert_eq!(remediation, None);
+
+        // A DSM that accepts the cookie on its own too is still healthy, and says so differently.
+        let (status, detail, _) = ablation_verdict(&ablation(None, None, None));
+        assert_eq!(status, DoctorSectionStatus::Pass);
+        assert!(detail.contains("the synthesised cookie alone was also accepted"));
+
+        // The reported live bug: the documented field works, the usual combination does not.
+        let (status, detail, remediation) = ablation_verdict(&ablation(Some(119), None, Some(119)));
+        assert_eq!(status, DoctorSectionStatus::Fail);
+        assert!(detail.contains("accepted with the _sid request field alone"));
+        assert!(detail.contains("rejected (DSM 119)"));
+        assert_eq!(remediation, Some(DOCTOR_COOKIE_CHANNEL_HINT));
+
+        // The mirror image: DSM resolves the session from the cookie and rejects the field.
+        let (status, detail, remediation) = ablation_verdict(&ablation(None, Some(119), None));
+        assert_eq!(status, DoctorSectionStatus::Warn);
+        assert!(detail.contains("resolving the session from the cookie"));
+        assert_eq!(remediation, None);
+
+        // Everything rejected: not a channel problem at all.
+        let (status, detail, remediation) =
+            ablation_verdict(&ablation(Some(119), Some(119), Some(119)));
+        assert_eq!(status, DoctorSectionStatus::Fail);
+        assert!(detail.contains("no longer valid server-side"));
+        assert_eq!(remediation, Some(DOCTOR_SESSION_DEAD_HINT));
+
+        // The usual combination and the field both rejected, but the cookie alone accepted: an
+        // odd shape that is reported factually rather than forced into one of the named rows.
+        let (status, detail, remediation) = ablation_verdict(&ablation(Some(119), Some(119), None));
+        assert_eq!(status, DoctorSectionStatus::Warn);
+        assert!(detail.contains("the synthesised cookie alone was also accepted"));
+        assert_eq!(remediation, None);
+
+        // A transport failure has no DSM code, and the detail names the outcome instead.
+        let mut transport = ablation(Some(119), None, Some(119));
+        transport[0].outcome = RequestOutcome::Transport;
+        transport[0].dsm_code = None;
+        let (_, detail, _) = ablation_verdict(&transport);
+        assert!(detail.contains("rejected (transport)"), "got: {detail}");
+
+        // Every variant renders in the human block, with the control explained.
+        let lines = channel_ablation_lines(&ablation(Some(119), None, Some(119))).join("\n");
+        for channels in SessionChannels::ABLATION_ORDER {
+            assert!(lines.contains(channels.as_str()), "missing {channels:?}");
+        }
+        assert!(lines.contains("rejected with DSM 119"));
+        assert!(lines.contains("accepted"));
+        assert!(lines.contains("it is the control"));
+    }
+
+    fn catalogue(entries: &[(&str, Option<u32>, Option<u32>)], unusable: usize) -> ApiCatalogue {
+        ApiCatalogue {
+            apis: entries
+                .iter()
+                .map(|(name, min, max)| {
+                    (
+                        (*name).to_owned(),
+                        DiscoveredApi {
+                            path: Some("entry.cgi".to_owned()),
+                            min_version: *min,
+                            max_version: *max,
+                            request_format: None,
+                        },
+                    )
+                })
+                .collect(),
+            unusable_entries: unusable,
+        }
+    }
+
+    /// Everything this tool requires, at a version DSM offers.
+    fn satisfying_entries() -> Vec<(&'static str, Option<u32>, Option<u32>)> {
+        API_REQUIREMENTS
+            .iter()
+            .map(|requirement| {
+                (
+                    requirement.api,
+                    Some(requirement.version),
+                    Some(requirement.version),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_capability_enumeration_folds_dsm_into_three_tiers_a_reader_can_use() {
+        let mut entries = satisfying_entries();
+        entries.push(("SYNO.FileStation.Rename", Some(1), Some(2)));
+        for index in 0..3 {
+            entries.push((
+                match index {
+                    0 => "SYNO.Core.System",
+                    1 => "SYNO.Core.Share",
+                    _ => "SYNO.DownloadStation.Task",
+                },
+                Some(1),
+                Some(1),
+            ));
+        }
+        let enumeration = CapabilityEnumeration::from_catalogue(&catalogue(&entries, 0));
+        assert_eq!(enumeration.total, entries.len());
+        assert!(enumeration.blocking_requirements().is_empty());
+        assert_eq!(enumeration.unsatisfied_optional(), 0);
+
+        // Tier 1: every File Station entry, with the version this tool asks of it when it asks.
+        let rename = enumeration
+            .file_station
+            .iter()
+            .find(|api| api.name == "SYNO.FileStation.Rename")
+            .expect("an advertised API this tool does not use");
+        assert_eq!(rename.required, None);
+        assert_eq!(rename.range(), "v1-2");
+        // Tier 3: namespaces outside File Station, largest first.
+        assert_eq!(
+            enumeration.namespaces,
+            [
+                ("SYNO.Core.*".to_owned(), 2),
+                ("SYNO.API.*".to_owned(), 1),
+                ("SYNO.DownloadStation.*".to_owned(), 1),
+            ]
+        );
+        assert_eq!(enumeration.namespace_overflow, None);
+
+        let (status, detail, _) = capability_enumeration_verdict(&enumeration);
+        assert_eq!(status, DoctorSectionStatus::Pass);
+        assert!(detail.contains("all 10 APIs this tool uses are present"));
+
+        let lines = capability_enumeration_lines(&enumeration).join("\n");
+        assert!(lines.contains("SYNO.FileStation.Rename"));
+        assert!(lines.contains("unused by this tool"));
+        assert!(lines.contains("SYNO.Core.* (2)"));
+        assert!(lines.contains("APIs this tool requires:"));
+    }
+
+    #[test]
+    fn the_capability_enumeration_fails_only_on_a_requirement_that_actually_blocks() {
+        // An optional API missing is a warning: the feature that needs it stops, not the sync.
+        let entries = satisfying_entries()
+            .into_iter()
+            .filter(|(api, _, _)| *api != "SYNO.FileStation.CopyMove")
+            .collect::<Vec<_>>();
+        let enumeration = CapabilityEnumeration::from_catalogue(&catalogue(&entries, 0));
+        assert_eq!(enumeration.unsatisfied_optional(), 1);
+        assert!(enumeration.blocking_requirements().is_empty());
+        let (status, detail, remediation) = capability_enumeration_verdict(&enumeration);
+        assert_eq!(status, DoctorSectionStatus::Warn);
+        assert!(detail.contains("1 optional API(s) are unavailable"));
+        assert_eq!(remediation, None);
+
+        // A required API offered only at versions this tool cannot use is a failure, and the
+        // report states both ranges rather than leaving the reader to guess.
+        let entries = satisfying_entries()
+            .into_iter()
+            .map(|(api, min, max)| {
+                if api == "SYNO.FileStation.CheckPermission" {
+                    (api, Some(1), Some(2))
+                } else {
+                    (api, min, max)
+                }
+            })
+            .collect::<Vec<_>>();
+        let enumeration = CapabilityEnumeration::from_catalogue(&catalogue(&entries, 0));
+        let blocking = enumeration.blocking_requirements();
+        assert_eq!(blocking.len(), 1);
+        assert_eq!(blocking[0].describe(), "INCOMPATIBLE (offered v1-2)");
+        let (status, detail, remediation) = capability_enumeration_verdict(&enumeration);
+        assert_eq!(status, DoctorSectionStatus::Fail);
+        assert!(detail.contains("SYNO.FileStation.CheckPermission"));
+        assert_eq!(remediation, Some(DOCTOR_CAPABILITY_VERSION_HINT));
+
+        // An API advertised with no version range cannot answer the question, and says so.
+        let entries = satisfying_entries()
+            .into_iter()
+            .map(|(api, min, max)| {
+                if api == "SYNO.FileStation.List" {
+                    (api, None, None)
+                } else {
+                    (api, min, max)
+                }
+            })
+            .collect::<Vec<_>>();
+        let enumeration = CapabilityEnumeration::from_catalogue(&catalogue(&entries, 0));
+        assert_eq!(
+            enumeration.blocking_requirements()[0].describe(),
+            "INCOMPATIBLE (no version range advertised)"
+        );
+
+        // An API absent altogether is named as such rather than as a version mismatch.
+        let entries = satisfying_entries()
+            .into_iter()
+            .filter(|(api, _, _)| *api != "SYNO.FileStation.List")
+            .collect::<Vec<_>>();
+        let enumeration = CapabilityEnumeration::from_catalogue(&catalogue(&entries, 0));
+        assert_eq!(
+            enumeration.blocking_requirements()[0].describe(),
+            "NOT ADVERTISED"
+        );
+
+        // An unreadable entry is a warning of its own: a DSM advertising one is worth a line.
+        let enumeration =
+            CapabilityEnumeration::from_catalogue(&catalogue(&satisfying_entries(), 3));
+        let (status, detail, _) = capability_enumeration_verdict(&enumeration);
+        assert_eq!(status, DoctorSectionStatus::Warn);
+        assert!(detail.contains("3 advertised entries could not be read"));
+        assert!(
+            capability_enumeration_lines(&enumeration)
+                .join("\n")
+                .contains("3 advertised entries could not be read")
+        );
+    }
+
+    /// A server can advertise arbitrarily many APIs, so the report has to bound what it prints.
+    #[test]
+    fn the_capability_enumeration_bounds_what_a_server_can_make_it_print() {
+        let mut entries = satisfying_entries();
+        let names = (0..DOCTOR_ADVERTISED_API_LIMIT + 5)
+            .map(|index| format!("SYNO.FileStation.Extra{index:03}"))
+            .chain(
+                (0..DOCTOR_NAMESPACE_LIMIT + 4)
+                    .map(|index| format!("SYNO.Package{index:03}.Service")),
+            )
+            .collect::<Vec<_>>();
+        entries.extend(names.iter().map(|name| (name.as_str(), Some(1), Some(1))));
+        let enumeration = CapabilityEnumeration::from_catalogue(&catalogue(&entries, 0));
+
+        assert_eq!(enumeration.file_station.len(), DOCTOR_ADVERTISED_API_LIMIT);
+        assert!(enumeration.file_station_truncated > 0);
+        assert_eq!(enumeration.namespaces.len(), DOCTOR_NAMESPACE_LIMIT);
+        let (apis, namespaces) = enumeration
+            .namespace_overflow
+            .expect("namespaces beyond the limit are counted");
+        assert!(apis > 0 && namespaces > 0);
+        let lines = capability_enumeration_lines(&enumeration).join("\n");
+        assert!(lines.contains("further File Station APIs not listed"));
+        assert!(lines.contains(&format!(
+            "others ({apis} APIs across {namespaces} further namespaces)"
+        )));
+
+        // A name is server-supplied text and is sanitized before it reaches a terminal.
+        assert_eq!(
+            namespace_of("SYNO.Core\u{1b}[31m.System"),
+            "SYNO.Core__31m.*"
+        );
+        assert_eq!(namespace_of("Flat"), "Flat");
+    }
+
+    fn capability_record(
+        api: &'static str,
+        verdict: CapabilityVerdict,
+        dsm_code: Option<i64>,
+        required: bool,
+    ) -> CapabilityRecord {
+        CapabilityRecord {
+            api,
+            method: "get",
+            version: 2,
+            verdict,
+            dsm_code,
+            elapsed_ms: 9,
+            required,
+        }
+    }
+
+    #[test]
+    fn a_dead_session_is_reported_as_a_dead_session_not_as_broken_capabilities() {
+        let station_info = FileStationInfo {
+            hostname: Some(BoundedText::sanitized("DiskStation")),
+            is_manager: false,
+            support_sharing: true,
+            support_virtual_protocol: Some(BoundedText::sanitized("cifs,nfs")),
+        };
+        let base = |records: Vec<CapabilityRecord>| CapabilityDiagnosis {
+            records,
+            info: Some(station_info),
+            first_hostname: station_info.hostname,
+            last_hostname: station_info.hostname,
+            hostname_changed: false,
+            session_aborted: false,
+            unprobed: DOCTOR_UNPROBED_CAPABILITIES.to_vec(),
+        };
+
+        // Everything works.
+        let healthy = base(vec![capability_record(
+            "SYNO.FileStation.List",
+            CapabilityVerdict::Works,
+            None,
+            true,
+        )]);
+        let (status, detail, _) = capability_diagnosis_verdict(&healthy);
+        assert_eq!(status, DoctorSectionStatus::Pass);
+        assert!(detail.contains("all 1 probed capabilities work"));
+
+        // An optional capability refused for this account warns; it must not fail a sync check.
+        let optional = base(vec![
+            capability_record(
+                "SYNO.FileStation.List",
+                CapabilityVerdict::Works,
+                None,
+                true,
+            ),
+            capability_record(
+                "SYNO.FileStation.BackgroundTask",
+                CapabilityVerdict::NoPermission,
+                Some(105),
+                false,
+            ),
+        ]);
+        assert_eq!(optional.broken_required(), 0);
+        let (status, detail, _) = capability_diagnosis_verdict(&optional);
+        assert_eq!(status, DoctorSectionStatus::Warn);
+        assert!(detail.contains("the rest are optional"));
+
+        // A required capability advertised and demonstrably unroutable fails, and the hint names
+        // the proxy rather than DSM: discovery and the call went to the same origin.
+        let unroutable = base(vec![capability_record(
+            "SYNO.FileStation.List",
+            CapabilityVerdict::NotRoutable,
+            Some(102),
+            true,
+        )]);
+        let (status, detail, remediation) = capability_diagnosis_verdict(&unroutable);
+        assert_eq!(status, DoctorSectionStatus::Fail);
+        assert!(detail.contains("advertised but not functional"));
+        assert_eq!(remediation, Some(DOCTOR_CAPABILITY_ROUTING_HINT));
+
+        // The rule that matters most: a session error stops the probing and is never a verdict
+        // about a capability. Warn, not fail, and pointing at the ablation.
+        let mut aborted = base(vec![capability_record(
+            "SYNO.FileStation.List",
+            CapabilityVerdict::NotProbed,
+            Some(119),
+            true,
+        )]);
+        aborted.session_aborted = true;
+        aborted.last_hostname = None;
+        assert_eq!(aborted.probed(), 0);
+        assert_eq!(aborted.broken_required(), 0);
+        let (status, detail, _) = capability_diagnosis_verdict(&aborted);
+        assert_eq!(status, DoctorSectionStatus::Warn);
+        assert!(detail.contains("describe the session rather than the capabilities"));
+
+        // Two host names in one run outrank everything else: it is the only positive proof that
+        // consecutive requests reached different hosts.
+        let mut two_hosts = base(vec![capability_record(
+            "SYNO.FileStation.List",
+            CapabilityVerdict::Works,
+            None,
+            true,
+        )]);
+        two_hosts.hostname_changed = true;
+        two_hosts.last_hostname = Some(BoundedText::sanitized("OtherStation"));
+        let (status, detail, remediation) = capability_diagnosis_verdict(&two_hosts);
+        assert_eq!(status, DoctorSectionStatus::Fail);
+        assert!(detail.contains("two different host names"));
+        assert_eq!(remediation, Some(DOCTOR_MULTIPLE_PATH_HINT));
+
+        let lines = capability_diagnosis_lines(&two_hosts).join("\n");
+        assert!(lines.contains("is not a DSM administrator"));
+        assert!(lines.contains("cifs,nfs"));
+        assert!(lines.contains("DIFFERENT host names"));
+        assert!(lines.contains("advertised but deliberately not probed:"));
+        let same_host = capability_diagnosis_lines(&healthy).join("\n");
+        assert!(same_host.contains("the same host name"));
+        assert!(same_host.contains("excludes nothing on its own"));
+        let unknown_host = capability_diagnosis_lines(&aborted).join("\n");
+        assert!(unknown_host.contains("could not be read at both ends"));
+    }
+
+    #[test]
+    fn every_dsm_answer_a_capability_probe_can_get_maps_to_one_verdict() {
+        let probe = |code: Option<i64>| CapabilityProbe {
+            api: "SYNO.FileStation.List",
+            method: "list_share",
+            version: 2,
+            outcome: if code.is_none() {
+                RequestOutcome::Ok
+            } else {
+                RequestOutcome::DsmError
+            },
+            dsm_code: code,
+            http_status: Some(200),
+            elapsed_ms: 4,
+        };
+        for (code, expected) in [
+            (None, CapabilityVerdict::Works),
+            // File Station answering "no such path" is a fact about the path, not the API.
+            (Some(408), CapabilityVerdict::Works),
+            (Some(102), CapabilityVerdict::NotRoutable),
+            (Some(103), CapabilityVerdict::MethodUnavailable),
+            (Some(104), CapabilityVerdict::VersionUnsupported),
+            (Some(105), CapabilityVerdict::NoPermission),
+            (Some(407), CapabilityVerdict::NoPermission),
+            (Some(106), CapabilityVerdict::NotProbed),
+            (Some(107), CapabilityVerdict::NotProbed),
+            (Some(119), CapabilityVerdict::NotProbed),
+            (Some(999), CapabilityVerdict::Failed),
+        ] {
+            assert_eq!(
+                CapabilityVerdict::classify(probe(code)),
+                expected,
+                "DSM {code:?}"
+            );
+            assert!(!expected.as_str().is_empty());
+        }
+        // A transport failure has no code at all and is not silently called a permission problem.
+        let mut transport = probe(None);
+        transport.outcome = RequestOutcome::Transport;
+        assert_eq!(
+            CapabilityVerdict::classify(transport),
+            CapabilityVerdict::Failed
+        );
+
+        // The same table, reached from an `Error` rather than from a probe record.
+        assert_eq!(
+            verdict_for::<()>(&Err(Error::Cancelled)),
+            CapabilityVerdict::Failed
+        );
+        assert_eq!(verdict_for(&Ok(())), CapabilityVerdict::Works);
+    }
+
+    /// The probe list is bounded by what DSM advertised, and never includes a mutating method.
+    #[test]
+    fn only_advertised_read_only_capabilities_are_probed() {
+        let baseline = capability_probe_specs(None);
+        assert_eq!(
+            baseline
+                .iter()
+                .map(|spec| (spec.api, spec.method))
+                .collect::<Vec<_>>(),
+            [("SYNO.FileStation.List", "list_share")],
+            "with nothing enumerated, only the always-safe probe runs"
+        );
+
+        let mut entries = satisfying_entries();
+        entries.push(("SYNO.FileStation.VirtualFolder", Some(1), Some(2)));
+        entries.push(("SYNO.FileStation.BackgroundTask", Some(1), Some(3)));
+        // Advertised at a version the probe does not ask for, so it stays unprobed.
+        entries.push(("SYNO.FileStation.DirSize", Some(1), Some(2)));
+        let enumeration = CapabilityEnumeration::from_catalogue(&catalogue(&entries, 0));
+        let specs = capability_probe_specs(Some(&enumeration));
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| (spec.api, spec.method))
+                .collect::<Vec<_>>(),
+            [
+                ("SYNO.FileStation.List", "list_share"),
+                ("SYNO.FileStation.VirtualFolder", "list"),
+                ("SYNO.FileStation.BackgroundTask", "list"),
+            ]
+        );
+        for spec in &specs {
+            assert_eq!(spec.cgi_path, "entry.cgi");
+            assert!(
+                !matches!(
+                    spec.method,
+                    "create" | "delete" | "rename" | "upload" | "start"
+                ),
+                "{}.{} mutates or spawns work",
+                spec.api,
+                spec.method
+            );
+        }
+
+        // An advertised API whose range excludes the probed version is left alone.
+        let mut entries = satisfying_entries();
+        entries.push(("SYNO.FileStation.VirtualFolder", Some(3), Some(4)));
+        let enumeration = CapabilityEnumeration::from_catalogue(&catalogue(&entries, 0));
+        assert_eq!(capability_probe_specs(Some(&enumeration)).len(), 1);
+    }
+
+    #[test]
+    fn the_fan_out_verdict_separates_a_rejected_burst_from_one_that_killed_the_session() {
+        let report = |succeeded, session_rejected, other_failures, follow_up| ConcurrencyReport {
+            parallel: 4,
+            succeeded,
+            session_rejected,
+            other_failures,
+            follow_up_succeeded: follow_up,
+            follow_up_session_rejected: !follow_up,
+            elapsed_ms: 431,
+        };
+
+        let (status, detail, remediation) = concurrency_verdict(&report(4, 0, 0, true));
+        assert_eq!(status, DoctorSectionStatus::Pass);
+        assert!(detail.contains("tolerates being used from several connections"));
+        assert_eq!(remediation, None);
+
+        // Some rejected, session survives: per-connection session state, which is the finding.
+        let (status, detail, remediation) = concurrency_verdict(&report(3, 1, 0, true));
+        assert_eq!(status, DoctorSectionStatus::Warn);
+        assert!(detail.contains("3 of 4 concurrent requests succeeded"));
+        assert!(detail.contains("the session itself survived the burst"));
+        assert_eq!(remediation, Some(DOCTOR_MULTIPLE_PATH_HINT));
+
+        let (_, detail, _) = concurrency_verdict(&report(3, 1, 0, false));
+        assert!(detail.contains("left the session unusable"));
+
+        // All succeeded, the follow-up did not: the burst itself invalidated the session.
+        let (status, detail, remediation) = concurrency_verdict(&report(4, 0, 0, false));
+        assert_eq!(status, DoctorSectionStatus::Warn);
+        assert!(detail.contains("the burst itself is what invalidated the session"));
+        assert_eq!(remediation, Some(DOCTOR_MULTIPLE_PATH_HINT));
+
+        // Failures that are not session rejections are reported as what they are.
+        let (status, detail, remediation) = concurrency_verdict(&report(2, 0, 2, true));
+        assert_eq!(status, DoctorSectionStatus::Warn);
+        assert!(detail.contains("failed for reasons other than a rejected session"));
+        assert_eq!(remediation, None);
+    }
+
+    fn segment(path: &str, depth: u8, exists: bool) -> api::PathSegmentProbe {
+        api::PathSegmentProbe {
+            path: path.to_owned(),
+            depth,
+            exists,
+            is_directory: exists,
+            mount_boundary: false,
+            dsm_code: (!exists).then_some(408),
+        }
+    }
+
+    #[test]
+    fn the_path_resolution_verdict_names_the_component_that_stops_it() {
+        // Nothing walked: the check could not start, and the section says so instead of guessing.
+        let (status, detail, remediation) =
+            path_resolution_verdict(&DestinationPathResolution::default());
+        assert_eq!(status, DoctorSectionStatus::Skip);
+        assert!(detail.contains("could not start"));
+        assert_eq!(remediation, None);
+
+        let resolved = DestinationPathResolution {
+            segments: vec![segment("/team", 1, true), segment("/team/target", 2, true)],
+            total_components: 2,
+            first_missing: None,
+        };
+        let (status, detail, _) = path_resolution_verdict(&resolved);
+        assert_eq!(status, DoctorSectionStatus::Pass);
+        assert!(detail.contains("all 2 components"));
+
+        // The share itself is missing: creating directories cannot fix that.
+        let missing_share = DestinationPathResolution {
+            segments: vec![segment("/team", 1, false)],
+            total_components: 2,
+            first_missing: Some(1),
+        };
+        let (status, detail, remediation) = path_resolution_verdict(&missing_share);
+        assert_eq!(status, DoctorSectionStatus::Fail);
+        assert!(detail.contains("the shared folder itself is absent"));
+        assert_eq!(remediation, Some(DOCTOR_MISSING_SHARE_HINT));
+
+        // Only a later component is missing: sync can create it, so this warns.
+        let missing_leaf = DestinationPathResolution {
+            segments: vec![segment("/team", 1, true), segment("/team/target", 2, false)],
+            total_components: 2,
+            first_missing: Some(2),
+        };
+        let (status, detail, remediation) = path_resolution_verdict(&missing_leaf);
+        assert_eq!(status, DoctorSectionStatus::Warn);
+        assert!(detail.contains("stops at component 2 of 2"));
+        assert_eq!(remediation, Some(DOCTOR_MISSING_COMPONENT_HINT));
+
+        // The walk stopped for a reason other than absence -- here a rejected session -- and the
+        // report says so rather than calling the component missing, which is a different fault.
+        let mut interrupted = missing_leaf.clone();
+        interrupted.first_missing = None;
+        interrupted.segments[1].dsm_code = Some(119);
+        let (status, detail, remediation) = path_resolution_verdict(&interrupted);
+        assert_eq!(status, DoctorSectionStatus::Warn);
+        assert!(detail.contains("stopped at component 2 of 2 after DSM answered 119"));
+        assert!(detail.contains("not known to be missing"));
+        assert_eq!(remediation, None);
+        assert!(path_resolution_lines(&interrupted)[1].contains("DSM 119 stopped the walk here"));
+
+        // Each component renders with what DSM said about it, in walk order.
+        let mut mounted = resolved.clone();
+        mounted.segments[1].mount_boundary = true;
+        mounted
+            .segments
+            .push(segment("/team/target/child", 3, true));
+        mounted.segments[2].is_directory = false;
+        mounted.total_components = 4;
+        let lines = path_resolution_lines(&mounted);
+        assert!(lines[0].contains("/team") && lines[0].contains("exists, directory"));
+        assert!(lines[1].contains("mounted filesystem boundary"));
+        assert!(lines[2].contains("exists, not a directory"));
+        assert!(lines[3].contains("1 further component(s) were not inspected"));
+        assert!(path_resolution_lines(&missing_leaf)[1].contains("absent (DSM 408)"));
+    }
+
+    /// A diagnostic section that fails must not write "not run" over the sections after it: they
+    /// do run, and they record their own results.
+    #[test]
+    fn a_failed_diagnostic_section_does_not_disown_the_rest_of_the_run() {
+        let mut result = routing_doctor_result();
+        record_diagnostic_section(
+            &mut result,
+            "session_channel_ablation",
+            DoctorSectionStatus::Fail,
+            "the cookie poisoned the session".to_owned(),
+            Duration::from_millis(4),
+            Some(DOCTOR_COOKIE_CHANNEL_HINT),
+        );
+        let section = result
+            .sections
+            .iter()
+            .find(|section| section.id == "session_channel_ablation")
+            .expect("the ablation section");
+        assert_eq!(section.status, DoctorSectionStatus::Fail);
+        assert_eq!(section.remediation, Some(DOCTOR_COOKIE_CHANNEL_HINT));
+        assert_eq!(
+            result.failure.as_deref(),
+            Some("the cookie poisoned the session")
+        );
+        assert!(result.failed());
+        // Nothing after it was written off.
+        assert!(
+            result
+                .sections
+                .iter()
+                .filter(|section| section.id != "session_channel_ablation")
+                .all(|section| !section.detail.contains("not run because")),
+            "a failed diagnostic must not disown the sections that follow it"
+        );
     }
 }

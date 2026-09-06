@@ -446,6 +446,15 @@ fn read_totp_provisioning(from_stdin: bool, from_file: Option<&Path>) -> Result<
     prompt_secret("DSM TOTP manual key or otpauth URI: ", "DSM TOTP seed")
 }
 
+/// Read one secret line from piped stdin.
+///
+/// This blocks until the pipe delivers a line or closes, and std restarts the read across
+/// signals, so a first Ctrl-C is observed but does not unblock it. That is left as-is
+/// deliberately: the path is only reachable when the operator passed `--password-stdin` or
+/// `--secret-stdin`, and the alternative -- reading on a detached thread the main thread stops
+/// waiting for -- would strand a live secret in a thread that never drops its `Zeroizing`
+/// buffer. A second Ctrl-C exits the process instead. The masked terminal prompt below has no
+/// such gap: there Ctrl-C is itself the byte that ends the read.
 fn read_secret_line(label: &str) -> Result<Zeroizing<String>> {
     let mut line = Zeroizing::new(String::new());
     let mut input = io::stdin().lock().take(MAX_STDIN_SECRET_BYTES);
@@ -483,9 +492,16 @@ fn prompt_secret(prompt: &str, label: &str) -> Result<Zeroizing<String>> {
     let config = rpassword::ConfigBuilder::new()
         .password_feedback_mask(INTERACTIVE_SECRET_MASK)
         .build();
+    // Masked entry puts the terminal in raw mode, which suppresses ISIG: Ctrl-C arrives as an
+    // ETX byte instead of a signal. rpassword restores the terminal, re-raises SIGINT so the
+    // installed handler still sets the cancellation token, and reports `Interrupted`. Mapping
+    // that to `Cancelled` keeps the documented exit code 130 instead of a generic failure.
     let value = rpassword::prompt_password_with_config(prompt, config)
         .map(Zeroizing::new)
-        .map_err(|error| Error::Message(format!("failed to read {label}: {error}")))?;
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::Interrupted => Error::Cancelled,
+            _ => Error::Message(format!("failed to read {label}: {error}")),
+        })?;
     validate_secret_input(&value, label)?;
     Ok(value)
 }
