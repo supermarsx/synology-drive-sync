@@ -2137,10 +2137,12 @@ append_audit_event() {
     audit_actor_json=$(json_quote "$audit_actor") || return $?
     audit_profile_json=$(json_quote "${audit_profile:-none}") || return $?
     audit_client_request_field=
+    audit_client_request_needle=
     audit_activity_message="Module $audit_operation $audit_state [$audit_transaction]"
     if [ -n "$audit_client_request_id" ]; then
         audit_client_request_json=$(json_quote "$audit_client_request_id") || return $?
         audit_client_request_field=",\"client_request_id\":$audit_client_request_json"
+        audit_client_request_needle="\"client_request_id\":$audit_client_request_json"
         audit_activity_message="$audit_activity_message request_id=$audit_client_request_id"
     fi
     case $audit_state in
@@ -2179,27 +2181,59 @@ append_audit_event() {
             [ -e "$audit_existing" ] || [ -L "$audit_existing" ] || continue
             [ -f "$audit_existing" ] && [ ! -L "$audit_existing" ] \
                 && [ "$(stat -c '%u:%a:%h' "$audit_existing" 2>/dev/null || true)" = "$path_owner:600:1" ] || { audit_append_status=73; break; }
-            audit_match_count=$(grep -F "\"transaction\":$audit_transaction_json" "$audit_existing" 2>/dev/null |
-                grep -F "\"state\":$audit_state_json" | wc -l | tr -d ' ')
-            if [ -n "$audit_client_request_id" ]; then
-                audit_exact_count=$(grep -F "\"transaction\":$audit_transaction_json" "$audit_existing" 2>/dev/null |
-                    grep -F "\"state\":$audit_state_json" |
-                    grep -F "\"operation\":$audit_operation_json" |
-                    grep -F "\"origin\":$audit_origin_json" |
-                    grep -F "\"actor\":$audit_actor_json" |
-                    grep -F "\"actor_uid\":$audit_actor_uid" |
-                    grep -F "\"profile\":$audit_profile_json" |
-                    grep -F "\"client_request_id\":$audit_client_request_json" | wc -l | tr -d ' ')
-            else
-                audit_exact_count=$(grep -F "\"transaction\":$audit_transaction_json" "$audit_existing" 2>/dev/null |
-                    grep -F "\"state\":$audit_state_json" |
-                    grep -F "\"operation\":$audit_operation_json" |
-                    grep -F "\"origin\":$audit_origin_json" |
-                    grep -F "\"actor\":$audit_actor_json" |
-                    grep -F "\"actor_uid\":$audit_actor_uid" |
-                    grep -F "\"profile\":$audit_profile_json" | wc -l | tr -d ' ')
-            fi
-            case $audit_match_count:$audit_exact_count in *[!0-9:]*) audit_append_status=73; break ;; esac
+            # One awk pass per file instead of a grep pipeline per counter.
+            # The old form spawned four processes for the match count and ten
+            # for the exact count and read the file twice, all while holding
+            # the event log lock -- roughly 120 processes per audit write once
+            # the activity half below is included. index() is the same
+            # substring test grep -F applies per line, so both counters are
+            # unchanged; only the process count and the re-reads are.
+            #
+            # Needles travel through the environment rather than -v: json_quote
+            # emits backslash escapes, and awk expands escape sequences in a -v
+            # assignment but never in ENVIRON.
+            audit_counts=$(AUDIT_TX="\"transaction\":$audit_transaction_json" \
+                AUDIT_ST="\"state\":$audit_state_json" \
+                AUDIT_OP="\"operation\":$audit_operation_json" \
+                AUDIT_OG="\"origin\":$audit_origin_json" \
+                AUDIT_AC="\"actor\":$audit_actor_json" \
+                AUDIT_AU="\"actor_uid\":$audit_actor_uid" \
+                AUDIT_PR="\"profile\":$audit_profile_json" \
+                AUDIT_CR="$audit_client_request_needle" \
+                LC_ALL=C awk '
+                BEGIN {
+                    needle_tx = ENVIRON["AUDIT_TX"]; needle_st = ENVIRON["AUDIT_ST"]
+                    needle_op = ENVIRON["AUDIT_OP"]; needle_og = ENVIRON["AUDIT_OG"]
+                    needle_ac = ENVIRON["AUDIT_AC"]; needle_au = ENVIRON["AUDIT_AU"]
+                    needle_pr = ENVIRON["AUDIT_PR"]; needle_cr = ENVIRON["AUDIT_CR"]
+                    # An empty needle would be a silent dedup failure: index(s, "")
+                    # is 1 on some awks and 0 on others, so an unavailable ENVIRON
+                    # either matches everything or nothing. Refuse to guess. Only
+                    # needle_cr may legitimately be empty.
+                    needles_ok = 1
+                    if (needle_tx == "" || needle_st == "" || needle_op == "" ||
+                        needle_og == "" || needle_ac == "" || needle_au == "" ||
+                        needle_pr == "") { needles_ok = 0; exit 73 }
+                }
+                index($0, needle_tx) == 0 || index($0, needle_st) == 0 { next }
+                { matched++ }
+                index($0, needle_op) && index($0, needle_og) &&
+                index($0, needle_ac) && index($0, needle_au) &&
+                index($0, needle_pr) &&
+                (needle_cr == "" || index($0, needle_cr)) { exact++ }
+                END {
+                    # exit in BEGIN still runs END, so the guard has to hold here too.
+                    if (!needles_ok) exit 73
+                    printf "%d:%d\n", matched + 0, exact + 0
+                }
+                ' "$audit_existing" 2>/dev/null)
+            # Stricter than the old wc -l output, which was numeric by
+            # construction: an awk that failed to run must not read as zero.
+            case $audit_counts in
+                ''|*[!0-9:]*|:*|*:|*:*:*) audit_append_status=73; break ;;
+            esac
+            audit_match_count=${audit_counts%%:*}
+            audit_exact_count=${audit_counts#*:}
             [ "$audit_match_count" -eq "$audit_exact_count" ] || { audit_append_status=73; break; }
             [ "$audit_exact_count" -eq 0 ] || audit_record_exists=true
         done
@@ -2209,11 +2243,30 @@ append_audit_event() {
             [ -e "$activity_existing" ] || [ -L "$activity_existing" ] || continue
             [ -f "$activity_existing" ] && [ ! -L "$activity_existing" ] \
                 && [ "$(stat -c '%u:%a:%h' "$activity_existing" 2>/dev/null || true)" = "$path_owner:600:1" ] || { audit_append_status=73; break; }
-            activity_match_count=$(grep -F "|$audit_code|" "$activity_existing" 2>/dev/null |
-                grep -F "[$audit_transaction]" | wc -l | tr -d ' ')
-            activity_exact_count=$(grep -F "|$audit_code|${audit_profile:-none}|$audit_activity_state|audit|$audit_level|$audit_actor_uid|$audit_actor|$audit_activity_message" "$activity_existing" 2>/dev/null |
-                wc -l | tr -d ' ')
-            case $activity_match_count:$activity_exact_count in *[!0-9:]*) audit_append_status=73; break ;; esac
+            activity_counts=$(ACTIVITY_CODE="|$audit_code|" \
+                ACTIVITY_TX="[$audit_transaction]" \
+                ACTIVITY_EXACT="|$audit_code|${audit_profile:-none}|$audit_activity_state|audit|$audit_level|$audit_actor_uid|$audit_actor|$audit_activity_message" \
+                LC_ALL=C awk '
+                BEGIN {
+                    needle_code = ENVIRON["ACTIVITY_CODE"]
+                    needle_tx = ENVIRON["ACTIVITY_TX"]
+                    needle_exact = ENVIRON["ACTIVITY_EXACT"]
+                    needles_ok = 1
+                    if (needle_code == "" || needle_tx == "" || needle_exact == "")
+                        { needles_ok = 0; exit 73 }
+                }
+                index($0, needle_code) && index($0, needle_tx) { matched++ }
+                index($0, needle_exact) { exact++ }
+                END {
+                    if (!needles_ok) exit 73
+                    printf "%d:%d\n", matched + 0, exact + 0
+                }
+                ' "$activity_existing" 2>/dev/null)
+            case $activity_counts in
+                ''|*[!0-9:]*|:*|*:|*:*:*) audit_append_status=73; break ;;
+            esac
+            activity_match_count=${activity_counts%%:*}
+            activity_exact_count=${activity_counts#*:}
             [ "$activity_match_count" -eq "$activity_exact_count" ] || { audit_append_status=73; break; }
             [ "$activity_exact_count" -eq 0 ] || activity_record_exists=true
         done
