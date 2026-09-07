@@ -3637,7 +3637,6 @@ fn decode_relay_response(payload: &[u8]) -> BridgeResult<CgiResponse> {
 mod linux_runtime {
     use super::*;
     use reqwest::StatusCode;
-    use reqwest::blocking::Client;
     use reqwest::header::{ACCEPT, CONTENT_LENGTH, COOKIE, HeaderValue};
     use reqwest::redirect::Policy;
     use std::os::linux::fs::MetadataExt;
