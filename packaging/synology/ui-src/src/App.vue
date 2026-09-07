@@ -896,6 +896,7 @@ const ABOUT_RUST_DEPENDENCIES = Object.freeze([
   { name: "md-5", pin: "0.11.0", scope: "All platforms", url: "https://crates.io/crates/md-5" },
   { name: "hmac", pin: "0.13.0", scope: "All platforms", url: "https://crates.io/crates/hmac" },
   { name: "reqwest", pin: "0.13.4", scope: "All platforms", url: "https://crates.io/crates/reqwest" },
+  { name: "rustls", pin: "0.23.43", scope: "All platforms", url: "https://crates.io/crates/rustls" },
   { name: "rpassword", pin: "7.5.4", scope: "All platforms", url: "https://crates.io/crates/rpassword" },
   { name: "serde", pin: "1.0.229", scope: "All platforms", url: "https://crates.io/crates/serde" },
   { name: "serde_json", pin: "1.0.151", scope: "All platforms", url: "https://crates.io/crates/serde_json" },

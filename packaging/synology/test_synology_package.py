@@ -15195,8 +15195,8 @@ WALL_CLOCK_CALLS = frozenset({"sleep", "monotonic", "time", "perf_counter"})
 
 #: Default ceiling on the parallel lane. Wall-clock time bottoms out at the
 #: longest single test, so past a handful of workers extra concurrency buys
-#: load rather than speed: measured on a 24-test lane, 8 workers already hit
-#: that floor exactly (1102s serial to 278s, the duration of the longest test).
+#: load rather than speed: measured on a 24-test lane, 8 workers already reach
+#: that floor (1102s serial to ~290s, against a longest test of 277s).
 #: Capping keeps the load on shared CI hardware bounded at no cost in wall time.
 DEFAULT_MAX_WORKERS = 8
 
