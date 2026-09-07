@@ -1797,7 +1797,8 @@ impl RemoteSink {
             .as_ref()
             .map(load_bearer_token)
             .transpose()?;
-        let client = Client::builder()
+        let client = crate::blocking_client_builder()
+            .map_err(|_| ObservabilityError::InvalidRemoteConfiguration)?
             .connect_timeout(config.timeout)
             .timeout(config.timeout)
             // Never forward an observability payload or bearer credential to a redirect

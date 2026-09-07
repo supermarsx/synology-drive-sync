@@ -839,12 +839,12 @@ impl ApiClient {
         observer: Option<RequestObserver>,
     ) -> Result<Self> {
         let base = normalize_base_url(&options.base_url, options.allow_http)?;
-        let mut builder = HttpClient::builder()
+        let mut builder = crate::blocking_client_builder()?
             .connect_timeout(options.connect_timeout)
             .timeout(control_request_timeout(options.request_timeout))
             .redirect(Policy::none())
             .user_agent(concat!("synology-drive-sync/", env!("SDSYNC_VERSION")));
-        let mut download_builder = AsyncHttpClient::builder()
+        let mut download_builder = crate::async_client_builder()?
             .connect_timeout(options.connect_timeout)
             .read_timeout(control_request_timeout(options.request_timeout))
             .redirect(Policy::none())
@@ -4454,7 +4454,7 @@ pub(crate) fn probe_client(
     request_timeout: Duration,
 ) -> Result<HttpClient> {
     let timeout = request_timeout.min(control_request_timeout(options.request_timeout));
-    let mut builder = HttpClient::builder()
+    let mut builder = crate::blocking_client_builder()?
         .connect_timeout(options.connect_timeout.min(timeout))
         .timeout(timeout)
         .redirect(Policy::none())
@@ -5775,12 +5775,14 @@ mod tests {
         idle_timeout: Duration,
         operation_timeout: Duration,
     ) -> ApiClient {
-        let http = HttpClient::builder()
+        let http = crate::blocking_client_builder()
+            .expect("ring provider installs")
             .timeout(idle_timeout.min(operation_timeout))
             .redirect(Policy::none())
             .build()
             .unwrap();
-        let download_http = AsyncHttpClient::builder()
+        let download_http = crate::async_client_builder()
+            .expect("ring provider installs")
             .connect_timeout(idle_timeout.min(operation_timeout))
             .read_timeout(idle_timeout.min(operation_timeout))
             .redirect(Policy::none())
@@ -6014,7 +6016,13 @@ mod tests {
     fn decode_scripted_error(status: StatusCode, body: String, api: &str, method: &str) -> Error {
         let (base, server) = scripted_server_with_status(vec![(status, body)]);
         let url = Url::parse(&base).unwrap().join("webapi/entry.cgi").unwrap();
-        let response = HttpClient::new().post(url).send().unwrap();
+        let response = crate::blocking_client_builder()
+            .expect("ring provider installs")
+            .build()
+            .expect("client builds")
+            .post(url)
+            .send()
+            .unwrap();
         let error =
             decode_response_observed::<Value>(response, api, method, &mut ResponseFacts::default())
                 .unwrap_err();
@@ -8210,8 +8218,14 @@ mod tests {
     #[test]
     fn worker_clones_report_and_share_one_budget() {
         let client = ApiClient {
-            http: HttpClient::new(),
-            download_http: AsyncHttpClient::new(),
+            http: crate::blocking_client_builder()
+                .expect("ring provider installs")
+                .build()
+                .expect("client builds"),
+            download_http: crate::async_client_builder()
+                .expect("ring provider installs")
+                .build()
+                .expect("client builds"),
             base: Url::parse("https://files.example.test/webapi/").unwrap(),
             apis: HashMap::new(),
             session: None,
@@ -10850,8 +10864,14 @@ mod tests {
     #[test]
     fn legacy_md5_and_complete_fingerprint_capability_gates_remain_distinct() {
         let client_for = |api: &str| ApiClient {
-            http: HttpClient::new(),
-            download_http: AsyncHttpClient::new(),
+            http: crate::blocking_client_builder()
+                .expect("ring provider installs")
+                .build()
+                .expect("client builds"),
+            download_http: crate::async_client_builder()
+                .expect("ring provider installs")
+                .build()
+                .expect("client builds"),
             base: Url::parse("https://files.example.test/webapi/").unwrap(),
             apis: HashMap::from([(
                 api.to_owned(),

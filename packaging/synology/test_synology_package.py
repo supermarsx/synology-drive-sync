@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import ast
+import concurrent.futures
 import copy
 import io
 import json
@@ -19,7 +21,9 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
+import traceback
 import unittest
 from pathlib import Path
 
@@ -324,6 +328,12 @@ def repack_payload_member(
 
 
 class BuilderTests(unittest.TestCase):
+    #: Every test here builds into its own temporary directory and reads the
+    #: repository without writing to it, and none of them assert on elapsed
+    #: time. test_parallel_safe_classes_do_not_read_the_wall_clock keeps the
+    #: second half of that claim true as the class grows.
+    parallel_safe = True
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="sdsync-spk-test-")
         self.root = Path(self.temporary.name)
@@ -1396,6 +1406,67 @@ class BuilderTests(unittest.TestCase):
             self.assertNotIn("Selecting one switches", document)
         self.assertNotIn("**Package controller**", dashboard)
         self.assertNotIn("<strong>Package controller</strong>", integrated_help)
+
+    def test_parallel_safe_classes_do_not_read_the_wall_clock(self) -> None:
+        """Classes in the parallel lane must not depend on how busy the host is.
+
+        A test that bounds its own duration can be pushed past that bound by
+        the workers running beside it, which turns a scheduling delay into an
+        intermittent failure. Rather than trust the ``parallel_safe`` flag,
+        re-derive it from this module's syntax tree, so that adding a sleep or
+        a deadline to a parallel-safe class fails here, deterministically, in
+        the change that introduced it.
+        """
+        with open(__file__, "r", encoding="utf-8", newline="") as handle:
+            module_source = handle.read()
+        violations = []
+        for node in ast.parse(module_source).body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            opted_in = any(
+                isinstance(statement, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id == "parallel_safe"
+                    for target in statement.targets
+                )
+                and isinstance(statement.value, ast.Constant)
+                and statement.value.value is True
+                for statement in node.body
+            )
+            if not opted_in:
+                continue
+            for child in ast.walk(node):
+                if not isinstance(child, ast.Call):
+                    continue
+                function = child.func
+                if (
+                    isinstance(function, ast.Attribute)
+                    and isinstance(function.value, ast.Name)
+                    and function.value.id == "time"
+                    and function.attr in WALL_CLOCK_CALLS
+                ):
+                    violations.append(
+                        f"{node.name} line {child.lineno}: time.{function.attr}()"
+                    )
+                for keyword in child.keywords:
+                    if keyword.arg != "timeout":
+                        continue
+                    if (
+                        isinstance(keyword.value, ast.Name)
+                        and keyword.value.id in PARALLEL_SAFE_TIMEOUT_NAMES
+                    ):
+                        continue
+                    violations.append(
+                        f"{node.name} line {keyword.value.lineno}: timeout= outside "
+                        f"{sorted(PARALLEL_SAFE_TIMEOUT_NAMES)}"
+                    )
+        self.assertEqual(
+            violations,
+            [],
+            "a parallel_safe class gained a wall-clock dependency; either remove "
+            "the dependency or drop parallel_safe from the class:\n"
+            + "\n".join(violations),
+        )
 
 
 @unittest.skipUnless(os.name == "posix", "DSM shell lifecycle mocks require a POSIX host")
@@ -15094,5 +15165,164 @@ fi
         self.assertFalse(control.exists())
 
 
+# ---------------------------------------------------------------------------
+# Parallel execution
+#
+# The suite is dominated by subprocess work (package builds, shell lifecycle
+# runs), so the interpreter spends nearly all of its time blocked in wait().
+# Threads therefore give real concurrency here without the pickling and
+# re-import cost of processes, and without a third-party dependency: a bare
+# "python3 packaging/synology/test_synology_package.py" stays the entry point.
+#
+# Only classes that opt in with "parallel_safe = True" run concurrently.
+# Opting in is a claim that the class reads no wall clock, because a test that
+# asserts an elapsed-time upper bound can be pushed past that bound by load
+# from its neighbours. That claim is not taken on trust:
+# test_parallel_safe_classes_do_not_read_the_wall_clock re-derives it from the
+# module's own syntax tree, so a later edit that introduces a deadline into a
+# parallel-safe class fails the suite instead of producing an intermittent
+# failure somewhere else.
+# ---------------------------------------------------------------------------
+
+#: Subprocess timeouts a parallel-safe class may still use. These are named
+#: constants with margin measured in minutes rather than the tight bounds that
+#: distinguish a fast path from a fallback, so scheduling delay cannot reach
+#: them. A bare numeric literal is rejected: it is usually a tight bound.
+PARALLEL_SAFE_TIMEOUT_NAMES = frozenset({"PACKAGE_TOOL_TIMEOUT_SECONDS"})
+
+#: Wall-clock readings that make a test sensitive to how busy the machine is.
+WALL_CLOCK_CALLS = frozenset({"sleep", "monotonic", "time", "perf_counter"})
+
+#: Default ceiling on the parallel lane. Wall-clock time bottoms out at the
+#: longest single test, so past a handful of workers extra concurrency buys
+#: load rather than speed: measured on a 24-test lane, 8 workers already hit
+#: that floor exactly (1102s serial to 278s, the duration of the longest test).
+#: Capping keeps the load on shared CI hardware bounded at no cost in wall time.
+DEFAULT_MAX_WORKERS = 8
+
+
+def iter_tests(suite):
+    """Yield the individual test cases inside an arbitrarily nested suite."""
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            yield from iter_tests(item)
+        else:
+            yield item
+
+
+def runs_in_parallel(test):
+    return getattr(type(test), "parallel_safe", False) is True
+
+
+def resolve_worker_count(parallel_test_count: int) -> int:
+    """Worker count for the parallel lane.
+
+    Honours SDSYNC_TEST_JOBS so a constrained runner can pin it exactly;
+    otherwise takes the CPU count bounded by DEFAULT_MAX_WORKERS. Wall-clock
+    time cannot fall below the longest single test, so beyond that ceiling
+    extra workers only add load, and the lane never needs more workers than it
+    has tests to run.
+    """
+    override = os.environ.get("SDSYNC_TEST_JOBS", "").strip()
+    if override:
+        try:
+            requested = int(override)
+        except ValueError:
+            raise SystemExit(f"SDSYNC_TEST_JOBS must be an integer, got {override!r}")
+        if requested < 1:
+            raise SystemExit("SDSYNC_TEST_JOBS must be at least 1")
+    else:
+        requested = min(os.cpu_count() or 2, DEFAULT_MAX_WORKERS)
+    return max(1, min(requested, parallel_test_count))
+
+
+def run_suite_in_parallel(module=None, stream=None) -> int:
+    """Run a module's tests, parallel lane first, and return an exit status."""
+    stream = stream or sys.stderr
+    loader = unittest.TestLoader()
+    all_tests = list(
+        iter_tests(loader.loadTestsFromModule(module or sys.modules[__name__]))
+    )
+    parallel = [test for test in all_tests if runs_in_parallel(test)]
+    serial = [test for test in all_tests if not runs_in_parallel(test)]
+    workers = resolve_worker_count(len(parallel)) if parallel else 1
+
+    print(
+        f"running {len(all_tests)} tests: {len(parallel)} in parallel across "
+        f"{workers} workers, {len(serial)} serially",
+        file=stream,
+        flush=True,
+    )
+
+    emit_lock = threading.Lock()
+    outcomes = []
+
+    def record(test, result, seconds, override=None):
+        if override is not None:
+            status, detail = override
+        elif result.errors:
+            status, detail = "ERROR", result.errors[0][1]
+        elif result.failures:
+            status, detail = "FAIL", result.failures[0][1]
+        elif result.unexpectedSuccesses:
+            status, detail = "UNEXPECTED SUCCESS", ""
+        elif result.skipped:
+            status, detail = "skipped", result.skipped[0][1]
+        else:
+            status, detail = "ok", ""
+        with emit_lock:
+            outcomes.append((test.id(), status, detail, seconds))
+            print(f"{test.id()} ... {status} ({seconds:.2f}s)", file=stream, flush=True)
+
+    def run_one(test):
+        result = unittest.TestResult()
+        started = time.monotonic()
+        try:
+            test.run(result)
+        except BaseException:
+            # A crash in the harness itself must never be summarised as a pass.
+            record(
+                test,
+                result,
+                time.monotonic() - started,
+                override=("ERROR", traceback.format_exc()),
+            )
+            raise
+        record(test, result, time.monotonic() - started)
+
+    started_at = time.monotonic()
+    if parallel:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            for future in concurrent.futures.as_completed(
+                pool.submit(run_one, test) for test in parallel
+            ):
+                future.result()
+    for test in serial:
+        run_one(test)
+    elapsed = time.monotonic() - started_at
+
+    failed_states = {"FAIL", "ERROR", "UNEXPECTED SUCCESS"}
+    broken = [entry for entry in outcomes if entry[1] in failed_states]
+    skipped = [entry for entry in outcomes if entry[1] == "skipped"]
+    for test_id, status, detail, _ in broken:
+        print(f"\n{'=' * 70}\n{status}: {test_id}\n{'-' * 70}\n{detail}", file=stream)
+    print(
+        f"\nRan {len(outcomes)} tests in {elapsed:.2f}s\n\n"
+        + (
+            f"FAILED (failures={len(broken)}, skipped={len(skipped)})"
+            if broken
+            else f"OK (skipped={len(skipped)})"
+        ),
+        file=stream,
+        flush=True,
+    )
+    return 1 if broken else 0
+
+
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    if len(sys.argv) > 1:
+        # An explicit selection (a single test id, -k, -v) keeps stock unittest
+        # semantics, so every existing invocation behaves exactly as before.
+        unittest.main(verbosity=2)
+    else:
+        sys.exit(run_suite_in_parallel())

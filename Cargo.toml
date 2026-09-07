@@ -40,7 +40,16 @@ ignore = "0.4.33"
 keyring-core = "1.0.0"
 md-5 = { version = "0.11.0", default-features = false }
 hmac = "0.13.0"
-reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "form", "multipart", "rustls"] }
+# `rustls-no-provider` rather than `rustls`: reqwest's `rustls` feature hard-wires
+# the aws-lc-rs provider, whose RNG falls back to /dev/urandom with an
+# RNDGETENTCNT wait when the kernel has no getrandom(2). On a headless NAS that
+# blocks for tens of minutes inside TLS client construction -- which is outside
+# every request deadline this crate has -- and stalls the whole serial job queue.
+# ring reaches the same randomness through the getrandom crate, which waits at
+# most once for the pool to initialise and never re-blocks. Selecting the
+# provider here means this crate must install it; see `install_crypto_provider`.
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "form", "multipart", "rustls-no-provider"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rpassword = "7.5.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["raw_value"] }

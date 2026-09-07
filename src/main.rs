@@ -87,6 +87,13 @@ struct NamedSourceSettings {
 }
 
 fn main() -> ExitCode {
+    // Before anything else: this build selects its own TLS provider, and a
+    // missing one would otherwise surface much later, inside client
+    // construction, where no deadline covers it.
+    if let Err(error) = synology_drive_sync::install_crypto_provider() {
+        print_error(&error);
+        return ExitCode::from(error_exit_code(&error));
+    }
     let cli = cli::Cli::parse_checked();
     match dispatch(&cli) {
         Ok(code) => code,

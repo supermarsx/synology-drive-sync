@@ -3967,7 +3967,14 @@ mod linux_runtime {
         let url = format!(
             "{scheme}://127.0.0.1:{port}{DSM_USER_SERVICE_PATH}?api={DSM_USER_SERVICE_API}&version=1&method=get_user_service"
         );
-        let client = Client::builder()
+        // Through the workspace choke point rather than building a reqwest
+        // client here: this is the DSM package's own API server, and under
+        // `rustls-no-provider` a client built without an installed provider
+        // panics on reqwest's internal runtime thread instead of returning an
+        // error. This path is why the choke point exists -- it reaches TLS
+        // without going through ApiClient at all.
+        let client = synology_drive_sync::blocking_client_builder()
+            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?
             .no_proxy()
             .redirect(Policy::none())
             .http1_only()
@@ -10886,6 +10893,13 @@ fn record_pre_relay_activity(stage: &str, code: &str, status: u16) -> BridgeResu
 }
 
 pub(crate) fn main_entry() -> ExitCode {
+    // Same reasoning as the CLI: install the TLS provider first, and refuse to
+    // run without one rather than discovering it inside a queued job. This
+    // process serves the CGI and executes queued connection work, so a late
+    // failure here is the one that stalls the whole control queue.
+    if synology_drive_sync::install_crypto_provider().is_err() {
+        return ExitCode::from(1);
+    }
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if arguments.is_empty() {
         let is_get = std::env::var("REQUEST_METHOD").is_ok_and(|method| method == "GET");
