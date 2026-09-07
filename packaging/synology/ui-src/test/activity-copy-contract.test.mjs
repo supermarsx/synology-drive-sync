@@ -6,7 +6,7 @@ const appSource = await readFile(new URL("../src/App.vue", import.meta.url), "ut
 const cssSource = await readFile(new URL("../src/styles/native.css", import.meta.url), "utf8");
 const cssDist = await readFile(new URL("../dist/style.css", import.meta.url), "utf8");
 
-function loadAppComponent() {
+function loadAppComponent(overrides = {}) {
   const script = appSource.match(/<script>\s*([\s\S]*?)\s*<\/script>/);
   assert.ok(script, "App.vue script block is missing");
   let executable = script[1]
@@ -37,7 +37,12 @@ function loadAppComponent() {
     createAutosaveCoordinator: () => ({}),
     installControlLayout: () => () => {},
     ActionIcon: { name: "ActionIcon" },
-    SecurityPanel: {}
+    SecurityPanel: {},
+    // Overrides replace a stub in place; a name the defaults do not carry (a
+    // `document` for code that guards on it, say) is appended as one more
+    // sandbox parameter, so callers that pass nothing keep the exact frame
+    // every other test in this file loads.
+    ...overrides
   };
   return Function(...Object.keys(stubs), executable)(...Object.values(stubs));
 }
@@ -987,4 +992,66 @@ test("copy falls back for DSM browsers and reports a rejected clipboard without 
     globalThis.window = priorWindow;
     globalThis.document = priorDocument;
   }
+});
+
+test("a failing package log read never discards the activity feed", async () => {
+  const events = [{
+    epoch: 10,
+    category: "sync",
+    level: "info",
+    code: "sync.completed",
+    message: "nightly finished"
+  }];
+
+  const run = async (failingAction) => {
+    const requested = [];
+    const scoped = loadAppComponent({
+      document: { hidden: false },
+      apiGet: async (_auth, action) => {
+        requested.push(action);
+        if (action === failingAction) throw new Error(`${action} read exceeded its client limit`);
+        return action === "logs"
+          ? { schema: "sdsync.dsm-logs.v1", logs: [{ source: "api", lines: ["{\"level\":\"info\"}"] }] }
+          : { schema: "sdsync.dsm-activity.v1", events };
+      }
+    });
+    const context = {
+      disposed: false,
+      logsLoading: false,
+      logsPaused: false,
+      route: "activity",
+      auth: {},
+      logLines: 200,
+      logSource: "all",
+      logRecords: [],
+      logOutput: "",
+      activityEvents: [],
+      logState: "",
+      scheduleLogs() {}
+    };
+    context.logRecordsFrom = (...args) => scoped.methods.logRecordsFrom.apply(context, args);
+    await scoped.methods.refreshLogs.call(context);
+    return { context, requested };
+  };
+
+  // The package log scan is far more expensive than the activity feed, so a
+  // joint wait let one stalled read blank an Activity list the package had
+  // already returned in full.
+  const logsDown = await run("logs");
+  assert.deepEqual(logsDown.requested, ["logs", "activity"]);
+  assert.deepEqual(
+    logsDown.context.activityEvents,
+    events,
+    "a failed package log read must not discard a delivered activity payload"
+  );
+  assert.match(logsDown.context.logState, /package log read unavailable/);
+
+  const activityDown = await run("activity");
+  assert.deepEqual(activityDown.context.activityEvents, []);
+  assert.match(activityDown.context.logOutput, /^\[api\]/);
+  assert.match(activityDown.context.logState, /activity feed unavailable/);
+
+  const healthy = await run("none");
+  assert.deepEqual(healthy.context.activityEvents, events);
+  assert.equal(healthy.context.logState, "Live · 200 line limit");
 });

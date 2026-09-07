@@ -393,10 +393,12 @@ but does not cancel a job already accepted by the server.
    earlier secret stages may have applied before a later stage failed or became outcome-unknown.
 6. Note the request and job correlation shown by the UI, when available.
 7. Only the affected UI scope and dependent operations are paused; use independent controls normally.
-   A connection-request incident freezes the affected profile and credential fields and blocks profile
-   submission, authentication, and File Station requests so the submitted draft cannot drift and two
-   temporary sessions cannot overlap. Use **Reconcile connection request** to resume the exact queued
-   result.
+   An unresolved connection-request incident freezes the affected profile and credential fields and
+   blocks profile submission, authentication, and File Station requests so the submitted draft cannot
+   drift and two temporary sessions cannot overlap. Use **Reconcile connection request** to resume the
+   exact queued result. A request DSM already settled — including a failure reporting that the
+   temporary File Station session could not be closed — is reported with its correlation but does not
+   raise that barrier; correct the draft and try again.
 8. When the banner offers **Reconcile profile request**, use it before another save. It performs no
    mutation. A success requires exact request/job/operation ownership; configuration success also
    requires an exact fresh non-secret snapshot, while secret success requires trustworthy presence

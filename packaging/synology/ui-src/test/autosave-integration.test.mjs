@@ -833,6 +833,153 @@ test("remote browsing cancels a pending profile autosave and a failed browse nev
   assert.equal(profilePosts, 1, "a later edit remains autosavable after connection-only browse evidence");
 });
 
+function connectionProbeContext(context, component) {
+  Object.assign(context, {
+    profileEditorOpen: true,
+    canTestProfileAuthentication: true,
+    profileSaveState: "idle",
+    profileForm: {
+      name: "nightly", source: "/volume1/source", url: "https://nas.example.invalid",
+      username: "sync-user", allow_http: false, danger_invalid_certs: false,
+      ca_certificate: "", connect_timeout: 15, timeout: 120, retries: 2
+    },
+    selectedProfile: "nightly",
+    selectedProfileModel: { name: "nightly", has_password: true, has_totp: false },
+    secretModes: { password: "keep", totp: "keep", remote_log_token: "keep" },
+    secretValues: { password: "", totp: "", remote_log_token: "" },
+    profileConnectionRequest: 0,
+    profileConnectionMessage: "",
+    connectionIncidentEvidence: "",
+    connectionProof: "",
+    connectionProofExpires: 0,
+    connectionProofTimer: 0,
+    bridgeIssue: { title: "", message: "" },
+    connectionLabel: "Authenticated package bridge",
+    toasts: [],
+    toast(title, message, error = false) { this.toasts.push({ title, message, error }); }
+  });
+  for (const name of [
+    "strictDraftInteger", "between", "clearConnectionProofTimer", "scheduleConnectionProofExpiry",
+    "connectionRequestPayload", "holdProfileAutosaveForConnection", "releaseProfileAutosaveFromConnection",
+    "autosaveChanged", "reportMutationError", "ensureProfileFailureRecords",
+    "syncProfileFailureState", "clearProfileConfigurationFailure"
+  ]) context[name] = (...args) => component.methods[name].apply(context, args);
+  return context;
+}
+
+// Exactly the error api.js builds from a completed job whose terminal result is
+// `ok: false` with a File Station cleanup code: the request outcome is known
+// and attributable to one job, and only the temporary session cleanup is in
+// doubt.
+function settledCleanupFailure(requestId, jobId) {
+  return Object.assign(
+    new Error("The temporary File Station session could not be closed safely."),
+    {
+      name: "DsmApiError",
+      status: 200,
+      code: "file_station_logout_failed",
+      requiresInspection: true,
+      accepted: true,
+      operation: "test-profile-auth",
+      requestId,
+      trustedRequestId: true,
+      jobId,
+      trustedJobId: true
+    }
+  );
+}
+
+test("a completed job's cleanup failure reaches the AppWindow and leaves the connection scope usable", async () => {
+  const requestId = "a".repeat(32);
+  const jobId = "b".repeat(48);
+  let authenticationPosts = 0;
+  const { clock, context, component } = await coordinatorRuntime(async (_auth, _csrf, action) => {
+    if (action === "test-profile-auth") {
+      authenticationPosts += 1;
+      throw settledCleanupFailure(requestId, jobId);
+    }
+    return { ok: true };
+  });
+  connectionProbeContext(context, component);
+
+  await component.methods.testProfileAuthentication.call(context, { preventDefault() {} });
+  await clock.advance(5000);
+
+  assert.equal(authenticationPosts, 1);
+  const incident = context.isolatedIncidents.connection;
+  assert.equal(incident.active, true);
+  assert.equal(incident.settled, true, "a terminal result for the exact job is a settled outcome");
+  assert.equal(incident.outcomeUnknown, false);
+  assert.equal(incident.requiresInspection, true);
+  assert.equal(incident.requestId, requestId);
+  assert.equal(incident.jobId, jobId);
+
+  // A settled outcome must never raise the reconciliation barrier: the only
+  // thing reconciliation could do is re-read the result already in hand.
+  assert.equal(component.computed.connectionOutcomeUnresolved.call(context), false);
+  assert.equal(component.computed.incidentOutcomeUnresolved.call(context), false);
+  assert.equal(component.computed.connectionReconciliationIncident.call(context), null);
+  assert.equal(component.computed.connectionIncidentEvidence.call(context), "");
+
+  // The operator still keeps the correlated evidence for Activity / Logs.
+  assert.equal(context.profileConnectionState, "error");
+  assert.match(context.profileConnectionMessage, new RegExp(`Client request ID: ${requestId}\\.`));
+  assert.match(context.profileConnectionMessage, new RegExp(`Queued job ID: ${jobId}\\.`));
+
+  // ...and can correct the draft and test again immediately.
+  await component.methods.testProfileAuthentication.call(context, { preventDefault() {} });
+  await clock.advance(5000);
+  assert.equal(
+    authenticationPosts,
+    2,
+    "a settled failure must not lock the scope behind a redundant reconciliation"
+  );
+});
+
+test("an unobserved authentication outcome still locks the connection scope until it is reconciled", async () => {
+  const requestId = "c".repeat(32);
+  const jobId = "d".repeat(48);
+  let authenticationPosts = 0;
+  const { clock, context, component } = await coordinatorRuntime(async (_auth, _csrf, action) => {
+    if (action === "test-profile-auth") {
+      authenticationPosts += 1;
+      // No terminal result was ever observed for the accepted job.
+      throw Object.assign(new Error("Authentication result could not be observed"), {
+        name: "QueuedOutcomeUnknownError",
+        outcomeUnknown: true,
+        accepted: true,
+        operation: "test-profile-auth",
+        requestId,
+        trustedRequestId: true,
+        jobId,
+        trustedJobId: true
+      });
+    }
+    return { ok: true };
+  });
+  connectionProbeContext(context, component);
+
+  await component.methods.testProfileAuthentication.call(context, { preventDefault() {} });
+  await clock.advance(5000);
+
+  assert.equal(authenticationPosts, 1);
+  assert.equal(context.isolatedIncidents.connection.settled, false);
+  assert.equal(component.computed.connectionOutcomeUnresolved.call(context), true);
+  assert.equal(component.computed.incidentOutcomeUnresolved.call(context), true);
+  assert.strictEqual(
+    component.computed.connectionReconciliationIncident.call(context),
+    context.isolatedIncidents.connection
+  );
+
+  await component.methods.testProfileAuthentication.call(context, { preventDefault() {} });
+  await clock.advance(5000);
+  assert.equal(
+    authenticationPosts,
+    1,
+    "an unknown outcome must never be retried into a possible duplicate"
+  );
+});
+
 test("security autosave never invites a duplicate after terminal success and CSRF refresh failure", async () => {
   let posts = 0;
   const refreshFailure = new Error("DSM CSRF refresh returned an invalid document");

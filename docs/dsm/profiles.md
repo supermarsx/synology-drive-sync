@@ -61,12 +61,14 @@ test. The test can use stored credentials while secret writes are disabled, prov
 actions remain allowed. Transient values are neither returned nor persisted by testing; creating a
 new profile persists its password only in the later protected-secret save stage.
 
-After controller dispatch, **Test authentication** gives API discovery and login, including an
-optional TOTP challenge, one shared 12-second probe budget and reserves a separate 3 seconds for
-logout. **Browse target** gives discovery, login, an optional TOTP challenge, and directory listing
-one shared 27-second budget, again with a separate 3 seconds reserved for logout. These are
-execution budgets, not end-to-end UI countdowns: FIFO queueing and result observation or
-reconciliation can leave an accepted request displayed as pending beyond 15 or 30 seconds.
+After controller dispatch, **Test authentication** gives API discovery, login including an optional
+TOTP challenge, and the File Station session confirmation one shared 45-second probe budget, and
+reserves a separate 10 seconds for logout. **Browse target** gives discovery, login, an optional
+TOTP challenge, and directory listing one shared 50-second budget, again with a separate 10 seconds
+reserved for logout. Each budget covers the per-request ceiling of every round trip it contains, so
+a slow relay such as QuickConnect is reported as slow rather than as a failed session cleanup.
+These are execution budgets, not end-to-end UI countdowns: FIFO queueing and result observation or
+reconciliation can leave an accepted request displayed as pending for longer still.
 Interactive probes deliberately disable configured transport retries so one click cannot multiply
 that bounded wait. This exception applies only to authentication testing and remote browsing;
 normal sync operations retain the retry policy saved in the profile.
@@ -214,9 +216,13 @@ failure unlocks that failed stage for correction. Pending, expired, foreign-sess
 job-mismatched, or unresolved evidence stays locked because absence is not proof that DSM rejected the
 original POST.
 
-Authentication tests and remote browsing use the same recovery rule. While either exact request is
-unresolved, the UI freezes the affected profile and credential fields, blocks profile submission and
-a second connection request, and offers **Reconcile connection request** when the package advertises
+Authentication tests and remote browsing use the same recovery rule, and an outcome DSM has already
+settled is not treated as unresolved. When the package returns an exact terminal result for the
+queued job — including a failure reporting that the temporary File Station session could not be
+closed — that failure is shown with its request and job correlation and the draft stays editable,
+because reconciliation could only re-read the result already held. Only a genuinely unresolved
+outcome freezes the affected profile and credential fields, blocks profile submission and a second
+connection request, and offers **Reconcile connection request** when the package advertises
 support. A reconciled authentication success settles the old request but does not reuse its proof;
 one fresh test then unlocks browsing. A settled failure likewise unlocks the preserved draft for
 correction. No credential is stored by the test or included in the incident record.

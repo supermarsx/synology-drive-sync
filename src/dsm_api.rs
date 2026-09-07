@@ -187,14 +187,34 @@ const AUTH_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_MANAGER_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(target_os = "linux")]
 const CONTROLLER_WAKE_TIMEOUT: Duration = Duration::from_secs(2);
+// Interactive connection jobs stay bounded, but a probe budget is only safe if
+// it covers every control round trip it actually contains. `ApiClient` already
+// caps one control request at `INTERACTIVE_CONTROL_REQUEST_CEILING`, so a
+// budget below the sum of its legs turns a slow-but-healthy relay into a
+// spurious failure: the shared deadline expires mid-probe, or the cleanup
+// logout is abandoned and the AppWindow reports `file_station_logout_failed`.
+// A QuickConnect relay measured 3.8 s for a single discovery request, which
+// alone exceeds a three-second logout slice.
+//
+// `interactive_connection_budgets_cover_every_control_leg` re-derives each
+// budget from the round-trip counts of the code paths it bounds, so adding a
+// leg without widening the budget fails that test rather than the operator's
+// next authentication attempt.
 #[cfg(target_os = "linux")]
-const INTERACTIVE_AUTH_TEST_PROBE_TIMEOUT: Duration = Duration::from_secs(12);
+const INTERACTIVE_CONTROL_REQUEST_CEILING: Duration = Duration::from_secs(10);
+// Two discovery legs (`entry.cgi` plus the `query.cgi` fallback), two login
+// legs (the plain login plus a TOTP-challenged retry), and one File Station
+// session confirmation, which caps itself at five seconds.
 #[cfg(target_os = "linux")]
-const INTERACTIVE_AUTH_TEST_LOGOUT_TIMEOUT: Duration = Duration::from_secs(3);
+const INTERACTIVE_AUTH_TEST_PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 #[cfg(target_os = "linux")]
-const INTERACTIVE_REMOTE_BROWSE_PROBE_TIMEOUT: Duration = Duration::from_secs(27);
+const INTERACTIVE_AUTH_TEST_LOGOUT_TIMEOUT: Duration = INTERACTIVE_CONTROL_REQUEST_CEILING;
+// The same discovery and login legs plus one bounded directory listing, which
+// is a general control request rather than the smaller confirmation slice.
 #[cfg(target_os = "linux")]
-const INTERACTIVE_REMOTE_BROWSE_LOGOUT_TIMEOUT: Duration = Duration::from_secs(3);
+const INTERACTIVE_REMOTE_BROWSE_PROBE_TIMEOUT: Duration = Duration::from_secs(50);
+#[cfg(target_os = "linux")]
+const INTERACTIVE_REMOTE_BROWSE_LOGOUT_TIMEOUT: Duration = INTERACTIVE_CONTROL_REQUEST_CEILING;
 #[cfg(target_os = "linux")]
 const MAX_HELPER_STDERR_BYTES: usize = 64 * 1024;
 #[cfg(target_os = "linux")]
@@ -556,6 +576,7 @@ enum ReadAction {
 enum LogSource {
     All,
     Api,
+    Doctor,
     Controller,
     Scheduler,
     Sync,
@@ -567,6 +588,7 @@ impl LogSource {
         match self {
             Self::All => "all",
             Self::Api => "api",
+            Self::Doctor => "doctor",
             Self::Controller => "controller",
             Self::Scheduler => "scheduler",
             Self::Sync => "sync",
@@ -1873,6 +1895,7 @@ fn parse_read_action(mut query: BTreeMap<String, String>) -> BridgeResult<ReadAc
             let source = match query.remove("source").as_deref().unwrap_or("all") {
                 "all" => LogSource::All,
                 "api" => LogSource::Api,
+                "doctor" => LogSource::Doctor,
                 "controller" => LogSource::Controller,
                 "scheduler" => LogSource::Scheduler,
                 "sync" => LogSource::Sync,
@@ -2900,6 +2923,10 @@ fn policy_level_for_log_source(
     match source {
         "audit" => Some(policy.audit_log_level),
         "api" => Some(policy.bridge_log_level),
+        // The manager writes the doctor inventory log at the operations level
+        // and emits it as its own source in the aggregate document. Without
+        // this arm every doctor line is silently discarded here.
+        "doctor" => Some(policy.operations_log_level),
         "controller" => Some(policy.controller_log_level),
         "scheduler" => Some(policy.scheduler_log_level),
         "sync" => Some(policy.sync_log_level),
@@ -16132,18 +16159,74 @@ mod tests {
         assert_eq!(
             interactive_connection_budget(&authentication),
             Some(InteractiveConnectionBudget {
-                probe: Duration::from_secs(12),
-                logout: Duration::from_secs(3),
+                probe: Duration::from_secs(45),
+                logout: Duration::from_secs(10),
             })
         );
         assert_eq!(
             interactive_connection_budget(&browsing),
             Some(InteractiveConnectionBudget {
-                probe: Duration::from_secs(27),
-                logout: Duration::from_secs(3),
+                probe: Duration::from_secs(50),
+                logout: Duration::from_secs(10),
             })
         );
         assert_eq!(interactive_connection_budget(&serialized), None);
+    }
+
+    /// A probe or cleanup budget below the sum of the control round trips it
+    /// contains fails on a slow-but-healthy relay instead of on a broken
+    /// target, and the AppWindow reports that as an unresolved connection
+    /// incident. Deriving the expected budgets from the leg counts here means
+    /// adding a round trip to either path without widening its budget fails.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interactive_connection_budgets_cover_every_control_leg() {
+        // `ApiClient::discover` tries `entry.cgi` and falls back to `query.cgi`.
+        const DISCOVERY_LEGS: u32 = 2;
+        // `authenticate_file_station` logs in once, then again for a TOTP challenge.
+        const LOGIN_LEGS: u32 = 2;
+        // `ApiClient::confirm_file_station_session` caps itself below the
+        // general control ceiling, so the probe reserves only that slice.
+        const SESSION_CONFIRMATION_CEILING: Duration = Duration::from_secs(5);
+
+        let ceiling = INTERACTIVE_CONTROL_REQUEST_CEILING;
+        let shared_probe_legs = ceiling * (DISCOVERY_LEGS + LOGIN_LEGS);
+
+        assert_eq!(
+            INTERACTIVE_AUTH_TEST_PROBE_TIMEOUT,
+            shared_probe_legs + SESSION_CONFIRMATION_CEILING
+        );
+        assert_eq!(
+            INTERACTIVE_REMOTE_BROWSE_PROBE_TIMEOUT,
+            shared_probe_legs + ceiling
+        );
+
+        // Logout is one control request on a session that already exists, and
+        // it is the only leg whose failure is reported as a cleanup incident.
+        // Anything below the per-request ceiling abandons a healthy logout.
+        for logout in [
+            INTERACTIVE_AUTH_TEST_LOGOUT_TIMEOUT,
+            INTERACTIVE_REMOTE_BROWSE_LOGOUT_TIMEOUT,
+        ] {
+            assert_eq!(logout, ceiling);
+        }
+
+        // Both operations must still settle well inside the AppWindow's
+        // 120-second queued-result observation window, or a budget widened
+        // here would only move the failure to the browser.
+        const APPWINDOW_RESULT_OBSERVATION_WINDOW: Duration = Duration::from_secs(120);
+        for (probe, logout) in [
+            (
+                INTERACTIVE_AUTH_TEST_PROBE_TIMEOUT,
+                INTERACTIVE_AUTH_TEST_LOGOUT_TIMEOUT,
+            ),
+            (
+                INTERACTIVE_REMOTE_BROWSE_PROBE_TIMEOUT,
+                INTERACTIVE_REMOTE_BROWSE_LOGOUT_TIMEOUT,
+            ),
+        ] {
+            assert!(probe + logout < APPWINDOW_RESULT_OBSERVATION_WINDOW);
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -19677,6 +19760,95 @@ mod tests {
         assert_eq!(value["nested"]["token"], "[redacted]");
         assert_eq!(value["message"], "[redacted]");
         assert!(parse_manager_result(output, Some(b"exact-secret")).is_err());
+    }
+
+    /// The manager writes a doctor inventory log, emits it as its own source in
+    /// the aggregate document, and accepts `--source doctor`; the AppWindow
+    /// offers it in the log source chooser. The bridge sits between them, so a
+    /// source it does not know is rejected outright on selection and silently
+    /// stripped of every line inside the aggregate.
+    #[test]
+    fn doctor_log_source_is_selectable_and_survives_the_aggregate_policy_filter() {
+        let request = validate_http_request(environment(
+            "GET",
+            "action=logs&lines=200&source=doctor&SynoToken=abc123",
+        ))
+        .unwrap();
+        assert!(matches!(
+            request,
+            ValidatedHttpRequest::Get {
+                action: ReadAction::Logs {
+                    lines: 200,
+                    source: LogSource::Doctor
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            read_manager_arguments(&ReadAction::Logs {
+                lines: 200,
+                source: LogSource::Doctor,
+            })
+            .unwrap(),
+            ["api", "logs", "--lines", "1000", "--source", "doctor"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+
+        let aggregate = br#"{"schema":"sdsync.dsm-logs.v1","logs":[{"source":"api","lines":["{\"level\":\"info\",\"category\":\"bridge\"}"]},{"source":"doctor","lines":["{\"level\":\"info\",\"category\":\"operations\",\"event\":\"doctor_inventory\"}"]}]}"#;
+        let all = parse_and_sanitize_manager_json(
+            aggregate,
+            &ReadAction::Logs {
+                lines: 10,
+                source: LogSource::All,
+            },
+            None,
+            Some(&SecurityPolicyArgs::default()),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&all).unwrap();
+        let doctor = value["logs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["source"] == "doctor")
+            .expect("aggregate keeps the doctor source");
+        assert_eq!(doctor["lines"].as_array().unwrap().len(), 1);
+
+        let selected = parse_and_sanitize_manager_json(
+            aggregate,
+            &ReadAction::Logs {
+                lines: 10,
+                source: LogSource::Doctor,
+            },
+            None,
+            Some(&SecurityPolicyArgs::default()),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&selected).unwrap();
+        assert_eq!(value["logs"].as_array().unwrap().len(), 1);
+        assert_eq!(value["logs"][0]["source"], "doctor");
+        assert_eq!(value["logs"][0]["lines"].as_array().unwrap().len(), 1);
+
+        // Doctor output is operational evidence, so an administrator who turns
+        // the operations level off must still see it disappear.
+        let operations_off = SecurityPolicyArgs {
+            operations_log_level: PolicyLogLevel::Off,
+            ..SecurityPolicyArgs::default()
+        };
+        let hidden = parse_and_sanitize_manager_json(
+            aggregate,
+            &ReadAction::Logs {
+                lines: 10,
+                source: LogSource::Doctor,
+            },
+            None,
+            Some(&operations_off),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&hidden).unwrap();
+        assert!(value["logs"][0]["lines"].as_array().unwrap().is_empty());
     }
 
     #[test]

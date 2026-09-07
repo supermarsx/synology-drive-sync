@@ -344,6 +344,9 @@ test("manual profile reconciliation is exposed only for a supported capability a
   assert.match(appSource, /v-else-if="connectionReconciliationIncident && hasCapability\('request_reconciliation'\)"[\s\S]*?@click="reconcileConnectionIncident"/);
   const connectionIncident = {
     active: true,
+    outcomeUnknown: true,
+    requiresInspection: true,
+    settled: false,
     requestId: "f".repeat(32),
     operation: "test-profile-auth"
   };
@@ -352,6 +355,13 @@ test("manual profile reconciliation is exposed only for a supported capability a
   }), connectionIncident);
   assert.equal(component.computed.connectionReconciliationIncident.call({
     isolatedIncidents: { connection: { ...connectionIncident, operation: "configure-profile" } }
+  }), null);
+  // A settled terminal failure is already resolved: DSM returned its exact
+  // result. Offering to reconcile it would only re-read that same result.
+  assert.equal(component.computed.connectionReconciliationIncident.call({
+    isolatedIncidents: {
+      connection: { ...connectionIncident, outcomeUnknown: false, settled: true }
+    }
   }), null);
 });
 

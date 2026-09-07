@@ -532,7 +532,7 @@ const INCIDENT_SCOPE_LABELS = Object.freeze({
 });
 const PROFILE_SECRET_KINDS = Object.freeze(["password", "totp", "remote-log-token"]);
 const PROFILE_CREATION_WINDOW_WARNING = "Keep this AppWindow open; do not navigate away until profile creation finishes.";
-const PROFILE_CONNECTION_HEALTHY_TIMING = "On a healthy path, allow up to 15 seconds once dispatched; queued-result polling can continue shortly after. Controller or service failures may settle differently.";
+const PROFILE_CONNECTION_HEALTHY_TIMING = "On a healthy path, allow up to 20 seconds once dispatched, and up to a minute through a slow relay such as QuickConnect; queued-result polling can continue shortly after. Controller or service failures may settle differently.";
 const PROFILE_CONNECTION_API_LIMITS = Object.freeze({
   csrfReissueTimeoutMs: 10000,
   postRequestTimeoutMs: 45000,
@@ -601,7 +601,29 @@ function scopeMutationOutcomeUnresolved(component, scope) {
 }
 
 function emptyIsolatedIncident() {
-  return { active: false, kind: "", operation: "", outcomeUnknown: false, requiresInspection: false, message: "", requestId: "", jobId: "", subject: "", retryable: false };
+  return { active: false, kind: "", operation: "", outcomeUnknown: false, requiresInspection: false, settled: false, message: "", requestId: "", jobId: "", subject: "", retryable: false };
+}
+
+// DSM returned a schema-valid terminal result for this exact accepted job, so
+// the request outcome is known: it definitively failed. Only the temporary
+// File Station session cleanup is in doubt. That is not an unresolved outcome,
+// and reconciling it can only re-read the very result already in hand.
+function settledTerminalOutcome(error) {
+  return Boolean(error
+    && error.accepted === true
+    && error.outcomeUnknown !== true
+    && error.trustedJobId === true
+    && validatedJobId(error.jobId));
+}
+
+// A scope stays locked only while its outcome is genuinely unknown, or while a
+// cleanup failure arrived without a terminal result to attribute it to. A
+// settled failure is reported and left unlocked so the operator can correct
+// the draft and try again.
+function unresolvedIsolatedIncident(incident) {
+  return Boolean(incident && incident.active === true
+    && (incident.outcomeUnknown === true
+      || (incident.requiresInspection === true && incident.settled !== true)));
 }
 
 function emptyScopeIncident() {
@@ -624,8 +646,7 @@ function emptyScopeIncident() {
 
 function isolatedIncidentUnresolved(component, scope) {
   const incident = component && component.isolatedIncidents && component.isolatedIncidents[scope];
-  return Boolean(incident && incident.active === true
-    && (incident.outcomeUnknown === true || incident.requiresInspection === true));
+  return unresolvedIsolatedIncident(incident);
 }
 
 function unresolvedScopeNames(component) {
@@ -686,7 +707,7 @@ function unresolvedIncidentGuidance(component) {
   }
   for (const scope of ["connection", "operations"]) {
     const incident = component.isolatedIncidents && component.isolatedIncidents[scope];
-    if (!incident || incident.active !== true) continue;
+    if (!unresolvedIsolatedIncident(incident)) continue;
     evidence.push([incident.subject ? `${INCIDENT_SCOPE_LABELS[scope]} subject: ${incident.subject}.` : "", incident.requestId ? `Client request ID: ${incident.requestId}.` : "", incident.jobId ? `Queued job ID: ${incident.jobId}.` : ""].filter(Boolean).join(" "));
   }
   const correlation = evidence.filter(Boolean).join(" ");
@@ -712,7 +733,11 @@ function recordIsolatedIncident(component, scope, kind, error, report = null, me
     : { connection: emptyIsolatedIncident(), operations: emptyIsolatedIncident() };
   const previous = incidents[scope] || emptyIsolatedIncident();
   const details = metadata && typeof metadata === "object" ? metadata : {};
-  const preserve = previous.active === true;
+  // Preserving earlier evidence exists to stop later noise from overwriting an
+  // outcome nobody has resolved yet. A settled failure is already resolved, so
+  // it must not shadow the evidence for the request the operator just made.
+  const preserve = unresolvedIsolatedIncident(previous);
+  const settled = settledTerminalOutcome(error);
   incidents[scope] = {
     active: true,
     kind: preserve ? previous.kind : kind,
@@ -721,6 +746,7 @@ function recordIsolatedIncident(component, scope, kind, error, report = null, me
       : boundedText((error && error.operation) || details.operation, "").slice(0, 64),
     outcomeUnknown: previous.outcomeUnknown === true || outcomeUnknown,
     requiresInspection: previous.requiresInspection === true || requiresInspection,
+    settled: preserve ? previous.settled === true : settled,
     message: preserve ? previous.message : boundedText((report && report.message) || (error && error.message), "Operation evidence needs inspection.").slice(0, MUTATION_MESSAGE_LIMIT),
     requestId: preserve ? previous.requestId : ((report && report.requestId) || ""),
     jobId: preserve ? previous.jobId : ((report && report.jobId) || ""),
@@ -2267,6 +2293,16 @@ function partialMutationInspectionRequired(caught, fallback, appliedDetail) {
   return failure;
 }
 
+// The Activity route shows two independent read-only feeds. Name whichever one
+// is unavailable instead of reporting the pair as dead, so a stalled package
+// log scan is not mistaken for a stalled package.
+function logsFeedState(logsReady, activityReady, lines) {
+  if (logsReady && activityReady) return `Live · ${lines} line limit`;
+  if (logsReady) return `Package log live · ${lines} line limit · activity feed unavailable`;
+  if (activityReady) return `Activity live · ${lines} line limit · package log read unavailable`;
+  return "Logs unavailable";
+}
+
 function normalizedActivityEvent(event) {
   if (!event || typeof event !== "object" || Array.isArray(event)) return null;
   // Activity values arrive inside a response that is already globally bounded,
@@ -2453,7 +2489,7 @@ export default {
     routineMutationBlocked() { return this.profileOutcomeUnresolved || this.routineOutcomeUnresolved; },
     routineMutationGuidance() { return this.profileOutcomeUnresolved ? this.profileOutcomeGuidance : this.routineOutcomeGuidance; },
     operationMutationGuidance() { return this.profileOutcomeUnresolved ? this.profileOutcomeGuidance : (this.operationOutcomeUnresolved ? this.operationOutcomeGuidance : ""); },
-    connectionIncidentEvidence() { const incident = this.isolatedIncidents && this.isolatedIncidents.connection; return boundedText(incident && incident.message, ""); },
+    connectionIncidentEvidence() { const incident = this.isolatedIncidents && this.isolatedIncidents.connection; return unresolvedIsolatedIncident(incident) ? boundedText(incident.message, "") : ""; },
     profileRecoveryActive() { return this.profileEditorOpen === true && (this.profileOutcomeUnresolved || this.connectionOutcomeUnresolved) && this.profileSaveState !== "saving" && this.profileConnectionState !== "testing"; },
     profileReconciliationIncident() {
       const incident = this.autosaveIncidents && this.autosaveIncidents.profile;
@@ -2466,7 +2502,7 @@ export default {
     },
     connectionReconciliationIncident() {
       const incident = this.isolatedIncidents && this.isolatedIncidents.connection;
-      if (!incident || incident.active !== true || !validatedClientRequestId(incident.requestId)) return null;
+      if (!unresolvedIsolatedIncident(incident) || !validatedClientRequestId(incident.requestId)) return null;
       if (![ACTIONS.testProfileAuth, ACTIONS.browseRemote].includes(incident.operation)) return null;
       return incident;
     },
@@ -4836,18 +4872,24 @@ export default {
       this.logsLoading = true;
       try {
         const lines = Math.min(1000, Math.max(1, Number(this.logLines) || 200));
-        const [logs, activity] = await Promise.all([
+        // Two independent read-only feeds. Waiting on them jointly must not let
+        // one failure discard the other's payload: the package log scan is far
+        // more expensive than the activity feed, so a combined wait turned a
+        // healthy activity response into an empty Activity list.
+        const [logs, activity] = await Promise.allSettled([
           apiGet(this.auth, "logs", { lines, source: this.logSource }),
           apiGet(this.auth, "activity", { lines })
         ]);
         if (this.disposed) return;
-        const records = this.logRecordsFrom(logs);
-        this.logRecords = records;
-        this.logOutput = records.length
-          ? records.map((record) => `[${record.source}] ${record.text}`).join("\n").slice(0, MAX_RESPONSE_BYTES)
-          : "No log data yet.";
-        this.activityEvents = arrayOf(activity.events);
-        this.logState = `Live · ${lines} line limit`;
+        if (logs.status === "fulfilled") {
+          const records = this.logRecordsFrom(logs.value);
+          this.logRecords = records;
+          this.logOutput = records.length
+            ? records.map((record) => `[${record.source}] ${record.text}`).join("\n").slice(0, MAX_RESPONSE_BYTES)
+            : "No log data yet.";
+        }
+        if (activity.status === "fulfilled") this.activityEvents = arrayOf(activity.value.events);
+        this.logState = logsFeedState(logs.status === "fulfilled", activity.status === "fulfilled", lines);
       } catch (_error) {
         if (!this.disposed) this.logState = "Logs unavailable";
       } finally {

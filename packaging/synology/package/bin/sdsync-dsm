@@ -2168,15 +2168,28 @@ api_json_log_lines() {
     [ -n "$json_log_inputs" ] || { printf '[]'; return; }
     # All paths are fixed package-owned DSM paths and cannot contain spaces.
     set -- $json_log_inputs
-    json_log_path_count=$#
-    LC_ALL=C awk -v home="$package_home" -v var="$package_var" \
+    # Bound the scan window before the per-character redaction pass, the way
+    # api_activity already bounds its input. The requested count is a scan
+    # bound, not merely the size of the output ring: a rotated log set reaches
+    # tens of megabytes, and walking all of it through the redaction and
+    # quoting loops makes this read slower every day until the bridge's capture
+    # timeout kills it on every request. Two stages keep the read proportional
+    # to the window: each rotation contributes at most one window, and the
+    # concatenation is trimmed to the newest window overall.
+    #
+    # Every operand is a secret file that BEGIN reads and then blanks, so awk
+    # is left with no usable operand and reads this pipeline from standard
+    # input, exactly as api_activity's awk does.
+    { for json_log_window in "$@"; do tail -n "$json_log_lines" "$json_log_window"; done; } \
+        | tail -n "$json_log_lines" \
+        | LC_ALL=C awk -v home="$package_home" -v var="$package_var" \
         -v real_home="$package_home_real" -v real_var="$package_var_real" \
         -v requested="$json_log_lines" -v byte_limit="$json_log_byte_limit" -v line_limit=8192 \
         -v source="$json_log_source" -v threshold="$json_log_threshold" \
         -v bridge_threshold="$security_runtime_bridge_level" \
         -v authentication_threshold="$security_runtime_authentication_level" \
         -v security_threshold="$security_runtime_security_level" \
-        -v log_path_count="$json_log_path_count" '
+        -v log_path_count=0 '
         function level_rank(level) {
             if (level == "trace") return 0
             if (level == "debug") return 1
@@ -2348,8 +2361,7 @@ api_json_log_lines() {
             }
             printf "]"
         }
-    ' "$secret_root"/*.password "$secret_root"/*.totp "$secret_root"/*.remote-log-token \
-        "$@"
+    ' "$secret_root"/*.password "$secret_root"/*.totp "$secret_root"/*.remote-log-token
 }
 
 api_logs() {

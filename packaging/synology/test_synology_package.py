@@ -3648,6 +3648,82 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(invalid.returncode, 64)
         self.assertEqual(invalid_payload["code"], "invalid_request")
 
+    def test_api_logs_scan_window_is_bounded_before_redaction(self) -> None:
+        """`--lines` bounds the scan, not merely the emitted ring.
+
+        Every scanned line is walked character by character for secret
+        redaction and JSON quoting. Reading a whole rotated log set that way
+        makes this call slower every day until the bridge's capture timeout
+        kills it, which takes the Activity view down with it.
+        """
+        log_directory = self.real_var / "log"
+
+        def write_log(path: Path, text: str) -> None:
+            path.write_text(text, encoding="utf-8")
+            path.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(path, self.drop_uid, self.drop_gid)
+
+        # A deterministic witness. The newest lines sit below the configured
+        # threshold, so a scan bounded to the window returns nothing, while a
+        # scan that walks the whole file keeps reaching further back until the
+        # ring is full. Callers absorb this by asking for a wider window than
+        # they intend to display.
+        changed = self.shell(
+            self.manager,
+            "configure-security-policy",
+            *self.security_policy_options(bridge_log_level="warn"),
+        )
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        older_warning = json.dumps(
+            {"level": "warn", "category": "bridge", "message": "older-warning"},
+            separators=(",", ":"),
+        )
+        newer_info = json.dumps(
+            {"level": "info", "category": "bridge", "message": "newer-info"},
+            separators=(",", ":"),
+        )
+        write_log(
+            log_directory / "api.log",
+            (older_warning + "\n") * 40 + (newer_info + "\n") * 10,
+        )
+        windowed, windowed_payload = self.api("logs", "--lines", "5", "--source", "api")
+        self.assertEqual(windowed.returncode, 0, windowed.stderr)
+        windowed_api = next(
+            entry for entry in windowed_payload["logs"] if entry["source"] == "api"
+        )
+        self.assertEqual(windowed_api["lines"], [])
+
+        # ...and the same bound is what keeps the cost proportional to the
+        # window rather than to the file. An end-to-end character walk of this
+        # file does not finish inside the bridge's 20-second capture timeout.
+        noisy = json.dumps(
+            {"level": "warn", "category": "bridge", "message": "n" * 96},
+            separators=(",", ":"),
+        )
+        recent = json.dumps(
+            {"level": "warn", "category": "bridge", "message": "recent-marker"},
+            separators=(",", ":"),
+        )
+        write_log(
+            log_directory / "api.log",
+            (noisy + "\n") * 200_000 + (recent + "\n") * 5,
+        )
+        started = time.monotonic()
+        large, large_payload = self.api("logs", "--lines", "5", "--source", "api")
+        elapsed = time.monotonic() - started
+        self.assertEqual(large.returncode, 0, large.stderr)
+        large_api = next(
+            entry for entry in large_payload["logs"] if entry["source"] == "api"
+        )
+        self.assertEqual(len(large_api["lines"]), 5)
+        self.assertTrue(all("recent-marker" in line for line in large_api["lines"]))
+        self.assertLess(
+            elapsed,
+            10.0,
+            f"log read scanned past its window ({elapsed:.1f}s for 5 requested lines)",
+        )
+
     def test_api_logs_and_activity_include_rotated_history_and_reject_unsafe_rotations(self) -> None:
         self.assertEqual(
             self.configure("history", self.source_one, "/home/Drive/History", True).returncode,
