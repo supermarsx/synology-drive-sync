@@ -345,10 +345,13 @@ fn routing_only_doctor_stops_after_reverse_proxy_discovery() {
         !probes.is_empty(),
         "the transport probe should have issued its own HTTP samples"
     );
+    // `entry.cgi` is what API discovery opens with, so it is what the probe must time. Pinning
+    // the probe to the `query.cgi` fallback measured a route the run itself never used, and on a
+    // host that serves only one of the two it measured a handler that does not exist.
     for probe in &probes {
         assert!(
-            probe.request_path.starts_with("/prefix/webapi/query.cgi"),
-            "the probe should measure the discovery route, not {:?}",
+            probe.request_path.starts_with("/prefix/webapi/entry.cgi"),
+            "the probe should measure the route discovery actually uses, not {:?}",
             probe.request_path
         );
     }
@@ -548,7 +551,13 @@ fn authenticated_target_doctor_checks_exact_destination_and_logs_out() {
             .iter()
             .map(|probe| probe["channels"].as_str().expect("channel name"))
             .collect::<Vec<_>>(),
-        ["all", "sid-field-only", "cookie-only", "token-header-only"]
+        [
+            "all",
+            "sid-field-only",
+            "cookie-only",
+            "token-header-only",
+            "sid-field-only-tokenless-login"
+        ]
     );
     assert_eq!(channels[0]["outcome"], "ok");
     assert_eq!(channels[1]["outcome"], "ok");
@@ -1634,8 +1643,16 @@ fn dsm7_reverse_proxy_receives_explicit_session_headers_and_body_fields() {
             (true, true, false, false),
             (false, false, true, false),
             (false, false, false, true),
+            // The tokenless-login variant: the documented `_sid` field alone, against a session
+            // established by a second login that omitted `enable_syno_token`.
+            (true, false, false, false),
+            // That second session logging itself out. It carries no `SynoToken` because DSM never
+            // issued it one, which is the whole point of the variant -- and its presence here is
+            // the proof that the extra session does not outlive the probe that needed it.
+            (true, false, true, false),
         ],
-        "only the three reduced ablation variants may present a partial session"
+        "only the reduced ablation variants and the second session's logout may present a \
+         partial session"
     );
     assert!(ordinary.iter().all(|request| {
         request.fields.get("_sid").map(String::as_str) == Some("e2e-session-secret")
@@ -1654,12 +1671,40 @@ fn dsm7_reverse_proxy_receives_explicit_session_headers_and_body_fields() {
     );
     assert_eq!(actual["session_channels"][0]["outcome"], "ok");
     assert_eq!(actual["session_channels"][1]["dsm_code"], 119);
+    assert_eq!(actual["session_channels"][2]["dsm_code"], 119);
+    // Cookie-only was rejected as well, so no single channel carries this session and the verdict
+    // must say the *combination* is what DSM accepts. Reading the `_sid` rejection on its own as
+    // "DSM resolves the session from the cookie" pointed the operator at dropping the cookie --
+    // the one change that would break a server behaving like this one.
+    let ablation_section = section(&actual, "session_channel_ablation");
+    let detail = ablation_section["detail"]
+        .as_str()
+        .expect("ablation detail");
     assert!(
-        section(&actual, "session_channel_ablation")["detail"]
-            .as_str()
-            .expect("ablation detail")
-            .contains("resolving the session from the cookie"),
-        "the ablation should name which channel the server actually honoured"
+        detail.contains("only the full combination of channels was accepted"),
+        "the ablation should name what the server actually honoured: {detail}"
+    );
+    assert!(
+        !detail.contains("resolving the session from the cookie"),
+        "a rejected cookie-only variant cannot support that reading: {detail}"
+    );
+    // The tokenless second login is rejected by this server too, which is itself the finding.
+    assert_eq!(
+        actual["session_channels"][4]["channels"],
+        "sid-field-only-tokenless-login"
+    );
+    assert_eq!(actual["session_channels"][4]["ran"], true);
+    assert!(
+        detail.contains("regardless of how the session was created"),
+        "the tokenless variant's answer belongs in the verdict: {detail}"
+    );
+    let remediation = ablation_section["remediation"]
+        .as_str()
+        .expect("ablation remediation");
+    assert!(
+        remediation.contains("Keep sending both channels"),
+        "the remediation must not tell an operator to remove a channel this server requires: \
+         {remediation}"
     );
 
     let rendered = format!(
@@ -2405,6 +2450,123 @@ fn totp_is_generated_only_after_challenge_and_never_reaches_process_output() {
     assert_eq!(
         requests.last().map(|request| request.operation()),
         Some("SYNO.API.Auth.logout".to_owned())
+    );
+}
+
+/// The ablation's second login must not be able to break the run it is diagnosing.
+///
+/// Both this client's logins and its logouts name `session=FileStation`. DSM binds one session per
+/// (account, session name) and answers a collision with `107`, "session interrupted by duplicate
+/// login" -- a code `session_is_unusable` treats as fatal. A second login taken at step 7 could
+/// therefore invalidate the run's own session and abort steps 8 through 16, which for a user whose
+/// reported problem *is* a session that stops being recognised would mean the diagnostic
+/// manufacturing the symptom it was asked to explain.
+///
+/// The variant is deferred to after the primary logout, so this asserts two things: the duplicate
+/// login really does arrive last, and every section that depends on the primary session completed
+/// normally against a server that punishes duplicate logins.
+#[test]
+fn the_second_ablation_login_cannot_disturb_the_run_it_diagnoses() {
+    let fixture = TestDir::new("duplicate-login");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/probe");
+    server.invalidate_session_on_duplicate_login();
+
+    let output = run(&[
+        "--quiet",
+        "--output",
+        "json",
+        "doctor",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password.to_str().expect("UTF-8 password path"),
+        "--no-vault",
+        "--allow-http",
+        "--level",
+        "extensive",
+        "target",
+        "/team/probe",
+        "--write-test",
+    ]);
+
+    assert_success(&output);
+    let result = stdout_json(&output);
+    assert_eq!(result["level"], "extensive");
+
+    // Everything from the ablation onwards runs on the primary session. None of it may fail.
+    for id in [
+        "session_channel_ablation",
+        "session_concurrency",
+        "capability_diagnosis",
+        "destination_path_resolution",
+        "destination_permissions",
+        "destination_inventory",
+        "disposable_write_verify_cleanup",
+        "session_logout",
+    ] {
+        assert_ne!(
+            section(&result, id)["status"],
+            "fail",
+            "{id} failed on a server that invalidates a session on duplicate login: {}",
+            section(&result, id)["detail"]
+        );
+    }
+    assert_eq!(section(&result, "session_logout")["status"], "pass");
+    assert_eq!(
+        section(&result, "disposable_write_verify_cleanup")["status"],
+        "pass"
+    );
+    assert_eq!(result["write_test"]["status"], "success");
+
+    // The variant did run -- this test would otherwise pass by never taking the risk at all.
+    assert_eq!(server.logins_seen(), 2, "the second login must be made");
+    let channels = result["session_channels"]
+        .as_array()
+        .expect("session channel probes");
+    assert_eq!(
+        channels[4]["channels"], "sid-field-only-tokenless-login",
+        "the deferred variant is the last one"
+    );
+    assert_eq!(channels[4]["ran"], true);
+
+    // And it ran *after* the primary session was closed, which is what makes it safe rather than
+    // lucky. A regression that moved it back into step 7 fails here.
+    let operations = server
+        .requests()
+        .iter()
+        .map(|request| request.operation())
+        .collect::<Vec<_>>();
+    let logins = operations
+        .iter()
+        .enumerate()
+        .filter(|(_, operation)| operation.as_str() == "SYNO.API.Auth.login")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let logouts = operations
+        .iter()
+        .enumerate()
+        .filter(|(_, operation)| operation.as_str() == "SYNO.API.Auth.logout")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(logins.len(), 2, "one primary login and one probe login");
+    assert_eq!(logouts.len(), 2, "each session logs itself out");
+    assert!(
+        logins[1] > logouts[0],
+        "the duplicate login must arrive after the primary session is closed: \
+         logins at {logins:?}, logouts at {logouts:?}"
+    );
+    assert!(
+        logouts[1] > logins[1],
+        "the second session must log itself out: logouts at {logouts:?}"
+    );
+    assert_eq!(
+        operations.last().map(String::as_str),
+        Some("SYNO.API.Auth.logout"),
+        "the run ends with a logout, not with a live extra session"
     );
 }
 

@@ -307,7 +307,8 @@
         "response_bytes",
         "elapsed_ms",
         "retry_backoff_ms",
-        "redirect_host"
+        "redirect_host",
+        "decode"
       ],
       "properties": {
         "api": { "$ref": "#/$defs/apiName" },
@@ -344,7 +345,40 @@
         "response_bytes": { "$ref": "#/$defs/nonNegativeInteger" },
         "elapsed_ms": { "$ref": "#/$defs/nonNegativeInteger" },
         "retry_backoff_ms": { "$ref": "#/$defs/nullableNonNegativeInteger" },
-        "redirect_host": { "$ref": "#/$defs/nullableBoundedToken" }
+        "redirect_host": { "$ref": "#/$defs/nullableBoundedToken" },
+        "decode": {
+          "oneOf": [
+            { "$ref": "#/$defs/decodeFault" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "decodeFault": {
+      "description": "Why one response body did not deserialize, in schema terms. `path` is a dotted member path built from object keys and array indices, `field` is the member the deserializer named, `expected` is the deserializer's own description of what it wanted, and `found` is a JSON type. No value from the response is representable.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "field", "expected", "found", "line", "column"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "unspecified",
+            "missing-field",
+            "unknown-field",
+            "duplicate-field",
+            "type-mismatch",
+            "syntax",
+            "unexpected-end"
+          ]
+        },
+        "path": { "$ref": "#/$defs/boundedToken" },
+        "field": { "$ref": "#/$defs/boundedToken" },
+        "expected": { "$ref": "#/$defs/boundedToken" },
+        "found": {
+          "enum": ["unknown", "absent", "null", "boolean", "number", "string", "array", "object"]
+        },
+        "line": { "$ref": "#/$defs/nonNegativeInteger" },
+        "column": { "$ref": "#/$defs/nonNegativeInteger" }
       }
     },
     "connectionDetail": {

@@ -81,11 +81,17 @@ the transport half. Read the three transport sections together:
 
 At Standard and above, two authenticated sections settle it rather than leaving it to inference:
 
-- **DSM session channel ablation** makes the same read-only request four times, varying only which
-  channels carry the session. If DSM accepts the documented `_sid` request field on its own and
-  rejects the combination this client normally sends, the fault is the client's session transport
-  and the section says so with the fix. If every channel is rejected, the session identifier itself
-  is gone server-side, which no client-side change addresses.
+- **DSM session channel ablation** makes the same read-only request once per variant, varying only
+  which channels carry the session. If DSM accepts the documented `_sid` request field on its own
+  and rejects the combination this client normally sends, the fault is the client's session
+  transport and the section says so with the fix. If only the *full combination* is accepted --
+  the cookie alone rejected as well -- DSM is authenticating browser-style and the fix is to keep
+  sending both channels, not to remove one. If every channel is rejected, the session identifier
+  itself is gone server-side, which no client-side change addresses. At Extensive a fifth variant
+  logs in a second time *without* `enable_syno_token` and offers that session through `_sid`
+  alone, which settles whether the request-parameter path is refused in general or only for
+  browser-style sessions. That second login is deliberately taken after the run's own session has
+  been logged out, so a duplicate-login collision (DSM `107`) cannot interrupt the run itself.
 - **File Station capability diagnosis** reads `SYNO.FileStation.Info` `get` at the start and again
   at the end of the run. Two *different* host names inside one run is the only positive proof in
   this report that consecutive requests reached different DSM hosts. The same host name at both ends

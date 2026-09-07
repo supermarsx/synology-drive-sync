@@ -21,9 +21,9 @@ use synology_drive_sync::batch::{BatchJob, ValidatedBatch};
 use synology_drive_sync::cancel::CancellationToken;
 use synology_drive_sync::local::{self, IgnoreRules, LocalEntry};
 use synology_drive_sync::observability::{
-    BUILD, BearerTokenSource, BoundedText, EventCode, EventLogger, EventMetrics, FileLogConfig,
-    LogEvent, LogFormat as EventLogFormat, LogLevel as EventLogLevel, LoggerConfig, RemoteDelivery,
-    RemoteLogConfig, RequestOutcome, SessionTransport,
+    BUILD, BearerTokenSource, BoundedText, DecodeFault, EventCode, EventLogger, EventMetrics,
+    FileLogConfig, LogEvent, LogFormat as EventLogFormat, LogLevel as EventLogLevel, LoggerConfig,
+    RemoteDelivery, RemoteLogConfig, RequestOutcome, SessionTransport,
 };
 use synology_drive_sync::path::RemoteRoot;
 use synology_drive_sync::plan::{self, CompareMode, PlanOptions, RemoteSnapshot, SyncPlan};
@@ -42,6 +42,7 @@ use synology_drive_sync::transport_diagnostics::{
     TransportTranscript, classify_endpoint, measure_reachability,
 };
 use synology_drive_sync::{Error, Result};
+use zeroize::Zeroizing;
 
 mod cli;
 mod config;
@@ -1710,6 +1711,8 @@ struct DoctorCall {
     http_status: Option<u16>,
     session: SessionTransport,
     elapsed_ms: u64,
+    /// Why the body would not deserialize, for a call whose outcome is `decode`.
+    decode: Option<DecodeFault>,
 }
 
 /// Collects the DSM calls made since the previous section closed, and the run-wide transcript.
@@ -1755,6 +1758,7 @@ impl DoctorCallLog {
                         http_status: call.http_status,
                         session: call.session,
                         elapsed_ms: call.elapsed_ms,
+                        decode: call.decode,
                     });
                 }
             }
@@ -2196,6 +2200,23 @@ const DOCTOR_MULTIPLE_PATH_HINT: &str = "consecutive requests do not all look li
      [alias].direct.quickconnect.to form. If the session errors disappear there, the path is the \
      cause and no client-side change will fix it.";
 
+/// Sockets open, and every HTTP sample is abandoned at the probe's own ceiling.
+///
+/// A transport finding gets a transport next step. This one used to inherit the session-affinity
+/// hint below, which sent an operator hunting a session problem on the strength of a probe that
+/// had simply not waited long enough for a relayed round trip.
+const DOCTOR_PROBE_TIMEOUT_HINT: &str = "TCP connects succeeded and every HTTP sample was abandoned at the probe's per-sample \
+     ceiling, so this is a slow path rather than a closed one, and it says nothing about the \
+     session. Read the authenticated sections below first: if they succeeded, only the timing \
+     figures are missing. If they failed too, raise --request-timeout, or reach the NAS by a \
+     route with fewer hops than a QuickConnect relay.";
+
+/// Sockets open and the HTTP request is refused, reset, or terminated before any response.
+const DOCTOR_PROBE_TRANSPORT_HINT: &str = "TCP connects succeeded but no HTTP request completed, which points at the layer between the \
+     socket and DSM rather than at the session: TLS termination, a reverse proxy that does not \
+     forward /webapi/*, or an interception that closes the connection. The failure reason printed \
+     with this finding names the layer that refused.";
+
 const DOCTOR_RELAY_HINT: &str = "a QuickConnect relay carries this run. The relay offers no session-affinity guarantee, so a \
      DSM session accepted on one request can be presented to a different backend on the next. \
      Re-run against [alias].direct.quickconnect.to, a Synology DDNS name, or the LAN address to \
@@ -2207,6 +2228,26 @@ const DOCTOR_COOKIE_CHANNEL_HINT: &str = "DSM accepted this session when it was 
      in with format=sid is defined as \"cookie will not be set\", so DSM never issued that cookie \
      and is being asked to resolve a cookie session it does not have. Stop sending the cookie \
      header for sid-format logins.";
+
+/// Only the full combination is accepted, and no separate login showed a way out of it.
+///
+/// Deliberately does *not* advise dropping the cookie. On a DSM answering this way the cookie is
+/// half of what makes the session work, and removing it is the one change guaranteed to break a
+/// setup that is currently functioning.
+const DOCTOR_COMBINED_CHANNEL_HINT: &str = "this DSM accepts the session only as the `id` cookie and the X-SYNO-TOKEN header together, \
+     which is how its own web UI authenticates, and refuses the _sid/SynoToken request-parameter \
+     path its published guide describes. Keep sending both channels: dropping either one is what \
+     would break this setup. It also means a later 106/107/119 is not a channel this client picks \
+     wrongly -- read it as a session that has genuinely gone away, and look at the relay and \
+     intermediary findings below for why.";
+
+/// The tokenless login was accepted through the documented field, which is a real finding.
+const DOCTOR_TOKENLESS_LOGIN_HINT: &str = "a login made *without* enable_syno_token is accepted through the documented _sid request \
+     field alone, while this run's own token-bound session is not. That is a guide-conformant \
+     configuration this DSM does support: the parameter path is refused only for sessions created \
+     the browser-style way. Nothing needs changing while the current run works, but if session \
+     rejections persist across a relay, a client logging in without enable_syno_token can carry \
+     its session in the request field alone and stop depending on cookie handling entirely.";
 
 /// The ablation finding that names no client-side fix, and says so.
 const DOCTOR_SESSION_DEAD_HINT: &str = "every session channel was rejected, so the session identifier itself is no longer valid \
@@ -2402,11 +2443,16 @@ fn record_reachability_section(
     reachability: ReachabilityReport,
     elapsed: Duration,
 ) {
-    let multiple_paths = reachability.reached() && reachability.suggests_multiple_paths();
-    let (status, detail) = if reachability.cancelled {
+    // The hint is chosen by the branch that was actually taken, not by a condition tested
+    // alongside it. A relay hostname resolving to several addresses makes `suggests_multiple_paths`
+    // true on almost every QuickConnect run, so gating the session-affinity hint on that alone
+    // attached it to findings it does not explain -- including "no HTTP sample completed", where
+    // it sent the reader after a session problem that the evidence never pointed at.
+    let (status, detail, remediation) = if reachability.cancelled {
         (
             DoctorSectionStatus::Skip,
             "the transport probe stopped when the run was cancelled".to_owned(),
+            None,
         )
     } else if !reachability.reached() {
         (
@@ -2422,14 +2468,27 @@ fn record_reachability_section(
                     .map(|reason| format!("; {reason}"))
                     .unwrap_or_default(),
             ),
+            None,
         )
     } else if reachability.connects_but_does_not_answer() {
+        let timed_out = reachability.http.timed_out;
         (
             DoctorSectionStatus::Warn,
             format!(
-                "TCP connections to {}:{} succeed, but no HTTP sample completed{}",
+                "TCP connections to {}:{} succeed, but no HTTP sample completed{}{}",
                 reachability.host,
                 reachability.port,
+                if timed_out {
+                    reachability
+                        .http
+                        .request_timeout
+                        .map(|timeout| {
+                            format!(" within the {:.1} s probe ceiling", timeout.as_secs_f64())
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                },
                 reachability
                     .http
                     .failure_reason
@@ -2437,6 +2496,11 @@ fn record_reachability_section(
                     .map(|reason| format!("; {reason}"))
                     .unwrap_or_default(),
             ),
+            Some(if timed_out {
+                DOCTOR_PROBE_TIMEOUT_HINT
+            } else {
+                DOCTOR_PROBE_TRANSPORT_HINT
+            }),
         )
     } else if reachability.suggests_multiple_paths() {
         let mut reasons = Vec::new();
@@ -2459,6 +2523,7 @@ fn record_reachability_section(
                  one host: {}",
                 reasons.join("; ")
             ),
+            Some(DOCTOR_MULTIPLE_PATH_HINT),
         )
     } else {
         (
@@ -2467,11 +2532,9 @@ fn record_reachability_section(
                 "TCP reachability is consistent: connect {}",
                 reachability.tcp_connect.describe()
             ),
+            None,
         )
     };
-    // Only the finding that earns it. A host that accepts connections and then answers nothing
-    // is a different fault, and pointing its reader at session affinity would be misdirection.
-    let remediation = multiple_paths.then_some(DOCTOR_MULTIPLE_PATH_HINT);
     result.set_derived_section("network_reachability", status, detail, remediation);
     if let Some(section) = result
         .sections
@@ -3018,12 +3081,22 @@ fn record_diagnostic_section(
 
 /// Present the same authenticated call through one session channel at a time.
 ///
-/// The four variants run whatever they find: a `119` here is the observation, not an error, so
-/// this deliberately does not route through [`session_is_unusable`]. Aborting on the first
-/// rejection is exactly what would make the probe useless.
-fn record_session_channel_ablation(result: &mut DoctorResult, client: &ApiClient) {
+/// The variants run whatever they find: a `119` here is the observation, not an error, so this
+/// deliberately does not route through [`session_is_unusable`]. Aborting on the first rejection is
+/// exactly what would make the probe useless.
+///
+/// The fifth variant -- the one that varies how the session was *created* rather than how it is
+/// presented -- is not run here. It needs a second login, and this section runs at step 7 with
+/// nine sections still to come on the primary session; [`record_tokenless_login_variant`] takes
+/// it at the end of the run instead, and rewrites this section's verdict with its answer. Until
+/// then the slot records why it has not run, which is not the same thing as a rejection.
+fn record_session_channel_ablation(
+    result: &mut DoctorResult,
+    client: &ApiClient,
+    tokenless: &TokenlessProbeLogin,
+) {
     let started = Instant::now();
-    let probes = match client.probe_session_channels() {
+    let probes = match client.probe_session_channels(tokenless.deferral_reason()) {
         Ok(probes) => probes,
         Err(error) => {
             result.set_section(
@@ -3051,11 +3124,148 @@ fn record_session_channel_ablation(result: &mut DoctorResult, client: &ApiClient
     result.channel_ablation = Some(probes);
 }
 
-/// Reach a verdict from the four ablation variants.
+/// The section this verdict belongs to, named once because two functions now write it.
+const ABLATION_SECTION: &str = "session_channel_ablation";
+
+/// Run the deferred tokenless-login variant and fold its answer into the ablation verdict.
+///
+/// Called after [`record_doctor_logout`], which is the whole point. The variant logs in a second
+/// time, and both this client's logins and its logouts name the same DSM session -- `session=
+/// FileStation` in `login` and in `logout` alike. DSM binds one session per (account, session
+/// name) and has a dedicated error for a collision: `107`, "session interrupted by duplicate
+/// login", which [`session_is_unusable`] treats as fatal. A second login taken at step 7 could
+/// therefore invalidate the run's own session server-side and abort steps 8 through 16, and the
+/// second session's logout could tear down the shared name outright.
+///
+/// Running it once the primary session is already closed removes both hazards by construction
+/// rather than by hoping DSM is lenient: there is no session left to interrupt, and no shared name
+/// left to tear down. Nothing in the run reads the primary session after this point.
+fn record_tokenless_login_variant(
+    result: &mut DoctorResult,
+    client: &ApiClient,
+    login: &TokenlessProbeLogin,
+    cancellation: &CancellationToken,
+) {
+    let Some(probes) = result.channel_ablation.as_ref() else {
+        // The ablation did not run, so there is no verdict to refine and no reason to log in.
+        return;
+    };
+    let slot = probes.len() - 1;
+    if probes[slot].ran() {
+        return;
+    }
+    let started = Instant::now();
+    let probe = if cancellation.is_cancelled() {
+        ChannelProbe::skipped(
+            api::SessionChannels::SidFieldOnlyTokenlessLogin,
+            "the run was cancelled before the deferred variant could be issued",
+        )
+    } else {
+        run_tokenless_login_variant(client, login)
+    };
+    let Some(probes) = result.channel_ablation.as_mut() else {
+        return;
+    };
+    probes[slot] = probe;
+    let probes = *probes;
+
+    let (status, detail, remediation) = ablation_verdict(&probes);
+    // Written into the section directly rather than through `set_section`, which would replace
+    // the four variants' own calls with these. The requests this variant made are appended to
+    // them instead, keeping their real -- and visibly out of order -- sequence numbers.
+    let calls = result.call_log.drain();
+    let elapsed = started.elapsed();
+    if let Some(section) = result
+        .sections
+        .iter_mut()
+        .find(|section| section.id == ABLATION_SECTION)
+    {
+        section.status = status;
+        section.detail = bounded_doctor_detail(&detail);
+        section.remediation = remediation;
+        section.elapsed = section.elapsed.saturating_add(elapsed);
+        section.calls.extend(calls);
+    }
+    if status == DoctorSectionStatus::Fail {
+        result.failure.get_or_insert(detail);
+    }
+}
+
+/// What the ablation needs in order to make its second, deliberately tokenless login.
+///
+/// The password is held rather than a pre-made session, because the second login is deliberately
+/// deferred to the end of the run -- see [`record_tokenless_login_variant`] for why. The plaintext
+/// lives in a `Zeroizing` buffer, only at the extensive level, and is erased when this value is
+/// dropped.
+enum TokenlessProbeLogin {
+    Available {
+        username: String,
+        password: Zeroizing<String>,
+    },
+    Unavailable(&'static str),
+}
+
+impl TokenlessProbeLogin {
+    /// Why the variant will not run, for the ablation to record before the deferred attempt.
+    fn deferral_reason(&self) -> &'static str {
+        match self {
+            Self::Available { .. } => {
+                "deferred to the end of the run, after the primary session is closed"
+            }
+            Self::Unavailable(reason) => reason,
+        }
+    }
+}
+
+/// How long the extra ablation session is given to log itself out.
+const DOCTOR_TOKENLESS_LOGOUT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run the tokenless-login variant: a second session, one read-only call, then a logout.
+///
+/// The client is cloned from the primary one so no second API discovery is paid for. Cloning is
+/// safe in-process: `session` is a plain field copied by value, so a login here cannot replace the
+/// primary client's in-memory session, and no client this crate builds enables `cookie_store`, so
+/// there is no shared jar for one session's identifier to reach the other's requests. The
+/// `reqwest` connection pool, the observer, and the cancellation token are shared, none of which
+/// carries session state -- and the observer being shared is what puts these requests in the
+/// run's own transcript.
+///
+/// Only the no-OTP path is attempted: replaying the one-time code the first login consumed is
+/// exactly what a read-only diagnostic must not do, and prompting an operator again for a probe is
+/// worse than reporting that the variant did not run.
+///
+/// The second session is logged out on every path out of this function, successful or not.
+fn run_tokenless_login_variant(client: &ApiClient, login: &TokenlessProbeLogin) -> ChannelProbe {
+    let skipped =
+        |reason| ChannelProbe::skipped(api::SessionChannels::SidFieldOnlyTokenlessLogin, reason);
+    let TokenlessProbeLogin::Available { username, password } = login else {
+        return skipped(login.deferral_reason());
+    };
+    let mut probe_client = client.clone();
+    match probe_client.login_without_syno_token(username, password, None) {
+        Ok(()) => {}
+        // 403/406 is DSM asking for a one-time code: the account has two-factor authentication,
+        // and this variant is not worth a second prompt.
+        Err(error) if matches!(error.api_code(), Some(403 | 406)) => {
+            return skipped(
+                "a second login would need another one-time code, so it was not attempted",
+            );
+        }
+        Err(_) => {
+            return skipped("a second login without enable_syno_token could not be established");
+        }
+    }
+    let probe = probe_client.probe_tokenless_sid_field();
+    let _ = probe_client.logout_bounded(DOCTOR_TOKENLESS_LOGOUT_TIMEOUT);
+    probe.unwrap_or_else(|_| skipped("the second session's probe request could not be issued"))
+}
+
+/// Reach a verdict from the ablation variants.
 ///
 /// Only the first three decide it. `TokenHeaderOnly` carries no session identifier at all, so DSM
 /// is *expected* to reject it; it is the control that proves the probe can tell acceptance from
 /// rejection, and treating its rejection as a finding would be a false alarm on every healthy NAS.
+/// The tokenless-login variant refines the verdict when it ran, and is silent when it did not.
 fn ablation_verdict(
     probes: &[ChannelProbe; SESSION_CHANNEL_VARIANTS],
 ) -> (DoctorSectionStatus, String, Option<&'static str>) {
@@ -3063,6 +3273,7 @@ fn ablation_verdict(
     let sid = probes[1];
     let cookie = probes[2];
     let control = probes[3];
+    let tokenless = probes[4];
     let cookie_note = if cookie.accepted() {
         "the synthesised cookie alone was also accepted"
     } else {
@@ -3090,14 +3301,52 @@ fn ablation_verdict(
             ),
             Some(DOCTOR_COOKIE_CHANNEL_HINT),
         )
-    } else if all.accepted() {
+    } else if all.accepted() && cookie.accepted() {
         (
             DoctorSectionStatus::Warn,
-            "DSM accepted this client's usual channel combination but rejected the documented \
-             _sid request field on its own, so DSM is resolving the session from the cookie \
-             rather than from the field its own guide specifies for a format=sid login"
+            "DSM accepted this client's usual channel combination and the synthesised cookie on \
+             its own, but rejected the documented _sid request field, so this DSM is resolving \
+             the session from the cookie rather than from the field its own guide specifies for \
+             a format=sid login"
                 .to_owned(),
             None,
+        )
+    } else if all.accepted() {
+        // Everything except the full combination was rejected, the cookie alone included. The
+        // channels are not interchangeable here: it is their *combination* that DSM accepts, and
+        // saying the cookie resolves the session -- as this once did, on the strength of the
+        // `_sid` rejection alone -- would point an operator at removing the cookie, which is
+        // precisely the change that would break a NAS behaving this way.
+        let tokenless_note = if !tokenless.ran() {
+            String::new()
+        } else if tokenless.accepted() {
+            " -- and a second login made without enable_syno_token *was* accepted through the \
+             _sid field alone, so the parameter path is refused for token-bound sessions rather \
+             than by this DSM in general"
+                .to_owned()
+        } else {
+            format!(
+                " -- a second login made without enable_syno_token was rejected through the _sid \
+                 field as well ({}), so the parameter path is refused regardless of how the \
+                 session was created",
+                tokenless
+                    .dsm_code
+                    .map(|code| format!("DSM {code}"))
+                    .unwrap_or_else(|| tokenless.outcome.as_str().to_owned())
+            )
+        };
+        (
+            DoctorSectionStatus::Warn,
+            format!(
+                "only the full combination of channels was accepted: DSM took the `id` cookie and \
+                 the X-SYNO-TOKEN header together, and rejected the cookie alone, the token \
+                 header alone, and the documented _sid/SynoToken request fields{tokenless_note}"
+            ),
+            Some(if tokenless.accepted() {
+                DOCTOR_TOKENLESS_LOGIN_HINT
+            } else {
+                DOCTOR_COMBINED_CHANNEL_HINT
+            }),
         )
     } else if !cookie.accepted() && !control.accepted() {
         (
@@ -3752,6 +4001,12 @@ fn doctor_run(
         LogEvent::new(EventLogLevel::Info, EventCode::AuthenticationStarted),
     )?;
     let authentication_started = Instant::now();
+    // The ablation's tokenless variant needs a second login, so it needs the password after this
+    // closure has returned. The buffer is `Zeroizing` and is dropped as soon as the ablation
+    // section is done with it.
+    let mut tokenless_probe = TokenlessProbeLogin::Unavailable(
+        "the tokenless-login variant runs only at the extensive level",
+    );
     let authentication = (|| {
         let mut vault = credentials::VaultSession::new(
             !settings.authentication.no_vault,
@@ -3771,6 +4026,12 @@ fn doctor_run(
             &mut vault,
             settings.authentication.totp_secret_file.as_deref(),
         );
+        if authenticated.is_ok() && settings.level == cli::DoctorLevel::Extensive {
+            tokenless_probe = TokenlessProbeLogin::Available {
+                username: username.to_owned(),
+                password: password.clone(),
+            };
+        }
         drop(password);
         authenticated
     })();
@@ -3815,7 +4076,7 @@ fn doctor_run(
     // later section happened to ask for. The ablation comes first because the capability
     // diagnosis reads its verdict: without it, a dead session masquerades as broken capabilities.
     if !session_logging_failed && cancellation.check().is_ok() {
-        record_session_channel_ablation(&mut result, &client);
+        record_session_channel_ablation(&mut result, &client, &tokenless_probe);
         if settings.level == cli::DoctorLevel::Extensive && cancellation.check().is_ok() {
             record_session_concurrency(&mut result, &client);
         }
@@ -4148,6 +4409,11 @@ fn doctor_run(
     }
 
     record_doctor_logout(&mut client, &mut result);
+    // Deliberately after the logout above: this is the only place in the run that opens a second
+    // DSM session, and once the primary one is closed there is nothing left for a duplicate login
+    // to interrupt. Nothing below reads the primary session.
+    record_tokenless_login_variant(&mut result, &client, &tokenless_probe, cancellation);
+    drop(tokenless_probe);
     Ok(result)
 }
 
@@ -5883,6 +6149,15 @@ fn doctor_call_value(call: &DoctorCall) -> Value {
             "syno_token_field": call.session.syno_token_field,
         },
         "elapsed_ms": call.elapsed_ms,
+        // Schema, not content: a member path, a JSON type, and the deserializer's own
+        // expectation. Present only when the call actually failed to decode.
+        "decode": call.decode.map(|fault| json!({
+            "kind": fault.kind.as_str(),
+            "path": fault.path.as_str(),
+            "field": fault.field.as_str(),
+            "expected": fault.expected.as_str(),
+            "found": fault.found.as_str(),
+        })),
     })
 }
 
@@ -5936,6 +6211,10 @@ fn channel_probe_value(probe: &ChannelProbe) -> Value {
         "dsm_code": probe.dsm_code,
         "http_status": probe.http_status,
         "elapsed_ms": probe.elapsed_ms,
+        // A variant that did not run is distinguishable from one that was rejected, so a reader
+        // parsing this cannot mistake an unattempted variant for evidence.
+        "ran": probe.ran(),
+        "skipped_reason": probe.skipped,
     })
 }
 
@@ -6175,13 +6454,21 @@ fn channel_ablation_lines(probes: &[ChannelProbe; SESSION_CHANNEL_VARIANTS]) -> 
             .to_owned(),
     ];
     for probe in probes {
+        if let Some(reason) = probe.skipped {
+            lines.push(format!(
+                "  {:<30}{:<48}not run: {reason}",
+                probe.channels.as_str(),
+                probe.channels.describe(),
+            ));
+            continue;
+        }
         let answer = match (probe.outcome, probe.dsm_code) {
             (RequestOutcome::Ok, _) => "accepted".to_owned(),
             (_, Some(code)) => format!("rejected with DSM {code}"),
             (outcome, None) => format!("failed ({})", outcome.as_str()),
         };
         lines.push(format!(
-            "  {:<20}{:<48}{answer} in {} ms",
+            "  {:<30}{:<48}{answer} in {} ms",
             probe.channels.as_str(),
             probe.channels.describe(),
             probe.elapsed_ms,
@@ -6192,25 +6479,41 @@ fn channel_ablation_lines(probes: &[ChannelProbe; SESSION_CHANNEL_VARIANTS]) -> 
          to reject it; it is the control that proves this probe can tell acceptance from rejection"
             .to_owned(),
     );
+    lines.push(
+        "the last variant is the only one that varies how the session was *created* rather than \
+         how it is presented: a second login without enable_syno_token, offered the documented \
+         _sid request field alone. It is read-only, and it is measured at the very end of the run \
+         -- after this run's own session has been logged out -- because DSM binds one session per \
+         account and session name, and a duplicate login can interrupt the other. Its own session \
+         is logged out immediately afterwards. Its request numbers are therefore higher than the \
+         rest of this block's"
+            .to_owned(),
+    );
     lines
 }
 
 fn capability_diagnosis_lines(diagnosis: &CapabilityDiagnosis) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(info) = diagnosis.info {
+        // "DSM did not report it" is printed as itself. File Station omits members between DSM
+        // releases, and rendering an absent flag as a denial invents a permission verdict.
         lines.push(format!(
             "host {:?} -- this account {} a DSM administrator",
             info.hostname
                 .map(|host| host.as_str().to_owned())
                 .unwrap_or_else(|| "(not reported)".to_owned()),
-            if info.is_manager { "is" } else { "is not" },
+            match info.is_manager {
+                Some(true) => "is",
+                Some(false) => "is not",
+                None => "was not reported as",
+            },
         ));
         lines.push(format!(
             "sharing links: {}; mountable virtual filesystems: {}",
-            if info.support_sharing {
-                "supported for this account"
-            } else {
-                "not available to this account"
+            match info.support_sharing {
+                Some(true) => "supported for this account",
+                Some(false) => "not available to this account",
+                None => "not reported",
             },
             info.support_virtual_protocol
                 .map(|protocols| protocols.as_str().to_owned())
@@ -6334,6 +6637,12 @@ fn doctor_human(result: &DoctorResult) -> String {
                 call.elapsed_ms,
             )
             .expect("writing to a String cannot fail");
+            // A bare `decode` names no next step. The member path and the JSON type do, and both
+            // are schema rather than response content, so they can be printed as they are.
+            if let Some(fault) = call.decode {
+                writeln!(human, "              {}", fault.describe())
+                    .expect("writing to a String cannot fail");
+            }
         }
         if let Some(remediation) = section.remediation {
             writeln!(human, "         hint: {remediation}")
@@ -7426,6 +7735,10 @@ mod tests {
                 statuses: [200].into_iter().collect(),
                 failures: 0,
                 failure_reason: None,
+                timed_out: false,
+                request_timeout: Some(Duration::from_secs(12)),
+                route: Some("entry.cgi"),
+                routes_rejected: 0,
             },
             budget_exhausted: false,
             cancelled: false,
@@ -7562,6 +7875,199 @@ mod tests {
             hash_content: true,
             elapsed: Duration::from_millis(9),
         }
+    }
+
+    use synology_drive_sync::transport_diagnostics::{
+        DnsObservation, HttpTimingObservation, LatencySamples,
+    };
+
+    /// A reachability report with TCP samples and whatever HTTP outcome a case needs.
+    fn reachability_fixture(addresses: usize, http: HttpTimingObservation) -> ReachabilityReport {
+        let mut tcp = LatencySamples::default();
+        for micros in [21_000_u64, 21_400, 20_800] {
+            tcp.push(Duration::from_micros(micros));
+        }
+        ReachabilityReport {
+            host: "nascheckoffice.fr3.quickconnect.to".to_owned(),
+            port: 443,
+            tls: true,
+            dns: DnsObservation {
+                elapsed: Some(Duration::from_micros(18_400)),
+                address_count: addresses,
+                ipv4_count: addresses,
+                ipv6_count: 0,
+                literal: false,
+                error: None,
+            },
+            tcp_per_address: vec![tcp.clone(); addresses],
+            tcp_connect: tcp,
+            tcp_failures: 0,
+            tcp_failure_reason: None,
+            http,
+            budget_exhausted: false,
+            cancelled: false,
+        }
+    }
+
+    /// A `decode` outcome has to explain itself where the operator reads the failing call.
+    ///
+    /// The fixture is the record a live DSM produced: `getinfo` on a path that does not exist,
+    /// whose single entry carries a per-entry `408` and therefore no `name`. Printing only
+    /// `decode` there cost a round trip with the operator to learn which member had disagreed.
+    #[test]
+    fn a_decode_failure_is_explained_beside_the_call_that_failed() {
+        use synology_drive_sync::observability::{DecodeFaultKind, JsonKind, ShortToken};
+
+        let call = DoctorCall {
+            sequence: 25,
+            api: "SYNO.FileStation.List",
+            method: "getinfo",
+            version: 2,
+            outcome: RequestOutcome::Decode,
+            dsm_code: None,
+            http_status: Some(200),
+            session: SessionTransport::default(),
+            elapsed_ms: 174,
+            decode: Some(DecodeFault {
+                kind: DecodeFaultKind::MissingField,
+                path: BoundedText::sanitized("data.files.0.name"),
+                field: ShortToken::sanitized("name"),
+                expected: ShortToken::default(),
+                found: JsonKind::Absent,
+                line: 1,
+                column: 76,
+            }),
+        };
+
+        let value = doctor_call_value(&call);
+        assert_eq!(value["outcome"], "decode");
+        assert_eq!(value["decode"]["kind"], "missing-field");
+        assert_eq!(value["decode"]["path"], "data.files.0.name");
+        assert_eq!(value["decode"]["found"], "absent");
+
+        let mut result = routing_doctor_result();
+        result
+            .sections
+            .iter_mut()
+            .find(|section| section.id == "dsm_api_discovery")
+            .expect("a section to attach the call to")
+            .calls = vec![call];
+        let human = doctor_human(&result);
+        assert!(
+            human.contains("#25 SYNO.FileStation.List.getinfo v2"),
+            "the call itself must still render: {human}"
+        );
+        assert!(
+            human.contains("missing-field at data.files.0.name"),
+            "the decode reason belongs next to the call: {human}"
+        );
+        // A call that decoded fine adds no line, so the common case is not noisier for this.
+        let mut clean = call;
+        clean.outcome = RequestOutcome::Ok;
+        clean.decode = None;
+        let mut result = routing_doctor_result();
+        result
+            .sections
+            .iter_mut()
+            .find(|section| section.id == "dsm_api_discovery")
+            .expect("a section to attach the call to")
+            .calls = vec![clean];
+        assert!(!doctor_human(&result).contains("missing-field"));
+    }
+
+    /// Each reachability finding gets the hint that explains *it*.
+    ///
+    /// A QuickConnect hostname resolves to several addresses, which makes
+    /// `suggests_multiple_paths` true on nearly every relayed run. Gating the session-affinity
+    /// hint on that condition alone -- rather than on the branch that was taken -- attached it to
+    /// "no HTTP sample completed", sending an operator after a session problem on the strength of
+    /// a probe that had merely timed out.
+    #[test]
+    fn a_reachability_hint_is_chosen_by_the_finding_it_explains() {
+        let mut first_byte = LatencySamples::default();
+        for micros in [96_200_u64, 97_100, 96_800] {
+            first_byte.push(Duration::from_micros(micros));
+        }
+        let case = |report: ReachabilityReport| {
+            let mut result = routing_doctor_result();
+            record_reachability_section(&mut result, report, Duration::from_millis(742));
+            let section = result
+                .sections
+                .iter()
+                .find(|section| section.id == "network_reachability")
+                .expect("the reachability section")
+                .clone();
+            (section.status, section.detail.clone(), section.remediation)
+        };
+
+        // Two addresses and no HTTP sample: a transport finding, and a transport hint.
+        let timed_out = reachability_fixture(
+            2,
+            HttpTimingObservation {
+                failures: 2,
+                failure_reason: Some(
+                    "error sending request for url (https://host/webapi/entry.cgi): operation \
+                     timed out"
+                        .to_owned(),
+                ),
+                timed_out: true,
+                request_timeout: Some(Duration::from_secs(12)),
+                route: Some("entry.cgi"),
+                ..HttpTimingObservation::default()
+            },
+        );
+        let (status, detail, remediation) = case(timed_out.clone());
+        assert_eq!(status, DoctorSectionStatus::Warn);
+        assert!(detail.contains("no HTTP sample completed"));
+        assert!(
+            detail.contains("within the 12.0 s probe ceiling"),
+            "the ceiling the samples ran under belongs in the finding: {detail}"
+        );
+        assert_eq!(remediation, Some(DOCTOR_PROBE_TIMEOUT_HINT));
+        assert_ne!(
+            remediation,
+            Some(DOCTOR_MULTIPLE_PATH_HINT),
+            "a timed-out probe says nothing about session affinity"
+        );
+
+        // The same finding, refused rather than timed out: a different transport hint.
+        let mut refused = timed_out;
+        refused.http.timed_out = false;
+        refused.http.failure_reason = Some("connection closed before message completed".to_owned());
+        let (_, detail, remediation) = case(refused);
+        assert!(!detail.contains("probe ceiling"));
+        assert_eq!(remediation, Some(DOCTOR_PROBE_TRANSPORT_HINT));
+
+        // HTTP answers, and the several addresses are now the finding: the affinity hint earns it.
+        let answered = reachability_fixture(
+            2,
+            HttpTimingObservation {
+                first_byte: first_byte.clone(),
+                statuses: [200].into_iter().collect(),
+                request_timeout: Some(Duration::from_secs(12)),
+                route: Some("entry.cgi"),
+                ..HttpTimingObservation::default()
+            },
+        );
+        let (status, detail, remediation) = case(answered);
+        assert_eq!(status, DoctorSectionStatus::Warn);
+        assert!(detail.contains("resolves to 2 addresses"));
+        assert_eq!(remediation, Some(DOCTOR_MULTIPLE_PATH_HINT));
+
+        // One address and a clean answer: nothing to say.
+        let healthy = reachability_fixture(
+            1,
+            HttpTimingObservation {
+                first_byte,
+                statuses: [200].into_iter().collect(),
+                request_timeout: Some(Duration::from_secs(12)),
+                route: Some("entry.cgi"),
+                ..HttpTimingObservation::default()
+            },
+        );
+        let (status, _, remediation) = case(healthy);
+        assert_eq!(status, DoctorSectionStatus::Pass);
+        assert_eq!(remediation, None);
     }
 
     fn routing_doctor_result() -> DoctorResult {
@@ -9483,18 +9989,39 @@ mod tests {
             dsm_code: code,
             http_status: Some(200),
             elapsed_ms: 12,
+            skipped: None,
         }
     }
 
-    /// Four variants, ordered as the probe runs them.
-    fn ablation(all: Option<i64>, sid: Option<i64>, cookie: Option<i64>) -> [ChannelProbe; 4] {
+    /// The variants, ordered as the probe runs them.
+    ///
+    /// The tokenless-login variant defaults to not having run, which is what a standard-level run
+    /// and every two-factor account produce: the verdict has to be reached without it.
+    fn ablation(
+        all: Option<i64>,
+        sid: Option<i64>,
+        cookie: Option<i64>,
+    ) -> [ChannelProbe; SESSION_CHANNEL_VARIANTS] {
         [
             probe(SessionChannels::All, all),
             probe(SessionChannels::SidFieldOnly, sid),
             probe(SessionChannels::CookieOnly, cookie),
             // The control: no session identifier at all, so a healthy DSM rejects it.
             probe(SessionChannels::TokenHeaderOnly, Some(119)),
+            ChannelProbe::skipped(
+                SessionChannels::SidFieldOnlyTokenlessLogin,
+                "not attempted by this fixture",
+            ),
         ]
+    }
+
+    /// The same variants with the tokenless second login having answered.
+    fn with_tokenless_login(
+        mut probes: [ChannelProbe; SESSION_CHANNEL_VARIANTS],
+        code: Option<i64>,
+    ) -> [ChannelProbe; SESSION_CHANNEL_VARIANTS] {
+        probes[4] = probe(SessionChannels::SidFieldOnlyTokenlessLogin, code);
+        probes
     }
 
     /// The ablation's verdict table is the whole diagnostic, so every row of it is pinned.
@@ -9522,11 +10049,61 @@ mod tests {
         assert!(detail.contains("rejected (DSM 119)"));
         assert_eq!(remediation, Some(DOCTOR_COOKIE_CHANNEL_HINT));
 
-        // The mirror image: DSM resolves the session from the cookie and rejects the field.
+        // The mirror image: the cookie alone is accepted, so DSM really is resolving the session
+        // from it and the documented field is the odd one out.
         let (status, detail, remediation) = ablation_verdict(&ablation(None, Some(119), None));
         assert_eq!(status, DoctorSectionStatus::Warn);
         assert!(detail.contains("resolving the session from the cookie"));
         assert_eq!(remediation, None);
+
+        // The shape a live QuickConnect-relayed DSM 7 actually produced: only the full
+        // combination is accepted. The cookie alone was rejected too, so nothing here says the
+        // cookie resolves the session, and the advice must never be to stop sending it.
+        let combination_only = ablation(None, Some(119), Some(119));
+        let (status, detail, remediation) = ablation_verdict(&combination_only);
+        assert_eq!(status, DoctorSectionStatus::Warn);
+        assert!(
+            detail.contains("only the full combination of channels was accepted"),
+            "got: {detail}"
+        );
+        assert!(
+            !detail.contains("resolving the session from the cookie"),
+            "cookie-only was rejected, so this verdict must not claim the cookie carries it: \
+             {detail}"
+        );
+        assert_eq!(remediation, Some(DOCTOR_COMBINED_CHANNEL_HINT));
+        let hint = remediation.unwrap();
+        assert!(
+            hint.contains("Keep sending both channels"),
+            "the remediation must not advise removing a channel this setup depends on: {hint}"
+        );
+
+        // The same shape, with the tokenless second login accepted through the documented field:
+        // a guide-conformant configuration exists, and the report says so.
+        let (status, detail, remediation) =
+            ablation_verdict(&with_tokenless_login(combination_only, None));
+        assert_eq!(status, DoctorSectionStatus::Warn);
+        assert!(
+            detail.contains("without enable_syno_token *was* accepted"),
+            "got: {detail}"
+        );
+        assert_eq!(remediation, Some(DOCTOR_TOKENLESS_LOGIN_HINT));
+
+        // And with it rejected as well: the parameter path is refused however the session is made.
+        let (_, detail, remediation) =
+            ablation_verdict(&with_tokenless_login(combination_only, Some(119)));
+        assert!(
+            detail.contains("regardless of how the session was created"),
+            "got: {detail}"
+        );
+        assert_eq!(remediation, Some(DOCTOR_COMBINED_CHANNEL_HINT));
+
+        // A variant that did not run contributes nothing to the verdict either way.
+        let (_, detail, _) = ablation_verdict(&combination_only);
+        assert!(
+            !detail.contains("enable_syno_token"),
+            "an unattempted variant must not appear as evidence: {detail}"
+        );
 
         // Everything rejected: not a channel problem at all.
         let (status, detail, remediation) =
@@ -9557,6 +10134,17 @@ mod tests {
         assert!(lines.contains("rejected with DSM 119"));
         assert!(lines.contains("accepted"));
         assert!(lines.contains("it is the control"));
+        assert!(
+            lines.contains("not run: not attempted by this fixture"),
+            "a variant that did not run must say so rather than look rejected: {lines}"
+        );
+        let ran = channel_ablation_lines(&with_tokenless_login(
+            ablation(Some(119), None, Some(119)),
+            None,
+        ))
+        .join("\n");
+        assert!(!ran.contains("not run:"));
+        assert!(ran.contains("second login without SynoToken"));
     }
 
     fn catalogue(entries: &[(&str, Option<u32>, Option<u32>)], unusable: usize) -> ApiCatalogue {
@@ -9776,8 +10364,8 @@ mod tests {
     fn a_dead_session_is_reported_as_a_dead_session_not_as_broken_capabilities() {
         let station_info = FileStationInfo {
             hostname: Some(BoundedText::sanitized("DiskStation")),
-            is_manager: false,
-            support_sharing: true,
+            is_manager: Some(false),
+            support_sharing: Some(true),
             support_virtual_protocol: Some(BoundedText::sanitized("cifs,nfs")),
         };
         let base = |records: Vec<CapabilityRecord>| CapabilityDiagnosis {

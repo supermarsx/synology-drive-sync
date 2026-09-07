@@ -468,6 +468,134 @@ impl RequestOutcome {
     }
 }
 
+/// What kind of mismatch stopped a response body from deserializing.
+///
+/// A [`RequestOutcome::Decode`] on its own tells an operator only that DSM answered with
+/// something the client could not read, which is the least actionable failure this tool can
+/// report. This names the shape of the disagreement instead.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DecodeFaultKind {
+    /// The response was read but the reason could not be classified any further.
+    #[default]
+    Unspecified,
+    /// A member the client requires was not in the object.
+    MissingField,
+    /// The object carried a member the client's schema rejects.
+    UnknownField,
+    /// One member appeared twice, which for us means two spellings mapped to one field.
+    DuplicateField,
+    /// The member was there under a JSON type the client does not accept.
+    TypeMismatch,
+    /// The bytes were not JSON at all.
+    Syntax,
+    /// The body ended in the middle of a value.
+    UnexpectedEnd,
+}
+
+impl DecodeFaultKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::MissingField => "missing-field",
+            Self::UnknownField => "unknown-field",
+            Self::DuplicateField => "duplicate-field",
+            Self::TypeMismatch => "type-mismatch",
+            Self::Syntax => "syntax",
+            Self::UnexpectedEnd => "unexpected-end",
+        }
+    }
+}
+
+/// A JSON value's type.
+///
+/// The type of a value is schema, not content: it says `array` where the value itself might have
+/// said `["cifs","nfs"]`, and it cannot carry a session identifier however DSM shapes its reply.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum JsonKind {
+    /// The response did not say, or the message did not name a type.
+    #[default]
+    Unknown,
+    /// The member was not present at all.
+    Absent,
+    Null,
+    Bool,
+    Number,
+    String,
+    Array,
+    Object,
+}
+
+impl JsonKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Absent => "absent",
+            Self::Null => "null",
+            Self::Bool => "boolean",
+            Self::Number => "number",
+            Self::String => "string",
+            Self::Array => "array",
+            Self::Object => "object",
+        }
+    }
+}
+
+/// Why one response body did not deserialize, in terms of schema rather than of content.
+///
+/// Every member is a fixed enum, an integer, or bounded sanitized text drawn from a *name*: the
+/// dotted path is built from the object keys and array indices walked to reach the disagreement,
+/// the field is the member the deserializer named, and `expected` is the deserializer's own
+/// description of what it wanted. No value from the response is representable here, which is the
+/// property that lets this be printed next to a failing call on an operator's terminal.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DecodeFault {
+    pub kind: DecodeFaultKind,
+    /// Dotted path to the member that did not match, such as `data.files.0.name`. Array elements
+    /// appear as their index. Empty when the position could not be resolved to a member.
+    pub path: BoundedText,
+    /// The member the deserializer named, when it named one.
+    pub field: ShortToken,
+    /// What the deserializer wanted, in its own words (`a string`, `u64`, `struct Envelope`).
+    pub expected: ShortToken,
+    /// The JSON type actually found at [`Self::path`].
+    pub found: JsonKind,
+    /// 1-based position the deserializer reported, retained so two runs can be compared.
+    pub line: u32,
+    pub column: u32,
+}
+
+impl DecodeFault {
+    /// One line an operator can act on, in the same `key=value` vocabulary the call lines use.
+    pub fn describe(self) -> String {
+        use std::fmt::Write as _;
+        let mut text = self.kind.as_str().to_owned();
+        if !self.path.is_empty() {
+            let _ = write!(text, " at {}", self.path);
+        }
+        if !self.expected.is_empty() {
+            let _ = write!(text, "; expected {}", self.expected);
+        }
+        // `absent` is not reported: the only kind that produces it already says the member was
+        // not there, and repeating it turns a one-line finding into a riddle.
+        if !matches!(self.found, JsonKind::Unknown | JsonKind::Absent) {
+            let _ = write!(text, ", found {}", self.found.as_str());
+        }
+        text
+    }
+
+    fn json_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "kind": self.kind.as_str(),
+            "path": self.path.as_str(),
+            "field": self.field.as_str(),
+            "expected": self.expected.as_str(),
+            "found": self.found.as_str(),
+            "line": self.line,
+            "column": self.column,
+        })
+    }
+}
+
 /// A cookie name or an intermediary banner, bounded to half a [`BoundedText`].
 ///
 /// Shorter than [`BoundedText`] on purpose: several of these are carried per request record, and
@@ -744,6 +872,11 @@ pub struct ApiCallDetail {
     pub retry_backoff_ms: Option<u64>,
     /// The host of a refused redirect's `Location`. Host only; `None` for a relative target.
     pub redirect_host: Option<BoundedText>,
+    /// Why the body would not deserialize, when [`Self::outcome`] is [`RequestOutcome::Decode`].
+    ///
+    /// Present only for that outcome, and holding schema rather than content: without it a decode
+    /// failure costs a round trip with the operator to learn which member DSM shaped differently.
+    pub decode: Option<DecodeFault>,
 }
 
 impl ApiCallDetail {
@@ -779,6 +912,7 @@ impl ApiCallDetail {
             elapsed_ms: 0,
             retry_backoff_ms: None,
             redirect_host: None,
+            decode: None,
         }
     }
 
@@ -807,6 +941,7 @@ impl ApiCallDetail {
             "elapsed_ms": self.elapsed_ms,
             "retry_backoff_ms": self.retry_backoff_ms,
             "redirect_host": self.redirect_host.map(|host| host.as_str().to_owned()),
+            "decode": self.decode.map(DecodeFault::json_value),
         })
     }
 
@@ -898,6 +1033,9 @@ impl ApiCallDetail {
         }
         if let Some(host) = self.redirect_host {
             let _ = write!(line, " redirect_host={host}");
+        }
+        if let Some(decode) = self.decode {
+            let _ = write!(line, " decode={}", decode.describe());
         }
         if let Some(description) = self.dsm_description {
             let _ = write!(line, " detail=\"{description}\"");
@@ -2073,6 +2211,15 @@ mod tests {
         call.elapsed_ms = 79;
         call.retry_backoff_ms = Some(500);
         call.redirect_host = Some(BoundedText::sanitized("relay.example.test"));
+        call.decode = Some(DecodeFault {
+            kind: DecodeFaultKind::TypeMismatch,
+            path: BoundedText::sanitized("data.files.0.additional.time.mtime"),
+            field: ShortToken::sanitized("mtime"),
+            expected: ShortToken::sanitized("i64"),
+            found: JsonKind::String,
+            line: 1,
+            column: 212,
+        });
         (
             BUILD,
             call,
@@ -2176,6 +2323,16 @@ mod tests {
             "response_bytes",
             "retry_backoff_ms",
             "redirect_host",
+            // Decode fault. A classification, a dotted member path built from keys and indices,
+            // the member name, the deserializer's own expectation, and a JSON type. No value.
+            "decode",
+            "kind",
+            "path",
+            "field",
+            "expected",
+            "found",
+            "line",
+            "column",
             // Described cookies. Names, a salted digest, and attribute presence; no value.
             "cookies",
             "described",

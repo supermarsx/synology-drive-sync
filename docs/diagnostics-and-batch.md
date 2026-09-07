@@ -185,6 +185,14 @@ so each pays a full DNS, TCP, and TLS cost — and reports connect-to-first-byte
 total. Sample counts are 3 TCP / 2 HTTP at Quick, 5 / 3 at Standard, and 9 / 5 at Extensive, each
 under a total time ceiling.
 
+The probe walks the same CGI ladder API discovery does: `entry.cgi` first, and `query.cgi` only if
+the first answers with an HTTP error status. The route that answered is named in the report, along
+with the per-sample ceiling the timings were taken under — 5 s at Quick, 8 s at Standard, 12 s at
+Extensive. The ceiling is generous because a QuickConnect relay answers this same request in around
+four seconds: a probe that gave up sooner reported "no HTTP sample completed" for hosts the rest of
+the run then authenticated against successfully. When a sample is abandoned at that ceiling the
+report says so explicitly, and distinguishes it from a request the path refused.
+
 The TLS handshake is **not** separately measurable through the blocking HTTP client, and the report
 says so rather than inventing a split. The figure it does publish, "TLS handshake plus DSM service
 time", is the median first byte minus the median TCP connect, and is labelled as a derived
@@ -265,20 +273,38 @@ DSM accepts a session through several channels at once, and this client presents
 `Cookie: id=<sid>`. When DSM rejects a session, the report cannot say which channel it rejected --
 unless it varies them.
 
-**DSM session channel ablation** (step 7) makes the same read-only `list_share` request four times,
+**DSM session channel ablation** (step 7) makes the same read-only `list_share` request five times,
 varying only which channels carry the session: all of them first, so the probe reproduces the run's
 own behaviour before changing anything, then the `_sid` field alone, the cookie alone, and the
-`X-SYNO-TOKEN` header alone. The last variant carries no session identifier at all and is expected
-to be rejected; it is the control that proves the probe can tell acceptance from rejection.
+`X-SYNO-TOKEN` header alone. That fourth variant carries no session identifier at all and is
+expected to be rejected; it is the control that proves the probe can tell acceptance from rejection.
+
+The fifth variant is the only one that varies how the session was *created* rather than how it is
+presented. It performs a second login **without** `enable_syno_token` -- the flag that asks DSM for
+the browser-style, cookie-and-header session -- and offers the resulting session through the
+documented `_sid` request field alone. It runs at Extensive only, is skipped when the account
+requires a one-time code (replaying the code the first login consumed is not something a read-only
+diagnostic may do), and its session is logged out as soon as the variant has answered. A variant
+that did not run is reported as `"ran": false` with a reason, never as a rejection.
+
+It is measured **after the run's own session has been logged out**, not at step 7 with the others,
+and its verdict is folded back into this section afterwards. Both this client's logins and its
+logouts name `session=FileStation`; DSM binds one session per account and session name and answers
+a collision with `107`, "session interrupted by duplicate login". Taking the second login while the
+primary session is live could therefore invalidate it and abort every section after step 7 --
+a diagnostic manufacturing the symptom it was asked to explain. Deferring it removes the hazard by
+construction: there is no session left to interrupt. Its request numbers in the block are
+consequently higher than the other four variants'.
 
 The verdicts are:
 
-| All channels | `_sid` field alone | Verdict |
-| --- | --- | --- |
-| accepted | accepted | Channel selection is not the fault. |
-| **rejected** | **accepted** | **Fail.** The extra channels are what DSM rejects. Logging in with `format=sid` is documented as "cookie will not be set", so the synthesised cookie asks DSM to resolve a session it never issued. |
-| accepted | rejected | DSM is resolving the session from the cookie rather than from the field its own guide specifies for a `format=sid` login. |
-| rejected | rejected | The session identifier itself is no longer valid server-side; not a channel problem. |
+| All channels | `_sid` field alone | Cookie alone | Verdict |
+| --- | --- | --- | --- |
+| accepted | accepted | either | Channel selection is not the fault. |
+| **rejected** | **accepted** | either | **Fail.** The extra channels are what DSM rejects. Logging in with `format=sid` is documented as "cookie will not be set", so the synthesised cookie asks DSM to resolve a session it never issued. |
+| accepted | rejected | accepted | DSM is resolving the session from the cookie rather than from the field its own guide specifies for a `format=sid` login. |
+| accepted | rejected | rejected | Only the *combination* is accepted: DSM requires the `id` cookie and the `X-SYNO-TOKEN` header together and refuses the request-parameter path its guide describes. Keep sending both channels -- dropping either is what would break such a NAS. If the tokenless variant ran and was accepted, a guide-conformant configuration exists and the report says so. |
+| rejected | rejected | rejected | The session identifier itself is no longer valid server-side; not a channel problem. |
 
 The probe deliberately does **not** stop on 106/107/119. Those codes are the observation it exists
 to make, and aborting on the first one would tell the operator nothing. It varies only which

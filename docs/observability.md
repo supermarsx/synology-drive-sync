@@ -203,7 +203,13 @@ Specifically:
   first `=` — so a rotated session identifier is never representable; `Location` is reduced to a
   **host**;
 - response bodies are reduced to a byte count and the DSM error code, and the existing
-  withheld-response-body rule for authenticated APIs is unchanged.
+  withheld-response-body rule for authenticated APIs is unchanged;
+- a call whose outcome is `decode` carries a `decode` object describing the disagreement in schema
+  terms only: a classification (`missing-field`, `type-mismatch`, …), a dotted member path built
+  from the object keys and array indices walked to reach it (`data.files.0.name`), the member name
+  the deserializer named, the deserializer's own description of what it wanted, and the JSON
+  **type** it found. serde's own message is not forwarded, because `invalid type: string "…"`
+  quotes the value it rejected.
 
 > **`--log-level debug` with `--remote-log-url` discloses the NAS hostname.** The
 > `connection.established` record contains the endpoint host and port, and `api_call.*` records
@@ -322,7 +328,8 @@ requests is marked `derived`.
 
 The same document also carries `capabilities` (what DSM advertises, folded into the three tiers the
 report prints, plus the requirement matrix), `session_channels` (one record per ablation variant:
-the channels it presented, the outcome, the DSM code, and the latency), `session_concurrency` (the
+the channels it presented, the outcome, the DSM code, the latency, and whether the variant `ran` at
+all with a compile-time `skipped_reason` when it did not), `session_concurrency` (the
 fan-out counts and whether the sequential follow-up survived), `capability_diagnosis` (the
 per-capability verdicts, the File Station host identity, and whether the host name changed mid-run),
 and `path_resolution` (the destination walked one component at a time). No session identifier,

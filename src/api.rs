@@ -27,8 +27,9 @@ use crate::local::{EntryKind, LocalEntry};
 // wire, and the binary decides what that is worth logging.
 use crate::observability::{
     ApiCallDetail, BoundedText, CdnMarker, CertificateVerification, ConnectionDetail, CookieFact,
-    CookieFacts, CookiePersistence, CookieSameSite, IntermediaryFacts, LoginFormat, RequestOutcome,
-    RequestTransport, SessionShape, SessionTransport, ShortToken, UrlScheme,
+    CookieFacts, CookiePersistence, CookieSameSite, DecodeFault, DecodeFaultKind,
+    IntermediaryFacts, JsonKind, LoginFormat, RequestOutcome, RequestTransport, SessionShape,
+    SessionTransport, ShortToken, UrlScheme,
 };
 use crate::path::{RemoteRoot, parent_and_name};
 use crate::{Error, Result};
@@ -242,6 +243,26 @@ pub struct DiagnosticRemoteInventory {
     pub deadline_ms: u64,
 }
 
+impl DiagnosticRemoteInventory {
+    /// The verdict for a destination File Station says is not there.
+    ///
+    /// Named once because DSM reports a missing path two ways -- as an envelope error and as a
+    /// per-entry status -- and both have to reach the same answer.
+    fn absent_root() -> Self {
+        Self {
+            root_exists: false,
+            total_entries: 0,
+            sample: Vec::new(),
+            truncated: false,
+            truncated_count: 0,
+            truncated_reason: None,
+            pages_requested: 0,
+            traversal_depth: 0,
+            deadline_ms: duration_millis_saturating(DIAGNOSTIC_INVENTORY_TIMEOUT),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DestinationWriteCheck {
     /// The existing directory whose child-create permission was checked.
@@ -372,7 +393,7 @@ pub const API_REQUIREMENTS: &[ApiRequirement] = &[
 ];
 
 /// How many session-channel variants the ablation probe runs.
-pub const SESSION_CHANNEL_VARIANTS: usize = 4;
+pub const SESSION_CHANNEL_VARIANTS: usize = 5;
 
 /// Which channels carry the DSM session on one request.
 ///
@@ -390,6 +411,15 @@ pub enum SessionChannels {
     CookieOnly,
     /// Only the `X-SYNO-TOKEN` header, with no session identifier at all.
     TokenHeaderOnly,
+    /// Only the documented `_sid` request field, from a session established *without*
+    /// `enable_syno_token`.
+    ///
+    /// The other four vary how one session is presented. This one varies how the session was
+    /// created, because that is the other half of the hypothesis: logging in with
+    /// `enable_syno_token=yes` asks DSM for browser-style cookie-and-header authentication, and a
+    /// DSM that then refuses the documented `_sid` parameter path may be refusing it *for that
+    /// session* rather than in general. A login without the flag settles which.
+    SidFieldOnlyTokenlessLogin,
 }
 
 impl SessionChannels {
@@ -400,6 +430,7 @@ impl SessionChannels {
         Self::SidFieldOnly,
         Self::CookieOnly,
         Self::TokenHeaderOnly,
+        Self::SidFieldOnlyTokenlessLogin,
     ];
 
     #[must_use]
@@ -414,12 +445,21 @@ impl SessionChannels {
 
     #[must_use]
     pub fn sends_sid_field(self) -> bool {
-        matches!(self, Self::All | Self::SidFieldOnly)
+        matches!(
+            self,
+            Self::All | Self::SidFieldOnly | Self::SidFieldOnlyTokenlessLogin
+        )
     }
 
     #[must_use]
     pub fn sends_token_field(self) -> bool {
         matches!(self, Self::All | Self::SidFieldOnly)
+    }
+
+    /// Whether the variant needs a session established separately from the run's own.
+    #[must_use]
+    pub fn needs_tokenless_login(self) -> bool {
+        self == Self::SidFieldOnlyTokenlessLogin
     }
 
     #[must_use]
@@ -429,6 +469,7 @@ impl SessionChannels {
             Self::SidFieldOnly => "sid-field-only",
             Self::CookieOnly => "cookie-only",
             Self::TokenHeaderOnly => "token-header-only",
+            Self::SidFieldOnlyTokenlessLogin => "sid-field-only-tokenless-login",
         }
     }
 
@@ -440,6 +481,7 @@ impl SessionChannels {
             Self::SidFieldOnly => "sid-field + token-field",
             Self::CookieOnly => "cookie only",
             Self::TokenHeaderOnly => "token-header only",
+            Self::SidFieldOnlyTokenlessLogin => "sid-field only, second login without SynoToken",
         }
     }
 }
@@ -452,6 +494,12 @@ pub struct ChannelProbe {
     pub dsm_code: Option<i64>,
     pub http_status: Option<u16>,
     pub elapsed_ms: u64,
+    /// Why this variant was not attempted, when it was not.
+    ///
+    /// A compile-time string, so no runtime text reaches the report through it. A variant that
+    /// did not run is not evidence of anything, and reading it as a rejection would put a finding
+    /// in the verdict that nothing observed.
+    pub skipped: Option<&'static str>,
 }
 
 impl ChannelProbe {
@@ -464,7 +512,23 @@ impl ChannelProbe {
             dsm_code: None,
             http_status: None,
             elapsed_ms: 0,
+            skipped: None,
         }
+    }
+
+    /// A variant that was deliberately not attempted, and the reason.
+    #[must_use]
+    pub fn skipped(channels: SessionChannels, reason: &'static str) -> Self {
+        Self {
+            skipped: Some(reason),
+            ..Self::unrun(channels)
+        }
+    }
+
+    /// Whether this variant produced an observation at all.
+    #[must_use]
+    pub fn ran(self) -> bool {
+        self.skipped.is_none()
     }
 
     #[must_use]
@@ -510,11 +574,14 @@ pub struct CapabilityProbe {
 /// The two text fields are sanitized and bounded on the way in: `hostname` is DSM's own name for
 /// the host that served the request, and `support_virtual_protocol` is a comma-separated list of
 /// VFS types. Neither is a secret, and neither is trusted as free-form terminal output.
+/// Each flag is an `Option` because "DSM did not say" and "DSM said no" are different answers,
+/// and a capability report that renders the first as the second is worse than one that admits it
+/// does not know.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FileStationInfo {
     pub hostname: Option<BoundedText>,
-    pub is_manager: bool,
-    pub support_sharing: bool,
+    pub is_manager: Option<bool>,
+    pub support_sharing: Option<bool>,
     pub support_virtual_protocol: Option<BoundedText>,
 }
 
@@ -700,6 +767,8 @@ struct ResponseFacts {
     /// The host of a `Location` target, when the response redirected. Host only.
     redirect_host: Option<BoundedText>,
     response_bytes: u64,
+    /// Why the body would not deserialize, in schema terms. Set only on a decode failure.
+    decode: Option<DecodeFault>,
 }
 
 impl ApiClient {
@@ -1291,6 +1360,35 @@ impl ApiClient {
     }
 
     pub fn login(&mut self, username: &str, password: &str, otp: Option<&str>) -> Result<()> {
+        self.login_negotiating_syno_token(username, password, otp, true)
+    }
+
+    /// Log in without asking DSM for a `SynoToken`.
+    ///
+    /// `enable_syno_token=yes` is what turns a login into the browser-style, cookie-and-header
+    /// session DSM's own web UI uses, and a session created that way may be one DSM will not
+    /// resolve from the `_sid` request parameter its guide documents. Establishing a second
+    /// session without the flag is the only way to tell "this DSM rejects the parameter path"
+    /// from "this DSM rejects the parameter path *for token-bound sessions*".
+    ///
+    /// Diagnostic use only. The session this produces has no `SynoToken`, so it cannot carry the
+    /// header channel, and the caller is responsible for logging it out.
+    pub fn login_without_syno_token(
+        &mut self,
+        username: &str,
+        password: &str,
+        otp: Option<&str>,
+    ) -> Result<()> {
+        self.login_negotiating_syno_token(username, password, otp, false)
+    }
+
+    fn login_negotiating_syno_token(
+        &mut self,
+        username: &str,
+        password: &str,
+        otp: Option<&str>,
+        enable_syno_token: bool,
+    ) -> Result<()> {
         // A failed re-login must never leave an older session usable.
         self.session = None;
         let spec = self.required_spec("SYNO.API.Auth")?;
@@ -1313,7 +1411,7 @@ impl ApiClient {
             pair("session", "FileStation"),
             pair("format", "sid"),
         ];
-        if auth_version >= 6 {
+        if auth_version >= 6 && enable_syno_token {
             fields.push(pair("enable_syno_token", "yes"));
         }
         if let Some(code) = otp {
@@ -1537,6 +1635,7 @@ impl ApiClient {
             let prefix = format!("{parent}/");
             let mut output = Vec::new();
             for item in data.files {
+                let item = item.into_item("SYNO.FileStation.List", "list")?;
                 if !item.isdir
                     || item.disable_list
                     || permission_disables_listing(item.additional.as_ref())
@@ -2163,17 +2262,7 @@ impl ApiClient {
                 });
             }
             Err(error) if error.api_code() == Some(408) => {
-                return Ok(DiagnosticRemoteInventory {
-                    root_exists: false,
-                    total_entries: 0,
-                    sample: Vec::new(),
-                    truncated: false,
-                    truncated_count: 0,
-                    truncated_reason: None,
-                    pages_requested: 0,
-                    traversal_depth: 0,
-                    deadline_ms: duration_millis_saturating(DIAGNOSTIC_INVENTORY_TIMEOUT),
-                });
+                return Ok(DiagnosticRemoteInventory::absent_root());
             }
             Err(error) => return Err(error),
         };
@@ -2183,7 +2272,21 @@ impl ApiClient {
                 message: "target diagnostic expected exactly one path result".to_owned(),
             });
         }
-        let root_item = info.files.pop().expect("length checked");
+        // File Station reports a missing path per entry as readily as it does at the envelope
+        // level, so the same `408` has to be recognised in both places or the destination check
+        // reports a malformed response where it means "that directory is not there".
+        let root_item = match info
+            .files
+            .pop()
+            .expect("length checked")
+            .into_item("SYNO.FileStation.List", "getinfo")
+        {
+            Ok(item) => item,
+            Err(error) if error.api_code() == Some(408) => {
+                return Ok(DiagnosticRemoteInventory::absent_root());
+            }
+            Err(error) => return Err(error),
+        };
         if root_item.path != root.as_str() || !root_item.isdir {
             return Err(Error::InvalidResponse {
                 operation: "SYNO.FileStation.List.getinfo".to_owned(),
@@ -2213,7 +2316,7 @@ impl ApiClient {
                 json_array(["size", "time", "mount_point_type"])?,
             ),
         ];
-        let mut data: ListData = self
+        let data: ListData = self
             .call_bounded("SYNO.FileStation.List", 2, "list", parameters, remaining()?)?
             .ok_or_else(|| Error::InvalidResponse {
                 operation: "SYNO.FileStation.List.list".to_owned(),
@@ -2226,14 +2329,19 @@ impl ApiClient {
             });
         }
 
-        data.files.sort_by(|left, right| {
+        let mut files = data
+            .files
+            .into_iter()
+            .map(|item| item.into_item("SYNO.FileStation.List", "list"))
+            .collect::<Result<Vec<_>>>()?;
+        files.sort_by(|left, right| {
             left.name
                 .cmp(&right.name)
                 .then_with(|| left.path.cmp(&right.path))
         });
-        let mut validated = Vec::with_capacity(data.files.len());
+        let mut validated = Vec::with_capacity(files.len());
         let mut observed_paths = BTreeSet::new();
-        for item in data.files {
+        for item in files {
             let (actual_parent, actual_name) = parent_and_name(&item.path)?;
             if actual_parent != root.as_str()
                 || actual_name != item.name
@@ -2457,7 +2565,8 @@ impl ApiClient {
             })
     }
 
-    /// Present the same read-only request four times, varying only how the session is carried.
+    /// Present the same read-only request once per variant, varying only how the session is
+    /// carried.
     ///
     /// This is the one measurement that separates "the session is rejected because of how this
     /// client presents it" from "the session is rejected because the path does not carry it".
@@ -2467,15 +2576,35 @@ impl ApiClient {
     ///
     /// The variants run in a fixed order with [`SessionChannels::All`] first, so the probe
     /// reproduces the run's own behaviour before it starts changing anything.
-    pub fn probe_session_channels(&self) -> Result<[ChannelProbe; SESSION_CHANNEL_VARIANTS]> {
+    /// The variant that needs its own session is left for [`Self::probe_tokenless_sid_field`],
+    /// which the caller runs against a separately established client: this method has one session
+    /// and cannot make another without the password, which it deliberately never sees.
+    pub fn probe_session_channels(
+        &self,
+        tokenless_unavailable: &'static str,
+    ) -> Result<[ChannelProbe; SESSION_CHANNEL_VARIANTS]> {
         self.required_session()?;
         self.validate_api("SYNO.FileStation.List", 2)?;
         let mut probes = [ChannelProbe::unrun(SessionChannels::All); SESSION_CHANNEL_VARIANTS];
         for (slot, channels) in SessionChannels::ABLATION_ORDER.iter().enumerate() {
             self.cancellation.check()?;
-            probes[slot] = self.probe_one_session_channel(*channels)?;
+            probes[slot] = if channels.needs_tokenless_login() {
+                ChannelProbe::skipped(*channels, tokenless_unavailable)
+            } else {
+                self.probe_one_session_channel(*channels)?
+            };
         }
         Ok(probes)
+    }
+
+    /// The documented `_sid` request field alone, against this client's own session.
+    ///
+    /// Meant to be called on a client whose session was established by
+    /// [`Self::login_without_syno_token`]; nothing here enforces that, because the point of the
+    /// variant is what DSM answers rather than what the client believes it holds.
+    pub fn probe_tokenless_sid_field(&self) -> Result<ChannelProbe> {
+        self.validate_api("SYNO.FileStation.List", 2)?;
+        self.probe_one_session_channel(SessionChannels::SidFieldOnlyTokenlessLogin)
     }
 
     /// One ablation variant: build the request by hand so the channel is explicit.
@@ -2552,6 +2681,7 @@ impl ApiClient {
             dsm_code: record.dsm_code,
             http_status: record.http_status,
             elapsed_ms: record.elapsed_ms,
+            skipped: None,
         })
     }
 
@@ -2597,6 +2727,15 @@ impl ApiClient {
                 operation: "SYNO.FileStation.Info.get".to_owned(),
                 message: "successful response contained no File Station information".to_owned(),
             })?;
+        let protocols = info
+            .support_virtual_protocol
+            .as_ref()
+            .and_then(virtual_protocol_text)
+            .or_else(|| {
+                info.support_virtual
+                    .as_ref()
+                    .and_then(virtual_protocol_text)
+            });
         Ok(FileStationInfo {
             hostname: info
                 .hostname
@@ -2604,8 +2743,7 @@ impl ApiClient {
                 .map(|hostname| BoundedText::sanitized(&hostname)),
             is_manager: info.is_manager,
             support_sharing: info.support_sharing,
-            support_virtual_protocol: info
-                .support_virtual_protocol
+            support_virtual_protocol: protocols
                 .filter(|protocols| !protocols.is_empty())
                 .map(|protocols| BoundedText::sanitized(&protocols)),
         })
@@ -2953,7 +3091,7 @@ impl ApiClient {
         &self,
         folder: &str,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<RemoteItemWire>> {
+    ) -> Result<Vec<RemoteItem>> {
         let mut offset = 0_usize;
         let mut output = Vec::new();
         loop {
@@ -2977,7 +3115,9 @@ impl ApiClient {
                     message: "successful response contained no directory data".to_owned(),
                 })?;
             let count = data.files.len();
-            output.extend(data.files);
+            for item in data.files {
+                output.push(item.into_item("SYNO.FileStation.List", "list")?);
+            }
             offset += count;
             if offset >= data.total {
                 break;
@@ -2995,11 +3135,11 @@ impl ApiClient {
         Ok(output)
     }
 
-    fn get_info(&self, path: &str) -> Result<RemoteItemWire> {
+    fn get_info(&self, path: &str) -> Result<RemoteItem> {
         self.get_info_with_retry(path, true)
     }
 
-    fn get_info_with_retry(&self, path: &str, allow_retry: bool) -> Result<RemoteItemWire> {
+    fn get_info_with_retry(&self, path: &str, allow_retry: bool) -> Result<RemoteItem> {
         let parameters = vec![
             pair("path", json_array([path])?),
             pair(
@@ -3038,7 +3178,9 @@ impl ApiClient {
                 ),
             });
         }
-        Ok(item)
+        // The path is checked before the per-entry status is raised, so a `408` is never
+        // attributed to a path other than the one that was asked about.
+        item.into_item("SYNO.FileStation.List", "getinfo")
     }
 
     fn call<T: DeserializeOwned>(
@@ -3357,19 +3499,48 @@ struct LoginData {
 
 /// `SYNO.FileStation.Info` version 2 `get`.
 ///
-/// Every field is optional. Synology's own guide is inconsistent between its prose
-/// (`support_virtual_protocol`) and its worked example (`support_virtual`), so both spellings are
-/// accepted rather than one of them being guessed at.
+/// Every member is optional, and the two virtual-protocol members are read as raw JSON, because
+/// DSM 7 does not answer in the shape the guide documents. The guide describes
+/// `support_virtual_protocol` as a comma-separated *string* and its worked example spells the
+/// same idea `support_virtual`; a DSM 7.2 host answers with a JSON *array* under the documented
+/// name and an unrelated *object* of mount toggles under the example's name. Reading either as a
+/// `String` -- and reading both through one serde alias, as this once did -- fails on every real
+/// DSM 7, which is what made a capability probe report `decode` against a healthy NAS.
 #[derive(Debug, Deserialize)]
 struct FileStationInfoWire {
     #[serde(default)]
     hostname: Option<String>,
     #[serde(default)]
-    is_manager: bool,
+    is_manager: Option<bool>,
     #[serde(default)]
-    support_sharing: bool,
-    #[serde(default, alias = "support_virtual")]
-    support_virtual_protocol: Option<String>,
+    support_sharing: Option<bool>,
+    #[serde(default)]
+    support_virtual_protocol: Option<Value>,
+    /// The guide's worked-example spelling. Consulted only when it carries protocol names, which
+    /// on DSM 7 it does not: there it is an object describing which mounts the account may make.
+    #[serde(default)]
+    support_virtual: Option<Value>,
+}
+
+/// The virtual-protocol list as text, in whichever of DSM's shapes it arrives.
+///
+/// A string is passed through, an array of strings is joined the way the guide's prose says the
+/// value looks, and anything else -- DSM 7's `support_virtual` object, a number, a null -- is
+/// reported as "not stated" rather than guessed at.
+fn virtual_protocol_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(items) => {
+            let names: Vec<&str> = items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .collect();
+            (!names.is_empty()).then(|| names.join(","))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -3424,12 +3595,78 @@ struct TaskStatusData {
 #[derive(Debug, Deserialize)]
 struct RemoteItemWire {
     path: String,
-    name: String,
-    isdir: bool,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    isdir: Option<bool>,
+    /// File Station's per-entry status for this path.
+    ///
+    /// `getinfo` answers each requested path independently, so an envelope that succeeded can
+    /// still report `408` for a path that does not exist -- and such an entry carries neither a
+    /// `name` nor an `isdir`. Requiring those two members turned "the path is not there", which
+    /// is the answer the write probe is asking for, into an undiagnosable decode failure.
+    #[serde(default)]
+    code: Option<i64>,
     #[serde(default)]
     disable_list: bool,
     #[serde(default)]
     additional: Option<RemoteAdditionalWire>,
+}
+
+/// One File Station entry whose shape has been checked, so the rest of the client need not.
+///
+/// Separate from [`RemoteItemWire`] on purpose: the wire type tolerates everything DSM sends and
+/// this one holds only entries that actually describe a file or folder. Anything else has already
+/// been turned into the DSM error it is.
+#[derive(Debug)]
+struct RemoteItem {
+    path: String,
+    name: String,
+    isdir: bool,
+    disable_list: bool,
+    additional: Option<RemoteAdditionalWire>,
+}
+
+impl RemoteItemWire {
+    /// Validate one entry, turning a per-entry status into the DSM error it stands for.
+    ///
+    /// A non-zero `code` becomes [`Error::Api`], so the `408` handling every caller already has
+    /// keeps working whether DSM reports a missing path at the envelope level or per entry. Only
+    /// after that is a missing `name` or `isdir` treated as a malformed response, because for an
+    /// entry DSM is describing rather than rejecting, those two are the entry.
+    fn into_item(self, api: &'static str, method: &'static str) -> Result<RemoteItem> {
+        if let Some(code) = self.code.filter(|code| *code != 0) {
+            return Err(Error::Api {
+                api: api.to_owned(),
+                operation: method.to_owned(),
+                code,
+                description: api_error_description(api, code)
+                    .map(|description| format!(": {description}"))
+                    .unwrap_or_default(),
+                // The per-entry status is a code, not a payload; there is nothing else to carry.
+                details: Vec::new(),
+            });
+        }
+        let missing = match (&self.name, self.isdir) {
+            (Some(_), Some(_)) => None,
+            (None, Some(_)) => Some("name"),
+            (Some(_), None) => Some("isdir"),
+            (None, None) => Some("name or isdir"),
+        };
+        if let Some(missing) = missing {
+            return Err(Error::InvalidResponse {
+                operation: format!("{api}.{method}"),
+                message: format!("entry described no {missing}"),
+            });
+        }
+        Ok(RemoteItem {
+            path: self.path,
+            name: self.name.expect("name presence checked"),
+            isdir: self.isdir.expect("isdir presence checked"),
+            disable_list: self.disable_list,
+            additional: self.additional,
+        })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3481,9 +3718,16 @@ fn permission_disables_listing(additional: Option<&RemoteAdditionalWire>) -> boo
         })
 }
 
+/// The `time` member of a `<file additional>` object.
+///
+/// `mtime` is optional because the object carries four timestamps and DSM is free to answer with
+/// any subset of them. A caller that needs a modification time says so through [`file_metadata`],
+/// which fails with a message naming what was missing rather than with a decode failure naming
+/// nothing.
 #[derive(Debug, Deserialize)]
 struct RemoteTimeWire {
-    mtime: i64,
+    #[serde(default)]
+    mtime: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3574,8 +3818,15 @@ async fn download_content_fingerprint(
     if content_type.starts_with("application/json") {
         let body =
             read_download_json_body(&mut response, deadline, cancellation, remote_path).await?;
-        let decoded =
-            decode_response_body::<Value>(status, &body, "SYNO.FileStation.Download", "download");
+        // The download path has no `ApiCallDetail` to attach a fault to: this JSON body is a DSM
+        // error standing in for file content, and the error it raises is what the caller sees.
+        let decoded = decode_response_body::<Value>(
+            status,
+            &body,
+            "SYNO.FileStation.Download",
+            "download",
+            &mut None,
+        );
         return match decoded {
             Err(error) => Err(error),
             Ok(_) => Err(Error::InvalidResponse {
@@ -3699,7 +3950,7 @@ fn file_metadata(
     additional: &RemoteAdditionalWire,
 ) -> Result<(u64, i64)> {
     let size = additional.size;
-    let mtime_seconds = additional.time.as_ref().map(|time| time.mtime);
+    let mtime_seconds = additional.time.as_ref().and_then(|time| time.mtime);
     if kind == EntryKind::Directory {
         return Ok((size.unwrap_or(0), mtime_seconds.unwrap_or(0)));
     }
@@ -3724,6 +3975,252 @@ fn bounded_diagnostic_text(value: &str, maximum_chars: usize) -> (String, bool) 
 
 fn duration_millis_saturating(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Decode diagnosis
+// ---------------------------------------------------------------------------------------------
+
+/// Describe a failed deserialization in schema terms, without repeating any response content.
+///
+/// serde's own message cannot be forwarded: `invalid type: string "…"` quotes the value it
+/// rejected, and a DSM response body can carry a session identifier. Only four things are kept --
+/// the classification, the member name serde named, serde's own description of what it wanted,
+/// and the JSON *type* it found -- and the reported position is turned into a dotted member path
+/// by walking the body's structure rather than by copying any part of it.
+fn decode_fault(body: &[u8], error: &serde_json::Error) -> DecodeFault {
+    let message = error.to_string();
+    let (kind, field) = classify_decode_message(&message, error);
+    let (container, member) = json_member_paths(body, error.line(), error.column());
+    // A named member is described where it *should have been*, which for a missing or duplicated
+    // one is inside its container rather than at the position the parser stopped at.
+    let path = match kind {
+        DecodeFaultKind::MissingField
+        | DecodeFaultKind::UnknownField
+        | DecodeFaultKind::DuplicateField => match (container.is_empty(), field.is_empty()) {
+            (_, true) => container,
+            (true, false) => field.clone(),
+            (false, false) => format!("{container}.{field}"),
+        },
+        _ => member,
+    };
+    DecodeFault {
+        kind,
+        path: BoundedText::sanitized(&path),
+        field: ShortToken::sanitized(&field),
+        expected: ShortToken::sanitized(&expected_description(&message)),
+        found: found_json_kind(&message, kind),
+        line: u32::try_from(error.line()).unwrap_or(u32::MAX),
+        column: u32::try_from(error.column()).unwrap_or(u32::MAX),
+    }
+}
+
+/// Classify serde's message, and recover the member name it names.
+///
+/// Matching on the message text is deliberate: `serde_json::Error` exposes only a coarse
+/// [`serde_json::error::Category`], and the difference between "the member is missing" and "the
+/// member is the wrong type" is the whole value of this diagnostic. The category still decides
+/// every case the message does not name, so an unrecognised message degrades to a coarse but
+/// truthful classification rather than to a wrong one.
+fn classify_decode_message(message: &str, error: &serde_json::Error) -> (DecodeFaultKind, String) {
+    for (prefix, kind) in [
+        ("missing field ", DecodeFaultKind::MissingField),
+        ("unknown field ", DecodeFaultKind::UnknownField),
+        ("duplicate field ", DecodeFaultKind::DuplicateField),
+    ] {
+        if let Some(rest) = message.strip_prefix(prefix) {
+            return (kind, backtick_quoted(rest).unwrap_or_default());
+        }
+    }
+    if message.starts_with("invalid type:")
+        || message.starts_with("invalid value:")
+        || message.starts_with("invalid length")
+    {
+        return (DecodeFaultKind::TypeMismatch, String::new());
+    }
+    let kind = match error.classify() {
+        serde_json::error::Category::Syntax => DecodeFaultKind::Syntax,
+        serde_json::error::Category::Eof => DecodeFaultKind::UnexpectedEnd,
+        serde_json::error::Category::Data | serde_json::error::Category::Io => {
+            DecodeFaultKind::Unspecified
+        }
+    };
+    (kind, String::new())
+}
+
+/// The text between the first pair of backticks, which is how serde quotes a member name.
+fn backtick_quoted(text: &str) -> Option<String> {
+    let rest = text.strip_prefix('`')?;
+    let end = rest.find('`')?;
+    Some(rest[..end].to_owned())
+}
+
+/// Serde's own `expected` description, which comes from a `Visitor::expecting` implementation
+/// and so is derived from the client's schema rather than from the server's bytes.
+fn expected_description(message: &str) -> String {
+    let Some(rest) = message.split(", expected ").nth(1) else {
+        return String::new();
+    };
+    let end = rest.find(" at line ").unwrap_or(rest.len());
+    rest[..end].trim().to_owned()
+}
+
+/// The JSON type serde named as *found*, taken from the type word alone.
+///
+/// `invalid type: string "abcdef"` yields [`JsonKind::String`] and nothing else: the word before
+/// the value is the only part of that message this reads.
+fn found_json_kind(message: &str, kind: DecodeFaultKind) -> JsonKind {
+    if kind == DecodeFaultKind::MissingField {
+        return JsonKind::Absent;
+    }
+    let Some(rest) = message.strip_prefix("invalid type: ") else {
+        return JsonKind::Unknown;
+    };
+    let word = rest
+        .split([' ', ',', '`'])
+        .find(|word| !word.is_empty())
+        .unwrap_or_default();
+    match word {
+        "null" | "unit" => JsonKind::Null,
+        "boolean" => JsonKind::Bool,
+        "integer" | "floating" => JsonKind::Number,
+        "string" | "character" => JsonKind::String,
+        "sequence" => JsonKind::Array,
+        "map" => JsonKind::Object,
+        _ => JsonKind::Unknown,
+    }
+}
+
+/// The dotted paths of the member at a reported position, and of the container holding it.
+///
+/// Built by walking the body's structural bytes and keeping only object keys and array indices;
+/// no scalar value is ever read, and a string is consumed for its span rather than its contents
+/// unless it is in key position. Returns `(container, member)` so a caller can describe a member
+/// that is *missing* -- which has a container but no position of its own -- as well as one that
+/// is present under the wrong type.
+fn json_member_paths(body: &[u8], line: usize, column: usize) -> (String, String) {
+    enum Frame {
+        Object { key: String, expecting_key: bool },
+        Array { index: usize },
+    }
+
+    let target = decode_target_offset(body, line, column);
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut index = 0_usize;
+    while index < body.len() && index < target {
+        match body[index] {
+            b'"' => {
+                let (text, next) = scan_json_string(body, index);
+                if let Some(Frame::Object { key, expecting_key }) = stack.last_mut()
+                    && *expecting_key
+                {
+                    *key = text;
+                    *expecting_key = false;
+                }
+                index = next;
+            }
+            b'{' => {
+                stack.push(Frame::Object {
+                    key: String::new(),
+                    expecting_key: true,
+                });
+                index += 1;
+            }
+            b'[' => {
+                stack.push(Frame::Array { index: 0 });
+                index += 1;
+            }
+            b'}' | b']' => {
+                stack.pop();
+                index += 1;
+            }
+            b',' => {
+                match stack.last_mut() {
+                    Some(Frame::Object { key, expecting_key }) => {
+                        key.clear();
+                        *expecting_key = true;
+                    }
+                    Some(Frame::Array { index }) => *index += 1,
+                    None => {}
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+
+    let mut container = String::new();
+    let mut member = String::new();
+    for frame in &stack {
+        match frame {
+            Frame::Object { key, .. } => {
+                container = member.clone();
+                if !key.is_empty() {
+                    push_path_segment(&mut member, key);
+                }
+            }
+            Frame::Array { index } => {
+                container = member.clone();
+                push_path_segment(&mut member, &index.to_string());
+            }
+        }
+    }
+    (container, member)
+}
+
+/// Where in the body the reported position falls, backed up onto a structural byte.
+///
+/// serde reports the position it had reached, which for a structural disagreement is at or just
+/// past the bracket or brace that caused it. Stepping back onto that byte is what keeps a
+/// container on the walk's stack at the moment the walk stops, and so keeps `data.files` from
+/// reading as `data.files.0` merely because the parser had already consumed the `[`.
+fn decode_target_offset(body: &[u8], line: usize, column: usize) -> usize {
+    let mut offset = 0_usize;
+    let mut current_line = 1_usize;
+    while current_line < line && offset < body.len() {
+        if body[offset] == b'\n' {
+            current_line += 1;
+        }
+        offset += 1;
+    }
+    let mut target = offset
+        .saturating_add(column.saturating_sub(1))
+        .min(body.len());
+    if target > 0 && matches!(body[target - 1], b'{' | b'[' | b'}' | b']') {
+        target -= 1;
+    }
+    target
+}
+
+/// Consume one JSON string starting at `start`, returning its unescaped-enough text and the index
+/// just past its closing quote.
+///
+/// Escapes are honoured only far enough to find the end of the string and to keep a key readable:
+/// the text is used as a path segment and is sanitized before it reaches any record.
+fn scan_json_string(body: &[u8], start: usize) -> (String, usize) {
+    let mut text = String::new();
+    let mut index = start + 1;
+    while index < body.len() {
+        match body[index] {
+            b'"' => return (text, index + 1),
+            b'\\' => {
+                // The escaped byte cannot end the string, whatever it is.
+                index += 2;
+            }
+            byte => {
+                text.push(char::from(byte));
+                index += 1;
+            }
+        }
+    }
+    (text, body.len())
+}
+
+fn push_path_segment(path: &mut String, segment: &str) {
+    if !path.is_empty() {
+        path.push('.');
+    }
+    path.push_str(segment);
 }
 
 /// Decode a response and record the facts that stop being observable once the body is read.
@@ -3769,14 +4266,21 @@ fn decode_response_observed<T: DeserializeOwned>(
             message: "response exceeded the 32 MiB safety limit".to_owned(),
         });
     }
-    decode_response_body(status, &body, api, method)
+    decode_response_body(status, &body, api, method, &mut facts.decode)
 }
 
+/// Decode one DSM envelope, recording *why* it did not decode when it does not.
+///
+/// `fault` receives the schema-level description of a deserialization failure. It is separate
+/// from the returned error because [`Error::InvalidResponse`] is raised from a dozen places that
+/// have no serde error to describe, and because the record it feeds must stay `Copy` and free of
+/// response content.
 fn decode_response_body<T: DeserializeOwned>(
     status: StatusCode,
     body: &[u8],
     api: &str,
     method: &str,
+    fault: &mut Option<DecodeFault>,
 ) -> Result<Option<T>> {
     // API discovery is the only unauthenticated response decoded here. Every other API either
     // receives login material or an authenticated SID/SynoToken. Default to withholding those
@@ -3796,19 +4300,28 @@ fn decode_response_body<T: DeserializeOwned>(
     }
 
     let envelope: Envelope<T> = serde_json::from_slice(body).map_err(|error| {
-        let snippet = if withhold_response_body {
-            format!("[{}]", withheld_response_message(api))
-        } else {
-            response_snippet(body)
-        };
+        let diagnosis = decode_fault(body, &error);
+        *fault = Some(diagnosis);
         let route_hint = if looks_like_html(body) {
             " (the proxy returned HTML, so /webapi/* is probably routed to the File Station UI instead of WebAPI)"
         } else {
             ""
         };
+        // serde's own text quotes the value it rejected, so it is forwarded only for the one
+        // unauthenticated API whose body is already reportable. Everywhere else the schema-level
+        // diagnosis says the same thing about the *shape* without republishing the bytes.
+        let detail = if withhold_response_body {
+            format!(
+                "{}; response: [{}]",
+                diagnosis.describe(),
+                withheld_response_message(api)
+            )
+        } else {
+            format!("{error}; response: {}", response_snippet(body))
+        };
         Error::InvalidResponse {
             operation: format!("{api}.{method}"),
-            message: format!("expected a DSM JSON envelope: {error}; response: {snippet}{route_hint}"),
+            message: format!("expected a DSM JSON envelope: {detail}{route_hint}"),
         }
     })?;
     if envelope.success {
@@ -3924,24 +4437,26 @@ fn load_ca_certificate(path: &std::path::Path) -> Result<Certificate> {
     })
 }
 
-/// Longest a transport probe request may run before it is abandoned.
-///
-/// Far shorter than the control-request timeout, and deliberately so. The probe measures latency;
-/// it does not need the answer. An endpoint that has not produced a first byte in this long has
-/// already told the probe everything a longer wait would, and every second past that is a second
-/// added to a diagnostic an operator is watching.
-const PROBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
-
 /// A blocking client for transport probes, trusting exactly what the control client trusts.
 ///
 /// Connection reuse is switched off so every request this client makes pays for a fresh DNS
 /// lookup, TCP connect, and TLS handshake. That is the opposite of what the control client wants
 /// and precisely what a latency measurement needs: a pooled second request would report the cost
 /// of an already-open socket and hide the very variance the probe exists to find.
-pub(crate) fn probe_client(options: &ClientOptions) -> Result<HttpClient> {
+///
+/// `request_timeout` is the caller's ceiling, and it is *not* clamped to something small here.
+/// It once was -- four seconds -- and against a QuickConnect relay whose unauthenticated
+/// discovery request measurably takes 3.8 seconds, every probe sample timed out while the control
+/// client on the same host succeeded. A probe that gives up sooner than the client it is meant to
+/// explain reports a fault that does not exist; the budget's own ceiling bounds it instead.
+pub(crate) fn probe_client(
+    options: &ClientOptions,
+    request_timeout: Duration,
+) -> Result<HttpClient> {
+    let timeout = request_timeout.min(control_request_timeout(options.request_timeout));
     let mut builder = HttpClient::builder()
-        .connect_timeout(options.connect_timeout.min(PROBE_REQUEST_TIMEOUT))
-        .timeout(control_request_timeout(options.request_timeout).min(PROBE_REQUEST_TIMEOUT))
+        .connect_timeout(options.connect_timeout.min(timeout))
+        .timeout(timeout)
         .redirect(Policy::none())
         .pool_max_idle_per_host(0)
         .user_agent(concat!("synology-drive-sync/", env!("SDSYNC_VERSION")));
@@ -4209,6 +4724,7 @@ fn apply_response_facts(record: &mut ApiCallDetail, facts: ResponseFacts) {
     record.intermediary = facts.intermediary;
     record.redirect_host = facts.redirect_host;
     record.response_bytes = facts.response_bytes;
+    record.decode = facts.decode;
 }
 
 /// Fold a decoded result into the record that will be reported.
@@ -6913,7 +7429,7 @@ mod tests {
     fn file_metadata_fails_closed_for_files_and_defaults_only_for_directories() {
         let complete = RemoteAdditionalWire {
             size: Some(9),
-            time: Some(RemoteTimeWire { mtime: 13 }),
+            time: Some(RemoteTimeWire { mtime: Some(13) }),
             mount_point_type: None,
             perm: None,
         };
@@ -9432,6 +9948,240 @@ mod tests {
         }
     }
 
+    /// A decode failure has to explain itself, in schema terms and without republishing the body.
+    ///
+    /// The four bodies are the shapes that actually cost round trips against a live NAS. What is
+    /// pinned is the *member path*: `decode` on its own tells an operator only that something did
+    /// not match, and the path is what turns the next occurrence into a one-line diagnosis.
+    #[test]
+    fn a_decode_failure_names_the_member_its_type_and_never_the_value() {
+        #[derive(Debug, Deserialize)]
+        struct Info {
+            #[allow(dead_code)]
+            #[serde(default, alias = "support_virtual")]
+            support_virtual_protocol: Option<String>,
+        }
+        #[derive(Debug, Deserialize)]
+        struct Files {
+            #[allow(dead_code)]
+            files: Vec<Item>,
+        }
+        #[derive(Debug, Deserialize)]
+        struct Item {
+            #[allow(dead_code)]
+            path: String,
+            #[allow(dead_code)]
+            name: String,
+        }
+
+        // The DSM 7 `Info.get` body, against the schema this tool used to carry.
+        let dsm_seven_info = br#"{"data":{"hostname":"NAS","support_virtual":{"enable_iso_mount":true},"support_virtual_protocol":["cifs","nfs"]},"success":true}"#;
+        let error = serde_json::from_slice::<Envelope<Info>>(dsm_seven_info).unwrap_err();
+        let fault = decode_fault(dsm_seven_info, &error);
+        assert_eq!(fault.kind, DecodeFaultKind::TypeMismatch);
+        assert_eq!(fault.path.as_str(), "data.support_virtual");
+        assert_eq!(fault.found, JsonKind::Object);
+        assert_eq!(
+            fault.describe(),
+            "type-mismatch at data.support_virtual; expected a_string, found object"
+        );
+
+        // The same member when only the documented spelling is present, which is an array.
+        let array_form =
+            br#"{"data":{"support_virtual_protocol":["cifs","nfs"]},"success":true}"#.as_slice();
+        let error = serde_json::from_slice::<Envelope<Info>>(array_form).unwrap_err();
+        let fault = decode_fault(array_form, &error);
+        assert_eq!(fault.path.as_str(), "data.support_virtual_protocol");
+        assert_eq!(fault.found, JsonKind::Array);
+
+        // The `getinfo` per-entry status shape: the index is part of the path, so a body with
+        // several requested paths still names which one disagreed.
+        let per_entry = br#"{"data":{"files":[{"path":"/a","name":"a"},{"code":408,"isdir":false,"path":"/home/x"}]},"success":true}"#;
+        let error = serde_json::from_slice::<Envelope<Files>>(per_entry).unwrap_err();
+        let fault = decode_fault(per_entry, &error);
+        assert_eq!(fault.kind, DecodeFaultKind::MissingField);
+        assert_eq!(fault.path.as_str(), "data.files.1.name");
+        assert_eq!(fault.field.as_str(), "name");
+        assert_eq!(fault.found, JsonKind::Absent);
+
+        // A value of the wrong type is described by its type alone. The value here is the shape a
+        // session identifier would arrive in, and it must not appear anywhere in the diagnosis.
+        let secret_shaped =
+            br#"{"data":{"files":[{"path":"/a","name":"WQwvhBqfrOM4gPcQ"}]},"success":true}"#;
+        let error = serde_json::from_slice::<Envelope<Files>>(secret_shaped).unwrap();
+        assert!(error.success, "this body decodes; it is the control");
+        let mistyped =
+            br#"{"data":{"files":[{"path":"/a","name":9223372036854775807}]},"success":true}"#;
+        let error = serde_json::from_slice::<Envelope<Files>>(mistyped).unwrap_err();
+        let fault = decode_fault(mistyped, &error);
+        assert_eq!(fault.path.as_str(), "data.files.0.name");
+        assert_eq!(fault.found, JsonKind::Number);
+        let rendered = format!("{} {:?}", fault.describe(), fault);
+        for forbidden in ["9223372036854775807", "WQwvhBqfrOM4gPcQ", "/a"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "a decode diagnosis rendered response content: {rendered}"
+            );
+        }
+    }
+
+    /// The diagnosis has to reach the call record, or no operator will ever see it.
+    #[test]
+    fn a_decode_failure_reaches_the_recorded_call() {
+        let completed: Arc<Mutex<Vec<ApiCallDetail>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&completed);
+        let observer: RequestObserver = Arc::new(move |observation| {
+            if let ApiObservation::CallCompleted(call) = observation
+                && let Ok(mut sink) = sink.lock()
+            {
+                sink.push(call);
+            }
+        });
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            // `files` is an object where the client requires an array.
+            r#"{"success":true,"data":{"files":{"path":"/share/root"}}}"#.to_owned(),
+        ]);
+        let mut client = ApiClient::connect_observed(
+            &ClientOptions {
+                base_url: url,
+                allow_http: true,
+                accept_invalid_certs: false,
+                ca_certificate: None,
+                connect_timeout: Duration::from_secs(2),
+                request_timeout: Duration::from_secs(5),
+                retries: 0,
+            },
+            Some(observer),
+        )
+        .unwrap();
+        client.login("alice", "password", None).unwrap();
+        let error = client.get_info("/share/root").unwrap_err();
+        assert!(matches!(error, Error::InvalidResponse { .. }));
+        // The operator-facing message carries the schema diagnosis and withholds the body.
+        assert!(
+            error.to_string().contains("type-mismatch at data.files"),
+            "unexpected message: {error}"
+        );
+        assert!(error.to_string().contains("response body withheld"));
+
+        let calls = completed.lock().unwrap();
+        let record = calls
+            .iter()
+            .find(|call| call.method == "getinfo")
+            .expect("the failing call is recorded");
+        assert_eq!(record.outcome, RequestOutcome::Decode);
+        let fault = record.decode.expect("a decode outcome carries its reason");
+        assert_eq!(fault.path.as_str(), "data.files");
+        assert_eq!(fault.found, JsonKind::Object);
+        drop(calls);
+        server.join().unwrap();
+    }
+
+    /// The absence check must read File Station's *per-entry* status, not only its envelope one.
+    ///
+    /// This is the response a live DSM 7.2 sends for `getinfo` on a path that is not there: the
+    /// envelope succeeds, and the single entry carries `code: 408` with neither a `name` nor an
+    /// `isdir`. Requiring those two members made the third `getinfo` of a `--write-test` run --
+    /// the one that asks whether the probe's own unique directory already exists -- fail to
+    /// deserialize, which reported the destination as returning an invalid response when what it
+    /// had actually returned was "no, that path is free".
+    #[test]
+    fn a_per_entry_408_reads_as_an_absent_path_rather_than_as_a_decode_failure() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let probe_path = "/share/root/.synology-drive-sync-probe-test-absent";
+        let local = ProbeLocalFile::create(write_probe_fingerprint()).unwrap();
+        let cancellation = CancellationToken::default();
+        let per_entry_absent = serde_json::json!({
+            "success": true,
+            "data": {"files": [{"code": 408, "path": probe_path}]}
+        })
+        .to_string();
+
+        let responses = vec![
+            write_probe_discovery(false),
+            login_response(),
+            getinfo_directory("/share"),
+            getinfo_directory("/share/root"),
+            per_entry_absent,
+            // Reached only because the absence check answered "free"; the collision code ends the
+            // probe here without mutating anything, which keeps this test's blast radius at zero.
+            r#"{"success":false,"error":{"code":414}}"#.to_owned(),
+        ];
+        let (client, server) = write_probe_client(responses);
+        let failure = client
+            .run_write_probe_with_local(&root, probe_path, &local.entry, &cancellation)
+            .unwrap_err();
+        assert!(
+            matches!(failure.cause, Error::Api { code: 414, .. }),
+            "the run must reach folder creation, not stop at the absence check: {}",
+            failure.cause
+        );
+        assert!(failure.report.target_verified);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 6);
+        assert!(
+            String::from_utf8_lossy(&requests[5].body)
+                .contains("api=SYNO.FileStation.CreateFolder")
+        );
+    }
+
+    /// A per-entry status is a DSM verdict and stays one; a genuinely malformed entry stays an
+    /// error, with a message that names what was missing.
+    #[test]
+    fn per_entry_statuses_and_malformed_entries_are_told_apart() {
+        let permission_denied = RemoteItemWire {
+            path: "/share/root/secret".to_owned(),
+            name: None,
+            isdir: None,
+            code: Some(407),
+            disable_list: false,
+            additional: None,
+        };
+        let error = permission_denied
+            .into_item("SYNO.FileStation.List", "getinfo")
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::Api { code: 407, api, operation, .. }
+                if api == "SYNO.FileStation.List" && operation == "getinfo"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(error.api_code(), Some(407));
+
+        // `code: 0` is File Station saying the entry is fine, so the entry still has to describe
+        // itself. Nothing here may be defaulted into existence.
+        let nameless = RemoteItemWire {
+            path: "/share/root/child".to_owned(),
+            name: None,
+            isdir: Some(false),
+            code: Some(0),
+            disable_list: false,
+            additional: None,
+        };
+        let error = nameless
+            .into_item("SYNO.FileStation.List", "list")
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidResponse { operation, message }
+                if operation == "SYNO.FileStation.List.list" && message == "entry described no name"),
+            "unexpected error: {error}"
+        );
+
+        let complete = RemoteItemWire {
+            path: "/share/root/child".to_owned(),
+            name: Some("child".to_owned()),
+            isdir: Some(true),
+            code: None,
+            disable_list: true,
+            additional: None,
+        };
+        let item = complete.into_item("SYNO.FileStation.List", "list").unwrap();
+        assert_eq!(item.name, "child");
+        assert!(item.isdir);
+        assert!(item.disable_list);
+    }
+
     /// A deterministic name collision (414) is somebody else's directory and must never be
     /// cleaned up. Any other creation failure may have partially landed, so cleanup must run.
     #[test]
@@ -10629,7 +11379,9 @@ FplE
         let mut client = browsing_test_client(url);
         client.login("alice", "password", None).unwrap();
 
-        let probes = client.probe_session_channels().unwrap();
+        let probes = client
+            .probe_session_channels("no second login was attempted at this level")
+            .unwrap();
         assert_eq!(
             probes.map(|probe| probe.channels),
             SessionChannels::ABLATION_ORDER
@@ -10638,6 +11390,13 @@ FplE
         assert!(!probes[2].accepted() && probes[2].session_rejected());
         assert_eq!(probes[2].dsm_code, Some(119));
         assert_eq!(probes[3].http_status, Some(200));
+        // The tokenless-login variant needs a session this client cannot create, so it reports
+        // that it did not run rather than contributing a rejection nothing observed.
+        assert!(!probes[4].ran());
+        assert_eq!(
+            probes[4].skipped,
+            Some("no second login was attempted at this level")
+        );
 
         let requests = server.join().unwrap();
         let shape = |request: &CapturedRequest| {
@@ -10676,6 +11435,71 @@ FplE
         }
     }
 
+    /// The tokenless ablation variant is only worth anything if the login really omits the flag.
+    ///
+    /// `enable_syno_token=yes` is what makes DSM treat a session as the browser-style,
+    /// cookie-and-header kind. The variant exists to find out whether that is why a DSM refuses
+    /// the documented `_sid` parameter path, so a login that quietly kept sending the flag would
+    /// answer a different question while looking like it answered this one.
+    #[test]
+    fn a_tokenless_login_omits_the_flag_and_presents_only_the_documented_field() {
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            // DSM issues no SynoToken to a login that did not ask for one.
+            r#"{"success":true,"data":{"sid":"tokenless-session"}}"#.to_owned(),
+            r#"{"success":true,"data":{"total":0,"shares":[]}}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client
+            .login_without_syno_token("alice", "password", None)
+            .unwrap();
+        let probe = client.probe_tokenless_sid_field().unwrap();
+        assert!(probe.ran());
+        assert!(probe.accepted());
+        assert_eq!(
+            probe.channels,
+            SessionChannels::SidFieldOnlyTokenlessLogin,
+            "the probe must report the variant it actually ran"
+        );
+
+        let requests = server.join().unwrap();
+        let login = String::from_utf8_lossy(&requests[1].body).into_owned();
+        assert!(
+            !login.contains("enable_syno_token"),
+            "the tokenless login must not ask for a token: {login}"
+        );
+        assert!(login.contains("format=sid"));
+        let probed = String::from_utf8_lossy(&requests[2].body).into_owned();
+        assert!(probed.contains("_sid="), "unexpected probe body: {probed}");
+        assert!(
+            !probed.contains("SynoToken="),
+            "the variant presents the documented field alone: {probed}"
+        );
+        for header in ["cookie", X_SYNO_TOKEN_HEADER] {
+            assert!(
+                !requests[2]
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(header)),
+                "the variant must attach no {header} header"
+            );
+        }
+    }
+
+    /// The ordinary login is unchanged by the tokenless one existing.
+    #[test]
+    fn the_ordinary_login_still_negotiates_a_syno_token() {
+        let (url, server) = scripted_server(vec![required_discovery(), login_response()]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let requests = server.join().unwrap();
+        let login = String::from_utf8_lossy(&requests[1].body).into_owned();
+        assert!(
+            login.contains("enable_syno_token=yes"),
+            "unexpected login body: {login}"
+        );
+    }
+
     #[test]
     fn session_channel_selectors_and_probe_placeholders_are_self_consistent() {
         for channels in SessionChannels::ABLATION_ORDER {
@@ -10707,13 +11531,19 @@ FplE
         // An unauthenticated client has no session to ablate and says so rather than sending one.
         let (url, server) = scripted_server(vec![browser_discovery()]);
         let client = browsing_test_client(url);
-        assert!(client.probe_session_channels().is_err());
+        assert!(client.probe_session_channels("unavailable").is_err());
         server.join().unwrap();
     }
 
     /// `SYNO.FileStation.Info.get` is the only documented non-admin call that names the host.
+    ///
+    /// The third response is the one a real DSM 7.2 sends, and the reason this probe reported
+    /// `decode` twice per run against a healthy NAS: `support_virtual_protocol` arrives as a JSON
+    /// array rather than the comma-separated string the guide documents, and `support_virtual` --
+    /// which the guide's worked example uses for the same list -- is an unrelated object of mount
+    /// toggles. Reading both through one serde alias made every DSM 7 answer undecodable.
     #[test]
-    fn file_station_info_accepts_both_spellings_of_the_virtual_protocol_field() {
+    fn file_station_info_reads_every_shape_dsm_answers_with() {
         let documented = serde_json::json!({
             "success": true,
             "data": {
@@ -10730,11 +11560,33 @@ FplE
             "data": {"hostname": "Other Station", "support_virtual": "cifs"}
         })
         .to_string();
+        let dsm_seven = serde_json::json!({
+            "success": true,
+            "data": {
+                "enable_list_usergrp": false,
+                "hostname": "nascheckoffice",
+                "is_manager": true,
+                "items": [{"gid": 100}],
+                "support_file_request": true,
+                "support_sharing": true,
+                "support_vfs": true,
+                "support_virtual": {"enable_iso_mount": true, "enable_remote_mount": true},
+                "support_virtual_protocol": ["cifs", "nfs", "iso"],
+                "system_codepage": "enu",
+                "uid": 1026
+            }
+        })
+        .to_string();
+        // Nothing but the envelope: every member is optional, so a probe degrades to "not
+        // reported" instead of failing the section it is diagnosing.
+        let bare = serde_json::json!({"success": true, "data": {}}).to_string();
         let (url, server) = scripted_server(vec![
             info_discovery(),
             login_response(),
             documented,
             worked_example,
+            dsm_seven,
+            bare,
         ]);
         let mut client = connect_test_client(url);
         client.login("alice", "password", None).unwrap();
@@ -10744,8 +11596,8 @@ FplE
             first.hostname.map(|host| host.as_str().to_owned()),
             Some("DiskStation".to_owned())
         );
-        assert!(first.is_manager);
-        assert!(first.support_sharing);
+        assert_eq!(first.is_manager, Some(true));
+        assert_eq!(first.support_sharing, Some(true));
         assert_eq!(
             first
                 .support_virtual_protocol
@@ -10759,8 +11611,32 @@ FplE
             second.hostname.map(|host| host.as_str().to_owned()),
             Some("Other_Station".to_owned())
         );
-        assert!(!second.is_manager);
-        assert!(!second.support_sharing);
+        assert_eq!(second.is_manager, None, "DSM did not say, so neither do we");
+        assert_eq!(second.support_sharing, None);
+        assert_eq!(
+            second
+                .support_virtual_protocol
+                .map(|protocols| protocols.as_str().to_owned()),
+            Some("cifs".to_owned()),
+            "the guide's worked-example spelling still reads when it carries protocol names"
+        );
+
+        let third = client.file_station_info().unwrap();
+        assert_eq!(
+            third.hostname.map(|host| host.as_str().to_owned()),
+            Some("nascheckoffice".to_owned())
+        );
+        assert_eq!(third.is_manager, Some(true));
+        assert_eq!(
+            third
+                .support_virtual_protocol
+                .map(|protocols| protocols.as_str().to_owned()),
+            Some("cifs,nfs,iso".to_owned()),
+            "the array form is joined the way the guide's prose describes the value"
+        );
+
+        let fourth = client.file_station_info().unwrap();
+        assert_eq!(fourth, FileStationInfo::default());
         server.join().unwrap();
     }
 

@@ -43,11 +43,16 @@ const QUICKCONNECT_SUFFIX: &str = ".quickconnect.to";
 /// The label that marks the direct QuickConnect forms.
 const QUICKCONNECT_DIRECT_LABEL: &str = "direct";
 
-/// The unauthenticated route the HTTP timing probe measures against.
+/// The CGI endpoints the HTTP timing probe measures against, in the order discovery tries them.
 ///
-/// Deliberately the same discovery endpoint the client itself opens with, so the timing describes
-/// the path that actually matters rather than some other handler on the same host.
-const PROBE_QUERY: &str = "webapi/query.cgi?api=SYNO.API.Info&version=1&method=query";
+/// Both, and in this order, because [`crate::api::ApiClient`] discovery tries `entry.cgi` first
+/// and falls back to `query.cgi`: a host that answers one need not answer the other, and a probe
+/// pinned to the fallback measures a route the client may never use. The probe walks the same
+/// ladder, so what it times is what the run actually opens with.
+const PROBE_CGI_ROUTES: [&str; 2] = ["entry.cgi", "query.cgi"];
+
+/// The unauthenticated query every probe route carries.
+const PROBE_QUERY: &str = "?api=SYNO.API.Info&version=1&method=query";
 
 /// Which timing phases this client can and cannot separate, stated once.
 ///
@@ -331,20 +336,28 @@ pub struct ReachabilityBudget {
     pub http_samples: usize,
     /// A ceiling on the whole probe, so a slow or blackholed host cannot stall the run.
     pub total: Duration,
+    /// A ceiling on one HTTP sample.
+    ///
+    /// Generous on purpose. A QuickConnect relay answers the same unauthenticated discovery
+    /// request the control client makes in around 3.8 seconds, so the four-second ceiling this
+    /// once hard-coded expired on the relayed paths the probe exists to characterise -- reporting
+    /// "no HTTP sample completed" for a host the very next section authenticated against. A probe
+    /// that gives up sooner than the client it explains measures nothing but its own impatience.
+    pub http_request_timeout: Duration,
 }
 
 impl ReachabilityBudget {
     /// The default budget: enough samples for a median to mean something, short enough that an
     /// operator does not notice the wait.
     ///
-    /// The ceiling is checked before each sample rather than during one, so the true worst case is
-    /// the ceiling plus one sample. That is bounded because a probe request is itself bounded at
-    /// four seconds, well under the control-request timeout it would otherwise inherit.
+    /// The total ceiling is checked before each sample rather than during one, so the true worst
+    /// case is `total` plus one `http_request_timeout`.
     pub const fn standard() -> Self {
         Self {
             tcp_samples: 5,
             http_samples: 3,
             total: Duration::from_secs(10),
+            http_request_timeout: Duration::from_secs(8),
         }
     }
 
@@ -353,6 +366,7 @@ impl ReachabilityBudget {
             tcp_samples: 3,
             http_samples: 2,
             total: Duration::from_secs(6),
+            http_request_timeout: Duration::from_secs(5),
         }
     }
 
@@ -361,6 +375,7 @@ impl ReachabilityBudget {
             tcp_samples: 9,
             http_samples: 5,
             total: Duration::from_secs(20),
+            http_request_timeout: Duration::from_secs(12),
         }
     }
 }
@@ -401,6 +416,18 @@ pub struct HttpTimingObservation {
     pub statuses: BTreeSet<u16>,
     pub failures: u32,
     pub failure_reason: Option<String>,
+    /// Whether at least one sample was abandoned at its own ceiling rather than refused.
+    ///
+    /// The distinction is the whole difference between "nothing is listening on that path" and
+    /// "the path is slower than the probe was willing to wait", and only the second one is
+    /// answered by measuring for longer.
+    pub timed_out: bool,
+    /// The per-sample ceiling these measurements were taken under.
+    pub request_timeout: Option<Duration>,
+    /// Which CGI finally answered, of the routes discovery itself would try.
+    pub route: Option<&'static str>,
+    /// How many routes were rejected with an HTTP status before one answered.
+    pub routes_rejected: u32,
 }
 
 impl HttpTimingObservation {
@@ -425,6 +452,12 @@ impl HttpTimingObservation {
             "statuses": self.statuses.iter().copied().collect::<Vec<_>>(),
             "failures": self.failures,
             "failure_reason": self.failure_reason,
+            "timed_out": self.timed_out,
+            "request_timeout_ms": self
+                .request_timeout
+                .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+            "route": self.route,
+            "routes_rejected": self.routes_rejected,
         })
     }
 }
@@ -587,9 +620,32 @@ impl ReachabilityReport {
                     .unwrap_or_default(),
             ));
         }
+        // Which route answered and how long each sample was given are part of reading the timing:
+        // a figure measured against `query.cgi` describes a different handler from one measured
+        // against `entry.cgi`, and "no sample completed" means something else at 5 s than at 12 s.
+        if let Some(route) = self.http.route {
+            let mut line = format!("probe route: webapi/{route}");
+            if let Some(timeout) = self.http.request_timeout {
+                let _ = write!(line, ", {:.1} s per sample", timeout.as_secs_f64());
+            }
+            if self.http.routes_rejected > 0 {
+                let _ = write!(
+                    line,
+                    " (after {} route(s) answered with an HTTP error status, the same fallback \
+                     API discovery makes)",
+                    self.http.routes_rejected
+                );
+            }
+            lines.push(line);
+        }
         if self.http.first_byte.is_empty() {
             lines.push(format!(
-                "HTTP timing: no sample completed{}",
+                "HTTP timing: no sample completed{}{}",
+                if self.http.timed_out {
+                    " (abandoned at the per-sample ceiling, not refused)"
+                } else {
+                    ""
+                },
                 self.http
                     .failure_reason
                     .as_ref()
@@ -732,20 +788,28 @@ pub fn measure_reachability(
     if report.cancelled || budget.http_samples == 0 {
         return (report, observations);
     }
-    let client = match api::probe_client(options) {
+    report.http.request_timeout = Some(budget.http_request_timeout);
+    let client = match api::probe_client(options, budget.http_request_timeout) {
         Ok(client) => client,
         Err(error) => {
             report.http.failure_reason = Some(error.to_string());
             return (report, observations);
         }
     };
-    let Ok(probe_url) = base.join(PROBE_QUERY) else {
+    let probe_urls: Vec<_> = PROBE_CGI_ROUTES
+        .iter()
+        .filter_map(|cgi| base.join(&format!("webapi/{cgi}{PROBE_QUERY}")).ok())
+        .collect();
+    if probe_urls.len() != PROBE_CGI_ROUTES.len() {
         report.http.failure_reason =
             Some("the discovery route could not be derived from the base URL".to_owned());
         return (report, observations);
-    };
+    }
 
-    for _ in 0..budget.http_samples {
+    let mut route = 0_usize;
+    let mut samples = 0_usize;
+    report.http.route = Some(PROBE_CGI_ROUTES[route]);
+    while samples < budget.http_samples {
         if cancellation.is_cancelled() {
             report.cancelled = true;
             break;
@@ -755,8 +819,18 @@ pub fn measure_reachability(
             break;
         }
         let request_started = Instant::now();
-        match client.get(probe_url.clone()).send() {
+        match client.get(probe_urls[route].clone()).send() {
+            // A status rather than a timing: this route is not the one this host serves WebAPI
+            // on, and measuring it would characterise the proxy's 404 handler. Move to the route
+            // discovery would move to and do not spend a sample on the answer. Bounded by there
+            // being two routes, so this can advance at most once.
+            Ok(response) if response.status().as_u16() >= 400 && route + 1 < probe_urls.len() => {
+                report.http.routes_rejected = report.http.routes_rejected.saturating_add(1);
+                route += 1;
+                report.http.route = Some(PROBE_CGI_ROUTES[route]);
+            }
             Ok(response) => {
+                samples += 1;
                 let first_byte = request_started.elapsed();
                 // Headers are read before the body is touched, because consuming the body moves
                 // the response and takes them with it.
@@ -786,11 +860,13 @@ pub fn measure_reachability(
                 observations.push(observation);
             }
             Err(error) => {
+                samples += 1;
                 report.http.failures = report.http.failures.saturating_add(1);
+                report.http.timed_out |= error.is_timeout();
                 report
                     .http
                     .failure_reason
-                    .get_or_insert_with(|| error.to_string());
+                    .get_or_insert_with(|| transport_failure_reason(&error));
                 // Nothing has ever completed, and each further attempt costs the full probe
                 // timeout to learn the same thing. One failure is the answer.
                 if report.http.first_byte.is_empty() {
@@ -800,6 +876,48 @@ pub fn measure_reachability(
         }
     }
     (report, observations)
+}
+
+/// How far the failure reason may run before it is clipped.
+const MAX_FAILURE_REASON_CHARS: usize = 240;
+
+/// A transport failure described by its whole cause chain rather than by its outermost layer.
+///
+/// `reqwest` renders a request-level failure as `error sending request for url (...)` and puts
+/// everything that distinguishes one from another -- `operation timed out`, a TLS verification
+/// message, a DNS failure -- in the source chain, which `Display` drops. Reporting only the outer
+/// text told an operator that *something* went wrong on a URL they could already see, which is
+/// what made a probe timeout read as an unexplained transport fault.
+///
+/// The chain carries no credential: this probe is unauthenticated, sends no session channel, and
+/// the URL it names is the public discovery route.
+fn transport_failure_reason(error: &reqwest::Error) -> String {
+    cause_chain_reason(error)
+}
+
+/// The generic half of [`transport_failure_reason`], separated so it can be exercised directly:
+/// a `reqwest::Error` cannot be constructed outside its own crate.
+fn cause_chain_reason(error: &dyn std::error::Error) -> String {
+    let mut reason = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !text.is_empty() && !reason.contains(&text) {
+            let _ = write!(reason, ": {text}");
+        }
+        source = cause.source();
+        if reason.chars().count() >= MAX_FAILURE_REASON_CHARS {
+            break;
+        }
+    }
+    if reason.chars().count() > MAX_FAILURE_REASON_CHARS {
+        reason = reason
+            .chars()
+            .take(MAX_FAILURE_REASON_CHARS.saturating_sub(1))
+            .chain(['~'])
+            .collect();
+    }
+    reason
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1807,5 +1925,230 @@ mod tests {
         let summary = transcript.intermediary_summary(EndpointClassification::default());
         assert_eq!(summary.redirects_offered, 1);
         assert!(summary.redirect_hosts.contains("relay.example.test"));
+    }
+
+    /// A minimal HTTP server for the probe: answers each connection with one canned status.
+    ///
+    /// `answers` is consumed in order and each entry names the status and body for one request.
+    /// A connection arriving after the list is exhausted is accepted and left unanswered, which
+    /// is what the timing probe experiences as a stall.
+    fn probe_server(answers: Vec<u16>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("probe listener");
+        let url = format!("http://{}/", listener.local_addr().expect("probe address"));
+        let handle = std::thread::spawn(move || {
+            let mut routes = Vec::new();
+            // Held so a stalled connection stays open instead of being closed by its own drop;
+            // a closed socket is a different fault from a server that never answers.
+            let mut stalled = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().expect("probe stream clone"));
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    break;
+                }
+                // The TCP timing samples connect and close without sending anything. They are
+                // not requests and must not consume an answer.
+                if request_line.trim().is_empty() {
+                    continue;
+                }
+                routes.push(request_line.trim().to_owned());
+                let mut header = String::new();
+                while reader.read_line(&mut header).is_ok_and(|read| read > 2) {
+                    header.clear();
+                }
+                let Some(status) = answers.get(routes.len() - 1).copied() else {
+                    stalled.push(stream);
+                    continue;
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                );
+                let _ = stream.flush();
+                // Every scripted answer has been given, so the thread ends and can be joined. A
+                // server with no answers at all is the stalling one and never reaches here.
+                if routes.len() >= answers.len() {
+                    break;
+                }
+            }
+            routes
+        });
+        (url, handle)
+    }
+
+    fn probe_options(base_url: String) -> ClientOptions {
+        ClientOptions {
+            base_url,
+            allow_http: true,
+            accept_invalid_certs: false,
+            ca_certificate: None,
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(5),
+            retries: 0,
+        }
+    }
+
+    /// The probe must time the route API discovery actually uses, and follow discovery's own
+    /// fallback when the first one is not served.
+    ///
+    /// Pinning the probe to `query.cgi` measured a route the client need never open: discovery
+    /// tries `entry.cgi` first, so a host serving only that one made the probe characterise a
+    /// handler that does not exist there.
+    #[test]
+    fn the_probe_follows_the_same_cgi_ladder_as_api_discovery() {
+        // `entry.cgi` answers, so the fallback is never reached.
+        let (url, server) = probe_server(vec![200]);
+        let budget = ReachabilityBudget {
+            tcp_samples: 1,
+            http_samples: 1,
+            total: Duration::from_secs(5),
+            http_request_timeout: Duration::from_secs(3),
+        };
+        let (report, observations) = measure_reachability(
+            &probe_options(url),
+            budget,
+            &crate::cancel::CancellationToken::default(),
+        );
+        assert_eq!(report.http.route, Some("entry.cgi"));
+        assert_eq!(report.http.routes_rejected, 0);
+        assert_eq!(report.http.request_timeout, Some(Duration::from_secs(3)));
+        assert_eq!(observations.len(), 1);
+        drop(server);
+
+        // `entry.cgi` answers 404, so the probe moves to the route discovery would move to and
+        // does not spend a sample characterising the 404 handler.
+        let (url, server) = probe_server(vec![404, 200]);
+        let (report, observations) = measure_reachability(
+            &probe_options(url),
+            budget,
+            &crate::cancel::CancellationToken::default(),
+        );
+        assert_eq!(report.http.route, Some("query.cgi"));
+        assert_eq!(report.http.routes_rejected, 1);
+        assert_eq!(
+            report.http.statuses.iter().copied().collect::<Vec<_>>(),
+            vec![200],
+            "the rejected route must not pollute the measured statuses"
+        );
+        assert_eq!(observations.len(), 1);
+        let requests = server.join().expect("probe server");
+        assert!(
+            requests[0].contains("/webapi/entry.cgi"),
+            "unexpected first probe request: {requests:?}"
+        );
+        assert!(
+            requests[1].contains("/webapi/query.cgi"),
+            "unexpected fallback request: {requests:?}"
+        );
+    }
+
+    /// A probe that gives up before the host answers must say that is what happened.
+    ///
+    /// Against a QuickConnect relay the client's own discovery request takes around 3.8 seconds,
+    /// and the four-second ceiling the probe once hard-coded expired on it -- reporting "no HTTP
+    /// sample completed" with a reqwest message whose `Display` hides the timeout in its source
+    /// chain, for a host the very next section authenticated against successfully.
+    #[test]
+    fn a_probe_timeout_is_reported_as_a_timeout_and_names_its_cause() {
+        let (url, _server) = probe_server(Vec::new());
+        let budget = ReachabilityBudget {
+            tcp_samples: 1,
+            http_samples: 2,
+            total: Duration::from_secs(10),
+            http_request_timeout: Duration::from_millis(250),
+        };
+        let (report, observations) = measure_reachability(
+            &probe_options(url),
+            budget,
+            &crate::cancel::CancellationToken::default(),
+        );
+        assert!(report.reached(), "TCP connects; only HTTP does not answer");
+        assert!(report.connects_but_does_not_answer());
+        assert!(report.http.timed_out, "the failure was a timeout");
+        let reason = report
+            .http
+            .failure_reason
+            .clone()
+            .expect("a failure reason");
+        assert!(
+            reason.contains("timed out") || reason.contains("timeout"),
+            "the cause chain must survive into the reason: {reason}"
+        );
+        assert!(observations.is_empty());
+        let lines = report.human_lines().join("\n");
+        assert!(lines.contains("abandoned at the per-sample ceiling, not refused"));
+        assert!(lines.contains("probe route: webapi/entry.cgi"));
+    }
+
+    /// The cause chain is what distinguishes one transport failure from another, and it is bounded.
+    #[test]
+    fn a_failure_reason_carries_the_cause_chain_within_a_bound() {
+        #[derive(Debug)]
+        struct Layer(String, Option<Box<Layer>>);
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1
+                    .as_deref()
+                    .map(|layer| layer as &dyn std::error::Error)
+            }
+        }
+        let layer = |text: &str, inner: Option<Layer>| Layer(text.to_owned(), inner.map(Box::new));
+
+        // The shape reqwest produces for a probe timeout: the distinguishing text is one level
+        // down, where `Display` alone never reaches it.
+        let timed_out = layer(
+            "error sending request for url (https://host/webapi/entry.cgi)",
+            Some(layer("operation timed out", None)),
+        );
+        assert_eq!(
+            cause_chain_reason(&timed_out),
+            "error sending request for url (https://host/webapi/entry.cgi): operation timed out"
+        );
+
+        // A layer that only repeats its cause adds nothing and is not repeated.
+        let echoing = layer(
+            "operation timed out",
+            Some(layer("operation timed out", None)),
+        );
+        assert_eq!(cause_chain_reason(&echoing), "operation timed out");
+
+        // A pathological chain is clipped, visibly, rather than filling the report.
+        let mut deep = layer("z", None);
+        for index in 0..60 {
+            deep = layer(&format!("layer-{index:03}-padding"), Some(deep));
+        }
+        let reason = cause_chain_reason(&deep);
+        assert_eq!(reason.chars().count(), MAX_FAILURE_REASON_CHARS);
+        assert!(reason.ends_with('~'), "a clipped reason says so: {reason}");
+    }
+
+    /// Every level's per-sample ceiling has to outlast a relayed round trip, which is the case
+    /// the probe most needs to measure and the one it used to give up on.
+    #[test]
+    fn every_budget_waits_longer_than_a_relayed_round_trip() {
+        // The measured figure from the run that exposed this: a QuickConnect relay answered the
+        // unauthenticated discovery request in 3.788 s.
+        let observed_relay = Duration::from_millis(3_788);
+        for budget in [
+            ReachabilityBudget::quick(),
+            ReachabilityBudget::standard(),
+            ReachabilityBudget::extensive(),
+        ] {
+            assert!(
+                budget.http_request_timeout > observed_relay,
+                "a ceiling of {:?} expires on a relay that answers in {observed_relay:?}",
+                budget.http_request_timeout
+            );
+            assert!(budget.http_samples > 0);
+        }
     }
 }

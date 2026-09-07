@@ -69,6 +69,15 @@ struct ServerState {
     cookie_uses_remaining: u32,
     /// Host name to switch to after the next `SYNO.FileStation.Info.get` is answered.
     next_hostname: Option<String>,
+    /// Whether a second login invalidates the session the first one established.
+    ///
+    /// DSM binds one session per (account, session name) and both this client's logins name
+    /// `session=FileStation`, so a duplicate login is a real collision with a dedicated error:
+    /// `107`, "session interrupted by duplicate login". Modelling it is the only way to prove a
+    /// diagnostic that opens a second session cannot break the run it is diagnosing.
+    invalidate_on_duplicate_login: bool,
+    /// How many logins this server has answered.
+    logins_seen: u32,
 }
 
 #[derive(Debug)]
@@ -137,6 +146,8 @@ impl MockFileStation {
             reject_cookie_sessions: false,
             cookie_uses_remaining: 0,
             next_hostname: None,
+            invalidate_on_duplicate_login: false,
+            logins_seen: 0,
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_state = Arc::clone(&state);
@@ -237,6 +248,24 @@ impl MockFileStation {
             .lock()
             .expect("mock state lock")
             .reject_cookie_sessions = true;
+    }
+
+    /// Invalidate the first session as soon as a second login arrives, the way DSM's error 107
+    /// describes.
+    ///
+    /// The newest session is the one established without `enable_syno_token`, so it is the one
+    /// with no `SynoToken`; every later request that still carries one belongs to the session the
+    /// duplicate login displaced and is answered `107`.
+    pub fn invalidate_session_on_duplicate_login(&self) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .invalidate_on_duplicate_login = true;
+    }
+
+    /// How many logins this server has answered.
+    pub fn logins_seen(&self) -> u32 {
+        self.state.lock().expect("mock state lock").logins_seen
     }
 
     /// Advertise an API entry the documented map cannot describe, in the `query=all` response
@@ -511,7 +540,15 @@ fn route_request(
                 Some(_) => return api_error_with_marker(404, "rejected-otp-must-not-leak"),
             }
         }
-        let data = json!({"sid": SESSION_ID, "synotoken": SYNO_TOKEN});
+        state.logins_seen = state.logins_seen.saturating_add(1);
+        // A `SynoToken` is issued only to a login that asked for one, the way DSM does it. The
+        // ablation's tokenless variant depends on this: a mock that handed out a token regardless
+        // would let a client that had stopped omitting `enable_syno_token` pass unnoticed.
+        let data = if fields.get("enable_syno_token").map(String::as_str) == Some("yes") {
+            json!({"sid": SESSION_ID, "synotoken": SYNO_TOKEN})
+        } else {
+            json!({"sid": SESSION_ID})
+        };
         state.rotation_pending = state.rotate_session_on.is_some();
         state.cookie_uses_remaining = 1;
         return match &state.login_cookie {
@@ -523,6 +560,14 @@ fn route_request(
         return authenticated(state, fields, headers, || success(Value::Null));
     }
 
+    // A session displaced by a duplicate login, answered the way DSM answers it. Placed before
+    // the ordinary session check so the run sees `107` rather than a generic `119`.
+    if state.invalidate_on_duplicate_login
+        && state.logins_seen > 1
+        && fields.contains_key("SynoToken")
+    {
+        return api_error(107);
+    }
     if !valid_session(state, fields, headers) {
         return api_error(119);
     }
