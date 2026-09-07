@@ -27,7 +27,7 @@ use std::process::{Command, ExitCode, Stdio};
 #[cfg(target_os = "linux")]
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering as AtomicOrdering},
+    atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
 };
 #[cfg(target_os = "linux")]
 use std::time::Instant;
@@ -187,36 +187,70 @@ const AUTH_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_MANAGER_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(target_os = "linux")]
 const CONTROLLER_WAKE_TIMEOUT: Duration = Duration::from_secs(2);
-// Interactive connection jobs stay bounded, but a probe budget is only safe if
-// it covers every control round trip it actually contains. `ApiClient` already
-// caps one control request at `INTERACTIVE_CONTROL_REQUEST_CEILING`, so a
-// budget below the sum of its legs turns a slow-but-healthy relay into a
-// spurious failure: the shared deadline expires mid-probe, or the cleanup
-// logout is abandoned and the AppWindow reports `file_station_logout_failed`.
-// A QuickConnect relay measured 3.8 s for a single discovery request, which
-// alone exceeds a three-second logout slice.
+// These bound the consumer process that executes a queued interactive job, not
+// an API worker: `execute_connection_mutation` is reachable only from
+// `run_consumer`, which the controller starts as a separate `--consume-job`
+// process. Widening them therefore costs no API concurrency, and tightening
+// them buys none.
 //
-// `interactive_connection_budgets_cover_every_control_leg` re-derives each
-// budget from the round-trip counts of the code paths it bounds, so adding a
-// leg without widening the budget fails that test rather than the operator's
-// next authentication attempt.
+// Sizing, from real doctor runs against a QuickConnect relay: the first
+// request through a cold connection measured ~3788 ms (API discovery), while
+// later requests on the warm connection measured ~600 ms — `SYNO.API.Auth.logout`
+// came in at 619 ms as request #26.
+//
+// The auth probe is one absolute deadline covering discovery (up to two legs,
+// `entry.cgi` then the `query.cgi` fallback), login (up to two, the second
+// carrying a TOTP challenge), and the File Station session confirmation, whose
+// own cap is 5 s. At the measured latencies a healthy cold probe is
+// ~3.8 + 0.6 + 0.6 ≈ 5 s; the worst credible one is two cold-ish discovery legs
+// plus two logins plus the 5 s confirmation. Twelve seconds funded that with
+// ~1.4 s of margin over a single cold leg, which is too thin for a path whose
+// failure mode is a latched incident the operator cannot clear. Thirty seconds
+// covers the worst credible leg sequence rather than the healthy one, and costs
+// nothing to hold: this budget bounds the separate `--consume-job` consumer
+// process, never an API worker.
+//
+// `43cc1d2` added `confirm_file_station_session` as a third round trip inside
+// this deadline, which `b3a03a1` had sized for two. That is what consumed the
+// old margin.
 #[cfg(target_os = "linux")]
-const INTERACTIVE_CONTROL_REQUEST_CEILING: Duration = Duration::from_secs(10);
-// Two discovery legs (`entry.cgi` plus the `query.cgi` fallback), two login
-// legs (the plain login plus a TOTP-challenged retry), and one File Station
-// session confirmation, which caps itself at five seconds.
+const INTERACTIVE_AUTH_TEST_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+// Logout is a single warm leg on the session the probe just opened — measured
+// at 619 ms, so three seconds is roughly five times the observed cost. It is
+// kept separate from the probe deadline on purpose: `logout_bounded` replaces
+// an exhausted probe deadline so that a slow probe still gets to close its
+// temporary File Station session.
 #[cfg(target_os = "linux")]
-const INTERACTIVE_AUTH_TEST_PROBE_TIMEOUT: Duration = Duration::from_secs(45);
+const INTERACTIVE_AUTH_TEST_LOGOUT_TIMEOUT: Duration = Duration::from_secs(3);
+// The browse probe funds the same discovery and login legs plus one bounded
+// directory listing instead of the 5 s confirmation, and it already carried the
+// wider budget, so it needs no change.
 #[cfg(target_os = "linux")]
-const INTERACTIVE_AUTH_TEST_LOGOUT_TIMEOUT: Duration = INTERACTIVE_CONTROL_REQUEST_CEILING;
-// The same discovery and login legs plus one bounded directory listing, which
-// is a general control request rather than the smaller confirmation slice.
+const INTERACTIVE_REMOTE_BROWSE_PROBE_TIMEOUT: Duration = Duration::from_secs(27);
 #[cfg(target_os = "linux")]
-const INTERACTIVE_REMOTE_BROWSE_PROBE_TIMEOUT: Duration = Duration::from_secs(50);
-#[cfg(target_os = "linux")]
-const INTERACTIVE_REMOTE_BROWSE_LOGOUT_TIMEOUT: Duration = INTERACTIVE_CONTROL_REQUEST_CEILING;
+const INTERACTIVE_REMOTE_BROWSE_LOGOUT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Mirror of `PROFILE_CONNECTION_API_LIMITS.resultObservationTimeoutMs` in
+/// `packaging/synology/ui-src/src/App.vue`. The AppWindow stops watching a
+/// queued interactive job after this long, so a budget above it cannot help:
+/// the browser would give up first and report an outcome it never observed.
+/// `test_synology_ui.py` asserts this constant and the AppWindow's agree.
+#[cfg(all(target_os = "linux", test))]
+const APPWINDOW_RESULT_OBSERVATION_WINDOW: Duration = Duration::from_secs(120);
 #[cfg(target_os = "linux")]
 const MAX_HELPER_STDERR_BYTES: usize = 64 * 1024;
+/// Reported when every worker and the whole dispatch queue are occupied. It is
+/// deliberately distinct from `service_unavailable`: that means the service is
+/// not ready, this means it is running and refused one request without starting
+/// it, which is a capacity signal an operator can act on. Rendered by
+/// `error_payload`, so it is not gated to the target that produces it.
+const SATURATED_SERVICE_CODE: &str = "service_saturated";
+/// Concurrency for the whole dashboard, which is a handful of AppWindows rather
+/// than public traffic. Every handler is expected to be short: reads are file
+/// reads or a bounded manager call, and a mutation POST enqueues and returns
+/// rather than waiting for DSM I/O, which happens in a separate `--consume-job`
+/// process. Four workers is therefore sized against handler *duration*, not
+/// request volume — the lever that matters is keeping handlers short, not
+/// raising this number, and `API_QUEUE_CAPACITY` absorbs bursts in front of it.
 #[cfg(target_os = "linux")]
 const API_WORKER_COUNT: usize = 4;
 #[cfg(target_os = "linux")]
@@ -7193,7 +7227,7 @@ mod linux_files {
     use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 
     const NOFOLLOW_CLOEXEC: i32 = libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    const CGI_FAILURE_COALESCE_SECONDS: u64 = 30;
+    pub(super) const CGI_FAILURE_COALESCE_SECONDS: u64 = 30;
     const MAX_CGI_FAILURE_STATE_BYTES: u64 = 256;
     pub(super) const MAX_API_LOG_BYTES: u64 = 10 * 1024 * 1024;
     pub(super) const API_LOG_ROTATIONS: usize = 5;
@@ -7248,6 +7282,20 @@ mod linux_files {
         code: &str,
         status: u16,
     ) -> BridgeResult<bool> {
+        record_pre_relay_cgi_failure_repeated(package_uid, now, stage, code, status, 1)
+    }
+
+    /// As above, but for a caller that has been counting suppressed
+    /// occurrences of its own and wants the emitted record to say how many it
+    /// stands for.
+    pub(super) fn record_pre_relay_cgi_failure_repeated(
+        package_uid: u32,
+        now: u64,
+        stage: &str,
+        code: &str,
+        status: u16,
+        occurrences: u64,
+    ) -> BridgeResult<bool> {
         let policy = load_security_policy(package_uid)?;
         record_pre_relay_cgi_failure_under_policy_at(
             Path::new(LOG_ROOT),
@@ -7259,6 +7307,7 @@ mod linux_files {
             code,
             status,
             &policy,
+            occurrences,
         )
     }
 
@@ -7284,6 +7333,7 @@ mod linux_files {
             code,
             status,
             &SecurityPolicyArgs::default(),
+            1,
         )
     }
 
@@ -7311,6 +7361,7 @@ mod linux_files {
             code,
             status,
             &policy,
+            1,
         )
     }
 
@@ -7325,6 +7376,7 @@ mod linux_files {
         code: &str,
         status: u16,
         policy: &SecurityPolicyArgs,
+        occurrences: u64,
     ) -> BridgeResult<bool> {
         let category = cgi_failure_category(stage).ok_or_else(BridgeError::bad_request)?;
         if !event_visible_at_threshold(policy, category, "warn", false) {
@@ -7416,6 +7468,10 @@ mod linux_files {
             "stage": stage,
             "code": code,
             "status": status,
+            // How many occurrences this one record stands for. A caller that
+            // suppressed its own repeats reports them here; everyone else
+            // reports the single failure they are recording.
+            "occurrences": occurrences.max(1),
         }))
         .map_err(|_| BridgeError::internal())?;
         record.push(b'\n');
@@ -10692,7 +10748,9 @@ impl CgiResponse {
             ) => "service_request_unavailable",
             _ => default_code,
         });
-        let message = if stage == Some(CgiFailureStage::BridgeConnect)
+        let message = if code == SATURATED_SERVICE_CODE {
+            "The package service is busy and did not start this request. Nothing was submitted. Retry shortly; if this persists, close other Synology Drive Sync windows and inspect the package log."
+        } else if stage == Some(CgiFailureStage::BridgeConnect)
             && error.kind == ErrorKind::Unavailable
         {
             "The package service is not ready. Retry shortly. If this persists, restart Synology Drive Sync in Package Center and inspect its controller log."
@@ -11790,7 +11848,15 @@ fn run_server_loop(
     loop {
         match listener.accept() {
             Ok((stream, _)) => match workers.try_dispatch(stream) {
-                Ok(()) | Err(DispatchError::Full(_)) => {}
+                Ok(()) => {}
+                // Dropping the stream here closes the connection with no
+                // response and no record. A client cannot tell that apart from
+                // a crashed service, and nothing observes it — least of all the
+                // log endpoint an operator would reach for, which is served by
+                // this same pool. Answer immediately instead.
+                Err(DispatchError::Full(stream)) => {
+                    reject_saturated_connection(stream, package_uid)
+                }
                 Err(DispatchError::Disconnected(_)) => {
                     return Err(BridgeError::new(ErrorKind::Unavailable));
                 }
@@ -11799,6 +11865,96 @@ fn run_server_loop(
             Err(_) => return Err(BridgeError::new(ErrorKind::Unavailable)),
         }
     }
+}
+
+/// Answer a connection the worker pool had no room for, without letting the
+/// accept loop wait on it.
+///
+/// The response is a normal trusted error envelope, so the browser classifies
+/// it as an explicit pre-acceptance rejection: the request frame was never
+/// read, nothing was enqueued, and a mutation is therefore definitively not
+/// accepted. That matters more than the status code — a silently dropped
+/// connection makes the AppWindow treat a mutation as outcome-unknown and latch
+/// its scope, when in fact the service never saw it.
+#[cfg(target_os = "linux")]
+fn reject_saturated_connection(mut stream: std::os::unix::net::UnixStream, package_uid: u32) {
+    // Deliberately not the relay's 30-second I/O deadline. This runs on the
+    // accept loop, so it may never wait on a peer that is not reading; one
+    // small frame into a fresh socket buffer does not need longer.
+    const SATURATED_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+    let failure = CgiFailure::coded(
+        CgiFailureStage::BridgeConnect,
+        BridgeError::new(ErrorKind::Unavailable),
+        SATURATED_SERVICE_CODE,
+    );
+    if stream
+        .set_write_timeout(Some(SATURATED_WRITE_TIMEOUT))
+        .is_ok()
+        && let Ok(encoded) = encode_relay_response(&CgiResponse::failure(failure))
+    {
+        let _ = write_frame(&mut stream, &encoded, MAX_RELAY_RESPONSE_BYTES);
+        let _ = linux_socket::shutdown_write(&stream);
+    }
+    record_saturated_rejection(package_uid);
+}
+
+/// Count every rejection, but only reach for the log once per coalescing
+/// window.
+///
+/// The shared recorder loads the security policy and touches two files. Doing
+/// that per rejection would put uncached I/O on the accept loop under exactly
+/// the burst this path exists to survive. The service is long-lived, so it can
+/// keep the tally in memory and pay for the record at most once per window —
+/// and report how many rejections that record stands for, which is the
+/// difference between an operator seeing a blip and seeing an outage.
+#[cfg(target_os = "linux")]
+fn record_saturated_rejection(package_uid: u32) {
+    static REJECTED_SINCE_RECORD: AtomicU64 = AtomicU64::new(0);
+    static LAST_RECORD_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+    REJECTED_SINCE_RECORD.fetch_add(1, AtomicOrdering::Relaxed);
+    let Ok(now) = current_epoch() else {
+        return;
+    };
+    let previous = LAST_RECORD_EPOCH.load(AtomicOrdering::Relaxed);
+    if previous != 0 && now.saturating_sub(previous) < linux_files::CGI_FAILURE_COALESCE_SECONDS {
+        return;
+    }
+    // One accept-loop thread reaches the recorder per window; a lost race just
+    // defers this rejection's tally into the next record.
+    if LAST_RECORD_EPOCH
+        .compare_exchange(
+            previous,
+            now,
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+        )
+        .is_err()
+    {
+        return;
+    }
+    let occurrences = REJECTED_SINCE_RECORD
+        .swap(0, AtomicOrdering::Relaxed)
+        .max(1);
+    if linux_files::record_pre_relay_cgi_failure_repeated(
+        package_uid,
+        now,
+        CgiFailureStage::BridgeConnect.as_str(),
+        SATURATED_SERVICE_CODE,
+        503,
+        occurrences,
+    )
+    .is_ok_and(|recorded| recorded)
+    {
+        return;
+    }
+    // The shared window is deliberately global — one emission per window across
+    // every failure code, which is what stops a caller that can provoke many
+    // distinct codes from amplifying log writes. So this record can lose to an
+    // unrelated bridge failure. Give the tally back rather than dropping it, so
+    // saturation is reported late instead of never.
+    REJECTED_SINCE_RECORD.fetch_add(occurrences, AtomicOrdering::Relaxed);
+    LAST_RECORD_EPOCH.store(previous, AtomicOrdering::Relaxed);
 }
 
 #[cfg(target_os = "linux")]
@@ -14106,15 +14262,29 @@ mod tests {
                 .keys()
                 .cloned()
                 .collect::<BTreeSet<_>>();
+            // Closed on purpose: this record is written from a failure path
+            // that has seen untrusted request material, so the set of keys it
+            // may carry is enumerated rather than merely checked for known
+            // offenders. `occurrences` is how many suppressed repeats one
+            // emitted record stands for.
             assert_eq!(
                 keys,
                 [
-                    "category", "code", "epoch", "event", "level", "service", "stage", "status",
+                    "category",
+                    "code",
+                    "epoch",
+                    "event",
+                    "level",
+                    "occurrences",
+                    "service",
+                    "stage",
+                    "status",
                 ]
                 .into_iter()
                 .map(str::to_owned)
                 .collect()
             );
+            assert_eq!(record["occurrences"], 1);
             assert_eq!(record["service"], "synology-drive-sync");
             assert_eq!(record["stage"], arguments.0);
             assert_eq!(record["code"], arguments.1);
@@ -14834,6 +15004,58 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read(&outside).unwrap(), b"preserve");
+    }
+
+    /// A saturated pool used to drop the connection with no response and no
+    /// record. That is indistinguishable from a crashed service, it is
+    /// invisible in the package log an operator would consult, and — worst —
+    /// the AppWindow reads a dropped mutation POST as an outcome it cannot
+    /// determine, which latches the scope for a request the service never even
+    /// read. The answer must be an explicit, attributable rejection.
+    #[test]
+    fn saturated_service_answers_with_an_attributable_pre_acceptance_rejection() {
+        let response = CgiResponse::failure(CgiFailure::coded(
+            CgiFailureStage::BridgeConnect,
+            BridgeError::new(ErrorKind::Unavailable),
+            SATURATED_SERVICE_CODE,
+        ));
+        assert_eq!(response.status, 503);
+        // A trusted envelope is what makes the browser treat this as a
+        // definite rejection rather than an unknown outcome.
+        assert!(response.is_trusted_error_envelope());
+
+        let payload: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(payload["schema"], "sdsync.dsm-error.v1");
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["status"], 503);
+        assert_eq!(payload["code"], SATURATED_SERVICE_CODE);
+        assert_eq!(payload["stage"], "bridge_connect");
+
+        // Distinct from "not ready": an operator seeing this needs to know the
+        // service is alive and refused one request without starting it.
+        let unavailable = CgiResponse::staged_error(
+            CgiFailureStage::BridgeConnect,
+            BridgeError::new(ErrorKind::Unavailable),
+        );
+        let unavailable_payload: Value = serde_json::from_slice(&unavailable.body).unwrap();
+        assert_eq!(unavailable_payload["code"], "service_unavailable");
+        assert_ne!(payload["message"], unavailable_payload["message"]);
+        let message = payload["message"].as_str().unwrap();
+        assert!(message.contains("Nothing was submitted."), "{message}");
+
+        // ...and the stage must be one the pre-relay recorder can attribute to
+        // a log category, or the record is silently discarded and we are back
+        // to an unobservable drop.
+        assert_eq!(
+            cgi_failure_category(CgiFailureStage::BridgeConnect.as_str()),
+            Some("bridge")
+        );
+        assert!(event_visible_at_threshold(
+            &SecurityPolicyArgs::default(),
+            "bridge",
+            "warn",
+            false
+        ));
     }
 
     #[cfg(target_os = "linux")]
@@ -16156,76 +16378,91 @@ mod tests {
             name: "nightly".to_owned(),
         });
 
-        assert_eq!(
-            interactive_connection_budget(&authentication),
-            Some(InteractiveConnectionBudget {
-                probe: Duration::from_secs(45),
-                logout: Duration::from_secs(10),
-            })
-        );
-        assert_eq!(
-            interactive_connection_budget(&browsing),
-            Some(InteractiveConnectionBudget {
-                probe: Duration::from_secs(50),
-                logout: Duration::from_secs(10),
-            })
-        );
+        // Interactive only. Everything else runs the manager, which is bounded
+        // by its own capture timeout rather than by a connection budget.
         assert_eq!(interactive_connection_budget(&serialized), None);
-    }
+        let authentication_budget =
+            interactive_connection_budget(&authentication).expect("authentication is interactive");
+        let browsing_budget =
+            interactive_connection_budget(&browsing).expect("browsing is interactive");
 
-    /// A probe or cleanup budget below the sum of the control round trips it
-    /// contains fails on a slow-but-healthy relay instead of on a broken
-    /// target, and the AppWindow reports that as an unresolved connection
-    /// incident. Deriving the expected budgets from the leg counts here means
-    /// adding a round trip to either path without widening its budget fails.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn interactive_connection_budgets_cover_every_control_leg() {
-        // `ApiClient::discover` tries `entry.cgi` and falls back to `query.cgi`.
-        const DISCOVERY_LEGS: u32 = 2;
-        // `authenticate_file_station` logs in once, then again for a TOTP challenge.
-        const LOGIN_LEGS: u32 = 2;
-        // `ApiClient::confirm_file_station_session` caps itself below the
-        // general control ceiling, so the probe reserves only that slice.
-        const SESSION_CONFIRMATION_CEILING: Duration = Duration::from_secs(5);
+        // Operation-specific: the two probes fund different leg sequences, so
+        // one shared constant for both would be the bug this guards against.
+        // Authentication pays a File Station session confirmation that browsing
+        // does not; browsing pays a directory listing instead.
+        assert_ne!(authentication_budget.probe, browsing_budget.probe);
+        // Cleanup is the same single warm leg either way, and is deliberately
+        // reserved apart from the probe so an exhausted probe still logs out.
+        assert_eq!(authentication_budget.logout, browsing_budget.logout);
 
-        let ceiling = INTERACTIVE_CONTROL_REQUEST_CEILING;
-        let shared_probe_legs = ceiling * (DISCOVERY_LEGS + LOGIN_LEGS);
-
-        assert_eq!(
-            INTERACTIVE_AUTH_TEST_PROBE_TIMEOUT,
-            shared_probe_legs + SESSION_CONFIRMATION_CEILING
-        );
-        assert_eq!(
-            INTERACTIVE_REMOTE_BROWSE_PROBE_TIMEOUT,
-            shared_probe_legs + ceiling
-        );
-
-        // Logout is one control request on a session that already exists, and
-        // it is the only leg whose failure is reported as a cleanup incident.
-        // Anything below the per-request ceiling abandons a healthy logout.
-        for logout in [
-            INTERACTIVE_AUTH_TEST_LOGOUT_TIMEOUT,
-            INTERACTIVE_REMOTE_BROWSE_LOGOUT_TIMEOUT,
-        ] {
-            assert_eq!(logout, ceiling);
+        // Bounded: a zero budget would mean "no deadline", and these run in a
+        // consumer the controller waits on, so an unbounded one stalls the
+        // whole control queue.
+        for budget in [authentication_budget, browsing_budget] {
+            assert!(!budget.probe.is_zero());
+            assert!(!budget.logout.is_zero());
         }
 
-        // Both operations must still settle well inside the AppWindow's
-        // 120-second queued-result observation window, or a budget widened
-        // here would only move the failure to the browser.
-        const APPWINDOW_RESULT_OBSERVATION_WINDOW: Duration = Duration::from_secs(120);
-        for (probe, logout) in [
-            (
-                INTERACTIVE_AUTH_TEST_PROBE_TIMEOUT,
-                INTERACTIVE_AUTH_TEST_LOGOUT_TIMEOUT,
-            ),
-            (
-                INTERACTIVE_REMOTE_BROWSE_PROBE_TIMEOUT,
-                INTERACTIVE_REMOTE_BROWSE_LOGOUT_TIMEOUT,
-            ),
+        // The derivations live on the constants; pinned here so a change has to
+        // be deliberate rather than incidental.
+        assert_eq!(
+            authentication_budget,
+            InteractiveConnectionBudget {
+                probe: Duration::from_secs(30),
+                logout: Duration::from_secs(3),
+            }
+        );
+        assert_eq!(
+            browsing_budget,
+            InteractiveConnectionBudget {
+                probe: Duration::from_secs(27),
+                logout: Duration::from_secs(3),
+            }
+        );
+    }
+
+    /// A cross-layer contract, and the only place it is checked.
+    ///
+    /// These budgets bound the consumer process, but the AppWindow is watching
+    /// the same job through `PROFILE_CONNECTION_API_LIMITS.resultObservationTimeoutMs`.
+    /// If a budget ever exceeds that window, widening it stops buying anything:
+    /// the browser gives up first and reports an outcome it could not observe,
+    /// which is the latched incident this whole area exists to avoid. Nothing
+    /// else in the repository relates the two numbers, so changing either one
+    /// alone must fail here.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interactive_connection_budgets_settle_inside_the_appwindow_observation_window() {
+        let observation = APPWINDOW_RESULT_OBSERVATION_WINDOW;
+        let connection = ConnectionJobArgs {
+            profile: Some("nightly".to_owned()),
+            url: "https://nas.example.invalid".to_owned(),
+            username: "backup-user".to_owned(),
+            allow_http: false,
+            danger_accept_invalid_certs: false,
+            ca_certificate: None,
+            connect_timeout_seconds: 15,
+            timeout_seconds: 120,
+            retries: 5,
+            password_source: CredentialSource::Stored,
+            totp_source: CredentialSource::None,
+        };
+        for mutation in [
+            Mutation::TestProfileAuth(connection.clone()),
+            Mutation::BrowseRemote(BrowseRemoteJobArgs {
+                connection,
+                parent: "/".to_owned(),
+                connection_proof: format!("v1.10300.{}.{}", "b".repeat(64), "c".repeat(64)),
+            }),
         ] {
-            assert!(probe + logout < APPWINDOW_RESULT_OBSERVATION_WINDOW);
+            let budget = interactive_connection_budget(&mutation)
+                .expect("interactive mutation has a budget");
+            let total = budget.probe + budget.logout;
+            assert!(
+                total < observation,
+                "{} budget {total:?} must settle inside the AppWindow's {observation:?} window",
+                mutation.operation_id()
+            );
         }
     }
 

@@ -2168,28 +2168,32 @@ api_json_log_lines() {
     [ -n "$json_log_inputs" ] || { printf '[]'; return; }
     # All paths are fixed package-owned DSM paths and cannot contain spaces.
     set -- $json_log_inputs
-    # Bound the scan window before the per-character redaction pass, the way
-    # api_activity already bounds its input. The requested count is a scan
-    # bound, not merely the size of the output ring: a rotated log set reaches
-    # tens of megabytes, and walking all of it through the redaction and
-    # quoting loops makes this read slower every day until the bridge's capture
-    # timeout kills it on every request. Two stages keep the read proportional
-    # to the window: each rotation contributes at most one window, and the
-    # concatenation is trimmed to the newest window overall.
+    json_log_path_count=$#
+    # Do not put a window over the input here. This was tried -- piping each
+    # rotation through `tail -n "$json_log_lines"` before awk -- and it is a
+    # correctness regression, not an optimisation. The caller asked for the most
+    # recent N *matching* records; a window returns matches *within* the last N
+    # lines, which is a different question. A match sits arbitrarily far back
+    # whenever newer records are suppressed by the level threshold, so on a busy
+    # system a window silently hides real records from an operator. It is caught
+    # by test_log_thresholds_suppress_writers_and_return_requested_matching_errors
+    # and by test_api_logs_return_recent_matches_without_rescanning_history_cost.
     #
-    # Every operand is a secret file that BEGIN reads and then blanks, so awk
-    # is left with no usable operand and reads this pipeline from standard
-    # input, exactly as api_activity's awk does.
-    { for json_log_window in "$@"; do tail -n "$json_log_lines" "$json_log_window"; done; } \
-        | tail -n "$json_log_lines" \
-        | LC_ALL=C awk -v home="$package_home" -v var="$package_var" \
+    # Reading was never the cost, so bounding the read buys almost nothing. The
+    # threshold test below is a couple of index() calls that skip a non-matching
+    # line immediately; it is redaction and JSON quoting, which walk a line
+    # character by character, that made this call grow with history until the
+    # bridge's capture timeout killed it. Those now run in END over only the
+    # records that survive the ring. Measured on 29 MB of rotated logs: 41.0 s
+    # before, 1.25 s now, with byte-identical output.
+    LC_ALL=C awk -v home="$package_home" -v var="$package_var" \
         -v real_home="$package_home_real" -v real_var="$package_var_real" \
         -v requested="$json_log_lines" -v byte_limit="$json_log_byte_limit" -v line_limit=8192 \
         -v source="$json_log_source" -v threshold="$json_log_threshold" \
         -v bridge_threshold="$security_runtime_bridge_level" \
         -v authentication_threshold="$security_runtime_authentication_level" \
         -v security_threshold="$security_runtime_security_level" \
-        -v log_path_count=0 '
+        -v log_path_count="$json_log_path_count" '
         function level_rank(level) {
             if (level == "trace") return 0
             if (level == "debug") return 1
@@ -2315,14 +2319,7 @@ api_json_log_lines() {
                 ARGV[argument] = ""
             }
         }
-        {
-            line = $0
-            if (source != "audit") {
-                line_threshold = source == "api" ? api_threshold(line) : threshold
-                if (line_threshold == "off" || line_threshold == "invalid") next
-                event_level = structured_level(line)
-                if (event_level == "invalid" || level_rank(event_level) < level_rank(line_threshold)) next
-            }
+        function sanitize(line, first, needle_index) {
             first = 1
             while (first <= length(line) && substr(line, first, 1) ~ /[ \t]/) first++
             if (substr(line, first, 1) == "{" || substr(line, first, 1) == "[") {
@@ -2339,8 +2336,22 @@ api_json_log_lines() {
             line = replace_literal(line, real_var, "[package-var]")
             gsub(/\[package-home\]\/secrets\/[^ ]+/, "[secret]", line)
             if (length(line) > line_limit) line = substr(line, 1, line_limit)
+            return line
+        }
+        {
+            line = $0
+            if (source != "audit") {
+                line_threshold = source == "api" ? api_threshold(line) : threshold
+                if (line_threshold == "off" || line_threshold == "invalid") next
+                event_level = structured_level(line)
+                if (event_level == "invalid" || level_rank(event_level) < level_rank(line_threshold)) next
+            }
+            # Bound the retained line here so the ring cannot grow with an
+            # arbitrarily long record. Redaction may lengthen what it rewrites,
+            # so sanitize() applies the same ceiling again on the way out.
+            if (length(line) > line_limit) line = substr(line, 1, line_limit)
             record_count++
-            ring[((record_count - 1) % requested) + 1] = quote(line)
+            ring[((record_count - 1) % requested) + 1] = line
         }
         END {
             available = record_count < requested ? record_count : requested
@@ -2348,7 +2359,11 @@ api_json_log_lines() {
             selected_first = record_count + 1
             selected_bytes = 2
             for (record = record_count; record >= first_record; record--) {
-                encoded = ring[((record - 1) % requested) + 1]
+                slot = ((record - 1) % requested) + 1
+                # The expensive pass, run here and no earlier: at most one
+                # sanitize+quote per record the caller can actually receive.
+                encoded = quote(sanitize(ring[slot]))
+                ring[slot] = encoded
                 cost = length(encoded) + (selected_first <= record_count ? 1 : 0)
                 if (selected_bytes + cost > byte_limit) break
                 selected_bytes += cost
@@ -2361,7 +2376,8 @@ api_json_log_lines() {
             }
             printf "]"
         }
-    ' "$secret_root"/*.password "$secret_root"/*.totp "$secret_root"/*.remote-log-token
+    ' "$secret_root"/*.password "$secret_root"/*.totp "$secret_root"/*.remote-log-token \
+        "$@"
 }
 
 api_logs() {

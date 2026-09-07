@@ -143,6 +143,26 @@ class DsmUiContractTests(unittest.TestCase):
         self.assertIn('"request_reconciliation": true,', backend)
         self.assertIn('this.hasCapability("request_reconciliation")', app)
 
+        # The interactive connection budgets bound the consumer process while
+        # the AppWindow watches the same job on its own clock. If the two ever
+        # disagree the browser gives up first and reports an outcome it never
+        # observed, which is the latched incident the budgets exist to avoid.
+        # Neither file can see the other, so the agreement is asserted here.
+        observation = re.search(
+            r"resultObservationTimeoutMs:\s*(\d+)", app
+        )
+        self.assertIsNotNone(observation, "AppWindow connection limits are missing")
+        mirrored = re.search(
+            r"const APPWINDOW_RESULT_OBSERVATION_WINDOW: Duration = Duration::from_secs\((\d+)\)",
+            backend,
+        )
+        self.assertIsNotNone(mirrored, "DSM API is missing the mirrored observation window")
+        self.assertEqual(
+            int(observation.group(1)),
+            int(mirrored.group(1)) * 1000,
+            "AppWindow result observation window and the DSM API mirror disagree",
+        )
+
         for marker in (
             "same authenticated DSM `id` session",
             "Close and Cancel are disabled",

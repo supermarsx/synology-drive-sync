@@ -3648,13 +3648,16 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(invalid.returncode, 64)
         self.assertEqual(invalid_payload["code"], "invalid_request")
 
-    def test_api_logs_scan_window_is_bounded_before_redaction(self) -> None:
-        """`--lines` bounds the scan, not merely the emitted ring.
+    def test_api_logs_return_recent_matches_without_rescanning_history_cost(self) -> None:
+        """Cost is bounded to what is returned; eligibility is not bounded at all.
 
-        Every scanned line is walked character by character for secret
-        redaction and JSON quoting. Reading a whole rotated log set that way
-        makes this call slower every day until the bridge's capture timeout
-        kills it, which takes the Activity view down with it.
+        Redaction and JSON quoting walk every retained line character by
+        character. Doing that for each matching line in a whole rotated log set
+        made this call slower every day until the bridge's capture timeout
+        killed it. Doing it only for the records that survive the ring is the
+        fix — but `--lines` must keep meaning "the most recent N *matching*
+        records", not "matches inside the last N lines". Bounding the input
+        instead silently hides real records behind newer suppressed noise.
         """
         log_directory = self.real_var / "log"
 
@@ -3664,51 +3667,65 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             if os.getuid() == 0:
                 os.chown(path, self.drop_uid, self.drop_gid)
 
-        # A deterministic witness. The newest lines sit below the configured
-        # threshold, so a scan bounded to the window returns nothing, while a
-        # scan that walks the whole file keeps reaching further back until the
-        # ring is full. Callers absorb this by asking for a wider window than
-        # they intend to display.
         changed = self.shell(
             self.manager,
             "configure-security-policy",
             *self.security_policy_options(bridge_log_level="warn"),
         )
         self.assertEqual(changed.returncode, 0, changed.stderr)
-        older_warning = json.dumps(
-            {"level": "warn", "category": "bridge", "message": "older-warning"},
-            separators=(",", ":"),
-        )
-        newer_info = json.dumps(
-            {"level": "info", "category": "bridge", "message": "newer-info"},
-            separators=(",", ":"),
-        )
-        write_log(
-            log_directory / "api.log",
-            (older_warning + "\n") * 40 + (newer_info + "\n") * 10,
-        )
-        windowed, windowed_payload = self.api("logs", "--lines", "5", "--source", "api")
-        self.assertEqual(windowed.returncode, 0, windowed.stderr)
-        windowed_api = next(
-            entry for entry in windowed_payload["logs"] if entry["source"] == "api"
-        )
-        self.assertEqual(windowed_api["lines"], [])
 
-        # ...and the same bound is what keeps the cost proportional to the
-        # window rather than to the file. An end-to-end character walk of this
-        # file does not finish inside the bridge's 20-second capture timeout.
-        noisy = json.dumps(
-            {"level": "warn", "category": "bridge", "message": "n" * 96},
+        # The match sits behind far more newer records than the caller asked
+        # for, and every one of those is suppressed by the threshold. Any
+        # window over the input loses it.
+        wanted = json.dumps(
+            {"level": "warn", "category": "bridge", "message": "retained-warning"},
             separators=(",", ":"),
         )
-        recent = json.dumps(
-            {"level": "warn", "category": "bridge", "message": "recent-marker"},
+        noise = json.dumps(
+            {"level": "info", "category": "bridge", "message": "suppressed-noise"},
             separators=(",", ":"),
         )
-        write_log(
-            log_directory / "api.log",
-            (noisy + "\n") * 200_000 + (recent + "\n") * 5,
+        write_log(log_directory / "api.log", wanted + "\n" + (noise + "\n") * 150)
+        buried, buried_payload = self.api("logs", "--lines", "1", "--source", "api")
+        self.assertEqual(buried.returncode, 0, buried.stderr)
+        buried_api = next(
+            entry for entry in buried_payload["logs"] if entry["source"] == "api"
         )
+        self.assertEqual(len(buried_api["lines"]), 1, buried_api["lines"])
+        self.assertIn("retained-warning", buried_api["lines"][0])
+
+        # ...and the newest matches win when there are more than requested.
+        ordered = "".join(
+            json.dumps(
+                {"level": "warn", "category": "bridge", "message": "warning-%d" % index},
+                separators=(",", ":"),
+            )
+            + "\n"
+            + noise
+            + "\n"
+            for index in range(40)
+        )
+        write_log(log_directory / "api.log", ordered)
+        newest, newest_payload = self.api("logs", "--lines", "3", "--source", "api")
+        self.assertEqual(newest.returncode, 0, newest.stderr)
+        newest_api = next(
+            entry for entry in newest_payload["logs"] if entry["source"] == "api"
+        )
+        self.assertEqual(len(newest_api["lines"]), 3)
+        self.assertTrue(all("suppressed-noise" not in line for line in newest_api["lines"]))
+        self.assertEqual(
+            ["warning-37", "warning-38", "warning-39"],
+            [json.loads(line)["message"] for line in newest_api["lines"]],
+        )
+
+        # Cost stays bounded to the records returned rather than to history.
+        # The pre-fix form walked every matching line and took ~41 s on a file
+        # this size, well past the bridge's 20-second capture timeout.
+        bulky = json.dumps(
+            {"level": "warn", "category": "bridge", "message": "b" * 96},
+            separators=(",", ":"),
+        )
+        write_log(log_directory / "api.log", (bulky + "\n") * 200_000)
         started = time.monotonic()
         large, large_payload = self.api("logs", "--lines", "5", "--source", "api")
         elapsed = time.monotonic() - started
@@ -3717,11 +3734,10 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             entry for entry in large_payload["logs"] if entry["source"] == "api"
         )
         self.assertEqual(len(large_api["lines"]), 5)
-        self.assertTrue(all("recent-marker" in line for line in large_api["lines"]))
         self.assertLess(
             elapsed,
-            10.0,
-            f"log read scanned past its window ({elapsed:.1f}s for 5 requested lines)",
+            15.0,
+            "log read cost tracked history rather than output (%.1fs)" % elapsed,
         )
 
     def test_api_logs_and_activity_include_rotated_history_and_reject_unsafe_rotations(self) -> None:

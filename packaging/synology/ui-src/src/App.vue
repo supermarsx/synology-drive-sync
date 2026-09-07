@@ -532,7 +532,7 @@ const INCIDENT_SCOPE_LABELS = Object.freeze({
 });
 const PROFILE_SECRET_KINDS = Object.freeze(["password", "totp", "remote-log-token"]);
 const PROFILE_CREATION_WINDOW_WARNING = "Keep this AppWindow open; do not navigate away until profile creation finishes.";
-const PROFILE_CONNECTION_HEALTHY_TIMING = "On a healthy path, allow up to 20 seconds once dispatched, and up to a minute through a slow relay such as QuickConnect; queued-result polling can continue shortly after. Controller or service failures may settle differently.";
+const PROFILE_CONNECTION_HEALTHY_TIMING = "On a healthy path, allow up to 15 seconds once dispatched; queued-result polling can continue shortly after. Controller or service failures may settle differently.";
 const PROFILE_CONNECTION_API_LIMITS = Object.freeze({
   csrfReissueTimeoutMs: 10000,
   postRequestTimeoutMs: 45000,

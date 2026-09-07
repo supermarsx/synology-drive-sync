@@ -61,14 +61,12 @@ test. The test can use stored credentials while secret writes are disabled, prov
 actions remain allowed. Transient values are neither returned nor persisted by testing; creating a
 new profile persists its password only in the later protected-secret save stage.
 
-After controller dispatch, **Test authentication** gives API discovery, login including an optional
-TOTP challenge, and the File Station session confirmation one shared 45-second probe budget, and
-reserves a separate 10 seconds for logout. **Browse target** gives discovery, login, an optional
-TOTP challenge, and directory listing one shared 50-second budget, again with a separate 10 seconds
-reserved for logout. Each budget covers the per-request ceiling of every round trip it contains, so
-a slow relay such as QuickConnect is reported as slow rather than as a failed session cleanup.
-These are execution budgets, not end-to-end UI countdowns: FIFO queueing and result observation or
-reconciliation can leave an accepted request displayed as pending for longer still.
+After controller dispatch, **Test authentication** gives API discovery and login, including an
+optional TOTP challenge, one shared 12-second probe budget and reserves a separate 3 seconds for
+logout. **Browse target** gives discovery, login, an optional TOTP challenge, and directory listing
+one shared 27-second budget, again with a separate 3 seconds reserved for logout. These are
+execution budgets, not end-to-end UI countdowns: FIFO queueing and result observation or
+reconciliation can leave an accepted request displayed as pending beyond 15 or 30 seconds.
 Interactive probes deliberately disable configured transport retries so one click cannot multiply
 that bounded wait. This exception applies only to authentication testing and remote browsing;
 normal sync operations retain the retry policy saved in the profile.
