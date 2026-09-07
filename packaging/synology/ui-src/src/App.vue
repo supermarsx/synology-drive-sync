@@ -332,7 +332,7 @@
               <p v-if="!doctorReport.sections.length" class="sdsync-empty">Run Target Doctor to see OK, warning, not OK, and skipped evidence for each diagnostic area.</p>
               <ol v-else class="sdsync-doctor-sections">
                 <li v-for="(section, sectionIndex) in doctorReport.sections" :key="[section.profile, section.id, sectionIndex].join(':')" :class="doctorStatusClass(section.state)">
-                  <div class="sdsync-doctor-section-heading"><span class="sdsync-doctor-state-dot" /><div><strong>{{ section.label }}</strong><small v-if="section.profile">Profile: {{ section.profile }}</small><small v-if="section.timing_scope">Timing scope: {{ section.timing_scope }}</small></div><span class="sdsync-doctor-state-label">{{ doctorStatusLabel(section.state) }}</span><time v-if="section.duration_ms !== null">{{ formatDuration(section.duration_ms) }}</time></div>
+                  <div class="sdsync-doctor-section-heading"><span class="sdsync-doctor-state-dot" /><div><strong>{{ section.label }}</strong><small v-if="section.step">Step {{ section.step }} of {{ doctorStepTotal }}</small><small v-if="section.profile">Profile: {{ section.profile }}</small><small v-if="section.timing_scope">Timing scope: {{ section.timing_scope }}</small></div><span class="sdsync-doctor-state-label">{{ doctorStatusLabel(section.state) }}</span><time v-if="section.duration_ms !== null">{{ formatDuration(section.duration_ms) }}</time></div>
                   <p>{{ section.detail }}</p>
                   <ul v-if="section.checks.length" class="sdsync-doctor-checks"><li v-for="check in section.checks" :key="check.id" :class="doctorStatusClass(check.state)"><span class="sdsync-doctor-state-dot" /><strong>{{ check.label }}</strong><span>{{ check.detail }}</span><time v-if="check.duration_ms !== null">{{ formatDuration(check.duration_ms) }}</time><small>{{ doctorStatusLabel(check.state) }}</small></li></ul>
                   <div v-if="section.inventory" class="sdsync-doctor-inventory"><div class="sdsync-doctor-inventory-summary"><strong>{{ section.inventory.total }} remote entr{{ section.inventory.total === 1 ? 'y' : 'ies' }} reported</strong><span>{{ doctorInventoryScopeLabel(section.inventory.scope) }} · {{ section.inventory.entries.length }} displayed<span v-if="section.inventory.truncated"> · bounded sample truncated</span></span></div><p v-if="!section.inventory.entries.length" class="sdsync-doctor-inventory-empty">No logical entries were visible in this scope.</p><ul v-else><li v-for="(entry, entryIndex) in section.inventory.entries" :key="entry.path + ':' + entryIndex"><span class="sdsync-doctor-entry-kind">{{ entry.kind }}</span><div><strong>{{ entry.path }}</strong><small>{{ doctorInventoryMetadata(entry) }}</small></div></li></ul></div>
@@ -545,15 +545,35 @@ const PROFILE_CONNECTION_API_LIMITS = Object.freeze({
 });
 const DOCTOR_LEVELS = Object.freeze(["quick", "standard", "extensive"]);
 const DOCTOR_OUTPUT_LIMIT_BYTES = 1024 * 1024;
+// Mirror of DOCTOR_SECTION_SPECS in src/main.rs, in the same order. The two are
+// asserted to carry the same ids by test_synology_ui.py, because nothing else
+// relates them and a stale list here silently under-reports a diagnostic run.
+//
+// Order is the CLI's, which is thematic rather than execution order — File
+// Station capabilities are settled from the discovery response long before
+// authentication, yet belong beside the other File Station checks. The `step`
+// each section carries is what conveys execution order, and it is rendered.
+//
+// Every `minimum` is "quick" on purpose: the CLI builds all sixteen sections up
+// front as skipped and emits every id at every level, so there is no per-section
+// minimum on the Rust side to mirror. Do not invent one here.
 const DOCTOR_SECTION_CATALOG = Object.freeze([
+  Object.freeze({ id: "network_reachability", label: "Network reachability and connect timing", minimum: "quick", detail: "Measure TCP reachability and connect timing before any protocol negotiation." }),
   Object.freeze({ id: "routing_tls", label: "Routing and TLS negotiation", minimum: "quick", detail: "Resolve the endpoint and negotiate the configured HTTPS transport." }),
   Object.freeze({ id: "dsm_api_discovery", label: "DSM API discovery", minimum: "quick", detail: "Negotiate a compatible DSM and File Station API surface." }),
+  Object.freeze({ id: "capability_enumeration", label: "DSM capability enumeration", minimum: "quick", detail: "Enumerate the API surface the target advertises." }),
+  Object.freeze({ id: "intermediary_transport", label: "Intermediaries and reverse proxies", minimum: "quick", detail: "Summarise proxy and intermediary behaviour observed across the whole run." }),
   Object.freeze({ id: "dsm_session_auth", label: "DSM session authentication", minimum: "standard", detail: "Authenticate a temporary target session without exposing credentials." }),
+  Object.freeze({ id: "session_channel_ablation", label: "DSM session channel ablation", minimum: "standard", detail: "Establish which session channel the target actually honours." }),
+  Object.freeze({ id: "session_concurrency", label: "Concurrent session fan-out", minimum: "standard", detail: "Check whether concurrent authenticated requests keep their session." }),
+  Object.freeze({ id: "session_cookie_ledger", label: "Session cookie permanence", minimum: "standard", detail: "Summarise how the target's session cookies behaved across the whole run." }),
   Object.freeze({ id: "file_station_capabilities", label: "File Station capabilities", minimum: "standard", detail: "Check the target operations required by this profile." }),
+  Object.freeze({ id: "capability_diagnosis", label: "File Station capability diagnosis", minimum: "standard", detail: "Explain any capability the target declined to offer." }),
+  Object.freeze({ id: "destination_path_resolution", label: "Destination path resolution", minimum: "standard", detail: "Resolve the configured destination to an exact shared folder and path." }),
   Object.freeze({ id: "destination_permissions", label: "Destination permissions", minimum: "standard", detail: "With a configured destination, verify child-create/write permission at the exact path or its nearest existing ancestor; otherwise skip this section." }),
   Object.freeze({ id: "destination_inventory", label: "Destination inventory", minimum: "standard", detail: "With a configured destination, inspect a bounded direct-child sample; otherwise sample visible shared-folder roots without selecting or traversing a share." }),
   Object.freeze({ id: "disposable_write_verify_cleanup", label: "Disposable write, verify, and cleanup", minimum: "write", detail: "Create, verify, and remove one explicitly approved probe." }),
-  Object.freeze({ id: "session_logout", label: "Session logout", minimum: "standard", detail: "Confirm that the temporary DSM target session is closed." })
+  Object.freeze({ id: "session_logout", label: "DSM session logout", minimum: "standard", detail: "Confirm that the temporary DSM target session is closed." })
 ]);
 const DOCTOR_STATE_ALIASES = Object.freeze({
   pass: "ok", passed: "ok", success: "ok", succeeded: "ok", healthy: "ok", ready: "ok", ok: "ok",
@@ -1466,6 +1486,7 @@ function expectedDoctorSections(level, writeTest, state = "pending") {
     detail: state === "skipped"
       ? "The installed package returned no structured evidence for this diagnostic area."
       : section.detail,
+    step: null,
     duration_ms: null,
     timing_scope: "",
     checks: [],
@@ -1507,6 +1528,14 @@ function aggregateDoctorState(items, fallback = "warn") {
 function doctorDuration(value) {
   const number = Number(value);
   return Number.isFinite(number) && number >= 0 ? Math.round(number) : null;
+}
+
+// Execution order, which is deliberately not display order: the CLI groups
+// sections for reading and reports the step separately. Rendering the grouping
+// without the step would assert a sequence that is not the one that ran.
+function doctorStep(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 1 && number <= 999 ? number : null;
 }
 
 function doctorText(value, fallback = "", limit = 4096) {
@@ -1734,6 +1763,7 @@ function normalizedDoctorSection(value, index, profile = "") {
     : (value.inventory !== undefined ? value.inventory : (id.includes("inventory") ? value.entries : null));
   return {
     id,
+    step: doctorStep(value.step),
     label: doctorText(value.label || value.title || value.name || value.area || value.code, `Diagnostic section ${index + 1}`, 256),
     state: explicitState === undefined || explicitState === null || explicitState === ""
       ? aggregateDoctorState(checks, "warn")
@@ -1896,6 +1926,7 @@ function sectionsFromDoctorDocument(document) {
       label: "Remote inventory sample",
       state: doctorState((document.remote_inventory || {}).state || document.status, "ok"),
       detail: "Bounded remote discovery evidence returned by the target.",
+      step: null,
       duration_ms: null,
       timing_scope: "",
       checks: [],
@@ -1990,6 +2021,7 @@ function doctorReportFromResult(result, successful, requestedLevel, writeTest, s
       label: "Legacy terminal evidence",
       state: successful ? "ok" : "failed",
       detail: doctorText(rawOutput, successful ? "Doctor completed." : "Doctor failed."),
+      step: null,
       duration_ms: null,
       timing_scope: "operation",
       checks: [],
@@ -2004,6 +2036,7 @@ function doctorReportFromResult(result, successful, requestedLevel, writeTest, s
       label: "Package-local source diagnostic",
       state: "failed",
       detail: sourceFailureDetail,
+      step: null,
       duration_ms: null,
       timing_scope: "operation",
       checks: [],
@@ -2017,6 +2050,7 @@ function doctorReportFromResult(result, successful, requestedLevel, writeTest, s
       label: "Package Doctor operation",
       state: "failed",
       detail: doctorOperationFailureDetail(result, rawOutput),
+      step: null,
       duration_ms: null,
       timing_scope: "operation",
       checks: [],
@@ -2034,6 +2068,7 @@ function doctorReportFromResult(result, successful, requestedLevel, writeTest, s
         "The returned Doctor evidence is incomplete.",
         4096
       ),
+      step: null,
       duration_ms: null,
       timing_scope: "transport",
       checks: [],
@@ -2047,6 +2082,7 @@ function doctorReportFromResult(result, successful, requestedLevel, writeTest, s
       label: "Terminal warning evidence",
       state: "warn",
       detail: outputEnvelope.trailing_text,
+      step: null,
       duration_ms: null,
       timing_scope: "transport",
       checks: [],
@@ -2149,6 +2185,7 @@ function doctorTroubleshootingText(report, title, output) {
   ];
   for (const section of Array.isArray(model.sections) ? model.sections : []) {
     lines.push("", `[${doctorState(section.state, "warn").toUpperCase()}] ${doctorText(section.label, section.id, 256)}`);
+    if (section.step) lines.push(`Step: ${section.step}`);
     if (section.profile) lines.push(`Profile: ${doctorText(section.profile, "", 128)}`);
     if (section.duration_ms !== null && section.duration_ms !== undefined) lines.push(`Duration: ${section.duration_ms} ms`);
     if (section.timing_scope) lines.push(`Timing scope: ${doctorText(section.timing_scope, "unavailable", 64)}`);
@@ -2634,6 +2671,13 @@ export default {
       return "Each status below is based on returned target evidence; missing areas are marked skipped rather than assumed healthy.";
     },
     doctorCopyAvailable() { return Boolean(this.doctorReport && this.doctorReport.sections && this.doctorReport.sections.length); },
+    // The denominator the CLI prints is its own section count. Placeholders the
+    // AppWindow synthesises for a document that omitted a section carry no step,
+    // so counting the steps that arrived keeps "step N of T" agreeing with the
+    // run rather than with whatever the view padded it to.
+    doctorStepTotal() {
+      return this.doctorReport.sections.filter((section) => section.step).length;
+    },
     doctorCleanupWarning() {
       const section = this.doctorReport && Array.isArray(this.doctorReport.sections)
         ? this.doctorReport.sections.find((item) => item.id === "disposable_write_verify_cleanup" && ["warn", "failed"].includes(doctorState(item.state, "warn")))

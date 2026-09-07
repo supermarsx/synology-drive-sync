@@ -163,6 +163,51 @@ class DsmUiContractTests(unittest.TestCase):
             "AppWindow result observation window and the DSM API mirror disagree",
         )
 
+        # Second cross-layer list that nothing else relates. The CLI owns the
+        # diagnostic sections; the AppWindow keeps its own copy to draw the
+        # pending view and to pad a document that omitted one. A stale copy
+        # silently under-reports a diagnostic run, which is worst precisely when
+        # someone is troubleshooting.
+        cli = (repository / "src/main.rs").read_text(encoding="utf-8")
+        specs = re.search(
+            r"const DOCTOR_SECTION_SPECS: \[\(&str, &str, u8\); (\d+)\] = \[(.*?)\n\];",
+            cli,
+            re.S,
+        )
+        self.assertIsNotNone(specs, "CLI doctor section table is missing")
+        cli_ids = re.findall(r'\(\s*"([a-z_]+)",\s*"', specs.group(2))
+        self.assertEqual(
+            len(cli_ids),
+            int(specs.group(1)),
+            "CLI doctor section table declares a length its entries do not match",
+        )
+        catalog = re.search(
+            r"const DOCTOR_SECTION_CATALOG = Object\.freeze\(\[(.*?)\n\]\);", app, re.S
+        )
+        self.assertIsNotNone(catalog, "AppWindow doctor section catalog is missing")
+        ui_ids = re.findall(r'id: "([a-z_]+)"', catalog.group(1))
+
+        missing = [section for section in cli_ids if section not in ui_ids]
+        extra = [section for section in ui_ids if section not in cli_ids]
+        self.assertEqual(
+            (missing, extra),
+            ([], []),
+            "doctor sections drifted between the CLI and the AppWindow -- "
+            f"missing from the AppWindow: {missing or 'none'}; "
+            f"unknown to the CLI: {extra or 'none'}",
+        )
+        # Order is part of the contract too: the pending view is drawn from this
+        # catalog and should not reshuffle once real results arrive.
+        self.assertEqual(
+            ui_ids,
+            cli_ids,
+            "AppWindow doctor sections carry the CLI ids in a different order",
+        )
+        # The AppWindow renders execution order rather than implying it from
+        # display order, so the step the CLI emits has to survive the parser.
+        self.assertIn("step: doctorStep(value.step)", app)
+        self.assertIn('"step": section.step,', cli)
+
         for marker in (
             "same authenticated DSM `id` session",
             "Close and Cancel are disabled",

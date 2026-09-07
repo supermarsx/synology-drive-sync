@@ -63,25 +63,40 @@ async function loadDoctorHelpers() {
 
 test("Doctor levels are explicit, standard by default, and quick never promises authentication", async () => {
   const doctor = await loadDoctorHelpers();
-  assert.deepEqual(
-    doctor.expectedDoctorSections("quick", false).map((section) => section.id),
-    ["routing_tls", "dsm_api_discovery"]
+  // The catalog mirrors the CLI, which builds every section up front and emits
+  // every id at each level, so only the write probe is gated. What this test
+  // pins is the gating rule, not a transcription of the catalog: quick must
+  // never imply authentication happened, and the write probe must appear only
+  // when it was explicitly asked for.
+  const quick = doctor.expectedDoctorSections("quick", false).map((section) => section.id);
+  const standard = doctor.expectedDoctorSections("standard", false).map((section) => section.id);
+  const extensive = doctor.expectedDoctorSections("extensive", true).map((section) => section.id);
+
+  assert.ok(quick.includes("routing_tls") && quick.includes("dsm_api_discovery"));
+  assert.equal(quick.includes("dsm_session_auth"), false, "quick must not promise authentication");
+  assert.equal(quick.includes("destination_permissions"), false);
+  assert.equal(quick.includes("disposable_write_verify_cleanup"), false);
+
+  // Standard is a superset of quick, and adds the authenticated areas.
+  for (const id of quick) assert.ok(standard.includes(id), `standard dropped ${id}`);
+  assert.ok(standard.includes("dsm_session_auth") && standard.includes("session_logout"));
+  assert.equal(
+    standard.includes("disposable_write_verify_cleanup"),
+    false,
+    "the disposable probe requires an explicit opt-in"
   );
+
+  // The write probe is the only section the level gate adds, and it is last.
   assert.deepEqual(
-    doctor.expectedDoctorSections("standard", false).map((section) => section.id),
-    [
-      "routing_tls", "dsm_api_discovery", "dsm_session_auth",
-      "file_station_capabilities", "destination_permissions",
-      "destination_inventory", "session_logout"
-    ]
+    extensive,
+    standard.concat(["disposable_write_verify_cleanup"]).sort(
+      (left, right) => extensive.indexOf(left) - extensive.indexOf(right)
+    )
   );
-  assert.deepEqual(
-    doctor.expectedDoctorSections("extensive", true).map((section) => section.id),
-    [
-      "routing_tls", "dsm_api_discovery", "dsm_session_auth",
-      "file_station_capabilities", "destination_permissions",
-      "destination_inventory", "disposable_write_verify_cleanup", "session_logout"
-    ]
+  assert.ok(extensive.includes("disposable_write_verify_cleanup"));
+  assert.equal(
+    doctor.expectedDoctorSections("extensive", false).includes("disposable_write_verify_cleanup"),
+    false
   );
   assert.equal(doctor.runningDoctorReport("unsupported", false, 1).level, "standard");
   assert.match(source, /doctorForm: \{ scope: "all", level: "standard"/);
@@ -524,7 +539,15 @@ test("legacy output is preserved but unreported areas are skipped, never assumed
   assert.equal(report.structured, false);
   assert.equal(report.state, "failed");
   assert.equal(report.summary.failed, 1);
-  assert.equal(report.summary.skipped, 7);
+  // Derived rather than transcribed: legacy output means no structured evidence
+  // arrived, so every area the level expects has to read as skipped rather than
+  // healthy. Hardcoding the count is what let this go stale when the CLI grew
+  // from eight diagnostic sections to sixteen.
+  assert.equal(
+    report.summary.skipped,
+    doctor.expectedDoctorSections("standard", false).length
+  );
+  assert.ok(report.summary.skipped > 0);
   assert.equal(report.sections.at(-1).id, "terminal_evidence");
   assert.match(report.sections.at(-1).detail, /rejected authentication/);
 });
