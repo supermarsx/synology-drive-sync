@@ -12531,10 +12531,7 @@ fn execute_result_action(
     if let Some(_slot) = LongPollSlot::try_acquire() {
         let deadline = Instant::now() + API_LONG_POLL_WINDOW;
         let mut interval = LONG_POLL_FIRST_INTERVAL;
-        loop {
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                break;
-            };
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             std::thread::sleep(interval.min(remaining));
             if let Some(response) = completed_result_response(
                 paths,
