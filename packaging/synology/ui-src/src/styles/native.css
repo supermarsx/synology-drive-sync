@@ -4766,3 +4766,202 @@
     gap: 5px;
   }
 }
+
+/* DSM desktop widget card.
+   DSM renders this class outside the AppWindow, on the desktop document, so it
+   cannot inherit the palette from .sdsync-app and has to carry the same tokens
+   itself. The values are copied from the AppWindow palette above and the widget
+   contract test asserts they stay identical, so the two surfaces cannot drift
+   into looking like two different packages. */
+.sdsync-widget {
+  --sdsync-bg: #0b0706;
+  --sdsync-border-soft: #2b100b;
+  --sdsync-text: #fff4e8;
+  --sdsync-muted: #d1a180;
+  --sdsync-fire: #ff6a1a;
+  --sdsync-red: #ff6b55;
+  --sdsync-amber: #ffd2a3;
+  display: flex;
+  /* DSM fixes the card body at 318x84 medium and 318x168 expanded and sizes the
+     Ext panel itself, so the height is stated here rather than inherited: a
+     percentage height would collapse against an auto-height Ext panel body and
+     let the expanded profile list grow straight out of the card. max-height
+     still yields to a definite body height where Ext provides one, and
+     overflow:hidden clips rather than spills if the two ever disagree. */
+  overflow: hidden;
+  box-sizing: border-box;
+  width: 100%;
+  height: 168px;
+  max-height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  padding: 7px 10px 6px;
+  gap: 4px;
+  color: var(--sdsync-text);
+  color-scheme: dark;
+  background: var(--sdsync-bg);
+  font-family: Inter, "Segoe UI", system-ui, sans-serif;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.sdsync-widget.is-light {
+  --sdsync-bg: #f5ece5;
+  --sdsync-border-soft: #d4b39f;
+  --sdsync-text: #2a1007;
+  --sdsync-muted: #704b38;
+  --sdsync-fire: #9e350d;
+  --sdsync-red: #9e211b;
+  --sdsync-amber: #785000;
+  color-scheme: light;
+}
+
+.sdsync-widget-host,
+.sdsync-widget-host .x-panel-body {
+  overflow: hidden;
+  border: 0;
+  background: transparent;
+}
+
+.sdsync-widget-headline {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 7px;
+}
+
+.sdsync-widget-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  margin-top: 4px;
+  border: 1px solid currentColor;
+  background: currentColor;
+  color: var(--sdsync-muted);
+}
+
+.sdsync-widget.is-ok .sdsync-widget-dot {
+  color: var(--sdsync-fire);
+}
+
+.sdsync-widget.is-warn .sdsync-widget-dot {
+  color: var(--sdsync-amber);
+}
+
+.sdsync-widget.is-fail .sdsync-widget-dot {
+  color: var(--sdsync-red);
+}
+
+.sdsync-widget-headline-text {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.sdsync-widget-title {
+  overflow: hidden;
+  color: var(--sdsync-text);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sdsync-widget-detail {
+  overflow: hidden;
+  color: var(--sdsync-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sdsync-widget-run {
+  display: flex;
+  overflow: hidden;
+  align-items: center;
+  gap: 5px;
+  margin: 0;
+  color: var(--sdsync-fire);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sdsync-widget-profiles {
+  overflow-x: hidden;
+  overflow-y: auto;
+  min-height: 0;
+  flex: 1 1 auto;
+  margin: 2px 0 0;
+  padding: 3px 0 0;
+  border-top: 1px solid var(--sdsync-border-soft);
+  list-style: none;
+}
+
+.sdsync-widget-profile {
+  display: grid;
+  align-items: baseline;
+  padding: 2px 0;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
+
+.sdsync-widget-profile-name {
+  overflow: hidden;
+  color: var(--sdsync-text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sdsync-widget-profile-outcome {
+  color: var(--sdsync-muted);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.sdsync-widget-profile.is-ok .sdsync-widget-profile-outcome {
+  color: var(--sdsync-fire);
+}
+
+.sdsync-widget-profile.is-warn .sdsync-widget-profile-outcome {
+  color: var(--sdsync-amber);
+}
+
+.sdsync-widget-profile.is-fail .sdsync-widget-profile-outcome {
+  color: var(--sdsync-red);
+}
+
+.sdsync-widget-profile-age {
+  color: var(--sdsync-muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+/* margin-top keeps the footer on the bottom edge of whichever card size DSM
+   chose, including the compact card and the expanded card of an install that
+   has no profiles yet, where there is no profile list to absorb the slack. */
+.sdsync-widget-footer {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin: auto 0 0;
+  color: var(--sdsync-muted);
+  font-size: 10px;
+}
+
+.sdsync-widget-degraded {
+  color: var(--sdsync-amber);
+  white-space: nowrap;
+}
+
+/* The medium card is 84px tall against 168px expanded, so the compact state
+   has to buy back the vertical space the profile list would have used. */
+.sdsync-widget.is-compact {
+  height: 84px;
+  padding: 6px 10px 5px;
+  gap: 2px;
+}

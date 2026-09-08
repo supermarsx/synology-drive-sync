@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as FmtWrite;
 use std::io::{self, IsTerminal, Write};
@@ -209,6 +210,48 @@ fn dispatch(arguments: &cli::Cli) -> Result<ExitCode> {
             } else {
                 run_sync(resolved.remove(0).settings, true, plan.exit_code)
             }
+        }
+        cli::Invocation::Status(status) => {
+            if status.sync.batch.requested() {
+                return Err(Error::Configuration(
+                    "status inspects one source and destination pair; select a single profile"
+                        .to_owned(),
+                ));
+            }
+            let selected = select_job_profiles(
+                loaded.as_ref(),
+                arguments.global.profile.as_deref(),
+                &status.sync.batch,
+            )?;
+            let settings =
+                config::resolve_sync(selected[0].values, &status.sync, &arguments.global.output)
+                    .map_err(config_error)?;
+            run_status(status, settings)
+        }
+        cli::Invocation::Resync(resync) => {
+            // Checked before anything is resolved: a caller who asked a destructive-adjacent
+            // command to also delete should hear about that first, not after a profile error.
+            if resync.sync.safety.delete {
+                return Err(Error::Configuration(
+                    "resync never deletes; it only re-uploads. Remove --delete, and use `sync --delete` if a mirror deletion is what you want"
+                        .to_owned(),
+                ));
+            }
+            if resync.sync.batch.requested() {
+                return Err(Error::Configuration(
+                    "resync overwrites one destination at a time; select a single profile"
+                        .to_owned(),
+                ));
+            }
+            let selected = select_job_profiles(
+                loaded.as_ref(),
+                arguments.global.profile.as_deref(),
+                &resync.sync.batch,
+            )?;
+            let settings =
+                config::resolve_sync(selected[0].values, &resync.sync, &arguments.global.output)
+                    .map_err(config_error)?;
+            run_resync(resync, settings)
         }
         cli::Invocation::Doctor(doctor) => {
             let selected = select_job_profiles(
@@ -1099,7 +1142,12 @@ fn write_sync_batch_output_to<W: Write>(writer: &mut W, render: SyncBatchRender<
                     .as_ref()
                     .or(outcome.preflight_plan.as_ref());
                 if let Some(plan) = display_plan {
-                    write_plan_human_to(writer, plan, plan_only || output.verbosity > 0)?;
+                    write_plan_human_to(
+                        writer,
+                        plan,
+                        plan_only || output.verbosity > 0,
+                        &plan::Scope::root(),
+                    )?;
                 }
                 if let (Some(preflight), Some(execution)) =
                     (&outcome.preflight_plan, &outcome.execution_plan)
@@ -1190,6 +1238,7 @@ fn run_sync(
         result.elapsed,
         &settings.output,
         plan_only,
+        &resolved_scope(&settings)?,
     )?;
     changes_completion(
         !result.plan.is_empty(),
@@ -1272,6 +1321,325 @@ fn run_sync_job(
     })
 }
 
+/// Plan, and only on a matching confirmation perform, an unconditional re-upload.
+///
+/// Two steps by construction. Without a ticket this plans and returns; there is no argument
+/// combination that overwrites anything on a first invocation. With a ticket, the plan is rebuilt
+/// from live state and the guard runs *before* any mutation, so a destination that changed since
+/// the caller looked cannot be overwritten on the strength of a stale confirmation.
+fn run_resync(arguments: &cli::ResyncArgs, mut settings: config::ResolvedSync) -> Result<ExitCode> {
+    // The `--delete` argument is refused before resolution; this pins the setting off regardless
+    // of where else it could have come from, including a profile.
+    settings.safety.delete = false;
+    settings.behavior.force_resync = true;
+
+    let scope = resolved_scope(&settings)?;
+    let cancellation = install_cancellation_handler()?;
+    let plan_only = arguments.confirm.is_none();
+
+    // Captured from inside the guard so a refused confirmation can still report the plan that
+    // caused the refusal, rather than making the caller run the planning step again themselves.
+    let planned: RefCell<Option<SyncPlan>> = RefCell::new(None);
+    let expected = arguments.confirm.as_deref();
+    let outcome = run_sync_job(&settings, plan_only, &cancellation, |plan| {
+        planned.replace(Some(plan.clone()));
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        let current = plan::resync_ticket(&scope, CompareMode::Force, plan);
+        if current == expected {
+            Ok(())
+        } else {
+            Err(Error::ResyncTicketStale {
+                presented: expected.to_owned(),
+                current,
+            })
+        }
+    });
+
+    match outcome {
+        Ok(result) => {
+            let ticket = plan::resync_ticket(&scope, CompareMode::Force, &result.plan);
+            write_resync_output(
+                &result.plan,
+                result.report.as_ref(),
+                result.elapsed,
+                &settings.output,
+                &scope,
+                plan_only.then_some(ticket.as_str()),
+                None,
+            )?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(Error::ResyncTicketStale { presented, current }) => {
+            // A live destination changes; being told only "no" would leave the caller looping
+            // between plan and confirm. The refreshed plan and its ticket are printed here, so the
+            // next attempt describes what would actually happen.
+            let plan = planned
+                .into_inner()
+                .expect("the guard captured the plan before rejecting it");
+            write_resync_output(
+                &plan,
+                None,
+                Duration::default(),
+                &settings.output,
+                &scope,
+                Some(current.as_str()),
+                Some(presented.as_str()),
+            )?;
+            Ok(ExitCode::from(cli::PLAN_CHANGES_EXIT_CODE))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn write_resync_output(
+    plan: &SyncPlan,
+    report: Option<&ExecutionReport>,
+    elapsed: Duration,
+    output: &config::ResolvedOutput,
+    scope: &plan::Scope,
+    ticket: Option<&str>,
+    stale: Option<&str>,
+) -> Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write_resync_output_to(
+        &mut stdout,
+        plan,
+        report,
+        elapsed,
+        output,
+        scope,
+        ticket,
+        stale,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_resync_output_to<W: Write>(
+    writer: &mut W,
+    plan: &SyncPlan,
+    report: Option<&ExecutionReport>,
+    elapsed: Duration,
+    output: &config::ResolvedOutput,
+    scope: &plan::Scope,
+    ticket: Option<&str>,
+    stale: Option<&str>,
+) -> Result<()> {
+    match output.output {
+        cli::OutputFormat::Human => {
+            if let Some(stale) = stale {
+                writeln!(
+                    writer,
+                    "Ticket {stale} no longer matches what would be overwritten; nothing was changed. The refreshed plan follows."
+                )
+                .map_err(output_error)?;
+            }
+            write_plan_human_to(writer, plan, true, scope)?;
+            if let Some(report) = report {
+                writeln!(
+                    writer,
+                    "Resync complete: {} re-uploaded ({}) in {} ms.",
+                    report.uploaded,
+                    format_bytes(report.uploaded_bytes),
+                    duration_millis(elapsed),
+                )
+                .map_err(output_error)?;
+            }
+            if let Some(ticket) = ticket {
+                writeln!(
+                    writer,
+                    "Nothing has been changed. To perform this re-upload, confirm this exact plan:\n  --confirm {ticket}"
+                )
+                .map_err(output_error)?;
+            }
+            writer.flush().map_err(output_error)
+        }
+        cli::OutputFormat::Json => write_json_to(
+            writer,
+            &resync_value(plan, report, elapsed, scope, ticket, stale),
+        ),
+        cli::OutputFormat::Ndjson => {
+            write_json_line_to(
+                writer,
+                &resync_value(plan, report, elapsed, scope, ticket, stale),
+            )?;
+            write_plan_ndjson_to(writer, plan)
+        }
+    }
+}
+
+fn resync_value(
+    plan: &SyncPlan,
+    report: Option<&ExecutionReport>,
+    elapsed: Duration,
+    scope: &plan::Scope,
+    ticket: Option<&str>,
+    stale: Option<&str>,
+) -> Value {
+    json!({
+        "schema": "sdsync.resync.v1",
+        "kind": if ticket.is_some() { "plan" } else { "completion" },
+        "scope": scope.as_str(),
+        "confirmed": report.is_some(),
+        "stale_ticket": stale,
+        "ticket": ticket,
+        "overwrites": plan.uploads.len(),
+        "overwrite_bytes": plan.upload_bytes,
+        "deletes": plan.delete_count(),
+        "paths": plan
+            .uploads
+            .iter()
+            .map(|action| json!({
+                "relative": action.local.relative,
+                "remote_path": action.remote_path,
+                "bytes": action.local.size,
+            }))
+            .collect::<Vec<_>>(),
+        "result": report.map(|report| execution_value(report, elapsed)),
+    })
+}
+
+/// Answer one scoped status query and render it.
+///
+/// Read-only throughout: it authenticates, walks both sides under the scope, compares, and prints.
+/// It never writes to the NAS and cannot reach [`CompareMode::Force`].
+fn run_status(arguments: &cli::StatusArgs, settings: config::ResolvedSync) -> Result<ExitCode> {
+    let cancellation = install_cancellation_handler()?;
+    warn_for_insecure_network(&settings.network, &settings.output);
+
+    let scope = resolved_scope(&settings)?;
+    let root = RemoteRoot::parse(&settings.remote)?;
+    let rules = IgnoreRules::build(&settings.source, &settings.behavior.excludes)?;
+    let compare = compare_mode(settings.behavior.compare);
+    let query_states = status_state_filter(&arguments.states, arguments.all);
+
+    cancellation.check()?;
+    let scan = local::scan_scoped(
+        &settings.source,
+        &rules,
+        &scope,
+        arguments.include_excluded,
+        local::SCAN_BUDGET_DEFAULT,
+        &cancellation,
+    )?;
+    let mut local = scan.inventory;
+
+    let mut client = connect_client(
+        &settings.connection.url,
+        &settings.network,
+        &cancellation,
+        None,
+    )?;
+    let mut vault = credentials::VaultSession::new(
+        !settings.authentication.no_vault,
+        &settings.connection.url,
+        &settings.connection.username,
+        settings.network.allow_http,
+    );
+    let password = credentials::read_password_with_file(
+        settings.authentication.password_stdin,
+        settings.authentication.password_file.as_deref(),
+        &mut vault,
+    )?;
+    credentials::authenticate_with_sources(
+        &mut client,
+        &settings.connection.username,
+        &password,
+        &mut vault,
+        settings.authentication.totp_secret_file.as_deref(),
+    )?;
+    drop(password);
+
+    let operation = (|| {
+        cancellation.check()?;
+        let scoped = client.remote_inventory_scoped(
+            &root,
+            &scope,
+            local::SCAN_BUDGET_DEFAULT,
+            &cancellation,
+        )?;
+        let mut remote = scoped.inventory;
+        cancellation.check()?;
+
+        // A scope that exists on neither side is a distinct answer, not an empty listing: a
+        // caller asking about one folder needs to tell "not there" from "nothing to report".
+        if !scope.is_root()
+            && !local.entries.contains_key(scope.as_str())
+            && !remote.entries.contains_key(scope.as_str())
+        {
+            return Err(Error::ScopeNotFound(scope.as_str().to_owned()));
+        }
+
+        if compare == CompareMode::Content {
+            client.require_content_fingerprint_api()?;
+            local::populate_content_md5(&mut local, &cancellation)?;
+            let selected = plan::select_remote_content_hashes(&local, &remote, &rules, false);
+            client.populate_remote_content_fingerprints(&mut remote, &selected, &cancellation)?;
+        }
+        cancellation.check()?;
+
+        let mut page = plan::build_status_page(
+            &root,
+            &local,
+            &remote,
+            &scan.excluded,
+            &rules,
+            &plan::StatusQuery {
+                scope: &scope,
+                compare,
+                filter: arguments.filter.as_deref(),
+                states: query_states,
+                include_excluded: arguments.include_excluded,
+                limit: arguments
+                    .limit
+                    .map_or(plan::STATUS_PAGE_SIZE_DEFAULT, usize::from),
+                cursor: arguments
+                    .cursor
+                    .as_deref()
+                    .map(plan::StatusCursor::new)
+                    .as_ref(),
+            },
+        )?;
+        // Either side hitting its budget makes every total a floor rather than a count.
+        page.stats.complete = page.stats.complete && scan.complete && scoped.complete;
+        Ok(page)
+    })();
+
+    let page = finish_authenticated_operation(&mut client, operation)?;
+    write_status_output(&page, &scope, compare, &settings.output)?;
+    if cancellation.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Translate the requested states, expanding the `attention` shorthand.
+///
+/// The expansion comes from [`plan::StateKind::ATTENTION`] rather than being spelled out here, so
+/// the command line cannot drift from the set the engine and any other caller use.
+fn status_state_filter(states: &[cli::StateArg], all: bool) -> plan::StateFilter {
+    if all || states.is_empty() {
+        return plan::StateFilter::All;
+    }
+    let mut kinds = Vec::new();
+    for state in states {
+        match state {
+            cli::StateArg::Attention => kinds.extend_from_slice(plan::StateKind::ATTENTION),
+            cli::StateArg::TypeConflict => kinds.push(plan::StateKind::TypeConflict),
+            cli::StateArg::MissingRemote => kinds.push(plan::StateKind::MissingRemote),
+            cli::StateArg::Differs => kinds.push(plan::StateKind::Differs),
+            cli::StateArg::RemoteOnly => kinds.push(plan::StateKind::RemoteOnly),
+            cli::StateArg::InSync => kinds.push(plan::StateKind::InSync),
+            cli::StateArg::Excluded => kinds.push(plan::StateKind::Excluded),
+        }
+    }
+    kinds.sort_unstable();
+    kinds.dedup();
+    plan::StateFilter::Only(kinds)
+}
+
 fn prepare_and_run_sync(
     settings: &config::ResolvedSync,
     plan_only: bool,
@@ -1287,7 +1655,16 @@ fn prepare_and_run_sync(
         logger.as_ref(),
         LogEvent::new(EventLogLevel::Info, EventCode::LocalScanStarted),
     )?;
-    let mut local = local::scan(&settings.source, &rules, cancellation)?;
+    let scope = resolved_scope(settings)?;
+    let mut local = local::scan_scoped(
+        &settings.source,
+        &rules,
+        &scope,
+        false,
+        usize::MAX,
+        cancellation,
+    )?
+    .inventory;
     cancellation.check()?;
     log_event(
         logger.as_ref(),
@@ -1359,7 +1736,9 @@ fn prepare_and_run_sync(
             logger.as_ref(),
             LogEvent::new(EventLogLevel::Info, EventCode::RemoteScanStarted),
         )?;
-        let mut remote = client.remote_inventory(&root, cancellation)?;
+        let mut remote = client
+            .remote_inventory_scoped(&root, &scope, usize::MAX, cancellation)?
+            .inventory;
         cancellation.check()?;
         log_event(
             logger.as_ref(),
@@ -1371,18 +1750,15 @@ fn prepare_and_run_sync(
             ),
         )?;
 
-        if compare_mode(settings.behavior.compare) == CompareMode::Content {
-            client.require_content_fingerprint_api()?;
-            local::populate_content_md5(&mut local, cancellation)?;
-            let selected = plan::select_remote_content_hashes_for_plan(
-                &local,
-                &remote,
-                &rules,
-                server_copy,
-                settings.safety.delete,
-            );
-            client.populate_remote_content_fingerprints(&mut remote, &selected, cancellation)?;
-        }
+        populate_content_for_plan(
+            &client,
+            &mut local,
+            &mut remote,
+            &rules,
+            settings,
+            server_copy,
+            cancellation,
+        )?;
 
         let plan = plan::build_plan(
             &root,
@@ -1393,8 +1769,9 @@ fn prepare_and_run_sync(
                 delete: settings.safety.delete,
                 allow_empty_source: settings.safety.allow_empty_source,
                 max_delete: settings.safety.max_delete,
-                compare: compare_mode(settings.behavior.compare),
+                compare: effective_compare_mode(settings),
                 server_copy,
+                scope: scope.clone(),
             },
         )?;
         cancellation.check()?;
@@ -1502,6 +1879,44 @@ fn prepare_and_run_sync(
     finish_authenticated_operation(&mut client, operation)
 }
 
+/// Fetch exactly the content digests the active compare mode needs, and no more.
+///
+/// Content mode needs local digests plus the remote digests that comparison, optional server-copy
+/// reuse, and deletion guards require. Force mode compares nothing, so it needs no local hashing
+/// and no comparison digests -- but a forced *mirror* still needs the same deletion guards content
+/// mode would use. A guard must not weaken because a flag about uploading was passed.
+fn populate_content_for_plan(
+    client: &ApiClient,
+    local: &mut local::LocalInventory,
+    remote: &mut api::RemoteInventory,
+    rules: &IgnoreRules,
+    settings: &config::ResolvedSync,
+    server_copy: bool,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    match effective_compare_mode(settings) {
+        CompareMode::Content => {
+            client.require_content_fingerprint_api()?;
+            local::populate_content_md5(local, cancellation)?;
+            let selected = plan::select_remote_content_hashes_for_plan(
+                local,
+                remote,
+                rules,
+                server_copy,
+                settings.safety.delete,
+            );
+            client.populate_remote_content_fingerprints(remote, &selected, cancellation)?;
+        }
+        CompareMode::Force if settings.safety.delete => {
+            client.require_content_fingerprint_api()?;
+            let selected = plan::select_deletion_guard_hashes(local, remote, rules);
+            client.populate_remote_content_fingerprints(remote, &selected, cancellation)?;
+        }
+        CompareMode::Force | CompareMode::Metadata | CompareMode::SizeOnly => {}
+    }
+    Ok(())
+}
+
 fn build_reconciliation_plan(
     client: &ApiClient,
     settings: &config::ResolvedSync,
@@ -1511,11 +1926,26 @@ fn build_reconciliation_plan(
     cancellation: &CancellationToken,
 ) -> Result<SyncPlan> {
     cancellation.check()?;
-    let mut local = local::scan(&settings.source, rules, cancellation)?;
+    // Reconciliation re-asks the question the run just answered, so it must cover exactly the
+    // same scope. A whole-tree reconciliation after a scoped run would report every out-of-scope
+    // difference the run deliberately left alone.
+    let scope = resolved_scope(settings)?;
+    let compare = reconciliation_compare_mode(settings);
+    let mut local = local::scan_scoped(
+        &settings.source,
+        rules,
+        &scope,
+        false,
+        usize::MAX,
+        cancellation,
+    )?
+    .inventory;
     cancellation.check()?;
-    let mut remote = client.remote_inventory(root, cancellation)?;
+    let mut remote = client
+        .remote_inventory_scoped(root, &scope, usize::MAX, cancellation)?
+        .inventory;
     cancellation.check()?;
-    if compare_mode(settings.behavior.compare) == CompareMode::Content {
+    if compare == CompareMode::Content {
         client.require_content_fingerprint_api()?;
         local::populate_content_md5(&mut local, cancellation)?;
         let selected = plan::select_remote_content_hashes_for_plan(
@@ -1536,8 +1966,9 @@ fn build_reconciliation_plan(
             delete: settings.safety.delete,
             allow_empty_source: settings.safety.allow_empty_source,
             max_delete: settings.safety.max_delete,
-            compare: compare_mode(settings.behavior.compare),
+            compare,
             server_copy,
+            scope: scope.clone(),
         },
     )?;
     cancellation.check()?;
@@ -5698,10 +6129,11 @@ fn write_sync_output(
     elapsed: Duration,
     output: &config::ResolvedOutput,
     plan_only: bool,
+    scope: &plan::Scope,
 ) -> Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    write_sync_output_to(&mut stdout, plan, report, elapsed, output, plan_only)
+    write_sync_output_to(&mut stdout, plan, report, elapsed, output, plan_only, scope)
 }
 
 fn write_sync_output_to<W: Write>(
@@ -5711,10 +6143,11 @@ fn write_sync_output_to<W: Write>(
     elapsed: Duration,
     output: &config::ResolvedOutput,
     plan_only: bool,
+    scope: &plan::Scope,
 ) -> Result<()> {
     match output.output {
         cli::OutputFormat::Human => {
-            write_plan_human_to(writer, plan, plan_only || output.verbosity > 0)?;
+            write_plan_human_to(writer, plan, plan_only || output.verbosity > 0, scope)?;
             if let Some(report) = report {
                 writeln!(
                     writer,
@@ -5775,12 +6208,25 @@ fn sync_output(
     plan_only: bool,
 ) -> RenderedOutput {
     let mut buffer = Vec::new();
-    write_sync_output_to(&mut buffer, plan, report, elapsed, output, plan_only)
-        .expect("writing rendered sync output to a Vec cannot fail");
+    write_sync_output_to(
+        &mut buffer,
+        plan,
+        report,
+        elapsed,
+        output,
+        plan_only,
+        &plan::Scope::root(),
+    )
+    .expect("writing rendered sync output to a Vec cannot fail");
     captured_rendered_output(output.output, buffer)
 }
 
-fn write_plan_human_to<W: Write>(writer: &mut W, plan: &SyncPlan, detailed: bool) -> Result<()> {
+fn write_plan_human_to<W: Write>(
+    writer: &mut W,
+    plan: &SyncPlan,
+    detailed: bool,
+    scope: &plan::Scope,
+) -> Result<()> {
     writeln!(
         writer,
         "Plan: {} uploads ({}), {} server copies (verified upload fallback up to {}), {} directories, {} deletions, {} unchanged files, {} protected remote entries.",
@@ -5794,6 +6240,7 @@ fn write_plan_human_to<W: Write>(writer: &mut W, plan: &SyncPlan, detailed: bool
         plan.protected_entries
     )
     .map_err(output_error)?;
+    write_plan_scope_notice(writer, plan, scope)?;
     if !detailed {
         return Ok(());
     }
@@ -5856,10 +6303,48 @@ fn write_plan_human_to<W: Write>(writer: &mut W, plan: &SyncPlan, detailed: bool
     Ok(())
 }
 
+/// State what a forced plan will overwrite, and what a scoped plan did not look at.
+///
+/// The forced count comes from the plan itself rather than from the invocation, so it reports what
+/// is actually scheduled. It is printed before any mutation, which is what makes an inspected plan
+/// the confirmation step for a forced run.
+fn write_plan_scope_notice<W: Write>(
+    writer: &mut W,
+    plan: &SyncPlan,
+    scope: &plan::Scope,
+) -> Result<()> {
+    let forced: Vec<_> = plan
+        .uploads
+        .iter()
+        .filter(|action| action.reason == plan::ChangeReason::Forced)
+        .collect();
+    if !forced.is_empty() {
+        let bytes = forced.iter().fold(0_u64, |total, action| {
+            total.saturating_add(action.local.size)
+        });
+        writeln!(
+            writer,
+            "Forced comparison: {} remote files will be overwritten without being compared ({}). Remote copies that are identical or newer are replaced. Nothing is deleted by --compare force alone.",
+            forced.len(),
+            format_bytes(bytes)
+        )
+        .map_err(output_error)?;
+    }
+    if !scope.is_root() {
+        writeln!(
+            writer,
+            "Scoped to {:?}: entries outside it were neither compared nor modified, and the check for paths differing only by letter case covered this scope alone.",
+            scope.as_str()
+        )
+        .map_err(output_error)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn plan_human(plan: &SyncPlan, detailed: bool) -> String {
     let mut output = Vec::new();
-    write_plan_human_to(&mut output, plan, detailed)
+    write_plan_human_to(&mut output, plan, detailed, &plan::Scope::root())
         .expect("writing rendered human plan to a Vec cannot fail");
     String::from_utf8(output).expect("human plan output is UTF-8")
 }
@@ -6032,6 +6517,208 @@ fn plan_ndjson_values(plan: &SyncPlan) -> Vec<Value> {
     write_plan_ndjson_to(&mut output, plan)
         .expect("writing rendered NDJSON plan to a Vec cannot fail");
     parse_ndjson_output(&output)
+}
+
+fn write_status_output(
+    page: &plan::StatusPage,
+    scope: &plan::Scope,
+    compare: CompareMode,
+    output: &config::ResolvedOutput,
+) -> Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write_status_output_to(&mut stdout, page, scope, compare, output)
+}
+
+fn write_status_output_to<W: Write>(
+    writer: &mut W,
+    page: &plan::StatusPage,
+    scope: &plan::Scope,
+    compare: CompareMode,
+    output: &config::ResolvedOutput,
+) -> Result<()> {
+    match output.output {
+        cli::OutputFormat::Human => {
+            write_status_human_to(writer, page, scope, compare)?;
+            writer.flush().map_err(output_error)
+        }
+        cli::OutputFormat::Json => write_json_to(
+            writer,
+            &json!({
+                "schema": "sdsync.status.v1",
+                "kind": "status",
+                "scope": page.scope,
+                "compare": compare_label(compare),
+                "limit": page.limit,
+                "truncated": page.truncated,
+                "next_cursor": page.next_cursor.as_ref().map(plan::StatusCursor::as_str),
+                "stats": status_stats_value(&page.stats),
+                "entries": page
+                    .entries
+                    .iter()
+                    .map(status_entry_value)
+                    .collect::<Vec<_>>(),
+            }),
+        ),
+        cli::OutputFormat::Ndjson => {
+            write_json_line_to(
+                writer,
+                &json!({
+                    "schema": "sdsync.status.v1",
+                    "kind": "summary",
+                    "scope": page.scope,
+                    "compare": compare_label(compare),
+                    "limit": page.limit,
+                    "truncated": page.truncated,
+                    "next_cursor": page.next_cursor.as_ref().map(plan::StatusCursor::as_str),
+                    "stats": status_stats_value(&page.stats),
+                }),
+            )?;
+            for entry in &page.entries {
+                write_json_line_to(writer, &status_entry_value(entry))?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn compare_label(compare: CompareMode) -> &'static str {
+    match compare {
+        CompareMode::Content => "content",
+        CompareMode::Metadata => "metadata",
+        CompareMode::SizeOnly => "size-only",
+        CompareMode::Force => "force",
+    }
+}
+
+fn status_stats_value(stats: &plan::StatusStats) -> Value {
+    json!({
+        "compare": compare_label(stats.compare),
+        "in_sync_files": stats.in_sync_files,
+        "differing_files": stats.differing_files,
+        "missing_remote_files": stats.missing_remote_files,
+        "remote_only_entries": stats.remote_only_entries,
+        "type_conflicts": stats.type_conflicts,
+        "excluded_entries": stats.excluded_entries,
+        "directories": stats.directories,
+        "in_sync_bytes": stats.in_sync_bytes,
+        "transfer_bytes": stats.transfer_bytes,
+        "total_entries": stats.total_entries,
+        "attention_entries": stats.attention_entries,
+        "complete": stats.complete,
+    })
+}
+
+fn status_entry_value(entry: &plan::StatusEntry) -> Value {
+    let mut value = json!({
+        "schema": "sdsync.status-entry.v1",
+        "relative": entry.relative,
+        "remote_path": entry.remote_path,
+        "entry_kind": entry.kind.as_str(),
+        "state": entry.state.kind().as_str(),
+    });
+    let object = value
+        .as_object_mut()
+        .expect("status entry is constructed as a JSON object");
+    if let Some(reason) = entry.state.reason() {
+        object.insert("reason".to_owned(), json!(reason.as_str()));
+        object.insert("detail".to_owned(), json!(reason.detail()));
+    }
+    if let plan::StatusState::TypeConflict {
+        local_kind,
+        remote_kind,
+    } = entry.state
+    {
+        object.insert("local_kind".to_owned(), json!(local_kind.as_str()));
+        object.insert("remote_kind".to_owned(), json!(remote_kind.as_str()));
+    }
+    if let plan::StatusState::Excluded(cause) = entry.state {
+        object.insert("exclusion".to_owned(), json!(cause.as_str()));
+    }
+    if let Some(side) = entry.local {
+        object.insert(
+            "local".to_owned(),
+            json!({"size": side.size, "mtime_seconds": side.mtime_seconds}),
+        );
+    }
+    if let Some(side) = entry.remote {
+        object.insert(
+            "remote".to_owned(),
+            json!({"size": side.size, "mtime_seconds": side.mtime_seconds}),
+        );
+    }
+    value
+}
+
+fn write_status_human_to<W: Write>(
+    writer: &mut W,
+    page: &plan::StatusPage,
+    scope: &plan::Scope,
+    compare: CompareMode,
+) -> Result<()> {
+    let target = if scope.is_root() {
+        "the whole tree".to_owned()
+    } else {
+        format!("{:?}", scope.as_str())
+    };
+    let stats = &page.stats;
+    let qualifier = if stats.complete { "" } else { " at least" };
+    writeln!(
+        writer,
+        "Status of {target} compared by {}:{qualifier} {} in sync, {} differing, {} missing remotely, {} remote-only, {} type conflicts, {} excluded ({} to transfer).",
+        compare_label(compare),
+        stats.in_sync_files,
+        stats.differing_files,
+        stats.missing_remote_files,
+        stats.remote_only_entries,
+        stats.type_conflicts,
+        stats.excluded_entries,
+        format_bytes(stats.transfer_bytes),
+    )
+    .map_err(output_error)?;
+
+    for entry in &page.entries {
+        let detail = match entry.state {
+            plan::StatusState::InSync => "in sync".to_owned(),
+            plan::StatusState::Differs(reason) => format!("differs ({})", reason.detail()),
+            plan::StatusState::MissingRemote => "missing remotely".to_owned(),
+            plan::StatusState::RemoteOnly => "remote-only".to_owned(),
+            plan::StatusState::TypeConflict {
+                local_kind,
+                remote_kind,
+            } => format!(
+                "type conflict (local {}, remote {})",
+                local_kind.as_str(),
+                remote_kind.as_str()
+            ),
+            plan::StatusState::Excluded(cause) => format!("excluded ({})", cause.as_str()),
+        };
+        writeln!(writer, "  {} — {detail}", entry.relative).map_err(output_error)?;
+    }
+
+    if let Some(cursor) = &page.next_cursor {
+        writeln!(
+            writer,
+            "More entries remain; continue with --cursor {:?}.",
+            cursor.as_str()
+        )
+        .map_err(output_error)?;
+    }
+    if !stats.complete {
+        writeln!(
+            writer,
+            "The scan budget stopped this walk, so every total above is a lower bound; narrow the query with --scope."
+        )
+        .map_err(output_error)?;
+    }
+    if !scope.is_root() {
+        writeln!(
+            writer,
+            "Only {target} was examined; entries outside it were neither compared nor reported."
+        )
+        .map_err(output_error)?;
+    }
+    Ok(())
 }
 
 fn plan_summary_record(plan: &SyncPlan) -> Value {
@@ -7206,6 +7893,36 @@ fn warn_for_insecure_network(network: &config::ResolvedNetwork, output: &config:
     }
 }
 
+/// The scope a run is restricted to, or the whole tree when none was given.
+fn resolved_scope(settings: &config::ResolvedSync) -> Result<plan::Scope> {
+    match settings.behavior.scope.as_deref() {
+        Some(value) => plan::Scope::parse(value),
+        None => Ok(plan::Scope::root()),
+    }
+}
+
+/// The comparison a run actually plans with.
+///
+/// `Force` is reachable only through `resync`, which sets `force_resync` on settings whose plan the
+/// caller has already been shown and confirmed. It is deliberately not a `CompareArg`, so neither a
+/// command-line comparison nor a configuration profile can express it.
+fn effective_compare_mode(settings: &config::ResolvedSync) -> CompareMode {
+    if settings.behavior.force_resync {
+        CompareMode::Force
+    } else {
+        compare_mode(settings.behavior.compare)
+    }
+}
+
+/// The comparison a post-run reconciliation verifies convergence with.
+///
+/// Never `Force`: a forced re-plan schedules every file unconditionally, so reconciling against it
+/// would always report pending work. Reconciliation asks whether the destination has converged,
+/// which is a question about content, so it uses the ordinary comparison throughout.
+fn reconciliation_compare_mode(settings: &config::ResolvedSync) -> CompareMode {
+    compare_mode(settings.behavior.compare)
+}
+
 fn compare_mode(value: cli::CompareArg) -> CompareMode {
     match value {
         cli::CompareArg::Content => CompareMode::Content,
@@ -7430,6 +8147,8 @@ mod tests {
                 compare: cli::CompareArg::Content,
                 jobs: 2,
                 excludes: Vec::new(),
+                scope: None,
+                force_resync: false,
             },
             safety: config::ResolvedSafety {
                 delete: false,
@@ -10766,5 +11485,683 @@ mod tests {
                 .all(|section| !section.detail.contains("not run because")),
             "a failed diagnostic must not disown the sections that follow it"
         );
+    }
+}
+
+#[cfg(test)]
+mod status_command_tests {
+    use super::*;
+
+    fn output(format: cli::OutputFormat) -> config::ResolvedOutput {
+        config::ResolvedOutput {
+            verbosity: 0,
+            quiet: true,
+            log_level: cli::LogLevel::Off,
+            log_format: cli::LogFormat::Human,
+            log_file: None,
+            remote_log_url: None,
+            remote_log_token: None,
+            remote_log_mode: cli::RemoteLogMode::BestEffort,
+            progress: cli::ProgressMode::Never,
+            output: format,
+        }
+    }
+
+    fn entry(relative: &str, state: plan::StatusState) -> plan::StatusEntry {
+        plan::StatusEntry {
+            relative: relative.to_owned(),
+            remote_path: format!("/team/export/{relative}"),
+            kind: local::EntryKind::File,
+            state,
+            local: Some(plan::SideInfo {
+                size: 12,
+                mtime_seconds: 7,
+            }),
+            remote: Some(plan::SideInfo {
+                size: 34,
+                mtime_seconds: 9,
+            }),
+        }
+    }
+
+    fn sample_page() -> plan::StatusPage {
+        plan::StatusPage {
+            scope: "docs".to_owned(),
+            entries: vec![
+                entry(
+                    "docs/changed.txt",
+                    plan::StatusState::Differs(plan::ChangeReason::SizeDiffers),
+                ),
+                entry("docs/new.txt", plan::StatusState::MissingRemote),
+            ],
+            limit: 100,
+            next_cursor: Some(plan::StatusCursor::new("docs/new.txt")),
+            truncated: true,
+            stats: plan::StatusStats {
+                compare: CompareMode::Metadata,
+                in_sync_files: 4,
+                differing_files: 1,
+                missing_remote_files: 1,
+                remote_only_entries: 2,
+                type_conflicts: 0,
+                excluded_entries: 3,
+                directories: 1,
+                in_sync_bytes: 400,
+                transfer_bytes: 46,
+                total_entries: 11,
+                attention_entries: 4,
+                complete: true,
+            },
+        }
+    }
+
+    fn render(page: &plan::StatusPage, format: cli::OutputFormat) -> RenderedOutput {
+        let scope = plan::Scope::parse(&page.scope).unwrap();
+        let mut buffer = Vec::new();
+        write_status_output_to(
+            &mut buffer,
+            page,
+            &scope,
+            CompareMode::Metadata,
+            &output(format),
+        )
+        .expect("writing rendered status output to a Vec cannot fail");
+        captured_rendered_output(format, buffer)
+    }
+
+    fn rendered_human(output: RenderedOutput) -> String {
+        match output {
+            RenderedOutput::Human(value) => value,
+            other => panic!("expected human output, got {other:?}"),
+        }
+    }
+
+    fn rendered_json(output: RenderedOutput) -> Value {
+        match output {
+            RenderedOutput::Json(value) => value,
+            other => panic!("expected JSON output, got {other:?}"),
+        }
+    }
+
+    fn rendered_ndjson(output: RenderedOutput) -> Vec<Value> {
+        match output {
+            RenderedOutput::Ndjson(values) => values,
+            other => panic!("expected NDJSON output, got {other:?}"),
+        }
+    }
+
+    fn sync_settings() -> config::ResolvedSync {
+        config::ResolvedSync {
+            source: std::path::PathBuf::from("/source"),
+            remote: "/team/export".to_owned(),
+            connection: config::ResolvedConnection {
+                url: "https://nas.example.com".to_owned(),
+                username: "bot".to_owned(),
+            },
+            authentication: config::ResolvedAuthentication {
+                password_stdin: false,
+                password_file: None,
+                totp_secret_file: None,
+                no_vault: true,
+            },
+            behavior: config::ResolvedSyncBehavior {
+                compare: cli::CompareArg::Content,
+                jobs: 2,
+                excludes: Vec::new(),
+                scope: None,
+                force_resync: false,
+            },
+            safety: config::ResolvedSafety {
+                delete: false,
+                allow_empty_source: false,
+                max_delete: 10,
+            },
+            network: config::ResolvedNetwork {
+                retries: 1,
+                timeout: 30,
+                connect_timeout: 10,
+                max_rate: None,
+                ca_certificate: None,
+                allow_http: false,
+                danger_accept_invalid_certs: false,
+            },
+            output: output(cli::OutputFormat::Json),
+        }
+    }
+
+    // --- Compare-mode plumbing -------------------------------------------
+
+    #[test]
+    fn force_is_not_expressible_as_a_comparison_at_all() {
+        // `resync` is the only route to an unconditional re-upload, so no CompareArg maps to it
+        // and neither a command line nor a profile can name it.
+        for mode in [
+            cli::CompareArg::Content,
+            cli::CompareArg::Metadata,
+            cli::CompareArg::SizeOnly,
+        ] {
+            assert_ne!(compare_mode(mode), CompareMode::Force);
+        }
+    }
+
+    #[test]
+    fn only_a_forced_resync_reaches_the_force_compare_mode() {
+        let mut settings = sync_settings();
+        assert_eq!(effective_compare_mode(&settings), CompareMode::Content);
+        settings.behavior.force_resync = true;
+        assert_eq!(effective_compare_mode(&settings), CompareMode::Force);
+    }
+
+    #[test]
+    fn reconciliation_never_compares_with_force() {
+        // A forced re-plan schedules every file, so reconciling against it would always report
+        // pending work. Reconciliation asks a question about content.
+        let mut settings = sync_settings();
+        settings.behavior.force_resync = true;
+        assert_eq!(reconciliation_compare_mode(&settings), CompareMode::Content);
+
+        for mode in [
+            cli::CompareArg::Content,
+            cli::CompareArg::Metadata,
+            cli::CompareArg::SizeOnly,
+        ] {
+            settings.behavior.compare = mode;
+            assert_eq!(reconciliation_compare_mode(&settings), compare_mode(mode));
+        }
+    }
+
+    #[test]
+    fn compare_labels_are_stable_for_machine_output() {
+        assert_eq!(compare_label(CompareMode::Content), "content");
+        assert_eq!(compare_label(CompareMode::Metadata), "metadata");
+        assert_eq!(compare_label(CompareMode::SizeOnly), "size-only");
+        assert_eq!(compare_label(CompareMode::Force), "force");
+    }
+
+    // --- Scope resolution -------------------------------------------------
+
+    #[test]
+    fn an_absent_scope_resolves_to_the_whole_tree() {
+        let settings = sync_settings();
+        assert!(resolved_scope(&settings).unwrap().is_root());
+    }
+
+    #[test]
+    fn a_configured_scope_is_parsed_and_normalized() {
+        let mut settings = sync_settings();
+        settings.behavior.scope = Some("/docs/q3/".to_owned());
+        assert_eq!(resolved_scope(&settings).unwrap().as_str(), "docs/q3");
+    }
+
+    #[test]
+    fn an_unsafe_scope_is_rejected_before_any_scan() {
+        let mut settings = sync_settings();
+        settings.behavior.scope = Some("../escape".to_owned());
+        assert!(resolved_scope(&settings).is_err());
+    }
+
+    // --- State filter -----------------------------------------------------
+
+    #[test]
+    fn the_attention_shorthand_expands_to_the_engines_own_set() {
+        // Expanded from the engine constant so the command line cannot drift from it.
+        let filter = status_state_filter(&[cli::StateArg::Attention], false);
+        let mut expected = plan::StateKind::ATTENTION.to_vec();
+        expected.sort_unstable();
+        assert_eq!(filter, plan::StateFilter::Only(expected));
+    }
+
+    #[test]
+    fn no_state_argument_lists_every_state() {
+        assert_eq!(status_state_filter(&[], false), plan::StateFilter::All);
+        assert_eq!(
+            status_state_filter(&[cli::StateArg::Differs], true),
+            plan::StateFilter::All
+        );
+    }
+
+    #[test]
+    fn repeated_states_are_deduplicated() {
+        let filter = status_state_filter(
+            &[
+                cli::StateArg::Differs,
+                cli::StateArg::Attention,
+                cli::StateArg::Differs,
+            ],
+            false,
+        );
+        let plan::StateFilter::Only(kinds) = filter else {
+            panic!("expected an explicit state selection");
+        };
+        assert_eq!(kinds.len(), plan::StateKind::ATTENTION.len());
+    }
+
+    #[test]
+    fn a_single_state_selects_only_itself() {
+        assert_eq!(
+            status_state_filter(&[cli::StateArg::InSync], false),
+            plan::StateFilter::Only(vec![plan::StateKind::InSync])
+        );
+    }
+
+    // --- Rendering --------------------------------------------------------
+
+    #[test]
+    fn human_status_leads_with_whole_scope_totals() {
+        let text = rendered_human(render(&sample_page(), cli::OutputFormat::Human));
+        assert!(text.contains("4 in sync"), "{text}");
+        assert!(text.contains("1 differing"), "{text}");
+        assert!(text.contains("2 remote-only"), "{text}");
+        assert!(text.contains("compared by metadata"), "{text}");
+        assert!(text.contains("docs/changed.txt"), "{text}");
+        assert!(
+            text.contains("local and remote sizes differ"),
+            "the planner's own reason should be the row detail: {text}"
+        );
+    }
+
+    #[test]
+    fn human_status_offers_the_cursor_that_continues_the_listing() {
+        let text = rendered_human(render(&sample_page(), cli::OutputFormat::Human));
+        assert!(text.contains("--cursor \"docs/new.txt\""), "{text}");
+    }
+
+    #[test]
+    fn a_scoped_listing_says_what_it_did_not_examine() {
+        let text = rendered_human(render(&sample_page(), cli::OutputFormat::Human));
+        assert!(
+            text.contains("Only \"docs\" was examined"),
+            "a scoped result must not read as a whole-tree result: {text}"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_scan_says_its_totals_are_lower_bounds() {
+        let mut page = sample_page();
+        page.stats.complete = false;
+        let text = rendered_human(render(&page, cli::OutputFormat::Human));
+        assert!(text.contains("at least"), "{text}");
+        assert!(text.contains("lower bound"), "{text}");
+    }
+
+    #[test]
+    fn json_status_carries_the_page_the_totals_and_the_cursor() {
+        let value = rendered_json(render(&sample_page(), cli::OutputFormat::Json));
+        assert_eq!(value["schema"], "sdsync.status.v1");
+        assert_eq!(value["scope"], "docs");
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["next_cursor"], "docs/new.txt");
+        assert_eq!(value["stats"]["in_sync_files"], 4);
+        assert_eq!(value["stats"]["transfer_bytes"], 46);
+        assert_eq!(value["stats"]["attention_entries"], 4);
+        assert_eq!(value["stats"]["complete"], true);
+        assert_eq!(value["entries"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_status_row_carries_both_sides_and_the_reason() {
+        let value = rendered_json(render(&sample_page(), cli::OutputFormat::Json));
+        let row = &value["entries"][0];
+        assert_eq!(row["schema"], "sdsync.status-entry.v1");
+        assert_eq!(row["relative"], "docs/changed.txt");
+        assert_eq!(row["remote_path"], "/team/export/docs/changed.txt");
+        assert_eq!(row["state"], "differs");
+        assert_eq!(row["reason"], "size-differs");
+        assert_eq!(row["detail"], "local and remote sizes differ");
+        assert_eq!(row["local"]["size"], 12);
+        assert_eq!(row["remote"]["size"], 34);
+    }
+
+    #[test]
+    fn ndjson_status_emits_a_summary_then_one_record_per_entry() {
+        let records = rendered_ndjson(render(&sample_page(), cli::OutputFormat::Ndjson));
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["schema"], "sdsync.status.v1");
+        assert_eq!(records[0]["kind"], "summary");
+        assert_eq!(records[0]["stats"]["total_entries"], 11);
+        assert_eq!(records[1]["schema"], "sdsync.status-entry.v1");
+        assert_eq!(records[1]["state"], "differs");
+        assert_eq!(records[2]["state"], "missing-remote");
+    }
+
+    #[test]
+    fn a_type_conflict_row_names_both_kinds() {
+        let mut page = sample_page();
+        page.entries = vec![entry(
+            "docs/conflict",
+            plan::StatusState::TypeConflict {
+                local_kind: local::EntryKind::Directory,
+                remote_kind: local::EntryKind::File,
+            },
+        )];
+        let value = rendered_json(render(&page, cli::OutputFormat::Json));
+        let row = &value["entries"][0];
+        assert_eq!(row["state"], "type-conflict");
+        assert_eq!(row["local_kind"], "directory");
+        assert_eq!(row["remote_kind"], "file");
+    }
+
+    #[test]
+    fn an_excluded_row_names_its_cause() {
+        let mut page = sample_page();
+        page.entries = vec![entry(
+            "cache/big.tmp",
+            plan::StatusState::Excluded(plan::ExclusionCause::IgnoreRule),
+        )];
+        let value = rendered_json(render(&page, cli::OutputFormat::Json));
+        assert_eq!(value["entries"][0]["state"], "excluded");
+        assert_eq!(value["entries"][0]["exclusion"], "ignore-rule");
+    }
+
+    #[test]
+    fn an_in_sync_row_carries_no_change_reason() {
+        let mut page = sample_page();
+        page.entries = vec![entry("docs/same.txt", plan::StatusState::InSync)];
+        let value = rendered_json(render(&page, cli::OutputFormat::Json));
+        assert_eq!(value["entries"][0]["state"], "in-sync");
+        assert!(value["entries"][0].get("reason").is_none());
+    }
+
+    // --- Forced plan notice ----------------------------------------------
+
+    fn forced_plan() -> SyncPlan {
+        SyncPlan {
+            pre_deletes: Vec::new(),
+            creates: Vec::new(),
+            copies: Vec::new(),
+            uploads: vec![
+                plan::UploadAction {
+                    local: local::LocalEntry {
+                        relative: "a.txt".to_owned(),
+                        full_path: std::path::PathBuf::from("a.txt"),
+                        kind: local::EntryKind::File,
+                        size: 1_000,
+                        mtime_ms: 0,
+                        content_md5: None,
+                    },
+                    remote_path: "/team/export/a.txt".to_owned(),
+                    reason: plan::ChangeReason::Forced,
+                },
+                plan::UploadAction {
+                    local: local::LocalEntry {
+                        relative: "b.txt".to_owned(),
+                        full_path: std::path::PathBuf::from("b.txt"),
+                        kind: local::EntryKind::File,
+                        size: 24,
+                        mtime_ms: 0,
+                        content_md5: None,
+                    },
+                    remote_path: "/team/export/b.txt".to_owned(),
+                    reason: plan::ChangeReason::Forced,
+                },
+            ],
+            post_deletes: Vec::new(),
+            unchanged_files: 0,
+            protected_entries: 0,
+            upload_bytes: 1_024,
+        }
+    }
+
+    #[test]
+    fn a_forced_plan_states_what_it_will_overwrite_before_anything_runs() {
+        let text = plan_human(&forced_plan(), false);
+        assert!(
+            text.contains("2 remote files will be overwritten without being compared"),
+            "{text}"
+        );
+        assert!(text.contains("1.0 KiB") || text.contains("1024"), "{text}");
+        assert!(
+            text.contains("Nothing is deleted by --compare force alone"),
+            "the notice must not imply deletion: {text}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_plan_carries_no_forced_notice() {
+        let mut plan = forced_plan();
+        for upload in &mut plan.uploads {
+            upload.reason = plan::ChangeReason::MissingRemote;
+        }
+        let text = plan_human(&plan, false);
+        assert!(
+            !text.contains("overwritten without being compared"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_scoped_plan_says_the_case_check_covered_the_scope_alone() {
+        let scope = plan::Scope::parse("docs/q3").unwrap();
+        let mut buffer = Vec::new();
+        write_plan_human_to(&mut buffer, &forced_plan(), false, &scope).unwrap();
+        let text = String::from_utf8(buffer).unwrap();
+        assert!(text.contains("Scoped to \"docs/q3\""), "{text}");
+        assert!(
+            text.contains("letter case covered this scope alone"),
+            "a clean scoped run must not read as a whole-tree clean bill of health: {text}"
+        );
+    }
+
+    #[test]
+    fn an_unscoped_plan_makes_no_scope_claim() {
+        let text = plan_human(&forced_plan(), false);
+        assert!(!text.contains("Scoped to"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod resync_output_tests {
+    use super::*;
+
+    fn output(format: cli::OutputFormat) -> config::ResolvedOutput {
+        config::ResolvedOutput {
+            verbosity: 0,
+            quiet: true,
+            log_level: cli::LogLevel::Off,
+            log_format: cli::LogFormat::Human,
+            log_file: None,
+            remote_log_url: None,
+            remote_log_token: None,
+            remote_log_mode: cli::RemoteLogMode::BestEffort,
+            progress: cli::ProgressMode::Never,
+            output: format,
+        }
+    }
+
+    fn upload(relative: &str, size: u64) -> plan::UploadAction {
+        plan::UploadAction {
+            local: local::LocalEntry {
+                relative: relative.to_owned(),
+                full_path: std::path::PathBuf::from(relative),
+                kind: local::EntryKind::File,
+                size,
+                mtime_ms: 1_000,
+                content_md5: None,
+            },
+            remote_path: format!("/team/export/{relative}"),
+            reason: plan::ChangeReason::Forced,
+        }
+    }
+
+    fn forced_plan() -> SyncPlan {
+        SyncPlan {
+            pre_deletes: Vec::new(),
+            creates: Vec::new(),
+            copies: Vec::new(),
+            uploads: vec![upload("docs/a.txt", 1_000), upload("docs/b.txt", 24)],
+            post_deletes: Vec::new(),
+            unchanged_files: 0,
+            protected_entries: 0,
+            upload_bytes: 1_024,
+        }
+    }
+
+    fn render(
+        format: cli::OutputFormat,
+        ticket: Option<&str>,
+        stale: Option<&str>,
+        report: Option<&ExecutionReport>,
+    ) -> RenderedOutput {
+        let scope = plan::Scope::parse("docs").unwrap();
+        let mut buffer = Vec::new();
+        write_resync_output_to(
+            &mut buffer,
+            &forced_plan(),
+            report,
+            Duration::from_millis(7),
+            &output(format),
+            &scope,
+            ticket,
+            stale,
+        )
+        .expect("writing rendered resync output to a Vec cannot fail");
+        captured_rendered_output(format, buffer)
+    }
+
+    fn human(output: RenderedOutput) -> String {
+        match output {
+            RenderedOutput::Human(value) => value,
+            other => panic!("expected human output, got {other:?}"),
+        }
+    }
+
+    fn json(output: RenderedOutput) -> Value {
+        match output {
+            RenderedOutput::Json(value) => value,
+            other => panic!("expected JSON output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_planning_run_says_nothing_changed_and_offers_the_ticket() {
+        let text = human(render(
+            cli::OutputFormat::Human,
+            Some("abc1230000000000"),
+            None,
+            None,
+        ));
+        assert!(text.contains("Nothing has been changed"), "{text}");
+        assert!(text.contains("--confirm abc1230000000000"), "{text}");
+        // The overwrite framing comes from the plan itself.
+        assert!(
+            text.contains("2 remote files will be overwritten without being compared"),
+            "{text}"
+        );
+        assert!(text.contains("Nothing is deleted"), "{text}");
+    }
+
+    #[test]
+    fn a_planning_run_lists_the_files_it_would_overwrite() {
+        let text = human(render(
+            cli::OutputFormat::Human,
+            Some("abc1230000000000"),
+            None,
+            None,
+        ));
+        // The caller has to see the set, not just its size, or confirming means nothing.
+        assert!(text.contains("docs/a.txt"), "{text}");
+        assert!(text.contains("docs/b.txt"), "{text}");
+    }
+
+    #[test]
+    fn a_stale_ticket_is_refused_and_answered_with_a_fresh_plan_and_ticket() {
+        // One step, not two: a changing destination must not trap the caller in a loop.
+        let text = human(render(
+            cli::OutputFormat::Human,
+            Some("newticket0000000"),
+            Some("staleticket00000"),
+            None,
+        ));
+        assert!(text.contains("staleticket00000"), "{text}");
+        assert!(text.contains("no longer matches"), "{text}");
+        assert!(text.contains("nothing was changed"), "{text}");
+        assert!(text.contains("refreshed plan follows"), "{text}");
+        assert!(text.contains("--confirm newticket0000000"), "{text}");
+    }
+
+    #[test]
+    fn a_confirmed_run_reports_what_it_uploaded_and_offers_no_ticket() {
+        let report = ExecutionReport {
+            created: 0,
+            deleted: 0,
+            copied: 0,
+            uploaded: 2,
+            uploaded_bytes: 1_024,
+        };
+        let text = human(render(cli::OutputFormat::Human, None, None, Some(&report)));
+        assert!(text.contains("Resync complete: 2 re-uploaded"), "{text}");
+        assert!(!text.contains("--confirm"), "{text}");
+    }
+
+    #[test]
+    fn json_planning_output_carries_the_paths_bytes_and_ticket() {
+        let value = json(render(
+            cli::OutputFormat::Json,
+            Some("abc1230000000000"),
+            None,
+            None,
+        ));
+        assert_eq!(value["schema"], "sdsync.resync.v1");
+        assert_eq!(value["kind"], "plan");
+        assert_eq!(value["scope"], "docs");
+        assert_eq!(value["confirmed"], false);
+        assert_eq!(value["ticket"], "abc1230000000000");
+        assert_eq!(value["overwrites"], 2);
+        assert_eq!(value["overwrite_bytes"], 1_024);
+        assert_eq!(value["deletes"], 0);
+        assert_eq!(value["paths"].as_array().unwrap().len(), 2);
+        assert_eq!(value["paths"][0]["relative"], "docs/a.txt");
+        assert_eq!(value["paths"][0]["remote_path"], "/team/export/docs/a.txt");
+    }
+
+    #[test]
+    fn json_names_the_stale_ticket_alongside_its_replacement() {
+        let value = json(render(
+            cli::OutputFormat::Json,
+            Some("newticket0000000"),
+            Some("staleticket00000"),
+            None,
+        ));
+        assert_eq!(value["stale_ticket"], "staleticket00000");
+        assert_eq!(value["ticket"], "newticket0000000");
+        assert_eq!(value["confirmed"], false);
+    }
+
+    #[test]
+    fn a_resync_plan_never_reports_deletions() {
+        let value = json(render(
+            cli::OutputFormat::Json,
+            Some("abc1230000000000"),
+            None,
+            None,
+        ));
+        assert_eq!(value["deletes"], 0);
+    }
+
+    #[test]
+    fn the_status_stats_echo_the_comparison_that_produced_them() {
+        // A view that deliberately asks for a cheap comparison needs to be able to label it.
+        let stats = plan::StatusStats {
+            compare: CompareMode::Metadata,
+            in_sync_files: 1,
+            differing_files: 0,
+            missing_remote_files: 0,
+            remote_only_entries: 0,
+            type_conflicts: 0,
+            excluded_entries: 0,
+            directories: 0,
+            in_sync_bytes: 4,
+            transfer_bytes: 0,
+            total_entries: 1,
+            attention_entries: 0,
+            complete: true,
+        };
+        assert_eq!(status_stats_value(&stats)["compare"], "metadata");
+
+        let content = plan::StatusStats {
+            compare: CompareMode::Content,
+            ..stats
+        };
+        assert_eq!(status_stats_value(&content)["compare"], "content");
     }
 }

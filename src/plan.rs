@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use crate::api::{RemoteEntry, RemoteInventory};
 use crate::integrity::ContentMd5;
 use crate::local::{EntryKind, IgnoreRules, LocalEntry, LocalInventory};
-use crate::path::{RemoteRoot, depth, is_dsm_managed};
+use crate::path::{RemoteRoot, depth, is_dsm_managed, validate_relative};
 use crate::{Error, Result};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11,6 +11,112 @@ pub enum CompareMode {
     Content,
     Metadata,
     SizeOnly,
+    /// Skip the comparison entirely and schedule every in-scope file for upload.
+    ///
+    /// This is destructive-adjacent: it replaces remote file content that may be identical or
+    /// newer. It is never a default, is never implied by [`Scope`], and cannot be set from a
+    /// configuration profile. It does not delete on its own; mirror deletion remains behind the
+    /// separate delete option.
+    Force,
+}
+
+impl CompareMode {
+    /// Whether this mode requires plan-time content digests for the entries it may delete.
+    ///
+    /// [`Self::Force`] answers `true` alongside [`Self::Content`]. A deletion guard must never
+    /// weaken as a side effect of a flag that was about uploading rather than about guarding:
+    /// were `Force` merely "not `Content`", a forced mirror run would silently drop from
+    /// digest-guarded deletion to size/mtime-guarded deletion with nothing in the output saying so.
+    pub fn requires_deletion_digest(self) -> bool {
+        matches!(self, Self::Content | Self::Force)
+    }
+}
+
+/// A source-relative restriction naming either one directory subtree or one single file.
+///
+/// The same prefix predicate covers both: a file's relative path simply has no descendants. This
+/// is what makes "resync exactly this file" expressible, which pointing the source and destination
+/// at a subfolder cannot do.
+///
+/// Deliberately not a glob. A pattern language here would inherit the fragility that rules out
+/// building a UI action on gitignore negation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Scope(String);
+
+impl Scope {
+    /// The unrestricted scope: the whole tree.
+    pub fn root() -> Self {
+        Self(String::new())
+    }
+
+    /// Normalize and validate a caller-supplied scope.
+    ///
+    /// Accepts the same shape as any other relative path in this codebase, so a scope can never
+    /// name something the planner would refuse to map. Surrounding slashes are trimmed for
+    /// convenience; everything else that `validate_relative` rejects is rejected here.
+    pub fn parse(value: &str) -> Result<Self> {
+        let trimmed = value.trim_matches('/');
+        if trimmed.is_empty() {
+            return Ok(Self::root());
+        }
+        if trimmed.contains('\\') {
+            return Err(Error::Configuration(format!(
+                "scope {value:?} must use forward slashes, not backslashes"
+            )));
+        }
+        validate_relative(trimmed)?;
+        if trimmed.split('/').any(|part| part == "." || part == "..") {
+            return Err(Error::Configuration(format!(
+                "scope {value:?} must not contain . or .. components"
+            )));
+        }
+        if is_dsm_managed(trimmed) {
+            return Err(Error::Configuration(format!(
+                "scope {value:?} names a DSM-managed directory, which is never synchronized"
+            )));
+        }
+        Ok(Self(trimmed.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_root(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether `relative` is the scope itself or lies beneath it.
+    ///
+    /// The comparison is `/`-delimited, so a scope of `docs` matches `docs/a` but never `docsets`.
+    pub fn matches(&self, relative: &str) -> bool {
+        if self.is_root() {
+            return true;
+        }
+        if relative == self.0 {
+            return true;
+        }
+        relative
+            .strip_prefix(&self.0)
+            .is_some_and(|rest| rest.starts_with('/'))
+    }
+
+    /// Whether `relative` is a strict ancestor directory of the scope.
+    ///
+    /// Ancestors are walked and inventoried so a scoped plan can still create the parent
+    /// directories a scoped upload needs, but they are not themselves in scope and never appear
+    /// in a status listing.
+    pub fn is_ancestor_of_scope(&self, relative: &str) -> bool {
+        if self.is_root() {
+            return false;
+        }
+        if relative.is_empty() {
+            return true;
+        }
+        self.0
+            .strip_prefix(relative)
+            .is_some_and(|rest| rest.starts_with('/'))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -20,6 +126,15 @@ pub struct PlanOptions {
     pub max_delete: usize,
     pub compare: CompareMode,
     pub server_copy: bool,
+    /// Restricts which remote entries mirror deletion may consider.
+    ///
+    /// A scoped inventory also carries the directories between the destination root and the
+    /// scope, so that a scoped upload's parents are known to exist and are not re-created. Those
+    /// ancestors are outside the scope and have no local counterpart to match, which without this
+    /// restriction would present the scope's own parent directories as remote-only and therefore
+    /// deletable. Deletion is confined to the scope here rather than left to the empty-source
+    /// fuse to catch by accident.
+    pub scope: Scope,
 }
 
 /// Why the planner scheduled an action. Every variant names what the planner actually observed:
@@ -43,6 +158,8 @@ pub enum ChangeReason {
     RemoteDigestUnavailable,
     /// A remote entry of the other kind occupies the path and is replaced.
     TypeReplaced,
+    /// No comparison was performed because the run asked for an unconditional re-upload.
+    Forced,
 }
 
 impl ChangeReason {
@@ -55,6 +172,7 @@ impl ChangeReason {
             Self::LocalDigestUnavailable => "local-digest-unavailable",
             Self::RemoteDigestUnavailable => "remote-digest-unavailable",
             Self::TypeReplaced => "type-replaced",
+            Self::Forced => "forced",
         }
     }
 
@@ -74,6 +192,7 @@ impl ChangeReason {
                 "size and time equal, no complete remote MD5/CRC32/SHA-256 fingerprint, uploading unverified"
             }
             Self::TypeReplaced => "remote entry has the conflicting kind",
+            Self::Forced => "comparison skipped, forced re-upload overwrites the remote copy",
         }
     }
 }
@@ -173,6 +292,33 @@ pub fn select_remote_content_hashes(
     select_remote_content_hashes_for_plan(local, remote, rules, server_copy, false)
 }
 
+/// Select the remote files whose digests guard a mirror deletion, and nothing else.
+///
+/// This is the subset [`select_remote_content_hashes_for_plan`] adds for `delete = true`. It is
+/// exposed separately for [`CompareMode::Force`], which performs no comparison and therefore needs
+/// no comparison digests, but must still guard every entry it could delete exactly as content mode
+/// does. The cost is bounded by the delete-candidate set rather than by the whole scope.
+pub fn select_deletion_guard_hashes(
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+    rules: &IgnoreRules,
+) -> BTreeSet<String> {
+    let mut selected = BTreeSet::new();
+    for entry in remote.entries.values() {
+        if entry.kind != EntryKind::File || is_protected(entry, rules) {
+            continue;
+        }
+        let is_delete_candidate = local
+            .entries
+            .get(&entry.relative)
+            .is_none_or(|local_entry| local_entry.kind != EntryKind::File);
+        if is_delete_candidate {
+            selected.insert(entry.relative.clone());
+        }
+    }
+    selected
+}
+
 /// Select remote content needed for comparison, optional server-copy reuse, and deletion guards.
 /// A content-mode mirror must pass `delete = true` so every file that could be removed has a
 /// plan-time digest. `build_plan` fails closed if such a digest is absent.
@@ -201,18 +347,7 @@ pub fn select_remote_content_hashes_for_plan(
     }
 
     if delete {
-        for entry in remote.entries.values() {
-            if entry.kind != EntryKind::File || is_protected(entry, rules) {
-                continue;
-            }
-            let is_delete_candidate = local
-                .entries
-                .get(&entry.relative)
-                .is_none_or(|local_entry| local_entry.kind != EntryKind::File);
-            if is_delete_candidate {
-                selected.insert(entry.relative.clone());
-            }
-        }
+        selected.extend(select_deletion_guard_hashes(local, remote, rules));
     }
 
     if !server_copy {
@@ -378,6 +513,10 @@ pub fn build_plan(
             if local.entries.contains_key(&entry.relative) || predeleted.contains(&entry.relative) {
                 continue;
             }
+            // Never propose deleting something the run was told not to look at.
+            if !options.scope.matches(&entry.relative) {
+                continue;
+            }
             if is_protected(entry, rules)
                 || (entry.kind == EntryKind::Directory && protected_dirs.contains(&entry.relative))
             {
@@ -514,11 +653,17 @@ fn compare_files(
     remote: &RemoteEntry,
     mode: CompareMode,
 ) -> Option<ChangeReason> {
+    // Checked before the size comparison: a forced run performs no comparison at all, so it must
+    // not report a size difference it never consulted.
+    if mode == CompareMode::Force {
+        return Some(ChangeReason::Forced);
+    }
     if local.size != remote.size {
         return Some(ChangeReason::SizeDiffers);
     }
     let mtime_differs = local_mtime_seconds(local) != remote.mtime_seconds;
     match mode {
+        CompareMode::Force => Some(ChangeReason::Forced),
         CompareMode::SizeOnly => None,
         CompareMode::Metadata => mtime_differs.then_some(ChangeReason::MtimeDiffers),
         CompareMode::Content => match (local.content_md5, remote.content_md5) {
@@ -693,7 +838,7 @@ fn deletion_snapshot(
     remote_entries: &BTreeMap<String, RemoteEntry>,
     compare: CompareMode,
 ) -> Result<RemoteSnapshot> {
-    let content_md5 = if compare == CompareMode::Content && entry.kind == EntryKind::File {
+    let content_md5 = if compare.requires_deletion_digest() && entry.kind == EntryKind::File {
         let fingerprint = entry.content_md5.ok_or_else(|| {
             Error::Message(format!(
                 "content-mode deletion requires a plan-time MD5/CRC32/SHA-256 fingerprint for {:?}",
@@ -772,6 +917,515 @@ fn sort_plan(plan: &mut SyncPlan) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Scoped status query
+//
+// A live query, never an index. Nothing here is written to disk and nothing is cached between
+// calls: the answer is rebuilt from the two inventories on every request, exactly as `build_plan`
+// rebuilds content correspondence on every run. There is therefore nothing to go stale.
+//
+// Per-entry outcomes come from `compare_files`, the same function `build_plan` uses, so a status
+// row can never disagree with what a sync would actually do.
+// ---------------------------------------------------------------------------
+
+/// Default rows per page when a caller does not choose.
+pub const STATUS_PAGE_SIZE_DEFAULT: usize = 100;
+
+/// Hard ceiling on rows per page.
+///
+/// Enforced in [`build_status_page`] rather than in an argument parser, so no caller on any
+/// surface can obtain a larger page. The target hardware is armv7; a page is a per-request
+/// allocation on a device that cannot absorb an unbounded one.
+pub const STATUS_PAGE_SIZE_MAX: usize = 200;
+
+/// Why an entry is excluded from synchronization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExclusionCause {
+    /// Matched an ignore rule or `--exclude` pattern.
+    IgnoreRule,
+    /// A DSM administrative directory, which is never payload.
+    DsmManaged,
+    /// A File Station mount point. Its contents belong to another filesystem.
+    MountBoundary,
+}
+
+impl ExclusionCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IgnoreRule => "ignore-rule",
+            Self::DsmManaged => "dsm-managed",
+            Self::MountBoundary => "mount-boundary",
+        }
+    }
+}
+
+/// The comparison outcome for one entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatusState {
+    /// Present on both sides and equal under the active compare mode.
+    InSync,
+    /// Present on both sides and scheduled for upload. Carries the planner's own reason.
+    Differs(ChangeReason),
+    /// Present locally, absent remotely.
+    MissingRemote,
+    /// Present remotely, absent locally. Removed only by a mirror run.
+    RemoteOnly,
+    /// Both sides exist but disagree about file versus directory.
+    TypeConflict {
+        local_kind: EntryKind,
+        remote_kind: EntryKind,
+    },
+    /// Never synchronized, and why.
+    Excluded(ExclusionCause),
+}
+
+impl StatusState {
+    pub fn kind(self) -> StateKind {
+        match self {
+            Self::InSync => StateKind::InSync,
+            Self::Differs(_) => StateKind::Differs,
+            Self::MissingRemote => StateKind::MissingRemote,
+            Self::RemoteOnly => StateKind::RemoteOnly,
+            Self::TypeConflict { .. } => StateKind::TypeConflict,
+            Self::Excluded(_) => StateKind::Excluded,
+        }
+    }
+
+    /// The planner's reason, when one applies.
+    pub fn reason(self) -> Option<ChangeReason> {
+        match self {
+            Self::Differs(reason) => Some(reason),
+            Self::MissingRemote => Some(ChangeReason::MissingRemote),
+            _ => None,
+        }
+    }
+}
+
+/// The filterable name of a [`StatusState`], without its payload.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum StateKind {
+    TypeConflict,
+    MissingRemote,
+    Differs,
+    RemoteOnly,
+    InSync,
+    Excluded,
+}
+
+impl StateKind {
+    /// The states that need a person's attention, newest concern first.
+    ///
+    /// This is the canonical set behind the `attention` filter. It is defined once, here, so that
+    /// a caller selecting the default view cannot hand-roll a set that drifts from this one.
+    ///
+    /// `TypeConflict` is included even though it is not a difference: it is the one state that
+    /// makes a sync *fail* rather than proceed, so a view that hid it would hide the thing most
+    /// likely to be blocking the user.
+    pub const ATTENTION: &'static [Self] = &[
+        Self::TypeConflict,
+        Self::MissingRemote,
+        Self::Differs,
+        Self::RemoteOnly,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TypeConflict => "type-conflict",
+            Self::MissingRemote => "missing-remote",
+            Self::Differs => "differs",
+            Self::RemoteOnly => "remote-only",
+            Self::InSync => "in-sync",
+            Self::Excluded => "excluded",
+        }
+    }
+
+    pub fn needs_attention(self) -> bool {
+        Self::ATTENTION.contains(&self)
+    }
+}
+
+/// Which states a listing returns.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StateFilter {
+    /// Every state.
+    All,
+    /// Only the named states. [`StateKind::ATTENTION`] is the set behind the default UI view.
+    Only(Vec<StateKind>),
+}
+
+impl Default for StateFilter {
+    /// Items needing attention, which is the view a caller wants unless it says otherwise.
+    ///
+    /// The command line opts into [`Self::All`] explicitly instead: an exhaustive listing is the
+    /// better default for a shell, where the caller sees the whole answer at once.
+    fn default() -> Self {
+        Self::attention()
+    }
+}
+
+impl StateFilter {
+    /// The set a caller showing "only items needing attention" should ask for.
+    pub fn attention() -> Self {
+        Self::Only(StateKind::ATTENTION.to_vec())
+    }
+
+    fn admits(&self, kind: StateKind) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(kinds) => kinds.contains(&kind),
+        }
+    }
+}
+
+/// One side's metadata for a compared entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SideInfo {
+    pub size: u64,
+    pub mtime_seconds: i64,
+}
+
+/// One row of a status listing.
+///
+/// Deliberately small: a caller renders a full page of these without a follow-up request per row.
+/// Whether an entry would transfer, and how many bytes, is derivable from `state` and `local`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatusEntry {
+    /// Source-relative path. The stable identity a caller passes back to scope an action.
+    pub relative: String,
+    /// Full File Station path, so a caller never has to join paths itself.
+    pub remote_path: String,
+    pub kind: EntryKind,
+    pub state: StatusState,
+    pub local: Option<SideInfo>,
+    pub remote: Option<SideInfo>,
+}
+
+/// Whole-scope totals.
+///
+/// These describe the entire scope, not the returned page, and filters never narrow them. That is
+/// what lets a caller showing 200 attention rows still say how many files are in sync behind them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StatusStats {
+    /// The comparison the answer was actually produced with.
+    ///
+    /// Echoed so a caller can label how strict its own answer is. A view that deliberately asks
+    /// for a cheap comparison over a broad scope is being economical; one that cannot tell which
+    /// comparison it received is guessing.
+    pub compare: CompareMode,
+    pub in_sync_files: usize,
+    pub differing_files: usize,
+    pub missing_remote_files: usize,
+    pub remote_only_entries: usize,
+    pub type_conflicts: usize,
+    pub excluded_entries: usize,
+    pub directories: usize,
+    pub in_sync_bytes: u64,
+    /// Bytes that would transfer, accumulated exactly as `SyncPlan::upload_bytes` is.
+    pub transfer_bytes: u64,
+    pub total_entries: usize,
+    /// Entries in [`StateKind::ATTENTION`]; the row count of the default view.
+    pub attention_entries: usize,
+    /// False when a scan budget stopped the walk, making every count a lower bound.
+    pub complete: bool,
+}
+
+impl StatusStats {
+    fn new(compare: CompareMode) -> Self {
+        Self {
+            compare,
+            in_sync_files: 0,
+            differing_files: 0,
+            missing_remote_files: 0,
+            remote_only_entries: 0,
+            type_conflicts: 0,
+            excluded_entries: 0,
+            directories: 0,
+            in_sync_bytes: 0,
+            transfer_bytes: 0,
+            total_entries: 0,
+            attention_entries: 0,
+            complete: true,
+        }
+    }
+}
+
+/// A position in a listing. Not a snapshot, and not stored anywhere.
+///
+/// Resuming re-derives the answer from live state, so a cursor naming a path that has since been
+/// deleted still resumes correctly: the comparison is ordering, not lookup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatusCursor(String);
+
+impl StatusCursor {
+    pub fn new(relative: impl Into<String>) -> Self {
+        Self(relative.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A bounded page plus the totals for the whole scope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatusPage {
+    pub scope: String,
+    pub entries: Vec<StatusEntry>,
+    /// The limit actually applied, after clamping to [`STATUS_PAGE_SIZE_MAX`].
+    pub limit: usize,
+    pub next_cursor: Option<StatusCursor>,
+    pub truncated: bool,
+    pub stats: StatusStats,
+}
+
+/// Inputs to one status listing.
+#[derive(Clone, Debug)]
+pub struct StatusQuery<'a> {
+    pub scope: &'a Scope,
+    pub compare: CompareMode,
+    /// Case-insensitive substring matched against the final path component.
+    pub filter: Option<&'a str>,
+    pub states: StateFilter,
+    pub include_excluded: bool,
+    pub limit: usize,
+    pub cursor: Option<&'a StatusCursor>,
+}
+
+/// Answer a scoped status query from live inventories.
+///
+/// `excluded` carries paths the scoped scan pruned; it is empty unless the caller asked for them.
+/// Ordering is lexicographic over the merged local/remote key set, which makes the cursor a plain
+/// path and paging stateless.
+pub fn build_status_page(
+    root: &RemoteRoot,
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+    excluded: &BTreeSet<String>,
+    rules: &IgnoreRules,
+    query: &StatusQuery<'_>,
+) -> Result<StatusPage> {
+    let limit = query.limit.clamp(1, STATUS_PAGE_SIZE_MAX);
+
+    let mut keys: BTreeSet<&str> = BTreeSet::new();
+    for relative in local.entries.keys().chain(remote.entries.keys()) {
+        if query.scope.matches(relative) {
+            keys.insert(relative.as_str());
+        }
+    }
+    if query.include_excluded {
+        for relative in excluded {
+            if query.scope.matches(relative) {
+                keys.insert(relative.as_str());
+            }
+        }
+    }
+
+    let mut stats = StatusStats::new(query.compare);
+    let mut entries = Vec::new();
+    let mut next_cursor = None;
+    let after = query.cursor.map(StatusCursor::as_str);
+
+    for relative in keys {
+        let entry = classify(
+            root,
+            local,
+            remote,
+            excluded,
+            rules,
+            query.compare,
+            relative,
+        )?;
+        accumulate(&mut stats, &entry);
+
+        if !query.states.admits(entry.state.kind()) || !matches_filter(relative, query.filter) {
+            continue;
+        }
+        if after.is_some_and(|cursor| relative <= cursor) {
+            continue;
+        }
+        if entries.len() == limit {
+            // The page is full, but the walk continues so the stats still describe the whole
+            // scope. The first row that does not fit fixes the cursor for the next page.
+            if next_cursor.is_none() {
+                next_cursor = entries
+                    .last()
+                    .map(|last: &StatusEntry| StatusCursor::new(last.relative.clone()));
+            }
+            continue;
+        }
+        entries.push(entry);
+    }
+
+    Ok(StatusPage {
+        scope: query.scope.as_str().to_owned(),
+        entries,
+        limit,
+        truncated: next_cursor.is_some(),
+        next_cursor,
+        stats,
+    })
+}
+
+/// Length of a resync ticket, in hex characters.
+const RESYNC_TICKET_LENGTH: usize = 16;
+
+/// Derive the ticket that identifies exactly what a forced re-upload would overwrite.
+///
+/// A confirmation has to prove the caller saw *this* set of files, not merely that the command was
+/// run twice. The ticket is a digest over the scope, the comparison, the sorted list of paths that
+/// would be overwritten, and the byte total — so any change to what is about to happen produces a
+/// different ticket and the confirmation is refused.
+///
+/// Deliberately carries no clock. Nothing here is stored, so there is no expiry to enforce and no
+/// business inventing one: a ticket stops being valid when the content it describes changes, and
+/// stays valid indefinitely when it does not.
+pub fn resync_ticket(scope: &Scope, compare: CompareMode, plan: &SyncPlan) -> String {
+    let mut canonical = String::from("sdsync.resync-ticket.v1\n");
+    canonical.push_str(scope.as_str());
+    canonical.push('\n');
+    canonical.push_str(match compare {
+        CompareMode::Content => "content",
+        CompareMode::Metadata => "metadata",
+        CompareMode::SizeOnly => "size-only",
+        CompareMode::Force => "force",
+    });
+    canonical.push('\n');
+    canonical.push_str(&plan.upload_bytes.to_string());
+    canonical.push('\n');
+    // `sort_plan` already orders uploads by relative path, so the encoding is stable across runs
+    // that would do the same work.
+    for action in &plan.uploads {
+        canonical.push_str(&action.local.relative);
+        canonical.push('\0');
+        canonical.push_str(&action.local.size.to_string());
+        canonical.push('\n');
+    }
+
+    let mut ticket = ContentMd5::from_content(canonical.as_bytes())
+        .sha256_hex()
+        .expect("a freshly computed fingerprint carries its SHA-256");
+    ticket.truncate(RESYNC_TICKET_LENGTH);
+    ticket
+}
+
+fn matches_filter(relative: &str, filter: Option<&str>) -> bool {
+    let Some(filter) = filter.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    let (_, name) = relative_parent_and_name(relative);
+    name.to_lowercase().contains(&filter.to_lowercase())
+}
+
+fn accumulate(stats: &mut StatusStats, entry: &StatusEntry) {
+    stats.total_entries += 1;
+    if entry.state.kind().needs_attention() {
+        stats.attention_entries += 1;
+    }
+    if entry.kind == EntryKind::Directory && !matches!(entry.state, StatusState::Excluded(_)) {
+        stats.directories += 1;
+    }
+    let size = entry.local.map_or(0, |side| side.size);
+    match entry.state {
+        StatusState::InSync => {
+            if entry.kind == EntryKind::File {
+                stats.in_sync_files += 1;
+                stats.in_sync_bytes = stats.in_sync_bytes.saturating_add(size);
+            }
+        }
+        StatusState::Differs(_) => {
+            stats.differing_files += 1;
+            stats.transfer_bytes = stats.transfer_bytes.saturating_add(size);
+        }
+        StatusState::MissingRemote => {
+            if entry.kind == EntryKind::File {
+                stats.missing_remote_files += 1;
+                stats.transfer_bytes = stats.transfer_bytes.saturating_add(size);
+            }
+        }
+        StatusState::RemoteOnly => stats.remote_only_entries += 1,
+        StatusState::TypeConflict { .. } => {
+            stats.type_conflicts += 1;
+            stats.transfer_bytes = stats.transfer_bytes.saturating_add(size);
+        }
+        StatusState::Excluded(_) => stats.excluded_entries += 1,
+    }
+}
+
+fn classify(
+    root: &RemoteRoot,
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+    excluded: &BTreeSet<String>,
+    rules: &IgnoreRules,
+    compare: CompareMode,
+    relative: &str,
+) -> Result<StatusEntry> {
+    let local_entry = local.entries.get(relative);
+    let remote_entry = remote.entries.get(relative);
+
+    let kind = local_entry
+        .map(|entry| entry.kind)
+        .or_else(|| remote_entry.map(|entry| entry.kind))
+        .unwrap_or(EntryKind::Directory);
+
+    let remote_path = match remote_entry {
+        Some(entry) => entry.remote_path.clone(),
+        None => root.join(relative)?,
+    };
+
+    let state = if let Some(entry) = remote_entry.filter(|entry| is_protected(entry, rules)) {
+        StatusState::Excluded(if entry.mount_point_type.is_some() {
+            ExclusionCause::MountBoundary
+        } else if is_dsm_managed(&entry.relative) {
+            ExclusionCause::DsmManaged
+        } else {
+            ExclusionCause::IgnoreRule
+        })
+    } else if local_entry.is_none() && remote_entry.is_none() && excluded.contains(relative) {
+        StatusState::Excluded(if is_dsm_managed(relative) {
+            ExclusionCause::DsmManaged
+        } else {
+            ExclusionCause::IgnoreRule
+        })
+    } else {
+        match (local_entry, remote_entry) {
+            (Some(local_entry), Some(remote_entry)) => {
+                match (local_entry.kind, remote_entry.kind) {
+                    (EntryKind::Directory, EntryKind::Directory) => StatusState::InSync,
+                    (EntryKind::File, EntryKind::File) => {
+                        match compare_files(local_entry, remote_entry, compare) {
+                            None => StatusState::InSync,
+                            Some(reason) => StatusState::Differs(reason),
+                        }
+                    }
+                    (local_kind, remote_kind) => StatusState::TypeConflict {
+                        local_kind,
+                        remote_kind,
+                    },
+                }
+            }
+            (Some(_), None) => StatusState::MissingRemote,
+            (None, Some(_)) => StatusState::RemoteOnly,
+            (None, None) => StatusState::Excluded(ExclusionCause::IgnoreRule),
+        }
+    };
+
+    Ok(StatusEntry {
+        relative: relative.to_owned(),
+        remote_path,
+        kind,
+        state,
+        local: local_entry.map(|entry| SideInfo {
+            size: entry.size,
+            mtime_seconds: local_mtime_seconds(entry),
+        }),
+        remote: remote_entry.map(|entry| SideInfo {
+            size: entry.size,
+            mtime_seconds: entry.mtime_seconds,
+        }),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -845,6 +1499,7 @@ mod tests {
             max_delete: 100,
             compare: CompareMode::Metadata,
             server_copy: false,
+            scope: Scope::root(),
         }
     }
 
@@ -856,6 +1511,7 @@ mod tests {
         PlanOptions {
             compare: CompareMode::Content,
             server_copy,
+            scope: Scope::root(),
             ..options(delete)
         }
     }
@@ -1622,5 +2278,1207 @@ mod tests {
             Err(Error::Message(message))
                 if message == "content comparison requires every local file digest"
         ));
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fs;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn root() -> RemoteRoot {
+        RemoteRoot::parse("/share/root").unwrap()
+    }
+
+    fn local(entries: &[(&str, EntryKind, u64, i64)]) -> LocalInventory {
+        LocalInventory {
+            root: PathBuf::from("/source"),
+            entries: entries
+                .iter()
+                .map(|(relative, kind, size, mtime_ms)| {
+                    (
+                        (*relative).to_owned(),
+                        LocalEntry {
+                            relative: (*relative).to_owned(),
+                            full_path: PathBuf::from(relative),
+                            kind: *kind,
+                            size: *size,
+                            mtime_ms: *mtime_ms,
+                            content_md5: None,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn remote(entries: &[(&str, EntryKind, u64, i64)]) -> RemoteInventory {
+        RemoteInventory {
+            root_exists: true,
+            entries: entries
+                .iter()
+                .map(|(relative, kind, size, mtime_seconds)| {
+                    (
+                        (*relative).to_owned(),
+                        RemoteEntry {
+                            relative: (*relative).to_owned(),
+                            remote_path: format!("/share/root/{relative}"),
+                            kind: *kind,
+                            size: *size,
+                            mtime_seconds: *mtime_seconds,
+                            mount_point_type: None,
+                            content_md5: None,
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+        }
+    }
+
+    fn rules(patterns: &[&str]) -> IgnoreRules {
+        let root = std::env::temp_dir().join(format!("sdsync-status-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        IgnoreRules::build(
+            &root,
+            &patterns
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    fn query(scope: &Scope) -> StatusQuery<'_> {
+        StatusQuery {
+            scope,
+            compare: CompareMode::Metadata,
+            filter: None,
+            states: StateFilter::All,
+            include_excluded: false,
+            limit: STATUS_PAGE_SIZE_DEFAULT,
+            cursor: None,
+        }
+    }
+
+    fn page(
+        local: &LocalInventory,
+        remote: &RemoteInventory,
+        query: &StatusQuery<'_>,
+    ) -> StatusPage {
+        build_status_page(&root(), local, remote, &BTreeSet::new(), &rules(&[]), query).unwrap()
+    }
+
+    fn states(page: &StatusPage) -> Vec<(&str, StateKind)> {
+        page.entries
+            .iter()
+            .map(|entry| (entry.relative.as_str(), entry.state.kind()))
+            .collect()
+    }
+
+    fn names(page: &StatusPage) -> Vec<&str> {
+        page.entries
+            .iter()
+            .map(|entry| entry.relative.as_str())
+            .collect()
+    }
+
+    // --- Scope ------------------------------------------------------------
+
+    #[test]
+    fn scope_parse_normalizes_surrounding_slashes_and_accepts_the_empty_root() {
+        assert!(Scope::parse("").unwrap().is_root());
+        assert!(Scope::parse("/").unwrap().is_root());
+        assert_eq!(Scope::parse("docs").unwrap().as_str(), "docs");
+        assert_eq!(Scope::parse("/docs/").unwrap().as_str(), "docs");
+        assert_eq!(
+            Scope::parse("docs/q3/a.txt").unwrap().as_str(),
+            "docs/q3/a.txt"
+        );
+    }
+
+    #[test]
+    fn scope_parse_rejects_traversal_backslashes_and_dsm_managed_names() {
+        for value in [
+            "../escape",
+            "docs/../..",
+            "docs/./here",
+            "a\\b",
+            "@eaDir",
+            "#recycle/x",
+        ] {
+            assert!(
+                Scope::parse(value).is_err(),
+                "scope {value:?} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn scope_matches_only_on_component_boundaries() {
+        let scope = Scope::parse("docs").unwrap();
+        assert!(scope.matches("docs"));
+        assert!(scope.matches("docs/a.txt"));
+        assert!(scope.matches("docs/deep/b.txt"));
+        // Component-wise: a sibling that merely starts with the same letters is out of scope.
+        assert!(!scope.matches("docsets"));
+        assert!(!scope.matches("docsets/a.txt"));
+        assert!(!scope.matches("other"));
+    }
+
+    #[test]
+    fn a_file_scope_matches_itself_and_nothing_else() {
+        let scope = Scope::parse("docs/a.txt").unwrap();
+        assert!(scope.matches("docs/a.txt"));
+        assert!(!scope.matches("docs"));
+        assert!(!scope.matches("docs/b.txt"));
+    }
+
+    #[test]
+    fn the_root_scope_matches_everything() {
+        let scope = Scope::root();
+        assert!(scope.matches(""));
+        assert!(scope.matches("anything/at/all"));
+        assert!(!scope.is_ancestor_of_scope("anything"));
+    }
+
+    #[test]
+    fn ancestors_of_a_scope_are_recognized_but_are_not_in_scope() {
+        let scope = Scope::parse("a/b/c.txt").unwrap();
+        for ancestor in ["", "a", "a/b"] {
+            assert!(
+                scope.is_ancestor_of_scope(ancestor),
+                "{ancestor:?} should be an ancestor of the scope"
+            );
+            assert!(
+                !scope.matches(ancestor),
+                "{ancestor:?} is an ancestor and must not be in scope"
+            );
+        }
+        assert!(!scope.is_ancestor_of_scope("a/b/c.txt"));
+        assert!(!scope.is_ancestor_of_scope("a/z"));
+    }
+
+    // --- Force ------------------------------------------------------------
+
+    #[test]
+    fn force_reports_forced_without_consulting_size_or_time() {
+        let identical_local = LocalEntry {
+            relative: "a.txt".to_owned(),
+            full_path: PathBuf::from("a.txt"),
+            kind: EntryKind::File,
+            size: 10,
+            mtime_ms: 5_000,
+            content_md5: None,
+        };
+        let identical_remote = RemoteEntry {
+            relative: "a.txt".to_owned(),
+            remote_path: "/share/root/a.txt".to_owned(),
+            kind: EntryKind::File,
+            size: 10,
+            mtime_seconds: 5,
+            mount_point_type: None,
+            content_md5: None,
+        };
+        // Byte-for-byte identical under every other mode.
+        assert_eq!(
+            compare_files(&identical_local, &identical_remote, CompareMode::Metadata),
+            None
+        );
+        assert_eq!(
+            compare_files(&identical_local, &identical_remote, CompareMode::Force),
+            Some(ChangeReason::Forced)
+        );
+
+        // A differing pair still reports Forced, never a difference force never looked for.
+        let bigger = LocalEntry {
+            size: 99,
+            ..identical_local.clone()
+        };
+        assert_eq!(
+            compare_files(&bigger, &identical_remote, CompareMode::Force),
+            Some(ChangeReason::Forced)
+        );
+    }
+
+    #[test]
+    fn force_keeps_content_grade_deletion_guards() {
+        // The guard must not weaken as a side effect of a flag that was about uploading.
+        assert!(CompareMode::Content.requires_deletion_digest());
+        assert!(CompareMode::Force.requires_deletion_digest());
+        assert!(!CompareMode::Metadata.requires_deletion_digest());
+        assert!(!CompareMode::SizeOnly.requires_deletion_digest());
+    }
+
+    #[test]
+    fn a_forced_mirror_refuses_to_delete_without_a_plan_time_digest() {
+        let local = local(&[("keep.txt", EntryKind::File, 1, 1_000)]);
+        let remote = remote(&[
+            ("keep.txt", EntryKind::File, 1, 1),
+            ("gone.txt", EntryKind::File, 4, 2),
+        ]);
+        let error = build_plan(
+            &root(),
+            &local,
+            &remote,
+            &rules(&[]),
+            &PlanOptions {
+                delete: true,
+                allow_empty_source: false,
+                max_delete: 100,
+                compare: CompareMode::Force,
+                server_copy: false,
+                scope: Scope::root(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, Error::Message(message) if message.contains("fingerprint")),
+            "forced mirror deletion must fail closed without a digest, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn the_deletion_guard_selection_covers_only_delete_candidates() {
+        let local = local(&[("keep.txt", EntryKind::File, 1, 1_000)]);
+        let remote = remote(&[
+            ("keep.txt", EntryKind::File, 1, 1),
+            ("gone.txt", EntryKind::File, 4, 2),
+            ("also-gone.txt", EntryKind::File, 4, 2),
+        ]);
+        let selected = select_deletion_guard_hashes(&local, &remote, &rules(&[]));
+        assert_eq!(
+            selected.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["also-gone.txt", "gone.txt"]
+        );
+    }
+
+    #[test]
+    fn forced_uploads_carry_a_reason_that_names_the_overwrite() {
+        assert_eq!(ChangeReason::Forced.as_str(), "forced");
+        assert!(ChangeReason::Forced.detail().contains("overwrites"));
+
+        let local = local(&[("a.txt", EntryKind::File, 10, 5_000)]);
+        let remote = remote(&[("a.txt", EntryKind::File, 10, 5)]);
+        let plan = build_plan(
+            &root(),
+            &local,
+            &remote,
+            &rules(&[]),
+            &PlanOptions {
+                delete: false,
+                allow_empty_source: false,
+                max_delete: 100,
+                compare: CompareMode::Force,
+                server_copy: false,
+                scope: Scope::root(),
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.uploads.len(), 1);
+        assert_eq!(plan.uploads[0].reason, ChangeReason::Forced);
+        assert_eq!(plan.unchanged_files, 0);
+        assert_eq!(plan.upload_bytes, 10);
+    }
+
+    // --- Per-entry classification ----------------------------------------
+
+    #[test]
+    fn every_status_state_is_reported_from_the_same_comparison_the_planner_uses() {
+        let local = local(&[
+            ("dir", EntryKind::Directory, 0, 0),
+            ("same.txt", EntryKind::File, 4, 3_500),
+            ("changed.txt", EntryKind::File, 4, 5_000),
+            ("new.txt", EntryKind::File, 3, 2_000),
+            ("conflict", EntryKind::Directory, 0, 0),
+        ]);
+        let remote = remote(&[
+            ("dir", EntryKind::Directory, 0, 0),
+            ("same.txt", EntryKind::File, 4, 3),
+            ("changed.txt", EntryKind::File, 4, 4),
+            ("extra.txt", EntryKind::File, 1, 1),
+            ("conflict", EntryKind::File, 7, 9),
+        ]);
+        let scope = Scope::root();
+        let page = page(&local, &remote, &query(&scope));
+
+        assert_eq!(
+            states(&page),
+            [
+                ("changed.txt", StateKind::Differs),
+                ("conflict", StateKind::TypeConflict),
+                ("dir", StateKind::InSync),
+                ("extra.txt", StateKind::RemoteOnly),
+                ("new.txt", StateKind::MissingRemote),
+                ("same.txt", StateKind::InSync),
+            ]
+        );
+
+        let changed = page
+            .entries
+            .iter()
+            .find(|entry| entry.relative == "changed.txt")
+            .unwrap();
+        assert_eq!(
+            changed.state,
+            StatusState::Differs(ChangeReason::MtimeDiffers)
+        );
+        assert_eq!(changed.local.unwrap().size, 4);
+        assert_eq!(changed.remote.unwrap().mtime_seconds, 4);
+        assert_eq!(changed.remote_path, "/share/root/changed.txt");
+    }
+
+    #[test]
+    fn a_type_conflict_names_both_sides() {
+        let local = local(&[("conflict", EntryKind::Directory, 0, 0)]);
+        let remote = remote(&[("conflict", EntryKind::File, 7, 9)]);
+        let scope = Scope::root();
+        let page = page(&local, &remote, &query(&scope));
+        assert_eq!(
+            page.entries[0].state,
+            StatusState::TypeConflict {
+                local_kind: EntryKind::Directory,
+                remote_kind: EntryKind::File,
+            }
+        );
+        assert_eq!(page.stats.type_conflicts, 1);
+    }
+
+    #[test]
+    fn a_missing_remote_entry_still_carries_the_path_it_would_occupy() {
+        let local = local(&[("deep/new.txt", EntryKind::File, 3, 2_000)]);
+        let remote = remote(&[]);
+        let scope = Scope::root();
+        let page = page(&local, &remote, &query(&scope));
+        let entry = page
+            .entries
+            .iter()
+            .find(|entry| entry.relative == "deep/new.txt")
+            .unwrap();
+        assert_eq!(entry.remote_path, "/share/root/deep/new.txt");
+        assert_eq!(entry.state, StatusState::MissingRemote);
+        assert!(entry.remote.is_none());
+    }
+
+    #[test]
+    fn the_reported_reason_tracks_the_compare_mode() {
+        let local = local(&[("a.txt", EntryKind::File, 4, 5_000)]);
+        let remote = remote(&[("a.txt", EntryKind::File, 4, 4)]);
+        let scope = Scope::root();
+
+        // Size-only never inspects the differing mtime, so it reports equality.
+        let size_only = page(
+            &local,
+            &remote,
+            &StatusQuery {
+                compare: CompareMode::SizeOnly,
+                ..query(&scope)
+            },
+        );
+        assert_eq!(size_only.entries[0].state, StatusState::InSync);
+
+        let metadata = page(&local, &remote, &query(&scope));
+        assert_eq!(
+            metadata.entries[0].state,
+            StatusState::Differs(ChangeReason::MtimeDiffers)
+        );
+    }
+
+    #[test]
+    fn a_protected_remote_entry_reports_why_it_is_excluded() {
+        let local = local(&[]);
+        let mut remote = remote(&[("mounted", EntryKind::Directory, 0, 0)]);
+        remote.entries.get_mut("mounted").unwrap().mount_point_type = Some("cifs".to_owned());
+        let scope = Scope::root();
+        let page = page(&local, &remote, &query(&scope));
+        assert_eq!(
+            page.entries[0].state,
+            StatusState::Excluded(ExclusionCause::MountBoundary)
+        );
+        assert_eq!(page.stats.excluded_entries, 1);
+    }
+
+    #[test]
+    fn requested_excluded_paths_are_listed_with_their_cause() {
+        let excluded: BTreeSet<String> = ["cache/big.tmp".to_owned(), "@eaDir".to_owned()]
+            .into_iter()
+            .collect();
+        let scope = Scope::root();
+        let page = build_status_page(
+            &root(),
+            &local(&[]),
+            &remote(&[]),
+            &excluded,
+            &rules(&[]),
+            &StatusQuery {
+                include_excluded: true,
+                ..query(&scope)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            states(&page),
+            [
+                ("@eaDir", StateKind::Excluded),
+                ("cache/big.tmp", StateKind::Excluded),
+            ]
+        );
+        assert_eq!(
+            page.entries[0].state,
+            StatusState::Excluded(ExclusionCause::DsmManaged)
+        );
+        assert_eq!(
+            page.entries[1].state,
+            StatusState::Excluded(ExclusionCause::IgnoreRule)
+        );
+    }
+
+    #[test]
+    fn excluded_paths_stay_hidden_unless_they_are_requested() {
+        let excluded: BTreeSet<String> = ["cache/big.tmp".to_owned()].into_iter().collect();
+        let scope = Scope::root();
+        let page = build_status_page(
+            &root(),
+            &local(&[]),
+            &remote(&[]),
+            &excluded,
+            &rules(&[]),
+            &query(&scope),
+        )
+        .unwrap();
+        assert!(page.entries.is_empty());
+    }
+
+    // --- Scoping the listing ---------------------------------------------
+
+    #[test]
+    fn a_directory_scope_lists_only_its_subtree() {
+        let local = local(&[
+            ("docs", EntryKind::Directory, 0, 0),
+            ("docs/a.txt", EntryKind::File, 1, 1_000),
+            ("docs/deep/b.txt", EntryKind::File, 1, 1_000),
+            ("other/c.txt", EntryKind::File, 1, 1_000),
+        ]);
+        let remote = remote(&[]);
+        let scope = Scope::parse("docs").unwrap();
+        let page = page(&local, &remote, &query(&scope));
+        assert_eq!(names(&page), ["docs", "docs/a.txt", "docs/deep/b.txt"]);
+        assert_eq!(page.scope, "docs");
+    }
+
+    #[test]
+    fn a_file_scope_lists_exactly_one_row_and_omits_its_parents() {
+        let local = local(&[
+            ("docs", EntryKind::Directory, 0, 0),
+            ("docs/a.txt", EntryKind::File, 1, 1_000),
+            ("docs/b.txt", EntryKind::File, 1, 1_000),
+        ]);
+        let remote = remote(&[]);
+        let scope = Scope::parse("docs/a.txt").unwrap();
+        let page = page(&local, &remote, &query(&scope));
+        assert_eq!(names(&page), ["docs/a.txt"]);
+        // The parent was scanned so a scoped plan could create it, but it is not in scope and
+        // must not appear in the listing or the totals.
+        assert_eq!(page.stats.total_entries, 1);
+        assert_eq!(page.stats.directories, 0);
+    }
+
+    #[test]
+    fn a_scoped_listing_ignores_remote_entries_outside_the_scope() {
+        let local = local(&[("docs/a.txt", EntryKind::File, 1, 1_000)]);
+        let remote = remote(&[
+            ("docs/a.txt", EntryKind::File, 1, 1),
+            ("elsewhere/orphan.txt", EntryKind::File, 5, 5),
+        ]);
+        let scope = Scope::parse("docs").unwrap();
+        let page = page(&local, &remote, &query(&scope));
+        assert_eq!(names(&page), ["docs/a.txt"]);
+        assert_eq!(page.stats.remote_only_entries, 0);
+    }
+
+    // --- Stats ------------------------------------------------------------
+
+    #[test]
+    fn stats_agree_with_the_plan_built_from_the_same_inventories() {
+        let local = local(&[
+            ("dir", EntryKind::Directory, 0, 0),
+            ("same.txt", EntryKind::File, 4, 3_500),
+            ("changed.txt", EntryKind::File, 40, 5_000),
+            ("new.txt", EntryKind::File, 300, 2_000),
+        ]);
+        let remote = remote(&[
+            ("dir", EntryKind::Directory, 0, 0),
+            ("same.txt", EntryKind::File, 4, 3),
+            ("changed.txt", EntryKind::File, 40, 4),
+            ("extra.txt", EntryKind::File, 1, 1),
+        ]);
+        let scope = Scope::root();
+        let page = page(&local, &remote, &query(&scope));
+        let plan = build_plan(
+            &root(),
+            &local,
+            &remote,
+            &rules(&[]),
+            &PlanOptions {
+                delete: true,
+                allow_empty_source: false,
+                max_delete: 100,
+                compare: CompareMode::Metadata,
+                server_copy: false,
+                scope: Scope::root(),
+            },
+        )
+        .unwrap();
+
+        // The two must never drift: they answer the same question from the same comparison.
+        assert_eq!(page.stats.in_sync_files, plan.unchanged_files);
+        assert_eq!(page.stats.transfer_bytes, plan.upload_bytes);
+        assert_eq!(
+            page.stats.differing_files + page.stats.missing_remote_files,
+            plan.uploads.len()
+        );
+        assert_eq!(page.stats.remote_only_entries, plan.delete_count());
+        assert_eq!(page.stats.transfer_bytes, 340);
+        assert_eq!(page.stats.in_sync_bytes, 4);
+    }
+
+    #[test]
+    fn filters_narrow_the_rows_but_never_the_totals() {
+        let local = local(&[
+            ("same.txt", EntryKind::File, 4, 3_500),
+            ("changed.txt", EntryKind::File, 40, 5_000),
+        ]);
+        let remote = remote(&[
+            ("same.txt", EntryKind::File, 4, 3),
+            ("changed.txt", EntryKind::File, 40, 4),
+        ]);
+        let scope = Scope::root();
+        let page = page(
+            &local,
+            &remote,
+            &StatusQuery {
+                states: StateFilter::Only(vec![StateKind::Differs]),
+                ..query(&scope)
+            },
+        );
+        assert_eq!(states(&page), [("changed.txt", StateKind::Differs)]);
+        // A caller showing only the differing row still learns what sits behind it.
+        assert_eq!(page.stats.in_sync_files, 1);
+        assert_eq!(page.stats.differing_files, 1);
+        assert_eq!(page.stats.total_entries, 2);
+    }
+
+    #[test]
+    fn the_attention_set_is_the_states_that_need_action() {
+        assert_eq!(
+            StateKind::ATTENTION,
+            &[
+                StateKind::TypeConflict,
+                StateKind::MissingRemote,
+                StateKind::Differs,
+                StateKind::RemoteOnly,
+            ]
+        );
+        assert!(StateKind::TypeConflict.needs_attention());
+        assert!(StateKind::MissingRemote.needs_attention());
+        assert!(StateKind::Differs.needs_attention());
+        assert!(StateKind::RemoteOnly.needs_attention());
+        assert!(!StateKind::InSync.needs_attention());
+        assert!(!StateKind::Excluded.needs_attention());
+    }
+
+    #[test]
+    fn the_attention_filter_returns_exactly_the_attention_states() {
+        let local = local(&[
+            ("same.txt", EntryKind::File, 4, 3_500),
+            ("changed.txt", EntryKind::File, 4, 5_000),
+            ("new.txt", EntryKind::File, 3, 2_000),
+        ]);
+        let remote = remote(&[
+            ("same.txt", EntryKind::File, 4, 3),
+            ("changed.txt", EntryKind::File, 4, 4),
+            ("extra.txt", EntryKind::File, 1, 1),
+        ]);
+        let scope = Scope::root();
+        let page = page(
+            &local,
+            &remote,
+            &StatusQuery {
+                states: StateFilter::attention(),
+                ..query(&scope)
+            },
+        );
+        assert_eq!(
+            states(&page),
+            [
+                ("changed.txt", StateKind::Differs),
+                ("extra.txt", StateKind::RemoteOnly),
+                ("new.txt", StateKind::MissingRemote),
+            ]
+        );
+        assert_eq!(page.stats.attention_entries, 3);
+        assert_eq!(page.stats.in_sync_files, 1);
+    }
+
+    #[test]
+    fn the_name_filter_matches_the_last_component_case_insensitively() {
+        let local = local(&[
+            ("docs/Invoice-1.pdf", EntryKind::File, 1, 1_000),
+            ("invoices/other.txt", EntryKind::File, 1, 1_000),
+            ("docs/report.pdf", EntryKind::File, 1, 1_000),
+        ]);
+        let remote = remote(&[]);
+        let scope = Scope::root();
+        let page = page(
+            &local,
+            &remote,
+            &StatusQuery {
+                filter: Some("invoice"),
+                ..query(&scope)
+            },
+        );
+        // Matches the file name, not the directory that happens to contain the word.
+        assert_eq!(names(&page), ["docs/Invoice-1.pdf"]);
+        assert_eq!(page.stats.total_entries, 3);
+    }
+
+    #[test]
+    fn an_empty_filter_is_ignored_rather_than_matching_nothing() {
+        let local = local(&[("a.txt", EntryKind::File, 1, 1_000)]);
+        let remote = remote(&[]);
+        let scope = Scope::root();
+        let page = page(
+            &local,
+            &remote,
+            &StatusQuery {
+                filter: Some("   "),
+                ..query(&scope)
+            },
+        );
+        assert_eq!(page.entries.len(), 1);
+    }
+
+    // --- Pagination -------------------------------------------------------
+
+    fn numbered(count: usize) -> LocalInventory {
+        let owned: Vec<String> = (0..count).map(|index| format!("f{index:04}.txt")).collect();
+        let entries: Vec<(&str, EntryKind, u64, i64)> = owned
+            .iter()
+            .map(|relative| (relative.as_str(), EntryKind::File, 1, 1_000))
+            .collect();
+        local(&entries)
+    }
+
+    #[test]
+    fn the_page_size_is_capped_no_matter_what_the_caller_asks_for() {
+        let local = numbered(250);
+        let remote = remote(&[]);
+        let scope = Scope::root();
+        let page = page(
+            &local,
+            &remote,
+            &StatusQuery {
+                limit: usize::MAX,
+                ..query(&scope)
+            },
+        );
+        assert_eq!(page.limit, STATUS_PAGE_SIZE_MAX);
+        assert_eq!(page.entries.len(), STATUS_PAGE_SIZE_MAX);
+        assert!(page.truncated);
+        // The totals still describe the whole scope, not the capped page.
+        assert_eq!(page.stats.total_entries, 250);
+    }
+
+    #[test]
+    fn a_zero_limit_still_returns_a_usable_page() {
+        let local = numbered(3);
+        let remote = remote(&[]);
+        let scope = Scope::root();
+        let page = page(
+            &local,
+            &remote,
+            &StatusQuery {
+                limit: 0,
+                ..query(&scope)
+            },
+        );
+        assert_eq!(page.limit, 1);
+        assert_eq!(page.entries.len(), 1);
+    }
+
+    #[test]
+    fn a_page_that_exactly_fits_reports_no_continuation() {
+        let local = numbered(5);
+        let remote = remote(&[]);
+        let scope = Scope::root();
+        for (limit, truncated) in [(4, true), (5, false), (6, false)] {
+            let current = page(
+                &local,
+                &remote,
+                &StatusQuery {
+                    limit,
+                    ..query(&scope)
+                },
+            );
+            assert_eq!(current.truncated, truncated, "limit {limit}");
+            assert_eq!(current.next_cursor.is_some(), truncated, "limit {limit}");
+        }
+    }
+
+    #[test]
+    fn paging_with_the_cursor_visits_every_entry_exactly_once() {
+        let local = numbered(23);
+        let remote = remote(&[]);
+        let scope = Scope::root();
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let current = build_status_page(
+                &root(),
+                &local,
+                &remote,
+                &BTreeSet::new(),
+                &rules(&[]),
+                &StatusQuery {
+                    limit: 5,
+                    cursor: cursor.as_ref(),
+                    ..query(&scope)
+                },
+            )
+            .unwrap();
+            seen.extend(current.entries.iter().map(|entry| entry.relative.clone()));
+            match current.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        let expected: Vec<String> = (0..23).map(|index| format!("f{index:04}.txt")).collect();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn a_cursor_naming_a_vanished_entry_still_resumes_in_order() {
+        // A cursor is a position, not a lookup: the engine keeps no snapshot to invalidate.
+        let local = local(&[
+            ("a.txt", EntryKind::File, 1, 1_000),
+            ("c.txt", EntryKind::File, 1, 1_000),
+        ]);
+        let remote = remote(&[]);
+        let scope = Scope::root();
+        let cursor = StatusCursor::new("b.txt");
+        let page = page(
+            &local,
+            &remote,
+            &StatusQuery {
+                cursor: Some(&cursor),
+                ..query(&scope)
+            },
+        );
+        assert_eq!(names(&page), ["c.txt"]);
+    }
+
+    #[test]
+    fn the_cursor_survives_a_filtered_listing() {
+        let local = local(&[
+            ("a-differs.txt", EntryKind::File, 4, 5_000),
+            ("b-same.txt", EntryKind::File, 4, 3_500),
+            ("c-differs.txt", EntryKind::File, 4, 5_000),
+        ]);
+        let remote = remote(&[
+            ("a-differs.txt", EntryKind::File, 4, 4),
+            ("b-same.txt", EntryKind::File, 4, 3),
+            ("c-differs.txt", EntryKind::File, 4, 4),
+        ]);
+        let scope = Scope::root();
+        let first = page(
+            &local,
+            &remote,
+            &StatusQuery {
+                limit: 1,
+                states: StateFilter::Only(vec![StateKind::Differs]),
+                ..query(&scope)
+            },
+        );
+        assert_eq!(states(&first), [("a-differs.txt", StateKind::Differs)]);
+        let cursor = first.next_cursor.expect("a second differing row remains");
+
+        let second = page(
+            &local,
+            &remote,
+            &StatusQuery {
+                limit: 1,
+                states: StateFilter::Only(vec![StateKind::Differs]),
+                cursor: Some(&cursor),
+                ..query(&scope)
+            },
+        );
+        assert_eq!(states(&second), [("c-differs.txt", StateKind::Differs)]);
+        assert!(!second.truncated);
+    }
+
+    #[test]
+    fn stats_are_complete_by_default_and_the_page_echoes_its_scope() {
+        let local = numbered(2);
+        let remote = remote(&[]);
+        let scope = Scope::root();
+        let page = page(&local, &remote, &query(&scope));
+        assert!(page.stats.complete);
+        assert_eq!(page.scope, "");
+        assert_eq!(page.limit, STATUS_PAGE_SIZE_DEFAULT);
+    }
+
+    #[test]
+    fn state_kind_names_are_stable_for_machine_output() {
+        assert_eq!(StateKind::TypeConflict.as_str(), "type-conflict");
+        assert_eq!(StateKind::MissingRemote.as_str(), "missing-remote");
+        assert_eq!(StateKind::Differs.as_str(), "differs");
+        assert_eq!(StateKind::RemoteOnly.as_str(), "remote-only");
+        assert_eq!(StateKind::InSync.as_str(), "in-sync");
+        assert_eq!(StateKind::Excluded.as_str(), "excluded");
+        assert_eq!(ExclusionCause::IgnoreRule.as_str(), "ignore-rule");
+        assert_eq!(ExclusionCause::DsmManaged.as_str(), "dsm-managed");
+        assert_eq!(ExclusionCause::MountBoundary.as_str(), "mount-boundary");
+    }
+
+    #[test]
+    fn a_status_state_exposes_the_planner_reason_behind_it() {
+        assert_eq!(
+            StatusState::Differs(ChangeReason::SizeDiffers).reason(),
+            Some(ChangeReason::SizeDiffers)
+        );
+        assert_eq!(
+            StatusState::MissingRemote.reason(),
+            Some(ChangeReason::MissingRemote)
+        );
+        assert_eq!(StatusState::InSync.reason(), None);
+        assert_eq!(StatusState::RemoteOnly.reason(), None);
+    }
+}
+
+#[cfg(test)]
+mod scoped_deletion_tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn root() -> RemoteRoot {
+        RemoteRoot::parse("/share/root").unwrap()
+    }
+
+    fn local(entries: &[(&str, EntryKind, u64, i64)]) -> LocalInventory {
+        LocalInventory {
+            root: PathBuf::from("/source"),
+            entries: entries
+                .iter()
+                .map(|(relative, kind, size, mtime_ms)| {
+                    (
+                        (*relative).to_owned(),
+                        LocalEntry {
+                            relative: (*relative).to_owned(),
+                            full_path: PathBuf::from(relative),
+                            kind: *kind,
+                            size: *size,
+                            mtime_ms: *mtime_ms,
+                            content_md5: None,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn remote(entries: &[(&str, EntryKind, u64, i64)]) -> RemoteInventory {
+        RemoteInventory {
+            root_exists: true,
+            entries: entries
+                .iter()
+                .map(|(relative, kind, size, mtime_seconds)| {
+                    (
+                        (*relative).to_owned(),
+                        RemoteEntry {
+                            relative: (*relative).to_owned(),
+                            remote_path: format!("/share/root/{relative}"),
+                            kind: *kind,
+                            size: *size,
+                            mtime_seconds: *mtime_seconds,
+                            mount_point_type: None,
+                            content_md5: None,
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+        }
+    }
+
+    fn rules() -> IgnoreRules {
+        let root = std::env::temp_dir().join(format!("sdsync-scoped-del-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        IgnoreRules::build(&root, &[]).unwrap()
+    }
+
+    fn mirror(scope: Scope) -> PlanOptions {
+        PlanOptions {
+            delete: true,
+            allow_empty_source: true,
+            max_delete: 100,
+            compare: CompareMode::Metadata,
+            server_copy: false,
+            scope,
+        }
+    }
+
+    fn deleted(plan: &SyncPlan) -> Vec<&str> {
+        plan.post_deletes
+            .iter()
+            .map(|action| action.relative.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_scoped_mirror_never_deletes_the_ancestors_that_lead_to_its_scope() {
+        // A scoped remote inventory carries the directories between the root and the scope so a
+        // scoped upload's parents are known to exist. They have no local counterpart to match,
+        // so without the scope restriction they would read as remote-only and be deleted.
+        let local = local(&[
+            ("docs", EntryKind::Directory, 0, 0),
+            ("docs/q3", EntryKind::Directory, 0, 0),
+            ("docs/q3/keep.txt", EntryKind::File, 4, 1_000),
+        ]);
+        let remote = remote(&[
+            ("docs", EntryKind::Directory, 0, 0),
+            ("docs/q3", EntryKind::Directory, 0, 0),
+            ("docs/q3/keep.txt", EntryKind::File, 4, 1),
+            ("docs/q3/stale.txt", EntryKind::File, 9, 2),
+        ]);
+        let plan = build_plan(
+            &root(),
+            &local,
+            &remote,
+            &rules(),
+            &mirror(Scope::parse("docs/q3").unwrap()),
+        )
+        .unwrap();
+        assert_eq!(deleted(&plan), ["docs/q3/stale.txt"]);
+    }
+
+    #[test]
+    fn a_scoped_mirror_ignores_remote_only_entries_outside_the_scope() {
+        // The rest of the destination is not the scoped run's business, even under --delete.
+        let local = local(&[("docs/q3/keep.txt", EntryKind::File, 4, 1_000)]);
+        let remote = remote(&[
+            ("docs/q3/keep.txt", EntryKind::File, 4, 1),
+            ("elsewhere", EntryKind::Directory, 0, 0),
+            ("elsewhere/orphan.txt", EntryKind::File, 9, 2),
+            ("top-level.txt", EntryKind::File, 3, 3),
+        ]);
+        let plan = build_plan(
+            &root(),
+            &local,
+            &remote,
+            &rules(),
+            &mirror(Scope::parse("docs/q3").unwrap()),
+        )
+        .unwrap();
+        assert!(
+            plan.post_deletes.is_empty(),
+            "a scoped mirror proposed out-of-scope deletions: {:?}",
+            deleted(&plan)
+        );
+    }
+
+    #[test]
+    fn a_single_file_scope_deletes_nothing_but_that_file() {
+        let local = local(&[]);
+        let remote = remote(&[
+            ("docs/a.txt", EntryKind::File, 1, 1),
+            ("docs/b.txt", EntryKind::File, 1, 1),
+        ]);
+        let plan = build_plan(
+            &root(),
+            &local,
+            &remote,
+            &rules(),
+            &mirror(Scope::parse("docs/a.txt").unwrap()),
+        )
+        .unwrap();
+        assert_eq!(deleted(&plan), ["docs/a.txt"]);
+    }
+
+    #[test]
+    fn an_unscoped_mirror_still_considers_the_whole_destination() {
+        let local = local(&[("docs/q3/keep.txt", EntryKind::File, 4, 1_000)]);
+        let remote = remote(&[
+            ("docs/q3/keep.txt", EntryKind::File, 4, 1),
+            ("elsewhere/orphan.txt", EntryKind::File, 9, 2),
+        ]);
+        let plan = build_plan(&root(), &local, &remote, &rules(), &mirror(Scope::root())).unwrap();
+        assert_eq!(deleted(&plan), ["elsewhere/orphan.txt"]);
+    }
+
+    #[test]
+    fn the_delete_limit_counts_only_in_scope_deletions() {
+        let local = local(&[]);
+        let remote = remote(&[
+            ("docs/a.txt", EntryKind::File, 1, 1),
+            ("elsewhere/b.txt", EntryKind::File, 1, 1),
+            ("elsewhere/c.txt", EntryKind::File, 1, 1),
+            ("elsewhere/d.txt", EntryKind::File, 1, 1),
+        ]);
+        // A cap of one would trip if the three out-of-scope entries were counted.
+        let plan = build_plan(
+            &root(),
+            &local,
+            &remote,
+            &rules(),
+            &PlanOptions {
+                max_delete: 1,
+                ..mirror(Scope::parse("docs").unwrap())
+            },
+        )
+        .unwrap();
+        assert_eq!(deleted(&plan), ["docs/a.txt"]);
+    }
+}
+
+#[cfg(test)]
+mod resync_ticket_tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn upload(relative: &str, size: u64) -> UploadAction {
+        UploadAction {
+            local: LocalEntry {
+                relative: relative.to_owned(),
+                full_path: PathBuf::from(relative),
+                kind: EntryKind::File,
+                size,
+                mtime_ms: 1_000,
+                content_md5: None,
+            },
+            remote_path: format!("/share/root/{relative}"),
+            reason: ChangeReason::Forced,
+        }
+    }
+
+    fn plan_of(uploads: Vec<UploadAction>) -> SyncPlan {
+        let upload_bytes = uploads
+            .iter()
+            .fold(0_u64, |total, action| total + action.local.size);
+        SyncPlan {
+            pre_deletes: Vec::new(),
+            creates: Vec::new(),
+            copies: Vec::new(),
+            uploads,
+            post_deletes: Vec::new(),
+            unchanged_files: 0,
+            protected_entries: 0,
+            upload_bytes,
+        }
+    }
+
+    fn ticket(plan: &SyncPlan) -> String {
+        resync_ticket(&Scope::root(), CompareMode::Force, plan)
+    }
+
+    #[test]
+    fn a_ticket_is_short_stable_and_hex() {
+        let plan = plan_of(vec![upload("a.txt", 10), upload("b.txt", 20)]);
+        let first = ticket(&plan);
+        assert_eq!(first.len(), RESYNC_TICKET_LENGTH);
+        assert!(first.chars().all(|character| character.is_ascii_hexdigit()));
+        // Same work, same ticket: confirming is not a race against the clock.
+        assert_eq!(first, ticket(&plan));
+    }
+
+    #[test]
+    fn an_unchanged_plan_keeps_its_ticket_no_matter_how_much_time_passes() {
+        // Nothing in the encoding is time-derived, so a ticket cannot expire on its own. The only
+        // thing that invalidates one is a change to what would be overwritten.
+        let plan = plan_of(vec![upload("a.txt", 10)]);
+        let before = ticket(&plan);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(before, ticket(&plan));
+    }
+
+    #[test]
+    fn adding_a_file_to_the_overwrite_set_invalidates_the_ticket() {
+        let original = plan_of(vec![upload("a.txt", 10)]);
+        let grown = plan_of(vec![upload("a.txt", 10), upload("b.txt", 20)]);
+        assert_ne!(ticket(&original), ticket(&grown));
+    }
+
+    #[test]
+    fn removing_a_file_from_the_overwrite_set_invalidates_the_ticket() {
+        let original = plan_of(vec![upload("a.txt", 10), upload("b.txt", 20)]);
+        let shrunk = plan_of(vec![upload("a.txt", 10)]);
+        assert_ne!(ticket(&original), ticket(&shrunk));
+    }
+
+    #[test]
+    fn a_file_changing_size_invalidates_the_ticket() {
+        // The byte total is what the caller was shown, so it is part of what they confirmed.
+        let original = plan_of(vec![upload("a.txt", 10)]);
+        let resized = plan_of(vec![upload("a.txt", 11)]);
+        assert_ne!(ticket(&original), ticket(&resized));
+    }
+
+    #[test]
+    fn swapping_which_file_is_overwritten_invalidates_the_ticket() {
+        // Same count and same byte total, different files: the ticket must still differ, or a
+        // confirmation would authorize overwriting something the caller never saw.
+        let original = plan_of(vec![upload("a.txt", 10)]);
+        let swapped = plan_of(vec![upload("b.txt", 10)]);
+        assert_ne!(ticket(&original), ticket(&swapped));
+    }
+
+    #[test]
+    fn a_different_scope_invalidates_the_ticket() {
+        let plan = plan_of(vec![upload("docs/a.txt", 10)]);
+        let broad = resync_ticket(&Scope::root(), CompareMode::Force, &plan);
+        let narrow = resync_ticket(&Scope::parse("docs").unwrap(), CompareMode::Force, &plan);
+        assert_ne!(
+            broad, narrow,
+            "a ticket from one scope must not confirm a run of another"
+        );
+    }
+
+    #[test]
+    fn a_different_comparison_invalidates_the_ticket() {
+        let plan = plan_of(vec![upload("a.txt", 10)]);
+        assert_ne!(
+            resync_ticket(&Scope::root(), CompareMode::Force, &plan),
+            resync_ticket(&Scope::root(), CompareMode::Content, &plan)
+        );
+    }
+
+    #[test]
+    fn an_empty_plan_still_has_a_ticket() {
+        let empty = plan_of(Vec::new());
+        assert_eq!(ticket(&empty).len(), RESYNC_TICKET_LENGTH);
+    }
+
+    #[test]
+    fn path_boundaries_cannot_be_forged_by_concatenation() {
+        // Encoding separates path from size with a NUL, so two different sets cannot collide by
+        // running their fields together.
+        let left = plan_of(vec![upload("ab", 1), upload("c", 1)]);
+        let right = plan_of(vec![upload("a", 1), upload("bc", 1)]);
+        assert_ne!(ticket(&left), ticket(&right));
+    }
+
+    #[test]
+    fn the_default_state_filter_is_the_attention_set() {
+        // A caller that does not choose gets the view the request is usually for. The command line
+        // opts into StateFilter::All explicitly instead.
+        assert_eq!(StateFilter::default(), StateFilter::attention());
+        assert_eq!(
+            StateFilter::default(),
+            StateFilter::Only(StateKind::ATTENTION.to_vec())
+        );
     }
 }

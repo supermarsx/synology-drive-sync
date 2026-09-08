@@ -43,6 +43,7 @@ audit_log=$log_root/audit.log
 doctor_inventory_log=$log_root/doctor-inventory.log
 doctor_state=$state_root/doctor.state
 alert_state=$state_root/alerts.state
+dsm_system_log_state=$state_root/system-log.state
 package_home_real=$(CDPATH='' cd -- "$package_home" 2>/dev/null && pwd -P || printf '%s' "$package_home")
 package_var_real=$(CDPATH='' cd -- "$package_var" 2>/dev/null && pwd -P || printf '%s' "$package_var")
 controller_pid_file=$runtime_root/controller.pid
@@ -2096,6 +2097,7 @@ append_lifecycle_event() {
     append_activity "$lifecycle_code" none "$lifecycle_state" "$lifecycle_message" \
         controller "$lifecycle_level" false "$path_owner" package-service \
         || lifecycle_event_status=$?
+    dsm_log_event "service_$lifecycle_event"
     return "$lifecycle_event_status"
 }
 
@@ -2531,6 +2533,14 @@ handle_alert_result() {
         failure_count=$((failure_count + 1))
         if [ "$policy_enabled" = true ] && [ "$policy_failure" = true ] && [ "$failure_count" -ge "$policy_threshold" ]; then should_notify=true; fi
     fi
+    # System logging follows the failure threshold but not the desktop toggles:
+    # an administrator who silenced toasts still wants the durable record, and
+    # the facility carries its own enable and its own cooldown.
+    if [ "$alert_result" = succeeded ]; then
+        dsm_log_event sync_succeeded "$alert_now"
+    elif [ "$failure_count" -ge "$policy_threshold" ]; then
+        dsm_log_event sync_failed "$alert_now"
+    fi
     if [ "$should_notify" = true ] && [ "$last_notify" -gt 0 ] && [ $((alert_now - last_notify)) -lt "$policy_cooldown" ]; then
         should_notify=false
     fi
@@ -2560,6 +2570,9 @@ handle_doctor_alert() {
     case $doctor_failures:$doctor_last_notify in *[!0-9:]*) return 73 ;; esac
     doctor_failures=$((doctor_failures + 1))
     doctor_now=$(epoch_now)
+    if [ "$doctor_failures" -ge "$doctor_threshold" ]; then
+        dsm_log_event doctor_failed "$doctor_now"
+    fi
     if [ "$doctor_enabled" = true ] && [ "$doctor_failure" = true ] && [ "$doctor_failures" -ge "$doctor_threshold" ]; then
         if [ "$doctor_last_notify" -eq 0 ] || [ $((doctor_now - doctor_last_notify)) -ge "$doctor_cooldown" ]; then
             if safe_notify doctor_failed "$doctor_profile" "$doctor_exit"; then doctor_last_notify=$doctor_now; fi
@@ -2569,6 +2582,252 @@ handle_doctor_alert() {
     printf 'failure_count=%s\nlast_notify_epoch=%s\n' "$doctor_failures" "$doctor_last_notify" > "$doctor_temp"
     finish_private_file "$doctor_temp"
     mv -f "$doctor_temp" "$doctor_state"
+}
+
+# ---------------------------------------------------------------------------
+# DSM system log facility
+#
+# safe_notify above delivers a desktop toast to signed-in administrators. That
+# is not a log: it is not durable, it is not searchable, and an administrator
+# who was not signed in when it fired never learns it happened. This block is
+# the durable half -- one entry point, one event catalogue -- for the events an
+# administrator would want to find after the fact.
+#
+# What Synology actually offers a third-party package here, taken from the
+# developer guide rather than assumed:
+#
+#   * the conf/resource `sysnotify` worker registers package events into
+#     Control Panel > Notification > Rules, the surface that fans out to
+#     desktop, email, SMS, mobile, and CMS. It is the only documented route to
+#     that surface.
+#   * the conf/resource `syslog-config` worker installs a syslog-ng patterndb
+#     and a logrotate config, the only documented route by which a package's
+#     own log file is parsed into Log Center.
+#
+# This package deliberately acquires no conf/resource worker and validate_spk.py
+# rejects one, so neither route is open from here. docs/dsm/operations.md
+# records the boundary that leaves and what it would cost to change it.
+#
+# What remains is /usr/syno/bin/synologset1, DSM's own system-log writer. The
+# binary is real and DSM's scripts use it, but Synology publishes no
+# developer-guide contract for it, and its message identifiers come from a
+# Synology-owned catalogue a third party cannot extend. So this package ships
+# no identifier of its own invention: delivery stays inert until an
+# administrator supplies one they have verified on their DSM build, and until
+# then every event still reaches Activity exactly as it did before.
+#
+# Cost: the default configuration reads no file and spawns no process. The
+# policy load is one builtin read of alerts.conf per process, cached, and the
+# emit path is reached at most once per bucket per cooldown -- a sync failing
+# every five minutes costs one synologset1 fork an hour, not 288 entries a day.
+
+dsm_system_log_policy_loaded=false
+dsm_system_log_enabled=false
+dsm_system_log_message_id=
+dsm_system_log_min_rank=2
+dsm_system_log_cooldown=3600
+dsm_system_log_rank_value=2
+
+# Sets dsm_system_log_rank_value rather than printing it: this sits on the
+# per-event path, and a $( ) here would be a fork per event on an armv7 NAS.
+set_dsm_system_log_rank() {
+    case ${1:-} in
+        info) dsm_system_log_rank_value=1 ;;
+        warn) dsm_system_log_rank_value=2 ;;
+        err) dsm_system_log_rank_value=3 ;;
+        *) return 64 ;;
+    esac
+}
+
+load_dsm_system_log_policy() {
+    [ "$dsm_system_log_policy_loaded" != true ] || return 0
+    dsm_system_log_policy_loaded=true
+    dsm_system_log_enabled=false
+    dsm_system_log_message_id=
+    dsm_system_log_min_rank=2
+    dsm_system_log_cooldown=3600
+    [ -f "$alert_policy_file" ] && [ ! -L "$alert_policy_file" ] || return 0
+    dsm_policy_enable=false
+    dsm_policy_identifier=
+    dsm_policy_level=warn
+    dsm_policy_cooldown=3600
+    # One builtin read of the whole policy. Four `setting` calls would be four
+    # subshells and eight `sed` processes on a path every run, every schedule
+    # tick, and every dashboard request crosses.
+    while IFS='=' read -r dsm_policy_name dsm_policy_value; do
+        case $dsm_policy_name in
+            system_log) dsm_policy_enable=$dsm_policy_value ;;
+            system_log_message_id) dsm_policy_identifier=$dsm_policy_value ;;
+            system_log_level) dsm_policy_level=$dsm_policy_value ;;
+            cooldown_seconds) dsm_policy_cooldown=$dsm_policy_value ;;
+        esac
+    done < "$alert_policy_file"
+    [ "$dsm_policy_enable" = true ] || return 0
+    set_dsm_system_log_rank "$dsm_policy_level" || return 0
+    case $dsm_policy_cooldown in ''|*[!0-9]*) return 0 ;; esac
+    [ "$dsm_policy_cooldown" -ge 60 ] && [ "$dsm_policy_cooldown" -le 2592000 ] || return 0
+    # A message identifier belongs to Synology's catalogue, so accept only the
+    # shape DSM's own callers use and never substitute a default of our own.
+    case $dsm_policy_identifier in 0x*) ;; *) return 0 ;; esac
+    dsm_policy_digits=${dsm_policy_identifier#0x}
+    case $dsm_policy_digits in ''|*[!0-9A-Fa-f]*) return 0 ;; esac
+    [ "${#dsm_policy_digits}" -le 8 ] || return 0
+    dsm_system_log_message_id=$dsm_policy_identifier
+    dsm_system_log_min_rank=$dsm_system_log_rank_value
+    dsm_system_log_cooldown=$dsm_policy_cooldown
+    dsm_system_log_enabled=true
+}
+
+# Bound delivery with the administrator's existing alert cooldown, per event
+# bucket, so one failing routine cannot fill the system log. The ledger is read
+# and rewritten whole because the bucket set is fixed and small; that keeps the
+# read on shell builtins instead of one `sed` subshell per bucket.
+dsm_system_log_gate() {
+    dsm_gate_bucket=$1
+    dsm_gate_now=${2:-}
+    [ -d "$state_root" ] || return 1
+    [ ! -L "$dsm_system_log_state" ] || return 1
+    case $dsm_gate_now in ''|*[!0-9]*) dsm_gate_now=$(epoch_now) ;; esac
+    case $dsm_gate_now in ''|*[!0-9]*) return 1 ;; esac
+    dsm_gate_sync=0
+    dsm_gate_doctor=0
+    dsm_gate_authentication=0
+    dsm_gate_security=0
+    dsm_gate_bridge=0
+    dsm_gate_lifecycle=0
+    dsm_gate_queue=0
+    if [ -f "$dsm_system_log_state" ]; then
+        while IFS='=' read -r dsm_gate_name dsm_gate_value; do
+            case $dsm_gate_value in ''|*[!0-9]*) continue ;; esac
+            case $dsm_gate_name in
+                sync_epoch) dsm_gate_sync=$dsm_gate_value ;;
+                doctor_epoch) dsm_gate_doctor=$dsm_gate_value ;;
+                authentication_epoch) dsm_gate_authentication=$dsm_gate_value ;;
+                security_epoch) dsm_gate_security=$dsm_gate_value ;;
+                bridge_epoch) dsm_gate_bridge=$dsm_gate_value ;;
+                lifecycle_epoch) dsm_gate_lifecycle=$dsm_gate_value ;;
+                queue_epoch) dsm_gate_queue=$dsm_gate_value ;;
+            esac
+        done < "$dsm_system_log_state"
+    fi
+    case $dsm_gate_bucket in
+        sync) dsm_gate_last=$dsm_gate_sync ;;
+        doctor) dsm_gate_last=$dsm_gate_doctor ;;
+        authentication) dsm_gate_last=$dsm_gate_authentication ;;
+        security) dsm_gate_last=$dsm_gate_security ;;
+        bridge) dsm_gate_last=$dsm_gate_bridge ;;
+        lifecycle) dsm_gate_last=$dsm_gate_lifecycle ;;
+        queue) dsm_gate_last=$dsm_gate_queue ;;
+        *) return 1 ;;
+    esac
+    # A NAS whose clock is corrected backwards must not silence its own system
+    # log until real time catches up, so a stamp in the future opens the gate.
+    if [ "$dsm_gate_last" -gt 0 ] && [ "$dsm_gate_now" -ge "$dsm_gate_last" ] \
+        && [ $((dsm_gate_now - dsm_gate_last)) -lt "$dsm_system_log_cooldown" ]; then
+        return 1
+    fi
+    case $dsm_gate_bucket in
+        sync) dsm_gate_sync=$dsm_gate_now ;;
+        doctor) dsm_gate_doctor=$dsm_gate_now ;;
+        authentication) dsm_gate_authentication=$dsm_gate_now ;;
+        security) dsm_gate_security=$dsm_gate_now ;;
+        bridge) dsm_gate_bridge=$dsm_gate_now ;;
+        lifecycle) dsm_gate_lifecycle=$dsm_gate_now ;;
+        queue) dsm_gate_queue=$dsm_gate_now ;;
+    esac
+    # The stamp is committed before delivery is attempted, so an unavailable
+    # binary costs one probe per cooldown rather than one per event.
+    dsm_gate_temp=$dsm_system_log_state.tmp.$$
+    {
+        printf 'sync_epoch=%s\ndoctor_epoch=%s\nauthentication_epoch=%s\n' \
+            "$dsm_gate_sync" "$dsm_gate_doctor" "$dsm_gate_authentication"
+        printf 'security_epoch=%s\nbridge_epoch=%s\nlifecycle_epoch=%s\nqueue_epoch=%s\n' \
+            "$dsm_gate_security" "$dsm_gate_bridge" "$dsm_gate_lifecycle" "$dsm_gate_queue"
+    } > "$dsm_gate_temp" 2>/dev/null || { rm -f "$dsm_gate_temp"; return 1; }
+    finish_private_file "$dsm_gate_temp" 2>/dev/null || { rm -f "$dsm_gate_temp"; return 1; }
+    mv -f "$dsm_gate_temp" "$dsm_system_log_state" 2>/dev/null || { rm -f "$dsm_gate_temp"; return 1; }
+}
+
+dsm_system_log_emit() {
+    dsm_emit_level=$1
+    dsm_emit_key=$2
+    case $dsm_emit_level in info|warn|err) ;; *) return 64 ;; esac
+    # DSM receives only a reviewed fixed sentence and the administrator's own
+    # message identifier. Profile names, exit codes, paths, URLs, account names,
+    # log or error text, cookies, tokens, passwords, and TOTP material never
+    # enter this argv, exactly as they never enter the desktop notifier's.
+    case $dsm_emit_key in
+        sync_succeeded)
+            dsm_emit_text='Synology Drive Sync completed a synchronization run.' ;;
+        sync_failed)
+            dsm_emit_text='Synology Drive Sync failed a synchronization run. Open the package Activity page for details.' ;;
+        doctor_failed)
+            dsm_emit_text='Synology Drive Sync diagnostics reported a failure. Open the package Activity page for details.' ;;
+        authentication_failed)
+            dsm_emit_text='Synology Drive Sync rejected a dashboard authentication attempt.' ;;
+        security_failed)
+            dsm_emit_text='Synology Drive Sync refused a dashboard request that failed a runtime identity check.' ;;
+        bridge_failed)
+            dsm_emit_text='Synology Drive Sync could not serve a dashboard request.' ;;
+        bridge_rejected)
+            dsm_emit_text='Synology Drive Sync rejected an unauthorized dashboard change.' ;;
+        service_started)
+            dsm_emit_text='Synology Drive Sync package service started.' ;;
+        service_stopped)
+            dsm_emit_text='Synology Drive Sync package service stopped.' ;;
+        service_restarted)
+            dsm_emit_text='Synology Drive Sync package service restarted.' ;;
+        service_start_failed)
+            dsm_emit_text='Synology Drive Sync package service failed to start.' ;;
+        package_installed)
+            dsm_emit_text='Synology Drive Sync package was installed.' ;;
+        package_upgraded)
+            dsm_emit_text='Synology Drive Sync package was upgraded.' ;;
+        queue_saturated)
+            dsm_emit_text='Synology Drive Sync discarded completed dashboard results after reaching its queue limit.' ;;
+        *) return 64 ;;
+    esac
+    dsm_emit_status=69
+    if [ -x /usr/syno/bin/synologset1 ] && [ ! -L /usr/syno/bin/synologset1 ]; then
+        if /usr/syno/bin/synologset1 sys "$dsm_emit_level" "$dsm_system_log_message_id" \
+            "$dsm_emit_text" >/dev/null 2>&1; then return 0; else dsm_emit_status=$?; fi
+    fi
+    append_activity notification.unavailable none unavailable \
+        "DSM system log delivery unavailable" notifications warn 2>/dev/null || true
+    return "$dsm_emit_status"
+}
+
+# The single entry point every DSM-visible package event travels through.
+# Callers pass a catalogue key and, when they already hold one, the epoch they
+# are reasoning about. Best effort by contract: an absent binary, a denied
+# write, or a chroot without DSM tooling leaves the caller's own result and its
+# Activity record untouched, so no caller has to guard the call.
+dsm_log_event() {
+    dsm_event_key=$1
+    dsm_event_now=${2:-}
+    case $dsm_event_key in
+        sync_succeeded) dsm_event_level=info; dsm_event_bucket=sync ;;
+        sync_failed) dsm_event_level=err; dsm_event_bucket=sync ;;
+        doctor_failed) dsm_event_level=err; dsm_event_bucket=doctor ;;
+        authentication_failed) dsm_event_level=warn; dsm_event_bucket=authentication ;;
+        security_failed) dsm_event_level=err; dsm_event_bucket=security ;;
+        bridge_failed) dsm_event_level=warn; dsm_event_bucket=bridge ;;
+        bridge_rejected) dsm_event_level=warn; dsm_event_bucket=bridge ;;
+        service_started) dsm_event_level=info; dsm_event_bucket=lifecycle ;;
+        service_stopped) dsm_event_level=info; dsm_event_bucket=lifecycle ;;
+        service_restarted) dsm_event_level=info; dsm_event_bucket=lifecycle ;;
+        service_start_failed) dsm_event_level=err; dsm_event_bucket=lifecycle ;;
+        package_installed) dsm_event_level=info; dsm_event_bucket=lifecycle ;;
+        package_upgraded) dsm_event_level=info; dsm_event_bucket=lifecycle ;;
+        queue_saturated) dsm_event_level=warn; dsm_event_bucket=queue ;;
+        *) return 64 ;;
+    esac
+    load_dsm_system_log_policy || return 0
+    [ "$dsm_system_log_enabled" = true ] || return 0
+    set_dsm_system_log_rank "$dsm_event_level" || return 0
+    [ "$dsm_system_log_rank_value" -ge "$dsm_system_log_min_rank" ] || return 0
+    dsm_system_log_gate "$dsm_event_bucket" "$dsm_event_now" || return 0
+    dsm_system_log_emit "$dsm_event_level" "$dsm_event_key" || return 0
 }
 
 profile_exists() {

@@ -347,6 +347,15 @@ pub struct ResolvedSyncBehavior {
     pub compare: CompareArg,
     pub jobs: u8,
     pub excludes: Vec<String>,
+    /// Source-relative restriction naming one folder or file. Command line only.
+    pub scope: Option<String>,
+    /// Re-upload every in-scope file without comparing it.
+    ///
+    /// Set only by the `resync` command, and only for a run whose plan the caller has already
+    /// been shown and confirmed. It is deliberately not a comparison mode and not a profile key:
+    /// a persisted unconditional re-upload would overwrite the whole destination on every
+    /// scheduled run, with nothing in the configuration reading as destructive.
+    pub force_resync: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -784,6 +793,12 @@ fn resolve_behavior(
             .unwrap_or(CompareArg::Content),
         jobs,
         excludes,
+        // Deliberately never read from a profile: a persisted scope would silently sync a subset
+        // on every later run, and the omission would be invisible in the output.
+        scope: arguments.scope.clone(),
+        // Never resolved from arguments or a profile. `resync` sets it on the settings it has
+        // already planned and had confirmed; nothing else can reach it.
+        force_resync: false,
     })
 }
 
@@ -2143,5 +2158,78 @@ output = "json"
             error.to_string(),
             "invalid effective configuration: a remote-log token source requires remote-log-url"
         );
+    }
+}
+
+#[cfg(test)]
+mod scope_and_force_tests {
+    use super::*;
+
+    fn behavior_args() -> SyncBehaviorArgs {
+        SyncBehaviorArgs {
+            compare: None,
+            jobs: None,
+            excludes: Vec::new(),
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn a_scope_is_taken_from_the_command_line() {
+        let resolved = resolve_behavior(
+            &Profile::default(),
+            &SyncBehaviorArgs {
+                scope: Some("docs/q3".to_owned()),
+                ..behavior_args()
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved.scope.as_deref(), Some("docs/q3"));
+    }
+
+    #[test]
+    fn a_scope_defaults_to_absent_so_a_run_covers_the_whole_tree() {
+        let resolved = resolve_behavior(&Profile::default(), &behavior_args()).unwrap();
+        assert_eq!(resolved.scope, None);
+    }
+
+    #[test]
+    fn a_forced_resync_is_off_unless_the_resync_command_turns_it_on() {
+        let resolved = resolve_behavior(&Profile::default(), &behavior_args()).unwrap();
+        assert!(
+            !resolved.force_resync,
+            "an ordinary sync or plan must never re-upload without comparing"
+        );
+    }
+
+    #[test]
+    fn a_forced_resync_is_not_expressible_in_a_profile() {
+        // `force` is not a comparison mode at all, so a profile cannot name it and a scheduled run
+        // can never inherit an unconditional re-upload. It is reachable only from `resync`.
+        let error = toml::from_str::<Profile>(
+            "compare = \"force\"
+",
+        )
+        .expect_err("compare = \"force\" must not deserialize");
+        assert!(
+            error.to_string().contains("force"),
+            "the rejection should name the offending value: {error}"
+        );
+    }
+
+    #[test]
+    fn every_other_compare_mode_is_still_profile_settable() {
+        for mode in [
+            CompareArg::Content,
+            CompareArg::Metadata,
+            CompareArg::SizeOnly,
+        ] {
+            let profile = Profile {
+                compare: Some(mode),
+                ..Profile::default()
+            };
+            let resolved = resolve_behavior(&profile, &behavior_args()).unwrap();
+            assert_eq!(resolved.compare, mode);
+        }
     }
 }

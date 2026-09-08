@@ -19,6 +19,7 @@ from pathlib import Path, PurePosixPath
 from build_spk import (
     ARCHITECTURES,
     DSM_APP_CLASS,
+    DSM_WIDGET_CLASS,
     HERE,
     PackageError,
     UI_SOURCE,
@@ -66,6 +67,7 @@ REQUIRED_PAYLOAD = {
     *{f"ui/images/icon_{size}.png" for size in UI_ICON_SIZES},
 }
 APP_ID = DSM_APP_CLASS
+WIDGET_ID = DSM_WIDGET_CLASS
 APP_NAMESPACE = "SYNO.SDS.App.SynologyDriveSync"
 NATIVE_MODULE_PATTERN = re.compile(
     rf"SynologyDriveSync\.[0-9a-f]{{{UI_MODULE_DIGEST_HEX_LENGTH}}}\.js"
@@ -352,11 +354,47 @@ def validate_native_application(
         raise ValidationError(f"{label} contains an unreviewed DSM application property")
 
 
+def validate_native_widget(widget: object, label: str, *, generated: bool = False) -> None:
+    """Check the desktop widget registration entry.
+
+    DSM reads a different, smaller field set from a `type="widget"` entry than
+    from an application entry: the desktop widget card takes its menu and header
+    title from `title` (resolved with `appInstance` as a fallback string owner),
+    its header icon from `jsBaseURL` + `icon`, and launches `appInstance` when
+    that icon is clicked. Enumerate exactly those keys so the widget entry
+    cannot become a second, laxer route for an unreviewed DSM property.
+    """
+    if not isinstance(widget, dict):
+        raise ValidationError(f"{label} desktop widget entry must be an object")
+    expected = {
+        "type": "widget",
+        "title": "Synology Drive Sync",
+        "icon": "images/icon_{0}.png",
+        "appInstance": APP_ID,
+    }
+    for key, value in expected.items():
+        if widget.get(key) != value:
+            raise ValidationError(f"{label} has invalid desktop widget property {key!r}")
+    allowed = set(expected)
+    if generated:
+        if widget.get("depend") != []:
+            raise ValidationError(
+                f"{label} desktop widget must contain the deterministic empty DSM dependency list"
+            )
+        allowed.add("depend")
+    if set(widget) != allowed:
+        raise ValidationError(f"{label} contains an unreviewed DSM widget property")
+
+
 def validate_source_app_config(payload: bytes) -> None:
     model = load_unique_json(payload, "ui-src/app.config")
-    if not isinstance(model, dict) or set(model) != {APP_ID}:
-        raise ValidationError("ui-src/app.config must define exactly the native AppWindow class")
+    if not isinstance(model, dict) or set(model) != {APP_ID, WIDGET_ID}:
+        raise ValidationError(
+            "ui-src/app.config must define exactly the native AppWindow class "
+            "and its desktop widget class"
+        )
     validate_native_application(model[APP_ID], "ui-src/app.config")
+    validate_native_widget(model[WIDGET_ID], "ui-src/app.config")
 
 
 def validate_ui_config(payload: bytes) -> str:
@@ -371,9 +409,13 @@ def validate_ui_config(payload: bytes) -> str:
             "ui/config native module must use the exact content-addressed filename contract"
         )
     applications = model[module]
-    if not isinstance(applications, dict) or set(applications) != {APP_ID}:
-        raise ValidationError("ui/config module must define exactly the native AppWindow class")
+    if not isinstance(applications, dict) or set(applications) != {APP_ID, WIDGET_ID}:
+        raise ValidationError(
+            "ui/config module must define exactly the native AppWindow class "
+            "and its desktop widget class"
+        )
     validate_native_application(applications[APP_ID], "ui/config", generated=True)
+    validate_native_widget(applications[WIDGET_ID], "ui/config", generated=True)
     return f"ui/{module}"
 
 
@@ -1239,6 +1281,8 @@ def validate_native_build_contract(
         f"{APP_ID} = Vue.extend({{",
         "components: { App }",
         'template: "<App/>"',
+        'import { installWidget } from "./widget";',
+        "installWidget();",
     ):
         if marker not in main:
             raise ValidationError(f"native DSM entry module is missing {marker!r}")
@@ -1664,6 +1708,147 @@ def validate_native_build_contract(
         raise ValidationError("native DSM UI build dependencies must be exact and use DSM-compatible Vue 2.7.16")
 
     validate_native_api_source(api_payload)
+
+
+def _widget_constant(source: str, name: str) -> int:
+    match = re.search(rf"^export const {re.escape(name)} = (\d+);$", source, re.MULTILINE)
+    if match is None:
+        raise ValidationError(f"native DSM widget cadence constant {name} is not a reviewed literal")
+    return int(match.group(1))
+
+
+def validate_native_widget_source(
+    widget_payload: bytes,
+    panel_payload: bytes,
+    model_payload: bytes,
+) -> None:
+    """Check the DSM desktop widget adapter, panel, and cadence policy.
+
+    The widget is the only package surface that lives on the DSM desktop for the
+    whole life of a session, so the two things worth proving statically are that
+    it never holds a timer while it is off screen and that it can never become
+    the more talkative of the two surfaces this package ships.
+    """
+    widget = _decode_marker_source(widget_payload)
+    panel = _decode_marker_source(panel_payload)
+    model = _decode_marker_source(model_payload)
+
+    for marker in (
+        f'export const WIDGET_CLASS = "{WIDGET_ID}";',
+        "export function installWidget()",
+        "namespace.Widget = ext.extend(ext.Panel, {",
+        "minimizable: false,",
+        "base.afterRender.apply(this, arguments);",
+        "this.widgetPanel.$mount(host);",
+        "onActivate() {",
+        "onDeactivate() {",
+        "doExpand() {",
+        "doCollapse() {",
+        "destroy() {",
+        "this.widgetPanel.activate();",
+        "this.widgetPanel.deactivate();",
+        "this.widgetPanel.setCompact(false);",
+        "this.widgetPanel.setCompact(true);",
+        "this.widgetPanel.$destroy();",
+        "base.destroy.apply(this, arguments);",
+    ):
+        if marker not in widget:
+            raise ValidationError(f"native DSM widget adapter is missing {marker!r}")
+    # The adapter must survive a bundle load without the desktop toolkit,
+    # because the same bundle is what DSM executes to open the AppWindow.
+    if "if (!ext || !syno || typeof ext.extend !== \"function\" || !ext.Panel) return null;" not in widget:
+        raise ValidationError(
+            "native DSM widget adapter must fail closed when the DSM desktop toolkit is absent"
+        )
+    destroy_index = widget.find("destroy() {")
+    if widget.find("this.onDeactivate();", destroy_index) < 0 or (
+        widget.find("this.onDeactivate();", destroy_index)
+        > widget.find("base.destroy.apply(this, arguments);", destroy_index)
+    ):
+        raise ValidationError("native DSM widget adapter must stop polling before it is destroyed")
+
+    for marker in (
+        'import { SNAPSHOT_SCHEMA, apiGet } from "./api";',
+        'const snapshot = await apiGet(this.auth, "snapshot");',
+        'if (snapshot.schema !== SNAPSHOT_SCHEMA) throw new Error("Unsupported DSM API schema");',
+        "if (this.disposed || !this.activated || this.documentHidden || this.loading) return;",
+        "if (this.disposed || !this.activated || this.documentHidden) return;",
+        "this.documentHidden = Boolean(document.hidden);",
+        'document.addEventListener("visibilitychange", this.visibilityHandler);',
+        'document.removeEventListener("visibilitychange", this.visibilityHandler);',
+        "beforeDestroy() {",
+        "this.disposed = true;",
+        "this.stopTimer();",
+        "this.abortController.abort();",
+        "if (this.timer) window.clearTimeout(this.timer);",
+        "appWindowIntervalMs: this.preferences.statusIntervalMs",
+    ):
+        if marker not in panel:
+            raise ValidationError(f"native DSM widget panel is missing {marker!r}")
+    if "window.setInterval" in panel or "setInterval(" in panel or "setInterval(" in widget:
+        raise ValidationError("native DSM widget must not retain unmanaged interval timers")
+    # A desktop card is a read-only glance surface. Nothing about it is allowed
+    # to reach the mutating half of the bridge.
+    for forbidden in ("apiPost", "ACTIONS", "reconcileMutationRequest", "X-SDSYNC-CSRF", "csrf"):
+        if forbidden in panel or forbidden in widget or forbidden in model:
+            raise ValidationError(
+                f"native DSM widget must remain a read-only status surface, found {forbidden!r}"
+            )
+    for forbidden in (
+        "<iframe", "createElement(\"iframe\")", "createElement('iframe')",
+        "<object", "<embed", "document.documentElement",
+        "window.location", "window.history", "history.replaceState", "location.hash",
+        "hashchange", "v-html", ".innerHTML", "insertAdjacentHTML", "document.write(",
+        "eval(", "new Function(", "X-SYNO-TOKEN", "SynoToken", "document.cookie",
+    ):
+        for label, source in (("adapter", widget), ("panel", panel), ("model", model)):
+            if forbidden.lower() in source.lower():
+                raise ValidationError(
+                    f"native DSM widget {label} contains forbidden construct {forbidden}"
+                )
+
+    idle = _widget_constant(model, "WIDGET_IDLE_POLL_MS")
+    active = _widget_constant(model, "WIDGET_ACTIVE_POLL_MS")
+    # DSM's own first-party desktop widgets register a 60-second poll. A
+    # third-party card must not rest faster than that, and even while a run is
+    # in flight it must stay slower than the AppWindow's 5000 ms default so the
+    # background surface is never the eager one.
+    if idle < 60000:
+        raise ValidationError(
+            "native DSM widget resting cadence must not undercut DSM's own 60-second widget poll"
+        )
+    if active < 20000 or active > idle:
+        raise ValidationError(
+            "native DSM widget active cadence must stay between its 20-second floor "
+            "and its resting cadence"
+        )
+    ramp = re.search(
+        r"^export const WIDGET_BACKOFF_RAMP_MS = Object\.freeze\(\[([\d, ]+)\]\);$",
+        model,
+        re.MULTILINE,
+    )
+    if ramp is None:
+        raise ValidationError("native DSM widget backoff ramp is not a reviewed literal")
+    delays = [int(value) for value in ramp.group(1).split(",")]
+    if (
+        len(delays) < 2
+        or delays[0] < idle
+        or any(later < earlier for earlier, later in zip(delays, delays[1:]))
+        or delays[-1] > 300000
+    ):
+        raise ValidationError(
+            "native DSM widget failure backoff must decay monotonically to a bounded floor"
+        )
+    for marker in (
+        "export function widgetPollDelay(options = {})",
+        "return Math.min(WIDGET_MAX_POLL_MS, Math.max(base, floor));",
+        "export function widgetOverview(snapshot, nowMs = Date.now())",
+        "export function widgetProfileRows(snapshot, nowMs = Date.now())",
+        "export function widgetRun(snapshot)",
+        'export const APPWINDOW_SETTINGS_KEY = "sdsync.ui.settings.v1";',
+    ):
+        if marker not in model:
+            raise ValidationError(f"native DSM widget model is missing {marker!r}")
 
 
 def _javascript_string_literals(source: str):
@@ -2182,6 +2367,9 @@ def validate_source() -> None:
         UI_SOURCE / "webpack.config.js",
         UI_SOURCE / "src/main.js",
         UI_SOURCE / "src/App.vue",
+        UI_SOURCE / "src/widget.js",
+        UI_SOURCE / "src/WidgetPanel.vue",
+        UI_SOURCE / "src/widgetModel.mjs",
         UI_SOURCE / "src/ActionIcon.js",
         UI_SOURCE / "src/autosave.js",
         UI_SOURCE / "src/SecurityPanel.vue",
@@ -2243,6 +2431,11 @@ def validate_source() -> None:
         (UI_SOURCE / "src/controlLayout.js").read_bytes(),
         (UI_SOURCE / "src/ActionIcon.js").read_bytes(),
         (UI_SOURCE / "src/SecurityPanel.vue").read_bytes(),
+    )
+    validate_native_widget_source(
+        (UI_SOURCE / "src/widget.js").read_bytes(),
+        (UI_SOURCE / "src/WidgetPanel.vue").read_bytes(),
+        (UI_SOURCE / "src/widgetModel.mjs").read_bytes(),
     )
     validate_native_bundle(
         (UI_SOURCE / "dist/SynologyDriveSync.js").read_bytes(),

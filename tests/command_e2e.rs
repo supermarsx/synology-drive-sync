@@ -445,7 +445,7 @@ fn recursive_manpage_generation_preserves_unrelated_files_and_fails_on_a_file_pa
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.path().extension().is_some_and(|value| value == "1"))
         .count();
-    assert_eq!(generated_pages, 18);
+    assert_eq!(generated_pages, 20);
     assert!(root_page.contains(".SH SUBCOMMANDS"));
     assert!(nested_page.contains(".SH NAME"));
     assert!(nested_page.contains(".SH SYNOPSIS"));
@@ -728,5 +728,253 @@ fn early_configuration_batch_and_redaction_failures_never_contact_a_server() {
             "source",
         ]),
         "--max-total-delete applies only to batch plan and sync",
+    );
+}
+
+// --- Scoped status, scope, and forced comparison -------------------------
+//
+// These exercise the real binary. Anything needing a NAS stops at configuration or connection,
+// which is exactly where the guard rails under test live: every one of them must reject before a
+// server is contacted.
+
+#[test]
+fn status_help_documents_pagination_and_the_attention_shorthand() {
+    let fixture = Fixture::new();
+    let help = fixture.run(&["status", "--help"]);
+    help.assert_clean_success();
+    for expected in [
+        "--scope",
+        "--filter",
+        "--state",
+        "--limit",
+        "--cursor",
+        "--include-excluded",
+    ] {
+        assert!(
+            help.stdout.contains(expected),
+            "status help omitted {expected}: {}",
+            help.stdout
+        );
+    }
+    assert!(
+        help.stdout.contains("attention"),
+        "the attention shorthand must be discoverable: {}",
+        help.stdout
+    );
+    assert!(
+        help.stdout.contains("200"),
+        "the page ceiling must be stated in help: {}",
+        help.stdout
+    );
+}
+
+#[test]
+fn status_rejects_a_page_larger_than_the_ceiling() {
+    let fixture = Fixture::new();
+    let rejected = fixture.run_with_config(&["status", "--limit", "201"]);
+    rejected.assert_code(2);
+    assert!(
+        rejected.stderr.contains("201") || rejected.stderr.contains("not in"),
+        "{}",
+        rejected.stderr
+    );
+}
+
+#[test]
+fn status_rejects_an_unsafe_scope_before_contacting_a_server() {
+    let fixture = Fixture::new();
+    for scope in ["../escape", "@eaDir"] {
+        let rejected = fixture.run_with_config(&["status", "--scope", scope]);
+        assert_ne!(rejected.code, Some(0), "scope {scope:?} should be refused");
+        assert!(
+            rejected.stdout.is_empty(),
+            "a refused scope must print no listing: {}",
+            rejected.stdout
+        );
+    }
+}
+
+#[test]
+fn status_declines_a_multi_profile_batch() {
+    let fixture = Fixture::new();
+    let rejected = fixture.run_with_config(&["status", "--profiles", "alpha,beta"]);
+    rejected.assert_code(2);
+    assert!(
+        rejected.stderr.contains("one source and destination pair"),
+        "{}",
+        rejected.stderr
+    );
+}
+
+#[test]
+fn scope_is_offered_by_both_sync_and_plan() {
+    let fixture = Fixture::new();
+    for command in ["sync", "plan"] {
+        let help = fixture.run(&[command, "--help"]);
+        help.assert_clean_success();
+        assert!(
+            help.stdout.contains("--scope"),
+            "{command} help omitted --scope: {}",
+            help.stdout
+        );
+    }
+}
+
+#[test]
+fn scope_help_states_that_deletion_is_restricted_and_force_is_not_implied() {
+    let fixture = Fixture::new();
+    let help = fixture.run(&["plan", "--help"]);
+    help.assert_clean_success();
+    for expected in [
+        // A scoped mirror must not read as licence to delete the rest of the destination.
+        "Mirror deletion is restricted to the scope",
+        "still requires --allow-empty-source",
+        // A clean scoped run is not a whole-tree clean bill of health.
+        "letter case covers the scope alone",
+        // Scoping selects what is examined; it never changes how it is compared.
+        "This never implies --compare force",
+    ] {
+        assert!(
+            help.stdout.contains(expected),
+            "scope help omitted {expected:?}: {}",
+            help.stdout
+        );
+    }
+}
+
+#[test]
+fn status_is_listed_among_the_root_subcommands() {
+    let fixture = Fixture::new();
+    let help = fixture.run(&["--help"]);
+    help.assert_clean_success();
+    assert!(
+        help.stdout.contains("status"),
+        "status must be discoverable from the root help: {}",
+        help.stdout
+    );
+}
+
+// --- resync: plan, then confirm ------------------------------------------
+
+#[test]
+fn force_is_not_a_comparison_mode_on_any_command() {
+    let fixture = Fixture::new();
+    // The only route to an unconditional re-upload is `resync`, which is two-phase by
+    // construction. No flag on `sync`, `plan`, or `status` can mutate the instant it parses.
+    for command in ["sync", "plan", "status"] {
+        let rejected = fixture.run_with_config(&[command, "--compare", "force"]);
+        rejected.assert_code(2);
+        assert!(
+            rejected.stderr.contains("invalid value 'force'"),
+            "{command} accepted a forced comparison: {}",
+            rejected.stderr
+        );
+        assert!(rejected.stdout.is_empty());
+    }
+
+    let help = fixture.run(&["sync", "--help"]);
+    help.assert_clean_success();
+    assert!(
+        !help.stdout.contains("- force"),
+        "force must not appear among the comparison modes: {}",
+        help.stdout
+    );
+}
+
+#[test]
+fn a_profile_cannot_persist_a_forced_re_upload() {
+    let fixture = Fixture::new();
+    let config = fixture.root.join("forced.toml");
+    fs::write(
+        &config,
+        format!(
+            "default-profile = \"forced\"\n\n[profiles.forced]\nsource = {source}\nremote = \"/team/alpha\"\nurl = \"https://files.example.invalid/reverse-proxy\"\nusername = \"alpha-user\"\nno-vault = true\ncompare = \"force\"\nretries = 0\ntimeout = 30\nconnect-timeout = 2\nprogress = \"never\"\noutput = \"human\"\n",
+            source = toml_literal(&fixture.alpha_source),
+        ),
+    )
+    .expect("write a profile that tries to persist a forced comparison");
+
+    let mut command = fixture.command();
+    command.arg("--config").arg(&config).arg("plan");
+    let rejected = Captured::run(command);
+    rejected.assert_code(2);
+    // A scheduled run must never inherit an unconditional overwrite of the whole destination.
+    assert!(
+        rejected.stderr.contains("force"),
+        "the rejection should name the offending value: {}",
+        rejected.stderr
+    );
+    assert!(rejected.stdout.is_empty());
+}
+
+#[test]
+fn resync_help_describes_the_two_phase_flow_and_the_ticket() {
+    let fixture = Fixture::new();
+    let help = fixture.run(&["resync", "--help"]);
+    help.assert_clean_success();
+    for expected in [
+        "--confirm",
+        "--scope",
+        // The consequence has to be named, not just the mechanism.
+        "replacing the remote copy",
+        "It never deletes",
+        "Without --confirm the command only plans",
+        // A changing NAS must not become a plan/confirm loop.
+        "never becomes a loop",
+        // No clock: only content change invalidates a ticket.
+        "does not expire",
+    ] {
+        assert!(
+            help.stdout.contains(expected),
+            "resync help omitted {expected:?}: {}",
+            help.stdout
+        );
+    }
+}
+
+#[test]
+fn resync_refuses_to_delete() {
+    let fixture = Fixture::new();
+    let rejected = fixture.run_with_config(&["resync", "--delete"]);
+    rejected.assert_code(2);
+    assert!(
+        rejected.stderr.contains("resync never deletes"),
+        "{}",
+        rejected.stderr
+    );
+    assert!(rejected.stdout.is_empty());
+}
+
+#[test]
+fn resync_declines_a_multi_profile_batch() {
+    let fixture = Fixture::new();
+    let rejected = fixture.run_with_config(&["resync", "--profiles", "alpha,beta"]);
+    rejected.assert_code(2);
+    assert!(
+        rejected.stderr.contains("one destination at a time"),
+        "{}",
+        rejected.stderr
+    );
+}
+
+#[test]
+fn resync_rejects_an_unsafe_scope_before_contacting_a_server() {
+    let fixture = Fixture::new();
+    for scope in ["../escape", "@eaDir"] {
+        let rejected = fixture.run_with_config(&["resync", "--scope", scope]);
+        assert_ne!(rejected.code, Some(0), "scope {scope:?} should be refused");
+        assert!(rejected.stdout.is_empty());
+    }
+}
+
+#[test]
+fn resync_is_listed_among_the_root_subcommands() {
+    let fixture = Fixture::new();
+    let help = fixture.run(&["--help"]);
+    help.assert_clean_success();
+    assert!(
+        help.stdout.contains("resync"),
+        "resync must be discoverable from the root help: {}",
+        help.stdout
     );
 }

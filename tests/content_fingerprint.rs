@@ -66,6 +66,7 @@ fn public_planner_rejects_equal_md5_and_crc32_when_sha256_differs() {
             max_delete: 100,
             compare: CompareMode::Content,
             server_copy: false,
+            scope: synology_drive_sync::plan::Scope::root(),
         },
     )
     .unwrap();

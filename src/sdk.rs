@@ -142,6 +142,7 @@ impl SdkError {
             Error::InvalidUrl(_)
             | Error::HttpsRequired
             | Error::UnsafeRemotePath { .. }
+            | Error::ScopeNotFound(_)
             | Error::Configuration(_) => ErrorCode::InvalidRequest,
             Error::InvalidSource(_)
             | Error::UnsupportedLocalEntry { .. }
@@ -154,6 +155,7 @@ impl SdkError {
             | Error::ProtectedConflict(_)
             | Error::EmptySourceDeletion
             | Error::DeleteLimit { .. }
+            | Error::ResyncTicketStale { .. }
             | Error::RemoteSnapshotChanged(_) => ErrorCode::Safety,
             Error::Cancelled => ErrorCode::Cancelled,
             Error::ReconciliationPending { .. } => ErrorCode::Reconciliation,
@@ -876,6 +878,8 @@ impl Engine {
                     max_delete: request.deletion.max_delete,
                     compare: request.comparison.into(),
                     server_copy,
+                    // The SDK always plans the whole tree; scoping is a command-line concern.
+                    scope: plan::Scope::root(),
                 },
             )
             .map_err(SdkError::from_core)?;
@@ -1173,6 +1177,8 @@ fn reconciliation_plan(
             max_delete: request.deletion.max_delete,
             compare: request.comparison.into(),
             server_copy,
+            // The SDK always plans the whole tree; scoping is a command-line concern.
+            scope: plan::Scope::root(),
         },
     )
     .map_err(SdkError::from_core)

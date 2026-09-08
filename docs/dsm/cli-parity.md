@@ -69,6 +69,15 @@ for armv7 portability, and caps `--max-rate` at JavaScript's exact-integer maxim
 Routine, legacy-schedule, and all-profile foreground `--max-total-delete` ceilings use the same
 `0..2147483647` portable bound.
 
+`configure-alerts` is the one command with a deliberate parity gap. Its five desktop-alert fields
+match the dashboard's Notifications tab exactly, but its three DSM system log fields
+(`--system-log`, `--system-log-level`, `--system-log-message-id`) are CLI-only and have no dashboard
+equivalent, because the message identifier belongs to DSM's own catalogue and must be verified
+against a specific DSM build rather than typed into a form. The desktop fields are a full
+replacement on every save; the system log fields default to what is already stored, so saving from
+the dashboard does not silently disable system logging. See
+[DSM system log](operations.md#dsm-system-log).
+
 ## Common recovery sequence
 
 ```bash

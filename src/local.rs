@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf, Prefix};
@@ -7,6 +7,7 @@ use std::time::UNIX_EPOCH;
 use crate::cancel::CancellationToken;
 use crate::integrity::{ContentHasher, ContentMd5};
 use crate::path::{drive_path_issue, is_dsm_managed, path_for_match, validate_relative};
+use crate::plan::Scope;
 use crate::{Error, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
@@ -127,6 +128,84 @@ impl IgnoreRules {
     }
 }
 
+/// Ceiling on entries recorded by one scoped scan, per side.
+///
+/// The page cap bounds a status *response*; it does not bound the walk that produces one. A scoped
+/// scan materializes the local and remote inventories in full before anything is compared, so on
+/// the armv7 target the binding constraint is memory rather than time, and this is where that
+/// ceiling is enforced.
+///
+/// Derived, not chosen. `tests/scan_memory.rs` measures the real heap cost of one scanned entry on
+/// both sides with a counting allocator and holds the two inventories for one request under a
+/// 32 MiB ceiling:
+///
+/// ```text
+/// measured   1,336 B/pair on Linux glibc, 1,350 B/pair on Windows (deep 99-byte paths)
+/// ceiling   32 MiB = 33,554,432 bytes
+/// implied   33,554,432 / 1,422 = 23,595 entries per side
+/// shipped   20,000, keeping headroom for measurement spread across platforms
+/// ```
+///
+/// That test fails if this constant is raised without re-running the measurement, so the number
+/// and the evidence behind it cannot drift apart. Re-derive it there rather than re-guessing here;
+/// its module comment breaks the per-entry cost down by field.
+///
+/// Two caveats for whoever retunes this. Roughly half of each entry is the path stored again --
+/// as a map key, and as a derived absolute path on each side -- so a compact representation would
+/// buy more than a larger ceiling would. And cost tracks path length, so an entry is not a fixed
+/// amount of memory: shallow trees cost about half what deep ones do, and this budget is set from
+/// the deep-path worst case.
+///
+/// A batch `sync` deliberately keeps its unbudgeted full-tree scan: it is not interactive
+/// per-request work and does not share this cost budget.
+pub const SCAN_BUDGET_DEFAULT: usize = 20_000;
+
+/// The result of a scoped walk.
+#[derive(Debug)]
+pub struct ScopedScan {
+    pub inventory: LocalInventory,
+    /// Paths pruned by an ignore rule or as DSM-managed. Populated only on request.
+    pub excluded: BTreeSet<String>,
+    /// False when the budget stopped the walk, making the inventory a subset of the scope.
+    pub complete: bool,
+}
+
+struct ScanContext<'a> {
+    rules: &'a IgnoreRules,
+    scope: &'a Scope,
+    include_excluded: bool,
+    budget: usize,
+    cancellation: &'a CancellationToken,
+}
+
+struct ScanOutput {
+    entries: BTreeMap<String, LocalEntry>,
+    excluded: BTreeSet<String>,
+    complete: bool,
+}
+
+impl Default for ScanOutput {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            excluded: BTreeSet::new(),
+            complete: true,
+        }
+    }
+}
+
+impl ScanOutput {
+    /// Record an entry, reporting whether the walk may continue.
+    fn insert(&mut self, relative: String, entry: LocalEntry, budget: usize) -> bool {
+        self.entries.insert(relative, entry);
+        if self.entries.len() >= budget {
+            self.complete = false;
+            return false;
+        }
+        true
+    }
+}
+
 /// Walk `source` into a deterministic inventory.
 ///
 /// A large tree is one of the longest uninterruptible phases a run has, so `cancellation` is
@@ -137,6 +216,33 @@ pub fn scan(
     rules: &IgnoreRules,
     cancellation: &CancellationToken,
 ) -> Result<LocalInventory> {
+    let scope = Scope::root();
+    Ok(scan_scoped(source, rules, &scope, false, usize::MAX, cancellation)?.inventory)
+}
+
+/// Walk only the part of `source` that `scope` names.
+///
+/// Entries keep their **source-relative** paths regardless of the scope, so ignore rules match
+/// exactly what they match in an unscoped scan. The walk descends only into the scope's subtree
+/// and the ancestor chain leading to it, so its cost is proportional to the scope rather than to
+/// the tree.
+///
+/// Directories on the ancestor chain are recorded even though they are not in scope: a scoped
+/// upload still needs its parent directories created. They are excluded from status listings by
+/// [`Scope::matches`], which admits only the scope itself and its descendants.
+///
+/// A scoped walk sees only scanned entries, so its portable-case-collision check covers the scope
+/// alone. A collision outside the scope goes undetected — but is also untouched, so a scoped run
+/// cannot create one. Callers must say so in their output rather than let a clean scoped result
+/// read as a whole-tree clean bill of health.
+pub fn scan_scoped(
+    source: &Path,
+    rules: &IgnoreRules,
+    scope: &Scope,
+    include_excluded: bool,
+    budget: usize,
+    cancellation: &CancellationToken,
+) -> Result<ScopedScan> {
     cancellation.check()?;
     let source_metadata = fs::symlink_metadata(source).map_err(|source_error| Error::FileIo {
         path: source.to_owned(),
@@ -163,9 +269,16 @@ pub fn scan(
         });
     }
 
-    let mut entries = BTreeMap::new();
-    scan_dir(&root, "", rules, cancellation, &mut entries)?;
-    if let Some((first, second)) = portable_case_collision(entries.keys()) {
+    let context = ScanContext {
+        rules,
+        scope,
+        include_excluded,
+        budget,
+        cancellation,
+    };
+    let mut output = ScanOutput::default();
+    scan_dir(&root, "", &context, &mut output)?;
+    if let Some((first, second)) = portable_case_collision(output.entries.keys()) {
         return Err(Error::UnsupportedLocalEntry {
             path: root.join(&second),
             reason: format!(
@@ -173,7 +286,14 @@ pub fn scan(
             ),
         });
     }
-    Ok(LocalInventory { root, entries })
+    Ok(ScopedScan {
+        inventory: LocalInventory {
+            root,
+            entries: output.entries,
+        },
+        excluded: output.excluded,
+        complete: output.complete,
+    })
 }
 
 pub fn populate_content_md5(
@@ -255,10 +375,11 @@ fn verify_metadata_snapshot(entry: &LocalEntry, metadata: &fs::Metadata) -> Resu
 fn scan_dir(
     directory: &Path,
     relative_parent: &str,
-    rules: &IgnoreRules,
-    cancellation: &CancellationToken,
-    output: &mut BTreeMap<String, LocalEntry>,
+    context: &ScanContext<'_>,
+    output: &mut ScanOutput,
 ) -> Result<()> {
+    let cancellation = context.cancellation;
+    let rules = context.rules;
     cancellation.check()?;
     let reader = fs::read_dir(directory).map_err(|source| Error::FileIo {
         path: directory.to_owned(),
@@ -293,6 +414,18 @@ fn scan_dir(
         // otherwise unusual managed entry is not traversed. Remote planning protects the same
         // names, so mirror mode cannot interpret the omission as authorization to delete them.
         if is_dsm_managed(&relative) {
+            if context.include_excluded && context.scope.matches(&relative) {
+                output.excluded.insert(relative);
+            }
+            continue;
+        }
+
+        // Outside the scope entirely: neither the entry itself nor anything beneath it can be in
+        // scope, so it is never opened. This is what keeps a scoped scan proportional to the
+        // scope rather than to the tree.
+        let in_scope = context.scope.matches(&relative);
+        let on_scope_path = context.scope.is_ancestor_of_scope(&relative);
+        if !in_scope && !on_scope_path {
             continue;
         }
 
@@ -309,6 +442,11 @@ fn scan_dir(
             source,
         })?;
         if rules.is_ignored(&relative, file_type.is_dir()) {
+            // Recorded as a single entry and not descended into, so asking for excluded paths
+            // cannot turn a bounded scan into an unbounded one.
+            if context.include_excluded && in_scope {
+                output.excluded.insert(relative);
+            }
             continue;
         }
         let metadata = fs::symlink_metadata(child.path()).map_err(|source| Error::FileIo {
@@ -330,7 +468,9 @@ fn scan_dir(
 
         if metadata.is_dir() {
             let full_path = child.path();
-            output.insert(
+            // An ancestor of the scope is recorded so a scoped plan can still create the parent
+            // directories its uploads need. `Scope::matches` keeps it out of status listings.
+            if !output.insert(
                 relative.clone(),
                 LocalEntry {
                     relative: relative.clone(),
@@ -340,8 +480,14 @@ fn scan_dir(
                     mtime_ms: 0,
                     content_md5: None,
                 },
-            );
-            scan_dir(&full_path, &relative, rules, cancellation, output)?;
+                context.budget,
+            ) {
+                return Ok(());
+            }
+            scan_dir(&full_path, &relative, context, output)?;
+            if !output.complete {
+                return Ok(());
+            }
         } else if metadata.is_file() {
             let full_path = child.path();
             let modified = metadata.modified().map_err(|source| Error::FileIo {
@@ -360,17 +506,25 @@ fn scan_dir(
                     path: full_path.clone(),
                     reason: "modification time is outside DSM's supported range".to_owned(),
                 })?;
-            output.insert(
-                relative.clone(),
-                LocalEntry {
-                    relative,
-                    full_path,
-                    kind: EntryKind::File,
-                    size: metadata.len(),
-                    mtime_ms,
-                    content_md5: None,
-                },
-            );
+            // A file is only ever recorded when it is itself in scope. A file cannot be an
+            // ancestor of anything, so a file sitting where the scope expects a directory simply
+            // means the scope names nothing.
+            if in_scope
+                && !output.insert(
+                    relative.clone(),
+                    LocalEntry {
+                        relative,
+                        full_path,
+                        kind: EntryKind::File,
+                        size: metadata.len(),
+                        mtime_ms,
+                        content_md5: None,
+                    },
+                    context.budget,
+                )
+            {
+                return Ok(());
+            }
         } else {
             return Err(Error::UnsupportedLocalEntry {
                 path: child.path(),
@@ -500,6 +654,25 @@ mod tests {
 
     use super::*;
 
+    /// Walk one directory unscoped and unbudgeted, as the recursion does.
+    fn walk_dir(
+        directory: &Path,
+        relative_parent: &str,
+        rules: &IgnoreRules,
+        cancellation: &CancellationToken,
+        output: &mut ScanOutput,
+    ) -> Result<()> {
+        let scope = Scope::root();
+        let context = ScanContext {
+            rules,
+            scope: &scope,
+            include_excluded: false,
+            budget: usize::MAX,
+            cancellation,
+        };
+        scan_dir(directory, relative_parent, &context, output)
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -570,8 +743,8 @@ mod tests {
         // Walk one subtree with a live token, then cancel and descend into the next exactly as
         // the recursion does. The walker refuses the directory and adds nothing to the results.
         let cancellation = CancellationToken::default();
-        let mut output = BTreeMap::new();
-        scan_dir(
+        let mut output = ScanOutput::default();
+        walk_dir(
             &root.join("alpha"),
             "alpha",
             &rules,
@@ -579,12 +752,12 @@ mod tests {
             &mut output,
         )
         .unwrap();
-        let walked: Vec<_> = output.keys().cloned().collect();
+        let walked: Vec<_> = output.entries.keys().cloned().collect();
         assert_eq!(walked, ["alpha/nested", "alpha/nested/a.txt"]);
 
         cancellation.cancel();
         assert!(matches!(
-            scan_dir(
+            walk_dir(
                 &root.join("beta"),
                 "beta",
                 &rules,
@@ -593,7 +766,7 @@ mod tests {
             ),
             Err(Error::Cancelled)
         ));
-        assert_eq!(output.keys().cloned().collect::<Vec<_>>(), walked);
+        assert_eq!(output.entries.keys().cloned().collect::<Vec<_>>(), walked);
 
         // The public entry point surfaces cancellation and never a partial inventory.
         assert!(matches!(
@@ -1105,11 +1278,11 @@ mod tests {
     fn scan_dir_reports_the_missing_directory_it_could_not_read() {
         let root = temp_dir("scan-dir-missing");
         let missing = root.join("does-not-exist");
-        let mut output = BTreeMap::new();
+        let mut output = ScanOutput::default();
         let rules = IgnoreRules::build(&root, &[]).unwrap();
 
         assert!(matches!(
-            scan_dir(
+            walk_dir(
                 &missing,
                 "does-not-exist",
                 &rules,
@@ -1118,7 +1291,7 @@ mod tests {
             ),
             Err(Error::FileIo { path, .. }) if path == missing
         ));
-        assert!(output.is_empty());
+        assert!(output.entries.is_empty());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1343,6 +1516,239 @@ mod tests {
                 && source.kind() != std::io::ErrorKind::NotFound
         ));
 
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod scoped_scan_tests {
+    use std::fs;
+
+    use super::*;
+
+    fn tree(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "sdsync-scoped-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        for directory in ["docs/q3", "docs/q4", "other/deep", "cache"] {
+            fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        fs::write(root.join("top.txt"), "t").unwrap();
+        fs::write(root.join("docs/a.txt"), "a").unwrap();
+        fs::write(root.join("docs/q3/summary.pdf"), "s").unwrap();
+        fs::write(root.join("docs/q4/draft.pdf"), "d").unwrap();
+        fs::write(root.join("other/deep/far.txt"), "f").unwrap();
+        fs::write(root.join("cache/big.tmp"), "c").unwrap();
+        root
+    }
+
+    fn walk(root: &Path, scope: &str, patterns: &[&str]) -> ScopedScan {
+        let rules = IgnoreRules::build(
+            root,
+            &patterns
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let scope = Scope::parse(scope).unwrap();
+        scan_scoped(
+            root,
+            &rules,
+            &scope,
+            false,
+            usize::MAX,
+            &CancellationToken::default(),
+        )
+        .unwrap()
+    }
+
+    fn keys(scan: &ScopedScan) -> Vec<String> {
+        scan.inventory.entries.keys().cloned().collect()
+    }
+
+    #[test]
+    fn an_unscoped_scan_is_unchanged_by_the_scoping_machinery() {
+        let root = tree("unscoped");
+        let scan = walk(&root, "", &[]);
+        assert_eq!(
+            keys(&scan),
+            [
+                "cache",
+                "cache/big.tmp",
+                "docs",
+                "docs/a.txt",
+                "docs/q3",
+                "docs/q3/summary.pdf",
+                "docs/q4",
+                "docs/q4/draft.pdf",
+                "other",
+                "other/deep",
+                "other/deep/far.txt",
+                "top.txt",
+            ]
+        );
+        assert!(scan.complete);
+        assert!(scan.excluded.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_directory_scope_walks_only_its_subtree() {
+        let root = tree("subtree");
+        let scan = walk(&root, "docs/q3", &[]);
+        // The ancestor chain is recorded so a scoped plan can still create parents; nothing
+        // outside the scope or its ancestors is opened at all.
+        assert_eq!(keys(&scan), ["docs", "docs/q3", "docs/q3/summary.pdf"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_file_scope_records_the_file_and_only_its_ancestor_directories() {
+        let root = tree("file-scope");
+        let scan = walk(&root, "docs/q3/summary.pdf", &[]);
+        assert_eq!(keys(&scan), ["docs", "docs/q3", "docs/q3/summary.pdf"]);
+        // The sibling in the same directory is never recorded.
+        assert!(!scan.inventory.entries.contains_key("docs/a.txt"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_scope_that_does_not_exist_yields_only_the_ancestors_that_do() {
+        let root = tree("absent");
+        let scan = walk(&root, "docs/q9/missing.txt", &[]);
+        assert_eq!(keys(&scan), ["docs"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scoped_relatives_stay_source_relative_so_ignore_rules_still_match() {
+        let root = tree("ignore");
+        // The pattern is written against the source-relative path, as it always is.
+        let scan = walk(&root, "docs", &["docs/q4/**"]);
+        assert_eq!(
+            keys(&scan),
+            [
+                "docs",
+                "docs/a.txt",
+                "docs/q3",
+                "docs/q3/summary.pdf",
+                "docs/q4"
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn excluded_paths_are_reported_only_when_requested() {
+        let root = tree("excluded");
+        let rules = IgnoreRules::build(&root, &["cache/**".to_owned()]).unwrap();
+        let scope = Scope::root();
+
+        let quiet = scan_scoped(
+            &root,
+            &rules,
+            &scope,
+            false,
+            usize::MAX,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(quiet.excluded.is_empty());
+
+        let loud = scan_scoped(
+            &root,
+            &rules,
+            &scope,
+            true,
+            usize::MAX,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(loud.excluded.contains("cache/big.tmp"));
+        // The excluded entry is recorded but never becomes part of the payload inventory.
+        assert!(!loud.inventory.entries.contains_key("cache/big.tmp"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_excluded_directory_is_recorded_once_and_not_descended_into() {
+        let root = tree("excluded-dir");
+        let rules = IgnoreRules::build(&root, &["other/".to_owned()]).unwrap();
+        let scope = Scope::root();
+        let scan = scan_scoped(
+            &root,
+            &rules,
+            &scope,
+            true,
+            usize::MAX,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(scan.excluded.contains("other"));
+        // Recording the pruned directory must not turn a bounded scan into a walk of its contents.
+        assert!(!scan.excluded.iter().any(|path| path.starts_with("other/")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_budget_stops_the_walk_and_says_the_result_is_partial() {
+        let root = tree("budget");
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        let scope = Scope::root();
+        let scan = scan_scoped(
+            &root,
+            &rules,
+            &scope,
+            false,
+            3,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(
+            !scan.complete,
+            "an exhausted budget must report a partial scan"
+        );
+        assert!(scan.inventory.entries.len() <= 3);
+
+        // The same tree within budget completes.
+        let full = scan_scoped(
+            &root,
+            &rules,
+            &scope,
+            false,
+            usize::MAX,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(full.complete);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_scoped_scan_is_cancellable() {
+        let root = tree("cancel");
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        let scope = Scope::parse("docs").unwrap();
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        assert!(matches!(
+            scan_scoped(&root, &rules, &scope, false, usize::MAX, &cancellation),
+            Err(Error::Cancelled)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_public_scan_entry_point_still_returns_the_whole_tree() {
+        let root = tree("public");
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        let inventory = scan(&root, &rules, &CancellationToken::default()).unwrap();
+        assert_eq!(inventory.entries.len(), 12);
+        assert_eq!(inventory.files(), 6);
         fs::remove_dir_all(root).unwrap();
     }
 }

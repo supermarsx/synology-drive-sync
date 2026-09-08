@@ -48,6 +48,14 @@ configure-profile options:
   --remote-log-url URL --remote-log-mode best-effort|required
   --default                             (make this the default profile)
 
+configure-alerts options:
+  --enabled true|false --on-success true|false --on-failure true|false
+  --failure-threshold 1..100 --cooldown 60..2592000
+  --system-log true|false                (DSM system log delivery; default off)
+  --system-log-level info|warn|err       (lowest severity delivered; default warn)
+  --system-log-message-id 0xHHHHHHHH     (identifier from DSM's own system-log
+                                          catalogue, verified on your DSM build)
+
 REMOTE is your chosen File Station logical path, for example
 /home/Drive/Backups or /TeamShare/Backups. It is never a /volumeN path.
 
@@ -1150,6 +1158,21 @@ configure_routine() {
 configure_alert_policy() {
     alerts_enabled=true alerts_success=false alerts_failure=true
     alerts_threshold=1 alerts_cooldown=3600
+    # Invariant: a dashboard alert save must not disable system logging.
+    #
+    # The five desktop fields below are a full replacement on every save. These
+    # three deliberately are not -- they default to whatever is already stored.
+    # The reason is that the dashboard's Notifications tab sends only the five
+    # (see `Mutation::AlertPolicy` in src/dsm_api.rs, which builds that argv), so
+    # defaulting these the same way would make every save from that tab switch
+    # system logging off and discard the administrator's verified message
+    # identifier -- with no error, and no visible change in the form that caused
+    # it. Read cold this asymmetry looks like an inconsistency worth tidying up;
+    # it is load-bearing. test_dsm_system_log_is_opt_in_rate_limited_and_best_effort
+    # fails if it is removed.
+    alerts_system_log=$(setting "$alert_policy_file" system_log false)
+    alerts_system_log_id=$(setting "$alert_policy_file" system_log_message_id '')
+    alerts_system_log_level=$(setting "$alert_policy_file" system_log_level warn)
     while [ "$#" -gt 0 ]; do
         case $1 in
             --enabled) need_value "$@"; alerts_enabled=$2; shift 2 ;;
@@ -1157,6 +1180,9 @@ configure_alert_policy() {
             --on-failure) need_value "$@"; alerts_failure=$2; shift 2 ;;
             --failure-threshold) need_value "$@"; alerts_threshold=$2; shift 2 ;;
             --cooldown) need_value "$@"; alerts_cooldown=$2; shift 2 ;;
+            --system-log) need_value "$@"; alerts_system_log=$2; shift 2 ;;
+            --system-log-message-id) need_value "$@"; alerts_system_log_id=$2; shift 2 ;;
+            --system-log-level) need_value "$@"; alerts_system_log_level=$2; shift 2 ;;
             *) die "unknown configure-alerts option: $1" ;;
         esac
     done
@@ -1168,10 +1194,33 @@ configure_alert_policy() {
     [ "$alerts_threshold" -ge 1 ] && [ "$alerts_threshold" -le 100 ] || die "failure-threshold must be 1..100"
     case $alerts_cooldown in ''|*[!0-9]*) die "cooldown must be an integer" ;; esac
     [ "$alerts_cooldown" -ge 60 ] && [ "$alerts_cooldown" -le 2592000 ] || die "cooldown must be 60..2592000 seconds"
+    case $alerts_system_log in true|false) ;; *) die "system-log must be true or false" ;; esac
+    case $alerts_system_log_level in info|warn|err) ;; *) die "system-log-level must be info, warn, or err" ;; esac
+    # The identifier names an entry in Synology's own system-log message
+    # catalogue, which a third-party package cannot extend, so this package
+    # never supplies one of its own. Accept only the shape DSM's callers use
+    # and refuse to enable delivery that would be silently inert without it.
+    case $alerts_system_log_id in
+        '') ;;
+        0x*)
+            alerts_system_log_digits=${alerts_system_log_id#0x}
+            case $alerts_system_log_digits in
+                ''|*[!0-9A-Fa-f]*) die "system-log-message-id must be 0x followed by 1..8 hexadecimal digits" ;;
+            esac
+            [ "${#alerts_system_log_digits}" -le 8 ] \
+                || die "system-log-message-id must be 0x followed by 1..8 hexadecimal digits"
+            ;;
+        *) die "system-log-message-id must be 0x followed by 1..8 hexadecimal digits" ;;
+    esac
+    if [ "$alerts_system_log" = true ] && [ -z "$alerts_system_log_id" ]; then
+        die "system-log requires --system-log-message-id verified on this DSM build"
+    fi
     alert_temp=$alert_policy_file.tmp.$$
     {
         printf 'enabled=%s\non_success=%s\non_failure=%s\n' "$alerts_enabled" "$alerts_success" "$alerts_failure"
         printf 'failure_threshold=%s\ncooldown_seconds=%s\n' "$alerts_threshold" "$alerts_cooldown"
+        printf 'system_log=%s\nsystem_log_message_id=%s\nsystem_log_level=%s\n' \
+            "$alerts_system_log" "$alerts_system_log_id" "$alerts_system_log_level"
     } > "$alert_temp"
     finish_private_file "$alert_temp"
     mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
@@ -3167,6 +3216,11 @@ api_cgi_failure() {
         "Package service synology-drive-sync request failed stage=$cgi_failure_stage code=$cgi_failure_code status=$cgi_failure_status" \
         "$cgi_failure_category" warn false \
         || api_error unavailable "CGI failure activity could not be recorded" 69
+    case $cgi_failure_event in
+        authentication.failed) dsm_log_event authentication_failed ;;
+        security.failed) dsm_log_event security_failed ;;
+        bridge.failed) dsm_log_event bridge_failed ;;
+    esac
     api_result "CGI failure activity recorded"
 }
 
@@ -3283,6 +3337,7 @@ api_command() {
         audit-rejected)
             [ "$#" -eq 0 ] || api_error invalid_request "audit-rejected accepts no arguments" 64
             append_audit_event rejected-post failed all >/dev/null 2>&1 || api_error audit_unavailable "mandatory audit record could not be written" 73
+            dsm_log_event bridge_rejected
             api_result "Rejected dashboard mutation audited"
             ;;
         audit-event) api_audit_event "$@" ;;

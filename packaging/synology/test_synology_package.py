@@ -566,7 +566,13 @@ class BuilderTests(unittest.TestCase):
                 self.assertRegex(module, validate_spk.NATIVE_MODULE_PATTERN)
                 self.assertNotEqual(module, "SynologyDriveSync.js")
                 native_applications = ui_config[module]
-                self.assertEqual(set(native_applications), {validate_spk.APP_ID})
+                self.assertEqual(
+                    set(native_applications),
+                    {validate_spk.APP_ID, validate_spk.WIDGET_ID},
+                )
+                native_widget = native_applications[validate_spk.WIDGET_ID]
+                self.assertEqual(native_widget["type"], "widget")
+                self.assertEqual(native_widget["depend"], [])
                 native_application = native_applications[validate_spk.APP_ID]
                 self.assertEqual(native_application["type"], "app")
                 self.assertEqual(native_application["appWindow"], validate_spk.APP_ID)
@@ -597,10 +603,15 @@ class BuilderTests(unittest.TestCase):
         source = json.loads((HERE / "ui-src/app.config").read_text(encoding="utf-8"))
         application = copy.deepcopy(source[validate_spk.APP_ID])
         application["depend"] = []
+        widget = copy.deepcopy(source[validate_spk.WIDGET_ID])
+        widget["depend"] = []
         bundle = (HERE / "ui-src/dist/SynologyDriveSync.js").read_bytes()
         module = validate_spk.native_ui_module_name(bundle)
         installed = {
-            module: {validate_spk.APP_ID: application}
+            module: {
+                validate_spk.APP_ID: application,
+                validate_spk.WIDGET_ID: widget,
+            }
         }
         validate_spk.validate_ui_config(json.dumps(installed).encode("utf-8"))
 
@@ -7481,6 +7492,181 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 for event in unavailable
             )
         )
+
+    def test_dsm_system_log_is_opt_in_rate_limited_and_best_effort(self) -> None:
+        policy = self.real_home / "config/alerts.conf"
+
+        # The identifier names an entry in Synology's own catalogue, so the
+        # package must refuse to enable delivery it would have to invent one for.
+        missing = self.shell(self.manager, "configure-alerts", "--system-log", "true")
+        self.assertEqual(missing.returncode, 64, missing.stdout)
+        self.assertIn("--system-log-message-id", missing.stderr)
+        for rejected in ("11100000", "0x", "0xZZ", "0x123456789", "0x1 1"):
+            refused = self.shell(
+                self.manager, "configure-alerts", "--system-log-message-id", rejected
+            )
+            self.assertEqual(refused.returncode, 64, (rejected, refused.stdout))
+        for rejected in ("maybe", "ERR", "trace"):
+            refused = self.shell(
+                self.manager, "configure-alerts", "--system-log-level", rejected
+            )
+            self.assertEqual(refused.returncode, 64, (rejected, refused.stdout))
+
+        configured = self.shell(
+            self.manager, "configure-alerts",
+            "--enabled", "false", "--cooldown", "3600",
+            "--system-log", "true",
+            "--system-log-message-id", "0x11100000",
+            "--system-log-level", "warn",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        stored = policy.read_text(encoding="utf-8")
+        self.assertIn("system_log=true\n", stored)
+        self.assertIn("system_log_message_id=0x11100000\n", stored)
+        self.assertIn("system_log_level=warn\n", stored)
+
+        # Invariant: a dashboard alert save must not disable system logging.
+        #
+        # These five flags are exactly what the bridge sends for a dashboard
+        # save -- see `Mutation::AlertPolicy` in src/dsm_api.rs, which pushes
+        # this argv and nothing else. The five desktop fields are a full
+        # replacement, so if the three system-log fields defaulted the same way
+        # the desktop ones do, every save from the Notifications tab would
+        # silently switch system logging off and clear the administrator's
+        # message identifier, with no error and no visible change in the form
+        # that caused it. This test is what keeps that asymmetry from being
+        # tidied away later as a pointless inconsistency.
+        resaved = self.shell(
+            self.manager, "configure-alerts",
+            "--enabled", "true", "--on-success", "false", "--on-failure", "true",
+            "--failure-threshold", "1", "--cooldown", "3600",
+        )
+        self.assertEqual(resaved.returncode, 0, resaved.stderr)
+        preserved = policy.read_text(encoding="utf-8")
+        self.assertIn("system_log=true\n", preserved)
+        self.assertIn("system_log_message_id=0x11100000\n", preserved)
+        self.assertIn("system_log_level=warn\n", preserved)
+
+        common = self.real_target / "libexec/sdsync-common"
+        source = common.read_text(encoding="utf-8")
+        writer = self.root / "synologset1"
+        capture = self.root / "synologset1.args"
+        writer.write_text(
+            "#!/bin/sh\n"
+            f'printf \'%s\\n\' --CALL-- "$@" >> "{capture}"\n',
+            encoding="utf-8",
+        )
+        writer.chmod(0o755)
+        common.write_text(
+            source.replace("/usr/syno/bin/synologset1", str(writer)), encoding="utf-8"
+        )
+        clock = self.root / "system-log-clock"
+        clock.write_text("1000\n", encoding="utf-8")
+        helper = self.root / "system-log.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{common}"\n'
+            "ensure_layout\n"
+            f'clock="{clock}"\n'
+            'epoch_now() { IFS= read -r value < "$clock"; printf \'%s\\n\' "$value"; }\n'
+            # A routine failing every five minutes must not become one entry
+            # per failure; the shared cooldown collapses the burst.
+            "dsm_log_event sync_failed 1000\n"
+            "dsm_log_event sync_failed 1300\n"
+            "dsm_log_event sync_failed 1600\n"
+            "dsm_log_event sync_failed 4599\n"
+            "dsm_log_event sync_failed 4600\n"
+            # A different bucket keeps its own cooldown.
+            "dsm_log_event authentication_failed 4601\n"
+            # Below the configured minimum severity nothing is delivered.
+            "dsm_log_event sync_succeeded 9000\n"
+            # An unregistered key is a caller error, never a silent pass.
+            "set +e; dsm_log_event not_a_real_event 9100; code=$?; set -e\n"
+            '[ "$code" -eq 64 ]\n',
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            for path in (writer, common, helper, clock):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        result = self.shell(helper)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            capture.read_text(encoding="utf-8").splitlines(),
+            [
+                "--CALL--", "sys", "err", "0x11100000",
+                "Synology Drive Sync failed a synchronization run."
+                " Open the package Activity page for details.",
+                "--CALL--", "sys", "err", "0x11100000",
+                "Synology Drive Sync failed a synchronization run."
+                " Open the package Activity page for details.",
+                "--CALL--", "sys", "warn", "0x11100000",
+                "Synology Drive Sync rejected a dashboard authentication attempt.",
+            ],
+        )
+
+        # Delivery is best effort: an absent binary leaves the caller's result
+        # alone and is recorded in Activity rather than disguised as success.
+        common.write_text(
+            source.replace("/usr/syno/bin/synologset1", str(self.root / "absent-writer")),
+            encoding="utf-8",
+        )
+        degraded = self.root / "system-log-absent.sh"
+        degraded.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{common}"\n'
+            "ensure_layout\n"
+            "dsm_log_event bridge_failed 20000\n",
+            encoding="utf-8",
+        )
+        degraded.chmod(0o755)
+        if os.getuid() == 0:
+            for path in (common, degraded):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        fallback = self.shell(degraded)
+        self.assertEqual(fallback.returncode, 0, fallback.stderr)
+        activity, payload = self.api("activity", "--lines", "20")
+        self.assertEqual(activity.returncode, 0, activity.stderr)
+        self.assertIn(
+            "DSM system log delivery unavailable",
+            [event["message"] for event in payload["events"]],
+        )
+
+    def test_dsm_system_log_stays_inert_until_an_administrator_enables_it(self) -> None:
+        common = self.real_target / "libexec/sdsync-common"
+        source = common.read_text(encoding="utf-8")
+        writer = self.root / "unconfigured-synologset1"
+        capture = self.root / "unconfigured-synologset1.args"
+        writer.write_text(
+            "#!/bin/sh\n"
+            f'printf \'%s\\n\' --CALL-- "$@" >> "{capture}"\n',
+            encoding="utf-8",
+        )
+        writer.chmod(0o755)
+        common.write_text(
+            source.replace("/usr/syno/bin/synologset1", str(writer)), encoding="utf-8"
+        )
+        helper = self.root / "system-log-default.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{common}"\n'
+            "ensure_layout\n"
+            "for event in sync_failed doctor_failed authentication_failed"
+            " security_failed bridge_failed bridge_rejected service_started"
+            " service_stopped service_restarted service_start_failed"
+            " package_installed package_upgraded queue_saturated; do\n"
+            '  dsm_log_event "$event" 1000\n'
+            "done\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            for path in (writer, common, helper):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        result = self.shell(helper)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(capture.exists(), "default configuration must not reach DSM")
+        self.assertFalse((self.real_var / "state/system-log.state").exists())
 
     def test_controller_drains_existing_safe_queue_without_poll_sleep(self) -> None:
         bridge_capture = self.root / "fast-queue-bridge-capture"

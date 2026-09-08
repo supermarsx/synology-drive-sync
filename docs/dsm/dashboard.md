@@ -42,6 +42,76 @@ instead of hand-creating a link or changing ownership.
 > `EACCES` skips the validator and selects the bounded loopback user-service path. Package mutation
 > still requires the independently issued package CSRF token.
 
+## Desktop widget
+
+The same installed module registers a second DSM class,
+`SYNO.SDS.App.SynologyDriveSync.Widget`, with `type="widget"`. DSM lists every registered widget
+class in the desktop widget panel, so the card appears under the panel's **+** button once the
+package is installed and started. Adding it pins a 318-pixel card that shows sync state at a glance;
+clicking the card's header icon opens the full AppWindow.
+
+The card has two sizes, both chosen by DSM rather than by the package:
+
+| Card size | Shows |
+| --- | --- |
+| Medium (84 px) | Overall health headline, one supporting line, and the active-run banner |
+| Expanded (168 px) | The same headline plus a scrolling per-profile list |
+
+Each profile row reports the best evidence the package status snapshot actually carries. Where a
+routine exists for the profile, the row reports that routine's own last execution state
+(`Succeeded`, `Failed`, `Running`, `Deferred`, `Scheduled`, or `Not yet run`) and the age of its last
+success. Where no routine exists, the snapshot has no per-profile run record at all, so the row falls
+back to the cached Doctor result and says so explicitly (`Doctor passed`, `Doctor failed`, or
+`No routine`). The headline reports the worst state present rather than an average: an untrusted
+controller identity outranks a failing profile, which outranks a stopped service, which outranks a
+profile that has never run.
+
+The widget is read-only. It calls only the `snapshot` read of the same authenticated CGI bridge the
+AppWindow uses, and it can neither queue an operation nor reach a secret. Its refresh discipline is
+deliberately conservative, because a pinned widget otherwise polls a NAS for the whole life of a DSM
+session:
+
+- it holds no timer at all until DSM activates the card, and drops the timer immediately when the
+  card is minimised, the widget panel is closed, or the DSM browser tab is hidden;
+- it rests at one read per 60 seconds, matching the interval DSM's own first-party desktop widgets
+  register, and reads every 20 seconds only while a run is genuinely in flight;
+- it never polls faster than the AppWindow's own **Status refresh** setting, which it reads from the
+  same stored preference, so raising that setting also slows the widget;
+- consecutive failures back the interval off to a five-minute floor, and one successful read clears
+  the backoff. The card keeps displaying the last snapshot it did retrieve and marks itself
+  `Retrying slowly` rather than blanking.
+
+### When the widget cannot read the package
+
+A pinned card outlives the package it reports on, so an unreachable or unauthenticated bridge is a
+normal state for it rather than an error case. The card names the reason instead of showing a
+generic failure, using the same titles the AppWindow's connection banner uses for the same
+conditions:
+
+| What happened | Card headline | What to do |
+| --- | --- | --- |
+| Package stopped, or its helper or web API could not start | Package service unavailable | Start the package in Package Center |
+| DSM session no longer valid for the package CGI | DSM session expired | Sign in to DSM again |
+| Account is not a DSM administrator, or HTTPS is required | DSM access denied | Use a DSM administrator account |
+| DSM did not reach the package's native API route | Package UI route unavailable | Repair or reinstall the package release |
+| Bundle and package API schemas disagree | UI and package versions differ | Repair or reinstall one complete release |
+| Request did not complete at all | Package bridge unavailable | Confirm the package is running |
+
+A single failed read never changes the headline; the card keeps showing the last status it did
+retrieve. The reason takes over once two consecutive reads have failed, or immediately when the
+widget has never had a successful read. Rows from the last good snapshot stay on screen underneath
+with their ages attached, and the footer keeps the timestamp of that reading, so a stale card is
+always distinguishable from a current one.
+
+The card has no spinner and performs no retry inside a poll: one scheduled read is exactly one
+request. A permanently failing bridge therefore settles at one snapshot request per five minutes
+per open DSM desktop, plus at most one DSM token request alongside it, and stops entirely the moment
+the card is minimised, the widget panel is closed, or the browser tab is hidden. A successful read
+clears the backoff and the card recovers on its own without being removed and re-added.
+
+The widget follows the AppWindow's **Theme** preference and adds no DSM taskbar tray button; desktop
+alerts remain the only notification surface.
+
 ## Connection and read-only states
 
 The footer distinguishes these states:
@@ -203,6 +273,11 @@ The desktop message never contains a profile name, exit code, path, URL, account
 TOTP material, bearer token, or arbitrary log text. Inspect Activity and bounded package logs for the
 specific operation and result. The package does not acquire the `sysnotify` resource or register
 Notification Center rules, email, SMS, mobile, or CMS delivery channels.
+
+A desktop alert is not durable. The package also carries an optional DSM system log channel covering
+sync, Doctor, authentication, request, and service-lifecycle events. It is off by default, has no
+dashboard field, and is configured over SSH with `configure-alerts`; see
+[DSM system log](operations.md#dsm-system-log).
 
 ## Security
 

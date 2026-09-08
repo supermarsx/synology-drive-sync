@@ -208,6 +208,117 @@ sudo -u "$PACKAGE_USER" -- "$MANAGER" configure-alerts \
   --cooldown 3600
 ```
 
+## DSM system log
+
+A desktop alert is not a log. It is not durable, it is not searchable, and an administrator who was
+not signed in when it fired never learns that it happened. The package therefore carries a second,
+durable channel: one shell facility, `dsm_log_event`, that every DSM-visible package event travels
+through, writing a fixed sentence per event to DSM's own system log through
+`/usr/syno/bin/synologset1`.
+
+### What DSM actually offers a third-party package
+
+Synology's package developer guide documents exactly two integration points here, and both are
+`conf/resource` resource workers:
+
+| Worker | What the guide says it does | Surface the guide attributes to it |
+| --- | --- | --- |
+| `sysnotify` | Merges the package's notification strings into DSM's index | Control Panel > Notification > Rules, and from there desktop, email, SMS, mobile, and CMS |
+| `syslog-config` | Installs a syslog-ng config fragment and a logrotate config, then reloads syslog-ng | None stated |
+
+Read the second row carefully, because it is easy to assume more than it says. `syslog-config`
+installs *configuration* — parsing and rotation rules for a log file the package writes itself, into
+`/usr/local/etc/syslog-ng/patterndb.d/` and `/usr/local/etc/logrotate.d/`. It is not an emit path: it
+delivers nothing on its own, and the guide page never mentions Log Center. Its timing is
+`FROM_STARTUP_TO_HALT`, so acquisition runs before the start script and a failure aborts package
+startup — a poor trade for a best-effort logging channel. The only documented route to an
+administrator-facing alert surface is `sysnotify`.
+
+This package deliberately acquires **no** `conf/resource` worker, and `validate_spk.py` rejects one,
+so neither surface is open to it. That is a reviewed security boundary, not an oversight: acquiring
+`sysnotify` would put this package's strings into a DSM-wide index and its events into the rule set
+that drives an administrator's mail and mobile push. Changing it is a package-contract decision, not
+a logging change — it requires a `conf/resource` member, notification text directories, and matching
+validator and negative-test updates.
+
+What remains is `synologset1`, DSM's own system-log writer. The binary is real and DSM's own scripts
+use it, but Synology publishes no developer-guide contract for it, and its message identifiers come
+from a Synology-owned catalogue that a third-party package cannot extend. **This package therefore
+ships no message identifier of its own.** Delivery stays inert until an administrator supplies one
+they have verified on their own DSM build. Until then — and this is the important part — every event
+still reaches Activity exactly as it did before.
+
+### Configuring it
+
+There is no dashboard field. Configure it over SSH:
+
+```bash
+sudo -u "$PACKAGE_USER" -- "$MANAGER" configure-alerts \
+  --system-log true \
+  --system-log-message-id 0x11100000 \
+  --system-log-level warn
+```
+
+| Field | Meaning |
+| --- | --- |
+| `--system-log` | Master enable; default `false`. Refused without a message identifier. |
+| `--system-log-level` | Lowest severity delivered: `info`, `warn`, or `err`. Default `warn`. |
+| `--system-log-message-id` | `0x` followed by 1..8 hexadecimal digits, from DSM's own catalogue. |
+
+The desktop-alert fields are a full replacement on every save, but these three default to what is
+already stored, so a save from the dashboard's alert form does not switch system logging back off.
+
+### Event catalogue
+
+| Event | Severity | Group | Raised when |
+| --- | --- | --- | --- |
+| `sync_succeeded` | info | sync | A synchronization run completed |
+| `sync_failed` | err | sync | Consecutive failures reached the alert failure threshold |
+| `doctor_failed` | err | doctor | Doctor failures reached the alert failure threshold |
+| `authentication_failed` | warn | authentication | A dashboard authentication attempt was rejected |
+| `security_failed` | err | security | A request failed a CGI or runtime identity check |
+| `bridge_failed` | warn | bridge | A dashboard request could not be served |
+| `bridge_rejected` | warn | bridge | An unauthorized dashboard mutation was refused |
+| `service_started` | info | lifecycle | The package service started |
+| `service_stopped` | info | lifecycle | The package service stopped |
+| `service_restarted` | info | lifecycle | The package service restarted |
+| `service_start_failed` | err | lifecycle | The package service failed to start |
+| `package_installed` | info | lifecycle | A fresh install completed |
+| `package_upgraded` | info | lifecycle | An upgrade completed |
+| `queue_saturated` | warn | queue | Completed dashboard results were discarded at the queue limit |
+
+DSM receives only the fixed reviewed sentence for the event and the configured message identifier. A
+profile name, exit code, path, URL, account name, log or error text, cookie, token, password, or
+TOTP value never enters that argv, exactly as none of them enters the desktop notifier's.
+
+### Rate limiting
+
+Sync and Doctor events follow the same `failure_threshold` the desktop alert policy uses. Every event
+is then rate-limited by `cooldown_seconds`, tracked **independently per group** in
+`var/state/system-log.state`. A routine failing every five minutes produces one system log entry per
+cooldown, not 288 a day; a burst of rejected dashboard requests cannot crowd out a sync failure,
+because they are different groups. Unlike the desktop policy, system logging is not governed by
+`--enabled`, `--on-success`, or `--on-failure`: an administrator who silenced toasts still wants the
+durable record.
+
+The cooldown stamp is committed before delivery is attempted, so a DSM without the binary costs one
+probe per cooldown rather than one per event. A clock corrected backwards re-opens the gate rather
+than silencing the log until real time catches up.
+
+### When it is unavailable
+
+Logging is best effort by contract. An absent or symlinked binary, a permission denial, or a chroot
+without DSM tooling leaves the caller's own result untouched and records `notification.unavailable`
+in Activity with the message `DSM system log delivery unavailable`. No caller has to guard the call
+and no run fails because logging did.
+
+Repository tests cover the policy parsing, the identifier and severity validation, the per-group
+cooldown, the fixed argv, and the unavailable fallback. They do **not** prove that `synologset1`
+accepts package-user calls, that a given identifier renders on a particular DSM build, or that the
+resulting entry appears in Log Center's filters. Establish those during
+[live-NAS acceptance](troubleshooting.md#live-nas-acceptance) before relying on this channel for
+unattended attention.
+
 ## Open-session fallback
 
 The dashboard can request a browser notification and play a short local tone when it observes a new

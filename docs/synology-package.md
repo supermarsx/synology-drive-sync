@@ -14,7 +14,8 @@ source NAS                                                target NAS
 ```
 
 The current SPK source, planned to first ship in release 26.10, includes a dark-first
-administrator-only native DSM Vue `type=app` AppWindow and the `sdsync-dsm` SSH manager. Both surfaces operate the
+administrator-only native DSM Vue `type=app` AppWindow, a read-only `type=widget` DSM desktop
+status card, and the `sdsync-dsm` SSH manager. The AppWindow and the manager operate the
 same package-owned profiles, credentials, routines, state, and logs. The dashboard is
 administrator-only; it never returns a stored password, TOTP seed, or remote logging token to the
 browser. The CLI remains the recovery and automation surface when the dashboard cannot open.
@@ -74,7 +75,7 @@ or an enabled Team Folder.
 
 | Subject | Guide |
 | --- | --- |
-| What every dashboard page, status, action, and preference does | [Dashboard and navigation](dsm/dashboard.md) |
+| What every dashboard page, status, action, and preference does, and the DSM desktop widget | [Dashboard and navigation](dsm/dashboard.md) |
 | Model, DSM version, CPU, `INFO` architecture, and release asset | [Compatibility and release selection](dsm/compatibility.md) |
 | Checksum verification, Package Center install, source ACL, upgrade, and uninstall | [Install, ACLs, and lifecycle](dsm/install-lifecycle.md) |
 | Every basic, deletion, TLS, retry, rate, output, and remote-log profile field | [Profiles and destinations](dsm/profiles.md) |
@@ -170,6 +171,13 @@ protected authenticator access, `X-SDSYNC-Request: 1` to `HTTP_X_SDSYNC_REQUEST=
 Package Center install/start/open behavior, DSM desktop delivery through `synodsmnotify`, and the
 complete two-NAS data path as live acceptance work—not as proven behavior. The SPK does not acquire
 `sysnotify` or register Notification Center email, SMS, mobile, CMS, or rule/channel delivery.
+
+The optional DSM system log channel is the same kind of boundary. Its policy parsing, identifier
+validation, per-group rate limiting, fixed argv, and degraded path are covered by repository tests;
+`synologset1` accepting package-user calls, a given message identifier rendering on a particular DSM
+build, and the entry appearing in Log Center are live acceptance work. The package ships no message
+identifier of its own, because that catalogue belongs to Synology. See
+[DSM system log](dsm/operations.md#dsm-system-log).
 
 Official framework references:
 

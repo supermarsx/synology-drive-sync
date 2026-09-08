@@ -496,6 +496,33 @@ channels cannot repair a missing desktop alert.
 The browser fallback is not an unattended transport. It requires the dashboard to remain open and
 browser permission to be granted.
 
+## DSM system log entry does not appear
+
+This channel is off by default and has no dashboard field, so the first thing to check is whether it
+was ever enabled. In order:
+
+1. `sudo -u "$PACKAGE_USER" -- "$MANAGER" configure-alerts --system-log true --system-log-message-id
+   0xNNNNNNNN` must have been run, with an identifier from DSM's own catalogue. The package ships no
+   identifier and refuses to enable delivery without one, because the catalogue is Synology-owned and
+   cannot be extended by a third-party package.
+2. `--system-log-level` defaults to `warn`, so the `info` events (sync success, service start/stop,
+   install, upgrade) are dropped until it is lowered.
+3. Delivery is rate-limited per event group by the alert `cooldown_seconds`. Consult
+   `var/state/system-log.state`; each `*_epoch` line is the last delivery for that group. A group
+   inside its cooldown is silent by design.
+4. Look for `notification.unavailable` with the message `DSM system log delivery unavailable` in
+   Activity. That is recorded when `/usr/syno/bin/synologset1` is missing, is a symlink, or returns
+   non-zero. Logging never fails the run that raised the event, so the run's own result is unaffected.
+
+To establish the identifier on a new DSM build, run `synologset1` by hand as the package user with a
+candidate identifier, then confirm in Log Center that the entry rendered the expected text. Record
+the DSM version alongside the identifier: it is a Synology-internal value and is not promised stable
+across DSM releases.
+
+The package acquires no `conf/resource` worker, so it installs no Log Center syslog-ng patterndb and
+registers no Notification Center rule. An entry that does not appear under a Log Center filter you
+expected is more likely a classification gap than a delivery failure; check the unfiltered log first.
+
 ## Exit `75`, active lock, or package will not stop
 
 Status and logs should identify the active operation/PID. Wait for a legitimate operation to finish.
@@ -599,6 +626,20 @@ record those results from the installed AppWindow.
 - Activity/log bounds and rotation work through restart;
 - direct DSM success/failure/Doctor desktop alerts obey threshold/cooldown, use only fixed I18N keys,
   expose details only through Activity/logs, and do not register Notification Center channels;
+- the desktop-only claim is confirmed rather than assumed: configure email notifications in Control
+  Panel > Notification, force a sync failure, and record that the alert reaches the DSM desktop
+  notification panel and that **no** email, SMS, or push message is delivered. Synology documents
+  `synodsmnotify` as reaching the desktop panel and attributes the mail/SMS/push fan-out to the
+  `conf/resource` `sysnotify` worker this package does not acquire, and `synodsmnotify` carries no
+  event identifier for a notification rule to match — but that reasoning is documentary, and this is
+  the step that settles it on real hardware. If mail does arrive, the desktop-only boundary claimed
+  throughout these documents is wrong and must be corrected;
+- the DSM system log channel is verified end to end on the exact DSM build: a candidate message
+  identifier is established by hand, `configure-alerts --system-log` accepts it, an event of each
+  severity renders the expected fixed sentence, Log Center displays it, the per-group cooldown
+  suppresses a repeated failure, and an intentionally wrong identifier or a removed
+  `synologset1` degrades to `notification.unavailable` without failing the run. Record the DSM
+  version with the identifier, which is a Synology-internal value with no cross-release promise;
   and
 - service restart after source-NAS reboot preserves configuration without triggering an unreviewed
   immediate mutation.

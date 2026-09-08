@@ -175,5 +175,8 @@ postinst_policy_lock=false
 release_private_process_lock "$lifecycle_lock"
 postinst_lifecycle_lock=false
 trap - 0 HUP INT TERM
+case ${SYNOPKG_PKG_STATUS:-INSTALL} in
+    INSTALL) dsm_log_event package_installed ;;
+esac
 package_message "Installed safely with scheduling disabled. Configure profiles with $manager"
 exit 0

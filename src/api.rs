@@ -32,6 +32,7 @@ use crate::observability::{
     SessionTransport, ShortToken, UrlScheme,
 };
 use crate::path::{RemoteRoot, parent_and_name};
+use crate::plan::Scope;
 use crate::{Error, Result};
 
 const DISCOVERY_APIS: &[&str] = &[
@@ -207,6 +208,14 @@ pub struct RemoteDirectoryPage {
 pub struct RemoteInventory {
     pub root_exists: bool,
     pub entries: BTreeMap<String, RemoteEntry>,
+}
+
+/// A remote inventory walked under a scope, plus whether the budget let it finish.
+#[derive(Debug)]
+pub struct ScopedRemoteInventory {
+    pub inventory: RemoteInventory,
+    /// False when the entry budget stopped the walk, making the inventory a subset of the scope.
+    pub complete: bool,
 }
 
 /// One bounded, display-safe entry returned by a target diagnostic.
@@ -2119,46 +2128,117 @@ impl ApiClient {
         root: &RemoteRoot,
         cancellation: &CancellationToken,
     ) -> Result<RemoteInventory> {
+        let scope = Scope::root();
+        Ok(self
+            .remote_inventory_scoped(root, &scope, usize::MAX, cancellation)?
+            .inventory)
+    }
+
+    /// Walk only the part of the destination that `scope` names.
+    ///
+    /// Entries keep their **root-relative** paths regardless of the scope, so ignore rules and
+    /// plan comparison behave exactly as they do for a whole-tree inventory.
+    ///
+    /// The ancestor guard runs over the scope path rather than the root, so it covers the root's
+    /// ancestors *and* the scope's own components in one pass: a mount point anywhere along the
+    /// way is still rejected. Directories between the root and the scope are recorded, so a
+    /// scoped plan does not propose re-creating parents that already exist.
+    ///
+    /// A scope may name a single file. A scope that does not exist remotely is not an error: it
+    /// is the answer "nothing here is on the NAS yet".
+    pub fn remote_inventory_scoped(
+        &self,
+        root: &RemoteRoot,
+        scope: &Scope,
+        budget: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<ScopedRemoteInventory> {
         let mut entries = BTreeMap::new();
-        let mut pending = vec![root.as_str().to_owned()];
+        let scope_path = root.join(scope.as_str())?;
+        let mut pending = vec![scope_path.clone()];
         let mut root_exists = true;
 
         // Inspect every ancestor before traversing. This also catches a destination below
         // a mounted remote folder, including when the final destination does not exist yet.
-        for path in absolute_prefixes(root.as_str()) {
+        for path in absolute_prefixes(&scope_path) {
             cancellation.check()?;
             let info = match self.get_info(&path) {
                 Ok(info) => info,
                 Err(error) if error.api_code() == Some(408) => {
-                    return Ok(RemoteInventory {
-                        root_exists: false,
-                        entries,
+                    // Absent at or above the root means the root itself is missing. Absent below
+                    // it means only the scope is missing, which is a legitimate answer.
+                    if path.len() <= root.as_str().len() {
+                        root_exists = false;
+                    }
+                    return Ok(ScopedRemoteInventory {
+                        inventory: RemoteInventory {
+                            root_exists,
+                            entries,
+                        },
+                        complete: true,
                     });
                 }
                 Err(error) => return Err(error),
             };
-            if !info.isdir {
+            let is_scope_path = path == scope_path;
+            // A scope is allowed to name one file; anything else on the path must be a directory.
+            let scope_names_a_file = is_scope_path && !scope.is_root() && !info.isdir;
+            if !info.isdir && !scope_names_a_file {
                 return Err(Error::Message(format!(
                     "remote destination ancestor {path} exists but is not a directory"
                 )));
             }
-            if let Some(mount_type) = info
-                .additional
-                .and_then(|additional| additional.mount_point_type)
+            let additional = info.additional.unwrap_or_default();
+            if let Some(mount_type) = additional
+                .mount_point_type
+                .clone()
                 .filter(|value| !value.trim().is_empty())
             {
                 return Err(Error::RemoteMountRoot { path, mount_type });
             }
+            if root.contains_child(&path) {
+                let relative = root.relative(&path)?;
+                let kind = if info.isdir {
+                    EntryKind::Directory
+                } else {
+                    EntryKind::File
+                };
+                let (size, mtime_seconds) =
+                    file_metadata("SYNO.FileStation.Getinfo.getinfo", kind, &additional)?;
+                entries.insert(
+                    relative.clone(),
+                    RemoteEntry {
+                        relative,
+                        remote_path: path.clone(),
+                        kind,
+                        size,
+                        mtime_seconds,
+                        mount_point_type: None,
+                        content_md5: None,
+                    },
+                );
+            }
+            if scope_names_a_file {
+                // Nothing to list beneath a file.
+                pending.clear();
+            }
         }
 
+        let mut complete = true;
         while let Some(folder) = pending.pop() {
             cancellation.check()?;
+            if entries.len() >= budget {
+                complete = false;
+                break;
+            }
             let files = match self.list_directory(&folder, cancellation) {
                 Ok(files) => files,
                 Err(error) if folder == root.as_str() && error.api_code() == Some(408) => {
                     root_exists = false;
                     break;
                 }
+                // The scope itself may simply not exist yet; that is an answer, not a failure.
+                Err(error) if folder == scope_path && error.api_code() == Some(408) => break,
                 Err(error) => return Err(error),
             };
 
@@ -2212,9 +2292,12 @@ impl ApiClient {
             }
         }
 
-        Ok(RemoteInventory {
-            root_exists,
-            entries,
+        Ok(ScopedRemoteInventory {
+            inventory: RemoteInventory {
+                root_exists,
+                entries,
+            },
+            complete,
         })
     }
 

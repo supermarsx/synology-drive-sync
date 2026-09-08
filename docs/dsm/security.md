@@ -412,6 +412,27 @@ Repository validation rejects the legacy `synonotify` event/custom-variable path
 the exact fixed I18N argv. It does not prove that `synodsmnotify` accepts package-user calls or renders
 those keys on a particular DSM build; that remains live-NAS acceptance.
 
+## DSM system log boundary
+
+The durable half of the same boundary is `/usr/syno/bin/synologset1`, reached through the single
+`dsm_log_event` facility. It carries the same argv discipline: an absolute path invoked directly,
+never through `eval`, `sh -c`, `xargs`, or a constructed command string, and each catalogue event
+maps to one literal reviewed sentence. Profile names, exit codes, paths, URLs, account names,
+log or error text, cookies, CSRF or compatibility-token values, passwords, TOTP material, and
+remote-log tokens never enter that argv.
+
+Two properties are specific to this channel. Delivery is off by default and cannot be enabled
+without a message identifier, because those identifiers belong to a Synology-owned catalogue a
+third-party package cannot extend; the package therefore ships none of its own invention and the
+manager refuses an enable that would be silently inert. And the identifier is validated to `0x`
+plus 1..8 hexadecimal digits before it is ever passed to DSM, so a corrupted or hand-edited policy
+file cannot turn the identifier position into an operand of the administrator's choosing.
+
+Repository tests cover the policy parsing, identifier and severity validation, the per-group
+cooldown, the fixed argv, and the degraded path. They do not prove that `synologset1` accepts
+package-user calls, that an identifier renders on a particular DSM build, or that the entry appears
+in Log Center; that remains live-NAS acceptance.
+
 ## Browser content policy
 
 The page uses a restrictive self-only Content Security Policy, no inline event handlers, no `eval`,

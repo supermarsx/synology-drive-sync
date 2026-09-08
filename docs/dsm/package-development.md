@@ -36,7 +36,8 @@ capability declaration.
 the source bundle to `SynologyDriveSync.js`. The assembler deterministically reproduces the normal
 DSM toolkit merge while deriving the installed module filename from the exact bundle SHA-256:
 `ui/config` and `ui/SynologyDriveSync.<bundle-sha256-prefix>.js` use the same content-addressed key,
-contain the class entry plus `depend: []`, and are packaged with `ui/style.css` at mode `0644`.
+contain the application class entry and the desktop widget class entry below, each plus `depend: []`,
+and are packaged with `ui/style.css` at mode `0644`.
 Changing the bundle changes its installed URL, preventing stale JavaScript reuse through DSM or a
 reverse proxy; the validator rejects a filename whose digest does not match its bytes.
 
@@ -44,6 +45,31 @@ The bundle uses `SYNO.namespace` and `Vue.extend`; its root is `v-app-instance` 
 `v-app-window`. It renders the dashboard directly rather than embedding a `type=url` page or iframe.
 It calls the regular packaged `ui/api.cgi` through the canonical same-origin endpoint
 `/webman/3rdparty/synology-drive-sync/api.cgi`.
+
+## Desktop widget contract
+
+`ui-src/app.config` declares a second class, `SYNO.SDS.App.SynologyDriveSync.Widget`, in the same
+module. DSM builds `SYNO.SDS.Config.FnMap` from the installed `ui/config` and offers every entry
+whose `config.type` is `widget` in the desktop widget panel, so a widget is registered exactly like
+an application and not through a separate manifest. The reviewed widget entry carries only the four
+fields DSM reads for a widget card — `type`, `title`, `icon`, and `appInstance` — plus the same
+generated `depend: []`; the builder and validator enumerate that set independently of the application
+field set, so the widget entry cannot become a laxer route for an unreviewed DSM property.
+
+DSM resolves the card class with `Ext.getClassByName`, a plain dotted lookup on the global object,
+and constructs it with `{ renderTo, jsConfig, appWin, height, width: 318 }`. The class is therefore
+an `Ext.Panel`, not a Vue class; `src/widget.js` is that adapter and forwards DSM's
+`onActivate`, `onDeactivate`, `doExpand`, `doCollapse`, and `destroy` callbacks to a Vue panel it
+mounts in the panel body. Registration is a load-time side effect of the same bundle, because DSM
+calls `SYNO.SDS.JSLoad` on the widget class name and then resolves it immediately. When the bundle
+is executed without the DSM desktop toolkit the adapter returns without registering anything, so a
+missing `Ext` can never keep the AppWindow from starting.
+
+The widget reads only the `snapshot` action of the same CGI bridge and holds no timer while its card
+is inactive or the DSM tab is hidden. `validate_spk.py` enumerates the cadence constants as reviewed
+literals and rejects a resting interval below DSM's own 60-second first-party widget poll, a
+non-monotonic failure backoff, an unbounded backoff floor, and any mutating API symbol in the widget
+sources.
 
 DSM, not a lifecycle script, owns the
 `/usr/syno/synoman/webman/3rdparty/synology-drive-sync` link created from `dsmuidir`. The package must
@@ -169,7 +195,7 @@ claimed bit-for-bit reproducible across different compiler/linker/runner images.
 
 - safe outer/inner archive member names, types, modes, ordering, and required files;
 - filename/version/`INFO` architecture and DSM-bound consistency;
-- exact `conf/privilege` and module-keyed `type=app`/AppWindow config, absence of `conf/resource` and legacy sysnotify mail
+- exact `conf/privilege` and module-keyed `type=app`/AppWindow plus `type=widget` config, absence of `conf/resource` and legacy sysnotify mail
   templates, and fixed desktop-alert I18N texts;
 - exact `INFO`/application-class identity, bundle/style members, and the canonical
   `/webman/3rdparty/synology-drive-sync/api.cgi` boundary;
@@ -216,7 +242,8 @@ launch, the official same-origin `SYNO.API.Auth` version 6 token response and pa
 `X-SYNO-TOKEN` forwarding, DSM's executable-owner CGI runtime identity, fixed-helper `X_OK` probing,
 protected `authenticate.cgi` validation/revalidation and execution after a successful probe, bounded
 loopback user-service authentication when that probe returns `EACCES` without invoking the validator,
-package-owned socket behavior, administrator groups, direct `synodsmnotify` desktop delivery, source
+package-owned socket behavior, administrator groups, direct `synodsmnotify` desktop delivery,
+`synologset1` system-log delivery and its Synology-owned message identifiers, source
 ACLs, reverse proxy, File Station, TOTP, Drive indexing, or sync behavior on a physical model.
 Complete [live-NAS acceptance](troubleshooting.md#live-nas-acceptance) before publishing a support
 claim.
@@ -232,3 +259,12 @@ Official framework references:
 - [FHS paths](https://help.synology.com/developer-guide/integrate_dsm/fhs.html)
 - [Platform and `arch` values](https://help.synology.com/developer-guide/appendix/platarchs.html)
 - [Lifecycle scripts](https://help.synology.com/developer-guide/synology_package/scripts.html)
+- [System notification resource worker](https://help.synology.com/developer-guide/resource_acquisition/sysnotify.html)
+- [Syslog config resource worker](https://help.synology.com/developer-guide/resource_acquisition/syslog_config.html)
+
+Both are `conf/resource` workers this package deliberately does not acquire. `sysnotify` is the
+documented route to Control Panel > Notification > Rules; `syslog-config` installs syslog-ng and
+logrotate configuration for a log the package writes itself and is not an emit path — its guide page
+attributes no delivery surface to it. See
+[DSM system log](operations.md#dsm-system-log) for the channel that remains and what it costs to
+change that decision.

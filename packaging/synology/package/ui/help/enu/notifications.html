@@ -30,6 +30,16 @@
   </ul>
   <p>Open Activity and package logs for bounded diagnostic detail.</p>
 
+  <h2>DSM system log</h2>
+  <p>Desktop alerts are not durable: an administrator who was not signed in when one fired never sees it. The package can additionally write a fixed sentence per event to DSM's own system log through <code>/usr/syno/bin/synologset1</code>. This is off by default and has no dashboard field; configure it with <code>configure-alerts</code> over SSH.</p>
+  <dl>
+    <dt>--system-log</dt><dd>Enables system log delivery. Requires a message identifier.</dd>
+    <dt>--system-log-level</dt><dd><code>info</code>, <code>warn</code>, or <code>err</code>; the lowest severity delivered. Default <code>warn</code>.</dd>
+    <dt>--system-log-message-id</dt><dd>An identifier from DSM's own system-log message catalogue, in <code>0x</code> hexadecimal form. The catalogue belongs to Synology and cannot be extended by a third-party package, so this package ships no identifier of its own and delivery stays inert until you supply one you have verified on your DSM build.</dd>
+  </dl>
+  <p>Delivery reuses the alert failure threshold and is rate-limited by the alert cooldown independently per event group, so a routine failing every five minutes produces one system log entry per cooldown rather than one per failure. Events cover sync results, Target Doctor failures, dashboard authentication and request failures, rejected changes, package service start/stop/restart, and install and upgrade. If the DSM binary is absent or refuses the call, the run keeps its own result and Activity records <code>notification.unavailable</code>.</p>
+  <p>This package acquires no DSM resource worker, so it registers no Control Panel notification rule and installs no Log Center pattern. Email, SMS, mobile, and CMS delivery cannot be enabled through this package.</p>
+
   <h2>Open-session signals</h2>
   <p>Browser notification and audible-cue settings are optional, non-secret preferences for the current browser. Saving them requires the notification-change policy and records a fixed <code>session-notifications</code> audit event before local persistence. They operate only while the AppWindow session can observe a newly failed result and do not replace DSM package alerts.</p>
 </body>

@@ -271,8 +271,12 @@ class DsmUiContractTests(unittest.TestCase):
         config = json.loads((UI_SOURCE / "app.config").read_text(encoding="utf-8"))
         notifier = (HERE / "package/libexec/sdsync-common").read_bytes()
         app_id = "SYNO.SDS.App.SynologyDriveSync.Instance"
+        widget_id = "SYNO.SDS.App.SynologyDriveSync.Widget"
         application = config[app_id]
-        self.assertEqual(set(config), {app_id})
+        widget = config[widget_id]
+        self.assertEqual(set(config), {app_id, widget_id})
+        self.assertEqual(widget["type"], "widget")
+        self.assertEqual(widget["appInstance"], app_id)
         self.assertEqual(application["type"], "app")
         self.assertEqual(application["title"], "Synology Drive Sync")
         self.assertEqual(application["appWindow"], app_id)
@@ -287,9 +291,16 @@ class DsmUiContractTests(unittest.TestCase):
         module_path = f"ui/{module}"
         expected_installed_application = dict(application)
         expected_installed_application["depend"] = []
+        expected_installed_widget = dict(widget)
+        expected_installed_widget["depend"] = []
         self.assertEqual(
             installed_config,
-            {module: {app_id: expected_installed_application}},
+            {
+                module: {
+                    app_id: expected_installed_application,
+                    widget_id: expected_installed_widget,
+                }
+            },
         )
         self.assertEqual(
             validate_spk.validate_ui_config(json.dumps(installed_config).encode()),

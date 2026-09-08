@@ -149,5 +149,6 @@ upgrade_policy_lock=false
 release_private_process_lock "$lifecycle_lock"
 upgrade_lifecycle_lock=false
 trap - 0 HUP INT TERM
+dsm_log_event package_upgraded
 package_message "Upgrade completed; private configuration and credentials were retained"
 exit 0

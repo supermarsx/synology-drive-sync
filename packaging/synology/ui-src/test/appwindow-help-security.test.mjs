@@ -28,6 +28,7 @@ const toc = JSON.parse(await readFile(new URL("helptoc.conf", helpRoot), "utf8")
 const strings = await readFile(new URL("texts/enu/strings", helpRoot), "utf8");
 
 const APP_CLASS = "SYNO.SDS.App.SynologyDriveSync.Instance";
+const WIDGET_CLASS = "SYNO.SDS.App.SynologyDriveSync.Widget";
 const HELP_PAGES = [
   "overview", "profiles", "routines", "health", "activity", "notifications", "security", "settings", "about"
 ];
@@ -77,11 +78,17 @@ async function loadAppComponent(postSpy, trace) {
 }
 
 test("native AppWindow title is literal and contextual DSM Help covers every route", async () => {
-  assert.deepEqual(Object.keys(appConfig), [APP_CLASS]);
+  assert.deepEqual(Object.keys(appConfig), [APP_CLASS, WIDGET_CLASS]);
   assert.equal(appConfig[APP_CLASS].type, "app");
   assert.equal(appConfig[APP_CLASS].title, "Synology Drive Sync");
   assert.equal(appConfig[APP_CLASS].appWindow, APP_CLASS);
   assert.equal(appConfig[APP_CLASS].url, undefined);
+  assert.deepEqual(appConfig[WIDGET_CLASS], {
+    type: "widget",
+    title: "Synology Drive Sync",
+    icon: "images/icon_{0}.png",
+    appInstance: APP_CLASS
+  });
 
   assert.match(app, /<v-app-window[\s\S]{0,180}?title="Synology Drive Sync"/);
   assert.doesNotMatch(app, /:title="windowTitle"|APP_TITLE_FALLBACK|resolvedWindowTitle/);

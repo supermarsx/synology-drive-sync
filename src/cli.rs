@@ -35,6 +35,14 @@ const PLAN_LONG_ABOUT: &str = "Discover and authenticate to File Station, scan b
 
 const PLAN_EXAMPLES: &str = "Examples:\n  synology-drive-sync plan ./export /team/export --profile nas\n  synology-drive-sync plan --profile production --delete --output json\n  synology-drive-sync plan ./export /team/export --compare size-only --exclude '*.tmp' --output ndjson\n  synology-drive-sync plan --profile production --exit-code || test $? -eq 10";
 
+const STATUS_LONG_ABOUT: &str = "Report the synchronization state of each entry under a folder, or of one single file, by comparing live local and remote state. Nothing is written and no index is kept: the answer is rebuilt from both sides on every invocation, so it can never be stale, and repeating a query re-scans.\n\nEach entry is reported as in sync, differing (with the comparison that decided it), missing remotely, remote-only, a local/remote type conflict, or excluded from synchronization. Comparison uses the same code path as `plan` and `sync`, so a status row cannot disagree with what a sync would do.\n\nResults are paginated and a page can never exceed 200 entries. Use --cursor with the value printed as the next cursor to continue. Totals always describe the whole scope, not the returned page, so a filtered listing still reports honest counts.\n\nThis command never modifies the NAS and cannot force an upload.";
+
+const STATUS_EXAMPLES: &str = "Examples:\n  synology-drive-sync status --profile nas --state attention\n  synology-drive-sync status ./export /team/export --scope reports/q3\n  synology-drive-sync status --profile nas --scope reports/q3/summary.pdf --output json\n  synology-drive-sync status --profile nas --filter invoice --state differs --limit 50\n  synology-drive-sync status --profile nas --all --cursor 'reports/q3/summary.pdf' --output ndjson";
+
+const RESYNC_LONG_ABOUT: &str = "Re-upload files without comparing them, replacing the remote copy whatever it currently holds. This is the only command that overwrites remote content that may be identical, or newer, than the local file. It never deletes: removing remote-only entries remains a separate `sync --delete` decision.\n\nIt runs in two steps and cannot be collapsed into one. Without --confirm the command only plans: it lists every file it would overwrite, totals the bytes, changes nothing on the NAS, and prints a ticket. Passing that ticket back as --confirm performs the upload.\n\nThe ticket is derived from the exact set of files and bytes you were shown, so confirming proves that set was seen rather than merely that the command was rerun. If the source or destination changed in between, the ticket no longer matches: the command refuses, then immediately prints the new overwrite list and a new ticket in the same output, so a changing NAS never becomes a loop. The ticket carries no clock and does not expire; only a change to what would be overwritten invalidates it.\n\nUse --scope to re-upload one folder or one single file rather than everything.";
+
+const RESYNC_EXAMPLES: &str = "Examples:\n  synology-drive-sync resync --profile nas --scope reports/q3\n  synology-drive-sync resync --profile nas --scope reports/q3 --confirm 4f2a91c0b7d3e685\n  synology-drive-sync resync --profile nas --scope reports/q3/summary.pdf\n  synology-drive-sync resync --profile nas --output json";
+
 const DOCTOR_LONG_ABOUT: &str = "Validate local sources, selected profiles, reverse-proxy routing, required DSM/File Station APIs, authentication, and remote destinations. Target levels are quick (unauthenticated routing/TLS/API discovery), standard (authenticated capabilities/permission/bounded discovery), and extensive (the fullest capability report). The default is standard. Every level is non-mutating unless `target --write-test` is separately supplied; that explicit opt-in runs a disposable create/upload/copy/verify/cleanup probe and must be used only on a prepared non-critical destination.\n\nUse `source` for a local-only scan, --routing-only as the legacy quick check when credentials are intentionally unavailable, or `target` for authenticated target discovery. Without a resolved remote, Standard and Extensive list at most five visible shared-folder roots without selecting one. With a CLI or profile remote, they inspect permission and at most five direct children of that exact destination. Standard and Extensive use normal password and TOTP resolution.";
 
 const DOCTOR_EXAMPLES: &str = "Examples:\n  synology-drive-sync doctor source ./export --hash --output json\n  synology-drive-sync doctor --url https://files.example.com --username mirror-bot --routing-only\n  synology-drive-sync doctor --profile production target /team/export --output json\n  synology-drive-sync doctor --profile acceptance target --write-test\n  synology-drive-sync doctor --config ./config.toml --profiles nas-a,nas-b target --output ndjson";
@@ -114,6 +122,8 @@ impl Cli {
                 legacy: false,
             },
             Some(Command::Plan(arguments)) => Invocation::Plan(arguments),
+            Some(Command::Status(arguments)) => Invocation::Status(arguments),
+            Some(Command::Resync(arguments)) => Invocation::Resync(arguments),
             Some(Command::Doctor(arguments)) => Invocation::Doctor(arguments),
             Some(Command::Config(arguments)) => Invocation::Config(arguments),
             Some(Command::Credentials(arguments)) => Invocation::Credentials(arguments),
@@ -146,6 +156,8 @@ pub enum Invocation<'a> {
         legacy: bool,
     },
     Plan(&'a PlanArgs),
+    Status(&'a StatusArgs),
+    Resync(&'a ResyncArgs),
     Doctor(&'a DoctorArgs),
     Config(&'a ConfigArgs),
     Credentials(&'a CredentialsArgs),
@@ -162,6 +174,14 @@ pub enum Command {
     /// Show the complete sync plan without modifying the NAS.
     #[command(long_about = PLAN_LONG_ABOUT, after_help = PLAN_EXAMPLES)]
     Plan(PlanArgs),
+
+    /// List the per-file sync state of a folder or a single file.
+    #[command(long_about = STATUS_LONG_ABOUT, after_help = STATUS_EXAMPLES)]
+    Status(StatusArgs),
+
+    /// Re-upload files without comparing them, in two steps: plan, then confirm.
+    #[command(long_about = RESYNC_LONG_ABOUT, after_help = RESYNC_EXAMPLES)]
+    Resync(ResyncArgs),
 
     /// Diagnose profile, proxy, API discovery, and authentication.
     #[command(long_about = DOCTOR_LONG_ABOUT, after_help = DOCTOR_EXAMPLES)]
@@ -195,6 +215,75 @@ pub struct PlanArgs {
     /// Exit 10 when the plan contains pending changes; an empty plan exits 0.
     #[arg(long, help_heading = "Output/Logging")]
     pub exit_code: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ResyncArgs {
+    #[command(flatten)]
+    pub sync: SyncArgs,
+
+    /// Perform the re-upload that this ticket describes.
+    #[arg(
+        long,
+        value_name = "TICKET",
+        help_heading = "Resync",
+        long_help = "Perform the re-upload described by a ticket printed by a previous planning run. Without this argument the command only plans and never modifies the NAS.\n\nThe ticket identifies the exact set of files and the byte total you were shown. If either side has changed since, it no longer matches: the command refuses to overwrite anything, then prints the new overwrite list and a new ticket so the next attempt describes what would actually happen. Tickets carry no timestamp and never expire on their own."
+    )]
+    pub confirm: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct StatusArgs {
+    #[command(flatten)]
+    pub sync: SyncArgs,
+
+    /// Match this substring against the file name, case-insensitively.
+    #[arg(
+        long,
+        value_name = "SUBSTRING",
+        help_heading = "Status",
+        long_help = "Return only entries whose final path component contains this substring, compared case-insensitively. This narrows which rows are listed; it never changes the reported totals, which always describe the whole scope."
+    )]
+    pub filter: Option<String>,
+
+    /// Report only these states. May be repeated. Defaults to every state.
+    #[arg(
+        long = "state",
+        value_name = "STATE",
+        value_enum,
+        action = ArgAction::Append,
+        conflicts_with = "all",
+        help_heading = "Status",
+        long_help = "Report only the named states; may be repeated. `attention` is a shorthand for the four states that need a person to act: type-conflict, missing-remote, differs, and remote-only. It is the set a file-status view should request for its default listing.\n\nThe command's own default is every state, because an explicit listing is the better default for a command line. Filtering narrows the rows returned and never the reported totals."
+    )]
+    pub states: Vec<StateArg>,
+
+    /// Report every state explicitly, including in-sync and excluded entries.
+    #[arg(long, help_heading = "Status")]
+    pub all: bool,
+
+    /// Maximum entries to return, 1 through 200.
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u16).range(1..=200),
+        help_heading = "Status",
+        long_help = "Maximum entries in the returned page, between 1 and 200. The 200-entry ceiling is enforced by the query engine itself, so no invocation can request an unbounded listing."
+    )]
+    pub limit: Option<u16>,
+
+    /// Resume the listing after this entry, using a previously printed next cursor.
+    #[arg(
+        long,
+        value_name = "CURSOR",
+        help_heading = "Status",
+        long_help = "Resume after the entry this cursor names, continuing a previous page. A cursor is a position, not a snapshot: the next page is computed from current state, so a cursor stays usable even if the entry it names has since been deleted."
+    )]
+    pub cursor: Option<String>,
+
+    /// Include entries excluded by ignore rules or as DSM-managed.
+    #[arg(long, help_heading = "Status")]
+    pub include_excluded: bool,
 }
 
 #[derive(Debug, Args)]
@@ -370,6 +459,15 @@ pub struct SyncBehaviorArgs {
         long_help = "Add a gitignore-style exclusion; may be repeated. Patterns are matched in the order given, and a pattern beginning with `!` negates a prior match instead of excluding it, exactly like a .gitignore line. This makes it possible to exclude everything and then re-include a narrow subset. For example, `--exclude '*' --exclude '!*.pdf'` excludes every file except PDFs."
     )]
     pub excludes: Vec<String>,
+
+    /// Restrict the run to one SOURCE-relative file or folder.
+    #[arg(
+        long = "scope",
+        value_name = "PATH",
+        help_heading = "Sync",
+        long_help = "Restrict the run to one SOURCE-relative path, naming either a folder (its whole subtree) or a single file. The path is relative to SOURCE: it is not absolute and not a pattern. Entries outside the scope are neither compared nor modified.\n\nMirror deletion is restricted to the scope as well: with --delete, only remote-only entries inside the scope are considered, never the rest of the destination. The deletion guards still apply and are evaluated against the scoped counts, so scope-mirroring a folder whose local contents were all removed still requires --allow-empty-source.\n\nBecause only the scope is scanned, the check for paths that differ only by letter case covers the scope alone. A scoped run cannot create a collision outside it, but a clean scoped result is not a whole-tree result.\n\nThis never implies --compare force. Scoping selects what is examined; it does not change how it is compared."
+    )]
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -829,6 +927,20 @@ pub enum CompareArg {
     Content,
     Metadata,
     SizeOnly,
+}
+
+/// One selectable status state, plus the `attention` shorthand.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StateArg {
+    /// Shorthand for type-conflict, missing-remote, differs, and remote-only.
+    Attention,
+    TypeConflict,
+    MissingRemote,
+    Differs,
+    RemoteOnly,
+    InSync,
+    Excluded,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]

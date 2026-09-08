@@ -24,6 +24,10 @@ HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[1]
 PACKAGE = "synology-drive-sync"
 DSM_APP_CLASS = "SYNO.SDS.App.SynologyDriveSync.Instance"
+# DSM offers a desktop widget for every registered class whose config declares
+# type="widget"; the card is then resolved by this exact name through
+# Ext.getClassByName. It ships in the same module as the AppWindow class.
+DSM_WIDGET_CLASS = "SYNO.SDS.App.SynologyDriveSync.Widget"
 UI_SOURCE = HERE / "ui-src"
 UI_SOURCE_MODULE = "SynologyDriveSync.js"
 UI_MODULE_DIGEST_HEX_LENGTH = 32
@@ -389,9 +393,10 @@ def native_ui_payloads() -> tuple[tuple[bytes, str], ...]:
     """Validate and render the fixed AppWindow payload staged in the SPK."""
     app_config_path = UI_SOURCE / "app.config"
     app_config = _json_object(app_config_path)
-    if set(app_config) != {DSM_APP_CLASS}:
+    if set(app_config) != {DSM_APP_CLASS, DSM_WIDGET_CLASS}:
         raise PackageError(
-            f"app.config must define exactly the native DSM class {DSM_APP_CLASS}"
+            f"app.config must define exactly the native DSM classes {DSM_APP_CLASS} "
+            f"and {DSM_WIDGET_CLASS}"
         )
     application = app_config[DSM_APP_CLASS]
     expected_application = {
@@ -424,6 +429,33 @@ def native_ui_payloads() -> tuple[tuple[bytes, str], ...]:
                 f"app.config entry {DSM_APP_CLASS}.{key} must equal {expected!r}"
             )
 
+    # The widget entry is enumerated and rendered by a different DSM surface
+    # than the app entry, and it reads a different, smaller set of fields: the
+    # desktop widget card resolves its title through
+    # UIString.GetLocalizedString(config.title, [class, config.appInstance]),
+    # its header icon through config.jsBaseURL + "/" + config.icon, and
+    # launches config.appInstance when that icon is clicked. Enumerate exactly
+    # those four keys rather than reusing the application field set, so an
+    # unreviewed DSM property cannot arrive through the widget entry either.
+    widget = app_config[DSM_WIDGET_CLASS]
+    expected_widget = {
+        "type": "widget",
+        "title": "Synology Drive Sync",
+        "icon": "images/icon_{0}.png",
+        "appInstance": DSM_APP_CLASS,
+    }
+    if not isinstance(widget, dict):
+        raise PackageError(f"app.config entry {DSM_WIDGET_CLASS} must be an object")
+    if set(widget) != set(expected_widget):
+        raise PackageError(
+            f"app.config entry {DSM_WIDGET_CLASS} must contain only the reviewed fields"
+        )
+    for key, expected in expected_widget.items():
+        if widget.get(key) != expected:
+            raise PackageError(
+                f"app.config entry {DSM_WIDGET_CLASS}.{key} must equal {expected!r}"
+            )
+
     config_define_path = UI_SOURCE / "config.define"
     config_define = _json_object(config_define_path)
     expected_define = {
@@ -447,9 +479,16 @@ def native_ui_payloads() -> tuple[tuple[bytes, str], ...]:
     # depends on an unpinned DSM toolkit installation.
     installed_application = dict(application)
     installed_application["depend"] = []
+    installed_widget = dict(widget)
+    installed_widget["depend"] = []
     installed_config = (
         json.dumps(
-            {installed_module: {DSM_APP_CLASS: installed_application}},
+            {
+                installed_module: {
+                    DSM_APP_CLASS: installed_application,
+                    DSM_WIDGET_CLASS: installed_widget,
+                }
+            },
             ensure_ascii=False,
             indent=2,
             separators=(",", ": "),

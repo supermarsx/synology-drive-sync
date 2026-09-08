@@ -116,6 +116,24 @@ pub enum Error {
     #[error("source file changed while it was being synchronized: {0:?}")]
     SourceChanged(PathBuf),
 
+    /// A resync confirmation named a set of files that is no longer what would be overwritten.
+    ///
+    /// Not a dead end: the caller is shown the new overwrite list and a new ticket alongside this,
+    /// so a destination that changes under them is one step to resolve rather than a loop.
+    #[error(
+        "resync ticket {presented} no longer describes what would be overwritten (now {current}); \
+         review the refreshed plan below and confirm it instead"
+    )]
+    ResyncTicketStale { presented: String, current: String },
+
+    /// A `--scope` argument named a relative path that exists on neither side.
+    ///
+    /// Distinct from a generic failure on purpose: a caller that asked about one folder or file
+    /// needs to tell "that path is not there" apart from "the query failed", and callers render
+    /// the two very differently.
+    #[error("scope {0:?} does not exist in the local source or under the remote destination")]
+    ScopeNotFound(String),
+
     #[error("DSM returned an invalid MD5 content digest")]
     InvalidContentHash,
 
