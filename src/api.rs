@@ -2225,6 +2225,10 @@ impl ApiClient {
     /// children, and returns at most five deterministic samples. Sync planning continues to use
     /// the complete recursive inventory; Doctor uses this narrow path so an unexpectedly large
     /// tree cannot turn an interactive health check into an unbounded scan.
+    ///
+    /// A caller that has just walked the destination itself wants
+    /// [`Self::diagnostic_remote_inventory_of_existing_root`], which skips the opening `getinfo`
+    /// as already answered rather than paying for it twice.
     pub fn diagnostic_remote_inventory(
         &self,
         root: &RemoteRoot,
@@ -2304,6 +2308,36 @@ impl ApiClient {
             });
         }
 
+        self.diagnostic_inventory_page(root, remaining()?)
+    }
+
+    /// The same bounded inventory, for a destination the caller has already inspected.
+    ///
+    /// [`Self::diagnostic_remote_inventory`] opens with a `getinfo` that establishes three things:
+    /// the path exists, it is a directory, and it is not a mount boundary. The doctor's write
+    /// permission check walks the destination one component at a time immediately beforehand and
+    /// establishes exactly those three, for exactly that path, from the same `getinfo` method with
+    /// the same `additional` fields -- it returns `RemoteMountRoot` for a mount boundary and a
+    /// plain error for a non-directory, so a walk that reports the destination as existing has
+    /// already ruled both out. Repeating the request costs a full round trip to re-learn it.
+    ///
+    /// Only for a caller holding that evidence. Every other path keeps the opening `getinfo`,
+    /// which is what turns an absent destination into `absent_root` rather than an error.
+    pub fn diagnostic_remote_inventory_of_existing_root(
+        &self,
+        root: &RemoteRoot,
+    ) -> Result<DiagnosticRemoteInventory> {
+        self.required_session()?;
+        // The whole budget goes to the listing: there is no `getinfo` here to share it with.
+        self.diagnostic_inventory_page(root, DIAGNOSTIC_INVENTORY_TIMEOUT)
+    }
+
+    /// The one bounded direct-child page both diagnostic inventories return.
+    fn diagnostic_inventory_page(
+        &self,
+        root: &RemoteRoot,
+        timeout: Duration,
+    ) -> Result<DiagnosticRemoteInventory> {
         let parameters = vec![
             pair("folder_path", json_string(root.as_str())?),
             pair("offset", "0"),
@@ -2317,7 +2351,7 @@ impl ApiClient {
             ),
         ];
         let data: ListData = self
-            .call_bounded("SYNO.FileStation.List", 2, "list", parameters, remaining()?)?
+            .call_bounded("SYNO.FileStation.List", 2, "list", parameters, timeout)?
             .ok_or_else(|| Error::InvalidResponse {
                 operation: "SYNO.FileStation.List.list".to_owned(),
                 message: "successful response contained no directory data".to_owned(),

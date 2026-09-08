@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use clap::CommandFactory;
 use serde_json::{Value, json};
+use synology_drive_sync::DOCTOR_SECTION_SPECS;
 use synology_drive_sync::api::{
     self, API_REQUIREMENTS, ApiCatalogue, ApiClient, ApiObservation, ApiRequirement,
     CapabilityProbe, CapabilityProbeSpec, ChannelProbe, ClientOptions, DestinationPathResolution,
@@ -1811,61 +1812,6 @@ struct DoctorSection {
     remediation: Option<&'static str>,
 }
 
-/// Report sections in display order, each with the step at which it actually runs.
-///
-/// Display order and execution order deliberately differ: File Station capabilities are settled
-/// from the cached discovery response *before* authentication, but reading it fourth in the report
-/// keeps the transport, session, and destination groups together. The step number is carried so
-/// the report can state the real order rather than implying the printed one.
-///
-/// The transport group is the same idea applied to the run's two ends. Reachability is measured
-/// at step 1, before any client exists, because a latency figure taken through a pooled
-/// connection measures nothing. The intermediary fingerprint and the cookie ledger are summaries
-/// of responses other sections produced, so they run last -- after logout, whose `Set-Cookie` is
-/// itself evidence -- and are displayed next to the checks they explain.
-const DOCTOR_SECTION_SPECS: [(&str, &str, u8); 16] = [
-    (
-        "network_reachability",
-        "Network reachability and connect timing",
-        1,
-    ),
-    ("routing_tls", "Routing and TLS negotiation", 2),
-    ("dsm_api_discovery", "DSM API discovery", 3),
-    ("capability_enumeration", "DSM capability enumeration", 4),
-    (
-        "intermediary_transport",
-        "Intermediaries and reverse proxies",
-        15,
-    ),
-    ("dsm_session_auth", "DSM session authentication", 6),
-    (
-        "session_channel_ablation",
-        "DSM session channel ablation",
-        7,
-    ),
-    ("session_concurrency", "Concurrent session fan-out", 8),
-    ("session_cookie_ledger", "Session cookie permanence", 16),
-    ("file_station_capabilities", "File Station capabilities", 5),
-    (
-        "capability_diagnosis",
-        "File Station capability diagnosis",
-        9,
-    ),
-    (
-        "destination_path_resolution",
-        "Destination path resolution",
-        10,
-    ),
-    ("destination_permissions", "Destination permissions", 11),
-    ("destination_inventory", "Destination inventory", 12),
-    (
-        "disposable_write_verify_cleanup",
-        "Disposable write, verify, and cleanup",
-        13,
-    ),
-    ("session_logout", "DSM session logout", 14),
-];
-
 /// Sections whose verdict is a summary of requests other sections already own.
 ///
 /// They are recorded after the run finishes, so the generic "not run because X failed" placeholder
@@ -2218,6 +2164,18 @@ const DOCTOR_PROBE_TIMEOUT_HINT: &str = "TCP connects succeeded and every HTTP s
      figures are missing. If they failed too, raise --request-timeout, or reach the NAS by a \
      route with fewer hops than a QuickConnect relay.";
 
+/// The probe stopped itself, so its silence is about the budget rather than about the path.
+///
+/// Deliberately not one of the two hints above: both of those name a fault on the path, and
+/// naming one here would send the reader after a problem this evidence does not support. The
+/// probe running out of time says nothing about whether DSM answers -- the authenticated sections
+/// below made real requests and are the better witness.
+const DOCTOR_PROBE_BUDGET_HINT: &str = "the probe ran out of its own time budget before taking the samples it wanted, so this is a \
+     statement about the diagnostic rather than about the path. Read the authenticated sections \
+     below: they made real requests, and if they succeeded then only the timing detail is \
+     missing. Slow but successful TCP connects are the usual cause, and they are worth a look on \
+     their own.";
+
 /// Sockets open and the HTTP request is refused, reset, or terminated before any response.
 const DOCTOR_PROBE_TRANSPORT_HINT: &str = "TCP connects succeeded but no HTTP request completed, which points at the layer between the \
      socket and DSM rather than at the session: TLS termination, a reverse proxy that does not \
@@ -2417,9 +2375,12 @@ fn doctor_checks(
 ) -> Result<DoctorResult> {
     let call_log = DoctorCallLog::default();
     let reachability_started = Instant::now();
+    // Held rather than passed inline: the section reports what the probe was asked for as well as
+    // what it got, so a run that stopped short can say by how much.
+    let budget = reachability_budget(settings.level);
     let (reachability, probes) = measure_reachability(
         &client_options(&settings.url, &settings.network),
-        reachability_budget(settings.level),
+        budget,
         cancellation,
     );
     let reachability_elapsed = reachability_started.elapsed();
@@ -2435,7 +2396,7 @@ fn doctor_checks(
         perform_write_probe,
         call_log,
     )?;
-    record_reachability_section(&mut result, reachability, reachability_elapsed);
+    record_reachability_section(&mut result, reachability, budget, reachability_elapsed);
     record_transport_summary_sections(&mut result, &settings.url);
     Ok(result)
 }
@@ -2448,6 +2409,7 @@ fn doctor_checks(
 fn record_reachability_section(
     result: &mut DoctorResult,
     reachability: ReachabilityReport,
+    budget: ReachabilityBudget,
     elapsed: Duration,
 ) {
     // The hint is chosen by the branch that was actually taken, not by a condition tested
@@ -2508,6 +2470,27 @@ fn record_reachability_section(
             } else {
                 DOCTOR_PROBE_TRANSPORT_HINT
             }),
+        )
+    } else if reachability.budget_exhausted {
+        // Placed below the two findings above and above the consistent verdict, deliberately.
+        // Those two are real conclusions about the path and stay reportable on a probe that ran
+        // short. "Consistent" is not: the samples that would have contradicted it are exactly the
+        // ones the ceiling prevented, so a probe that stopped early must not be allowed to pass
+        // itself off as one that looked and found nothing wrong. That verdict is reachable with
+        // `http.failures == 0`, which `connects_but_does_not_answer` excludes, so before this
+        // branch existed a probe that took no HTTP sample at all reported PASS while the
+        // transport block underneath said it had stopped early.
+        (
+            DoctorSectionStatus::Warn,
+            format!(
+                "the probe stopped at its own {:.0} s ceiling after {} of {} HTTP sample(s), so \
+                 this run did not measure the path as fully as the {} level asks for",
+                budget.total.as_secs_f64(),
+                reachability.http.first_byte.len(),
+                budget.http_samples,
+                result.level.as_str(),
+            ),
+            Some(DOCTOR_PROBE_BUDGET_HINT),
         )
     } else if reachability.suggests_multiple_paths() {
         let mut reasons = Vec::new();
@@ -4147,6 +4130,14 @@ fn doctor_run(
                 // without claiming the requests a second time.
                 let session_was_rejected =
                     write_result.as_ref().err().is_some_and(session_is_unusable);
+                // `destination_exists` is set only where the walk ran every component to the end
+                // without returning early, which means the destination's own `getinfo` came back
+                // as an existing directory that is not a mount boundary. That is precisely what
+                // the inventory's opening `getinfo` re-establishes, so the inventory can start at
+                // its listing instead. Any other outcome -- an absent component, a mount root, a
+                // refused permission -- leaves the question open and keeps the full check.
+                let destination_walked_and_exists =
+                    matches!(&write_result, Ok(check) if check.destination_exists);
                 match write_result {
                     Ok(write_check) => {
                         result.write_permission_scope = Some(if write_check.destination_exists {
@@ -4212,10 +4203,13 @@ fn doctor_run(
                         inventory_started.elapsed(),
                     );
                 } else {
-                    match cancellation
-                        .check()
-                        .and_then(|()| client.diagnostic_remote_inventory(&root))
-                    {
+                    match cancellation.check().and_then(|()| {
+                        if destination_walked_and_exists {
+                            client.diagnostic_remote_inventory_of_existing_root(&root)
+                        } else {
+                            client.diagnostic_remote_inventory(&root)
+                        }
+                    }) {
                         Ok(inventory) => {
                             result.remote_checked = true;
                             result.remote_exists = Some(inventory.root_exists);
@@ -7762,7 +7756,12 @@ mod tests {
             .transcript
             .lock()
             .expect("transport transcript lock") = transcript;
-        record_reachability_section(&mut result, reachability, Duration::from_millis(742));
+        record_reachability_section(
+            &mut result,
+            reachability,
+            ReachabilityBudget::extensive(),
+            Duration::from_millis(742),
+        );
         record_transport_summary_sections(
             &mut result,
             "https://nascheckoffice.fr3.quickconnect.to/",
@@ -7997,7 +7996,12 @@ mod tests {
         }
         let case = |report: ReachabilityReport| {
             let mut result = routing_doctor_result();
-            record_reachability_section(&mut result, report, Duration::from_millis(742));
+            record_reachability_section(
+                &mut result,
+                report,
+                ReachabilityBudget::extensive(),
+                Duration::from_millis(742),
+            );
             let section = result
                 .sections
                 .iter()
@@ -8072,9 +8076,43 @@ mod tests {
                 ..HttpTimingObservation::default()
             },
         );
-        let (status, _, remediation) = case(healthy);
+        let (status, _, remediation) = case(healthy.clone());
         assert_eq!(status, DoctorSectionStatus::Pass);
         assert_eq!(remediation, None);
+
+        // The same clean evidence, from a probe that stopped at its own ceiling. Nothing here
+        // points at a fault -- one address, samples that agree -- which is exactly why this used
+        // to report PASS: `connects_but_does_not_answer` requires `failures > 0`, so a probe that
+        // ran short without failing anything fell through to the consistent verdict and claimed a
+        // path it had not finished measuring. The transport block underneath said it had stopped
+        // early, so the run contradicted itself and the headline was the half most people read.
+        let mut stopped_early = healthy;
+        stopped_early.budget_exhausted = true;
+        stopped_early.http.first_byte = {
+            let mut taken = LatencySamples::default();
+            taken.push(Duration::from_micros(96_200));
+            taken
+        };
+        let (status, detail, remediation) = case(stopped_early);
+        assert_eq!(
+            status,
+            DoctorSectionStatus::Warn,
+            "a probe that ran out of budget must not report a consistent path: {detail}"
+        );
+        assert!(
+            detail.contains("20 s ceiling"),
+            "the finding names the ceiling that stopped it: {detail}"
+        );
+        assert!(
+            detail.contains("1 of 3 HTTP sample"),
+            "and how far short it fell: {detail}"
+        );
+        assert_eq!(remediation, Some(DOCTOR_PROBE_BUDGET_HINT));
+        assert_ne!(
+            remediation,
+            Some(DOCTOR_PROBE_TRANSPORT_HINT),
+            "the probe stopping itself is not evidence of a fault on the path"
+        );
     }
 
     fn routing_doctor_result() -> DoctorResult {

@@ -22,6 +22,156 @@ api_socket_dir=$runtime_root
 api_socket=$api_socket_dir/api.sock
 api_log=$log_root/api.log
 
+# ---------------------------------------------------------------------------
+# Poll pacing for lifecycle wait loops
+#
+# These live here, in the library the lifecycle scripts source, rather than in
+# libexec/sdsync-common: the two are deliberately separate -- both define
+# same_private_executable, and this file is sourced by preinst before
+# $package_root exists, so it cannot source that one. Kept self-contained on
+# purpose, using only what this library already provides.
+#
+# A condition that becomes true 20 ms after a failed check still costs a full
+# second at one-second granularity, and a run crosses roughly 258 lifecycle
+# transitions. These helpers let the wait loops look more often.
+#
+# They apply to exactly one kind of site: where the sleep is *sampling
+# granularity* and nothing else. Shortening the other kinds changes behaviour
+# rather than latency, and each failure is silent:
+#
+#   * a `while count < 3` loop after a signal is a **grace period** -- the
+#     iterations are the guarantee, and shortening turns 3 s into 0.15 s while
+#     the guarding test still passes for the wrong reason;
+#   * the event-log lock's `attempt < 10` retries are a **tolerance** -- the
+#     bound counts attempts, not seconds, and there is no timeout-named
+#     variable to notice, so ~10 s of tolerance quietly becomes ~0.5 s;
+#   * the staleness confirmation below is a **proof** -- the duration between
+#     two observations is the evidence, and shortening it can recover a lock
+#     from an owner that is merely mid-write;
+#   * a loop that re-sends a signal on each pass multiplies the *signals*, not
+#     just the checks;
+#   * and sdsync-controller's runner-guard sleep is already interrupt-driven,
+#     forking a cancellable child per tick, so shortening makes it slower.
+#
+# Two properties keep the safe case safe. Elapsed time accumulates in
+# milliseconds rather than iterations, so a caller's seconds budget survives a
+# change of resolution -- without that, dropping the interval does not speed a
+# 120 s timeout up, it cuts it to 6 s. And the interval widens back to one
+# second after the first, because these loop bodies each spawn several
+# processes: polling a long wait at 50 ms would multiply the fork rate
+# twentyfold on hardware where fork is the expensive operation, long after the
+# fast case has been missed.
+# ---------------------------------------------------------------------------
+poll_resolution_file=$runtime_root/poll-resolution
+poll_resolution_ms=1000
+poll_fast_window_ms=1000
+poll_probe_iterations=4
+poll_elapsed_ms=0
+
+# Sub-second sleep is a busybox extension, not POSIX, and DSM ships a custom
+# build. Rather than trust a flag, measure: four 50 ms sleeps land inside one
+# second, while four that round up to a second take about four. `date` gives
+# whole seconds, which is all busybox guarantees, and the 1-versus-4 gap leaves
+# room for a loaded NAS at boot. The exit status is checked first so a build
+# that rejects the argument outright costs nothing.
+probe_poll_resolution() {
+    poll_probe_ms=1000
+    poll_probe_before=$(date +%s 2>/dev/null || true)
+    poll_probe_index=0
+    while [ "$poll_probe_index" -lt "$poll_probe_iterations" ]; do
+        sleep 0.05 2>/dev/null || { poll_probe_before=; break; }
+        poll_probe_index=$((poll_probe_index + 1))
+    done
+    poll_probe_after=$(date +%s 2>/dev/null || true)
+    case ${poll_probe_before:-} in ''|*[!0-9]*) poll_probe_before= ;; esac
+    case ${poll_probe_after:-} in ''|*[!0-9]*) poll_probe_after= ;; esac
+    if [ -n "$poll_probe_before" ] && [ -n "$poll_probe_after" ] \
+        && [ "$((poll_probe_after - poll_probe_before))" -le 1 ]; then
+        poll_probe_ms=50
+    fi
+    poll_resolution_ms=$poll_probe_ms
+    poll_resolution_publish
+}
+
+# The result is runtime state, but $runtime_root is only purged on uninstall --
+# preupgrade merely refuses on specific transition artifacts and postupgrade's
+# ensure_layout creates without deleting -- so an upgrade can carry a stale
+# result into a build whose busybox differs. The package identity stamp makes
+# that structurally impossible rather than merely unlikely.
+poll_resolution_identity() {
+    poll_identity_raw=$(stat -c '%d:%i:%s:%Y' \
+        "$package_root/bin/sdsync-dsm" "$common_runtime" 2>/dev/null) || return 1
+    set -- $poll_identity_raw
+    poll_identity=$*
+    [ -n "$poll_identity" ]
+}
+
+poll_resolution_publish() {
+    poll_resolution_identity || return 0
+    [ -d "$runtime_root" ] && [ ! -L "$runtime_root" ] || return 0
+    poll_publish_temp=$poll_resolution_file.$$
+    [ ! -e "$poll_publish_temp" ] && [ ! -L "$poll_publish_temp" ] || return 0
+    if [ -e "$poll_resolution_file" ] || [ -L "$poll_resolution_file" ]; then
+        [ -f "$poll_resolution_file" ] && [ ! -L "$poll_resolution_file" ] || return 0
+    fi
+    { printf '%s\n%s\n' "$poll_identity" "$poll_resolution_ms" > "$poll_publish_temp"; } 2>/dev/null || {
+        rm -f "$poll_publish_temp" 2>/dev/null || true
+        return 0
+    }
+    chmod 0600 "$poll_publish_temp" 2>/dev/null || true
+    mv -f "$poll_publish_temp" "$poll_resolution_file" 2>/dev/null || \
+        rm -f "$poll_publish_temp" 2>/dev/null || true
+    return 0
+}
+
+# Fail closed. Missing, unreadable, malformed, or stamped by a different build
+# all mean one second -- never fractional. A process that finds no result does
+# not re-probe, because that would reintroduce the cost the lifecycle entry
+# point already paid; absent simply means the fallback.
+load_poll_resolution() {
+    poll_resolution_ms=1000
+    [ ! -L "$poll_resolution_file" ] && [ -f "$poll_resolution_file" ] \
+        && [ -r "$poll_resolution_file" ] || return 0
+    poll_resolution_identity || return 0
+    {
+        IFS= read -r poll_loaded_identity || return 0
+        IFS= read -r poll_loaded_ms || return 0
+        if IFS= read -r poll_loaded_surplus; then return 0; fi
+        [ "$poll_loaded_identity" = "$poll_identity" ] || return 0
+        case $poll_loaded_ms in ''|*[!0-9]*) return 0 ;; esac
+        [ "$poll_loaded_ms" -ge 10 ] && [ "$poll_loaded_ms" -le 1000 ] || return 0
+        poll_resolution_ms=$poll_loaded_ms
+    } < "$poll_resolution_file"
+    return 0
+}
+
+poll_reset() {
+    poll_elapsed_ms=0
+}
+
+# One tick. Fractional only inside the fast window and only when the probe
+# proved it; everything else is the ordinary one-second sleep.
+poll_wait() {
+    if [ "$poll_resolution_ms" -lt 1000 ] && [ "$poll_elapsed_ms" -lt "$poll_fast_window_ms" ]; then
+        if sleep 0.05 2>/dev/null; then
+            poll_elapsed_ms=$((poll_elapsed_ms + poll_resolution_ms))
+            return 0
+        fi
+        poll_resolution_ms=1000
+    fi
+    sleep 1
+    poll_elapsed_ms=$((poll_elapsed_ms + 1000))
+}
+
+# The budget stays in seconds, as the operator set it and as the messages
+# report it; only the accounting is finer.
+poll_expired() {
+    poll_budget_seconds=$1
+    case $poll_budget_seconds in ''|*[!0-9]*) return 0 ;; esac
+    [ "$poll_elapsed_ms" -ge "$((poll_budget_seconds * 1000))" ]
+}
+
+
 package_message() {
     if [ -n "${SYNOPKG_TEMP_LOGFILE:-}" ]; then
         printf '%s\n' "$*" >> "$SYNOPKG_TEMP_LOGFILE"

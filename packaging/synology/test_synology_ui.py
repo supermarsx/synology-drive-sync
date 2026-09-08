@@ -163,29 +163,48 @@ class DsmUiContractTests(unittest.TestCase):
             "AppWindow result observation window and the DSM API mirror disagree",
         )
 
-        # Second cross-layer list that nothing else relates. The CLI owns the
-        # diagnostic sections; the AppWindow keeps its own copy to draw the
-        # pending view and to pad a document that omitted one. A stale copy
-        # silently under-reports a diagnostic run, which is worst precisely when
-        # someone is troubleshooting.
+        # Second cross-layer list that nothing else relates. The library owns the
+        # diagnostic sections now: the CLI that emits them, the DSM progress-record
+        # validator that resolves a job-supplied id against them, and this AppWindow
+        # copy all read from one definition. The AppWindow's is necessarily a
+        # duplicate because it is JavaScript, so this is what holds it in step. A
+        # stale copy silently under-reports a diagnostic run, which is worst
+        # precisely when someone is troubleshooting.
         cli = (repository / "src/main.rs").read_text(encoding="utf-8")
+        library = (repository / "src/lib.rs").read_text(encoding="utf-8")
+        self.assertTrue(
+            "const DOCTOR_SECTION_SPECS" not in cli,
+            "the CLI must read the shared catalogue rather than redeclaring one",
+        )
         specs = re.search(
-            r"const DOCTOR_SECTION_SPECS: \[\(&str, &str, u8\); (\d+)\] = \[(.*?)\n\];",
-            cli,
+            r"pub const DOCTOR_SECTION_SPECS: \[\(&str, &str, u8\); (\d+)\] = \[(.*?)\n\];",
+            library,
             re.S,
         )
-        self.assertIsNotNone(specs, "CLI doctor section table is missing")
+        self.assertIsNotNone(specs, "shared doctor section table is missing")
         cli_ids = re.findall(r'\(\s*"([a-z_]+)",\s*"', specs.group(2))
         self.assertEqual(
             len(cli_ids),
             int(specs.group(1)),
-            "CLI doctor section table declares a length its entries do not match",
+            "shared doctor section table declares a length its entries do not match",
         )
         catalog = re.search(
             r"const DOCTOR_SECTION_CATALOG = Object\.freeze\(\[(.*?)\n\]\);", app, re.S
         )
         self.assertIsNotNone(catalog, "AppWindow doctor section catalog is missing")
         ui_ids = re.findall(r'id: "([a-z_]+)"', catalog.group(1))
+
+        # Both sides must actually carry sections before their agreement means
+        # anything. Without this, a regex that matched but captured nothing would
+        # compare an empty list against an empty list and pass -- a green result
+        # from a test that checked no section at all, which is the exact failure
+        # this comparison exists to prevent in the product.
+        self.assertGreater(
+            len(cli_ids), 0, "shared doctor section table parsed to no sections"
+        )
+        self.assertGreater(
+            len(ui_ids), 0, "AppWindow doctor section catalog parsed to no sections"
+        )
 
         missing = [section for section in cli_ids if section not in ui_ids]
         extra = [section for section in ui_ids if section not in cli_ids]
@@ -2040,7 +2059,7 @@ function bind(context, names) {
         with self.assertRaisesRegex(validate_spk.ValidationError, "retry pending and transport"):
             validate_build(
                 api=source["api"].replace(
-                    b"await delay(interval, auth && auth.signal, limits, observation);",
+                    b"await delay(retryInterval, auth && auth.signal, limits, observation);",
                     b"await Promise.resolve();",
                     1,
                 )
@@ -2048,8 +2067,8 @@ function bind(context, names) {
         with self.assertRaisesRegex(validate_spk.ValidationError, "queued-result observer"):
             validate_build(
                 api=source["api"].replace(
-                    b"if (!observation && consecutiveObservationFailures >= RESULT_POLL_OBSERVATION_FAILURES)",
-                    b"if (consecutiveObservationFailures >= RESULT_POLL_OBSERVATION_FAILURES)",
+                    b"if (!observation && observationLostForTooLong)",
+                    b"if (observationLostForTooLong)",
                     1,
                 )
             )

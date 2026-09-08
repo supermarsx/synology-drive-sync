@@ -273,6 +273,10 @@ hard_stop_exact_launched_child() {
         *) return 73 ;;
     esac
     kill -KILL "$hard_stop_pid" 2>/dev/null || true
+    # Poll bucket B -- the three iterations *are* the three-second grace after
+    # the signal, not a sampling rate. Converting this to poll_wait would leave
+    # the loop looking identical while the grace became 0.15 s, and the test
+    # that pins 3 <= elapsed <= 4 would still pass for the wrong reason.
     hard_stop_count=0
     while [ "$hard_stop_count" -lt 3 ]; do
         hard_stop_status=0
@@ -601,6 +605,8 @@ stop_failed_start_children() {
                 ;;
             *) return 73 ;;
         esac
+        # Poll bucket B -- three iterations are the post-signal grace, not a
+        # sampling rate. Same for the KILL loop below.
         failed_stop_count=0
         while [ "$failed_stop_count" -lt 3 ]; do
             failed_stop_identity=0
@@ -855,6 +861,10 @@ cleanup_failed_start() {
     # commit that this failure path never writes.
     remove_own_controller_start_lease >/dev/null 2>&1 || true
     cleanup_api_socket_identity=${launched_api_socket_identity:-}
+    # Not a bucket-A site despite the shape: the body re-sends TERM on every
+    # pass, so the interval sets the *signal* rate as well as the check rate.
+    # Polling this twenty times faster would send twenty times the signals, and
+    # the bound is a ten-second grace besides. Left at one second deliberately.
     cleanup_count=0
     while [ "$cleanup_count" -lt 10 ]; do
         cleanup_live=false
@@ -1003,6 +1013,12 @@ case ${1:-} in
             package_message "service startup timeout must be between 1 and 600 seconds"
             exit 1
         fi
+        # One probe per lifecycle transition, ahead of the readiness loops that
+        # are about to use it. The controller and everything downstream inherit
+        # the recorded result rather than re-probing: the loops that run before
+        # the controller exists are the densest part of the transition budget,
+        # and a per-process probe would leave exactly them at one second.
+        probe_poll_resolution
         trap finish_start 0
         trap 'exit 1' HUP INT TERM
         acquire_lifecycle_serialization || exit 1
@@ -1120,7 +1136,14 @@ case ${1:-} in
         esac
         launched_api_boot=$api_supervisor_boot
         api_prepared=false
+        # Poll bucket A. The header keeps its original shape deliberately: the
+        # packaging suite rewrites this exact line by source-text substitution
+        # to shrink the budget during failed-start tests, so "$count" has to
+        # stay a count of *seconds*. It is now accumulated elapsed time rather
+        # than an iteration tally, which is what lets the interval drop below a
+        # second without turning a 120 s budget into 6 s.
         count=0
+        poll_reset
         while [ "$count" -lt "$startup_timeout" ]; do
             saved_api_pid=$(api_pid 2>/dev/null || true)
             if [ "$saved_api_pid" = "$launched_api_pid" ] && \
@@ -1138,8 +1161,8 @@ case ${1:-} in
                 fi
             fi
             script_pid_live "$launched_api_pid" || break
-            sleep 1
-            count=$((count + 1))
+            poll_wait
+            count=$((poll_elapsed_ms / 1000))
         done
         if [ "$api_prepared" != true ]; then
             package_message "API service failed before startup commit; inspect $api_log"
@@ -1159,7 +1182,9 @@ case ${1:-} in
         esac
         launched_controller_boot=$api_supervisor_boot
         services_prepared=false
+        # Poll bucket A -- see the note on the API readiness loop above.
         count=0
+        poll_reset
         while [ "$count" -lt "$startup_timeout" ]; do
             if launched_controller_prepared_matches "$launched_controller_pid" \
                 "$launched_controller_start" "$launched_controller_boot" \
@@ -1171,8 +1196,8 @@ case ${1:-} in
             fi
             script_pid_live "$launched_controller_pid" || break
             script_pid_live "$launched_api_pid" || break
-            sleep 1
-            count=$((count + 1))
+            poll_wait
+            count=$((poll_elapsed_ms / 1000))
         done
         if [ "$services_prepared" != true ]; then
             report_controller_precommit_diagnostics
@@ -1184,7 +1209,9 @@ case ${1:-} in
             exit 1
         }
         services_ready=false
+        # Poll bucket A -- see the note on the API readiness loop above.
         count=0
+        poll_reset
         while [ "$count" -lt "$startup_timeout" ]; do
             current_api_pid=$(api_pid 2>/dev/null || true)
             if [ "$current_api_pid" = "$launched_api_pid" ] \
@@ -1233,8 +1260,8 @@ case ${1:-} in
             fi
             script_pid_live "$launched_controller_pid" || break
             script_pid_live "$launched_api_pid" || break
-            sleep 1
-            count=$((count + 1))
+            poll_wait
+            count=$((poll_elapsed_ms / 1000))
         done
         package_message "committed services failed to publish final readiness"
         exit 1
@@ -1363,6 +1390,8 @@ case ${1:-} in
             # mandatory second check makes it exit without publishing PID or
             # readiness; this bounded observation catches and signals only an
             # exact controller owner if it reaches the lock during that race.
+            # Poll bucket B -- a three-second grace for the cancelled startup
+            # to settle, expressed as iterations.
             cancelled_wait=0
             while [ "$cancelled_wait" -lt 3 ]; do
                 cancelled_lock_status=0
@@ -1575,7 +1604,10 @@ case ${1:-} in
         fi
         timeout=${SDSYNC_DSM_STOP_TIMEOUT:-120}
         case $timeout in ''|*[!0-9]*) timeout=120 ;; esac
-        elapsed=0
+        # Poll bucket A. The budget and the message the operator sees stay in
+        # seconds; only the sampling is finer.
+        load_poll_resolution
+        poll_reset
         while :; do
             controller_still_active=false
             run_still_active=false
@@ -1616,12 +1648,11 @@ case ${1:-} in
             fi
             [ "$controller_still_active" = true ] || [ "$run_still_active" = true ] || \
                 [ "$api_still_active" = true ] || break
-            if [ "$elapsed" -ge "$timeout" ]; then
+            if poll_expired "$timeout"; then
                 package_message "graceful stop timed out after $timeout seconds; process was not force-killed"
                 exit 1
             fi
-            sleep 1
-            elapsed=$((elapsed + 1))
+            poll_wait
         done
         stale_run_lock_status=0
         acquire_private_process_lock "$run_lock" || stale_run_lock_status=$?

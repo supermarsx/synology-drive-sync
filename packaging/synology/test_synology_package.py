@@ -2922,12 +2922,19 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         label: str,
         timeout: float = 6.0,
     ) -> None:
-        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        deadline = started + timeout
         while time.monotonic() < deadline:
             state = self.exact_process_state(pid, expected_start, label=label)
             if state is None or state in {"Z", "X", "x"}:
+                if WAIT_PROFILE_PATH:
+                    record_wait(
+                        self.id(), "process_terminal", timeout, time.monotonic() - started
+                    )
                 return
             time.sleep(0.01)
+        if WAIT_PROFILE_PATH:
+            record_wait(self.id(), "process_terminal", timeout, time.monotonic() - started)
         self.fail(f"{label} PID {pid} remained live past its terminal deadline")
 
     def configure(self, name: str, source: Path, remote: str, default: bool = False) -> subprocess.CompletedProcess[str]:
@@ -3058,9 +3065,12 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         return request
 
     def wait_for_path(self, path: Path, message: str, *, timeout: float = 5.0) -> None:
-        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        deadline = started + timeout
         while not path.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
+        if WAIT_PROFILE_PATH:
+            record_wait(self.id(), "wait_for_path", timeout, time.monotonic() - started)
         self.assertTrue(path.exists(), message)
 
     def wait_for_absence(self, path: Path, message: str, *, timeout: float = 5.0) -> None:
@@ -15166,6 +15176,92 @@ fi
 
 
 # ---------------------------------------------------------------------------
+# Wait profiling (measurement only)
+#
+# Set SDSYNC_TEST_PROFILE=<path> to record, for every bounded wait, how much of
+# its timeout budget the wait actually consumed. Unset, every hook below is a
+# single already-false module global check and the suite behaves exactly as it
+# did before; nothing here changes control flow, ordering, or any assertion.
+#
+# The point is to decide parallel-lane membership from data instead of
+# judgement. A wait that consumes 20 ms of a 5 s budget survives a machine
+# running orders of magnitude slower; one already consuming 2 s of a 2.5 s
+# budget does not, and its test has to stay serial. See report_wait_profile.
+# ---------------------------------------------------------------------------
+
+#: Fraction of its own timeout a wait may consume and still be considered safe
+#: to run in a parallel lane. Tied to the worker count rather than picked: a
+#: test qualifies only if its tightest wait would still fit were the machine
+#: WAIT_PROFILE_SAFETY_FACTOR times slower than it is when measured serially.
+WAIT_PROFILE_SAFETY_FACTOR = 8
+
+WAIT_PROFILE_PATH = os.environ.get("SDSYNC_TEST_PROFILE", "").strip()
+_wait_observations: list[tuple[str, str, int, float, float]] = []
+_wait_profile_lock = threading.Lock()
+
+
+def record_wait(test_id: str, kind: str, timeout: float, waited: float) -> None:
+    """Record one bounded wait. Called only while profiling is enabled."""
+    caller_line = sys._getframe(2).f_lineno
+    with _wait_profile_lock:
+        _wait_observations.append((test_id, kind, caller_line, timeout, waited))
+
+
+def report_wait_profile(durations, stream) -> None:
+    """Emit the per-test breakdown and the margin table, worst margin first."""
+    by_test: dict[str, list[tuple[str, int, float, float]]] = {}
+    for test_id, kind, line, timeout, waited in _wait_observations:
+        by_test.setdefault(test_id, []).append((kind, line, timeout, waited))
+
+    print("\n" + "=" * 78, file=stream)
+    print("PER-TEST DURATION (slowest first)", file=stream)
+    print("=" * 78, file=stream)
+    for seconds, test_id in sorted(durations, reverse=True):
+        print(f"{seconds:9.2f}s  {test_id}", file=stream)
+
+    print("\n" + "=" * 78, file=stream)
+    print(
+        "WAIT MARGIN TABLE - fraction of budget consumed, worst first\n"
+        f"a site is parallel-safe when used <= 1/{WAIT_PROFILE_SAFETY_FACTOR} "
+        f"({1 / WAIT_PROFILE_SAFETY_FACTOR:.3f})",
+        file=stream,
+    )
+    print("=" * 78, file=stream)
+    rows = [
+        (waited / timeout if timeout else float("inf"), waited, timeout, kind, line, test_id)
+        for test_id, kind, line, timeout, waited in _wait_observations
+    ]
+    for used, waited, timeout, kind, line, test_id in sorted(rows, reverse=True):
+        verdict = "TIGHT" if used > 1 / WAIT_PROFILE_SAFETY_FACTOR else "ok"
+        print(
+            f"{used:7.4f}  {verdict:5}  {waited:7.3f}s of {timeout:6.2f}s  "
+            f"{kind}:{line}  {test_id.rsplit('.', 1)[-1]}",
+            file=stream,
+        )
+
+    print("\n" + "=" * 78, file=stream)
+    print("LANE RECOMMENDATION derived from the measured margins", file=stream)
+    print("=" * 78, file=stream)
+    threshold = 1 / WAIT_PROFILE_SAFETY_FACTOR
+    tight = {
+        test_id
+        for test_id, waits in by_test.items()
+        if any(w / t > threshold if t else True for _, _, t, w in waits)
+    }
+    for test_id in sorted(tight):
+        worst = max(w / t if t else float("inf") for _, _, t, w in by_test[test_id])
+        print(f"  SERIAL (measured margin {worst:.3f})  {test_id}", file=stream)
+    print(
+        f"\n{len(tight)} test(s) exceed the {threshold:.3f} threshold and must stay serial.\n"
+        f"{len(by_test) - len(tight)} instrumented test(s) are within budget.\n"
+        "Tests with no instrumented wait are unaffected; tests using a manual\n"
+        "deadline loop are not instrumented and stay serial under the\n"
+        "fail-closed rule.",
+        file=stream,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Parallel execution
 #
 # The suite is dominated by subprocess work (package builds, shell lifecycle
@@ -15316,6 +15412,11 @@ def run_suite_in_parallel(module=None, stream=None) -> int:
         file=stream,
         flush=True,
     )
+    if WAIT_PROFILE_PATH:
+        durations = [(seconds, test_id) for test_id, _, _, seconds in outcomes]
+        with open(WAIT_PROFILE_PATH, "w", encoding="utf-8", newline="\n") as profile:
+            report_wait_profile(durations, profile)
+        print(f"wait profile written to {WAIT_PROFILE_PATH}", file=stream, flush=True)
     return 1 if broken else 0
 
 

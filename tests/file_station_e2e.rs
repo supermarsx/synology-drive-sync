@@ -487,6 +487,12 @@ fn authenticated_target_doctor_checks_exact_destination_and_logs_out() {
     // unauthenticated discovery reads, login, the session confirmation, the four session-channel
     // ablation variants, the capability diagnosis bracketed by its two host reads, the
     // destination walk and permission check, the bounded inventory, and logout.
+    //
+    // The walk's second `getinfo` is the destination's own, and it establishes that the path
+    // exists, is a directory, and is not a mount boundary. The inventory therefore opens at its
+    // listing rather than repeating that request: a run against a healthy target pays for the
+    // destination `getinfo` exactly once. A destination the walk did not resolve keeps the
+    // inventory's own `getinfo`, which is what turns an absent path into `absent_root`.
     assert_eq!(
         operations,
         [
@@ -506,10 +512,18 @@ fn authenticated_target_doctor_checks_exact_destination_and_logs_out() {
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.CheckPermission.write",
-            "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.List.list",
             "SYNO.API.Auth.logout",
         ]
+    );
+    // The destination is inspected once, not twice.
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| operation.as_str() == "SYNO.FileStation.List.getinfo")
+            .count(),
+        2,
+        "one `getinfo` per path component, and none repeated for the inventory"
     );
     assert_eq!(
         requests[2].fields.get("account").map(String::as_str),
@@ -3031,7 +3045,8 @@ allow-http = true
         "SYNO.FileStation.List.getinfo",
         "SYNO.FileStation.List.getinfo",
         "SYNO.FileStation.CheckPermission.write",
-        "SYNO.FileStation.List.getinfo",
+        // No third `getinfo`: the walk already established that the destination exists, is a
+        // directory, and is not a mount boundary, so the inventory opens at its listing.
         "SYNO.FileStation.List.list",
         "SYNO.API.Auth.logout",
     ];
@@ -3085,6 +3100,29 @@ fn write_test_batch_rejects_a_missing_destination_during_non_mutating_preflight(
     assert_eq!(records[1]["profile"], "beta");
     assert_eq!(records[1]["status"], "failed");
     assert_eq!(records[1]["doctor"]["remote_exists"], false);
+    // A destination the walk could not resolve keeps the inventory's own `getinfo`. That request
+    // is what reports the target as absent rather than as an error, so the round trip a resolved
+    // destination no longer pays for must still be made here. `remote_exists: false` above is
+    // reachable only through it; this names the request so a regression says which one went
+    // missing.
+    // Counted, not merely present: the walk issues its own `getinfo` for this path on the way to
+    // discovering the 408, so `any` would pass on the walk's request alone and prove nothing. Two
+    // is the walk's and the inventory's.
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|request| {
+                request.operation() == "SYNO.FileStation.List.getinfo"
+                    && request
+                        .fields
+                        .get("path")
+                        .is_some_and(|path| path.contains("/team/missing"))
+            })
+            .count(),
+        2,
+        "the absent destination must still be inspected by the inventory's own getinfo"
+    );
     assert_eq!(
         section(&records[1]["doctor"], "disposable_write_verify_cleanup")["status"],
         "fail"

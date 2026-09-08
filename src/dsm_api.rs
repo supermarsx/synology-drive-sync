@@ -27,7 +27,7 @@ use std::process::{Command, ExitCode, Stdio};
 #[cfg(target_os = "linux")]
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
 };
 #[cfg(target_os = "linux")]
 use std::time::Instant;
@@ -60,6 +60,7 @@ const REQUESTS_DIR: &str = "/var/packages/synology-drive-sync/var/control/reques
 const PROCESSING_DIR: &str = "/var/packages/synology-drive-sync/var/control/processing";
 const RESPONSES_DIR: &str = "/var/packages/synology-drive-sync/var/control/responses";
 const STAGING_DIR: &str = "/var/packages/synology-drive-sync/var/control/staging";
+const PROGRESS_DIR: &str = "/var/packages/synology-drive-sync/var/control/progress";
 const CSRF_KEY_PATH: &str = "/var/packages/synology-drive-sync/var/control/csrf.key";
 const SECURITY_POLICY_PATH: &str = "/var/packages/synology-drive-sync/home/config/security.conf";
 const PROFILE_SECRET_ROOT: &str = "/var/packages/synology-drive-sync/home/secrets";
@@ -245,16 +246,176 @@ const MAX_HELPER_STDERR_BYTES: usize = 64 * 1024;
 /// `error_payload`, so it is not gated to the target that produces it.
 const SATURATED_SERVICE_CODE: &str = "service_saturated";
 /// Concurrency for the whole dashboard, which is a handful of AppWindows rather
-/// than public traffic. Every handler is expected to be short: reads are file
-/// reads or a bounded manager call, and a mutation POST enqueues and returns
-/// rather than waiting for DSM I/O, which happens in a separate `--consume-job`
-/// process. Four workers is therefore sized against handler *duration*, not
-/// request volume — the lever that matters is keeping handlers short, not
-/// raising this number, and `API_QUEUE_CAPACITY` absorbs bursts in front of it.
+/// than public traffic.
+///
+/// This was four, sized against handler *duration* on the premise that every
+/// handler is short: reads are file reads or a bounded manager call, and a
+/// mutation POST enqueues and returns rather than waiting for DSM I/O, which
+/// happens in a separate `--consume-job` process. That premise no longer holds
+/// on its own. Result polling is moving to a bounded long-poll, where a handler
+/// deliberately waits for a response file to appear instead of returning
+/// "pending" immediately, so some handlers are long *by design*.
+///
+/// The sizing therefore changed from duration to **bounded occupancy**. At most
+/// `L = max(1, API_WORKER_COUNT / 3)` handlers may be parked in a long wait at
+/// once; the cap is checked inside the handler, after dispatch, so a refused
+/// long-poll returns the immediate "pending" it returns today and frees its
+/// worker rather than queueing. That leaves `API_WORKER_COUNT - L` workers
+/// always available for short requests — eight of twelve here.
+///
+/// Eight short-request workers at the ~0.25 s a snapshot now costs is ~32
+/// requests per second. An active AppWindow tab asks for roughly 0.4 of one
+/// (0.9 while observing a job), and both refreshes stop while the tab is
+/// hidden, so this covers far more tabs than a NAS dashboard has. Keeping
+/// handlers short is still the lever that matters; what changed is that the
+/// pool must now also absorb a bounded number of handlers that are not.
 #[cfg(target_os = "linux")]
-const API_WORKER_COUNT: usize = 4;
+const API_WORKER_COUNT: usize = 12;
+/// Burst absorption in front of the pool, bounded by two things.
+///
+/// Every queued item is an accepted connection holding one descriptor, so the
+/// worst case is `API_WORKER_COUNT + API_QUEUE_CAPACITY + 1` open descriptors —
+/// 45 against a 1024 soft limit. And it stays well under the listener's 128
+/// kernel accept backlog, so that backlog remains the outer buffer rather than
+/// this queue becoming the inner one.
+///
+/// The interaction worth stating, because a deeper queue trades rejection for
+/// latency: a request at the back waits `API_QUEUE_CAPACITY / throughput`, and
+/// with eight guaranteed short-request workers that is about a second today. It
+/// only threatens the AppWindow's 120-second observation window if a short
+/// handler reaches ~30 s — `32 / (8 / d) < 120` gives `d < 30` — by which point
+/// handler duration is the defect and queue depth is not. Deepening this past
+/// the point where that inequality holds would let a client wait out its own
+/// window while the service looked healthy, which is worse than a
+/// `service_saturated` rejection it can act on.
 #[cfg(target_os = "linux")]
-const API_QUEUE_CAPACITY: usize = 16;
+const API_QUEUE_CAPACITY: usize = 32;
+
+/// How many handlers may be parked in a long wait at once.
+///
+/// Derived from the pool rather than configured, so it cannot be set to a value that starves short
+/// requests: `API_WORKER_COUNT - API_LONG_POLL_LIMIT` workers are always available for them. See
+/// the `API_WORKER_COUNT` rationale above for the occupancy argument this belongs to.
+#[cfg(target_os = "linux")]
+const API_LONG_POLL_LIMIT: usize = if API_WORKER_COUNT / 3 > 1 {
+    API_WORKER_COUNT / 3
+} else {
+    1
+};
+/// How long a single long-poll may hold its connection.
+///
+/// An order of magnitude inside `RELAY_IO_TIMEOUT`, so the wait can never be the thing that trips
+/// the transport. Jobs outliving it are not penalised: the client simply polls again, which is the
+/// behaviour it has today.
+#[cfg(all(target_os = "linux", not(test)))]
+const API_LONG_POLL_WINDOW: Duration = Duration::from_secs(3);
+/// Tests exercise the same code path without paying the production wait.
+#[cfg(all(target_os = "linux", test))]
+const API_LONG_POLL_WINDOW: Duration = Duration::from_millis(60);
+/// First and maximum gaps between completion checks inside a long wait.
+///
+/// The first is short because most jobs finish quickly and the whole point is to answer at the
+/// speed of the job; the ramp keeps a long wait from turning into a busy loop.
+#[cfg(target_os = "linux")]
+const LONG_POLL_FIRST_INTERVAL: Duration = Duration::from_millis(25);
+#[cfg(target_os = "linux")]
+const LONG_POLL_MAX_INTERVAL: Duration = Duration::from_millis(200);
+
+// The pool relationships, checked at compile time.
+//
+// These relate constants to each other, so as runtime assertions they folded to
+// `assert!(true)` -- clippy was right that they compiled to nothing. The relationships are
+// real all the same; what was wrong was the place. As `const` assertions they fail the
+// *build* rather than a test, which is strictly stronger: a change that breaks one cannot
+// be committed, let alone shipped, and it cannot be missed by a test that was not run.
+//
+// `assertions_on_constants` fires here too, and is allowed rather than worked around: the
+// lint exists to catch an assertion that is constant *by accident*, and these are constant
+// *by intent*. Being always-true is the whole point -- the day one of them is false, this
+// crate stops compiling, which is exactly the behaviour being asked for.
+#[cfg(target_os = "linux")]
+#[allow(clippy::assertions_on_constants)]
+const _: () = assert!(
+    API_LONG_POLL_LIMIT < API_WORKER_COUNT,
+    "a full long-poll lane must still leave a worker for short requests"
+);
+#[cfg(target_os = "linux")]
+#[allow(clippy::assertions_on_constants)]
+const _: () = assert!(
+    API_QUEUE_CAPACITY < 128,
+    "queue capacity must stay under the listener's 128-deep accept backlog"
+);
+// The descriptor budget, checked when this crate is compiled.
+//
+// Both quantities are named so the arithmetic says what it counts, and both are scoped to
+// this block rather than to the module. On the pinned toolchain an anonymous `const _` does
+// not mark what it references as live, so module-level constants used only by an assertion
+// are reported as dead code -- which is why naming them produced that error in the first
+// place. Scoping keeps the names, which is the point since `+ 1` and `256` mean nothing on
+// their own, without leaving items behind that exist only to be checked and would otherwise
+// need an `#[allow(dead_code)]` marking a constant unused whose whole purpose is to be used.
+//
+// Verified on 1.88.0 and stable: clean under `-D warnings`, and still fails the build when
+// the invariant is violated.
+#[cfg(target_os = "linux")]
+#[allow(clippy::assertions_on_constants)]
+const _: () = {
+    /// The descriptor the listener itself holds, beside the workers and queued connections.
+    const LISTENER_DESCRIPTORS: usize = 1;
+    /// A deliberately conservative floor for the process descriptor soft limit. DSM units vary
+    /// and the real limit is typically 1024; checking against 256 makes a pool or queue change
+    /// clear any plausible limit rather than merely the one on whichever machine ran the build.
+    const DESCRIPTOR_BUDGET: usize = 256;
+    assert!(
+        API_WORKER_COUNT + API_QUEUE_CAPACITY + LISTENER_DESCRIPTORS <= DESCRIPTOR_BUDGET,
+        "worst-case descriptor use must stay far below the soft limit"
+    );
+};
+
+/// Occupancy of the long-poll lane.
+#[cfg(target_os = "linux")]
+static LONG_POLL_OCCUPANCY: AtomicUsize = AtomicUsize::new(0);
+
+/// A claim on one of the `API_LONG_POLL_LIMIT` long-wait slots.
+///
+/// Acquired *inside* the handler, after the connection has already been dispatched to a worker, so
+/// a refusal costs nothing: the handler returns the same immediate response it returns today and
+/// releases its worker. The queue is crossed before any waiting begins, so long-polling cannot add
+/// queue pressure and cannot turn a request that would have been served into a
+/// `service_saturated` rejection.
+///
+/// Released on drop, so an early return or a panic cannot leak a slot and shrink the lane for the
+/// life of the process.
+#[cfg(target_os = "linux")]
+struct LongPollSlot;
+
+#[cfg(target_os = "linux")]
+impl LongPollSlot {
+    fn try_acquire() -> Option<Self> {
+        let mut occupancy = LONG_POLL_OCCUPANCY.load(AtomicOrdering::Relaxed);
+        loop {
+            if occupancy >= API_LONG_POLL_LIMIT {
+                return None;
+            }
+            match LONG_POLL_OCCUPANCY.compare_exchange_weak(
+                occupancy,
+                occupancy + 1,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(observed) => occupancy = observed,
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LongPollSlot {
+    fn drop(&mut self) {
+        LONG_POLL_OCCUPANCY.fetch_sub(1, AtomicOrdering::AcqRel);
+    }
+}
 
 type HmacSha256 = Hmac<Sha256>;
 type BridgeResult<T> = Result<T, BridgeError>;
@@ -269,6 +430,7 @@ struct ControlPaths<'a> {
     processing: &'a Path,
     responses: &'a Path,
     staging: &'a Path,
+    progress: &'a Path,
     csrf_key: &'a Path,
     enqueue_lock: &'a Path,
     enqueue_sequence: &'a Path,
@@ -439,6 +601,7 @@ impl ControlPaths<'static> {
             processing: Path::new(PROCESSING_DIR),
             responses: Path::new(RESPONSES_DIR),
             staging: Path::new(STAGING_DIR),
+            progress: Path::new(PROGRESS_DIR),
             csrf_key: Path::new(CSRF_KEY_PATH),
             enqueue_lock: Path::new(ENQUEUE_LOCK_PATH),
             enqueue_sequence: Path::new(ENQUEUE_SEQUENCE_PATH),
@@ -2505,6 +2668,59 @@ fn valid_server_job_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// A validated view of a job's progress record.
+///
+/// Every field here is derived locally. The record on disk contributes exactly one piece of
+/// untrusted data -- the section id -- and it is used only as an allow-list key, so the label and
+/// step shown to an administrator come from the catalogue rather than from the job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProgressView {
+    step: u8,
+    total: u8,
+    label: &'static str,
+    updated_at: u64,
+}
+
+const PROGRESS_SCHEMA: &str = "sdsync.dsm-request-progress.v1";
+
+/// Validate a progress document against the request it claims to describe.
+///
+/// Returns `None` for anything that does not match exactly. Progress is advisory: a caller that
+/// gets `None` reports the plain `pending` it would have reported before progress existed, so a
+/// malformed, stale, or mismatched record can never fail a status read or block an operator.
+///
+/// The binding to both `request_id` and `job_id` is what stops a record written for one request
+/// being reported against another.
+fn validated_progress(document: &Value, request_id: &str, job_id: &str) -> Option<ProgressView> {
+    if !valid_client_request_id(request_id) || !valid_server_job_id(job_id) {
+        return None;
+    }
+    if document.get("schema").and_then(Value::as_str) != Some(PROGRESS_SCHEMA) {
+        return None;
+    }
+    if document.get("request_id").and_then(Value::as_str) != Some(request_id) {
+        return None;
+    }
+    if document.get("job_id").and_then(Value::as_str) != Some(job_id) {
+        return None;
+    }
+    let section = document.get("section").and_then(Value::as_str)?;
+    // The label and the step both come from the catalogue, never from the document. An id that is
+    // not in the catalogue yields no progress at all rather than an unlabelled step.
+    let (label, step) = synology_drive_sync::doctor_section(section)?;
+    let updated_at = document.get("updated_at").and_then(Value::as_u64)?;
+    let total = u8::try_from(synology_drive_sync::DOCTOR_SECTION_SPECS.len()).ok()?;
+    if step == 0 || step > total {
+        return None;
+    }
+    Some(ProgressView {
+        step,
+        total,
+        label,
+        updated_at,
+    })
 }
 
 fn valid_request_fingerprint(value: &str) -> bool {
@@ -9102,6 +9318,39 @@ mod linux_files {
         Ok(None)
     }
 
+    /// A progress record is at most a handful of short fields; anything larger is not one.
+    ///
+    /// `usize` because this is a read buffer bound rather than a wire value: the reader below
+    /// cannot fail, so a conversion here would have to be infallible or panic, and there is no
+    /// reason to introduce either.
+    const MAX_PROGRESS_BYTES: usize = 1024;
+
+    /// Read the progress a job has published for a request, if any.
+    ///
+    /// Deliberately returns `Option` rather than `BridgeResult`: progress is advisory, so every
+    /// failure -- a missing directory, an unreadable file, a malformed document, a record naming a
+    /// different job -- collapses to "no progress" and the caller reports the same plain `pending`
+    /// it reported before progress existed. Nothing here can fail a status read.
+    ///
+    /// The caller must already have established that this session owns `request_id`; this reads
+    /// the record, it does not authorise it.
+    pub(super) fn read_request_progress(
+        paths: &ControlPaths<'_>,
+        package_uid: u32,
+        request_id: &str,
+        job_id: &str,
+    ) -> Option<ProgressView> {
+        if !valid_client_request_id(request_id) || !valid_server_job_id(job_id) {
+            return None;
+        }
+        validate_private_directory(paths.progress, package_uid).ok()?;
+        let path = paths.progress.join(format!("{request_id}.json"));
+        let bytes =
+            read_transient_optional_private_file(&path, package_uid, MAX_PROGRESS_BYTES).ok()??;
+        let document: Value = serde_json::from_slice(bytes.as_slice()).ok()?;
+        validated_progress(&document, request_id, job_id)
+    }
+
     fn read_any_session_request_record(
         paths: &ControlPaths<'_>,
         package_uid: u32,
@@ -12169,10 +12418,14 @@ fn execute_request_status_action(
     )?;
     match status {
         Some(SessionRequestStatus::Pending { job_id, operation }) => {
-            request_status_found_response(request_id, &job_id, &operation, "pending", false)
+            let progress =
+                linux_files::read_request_progress(paths, package_uid, request_id, &job_id);
+            request_status_found_response(
+                request_id, &job_id, &operation, "pending", false, progress,
+            )
         }
         Some(SessionRequestStatus::Complete { job_id, operation }) => {
-            request_status_found_response(request_id, &job_id, &operation, "complete", true)
+            request_status_found_response(request_id, &job_id, &operation, "complete", true, None)
         }
         None => request_status_unresolved_response(request_id),
     }
@@ -12185,6 +12438,7 @@ fn request_status_found_response(
     operation: &str,
     state: &str,
     complete: bool,
+    progress: Option<ProgressView>,
 ) -> BridgeResult<CgiResponse> {
     if !valid_client_request_id(request_id)
         || !valid_server_job_id(job_id)
@@ -12194,14 +12448,24 @@ fn request_status_found_response(
     {
         return Err(BridgeError::new(ErrorKind::Unavailable));
     }
-    let body = serde_json::to_vec(&json!({
+    let mut document = json!({
         "schema": "sdsync.dsm-request-status.v1",
         "request_id": request_id,
         "job_id": job_id,
         "operation": operation,
         "state": state,
-    }))
-    .map_err(|_| BridgeError::internal())?;
+    });
+    // Progress is reported only while pending. Once complete the result itself is the answer, and
+    // a trailing progress record would invite the client to render a step count beside it.
+    if let (false, Some(view)) = (complete, progress) {
+        document["progress"] = json!({
+            "step": view.step,
+            "total": view.total,
+            "label": view.label,
+            "updated_at": view.updated_at,
+        });
+    }
+    let body = serde_json::to_vec(&document).map_err(|_| BridgeError::internal())?;
     if complete {
         Ok(CgiResponse::success(body))
     } else {
@@ -12223,8 +12487,86 @@ fn request_status_unresolved_response(request_id: &str) -> BridgeResult<CgiRespo
     Ok(CgiResponse::accepted(body))
 }
 
+/// Answer a result poll, waiting briefly for a job that is about to finish.
+///
+/// The client polls this on a ramp, so a job completing just after a poll is not seen until the
+/// next one -- a job finishing at 600 ms was invisible until 2500 ms. Rather than returning
+/// "pending" the instant it is observed, hold the connection for a bounded window and answer the
+/// moment the result lands.
+///
+/// Three properties make that safe, and all three are structural rather than conventional:
+///
+/// * The wait is bounded by `API_LONG_POLL_WINDOW`, an order of magnitude inside the transport's
+///   own timeout, so it can never be the thing that trips it.
+/// * At most `API_LONG_POLL_LIMIT` handlers wait at once, leaving
+///   `API_WORKER_COUNT - API_LONG_POLL_LIMIT` workers for short requests at all times.
+/// * The slot is claimed *after* dispatch, so a handler that cannot get one returns exactly the
+///   response it returns today. Long-polling degrades to the current behaviour rather than to an
+///   error, and adds no queue pressure.
 #[cfg(target_os = "linux")]
 fn execute_result_action(
+    paths: &ControlPaths<'_>,
+    job_id: &str,
+    session_binding: &[u8; 32],
+    authenticated_uid: u32,
+    package_uid: u32,
+    now: u64,
+    result_retention_seconds: u64,
+) -> BridgeResult<CgiResponse> {
+    if !valid_server_job_id(job_id) {
+        return Err(BridgeError::bad_request());
+    }
+    // Already finished: answer without waiting or claiming a slot.
+    if let Some(response) = completed_result_response(
+        paths,
+        job_id,
+        session_binding,
+        authenticated_uid,
+        package_uid,
+        now,
+        result_retention_seconds,
+    )? {
+        return Ok(response);
+    }
+    if let Some(_slot) = LongPollSlot::try_acquire() {
+        let deadline = Instant::now() + API_LONG_POLL_WINDOW;
+        let mut interval = LONG_POLL_FIRST_INTERVAL;
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            std::thread::sleep(interval.min(remaining));
+            if let Some(response) = completed_result_response(
+                paths,
+                job_id,
+                session_binding,
+                authenticated_uid,
+                package_uid,
+                now,
+                result_retention_seconds,
+            )? {
+                return Ok(response);
+            }
+            interval = (interval * 2).min(LONG_POLL_MAX_INTERVAL);
+        }
+    }
+    // Either the lane was full or the job outlived the window. Fall through to the unchanged
+    // answer, which is the one this endpoint has always given. `now` is deliberately the timestamp
+    // captured before the wait: reusing it makes this response identical to the one the caller
+    // would have received had it never waited at all.
+    execute_result_action_after_wait(
+        paths,
+        job_id,
+        session_binding,
+        authenticated_uid,
+        package_uid,
+        now,
+        result_retention_seconds,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn execute_result_action_after_wait(
     paths: &ControlPaths<'_>,
     job_id: &str,
     session_binding: &[u8; 32],
@@ -13187,6 +13529,181 @@ fn write_cgi_response(response: &CgiResponse) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// The long-poll lane admits up to its cap, refuses past it, and never leaks a slot.
+    ///
+    /// The refusal is the safety property: a handler that cannot get a slot returns the immediate
+    /// response this endpoint has always returned, so the lane filling up degrades to today's
+    /// behaviour rather than to an error. Leaking a slot would be worse than either, because it
+    /// shrinks the lane permanently and silently, so the drop path is asserted too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn long_poll_lane_is_bounded_and_returns_slots_on_drop() {
+        let _serialised = CONTROL_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            LONG_POLL_OCCUPANCY.load(AtomicOrdering::Relaxed),
+            0,
+            "the lane must start empty"
+        );
+        let held: Vec<LongPollSlot> = (0..API_LONG_POLL_LIMIT)
+            .map(|_| LongPollSlot::try_acquire().expect("the lane must admit up to its cap"))
+            .collect();
+        assert!(
+            LongPollSlot::try_acquire().is_none(),
+            "the lane must refuse a claim beyond its cap rather than growing"
+        );
+
+        drop(held);
+        assert_eq!(
+            LONG_POLL_OCCUPANCY.load(AtomicOrdering::Relaxed),
+            0,
+            "every slot must be returned on drop"
+        );
+        assert!(
+            LongPollSlot::try_acquire().is_some(),
+            "the lane must be reusable once its slots are released"
+        );
+    }
+
+    /// The drain-time invariant, checked when this crate is compiled.
+    ///
+    /// It lives in the test module rather than beside the pool constants only because
+    /// `APPWINDOW_RESULT_OBSERVATION_WINDOW` is itself test-only. A request at the back of a full
+    /// queue waits `API_QUEUE_CAPACITY / throughput`; with the workers always left for short
+    /// requests that stays inside the AppWindow's observation window unless a short handler
+    /// degrades to roughly thirty seconds -- at which point handler duration is the defect and
+    /// queue depth is not. Deepening the queue past that point would let a client wait out its own
+    /// window while the service still looked healthy.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::assertions_on_constants)]
+    const _: () = assert!(
+        (APPWINDOW_RESULT_OBSERVATION_WINDOW.as_secs() as usize)
+            * (API_WORKER_COUNT - API_LONG_POLL_LIMIT)
+            / API_QUEUE_CAPACITY
+            >= 10,
+        "a full queue must tolerate a short handler an order of magnitude slower than today's"
+    );
+
+    /// The long-poll cap must stay derived from the pool rather than chosen separately.
+    ///
+    /// The other pool relationships this test used to assert are now `const` assertions -- as
+    /// runtime assertions they related one constant to another and folded to `assert!(true)`,
+    /// which reported success while proving nothing at the moment it ran. This one cannot follow
+    /// them: `std::cmp::max` is not a const fn, so the derivation is checked here instead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn long_poll_cap_stays_derived_from_the_pool() {
+        assert_eq!(
+            API_LONG_POLL_LIMIT,
+            std::cmp::max(1, API_WORKER_COUNT / 3),
+            "the long-poll cap must stay derived from the pool, not set independently"
+        );
+    }
+
+    fn progress_document(section: &str) -> Value {
+        json!({
+            "schema": PROGRESS_SCHEMA,
+            "request_id": "0".repeat(32),
+            "job_id": "a".repeat(SERVER_JOB_ID_BYTES * 2),
+            "section": section,
+            "updated_at": 1_700_000_000u64,
+        })
+    }
+
+    /// A well-formed record resolves, and every displayed field comes from the catalogue.
+    #[test]
+    fn progress_resolves_step_and_label_from_the_catalogue() {
+        let request_id = "0".repeat(32);
+        let job_id = "a".repeat(SERVER_JOB_ID_BYTES * 2);
+        let view = validated_progress(&progress_document("routing_tls"), &request_id, &job_id)
+            .expect("a well-formed record must resolve");
+        assert_eq!(view.label, "Routing and TLS negotiation");
+        assert_eq!(view.step, 2);
+        assert_eq!(view.total, 16);
+        assert_eq!(view.updated_at, 1_700_000_000);
+    }
+
+    /// The document cannot supply the text an administrator sees.
+    ///
+    /// This is the whole point of resolving the section id against the catalogue: a job that is
+    /// buggy or compromised names a section, and the label is looked up locally. A `label` field
+    /// in the document is ignored entirely rather than preferred or merged.
+    #[test]
+    fn progress_ignores_any_label_the_document_tries_to_supply() {
+        let request_id = "0".repeat(32);
+        let job_id = "a".repeat(SERVER_JOB_ID_BYTES * 2);
+        let mut document = progress_document("routing_tls");
+        document["label"] = json!("<script>alert(1)</script>");
+        document["step"] = json!(99);
+        document["total"] = json!(99);
+        let view = validated_progress(&document, &request_id, &job_id)
+            .expect("extra fields must not prevent resolution");
+        assert_eq!(view.label, "Routing and TLS negotiation");
+        assert_eq!(view.step, 2);
+        assert_eq!(view.total, 16);
+    }
+
+    /// Anything that does not match exactly yields no progress at all.
+    #[test]
+    fn progress_rejects_mismatched_stale_or_malformed_records() {
+        let request_id = "0".repeat(32);
+        let job_id = "a".repeat(SERVER_JOB_ID_BYTES * 2);
+        let other_request = "1".repeat(32);
+        let other_job = "b".repeat(SERVER_JOB_ID_BYTES * 2);
+
+        let mut wrong_schema = progress_document("routing_tls");
+        wrong_schema["schema"] = json!("sdsync.dsm-request-progress.v2");
+
+        let mut missing_updated_at = progress_document("routing_tls");
+        missing_updated_at["updated_at"] = Value::Null;
+
+        for (case, document, request, job) in [
+            (
+                "wrong schema",
+                wrong_schema,
+                request_id.clone(),
+                job_id.clone(),
+            ),
+            (
+                "record belongs to another request",
+                progress_document("routing_tls"),
+                other_request,
+                job_id.clone(),
+            ),
+            (
+                "record belongs to another job",
+                progress_document("routing_tls"),
+                request_id.clone(),
+                other_job,
+            ),
+            (
+                "unknown section id",
+                progress_document("not_a_section"),
+                request_id.clone(),
+                job_id.clone(),
+            ),
+            (
+                "section id is close but not exact",
+                progress_document("routing_tls "),
+                request_id.clone(),
+                job_id.clone(),
+            ),
+            (
+                "no updated_at",
+                missing_updated_at,
+                request_id.clone(),
+                job_id.clone(),
+            ),
+        ] {
+            assert_eq!(
+                validated_progress(&document, &request, &job),
+                None,
+                "{case} must not resolve"
+            );
+        }
+    }
     #[cfg(target_os = "linux")]
     use std::os::linux::fs::MetadataExt;
     #[cfg(target_os = "linux")]
@@ -13460,6 +13977,7 @@ mod tests {
         processing: PathBuf,
         responses: PathBuf,
         staging: PathBuf,
+        progress: PathBuf,
         csrf_key: PathBuf,
         enqueue_lock: PathBuf,
         enqueue_sequence: PathBuf,
@@ -13488,6 +14006,7 @@ mod tests {
             let processing = root.join("processing");
             let responses = root.join("responses");
             let staging = root.join("staging");
+            let progress = root.join("progress");
             let audit_outbox_directory = root.join("audit-outbox");
             for directory in [
                 &root,
@@ -13495,6 +14014,7 @@ mod tests {
                 &processing,
                 &responses,
                 &staging,
+                &progress,
                 &audit_outbox_directory,
             ] {
                 fs::create_dir(directory).unwrap();
@@ -13509,6 +14029,7 @@ mod tests {
                 audit_outbox_lock: root.join("audit-outbox.flock"),
                 package_transition: root.join("package.transition"),
                 service_closed: root.join("service.closed"),
+                progress,
                 root,
                 requests,
                 processing,
@@ -13524,6 +14045,7 @@ mod tests {
                 processing: &self.processing,
                 responses: &self.responses,
                 staging: &self.staging,
+                progress: &self.progress,
                 csrf_key: &self.csrf_key,
                 enqueue_lock: &self.enqueue_lock,
                 enqueue_sequence: &self.enqueue_sequence,
@@ -16751,6 +17273,7 @@ mod tests {
                 "untrusted-operation",
                 "pending",
                 false,
+                None,
             )
             .unwrap_err()
             .kind,

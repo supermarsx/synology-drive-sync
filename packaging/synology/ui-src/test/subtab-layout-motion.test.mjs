@@ -223,12 +223,33 @@ test("Routines uses a profile-style New routine action and a catalog-first edito
     assert.match(action, /<action-icon name="add"\s*\/>/);
   }
   assert.match(routineAction[1], /@click="openRoutine\(''\)"/);
-  assert.match(routines, /:class="\['sdsync-routines-layout', \{ 'is-catalog-only': !routineEditorOpen \}\]"/);
-  assert.ok(
-    routines.indexOf('class="sdsync-panel sdsync-routine-catalog"')
-      < routines.indexOf('v-if="routineEditorOpen"'),
-    "the configured routine catalog must precede the conditional editor"
+  assert.match(
+    routines,
+    /:class="\['sdsync-routines-layout', routineEditorOpen \? 'is-editor-only' : 'is-catalog-only'\]"/,
+    "the routine view must expose explicit one-track catalog/editor layout modes, mirroring profiles"
   );
+
+  const exclusiveRoutineViews = routines.match(
+    /<transition\b(?=[^>]*\bname="sdsync-page-swap")(?=[^>]*\bmode="out-in")[^>]*>\s*(<article\b(?=[^>]*\bv-if="!routineEditorOpen")(?=[^>]*\bkey="routine-catalog")(?=[^>]*\bclass="[^"]*\bsdsync-routine-catalog\b[^"]*")[^>]*>[\s\S]*?<\/article>)\s*(<v-form\b(?=[^>]*\bv-else\b)(?=[^>]*\bkey="routine-editor")(?=[^>]*\bclass="[^"]*\bsdsync-editor\b[^"]*")[^>]*>[\s\S]*?<\/v-form>)\s*<\/transition>/
+  );
+  assert.ok(exclusiveRoutineViews, "routine catalog v-if and editor v-else must be immediate keyed siblings in one out-in transition");
+  assert.doesNotMatch(routines, /sdsync-routine-catalog[\s\S]*?<v-form\b[^>]*\bv-if="routineEditorOpen"/,
+    "the routine catalog and editor must never render simultaneously as a divided two-column layout");
+
+  const routineViewModes = css.match(
+    /\.sdsync-routines-layout\.is-catalog-only,[\s\S]*?\.sdsync-routines-layout\.is-editor-only[\s\S]*?\{([\s\S]*?)\}/
+  );
+  assert.ok(routineViewModes, "routine catalog/editor layout modes need an explicit shared CSS rule");
+  assert.match(routineViewModes[1], /grid-template-columns:\s*minmax\(0, 1fr\)/,
+    "both routine views must occupy one full-width grid track, matching profiles");
+
+  const routineEditorTrack = css.match(
+    /\.sdsync-app \.sdsync-routines-layout\.is-editor-only,[\s\S]*?\.sdsync-app \.sdsync-routines-layout\.is-editor-only > \.sdsync-routine-editor[\s\S]*?\{([\s\S]*?)\}/
+  );
+  assert.ok(routineEditorTrack, "the open routine editor needs the full-width AppWindow track rule, matching profiles");
+  assert.match(routineEditorTrack[1], /width:\s*100%/);
+  assert.match(routineEditorTrack[1], /max-width:\s*100%/);
+
   assert.match(app, /routineEditorOpen:\s*false/);
   assert.match(app, /openRoutine\(profile = ""\) \{[^}]*this\.routineEditorOpen = true; this\.loadRoutine\(profile\); \}/);
   assert.doesNotMatch(routines, /sdsync-subtabs|role="tablist"|role="tabpanel"|data-subtab-panel/);

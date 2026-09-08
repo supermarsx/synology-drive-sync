@@ -863,6 +863,12 @@ start_runner_wait_guard() {
             process_identity_is_live "$runner_guard_parent" \
             "$runner_guard_parent_start" "$runner_guard_parent_boot"; do
             runner_guard_stop_requested && exit 0
+            # Poll bucket E -- shortening this makes it *slower*. The sleep is
+            # a cancellable child so TERM can interrupt it, which already makes
+            # the wait interrupt-driven rather than poll-driven; a finer
+            # interval buys no latency and costs an extra fork plus an identity
+            # capture on every tick, on hardware where fork is the expensive
+            # operation.
             /bin/sleep 1 &
             launched_runner_guard_sleep_pid=$!
             if ! capture_work_child_identity "$launched_runner_guard_sleep_pid" \
@@ -1023,6 +1029,8 @@ stop_work_children_bounded() {
         "$active_pid" "$active_pid_start" "$active_pid_boot"; then
         kill -TERM "$active_pid" 2>/dev/null || true
     fi
+    # Poll bucket B -- the three iterations are the post-TERM grace, not a
+    # sampling rate; shortening turns three seconds into 0.15 s silently.
     bounded_stop_count=0
     while [ "$bounded_stop_count" -lt 3 ]; do
         bounded_child_live=false

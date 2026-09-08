@@ -213,7 +213,16 @@ test("repeated queued-result observation errors become outcome unknown, not fail
         return true;
       }
     );
-    assert.equal(resultReads, 5);
+    // The old assertion was exactly 5, which was not a chosen property but a
+    // consequence of the ceiling being an attempt count. Now that the ceiling is a
+    // duration, the number of reads depends on the backoff, and what actually needs
+    // guarding is that the backoff exists: this caller polls at 0 ms against an
+    // endpoint failing instantly, so without it the client would issue hundreds of
+    // requests inside the window rather than a handful.
+    assert.ok(
+      resultReads >= 2 && resultReads <= 12,
+      `expected a handful of backed-off observations, got ${resultReads}`
+    );
   } finally {
     restore();
   }
@@ -247,7 +256,7 @@ test("AppWindow overlays, focus behavior, labels, secrets, and mutation guards r
   assert.match(source, /if \(configurationApplied && !this\.selectedProfile\) this\.selectedProfile = payload\.name;[\s\S]*?this\.profileSaveState = "error";[\s\S]*?profile editor was preserved/);
 });
 
-test("unbounded polling bounds each attempt and has a five-failure ceiling while bounded callers own the overall budget", () => {
+test("unbounded polling bounds each attempt and gives up on a time-based ceiling while bounded callers own the overall budget", () => {
   assert.match(apiSource, /\/webapi\/entry\.cgi\?api=SYNO\.API\.Auth&version=6&method=token/);
   assert.match(apiSource, /authenticated\["X-SYNO-TOKEN"\] = dsmAuth\.token/);
   assert.match(apiSource, /apiGetWithDsmAuth\([\s\S]*?"result",[\s\S]*?\{ job_id: jobId \},[\s\S]*?dsmAuth,[\s\S]*?true,[\s\S]*?attempt\.signal[\s\S]*?\)/);
@@ -260,8 +269,26 @@ test("unbounded polling bounds each attempt and has a five-failure ceiling while
   assert.doesNotMatch(apiSource, /RESULT_POLL_ATTEMPTS|within two minutes/);
   assert.match(apiSource, /for \(;;\)/);
   assert.match(apiSource, /const limits = boundedObservationLimits \|\| terminalAttemptLimits\(\)/);
-  assert.match(apiSource, /if \(!observation && consecutiveObservationFailures >= RESULT_POLL_OBSERVATION_FAILURES\)/);
-  assert.match(apiSource, /const RESULT_POLL_OBSERVATION_FAILURES = 5/);
+  // The ceiling is a duration, not an attempt count. A count scales with the poll
+  // interval, so speeding the ramp up would silently shrink how much transport
+  // trouble is survivable; pinning the elapsed-time form keeps that from returning.
+  assert.match(
+    apiSource,
+    /readClock\(\) - firstObservationFailureAt >= RESULT_OBSERVATION_FAILURE_WINDOW_MS/
+  );
+  assert.match(apiSource, /const RESULT_OBSERVATION_FAILURE_WINDOW_MS = 10000/);
+  // ...and one anomalous request, however slow, must not end observation alone.
+  assert.match(
+    apiSource,
+    /consecutiveObservationFailures >= RESULT_OBSERVATION_MIN_FAILURES/
+  );
+  assert.doesNotMatch(apiSource, /RESULT_POLL_OBSERVATION_FAILURES/);
+  // The pending cadence decays rather than stepping 500 ms straight to 2000 ms.
+  assert.match(
+    apiSource,
+    /const RESULT_POLL_RAMP_MS = Object\.freeze\(\[150, 300, 600, 1200, 2000\]\)/
+  );
+  assert.doesNotMatch(apiSource, /RESULT_INITIAL_POLL_INTERVAL_MS/);
   assert.match(apiSource, /const result = await awaitQueuedResult\([\s\S]*?id,[\s\S]*?action,[\s\S]*?limits,[\s\S]*?boundedObservationLimits[\s\S]*?\)/);
   assert.match(apiSource, /pollJobResult\([\s\S]*?requestId,[\s\S]*?limits,[\s\S]*?observation,[\s\S]*?operation[\s\S]*?\)[\s\S]*?limits\.resultObservationTimeoutMs/);
   assert.match(apiSource, /observation\.expired = true;[\s\S]*?observation\.cancelCurrent\(\)/);

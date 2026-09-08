@@ -2055,21 +2055,25 @@
 
 .sdsync-profiles-layout.is-catalog-only,
 .sdsync-profiles-layout.is-editor-only,
-.sdsync-routines-layout.is-catalog-only {
+.sdsync-routines-layout.is-catalog-only,
+.sdsync-routines-layout.is-editor-only {
   grid-template-columns: minmax(0, 1fr);
 }
 
-.sdsync-profiles-layout.is-editor-only > .sdsync-editor {
+.sdsync-profiles-layout.is-editor-only > .sdsync-editor,
+.sdsync-routines-layout.is-editor-only > .sdsync-editor {
   width: 100%;
   max-width: 100%;
   min-width: 0;
 }
 
-/* The profile catalog and editor are alternate views. When the editor is
- * active it owns the full AppWindow track, and each configuration control
- * owns a separate row even inside advanced and danger sections. */
+/* The profile and routine catalogs and editors are alternate views. When an
+ * editor is active it owns the full AppWindow track, and each configuration
+ * control owns a separate row even inside advanced and danger sections. */
 .sdsync-app .sdsync-profiles-layout.is-editor-only,
-.sdsync-app .sdsync-profiles-layout.is-editor-only > .sdsync-profile-editor {
+.sdsync-app .sdsync-profiles-layout.is-editor-only > .sdsync-profile-editor,
+.sdsync-app .sdsync-routines-layout.is-editor-only,
+.sdsync-app .sdsync-routines-layout.is-editor-only > .sdsync-routine-editor {
   width: 100%;
   max-width: 100%;
   min-width: 0;

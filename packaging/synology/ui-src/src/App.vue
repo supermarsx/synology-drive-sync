@@ -268,13 +268,14 @@
             <div class="sdsync-page-actions">
               <v-button suffix="main" display="icon-text" tooltip="Create a per-profile automation routine" :disabled="!canChangeRoutines || !profiles.length || operationBusy" @click="openRoutine('')"><template #icon><action-icon name="add" /></template>New routine</v-button>
             </div>
-            <div :class="['sdsync-routines-layout', { 'is-catalog-only': !routineEditorOpen }]">
-              <article class="sdsync-panel sdsync-routine-catalog">
+            <div :class="['sdsync-routines-layout', routineEditorOpen ? 'is-editor-only' : 'is-catalog-only']">
+              <transition name="sdsync-page-swap" mode="out-in">
+              <article v-if="!routineEditorOpen" key="routine-catalog" class="sdsync-panel sdsync-routine-catalog">
                 <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Configured routines</p><h3>Per-profile automation</h3></div><span class="sdsync-mini-badge">{{ routines.length }} total</span></div>
                 <p v-if="!routines.length" class="sdsync-empty">No configured routines. Choose New routine to automate a profile.</p>
                 <button v-for="routine in routines" :key="routine.profile" type="button" :class="['sdsync-routine-row', { 'is-selected': selectedRoutine && selectedRoutine.profile === routine.profile }]" :title="'Edit routine for ' + routine.profile" :disabled="operationBusy" @click="openRoutine(routine.profile)"><span><strong><action-icon name="edit" />&nbsp;{{ routine.profile }}</strong><small>{{ routine.mode || 'interval' }} · {{ routine.backend || 'fallback unreported' }} · {{ routine.state || (routine.enabled ? 'enabled' : 'disabled') }}</small></span><time>{{ routine.enabled ? formatDate(routine.next_run_epoch) : 'Disabled' }}</time></button>
               </article>
-              <v-form v-if="routineEditorOpen" v-model="routineForm" class="sdsync-panel sdsync-horizontal-form sdsync-routine-editor" direction="horizontal" @submit="saveRoutine">
+              <v-form v-else key="routine-editor" v-model="routineForm" class="sdsync-panel sdsync-editor sdsync-horizontal-form sdsync-routine-editor" direction="horizontal" @submit="saveRoutine">
                     <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Routine editor</p><h3>{{ selectedRoutine ? 'Edit ' + selectedRoutine.profile : 'New profile routine' }}</h3></div><v-button type="border" display="icon-text" tooltip="Close the routine editor and discard unsaved values" @click="closeRoutine"><template #icon><action-icon name="close" /></template>Close</v-button></div>
                     <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Profile" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-profile" /></template><v-single-select class="sdsync-select-control" v-model="routineForm.profile" :options="profileOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-describedby="sdsync-help-routine-profile" :disabled="!canChangeRoutines || operationBusy" @input="loadRoutine"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></v-form-item>
                     <div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Enable routine <control-help help-key="routine-enabled" /></span><v-checkbox class="sdsync-checkbox-control" v-model="routineForm.enabled" aria-label="Enable routine" aria-describedby="sdsync-help-routine-enabled" :disabled="!canChangeRoutines" /></div>
@@ -300,6 +301,7 @@
                     <fieldset class="sdsync-danger-fieldset"><legend>Routine deletion guard</legend><div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Permit profile deletion rules <control-help help-key="routine-delete" /></span><v-checkbox class="sdsync-checkbox-control" v-model="routineForm.allow_delete" aria-label="Permit profile deletion rules" aria-describedby="sdsync-help-routine-delete" :disabled="!canEditRoutineDeletion" /></div><v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Routine deletion approval ceiling"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-max-delete" /></template><v-input class="sdsync-input-control" v-model="routineForm.max_total_delete" number-only aria-describedby="sdsync-help-routine-max-delete" :disabled="!canChangeRoutines" /></v-form-item></fieldset>
                     <div class="sdsync-form-actions"><v-button suffix="red" display="icon-text" :tooltip="routineMutationBlocked ? routineMutationGuidance : 'Remove this automation policy without deleting its profile'" :disabled="!canRemoveRoutine" @click="removeRoutine"><template #icon><action-icon name="delete" /></template>Remove routine</v-button><span class="sdsync-field-note">Existing safe routine changes autosave after 1.3 seconds. Creation and deletion approval stay explicit.</span><v-button suffix="cancel" display="icon-text" tooltip="Discard unsaved routine values" @click="closeRoutine"><template #icon><action-icon name="close" /></template>Cancel</v-button><v-button suffix="main" display="icon-text" html-type="submit" :tooltip="routineMutationBlocked ? routineMutationGuidance : 'Validate and apply this per-profile automation policy immediately'" :disabled="!canSubmitRoutine"><template #icon><action-icon name="save" /></template>{{ routineMutationBlocked ? 'Save locked' : 'Save now' }}</v-button></div>
               </v-form>
+              </transition>
             </div>
           </section>
 
@@ -1022,7 +1024,7 @@ function settingsFromStoredValue(storedValue) {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return fallback;
     return {
       theme: ["dark", "light", "system"].includes(parsed.theme) ? parsed.theme : fallback.theme,
-      status_refresh: [0, 3000, 5000, 10000, 30000].includes(Number(parsed.status_refresh)) ? Number(parsed.status_refresh) : fallback.status_refresh,
+      status_refresh: [0, 1000, 3000, 5000, 10000, 30000].includes(Number(parsed.status_refresh)) ? Number(parsed.status_refresh) : fallback.status_refresh,
       log_refresh: [0, 5000, 10000, 30000].includes(Number(parsed.log_refresh)) ? Number(parsed.log_refresh) : fallback.log_refresh,
       desktop_notifications: parsed.desktop_notifications === true,
       audible: parsed.audible === true
@@ -2729,7 +2731,7 @@ export default {
     activityLevelOptions() { return options([["all", "All levels"], ...["trace", "debug", "info", "warn", "error"].map((level) => [level, level])]); },
     logLineOptions() { return options([[100, "100 lines"], [200, "200 lines"], [500, "500 lines"], [1000, "1000 lines"]]); },
     themeOptions() { return options([["dark", "Hellfire dark"], ["system", "Follow system"], ["light", "Ash light"]]); },
-    statusRefreshOptions() { return options([[0, "Manual only"], [3000, "Every 3 seconds"], [5000, "Every 5 seconds"], [10000, "Every 10 seconds"], [30000, "Every 30 seconds"]]); },
+    statusRefreshOptions() { return options([[0, "Manual only"], [1000, "Every second"], [3000, "Every 3 seconds"], [5000, "Every 5 seconds"], [10000, "Every 10 seconds"], [30000, "Every 30 seconds"]]); },
     logRefreshOptions() { return options([[0, "Manual only"], [5000, "Every 5 seconds"], [10000, "Every 10 seconds"], [30000, "Every 30 seconds"]]); }
   },
   watch: {

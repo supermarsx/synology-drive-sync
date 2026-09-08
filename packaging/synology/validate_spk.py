@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import io
 import json
@@ -105,6 +106,73 @@ class ValidationError(AssertionError):
     pass
 
 
+def _decode_marker_source(payload: bytes) -> str:
+    """Decode a source payload for literal marker/contract substring checks.
+
+    Marker checks assert that specific hand-authored source text is present
+    verbatim; a Windows checkout with ``core.autocrlf`` can rewrite an
+    otherwise-unmodified file to CRLF, and a marker containing an embedded
+    ``\\n`` (for example ``"foo,\\n  bar"``) then silently stops matching.
+    Normalize CRLF to LF before the substring search so these checks are
+    invariant to the working copy's line-ending style.
+
+    Never use this for a byte-exact tamper check (hashes, checksums, or "the
+    bundle embeds these exact artifact bytes" comparisons) — those
+    intentionally compare raw, unnormalized bytes so a payload that was
+    genuinely modified (not just re-line-ended) is still rejected. See
+    ``_diagnose_crlf_only_failure`` for how such checks still get a useful
+    error instead of a silent false failure.
+    """
+    return payload.decode("utf-8").replace("\r\n", "\n")
+
+
+def _diagnose_crlf_only_failure(validator):
+    """Make a validator's failure explain a pure line-ending mismatch.
+
+    Most byte-level checks in this module already tolerate CRLF: marker and
+    contract checks decode through ``_decode_marker_source`` above, so they
+    simply pass under a CRLF working copy. A handful of checks reachable
+    from the wrapped validator are deliberately byte-exact tamper checks
+    (for example, that the built bundle embeds the exact packaged
+    stylesheet bytes) and must keep comparing raw bytes, or they would stop
+    catching a genuinely modified payload.
+
+    When the wrapped validator still raises, retry it once with every
+    ``bytes`` argument's CRLF sequences folded to LF. If that retry passes,
+    the original failure was exactly a line-ending artifact (of the checked
+    out source, not of application logic), and the error says so instead of
+    pointing at the wrong layer. If the retry also fails, the original
+    error is raised unchanged — this never weakens a tamper check: a
+    payload that was actually modified beyond its line endings still fails
+    both the real call and the diagnostic retry.
+    """
+
+    @functools.wraps(validator)
+    def wrapper(*args, **kwargs):
+        try:
+            return validator(*args, **kwargs)
+        except ValidationError as error:
+            normalized_args = [
+                arg.replace(b"\r\n", b"\n") if isinstance(arg, bytes) else arg
+                for arg in args
+            ]
+            normalized_kwargs = {
+                key: (value.replace(b"\r\n", b"\n") if isinstance(value, bytes) else value)
+                for key, value in kwargs.items()
+            }
+            try:
+                validator(*normalized_args, **normalized_kwargs)
+            except Exception:
+                raise error from None
+            raise ValidationError(
+                f"{error} (this marker matches after CRLF normalization, so the "
+                "checked-out source has a line-ending problem, not a content "
+                "problem)"
+            ) from error
+
+    return wrapper
+
+
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arch", choices=sorted(ARCHITECTURES))
@@ -157,8 +225,8 @@ def validate_ui_dependency_resolution(
 ) -> None:
     """Enforce the audited PostCSS resolution used by the Vue 2 build chain."""
     try:
-        workspace = workspace_payload.decode("utf-8")
-        lockfile = lock_payload.decode("utf-8")
+        workspace = _decode_marker_source(workspace_payload)
+        lockfile = _decode_marker_source(lock_payload)
     except UnicodeDecodeError as error:
         raise ValidationError("native DSM dependency manifests must be UTF-8") from error
 
@@ -310,7 +378,7 @@ def validate_ui_config(payload: bytes) -> str:
 
 
 def validate_ui_texts(strings_payload: bytes) -> None:
-    strings = strings_payload.decode("utf-8")
+    strings = _decode_marker_source(strings_payload)
     sections: dict[str, dict[str, str]] = {}
     current: dict[str, str] | None = None
     for line_number, line in enumerate(strings.splitlines(), 1):
@@ -389,7 +457,7 @@ def validate_dsm_help(
         raise ValidationError("DSM Help document set does not match the reviewed dashboard sections")
     for page, payload in documents.items():
         try:
-            document = payload.decode("utf-8")
+            document = _decode_marker_source(payload)
         except UnicodeDecodeError as error:
             raise ValidationError(f"DSM Help document {page}.html is not UTF-8") from error
         for marker in (
@@ -408,7 +476,7 @@ def validate_dsm_help(
 
 
 def validate_notifier(payload: bytes) -> None:
-    source = payload.decode("utf-8")
+    source = _decode_marker_source(payload)
     legacy = "/usr/syno/bin/synonotify"
     direct = "/usr/syno/bin/synodsmnotify"
     if legacy in source:
@@ -432,7 +500,7 @@ def validate_notifier(payload: bytes) -> None:
 
 
 def validate_svg_icon(payload: bytes) -> None:
-    source = payload.decode("utf-8")
+    source = _decode_marker_source(payload)
     if '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256"' not in source:
         raise ValidationError("authored icon source must be a bounded 256x256 SVG")
     if '<rect x="16" y="16" width="224" height="224"' not in source:
@@ -442,8 +510,9 @@ def validate_svg_icon(payload: bytes) -> None:
         raise ValidationError("authored icon source contains an external or executable construct")
 
 
+@_diagnose_crlf_only_failure
 def validate_native_api_source(payload: bytes) -> None:
-    source = payload.decode("utf-8")
+    source = _decode_marker_source(payload)
     endpoints = re.findall(r'["\']([^"\']*api\.cgi)["\']', source)
     if endpoints != [CANONICAL_API]:
         raise ValidationError("native DSM UI must use only the canonical absolute package CGI path")
@@ -485,9 +554,10 @@ def validate_native_api_source(payload: bytes) -> None:
         "signal.addEventListener(\"abort\", cancel, { once: true })",
         "signal.removeEventListener(\"abort\", cancel)",
         "window.clearTimeout(timer)",
-        "const RESULT_INITIAL_POLL_INTERVAL_MS = 500;",
-        "const RESULT_POLL_INTERVAL_MS = 2000;",
-        "const RESULT_POLL_OBSERVATION_FAILURES = 5;",
+        "const RESULT_POLL_RAMP_MS = Object.freeze([150, 300, 600, 1200, 2000]);",
+        "const RESULT_POLL_INTERVAL_MS = RESULT_POLL_RAMP_MS[RESULT_POLL_RAMP_MS.length - 1];",
+        "const RESULT_OBSERVATION_FAILURE_WINDOW_MS = 10000;",
+        "const RESULT_OBSERVATION_MIN_FAILURES = 2;",
         "const POST_DISPATCH_REPLAY_DELAYS_MS = Object.freeze([250, 1000]);",
         "const POST_DISPATCH_MAX_ATTEMPTS = POST_DISPATCH_REPLAY_DELAYS_MS.length + 1;",
         'export const REQUEST_STATUS_SCHEMA = "sdsync.dsm-request-status.v1";',
@@ -806,7 +876,9 @@ def validate_native_api_source(payload: bytes) -> None:
         "for (;;)",
         "if (auth && auth.signal && auth.signal.aborted) throw error;",
         "consecutiveObservationFailures += 1;",
-        "if (!observation && consecutiveObservationFailures >= RESULT_POLL_OBSERVATION_FAILURES)",
+        "if (!observation && observationLostForTooLong)",
+        "consecutiveObservationFailures >= RESULT_OBSERVATION_MIN_FAILURES",
+        "firstObservationFailureAt >= RESULT_OBSERVATION_FAILURE_WINDOW_MS",
         "consecutiveObservationFailures = 0;",
         "status.state === \"pending\"",
         "status.state === \"expired_or_missing\"",
@@ -834,7 +906,7 @@ def validate_native_api_source(payload: bytes) -> None:
         )
     if (
         poll_source.count(
-            "await delay(interval, auth && auth.signal, limits, observation);"
+            "await delay(retryInterval, auth && auth.signal, limits, observation);"
         ) != 1
         or poll_source.count(
             "await delay(pendingInterval, auth && auth.signal, limits, observation);"
@@ -1136,6 +1208,7 @@ def _validate_bundled_action_icon(script: str, action_icon_source: str | None = 
         )
 
 
+@_diagnose_crlf_only_failure
 def validate_native_build_contract(
     main_payload: bytes,
     app_payload: bytes,
@@ -1149,12 +1222,12 @@ def validate_native_build_contract(
     action_icon_payload: bytes | None = None,
     security_panel_payload: bytes | None = None,
 ) -> None:
-    main = main_payload.decode("utf-8")
-    app = app_payload.decode("utf-8")
-    css = css_payload.decode("utf-8")
-    webpack = webpack_payload.decode("utf-8")
-    runtime_styles = runtime_styles_payload.decode("utf-8")
-    control_layout = control_layout_payload.decode("utf-8")
+    main = _decode_marker_source(main_payload)
+    app = _decode_marker_source(app_payload)
+    css = _decode_marker_source(css_payload)
+    webpack = _decode_marker_source(webpack_payload)
+    runtime_styles = _decode_marker_source(runtime_styles_payload)
+    control_layout = _decode_marker_source(control_layout_payload)
 
     for marker in (
         'import Vue from "vue";',
@@ -1437,8 +1510,8 @@ def validate_native_build_contract(
     if (action_icon_payload is None) != (security_panel_payload is None):
         raise ValidationError("shared ActionIcon validation requires both component sources")
     if action_icon_payload is not None and security_panel_payload is not None:
-        action_icon = action_icon_payload.decode("utf-8")
-        security_panel = security_panel_payload.decode("utf-8")
+        action_icon = _decode_marker_source(action_icon_payload)
+        security_panel = _decode_marker_source(security_panel_payload)
         for icon in route_icons | {"help", "save", "chevron-down"}:
             icon_property = rf'^\s*(?:"{re.escape(icon)}"|{re.escape(icon)}):\s*\['
             if not re.search(icon_property, action_icon, re.MULTILINE):
@@ -1972,11 +2045,20 @@ def _validate_runtime_style_bundle(script: str, style: str) -> None:
         )
 
 
+@_diagnose_crlf_only_failure
 def validate_native_bundle(
     script_payload: bytes,
     style_payload: bytes,
     action_icon_payload: bytes | None = None,
 ) -> None:
+    # script/style are intentionally decoded raw (not via _decode_marker_source):
+    # _validate_runtime_style_bundle() below asserts the built bundle embeds the
+    # exact packaged stylesheet bytes, and _uses_dsm_global_vue() does its own
+    # character-level JS lexing. Both are tamper/build-integrity checks, not
+    # source-contract markers, and normalizing here would risk masking a real
+    # mismatch between the two built artifacts. A pure line-ending mismatch
+    # still gets a clear explanation via the @_diagnose_crlf_only_failure retry
+    # above instead of silently passing or pointing at the wrong layer.
     script = script_payload.decode("utf-8")
     style = style_payload.decode("utf-8")
     for marker in (

@@ -35,6 +35,7 @@ control_requests=$control_root/requests
 control_processing=$control_root/processing
 control_responses=$control_root/responses
 control_staging=$control_root/staging
+control_progress=$control_root/progress
 log_root=$package_var/log
 controller_log=$log_root/controller.log
 activity_log=$log_root/activity.log
@@ -106,9 +107,20 @@ decimal_at_most() {
     return 0
 }
 
+# A process cannot change its own uid, so ask once and remember. This was being
+# asked 42 times in a single profile save -- once per finish_private_file, by
+# way of this function -- at a fork apiece. Resolved lazily so a caller that
+# never touches a private file pays nothing.
+process_uid=
+resolve_process_uid() {
+    [ -z "$process_uid" ] || return 0
+    process_uid=$(id -u 2>/dev/null || printf '')
+}
+
 set_private_owner() {
     private_path=$1
-    if [ "$(id -u)" = 0 ] && [ -n "$path_owner" ] && [ -n "$path_group" ]; then
+    resolve_process_uid
+    if [ "$process_uid" = 0 ] && [ -n "$path_owner" ] && [ -n "$path_group" ]; then
         chown "$path_owner:$path_group" "$private_path"
     fi
 }
@@ -141,6 +153,39 @@ require_package_identity() {
     fi
 }
 
+# True only when every path given already satisfies the complete post-condition
+# of the repair loop below. Note that [ -d ] follows a symlink and answers yes
+# for a symlink to a directory, so [ -L ] is the test actually standing between
+# this fast path and the refusal it must not skip. Mode and ownership for all
+# nineteen paths come from a single stat rather than one per path, and the
+# read-back loop is fed by a here-document so it stays in this shell.
+layout_already_private() {
+    for layout_dir in "$@"; do
+        [ -d "$layout_dir" ] && [ ! -L "$layout_dir" ] || return 1
+    done
+    layout_expected=$#
+    layout_report=$(stat -c '%a %u %g' "$@" 2>/dev/null) || return 1
+    resolve_process_uid
+    layout_check_owner=false
+    if [ "$process_uid" = 0 ] && [ -n "$path_owner" ] && [ -n "$path_group" ]; then
+        layout_check_owner=true
+    fi
+    layout_seen=0
+    layout_intact=true
+    while IFS=' ' read -r layout_mode layout_uid layout_gid layout_surplus; do
+        [ -n "$layout_mode" ] || continue
+        layout_seen=$((layout_seen + 1))
+        [ -z "$layout_surplus" ] || layout_intact=false
+        [ "$layout_mode" = 700 ] || layout_intact=false
+        if [ "$layout_check_owner" = true ]; then
+            [ "$layout_uid" = "$path_owner" ] && [ "$layout_gid" = "$path_group" ] || layout_intact=false
+        fi
+    done <<LAYOUT_REPORT
+$layout_report
+LAYOUT_REPORT
+    [ "$layout_intact" = true ] && [ "$layout_seen" -eq "$layout_expected" ]
+}
+
 ensure_layout() {
     old_umask=$(umask)
     umask 077
@@ -162,10 +207,26 @@ ensure_layout() {
     else
         private_roots=$package_var
     fi
-    for private_dir in $private_roots "$config_root" "$profiles_dir" \
+    # One list, consumed by both the check and the repair below, so the two can
+    # never drift apart and leave a directory checked but unrepaired -- or
+    # repaired but unchecked.
+    set -- $private_roots "$config_root" "$profiles_dir" \
         "$routines_dir" "$secret_root" "$state_root" "$routine_state_dir" "$profile_state_dir" \
         "$health_dir" "$cache_root" "$audit_outbox_dir" "$runtime_root" "$control_root" "$control_requests" \
-        "$control_processing" "$control_responses" "$control_staging" "$log_root"
+        "$control_processing" "$control_responses" "$control_staging" "$control_progress" "$log_root"
+    # Every invocation used to spend mkdir + chmod + chown on all nineteen of
+    # these whether or not they were already correct: about 57 processes, and
+    # 119 of the 175 spawned by a single profile save went on exactly this. Skip
+    # that work only when the whole invariant already holds -- present, a real
+    # directory rather than a symlink, mode 0700, and owned as this process
+    # would chown it. Anything less falls through to the untouched repair loop,
+    # because a fast path that skipped on existence alone would quietly retire
+    # the symlink refusal, which is a security check and not a tidiness one.
+    if layout_already_private "$@"; then
+        umask "$old_umask"
+        return 0
+    fi
+    for private_dir in "$@"
     do
         if [ -L "$private_dir" ]; then
             echo "refusing symlinked package data directory: $private_dir" >&2
@@ -631,6 +692,19 @@ controller_start_lease_committed_matches_parent() {
     controller_start_lease_identity_matches_parent
 }
 
+# Poll bucket A: the sleep here is sampling granularity and nothing else -- the
+# lease is either committed or it is not, and there is no counter whose units
+# could drift.
+#
+# Left at one second all the same, because of a library boundary rather than a
+# hazard. The pacing helpers live in packaging/synology/scripts/common, which
+# is what the lifecycle scripts source; this file is sourced by the controller
+# and the manager instead, and the two libraries are deliberately separate --
+# both define same_private_executable, and scripts/common is sourced by preinst
+# before $package_root exists, so it cannot pull this file in. Converting this
+# site would mean a second copy of the pacing helpers, which is not worth it
+# for one lease wait. If the helpers ever need a shared home, that is the
+# change to make, not a duplicate.
 wait_for_controller_start_commit() {
     while :; do
         read_controller_start_lease || return 73
@@ -1140,6 +1214,15 @@ create_event_log_lock_directory() {
     private_event_lock_directory "$event_log_lock" || return 1
 }
 
+# Poll bucket C -- do not convert the `sleep 1` calls below to poll_wait. The
+# `event_lock_attempt -lt 10` bounds throughout this function count *attempts*,
+# not seconds, so the ~10 s of lock tolerance they provide is a product of the
+# interval and the bound. There is no timeout-named variable here, which is
+# what makes it dangerous: a search for `*_timeout` finds nothing and a
+# fractional interval would quietly cut the tolerance to about half a second.
+#
+# The `event_stale_observations` check further down is bucket D and is worse
+# still; see the comment there.
 acquire_event_log_lock() {
     [ "$event_log_lock_held" != true ] || return 0
     create_event_log_lock_directory || return 73
@@ -1315,6 +1398,13 @@ acquire_event_log_lock() {
             event_stale_identity=$event_lock_identity
             event_stale_observations=1
         fi
+        # Poll bucket D -- the duration is the evidence, not the sampling rate.
+        # This declares the lock stale only after two observations of an
+        # unchanged, non-live identity, and the sleep between them is what makes
+        # the second observation independent. It reads exactly like a bucket-A
+        # poll and is not one: shorten it and "unchanged for a second" becomes
+        # "unchanged for fifty milliseconds", which can recover a lock from an
+        # owner that is merely mid-write. Leave it at one second.
         if [ "$event_stale_observations" -lt 2 ]; then
             sleep 1
             continue

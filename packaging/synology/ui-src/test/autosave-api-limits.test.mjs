@@ -106,7 +106,8 @@ function installBrowser(packageFetch, tokenFetch = undefined, timers = undefined
     crypto: globalThis.crypto || webcrypto,
     fetch: tokenFetch,
     setTimeout: timers ? timers.setTimeout : globalThis.setTimeout,
-    clearTimeout: timers ? timers.clearTimeout : globalThis.clearTimeout
+    clearTimeout: timers ? timers.clearTimeout : globalThis.clearTimeout,
+    now: timers ? () => timers.time : undefined
   };
   globalThis.fetch = packageFetch;
   return () => {
@@ -245,7 +246,7 @@ test("unbounded-terminal POST dispatch still times out, aborts, and exact-replay
   }
 });
 
-test("unbounded terminal observation aborts five hung result reads without an overall deadline", async () => {
+test("unbounded terminal observation aborts hung result reads and ends on its time ceiling, not an attempt count", async () => {
   const clock = new FakeClock();
   const jobId = "d".repeat(48);
   const resultSignals = [];
@@ -281,17 +282,27 @@ test("unbounded terminal observation aborts five hung result reads without an ov
       return true;
     });
 
-    for (let attempt = 0; attempt < 5; attempt += 1) {
+    // Each read hangs for its full 10s request timeout, so two of them exhaust the
+    // 10s observation window. Under the old attempt ceiling this took five reads and
+    // roughly a minute; the quantity being bounded is now the one that matters.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
       await clock.settleUntil(
         () => resultSignals.length === attempt + 1 && clock.hasTimerIn(10000),
         `default result request timeout ${attempt + 1}`
       );
       assert.equal(clock.hasTimerIn(30000), false, "unbounded terminal polling must not arm an overall deadline");
       await clock.advance(10000);
+      if (attempt === 0) {
+        await clock.settleUntil(
+          () => clock.hasTimerIn(150),
+          "backoff before the next observation"
+        );
+        await clock.advance(150);
+      }
     }
 
     await rejected;
-    assert.equal(resultSignals.length, 5);
+    assert.equal(resultSignals.length, 2);
     assert.equal(resultSignals.every((signal) => signal instanceof AbortSignal && signal.aborted), true);
     assert.equal(clock.timers.size, 0);
   } finally {
@@ -304,11 +315,12 @@ function limits(api, clock, overrides = {}) {
     ...api.AUTOSAVE_API_LIMITS,
     ...overrides,
     setTimeout: clock.setTimeout,
-    clearTimeout: clock.clearTimeout
+    clearTimeout: clock.clearTimeout,
+    now: () => clock.time
   };
 }
 
-test("default terminal polling uses one fast observation before returning to 2s", async () => {
+test("default terminal polling walks a decaying ramp rather than one fast poll then 2s", async () => {
   const clock = new FakeClock();
   const jobId = "a".repeat(48);
   let requestId = "";
@@ -355,20 +367,23 @@ test("default terminal polling uses one fast observation before returning to 2s"
       undefined,
       limits(api, clock)
     );
+    // First step of RESULT_POLL_RAMP_MS. The old ladder answered a job finishing at
+    // 601ms only at 2500ms; the ramp answers at roughly the speed of the job while
+    // still decaying to the long-operation cadence for jobs that genuinely run long.
     await clock.settleUntil(
-      () => resultReads === 1 && clock.hasTimerIn(500),
-      "default 500ms terminal result poll"
+      () => resultReads === 1 && clock.hasTimerIn(150),
+      "first ramp step"
     );
-    await clock.advance(499);
+    await clock.advance(149);
     assert.equal(resultReads, 1, "the result observer must not busy-spin");
     await clock.advance(1);
     assert.equal(resultReads, 2);
     await clock.settleUntil(
-      () => clock.hasTimerIn(2000),
-      "default 2s long-operation result poll"
+      () => clock.hasTimerIn(300),
+      "second ramp step"
     );
-    await clock.advance(1999);
-    assert.equal(resultReads, 2, "long operations must retain the bounded 2s cadence");
+    await clock.advance(299);
+    assert.equal(resultReads, 2, "the ramp must decay rather than busy-spin");
     await clock.advance(1);
     const result = await pending;
     assert.equal(result.observed, true);

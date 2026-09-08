@@ -445,6 +445,7 @@ test("Manual refresh options clear timers without creating replacements", async 
   const methods = component.methods;
   assert.deepEqual(component.computed.statusRefreshOptions(), [
     { value: 0, label: "Manual only" },
+    { value: 1000, label: "Every second" },
     { value: 3000, label: "Every 3 seconds" },
     { value: 5000, label: "Every 5 seconds" },
     { value: 10000, label: "Every 10 seconds" },

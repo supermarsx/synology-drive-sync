@@ -370,10 +370,31 @@ impl ReachabilityBudget {
         }
     }
 
+    /// Extensive buys enough TCP samples that a bimodal connect time is unmistakable, and the
+    /// fewest HTTP samples that can still reach a verdict.
+    ///
+    /// **Three is a floor, not a preference.** The only finding the HTTP samples uniquely produce
+    /// is [`LatencySamples::is_widely_spread`], which requires `len() >= 3` before it can fire at
+    /// all. Trimming this to 2 would not make the probe cheaper so much as make that finding
+    /// unreachable, and the section would report a consistent path because it never had enough
+    /// samples to say otherwise.
+    ///
+    /// It was 5, and the fourth and fifth samples were what made this the most expensive section
+    /// of the run. On a QuickConnect relay each HTTP sample costs the ~3.8 s a relayed discovery
+    /// request costs, so five of them approach the 20 s `total` on their own -- before the client
+    /// this probe explains has even been constructed. Those two extra samples bought confidence
+    /// about a conclusion the run already had from elsewhere: `suggests_multiple_paths` is
+    /// `dns.address_count > 1 || ...`, which a relay hostname satisfies on almost every run, and
+    /// the intermediary section warns on a relayed endpoint independently. Three keeps the
+    /// verdict reachable and leaves the ceiling real headroom rather than about a second of it.
+    ///
+    /// This is also why the ceiling is not the thing to adjust: the worst case is `total` plus one
+    /// `http_request_timeout`, so buying margin by raising `total` would have re-inflated exactly
+    /// the number the margin was for.
     pub const fn extensive() -> Self {
         Self {
             tcp_samples: 9,
-            http_samples: 5,
+            http_samples: 3,
             total: Duration::from_secs(20),
             http_request_timeout: Duration::from_secs(12),
         }
@@ -2149,6 +2170,49 @@ mod tests {
                 budget.http_request_timeout
             );
             assert!(budget.http_samples > 0);
+        }
+    }
+
+    /// The HTTP sample count is a floor, not a preference.
+    ///
+    /// `is_widely_spread` cannot fire below three samples, so a level that means to report an
+    /// HTTP-spread finding has to take at least three. This binds the budgets to the predicate
+    /// rather than to a number someone typed: trim `extensive` to 2 and the finding becomes
+    /// unreachable, and the section would report a consistent path because it never had the
+    /// samples to say otherwise -- a silent loss no timing test would catch.
+    ///
+    /// Quick is deliberately exempt. It is the level an operator reaches for when something is
+    /// already wrong, and it leans on DNS address count and TCP spread instead.
+    #[test]
+    fn levels_that_report_http_spread_take_enough_samples_to_reach_the_verdict() {
+        // Derived here rather than asserted from memory: two samples as far apart as the
+        // predicate's own floor and ratio allow still does not qualify, and a third identical
+        // sample tips it. Whatever `is_widely_spread` requires, this reads it back.
+        let mut two = LatencySamples::default();
+        two.push(Duration::from_millis(10));
+        two.push(Duration::from_millis(100));
+        assert!(
+            !two.is_widely_spread(),
+            "two samples cannot establish a spread however far apart they are"
+        );
+        let mut three = two.clone();
+        three.push(Duration::from_millis(100));
+        assert!(
+            three.is_widely_spread(),
+            "three samples over the floor and ratio is the point at which the finding fires"
+        );
+        let spread_floor = three.len();
+
+        for (level, budget) in [
+            ("standard", ReachabilityBudget::standard()),
+            ("extensive", ReachabilityBudget::extensive()),
+        ] {
+            assert!(
+                budget.http_samples >= spread_floor,
+                "{level} takes {} HTTP samples, below the {spread_floor} `is_widely_spread` \
+                 needs; the level would report a consistent path it never measured",
+                budget.http_samples
+            );
         }
     }
 }

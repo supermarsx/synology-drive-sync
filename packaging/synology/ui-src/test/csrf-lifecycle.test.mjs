@@ -709,7 +709,18 @@ test("post-202 observation, invalid-result, and expired-result errors retain exa
           }
         );
         assert.equal(postCount, 1, "queued observation must never repeat POST");
-        assert.equal(resultCount, scenario === "observation" ? 5 : 1);
+        // Exactly 5 was an artifact of the old attempt-count ceiling. With a duration
+        // ceiling the count follows the backoff, so what is worth asserting is that the
+        // observer backs off at all: this caller polls at 0ms against an endpoint that
+        // fails instantly, and without backoff it would issue hundreds of reads.
+        if (scenario === "observation") {
+          assert.ok(
+            resultCount >= 2 && resultCount <= 12,
+            `expected a handful of backed-off observations, got ${resultCount}`
+          );
+        } else {
+          assert.equal(resultCount, 1);
+        }
       });
     }
   } finally {

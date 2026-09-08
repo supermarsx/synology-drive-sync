@@ -31,12 +31,27 @@ const TERMINAL_API_ATTEMPT_TIMEOUTS = Object.freeze({
 });
 
 const CSRF_SCHEMA = "sdsync.dsm-csrf.v1";
-// Terminal reads are side-effect free. Observe the first pending result quickly
-// so a freshly-woken controller feels responsive, then return to the bounded
-// long-operation cadence used by Doctor and other potentially slow jobs.
-const RESULT_INITIAL_POLL_INTERVAL_MS = 500;
-const RESULT_POLL_INTERVAL_MS = 2000;
-const RESULT_POLL_OBSERVATION_FAILURES = 5;
+// Terminal reads are side-effect free, so the first observations can be cheap and
+// frequent and then decay toward the bounded long-operation cadence that Doctor and
+// other slow jobs need. The previous two-step ladder (500 ms once, then 2000 ms flat)
+// meant a job finishing at 601 ms was invisible until 2500 ms; a job that finished
+// just after the first poll paid the full long-operation interval for it.
+const RESULT_POLL_RAMP_MS = Object.freeze([150, 300, 600, 1200, 2000]);
+const RESULT_POLL_INTERVAL_MS = RESULT_POLL_RAMP_MS[RESULT_POLL_RAMP_MS.length - 1];
+// How long observation may go on failing before the outcome is declared unknown.
+//
+// This is a duration and not an attempt count, and the distinction is the whole
+// point. A count is only a proxy for time, and it is a proxy whose scale moves with
+// the poll interval: five attempts was ten seconds of tolerance at 2000 ms, but would
+// be 750 ms once the ramp starts at 150 ms -- a thirteen-fold cut in how much
+// transport trouble is survivable, arriving silently as a side effect of polling
+// faster. Ten seconds preserves the tolerance the count was chosen to express.
+const RESULT_OBSERVATION_FAILURE_WINDOW_MS = 10000;
+// ...but a single anomalous request must not end observation on its own, however long
+// it took. A request may itself burn ten seconds before failing, so the window alone
+// could be spent by one hung read; requiring a second independent failure keeps that
+// from being mistaken for sustained loss of observability.
+const RESULT_OBSERVATION_MIN_FAILURES = 2;
 const POST_DISPATCH_REPLAY_DELAYS_MS = Object.freeze([250, 1000]);
 const POST_DISPATCH_MAX_ATTEMPTS = POST_DISPATCH_REPLAY_DELAYS_MS.length + 1;
 const MAX_DSM_TOKEN_RESPONSE_BYTES = 16 * 1024;
@@ -603,7 +618,7 @@ function normalizedRequestLimits(options) {
     "readTimeoutMs", "resultRequestTimeoutMs", "resultObservationTimeoutMs",
     "requestReconciliationTimeoutMs", "requestReconciliationPollIntervalMs"
   ];
-  const supportedKeys = new Set([...timeoutKeys, "setTimeout", "clearTimeout"]);
+  const supportedKeys = new Set([...timeoutKeys, "setTimeout", "clearTimeout", "now"]);
   if (Object.keys(options).some((key) => !supportedKeys.has(key))) {
     throw new TypeError("API request limits contain an unsupported option");
   }
@@ -621,12 +636,20 @@ function normalizedRequestLimits(options) {
   if (options.clearTimeout !== undefined && typeof options.clearTimeout !== "function") {
     throw new TypeError("API request clearTimeout option must be a function");
   }
+  if (options.now !== undefined && typeof options.now !== "function") {
+    throw new TypeError("API request now option must be a function");
+  }
   normalized.setTimer = typeof options.setTimeout === "function"
     ? options.setTimeout
     : (callback, milliseconds) => window.setTimeout(callback, milliseconds);
   normalized.clearTimer = typeof options.clearTimeout === "function"
     ? options.clearTimeout
     : (timer) => window.clearTimeout(timer);
+  // The observation ceiling is a duration, so whoever supplies the timers must be able
+  // to supply the clock as well. A caller that fakes setTimeout but not the clock would
+  // advance timers against a deadline that never moves -- the two would disagree and
+  // the ceiling would be untestable. Defaults to the real clock, as production wants.
+  normalized.now = typeof options.now === "function" ? options.now : () => Date.now();
   if ((options.setTimeout === undefined) !== (options.clearTimeout === undefined)) {
     throw new TypeError("API request limits must provide both timer functions or neither");
   }
@@ -638,7 +661,12 @@ function terminalAttemptLimits() {
     ...TERMINAL_API_ATTEMPT_TIMEOUTS,
     resultObservationTimeoutMs: null,
     setTimer: (callback, milliseconds) => window.setTimeout(callback, milliseconds),
-    clearTimer: (timer) => window.clearTimeout(timer)
+    clearTimer: (timer) => window.clearTimeout(timer),
+    // Same injection point as the timers above. A harness that fakes window.setTimeout
+    // but leaves the clock real would advance timers against a deadline that never
+    // moves, so the unbounded observation ceiling could not be exercised at all.
+    // Production has no window.now and falls through to the real clock.
+    now: () => (typeof window.now === "function" ? window.now() : Date.now())
   };
 }
 
@@ -848,6 +876,12 @@ async function pollJobResult(
     : RESULT_POLL_INTERVAL_MS;
   let pendingResultReads = 0;
   let consecutiveObservationFailures = 0;
+  let firstObservationFailureAt = 0;
+  // Read the clock through the same injection point the timers use. The observation
+  // ceiling is a duration, so a test that controls setTimeout but not the clock would
+  // advance timers past a deadline that never moves -- two clocks disagreeing, and the
+  // ceiling silently untestable. Production passes neither and gets Date.now.
+  const readClock = limits && typeof limits.now === "function" ? limits.now : () => Date.now();
   for (;;) {
     if (observation && observation.expired) {
       throw queuedObservationTimeout(
@@ -898,13 +932,19 @@ async function pollJobResult(
         );
       }
       consecutiveObservationFailures += 1;
+      if (firstObservationFailureAt === 0) firstObservationFailureAt = readClock();
       // The POST was already accepted. Repeated transport/auth observation
       // failures are not evidence that the queued mutation failed, so surface
       // an explicit outcome-unknown state rather than inviting a duplicate.
       // Bounded callers own an overall observation deadline, so transient
       // request failures remain retryable until that deadline. Unbounded
-      // callers retain a finite failure ceiling rather than polling forever.
-      if (!observation && consecutiveObservationFailures >= RESULT_POLL_OBSERVATION_FAILURES) {
+      // callers give up after a bounded period of continuous failure -- measured
+      // as elapsed time rather than as a number of attempts, so that changing the
+      // poll cadence cannot quietly change how much trouble is survivable.
+      const observationLostForTooLong =
+        consecutiveObservationFailures >= RESULT_OBSERVATION_MIN_FAILURES
+        && readClock() - firstObservationFailureAt >= RESULT_OBSERVATION_FAILURE_WINDOW_MS;
+      if (!observation && observationLostForTooLong) {
         throw new QueuedOutcomeUnknownError(
           jobId,
           "DSM accepted the operation, but its result cannot currently be observed. Do not retry it; inspect Activity and Logs.",
@@ -912,7 +952,27 @@ async function pollJobResult(
           expectedOperation
         );
       }
-      await delay(interval, auth && auth.signal, limits, observation);
+      // Back off between failed observations, flooring the caller's interval with the
+      // same ramp the pending path uses. Without this the time-based ceiling would have
+      // no attempt bound at all: a caller polling at a very short interval against an
+      // endpoint that fails instantly would retry for the whole window as fast as the
+      // network allowed. The count-based ceiling used to bound that as a side effect;
+      // now it is bounded on purpose, and a caller asking for a longer interval keeps it.
+      // Only floor the retry where nothing else bounds it. A bounded caller already
+      // owns an overall observation deadline, so its interval is its own to choose --
+      // flooring that would let this backoff spend a budget the caller set deliberately.
+      // An unbounded caller has no such deadline, and the time-based ceiling below is a
+      // duration rather than an attempt count, so without a floor it would retry as fast
+      // as the network allowed for the whole window.
+      const retryInterval = observation
+        ? interval
+        : Math.max(
+          interval,
+          RESULT_POLL_RAMP_MS[
+            Math.min(consecutiveObservationFailures - 1, RESULT_POLL_RAMP_MS.length - 1)
+          ]
+        );
+      await delay(retryInterval, auth && auth.signal, limits, observation);
       continue;
     }
     if (observation && observation.expired) {
@@ -924,6 +984,7 @@ async function pollJobResult(
       );
     }
     consecutiveObservationFailures = 0;
+    firstObservationFailureAt = 0;
     if (status.schema !== RESULT_STATUS_SCHEMA || status.job_id !== jobId) {
       throw new QueuedOutcomeUnknownError(
         jobId,
@@ -933,8 +994,11 @@ async function pollJobResult(
       );
     }
     if (status.state === "pending") {
-      const pendingInterval = pendingResultReads === 0 && interval === RESULT_POLL_INTERVAL_MS
-        ? RESULT_INITIAL_POLL_INTERVAL_MS
+      // A caller that named its own interval keeps it; otherwise walk the ramp, so
+      // the answer arrives at roughly the speed of the job for short jobs without
+      // hammering the endpoint for long ones.
+      const pendingInterval = interval === RESULT_POLL_INTERVAL_MS
+        ? RESULT_POLL_RAMP_MS[Math.min(pendingResultReads, RESULT_POLL_RAMP_MS.length - 1)]
         : interval;
       pendingResultReads += 1;
       await delay(pendingInterval, auth && auth.signal, limits, observation);
