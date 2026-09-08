@@ -27,6 +27,7 @@ state_root=$package_var/state
 routine_state_dir=$state_root/routines
 profile_state_dir=$state_root/profiles
 health_dir=$state_root/health
+cache_root=$state_root/cache
 audit_outbox_dir=$state_root/audit-outbox
 runtime_root=$package_var/run
 control_root=$package_var/control
@@ -163,7 +164,7 @@ ensure_layout() {
     fi
     for private_dir in $private_roots "$config_root" "$profiles_dir" \
         "$routines_dir" "$secret_root" "$state_root" "$routine_state_dir" "$profile_state_dir" \
-        "$health_dir" "$audit_outbox_dir" "$runtime_root" "$control_root" "$control_requests" \
+        "$health_dir" "$cache_root" "$audit_outbox_dir" "$runtime_root" "$control_root" "$control_requests" \
         "$control_processing" "$control_responses" "$control_staging" "$log_root"
     do
         if [ -L "$private_dir" ]; then
@@ -2501,4 +2502,349 @@ private_secret_file() {
     secret_links=$(stat -c '%h' "$secret_path" 2>/dev/null || true)
     [ "$secret_mode" = 600 ] && [ -n "$path_owner" ] && [ "$secret_owner" = "$path_owner" ] \
         && [ "$secret_links" = 1 ]
+}
+
+# ---------------------------------------------------------------------------
+# Response cache for the read-only DSM API endpoints
+#
+# The dashboard re-reads `api snapshot` every five seconds for every open
+# browser tab, and that response is a pure function of private package files.
+# An entry therefore stores the exact bytes that would have been served --
+# always the finished, post-redaction response, never an intermediate --
+# keyed by a fingerprint of every file the response was derived from.
+#
+# The fingerprint is the stat identity of every input plus a content witness.
+# Every package state document is published by rename, so its inode moves on
+# each write, but an operator can still rewrite a config file in place; the
+# witness closes the gaps stat alone leaves, principally a write inside the
+# same mtime second. It reads content rather than sampling a boundary line
+# because a boundary cannot see an edit that leaves the last line alone -- a
+# failure measured here, not imagined -- and because these inputs are a few
+# kilobytes against the ~1000 process spawns being removed.
+#
+# That trade does not generalise. An input whose size is the cost -- a
+# megabyte-scale append-only log -- would need a seek-based window read from
+# the end holding its newest record instead, and note that on busybox
+# `tail -n 1` is not such a seek: measured on 1.36 it reads 983040 bytes of a
+# 2.4 MB file, where `tail -c 4096` reads 4096. Witnessing the wrong end of
+# such a file serves stale data indefinitely while every check looks healthy.
+#
+# Secret material is fingerprinted by stat alone and is never witnessed: a
+# witness reads file content, and no secret byte may be written into a cache
+# entry. Callers pass secret paths in the stat-only list.
+# ---------------------------------------------------------------------------
+cache_schema=sdsync.cache.v1
+cache_entry_limit=16
+cache_total_limit=4194304
+cache_body_limit=1048576
+cache_content_witness_limit=1048576
+cache_fingerprint_line_limit=4096
+cache_flight_stale_seconds=120
+cache_newline='
+'
+cache_fingerprint=
+cache_body=
+cache_body_bytes=
+cache_flight_path=
+cache_temp_path=
+
+cache_name_is_safe() {
+    case ${1:-} in
+        ''|.*|*[!A-Za-z0-9._-]*) return 1 ;;
+        *..*) return 1 ;;
+    esac
+    [ "${#1}" -le 64 ]
+}
+
+# Build the invalidation fingerprint for one cache key.
+#   $1 cache key
+#   $2 input paths fingerprinted by stat alone (secret material belongs here)
+#   $3 input paths that also contribute a content witness
+#
+# The witnessed inputs are read in full. That is only correct while they stay
+# small; see the note above this section before pointing this at anything
+# whose size is itself the cost.
+#
+# Package paths are fixed and profile and routine names are validated, so no
+# input path can contain whitespace. Any failure leaves the fingerprint empty,
+# which makes every lookup and store a miss rather than a wrong answer.
+cache_build_fingerprint() {
+    cache_fingerprint=
+    cache_fp_key=$1
+    cache_fp_stat_only=$2
+    cache_fp_witnessed=$3
+    cache_name_is_safe "$cache_fp_key" || return 1
+    cache_fp_present=
+    cache_fp_witness_present=
+    cache_fp_absent=
+    for cache_fp_path in $cache_fp_stat_only; do
+        if [ -e "$cache_fp_path" ] || [ -L "$cache_fp_path" ]; then
+            cache_fp_present="$cache_fp_present $cache_fp_path"
+        else
+            cache_fp_absent="$cache_fp_absent $cache_fp_path"
+        fi
+    done
+    for cache_fp_path in $cache_fp_witnessed; do
+        if [ -e "$cache_fp_path" ] || [ -L "$cache_fp_path" ]; then
+            cache_fp_present="$cache_fp_present $cache_fp_path"
+            # Witness only a plain file the package itself owns the shape of.
+            # tail and cat both follow a symlink, and no fingerprint may read
+            # through one; stat records the anomaly without opening it, which
+            # is enough to keep the entry from matching.
+            if [ -f "$cache_fp_path" ] && [ ! -L "$cache_fp_path" ]; then
+                cache_fp_witness_present="$cache_fp_witness_present $cache_fp_path"
+            fi
+        else
+            cache_fp_absent="$cache_fp_absent $cache_fp_path"
+        fi
+    done
+    # One stat covers both package scripts -- so an upgrade retires every entry
+    # -- and every present input. %d:%i alone already moves on each write of a
+    # rename-published document; %u:%g:%a:%h keep an entry from outliving a
+    # change of owner, mode, or link count that the uncached path refuses to
+    # serve. %y carries the nanosecond mtime where the platform records one and
+    # is inert where it does not, so it narrows the same-second window without
+    # being relied on. A file that disappears between the test above and this
+    # stat makes stat fail, which is a miss.
+    cache_fp_identity=$(stat -c '%n %d:%i:%u:%g:%a:%h:%s:%Y %y' \
+        "$manager" "$package_root/libexec/sdsync-common" $cache_fp_present 2>/dev/null) || return 1
+    cache_fp_witness=
+    if [ -n "$cache_fp_witness_present" ]; then
+        # Folded to a single line so the entry stays cheap to read back; the
+        # per-file byte counts above already separate the inputs, so the fold
+        # cannot make two different states look alike.
+        cache_fp_witness=$(cat $cache_fp_witness_present 2>/dev/null | tr '\n' '\037') || return 1
+        [ "${#cache_fp_witness}" -le "$cache_content_witness_limit" ] || return 1
+    fi
+    cache_fingerprint="$cache_schema
+key $cache_fp_key
+absent$cache_fp_absent
+identity
+$cache_fp_identity
+witness
+$cache_fp_witness"
+}
+
+# Serve the entry matching the fingerprint built above. On success the body is
+# in $cache_body and its byte count in $cache_body_bytes; every field is read
+# with shell builtins, so a hit spawns no process at all. One open serves the
+# whole entry, so a concurrent publish can never splice two generations
+# together, and the trailing sentinel turns a truncated entry into a miss
+# rather than a malformed response.
+cache_lookup() {
+    cache_body=
+    cache_body_bytes=
+    cache_lookup_key=$1
+    cache_name_is_safe "$cache_lookup_key" || return 1
+    [ -n "$cache_fingerprint" ] || return 1
+    cache_lookup_path=$cache_root/$cache_lookup_key
+    [ ! -L "$cache_lookup_path" ] && [ -f "$cache_lookup_path" ] && [ -r "$cache_lookup_path" ] || return 1
+    {
+        IFS=' ' read -r cache_lookup_schema cache_lookup_bytes cache_lookup_lines cache_lookup_surplus || return 1
+        [ "$cache_lookup_schema" = "$cache_schema" ] || return 1
+        [ -z "$cache_lookup_surplus" ] || return 1
+        case $cache_lookup_bytes in ''|*[!0-9]*) return 1 ;; esac
+        case $cache_lookup_lines in ''|*[!0-9]*) return 1 ;; esac
+        [ "$cache_lookup_bytes" -ge 1 ] && [ "$cache_lookup_bytes" -le "$cache_body_limit" ] || return 1
+        [ "$cache_lookup_lines" -ge 1 ] && [ "$cache_lookup_lines" -le "$cache_fingerprint_line_limit" ] || return 1
+        cache_lookup_blob=
+        cache_lookup_index=0
+        while [ "$cache_lookup_index" -lt "$cache_lookup_lines" ]; do
+            IFS= read -r cache_lookup_line || return 1
+            if [ "$cache_lookup_index" -eq 0 ]; then
+                cache_lookup_blob=$cache_lookup_line
+            else
+                cache_lookup_blob=$cache_lookup_blob$cache_newline$cache_lookup_line
+            fi
+            cache_lookup_index=$((cache_lookup_index + 1))
+        done
+        [ "$cache_lookup_blob" = "$cache_fingerprint" ] || return 1
+        IFS= read -r cache_lookup_body || return 1
+        IFS= read -r cache_lookup_sentinel || return 1
+        [ "$cache_lookup_sentinel" = "$cache_schema.end" ] || return 1
+        if IFS= read -r cache_lookup_trailing; then return 1; fi
+        cache_body=$cache_lookup_body
+        cache_body_bytes=$cache_lookup_bytes
+    } < "$cache_lookup_path"
+}
+
+# Publish the response in $2 under key $1 for the fingerprint built above.
+# The entry is written to a private temporary file and renamed into place, so
+# a concurrent reader sees either the previous entry or this one whole.
+cache_store() {
+    cache_store_key=$1
+    cache_store_body_path=$2
+    cache_name_is_safe "$cache_store_key" || return 1
+    [ -n "$cache_fingerprint" ] || return 1
+    [ -d "$cache_root" ] && [ ! -L "$cache_root" ] || return 1
+    [ -f "$cache_store_body_path" ] && [ ! -L "$cache_store_body_path" ] || return 1
+    cache_store_bytes=$(wc -c < "$cache_store_body_path" 2>/dev/null | tr -d ' ') || return 1
+    case $cache_store_bytes in ''|*[!0-9]*) return 1 ;; esac
+    [ "$cache_store_bytes" -ge 1 ] && [ "$cache_store_bytes" -le "$cache_body_limit" ] || return 1
+    # The reader replays the body with shell builtins, which is byte-exact only
+    # for a single newline-terminated line. Every cached response is one line of
+    # JSON; anything else is simply not cached.
+    cache_store_lines=$(wc -l < "$cache_store_body_path" 2>/dev/null | tr -d ' ') || return 1
+    [ "$cache_store_lines" = 1 ] || return 1
+    cache_store_fp_lines=$(printf '%s\n' "$cache_fingerprint" | wc -l | tr -d ' ') || return 1
+    case $cache_store_fp_lines in ''|*[!0-9]*) return 1 ;; esac
+    [ "$cache_store_fp_lines" -ge 1 ] && [ "$cache_store_fp_lines" -le "$cache_fingerprint_line_limit" ] || return 1
+    cache_retire_foreign_package || return 1
+    # rename onto a directory would move the temporary file inside it instead
+    # of replacing it, leaving a private file behind that nothing reclaims.
+    cache_store_target=$cache_root/$cache_store_key
+    if [ -e "$cache_store_target" ] || [ -L "$cache_store_target" ]; then
+        [ -f "$cache_store_target" ] && [ ! -L "$cache_store_target" ] || return 1
+    fi
+    cache_temp_path=$cache_root/.tmp.$cache_store_key.$$
+    [ ! -e "$cache_temp_path" ] && [ ! -L "$cache_temp_path" ] || { cache_temp_path=; return 1; }
+    cache_store_status=0
+    {
+        printf '%s %s %s\n' "$cache_schema" "$cache_store_bytes" "$cache_store_fp_lines"
+        printf '%s\n' "$cache_fingerprint"
+        cat "$cache_store_body_path"
+        printf '%s.end\n' "$cache_schema"
+    } > "$cache_temp_path" || cache_store_status=$?
+    if [ "$cache_store_status" -ne 0 ]; then
+        rm -f "$cache_temp_path" 2>/dev/null || true
+        cache_temp_path=
+        return 1
+    fi
+    finish_private_file "$cache_temp_path" || {
+        rm -f "$cache_temp_path" 2>/dev/null || true
+        cache_temp_path=
+        return 1
+    }
+    mv -f "$cache_temp_path" "$cache_root/$cache_store_key" || {
+        rm -f "$cache_temp_path" 2>/dev/null || true
+        cache_temp_path=
+        return 1
+    }
+    cache_temp_path=
+    cache_prune || true
+}
+
+# An upgrade replaces both package scripts, so every stored fingerprint stops
+# matching and no stale entry can be served. Retire the files themselves the
+# first time anything is cached afterwards rather than leaving unusable entries
+# for the size bound to reclaim. Uninstall already removes the whole state tree.
+cache_retire_foreign_package() {
+    cache_package_marker=$cache_root/.package
+    cache_package_identity=$(stat -c '%d:%i:%s:%Y' \
+        "$manager" "$package_root/libexec/sdsync-common" 2>/dev/null) || return 1
+    cache_package_recorded=
+    if [ -f "$cache_package_marker" ] && [ ! -L "$cache_package_marker" ]; then
+        IFS= read -r cache_package_recorded < "$cache_package_marker" 2>/dev/null || cache_package_recorded=
+    fi
+    # stat prints one line per file and the marker holds one line; the format
+    # contains no spaces, so re-splitting on whitespace folds it safely.
+    set -- $cache_package_identity
+    cache_package_flat=$*
+    [ "$cache_package_recorded" != "$cache_package_flat" ] || return 0
+    for cache_package_entry in "$cache_root"/*; do
+        [ -e "$cache_package_entry" ] || [ -L "$cache_package_entry" ] || continue
+        [ -L "$cache_package_entry" ] || rm -f "$cache_package_entry" 2>/dev/null || true
+    done
+    if [ -e "$cache_package_marker" ] || [ -L "$cache_package_marker" ]; then
+        [ -f "$cache_package_marker" ] && [ ! -L "$cache_package_marker" ] || return 1
+    fi
+    cache_package_temp=$cache_root/.package.$$
+    printf '%s\n' "$cache_package_flat" > "$cache_package_temp" || return 1
+    finish_private_file "$cache_package_temp" || { rm -f "$cache_package_temp" 2>/dev/null || true; return 1; }
+    mv -f "$cache_package_temp" "$cache_package_marker" || {
+        rm -f "$cache_package_temp" 2>/dev/null || true
+        return 1
+    }
+}
+
+# Bound what the cache may occupy. Entries are retired newest-first past the
+# count and byte ceilings, so a client walking the whole --lines range cannot
+# grow the package state tree without limit.
+cache_prune() {
+    cache_prune_entries=
+    for cache_prune_entry in "$cache_root"/*; do
+        [ -f "$cache_prune_entry" ] && [ ! -L "$cache_prune_entry" ] || continue
+        cache_prune_entries="$cache_prune_entries $cache_prune_entry"
+    done
+    [ -n "$cache_prune_entries" ] || return 0
+    cache_prune_victims=$(stat -c '%Y %s %n' $cache_prune_entries 2>/dev/null | sort -rn |
+        LC_ALL=C awk -v max_entries="$cache_entry_limit" -v max_bytes="$cache_total_limit" '
+            { kept++; total += $2
+              if (kept > max_entries || total > max_bytes) print $3 }') || return 0
+    for cache_prune_victim in $cache_prune_victims; do
+        case $cache_prune_victim in
+            "$cache_root"/*) [ -L "$cache_prune_victim" ] || rm -f "$cache_prune_victim" 2>/dev/null || true ;;
+        esac
+    done
+}
+
+# Several dashboard tabs meeting a cold cache must not all recompute the same
+# response: on a four-worker bridge pool that is exactly the exhaustion this
+# cache exists to prevent. The flight is advisory and never blocks -- a caller
+# that loses it serves the previous entry when there is one, and otherwise
+# computes its own response without publishing it.
+cache_flight_begin() {
+    cache_flight_path=
+    cache_flight_key=$1
+    cache_name_is_safe "$cache_flight_key" || return 1
+    cache_flight_candidate=$cache_root/.$cache_flight_key.flight
+    [ ! -L "$cache_flight_candidate" ] || return 1
+    if cache_flight_claim "$cache_flight_candidate"; then
+        cache_flight_path=$cache_flight_candidate
+        return 0
+    fi
+    cache_flight_is_abandoned "$cache_flight_candidate" || return 1
+    rm -f "$cache_flight_candidate/owner" 2>/dev/null || true
+    rmdir "$cache_flight_candidate" 2>/dev/null || true
+    cache_flight_claim "$cache_flight_candidate" || return 1
+    cache_flight_path=$cache_flight_candidate
+}
+
+cache_flight_claim() {
+    cache_flight_claimed=$1
+    mkdir "$cache_flight_claimed" 2>/dev/null || return 1
+    chmod 0700 "$cache_flight_claimed" 2>/dev/null || true
+    set_private_owner "$cache_flight_claimed" 2>/dev/null || true
+    # A losing caller may reclaim an abandoned flight out from under this
+    # write, so the redirection itself has to be able to fail quietly: the
+    # shell reports a failed redirection before the command's own 2>/dev/null
+    # is in effect, which is why the whole compound is wrapped.
+    { printf '%s\n' "$$" > "$cache_flight_claimed/owner"; } 2>/dev/null || return 0
+    finish_private_file "$cache_flight_claimed/owner" 2>/dev/null || true
+    return 0
+}
+
+# Reclaim only on positive evidence: an owner that is gone, or a flight that
+# has outlived its bound. A directory whose owner file has not been written yet
+# is younger than the bound and is left alone, so a caller that merely lost the
+# race computes its own response instead of stealing a live flight.
+cache_flight_is_abandoned() {
+    cache_flight_checked=$1
+    [ -d "$cache_flight_checked" ] && [ ! -L "$cache_flight_checked" ] || return 0
+    cache_flight_owner=
+    if [ -f "$cache_flight_checked/owner" ] && [ ! -L "$cache_flight_checked/owner" ]; then
+        IFS= read -r cache_flight_owner < "$cache_flight_checked/owner" 2>/dev/null || cache_flight_owner=
+    fi
+    case ${cache_flight_owner:-} in
+        ''|*[!0-9]*) ;;
+        *) kill -0 "$cache_flight_owner" 2>/dev/null || return 0 ;;
+    esac
+    # A live pid can still be a reused number, so a flight that outlives its
+    # bound becomes reclaimable regardless.
+    cache_flight_now=$(epoch_now 2>/dev/null || true)
+    cache_flight_stamp=$(stat -c '%Y' "$cache_flight_checked" 2>/dev/null || true)
+    case ${cache_flight_now:-} in ''|*[!0-9]*) return 1 ;; esac
+    case ${cache_flight_stamp:-} in ''|*[!0-9]*) return 1 ;; esac
+    [ "$((cache_flight_now - cache_flight_stamp))" -ge "$cache_flight_stale_seconds" ]
+}
+
+cache_flight_end() {
+    [ -n "${cache_flight_path:-}" ] || return 0
+    case $cache_flight_path in
+        "$cache_root"/.*.flight)
+            rm -f "$cache_flight_path/owner" 2>/dev/null || true
+            rmdir "$cache_flight_path" 2>/dev/null || true
+            ;;
+    esac
+    cache_flight_path=
 }

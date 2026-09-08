@@ -88,11 +88,12 @@ restore_tty() {
 }
 cleanup_manager_lock() {
     restore_tty
+    cache_flight_end 2>/dev/null || true
     for cleanup_path in "${fragment_temp:-}" "${secret_temp:-}" "${candidate:-}" \
         "${schedule_temp:-}" "${routine_temp:-}" "${routine_graph_temp:-}" "${alert_temp:-}" \
         "${security_temp:-}" \
         "${api_stdout:-}" "${api_stderr:-}" "${snapshot_json:-}" "${activity_input:-}" \
-        "${activity_json:-}" \
+        "${activity_json:-}" "${cache_temp_path:-}" \
         "${source_doctor_output:-}" "${target_doctor_output:-}" \
         "${doctor_inventory_records:-}"; do
         [ -n "$cleanup_path" ] || continue
@@ -2507,8 +2508,25 @@ api_activity() {
         api_error unsafe_state "unsafe API activity path" 73
     : > "$activity_input" || api_error unsafe_state "cannot create activity input" 73
     finish_private_file "$activity_input" || api_error unsafe_state "cannot secure activity input" 73
+    # Window each rotation before combining. This is safe here and is *not*
+    # safe in api_json_log_lines: that awk filters by level threshold, so a
+    # window there answers "matches within the last N lines" instead of "the
+    # last N matching records" and silently drops history. The awk below
+    # applies no filter at all -- it validates the shape of every record and
+    # emits all of them, and the ring buffer it fills already keeps only the
+    # newest "$activity_lines". Policy filtering happens afterwards in Rust,
+    # where it can only return fewer records, never an older one in place of a
+    # newer one.
+    #
+    # The result is byte-identical because the last N lines of the full
+    # concatenation are drawn only from its tail: each rotation contributes at
+    # most its own final N lines, in the same order, so the second window
+    # selects exactly the same lines -- including a final record with no
+    # trailing newline, which tail reproduces verbatim. Sources are listed
+    # oldest first (.3 .2 .1 then the active log) because append_rotating_log
+    # appends and rotates forward, so the newest record is always at the tail.
     for activity_source in "$@"; do
-        cat "$activity_source" >> "$activity_input" || \
+        tail -n "$activity_lines" "$activity_source" >> "$activity_input" || \
             api_error unsafe_state "cannot read activity history" 73
     done
     finish_private_file "$activity_input" || api_error unsafe_state "cannot secure activity input" 73
@@ -2819,6 +2837,10 @@ api_routine_json() {
 
 api_snapshot() {
     [ "$#" -eq 0 ] || api_error invalid_request "snapshot accepts no arguments" 64
+    # Kept ahead of the cache so a corrupt policy still fails the request in
+    # the same order it always did, cached response or not. It costs three
+    # process spawns against the invocation floor and re-validates the policy
+    # document on every hit.
     load_security_policy_runtime || api_error corrupt_state "security policy is not a private complete document" 73
     generated_epoch=$(epoch_now)
     case $generated_epoch in ''|*[!0-9]*) api_error unavailable "system clock is unavailable" 69 ;; esac
@@ -2832,6 +2854,71 @@ api_snapshot() {
         else service_pid=0; service_state=stopped
         fi
     fi
+    # The clock reading and the live service state are the only parts of this
+    # response that are not a function of package files, so they are always
+    # computed and the rest of the document is what the cache holds. Both
+    # values are closed sets of digits and keywords, which is why the header
+    # can be assembled without json_quote; the guard keeps that true.
+    case $service_state in
+        stopped|running|untrusted) ;;
+        *) api_error internal_error "invalid service state" 70 ;;
+    esac
+    snapshot_head='{"schema":"sdsync.dsm-api.v1","generated_at_epoch":'$generated_epoch',"service":{"state":"'$service_state'","pid":'$service_pid'},'
+
+    # Fingerprint every file the remaining document is derived from. Secret
+    # material is listed stat-only: its presence and private mode are all the
+    # response reports, and a witness reads content, so no secret byte may
+    # reach a cache entry. The rest are witnessed by content because these are
+    # small documents that an operator can rewrite in place -- sampling only a
+    # boundary line cannot see an edit that leaves the last line alone, and the
+    # whole set is a few kilobytes against the ~1000 spawns being removed.
+    snapshot_cache_key=snapshot
+    snapshot_cache_flight=false
+    snapshot_cache_usable=true
+    # The private roots are fingerprinted too. Their identity decides
+    # $path_owner, which every private-file check compares against, so a root
+    # that changed owner or became a symlink must not keep being answered from
+    # an entry built while it was sound. Directories cost nothing extra: they
+    # ride in the same stat, and the witness step skips anything that is not a
+    # plain file.
+    #
+    # $state_root is deliberately absent. Both read-only endpoints create and
+    # remove a private temporary file directly inside it, which moves its mtime
+    # on every miss, so fingerprinting it would make each stored entry
+    # unmatchable by the very next request -- a cache that can never hit.
+    # ensure_layout re-applies that directory's mode and owner ahead of every
+    # request anyway, and every file below it is fingerprinted individually.
+    snapshot_cache_secrets="$package_home $package_home_real $package_var $package_var_real $config_root $profiles_dir $routines_dir $secret_root $health_dir $routine_state_dir"
+    snapshot_cache_witnessed="$schedule_file $controller_state $run_state $default_profile_file $alert_policy_file $security_policy_file"
+    for snapshot_cache_path in "$profiles_dir"/*.toml; do
+        [ -e "$snapshot_cache_path" ] || [ -L "$snapshot_cache_path" ] || continue
+        snapshot_cache_name=${snapshot_cache_path##*/}; snapshot_cache_name=${snapshot_cache_name%.toml}
+        if ! valid_name "$snapshot_cache_name"; then snapshot_cache_usable=false; break; fi
+        snapshot_cache_witnessed="$snapshot_cache_witnessed $snapshot_cache_path $health_dir/$snapshot_cache_name.state"
+        snapshot_cache_secrets="$snapshot_cache_secrets $secret_root/$snapshot_cache_name.password"
+        snapshot_cache_secrets="$snapshot_cache_secrets $secret_root/$snapshot_cache_name.totp"
+        snapshot_cache_secrets="$snapshot_cache_secrets $secret_root/$snapshot_cache_name.remote-log-token"
+    done
+    if [ "$snapshot_cache_usable" = true ]; then
+        for snapshot_cache_path in "$routines_dir"/*.conf; do
+            [ -e "$snapshot_cache_path" ] || [ -L "$snapshot_cache_path" ] || continue
+            snapshot_cache_name=${snapshot_cache_path##*/}; snapshot_cache_name=${snapshot_cache_name%.conf}
+            if ! valid_name "$snapshot_cache_name"; then snapshot_cache_usable=false; break; fi
+            snapshot_cache_witnessed="$snapshot_cache_witnessed $snapshot_cache_path $routine_state_dir/$snapshot_cache_name.state"
+        done
+    fi
+    if [ "$snapshot_cache_usable" = true ] &&
+        cache_build_fingerprint "$snapshot_cache_key" "$snapshot_cache_secrets" "$snapshot_cache_witnessed"; then
+        if cache_lookup "$snapshot_cache_key"; then
+            snapshot_size=$((${#snapshot_head} + cache_body_bytes))
+            if [ "$snapshot_size" -gt 1048576 ]; then api_error response_too_large "snapshot response exceeds its safe bound" 69; fi
+            printf '%s' "$snapshot_head"
+            printf '%s\n' "$cache_body"
+            return
+        fi
+        if cache_flight_begin "$snapshot_cache_key"; then snapshot_cache_flight=true; fi
+    fi
+
     api_load_kv "$schedule_file" enabled false; schedule_enabled=$kv_value
     api_load_kv "$schedule_file" interval_seconds 3600; schedule_interval=$kv_value
     api_load_kv "$schedule_file" allow_delete false; schedule_delete=$kv_value
@@ -2935,8 +3022,6 @@ api_snapshot() {
     snapshot_json=$state_root/.api.$$.snapshot
     [ ! -L "$snapshot_json" ] || api_error unsafe_state "unsafe API snapshot path" 73
     {
-    printf '{"schema":"sdsync.dsm-api.v1","generated_at_epoch":%s,' "$generated_epoch"
-    printf '"service":{"state":%s,"pid":%s},' "$(json_quote "$service_state")" "$service_pid"
     printf '"schedule":{"enabled":%s,"interval_seconds":%s,"allow_delete":%s,"max_total_delete":%s},' \
         "$schedule_enabled" "$schedule_interval" "$schedule_delete" "$schedule_max"
     printf '"controller":{"state":%s,"pid":%s,"next_run_epoch":%s,"active_pid":%s,"updated_epoch":%s},' \
@@ -2986,9 +3071,15 @@ api_snapshot() {
     printf '"capabilities":{"mutations":false,"secrets":false,"write_test":false}}\n'
     } > "$snapshot_json"
     finish_private_file "$snapshot_json"
-    snapshot_size=$(wc -c < "$snapshot_json" | tr -d ' ')
-    case $snapshot_size in ''|*[!0-9]*) rm -f "$snapshot_json"; snapshot_json=; api_error unsafe_state "cannot measure snapshot response" 73 ;; esac
+    snapshot_body_size=$(wc -c < "$snapshot_json" | tr -d ' ')
+    case $snapshot_body_size in ''|*[!0-9]*) rm -f "$snapshot_json"; snapshot_json=; api_error unsafe_state "cannot measure snapshot response" 73 ;; esac
+    snapshot_size=$((${#snapshot_head} + snapshot_body_size))
     if [ "$snapshot_size" -gt 1048576 ]; then rm -f "$snapshot_json"; snapshot_json=; api_error response_too_large "snapshot response exceeds its safe bound" 69; fi
+    if [ "$snapshot_cache_flight" = true ]; then
+        cache_store "$snapshot_cache_key" "$snapshot_json" || true
+    fi
+    cache_flight_end
+    printf '%s' "$snapshot_head"
     cat "$snapshot_json"
     rm -f "$snapshot_json"
     snapshot_json=
