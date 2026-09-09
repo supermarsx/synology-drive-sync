@@ -24,6 +24,21 @@ struct StrongContentDigests {
     sha256: [u8; 32],
 }
 
+/// What a fingerprint comparison established, as distinct from whether it succeeded.
+///
+/// Callers that merely decide whether to upload may act on [`Self::Md5Only`]; callers
+/// that delete or overwrite on the strength of a match require [`Self::Strong`], and the
+/// type is what stops the two being confused.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ContentMatch {
+    /// Every digest both sides carry agreed, SHA-256 included.
+    Strong,
+    /// Only MD5 was comparable, and it agreed. One side carries no strong digest.
+    Md5Only,
+    /// The digests that could be compared disagreed.
+    Differs,
+}
+
 /// Source-compatible name for callers that consume File Station's MD5.
 /// Values returned by the sync hasher are complete [`ContentFingerprint`]s.
 /// Derived equality compares the whole representation, so callers that need
@@ -96,11 +111,45 @@ impl ContentFingerprint {
 
     /// Compare all three digests. `None` means one side is an MD5-only legacy
     /// value and therefore cannot establish content equality.
+    ///
+    /// Retained for callers comparing two locally computed fingerprints, where both
+    /// sides are always complete and `None` really would indicate a defect. Content
+    /// planning uses [`Self::compare_content`], which reports the strength of the
+    /// evidence instead of discarding a usable MD5 answer.
     pub fn full_match(&self, other: &Self) -> Option<bool> {
         let (Some(left), Some(right)) = (self.strong, other.strong) else {
             return None;
         };
         Some(self.md5 == other.md5 && left == right)
+    }
+
+    /// Compare two fingerprints, reporting *what was established* rather than a bare
+    /// boolean.
+    ///
+    /// The distinction is the point. "Equal by MD5" and "equal by MD5, CRC32 and
+    /// SHA-256" are different claims, and a caller that may act destructively on the
+    /// answer must be able to tell them apart rather than have the difference
+    /// flattened into `true`.
+    ///
+    /// Note for anyone reading this in a year: the remote side of a content comparison
+    /// stopped carrying strong digests **by deliberate decision**, not by accident.
+    /// File Station computes only MD5 server-side, so the only way to obtain a remote
+    /// SHA-256 is to download the whole file — which cost a full-tree transfer on every
+    /// scheduled run. Comparison now uses the server-side MD5; the paths that guard a
+    /// mutation still obtain strong digests, by downloading only their own bounded
+    /// candidate sets. So a `Md5Only` result here is expected and normal, where before
+    /// this change it could only mean a legacy value.
+    pub fn compare_content(&self, other: &Self) -> ContentMatch {
+        if self.md5 != other.md5 {
+            return ContentMatch::Differs;
+        }
+        match (self.strong, other.strong) {
+            (Some(left), Some(right)) if left == right => ContentMatch::Strong,
+            // Both sides carry strong digests and they disagree. The MD5s matching is
+            // then evidence of a collision, not of equality, so this is a difference.
+            (Some(_), Some(_)) => ContentMatch::Differs,
+            _ => ContentMatch::Md5Only,
+        }
     }
 
     /// Compare the compatibility MD5 component only. Content planning must use
@@ -150,6 +199,47 @@ impl ContentHasher {
 }
 
 impl Default for ContentHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Compute only the MD5 component of a fingerprint.
+///
+/// For the comparison set, and only for it. Once remote comparison digests come from File
+/// Station's server-side MD5, the CRC32 and SHA-256 a local [`ContentHasher`] also computes have
+/// nothing on the other side to be compared against — [`ContentFingerprint::compare_content`]
+/// yields `Md5Only` whether they are present or not. Computing them anyway is measurable waste:
+/// SHA-256 alone is roughly 70% of the time this crate spends hashing.
+///
+/// This is where `cpu-governor`'s "SHA-256 is never compared" claim becomes true. It was **false**
+/// when it was made — remote fingerprints then came from downloading each file and hashing it with
+/// the full [`ContentHasher`], so both sides did carry SHA-256 and it really was compared. It
+/// becomes true only as a consequence of moving comparison onto the server-side MD5, which is why
+/// narrowing here is safe now and would have silently weakened content comparison before.
+///
+/// The result carries no strong proof, so anything that needs one must recompute at full strength.
+/// A comparison-set file that turns out to differ becomes an upload and must be promoted before it
+/// is uploaded; see `promote_upload_fingerprints`.
+pub struct Md5ContentHasher {
+    md5: Md5,
+}
+
+impl Md5ContentHasher {
+    pub fn new() -> Self {
+        Self { md5: Md5::new() }
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.md5.update(bytes);
+    }
+
+    pub fn finalize(self) -> ContentFingerprint {
+        ContentFingerprint::from_bytes(self.md5.finalize().into())
+    }
+}
+
+impl Default for Md5ContentHasher {
     fn default() -> Self {
         Self::new()
     }

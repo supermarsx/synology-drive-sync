@@ -1574,9 +1574,17 @@ fn run_status(arguments: &cli::StatusArgs, settings: config::ResolvedSync) -> Re
 
         if compare == CompareMode::Content {
             client.require_content_fingerprint_api()?;
-            local::populate_content_md5(&mut local, &cancellation)?;
-            let selected = plan::select_remote_content_hashes(&local, &remote, &rules, false);
-            client.populate_remote_content_fingerprints(&mut remote, &selected, &cancellation)?;
+            // Status is read-only: it never deletes, uploads or server-copies, so every digest
+            // it needs is a comparison digest, none of them guards a mutation, and nothing here
+            // is ever promoted -- a status run reports a difference rather than acting on one.
+            let comparison = plan::select_comparison_remote_digests(&local, &remote, &rules);
+            local::populate_content_md5_selective(&mut local, &comparison, &cancellation)?;
+            client.populate_remote_content_digests(
+                &mut remote,
+                &comparison,
+                &BTreeSet::new(),
+                &cancellation,
+            )?;
         }
         cancellation.check()?;
 
@@ -1760,7 +1768,7 @@ fn prepare_and_run_sync(
             cancellation,
         )?;
 
-        let plan = plan::build_plan(
+        let mut plan = plan::build_plan(
             &root,
             &local,
             &remote,
@@ -1774,6 +1782,11 @@ fn prepare_and_run_sync(
                 scope: scope.clone(),
             },
         )?;
+        // A comparison-set file that turned out to differ is now an upload, and uploads are
+        // verified against a strong digest. Raise them here, before the plan is reported or
+        // executed, so every consumer of it sees fingerprints of the strength it expects.
+        plan::promote_upload_fingerprints(&mut plan, cancellation)?;
+        let plan = plan;
         cancellation.check()?;
         log_event(
             logger.as_ref(),
@@ -1792,15 +1805,19 @@ fn prepare_and_run_sync(
         }
 
         if plan.is_empty() {
-            let reconciliation = build_reconciliation_plan(
-                &client,
-                settings,
-                &root,
-                &rules,
-                server_copy,
-                cancellation,
-            )?;
-            ensure_reconciled(&reconciliation)?;
+            // Nothing was executed, so there is no convergence to verify. Reconciliation exists to
+            // prove that the operations a run performed achieved the intended state; an empty plan
+            // performed none. Rebuilding it here re-derives the identical answer from the identical
+            // inputs at full price -- a second whole-tree scan, a second whole-tree content hash,
+            // and a second remote inventory. On a large tree in content mode that second pass is
+            // the single largest cost a no-op run has, and it buys nothing.
+            //
+            // This is deliberately not a safety check, and must not be reinstated as one. The
+            // second pass observes the tree strictly later than the first, so the only difference
+            // it can ever report is a change this run did not make -- whereupon `ensure_reconciled`
+            // fails the run for someone else's concurrent edit. Dropping it therefore makes a no-op
+            // run both cheaper and more correct. Post-execution reconciliation below is untouched:
+            // that one verifies work that actually happened, which is the case it exists for.
             cancellation.check()?;
             return Ok((plan, None));
         }
@@ -1897,18 +1914,24 @@ fn populate_content_for_plan(
     match effective_compare_mode(settings) {
         CompareMode::Content => {
             client.require_content_fingerprint_api()?;
-            local::populate_content_md5(local, cancellation)?;
-            let selected = plan::select_remote_content_hashes_for_plan(
+            let comparison = plan::select_comparison_remote_digests(local, remote, rules);
+            let strong = plan::select_strong_remote_digests(
                 local,
                 remote,
                 rules,
                 server_copy,
                 settings.safety.delete,
             );
-            client.populate_remote_content_fingerprints(remote, &selected, cancellation)?;
+            // Local strength mirrors remote strength, entry for entry: MD5 where the remote side
+            // will only carry MD5, full strength everywhere else. Uploads promoted out of the
+            // comparison set are raised by `plan::promote_upload_fingerprints` before execution.
+            local::populate_content_md5_selective(local, &comparison, cancellation)?;
+            client.populate_remote_content_digests(remote, &comparison, &strong, cancellation)?;
         }
         CompareMode::Force if settings.safety.delete => {
             client.require_content_fingerprint_api()?;
+            // Forced runs compare nothing, so every digest here guards a deletion and must be
+            // strong. Unchanged by the comparison split.
             let selected = plan::select_deletion_guard_hashes(local, remote, rules);
             client.populate_remote_content_fingerprints(remote, &selected, cancellation)?;
         }
@@ -1947,16 +1970,20 @@ fn build_reconciliation_plan(
     cancellation.check()?;
     if compare == CompareMode::Content {
         client.require_content_fingerprint_api()?;
-        local::populate_content_md5(&mut local, cancellation)?;
-        let selected = plan::select_remote_content_hashes_for_plan(
+        let comparison = plan::select_comparison_remote_digests(&local, &remote, rules);
+        let strong = plan::select_strong_remote_digests(
             &local,
             &remote,
             rules,
             server_copy,
             settings.safety.delete,
         );
-        client.populate_remote_content_fingerprints(&mut remote, &selected, cancellation)?;
+        local::populate_content_md5_selective(&mut local, &comparison, cancellation)?;
+        client.populate_remote_content_digests(&mut remote, &comparison, &strong, cancellation)?;
     }
+    // Deliberately no promotion here. A reconciliation plan is only ever inspected for emptiness
+    // by `ensure_reconciled` and is never executed, so nothing consumes an upload's digest and
+    // raising it would read every changed file again to answer a question nobody asks.
     let plan = plan::build_plan(
         root,
         &local,

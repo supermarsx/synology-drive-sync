@@ -4106,6 +4106,213 @@
   overflow-wrap: anywhere;
 }
 
+/* Sync status ------------------------------------------------------------ */
+
+/* Visually the bounded action row, deliberately under its own name: the three
+   rows the form-layout contract pins are a fixed set this page is not part of. */
+.sdsync-sync-actions {
+  display: flex;
+  width: 100%;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  margin: 16px 0 2px;
+  padding-top: 12px;
+  border-top: 1px solid var(--sdsync-border-soft);
+}
+
+.sdsync-sync-actions > * {
+  margin: 0 !important;
+}
+
+.sdsync-sync-query,
+.sdsync-sync-results,
+.sdsync-resync {
+  margin-bottom: 14px;
+  padding: 16px;
+}
+
+.sdsync-field-note.is-error {
+  color: var(--sdsync-red);
+}
+
+.sdsync-sync-stats {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  padding: 0;
+  gap: 10px;
+  margin: 14px 0 8px;
+}
+
+.sdsync-sync-stat {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+  padding: 11px;
+  border: 1px solid var(--sdsync-border-soft);
+  border-left: 2px solid var(--sdsync-trace);
+  border-radius: 2px;
+  background: var(--sdsync-panel-strong);
+}
+
+.sdsync-sync-stat dt,
+.sdsync-sync-stat small {
+  overflow: hidden;
+  color: var(--sdsync-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sdsync-sync-stat dd {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.sdsync-sync-stat.is-differs,
+.sdsync-sync-stat.is-missing-remote {
+  border-left-color: var(--sdsync-fire);
+}
+
+.sdsync-sync-stat.is-type-conflict {
+  border-left-color: var(--sdsync-red);
+}
+
+.sdsync-sync-state {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 6px;
+  border: 1px solid var(--sdsync-border-soft);
+  border-radius: 1px;
+  color: var(--sdsync-muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.045em;
+  white-space: nowrap;
+  text-transform: uppercase;
+  background: var(--sdsync-control);
+}
+
+.sdsync-sync-state.is-differs,
+.sdsync-sync-state.is-missing-remote,
+.sdsync-sync-state.is-remote-only {
+  color: var(--sdsync-fire);
+  border-color: rgba(255, 106, 26, 0.5);
+  background: rgba(255, 106, 26, 0.1);
+}
+
+.sdsync-sync-state.is-type-conflict {
+  color: var(--sdsync-red);
+  border-color: rgba(255, 107, 85, 0.55);
+  background: rgba(215, 46, 22, 0.14);
+}
+
+.sdsync-sync-path {
+  display: block;
+  max-width: 460px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sdsync-app td .sdsync-sync-path + small {
+  display: block;
+  max-width: 460px;
+  overflow: hidden;
+  color: var(--sdsync-muted);
+  text-overflow: ellipsis;
+}
+
+.sdsync-sync-row-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 7px;
+  border: 1px solid var(--sdsync-control-border);
+  border-radius: 1px;
+  color: var(--sdsync-text);
+  font-size: 10px;
+  cursor: pointer;
+  background: var(--sdsync-control);
+}
+
+.sdsync-sync-row-action:hover:not(:disabled) {
+  border-color: var(--sdsync-focus);
+  background: var(--sdsync-control-hover);
+}
+
+.sdsync-sync-row-action:disabled {
+  color: var(--sdsync-disabled);
+  border-color: var(--sdsync-border-soft);
+  cursor: not-allowed;
+  background: var(--sdsync-control-disabled);
+}
+
+.sdsync-sync-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.sdsync-sync-pager-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.sdsync-resync-plan {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--sdsync-border-soft);
+  border-left: 2px solid var(--sdsync-danger);
+  border-radius: 2px;
+  background: var(--sdsync-panel-strong);
+}
+
+.sdsync-resync-paths {
+  max-height: 260px;
+  margin: 10px 0 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+  border: 1px solid var(--sdsync-border-soft);
+  background: var(--sdsync-control);
+  scrollbar-color: var(--sdsync-control-border) var(--sdsync-control);
+}
+
+.sdsync-resync-paths li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--sdsync-border-soft);
+}
+
+.sdsync-resync-paths code {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sdsync-resync-paths small {
+  flex: 0 0 auto;
+  color: var(--sdsync-muted);
+  font-size: 10px;
+}
+
+@media (max-width: 1180px) {
+  .sdsync-sync-stats {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
 @media (max-width: 680px) {
   .sdsync-path-control {
     grid-template-columns: minmax(0, 1fr);

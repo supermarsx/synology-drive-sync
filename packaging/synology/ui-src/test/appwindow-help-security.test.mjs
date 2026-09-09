@@ -30,7 +30,7 @@ const strings = await readFile(new URL("texts/enu/strings", helpRoot), "utf8");
 const APP_CLASS = "SYNO.SDS.App.SynologyDriveSync.Instance";
 const WIDGET_CLASS = "SYNO.SDS.App.SynologyDriveSync.Widget";
 const HELP_PAGES = [
-  "overview", "profiles", "routines", "health", "activity", "notifications", "security", "settings", "about"
+  "overview", "profiles", "routines", "sync", "health", "activity", "notifications", "security", "settings", "about"
 ];
 
 function componentTags(source) {

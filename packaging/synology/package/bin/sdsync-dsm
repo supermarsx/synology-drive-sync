@@ -22,15 +22,21 @@ Usage:
   sdsync-dsm remove-password NAME | remove-totp NAME | remove-remote-log-token NAME
   sdsync-dsm configure-routine --profile NAME [options] | remove-routine NAME
   sdsync-dsm doctor [NAME|--all] [--write-test]
+  sdsync-dsm resync [NAME] [--scope PATH] [--confirm TICKET]
   sdsync-dsm plan [NAME|--all] [--allow-delete] [--max-total-delete N]
   sdsync-dsm run [NAME|--all] [--allow-delete] [--max-total-delete N]
   sdsync-dsm enable [--interval SECONDS] [--allow-delete] [--max-total-delete N]
   sdsync-dsm disable | status | logs [LINES] | paths
   sdsync-dsm api snapshot | logs --lines N | activity --lines N
+  sdsync-dsm api sync-status --profile NAME [--scope PATH] [--filter TEXT]
+                             [--state STATE] [--limit 1..200] [--cursor CURSOR]
+                             [--include-excluded true|false]
+  sdsync-dsm api resync --profile NAME [--scope PATH] [--confirm TICKET]
   sdsync-dsm api configure-profile ... | remove-profile NAME | set-default NAME
   sdsync-dsm api set-secret --profile NAME --kind password|totp|remote-log-token --mode replace|clear
   sdsync-dsm api schedule ... | routine ... | alert-policy ... | action ...
-  sdsync-dsm api security-policy ...
+  sdsync-dsm api security-policy ... | performance-policy ...
+  sdsync-dsm configure-performance --level full|balanced|gentle
 
 configure-profile options:
   --compare content|metadata|size-only   (default: content)
@@ -47,6 +53,14 @@ configure-profile options:
   --log-format human|json --progress auto|always|never --output human|json|ndjson
   --remote-log-url URL --remote-log-mode best-effort|required
   --default                             (make this the default profile)
+
+configure-performance options:
+  --level full|balanced|gentle           (how much of the NAS this package may
+                                          take; default balanced. full leaves
+                                          the sync core at the priority it
+                                          inherits, balanced runs it at nice 10,
+                                          gentle at nice 19. The dashboard is
+                                          never slowed at any level.)
 
 configure-alerts options:
   --enabled true|false --on-success true|false --on-failure true|false
@@ -99,7 +113,7 @@ cleanup_manager_lock() {
     cache_flight_end 2>/dev/null || true
     for cleanup_path in "${fragment_temp:-}" "${secret_temp:-}" "${candidate:-}" \
         "${schedule_temp:-}" "${routine_temp:-}" "${routine_graph_temp:-}" "${alert_temp:-}" \
-        "${security_temp:-}" \
+        "${security_temp:-}" "${performance_temp:-}" \
         "${api_stdout:-}" "${api_stderr:-}" "${snapshot_json:-}" "${activity_input:-}" \
         "${activity_json:-}" "${cache_temp_path:-}" \
         "${source_doctor_output:-}" "${target_doctor_output:-}" \
@@ -168,6 +182,15 @@ authorize_direct_policy_context() {
             ;;
         configure-alerts)
             [ "$security_runtime_allow_notification_changes" = true ] || return 77
+            ;;
+        configure-performance)
+            # Gated with the operational actions rather than under a policy
+            # field of its own. The security document is a fixed 28-field
+            # contract that callers and tests assert on exactly, so a 29th
+            # field would be a breaking change to it, and the level is
+            # operational tuning of how this package runs -- the same class as
+            # doctor -- not a change to what it is permitted to reach.
+            [ "$security_runtime_allow_operational_actions" = true ] || return 77
             ;;
         doctor)
             [ "$security_runtime_allow_operational_actions" = true ] || return 77
@@ -414,11 +437,12 @@ begin_mutation() {
             configure-profile|remove-profile|set-default|configure-routine|remove-routine|\
             set-password|set-totp|set-remote-log-token|remove-password|remove-totp|\
             remove-remote-log-token|enable|disable|set-schedule|configure-alerts|\
-            configure-security-policy|doctor)
+            configure-performance|configure-security-policy|doctor)
                 case $command_name in
                     configure-routine) direct_audit_operation=routine ;;
                     set-schedule|enable|disable) direct_audit_operation=schedule ;;
                     configure-alerts) direct_audit_operation=alert-policy ;;
+                    configure-performance) direct_audit_operation=performance-policy ;;
                     configure-security-policy)
                         direct_audit_operation=security-policy
                         ;;
@@ -1228,6 +1252,47 @@ configure_alert_policy() {
     alert_temp=
     reload_controller_if_running || echo "warning: configuration was saved but the controller could not be reloaded" >&2
     echo "updated DSM alert policy"
+}
+
+configure_performance_policy() {
+    # Invariant: this policy has exactly one field, and a save always replaces
+    # it.
+    #
+    # configure_alert_policy above has to default three of its eight fields to
+    # whatever is already stored, because the dashboard tab that saves it sends
+    # only the other five -- and defaulting those three the same way silently
+    # switched system logging off on every save. That asymmetry is load-bearing
+    # there and it is a trap: the same mistake in a second policy writer would
+    # be the same silent discard with a different name. A single derived level
+    # has no subset to lose, which is the reason it is a single derived level
+    # rather than one stored number per knob. Keep it that way; the moment this
+    # file gains an independent second field, every caller has to be audited for
+    # which fields it sends.
+    performance_level=
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --level)
+                need_value "$@"
+                [ -z "$performance_level" ] || die "duplicate configure-performance option: --level"
+                performance_level=$2
+                shift 2
+                ;;
+            *) die "unknown configure-performance option: $1" ;;
+        esac
+    done
+    [ -n "$performance_level" ] || die "configure-performance requires --level"
+    case $performance_level in
+        full|balanced|gentle) ;;
+        *) die "level must be full, balanced, or gentle" ;;
+    esac
+    performance_temp=$performance_policy_file.tmp.$$
+    printf 'level=%s\n' "$performance_level" > "$performance_temp"
+    finish_private_file "$performance_temp"
+    mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
+    mv -f "$performance_temp" "$performance_policy_file"
+    performance_temp=
+    reload_controller_if_running || echo "warning: configuration was saved but the controller could not be reloaded" >&2
+    echo "updated DSM performance policy"
 }
 
 configure_security_policy() {
@@ -2938,7 +3003,7 @@ api_snapshot() {
     # ensure_layout re-applies that directory's mode and owner ahead of every
     # request anyway, and every file below it is fingerprinted individually.
     snapshot_cache_secrets="$package_home $package_home_real $package_var $package_var_real $config_root $profiles_dir $routines_dir $secret_root $health_dir $routine_state_dir"
-    snapshot_cache_witnessed="$schedule_file $controller_state $run_state $default_profile_file $alert_policy_file $security_policy_file"
+    snapshot_cache_witnessed="$schedule_file $controller_state $run_state $default_profile_file $alert_policy_file $security_policy_file $performance_policy_file"
     for snapshot_cache_path in "$profiles_dir"/*.toml; do
         [ -e "$snapshot_cache_path" ] || [ -L "$snapshot_cache_path" ] || continue
         snapshot_cache_name=${snapshot_cache_path##*/}; snapshot_cache_name=${snapshot_cache_name%.toml}
@@ -2996,6 +3061,11 @@ api_snapshot() {
     case $run_operation in none|sync|plan) ;; *) api_error corrupt_state "invalid run operation" 73 ;; esac
     profile_default=$(current_default 2>/dev/null || true)
     if [ -n "$profile_default" ]; then valid_name "$profile_default" && profile_exists "$profile_default" || api_error corrupt_config "invalid default profile" 73; fi
+    # Unknown, malformed, or absent is Balanced, exactly as the runtime
+    # loader in sdsync-common resolves it. The dashboard must never show a
+    # level the runtime is not actually applying.
+    api_load_kv "$performance_policy_file" level balanced; performance_level=$kv_value
+    case $performance_level in full|balanced|gentle) ;; *) performance_level=balanced ;; esac
     api_load_kv "$alert_policy_file" enabled true; alert_enabled=$kv_value
     api_load_kv "$alert_policy_file" on_success false; alert_success=$kv_value
     api_load_kv "$alert_policy_file" on_failure true; alert_failure=$kv_value
@@ -3095,6 +3165,7 @@ api_snapshot() {
     done
     printf '],"alerts":{"enabled":%s,"on_success":%s,"on_failure":%s,"failure_threshold":%s,"cooldown_seconds":%s},' \
         "$alert_enabled" "$alert_success" "$alert_failure" "$alert_threshold" "$alert_cooldown"
+    printf '"performance":{"level":%s},' "$(json_quote "$performance_level")"
     printf '"security_policy":{"schema":"sdsync.dsm-security-policy.v1","policy_version":1,"require_https":%s,' "$security_require_https"
     printf '"allow_interface_changes":%s,' "$security_allow_interface_changes"
     printf '"allow_profile_changes":%s,"allow_secret_changes":%s,"allow_routine_changes":%s,' \
@@ -3132,6 +3203,155 @@ api_snapshot() {
     cat "$snapshot_json"
     rm -f "$snapshot_json"
     snapshot_json=
+}
+
+# ---------------------------------------------------------------------------
+# Per-file sync status and scoped resync
+#
+# Both endpoints hand the AppWindow the query engine's own `--output json`
+# document, carried verbatim inside the `output` string of the standard result
+# envelope. That is the same shape api_action already uses for Doctor NDJSON,
+# so the browser keeps exactly one response contract to parse and this file
+# keeps exactly one redaction path.
+#
+# Neither endpoint reformats the payload. `status` is paginated and capped at
+# 200 entries by the engine itself, and the totals it reports always describe
+# the whole scope rather than the returned page, so a bridge that rewrote them
+# could only make them wrong.
+
+api_bounded_query_text() {
+    query_text=$1
+    query_max=$2
+    query_label=$3
+    [ "${#query_text}" -le "$query_max" ] || api_error invalid_request "$query_label is too long" 64
+    # Paths and search text are user data and may legitimately be non-ASCII, so
+    # only control bytes are refused here. The authenticated bridge has already
+    # rejected NUL and undecodable input before this point.
+    case $query_text in
+        *[[:cntrl:]]*) api_error invalid_request "$query_label contains control characters" 64 ;;
+    esac
+}
+
+api_query_capture() {
+    query_stdout=$state_root/.api.$$.query-stdout
+    query_stderr=$state_root/.api.$$.query-stderr
+    [ ! -L "$query_stdout" ] && [ ! -L "$query_stderr" ] || api_error unsafe_state "unsafe API query path" 73
+    api_preflight_secret_material
+    umask 077
+    : > "$query_stdout" || api_error unsafe_state "cannot create query capture" 73
+    : > "$query_stderr" || api_error unsafe_state "cannot create query capture" 73
+    finish_private_file "$query_stdout"
+    finish_private_file "$query_stderr"
+    # stdout is captured apart from stderr on purpose: api_capture combines the
+    # two, and a single diagnostic warning written while the query ran would
+    # then corrupt the JSON document the AppWindow parses.
+    set +e
+    "$@" > "$query_stdout" 2> "$query_stderr"
+    query_exit=$?
+    set -e
+    finish_private_file "$query_stdout"
+    finish_private_file "$query_stderr"
+    # A full 200-entry page with both sides described is well under this bound;
+    # it matches the Doctor NDJSON reservation so one MiB of authenticated
+    # response still has ample JSON-escaping headroom.
+    query_payload=$(api_redact_file "$query_stdout" 327680 '{"schema":"sdsync.dsm-output-truncated.v1","truncated":true}')
+    query_detail=$(api_redact_file "$query_stderr" 65536)
+    rm -f "$query_stdout" "$query_stderr"
+    query_stdout= query_stderr=
+}
+
+api_query_failed() {
+    query_operation=$1
+    query_scope=$2
+    api_map_exit_code "$query_exit"
+    [ -n "$query_detail" ] || query_detail="$query_operation failed"
+    printf '{"schema":"sdsync.dsm-result.v1","ok":false,"code":%s,"message":%s,"exit_code":%s,"scope":%s,"output":%s}\n' \
+        "$(json_quote "$api_mapped_code")" "$(json_quote "$query_operation failed")" "$query_exit" \
+        "$(json_quote "$query_scope")" "$(json_quote "$query_detail")"
+    exit "$query_exit"
+}
+
+api_sync_status() {
+    status_profile= status_scope= status_filter= status_state=attention
+    status_limit=100 status_cursor= status_excluded=false
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --profile) api_need_value "$@"; status_profile=$2; shift 2 ;;
+            --scope) api_need_value "$@"; status_scope=$2; shift 2 ;;
+            --filter) api_need_value "$@"; status_filter=$2; shift 2 ;;
+            --state) api_need_value "$@"; status_state=$2; shift 2 ;;
+            --limit) api_need_value "$@"; status_limit=$2; shift 2 ;;
+            --cursor) api_need_value "$@"; status_cursor=$2; shift 2 ;;
+            --include-excluded) api_need_value "$@"; status_excluded=$2; shift 2 ;;
+            *) api_error invalid_request "unknown sync-status option" 64 ;;
+        esac
+    done
+    valid_name "$status_profile" && profile_exists "$status_profile" || \
+        api_error invalid_request "sync-status requires one existing profile" 64
+    case $status_state in
+        all|attention|type-conflict|missing-remote|differs|remote-only|in-sync|excluded) ;;
+        *) api_error invalid_request "unknown sync-status state" 64 ;;
+    esac
+    case $status_excluded in true|false) ;; *) api_error invalid_request "include-excluded must be true or false" 64 ;; esac
+    case $status_limit in ''|*[!0-9]*) api_error invalid_request "limit must be an integer" 64 ;; esac
+    # The engine enforces the same ceiling; refusing here keeps an oversized
+    # request from reaching it as an argument error the browser cannot read.
+    [ "$status_limit" -ge 1 ] && [ "$status_limit" -le 200 ] || api_error invalid_request "limit must be 1..200" 64
+    api_bounded_query_text "$status_scope" 4096 scope
+    api_bounded_query_text "$status_filter" 128 filter
+    api_bounded_query_text "$status_cursor" 4096 cursor
+    set -- "$binary" --config "$config_file" --output json status --profile "$status_profile"
+    [ -z "$status_scope" ] || set -- "$@" --scope "$status_scope"
+    [ -z "$status_filter" ] || set -- "$@" --filter "$status_filter"
+    if [ "$status_state" = all ]; then set -- "$@" --all; else set -- "$@" --state "$status_state"; fi
+    set -- "$@" --limit "$status_limit"
+    [ -z "$status_cursor" ] || set -- "$@" --cursor "$status_cursor"
+    [ "$status_excluded" = false ] || set -- "$@" --include-excluded
+    api_query_capture "$@"
+    [ "$query_exit" -eq 0 ] || api_query_failed sync-status "$status_profile"
+    # The standard queued-result envelope, not a read schema: a status query
+    # walks both trees and is dispatched as a job, so the browser observes it
+    # through the same terminal-result path as every other queued operation.
+    printf '{"schema":"sdsync.dsm-result.v1","ok":true,"message":%s,"status":"succeeded","exit_code":0,"scope":%s,"output":%s}\n' \
+        "$(json_quote "sync-status completed")" \
+        "$(json_quote "$status_profile")" "$(json_quote "$query_payload")"
+}
+
+api_resync() {
+    resync_api_profile= resync_api_scope= resync_api_ticket=
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --profile) api_need_value "$@"; resync_api_profile=$2; shift 2 ;;
+            --scope) api_need_value "$@"; resync_api_scope=$2; shift 2 ;;
+            --confirm) api_need_value "$@"; resync_api_ticket=$2; shift 2 ;;
+            *) api_error invalid_request "unknown resync option" 64 ;;
+        esac
+    done
+    valid_name "$resync_api_profile" && profile_exists "$resync_api_profile" || \
+        api_error invalid_request "resync requires one existing profile" 64
+    api_bounded_query_text "$resync_api_scope" 4096 scope
+    case $resync_api_ticket in
+        '') ;;
+        *[!0-9a-f]*) api_error invalid_request "resync ticket must be lowercase hexadecimal" 64 ;;
+        *) [ "${#resync_api_ticket}" -eq 16 ] || api_error invalid_request "resync ticket has an unexpected length" 64 ;;
+    esac
+    # Routed through the manager rather than the binary so the confirmed
+    # re-upload takes the package-management lock and the mandatory audit
+    # record, exactly as every other mutating operation does.
+    set -- "$manager" resync "$resync_api_profile"
+    [ -z "$resync_api_scope" ] || set -- "$@" --scope "$resync_api_scope"
+    [ -z "$resync_api_ticket" ] || set -- "$@" --confirm "$resync_api_ticket"
+    api_query_capture "$@"
+    # Exit 10 is not a failure: the confirmation no longer matched what would be
+    # overwritten, so nothing was changed and the payload already carries the
+    # refreshed plan and a new ticket. Reporting it as an error would hide the
+    # very document the caller needs in order to make progress.
+    if [ "$query_exit" -ne 0 ] && [ "$query_exit" -ne 10 ]; then
+        api_query_failed resync "$resync_api_profile"
+    fi
+    printf '{"schema":"sdsync.dsm-result.v1","ok":true,"message":%s,"status":"succeeded","exit_code":%s,"scope":%s,"output":%s}\n' \
+        "$(json_quote "resync completed")" "$query_exit" \
+        "$(json_quote "$resync_api_profile")" "$(json_quote "$query_payload")"
 }
 
 api_mutation_result() {
@@ -3237,7 +3457,7 @@ api_audit_event() {
     case $audit_event_operation in
         configure-profile|remove-profile|set-default|set-secret|set-password|remove-password|set-totp|remove-totp|\
         set-remote-log-token|remove-remote-log-token|test-profile-auth|browse-remote|schedule|routine|remove-routine|alert-policy|security-policy|\
-        interface-settings|session-notifications|doctor|plan|run) ;;
+        performance-policy|interface-settings|session-notifications|doctor|plan|run|sync-status|resync) ;;
         *) api_error invalid_request "invalid audit-event operation" 64 ;;
     esac
     case $audit_event_state in requested|succeeded|failed|outcome_unknown) ;; *) api_error invalid_request "invalid audit-event state" 64 ;; esac
@@ -3333,6 +3553,8 @@ api_command() {
         snapshot) api_snapshot "$@" ;;
         logs) api_logs "$@" ;;
         activity) api_activity "$@" ;;
+        sync-status) api_sync_status "$@" ;;
+        resync) api_resync "$@" ;;
         cgi-failure) api_cgi_failure "$@" ;;
         audit-rejected)
             [ "$#" -eq 0 ] || api_error invalid_request "audit-rejected accepts no arguments" 64
@@ -3381,6 +3603,11 @@ api_command() {
             [ "$#" -gt 0 ] || api_error invalid_request "alert-policy needs options" 64
             api_capture_or_error false "$manager" configure-alerts "$@"
             api_mutation_result "Alert policy changed"
+            ;;
+        performance-policy)
+            [ "$#" -gt 0 ] || api_error invalid_request "performance-policy needs options" 64
+            api_capture_or_error false "$manager" configure-performance "$@"
+            api_mutation_result "Performance level changed"
             ;;
         security-policy)
             [ "$#" -gt 0 ] || api_error invalid_request "security-policy needs options" 64
@@ -3546,6 +3773,67 @@ case $command_name in
         end_mutation "$doctor_status"
         exit "$doctor_exit"
         ;;
+    resync)
+        begin_mutation "$@"
+        resync_scope_name= resync_scope_seen=false resync_path= resync_ticket=
+        while [ "$#" -gt 0 ]; do
+            case $1 in
+                --scope) need_value "$@"; resync_path=$2; shift ;;
+                --confirm) need_value "$@"; resync_ticket=$2; shift ;;
+                --*) die "unknown option: $1" ;;
+                *)
+                    valid_name "$1" || die "invalid profile name: $1"
+                    [ "$resync_scope_seen" = false ] || die "choose exactly one profile scope"
+                    resync_scope_name=$1; resync_scope_seen=true
+                    ;;
+            esac
+            shift
+        done
+        if [ "$resync_scope_seen" = false ]; then
+            resync_scope_name=$(current_default 2>/dev/null) || die "no configured default profile"
+        fi
+        # Resync overwrites one destination tree and can never address --all:
+        # an unconditional re-upload of every profile at once is not something
+        # a single confirmation can honestly describe.
+        profile_exists "$resync_scope_name" || die "resync requires one existing profile"
+        profile_secret_exists "$resync_scope_name" || die "profile '$resync_scope_name' has no password"
+        case $resync_ticket in
+            '') ;;
+            *[!0-9a-f]*) die "resync ticket must be lowercase hexadecimal" ;;
+            *) [ "${#resync_ticket}" -eq 16 ] || die "resync ticket has an unexpected length" ;;
+        esac
+        load_security_policy_runtime || die "security policy is not a private complete document"
+        [ "$security_runtime_allow_operational_actions" = true ] || \
+            die "security policy blocks operational actions"
+        # Deliberately two calls, never one: without --confirm the engine only
+        # plans and prints a ticket, and no argument combination here can make
+        # a first invocation overwrite anything.
+        set -- "$binary" --config "$config_file" --output json resync --profile "$resync_scope_name"
+        [ -z "$resync_path" ] || set -- "$@" --scope "$resync_path"
+        [ -z "$resync_ticket" ] || set -- "$@" --confirm "$resync_ticket"
+        mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
+        if [ -n "$resync_ticket" ]; then
+            append_activity run.started "$resync_scope_name" running "Confirmed resync started" operations info 2>/dev/null || true
+        fi
+        set +e
+        "$@"
+        resync_exit=$?
+        set -e
+        if [ "$resync_exit" -eq 0 ]; then resync_state=succeeded; else resync_state=failed; fi
+        if [ -n "$resync_ticket" ]; then
+            if [ "$resync_exit" -eq 0 ]; then
+                append_activity run.succeeded "$resync_scope_name" succeeded "Confirmed resync completed" operations info 2>/dev/null || true
+            elif [ "$resync_exit" -eq 10 ]; then
+                # Nothing was changed; the printed plan and its new ticket
+                # describe what a fresh confirmation would actually do.
+                append_activity run.failed "$resync_scope_name" failed "Resync refused a stale confirmation; nothing was changed" operations warn 2>/dev/null || true
+            else
+                append_activity run.failed "$resync_scope_name" failed "Confirmed resync failed" operations error 2>/dev/null || true
+            fi
+        fi
+        end_mutation "$resync_state"
+        exit "$resync_exit"
+        ;;
     plan|run)
         require_package_identity || exit 77
         selection "$command_name" "$@"
@@ -3595,6 +3883,11 @@ case $command_name in
     configure-alerts)
         begin_mutation "$@"
         configure_alert_policy "$@"
+        end_mutation
+        ;;
+    configure-performance)
+        begin_mutation "$@"
+        configure_performance_policy "$@"
         end_mutation
         ;;
     configure-security-policy)

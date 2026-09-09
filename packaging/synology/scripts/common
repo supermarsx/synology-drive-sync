@@ -553,16 +553,33 @@ read_api_bound_identity() {
     api_path_exists "$api_bound_file" || return 1
     [ -f "$api_bound_file" ] && [ ! -L "$api_bound_file" ] || return 73
     api_expected_uid=$(package_uid 2>/dev/null || true)
-    api_bound_metadata=$(stat -c '%u:%a:%h' "$api_bound_file" 2>/dev/null || true)
-    [ -n "$api_expected_uid" ] && [ "$api_bound_metadata" = "$api_expected_uid:600:1" ] || return 73
-    api_bound_size=$(wc -c 2>/dev/null < "$api_bound_file" | tr -d ' ')
+    # Size folds into the stat that already reads owner, mode and link count,
+    # and the three fields come from builtin reads that establish the line
+    # count as they go. One process where this was seven -- and the startup
+    # readiness poll re-reads this record on every tick.
+    api_bound_metadata=$(stat -c '%u:%a:%h:%s' "$api_bound_file" 2>/dev/null || true)
+    [ -n "$api_expected_uid" ] || return 73
+    case $api_bound_metadata in "$api_expected_uid:600:1:"*) ;; *) return 73 ;; esac
+    api_bound_size=${api_bound_metadata##*:}
     case $api_bound_size in ''|*[!0-9]*) return 73 ;; esac
     [ "$api_bound_size" -le 96 ] || return 73
-    api_bound_lines=$(awk 'END { print NR }' "$api_bound_file" 2>/dev/null || true)
-    [ "$api_bound_lines" = 3 ] || return 73
-    api_bound_pid=$(sed -n '1p' "$api_bound_file" 2>/dev/null || true)
-    api_bound_start=$(sed -n '2p' "$api_bound_file" 2>/dev/null || true)
-    api_bound_boot=$(sed -n '3p' "$api_bound_file" 2>/dev/null || true)
+    api_bound_pid=
+    api_bound_start=
+    api_bound_boot=
+    api_bound_surplus=
+    api_bound_terminated=true
+    {
+        IFS= read -r api_bound_pid || return 73
+        IFS= read -r api_bound_start || return 73
+        IFS= read -r api_bound_boot || api_bound_terminated=false
+        if [ "$api_bound_terminated" = true ]; then
+            IFS= read -r api_bound_surplus || true
+        fi
+    } < "$api_bound_file"
+    # An unterminated third line is still three lines, exactly as the awk line
+    # count this replaces counted it; a fourth line of any kind is not.
+    [ -z "$api_bound_surplus" ] || return 73
+    [ "$api_bound_terminated" = true ] || [ -n "$api_bound_boot" ] || return 73
     case $api_bound_pid in ''|*[!0-9]*) return 73 ;; esac
     [ "$api_bound_pid" -gt 1 ] 2>/dev/null || return 73
     case $api_bound_start in ''|*[!0-9]*|0) return 73 ;; esac
@@ -615,16 +632,29 @@ read_api_ready_identity() {
     api_path_exists "$api_ready_file" || return 1
     [ -f "$api_ready_file" ] && [ ! -L "$api_ready_file" ] || return 73
     api_expected_uid=$(package_uid 2>/dev/null || true)
-    api_ready_metadata=$(stat -c '%u:%a:%h' "$api_ready_file" 2>/dev/null || true)
-    [ -n "$api_expected_uid" ] && [ "$api_ready_metadata" = "$api_expected_uid:600:1" ] || return 73
-    api_ready_size=$(wc -c 2>/dev/null < "$api_ready_file" | tr -d ' ')
+    # See read_api_bound_identity: one stat and three builtin reads, on the
+    # same per-tick path.
+    api_ready_metadata=$(stat -c '%u:%a:%h:%s' "$api_ready_file" 2>/dev/null || true)
+    [ -n "$api_expected_uid" ] || return 73
+    case $api_ready_metadata in "$api_expected_uid:600:1:"*) ;; *) return 73 ;; esac
+    api_ready_size=${api_ready_metadata##*:}
     case $api_ready_size in ''|*[!0-9]*) return 73 ;; esac
     [ "$api_ready_size" -le 96 ] || return 73
-    api_ready_lines=$(awk 'END { print NR }' "$api_ready_file" 2>/dev/null || true)
-    [ "$api_ready_lines" = 3 ] || return 73
-    api_ready_pid=$(sed -n '1p' "$api_ready_file" 2>/dev/null || true)
-    api_ready_start=$(sed -n '2p' "$api_ready_file" 2>/dev/null || true)
-    api_ready_boot=$(sed -n '3p' "$api_ready_file" 2>/dev/null || true)
+    api_ready_pid=
+    api_ready_start=
+    api_ready_boot=
+    api_ready_surplus=
+    api_ready_terminated=true
+    {
+        IFS= read -r api_ready_pid || return 73
+        IFS= read -r api_ready_start || return 73
+        IFS= read -r api_ready_boot || api_ready_terminated=false
+        if [ "$api_ready_terminated" = true ]; then
+            IFS= read -r api_ready_surplus || true
+        fi
+    } < "$api_ready_file"
+    [ -z "$api_ready_surplus" ] || return 73
+    [ "$api_ready_terminated" = true ] || [ -n "$api_ready_boot" ] || return 73
     case $api_ready_pid in ''|*[!0-9]*) return 73 ;; esac
     [ "$api_ready_pid" -gt 1 ] 2>/dev/null || return 73
     case $api_ready_start in ''|*[!0-9]*|0) return 73 ;; esac

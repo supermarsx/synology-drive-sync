@@ -56,6 +56,10 @@ struct ServerState {
     reject_next_valid_otp: bool,
     next_task: u64,
     md5_tasks: BTreeMap<String, String>,
+    /// How many status calls each MD5 task reports unfinished before returning a digest.
+    md5_unfinished_statuses: u32,
+    /// Status calls already answered per MD5 task, so the count above applies per task.
+    md5_status_calls: BTreeMap<String, u32>,
     copy_tasks: BTreeSet<String>,
     mutation_after_listing: Option<PendingMutation>,
     faults: Vec<InjectedFault>,
@@ -138,6 +142,8 @@ impl MockFileStation {
             reject_next_valid_otp: false,
             next_task: 1,
             md5_tasks: BTreeMap::new(),
+            md5_unfinished_statuses: 0,
+            md5_status_calls: BTreeMap::new(),
             copy_tasks: BTreeSet::new(),
             mutation_after_listing: None,
             faults: Vec::new(),
@@ -283,6 +289,19 @@ impl MockFileStation {
     /// the one observation that proves consecutive requests reached different DSM hosts.
     pub fn change_hostname_after_next_info_read(&self, hostname: &str) {
         self.state.lock().expect("mock state lock").next_hostname = Some(hostname.to_owned());
+    }
+
+    /// Make every MD5 task report unfinished for `count` status calls before it completes.
+    ///
+    /// Without this the mock answers the first status with a digest, so a client's polling
+    /// path is never exercised at all -- the sleep between polls, and any backoff applied to
+    /// it, would be dead code in every test that looks like it covers server-side MD5.
+    #[allow(dead_code)]
+    pub fn defer_md5_completion(&self, count: u32) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .md5_unfinished_statuses = count;
     }
 
     #[allow(dead_code)]
@@ -725,10 +744,15 @@ fn route_request(
             let Some(task) = json_string(fields.get("taskid")) else {
                 return api_error(101);
             };
-            let Some(path) = state.md5_tasks.get(&task) else {
+            let Some(path) = state.md5_tasks.get(&task).cloned() else {
                 return api_error(408);
             };
-            let Some(file) = state.files.get(path) else {
+            let answered = state.md5_status_calls.entry(task.clone()).or_insert(0);
+            *answered += 1;
+            if *answered <= state.md5_unfinished_statuses {
+                return success(json!({"finished": false}));
+            }
+            let Some(file) = state.files.get(&path) else {
                 return api_error(408);
             };
             let digest = Md5::digest(&file.contents);

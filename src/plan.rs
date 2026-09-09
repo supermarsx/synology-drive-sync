@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::api::{RemoteEntry, RemoteInventory};
-use crate::integrity::ContentMd5;
+use crate::cancel::CancellationToken;
+use crate::integrity::{ContentMatch, ContentMd5};
 use crate::local::{EntryKind, IgnoreRules, LocalEntry, LocalInventory};
 use crate::path::{RemoteRoot, depth, is_dsm_managed, validate_relative};
 use crate::{Error, Result};
@@ -319,15 +320,20 @@ pub fn select_deletion_guard_hashes(
     selected
 }
 
-/// Select remote content needed for comparison, optional server-copy reuse, and deletion guards.
-/// A content-mode mirror must pass `delete = true` so every file that could be removed has a
-/// plan-time digest. `build_plan` fails closed if such a digest is absent.
-pub fn select_remote_content_hashes_for_plan(
+/// Select the remote files a same-path comparison needs a digest for, and nothing else.
+///
+/// These are the entries where local and remote agree on size *and* modification time, so only a
+/// digest can separate "identical" from "changed without moving either". Every other pairing is
+/// already decided: a size difference short-circuits before any digest is read, and a modification
+/// time difference is reported as such.
+///
+/// This set is the whole tree in the steady state, which is exactly why its digests must be cheap
+/// to obtain. Nothing here guards a mutation -- the answer only decides whether to upload -- so an
+/// MD5 comparison is sufficient and [`select_strong_remote_digests`] carries the rest.
+pub fn select_comparison_remote_digests(
     local: &LocalInventory,
     remote: &RemoteInventory,
     rules: &IgnoreRules,
-    server_copy: bool,
-    delete: bool,
 ) -> BTreeSet<String> {
     let mut selected = BTreeSet::new();
     for local_entry in local.entries.values() {
@@ -345,11 +351,35 @@ pub fn select_remote_content_hashes_for_plan(
             selected.insert(remote_entry.relative.clone());
         }
     }
+    selected
+}
 
+/// Select the remote files whose digest guards a mutation and must therefore be strong.
+///
+/// Deletion guards and server-copy sources are grouped because they share the property that
+/// separates them from comparison: the digest does not decide whether to upload, it authorises
+/// destroying or duplicating remote data. Acting on an MD5 agreement alone would be a weaker claim
+/// than this code makes today, so these keep requiring a full MD5/CRC32/SHA-256 fingerprint.
+///
+/// Obtaining one means downloading the file, which is affordable here and not for comparison
+/// because of what the two sets contain. Both halves of this one are remote entries with **no
+/// local file counterpart**, which makes it disjoint from the comparison set and near-empty in the
+/// steady state this cost matters in: nothing is deleted and nothing is server-copied when nothing
+/// has changed. Its cost is therefore proportional to how much is actually being deleted or
+/// copied, not to how much exists -- with the honest exception of a first mirror run against an
+/// already-populated destination, where everything really is a deletion candidate and downloading
+/// it is the price of deleting it on strong evidence.
+pub fn select_strong_remote_digests(
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+    rules: &IgnoreRules,
+    server_copy: bool,
+    delete: bool,
+) -> BTreeSet<String> {
+    let mut selected = BTreeSet::new();
     if delete {
         selected.extend(select_deletion_guard_hashes(local, remote, rules));
     }
-
     if !server_copy {
         return selected;
     }
@@ -386,6 +416,59 @@ pub fn select_remote_content_hashes_for_plan(
         }
     }
     selected
+}
+
+/// Select remote content needed for comparison, optional server-copy reuse, and deletion guards.
+/// A content-mode mirror must pass `delete = true` so every file that could be removed has a
+/// plan-time digest. `build_plan` fails closed if such a digest is absent.
+///
+/// The union of the two selections above, kept for callers that want one set regardless of how
+/// each digest will be obtained.
+pub fn select_remote_content_hashes_for_plan(
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+    rules: &IgnoreRules,
+    server_copy: bool,
+    delete: bool,
+) -> BTreeSet<String> {
+    let mut selected = select_comparison_remote_digests(local, remote, rules);
+    selected.extend(select_strong_remote_digests(
+        local,
+        remote,
+        rules,
+        server_copy,
+        delete,
+    ));
+    selected
+}
+
+/// Raise every planned upload's fingerprint to full strength before anything is written.
+///
+/// The other half of [`crate::local::populate_content_md5_selective`]. Comparison-set files are
+/// hashed MD5-only because their remote counterpart carries nothing stronger to compare against;
+/// a file that turns out to *differ* leaves that set and becomes an upload, and uploads verify
+/// against a strong digest — `preflight_upload_source` re-hashes before writing and `upload_file`
+/// re-hashes after, both comparing with `full_match`, which cannot succeed unless both sides carry
+/// SHA-256.
+///
+/// Must therefore run after the plan is built and before it is executed. Skipping it would not
+/// fail loudly at the point of the mistake: those checks are `if let Some(expected)` guarded, so a
+/// weak digest turns a verified upload into a rejected one rather than an unverified one — noisy
+/// rather than silent, but wrong either way, and only because `full_match` refuses to answer on
+/// partial evidence. The strength is asserted here rather than assumed downstream.
+///
+/// Costs one extra read of each file that actually changed, which is about to be read again to be
+/// uploaded. In the steady state that motivated the narrowing, nothing has changed and this does
+/// nothing at all.
+pub fn promote_upload_fingerprints(
+    plan: &mut SyncPlan,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    for upload in &mut plan.uploads {
+        cancellation.check()?;
+        crate::local::promote_to_full_fingerprint(&mut upload.local, cancellation)?;
+    }
+    Ok(())
 }
 
 pub fn build_plan(
@@ -668,14 +751,17 @@ fn compare_files(
         CompareMode::Metadata => mtime_differs.then_some(ChangeReason::MtimeDiffers),
         CompareMode::Content => match (local.content_md5, remote.content_md5) {
             (Some(local_digest), Some(remote_digest)) => {
-                match local_digest.full_match(&remote_digest) {
-                    Some(true) => mtime_differs.then_some(ChangeReason::MtimeDiffers),
-                    Some(false) => Some(ChangeReason::ContentDiffers),
-                    None if mtime_differs => Some(ChangeReason::MtimeDiffers),
-                    None if !local_digest.has_full_proof() => {
-                        Some(ChangeReason::LocalDigestUnavailable)
+                // `Md5Only` is the normal outcome now, not a degraded one: remote
+                // comparison digests come from File Station's server-side MD5, which is
+                // the only digest it computes without transferring the file. Treating it
+                // as equality is the whole point of the change -- and is a decision about
+                // *comparison* only. Deletion and server-copy still require strong proof
+                // and obtain it separately; see `select_remote_digests`.
+                match local_digest.compare_content(&remote_digest) {
+                    ContentMatch::Strong | ContentMatch::Md5Only => {
+                        mtime_differs.then_some(ChangeReason::MtimeDiffers)
                     }
-                    None => Some(ChangeReason::RemoteDigestUnavailable),
+                    ContentMatch::Differs => Some(ChangeReason::ContentDiffers),
                 }
             }
             // A digest is unavailable, so content equality was never established. Name the
@@ -1711,11 +1797,29 @@ mod tests {
         assert_eq!(plan.uploads[0].reason, ChangeReason::ContentDiffers);
     }
 
+    /// An MD5-only fingerprint on one side establishes equality, deliberately.
+    ///
+    /// This test asserted the opposite until content mode stopped downloading. A fingerprint
+    /// without CRC32 and SHA-256 could not establish equality, which was the right rule while
+    /// every remote digest came from reading the whole file back. Remote comparison digests now
+    /// come from File Station's server-side MD5 — the only digest it will compute without
+    /// transferring the file — so an MD5-only remote value is the *normal* case, and continuing to
+    /// treat it as "cannot tell" would re-upload the entire tree on every scheduled run.
+    ///
+    /// The weakening is scoped to comparison, which only ever decides whether to upload. Digests
+    /// that authorise a deletion or a server-side copy still require full strength; see
+    /// `select_strong_remote_digests`.
+    ///
+    /// What must not change, and is the second half of this test: a difference is still a
+    /// difference. An MD5 disagreement is reported as differing content whichever side is the
+    /// MD5-only one.
     #[test]
-    fn content_mode_fails_closed_for_md5_only_legacy_values() {
+    fn content_mode_accepts_an_md5_only_match_and_still_reports_an_md5_difference() {
         let root = RemoteRoot::parse("/share/root").unwrap();
         let legacy = ContentMd5::from_bytes([0x33; 16]);
         let complete = ContentMd5::from_digests([0x33; 16], 0x1122_3344, [0x44; 32]);
+        let other_legacy = ContentMd5::from_bytes([0x99; 16]);
+        let other_complete = ContentMd5::from_digests([0x99; 16], 0x5566_7788, [0xaa; 32]);
         let plan_for = |local_digest, remote_digest| {
             let mut local = local(&[("payload.bin", EntryKind::File, 4, 1_000)]);
             let mut remote = remote(&[("payload.bin", EntryKind::File, 4, 1)]);
@@ -1731,12 +1835,56 @@ mod tests {
             .unwrap()
         };
 
+        assert!(
+            plan_for(complete, legacy).uploads.is_empty(),
+            "a server-side MD5 agreeing with a complete local fingerprint means in sync"
+        );
+        assert!(
+            plan_for(legacy, complete).uploads.is_empty(),
+            "the same holds whichever side carries the strong digests"
+        );
+
         assert_eq!(
-            plan_for(legacy, complete).uploads[0].reason,
+            plan_for(complete, other_legacy).uploads[0].reason,
+            ChangeReason::ContentDiffers
+        );
+        assert_eq!(
+            plan_for(legacy, other_complete).uploads[0].reason,
+            ChangeReason::ContentDiffers
+        );
+    }
+
+    /// A digest that is absent entirely is still reported as absent, on the side that lacks it.
+    ///
+    /// Distinct from the MD5-only case above: "compared by MD5 alone" is an answer, while "no
+    /// digest at all" is not one, and the two must not collapse into each other now that one of
+    /// them has become the normal path. These reasons are part of the rendered output, so the
+    /// distinction is visible to callers and not merely internal.
+    #[test]
+    fn content_mode_still_names_the_side_whose_digest_is_missing_entirely() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let complete = ContentMd5::from_digests([0x33; 16], 0x1122_3344, [0x44; 32]);
+        let plan_for = |local_digest, remote_digest| {
+            let mut local = local(&[("payload.bin", EntryKind::File, 4, 1_000)]);
+            let mut remote = remote(&[("payload.bin", EntryKind::File, 4, 1)]);
+            local.entries.get_mut("payload.bin").unwrap().content_md5 = local_digest;
+            remote.entries.get_mut("payload.bin").unwrap().content_md5 = remote_digest;
+            build_plan(
+                &root,
+                &local,
+                &remote,
+                &rules(&[]),
+                &content_options(false, false),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            plan_for(None, Some(complete)).uploads[0].reason,
             ChangeReason::LocalDigestUnavailable
         );
         assert_eq!(
-            plan_for(complete, legacy).uploads[0].reason,
+            plan_for(Some(complete), None).uploads[0].reason,
             ChangeReason::RemoteDigestUnavailable
         );
     }

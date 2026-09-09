@@ -12,6 +12,12 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 
 require_package_identity
 ensure_layout
+# Both are read before the first admission, because every child launch and
+# every runner-wait guard depends on them. The poll resolution is inherited
+# from the lifecycle transition that started this controller rather than
+# re-measured; the performance level is re-read on HUP alongside the schedule.
+load_runtime_poll_resolution
+load_performance_policy_runtime
 [ ! -L "$controller_log" ] || { echo "refusing symlinked controller log: $controller_log" >&2; exit 73; }
 rotate_log "$controller_log" 10485760 5
 [ ! -f "$controller_log" ] || finish_private_file "$controller_log"
@@ -32,8 +38,17 @@ valid_request_id() {
 private_control_file() {
     control_path=$1
     [ -f "$control_path" ] && [ ! -L "$control_path" ] && [ -r "$control_path" ] || return 1
-    control_mode=$(stat -c '%a' "$control_path" 2>/dev/null || true)
-    control_owner=$(stat -c '%u' "$control_path" 2>/dev/null || true)
+    # One stat, not one per field. This runs on every control-file read and on
+    # every admission, and a second command substitution here is a second fork
+    # and a second busybox exec for metadata the first call already returned.
+    # The mtime rides along for control_file_expired below; it is cleared on
+    # entry so a caller can never read it after a rejected file.
+    control_mtime=
+    control_metadata=$(stat -c '%a %u %Y' "$control_path" 2>/dev/null || true)
+    control_mode=${control_metadata%% *}
+    control_metadata_rest=${control_metadata#* }
+    control_owner=${control_metadata_rest%% *}
+    control_mtime=${control_metadata_rest#* }
     [ "$control_mode" = 600 ] && [ -n "$path_owner" ] && [ "$control_owner" = "$path_owner" ]
 }
 
@@ -41,8 +56,10 @@ control_file_expired() {
     expiry_path=$1
     expiry_now=$2
     expiry_max_age=$3
+    # Mode, owner and mtime come from the single stat above, so the age is
+    # judged against the same sample the privacy check accepted.
     private_control_file "$expiry_path" || return 1
-    expiry_mtime=$(stat -c '%Y' "$expiry_path" 2>/dev/null || true)
+    expiry_mtime=$control_mtime
     case $expiry_mtime in ''|*[!0-9]*) return 1 ;; esac
     [ "$expiry_mtime" -le "$expiry_now" ] || return 1
     [ $((expiry_now - expiry_mtime)) -gt "$expiry_max_age" ]
@@ -463,17 +480,21 @@ capture_work_child_identity() {
     case $captured_work_child_parent in ''|*[!0-9]*|0) return 1 ;; esac
     captured_work_child_attempt=0
     while [ "$captured_work_child_attempt" -lt 10 ]; do
-        captured_work_child_start=$(process_start_time "$captured_work_child_pid" 2>/dev/null || true)
-        captured_work_child_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
-            "/proc/$captured_work_child_pid/status" 2>/dev/null | sed -n '1p')
-        captured_work_child_ppid=$(sed -n 's/^PPid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
-            "/proc/$captured_work_child_pid/status" 2>/dev/null | sed -n '1p')
+        captured_work_child_uid=
+        captured_work_child_ppid=
+        read_process_stat_fields "$captured_work_child_pid" || true
+        captured_work_child_start=$process_stat_start
+        if read_process_status_ids "$captured_work_child_pid"; then
+            captured_work_child_uid=$process_status_uid
+            captured_work_child_ppid=$process_status_ppid
+        fi
         case $captured_work_child_start in ''|*[!0-9]*|0) ;;
             *)
                 if [ "$captured_work_child_uid" = "$path_owner" ] && \
                     [ "$captured_work_child_ppid" = "$captured_work_child_parent" ]; then
-                    captured_work_child_start_recheck=$(process_start_time \
-                        "$captured_work_child_pid" 2>/dev/null || true)
+                    captured_work_child_start_recheck=
+                    read_process_stat_fields "$captured_work_child_pid" && \
+                        captured_work_child_start_recheck=$process_stat_start
                     if [ "$captured_work_child_start_recheck" = "$captured_work_child_start" ]; then
                         return 0
                     fi
@@ -596,6 +617,26 @@ cleanup_runner_guard_channels() {
     return "$runner_guard_cleanup_result"
 }
 
+admission_yield() {
+    # `/bin/sleep 0` never slept. It forked, exec'd BusyBox, and returned, so a
+    # full round of the admission loop spent one process creation per probe to
+    # cover about a millisecond each -- on the hardware where fork is the most
+    # expensive thing this package does. A proven fractional sleep covers fifty
+    # milliseconds for the same single process.
+    #
+    # The measurement is the one the lifecycle transition that started this
+    # controller already published; this never probes. A build that never
+    # proved a fractional sleep keeps the original zero-second yield rather
+    # than falling back to a bare builtin spin, which would burn the whole
+    # ceiling in microseconds and drop admission onto the one-second path --
+    # the sluggishness this loop exists to avoid.
+    if [ "$runtime_poll_resolution_ms" -lt 1000 ]; then
+        /bin/sleep 0.05 2>/dev/null && return 0
+        runtime_poll_resolution_ms=1000
+    fi
+    /bin/sleep 0
+}
+
 wait_for_child_admission() {
     waited_admission_path=$1
     waited_admission_parent=$2
@@ -616,11 +657,17 @@ wait_for_child_admission() {
         fi
         process_identity_is_live "$waited_admission_parent" \
             "$waited_admission_parent_start" "$waited_admission_parent_boot" || return 1
-        # Yield immediately while the parent captures/publishes. Integer zero
-        # is supported by DSM's BusyBox sleep and avoids a systematic one-second
-        # admission delay without depending on fractional sleep support.
+        # Poll bucket F -- the admission handshake, while the parent captures
+        # and publishes. The ceiling counts yields rather than milliseconds
+        # because it is also the performance policy's knob, and the two
+        # resolutions give it a coherent meaning either way: at the proven
+        # fractional resolution each yield covers 50 ms, and on a build that
+        # never proved one each yield is the historical zero-second sleep. Both
+        # fall through to the one-second path once the ceiling is spent, so a
+        # lower ceiling trades admission latency for processes, which is
+        # exactly what the policy levels are asked to trade.
         waited_admission_yield=0
-        while [ "$waited_admission_yield" -lt 32 ]; do
+        while [ "$waited_admission_yield" -lt "$performance_admission_yields" ]; do
             if [ -n "$waited_admission_stop" ]; then
                 waited_admission_stop_status=0
                 runner_guard_stop_status "$waited_admission_stop" \
@@ -639,7 +686,7 @@ wait_for_child_admission() {
                 [ "$waited_admission_decision" = go ]
                 return $?
             fi
-            /bin/sleep 0
+            admission_yield
             waited_admission_yield=$((waited_admission_yield + 1))
         done
         /bin/sleep 1
@@ -654,7 +701,9 @@ work_child_identity_is_running() {
     bounded_child_boot=${3:-}
     case $bounded_child_start in ''|*[!0-9]*|0) return 1 ;; esac
     valid_boot_identity "$bounded_child_boot" || return 1
-    bounded_child_state=$(sed -n 's/^.*) \([^ ]\).*/\1/p' "/proc/$bounded_child_pid/stat" 2>/dev/null || true)
+    bounded_child_state=
+    read_process_stat_fields "$bounded_child_pid" && \
+        bounded_child_state=$process_stat_state
     case $bounded_child_state in ''|Z|X|x) return 1 ;; esac
     # Keep the exact PID/start/boot verification last so TERM/KILL follows it
     # without another operation that could widen the PID-reuse race window.
@@ -817,6 +866,27 @@ stop_runner_guard_sleep() {
 }
 
 start_runner_wait_guard() {
+    # An admitted, live guard is not replaced. wait_for_runner re-enters `wait`
+    # on every ALRM tick, and rebuilding the watchdog on each re-entry cost a
+    # full admission handshake plus a stop-latch directory created and removed,
+    # once a second, for the whole duration of every sync. That was never a
+    # design decision -- it fell out of the loop calling stop and start around
+    # a `wait` that an alarm is *expected* to interrupt. The alarm cadence, the
+    # signal semantics and every latch are unchanged here; this only declines
+    # to build a second watchdog while the first is still running.
+    #
+    # Liveness is the exact PID/start/boot tuple, never a non-empty PID
+    # variable. A guard that exited on its own must be replaced, or the wait it
+    # protects would silently run with no watchdog at all -- and a stale tuple
+    # is torn down through the normal path first so it cannot be leaked.
+    if [ -n "$runner_wait_guard_pid" ]; then
+        if [ "$runner_wait_guard_admitted" = true ] \
+            && runner_guard_identity_is_live "$runner_wait_guard_pid" \
+                "$runner_wait_guard_start" "$runner_wait_guard_boot"; then
+            return 0
+        fi
+        stop_runner_wait_guard || return 73
+    fi
     runner_guard_parent=$$
     runner_guard_parent_start=$(process_start_time "$runner_guard_parent" 2>/dev/null || true)
     case $runner_guard_parent_start in ''|*[!0-9]*|0) return 73 ;; esac
@@ -1121,8 +1191,15 @@ wait_for_runner() {
         wait "$active_pid"
         current_wait_status=$?
         set -e
-        stop_runner_wait_guard
+        # An interrupted wait does not retire the guard. The alarm that
+        # interrupted it is the guard doing its job; the loop is about to
+        # re-enter `wait`, and the same watchdog covers that re-entry. Stopping
+        # and restarting it here is what made a running sync pay a whole
+        # admission handshake every second for as long as it ran. The guard is
+        # retired when the wait actually completes, immediately below, and
+        # again after the loop.
         if [ "$wait_interrupted" = true ]; then previous_wait_status=$current_wait_status; continue; fi
+        stop_runner_wait_guard
         if [ "$current_wait_status" -eq 127 ] && [ -n "$previous_wait_status" ]; then scheduled_exit=$previous_wait_status; else scheduled_exit=$current_wait_status; fi
         break
     done
@@ -1550,6 +1627,10 @@ while [ "$shutdown" = false ]; do
         # a 1-hour -> 60-second reconfiguration take effect promptly after HUP.
         next_run=0
         stop_realtime_watchers 2>/dev/null || true
+        # A saved performance level takes effect on the same HUP as a saved
+        # schedule, so the dashboard's Save is what applies it rather than a
+        # package restart.
+        load_performance_policy_runtime
         reload_requested=false
     fi
     control_queue_progress=false

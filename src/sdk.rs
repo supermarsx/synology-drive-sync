@@ -839,17 +839,23 @@ impl Engine {
                 client
                     .require_content_fingerprint_api()
                     .map_err(SdkError::from_core)?;
-                local::populate_content_md5(&mut local, cancellation)
-                    .map_err(SdkError::from_core)?;
-                let selected = plan::select_remote_content_hashes_for_plan(
+                let comparison = plan::select_comparison_remote_digests(&local, &remote, &rules);
+                let strong = plan::select_strong_remote_digests(
                     &local,
                     &remote,
                     &rules,
                     server_copy,
                     request.deletion.enabled,
                 );
+                local::populate_content_md5_selective(&mut local, &comparison, cancellation)
+                    .map_err(SdkError::from_core)?;
                 client
-                    .populate_remote_content_fingerprints(&mut remote, &selected, cancellation)
+                    .populate_remote_content_digests(
+                        &mut remote,
+                        &comparison,
+                        &strong,
+                        cancellation,
+                    )
                     .map_err(SdkError::from_core)?;
                 emit(
                     cancellation,
@@ -867,7 +873,7 @@ impl Engine {
                     phase: Phase::Planning,
                 },
             )?;
-            let plan = plan::build_plan(
+            let mut plan = plan::build_plan(
                 &root,
                 &local,
                 &remote,
@@ -883,6 +889,11 @@ impl Engine {
                 },
             )
             .map_err(SdkError::from_core)?;
+            // This plan is executed, so its uploads need the strong digest the upload path
+            // verifies against. See `plan::promote_upload_fingerprints`.
+            plan::promote_upload_fingerprints(&mut plan, cancellation)
+                .map_err(SdkError::from_core)?;
+            let plan = plan;
             let summary = summarize_plan(&plan);
             emit(
                 cancellation,
@@ -1154,18 +1165,22 @@ fn reconciliation_plan(
         client
             .require_content_fingerprint_api()
             .map_err(SdkError::from_core)?;
-        local::populate_content_md5(&mut local, cancellation).map_err(SdkError::from_core)?;
-        let selected = plan::select_remote_content_hashes_for_plan(
+        let comparison = plan::select_comparison_remote_digests(&local, &remote, rules);
+        let strong = plan::select_strong_remote_digests(
             &local,
             &remote,
             rules,
             server_copy,
             request.deletion.enabled,
         );
+        local::populate_content_md5_selective(&mut local, &comparison, cancellation)
+            .map_err(SdkError::from_core)?;
         client
-            .populate_remote_content_fingerprints(&mut remote, &selected, cancellation)
+            .populate_remote_content_digests(&mut remote, &comparison, &strong, cancellation)
             .map_err(SdkError::from_core)?;
     }
+    // No promotion: a reconciliation plan is inspected for emptiness, never executed, so nothing
+    // consumes an upload's digest here.
     plan::build_plan(
         root,
         &local,

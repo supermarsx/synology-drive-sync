@@ -347,9 +347,28 @@ runner_supervisor_boot=$(boot_identity) || {
     echo "cannot capture runner boot identity before core launch" >&2
     exit 73
 }
+# The core is the only process the performance level renices. It is bulk work
+# that runs for minutes and competes with DSM's own interface for a small
+# armv7 CPU; the API bridge that serves the dashboard is never renice'd at any
+# level, because throttling the request path is what makes a package feel
+# broken rather than considerate. The level is applied by the supervisor with
+# setpriority(2) immediately before it execs the core, so it covers the core
+# and everything the core spawns, and nothing else in this chain.
+load_performance_policy_runtime
 set -- "$api_bridge" --exec-supervised-core "$$" "$runner_supervisor_start" \
-    "$runner_supervisor_boot" -- "$@"
-
+    "$runner_supervisor_boot" --core-nice "$performance_core_nice" -- "$@"
+# I/O priority is deliberately not set here, and the omission is the decision.
+#
+# ionice only means something under a scheduler that implements I/O priorities.
+# Under mq-deadline or none -- the common defaults -- it does nothing at all,
+# and under BFQ or CFQ it is a real deprioritisation. Which of those DSM's
+# armv7 kernel uses cannot be established from a build host, so shipping it as
+# a default would mean shipping a mechanism whose two possible behaviours are
+# "no effect" and "starves the sync", with no way to know which. CPU nice has
+# neither problem: its effect is kernel-independent, and being a relative
+# weight rather than a cap it still leaves a lone sync a full core on an idle
+# NAS. The report asks the operator for `cat /sys/block/*/queue/scheduler`,
+# which is the one piece of evidence that would make this decidable.
 audit_outbox_execute "$SDSYNC_DSM_AUDIT_TRANSACTION" || {
     echo "mandatory audit execution phase could not be recorded" >&2
     exit 73

@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf, Prefix};
 use std::time::UNIX_EPOCH;
 
 use crate::cancel::CancellationToken;
-use crate::integrity::{ContentHasher, ContentMd5};
+use crate::integrity::{ContentHasher, ContentMd5, Md5ContentHasher};
 use crate::path::{drive_path_issue, is_dsm_managed, path_for_match, validate_relative};
 use crate::plan::Scope;
 use crate::{Error, Result};
@@ -309,10 +309,100 @@ pub fn populate_content_md5(
     Ok(())
 }
 
+/// Hash every file, computing only MD5 for the entries a comparison will decide.
+///
+/// `comparison` names the files whose remote counterpart agrees on size and modification time.
+/// Their remote digest comes from File Station's server-side MD5, which carries no CRC32 or
+/// SHA-256, so computing those locally produces values that nothing can be compared against --
+/// and SHA-256 is roughly 70% of the time this crate spends hashing. Everything else is hashed at
+/// full strength, because it is already known to be an upload or a server-copy source, and those
+/// consume a strong digest.
+///
+/// A comparison-set file whose digests disagree becomes an upload and therefore *does* need full
+/// strength. That promotion is deliberately not attempted here -- which files differ is not known
+/// until the plan is built -- and is completed by [`promote_to_full_fingerprint`]. Leaving it
+/// undone is not a silent downgrade but a loud one: `full_match` returns `None` without strong
+/// digests on both sides, and the upload verification in `api` treats that as a mismatch.
+pub fn populate_content_md5_selective(
+    inventory: &mut LocalInventory,
+    comparison: &BTreeSet<String>,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    for (relative, entry) in inventory.entries.iter_mut() {
+        cancellation.check()?;
+        if entry.kind != EntryKind::File {
+            continue;
+        }
+        entry.content_md5 = Some(if comparison.contains(relative) {
+            hash_file_md5_snapshot(entry, cancellation)?
+        } else {
+            hash_file_snapshot(entry, cancellation)?
+        });
+    }
+    Ok(())
+}
+
+/// Recompute an entry's fingerprint at full strength.
+///
+/// Used to promote a file that was hashed for comparison only and then turned out to differ, so
+/// that the upload path has the strong digest it verifies against. Re-reads the file, and the
+/// snapshot checks inside the hash apply as they always do: a source that changed between the
+/// comparison and the promotion is reported rather than uploaded on stale evidence.
+pub fn promote_to_full_fingerprint(
+    entry: &mut LocalEntry,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    if entry
+        .content_md5
+        .is_some_and(|fingerprint| fingerprint.has_full_proof())
+    {
+        return Ok(());
+    }
+    entry.content_md5 = Some(hash_file_snapshot(entry, cancellation)?);
+    Ok(())
+}
+
 pub fn hash_file_snapshot(
     entry: &LocalEntry,
     cancellation: &CancellationToken,
 ) -> Result<ContentMd5> {
+    hash_file_with(
+        entry,
+        cancellation,
+        ContentHasher::new(),
+        |hasher, bytes| hasher.update(bytes),
+    )
+}
+
+/// Compute only the MD5 component of `entry`'s fingerprint, with the same snapshot checks.
+pub fn hash_file_md5_snapshot(
+    entry: &LocalEntry,
+    cancellation: &CancellationToken,
+) -> Result<ContentMd5> {
+    hash_file_with(
+        entry,
+        cancellation,
+        Md5ContentHasher::new(),
+        |hasher, bytes| hasher.update(bytes),
+    )
+}
+
+/// Read `entry` once under its snapshot checks, feeding every byte to `hasher`.
+///
+/// The checks bracketing the read are the load-bearing part and are shared rather than duplicated
+/// per digest strength: metadata before opening, metadata of the open handle, then both again
+/// after the last byte. A file that changed underneath the read is reported as
+/// [`Error::SourceChanged`] instead of yielding a digest of a mixture of two versions.
+fn hash_file_with<H, F>(
+    entry: &LocalEntry,
+    cancellation: &CancellationToken,
+    mut hasher: H,
+    mut update: F,
+) -> Result<ContentMd5>
+where
+    H: FingerprintHasher,
+    F: FnMut(&mut H, &[u8]),
+{
     verify_entry_snapshot(entry)?;
     let mut file = fs::File::open(&entry.full_path).map_err(|source| Error::FileIo {
         path: entry.full_path.clone(),
@@ -320,7 +410,6 @@ pub fn hash_file_snapshot(
     })?;
     verify_open_snapshot(entry, &file)?;
 
-    let mut hasher = ContentHasher::new();
     let mut buffer = [0_u8; 128 * 1024];
     loop {
         cancellation.check()?;
@@ -331,11 +420,28 @@ pub fn hash_file_snapshot(
         if count == 0 {
             break;
         }
-        hasher.update(&buffer[..count]);
+        update(&mut hasher, &buffer[..count]);
     }
     verify_open_snapshot(entry, &file)?;
     verify_entry_snapshot(entry)?;
-    Ok(hasher.finalize())
+    Ok(hasher.finish())
+}
+
+/// The two fingerprint strengths, so the snapshot-checked read can be written once.
+trait FingerprintHasher {
+    fn finish(self) -> ContentMd5;
+}
+
+impl FingerprintHasher for ContentHasher {
+    fn finish(self) -> ContentMd5 {
+        self.finalize()
+    }
+}
+
+impl FingerprintHasher for Md5ContentHasher {
+    fn finish(self) -> ContentMd5 {
+        self.finalize()
+    }
 }
 
 fn verify_entry_snapshot(entry: &LocalEntry) -> Result<()> {
@@ -1749,6 +1855,102 @@ mod scoped_scan_tests {
         let inventory = scan(&root, &rules, &CancellationToken::default()).unwrap();
         assert_eq!(inventory.entries.len(), 12);
         assert_eq!(inventory.files(), 6);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_strength_tests {
+    use std::fs;
+
+    use super::*;
+
+    /// Build a two-file tree and scan it, so the entries carry real metadata snapshots.
+    fn scanned(name: &str) -> (PathBuf, LocalInventory) {
+        let root = std::env::temp_dir().join(format!(
+            "sdsync-strength-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("compared.bin"), b"compared").unwrap();
+        fs::write(root.join("uploaded.bin"), b"uploaded").unwrap();
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        let inventory = scan(&root, &rules, &CancellationToken::default()).unwrap();
+        (root, inventory)
+    }
+
+    /// Comparison-set files are hashed MD5-only; everything else keeps full strength.
+    ///
+    /// The narrowing that made content mode affordable locally as well as remotely. A file whose
+    /// remote counterpart agrees on size and modification time has its digest compared against
+    /// File Station's server-side MD5, which carries no CRC32 or SHA-256 -- so computing those
+    /// locally produces values nothing can be compared against, and SHA-256 alone is roughly 70%
+    /// of the time this crate spends hashing. A file with no such counterpart is already known to
+    /// be an upload, and uploads consume a strong digest, so it is hashed in full from the start.
+    #[test]
+    fn only_comparison_set_files_are_hashed_md5_only() {
+        let (root, mut inventory) = scanned("selective");
+        let comparison = BTreeSet::from(["compared.bin".to_owned()]);
+        populate_content_md5_selective(&mut inventory, &comparison, &CancellationToken::default())
+            .unwrap();
+
+        let compared = inventory.entries["compared.bin"].content_md5.unwrap();
+        let uploaded = inventory.entries["uploaded.bin"].content_md5.unwrap();
+        assert!(
+            !compared.has_full_proof(),
+            "a comparison-set file must not pay for digests nothing will compare"
+        );
+        assert!(
+            uploaded.has_full_proof(),
+            "a file outside the comparison set is an upload and needs strong proof"
+        );
+        // Narrowing changes which digests are computed, never the MD5 that is.
+        assert_eq!(
+            compared.as_bytes(),
+            ContentMd5::from_content(b"compared").as_bytes()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Promotion raises a comparison-set digest to full strength, and leaves a complete one alone.
+    ///
+    /// The counterpart to the narrowing above. A comparison-set file that turns out to differ
+    /// becomes an upload, and the upload path verifies with `full_match`, which cannot answer
+    /// unless both sides carry SHA-256. Promotion closes that gap. Skipping it does not produce an
+    /// unverified upload but a failed one, which is the right direction to fail in -- and is
+    /// covered end to end by `content_mode_still_detects_a_change_hidden_behind_equal_size_and_mtime`.
+    #[test]
+    fn promotion_raises_an_md5_only_digest_and_leaves_a_complete_one_untouched() {
+        let (root, mut inventory) = scanned("promotion");
+        let cancellation = CancellationToken::default();
+        populate_content_md5_selective(
+            &mut inventory,
+            &BTreeSet::from(["compared.bin".to_owned()]),
+            &cancellation,
+        )
+        .unwrap();
+
+        let entry = inventory.entries.get_mut("compared.bin").unwrap();
+        assert!(!entry.content_md5.unwrap().has_full_proof());
+        promote_to_full_fingerprint(entry, &cancellation).unwrap();
+        let promoted = entry.content_md5.unwrap();
+        assert!(
+            promoted.has_full_proof(),
+            "a promoted digest must carry the components an upload verifies against"
+        );
+        assert_eq!(promoted, ContentMd5::from_content(b"compared"));
+
+        // Idempotent: promoting a digest that is already complete must not change it.
+        promote_to_full_fingerprint(entry, &cancellation).unwrap();
+        assert_eq!(entry.content_md5.unwrap(), promoted);
+
+        // And a file hashed at full strength from the start is already promoted.
+        let strong = inventory.entries.get_mut("uploaded.bin").unwrap();
+        let before = strong.content_md5.unwrap();
+        promote_to_full_fingerprint(strong, &cancellation).unwrap();
+        assert_eq!(strong.content_md5.unwrap(), before);
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 #[cfg(target_os = "linux")]
 use std::sync::{
-    Arc,
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
 };
 #[cfg(target_os = "linux")]
@@ -165,6 +165,15 @@ const MAX_DSM_USER_SERVICE_OUTPUT_BYTES: usize = MAX_MANAGER_OUTPUT_BYTES;
 const MAX_SECRET_BYTES: usize = 4096;
 const MAX_CONNECTION_SECRET_BYTES: usize = (MAX_SECRET_BYTES * 2) + 32;
 const CONNECTION_PROOF_LIFETIME_SECONDS: u64 = 5 * 60;
+/// The query engine's own page ceiling, restated so an oversized request is
+/// refused before it is queued rather than after it is dispatched.
+const SYNC_STATUS_MAX_LIMIT: u16 = 200;
+/// A source-relative path, bounded by the platform path limit.
+const MAX_SCOPE_BYTES: usize = 4096;
+/// A file-name search fragment, not a path.
+const MAX_STATUS_FILTER_BYTES: usize = 128;
+/// Width of a resync ticket digest in hexadecimal characters.
+const RESYNC_TICKET_BYTES: usize = 16;
 const MAX_DSM_DELETE_BOUND: u64 = 2_147_483_647;
 const MAX_JOB_AGE_SECONDS: u64 = 24 * 60 * 60;
 const RESULT_RETENTION_SECONDS: u64 = 60 * 60;
@@ -269,6 +278,18 @@ const SATURATED_SERVICE_CODE: &str = "service_saturated";
 /// hidden, so this covers far more tabs than a NAS dashboard has. Keeping
 /// handlers short is still the lever that matters; what changed is that the
 /// pool must now also absorb a bounded number of handlers that are not.
+///
+/// One premise above has since been corrected, and it is the reason this
+/// number no longer bounds anything expensive. "A file read or a bounded
+/// manager call" treats those two as comparable; they are not. A manager call
+/// forks `sdsync-dsm`, a POSIX shell program of several thousand lines that
+/// forks again for most of what it does, and a read handler waits for it
+/// inside its worker. Sized as occupancy this pool would therefore permit
+/// twelve concurrent shell programs, which on a two-core armv7 unit saturates
+/// the machine and keeps it saturated. What bounds that now is
+/// `MANAGER_CONCURRENCY_LIMIT`, deliberately separate from this number:
+/// occupancy stays wide so short requests are served immediately, while the
+/// expensive operation is narrow.
 #[cfg(target_os = "linux")]
 const API_WORKER_COUNT: usize = 12;
 /// Burst absorption in front of the pool, bounded by two things.
@@ -414,6 +435,122 @@ impl LongPollSlot {
 impl Drop for LongPollSlot {
     fn drop(&mut self) {
         LONG_POLL_OCCUPANCY.fetch_sub(1, AtomicOrdering::AcqRel);
+    }
+}
+
+/// How many manager invocations may run at once.
+///
+/// Deliberately separate from `API_WORKER_COUNT` and much smaller, because the two bound different
+/// things. The pool bounds how many requests may be *in flight*; this bounds how many may be
+/// *expensive* at the same time. Conflating them is what let twelve concurrent forks of a
+/// multi-thousand-line shell program be reachable from an AppWindow doing nothing but refreshing.
+///
+/// Three rather than one, so a window refreshing status while another reads logs is not serialised
+/// behind a single lane and one slow manager cannot stall every reader. Three rather than twelve
+/// because beyond roughly the core count of the smallest supported unit the extra concurrency buys
+/// no throughput and costs contention — and the smallest supported unit is a two-core armv7.
+///
+/// This is a hard bound, not a heuristic: it does not consult load, and it cannot be widened by
+/// anything a client sends.
+#[cfg(target_os = "linux")]
+const MANAGER_CONCURRENCY_LIMIT: usize = 3;
+
+/// How long a request may wait for a manager permit before giving up.
+///
+/// Waiting is right where the lane is briefly busy: a snapshot costs ~0.25 s, so a queued reader
+/// is served long before this. Waiting is wrong where it is indefinite, and it is bounded for the
+/// same reason `API_QUEUE_CAPACITY` is: `READ_MANAGER_TIMEOUT` is 20 s, so three lanes plus twelve
+/// workers could otherwise park a request for a minute and let it wait out the AppWindow's own
+/// window while the service still looked healthy. Five seconds keeps the worst case a request can
+/// experience — this wait plus one full `READ_MANAGER_TIMEOUT` — inside `RELAY_IO_TIMEOUT`, so the
+/// bound can never be the thing that trips the transport.
+#[cfg(target_os = "linux")]
+const MANAGER_PERMIT_WAIT: Duration = Duration::from_secs(5);
+
+// The manager-lane relationships, checked at compile time for the same reason the pool's are.
+#[cfg(target_os = "linux")]
+#[allow(clippy::assertions_on_constants)]
+const _: () = assert!(
+    MANAGER_CONCURRENCY_LIMIT < API_WORKER_COUNT,
+    "the manager lane must be narrower than the pool, or it bounds nothing"
+);
+#[cfg(target_os = "linux")]
+#[allow(clippy::assertions_on_constants)]
+const _: () = assert!(
+    MANAGER_PERMIT_WAIT.as_secs() + READ_MANAGER_TIMEOUT.as_secs() < RELAY_IO_TIMEOUT.as_secs(),
+    "waiting for a permit and then running a manager must stay inside the relay's I/O deadline"
+);
+
+/// Highest scheduling nice value the core may be asked to run at.
+///
+/// Nineteen is the kernel's own maximum, so this is the range check rather than a policy:
+/// the shell runner owns which level to ask for, and this end only refuses what the
+/// kernel could not honour. Negative values are outside the range on purpose — raising
+/// priority requires privilege this package does not have and does not want, so a request
+/// to raise is a defect rather than something to attempt and fail at.
+#[cfg(target_os = "linux")]
+const MAX_CORE_NICE: i32 = 19;
+
+/// Occupancy of the manager lane, and where requests wait for a slot in it.
+#[cfg(target_os = "linux")]
+struct ManagerLane {
+    occupancy: Mutex<usize>,
+    released: Condvar,
+}
+
+#[cfg(target_os = "linux")]
+static MANAGER_LANE: ManagerLane = ManagerLane {
+    occupancy: Mutex::new(0),
+    released: Condvar::new(),
+};
+
+/// A claim on one of the `MANAGER_CONCURRENCY_LIMIT` manager slots.
+///
+/// Released on drop, so an early return, a `?` on a failed spawn, or a panic inside the manager
+/// call cannot leak a slot and shrink the lane for the life of the process — the same property
+/// `LongPollSlot` relies on, and for the same reason.
+#[cfg(target_os = "linux")]
+struct ManagerPermit;
+
+#[cfg(target_os = "linux")]
+impl ManagerPermit {
+    /// Claim a slot, waiting at most `MANAGER_PERMIT_WAIT` for one.
+    ///
+    /// A poisoned lock is reported as unavailable rather than recovered: the count is the only
+    /// state behind it, but a panic while holding it means a permit was already leaked, and
+    /// serving on through that would let the lane silently widen.
+    fn acquire() -> BridgeResult<Self> {
+        let deadline = Instant::now() + MANAGER_PERMIT_WAIT;
+        let mut occupancy = MANAGER_LANE
+            .occupancy
+            .lock()
+            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+        loop {
+            if *occupancy < MANAGER_CONCURRENCY_LIMIT {
+                *occupancy += 1;
+                return Ok(Self);
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(BridgeError::new(ErrorKind::Unavailable));
+            };
+            let (guard, _) = MANAGER_LANE
+                .released
+                .wait_timeout(occupancy, remaining)
+                .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+            occupancy = guard;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ManagerPermit {
+    fn drop(&mut self) {
+        if let Ok(mut occupancy) = MANAGER_LANE.occupancy.lock() {
+            *occupancy = occupancy.saturating_sub(1);
+        }
+        // One waiter per released slot. A spurious or lost wake cannot strand a request past its
+        // own deadline, because `acquire` waits with a timeout and rechecks the count.
+        MANAGER_LANE.released.notify_one();
     }
 }
 
@@ -1690,6 +1827,64 @@ struct OperationalActionArgs {
     max_total_delete: Option<u64>,
 }
 
+/// One scoped, paginated per-file status query.
+///
+/// Every field is always present on the wire. The optional narrowings arrive as
+/// empty strings rather than being omitted, so the accepted key set is exact and
+/// a request carrying an unexpected shape is refused rather than defaulted.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SyncStatusArgs {
+    profile: String,
+    scope: String,
+    filter: String,
+    state: SyncStatusState,
+    limit: u16,
+    cursor: String,
+    include_excluded: bool,
+}
+
+/// One re-upload, planned or confirmed.
+///
+/// An empty `confirm` plans and returns a ticket without changing anything. A
+/// present ticket performs the upload the ticket describes. There is no third
+/// case, and no single request that can plan and upload at once.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ResyncArgs {
+    profile: String,
+    scope: String,
+    confirm: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum SyncStatusState {
+    All,
+    Attention,
+    TypeConflict,
+    MissingRemote,
+    Differs,
+    RemoteOnly,
+    InSync,
+    Excluded,
+}
+
+impl SyncStatusState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Attention => "attention",
+            Self::TypeConflict => "type-conflict",
+            Self::MissingRemote => "missing-remote",
+            Self::Differs => "differs",
+            Self::RemoteOnly => "remote-only",
+            Self::InSync => "in-sync",
+            Self::Excluded => "excluded",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 enum OperationalDoctorLevel {
@@ -1741,6 +1936,8 @@ enum Mutation {
     SecurityPolicy(SecurityPolicyArgs),
     ClientEvent(ClientEventArgs),
     Action(OperationalActionArgs),
+    SyncStatus(SyncStatusArgs),
+    Resync(ResyncArgs),
 }
 
 struct ParsedMutation {
@@ -1783,6 +1980,8 @@ impl Mutation {
             Self::SecurityPolicy(_) => "security-policy",
             Self::ClientEvent(_) => "client-event",
             Self::Action(_) => "action",
+            Self::SyncStatus(_) => "sync-status",
+            Self::Resync(_) => "resync",
         }
     }
 
@@ -1801,6 +2000,8 @@ impl Mutation {
             Self::SecurityPolicy(value) => serde_json::to_value(value),
             Self::ClientEvent(value) => serde_json::to_value(value),
             Self::Action(value) => serde_json::to_value(value),
+            Self::SyncStatus(value) => serde_json::to_value(value),
+            Self::Resync(value) => serde_json::to_value(value),
         };
         result.map_err(|_| BridgeError::internal())
     }
@@ -2528,6 +2729,16 @@ fn parse_mutation_request(body: &[u8]) -> BridgeResult<ParsedMutation> {
             validate_operational_action(&arguments)?;
             (Mutation::Action(arguments), None)
         }
+        "sync-status" => {
+            let arguments: SyncStatusArgs = parse_arguments(request.arguments)?;
+            validate_sync_status(&arguments)?;
+            (Mutation::SyncStatus(arguments), None)
+        }
+        "resync" => {
+            let arguments: ResyncArgs = parse_arguments(request.arguments)?;
+            validate_resync(&arguments)?;
+            (Mutation::Resync(arguments), None)
+        }
         _ => return Err(BridgeError::bad_request()),
     };
 
@@ -2629,6 +2840,16 @@ fn parse_job(body: &[u8]) -> BridgeResult<ParsedJob> {
             validate_operational_action(&value)?;
             Mutation::Action(value)
         }
+        "sync-status" => {
+            let value: SyncStatusArgs = parse_arguments(job.arguments)?;
+            validate_sync_status(&value)?;
+            Mutation::SyncStatus(value)
+        }
+        "resync" => {
+            let value: ResyncArgs = parse_arguments(job.arguments)?;
+            validate_resync(&value)?;
+            Mutation::Resync(value)
+        }
         _ => return Err(BridgeError::bad_request()),
     };
     Ok(ParsedJob {
@@ -2651,7 +2872,9 @@ fn queued_job_class(job: &ParsedJob) -> QueuedJobClass {
         // profile, credential, policy, or scheduler state. A bounded
         // connection probe can therefore run beside them without observing a
         // partially committed configuration mutation.
-        Mutation::Action(_) => QueuedJobClass::Concurrent,
+        Mutation::Action(_) | Mutation::SyncStatus(_) | Mutation::Resync(_) => {
+            QueuedJobClass::Concurrent
+        }
         _ => QueuedJobClass::Serialized,
     }
 }
@@ -3387,12 +3610,56 @@ fn validate_mutation_against_security_policy(
                 && (policy.allow_doctor_write_test || value.write_test != Some(true))
                 && (policy.allow_destructive_sync || value.allow_delete != Some(true))
         }
+        Mutation::SyncStatus(_) | Mutation::Resync(_) => policy.allow_operational_actions,
     };
     if allowed {
         Ok(())
     } else {
         Err(BridgeError::new(ErrorKind::Forbidden))
     }
+}
+
+/// Reject anything the query engine would refuse, before it is queued.
+///
+/// The 200-row ceiling is the engine's own and is enforced there too; refusing
+/// it here as well keeps an oversized request from reaching the browser as an
+/// argument error it cannot render.
+fn validate_sync_status(value: &SyncStatusArgs) -> BridgeResult<()> {
+    validate_existing_name(&value.profile)?;
+    if value.limit < 1 || value.limit > SYNC_STATUS_MAX_LIMIT {
+        return Err(BridgeError::bad_request());
+    }
+    validate_scoped_text(&value.scope, MAX_SCOPE_BYTES)?;
+    validate_scoped_text(&value.filter, MAX_STATUS_FILTER_BYTES)?;
+    validate_scoped_text(&value.cursor, MAX_SCOPE_BYTES)
+}
+
+fn validate_resync(value: &ResyncArgs) -> BridgeResult<()> {
+    validate_existing_name(&value.profile)?;
+    validate_scoped_text(&value.scope, MAX_SCOPE_BYTES)?;
+    // A ticket is a fixed-width digest over the scope, the mode, the sorted
+    // overwrite list, and the byte total. Empty means "plan only".
+    if !value.confirm.is_empty()
+        && (value.confirm.len() != RESYNC_TICKET_BYTES
+            || !value
+                .confirm
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    {
+        return Err(BridgeError::bad_request());
+    }
+    Ok(())
+}
+
+/// Bound one caller-supplied path or search string.
+///
+/// Paths are user data and may legitimately be non-ASCII, so only control
+/// bytes are refused. An empty value means the narrowing is unused.
+fn validate_scoped_text(value: &str, maximum: usize) -> BridgeResult<()> {
+    if value.len() > maximum || value.chars().any(char::is_control) {
+        return Err(BridgeError::bad_request());
+    }
+    Ok(())
 }
 
 fn validate_operational_action(value: &OperationalActionArgs) -> BridgeResult<()> {
@@ -6307,6 +6574,36 @@ fn mutation_manager_arguments(mutation: &Mutation) -> Vec<OsString> {
             arguments.push("client-event".into());
             push_pair(&mut arguments, "--event", value.event.as_str());
         }
+        Mutation::SyncStatus(value) => {
+            arguments.push("sync-status".into());
+            push_pair(&mut arguments, "--profile", &value.profile);
+            if !value.scope.is_empty() {
+                push_pair(&mut arguments, "--scope", &value.scope);
+            }
+            if !value.filter.is_empty() {
+                push_pair(&mut arguments, "--filter", &value.filter);
+            }
+            push_pair(&mut arguments, "--state", value.state.as_str());
+            push_pair(&mut arguments, "--limit", &value.limit.to_string());
+            if !value.cursor.is_empty() {
+                push_pair(&mut arguments, "--cursor", &value.cursor);
+            }
+            push_pair(
+                &mut arguments,
+                "--include-excluded",
+                bool_text(value.include_excluded),
+            );
+        }
+        Mutation::Resync(value) => {
+            arguments.push("resync".into());
+            push_pair(&mut arguments, "--profile", &value.profile);
+            if !value.scope.is_empty() {
+                push_pair(&mut arguments, "--scope", &value.scope);
+            }
+            if !value.confirm.is_empty() {
+                push_pair(&mut arguments, "--confirm", &value.confirm);
+            }
+        }
         Mutation::Action(value) => {
             arguments.push("action".into());
             push_pair(&mut arguments, "--kind", value.kind.as_str());
@@ -7176,9 +7473,25 @@ fn manager_command(arguments: &[OsString], has_secret_input: bool) -> BridgeResu
     Ok(command)
 }
 
+/// Run a read-side manager invocation, holding a manager permit for the exec alone.
+///
+/// This is the one manager call a client can drive repeatedly: `snapshot`, `logs` and `activity`
+/// are what an open AppWindow asks for on a timer, so it is the path along which many windows turn
+/// into many concurrent shell programs. The bound is therefore applied here rather than inside
+/// `manager_command`, and the other three manager callers are deliberately outside it: the
+/// controller wake and the two audit records are one-shot consequences of a request that already
+/// happened, not something a client can repeat, and putting them behind the same lane would let a
+/// burst of reads delay an audit record that must be written.
+///
+/// The permit is taken after the command is built and dropped as soon as the call returns, so a
+/// slot is held for the exec and nothing else. Exhaustion is reported as unavailable rather than
+/// with the dedicated `service_saturated` code, which is reachable only from the accept loop's
+/// pre-acceptance rejection; distinguishing the two would mean widening `ErrorKind` across every
+/// match in this module for no change in what the client does, which is retry.
 #[cfg(target_os = "linux")]
 fn run_read_manager(arguments: &[OsString]) -> BridgeResult<CapturedOutput> {
     let mut command = manager_command(arguments, false)?;
+    let _permit = ManagerPermit::acquire()?;
     capture_bounded_command(
         &mut command,
         MAX_MANAGER_OUTPUT_BYTES,
@@ -7263,6 +7576,8 @@ fn mutation_audit_profile(mutation: &Mutation) -> &str {
         Mutation::Routine(value) => &value.profile,
         Mutation::RemoveRoutine(value) => &value.name,
         Mutation::Action(value) => &value.scope,
+        Mutation::SyncStatus(value) => &value.profile,
+        Mutation::Resync(value) => &value.profile,
         Mutation::Schedule(_)
         | Mutation::AlertPolicy(_)
         | Mutation::SecurityPolicy(_)
@@ -7323,6 +7638,8 @@ fn valid_audit_operation(value: &str) -> bool {
             | "doctor"
             | "plan"
             | "run"
+            | "sync-status"
+            | "resync"
     )
 }
 
@@ -8045,7 +8362,7 @@ mod linux_files {
             "security-policy" => "security",
             "rejected-post" => "bridge",
             "session-notifications" => "notifications",
-            "doctor" | "plan" | "run" => "operations",
+            "doctor" | "plan" | "run" | "sync-status" | "resync" => "operations",
             _ => return Err(BridgeError::unsafe_runtime()),
         };
         let expected_level = match parsed.state {
@@ -11234,10 +11551,7 @@ pub(crate) fn main_entry() -> ExitCode {
         {
             ExitCode::FAILURE
         }
-    } else if arguments.len() >= 6
-        && arguments[0] == "--exec-supervised-core"
-        && arguments[4] == "--"
-    {
+    } else if arguments.len() >= 6 && arguments[0] == "--exec-supervised-core" {
         #[cfg(target_os = "linux")]
         {
             let result = (|| {
@@ -11256,16 +11570,15 @@ pub(crate) fn main_entry() -> ExitCode {
                     .filter(|value| valid_boot_id(value))
                     .ok_or_else(BridgeError::bad_request)?
                     .to_owned();
-                if arguments[5] != BINARY_PATH {
-                    return Err(BridgeError::bad_request());
-                }
+                let (core_nice, core_arguments) = parse_supervised_core_tail(&arguments)?;
                 exec_supervised_core(
                     SupervisedParent {
                         pid: parent_pid,
                         start: parent_start,
                         boot: parent_boot,
                     },
-                    &arguments[6..],
+                    core_nice,
+                    core_arguments,
                 )
             })();
             match result {
@@ -11996,8 +12309,89 @@ fn exec_supervised_controller(parent: SupervisedParent) -> BridgeResult<()> {
     })
 }
 
+/// Parse the tail of an `--exec-supervised-core` invocation.
+///
+/// Two layouts are accepted, deliberately:
+///
+/// ```text
+/// --exec-supervised-core <pid> <start> <boot> -- <binary> [args...]
+/// --exec-supervised-core <pid> <start> <boot> --core-nice <0..=19> -- <binary> [args...]
+/// ```
+///
+/// Both, rather than only the newer one, because this parser and the shell runner that
+/// builds the invocation live in different halves of the package and are updated
+/// separately. Accepting only the new form would mean every sync run fails until both
+/// halves land, and would make rolling back either half on its own an outage. Accepting
+/// both makes the two independent in either direction.
+///
+/// An absent `--core-nice` means zero, which is the inherited priority this path has
+/// always run at, so the older form keeps its exact behaviour instead of silently
+/// acquiring a niced one.
+///
+/// The level is validated, never clamped: a runner that asks for something outside the
+/// range has a defect, and quietly substituting the nearest legal value would hide it
+/// behind a sync that merely runs at the wrong priority.
 #[cfg(target_os = "linux")]
-fn exec_supervised_core(parent: SupervisedParent, arguments: &[OsString]) -> BridgeResult<()> {
+fn parse_supervised_core_tail(arguments: &[OsString]) -> BridgeResult<(i32, &[OsString])> {
+    let niced = arguments
+        .get(4)
+        .is_some_and(|value| *value == "--core-nice");
+    let separator = if niced { 6 } else { 4 };
+    let core_nice = if niced {
+        arguments
+            .get(5)
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|value| (0..=MAX_CORE_NICE).contains(value))
+            .ok_or_else(BridgeError::bad_request)?
+    } else {
+        0
+    };
+    if arguments.get(separator).is_none_or(|value| *value != "--") {
+        return Err(BridgeError::bad_request());
+    }
+    if arguments
+        .get(separator + 1)
+        .is_none_or(|value| *value != BINARY_PATH)
+    {
+        return Err(BridgeError::bad_request());
+    }
+    Ok((core_nice, &arguments[separator + 2..]))
+}
+
+/// Lower this thread's scheduling priority before the core replaces the process image.
+///
+/// Placed here, immediately before `execve`, for a reason that is easy to get wrong: on
+/// Linux the nice value is **per-thread**, not per-process. It is inherited across
+/// `execve` and by threads created later, so setting it on this single-threaded process
+/// is what makes the entire synced-off core run at the requested level. The same call
+/// made after threads exist would quietly apply to one thread and look like it worked.
+///
+/// Only lowering is reachable — the range is validated to `0..=MAX_CORE_NICE` at the
+/// parser — and lowering never requires privilege, so the remaining failure modes are
+/// impossible ones: `PRIO_PROCESS` with `who = 0` cannot be an invalid target, and the
+/// calling thread cannot be missing. A failure therefore means the runtime is not what
+/// this code believes it to be, and is fatal for the same reason
+/// `set_parent_death_signal` treats its own failure that way.
+///
+/// Unlike `getpriority`, `setpriority` returns only 0 or -1, so there is no legitimate
+/// negative return to disambiguate from an error and no errno dance is needed.
+#[cfg(target_os = "linux")]
+fn set_core_priority(core_nice: i32) -> BridgeResult<()> {
+    // SAFETY: setpriority takes no pointer arguments. PRIO_PROCESS with `who = 0` names
+    // the calling thread, which is the one `execve` is about to replace.
+    if unsafe { libc::setpriority(libc::PRIO_PROCESS as _, 0, core_nice) } != 0 {
+        return Err(BridgeError::unsafe_runtime());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn exec_supervised_core(
+    parent: SupervisedParent,
+    core_nice: i32,
+    arguments: &[OsString],
+) -> BridgeResult<()> {
     use std::os::unix::process::CommandExt;
 
     // The runner owns run.lock and remains the sole process lifecycle parent.
@@ -12012,6 +12406,12 @@ fn exec_supervised_core(parent: SupervisedParent, arguments: &[OsString]) -> Bri
     let package_uid = validate_package_identity(&identity)?;
     exact_parent_is_live(&parent, package_uid)?;
     linux_files::validate_private_executable(Path::new(BINARY_PATH), package_uid)?;
+    // Applied last, after every identity and liveness check has passed, and immediately
+    // before the image is replaced. Zero is left alone rather than set explicitly so the
+    // older no-flag invocation performs no priority call at all.
+    if core_nice != 0 {
+        set_core_priority(core_nice)?;
+    }
     let mut command = Command::new(BINARY_PATH);
     command.args(arguments);
     for name in CORE_CLI_ENVIRONMENT_VARIABLES {
@@ -13561,6 +13961,211 @@ mod tests {
         assert!(
             LongPollSlot::try_acquire().is_some(),
             "the lane must be reusable once its slots are released"
+        );
+    }
+
+    /// Both `--exec-supervised-core` layouts parse, and the flag is optional in both directions.
+    ///
+    /// This is the property that lets the shell runner and this parser ship independently. The
+    /// two live in different halves of the package: if only the newer layout parsed, every sync
+    /// run would fail `bad_request` until both halves landed, and rolling back either half alone
+    /// would be an outage. The older layout must therefore keep working *and* keep its exact
+    /// previous behaviour, which is nice 0 — not a silently niced one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn both_supervised_core_layouts_parse_with_the_flag_defaulting_to_zero() {
+        let arguments = |tail: &[&str]| {
+            let mut all: Vec<OsString> = ["--exec-supervised-core", "1234", "99", "boot-id"]
+                .iter()
+                .map(OsString::from)
+                .collect();
+            all.extend(tail.iter().map(OsString::from));
+            all
+        };
+
+        let legacy = arguments(&["--", BINARY_PATH, "sync", "all"]);
+        let (core_nice, core_arguments) =
+            parse_supervised_core_tail(&legacy).expect("the pre-flag layout must still parse");
+        assert_eq!(
+            core_nice, 0,
+            "an absent flag must mean the inherited priority"
+        );
+        assert_eq!(core_arguments, ["sync", "all"].map(OsString::from));
+
+        let niced = arguments(&["--core-nice", "5", "--", BINARY_PATH, "sync", "all"]);
+        let (core_nice, core_arguments) =
+            parse_supervised_core_tail(&niced).expect("the flagged layout must parse");
+        assert_eq!(core_nice, 5);
+        assert_eq!(core_arguments, ["sync", "all"].map(OsString::from));
+
+        // A core invoked with no arguments of its own is still a complete invocation.
+        let bare = arguments(&["--core-nice", "0", "--", BINARY_PATH]);
+        let (core_nice, core_arguments) =
+            parse_supervised_core_tail(&bare).expect("an argument-less core must parse");
+        assert_eq!(core_nice, 0);
+        assert!(core_arguments.is_empty());
+    }
+
+    /// The level is validated against the kernel's range and refused, never clamped.
+    ///
+    /// Clamping would turn a runner defect into a sync that merely runs at the wrong priority,
+    /// which is the kind of failure nobody notices. Negative values are refused with the rest:
+    /// raising priority needs privilege this package does not have, so asking to raise is a
+    /// defect rather than something to attempt.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_out_of_range_or_malformed_core_nice_is_refused_rather_than_clamped() {
+        let with_level = |level: &str| {
+            let mut all: Vec<OsString> = ["--exec-supervised-core", "1234", "99", "boot-id"]
+                .iter()
+                .map(OsString::from)
+                .collect();
+            all.extend(
+                ["--core-nice", level, "--", BINARY_PATH]
+                    .iter()
+                    .map(OsString::from),
+            );
+            all
+        };
+
+        for level in ["20", "-1", "-20", "", "five", "5x", "1e1", "٥"] {
+            assert!(
+                parse_supervised_core_tail(&with_level(level)).is_err(),
+                "{level:?} must be refused"
+            );
+        }
+        for level in ["0", "19"] {
+            let arguments = with_level(level);
+            assert!(
+                parse_supervised_core_tail(&arguments).is_ok(),
+                "{level:?} is inside the kernel's range and must be accepted"
+            );
+        }
+    }
+
+    /// A malformed tail is refused in either layout rather than reaching the core.
+    ///
+    /// `--` and the binary path are what separate this parser's own arguments from the ones it
+    /// forwards, so losing either would mean forwarding a flag as a sync argument, or execing
+    /// something other than the validated private binary.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_supervised_core_tail_without_its_separator_or_binary_is_refused() {
+        let tail = |tail: &[&str]| {
+            let mut all: Vec<OsString> = ["--exec-supervised-core", "1234", "99", "boot-id"]
+                .iter()
+                .map(OsString::from)
+                .collect();
+            all.extend(tail.iter().map(OsString::from));
+            all
+        };
+
+        for malformed in [
+            vec!["--", "/usr/bin/other", "sync"],
+            vec!["--core-nice", "5", "--", "/usr/bin/other"],
+            vec!["--core-nice", "5", BINARY_PATH, "sync"],
+            vec!["--core-nice", "--", BINARY_PATH, "sync"],
+            vec!["-", BINARY_PATH, "sync"],
+        ] {
+            assert!(
+                parse_supervised_core_tail(&tail(&malformed)).is_err(),
+                "{malformed:?} must be refused"
+            );
+        }
+    }
+
+    /// The manager lane admits its cap, refuses beyond it, and returns every slot on drop.
+    ///
+    /// The refusal is the load-bearing half. This lane is what stops an AppWindow refreshing on a
+    /// timer from turning into as many concurrent forks of a multi-thousand-line shell program as
+    /// there are workers -- the shape that saturates a two-core armv7 unit and keeps it saturated.
+    /// A leaked slot would be worse than a refusal, because it shrinks the lane permanently and
+    /// silently, so the drop path is asserted too.
+    ///
+    /// The refusal is timed rather than immediate, so this also pins that a full lane gives up
+    /// near `MANAGER_PERMIT_WAIT` instead of blocking its worker indefinitely. The bound is
+    /// asserted one-sided -- at least the wait, and comfortably inside the relay deadline that
+    /// makes waiting safe at all -- because a scheduler may always oversleep, and a test that
+    /// pinned an upper bound tightly would be a flake on a loaded machine rather than a defect.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn manager_lane_is_bounded_refuses_in_bounded_time_and_returns_slots_on_drop() {
+        let _serialised = CONTROL_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            *MANAGER_LANE
+                .occupancy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            0,
+            "the lane must start empty"
+        );
+
+        let held: Vec<ManagerPermit> = (0..MANAGER_CONCURRENCY_LIMIT)
+            .map(|_| ManagerPermit::acquire().expect("the lane must admit up to its cap"))
+            .collect();
+
+        let refused_at = Instant::now();
+        assert!(
+            ManagerPermit::acquire().is_err(),
+            "the lane must refuse a claim beyond its cap rather than growing"
+        );
+        let waited = refused_at.elapsed();
+        assert!(
+            waited >= MANAGER_PERMIT_WAIT,
+            "a full lane must wait for a slot before giving up, waited {waited:?}"
+        );
+        assert!(
+            waited < RELAY_IO_TIMEOUT,
+            "giving up must stay inside the relay deadline, waited {waited:?}"
+        );
+
+        drop(held);
+        assert_eq!(
+            *MANAGER_LANE
+                .occupancy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            0,
+            "every slot must be returned on drop"
+        );
+        assert!(
+            ManagerPermit::acquire().is_ok(),
+            "the lane must be reusable once its slots are released"
+        );
+    }
+
+    /// A waiter is woken by a release rather than by its own timeout expiring.
+    ///
+    /// Without this the lane would still be *correct* -- `acquire` rechecks the count after every
+    /// timed wait -- but every queued reader would pay the full `MANAGER_PERMIT_WAIT` before being
+    /// served, turning a bound meant to protect the machine into latency the user feels. Holding
+    /// the wait to a fraction of the timeout is what distinguishes the two.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_released_manager_slot_wakes_a_waiter_promptly() {
+        let _serialised = CONTROL_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held: Vec<ManagerPermit> = (0..MANAGER_CONCURRENCY_LIMIT)
+            .map(|_| ManagerPermit::acquire().expect("the lane must admit up to its cap"))
+            .collect();
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(held);
+        });
+
+        let waited_from = Instant::now();
+        let permit = ManagerPermit::acquire().expect("a released slot must be handed to a waiter");
+        let waited = waited_from.elapsed();
+        releaser.join().expect("releaser thread");
+        drop(permit);
+
+        assert!(
+            waited < MANAGER_PERMIT_WAIT / 2,
+            "a waiter must be woken by the release, not by its own timeout, waited {waited:?}"
         );
     }
 

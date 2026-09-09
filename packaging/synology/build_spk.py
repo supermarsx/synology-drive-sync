@@ -36,6 +36,7 @@ UI_HELP_PAGES = (
     "overview",
     "profiles",
     "routines",
+    "sync",
     "health",
     "activity",
     "notifications",

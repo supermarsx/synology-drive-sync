@@ -233,6 +233,13 @@ export const ACTIONS = Object.freeze({
   alertPolicy: "alert-policy",
   securityPolicy: "security-policy",
   clientEvent: "client-event",
+  // Both of these are queued jobs rather than reads. A status query walks the
+  // local tree and enumerates the remote one over the network, so it is a job
+  // wearing a read's clothes: on the synchronous path it would occupy a worker
+  // for as long as the destination takes to answer, and block the queue behind
+  // it. See ARGUMENT_KEYS below for the two-phase resync contract.
+  syncStatus: "sync-status",
+  resync: "resync",
   execute: "action"
 });
 
@@ -247,6 +254,10 @@ const GET_ARGUMENT_KEYS = Object.freeze({
   result: Object.freeze(["job_id"]),
   "request-status": Object.freeze(["request_id"])
 });
+// A status page can never exceed this many rows: the query engine enforces the
+// same ceiling, so no request the AppWindow can compose returns an unbounded
+// listing that the browser would then have to render.
+export const SYNC_STATUS_MAX_LIMIT = 200;
 
 export const ARGUMENT_KEYS = Object.freeze({
   "configure-profile": Object.freeze([
@@ -293,6 +304,14 @@ export const ARGUMENT_KEYS = Object.freeze({
     "secrets_log_level", "security_log_level", "sync_log_level"
   ]),
   "client-event": Object.freeze(["event"]),
+  // Every key is always sent. `state` selects one status state or "all", and
+  // the optional narrowings are sent empty when unused, because the bridge
+  // contract is an exact key set rather than a subset.
+  "sync-status": Object.freeze(["cursor", "filter", "include_excluded", "limit", "profile", "scope", "state"]),
+  // Two-phase by construction: an empty `confirm` only plans and returns a
+  // ticket, and the ticket a caller sends back is the proof that the exact
+  // overwrite list it describes was the one displayed.
+  resync: Object.freeze(["confirm", "profile", "scope"]),
   action: Object.freeze(["allow_delete", "kind", "level", "max_total_delete", "scope", "write_test"])
 });
 

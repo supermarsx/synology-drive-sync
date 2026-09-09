@@ -22,6 +22,7 @@ schedule_file=$config_root/schedule.conf
 routines_dir=$config_root/routines.d
 alert_policy_file=$config_root/alerts.conf
 security_policy_file=$config_root/security.conf
+performance_policy_file=$config_root/performance.conf
 secret_root=$package_home/secrets
 state_root=$package_var/state
 routine_state_dir=$state_root/routines
@@ -895,29 +896,161 @@ private_event_lock_directory() {
     done
 }
 
+# Procfs identity reads happen on every admission, every guard tick, and every
+# exact signal, so they are the package's hottest code. Fork and exec are the
+# expensive operations on the armv7 units this targets -- an awk or sed
+# substitution costs a subshell plus a busybox exec, while the same parse in
+# shell builtins costs neither -- so these two helpers read each procfs file
+# once and publish the fields, and the callers below consume the variables
+# instead of spawning a pipeline per field.
+#
+# Reading /proc/<pid>/stat once is also stricter than the column indexing it
+# replaces: everything after the final ") " is fixed-position, so a comm
+# containing a space cannot shift the field the way an awk column number can,
+# and state and start tick can no longer be read from two separate samples.
+read_process_stat_fields() {
+    process_stat_state=
+    process_stat_start=
+    process_stat_ppid=
+    # The stderr redirect has to precede the input redirect, not follow it.
+    # Redirections apply left to right, so `< missing 2>/dev/null` fails the
+    # open before stderr has been diverted and BusyBox prints "can't open" to
+    # the real stderr -- which for the controller is its own log file. A PID
+    # that exits between the check and the read is a normal race here, not an
+    # error worth a log line.
+    IFS= read -r process_stat_line 2>/dev/null < "/proc/$1/stat" || return 1
+    process_stat_rest=${process_stat_line##*') '}
+    [ "$process_stat_rest" != "$process_stat_line" ] || return 1
+    process_stat_saved_ifs=$IFS
+    IFS=' '
+    set -- $process_stat_rest
+    IFS=$process_stat_saved_ifs
+    [ "$#" -ge 20 ] || return 1
+    process_stat_state=$1
+    process_stat_ppid=$2
+    process_stat_start=${20}
+    case $process_stat_start in ''|*[!0-9]*|0) process_stat_start= ;; esac
+    case $process_stat_ppid in ''|*[!0-9]*) process_stat_ppid= ;; esac
+    [ -n "$process_stat_state" ] && [ -n "$process_stat_start" ]
+}
+
+# One builtin pass over /proc/<pid>/status. The first Uid:/PPid: line wins,
+# which is what the `sed -n '1p'` on the end of the replaced pipelines did, and
+# the scan stops as soon as both are known so the remaining fifty-odd lines are
+# never parsed.
+read_process_status_ids() {
+    process_status_uid=
+    process_status_ppid=
+    while IFS= read -r process_status_line; do
+        case $process_status_line in
+            Uid:*) [ -z "$process_status_uid" ] || continue
+                process_status_field=${process_status_line#Uid:} ;;
+            PPid:*) [ -z "$process_status_ppid" ] || continue
+                process_status_field=${process_status_line#PPid:} ;;
+            *) continue ;;
+        esac
+        while :; do
+            case $process_status_field in
+                [[:space:]]*) process_status_field=${process_status_field#?} ;;
+                *) break ;;
+            esac
+        done
+        process_status_field=${process_status_field%%[[:space:]]*}
+        case $process_status_field in ''|*[!0-9]*) process_status_field= ;; esac
+        case $process_status_line in
+            Uid:*) process_status_uid=$process_status_field ;;
+            *) process_status_ppid=$process_status_field ;;
+        esac
+        [ -z "$process_status_uid" ] || [ -z "$process_status_ppid" ] || break
+    done 2>/dev/null < "/proc/$1/status"
+    [ -n "$process_status_uid" ] && [ -n "$process_status_ppid" ]
+}
+
+# The lifecycle entry point measures once per transition whether this DSM
+# build's BusyBox sleep honours a fractional argument, and publishes the answer
+# under a package-identity stamp. The controller is a long-lived child of that
+# transition, so it can inherit the measurement rather than pay for its own:
+# one builtin read here instead of four 50 ms probe sleeps on the start path.
+#
+# This is a deliberate second reader rather than a shared helper. The lifecycle
+# library is sourced by preinst before $package_root exists and is kept
+# self-contained for exactly that reason -- see the note at the top of
+# scripts/common -- so it cannot depend on this file and this file must not
+# depend on it. The stamp still matches byte for byte because both stat the
+# same two payload files in the same order.
+#
+# Fail closed, on the same terms as the writer: missing, unreadable,
+# malformed, or stamped by a different build all mean one second, never
+# fractional, and a process that finds no result does not re-probe.
+runtime_poll_resolution_ms=1000
+runtime_poll_resolution_file=$runtime_root/poll-resolution
+
+load_runtime_poll_resolution() {
+    runtime_poll_resolution_ms=1000
+    [ ! -L "$runtime_poll_resolution_file" ] && [ -f "$runtime_poll_resolution_file" ] \
+        && [ -r "$runtime_poll_resolution_file" ] || return 0
+    runtime_poll_identity_raw=$(stat -c '%d:%i:%s:%Y' \
+        "$package_root/bin/sdsync-dsm" "$package_root/libexec/sdsync-common" 2>/dev/null) || return 0
+    set -- $runtime_poll_identity_raw
+    runtime_poll_identity=$*
+    [ -n "$runtime_poll_identity" ] || return 0
+    {
+        IFS= read -r runtime_poll_stored_identity || return 0
+        IFS= read -r runtime_poll_stored_ms || return 0
+        if IFS= read -r runtime_poll_stored_surplus; then return 0; fi
+        [ "$runtime_poll_stored_identity" = "$runtime_poll_identity" ] || return 0
+        case $runtime_poll_stored_ms in ''|*[!0-9]*) return 0 ;; esac
+        [ "$runtime_poll_stored_ms" -ge 10 ] && [ "$runtime_poll_stored_ms" -le 1000 ] || return 0
+        runtime_poll_resolution_ms=$runtime_poll_stored_ms
+    } < "$runtime_poll_resolution_file"
+    return 0
+}
+
 process_start_time() {
     process_start_pid=$1
     is_pid "$process_start_pid" || return 1
-    process_start_value=$(awk '{ print $22 }' "/proc/$process_start_pid/stat" 2>/dev/null || true)
+    process_start_value=
+    read_process_stat_fields "$process_start_pid" 2>/dev/null && \
+        process_start_value=$process_stat_start
     case $process_start_value in ''|*[!0-9]*|0) return 1 ;; esac
     printf '%s\n' "$process_start_value"
 }
 
 valid_boot_identity() {
     case ${1:-} in ????????-????-????-????-????????????) ;; *) return 1 ;; esac
-    boot_identity_compact=$(printf '%s' "$1" | tr -d '-')
+    boot_identity_remainder=$1
+    boot_identity_compact=
+    while :; do
+        case $boot_identity_remainder in
+            *-*)
+                boot_identity_compact=$boot_identity_compact${boot_identity_remainder%%-*}
+                boot_identity_remainder=${boot_identity_remainder#*-}
+                ;;
+            *)
+                boot_identity_compact=$boot_identity_compact$boot_identity_remainder
+                break
+                ;;
+        esac
+    done
     [ "${#boot_identity_compact}" -eq 32 ] || return 1
     case $boot_identity_compact in *[!0-9a-f]*) return 1 ;; esac
 }
 
 boot_identity() {
     [ -f "$boot_identity_path" ] && [ ! -L "$boot_identity_path" ] && [ -r "$boot_identity_path" ] || return 73
-    boot_identity_mode=$(stat -c '%a' "$boot_identity_path" 2>/dev/null || true)
-    boot_identity_owner=$(stat -c '%u' "$boot_identity_path" 2>/dev/null || true)
+    boot_identity_metadata=$(stat -c '%a %u' "$boot_identity_path" 2>/dev/null || true)
+    boot_identity_mode=${boot_identity_metadata%% *}
+    boot_identity_owner=${boot_identity_metadata##* }
     [ "$boot_identity_mode" = 444 ] && [ "$boot_identity_owner" = 0 ] || return 73
-    boot_identity_lines=$(awk 'END { print NR }' "$boot_identity_path" 2>/dev/null || true)
-    [ "$boot_identity_lines" = 1 ] || return 73
-    IFS= read -r boot_identity_value < "$boot_identity_path" || return 73
+    # Exactly one newline-terminated line, established by the reads themselves
+    # rather than by an awk line count: the first read fails on a file with no
+    # trailing newline and the second must find nothing after it.
+    boot_identity_surplus=
+    {
+        IFS= read -r boot_identity_value || return 73
+        IFS= read -r boot_identity_surplus && return 73
+    } < "$boot_identity_path"
+    [ -z "$boot_identity_surplus" ] || return 73
     valid_boot_identity "$boot_identity_value" || return 73
     printf '%s\n' "$boot_identity_value"
 }
@@ -933,10 +1066,16 @@ process_identity_is_live() {
     [ -e "/proc/$process_identity_pid" ] || return 1
     case ${path_owner:-} in ''|*[!0-9]*) return 73 ;; esac
 
-    process_identity_actual_start=$(process_start_time "$process_identity_pid" 2>/dev/null || true)
-    process_identity_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "/proc/$process_identity_pid/status" 2>/dev/null | sed -n '1p')
-    process_identity_state=$(sed -n 's/^.*) \([^ ]\).*/\1/p' \
-        "/proc/$process_identity_pid/stat" 2>/dev/null || true)
+    process_identity_actual_start=
+    process_identity_state=
+    process_identity_uid=
+    if read_process_stat_fields "$process_identity_pid"; then
+        process_identity_actual_start=$process_stat_start
+        process_identity_state=$process_stat_state
+    fi
+    if read_process_status_ids "$process_identity_pid"; then
+        process_identity_uid=$process_status_uid
+    fi
     if [ -z "$process_identity_actual_start" ] || [ -z "$process_identity_uid" ] || \
         [ -z "$process_identity_state" ]; then
         [ -e "/proc/$process_identity_pid" ] || return 1
@@ -948,11 +1087,16 @@ process_identity_is_live() {
     # Recheck the exact tuple immediately before classifying it. A stale lock
     # may be recovered only after this process is absent or terminal; a reused,
     # partially readable, or unknown PID remains fail closed.
-    process_identity_start_recheck=$(process_start_time "$process_identity_pid" 2>/dev/null || true)
-    process_identity_uid_recheck=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
-        "/proc/$process_identity_pid/status" 2>/dev/null | sed -n '1p')
-    process_identity_state_recheck=$(sed -n 's/^.*) \([^ ]\).*/\1/p' \
-        "/proc/$process_identity_pid/stat" 2>/dev/null || true)
+    process_identity_start_recheck=
+    process_identity_state_recheck=
+    process_identity_uid_recheck=
+    if read_process_stat_fields "$process_identity_pid"; then
+        process_identity_start_recheck=$process_stat_start
+        process_identity_state_recheck=$process_stat_state
+    fi
+    if read_process_status_ids "$process_identity_pid"; then
+        process_identity_uid_recheck=$process_status_uid
+    fi
     if [ -z "$process_identity_start_recheck" ] || [ -z "$process_identity_uid_recheck" ] || \
         [ -z "$process_identity_state_recheck" ]; then
         [ -e "/proc/$process_identity_pid" ] || return 1
@@ -1517,6 +1661,59 @@ setting() {
     else
         printf '%s\n' "$setting_default"
     fi
+}
+
+# How much of the NAS this package may take, as one named choice rather than a
+# pile of independent numbers. Every knob derives from the level, so the three
+# levels stay reviewable and cannot be combined into a state nobody has
+# reasoned about:
+#
+#   full     -- the historical behaviour. The core runs at the priority it
+#               inherits, and admission keeps its widest fast-path window.
+#   balanced -- the default. The core is nice 10, so DSM's own interface keeps
+#               the CPU whenever the two compete, and admission gives up its
+#               fast path sooner.
+#   gentle   -- for the smallest armv7 units. Nice 19 and the shortest window.
+#
+# Two things are deliberately not knobs. The API bridge is never renice'd at
+# any level: it serves the interactive request path, and throttling that is
+# what makes a package feel broken rather than considerate. And the file holds
+# exactly one key. A policy writer that stores several independent fields has
+# to decide, for each one, whether a save replaces it or defaults it to what is
+# stored -- get that wrong and a save from a form that sends a subset silently
+# discards the rest, which is the bug configure_alert_policy documents at
+# length in bin/sdsync-dsm. One derived level cannot have a subset.
+load_performance_policy_runtime() {
+    performance_runtime_level=balanced
+    performance_stored_level=$(setting "$performance_policy_file" level balanced)
+    case $performance_stored_level in
+        full|balanced|gentle) performance_runtime_level=$performance_stored_level ;;
+        *) ;;
+    esac
+    # The I/O class is carried separately because setpriority(2) does not touch
+    # it: CPU priority reaches the core through the supervisor, and I/O
+    # priority through an ionice prefix in sdsync-run. Class 0 means "leave the
+    # inherited class alone", 2 is best-effort at the given level, 3 is idle.
+    case $performance_runtime_level in
+        full)
+            performance_core_nice=0
+            performance_admission_yields=32
+            performance_io_class=0
+            performance_io_level=0
+            ;;
+        balanced)
+            performance_core_nice=10
+            performance_admission_yields=8
+            performance_io_class=2
+            performance_io_level=6
+            ;;
+        *)
+            performance_core_nice=19
+            performance_admission_yields=4
+            performance_io_class=3
+            performance_io_level=0
+            ;;
+    esac
 }
 
 load_security_policy_runtime() {
@@ -2172,7 +2369,7 @@ append_audit_event() {
     case $audit_transaction in ''|*[!A-Za-z0-9_-]*) return 64 ;; esac
     [ "${#audit_transaction}" -le 96 ] || return 64
     case $audit_operation in
-        configure-profile|remove-profile|set-default|schedule|alert-policy|enable|disable) audit_category=configuration ;;
+        configure-profile|remove-profile|set-default|schedule|alert-policy|performance-policy|enable|disable) audit_category=configuration ;;
         set-secret|set-password|set-totp|set-remote-log-token|remove-password|remove-totp|remove-remote-log-token) audit_category=secrets ;;
         test-profile-auth|browse-remote) audit_category=authentication ;;
         routine|configure-routine|remove-routine) audit_category=routines ;;
@@ -2180,7 +2377,7 @@ append_audit_event() {
         rejected-post) audit_category=bridge ;;
         interface-settings) audit_category=configuration ;;
         session-notifications) audit_category=notifications ;;
-        action|doctor|plan|run) audit_category=operations ;;
+        action|doctor|plan|run|sync-status|resync) audit_category=operations ;;
         *) return 64 ;;
     esac
     case $audit_state in requested|succeeded|failed|outcome_unknown) ;; *) return 64 ;; esac

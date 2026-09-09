@@ -26,3 +26,5 @@ compose*.yaml text eol=lf
 *.yaml text eol=lf
 .gitattributes text eol=lf
 *.config text eol=lf
+*.conf text eol=lf
+packaging/synology/package/ui/texts/**/strings text eol=lf

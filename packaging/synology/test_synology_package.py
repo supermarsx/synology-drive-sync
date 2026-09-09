@@ -2239,10 +2239,24 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "    cleanup_mock_stale_api_socket(sys.argv[2:])\n"
             "    raise SystemExit(0)\n"
             "\n"
-            "if len(sys.argv) >= 7 and sys.argv[1] == '--exec-supervised-core' and sys.argv[5] == '--':\n"
+            # The supervisor receives the performance level as an explicit
+            # --core-nice before the -- separator, and applies it to the core
+            # it is about to exec and to nothing else. Requiring the flag here
+            # rather than tolerating its absence is deliberate: if the runner
+            # ever stops sending it, that must fail loudly instead of silently
+            # reverting every sync to the priority it inherits.
+            "if (len(sys.argv) >= 9 and sys.argv[1] == '--exec-supervised-core'\n"
+            "        and sys.argv[5] == '--core-nice' and sys.argv[7] == '--'):\n"
             "    expected_parent = int(sys.argv[2])\n"
             "    expected_start = sys.argv[3]\n"
             "    expected_boot = sys.argv[4]\n"
+            "    core_nice = int(sys.argv[6])\n"
+            "    if core_nice < 0 or core_nice > 19:\n"
+            "        raise SystemExit(64)\n"
+            "    capture_nice = os.environ.get('SDSYNC_TEST_CORE_NICE_CAPTURE')\n"
+            "    if capture_nice:\n"
+            "        with Path(capture_nice).open('a', encoding='utf-8') as stream:\n"
+            "            stream.write(f'{core_nice}\\n')\n"
             "    def supervised_core_start(pid):\n"
             "        return Path(f'/proc/{pid}/stat').read_text(encoding='ascii').rsplit(') ', 1)[1].split()[19]\n"
             "    if (os.getppid() != expected_parent or supervised_core_start(expected_parent) != expected_start\n"
@@ -2251,7 +2265,12 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "    core_libc = ctypes.CDLL(None, use_errno=True)\n"
             "    if core_libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0 or os.getppid() != expected_parent:\n"
             "        raise SystemExit(73)\n"
-            "    os.execv(sys.argv[6], sys.argv[6:])\n"
+            "    if core_nice:\n"
+            "        try:\n"
+            "            os.setpriority(os.PRIO_PROCESS, 0, core_nice)\n"
+            "        except OSError:\n"
+            "            pass\n"
+            "    os.execv(sys.argv[8], sys.argv[8:])\n"
             "\n"
             "if len(sys.argv) == 5 and sys.argv[1] == '--exec-supervised-controller':\n"
             "    expected_parent = int(sys.argv[2])\n"
@@ -7493,6 +7512,79 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             )
         )
 
+    def test_performance_level_is_one_derived_field_read_by_runner_and_controller(self) -> None:
+        policy = self.real_home / "config/performance.conf"
+        self.assertFalse(policy.exists())
+
+        for rejected in ("", "Balanced", "quiet", "10", "full gentle", "-1"):
+            refused = self.shell(
+                self.manager, "configure-performance", "--level", rejected
+            )
+            self.assertEqual(refused.returncode, 64, (rejected, refused.stdout))
+            self.assertFalse(policy.exists(), rejected)
+        missing = self.shell(self.manager, "configure-performance")
+        self.assertEqual(missing.returncode, 64, missing.stdout)
+        duplicate = self.shell(
+            self.manager, "configure-performance", "--level", "full", "--level", "gentle"
+        )
+        self.assertEqual(duplicate.returncode, 64, duplicate.stdout)
+        unknown = self.shell(self.manager, "configure-performance", "--nice", "5")
+        self.assertEqual(unknown.returncode, 64, unknown.stdout)
+
+        configured = self.shell(self.manager, "configure-performance", "--level", "gentle")
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        self.assertEqual(policy.read_text(encoding="utf-8"), "level=gentle\n")
+        self.assertEqual(policy.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(policy.is_symlink())
+
+        # A save replaces the only field there is. The file never accumulates a
+        # second independently-saved value, which is exactly what makes the
+        # defaulting-to-stored trap documented in configure_alert_policy
+        # impossible to repeat here.
+        again = self.shell(self.manager, "configure-performance", "--level", "full")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(policy.read_text(encoding="utf-8"), "level=full\n")
+
+        probe = self.root / "performance-probe"
+        probe.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            '. "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+            "load_performance_policy_runtime\n"
+            'printf "%s %s %s\\n" "$performance_runtime_level" '
+            '"$performance_core_nice" "$performance_admission_yields"\n',
+            encoding="utf-8",
+        )
+        probe.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(probe, self.drop_uid, self.drop_gid)
+
+        def derived() -> str:
+            result = self.shell(probe)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.strip()
+
+        self.assertEqual(derived(), "full 0 32")
+        for level, expected in (
+            ("balanced", "balanced 10 8"),
+            ("gentle", "gentle 19 4"),
+        ):
+            saved = self.shell(self.manager, "configure-performance", "--level", level)
+            self.assertEqual(saved.returncode, 0, saved.stderr)
+            self.assertEqual(derived(), expected)
+
+        # Every unreadable, malformed, or unknown level is Balanced. A
+        # performance policy must never fail a start or a sync closed: the
+        # worst case for an unparseable level is the default everyone gets.
+        for corrupt in ("level=turbo\n", "\n", "level=\n", "nothing\n", "level=FULL\n"):
+            policy.write_text(corrupt, encoding="utf-8")
+            policy.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(policy, self.drop_uid, self.drop_gid)
+            self.assertEqual(derived(), "balanced 10 8", corrupt)
+        policy.unlink()
+        self.assertEqual(derived(), "balanced 10 8")
+
     def test_dsm_system_log_is_opt_in_rate_limited_and_best_effort(self) -> None:
         policy = self.real_home / "config/alerts.conf"
 
@@ -9214,10 +9306,7 @@ fi
 
         controller = self.real_target / "libexec/sdsync-controller"
         controller_source = controller.read_text(encoding="utf-8")
-        capture_attempt = (
-            '        captured_work_child_start=$(process_start_time '
-            '"$captured_work_child_pid" 2>/dev/null || true)\n'
-        )
+        capture_attempt = "        captured_work_child_start=$process_stat_start\n"
         publish_definition = "publish_child_admission() {\n"
         wrapper_assignment = "    launched_admission_pid=$!\n"
         stop_signal = (
@@ -11649,12 +11738,29 @@ fi
             "#!/bin/sh\n"
             "set -eu\n"
             '. "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
-            "process_start_time() {\n"
+            # Inject a procfs sample whose start tick alone is unreadable.
+            # This shadows the primitive rather than process_start_time so the
+            # partial read reaches every caller of it, including the identity
+            # verifier, which reads the fields directly. State and PPid stay
+            # genuine: only the tick goes missing, which is the exact partial
+            # sample the lock owner must refuse to classify.
+            "read_process_stat_fields() {\n"
             "    inspected_pid=$1\n"
-            '    [ "$inspected_pid" != "${SDSYNC_TEST_PARTIAL_PID:-}" ] || return 1\n'
-            "    inspected_start=$(awk '{ print $22 }' \"/proc/$inspected_pid/stat\" 2>/dev/null || true)\n"
-            "    case $inspected_start in ''|*[!0-9]*|0) return 1 ;; esac\n"
-            "    printf '%s\\n' \"$inspected_start\"\n"
+            "    process_stat_state=\n"
+            "    process_stat_start=\n"
+            "    process_stat_ppid=\n"
+            '    IFS= read -r inspected_line 2>/dev/null < "/proc/$inspected_pid/stat" || return 1\n'
+            "    inspected_rest=${inspected_line##*') '}\n"
+            '    [ "$inspected_rest" != "$inspected_line" ] || return 1\n'
+            "    set -- $inspected_rest\n"
+            '    [ "$#" -ge 20 ] || return 1\n'
+            "    process_stat_state=$1\n"
+            "    process_stat_ppid=$2\n"
+            "    process_stat_start=${20}\n"
+            '    [ "$inspected_pid" != "${SDSYNC_TEST_PARTIAL_PID:-}" ] || '
+            "{ process_stat_start=; return 1; }\n"
+            "    case $process_stat_start in ''|*[!0-9]*|0) process_stat_start= ;; esac\n"
+            '    [ -n "$process_stat_state" ] && [ -n "$process_stat_start" ]\n'
             "}\n"
             'if [ "$1" = status ]; then\n'
             '    status=0; private_process_lock_is_live "$SDSYNC_TEST_LOCK" || status=$?\n'
@@ -12965,6 +13071,121 @@ fi
             if unrelated is not None and unrelated.poll() is None:
                 unrelated.terminate()
                 unrelated.communicate(timeout=5)
+
+    def test_runner_wait_guard_is_not_rebuilt_while_a_live_one_is_published(self) -> None:
+        # The watchdog interrupts the runner wait about once a second for the
+        # whole length of a sync, and the loop used to stop and rebuild the
+        # guard on every one of those interrupts -- a full admission handshake
+        # plus a stop-latch directory created and removed, once a second, for
+        # as long as the sync ran.
+        #
+        # No functional test could see it. The behaviour was correct; only the
+        # cost was absurd, and cost is invisible to an assertion about
+        # behaviour. This test is the only witness: it counts guard creations
+        # against alarms actually delivered, so a future restructuring of
+        # wait_for_runner that reinstates the teardown fails here rather than
+        # quietly returning the controller to ~76 execs per second.
+        controller = self.real_target / "libexec/sdsync-controller"
+        controller_source = controller.read_text(encoding="utf-8")
+        guard_launch = "    launched_runner_wait_guard_pid=$!\n"
+        guard_alarm = (
+            '            kill -ALRM "$runner_guard_parent" 2>/dev/null || exit 0\n'
+        )
+        for needle in (guard_launch, guard_alarm):
+            self.assertEqual(controller_source.count(needle), 1, needle)
+        launches = self.root / "runner-guard-launches"
+        alarms = self.root / "runner-guard-alarms"
+        controller.write_text(
+            controller_source.replace(
+                guard_launch,
+                guard_launch
+                + '    printf \'%s\\n\' "$launched_runner_wait_guard_pid" '
+                + '>> "$SDSYNC_TEST_GUARD_LAUNCHES"\n',
+                1,
+            ).replace(
+                guard_alarm,
+                '            printf \'alarm\\n\' >> "$SDSYNC_TEST_GUARD_ALARMS"\n'
+                + guard_alarm,
+                1,
+            ),
+            encoding="utf-8",
+        )
+        controller.chmod(0o755)
+        for capture in (launches, alarms):
+            capture.write_text("", encoding="utf-8")
+            capture.chmod(0o666)
+
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode,
+            0,
+        )
+        password = self.root / "guard-lifetime-password"
+        password.write_text("test-password\n", encoding="utf-8")
+        self.assertEqual(
+            self.shell(
+                self.manager, "set-password", "personal", "--from-file", str(password)
+            ).returncode,
+            0,
+        )
+        self.assertEqual(
+            self.shell(self.manager, "enable", "--interval", "60").returncode, 0
+        )
+
+        core_pid_file = self.root / "guard-lifetime-core.pid"
+        environment = self.fast_clock_environment(step=61)
+        environment.update(
+            {
+                "SDSYNC_TEST_HOLD": "true",
+                "SDSYNC_TEST_CORE_PID_FILE": str(core_pid_file),
+                "SDSYNC_TEST_GUARD_LAUNCHES": str(launches),
+                "SDSYNC_TEST_GUARD_ALARMS": str(alarms),
+            }
+        )
+        started = self.shell(
+            self.lifecycle, "start", extra_environment=environment, timeout=15
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        core_pid = None
+        try:
+            for _ in range(400):
+                if core_pid_file.is_file() and (self.real_var / "run/run.lock").is_dir():
+                    core_pid = int(core_pid_file.read_text(encoding="utf-8").strip())
+                    break
+                time.sleep(0.025)
+            self.assertIsNotNone(core_pid, "scheduled core did not start")
+
+            # Hold the core long enough for the watchdog to fire several times.
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                if len(alarms.read_text(encoding="utf-8").split()) >= 4:
+                    break
+                time.sleep(0.1)
+            delivered = len(alarms.read_text(encoding="utf-8").split())
+            built = [
+                line for line in launches.read_text(encoding="utf-8").splitlines() if line
+            ]
+            self.assertGreaterEqual(
+                delivered,
+                4,
+                "the runner-wait watchdog stopped alarming; this test proves "
+                "nothing unless the alarm it counts against is still firing",
+            )
+            self.assertEqual(
+                len(built),
+                1,
+                "the runner-wait guard was rebuilt while a live one was "
+                f"published: {len(built)} guards for {delivered} alarms",
+            )
+            self.assertEqual(len(set(built)), len(built), built)
+        finally:
+            self.shell(
+                self.lifecycle, "stop", extra_environment=environment, timeout=20
+            )
+            if core_pid is not None:
+                try:
+                    os.kill(core_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_package_stop_waits_for_an_active_scheduled_run(self) -> None:
         self.assertEqual(

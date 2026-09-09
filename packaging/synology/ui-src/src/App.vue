@@ -305,6 +305,85 @@
             </div>
           </section>
 
+          <section v-else-if="route === 'sync'" class="sdsync-page" aria-labelledby="sdsync-page-title">
+            <v-form v-model="syncStatusForm" class="sdsync-panel sdsync-sync-query" @submit="checkSyncStatus">
+              <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Per-file state</p><h3>Check one scope</h3></div><span class="sdsync-pill neutral">On demand</span></div>
+              <p class="sdsync-field-note">Nothing is cached: both sides are compared again on every check, so an answer is never stale &#8212; and never free. This page has no refresh timer for that reason.</p>
+              <div class="sdsync-filter-list" aria-label="Sync status query">
+                <div v-for="field in syncTextFields" :key="field.key" class="sdsync-filter-row"><span class="sdsync-filter-label">{{ field.label }}</span><div class="sdsync-filter-control"><v-input class="sdsync-input-control" :value="syncStatusForm[field.key]" clearable :maxlength="field.max" :placeholder="field.placeholder" :aria-label="field.label" :aria-describedby="'sdsync-help-' + field.help" :disabled="syncLocked" @input="setSyncField(field, $event)" /><control-help :help-key="field.help" /></div></div>
+                <div v-for="field in syncSelectFields" :key="field.key" class="sdsync-filter-row"><span class="sdsync-filter-label">{{ field.label }}</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" :value="syncStatusForm[field.key]" :options="field.options" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" :aria-label="field.label" :aria-describedby="'sdsync-help-' + field.help" :disabled="syncLocked" @input="setSyncField(field, $event)"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help :help-key="field.help" /></div></div>
+              </div>
+              <div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Also walk excluded entries <control-help help-key="sync-excluded" /></span><v-checkbox class="sdsync-checkbox-control" v-model="syncStatusForm.include_excluded" aria-label="Also walk excluded entries" aria-describedby="sdsync-help-sync-excluded" :disabled="syncLocked" /></div>
+              <div class="sdsync-sync-actions">
+                <v-button v-if="syncStatusFiltersActive" type="border" display="icon-text" html-type="button" tooltip="Reset to the default attention view" :disabled="syncStatusBusy" @click="clearSyncFilters"><template #icon><action-icon name="close" /></template>Clear filters</v-button>
+                <v-button suffix="main" display="icon-text" html-type="submit" :tooltip="operationMutationGuidance || 'Compare both sides and load the first page'" :disabled="!syncStatusReady" :aria-busy="syncStatusBusy ? 'true' : 'false'"><template #icon><action-icon :class="{ 'sdsync-is-spinning': syncStatusBusy }" name="refresh" /></template>{{ syncStatusBusy ? 'Checking&#8230;' : 'Check status' }}</v-button>
+              </div>
+            </v-form>
+
+            <article class="sdsync-panel sdsync-sync-results" aria-live="polite" aria-labelledby="sdsync-sync-title">
+              <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">{{ syncStatusResult.loaded ? syncStatusResult.profile : 'Nothing loaded' }}</p><h3 id="sdsync-sync-title">{{ syncStatusResult.loaded ? syncStatusQueryLabel : 'Sync state' }}</h3></div><span v-if="syncStatusResult.loaded" class="sdsync-freshness">Compared by {{ syncStatusResult.compare }}</span></div>
+              <p v-if="!syncStatusResult.loaded" class="sdsync-empty">{{ syncStatusMessage }}</p>
+              <template v-else>
+                <dl class="sdsync-sync-stats" aria-label="Whole-scope totals">
+                  <div v-for="card in syncStatusCards" :key="card.id" :class="['sdsync-sync-stat', 'is-' + card.id]"><dt>{{ card.label }}</dt><dd>{{ card.value }}</dd></div>
+                </dl>
+                <p class="sdsync-field-note">{{ syncStatusTotalsNote }}</p>
+                <p v-if="syncStatusMessage" class="sdsync-empty">{{ syncStatusMessage }}</p>
+                <div v-else class="sdsync-table-wrap">
+                  <table>
+                    <thead><tr><th>Path</th><th>State</th><th>Local</th><th>On the NAS</th><th>Why</th><th><span class="sdsync-sr-only">Actions</span></th></tr></thead>
+                    <tbody>
+                      <tr v-for="entry in syncStatusResult.entries" :key="entry.key">
+                        <td><strong class="sdsync-sync-path">{{ entry.relative }}</strong><small>{{ entry.kind }} &#183; {{ entry.remotePath }}</small></td>
+                        <td><span :class="syncStateClass(entry.state)">{{ entry.label }}</span></td>
+                        <td>{{ syncEntrySide(entry.localSize, entry.localEpoch) }}</td>
+                        <td>{{ syncEntrySide(entry.remoteSize, entry.remoteEpoch) }}</td>
+                        <td>{{ entry.detail || '&#8212;' }}</td>
+                        <td><button type="button" class="sdsync-sync-row-action" :title="resyncEntryLabel(entry)" :aria-label="resyncEntryLabel(entry)" :disabled="!resyncCanPlan || entry.kind === 'directory'" @click="resyncEntry(entry)"><action-icon name="refresh" />Re-upload</button></td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="sdsync-sync-pager">
+                  <span class="sdsync-freshness">{{ syncStatusPageSummary }}</span>
+                  <div class="sdsync-sync-pager-actions">
+                    <v-button type="border" display="icon-text" tooltip="Return to the previous page" :disabled="!syncStatusHasPrevious || syncStatusBusy" @click="syncStatusPreviousPage"><template #icon><action-icon name="up" /></template>Previous page</v-button>
+                    <v-button type="border" display="icon-text" tooltip="Load the next page; 200 rows at most" :disabled="!syncStatusHasNext || syncStatusBusy" @click="syncStatusNextPage"><template #icon><action-icon name="navigate" /></template>Next page</v-button>
+                  </div>
+                </div>
+              </template>
+            </article>
+
+            <v-form v-model="resyncForm" class="sdsync-panel sdsync-resync" @submit="planResync">
+              <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Force a re-upload</p><h3>Resync</h3></div><span :class="pillClass(resyncPhase === 'confirmed' ? 'running' : 'default')">{{ resyncPhase === 'confirmed' ? 'Completed' : 'Two steps' }}</span></div>
+              <div class="sdsync-warning"><strong>A re-upload replaces the remote copy whatever it holds now, even an identical or newer one.</strong><span>It never deletes. The plan is shown first, and only confirming that exact plan uploads anything.</span></div>
+              <div class="sdsync-filter-list" aria-label="Resync scope">
+                <div class="sdsync-filter-row"><span class="sdsync-filter-label">Folder or file</span><div class="sdsync-filter-control"><v-input class="sdsync-input-control" v-model.trim="resyncForm.scope" clearable maxlength="4096" placeholder="Empty re-uploads everything in this profile" aria-label="Folder or file to re-upload" aria-describedby="sdsync-help-resync-scope" :disabled="!resyncCanPlan" /><control-help help-key="resync-scope" /></div></div>
+              </div>
+              <div class="sdsync-sync-actions">
+                <v-button v-if="resyncPhase !== 'idle'" type="border" display="icon-text" html-type="button" tooltip="Discard this plan without uploading anything" :disabled="resyncBusy" @click="clearResyncPlan('')"><template #icon><action-icon name="close" /></template>Discard plan</v-button>
+                <v-button suffix="grey" display="icon-text" html-type="submit" :tooltip="operationMutationGuidance || 'List what would be overwritten, changing nothing'" :disabled="!resyncCanPlan" :aria-busy="resyncPlanning ? 'true' : 'false'"><template #icon><action-icon :class="{ 'sdsync-is-spinning': resyncPlanning }" name="plan" /></template>Plan re-upload</v-button>
+              </div>
+              <p v-if="resyncMessage" :class="['sdsync-field-note', { 'is-error': resyncFailed }]">{{ resyncMessage }}</p>
+              <div v-if="resyncPlan.overwrites || resyncPhase === 'confirmed'" class="sdsync-resync-plan">
+                <dl class="sdsync-definition-grid">
+                  <div><dt>Scope</dt><dd>{{ resyncScopeLabel }}</dd></div>
+                  <div><dt>Files to overwrite</dt><dd>{{ resyncPlan.overwrites }}</dd></div>
+                  <div><dt>Data to upload</dt><dd>{{ formatBytes(resyncPlan.overwriteBytes) }}</dd></div>
+                  <div><dt>Ticket</dt><dd><code>{{ resyncPlan.ticket || 'Consumed' }}</code></dd></div>
+                </dl>
+                <p v-if="resyncPlan.staleTicket" class="sdsync-field-note is-error">Ticket {{ resyncPlan.staleTicket }} no longer matched what would be overwritten.</p>
+                <ol class="sdsync-resync-paths">
+                  <li v-for="path in resyncPlan.paths" :key="path.key"><code>{{ path.relative }}</code><small>{{ formatBytes(path.bytes) }}</small></li>
+                </ol>
+                <p v-if="resyncPlan.truncatedPaths" class="sdsync-field-note">First {{ resyncPlan.paths.length }} paths only; the totals above cover the whole plan.</p>
+                <div class="sdsync-sync-actions">
+                  <v-button suffix="red" display="icon-text" html-type="button" :tooltip="resyncPlanReady ? 'Upload exactly the files listed above' : 'Plan a re-upload before confirming'" :disabled="!resyncPlanReady" :aria-busy="resyncConfirming ? 'true' : 'false'" @click="confirmResync"><template #icon><action-icon :class="{ 'sdsync-is-spinning': resyncConfirming }" name="confirm" /></template>Confirm this exact plan</v-button>
+                </div>
+              </div>
+            </v-form>
+          </section>
+
           <section v-else-if="route === 'health'" class="sdsync-page" aria-labelledby="sdsync-page-title">
             <div class="sdsync-doctor-layout">
               <v-form v-model="doctorForm" class="sdsync-panel sdsync-horizontal-form sdsync-doctor-form" direction="horizontal" @submit="runDoctor">
@@ -507,6 +586,7 @@ import {
   MAX_RESPONSE_BYTES,
   QueuedOutcomeUnknownError,
   SNAPSHOT_SCHEMA,
+  SYNC_STATUS_MAX_LIMIT,
   apiGet,
   apiPost,
   purgeReconciliationAuth,
@@ -865,6 +945,7 @@ const HELP_CONTENT = Object.freeze({
   overview: "overview.html",
   profiles: "profiles.html",
   routines: "routines.html",
+  sync: "sync.html",
   health: "health.html",
   activity: "activity.html",
   notifications: "notifications.html",
@@ -981,6 +1062,13 @@ const CONTROL_HELP = Object.freeze({
   "routine-weekdays": "Weekdays on which this routine may execute.",
   "routine-delete": "Permit this routine to use the profile's separately approved deletion policy.",
   "routine-max-delete": "Additional routine-level ceiling for destination deletions.",
+  "sync-profile": "Source folder and File Station destination to compare. One profile at a time.",
+  "sync-scope": "One source-relative folder or file. Empty examines the whole tree. A path, not a pattern.",
+  "sync-filter": "List only file names containing this text, ignoring case. It narrows the rows, never the totals.",
+  "sync-state": "Needs attention covers the four states requiring a person: type conflicts, missing remotely, differs, remote only.",
+  "sync-limit": "Rows per page. The package returns at most 200 at once, so a large scope is read a page at a time.",
+  "sync-excluded": "Also walk entries excluded by ignore rules or DSM-managed paths. The query then examines more of the tree.",
+  "resync-scope": "Folder or file to re-upload. Empty re-uploads the whole profile. Overwriting never deletes.",
   "doctor-scope": "Run diagnostics for every profile or one selected profile.",
   "doctor-level": "Quick performs unauthenticated routing, TLS, and DSM API discovery only. Standard and Extensive authenticate and perform bounded inventory. With a configured destination, they check permission and sample its direct children. Without one, they skip permission and sample visible shared-folder roots without selecting or traversing a share. Extensive deepens the read-only checks.",
   "doctor-write": "Create, verify, and remove one disposable destination probe.",
@@ -2425,6 +2513,138 @@ function options(entries) {
   return entries.map(([value, label]) => ({ value, label }));
 }
 
+// ---------------------------------------------------------------------------
+// Per-file sync status
+//
+// The query engine holds no index: every page is rebuilt from both sides on
+// request, so a row can never be stale and there is nothing here to cache.
+// That also makes a status query expensive, which is why this view never runs
+// on a timer and only ever loads when a person asks it to.
+// ---------------------------------------------------------------------------
+// One table, read two ways: as the state picker's options and as the label for
+// a row's own state. A second copy could drift from this one.
+const SYNC_STATE_OPTIONS = Object.freeze([
+  ["attention", "Needs attention"],
+  ["differs", "Differs"],
+  ["missing-remote", "Missing remotely"],
+  ["remote-only", "Remote only"],
+  ["type-conflict", "Type conflict"],
+  ["in-sync", "In sync"],
+  ["excluded", "Excluded"],
+  ["all", "Every state"]
+]);
+const SYNC_STATE_LABELS = Object.freeze(Object.fromEntries(SYNC_STATE_OPTIONS));
+// The engine refuses anything above 200 itself. These are the sizes this window
+// offers, so the largest page a person can ask for is the largest that exists.
+const SYNC_PAGE_SIZES = Object.freeze([25, 50, 100, 200]);
+const SYNC_PAGE_SIZE_DEFAULT = 100;
+// [class suffix, label, engine stats field]
+const SYNC_STAT_CARDS = Object.freeze([
+  ["in-sync", "In sync", "in_sync_files"],
+  ["differs", "Differs", "differing_files"],
+  ["missing-remote", "Missing remotely", "missing_remote_files"],
+  ["remote-only", "Remote only", "remote_only_entries"],
+  ["type-conflict", "Type conflicts", "type_conflicts"],
+  ["excluded", "Excluded", "excluded_entries"]
+]);
+// A resync plan may name far more files than a window should draw. The
+// overwrite count and byte total below the list stay exact; only the rendered
+// path list is bounded.
+const RESYNC_PATH_LIMIT = 200;
+const UNREADABLE_RESPONSE = "The package returned a response this window cannot read.";
+const SYNC_STATUS_IDLE_MESSAGE = "Choose a profile and check its status. Nothing is read from the NAS until you do.";
+
+function emptySyncStatusPage() {
+  return {
+    loaded: false, profile: "", scope: "", compare: "", limit: 0,
+    truncated: false, nextCursor: "", entries: [], stats: null
+  };
+}
+
+function emptyResyncPlan() {
+  return {
+    profile: "", scope: "", ticket: "", staleTicket: "", overwrites: 0,
+    overwriteBytes: 0, paths: [], truncatedPaths: false, confirmed: false
+  };
+}
+
+// Both endpoints carry the engine's own JSON document inside the `output`
+// string of the bridge envelope, exactly as the Doctor terminal path does.
+function bridgeDocument(result, schema) {
+  let parsed = null;
+  try {
+    parsed = JSON.parse(boundedText(result && result.output, ""));
+  } catch (_error) {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  return parsed.schema === schema ? parsed : null;
+}
+
+function syncStatusEntry(record, index) {
+  const entry = record && typeof record === "object" ? record : {};
+  const local = entry.local && typeof entry.local === "object" ? entry.local : null;
+  const remote = entry.remote && typeof entry.remote === "object" ? entry.remote : null;
+  const state = boundedText(entry.state, "unknown");
+  const relative = boundedText(entry.relative, "");
+  let detail = boundedText(entry.detail, "");
+  if (!detail && state === "type-conflict") {
+    detail = `local ${boundedText(entry.local_kind, "entry")} against remote ${boundedText(entry.remote_kind, "entry")}`;
+  }
+  if (!detail && entry.exclusion) detail = `excluded by ${boundedText(entry.exclusion, "rule")}`;
+  return {
+    key: `${index}:${relative}`,
+    relative,
+    remotePath: boundedText(entry.remote_path, ""),
+    kind: boundedText(entry.entry_kind, "entry"),
+    state,
+    label: SYNC_STATE_LABELS[state] || state,
+    detail,
+    localSize: local ? numberOr(local.size, 0) : null,
+    localEpoch: local ? numberOr(local.mtime_seconds, 0) : null,
+    remoteSize: remote ? numberOr(remote.size, 0) : null,
+    remoteEpoch: remote ? numberOr(remote.mtime_seconds, 0) : null
+  };
+}
+
+function syncStatusPage(document, profile) {
+  const stats = document.stats && typeof document.stats === "object" ? document.stats : {};
+  return {
+    loaded: true,
+    profile,
+    scope: boundedText(document.scope, ""),
+    compare: boundedText(document.compare, "unknown"),
+    limit: numberOr(document.limit, 0),
+    truncated: document.truncated === true,
+    nextCursor: boundedText(document.next_cursor, ""),
+    entries: arrayOf(document.entries).map(syncStatusEntry),
+    // Kept under the engine's own field names rather than renamed: these
+    // totals always describe the whole scope, never the returned page, so this
+    // window can honestly say "1,204 differ" while drawing 200 rows.
+    stats,
+    complete: stats.complete === true
+  };
+}
+
+function resyncPlanFromDocument(document, profile) {
+  const paths = arrayOf(document.paths);
+  return {
+    profile,
+    scope: boundedText(document.scope, ""),
+    ticket: boundedText(document.ticket, ""),
+    staleTicket: boundedText(document.stale_ticket, ""),
+    overwrites: numberOr(document.overwrites, 0),
+    overwriteBytes: numberOr(document.overwrite_bytes, 0),
+    truncatedPaths: paths.length > RESYNC_PATH_LIMIT,
+    paths: paths.slice(0, RESYNC_PATH_LIMIT).map((record, index) => ({
+      key: `${index}:${boundedText(record && record.relative, "")}`,
+      relative: boundedText(record && record.relative, ""),
+      bytes: numberOr(record && record.bytes, 0)
+    })),
+    confirmed: document.confirmed === true
+  };
+}
+
 export default {
   name: "SynologyDriveSyncApp",
   components: { ActionIcon, ControlHelp, SecurityPanel },
@@ -2433,7 +2653,9 @@ export default {
     return {
       routes: [
         { id: "overview", title: "Overview", icon: "overview" }, { id: "profiles", title: "Profiles", icon: "profiles" },
-        { id: "routines", title: "Routines", icon: "routines" }, { id: "health", title: "Health / Doctor", icon: "health" },
+        { id: "routines", title: "Routines", icon: "routines" },
+        { id: "sync", title: "Sync status", icon: "sync" },
+        { id: "health", title: "Health / Doctor", icon: "health" },
         { id: "activity", title: "Activity / Logs", icon: "activity" }, { id: "notifications", title: "Notifications", icon: "notifications" },
         { id: "security", title: "Security", icon: "security" },
         { id: "settings", title: "Settings", icon: "settings" },
@@ -2456,6 +2678,10 @@ export default {
       profileConnectionState: "idle", profileConnectionMessage: "Test authentication to unlock the File Station browser.", connectionProof: "", connectionProofExpires: 0, connectionProofTimer: 0, profileConnectionRequest: 0, profileConnectionAutosaveHeld: false,
       profileSaveState: "idle", profileSaveMessage: "", profileCreationProgress: emptyProfileCreationProgress(), profileReconciliationState: "idle", pathBrowser: emptyPathBrowser(),
       routineEditorOpen: false, routineForm: emptyRoutine(), doctorForm: { scope: "all", level: "standard", write_test: false, write_confirm: false },
+      syncStatusForm: { profile: "", scope: "", filter: "", state: "attention", limit: SYNC_PAGE_SIZE_DEFAULT, include_excluded: false },
+      syncStatusResult: emptySyncStatusPage(), syncStatusPhase: "idle", syncStatusMessage: SYNC_STATUS_IDLE_MESSAGE,
+      syncStatusBusy: false, syncStatusCursors: [], syncStatusPageNumber: 0,
+      resyncForm: { scope: "" }, resyncPlan: emptyResyncPlan(), resyncPhase: "idle", resyncMessage: "", resyncBusy: false,
       alertForm: { enabled: false, on_success: false, on_failure: true, failure_threshold: 1, cooldown_seconds: 3600 },
       notificationTabs: [
         { id: "package-alerts", label: "Package alerts" },
@@ -2643,6 +2869,74 @@ export default {
     dependencyProfiles() { return this.profiles.filter((profile) => String(profile.name) !== String(this.routineForm.profile)); },
     profileOptions() { return options([["", "Choose a profile"], ...this.profiles.map((profile) => [String(profile.name), String(profile.name)])]); },
     scopeOptions() { return options([["all", "All profiles"], ...this.profiles.map((profile) => [String(profile.name), String(profile.name)])]); },
+    syncProfileOptions() { return options(this.profiles.map((profile) => [String(profile.name), String(profile.name)])); },
+    syncDefaultProfile() {
+      const preferred = this.profiles.find((profile) => profile.is_default === true || profile.default === true);
+      return boundedText((preferred || this.profiles[0] || {}).name, "");
+    },
+    syncStateOptions() { return options(SYNC_STATE_OPTIONS); },
+    syncPageSizeOptions() { return options(SYNC_PAGE_SIZES.map((size) => [size, `${size} rows per page`])); },
+    syncLocked() { return !this.canRunOperations || this.syncStatusBusy || this.resyncBusy; },
+    syncTextFields() {
+      return [
+        { key: "scope", help: "sync-scope", label: "Folder or file", max: 4096, placeholder: "reports/q3 — empty means the whole tree" },
+        { key: "filter", help: "sync-filter", label: "Search file name", max: 128, placeholder: "invoice" }
+      ];
+    },
+    syncSelectFields() {
+      return [
+        { key: "profile", help: "sync-profile", label: "Profile", options: this.syncProfileOptions, resets: true },
+        { key: "state", help: "sync-state", label: "Show states", options: this.syncStateOptions },
+        { key: "limit", help: "sync-limit", label: "Page size", options: this.syncPageSizeOptions }
+      ];
+    },
+    syncStatusCards() {
+      const stats = this.syncStatusResult.stats;
+      if (!stats) return [];
+      return SYNC_STAT_CARDS.map((card) => ({ id: card[0], label: card[1], value: String(numberOr(stats[card[2]], 0)) }));
+    },
+    // Files synced and data moved, stated once and plainly, because they are
+    // the two numbers the page exists to answer.
+    syncStatusTotalsNote() {
+      const stats = this.syncStatusResult.stats;
+      if (!stats) return "";
+      const bound = this.syncStatusResult.complete ? "" : " The walk did not finish, so these are a lower bound.";
+      return `${formatBytes(numberOr(stats.in_sync_bytes, 0))} is already in sync and ${formatBytes(numberOr(stats.transfer_bytes, 0))} would be uploaded. These cover ${this.syncStatusScopeLabel} in full, not the rows below.${bound}`;
+    },
+    syncStatusScopeLabel() {
+      const scope = boundedText(this.syncStatusResult.scope, "").trim();
+      return scope && scope !== "." ? scope : "the whole source tree";
+    },
+    // Totals cover the scope; the table shows one page of it. Saying so in the
+    // window is the difference between an honest count and a misleading one.
+    syncStatusPageSummary() {
+      const stats = this.syncStatusResult.stats;
+      if (!stats) return "";
+      const rows = this.syncStatusResult.entries.length;
+      const total = numberOr(stats.total_entries, 0);
+      return `Page ${this.syncStatusPageNumber} · ${rows} row${rows === 1 ? "" : "s"} of ${total} entr${total === 1 ? "y" : "ies"} in ${this.syncStatusScopeLabel}${this.syncStatusResult.truncated ? " · more pages" : " · last page"}`;
+    },
+    // Names the query that produced the rows on screen, so an edited but
+    // unsubmitted form can never be mistaken for what is displayed.
+    syncStatusQueryLabel() {
+      const query = this.syncStatusResult.query;
+      if (!query) return "";
+      const search = query.filter ? ` · matching "${query.filter}"` : "";
+      return `${SYNC_STATE_LABELS[query.state] || query.state} in ${query.scope || "the whole source tree"}${search}`;
+    },
+    syncStatusHasPrevious() { return this.syncStatusCursors.length > 1; },
+    syncStatusHasNext() { return this.syncStatusResult.truncated && Boolean(this.syncStatusResult.nextCursor); },
+    syncStatusReady() { return Boolean(this.syncStatusForm.profile) && !this.syncLocked; },
+    syncStatusFiltersActive() { return Boolean(boundedText(this.syncStatusForm.filter, "").trim()) || Boolean(boundedText(this.syncStatusForm.scope, "").trim()) || this.syncStatusForm.state !== "attention" || this.syncStatusForm.include_excluded === true; },
+    resyncScopeLabel() {
+      const scope = boundedText(this.resyncPlan.scope, "").trim();
+      return scope && scope !== "." ? scope : "everything in this profile";
+    },
+    resyncPlanReady() { return this.resyncPhase === "planned" && Boolean(this.resyncPlan.ticket) && !this.resyncBusy; },
+    resyncCanPlan() { return Boolean(this.syncStatusForm.profile) && !this.syncLocked; },
+    resyncPlanning() { return this.resyncBusy && this.resyncPhase === "planning"; },
+    resyncConfirming() { return this.resyncBusy && this.resyncPhase === "confirming"; },
+    resyncFailed() { return this.resyncPhase === "failed" || this.resyncPhase === "unknown"; },
     doctorLevelOptions() { return options([["quick", "Quick — unauthenticated negotiation"], ["standard", "Standard — complete readiness (recommended)"], ["extensive", "Extensive — deep read-only target inspection"]]); },
     doctorLevelTitle() { return { quick: "Quick · lowest target load", standard: "Standard · complete readiness", extensive: "Extensive · deepest read-only inspection" }[normalizedDoctorLevel(this.doctorForm.level)]; },
     doctorLevelGuidance() { return {
@@ -3347,6 +3641,9 @@ export default {
       }
       if (this.route === "routines" && route !== "routines") this.closeRoutine();
       this.route = route;
+      // Opening this page selects a profile but deliberately loads nothing: a
+      // status query walks both trees, so it runs only when a person asks.
+      if (route === "sync" && !this.syncStatusForm.profile) this.syncStatusForm.profile = this.syncDefaultProfile;
       if (route === "activity") {
         this.refreshLogs();
         if (this.profileRecoveryActive) void this.refreshSnapshot(false, true);
@@ -4742,6 +5039,197 @@ export default {
       if (this.doctorForm.write_test && !this.doctorForm.write_confirm) return this.toast("Write-test confirmation required", "Approve the disposable probe and cleanup before running.", true);
       if (this.doctorForm.write_test && !await this.confirmAction("Run the disposable target probe?", "The doctor briefly creates, verifies, and removes a unique probe in the selected destination after Extensive read-only checks.", "Run write test")) return;
       return this.executeOperation("doctor", { scope: this.doctorForm.scope, level, write_test: this.doctorForm.write_test, allow_delete: null, max_total_delete: null });
+    },
+    syncStateClass(state) { return ["sdsync-sync-state", `is-${String(state || "unknown")}`]; },
+    syncEntrySide(size, epoch) { return size === null ? "Absent" : `${formatBytes(size)} · ${formatDate(epoch)}`; },
+    resyncEntryLabel(entry) { return `Plan a re-upload of ${entry.relative}`; },
+    setSyncField(field, value) {
+      this.syncStatusForm[field.key] = value;
+      // Changing the profile also invalidates any resync plan, whose ticket
+      // was computed against the other profile's destination.
+      if (field.resets) this.onSyncProfileChanged();
+    },
+    resetSyncStatus(message) {
+      this.syncStatusResult = emptySyncStatusPage();
+      this.syncStatusCursors = [];
+      this.syncStatusPageNumber = 0;
+      this.syncStatusPhase = "idle";
+      this.syncStatusMessage = boundedText(message, SYNC_STATUS_IDLE_MESSAGE);
+    },
+    // A loaded page belongs to the query that produced it. Changing the query
+    // discards it rather than leaving rows on screen under a heading that no
+    // longer describes them.
+    onSyncQueryChanged() {
+      if (this.syncStatusResult.loaded || this.syncStatusPhase === "failed") {
+        this.resetSyncStatus("Query changed. Check status again to reload.");
+      }
+    },
+    onSyncProfileChanged() {
+      this.onSyncQueryChanged();
+      this.clearResyncPlan("");
+    },
+    clearSyncFilters() {
+      this.syncStatusForm.scope = "";
+      this.syncStatusForm.filter = "";
+      this.syncStatusForm.state = "attention";
+      this.syncStatusForm.include_excluded = false;
+      this.onSyncQueryChanged();
+    },
+    async loadSyncStatus(cursor, pageNumber) {
+      if (!this.syncStatusReady || this.disposed) return;
+      const profile = boundedText(this.syncStatusForm.profile, "");
+      const requested = Number(this.syncStatusForm.limit);
+      const limit = SYNC_PAGE_SIZES.includes(requested) ? requested : SYNC_PAGE_SIZE_DEFAULT;
+      const page = Math.max(1, Number(pageNumber) || 1);
+      const from = boundedText(cursor, "");
+      const query = {
+        state: boundedText(this.syncStatusForm.state, "attention"),
+        filter: boundedText(this.syncStatusForm.filter, "").trim(),
+        scope: boundedText(this.syncStatusForm.scope, "").trim(),
+        includeExcluded: this.syncStatusForm.include_excluded === true
+      };
+      this.syncStatusBusy = true;
+      this.syncStatusPhase = "loading";
+      this.syncStatusMessage = "Comparing both sides for this scope. The NAS is only read; a large scope takes a while.";
+      try {
+        // A queued job, not a read: this walks the local tree and enumerates
+        // the remote one, so it goes through the same terminal-observation
+        // path as Doctor rather than occupying a synchronous bridge worker.
+        const result = await apiPost(this.auth, this.csrfToken, ACTIONS.syncStatus, {
+          cursor: from,
+          filter: query.filter,
+          include_excluded: query.includeExcluded,
+          limit: Math.min(limit, SYNC_STATUS_MAX_LIMIT),
+          profile,
+          scope: query.scope,
+          state: query.state
+        }, true);
+        if (this.disposed) return;
+        const document = bridgeDocument(result, "sdsync.status.v1");
+        if (!document) throw new Error(UNREADABLE_RESPONSE);
+        this.syncStatusResult = Object.assign(syncStatusPage(document, profile), { query });
+        this.syncStatusPageNumber = page;
+        // One cursor per page already visited, so Previous can return to an
+        // exact position instead of re-walking from the start.
+        this.syncStatusCursors = this.syncStatusCursors.slice(0, page - 1).concat(from);
+        this.syncStatusPhase = "ready";
+        this.syncStatusMessage = this.syncStatusResult.entries.length
+          ? ""
+          : "No entry matches this state and search. The totals still cover the whole scope.";
+      } catch (error) {
+        if (this.disposed) return;
+        // Classified like any queued operation, but deliberately not recorded
+        // as an isolated incident: an unknown outcome here left nothing behind
+        // to reconcile, and quarantining every operation because a read-only
+        // scan did not report back would be the wrong trade.
+        const report = this.reportMutationError(
+          error,
+          "Sync status failed",
+          "Sync status outcome unknown",
+          "The package could not complete the status query."
+        );
+        this.syncStatusResult = emptySyncStatusPage();
+        this.syncStatusCursors = [];
+        this.syncStatusPageNumber = 0;
+        this.syncStatusPhase = "failed";
+        this.syncStatusMessage = report.message;
+      } finally {
+        if (!this.disposed) this.syncStatusBusy = false;
+      }
+    },
+    checkSyncStatus(event) {
+      if (event && event.preventDefault) event.preventDefault();
+      return this.loadSyncStatus("", 1);
+    },
+    syncStatusNextPage() {
+      if (!this.syncStatusHasNext) return undefined;
+      return this.loadSyncStatus(this.syncStatusResult.nextCursor, this.syncStatusPageNumber + 1);
+    },
+    syncStatusPreviousPage() {
+      if (!this.syncStatusHasPrevious) return undefined;
+      return this.loadSyncStatus(this.syncStatusCursors[this.syncStatusPageNumber - 2] || "", this.syncStatusPageNumber - 1);
+    },
+    clearResyncPlan(message) {
+      this.resyncPlan = emptyResyncPlan();
+      this.resyncPhase = "idle";
+      this.resyncMessage = boundedText(message, "");
+    },
+    resyncEntry(entry) {
+      if (!entry || !this.resyncCanPlan) return undefined;
+      this.resyncForm.scope = boundedText(entry.relative, "");
+      return this.planResync();
+    },
+    // Both phases are the same request with and without a ticket, so they are
+    // one method: the difference that matters is that a ticket is only ever
+    // sent after a person confirmed the exact plan it was printed with.
+    async runResync(ticket, profile, scope) {
+      const confirming = Boolean(ticket);
+      this.resyncBusy = true;
+      this.resyncPhase = confirming ? "confirming" : "planning";
+      this.resyncMessage = confirming
+        ? "Re-uploading the confirmed files. Keep this AppWindow open."
+        : "Building the overwrite list. This step changes nothing.";
+      try {
+        const result = await apiPost(this.auth, this.csrfToken, ACTIONS.resync, { confirm: ticket, profile, scope }, true);
+        if (this.disposed) return;
+        const document = bridgeDocument(result, "sdsync.resync.v1");
+        if (!document) throw new Error(UNREADABLE_RESPONSE);
+        const plan = Object.assign(resyncPlanFromDocument(document, profile), { requestedScope: scope });
+        this.resyncPlan = plan;
+        if (plan.confirmed) {
+          this.resyncPhase = "confirmed";
+          this.resyncMessage = `Re-uploaded ${plan.overwrites} file${plan.overwrites === 1 ? "" : "s"} to ${profile}.`;
+          this.toast("Re-upload complete", this.resyncMessage);
+          await this.refreshSnapshot(false, true);
+          return;
+        }
+        this.resyncPhase = plan.overwrites && plan.ticket ? "planned" : "empty";
+        if (!plan.overwrites) {
+          this.resyncMessage = "Nothing would be re-uploaded in this scope.";
+        } else if (confirming) {
+          // The engine refused a confirmation that no longer described what
+          // would be overwritten, and re-planned in the same response, so the
+          // window shows the replacement instead of looping back to planning.
+          this.resyncMessage = "What would be overwritten changed, so nothing was uploaded. Confirm the refreshed list to accept it.";
+          this.toast("Resync plan changed", this.resyncMessage, true);
+        } else {
+          this.resyncMessage = "Review this exact list, then confirm it. Nothing has changed yet.";
+        }
+      } catch (error) {
+        if (this.disposed) return;
+        const report = this.reportMutationError(
+          error,
+          confirming ? "Resync failed" : "Resync plan failed",
+          confirming ? "Resync outcome unknown" : "Resync plan outcome unknown",
+          "The package rejected the re-upload."
+        );
+        recordIsolatedIncident(this, "operations", "Resync", error, report, { subject: scope || profile });
+        this.resyncPhase = report.unknown ? "unknown" : "failed";
+        this.resyncMessage = report.message;
+      } finally {
+        if (!this.disposed) this.resyncBusy = false;
+      }
+    },
+    // Planning never writes. It exists to produce the exact overwrite list and
+    // the ticket that proves that list was the one displayed.
+    planResync(event) {
+      if (event && event.preventDefault) event.preventDefault();
+      if (!this.resyncCanPlan || this.disposed) return undefined;
+      return this.runResync("", boundedText(this.syncStatusForm.profile, ""), boundedText(this.resyncForm.scope, "").trim());
+    },
+    async confirmResync() {
+      if (!this.resyncPlanReady || this.disposed) return;
+      const plan = this.resyncPlan;
+      const count = plan.overwrites;
+      if (!await this.confirmAction(
+        `Re-upload ${count} file${count === 1 ? "" : "s"}?`,
+        `Every listed file is overwritten whatever the remote copy holds now. ${formatBytes(plan.overwriteBytes)} will be uploaded. Nothing is deleted.`,
+        "Re-upload now"
+      )) return;
+      // Re-checked after the dialog: the plan may have been discarded, or a
+      // profile change may have invalidated it, while it was open.
+      if (!this.resyncPlanReady || this.disposed || this.resyncPlan !== plan) return;
+      await this.runResync(plan.ticket, boundedText(plan.profile, ""), boundedText(plan.requestedScope, ""));
     },
     activityEvidence(event) { return activityTroubleshootingText(event); },
     logEvidence(record) {

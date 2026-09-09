@@ -53,6 +53,15 @@ const MAX_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// Longest a rate-limited reader sleeps before it looks at the cancellation token again.
 const RATE_LIMIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// First and maximum gaps between checks on a server-side MD5 task.
+///
+/// Content mode issues one of these per file in the comparison set, serially, so the first gap is
+/// what a small file's digest costs beyond its two round trips: a flat interval would be paid in
+/// full by every file whose task is not finished the moment it is first asked about. The ramp
+/// keeps a large file, whose digest legitimately takes seconds, from being polled thousands of
+/// times on the way there. The ceiling is the interval this loop used to use throughout.
+const REMOTE_MD5_FIRST_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const REMOTE_MD5_MAX_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// A single shared I/O runtime keeps synchronous SDK calls safe even when their caller is already
 /// running on Tokio. Download futures never run on or block the caller's executor.
 const DOWNLOAD_RUNTIME_THREADS: usize = 1;
@@ -1030,6 +1039,7 @@ impl ApiClient {
             })?;
         validate_task_id(&task.taskid, "SYNO.FileStation.MD5.start")?;
 
+        let mut poll_interval = REMOTE_MD5_FIRST_POLL_INTERVAL;
         loop {
             if cancellation.is_cancelled() {
                 let _ = self.stop_task("SYNO.FileStation.MD5", 2, &task.taskid);
@@ -1071,18 +1081,57 @@ impl ApiClient {
                 })?;
                 return ContentMd5::parse_hex(&digest);
             }
-            if let Err(error) = sleep_cancellable(Duration::from_millis(100), cancellation) {
+            // Ramped rather than flat, because this is now on the hot path: one MD5 task per
+            // file in the comparison set, issued serially. A flat 100 ms floor would add that
+            // much to every file whose task is not already finished when first asked -- twenty
+            // seconds across two hundred files -- which could make a change sold as "cheaper"
+            // arrive as "slower", the one outcome worse than not making it. Starting short
+            // answers a small file at the speed of the file; doubling to the old interval keeps
+            // a large one from being polled thousands of times.
+            if let Err(error) = sleep_cancellable(poll_interval, cancellation) {
                 let _ = self.stop_task("SYNO.FileStation.MD5", 2, &task.taskid);
                 return Err(error);
             }
+            poll_interval = (poll_interval * 2).min(REMOTE_MD5_MAX_POLL_INTERVAL);
         }
+    }
+
+    /// Populate remote digests for a content-mode plan, choosing the cheapest source that is
+    /// strong enough for what each digest will be used for.
+    ///
+    /// `comparison` entries only decide whether a file needs uploading, so they are answered by
+    /// File Station's own MD5 calculation — the server reads its copy and returns a digest, with
+    /// nothing transferred. `strong` entries authorise a deletion or a server-side copy, so they
+    /// keep requiring a full MD5/CRC32/SHA-256 fingerprint, which File Station cannot produce and
+    /// which therefore still costs a download.
+    ///
+    /// Splitting them is what makes content mode affordable on a NAS. The comparison set is the
+    /// whole tree in the steady state and previously cost a full-tree HTTPS download on every
+    /// scheduled run; the strong set is remote entries with no local counterpart, which is empty
+    /// when nothing has changed. The expensive mechanism now serves only the set that is small.
+    ///
+    /// An entry named by both is fetched once, at the stronger of the two, because a strong
+    /// fingerprint also satisfies a comparison.
+    pub fn populate_remote_content_digests(
+        &self,
+        inventory: &mut RemoteInventory,
+        comparison: &BTreeSet<String>,
+        strong: &BTreeSet<String>,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        self.populate_remote_content_fingerprints(inventory, strong, cancellation)?;
+        let comparison_only: BTreeSet<String> = comparison.difference(strong).cloned().collect();
+        self.populate_remote_content_md5(inventory, &comparison_only, cancellation)
     }
 
     /// Populate collision-resistant content fingerprints for the selected files.
     ///
-    /// File Station exposes only MD5 as a server-side calculation. Content mode therefore
-    /// streams each selected remote file through the documented Download API and computes MD5,
-    /// IEEE CRC32, and SHA-256 together without retaining the downloaded payload.
+    /// File Station exposes only MD5 as a server-side calculation, so a caller needing CRC32 and
+    /// SHA-256 has no alternative to reading the bytes: this streams each selected remote file
+    /// through the documented Download API and computes all three together without retaining the
+    /// payload. Reachable and supported — it is what [`Self::populate_remote_content_digests`]
+    /// uses for digests that guard a mutation — but it costs the file's size in transfer, so
+    /// select for it deliberately.
     pub fn populate_remote_content_fingerprints(
         &self,
         inventory: &mut RemoteInventory,

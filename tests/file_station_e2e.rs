@@ -2143,13 +2143,27 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
             .count(),
         2
     );
+    // Two mechanisms, split by what the digest is for. Each upload is verified by reading back
+    // what was written, which needs the strong fingerprint and therefore a download. The final
+    // reconciliation only compares, so it uses File Station's server-side MD5 and transfers
+    // nothing -- which is why this is two downloads rather than the four it was when comparison
+    // downloaded as well. Both paths are still content verified; one of them stopped paying for
+    // the file's bytes to do it.
     assert_eq!(
         sync_requests
             .iter()
             .filter(|request| request.operation() == "SYNO.FileStation.Download.download")
             .count(),
-        4,
-        "each upload and each final reconciliation path must be content verified"
+        2,
+        "each upload must be content verified by reading it back"
+    );
+    assert_eq!(
+        sync_requests
+            .iter()
+            .filter(|request| request.operation() == "SYNO.FileStation.MD5.start")
+            .count(),
+        2,
+        "the final reconciliation must compare both files without transferring them"
     );
     assert_eq!(
         sync_requests.last().map(|request| request.operation()),
@@ -2182,8 +2196,13 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
             "SYNO.FileStation.List.list",
             "SYNO.FileStation.List.list",
             "SYNO.FileStation.List.list",
-            "SYNO.FileStation.Download.download",
-            "SYNO.FileStation.Download.download",
+            // The reconciliation comparison. Two server-side digest tasks where there were two
+            // whole-file downloads: the same question asked of File Station instead of answered
+            // by transferring the answer's inputs.
+            "SYNO.FileStation.MD5.start",
+            "SYNO.FileStation.MD5.status",
+            "SYNO.FileStation.MD5.start",
+            "SYNO.FileStation.MD5.status",
             "SYNO.API.Auth.logout",
         ]
     );
@@ -2299,7 +2318,7 @@ fn missing_home_destination_is_provisioned_below_the_existing_home_root() {
     assert!(
         requests[reconciliation_list_index + 1..]
             .iter()
-            .any(|request| request.operation() == "SYNO.FileStation.Download.download"),
+            .any(|request| request.operation() == "SYNO.FileStation.MD5.start"),
         "final reconciliation must content-verify the uploaded payload"
     );
     assert_eq!(
@@ -3719,4 +3738,356 @@ fn batch_preflight_failure_aborts_mutation_for_every_target() {
     assert_eq!(alpha_server.file_contents("/team/alpha/alpha.txt"), None);
     assert_eq!(beta_server.file_contents("/team/beta/beta.txt"), None);
     assert_eq!(beta_server.pending_faults(), 0);
+}
+
+/// A run with nothing to do observes the tree exactly once, not twice.
+///
+/// An empty plan means no operation was performed, so there is no convergence to reconcile. The
+/// reconciliation pass that used to run on this branch re-derived the identical answer from the
+/// identical inputs at full price: a second whole-tree scan, a second whole-tree content hash and
+/// a second remote inventory. In content mode on the armv7 target that second pass was the single
+/// largest cost a no-op scheduled run had, and it proved nothing the first pass had not.
+///
+/// The baseline is taken from `plan`, which returns before reconciliation and is therefore known
+/// to perform exactly one planning pass. A `sync` that finds nothing to do must issue the same
+/// listings and the same content downloads as that single pass -- downloads being how content mode
+/// obtains a strong remote digest, and so a direct count of how many times the tree was compared.
+/// Either count doubling means the second pass is back.
+#[test]
+fn a_synchronised_tree_in_content_mode_is_compared_once_not_twice() {
+    let fixture = TestDir::new("sync-once");
+    let source = fixture.child("source");
+    fs::create_dir_all(source.join("nested")).expect("create nested source directory");
+    fs::write(source.join("alpha.txt"), b"alpha").expect("write alpha source file");
+    fs::write(source.join("nested/beta.bin"), b"beta-data").expect("write beta source file");
+    let password = fixture.write("password", PASSWORD);
+
+    // The remote side is seeded to agree on content, size and modification time, which is what
+    // puts both files in the size-and-mtime-matching set that content mode fetches digests for.
+    let server = MockFileStation::start();
+    server.add_directory("/team/sync");
+    server.add_directory("/team/sync/nested");
+    server.add_file(
+        "/team/sync/alpha.txt",
+        b"alpha",
+        modified_seconds(&source.join("alpha.txt")),
+    );
+    server.add_file(
+        "/team/sync/nested/beta.bin",
+        b"beta-data",
+        modified_seconds(&source.join("nested/beta.bin")),
+    );
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let arguments = |verb: &'static str| {
+        vec![
+            "--quiet",
+            "--output",
+            "json",
+            verb,
+            source_text,
+            "/team/sync",
+            "--url",
+            server.base_url(),
+            "--username",
+            "e2e-user",
+            "--password-file",
+            password_text,
+            "--no-vault",
+            "--allow-http",
+            "--compare",
+            "content",
+            "--jobs",
+            "1",
+        ]
+    };
+
+    let plan = run(&arguments("plan"));
+    assert_success(&plan);
+    let planned = stdout_json(&plan);
+    assert_eq!(planned["plan"]["summary"]["changes"], false);
+    assert_eq!(planned["plan"]["summary"]["unchanged_files"], 2);
+    let plan_requests = server.requests();
+
+    let sync = run(&arguments("sync"));
+    assert_success(&sync);
+    let synced = stdout_json(&sync);
+    assert_eq!(synced["plan"]["summary"]["changes"], false);
+    let sync_requests = &server.requests()[plan_requests.len()..];
+
+    let count = |requests: &[CapturedRequest], operation: &str| {
+        requests
+            .iter()
+            .filter(|request| request.operation() == operation)
+            .count()
+    };
+
+    for operation in [
+        "SYNO.FileStation.List.list",
+        "SYNO.FileStation.MD5.start",
+        "SYNO.FileStation.Download.download",
+    ] {
+        assert_eq!(
+            count(sync_requests, operation),
+            count(&plan_requests, operation),
+            "a no-op sync must issue the same {operation} calls as one planning pass"
+        );
+    }
+    // The comparison itself, counted directly: one server-side digest per file, once. Comparison
+    // deliberately transfers nothing, so the download count is the other half of the same claim.
+    assert_eq!(count(sync_requests, "SYNO.FileStation.MD5.start"), 2);
+    assert_eq!(
+        count(sync_requests, "SYNO.FileStation.Download.download"),
+        0
+    );
+
+    // Nothing was uploaded, copied, created or deleted: the run really did have nothing to do,
+    // so the counts above are measuring a no-op and not a run that quietly did work.
+    assert!(
+        sync_requests
+            .iter()
+            .all(|request| !is_mutation(&request.operation())),
+        "a no-op sync must not mutate the destination"
+    );
+    assert_eq!(server.pending_faults(), 0);
+}
+
+/// Content mode compares with File Station's own MD5 and transfers nothing.
+///
+/// This is the change that makes content mode affordable on a NAS. The comparison set is the whole
+/// tree once a backup has settled, and obtaining a remote SHA-256 for it meant downloading every
+/// file on every scheduled run -- the machine got more expensive the more in sync it was. File
+/// Station computes MD5 server-side without moving the bytes, and an MD5 agreement is enough to
+/// decide the only question comparison asks: upload this file, or not.
+///
+/// The download count is the assertion that matters. Zero means no file content crossed the wire.
+#[test]
+fn content_mode_compares_through_server_side_md5_without_downloading() {
+    let fixture = TestDir::new("server-md5");
+    let source = fixture.child("source");
+    fs::create_dir_all(source.join("nested")).expect("create nested source directory");
+    fs::write(source.join("alpha.txt"), b"alpha").expect("write alpha source file");
+    fs::write(source.join("nested/beta.bin"), b"beta-data").expect("write beta source file");
+    let password = fixture.write("password", PASSWORD);
+
+    let server = MockFileStation::start();
+    server.add_directory("/team/sync");
+    server.add_directory("/team/sync/nested");
+    server.add_file(
+        "/team/sync/alpha.txt",
+        b"alpha",
+        modified_seconds(&source.join("alpha.txt")),
+    );
+    server.add_file(
+        "/team/sync/nested/beta.bin",
+        b"beta-data",
+        modified_seconds(&source.join("nested/beta.bin")),
+    );
+    // Every MD5 task reports unfinished once before completing, so the polling path -- and the
+    // backoff applied to it -- is actually exercised rather than skipped by an instant answer.
+    server.defer_md5_completion(1);
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let sync = run(&[
+        "--quiet",
+        "--output",
+        "json",
+        "sync",
+        source_text,
+        "/team/sync",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password_text,
+        "--no-vault",
+        "--allow-http",
+        "--compare",
+        "content",
+        "--jobs",
+        "1",
+    ]);
+    assert_success(&sync);
+    let synced = stdout_json(&sync);
+    assert_eq!(synced["plan"]["summary"]["changes"], false);
+    assert_eq!(synced["plan"]["summary"]["unchanged_files"], 2);
+
+    let requests = server.requests();
+    let count = |operation: &str| {
+        requests
+            .iter()
+            .filter(|request| request.operation() == operation)
+            .count()
+    };
+    assert_eq!(
+        count("SYNO.FileStation.Download.download"),
+        0,
+        "comparison must not transfer file content"
+    );
+    assert_eq!(count("SYNO.FileStation.MD5.start"), 2);
+    assert_eq!(
+        count("SYNO.FileStation.MD5.status"),
+        4,
+        "one unfinished status and one finished status per file"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !is_mutation(&request.operation())),
+        "an in-sync tree must not be mutated"
+    );
+    assert_eq!(server.pending_faults(), 0);
+}
+
+/// A file whose content changed behind identical size and modification time is still caught.
+///
+/// The guarantee content mode exists for. Size and mtime agree, so only a digest separates these
+/// two files, and the digest now comes from the server rather than from a download. If this
+/// regressed, content mode would silently have become metadata mode.
+///
+/// It also guards **promotion**, and deliberately so: this file is in the comparison set, so it is
+/// hashed MD5-only, and differing makes it an upload — which verifies against a strong digest.
+/// Without `plan::promote_upload_fingerprints` raising it first, `preflight_upload_source` compares
+/// an MD5-only expectation against a full-strength re-hash, `full_match` refuses to answer on
+/// partial evidence, and the run fails closed with `SourceChanged`. Verified by disabling
+/// promotion and watching this test fail. Do not weaken it without replacing that coverage.
+#[test]
+fn content_mode_still_detects_a_change_hidden_behind_equal_size_and_mtime() {
+    let fixture = TestDir::new("server-md5-change");
+    let source = fixture.child("source");
+    fs::create_dir_all(&source).expect("create source directory");
+    fs::write(source.join("alpha.txt"), b"alpha").expect("write alpha source file");
+    let password = fixture.write("password", PASSWORD);
+
+    let server = MockFileStation::start();
+    server.add_directory("/team/sync");
+    // Same length, same modification time, different bytes.
+    server.add_file(
+        "/team/sync/alpha.txt",
+        b"ALPHA",
+        modified_seconds(&source.join("alpha.txt")),
+    );
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let sync = run(&[
+        "--quiet",
+        "--output",
+        "json",
+        "sync",
+        source_text,
+        "/team/sync",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password_text,
+        "--no-vault",
+        "--allow-http",
+        "--compare",
+        "content",
+        "--jobs",
+        "1",
+    ]);
+    assert_success(&sync);
+    let synced = stdout_json(&sync);
+    assert_eq!(synced["plan"]["summary"]["uploads"], 1);
+    assert_eq!(
+        synced["plan"]["actions"]["uploads"][0]["reason"],
+        "content-differs"
+    );
+    assert_eq!(
+        server.file_contents("/team/sync/alpha.txt"),
+        Some(b"alpha".to_vec())
+    );
+}
+
+/// A mirror deletion still requires a strong digest, obtained by downloading only the candidates.
+///
+/// Comparison was made cheaper by accepting an MD5 agreement; deletion was not, and must not be.
+/// Removing remote data on the strength of a match is a stronger claim than declining to upload,
+/// so the deletion guard keeps requiring MD5, CRC32 and SHA-256 together -- which File Station
+/// cannot compute, so those entries are still downloaded. What changed is that only they are.
+///
+/// The two counts together are the property: one download for the single deletion candidate, and
+/// none for the file that is merely being compared.
+#[test]
+fn a_mirror_deletion_still_downloads_its_guard_but_only_for_the_candidates() {
+    let fixture = TestDir::new("server-md5-delete");
+    let source = fixture.child("source");
+    fs::create_dir_all(&source).expect("create source directory");
+    fs::write(source.join("kept.txt"), b"kept").expect("write kept source file");
+    let password = fixture.write("password", PASSWORD);
+
+    let server = MockFileStation::start();
+    server.add_directory("/team/sync");
+    server.add_file(
+        "/team/sync/kept.txt",
+        b"kept",
+        modified_seconds(&source.join("kept.txt")),
+    );
+    // Present remotely, absent locally: the one deletion candidate.
+    server.add_file("/team/sync/gone.txt", b"gone", 1_700_000_000);
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let sync = run(&[
+        "--quiet",
+        "--output",
+        "json",
+        "sync",
+        source_text,
+        "/team/sync",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password_text,
+        "--no-vault",
+        "--allow-http",
+        "--compare",
+        "content",
+        "--delete",
+        "--jobs",
+        "1",
+    ]);
+    assert_success(&sync);
+
+    let requests = server.requests();
+    let downloaded_paths = requests
+        .iter()
+        .filter(|request| request.operation() == "SYNO.FileStation.Download.download")
+        .filter_map(|request| request.fields.get("path").cloned())
+        .collect::<Vec<_>>();
+    // Asserted by path rather than by count, because the count alone would not say *which* file
+    // was transferred, and that is the whole property. The deletion candidate appears twice: once
+    // for its plan-time guard digest, and once for the live re-check `verify_live_snapshot`
+    // performs immediately before removing it. The compared file must not appear at all.
+    assert!(
+        downloaded_paths
+            .iter()
+            .all(|path| path.contains("gone.txt")),
+        "only the deletion candidate may be transferred, saw {downloaded_paths:?}"
+    );
+    assert_eq!(
+        downloaded_paths.len(),
+        2,
+        "the deletion candidate is read for its plan-time guard and again before removal"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.operation() == "SYNO.FileStation.MD5.start"),
+        "the compared file must use the server-side digest"
+    );
+    assert_eq!(server.file_contents("/team/sync/gone.txt"), None);
+    assert_eq!(
+        server.file_contents("/team/sync/kept.txt"),
+        Some(b"kept".to_vec())
+    );
 }

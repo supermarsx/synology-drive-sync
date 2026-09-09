@@ -230,13 +230,15 @@ launched_child_identity_status() {
     launched_identity_current_boot=$(boot_identity) || return 73
     [ "$launched_identity_current_boot" = "$launched_identity_boot" ] || return 73
     [ -e "/proc/$launched_identity_pid" ] || return 1
-    launched_identity_state=$(sed -n 's/^.*) \([^ ]\).*/\1/p' \
-        "/proc/$launched_identity_pid/stat" 2>/dev/null || true)
-    launched_identity_actual_start=$(process_start_time "$launched_identity_pid" 2>/dev/null || true)
-    launched_identity_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
-        "/proc/$launched_identity_pid/status" 2>/dev/null | sed -n '1p')
-    launched_identity_parent=$(sed -n 's/^PPid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
-        "/proc/$launched_identity_pid/status" 2>/dev/null | sed -n '1p')
+    # Two builtin procfs reads rather than five subprocesses. This runs three
+    # times per startup readiness poll, and the poll ticks every 50 ms for the
+    # first second of every lifecycle transition.
+    read_process_stat_fields "$launched_identity_pid" || true
+    launched_identity_state=$process_stat_state
+    launched_identity_actual_start=$process_stat_start
+    read_process_status_ids "$launched_identity_pid" || true
+    launched_identity_uid=$process_status_uid
+    launched_identity_parent=$process_status_ppid
     if [ -z "$launched_identity_state" ] || [ -z "$launched_identity_actual_start" ] \
         || [ -z "$launched_identity_uid" ] || [ -z "$launched_identity_parent" ]; then
         [ -e "/proc/$launched_identity_pid" ] && return 73
@@ -250,11 +252,11 @@ launched_child_identity_status() {
         [ -e "/proc/$launched_identity_pid" ] && return 73
         return 1
     }
-    launched_identity_start_recheck=$(process_start_time "$launched_identity_pid" 2>/dev/null || true)
-    launched_identity_uid_recheck=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
-        "/proc/$launched_identity_pid/status" 2>/dev/null | sed -n '1p')
-    launched_identity_parent_recheck=$(sed -n 's/^PPid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
-        "/proc/$launched_identity_pid/status" 2>/dev/null | sed -n '1p')
+    read_process_stat_fields "$launched_identity_pid" || true
+    launched_identity_start_recheck=$process_stat_start
+    read_process_status_ids "$launched_identity_pid" || true
+    launched_identity_uid_recheck=$process_status_uid
+    launched_identity_parent_recheck=$process_status_ppid
     [ "$launched_identity_start_recheck" = "$launched_identity_start" ] \
         && [ "$launched_identity_uid_recheck" = "$path_owner" ] \
         && [ "$launched_identity_parent_recheck" = "$$" ] || return 73

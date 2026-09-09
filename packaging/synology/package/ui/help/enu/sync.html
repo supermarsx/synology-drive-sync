@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html class="img-no-display">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <link href="../../../../help/help.css" rel="stylesheet" type="text/css">
+  <link href="../../../../help/scrollbar/flexcroll.css" rel="stylesheet" type="text/css">
+  <script type="text/javascript" src="../../../../help/scrollbar/flexcroll.js"></script>
+  <script type="text/javascript" src="../../../../help/scrollbar/initFlexcroll.js"></script>
+  <title>Sync status and resync</title>
+</head>
+<body>
+  <h1>Sync status and resync</h1>
+  <p>This page answers two questions about one profile: what state each file is in, and how to force a file back onto the NAS. Choose a profile, optionally narrow to a folder or a single file, then choose <strong>Check status</strong>. Nothing is read from the NAS until you do.</p>
+
+  <h2>The answer is never stale, and never free</h2>
+  <p>No index is kept. Both the local folder and the File Station destination are walked again on every check, and each entry is compared with the same code path a real sync uses, so a status row cannot disagree with what a sync would do. Because the answer is rebuilt every time, this page deliberately has no refresh timer: it runs only when you ask it to. On a low-powered NAS, prefer a folder scope over the whole tree.</p>
+
+  <h2>States</h2>
+  <dl>
+    <dt>In sync</dt><dd>Present on both sides and equal under the profile's comparison setting.</dd>
+    <dt>Differs</dt><dd>Present on both sides and scheduled for upload. The <strong>Why</strong> column names the evidence that decided it, such as differing size or differing modification time.</dd>
+    <dt>Missing remotely</dt><dd>Present locally with no entry at the destination path.</dd>
+    <dt>Remote only</dt><dd>Present on the NAS with no local counterpart. It is removed only by a mirror run with deletion separately approved, never by this page.</dd>
+    <dt>Type conflict</dt><dd>Both sides exist but one is a file and the other a directory. This is the state that makes a sync fail rather than proceed.</dd>
+    <dt>Excluded</dt><dd>Never synchronized, because an ignore rule, a DSM-managed path, or a mount boundary excludes it.</dd>
+  </dl>
+  <p><strong>Needs attention</strong> is the default view and covers type conflicts, missing remotely, differs, and remote only.</p>
+
+  <h2>Totals and pages</h2>
+  <p>The totals above the table always describe the whole scope, not the rows drawn below it, so the counts stay honest while a search narrows the listing. A page never exceeds 200 rows; the package refuses a larger request rather than returning an unbounded listing. Use <strong>Next page</strong> and <strong>Previous page</strong> to move through a large scope. If a walk cannot finish, the page says so and the totals are reported as a lower bound.</p>
+
+  <h2>Searching for a file</h2>
+  <p><strong>Search file name</strong> lists only entries whose file name contains the text you type, compared without regard to case. It narrows which rows are listed and never changes the reported totals. <strong>Folder or file</strong> is a source-relative path rather than a pattern, and naming a single file reports just that file.</p>
+
+  <h2>Resync</h2>
+  <p>A resync re-uploads without comparing, replacing the remote copy whatever it currently holds, including a copy that is identical or newer. It never deletes: removing remote-only entries remains a separate mirror decision.</p>
+  <p>It runs in two steps and cannot be collapsed into one. <strong>Plan re-upload</strong> changes nothing; it lists every file that would be overwritten, totals the bytes, and prints a ticket derived from that exact list. <strong>Confirm this exact plan</strong> sends the ticket back and performs the upload. Confirming therefore proves the list was seen, not merely that the button was pressed twice.</p>
+  <p>If the source or destination changed in between, the ticket no longer matches what would be overwritten. The package refuses, changes nothing, and shows a refreshed list with a new ticket in its place, so a changing NAS never becomes a loop. A ticket carries no clock and does not expire on its own; only a change to what would be overwritten invalidates it.</p>
+  <p>Leave <strong>Folder or file</strong> empty to re-upload everything in the profile, name a folder to re-upload its subtree, or choose <strong>Re-upload</strong> on a table row to plan that single file.</p>
+
+  <h2>When the controls are unavailable</h2>
+  <p>Status checks and resync are operational actions. They are blocked while another operation is running, and while the security policy withholds operational actions. Confirmed re-uploads take the package management lock and are recorded in the package audit trail and activity feed like any other operation that changes the destination.</p>
+</body>
+</html>
