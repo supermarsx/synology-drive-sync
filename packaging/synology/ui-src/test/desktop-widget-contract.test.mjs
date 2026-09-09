@@ -94,6 +94,7 @@ function loadWidgetPanel(environment) {
     ActionIcon: { name: "ActionIcon" },
     SNAPSHOT_SCHEMA: "sdsync.dsm-api.v1",
     apiGet: environment.apiGet,
+    probeRequestOutcome: async () => ({}),
     APPWINDOW_SETTINGS_KEY,
     appWindowPreferences,
     widgetBridgeIssue,

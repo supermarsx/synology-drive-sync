@@ -25,6 +25,7 @@ function loadAppComponent(overrides = {}) {
     SNAPSHOT_SCHEMA: "sdsync.dsm-api.v1",
     apiGet: async () => ({}),
     apiPost: async () => ({}),
+    probeRequestOutcome: async () => ({}),
     purgeReconciliationAuth() {},
     reconcileMutationRequest: async () => ({}),
     arrayOf: (value) => Array.isArray(value) ? value : [],

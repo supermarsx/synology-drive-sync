@@ -1704,6 +1704,20 @@
   overflow-wrap: anywhere;
 }
 
+.sdsync-mutation-barrier .sdsync-barrier-gates,
+.sdsync-mutation-barrier .sdsync-barrier-progress {
+  flex-basis: 100%;
+}
+
+.sdsync-barrier-gates {
+  display: grid;
+  gap: 3px;
+}
+
+.sdsync-barrier-progress {
+  color: var(--sdsync-amber);
+}
+
 .sdsync-page {
   width: 100%;
   max-width: 1180px;

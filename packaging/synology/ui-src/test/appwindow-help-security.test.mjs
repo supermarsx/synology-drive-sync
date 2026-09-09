@@ -55,6 +55,7 @@ async function loadAppComponent(postSpy, trace) {
     MAX_RESPONSE_BYTES: 1024 * 1024,
     SNAPSHOT_SCHEMA: "sdsync.dsm-api.v1",
     apiGet: async () => ({}),
+    probeRequestOutcome: async () => ({}),
     apiPost: async (...args) => {
       trace.push("post");
       return postSpy(...args);

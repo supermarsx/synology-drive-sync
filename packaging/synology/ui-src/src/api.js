@@ -1109,22 +1109,54 @@ function exactRequestStatusKeys(model, expected) {
   return actual.length === keys.length && actual.every((key, index) => key === keys[index]);
 }
 
+// A pending job publishes bounded progress from the reviewed section catalogue,
+// and the bridge delivers it as exactly one additional key on the status
+// document. Both shapes are enumerated rather than tolerated: an unreviewed
+// seventh key still fails closed.
+//
+// Demanding an exact five-key match made the six-key form unreadable, and
+// `pollRequestStatus` treats an untrusted document as fatal. A long Doctor run
+// -- the one operation that publishes progress, and the slowest thing this
+// package does -- therefore declared its own outcome unknown within a second of
+// the first read, without consuming a single retry of its recovery window.
+function trustedRequestProgress(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (!exactRequestStatusKeys(value, ["label", "step", "total", "updated_at"])) return null;
+  const step = Number(value.step);
+  const total = Number(value.total);
+  const updatedAt = Number(value.updated_at);
+  if (!Number.isInteger(step) || !Number.isInteger(total) || !Number.isInteger(updatedAt)
+    || step < 1 || total < 1 || step > total || updatedAt < 1
+    || typeof value.label !== "string" || !value.label || value.label.length > 128) {
+    return null;
+  }
+  return { step, total, label: value.label, updatedAt };
+}
+
 function trustedRequestStatus(model, requestId, expectedOperation) {
   if (model.schema !== REQUEST_STATUS_SCHEMA || model.request_id !== requestId) return null;
   if (model.state === "unresolved"
     && exactRequestStatusKeys(model, ["request_id", "schema", "state"])) {
     return { state: "unresolved" };
   }
+  const identityKeys = ["job_id", "operation", "request_id", "schema", "state"];
+  const progress = model.progress === undefined ? null : trustedRequestProgress(model.progress);
   if (!["pending", "complete"].includes(model.state)
-    || !exactRequestStatusKeys(model, ["job_id", "operation", "request_id", "schema", "state"])
+    || !exactRequestStatusKeys(
+      model,
+      model.progress === undefined ? identityKeys : identityKeys.concat("progress")
+    )
     || !validJobId(model.job_id)
-    || model.operation !== expectedOperation) {
+    || model.operation !== expectedOperation
+    // Progress is published only while pending; once complete the result is the answer.
+    || (model.progress !== undefined && (!progress || model.state !== "pending"))) {
     return null;
   }
   return {
     state: model.state,
     jobId: model.job_id,
-    operation: model.operation
+    operation: model.operation,
+    progress
   };
 }
 
@@ -1376,6 +1408,118 @@ async function csrfForCurrentAuthGeneration(auth, csrfToken, dsmAuth, limits = n
     auth.onCsrfReissued(previousToken, replacementToken);
   }
   return replacementToken;
+}
+
+export const REQUEST_PROBE_SCHEMA = "sdsync.dsm-request-probe.v1";
+// The bridge writes one activity record per audited mutation state, keyed to the
+// exact client request ID (`Module <operation> <state> [<transaction>]
+// request_id=<id>` under code `audit.<state>`). That is the same evidence the
+// outcome-unknown message asks the operator to go and read by hand.
+const AUDIT_REQUEST_VERDICTS = Object.freeze({
+  "audit.succeeded": "settled",
+  "audit.failed": "settled",
+  "audit.outcome_unknown": "unknown",
+  "audit.requested": "accepted"
+});
+// Precedence when several records name the same request: a terminal state
+// outranks the package's own unknown, which outranks a bare acceptance.
+const AUDIT_VERDICT_RANK = Object.freeze({ settled: 3, unknown: 2, accepted: 1 });
+const ACTIVITY_PROBE_LINES = 200;
+
+function auditVerdictForRequest(model, requestId) {
+  const events = model && Array.isArray(model.events) ? model.events : [];
+  let best = null;
+  for (const event of events) {
+    if (!event || typeof event !== "object" || Array.isArray(event)) continue;
+    if (validClientRequestId(event.client_request_id) !== requestId) continue;
+    const verdict = AUDIT_REQUEST_VERDICTS[event.code];
+    if (!verdict) continue;
+    const epoch = Number(event.epoch);
+    const record = {
+      verdict,
+      code: event.code,
+      epoch: Number.isFinite(epoch) && epoch > 0 ? epoch : 0
+    };
+    if (!best
+      || AUDIT_VERDICT_RANK[verdict] > AUDIT_VERDICT_RANK[best.verdict]
+      || (AUDIT_VERDICT_RANK[verdict] === AUDIT_VERDICT_RANK[best.verdict] && record.epoch > best.epoch)) {
+      best = record;
+    }
+  }
+  return best;
+}
+
+/**
+ * Establish what is currently knowable about one dispatched request.
+ *
+ * Deliberately a single bounded pass rather than a loop, and deliberately
+ * incapable of rejecting: the caller polls this on a ramp and renders whatever
+ * it establishes, so every failure has to arrive as a verdict rather than as an
+ * exception that would end the account the operator is watching.
+ *
+ * Strictly read-only. It submits nothing, replays nothing, and never forgets the
+ * reconciliation authentication that the manual recovery path still needs.
+ *
+ * The private queue answers first because it is authoritative and cheap. Activity
+ * is consulted only when the queue holds no record, because that is the single
+ * case the queue cannot resolve on its own: a request that was never accepted and
+ * a request whose completed job has already been reaped both read `unresolved`.
+ */
+export async function probeRequestOutcome(auth, requestId, expectedOperation, options = undefined) {
+  const trustedRequestId = validClientRequestId(requestId);
+  if (!trustedRequestId || !ARGUMENT_KEYS[expectedOperation]) {
+    throw new TypeError("Request outcome probes require a trusted request ID and operation");
+  }
+  const limits = normalizedRequestLimits(options) || terminalAttemptLimits();
+  const observed = (verdict, detail = null) => ({
+    schema: REQUEST_PROBE_SCHEMA,
+    request_id: trustedRequestId,
+    operation: expectedOperation,
+    verdict,
+    job_id: (detail && detail.jobId) || "",
+    code: (detail && detail.code) || "",
+    epoch: (detail && detail.epoch) || 0,
+    progress: (detail && detail.progress) || null,
+    checked_at: limits.now()
+  });
+
+  let queueRead = false;
+  try {
+    let requestDsmAuth = rememberedReconciliationAuth(auth, trustedRequestId);
+    if (!requestDsmAuth) {
+      await ensureDsmToken();
+      requestDsmAuth = dsmAuthSnapshot();
+    }
+    const status = await requestStatusOnce(
+      auth,
+      trustedRequestId,
+      expectedOperation,
+      requestDsmAuth,
+      limits
+    );
+    queueRead = true;
+    if (status.state !== "unresolved") {
+      return observed(
+        status.state === "complete" ? "settled" : "accepted",
+        { jobId: status.jobId, progress: status.progress }
+      );
+    }
+  } catch (_error) {
+    if (auth && auth.signal && auth.signal.aborted) return observed("unavailable");
+  }
+
+  try {
+    const record = auditVerdictForRequest(
+      await apiGet(auth, "activity", { lines: ACTIVITY_PROBE_LINES }, options),
+      trustedRequestId
+    );
+    if (record) return observed(record.verdict, record);
+    // Both sources agree there is no trace. That is an answer, not a silence:
+    // nothing named this request ID, so nothing was accepted under it.
+    return observed(queueRead ? "absent" : "unavailable");
+  } catch (_error) {
+    return observed("unavailable");
+  }
 }
 
 export async function apiPost(

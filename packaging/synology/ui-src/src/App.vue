@@ -82,6 +82,20 @@
             <div>
               <strong>Scoped outcome needs reconciliation</strong>
               <span>{{ incidentGuidance }}</span>
+              <span class="sdsync-barrier-gates">
+                <small><strong>Blocked:</strong> {{ incidentScopeAvailability.blocked }}</small>
+                <small v-if="incidentScopeAvailability.available"><strong>Available:</strong> {{ incidentScopeAvailability.available }}</small>
+              </span>
+              <span v-if="incidentProbeAccount" class="sdsync-barrier-progress" role="status" aria-live="polite">{{ incidentProbeAccount }}</span>
+              <v-button
+                v-if="incidentProbeTargets.length"
+                type="border"
+                display="icon-text"
+                tooltip="Read the package queue and Activity for the exact preserved request ID; no new request is submitted"
+                :disabled="!canCheckIncidentOutcomes"
+                :aria-busy="incidentProbe.active ? 'true' : 'false'"
+                @click="checkIncidentOutcomes(true)"
+              ><template #icon><action-icon :class="{ 'sdsync-is-spinning': incidentProbe.active }" name="refresh" /></template>{{ incidentProbe.active ? 'Checking…' : 'Check again now' }}</v-button>
               <v-button
                 v-if="profileReconciliationIncident && hasCapability('request_reconciliation')"
                 type="border"
@@ -589,6 +603,7 @@ import {
   SYNC_STATUS_MAX_LIMIT,
   apiGet,
   apiPost,
+  probeRequestOutcome,
   purgeReconciliationAuth,
   reconcileMutationRequest,
   arrayOf,
@@ -751,69 +766,143 @@ function isolatedIncidentUnresolved(component, scope) {
   return unresolvedIsolatedIncident(incident);
 }
 
-function unresolvedScopeNames(component) {
-  const names = AUTOSAVE_SCOPES
-    .filter((scope) => scopeMutationOutcomeUnresolved(component, scope))
-    .map((scope) => INCIDENT_SCOPE_LABELS[scope]);
-  for (const scope of ["connection", "operations"]) {
-    if (isolatedIncidentUnresolved(component, scope)) names.push(INCIDENT_SCOPE_LABELS[scope]);
+// One walk over every scope that can hold an unresolved incident. The banner's
+// summary, its correlation evidence and the set of requests worth probing all
+// read from this, so they cannot drift apart about what is actually locked.
+function unresolvedIncidentEntries(component) {
+  const entries = [];
+  for (const scope of AUTOSAVE_SCOPES) {
+    if (!scopeMutationOutcomeUnresolved(component, scope)) continue;
+    const incident = component.autosaveIncidents && component.autosaveIncidents[scope];
+    entries.push({ scope, incident: incident && incident.active === true ? incident : null });
   }
-  return names;
+  for (const scope of ["connection", "operations"]) {
+    if (isolatedIncidentUnresolved(component, scope)) {
+      entries.push({ scope, incident: component.isolatedIncidents[scope] });
+    }
+  }
+  return entries;
+}
+
+function unresolvedScopeNames(component) {
+  return unresolvedIncidentEntries(component).map(({ scope }) => INCIDENT_SCOPE_LABELS[scope]);
 }
 
 function hasAnyUnresolvedIncident(component) {
   return unresolvedScopeNames(component).length > 0;
 }
 
+// The one place any incident turns into correlation evidence. Five copies of
+// this list had drifted apart only in how they label the subject, which is the
+// single thing a caller actually varies.
+function incidentCorrelation(incident, subjectPrefix = "Subject:") {
+  return incident
+    ? [
+      incident.subject ? `${subjectPrefix} ${incident.subject}.` : "",
+      incident.requestId ? `Client request ID: ${incident.requestId}.` : "",
+      incident.jobId ? `Queued job ID: ${incident.jobId}.` : ""
+    ].filter(Boolean).join(" ")
+    : "";
+}
+
+function guidanceText(...parts) {
+  return parts.filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+}
+
 function scopeMutationGuidance(component, scope) {
   const unknown = Boolean(component && component.autosaveOutcomeUnknownScopes
     && component.autosaveOutcomeUnknownScopes[scope] === true);
-  const label = INCIDENT_SCOPE_LABELS[scope] || scope;
-  const reason = unknown
-    ? "Its previous request may already have been accepted."
-    : "Its previous request was only partially applied and needs inspection.";
   const incident = component && component.autosaveIncidents && component.autosaveIncidents[scope];
-  const correlation = incident && incident.active === true
-    ? [incident.subject ? `Subject: ${incident.subject}.` : "", incident.requestId ? `Client request ID: ${incident.requestId}.` : "", incident.jobId ? `Queued job ID: ${incident.jobId}.` : ""].filter(Boolean).join(" ")
-    : "";
-  const availability = scope === "profile"
-    ? "Independent configuration scopes and their autosave remain available; routine changes and Run / Doctor stay paused because they depend on settled profile state."
-    : "Unrelated controls and autosave remain available.";
-  return `${label} is locked in this AppWindow. ${reason} ${correlation} Preserve the draft and inspect Activity / Logs plus current package state before reconciling it. ${availability}`.replace(/\s+/g, " ").trim();
+  return guidanceText(
+    `${INCIDENT_SCOPE_LABELS[scope] || scope} is locked in this AppWindow.`,
+    unknown
+      ? "Its previous request may already have been accepted."
+      : "Its previous request was only partially applied and needs inspection.",
+    incidentCorrelation(incident && incident.active === true ? incident : null),
+    "Preserve the draft and inspect Activity / Logs plus current package state before reconciling it.",
+    scope === "profile"
+      ? "Independent configuration scopes and their autosave remain available; routine changes and Run / Doctor stay paused because they depend on settled profile state."
+      : "Unrelated controls and autosave remain available."
+  );
 }
 
 function isolatedIncidentGuidance(component, scope) {
   const incident = component && component.isolatedIncidents && component.isolatedIncidents[scope];
-  const label = INCIDENT_SCOPE_LABELS[scope] || scope;
-  const reason = incident && incident.outcomeUnknown === true
-    ? "The previous request may already have been accepted."
-    : "The previous request or cleanup needs inspection.";
-  const correlation = incident
-    ? [incident.subject ? `Subject: ${incident.subject}.` : "", incident.requestId ? `Client request ID: ${incident.requestId}.` : "", incident.jobId ? `Queued job ID: ${incident.jobId}.` : ""].filter(Boolean).join(" ")
-    : "";
-  if (scope === "connection") {
-    return `${label} is locked in this AppWindow. ${reason} ${correlation} Resolve the exact request before changing the preserved profile and credential draft or starting another authentication or File Station request. Unrelated controls and autosave remain available.`.replace(/\s+/g, " ").trim();
-  }
-  return `${label} is locked in this AppWindow. ${reason} ${correlation} Inspect Activity / Logs and current package state before another request in this scope. Profile saves and unrelated controls and autosave remain available.`.replace(/\s+/g, " ").trim();
+  return guidanceText(
+    `${INCIDENT_SCOPE_LABELS[scope] || scope} is locked in this AppWindow.`,
+    incident && incident.outcomeUnknown === true
+      ? "The previous request may already have been accepted."
+      : "The previous request or cleanup needs inspection.",
+    incidentCorrelation(incident),
+    scope === "connection"
+      ? "Resolve the exact request before changing the preserved profile and credential draft or starting another authentication or File Station request. Unrelated controls and autosave remain available."
+      : "Inspect Activity / Logs and current package state before another request in this scope. Profile saves and unrelated controls and autosave remain available."
+  );
 }
 
 function unresolvedIncidentGuidance(component) {
   const scopes = unresolvedScopeNames(component);
   if (!scopes.length) return "No unresolved operation outcomes.";
   const listed = scopes.length === 1 ? scopes[0] : `${scopes.slice(0, -1).join(", ")} and ${scopes[scopes.length - 1]}`;
-  const evidence = [];
-  for (const scope of AUTOSAVE_SCOPES) {
-    const incident = component.autosaveIncidents && component.autosaveIncidents[scope];
-    if (!incident || incident.active !== true) continue;
-    evidence.push([incident.subject ? `${INCIDENT_SCOPE_LABELS[scope]} subject: ${incident.subject}.` : "", incident.requestId ? `Client request ID: ${incident.requestId}.` : "", incident.jobId ? `Queued job ID: ${incident.jobId}.` : ""].filter(Boolean).join(" "));
-  }
-  for (const scope of ["connection", "operations"]) {
-    const incident = component.isolatedIncidents && component.isolatedIncidents[scope];
-    if (!unresolvedIsolatedIncident(incident)) continue;
-    evidence.push([incident.subject ? `${INCIDENT_SCOPE_LABELS[scope]} subject: ${incident.subject}.` : "", incident.requestId ? `Client request ID: ${incident.requestId}.` : "", incident.jobId ? `Queued job ID: ${incident.jobId}.` : ""].filter(Boolean).join(" "));
-  }
-  const correlation = evidence.filter(Boolean).join(" ");
-  return `${listed} ${scopes.length === 1 ? "needs" : "need"} reconciliation. Only the named scope${scopes.length === 1 ? " and its dependent operations are" : "s and their dependent operations are"} affected; independent controls and autosave remain available. ${correlation} Preserve any open draft and inspect Activity / Logs plus current package state before reconciling.`.replace(/\s+/g, " ").trim();
+  const evidence = unresolvedIncidentEntries(component)
+    .map(({ scope, incident }) => incidentCorrelation(incident, `${INCIDENT_SCOPE_LABELS[scope]} subject:`));
+  // What is blocked and what is not is now stated explicitly beside this, from
+  // the same predicates the controls consult. Repeating it as prose here only
+  // gave the operator two claims to reconcile against each other.
+  return guidanceText(
+    `${listed} ${scopes.length === 1 ? "needs" : "need"} reconciliation.`,
+    evidence.filter(Boolean).join(" "),
+    "The package is being asked what became of the exact request; preserve any open draft while that settles."
+  );
+}
+
+// Every unresolved incident that names an exact request the package can be asked
+// about. The manual Reconcile controls are restricted to the four operations that
+// have an apply path; this is deliberately not, because establishing what happened
+// applies nothing and is useful for every locked scope.
+function probeableIncidents(component) {
+  return unresolvedIncidentEntries(component)
+    .filter(({ incident }) => incident && validatedClientRequestId(incident.requestId) && incident.operation);
+}
+
+// What the app has established so far, in the operator's terms. `absent` is a
+// finding and says so; only `unavailable` sends anyone to the logs.
+//
+// `absent` deliberately does not read as "so it never happened". No record can
+// mean the request never reached DSM, or that its completed job has already been
+// reaped, and those two differ in exactly the way that matters before a retry.
+const PROBE_VERDICT_COPY = Object.freeze({
+  settled: "DSM holds a completed record for this exact request.",
+  accepted: "DSM accepted this request and its job is still running.",
+  unknown: "The package recorded this request's own outcome as unknown.",
+  absent: "Neither the package queue nor Activity holds any record of this request ID. That does not confirm it never ran: a completed job's record is eventually reaped, so this stays locked.",
+  unavailable: "This check could not reach a trustworthy answer."
+});
+// Scopes whose lock exists only because the outcome was unknown. They have no
+// draft to reapply and no snapshot to match, so once the package proves what
+// became of the exact request, the premise of the lock is gone and it is
+// released. Profile and connection are absent on purpose: they have an apply
+// path, and it stays on the reviewed manual Reconcile controls.
+const SELF_RELEASING_INCIDENT_SCOPES = Object.freeze(["routine", "alerts", "security", "interface", "operations"]);
+// Cheap polling on a CPU-constrained NAS: start responsive, decay to a minute.
+const INCIDENT_PROBE_RAMP_MS = Object.freeze([2000, 5000, 10000, 20000, 30000, 60000]);
+
+// What is actually gated, derived from the same unresolved-scope predicates the
+// controls themselves consult, so the banner cannot claim availability the gates
+// do not grant. The prose it replaces asserted "unrelated controls remain
+// available" and was simply not believed.
+const INCIDENT_GATES = Object.freeze([
+  Object.freeze([INCIDENT_SCOPE_LABELS.profile, Object.freeze(["profile", "connection"])]),
+  Object.freeze([INCIDENT_SCOPE_LABELS.connection, Object.freeze(["profile", "connection"])]),
+  Object.freeze([INCIDENT_SCOPE_LABELS.routine, Object.freeze(["profile", "routine"])]),
+  Object.freeze([INCIDENT_SCOPE_LABELS.operations, Object.freeze(["profile", "operations"])]),
+  Object.freeze([INCIDENT_SCOPE_LABELS.alerts, Object.freeze(["alerts"])]),
+  Object.freeze([INCIDENT_SCOPE_LABELS.security, Object.freeze(["security"])]),
+  Object.freeze([INCIDENT_SCOPE_LABELS.interface, Object.freeze(["interface"])])
+]);
+
+function emptyIncidentProbe() {
+  return { active: false, scope: "", verdict: "", attempts: 0, checkedAt: 0, jobId: "", progress: null, message: "" };
 }
 
 function unresolvedScopeError(component, scope) {
@@ -2676,7 +2765,9 @@ export default {
       secretModes: { password: "keep", totp: "keep", remote_log_token: "keep" },
       secretValues: { password: "", totp: "", remote_log_token: "" },
       profileConnectionState: "idle", profileConnectionMessage: "Test authentication to unlock the File Station browser.", connectionProof: "", connectionProofExpires: 0, connectionProofTimer: 0, profileConnectionRequest: 0, profileConnectionAutosaveHeld: false,
-      profileSaveState: "idle", profileSaveMessage: "", profileCreationProgress: emptyProfileCreationProgress(), profileReconciliationState: "idle", pathBrowser: emptyPathBrowser(),
+      profileSaveState: "idle", profileSaveMessage: "", profileCreationProgress: emptyProfileCreationProgress(), profileReconciliationState: "idle",
+      incidentProbe: emptyIncidentProbe(), incidentProbeTimer: 0, incidentProbeStep: 0,
+      pathBrowser: emptyPathBrowser(),
       routineEditorOpen: false, routineForm: emptyRoutine(), doctorForm: { scope: "all", level: "standard", write_test: false, write_confirm: false },
       syncStatusForm: { profile: "", scope: "", filter: "", state: "attention", limit: SYNC_PAGE_SIZE_DEFAULT, include_excluded: false },
       syncStatusResult: emptySyncStatusPage(), syncStatusPhase: "idle", syncStatusMessage: SYNC_STATUS_IDLE_MESSAGE,
@@ -2741,6 +2832,33 @@ export default {
     operationOutcomeUnresolved() { return isolatedIncidentUnresolved(this, "operations"); },
     incidentOutcomeUnresolved() { return hasAnyUnresolvedIncident(this); },
     incidentGuidance() { return unresolvedIncidentGuidance(this); },
+    incidentProbeTargets() { return probeableIncidents(this); },
+    canCheckIncidentOutcomes() { return Boolean(this.incidentProbeTargets.length) && this.incidentProbe.active !== true; },
+    // The running account: how many times, when, and what the last answer was.
+    // Rendered in its own polite live region so a per-tick counter never
+    // interrupts the assertive barrier alert beside it.
+    incidentProbeAccount() {
+      if (!this.incidentProbeTargets.length) return "";
+      const probe = this.incidentProbe;
+      if (!probe.attempts) return probe.active ? "Checking with DSM now…" : "Preparing to check the preserved request with DSM…";
+      return guidanceText(
+        `${probe.active ? "Checking now" : "Still reconciling"} · checked ${probe.attempts} time${probe.attempts === 1 ? "" : "s"} · last at ${formatDate(probe.checkedAt)}.`,
+        probe.message,
+        probe.progress ? `Step ${probe.progress.step} of ${probe.progress.total}: ${probe.progress.label}.` : "",
+        probe.jobId ? `Queued job ID: ${probe.jobId}.` : ""
+      );
+    },
+    incidentScopeAvailability() {
+      const unresolved = (scope) => (scope === "connection" || scope === "operations")
+        ? isolatedIncidentUnresolved(this, scope)
+        : scopeMutationOutcomeUnresolved(this, scope);
+      const blocked = [];
+      const available = [];
+      INCIDENT_GATES.forEach(([label, scopes]) => {
+        (scopes.some(unresolved) ? blocked : available).push(label);
+      });
+      return { blocked: blocked.join(", "), available: available.join(", ") };
+    },
     profileOutcomeGuidance() { return scopeMutationGuidance(this, "profile"); },
     routineOutcomeGuidance() { return scopeMutationGuidance(this, "routine"); },
     alertsOutcomeGuidance() { return scopeMutationGuidance(this, "alerts"); },
@@ -3042,7 +3160,12 @@ export default {
     alertForm: { deep: true, handler() { this.autosaveChanged("alerts"); } },
     securityForm: { deep: true, handler() { this.autosaveChanged("security"); } },
     settings: { deep: true, handler() { this.autosaveChanged("interface"); } },
-    operationBusy(value) { if (this.autosaveCoordinator) this.autosaveCoordinator.setGlobalBusy(value === true); }
+    operationBusy(value) { if (this.autosaveCoordinator) this.autosaveCoordinator.setGlobalBusy(value === true); },
+    incidentOutcomeUnresolved(value) {
+      if (value) this.incidentProbeStep = 0;
+      else this.incidentProbe = emptyIncidentProbe();
+      this.scheduleIncidentProbe();
+    }
   },
   async mounted() {
     this.autosaveCoordinator = createAutosaveCoordinator({
@@ -3085,6 +3208,7 @@ export default {
         if (this.autosaveCoordinator) this.autosaveCoordinator.setGlobalBusy(this.operationBusy);
         this.refreshSnapshot(false);
         if (this.route === "activity") this.refreshLogs();
+        this.scheduleIncidentProbe();
       }
     };
     document.addEventListener("visibilitychange", this.visibilityHandler);
@@ -4017,6 +4141,77 @@ export default {
       }
     },
     hasCapability(name) { return this.capabilities[name] === true; },
+    // Keep looking, on a decaying interval, instead of stopping at the first
+    // recovery window. One bounded read pass per locked incident per tick, so
+    // the cost does not grow with the number of locked scopes.
+    scheduleIncidentProbe() {
+      window.clearTimeout(this.incidentProbeTimer);
+      this.incidentProbeTimer = 0;
+      if (this.disposed || document.hidden || !probeableIncidents(this).length) return;
+      const step = Math.min(this.incidentProbeStep, INCIDENT_PROBE_RAMP_MS.length - 1);
+      this.incidentProbeTimer = window.setTimeout(() => this.checkIncidentOutcomes(), INCIDENT_PROBE_RAMP_MS[step]);
+    },
+    // A scope whose lock rested only on not knowing. The package has now proved
+    // what became of the exact request, so the premise is gone with it.
+    releaseIncidentScope(scope) {
+      if (scope === "operations") return clearIsolatedIncident(this, scope);
+      if (this.autosaveFailureScopes) this.autosaveFailureScopes[scope] = false;
+      if (this.autosaveOutcomeUnknownScopes) this.autosaveOutcomeUnknownScopes[scope] = false;
+      if (this.autosaveInspectionScopes) this.autosaveInspectionScopes[scope] = false;
+      clearScopeIncident(this, scope);
+      this.refreshAutosaveStatus();
+    },
+    // Ask the package what became of every locked request. Applies nothing, and
+    // releases a lock only where the verdict disproves the premise it rests on:
+    // this replaces "we stopped looking" with what is actually knowable now.
+    async checkIncidentOutcomes(manual = false) {
+      if (this.disposed || this.incidentProbe.active) return;
+      const targets = probeableIncidents(this);
+      if (!targets.length) return this.scheduleIncidentProbe();
+      if (manual) this.incidentProbeStep = 0;
+      this.incidentProbe = { ...this.incidentProbe, active: true };
+      const released = [];
+      try {
+        for (const { scope, incident } of targets) {
+          let observed = null;
+          try {
+            observed = await probeRequestOutcome(this.auth, incident.requestId, incident.operation, AUTOSAVE_API_LIMITS);
+          } catch (_error) {
+            observed = null;
+          }
+          if (this.disposed) return;
+          const verdict = observed && PROBE_VERDICT_COPY[observed.verdict] ? observed.verdict : "unavailable";
+          this.incidentProbe = {
+            active: true,
+            scope,
+            verdict,
+            attempts: this.incidentProbe.attempts + 1,
+            checkedAt: (observed && observed.checked_at) || Date.now(),
+            jobId: (observed && observed.job_id) || "",
+            progress: (observed && observed.progress) || null,
+            message: PROBE_VERDICT_COPY[verdict]
+          };
+          if (verdict === "settled" && SELF_RELEASING_INCIDENT_SCOPES.includes(scope)) released.push(scope);
+        }
+      } finally {
+        if (!this.disposed) this.incidentProbe = { ...this.incidentProbe, active: false };
+      }
+      if (this.disposed) return;
+      this.incidentProbeStep += 1;
+      if (released.length) {
+        released.forEach((scope) => this.releaseIncidentScope(scope));
+        this.toast(
+          "Outcome established",
+          guidanceText(
+            `DSM holds a completed record for the preserved request, so ${released.map((scope) => INCIDENT_SCOPE_LABELS[scope]).join(" and ")} ${released.length === 1 ? "is" : "are"} unlocked.`,
+            "No new request was submitted. Review the refreshed state before repeating the change."
+          )
+        );
+        await this.refreshSnapshot(false, true);
+        if (this.disposed) return;
+      }
+      this.scheduleIncidentProbe();
+    },
     integer(value, fallback) { const parsed = Number(value); return Number.isInteger(parsed) ? parsed : fallback; },
     between(value, minimum, maximum) { const parsed = Number(value); return Number.isInteger(parsed) && parsed >= minimum && parsed <= maximum; },
     toast(title, message, error = false) { if (this.disposed) return; const item = { id: ++this.toastSequence, title, message, error }; this.toasts.push(item); const timer = window.setTimeout(() => { if (this.disposed) return; const index = this.toasts.findIndex((candidate) => candidate.id === item.id); if (index >= 0) this.toasts.splice(index, 1); this.toastTimers = this.toastTimers.filter((candidate) => candidate !== timer); }, 6000); this.toastTimers.push(timer); },
@@ -4043,7 +4238,7 @@ export default {
       this.profileSaveMessage = `Step ${boundedCurrent} of ${boundedTotal}: ${stageMessage} ${PROFILE_CREATION_WINDOW_WARNING}`;
     },
     clearProfileCreationProgress() { this.profileCreationProgress = emptyProfileCreationProgress(); },
-    stopTimers() { window.clearTimeout(this.snapshotTimer); window.clearTimeout(this.logTimer); this.snapshotTimer = 0; this.logTimer = 0; },
+    stopTimers() { window.clearTimeout(this.snapshotTimer); window.clearTimeout(this.logTimer); window.clearTimeout(this.incidentProbeTimer); this.snapshotTimer = 0; this.logTimer = 0; this.incidentProbeTimer = 0; },
     scheduleSnapshot() { window.clearTimeout(this.snapshotTimer); this.snapshotTimer = 0; const interval = Number(this.settings.status_refresh); if (interval > 0 && !this.disposed && !document.hidden && !this.snapshotRefreshBlocked) this.snapshotTimer = window.setTimeout(() => this.refreshSnapshot(false), interval); },
     scheduleLogs() { window.clearTimeout(this.logTimer); this.logTimer = 0; const interval = Number(this.settings.log_refresh); if (interval > 0 && !this.disposed && !document.hidden && this.route === "activity" && !this.logsPaused) this.logTimer = window.setTimeout(() => this.refreshLogs(), interval); },
     async refreshCsrf(options = undefined) { if (this.disposed) return; this.csrfToken = ""; const model = await apiGet(this.auth, "csrf", {}, options); if (this.disposed) return; if (typeof model.csrf_token !== "string" || !model.csrf_token || model.csrf_token.length > 4096) throw new Error("Authenticated bridge did not issue a valid CSRF token"); this.csrfToken = model.csrf_token; },

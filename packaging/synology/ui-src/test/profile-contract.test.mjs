@@ -30,7 +30,7 @@ function loadAppComponent(postSpy = async () => ({ ok: true })) {
     AUTOSAVE_API_LIMITS: Object.freeze({}),
     MAX_RESPONSE_BYTES: 1024 * 1024,
     SNAPSHOT_SCHEMA: "sdsync.dsm-api.v1",
-    apiGet: async () => ({}), apiPost: postSpy,
+    apiGet: async () => ({}), apiPost: postSpy, probeRequestOutcome: async () => ({}),
     arrayOf: (value) => Array.isArray(value) ? value : [],
     boundedText: (value, fallback = "") => String(typeof value === "string" && value ? value : fallback).slice(0, 65536),
     formatBytes: String, formatDate: String, formatDuration: String,

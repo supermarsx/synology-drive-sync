@@ -60,6 +60,7 @@ function loadAppComponent({
     SNAPSHOT_SCHEMA: "sdsync.dsm-api.v1",
     apiGet: get,
     apiPost: post,
+    probeRequestOutcome: async () => ({}),
     purgeReconciliationAuth: () => undefined,
     reconcileMutationRequest: reconcile,
     arrayOf: (value) => Array.isArray(value) ? value : [],

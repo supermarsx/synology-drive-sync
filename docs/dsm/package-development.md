@@ -212,6 +212,33 @@ claimed bit-for-bit reproducible across different compiler/linker/runner images.
   exact package-UID peer checks, private FHS behavior,
   icons, exact outer/installed license texts, and installed size.
 
+### Region-scoped checks in `src/api.js`
+
+Several validator checks do not search the whole file — they slice a region between two anchors and
+assert against that slice. Editing near an anchor, or appending to the file, can therefore fail a
+check that names a contract you did not think you were touching.
+
+The one that bites hardest: the POST contract region is
+`source[find("export async function apiPost(") : EOF]`, and it requires **exactly one**
+`await ensureDsmToken();` in that slice. Appending any new function that bootstraps a DSM token at
+the end of the file fails `validate_spk.py:736` with *"native DSM POST requests must await the shared
+DSM token bootstrap"* — an error that names the POST bridge rather than the function you just added.
+`probeRequestOutcome` is placed between `csrfForCurrentAuthGeneration` and `apiPost` for exactly this
+reason.
+
+The other bounded regions, for the same reason:
+
+| Region | Slice | Notable rule |
+| --- | --- | --- |
+| GET bridge | `apiGet(` → `\nfunction delay(` | exactly one `await ensureDsmToken();` |
+| POST bridge | `apiPost(` → end of file | exactly one `await ensureDsmToken();` |
+| Request reconciliation | `exactRequestStatusKeys(` → `\nasync function csrfForCurrentAuthGeneration(` | exactly one `"request-status"` literal; no `fetch(API_URL` or `apiPost(` |
+| Manual reconciliation (`App.vue`) | `async reconcileProfileIncident(event) {` → `\n    hasCapability(name)` | exact marker *counts* of 2; no `apiPost(` |
+
+The App.vue region pins counts rather than presence, so adding a third method between those two
+anchors that mentions `reconcileMutationRequest(` fails the correlation check. New methods belong
+after `hasCapability(name)`.
+
 Source-only validation:
 
 ```bash

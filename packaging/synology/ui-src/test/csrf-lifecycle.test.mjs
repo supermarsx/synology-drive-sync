@@ -55,6 +55,7 @@ async function loadAppComponent(postSpy, getSpy) {
     MAX_RESPONSE_BYTES: 1024 * 1024,
     SNAPSHOT_SCHEMA: "sdsync.dsm-api.v1",
     apiGet: getSpy,
+    probeRequestOutcome: async () => ({}),
     apiPost: postSpy,
     arrayOf: (value) => Array.isArray(value) ? value : [],
     boundedText: (value, fallback = "") => String(typeof value === "string" && value ? value : fallback).slice(0, 65536),
