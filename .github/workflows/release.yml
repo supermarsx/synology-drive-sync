@@ -145,8 +145,15 @@ jobs:
 
           release_pages="$RUNNER_TEMP/sdsync-release-pages.json"
           release_index="$RUNNER_TEMP/sdsync-release-index.json"
-          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            > "$release_pages"
+          # A plain read of the release list has returned HTTP 403 'Resource not
+          # accessible by integration' transiently, failing a release that then
+          # succeeded unchanged minutes later. Retry the read; a genuine
+          # permission failure still fails after three attempts.
+          for attempt in 1 2 3; do
+            if gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$release_pages"; then break; fi
+            [ "$attempt" -lt 3 ] || { echo "listing releases failed after 3 attempts" >&2; exit 1; }
+            sleep $((attempt * 10))
+          done
           jq -s 'add // []' "$release_pages" > "$release_index"
 
           # Normalize git state once, then make every calendar-tag and stale-run
@@ -1278,8 +1285,15 @@ jobs:
           # conflicting tags and already-published immutable state.
           release_pages="$RUNNER_TEMP/sdsync-stage-release-pages.json"
           release_index="$RUNNER_TEMP/sdsync-stage-release-index.json"
-          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            > "$release_pages"
+          # A plain read of the release list has returned HTTP 403 'Resource not
+          # accessible by integration' transiently, failing a release that then
+          # succeeded unchanged minutes later. Retry the read; a genuine
+          # permission failure still fails after three attempts.
+          for attempt in 1 2 3; do
+            if gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$release_pages"; then break; fi
+            [ "$attempt" -lt 3 ] || { echo "listing releases failed after 3 attempts" >&2; exit 1; }
+            sleep $((attempt * 10))
+          done
           jq -s 'add // []' "$release_pages" > "$release_index"
 
           tag_sha_json=null
@@ -1491,8 +1505,15 @@ jobs:
           max_visibility_attempts=6
           visibility_delay_seconds=1
           for visibility_attempt in $(seq 1 "$max_visibility_attempts"); do
-            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-              > "$release_pages"
+            # A plain read of the release list has returned HTTP 403 'Resource not
+            # accessible by integration' transiently, failing a release that then
+            # succeeded unchanged minutes later. Retry the read; a genuine
+            # permission failure still fails after three attempts.
+            for attempt in 1 2 3; do
+              if gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$release_pages"; then break; fi
+              [ "$attempt" -lt 3 ] || { echo "listing releases failed after 3 attempts" >&2; exit 1; }
+              sleep $((attempt * 10))
+            done
             jq -s 'add // []' "$release_pages" > "$release_index"
 
             if ! jq -e --argjson id "$release_id" \
@@ -1652,8 +1673,15 @@ jobs:
           git fetch --force --tags origin
           release_pages="$RUNNER_TEMP/sdsync-final-pages.json"
           release_index="$RUNNER_TEMP/sdsync-final-index.json"
-          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            > "$release_pages"
+          # A plain read of the release list has returned HTTP 403 'Resource not
+          # accessible by integration' transiently, failing a release that then
+          # succeeded unchanged minutes later. Retry the read; a genuine
+          # permission failure still fails after three attempts.
+          for attempt in 1 2 3; do
+            if gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$release_pages"; then break; fi
+            [ "$attempt" -lt 3 ] || { echo "listing releases failed after 3 attempts" >&2; exit 1; }
+            sleep $((attempt * 10))
+          done
           jq -s 'add // []' "$release_pages" > "$release_index"
           tag_sha_json=null
           if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
