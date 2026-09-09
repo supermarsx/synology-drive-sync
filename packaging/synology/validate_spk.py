@@ -984,6 +984,13 @@ def validate_native_api_source(payload: bytes) -> None:
         'model.state === "unresolved"',
         '["request_id", "schema", "state"]',
         '["job_id", "operation", "request_id", "schema", "state"]',
+        # A pending job publishes bounded progress as exactly one additional
+        # key. Both document shapes are enumerated so an unreviewed seventh key
+        # still fails closed; this must never become a tolerated-extras check.
+        "function trustedRequestProgress(value)",
+        '["label", "step", "total", "updated_at"]',
+        'model.progress === undefined ? identityKeys : identityKeys.concat("progress")',
+        'model.progress !== undefined && (!progress || model.state !== "pending")',
         "model.operation !== expectedOperation",
         "const attempt = linkedAbortAttempt(auth && auth.signal);",
         '"request-status",\n        { request_id: requestId },',
@@ -1014,6 +1021,18 @@ def validate_native_api_source(payload: bytes) -> None:
         raise ValidationError(
             "native DSM request reconciliation must be a single authenticated read path"
         )
+    # Progress is advisory and pending-only. A status document carrying it must
+    # still be rejected unless every progress field validates, so the key cannot
+    # become a way to smuggle unvalidated content past the contract.
+    for forbidden in (
+        "Object.keys(model).length >= 5",
+        "delete model.progress",
+        "...identityKeys, ...Object.keys(model)",
+    ):
+        if forbidden in request_status_source:
+            raise ValidationError(
+                "native DSM request status must enumerate both document shapes exactly"
+            )
 
     post_start = source.find("export async function apiPost(")
     post_source = source[post_start:] if post_start >= 0 else ""
