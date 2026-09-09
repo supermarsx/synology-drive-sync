@@ -810,6 +810,11 @@ jobs:
       - name: Install native musl toolchain
         if: matrix.cross_compile != true
         run: |
+          # GitHub's runner image pre-configures third-party apt repositories we
+          # do not use. A hash-sum mismatch in one of them fails `apt-get update`
+          # outright and has already broken a release build, so drop them: the
+          # only package needed here is musl-tools from Ubuntu's own archive.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.* /etc/apt/sources.list.d/microsoft-prod.*
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes musl-tools
       - name: Build native DSM-portable static binary
