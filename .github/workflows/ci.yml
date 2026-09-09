@@ -291,7 +291,12 @@ jobs:
           QEMU_IMAGE: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
         run: |
           set -euo pipefail
-          container=$(docker create "$QEMU_IMAGE")
+          container=""
+          for attempt in 1 2 3; do
+            if container=$(docker create "$QEMU_IMAGE"); then break; fi
+            [ "$attempt" -lt 3 ] || { echo "docker create failed after 3 attempts" >&2; exit 1; }
+            sleep $((attempt * 5))
+          done
           cleanup() {
             docker rm --force "$container" >/dev/null 2>&1 || true
           }
@@ -307,7 +312,7 @@ jobs:
           # outright and has already broken a release build, so drop them: the
           # only package needed here is musl-tools from Ubuntu's own archive.
           sudo rm -f /etc/apt/sources.list.d/google-chrome.* /etc/apt/sources.list.d/microsoft-prod.*
-          sudo apt-get update
+          sudo apt-get -o Acquire::Retries=3 update
           sudo apt-get install --no-install-recommends --yes musl-tools
       - name: Build native DSM-portable static binary
         if: matrix.cross_compile != true
