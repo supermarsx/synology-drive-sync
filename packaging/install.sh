@@ -220,6 +220,8 @@ while read -r member; do
         "$archive_root/man/synology-drive-sync-doctor-target.1"|\
         "$archive_root/man/synology-drive-sync-manpage.1"|\
         "$archive_root/man/synology-drive-sync-plan.1"|\
+        "$archive_root/man/synology-drive-sync-resync.1"|\
+        "$archive_root/man/synology-drive-sync-status.1"|\
         "$archive_root/man/synology-drive-sync-sync.1"|\
         "$archive_root/man/synology-drive-sync.1")
             ;;
