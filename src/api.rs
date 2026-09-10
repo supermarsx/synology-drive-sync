@@ -5166,6 +5166,7 @@ impl ProbeLocalFile {
                     kind: EntryKind::File,
                     size: metadata.len(),
                     mtime_ms,
+                    identity: crate::local::file_identity(&metadata),
                     content_md5: Some(content_md5),
                 },
             });
@@ -9228,6 +9229,7 @@ mod tests {
             kind: EntryKind::File,
             size: metadata.len(),
             mtime_ms,
+            identity: Default::default(),
             content_md5: Some(ContentMd5::from_content(payload)),
         };
         client
@@ -9350,6 +9352,7 @@ mod tests {
                     .as_millis(),
             )
             .unwrap(),
+            identity: Default::default(),
             content_md5: Some(ContentMd5::from_content(b"abc")),
         };
         client.upload(&local, "/share/root/abc.bin").unwrap();
@@ -9945,6 +9948,7 @@ mod tests {
             kind: EntryKind::File,
             size: 3,
             mtime_ms: 0,
+            identity: Default::default(),
             content_md5: None,
         };
         let error = client
@@ -9975,6 +9979,7 @@ mod tests {
             kind: EntryKind::File,
             size: metadata.len() + 1,
             mtime_ms,
+            identity: Default::default(),
             content_md5: None,
         };
         assert!(matches!(
@@ -9989,6 +9994,7 @@ mod tests {
             kind: EntryKind::File,
             size: metadata.len(),
             mtime_ms,
+            identity: Default::default(),
             content_md5: Some(ContentMd5::from_bytes([0_u8; 16])),
         };
         assert!(matches!(
@@ -10002,6 +10008,7 @@ mod tests {
             kind: EntryKind::File,
             size: metadata.len(),
             mtime_ms,
+            identity: Default::default(),
             content_md5: Some(ContentMd5::from_content(b"payload")),
         };
         client
@@ -10586,6 +10593,7 @@ mod tests {
                     .as_millis(),
             )
             .unwrap(),
+            identity: Default::default(),
             content_md5: Some(ContentMd5::from_content(contents)),
         };
         (path, entry)

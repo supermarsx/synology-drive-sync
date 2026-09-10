@@ -3307,6 +3307,14 @@ api_sync_status() {
     set -- "$@" --limit "$status_limit"
     [ -z "$status_cursor" ] || set -- "$@" --cursor "$status_cursor"
     [ "$status_excluded" = false ] || set -- "$@" --include-excluded
+    # Always on for the dashboard. The view exists to answer "what needs my
+    # attention" without re-reading every byte and re-asking File Station for
+    # every MD5, and a cache the operator must discover a flag to enable would
+    # not do that. It is safe to have on: no path that uploads, deletes, or
+    # server-copies reads it, stored evidence expires, a sample of it is
+    # re-verified live on every pass, and the answer reports the age of the
+    # oldest evidence it rests on.
+    set -- "$@" --status-cache "$status_cache_dir"
     api_query_capture "$@"
     [ "$query_exit" -eq 0 ] || api_query_failed sync-status "$status_profile"
     # The standard queued-result envelope, not a read schema: a status query

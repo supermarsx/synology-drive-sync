@@ -153,6 +153,7 @@ try {
         "$archiveRoot/man/synology-drive-sync-plan.1",
         "$archiveRoot/man/synology-drive-sync-resync.1",
         "$archiveRoot/man/synology-drive-sync-status.1",
+        "$archiveRoot/man/synology-drive-sync-status-rollup.1",
         "$archiveRoot/man/synology-drive-sync-sync.1",
         "$archiveRoot/man/synology-drive-sync.1"
     )) {

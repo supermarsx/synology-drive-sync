@@ -28,3 +28,4 @@ compose*.yaml text eol=lf
 *.config text eol=lf
 *.conf text eol=lf
 packaging/synology/package/ui/texts/**/strings text eol=lf
+*.ps1 text eol=lf

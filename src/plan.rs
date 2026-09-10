@@ -1216,6 +1216,14 @@ pub struct StatusStats {
 }
 
 impl StatusStats {
+    /// Zeroed totals for `compare`.
+    ///
+    /// Public so a consumer that persists or renders these can construct the same shape the engine
+    /// produces, rather than inventing a parallel one whose fields could drift from these.
+    pub fn empty(compare: CompareMode) -> Self {
+        Self::new(compare)
+    }
+
     fn new(compare: CompareMode) -> Self {
         Self {
             compare,
@@ -1534,6 +1542,7 @@ mod tests {
                             kind: *kind,
                             size: *size,
                             mtime_ms: *mtime_ms,
+                            identity: Default::default(),
                             content_md5: None,
                         },
                     )
@@ -2455,6 +2464,7 @@ mod status_tests {
                             kind: *kind,
                             size: *size,
                             mtime_ms: *mtime_ms,
+                            identity: Default::default(),
                             content_md5: None,
                         },
                     )
@@ -2619,6 +2629,7 @@ mod status_tests {
             kind: EntryKind::File,
             size: 10,
             mtime_ms: 5_000,
+            identity: Default::default(),
             content_md5: None,
         };
         let identical_remote = RemoteEntry {
@@ -3331,6 +3342,7 @@ mod scoped_deletion_tests {
                             kind: *kind,
                             size: *size,
                             mtime_ms: *mtime_ms,
+                            identity: Default::default(),
                             content_md5: None,
                         },
                     )
@@ -3506,6 +3518,7 @@ mod resync_ticket_tests {
                 kind: EntryKind::File,
                 size,
                 mtime_ms: 1_000,
+                identity: Default::default(),
                 content_md5: None,
             },
             remote_path: format!("/share/root/{relative}"),

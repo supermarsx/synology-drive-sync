@@ -35,9 +35,21 @@ const PLAN_LONG_ABOUT: &str = "Discover and authenticate to File Station, scan b
 
 const PLAN_EXAMPLES: &str = "Examples:\n  synology-drive-sync plan ./export /team/export --profile nas\n  synology-drive-sync plan --profile production --delete --output json\n  synology-drive-sync plan ./export /team/export --compare size-only --exclude '*.tmp' --output ndjson\n  synology-drive-sync plan --profile production --exit-code || test $? -eq 10";
 
-const STATUS_LONG_ABOUT: &str = "Report the synchronization state of each entry under a folder, or of one single file, by comparing live local and remote state. Nothing is written and no index is kept: the answer is rebuilt from both sides on every invocation, so it can never be stale, and repeating a query re-scans.\n\nEach entry is reported as in sync, differing (with the comparison that decided it), missing remotely, remote-only, a local/remote type conflict, or excluded from synchronization. Comparison uses the same code path as `plan` and `sync`, so a status row cannot disagree with what a sync would do.\n\nResults are paginated and a page can never exceed 200 entries. Use --cursor with the value printed as the next cursor to continue. Totals always describe the whole scope, not the returned page, so a filtered listing still reports honest counts.\n\nThis command never modifies the NAS and cannot force an upload.";
+const STATUS_LONG_ABOUT: &str = "Report the synchronization state of each entry under a folder, or of one single file, by comparing live local and remote state. Both trees are walked on every invocation, so which entries exist, and their sizes and modification times, are always read fresh.\n\nEach entry is reported as in sync, differing (with the comparison that decided it), missing remotely, remote-only, a local/remote type conflict, or excluded from synchronization. Comparison uses the same code path as `plan` and `sync`, so a status row cannot disagree with what a sync would do.\n\nBy default nothing is stored and every content digest is recomputed. With --status-cache, digests for files whose size, modification time, and filesystem identity are unchanged are reused instead of re-read, and the answer reports how much of it rested on stored evidence and how old the oldest of that evidence is. Deleting the cache directory is always safe and only ever costs time.\n\nResults are paginated and a page can never exceed 200 entries. Use --cursor with the value printed as the next cursor to continue. Totals always describe the whole scope, not the returned page, so a filtered listing still reports honest counts.\n\nThis command never modifies the NAS and cannot force an upload.";
 
 const STATUS_EXAMPLES: &str = "Examples:\n  synology-drive-sync status --profile nas --state attention\n  synology-drive-sync status ./export /team/export --scope reports/q3\n  synology-drive-sync status --profile nas --scope reports/q3/summary.pdf --output json\n  synology-drive-sync status --profile nas --filter invoice --state differs --limit 50\n  synology-drive-sync status --profile nas --all --cursor 'reports/q3/summary.pdf' --output ndjson";
+
+const STATUS_ROLLUP_LONG_ABOUT: &str = "Print the totals recorded by the most recent full `status` pass for each profile, and their combination, reading only the small rollup documents in the status cache directory.
+
+This scans nothing. It walks no local directory, contacts no NAS, and reads no content digest, so it costs one small file read per profile however large the trees are. That is what makes it suitable for a dashboard or a widget polling on a short interval.
+
+The figures are therefore as old as the pass that produced them, and every one of them is reported with the timestamp it was observed at. A profile that has never been observed is named rather than counted as zero, and makes the combined total incomplete: contributing zero would understate what is still pending. When a walk was stopped by its scan budget, the combined total is likewise incomplete and every count in it is a lower bound.
+
+When two profiles cover overlapping trees a combined total would count the same files more than once, so it is withheld and the reason is stated. Pass --profiles with the profiles you expect so that a missing one can be detected; without it, the result is explicitly not complete, because a total cannot be complete over a set nobody has stated.";
+
+const STATUS_ROLLUP_EXAMPLES: &str = "Examples:
+  synology-drive-sync status-rollup --status-cache /var/packages/synology-drive-sync/var/state/cache/status
+  synology-drive-sync status-rollup --status-cache ./cache --profiles photos,documents --output json";
 
 const RESYNC_LONG_ABOUT: &str = "Re-upload files without comparing them, replacing the remote copy whatever it currently holds. This is the only command that overwrites remote content that may be identical, or newer, than the local file. It never deletes: removing remote-only entries remains a separate `sync --delete` decision.\n\nIt runs in two steps and cannot be collapsed into one. Without --confirm the command only plans: it lists every file it would overwrite, totals the bytes, changes nothing on the NAS, and prints a ticket. Passing that ticket back as --confirm performs the upload.\n\nThe ticket is derived from the exact set of files and bytes you were shown, so confirming proves that set was seen rather than merely that the command was rerun. If the source or destination changed in between, the ticket no longer matches: the command refuses, then immediately prints the new overwrite list and a new ticket in the same output, so a changing NAS never becomes a loop. The ticket carries no clock and does not expire; only a change to what would be overwritten invalidates it.\n\nUse --scope to re-upload one folder or one single file rather than everything.";
 
@@ -123,6 +135,7 @@ impl Cli {
             },
             Some(Command::Plan(arguments)) => Invocation::Plan(arguments),
             Some(Command::Status(arguments)) => Invocation::Status(arguments),
+            Some(Command::StatusRollup(arguments)) => Invocation::StatusRollup(arguments),
             Some(Command::Resync(arguments)) => Invocation::Resync(arguments),
             Some(Command::Doctor(arguments)) => Invocation::Doctor(arguments),
             Some(Command::Config(arguments)) => Invocation::Config(arguments),
@@ -157,6 +170,7 @@ pub enum Invocation<'a> {
     },
     Plan(&'a PlanArgs),
     Status(&'a StatusArgs),
+    StatusRollup(&'a StatusRollupArgs),
     Resync(&'a ResyncArgs),
     Doctor(&'a DoctorArgs),
     Config(&'a ConfigArgs),
@@ -178,6 +192,10 @@ pub enum Command {
     /// List the per-file sync state of a folder or a single file.
     #[command(long_about = STATUS_LONG_ABOUT, after_help = STATUS_EXAMPLES)]
     Status(StatusArgs),
+
+    /// Print the stored sync-status totals, per profile and combined, without scanning anything.
+    #[command(name = "status-rollup", long_about = STATUS_ROLLUP_LONG_ABOUT, after_help = STATUS_ROLLUP_EXAMPLES)]
+    StatusRollup(StatusRollupArgs),
 
     /// Re-upload files without comparing them, in two steps: plan, then confirm.
     #[command(long_about = RESYNC_LONG_ABOUT, after_help = RESYNC_EXAMPLES)]
@@ -284,6 +302,70 @@ pub struct StatusArgs {
     /// Include entries excluded by ignore rules or as DSM-managed.
     #[arg(long, help_heading = "Status")]
     pub include_excluded: bool,
+
+    /// Reuse content digests stored in this directory instead of recomputing them.
+    #[arg(
+        long = "status-cache",
+        value_name = "DIR",
+        env = "SDSYNC_STATUS_CACHE_DIR",
+        help_heading = "Status",
+        long_help = "Reuse content digests stored under DIR for files whose size, modification time, and filesystem identity are unchanged, instead of re-reading every byte and asking File Station to recompute every server-side MD5.\n\nThis is a cache, not a record: deleting DIR is always safe and costs only time. No path that deletes, uploads, or server-copies ever reads it, so a stale entry can make a status listing late, never a synchronization wrong. The reported staleness is the age of the oldest evidence any answer rests on.\n\nThe directory must be private -- it is trusted input, so it is refused if it grants write access to group or other. Absent, nothing is stored or read and status behaves exactly as it did before this option existed."
+    )]
+    pub status_cache: Option<PathBuf>,
+
+    /// Ignore stored digests, recompute from live evidence, and rewrite the cache.
+    #[arg(
+        long = "status-cache-refresh",
+        env = "SDSYNC_STATUS_CACHE_REFRESH",
+        help_heading = "Status",
+        long_help = "Ignore every stored digest, recompute the answer from live evidence, and rewrite the cache with what this run observed. This is what a refresh control should invoke. Without --status-cache it does nothing, because there is no cache to ignore."
+    )]
+    pub status_cache_refresh: bool,
+
+    /// Treat stored digests older than this many days as absent.
+    #[arg(
+        long = "status-cache-max-age",
+        value_name = "DAYS",
+        env = "SDSYNC_STATUS_CACHE_MAX_AGE",
+        value_parser = clap::value_parser!(u16).range(1..=3650),
+        help_heading = "Status",
+        long_help = "Treat a stored digest older than DAYS as absent, so a tree that never changes is still verified end to end on a bounded cadence. A scheduled synchronization refreshes evidence long before this matters; it is the backstop for a destination that is only synchronized on demand."
+    )]
+    pub status_cache_max_age: Option<u16>,
+
+    /// Re-verify this many cached entries against live evidence on each run.
+    #[arg(
+        long = "status-cache-canary",
+        value_name = "N",
+        env = "SDSYNC_STATUS_CACHE_CANARY",
+        value_parser = clap::value_parser!(u16).range(0..=1000),
+        help_heading = "Status",
+        long_help = "Withhold N cached entries from reuse each run and recompute them live, then compare. This is a detector for systematic cache error, not a sweep: a single disagreement discards the entire cache and recomputes the whole answer, because one wrong entry is evidence about the file rather than about that entry. Set 0 to disable, at the cost of a cache that can be broadly wrong with nothing noticing."
+    )]
+    pub status_cache_canary: Option<u16>,
+}
+
+/// Inputs to one stored-totals read. Deliberately tiny: this command touches nothing else.
+#[derive(Debug, Args)]
+pub struct StatusRollupArgs {
+    /// Read the rollup documents stored under this directory.
+    #[arg(
+        long = "status-cache",
+        value_name = "DIR",
+        env = "SDSYNC_STATUS_CACHE_DIR",
+        help_heading = "Status"
+    )]
+    pub status_cache: PathBuf,
+
+    /// The profiles expected to be present, comma-separated.
+    #[arg(
+        long,
+        value_name = "NAMES",
+        value_delimiter = ',',
+        help_heading = "Status",
+        long_help = "The profiles that ought to have been observed, comma-separated. A named profile with no stored totals is reported as never observed and makes the combined total incomplete, rather than contributing zero and understating what is pending. Without this the result is explicitly incomplete, because a total cannot be complete over a set nobody has stated."
+    )]
+    pub profiles: Vec<String>,
 }
 
 #[derive(Debug, Args)]

@@ -28,6 +28,48 @@ impl EntryKind {
     }
 }
 
+/// Filesystem identity of a scanned entry, where the platform exposes one.
+///
+/// Captured during the walk because the walk already holds the [`fs::Metadata`] it comes from.
+/// Obtaining it later would mean a second stat of every entry, which is a cost comparable to the
+/// walk itself — and on the armv7 target that cost is the thing the status cache exists to avoid.
+///
+/// [`Self::is_known`] is false where nothing is exposed, and two unknown identities comparing equal
+/// establishes nothing. Consumers guard against that by never comparing identities across
+/// platforms; the status cache records the platform it was written on and refuses a file from
+/// another.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FileIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+impl FileIdentity {
+    pub fn is_known(self) -> bool {
+        self != Self::default()
+    }
+}
+
+/// Read the filesystem identity out of metadata the caller already holds.
+///
+/// Unix only. Windows exposes a volume serial and file index, but only when the metadata came from
+/// an open handle rather than a path stat, so a scan built on `symlink_metadata` would silently get
+/// nothing for most entries — an identity that is sometimes present is worse than one that is
+/// consistently absent, because only the second is safe to reason about.
+#[cfg(unix)]
+pub fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt as _;
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn file_identity(_metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity::default()
+}
+
 #[derive(Clone, Debug)]
 pub struct LocalEntry {
     pub relative: String,
@@ -35,6 +77,9 @@ pub struct LocalEntry {
     pub kind: EntryKind,
     pub size: u64,
     pub mtime_ms: i64,
+    /// Device and inode, where the platform exposes them. Default elsewhere, and default for
+    /// directories, which are never content-compared.
+    pub identity: FileIdentity,
     pub content_md5: Option<ContentMd5>,
 }
 
@@ -323,6 +368,24 @@ pub fn populate_content_md5(
 /// until the plan is built -- and is completed by [`promote_to_full_fingerprint`]. Leaving it
 /// undone is not a silent downgrade but a loud one: `full_match` returns `None` without strong
 /// digests on both sides, and the upload verification in `api` treats that as a mismatch.
+/// An entry that already carries a digest is left alone, and that is the hook the status digest
+/// cache hangs on: it fills `content_md5` for files it can prove are unchanged, and those files are
+/// then not re-read here.
+///
+/// Signalling through the field rather than through an explicit set of paths is a memory decision,
+/// not a stylistic one. A set naming the supplied paths would hold every path a third time —
+/// roughly 5 MB at the scan budget — on top of the two inventories that `tests/scan_memory.rs`
+/// pins at 27 MiB of a 32 MiB ceiling, and would breach it on the armv7 target the cache exists to
+/// help. The field already carries the information; a second copy of it is what does not fit.
+///
+/// Skipping is only safe because of what the supplier proved before filling the field: that the
+/// file's size, modification time and filesystem identity are unchanged since the digest was taken.
+/// That is the same evidence [`verify_metadata_snapshot`] accepts as proof a file did not change
+/// underneath a read — held across runs rather than across one read, which is the whole of the
+/// difference, and the reason no mutation path may fill this field from stored evidence.
+///
+/// Every caller other than the cache passes a freshly scanned inventory, where every digest is
+/// `None`, so for them this is exactly what it always was.
 pub fn populate_content_md5_selective(
     inventory: &mut LocalInventory,
     comparison: &BTreeSet<String>,
@@ -331,6 +394,9 @@ pub fn populate_content_md5_selective(
     for (relative, entry) in inventory.entries.iter_mut() {
         cancellation.check()?;
         if entry.kind != EntryKind::File {
+            continue;
+        }
+        if entry.content_md5.is_some() {
             continue;
         }
         entry.content_md5 = Some(if comparison.contains(relative) {
@@ -584,6 +650,7 @@ fn scan_dir(
                     kind: EntryKind::Directory,
                     size: 0,
                     mtime_ms: 0,
+                    identity: FileIdentity::default(),
                     content_md5: None,
                 },
                 context.budget,
@@ -624,6 +691,7 @@ fn scan_dir(
                         kind: EntryKind::File,
                         size: metadata.len(),
                         mtime_ms,
+                        identity: file_identity(&metadata),
                         content_md5: None,
                     },
                     context.budget,

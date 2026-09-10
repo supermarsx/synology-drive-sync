@@ -12,27 +12,37 @@
 //!
 //! # What the bytes are made of
 //!
-//! Measured for a 99-byte relative path, per local+remote entry pair. Windows and Linux/glibc
-//! agree to within 1% (1,350 and 1,336), so the figure is the data structures, not the allocator.
+//! Measured for a 99-byte relative path, per local+remote entry pair. Windows and Linux/glibc agree
+//! to within 1% (**1,466** and **1,451**), so the figure is the data structures, not the allocator.
+//! It projects to 27 MiB of the 32 MiB ceiling at the shipped budget.
+//!
+//! The itemised breakdown that used to live here totalled 1,336 and is **not** re-derived below,
+//! because it no longer adds up and re-deriving it honestly means attributing every struct change
+//! since it was written. What is known, measured rather than reasoned:
 //!
 //! ```text
-//! BTreeMap keys, both maps      464   the path again as a key, plus node storage
-//! LocalEntry::full_path         133   derivable from LocalInventory::root + relative
-//! RemoteEntry::remote_path      112   derivable from RemoteRoot + relative
-//!                             -----
-//! derivable or duplicated       709   53% of the total
-//! irreducible remainder         627   struct bodies, node overhead, the path stored once
-//!                             -----
-//! per pair                     1336
+//! LocalEntry::identity            30   FileIdentity, added for the status digest cache
+//! everything else              1,436   including ~100 unattributed to any itemised line
+//!                             ------
+//! per pair                     1,466
 //! ```
 //!
-//! Two consequences worth knowing before retuning:
+//! The `identity` figure was obtained by substitution — measuring with the field shrunk to two
+//! bytes and differencing — so it is evidence, not arithmetic. Note the ~2x amplification it shows:
+//! a 16-byte struct field costs about 30 bytes per entry because a `BTreeMap` node reserves value
+//! slots for 11 entries whether or not it holds 11. Anyone adding a field here should expect to pay
+//! roughly double what `size_of` suggests.
+//!
+//! Three consequences worth knowing before retuning:
 //!
 //! - The path text is held six times per pair (key, `relative`, and a derived absolute path, on
 //!   each side) for one logical path. That is where a compact representation would win.
-//! - Cost tracks path length, so "entries" is not a fixed amount of memory: the same count of
-//!   shallow entries costs 753 bytes per pair against 1,336 for deep ones, a 1.8x spread. The
-//!   budget is therefore set from the deep-path worst case.
+//! - Cost tracks path length, so "entries" is not a fixed amount of memory: shallow entries cost
+//!   roughly half what deep ones do, so the budget is set from the deep-path worst case.
+//! - The status digest cache does **not** add a third structure here. It is consumed one record at
+//!   a time against these two maps, so its own memory is a single line buffer regardless of how
+//!   many entries it holds. A cache materialised as a third `BTreeMap` would breach this ceiling,
+//!   which is why it is not one.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
@@ -116,6 +126,7 @@ fn local_inventory(count: usize) -> LocalInventory {
                 kind: EntryKind::File,
                 size: 4096,
                 mtime_ms: 1_762_000_000_000,
+                identity: Default::default(),
                 content_md5: None,
             },
         );

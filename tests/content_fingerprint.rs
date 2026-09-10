@@ -25,6 +25,7 @@ fn public_planner_rejects_equal_md5_and_crc32_when_sha256_differs() {
                 kind: EntryKind::File,
                 size: 4096,
                 mtime_ms: 1_785_769_200_000,
+                identity: Default::default(),
                 content_md5: Some(local_fingerprint),
             },
         )]),

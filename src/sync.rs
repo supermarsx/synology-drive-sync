@@ -824,6 +824,7 @@ mod tests {
             kind: EntryKind::File,
             size: 1,
             mtime_ms: 1,
+            identity: Default::default(),
             content_md5: None,
         }
     }

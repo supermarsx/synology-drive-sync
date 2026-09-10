@@ -7,6 +7,8 @@ The explicit command tree is preferred. Run `synology-drive-sync --help` and
 | --- | --- |
 | `sync SOURCE REMOTE` | Apply one finite local-to-remote synchronization. Remote-only entries remain unless deletion is explicitly armed. |
 | `plan SOURCE REMOTE` | Build and print the same plan without mutation. `--exit-code` returns 10 when work is pending. |
+| `status` | Compare both sides and list what needs attention, in bounded pages with whole-scope totals. Read-only. `--status-cache DIR` reuses stored content digests for unchanged files; see [Status digest cache](../status-cache.md). |
+| `status-rollup --status-cache DIR` | Print the totals recorded by the last full `status` pass, per profile and combined. Scans nothing: no local walk, no DSM access, one small file read per profile. |
 | `doctor source [SOURCE] [--hash]` | Local-only source validation; `--hash` reads and verifies every payload file. No DSM access. |
 | `doctor --level quick target [REMOTE]` | Validate endpoint policy, TLS, reverse-proxy routing, API discovery, and the full unauthenticated DSM capability enumeration, without credentials or destination access. |
 | `doctor target [REMOTE]` | Run the default Standard authenticated discovery, session-channel ablation, live capability diagnosis, destination walk, and logout checks without mutation. With no resolved remote it lists at most five File Station-reported shared-folder roots without claiming browse/write permission; with a remote it checks permission and at most five direct children. |

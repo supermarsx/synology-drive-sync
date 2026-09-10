@@ -445,7 +445,10 @@ fn recursive_manpage_generation_preserves_unrelated_files_and_fails_on_a_file_pa
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.path().extension().is_some_and(|value| value == "1"))
         .count();
-    assert_eq!(generated_pages, 20);
+    // One page per command, root included. Adding a subcommand changes this number *and* requires
+    // the new page to be added to the installer allowlists in `packaging/install.sh` and
+    // `packaging/install.ps1`, which reject an archive containing a file they do not name.
+    assert_eq!(generated_pages, 21);
     assert!(root_page.contains(".SH SUBCOMMANDS"));
     assert!(nested_page.contains(".SH NAME"));
     assert!(nested_page.contains(".SH SYNOPSIS"));

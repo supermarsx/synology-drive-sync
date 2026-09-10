@@ -64,6 +64,7 @@ fn root_and_recursive_manpage_modes_are_complete() {
         "synology-drive-sync-manpage.1",
         "synology-drive-sync-plan.1",
         "synology-drive-sync-resync.1",
+        "synology-drive-sync-status-rollup.1",
         "synology-drive-sync-status.1",
         "synology-drive-sync-sync.1",
         "synology-drive-sync.1",

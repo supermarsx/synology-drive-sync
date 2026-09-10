@@ -29,6 +29,12 @@ routine_state_dir=$state_root/routines
 profile_state_dir=$state_root/profiles
 health_dir=$state_root/health
 cache_root=$state_root/cache
+# Digest cache and aggregate rollup for the sync-status view. A subdirectory of
+# $cache_root on purpose: cache_prune only sees plain files at the top of that
+# directory, so these neither evict the response cache's entries nor count
+# against its byte ceiling -- and the core bounds them itself instead. Nothing
+# here is authoritative; removing the directory costs one uncached status pass.
+status_cache_dir=$cache_root/status
 audit_outbox_dir=$state_root/audit-outbox
 runtime_root=$package_var/run
 control_root=$package_var/control
@@ -214,9 +220,9 @@ ensure_layout() {
     # repaired but unchecked.
     set -- $private_roots "$config_root" "$profiles_dir" \
         "$routines_dir" "$secret_root" "$state_root" "$routine_state_dir" "$profile_state_dir" \
-        "$health_dir" "$cache_root" "$audit_outbox_dir" "$runtime_root" "$control_root" "$control_requests" \
+        "$health_dir" "$cache_root" "$status_cache_dir" "$audit_outbox_dir" "$runtime_root" "$control_root" "$control_requests" \
         "$control_processing" "$control_responses" "$control_staging" "$control_progress" "$log_root"
-    # Every invocation used to spend mkdir + chmod + chown on all nineteen of
+    # Every invocation used to spend mkdir + chmod + chown on all twenty of
     # these whether or not they were already correct: about 57 processes, and
     # 119 of the 175 spawned by a single profile save went on exactly this. Skip
     # that work only when the whole invariant already holds -- present, a real

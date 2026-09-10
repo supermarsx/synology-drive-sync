@@ -36,6 +36,7 @@ use synology_drive_sync::progress::{
 use synology_drive_sync::source_diagnostics::{
     SourceDiagnosticOptions, SourceDiagnosticReport, diagnose_source,
 };
+use synology_drive_sync::status_cache;
 use synology_drive_sync::sync::{
     self, ExecuteOptions, ExecutionEvent, ExecutionReport, UploadObserverFactory,
 };
@@ -223,10 +224,14 @@ fn dispatch(arguments: &cli::Cli) -> Result<ExitCode> {
                 arguments.global.profile.as_deref(),
                 &status.sync.batch,
             )?;
+            let profile = selected[0].name.clone();
             let settings =
                 config::resolve_sync(selected[0].values, &status.sync, &arguments.global.output)
                     .map_err(config_error)?;
-            run_status(status, settings)
+            run_status(status, &profile, settings)
+        }
+        cli::Invocation::StatusRollup(rollup) => {
+            run_status_rollup(rollup, &arguments.global.output)
         }
         cli::Invocation::Resync(resync) => {
             // Checked before anything is resolved: a caller who asked a destructive-adjacent
@@ -1505,7 +1510,11 @@ fn resync_value(
 ///
 /// Read-only throughout: it authenticates, walks both sides under the scope, compares, and prints.
 /// It never writes to the NAS and cannot reach [`CompareMode::Force`].
-fn run_status(arguments: &cli::StatusArgs, settings: config::ResolvedSync) -> Result<ExitCode> {
+fn run_status(
+    arguments: &cli::StatusArgs,
+    profile: &str,
+    settings: config::ResolvedSync,
+) -> Result<ExitCode> {
     let cancellation = install_cancellation_handler()?;
     warn_for_insecure_network(&settings.network, &settings.output);
 
@@ -1514,6 +1523,7 @@ fn run_status(arguments: &cli::StatusArgs, settings: config::ResolvedSync) -> Re
     let rules = IgnoreRules::build(&settings.source, &settings.behavior.excludes)?;
     let compare = compare_mode(settings.behavior.compare);
     let query_states = status_state_filter(&arguments.states, arguments.all);
+    let cache = open_status_cache(arguments, profile, &settings, compare);
 
     cancellation.check()?;
     let scan = local::scan_scoped(
@@ -1572,19 +1582,26 @@ fn run_status(arguments: &cli::StatusArgs, settings: config::ResolvedSync) -> Re
             return Err(Error::ScopeNotFound(scope.as_str().to_owned()));
         }
 
+        let mut cache_report = status_cache::CacheReport::off();
+        let mut comparison = BTreeSet::new();
         if compare == CompareMode::Content {
             client.require_content_fingerprint_api()?;
             // Status is read-only: it never deletes, uploads or server-copies, so every digest
             // it needs is a comparison digest, none of them guards a mutation, and nothing here
             // is ever promoted -- a status run reports a difference rather than acting on one.
-            let comparison = plan::select_comparison_remote_digests(&local, &remote, &rules);
-            local::populate_content_md5_selective(&mut local, &comparison, &cancellation)?;
-            client.populate_remote_content_digests(
+            //
+            // That is also precisely why this is the one path allowed to reuse stored digests.
+            let (selected, report) = populate_status_digests(
+                &client,
+                &mut local,
                 &mut remote,
-                &comparison,
-                &BTreeSet::new(),
+                &rules,
+                cache.as_ref(),
+                &settings.output,
                 &cancellation,
             )?;
+            comparison = selected;
+            cache_report = report;
         }
         cancellation.check()?;
 
@@ -1612,15 +1629,293 @@ fn run_status(arguments: &cli::StatusArgs, settings: config::ResolvedSync) -> Re
         )?;
         // Either side hitting its budget makes every total a floor rather than a count.
         page.stats.complete = page.stats.complete && scan.complete && scoped.complete;
-        Ok(page)
+
+        // Persist last, and only what this pass actually observed. A failure to write is not a
+        // failure to answer: the page in hand was derived from live evidence either way, so a
+        // full disk degrades the next run to a cold one rather than this one to an error.
+        if let Some(cache) = cache.as_ref()
+            && compare == CompareMode::Content
+        {
+            let scoped_query = !scope.is_root();
+            if let Err(error) = cache.store(&local, &remote, &comparison, scoped_query) {
+                warn_cache(
+                    &settings.output,
+                    &format!("digests were not stored: {error}"),
+                );
+            }
+            if let Err(error) = cache.store_rollup(&page.stats, &cache_report, scoped_query) {
+                warn_cache(&settings.output, &format!("rollup was not stored: {error}"));
+            }
+        }
+        Ok((page, cache_report))
     })();
 
-    let page = finish_authenticated_operation(&mut client, operation)?;
-    write_status_output(&page, &scope, compare, &settings.output)?;
+    let (page, cache_report) = finish_authenticated_operation(&mut client, operation)?;
+    write_status_output(&page, &scope, compare, &cache_report, &settings.output)?;
     if cancellation.is_cancelled() {
         return Err(Error::Cancelled);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Print the stored totals for every profile, and their combination.
+///
+/// The read path the dashboard and the desktop widget sit on, and the reason the whole feature can
+/// answer "what needs my attention" without a scan. It opens the rollup documents and **nothing
+/// else**: no digest cache, no source file, no File Station call, no authentication. That property
+/// is what makes it affordable on a short polling interval, and it is pinned by a test rather than
+/// left to be eroded by a later "small" lookup.
+fn run_status_rollup(
+    arguments: &cli::StatusRollupArgs,
+    output: &cli::OutputArgs,
+) -> Result<ExitCode> {
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| Error::Message("the system clock is before the Unix epoch".to_owned()))?
+            .as_secs(),
+    )
+    .map_err(|_| Error::Message("the system clock is outside the supported range".to_owned()))?;
+
+    let expected = (!arguments.profiles.is_empty()).then_some(arguments.profiles.as_slice());
+    let aggregate = status_cache::compose_rollups(&arguments.status_cache, expected, now);
+
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    // Read straight from the arguments rather than through `resolve_output`: that needs a
+    // configuration profile, and this command deliberately loads none.
+    match output.output.unwrap_or(cli::OutputFormat::Human) {
+        cli::OutputFormat::Json | cli::OutputFormat::Ndjson => {
+            let value = serde_json::to_value(&aggregate).map_err(|error| {
+                Error::Message(format!("could not render the stored totals: {error}"))
+            })?;
+            write_json_line_to(&mut stdout, &value)?;
+        }
+        cli::OutputFormat::Human => write_status_rollup_human_to(&mut stdout, &aggregate)?,
+    }
+    stdout.flush().map_err(output_error)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn write_status_rollup_human_to<W: Write>(
+    writer: &mut W,
+    aggregate: &status_cache::RollupAggregate,
+) -> Result<()> {
+    if aggregate.profiles.is_empty() {
+        writeln!(
+            writer,
+            "No profile has been observed yet; run status once to record totals."
+        )
+        .map_err(output_error)?;
+        return Ok(());
+    }
+    // A truncated walk makes every count a floor, so it is marked wherever it is printed rather
+    // than explained once at the bottom where a reader may not reach it.
+    for profile in &aggregate.profiles {
+        let more = if profile.observation.complete {
+            ""
+        } else {
+            "+"
+        };
+        writeln!(
+            writer,
+            "{}: {}{more} in sync, {}{more} pending upload ({}{more}), {}{more} needing attention, observed {}.",
+            profile.profile,
+            profile.state.in_sync.files,
+            profile.state.would_transfer.files,
+            format_bytes(profile.state.would_transfer.bytes),
+            profile.state.attention_entries,
+            describe_evidence_age(profile.observed_at_epoch),
+        )
+        .map_err(output_error)?;
+    }
+    for missing in &aggregate.profiles_never_observed {
+        writeln!(writer, "{missing}: never observed.").map_err(output_error)?;
+    }
+
+    match (&aggregate.total, &aggregate.total_unavailable_reason) {
+        (Some(total), _) => {
+            let more = if aggregate.complete { "" } else { "+" };
+            writeln!(
+                writer,
+                "All profiles: {}{more} in sync, {}{more} pending upload ({}{more}), {}{more} needing attention.",
+                total.in_sync.files,
+                total.would_transfer.files,
+                format_bytes(total.would_transfer.bytes),
+                total.attention_entries,
+            )
+            .map_err(output_error)?;
+        }
+        // Printed, never omitted. A missing row invites the reader to add the per-profile figures
+        // themselves and reach by hand the same wrong answer this withholding exists to prevent.
+        (None, Some(reason)) => {
+            writeln!(writer, "Combined total unavailable: {reason}.").map_err(output_error)?;
+        }
+        (None, None) => {}
+    }
+    if !aggregate.complete && aggregate.total.is_some() {
+        writeln!(
+            writer,
+            "Marked totals are lower bounds: a profile was never observed, or a scan budget stopped its walk."
+        )
+        .map_err(output_error)?;
+    }
+    Ok(())
+}
+
+/// Bind this query to a digest cache, or decline to use one.
+///
+/// Declines silently in every unusable case -- no directory configured, an unsafe directory, a
+/// comparison mode that computes no digests, a clock that cannot be read. A cache is an
+/// accelerator, so failing to obtain one is never an error a caller should see: the query simply
+/// costs what it always cost.
+///
+/// Only [`CompareMode::Content`] is eligible. The other modes decide from size and modification
+/// time alone, so there is nothing to accelerate and nothing to get wrong.
+fn open_status_cache(
+    arguments: &cli::StatusArgs,
+    profile: &str,
+    settings: &config::ResolvedSync,
+    compare: CompareMode,
+) -> Option<status_cache::StatusCache> {
+    if compare != CompareMode::Content {
+        return None;
+    }
+    let directory = arguments.status_cache.clone()?;
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs(),
+    )
+    .ok()?;
+    status_cache::StatusCache::open(
+        status_cache::CacheOptions {
+            directory,
+            profile: profile.to_owned(),
+            // The source and destination are part of the key. A profile repointed at another
+            // folder must not be answered from evidence gathered about the previous one.
+            source: settings.source.to_string_lossy().into_owned(),
+            remote: settings.remote.clone(),
+            compare: compare_label(compare),
+            refresh: arguments.status_cache_refresh,
+            max_age_seconds: arguments
+                .status_cache_max_age
+                .map_or(status_cache::DEFAULT_MAX_AGE_SECONDS, |days| {
+                    i64::from(days).saturating_mul(24 * 60 * 60)
+                }),
+            canary: arguments
+                .status_cache_canary
+                .map_or(status_cache::DEFAULT_CANARY, usize::from),
+        },
+        now,
+    )
+}
+
+/// Fill both inventories' content digests, reusing stored evidence where it is still valid.
+///
+/// The cache is a third digest populator, running before the two that already exist and narrowing
+/// what they are asked for. It never decides anything: the verdict is still derived from digests by
+/// [`plan::build_status_page`], so there is exactly one implementation of the comparison and a
+/// cached answer cannot diverge from a computed one.
+fn populate_status_digests(
+    client: &ApiClient,
+    local: &mut local::LocalInventory,
+    remote: &mut api::RemoteInventory,
+    rules: &IgnoreRules,
+    cache: Option<&status_cache::StatusCache>,
+    output: &config::ResolvedOutput,
+    cancellation: &CancellationToken,
+) -> Result<(BTreeSet<String>, status_cache::CacheReport)> {
+    let comparison = plan::select_comparison_remote_digests(local, remote, rules);
+
+    // Both populators skip whatever already carries a digest, so a warm cache narrows their work
+    // without either of them being told about it -- and, deliberately, without a set naming the
+    // served paths, which would hold every path a third time and breach the memory ceiling the
+    // scan budget itself is derived from.
+    let compute_live = |local: &mut local::LocalInventory,
+                        remote: &mut api::RemoteInventory|
+     -> Result<()> {
+        local::populate_content_md5_selective(local, &comparison, cancellation)?;
+        let outstanding: BTreeSet<String> = comparison
+            .iter()
+            .filter(|relative| {
+                remote
+                    .entries
+                    .get(relative.as_str())
+                    .is_none_or(|entry| entry.content_md5.is_none())
+            })
+            .cloned()
+            .collect();
+        client.populate_remote_content_digests(remote, &outstanding, &BTreeSet::new(), cancellation)
+    };
+
+    let Some(cache) = cache else {
+        compute_live(local, remote)?;
+        return Ok((comparison, status_cache::CacheReport::off()));
+    };
+
+    let served = cache.serve(local, remote, &comparison);
+    compute_live(local, remote)?;
+
+    // The canary is checked against digests that were just computed live, so a disagreement is
+    // evidence about the stored file rather than about the sample. Discarding all of it and
+    // recomputing is the response: repairing the one entry would conceal the systematic case,
+    // which is the only case worth detecting.
+    if let Some(disagreeing) =
+        status_cache::StatusCache::verify_canary(&served.probes, local, remote)
+    {
+        warn_cache(
+            output,
+            &format!(
+                "stored digests disagreed with live evidence at {disagreeing:?}; the cache was discarded and this answer recomputed in full"
+            ),
+        );
+        cache.discard();
+        for entry in local.entries.values_mut() {
+            entry.content_md5 = None;
+        }
+        for entry in remote.entries.values_mut() {
+            entry.content_md5 = None;
+        }
+        compute_live(local, remote)?;
+        let report = status_cache::CacheReport {
+            state: status_cache::CacheState::Unusable,
+            digests_reused: 0,
+            digests_computed: comparison.len(),
+            oldest_evidence_epoch: None,
+            canary_checked: served.probes.len(),
+        };
+        return Ok((comparison, report));
+    }
+
+    let reused = served.supplied;
+    let state = if cache.is_refresh() {
+        status_cache::CacheState::Refreshed
+    } else if reused == 0 {
+        status_cache::CacheState::Cold
+    } else {
+        status_cache::CacheState::Warm
+    };
+    let report = status_cache::CacheReport {
+        state,
+        digests_reused: reused,
+        digests_computed: comparison.len().saturating_sub(reused),
+        oldest_evidence_epoch: served.oldest_evidence_epoch,
+        canary_checked: served.probes.len(),
+    };
+    Ok((comparison, report))
+}
+
+/// Report a cache problem without failing the query.
+///
+/// Written to standard error, never to standard output: the DSM manager captures the two
+/// separately precisely so a diagnostic cannot corrupt the JSON document a caller is parsing.
+fn warn_cache(output: &config::ResolvedOutput, message: &str) {
+    if output.quiet {
+        return;
+    }
+    eprintln!("warning: status cache: {message}");
 }
 
 /// Translate the requested states, expanding the `attention` shorthand.
@@ -6550,11 +6845,28 @@ fn write_status_output(
     page: &plan::StatusPage,
     scope: &plan::Scope,
     compare: CompareMode,
+    cache: &status_cache::CacheReport,
     output: &config::ResolvedOutput,
 ) -> Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    write_status_output_to(&mut stdout, page, scope, compare, output)
+    write_status_output_to(&mut stdout, page, scope, compare, cache, output)
+}
+
+/// Describe how much of this answer rests on stored evidence, and how old the oldest of it is.
+///
+/// Emitted on every status answer, cached or not, so a caller never has to infer freshness from
+/// the absence of a field. `oldest_evidence_epoch` is deliberately the oldest and not the newest
+/// contributing observation: it is the only claim that is true of every row in the answer, and it
+/// is exactly the width of the window in which an undetected change could be hiding.
+fn status_cache_value(cache: &status_cache::CacheReport) -> Value {
+    json!({
+        "state": cache.state.as_str(),
+        "entries_reused": cache.digests_reused,
+        "entries_verified_live": cache.digests_computed,
+        "entries_canary_checked": cache.canary_checked,
+        "oldest_evidence_epoch": cache.oldest_evidence_epoch,
+    })
 }
 
 fn write_status_output_to<W: Write>(
@@ -6562,11 +6874,12 @@ fn write_status_output_to<W: Write>(
     page: &plan::StatusPage,
     scope: &plan::Scope,
     compare: CompareMode,
+    cache: &status_cache::CacheReport,
     output: &config::ResolvedOutput,
 ) -> Result<()> {
     match output.output {
         cli::OutputFormat::Human => {
-            write_status_human_to(writer, page, scope, compare)?;
+            write_status_human_to(writer, page, scope, compare, cache)?;
             writer.flush().map_err(output_error)
         }
         cli::OutputFormat::Json => write_json_to(
@@ -6580,6 +6893,7 @@ fn write_status_output_to<W: Write>(
                 "truncated": page.truncated,
                 "next_cursor": page.next_cursor.as_ref().map(plan::StatusCursor::as_str),
                 "stats": status_stats_value(&page.stats),
+                "cache": status_cache_value(cache),
                 "entries": page
                     .entries
                     .iter()
@@ -6599,6 +6913,7 @@ fn write_status_output_to<W: Write>(
                     "truncated": page.truncated,
                     "next_cursor": page.next_cursor.as_ref().map(plan::StatusCursor::as_str),
                     "stats": status_stats_value(&page.stats),
+                    "cache": status_cache_value(cache),
                 }),
             )?;
             for entry in &page.entries {
@@ -6682,6 +6997,7 @@ fn write_status_human_to<W: Write>(
     page: &plan::StatusPage,
     scope: &plan::Scope,
     compare: CompareMode,
+    cache: &status_cache::CacheReport,
 ) -> Result<()> {
     let target = if scope.is_root() {
         "the whole tree".to_owned()
@@ -6745,7 +7061,53 @@ fn write_status_human_to<W: Write>(
         )
         .map_err(output_error)?;
     }
+    // Stated as an age rather than a timestamp: a reader should not have to subtract to learn how
+    // old the evidence is, and how old it is *is* the point. Only the oldest contributing
+    // observation is quoted, because it is the only bound true of every row above.
+    if cache.digests_reused > 0
+        && let Some(oldest) = cache.oldest_evidence_epoch
+    {
+        writeln!(
+            writer,
+            "{} of {} compared digests were reused from stored evidence, the oldest {}.",
+            cache.digests_reused,
+            cache.digests_reused + cache.digests_computed,
+            describe_evidence_age(oldest),
+        )
+        .map_err(output_error)?;
+    }
+    if cache.state == status_cache::CacheState::Unusable {
+        writeln!(
+            writer,
+            "Stored digests disagreed with live evidence, so the cache was discarded and this answer was recomputed in full."
+        )
+        .map_err(output_error)?;
+    }
     Ok(())
+}
+
+/// Render an evidence timestamp as an age, which is what a reader actually needs from it.
+fn describe_evidence_age(observed_at_epoch: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok());
+    let Some(seconds) = now.map(|now| now.saturating_sub(observed_at_epoch)) else {
+        return format!("recorded at epoch {observed_at_epoch}");
+    };
+    if seconds < 0 {
+        return format!("recorded at epoch {observed_at_epoch}");
+    }
+    if seconds < 90 {
+        return "moments ago".to_owned();
+    }
+    if seconds < 3 * 3600 {
+        return format!("{} minutes ago", seconds / 60);
+    }
+    if seconds < 48 * 3600 {
+        return format!("{} hours ago", seconds / 3600);
+    }
+    format!("{} days ago", seconds / 86_400)
 }
 
 fn plan_summary_record(plan: &SyncPlan) -> Value {
@@ -8214,6 +8576,7 @@ mod tests {
             kind: local::EntryKind::File,
             size,
             mtime_ms,
+            identity: Default::default(),
             content_md5: Some(synology_drive_sync::integrity::ContentMd5::from_digests(
                 [0x2a; 16],
                 0x2a2a_2a2a,
@@ -11590,6 +11953,7 @@ mod status_command_tests {
             page,
             &scope,
             CompareMode::Metadata,
+            &status_cache::CacheReport::off(),
             &output(format),
         )
         .expect("writing rendered status output to a Vec cannot fail");
@@ -11904,6 +12268,7 @@ mod status_command_tests {
                         kind: local::EntryKind::File,
                         size: 1_000,
                         mtime_ms: 0,
+                        identity: Default::default(),
                         content_md5: None,
                     },
                     remote_path: "/team/export/a.txt".to_owned(),
@@ -11916,6 +12281,7 @@ mod status_command_tests {
                         kind: local::EntryKind::File,
                         size: 24,
                         mtime_ms: 0,
+                        identity: Default::default(),
                         content_md5: None,
                     },
                     remote_path: "/team/export/b.txt".to_owned(),
@@ -12003,6 +12369,7 @@ mod resync_output_tests {
                 kind: local::EntryKind::File,
                 size,
                 mtime_ms: 1_000,
+                identity: Default::default(),
                 content_md5: None,
             },
             remote_path: format!("/team/export/{relative}"),
