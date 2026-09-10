@@ -134,7 +134,17 @@ try {
         "$archiveRoot/completions/_synology-drive-sync",
         "$archiveRoot/completions/synology-drive-sync.fish",
         "$archiveRoot/completions/synology-drive-sync.ps1",
-        "$archiveRoot/completions/synology-drive-sync.elv",
+        "$archiveRoot/completions/synology-drive-sync.elv"
+    )) {
+        [void] $requiredFiles.Add($name)
+    }
+
+    # Man pages are allowed but not required. The archive is already
+    # SHA-256 verified before this check, and requiring a page would make
+    # this installer reject every release published before the subcommand
+    # that generates it existed -- which it did, twice.
+    $allowedFiles = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($name in @(
         "$archiveRoot/man/synology-drive-sync-completions.1",
         "$archiveRoot/man/synology-drive-sync-config-init.1",
         "$archiveRoot/man/synology-drive-sync-config-path.1",
@@ -157,7 +167,7 @@ try {
         "$archiveRoot/man/synology-drive-sync-sync.1",
         "$archiveRoot/man/synology-drive-sync.1"
     )) {
-        [void] $requiredFiles.Add($name)
+        [void] $allowedFiles.Add($name)
     }
 
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -182,7 +192,8 @@ try {
                 throw "Verified archive contains a duplicate member: $canonical"
             }
             if (-not $allowedDirectories.Contains($canonical) -and
-                -not $requiredFiles.Contains($canonical)) {
+                -not $requiredFiles.Contains($canonical) -and
+                -not $allowedFiles.Contains($canonical)) {
                 throw "Verified archive contains an unexpected member: $name"
             }
             if ($isDirectory -ne $allowedDirectories.Contains($canonical)) {
