@@ -320,9 +320,23 @@
           </section>
 
           <section v-else-if="route === 'sync'" class="sdsync-page" aria-labelledby="sdsync-page-title">
+            <article class="sdsync-panel sdsync-rollup" aria-labelledby="sdsync-rollup-title">
+              <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Stored totals</p><h3 id="sdsync-rollup-title">Sync summary</h3></div><div class="sdsync-evidence-heading-actions"><span class="sdsync-freshness">{{ statusRollupFreshness }}</span><v-button type="border" display="icon-text" aria-label="Re-read the stored totals" tooltip="Re-read what the last check recorded. This walks no folder and contacts no destination." :disabled="statusRollupLoading" :aria-busy="statusRollupLoading ? 'true' : 'false'" @click="refreshStatusRollup"><template #icon><action-icon :class="{ 'sdsync-is-spinning': statusRollupLoading }" name="refresh" /></template>Refresh</v-button></div></div>
+              <p class="sdsync-field-note">Read back from what the last check recorded, so it opens straight away: no folder is walked and the destination is not contacted. Check one scope below when you need a live per-file comparison.</p>
+              <p v-if="!statusRollup.loaded || (!statusRollup.total && !statusRollup.profiles.length)" class="sdsync-empty">{{ statusRollupMessage }}</p>
+              <template v-else>
+                <dl v-if="statusRollupCards.length" class="sdsync-sync-stats sdsync-rollup-stats" aria-label="Combined stored totals">
+                  <div v-for="card in statusRollupCards" :key="card.id" :class="['sdsync-sync-stat', 'is-' + card.id]"><dt>{{ card.label }}</dt><dd>{{ card.value }}</dd><small>{{ card.detail }}</small></div>
+                </dl>
+                <p v-if="statusRollupTotalNote" class="sdsync-field-note">{{ statusRollupTotalNote }}</p>
+                <div v-if="statusRollupRows.length" class="sdsync-table-wrap"><table><thead><tr><th>Profile</th><th>In sync</th><th>Pending upload</th><th>Needs attention</th><th>Observed</th></tr></thead><tbody><tr v-for="row in statusRollupRows" :key="row.profile"><td>{{ row.profile }}</td><td>{{ row.inSync }}</td><td>{{ row.pending }}</td><td>{{ row.attention }}</td><td :title="row.observedExact">{{ row.observed }}</td></tr></tbody></table></div>
+                <p v-if="statusRollupNeverObservedNote" class="sdsync-field-note">{{ statusRollupNeverObservedNote }}</p>
+              </template>
+            </article>
+
             <v-form v-model="syncStatusForm" class="sdsync-panel sdsync-sync-query" @submit="checkSyncStatus">
               <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Per-file state</p><h3>Check one scope</h3></div><span class="sdsync-pill neutral">On demand</span></div>
-              <p class="sdsync-field-note">Nothing is cached: both sides are compared again on every check, so an answer is never stale &#8212; and never free. This page has no refresh timer for that reason.</p>
+              <p class="sdsync-field-note">This check caches nothing: both sides are compared again every time, so its answer is never stale &#8212; and never free. The summary above is the cached one. This page has no refresh timer for that reason.</p>
               <div class="sdsync-filter-list" aria-label="Sync status query">
                 <div v-for="field in syncTextFields" :key="field.key" class="sdsync-filter-row"><span class="sdsync-filter-label">{{ field.label }}</span><div class="sdsync-filter-control"><v-input class="sdsync-input-control" :value="syncStatusForm[field.key]" clearable :maxlength="field.max" :placeholder="field.placeholder" :aria-label="field.label" :aria-describedby="'sdsync-help-' + field.help" :disabled="syncLocked" @input="setSyncField(field, $event)" /><control-help :help-key="field.help" /></div></div>
                 <div v-for="field in syncSelectFields" :key="field.key" class="sdsync-filter-row"><span class="sdsync-filter-label">{{ field.label }}</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" :value="syncStatusForm[field.key]" :options="field.options" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" :aria-label="field.label" :aria-describedby="'sdsync-help-' + field.help" :disabled="syncLocked" @input="setSyncField(field, $event)"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help :help-key="field.help" /></div></div>
@@ -456,7 +470,7 @@
               <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Bounded package logs</p><h3>Troubleshooting evidence</h3></div><div class="sdsync-evidence-heading-actions"><span class="sdsync-log-state">{{ logState }}</span><v-button type="border" display="icon-text" aria-label="Copy all visible package logs" tooltip="Copy the selected log sources as bounded, sanitized troubleshooting text" :disabled="!logRecords.length" @click="copyVisibleLogs"><template #icon><action-icon name="copy" /></template>Copy visible</v-button></div></div>
               <div class="sdsync-filter-list sdsync-log-filters" aria-label="Log filters"><div class="sdsync-filter-row"><span class="sdsync-filter-label">Source</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="logSource" :options="logSourceOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Log source" aria-describedby="sdsync-help-log-source" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-source" /></div></div><div class="sdsync-filter-row"><span class="sdsync-filter-label">Lines</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="logLines" :options="logLineOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Log line count" aria-describedby="sdsync-help-log-lines" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-lines" /></div></div></div>
               <p v-if="!logRecords.length" class="sdsync-empty">{{ logOutput }}</p>
-              <div v-else class="sdsync-log-records"><section v-for="record in logRecords" :key="record.id" class="sdsync-log-record"><header><span><strong>{{ record.source }}</strong><small>{{ record.lineCount }} line{{ record.lineCount === 1 ? '' : 's' }}</small></span><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy ' + record.source + ' log evidence'" tooltip="Copy this log record as bounded, sanitized troubleshooting text" @click="copyLogRecord(record)"><template #icon><action-icon name="copy" /></template>Copy</v-button></header><div v-if="record.doctorInventories.length" class="sdsync-log-inventory-evidence"><div v-for="(inventoryRecord, recordIndex) in record.doctorInventories" :key="inventoryRecord.epoch + ':' + inventoryRecord.profile + ':' + recordIndex" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ inventoryRecord.profile }} · {{ doctorInventoryScopeLabel(inventoryRecord.inventory.scope) }}</strong><span>{{ inventoryRecord.inventory.total }} total · {{ inventoryRecord.inventory.entries.length }} shown<span v-if="inventoryRecord.inventory.truncated"> · truncated</span></span></div><p v-if="!inventoryRecord.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in inventoryRecord.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div></div><pre tabindex="0">{{ record.text }}</pre></section></div>
+              <div v-else class="sdsync-log-records"><section v-for="record in logRecords" :key="record.id" class="sdsync-log-record"><header><span><strong>{{ record.source }}</strong><small>{{ record.lineCount }} line{{ record.lineCount === 1 ? '' : 's' }}</small></span><span class="sdsync-log-record-actions"><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy ' + record.source + ' log evidence'" tooltip="Copy this log record as bounded, sanitized troubleshooting text" @click="copyLogRecord(record)"><template #icon><action-icon name="copy" /></template>Copy</v-button><v-button class="sdsync-evidence-copy sdsync-log-clear" type="border" display="icon-text" :aria-label="'Clear the ' + record.source + ' package log'" :tooltip="logClearTooltip(record.source)" :disabled="!logSourceClearable(record.source) || !canRunOperations" @click="clearLogSource(record.source)"><template #icon><action-icon name="delete" /></template>Clear</v-button></span></header><div v-if="record.doctorInventories.length" class="sdsync-log-inventory-evidence"><div v-for="(inventoryRecord, recordIndex) in record.doctorInventories" :key="inventoryRecord.epoch + ':' + inventoryRecord.profile + ':' + recordIndex" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ inventoryRecord.profile }} · {{ doctorInventoryScopeLabel(inventoryRecord.inventory.scope) }}</strong><span>{{ inventoryRecord.inventory.total }} total · {{ inventoryRecord.inventory.entries.length }} shown<span v-if="inventoryRecord.inventory.truncated"> · truncated</span></span></div><p v-if="!inventoryRecord.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in inventoryRecord.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div></div><p v-if="!record.lines.length" class="sdsync-empty sdsync-log-empty">No lines to show. This log can still hold records that the current log level for its category keeps out of this view.</p><ol v-else class="sdsync-log-lines" tabindex="0"><li v-for="line in record.lines" :key="line.id"><time v-if="line.epoch">{{ formatDate(line.epoch) }}</time><time v-else class="is-unrecorded" title="This line was written without a recorded time; the package now stamps every record it writes.">Time not recorded</time><span>{{ line.text }}</span></li></ol></section></div>
             </article>
           </section>
 
@@ -617,6 +631,11 @@ import {
 import SecurityPanel from "./SecurityPanel.vue";
 
 const SETTINGS_KEY = "sdsync.ui.settings.v1";
+// Which bounded package logs the dashboard may empty. The audit log is absent
+// on purpose and the bridge refuses it independently: it is the record of who
+// cleared what, so offering a button that erases the evidence of its own use
+// would make the audit trail unable to answer the one question it exists for.
+const CLEARABLE_LOG_SOURCES = Object.freeze(["api", "controller", "doctor", "scheduler", "sync"]);
 const AUTOSAVE_SCOPES = Object.freeze(["profile", "routine", "alerts", "security", "interface"]);
 const INCIDENT_SCOPE_LABELS = Object.freeze({
   profile: "Profile configuration and secrets",
@@ -997,7 +1016,8 @@ function currentAutosaveStatus(
   failures,
   savedMessage = "All changes saved",
   outcomeUnknownScopes = null,
-  inspectionScopes = null
+  inspectionScopes = null,
+  heldScopes = null
 ) {
   for (const scope of AUTOSAVE_SCOPES) {
     if (failures && failures[scope] === true && outcomeUnknownScopes && outcomeUnknownScopes[scope] === true) {
@@ -1021,10 +1041,29 @@ function currentAutosaveStatus(
     }
   }
   if (!coordinator) return { phase: "saved", message: savedMessage };
-  const states = AUTOSAVE_SCOPES.map((scope) => coordinator.getState(scope)).filter((state) => state.registered && !state.cancelled);
+  const registered = AUTOSAVE_SCOPES.map((scope) => coordinator.getState(scope)).filter((state) => state.registered);
+  const states = registered.filter((state) => !state.cancelled);
+  // A scope held while a connection request is in flight is blocked on purpose
+  // and drains itself when the request settles. The generic blocked message
+  // below would tell the operator to press Save now, which is work they do not
+  // have to do and which they would be doing to recover an edit that is not
+  // actually at risk.
+  const isHeld = (state) => Boolean(heldScopes && heldScopes[state.scope] === true);
+  if (states.some((state) => state.dirty && isHeld(state))) {
+    return { phase: "pending", message: "Autosave held until the connection request settles" };
+  }
   if (states.some((state) => state.blocked && state.dirty)) return { phase: "blocked", message: "Changes require Save now" };
   if (states.some((state) => state.inFlight)) return { phase: "saving", message: "Saving changes…" };
   if (states.some((state) => state.dirty || state.scheduled || state.queued)) return { phase: "pending", message: "Autosave pending · 1.3 seconds" };
+  // Never report "saved" over an entry that still holds an unsaved edit.
+  //
+  // A cancelled scope is excluded from every phase above because nothing will
+  // dispatch it -- which is exactly why it must not then fall through to
+  // "saved". That combination is what made the connection-hold defect silent:
+  // the edit was stranded *and* the status line said it had been saved, so
+  // there was nothing for the operator to notice. Any future caller that
+  // cancels a scope the user is still editing now shows up here instead.
+  if (registered.some((state) => state.dirty)) return { phase: "blocked", message: "Unsaved changes · use Save now" };
   return { phase: "saved", message: savedMessage };
 }
 
@@ -1908,6 +1947,36 @@ function doctorInventoryRecordsFromText(value, limit = 20) {
   return records.slice(-maximum);
 }
 
+// Every package log stream stamps its own records, so a rendered time is read
+// back from the record rather than derived from when the browser saw it. The
+// shell, controller, scheduler, doctor, API and audit writers all emit whole
+// seconds in `epoch`; the core's own `sdsync.log.v1` sync stream emits
+// `timestamp_ms`. Both are named machine-readable fields -- nothing here looks
+// for a date inside the message text, and nothing invents one. A line that
+// carries neither field (a rotation-boundary partial, or a record clipped by
+// the bridge's 8192-byte per-line ceiling) reports 0 so the view can say the
+// time was not recorded instead of showing a plausible wrong one.
+function logLineEpochSeconds(line) {
+  const trimmed = String(line || "").trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return 0;
+  let record = null;
+  try { record = JSON.parse(trimmed); } catch (_error) { return 0; }
+  if (!record || typeof record !== "object" || Array.isArray(record)) return 0;
+  const seconds = Number(record.epoch);
+  if (Number.isFinite(seconds) && seconds > 0) return Math.floor(seconds);
+  const milliseconds = Number(record.timestamp_ms);
+  if (Number.isFinite(milliseconds) && milliseconds > 0) return Math.floor(milliseconds / 1000);
+  return 0;
+}
+
+function logLinesWithTime(value) {
+  return String(value || "").split("\n").map((line, index) => ({
+    id: index,
+    epoch: logLineEpochSeconds(line),
+    text: line
+  }));
+}
+
 function doctorInventoryRecordFromActivityMessage(value) {
   const prefix = "Doctor inventory evidence ";
   const message = typeof value === "string" ? value : "";
@@ -2643,10 +2712,91 @@ const RESYNC_PATH_LIMIT = 200;
 const UNREADABLE_RESPONSE = "The package returned a response this window cannot read.";
 const SYNC_STATUS_IDLE_MESSAGE = "Choose a profile and check its status. Nothing is read from the NAS until you do.";
 
+const ROLLUP_IDLE_MESSAGE = "No profile has recorded totals yet. Check one scope below once, and this summary answers instantly from then on.";
+const ROLLUP_SCHEMA = "sdsync.status-rollup-aggregate.v1";
+
 function emptySyncStatusPage() {
   return {
     loaded: false, profile: "", scope: "", compare: "", limit: 0,
     truncated: false, nextCursor: "", entries: [], stats: null
+  };
+}
+
+function emptyStatusRollup() {
+  return {
+    loaded: false, complete: false, observedAtEpoch: 0, overlapping: false,
+    profilesTotal: 0, profilesObserved: 0, neverObserved: [],
+    total: null, totalUnavailableReason: "", profiles: []
+  };
+}
+
+// Mirrors the core's own `describe_evidence_age` thresholds exactly, so the
+// dashboard and `status-rollup` on the command line never describe the same
+// evidence as two different ages. A time the browser cannot make sense of --
+// unset, or ahead of this clock -- is rendered as an absolute instant rather
+// than as an age, because "in 3 minutes" is worse than a date.
+function describeEvidenceAge(epoch) {
+  const observed = Number(epoch);
+  if (!Number.isFinite(observed) || observed <= 0) return "never observed";
+  const seconds = Math.floor(Date.now() / 1000) - observed;
+  if (seconds < 0) return formatDate(observed);
+  if (seconds < 90) return "moments ago";
+  if (seconds < 3 * 3600) return `${Math.floor(seconds / 60)} minutes ago`;
+  if (seconds < 48 * 3600) return `${Math.floor(seconds / 3600)} hours ago`;
+  return `${Math.floor(seconds / 86400)} days ago`;
+}
+
+function rollupCount(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : 0;
+}
+
+function rollupFilesAndBytes(value) {
+  const source = value && typeof value === "object" ? value : {};
+  return { files: rollupCount(source.files), bytes: rollupCount(source.bytes) };
+}
+
+function normalizedRollupState(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return {
+    inSync: rollupFilesAndBytes(value.in_sync),
+    wouldTransfer: rollupFilesAndBytes(value.would_transfer),
+    attention: rollupCount(value.attention_entries),
+    totalEntries: rollupCount(value.total_entries)
+  };
+}
+
+// The core establishes every figure here; this only shapes them for rendering.
+// Nothing is summed, inferred, or defaulted into existence: a `total` the core
+// withheld stays withheld, and its stated reason is carried through so the view
+// can say why rather than leaving a reader to add the rows up by hand and reach
+// the same wrong answer the core refused to state.
+function normalizedStatusRollup(model) {
+  if (!model || typeof model !== "object" || model.schema !== ROLLUP_SCHEMA) return emptyStatusRollup();
+  const profiles = arrayOf(model.profiles).slice(0, 64).map((entry) => {
+    const source = entry && typeof entry === "object" ? entry : {};
+    const observation = source.observation && typeof source.observation === "object" ? source.observation : {};
+    return {
+      profile: boundedText(source.profile, "Unnamed").slice(0, 128),
+      observedAtEpoch: rollupCount(source.observed_at_epoch),
+      complete: observation.complete === true,
+      state: normalizedRollupState(source.state)
+    };
+  }).filter((entry) => entry.state);
+  return {
+    loaded: true,
+    complete: model.complete === true,
+    observedAtEpoch: rollupCount(model.observed_at_epoch),
+    overlapping: model.overlapping_profiles === true,
+    profilesTotal: rollupCount(model.profiles_total),
+    profilesObserved: rollupCount(model.profiles_observed),
+    neverObserved: arrayOf(model.profiles_never_observed)
+      .slice(0, 64)
+      .map((name) => boundedText(name, "").slice(0, 128))
+      .filter(Boolean),
+    total: normalizedRollupState(model.total),
+    totalUnavailableReason: boundedText(model.total_unavailable_reason, "").slice(0, 512),
+    profiles
   };
 }
 
@@ -2770,6 +2920,7 @@ export default {
       pathBrowser: emptyPathBrowser(),
       routineEditorOpen: false, routineForm: emptyRoutine(), doctorForm: { scope: "all", level: "standard", write_test: false, write_confirm: false },
       syncStatusForm: { profile: "", scope: "", filter: "", state: "attention", limit: SYNC_PAGE_SIZE_DEFAULT, include_excluded: false },
+      statusRollup: emptyStatusRollup(), statusRollupLoading: false, statusRollupMessage: ROLLUP_IDLE_MESSAGE,
       syncStatusResult: emptySyncStatusPage(), syncStatusPhase: "idle", syncStatusMessage: SYNC_STATUS_IDLE_MESSAGE,
       syncStatusBusy: false, syncStatusCursors: [], syncStatusPageNumber: 0,
       resyncForm: { scope: "" }, resyncPlan: emptyResyncPlan(), resyncPhase: "idle", resyncMessage: "", resyncBusy: false,
@@ -3007,6 +3158,62 @@ export default {
         { key: "state", help: "sync-state", label: "Show states", options: this.syncStateOptions },
         { key: "limit", help: "sync-limit", label: "Page size", options: this.syncPageSizeOptions }
       ];
+    },
+    // A truncated walk makes every figure a floor, so the "+" is attached to
+    // each number where it is read rather than explained once underneath, where
+    // a reader may never reach it.
+    statusRollupCards() {
+      const total = this.statusRollup.total;
+      if (!total) return [];
+      const more = this.statusRollup.complete ? "" : "+";
+      return [
+        { id: "in-sync", label: "In sync", value: `${total.inSync.files}${more}`, detail: formatBytes(total.inSync.bytes) },
+        { id: "differs", label: "Pending upload", value: `${total.wouldTransfer.files}${more}`, detail: formatBytes(total.wouldTransfer.bytes) },
+        { id: "type-conflict", label: "Needs attention", value: `${total.attention}${more}`, detail: `of ${total.totalEntries}${more} entries` }
+      ];
+    },
+    statusRollupRows() {
+      return this.statusRollup.profiles.map((entry) => {
+        const more = entry.complete ? "" : "+";
+        return {
+          profile: entry.profile,
+          inSync: `${entry.state.inSync.files}${more} · ${formatBytes(entry.state.inSync.bytes)}${more}`,
+          pending: `${entry.state.wouldTransfer.files}${more} · ${formatBytes(entry.state.wouldTransfer.bytes)}${more}`,
+          attention: `${entry.state.attention}${more}`,
+          observed: describeEvidenceAge(entry.observedAtEpoch),
+          observedExact: entry.observedAtEpoch ? formatDate(entry.observedAtEpoch) : "Never observed"
+        };
+      });
+    },
+    // The oldest contributing observation, never the newest: the newest would
+    // describe the freshest part of the answer while implying it of all of it.
+    statusRollupFreshness() {
+      if (!this.statusRollup.loaded) return "Not read yet";
+      if (!this.statusRollup.observedAtEpoch) return "Never observed";
+      return `Oldest evidence ${describeEvidenceAge(this.statusRollup.observedAtEpoch)}`;
+    },
+    statusRollupTotalNote() {
+      const rollup = this.statusRollup;
+      if (!rollup.loaded) return "";
+      if (!rollup.total) {
+        // Rendered, never omitted. A missing row invites a reader to add the
+        // per-profile figures themselves and reach the wrong answer the core
+        // declined to state.
+        const reason = rollup.totalUnavailableReason
+          || (rollup.overlapping
+            ? "Two profiles cover overlapping trees, so a combined figure would count the shared files twice."
+            : "A combined figure cannot be stated over these profiles.");
+        return `No combined total: ${reason} The per-profile rows below are each exact.`;
+      }
+      if (!rollup.complete) {
+        return "A scan budget stopped at least one walk, so every figure here is a lower bound rather than a count.";
+      }
+      return `Combined across ${rollup.profilesObserved} of ${rollup.profilesTotal} configured profile${rollup.profilesTotal === 1 ? "" : "s"}.`;
+    },
+    statusRollupNeverObservedNote() {
+      const names = this.statusRollup.neverObserved;
+      if (!names.length) return "";
+      return `Never observed: ${names.join(", ")}. Until each is checked once, the combined figure is incomplete and understates what is pending.`;
     },
     syncStatusCards() {
       const stats = this.syncStatusResult.stats;
@@ -3384,7 +3591,8 @@ export default {
         this.autosaveFailureScopes,
         "All changes saved",
         this.autosaveOutcomeUnknownScopes,
-        this.autosaveInspectionScopes
+        this.autosaveInspectionScopes,
+        { profile: this.profileConnectionAutosaveHeld === true }
       );
       this.autosavePhase = status.phase;
       this.autosaveMessage = status.phase === "blocked" && candidate.manual && !anyFailurePaused ? candidate.manual : status.message;
@@ -3487,6 +3695,20 @@ export default {
         this.refreshAutosaveStatus("Profile autosave held for the active connection request");
         return;
       }
+      // Accepted, and the package told us so repeatedly: the last trusted read
+      // said the job is queued. Only the browser's observation window ran out.
+      //
+      // Treated like the deferred case rather than the failed one. It must not
+      // set `autosaveFailureScopes` or `autosaveOutcomeUnknownScopes`, because
+      // both of those tell the operator to stop and inspect a change that is
+      // going to apply. The scope stays blocked so a second edit cannot race
+      // the outstanding one, and nothing re-sends it -- the mutation is already
+      // on the queue under a known job ID.
+      if (error && error.stillPending === true) {
+        if (this.autosaveCoordinator) this.autosaveCoordinator.setScopeBlocked(task.scope, true);
+        this.refreshAutosaveStatus("Saved changes are queued behind a running operation · they will apply when it finishes");
+        return;
+      }
       this.pauseAutosave(
         task.scope,
         error,
@@ -3535,7 +3757,15 @@ export default {
         this.autosaveFailureScopes,
         savedMessage,
         this.autosaveOutcomeUnknownScopes,
-        this.autosaveInspectionScopes
+        this.autosaveInspectionScopes,
+        // The scopes deliberately paused rather than failed. Passed through the
+        // status function rather than assigned at the hold site, so the held
+        // message stays correct across every later refresh instead of surviving
+        // only until the next unrelated one overwrites it. Inlined rather than
+        // factored into a method because the test harnesses copy a fixed list of
+        // method names onto their context, and a new one would have to be added
+        // to each of them.
+        { profile: this.profileConnectionAutosaveHeld === true }
       );
       this.autosavePhase = status.phase;
       this.autosaveMessage = status.message;
@@ -3545,19 +3775,46 @@ export default {
       if (this.autosaveCoordinator) this.autosaveCoordinator.cancel(scope);
       if (refreshStatus) this.refreshAutosaveStatus();
     },
+    // Held, never cancelled.
+    //
+    // This used to call `cancelAutosave("profile")` first. `cancel()` latches
+    // `entry.cancelled`, which both `_arm` and `_enqueue` refuse to act on and
+    // which only `hydrate()` or a *further* edit ever clears -- so `release`'s
+    // `setScopeBlocked(false)` could not revive it. An edit typed within the
+    // 1.3 s debounce before Browse or Test was pressed stayed dirty and
+    // undispatched for the life of the form, and because `currentAutosaveStatus`
+    // drops cancelled scopes, the status line read "All changes saved" over it.
+    // Blocking is the pause this always wanted: the entry keeps its pending
+    // work, and the `setScopeBlocked(false)` in the release below re-arms and
+    // drains it.
     holdProfileAutosaveForConnection() {
       this.profileConnectionAutosaveHeld = true;
-      this.cancelAutosave("profile", false);
       if (!this.autosaveCoordinator) return;
       const state = this.autosaveCoordinator.getState("profile");
       if (state.registered) this.autosaveCoordinator.setScopeBlocked("profile", true);
+      this.refreshAutosaveStatus();
     },
+    // Release runs from `finally` on both the success and the failure path, so
+    // this is where the held draft's fate is decided.
+    //
+    // A probe that failed or whose outcome is unknown leaves an unresolved
+    // connection incident, and the draft that was pending when it started must
+    // not be dispatched into that. Two tests pin the absence of a profile
+    // mutation after such a probe. Until now that absence held only as a side
+    // effect of the hold cancelling the entry outright -- which is also what
+    // lost the edit on the *success* path, where nothing was ever wrong.
+    //
+    // Discarding here instead, by the incident's own predicate, keeps the
+    // guarantee deliberately rather than accidentally: a failed probe still
+    // fires nothing, a clean probe hands the edit back, and either way a later
+    // edit re-arms the scope because `update()` clears the cancelled latch.
     releaseProfileAutosaveFromConnection() {
       this.profileConnectionAutosaveHeld = false;
       if (this.disposed) return;
       if (this.autosaveCoordinator) {
         const state = this.autosaveCoordinator.getState("profile");
         if (state.registered) {
+          if (isolatedIncidentUnresolved(this, "connection")) this.autosaveCoordinator.cancel("profile");
           const blocked = Boolean(this.autosaveFailureScopes && this.autosaveFailureScopes.profile === true)
             || scopeMutationOutcomeUnresolved(this, "profile");
           this.autosaveCoordinator.setScopeBlocked("profile", blocked);
@@ -3765,9 +4022,14 @@ export default {
       }
       if (this.route === "routines" && route !== "routines") this.closeRoutine();
       this.route = route;
-      // Opening this page selects a profile but deliberately loads nothing: a
-      // status query walks both trees, so it runs only when a person asks.
-      if (route === "sync" && !this.syncStatusForm.profile) this.syncStatusForm.profile = this.syncDefaultProfile;
+      // Opening this page reads the stored totals and nothing else. That read
+      // opens a handful of small documents the last walk left behind, so it is
+      // affordable on every open. The per-file query below still walks both
+      // trees and still runs only when a person asks for it.
+      if (route === "sync") {
+        if (!this.syncStatusForm.profile) this.syncStatusForm.profile = this.syncDefaultProfile;
+        void this.refreshStatusRollup();
+      }
       if (route === "activity") {
         this.refreshLogs();
         if (this.profileRecoveryActive) void this.refreshSnapshot(false, true);
@@ -3845,6 +4107,21 @@ export default {
         correlation ? `${correlation} ${detail}` : detail,
         defaultMessage
       ).slice(0, MUTATION_MESSAGE_LIMIT);
+      // Accepted and still on the queue. Handled here rather than only in
+      // `autosaveFailed` because every manual caller that passes bounded
+      // observation limits reaches this function too, and without a branch of
+      // its own a still-queued change would fall through to the plain failure
+      // wording and tell the operator their save was rejected -- which is worse
+      // than the outcome-unknown report it replaced, not better. Not an error
+      // toast: nothing has gone wrong and there is nothing to inspect.
+      if (error && error.stillPending === true) {
+        const queuedMessage = withCorrelation(
+          `${observed} Do not send it again; it is already queued under this job ID.`,
+          "The package accepted this change and will apply it when the running operation finishes."
+        );
+        this.toast("Change queued", queuedMessage, false);
+        return { unknown: false, inspection: false, stillPending: true, message: queuedMessage, requestId, jobId };
+      }
       const csrfRejected = Boolean(!unknown && !inspection && error && error.preAcceptance === true && error.csrfRejected === true);
       if (csrfRejected) {
         this.csrfToken = "";
@@ -5270,6 +5547,31 @@ export default {
       this.syncStatusForm.include_excluded = false;
       this.onSyncQueryChanged();
     },
+    // The cheap half of this page. A GET, not a queued mutation: it opens the
+    // small documents the last walk stored and touches no source file and no
+    // File Station endpoint, so it answers in milliseconds and must never wait
+    // behind the walk it exists to save the operator from running.
+    async refreshStatusRollup() {
+      if (this.disposed || this.statusRollupLoading) return;
+      this.statusRollupLoading = true;
+      try {
+        const model = await apiGet(this.auth, "status-rollup");
+        if (this.disposed) return;
+        const rollup = normalizedStatusRollup(model);
+        this.statusRollup = rollup;
+        if (!rollup.loaded) this.statusRollupMessage = UNREADABLE_RESPONSE;
+        else if (!rollup.total && !rollup.profiles.length) this.statusRollupMessage = ROLLUP_IDLE_MESSAGE;
+      } catch (error) {
+        if (this.disposed) return;
+        this.statusRollup = emptyStatusRollup();
+        this.statusRollupMessage = boundedText(
+          this.describeBridgeError(error, "status").message,
+          "The stored totals could not be read."
+        );
+      } finally {
+        if (!this.disposed) this.statusRollupLoading = false;
+      }
+    },
     async loadSyncStatus(cursor, pageNumber) {
       if (!this.syncStatusReady || this.disposed) return;
       const profile = boundedText(this.syncStatusForm.profile, "");
@@ -5544,7 +5846,14 @@ export default {
     logRecordsFrom(model) {
       const records = [];
       let remaining = MAX_RESPONSE_BYTES;
-      const append = (sourceValue, textValue) => {
+      // A source selected on its own is rendered even when it has nothing to
+      // show, so its Clear control stays reachable. An empty view does not mean
+      // an empty file: raising a category's log level hides existing records
+      // from this list without removing the bytes they occupy. Under "All logs"
+      // the empty entries are dropped instead, so a fresh install still reads
+      // as one "No log data yet." rather than six empty cards.
+      const allowEmpty = this.logSource !== "all";
+      const append = (sourceValue, textValue, structured = false) => {
         if (remaining <= 0) return;
         const source = troubleshootingField(sourceValue, "log");
         const rawText = typeof textValue === "string" ? textValue : "";
@@ -5559,15 +5868,20 @@ export default {
         // the stored record and therefore in every later copy path.
         const sanitized = redactedTroubleshootingText(rawText);
         const candidate = sanitized.slice(0, remaining);
-        if (!candidate) return;
+        if (!candidate && !(structured && allowEmpty)) return;
         remaining -= candidate.length;
+        // Timestamps are read from the redacted, display-bounded text rather
+        // than from the raw response, so the time shown beside a line always
+        // belongs to the line actually rendered next to it.
+        const lines = candidate ? logLinesWithTime(candidate) : [];
         records.push({
           id: `${records.length}:${source}`,
           source,
           text: candidate,
           troubleshootingSource: source,
           troubleshootingText: candidate,
-          lineCount: candidate.split("\n").length,
+          lines,
+          lineCount: lines.length,
           doctorInventories
         });
       };
@@ -5577,7 +5891,7 @@ export default {
           if (!entry || typeof entry !== "object") return;
           const source = typeof entry.source === "string" ? entry.source : "log";
           if (Array.isArray(entry.lines)) {
-            append(source, entry.lines.map((line) => typeof line === "string" ? line : "").join("\n"));
+            append(source, entry.lines.map((line) => typeof line === "string" ? line : "").join("\n"), true);
             return;
           }
           const timestamp = typeof entry.timestamp === "string" ? entry.timestamp : "";
@@ -5629,6 +5943,40 @@ export default {
     },
     toggleLogs() { this.logsPaused = !this.logsPaused; this.logState = this.logsPaused ? "Paused" : "Resuming"; if (!this.logsPaused) this.refreshLogs(); else window.clearTimeout(this.logTimer); },
     clearLogView() { this.logRecords = []; this.logOutput = "View cleared. The package log was not deleted."; },
+    logSourceClearable(source) { return CLEARABLE_LOG_SOURCES.includes(source); },
+    logClearTooltip(source) {
+      if (!this.logSourceClearable(source)) {
+        return "The audit log records who cleared each package log, so it is deliberately not clearable from the dashboard.";
+      }
+      if (this.securityPolicy.allow_operational_actions === false) {
+        return "Operational actions are disabled by the current security policy.";
+      }
+      if (!this.canMutate) return "This DSM session cannot change package state.";
+      return "Empty this bounded package log and its rotated files. The package records the clearing itself in the audit log.";
+    },
+    async clearLogSource(source) {
+      if (!this.logSourceClearable(source)) return;
+      if (scopeMutationOutcomeUnresolved(this, "profile")) return this.toast("Log clearing locked", scopeMutationGuidance(this, "profile"), true);
+      if (isolatedIncidentUnresolved(this, "operations")) return this.toast("Log clearing locked", isolatedIncidentGuidance(this, "operations"), true);
+      if (!this.canRunOperations || this.operationBusy || this.disposed) return;
+      if (!await this.confirmAction(
+        `Clear the ${source} log?`,
+        "The active log and its rotated files are emptied on the NAS. Evidence already collected here is lost, and the package records this clearing in the audit log.",
+        "Clear log"
+      )) return;
+      this.operationBusy = true;
+      try {
+        await apiPost(this.auth, this.csrfToken, ACTIONS.clearLogs, { source });
+        if (this.disposed) return;
+        this.toast("Log cleared", `The package emptied the ${source} log and its rotated files.`);
+      } catch (error) {
+        if (this.disposed) return;
+        this.reportMutationError(error, "Log not cleared", "Log clearing outcome unknown", "The package rejected the change.");
+      } finally {
+        if (!this.disposed) this.operationBusy = false;
+      }
+      if (!this.disposed) await this.refreshLogs();
+    },
     async saveNotificationPreferences(event) {
       if (event && event.preventDefault) event.preventDefault();
       if (scopeMutationOutcomeUnresolved(this, "interface")) return this.toast("Session preference save locked", scopeMutationGuidance(this, "interface"), true);

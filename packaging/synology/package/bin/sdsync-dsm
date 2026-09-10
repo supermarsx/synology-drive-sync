@@ -28,6 +28,8 @@ Usage:
   sdsync-dsm enable [--interval SECONDS] [--allow-delete] [--max-total-delete N]
   sdsync-dsm disable | status | logs [LINES] | paths
   sdsync-dsm api snapshot | logs --lines N | activity --lines N
+  sdsync-dsm api clear-logs --source api|controller|doctor|scheduler|sync
+  sdsync-dsm api status-rollup
   sdsync-dsm api sync-status --profile NAME [--scope PATH] [--filter TEXT]
                              [--state STATE] [--limit 1..200] [--cursor CURSOR]
                              [--include-excluded true|false]
@@ -2598,6 +2600,91 @@ api_logs() {
     printf ']}\n'
 }
 
+# Replace one bounded package log with an empty private file of the same
+# identity. This is deliberately not `> file`: truncating in place keeps the
+# inode, so a writer that already opened it for append keeps its offset and the
+# next record lands after a hole of NUL bytes. Staging an empty private file and
+# renaming it over the path publishes the empty log atomically, gives every
+# reader either the whole old file or the whole new one, and never leaves a
+# world-readable window -- the same contract `append_rotating_log` relies on.
+clear_private_log_file() {
+    clear_log_path=$1
+    clear_log_keep=$2
+    private_log_path_safe_or_absent "$clear_log_path" || return $?
+    [ -f "$clear_log_path" ] || return 0
+    if [ "$clear_log_keep" != true ]; then
+        rm -f "$clear_log_path" || return 73
+        return 0
+    fi
+    clear_log_temp=$clear_log_path.clearing.$$
+    [ ! -e "$clear_log_temp" ] && [ ! -L "$clear_log_temp" ] || return 73
+    clear_log_old_umask=$(umask)
+    umask 077
+    clear_log_status=0
+    : > "$clear_log_temp" || clear_log_status=73
+    [ "$clear_log_status" -ne 0 ] || finish_private_file "$clear_log_temp" || clear_log_status=73
+    [ "$clear_log_status" -ne 0 ] || mv -f "$clear_log_temp" "$clear_log_path" || clear_log_status=73
+    umask "$clear_log_old_umask"
+    if [ "$clear_log_status" -ne 0 ] && [ ! -L "$clear_log_temp" ]; then
+        rm -f "$clear_log_temp" 2>/dev/null || true
+    fi
+    return "$clear_log_status"
+}
+
+api_clear_logs() {
+    clear_source=
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --source) api_need_value "$@"; clear_source=$2; shift 2 ;;
+            *) api_error invalid_request "unknown clear-logs option" 64 ;;
+        esac
+    done
+    # `audit` and `all` are refused here as well as in the bridge. The audit log
+    # is the record of who cleared which log, so a dashboard button that empties
+    # it would destroy the evidence of its own use; `all` is refused because the
+    # only honest thing it could do is silently skip that one file.
+    case $clear_source in
+        api|controller|doctor|scheduler|sync) ;;
+        audit) api_error forbidden "the audit log is not clearable" 77 ;;
+        *) api_error invalid_request "invalid log source" 64 ;;
+    esac
+    case $clear_source in
+        api) set -- "$log_root/api.log" "$log_root/api.log.1" "$log_root/api.log.2" \
+            "$log_root/api.log.3" "$log_root/api.log.4" "$log_root/api.log.5" ;;
+        controller) set -- "$controller_log" "$controller_log.1" "$controller_log.2" \
+            "$controller_log.3" "$controller_log.4" "$controller_log.5" ;;
+        doctor) set -- "$doctor_inventory_log" "$doctor_inventory_log.1" \
+            "$doctor_inventory_log.2" "$doctor_inventory_log.3" ;;
+        scheduler) set -- "$log_root/scheduler.log" "$log_root/scheduler.log.1" \
+            "$log_root/scheduler.log.2" "$log_root/scheduler.log.3" \
+            "$log_root/scheduler.log.4" "$log_root/scheduler.log.5" ;;
+        sync) set -- "$log_root/sync.log" "$log_root/sync.log.1" \
+            "$log_root/sync.log.2" "$log_root/sync.log.3" ;;
+    esac
+    # Validate the complete rotation set before touching any of it, exactly as
+    # rotate_log does, so a refusal leaves every file as it was rather than
+    # half-cleared.
+    for clear_preflight in "$@"; do
+        private_log_path_safe_or_absent "$clear_preflight" || \
+            api_error unsafe_state "unsafe private package log file" 73
+    done
+    # Serialise against the event-log writers. controller.log is appended under
+    # this lock, and holding it for every source costs nothing while keeping a
+    # clear from interleaving with a rotation already in progress.
+    acquire_event_log_lock || api_error unsafe_state "package event log is busy" 73
+    clear_status=0
+    clear_keep=true
+    for clear_target in "$@"; do
+        clear_private_log_file "$clear_target" "$clear_keep" || { clear_status=$?; break; }
+        # Only the active file is republished empty; its rotations are removed
+        # so the clearing actually returns their bytes to the volume.
+        clear_keep=false
+    done
+    release_event_log_lock || clear_status=$?
+    [ "$clear_status" -eq 0 ] || api_error unsafe_state "package log could not be cleared" 73
+    api_mutation_result "Cleared the $clear_source log"
+}
+
 api_activity() {
     activity_lines=100
     while [ "$#" -gt 0 ]; do
@@ -3325,6 +3412,52 @@ api_sync_status() {
         "$(json_quote "$status_profile")" "$(json_quote "$query_payload")"
 }
 
+# The stored totals, and the reason the Sync section can open with an answer.
+#
+# This reads the small rollup documents the last walk left behind and nothing
+# else: no digest cache, no source file, no File Station call, no
+# authentication. The core pins that property with a test that deletes the
+# source tree and still expects an answer, so nothing added here may introduce a
+# lookup -- not a `test -d` on a source root, not a profile connection probe.
+#
+# It is also the reason this is a read rather than a queued job. The expensive
+# walk belongs on the queue; this must not queue behind it.
+api_status_rollup() {
+    [ "$#" -eq 0 ] || api_error invalid_request "status-rollup accepts no arguments" 64
+    # The expected profile set is derived here rather than accepted from the
+    # caller. A configured profile with no stored totals is reported as never
+    # observed and forces the combined figure incomplete; letting a request name
+    # the set would let it omit one and understate what is pending, which is the
+    # direction that tells someone they are caught up when they are not.
+    #
+    # Parameter expansion only. This loop must not fork per profile: it runs on
+    # every open of the Sync section, which is exactly where the snapshot path
+    # was cut from 1,135 spawns to 12.
+    rollup_profiles=
+    for rollup_fragment in "$profiles_dir"/*.toml; do
+        [ -e "$rollup_fragment" ] || [ -L "$rollup_fragment" ] || continue
+        rollup_name=${rollup_fragment##*/}
+        rollup_name=${rollup_name%.toml}
+        case $rollup_name in ''|*[!A-Za-z0-9_-]*) continue ;; esac
+        if [ -z "$rollup_profiles" ]; then
+            rollup_profiles=$rollup_name
+        else
+            rollup_profiles=$rollup_profiles,$rollup_name
+        fi
+    done
+    # No --config: the core dispatches this command without resolving a
+    # configuration, and passing one would only add a way for an unrelated
+    # configuration fault to break a read that does not depend on it.
+    set -- "$binary" --output json status-rollup --status-cache "$status_cache_dir"
+    [ -z "$rollup_profiles" ] || set -- "$@" --profiles "$rollup_profiles"
+    api_query_capture "$@"
+    [ "$query_exit" -eq 0 ] || api_query_failed status-rollup all
+    # Forwarded verbatim. Every figure, its completeness marker and its age were
+    # established by the walk that stored them; a bridge that recomputed or
+    # re-totalled any of it could only introduce a second answer that disagrees.
+    printf '%s\n' "$query_payload"
+}
+
 api_resync() {
     resync_api_profile= resync_api_scope= resync_api_ticket=
     while [ "$#" -gt 0 ]; do
@@ -3465,7 +3598,7 @@ api_audit_event() {
     case $audit_event_operation in
         configure-profile|remove-profile|set-default|set-secret|set-password|remove-password|set-totp|remove-totp|\
         set-remote-log-token|remove-remote-log-token|test-profile-auth|browse-remote|schedule|routine|remove-routine|alert-policy|security-policy|\
-        performance-policy|interface-settings|session-notifications|doctor|plan|run|sync-status|resync) ;;
+        performance-policy|interface-settings|session-notifications|doctor|plan|run|sync-status|resync|clear-logs) ;;
         *) api_error invalid_request "invalid audit-event operation" 64 ;;
     esac
     case $audit_event_state in requested|succeeded|failed|outcome_unknown) ;; *) api_error invalid_request "invalid audit-event state" 64 ;; esac
@@ -3560,8 +3693,10 @@ api_command() {
     case $api_operation in
         snapshot) api_snapshot "$@" ;;
         logs) api_logs "$@" ;;
+        clear-logs) api_clear_logs "$@" ;;
         activity) api_activity "$@" ;;
         sync-status) api_sync_status "$@" ;;
+        status-rollup) api_status_rollup "$@" ;;
         resync) api_resync "$@" ;;
         cgi-failure) api_cgi_failure "$@" ;;
         audit-rejected)

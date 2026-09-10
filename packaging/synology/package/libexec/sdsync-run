@@ -310,12 +310,33 @@ preflight_profile_runtime() {
     fi
 }
 
+# Which profiles this run covers is decided here, once, and recorded.
+#
+# The completion states written after the core exits used to come from a second
+# glob of this directory -- the same question asked twice, at two times that can
+# disagree. A profile present only in the later listing was never part of the
+# run, yet would receive a record saying this run had succeeded for it, and a
+# brand-new profile reporting an earlier successful sync is a false assurance.
+#
+# No supported caller can currently produce that disagreement: `begin_mutation`
+# in sdsync-dsm refuses every profile, credential, routine and schedule change
+# while the run lock is live, so nothing can appear here mid-run. This is
+# therefore defence in depth, and deliberately so -- the runner's own record of
+# what it did should not depend on a guard three files away continuing to hold.
+# One decision point instead of two is also simply what the code meant.
+#
+# Space-separated and split on IFS below, which is safe because every fragment
+# here is named by `valid_name` on write -- letters, digits, underscore and
+# hyphen only, never whitespace. Same idiom the fingerprint and prune loops
+# already use.
+covered_profiles=
 if [ "$run_scope" = all ]; then
     found_profile=false
     for fragment in "$profiles_dir"/*.toml; do
         [ -e "$fragment" ] || [ -L "$fragment" ] || continue
         found_profile=true
         preflight_profile_runtime "$fragment" || exit $?
+        covered_profiles="$covered_profiles $runtime_profile"
     done
     [ "$found_profile" = true ] || {
         echo "no configured profiles" >&2
@@ -441,10 +462,13 @@ write_profile_completion_state() {
     finish_private_file "$profile_state_temp"
     mv -f "$profile_state_temp" "$profile_state_dir/$profile_state_name.state"
 }
+# The frozen set from preflight, not a fresh glob. A profile removed while the
+# run was in flight is still skipped, by the `[ -f ]` guard inside the writer
+# rather than by being absent from a later listing -- so removal stays silent
+# and creation stays uncounted, which is the pair this needs.
 if [ "$run_scope" = all ]; then
-    for profile_state_fragment in "$profiles_dir"/*.toml; do
-        [ -f "$profile_state_fragment" ] || continue
-        write_profile_completion_state "$profile_state_fragment"
+    for covered_profile in $covered_profiles; do
+        write_profile_completion_state "$profiles_dir/$covered_profile.toml"
     done
 else
     write_profile_completion_state "$profiles_dir/$run_scope.toml"

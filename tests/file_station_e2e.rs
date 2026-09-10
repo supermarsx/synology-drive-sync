@@ -2169,8 +2169,18 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
         sync_requests.last().map(|request| request.operation()),
         Some("SYNO.API.Auth.logout".to_owned())
     );
+    // Everything up to the reconciliation comparison is one request at a time in a fixed order,
+    // and is asserted as such. The comparison itself is not: the client keeps several server-side
+    // digest tasks in flight, so which of two files starts first, and whether a start or another
+    // file's status reaches the server next, belongs to the network. Asserting a single
+    // interleaving there would pin a scheduling accident and fail intermittently on a loaded
+    // machine. What is asserted instead is everything that is actually promised — see below.
+    let md5_phase = sync_requests
+        .iter()
+        .position(|request| request.operation().starts_with("SYNO.FileStation.MD5."))
+        .expect("the reconciliation must ask File Station for a digest");
     assert_eq!(
-        sync_requests
+        sync_requests[..md5_phase]
             .iter()
             .map(|request| request.operation())
             .collect::<Vec<_>>(),
@@ -2196,14 +2206,40 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
             "SYNO.FileStation.List.list",
             "SYNO.FileStation.List.list",
             "SYNO.FileStation.List.list",
-            // The reconciliation comparison. Two server-side digest tasks where there were two
-            // whole-file downloads: the same question asked of File Station instead of answered
-            // by transferring the answer's inputs.
+        ]
+    );
+    // The reconciliation comparison. Two server-side digest tasks where there were two whole-file
+    // downloads: the same question asked of File Station instead of answered by transferring the
+    // answer's inputs. Concurrency changed the interleaving and nothing else — the same two starts
+    // and two statuses, no third request, and the session still closes at the end.
+    let mut comparison = sync_requests[md5_phase..]
+        .iter()
+        .map(|request| request.operation())
+        .collect::<Vec<_>>();
+    assert_eq!(comparison.pop(), Some("SYNO.API.Auth.logout".to_owned()));
+    let mut starts = 0_usize;
+    for operation in &comparison {
+        match operation.as_str() {
+            "SYNO.FileStation.MD5.start" => starts += 1,
+            // A status can only be asked about a task that exists, so however the two files
+            // interleave, no status may precede every start.
+            "SYNO.FileStation.MD5.status" => {
+                assert!(
+                    starts > 0,
+                    "a digest was polled before any task was started"
+                );
+            }
+            other => panic!("unexpected request during the reconciliation comparison: {other}"),
+        }
+    }
+    comparison.sort();
+    assert_eq!(
+        comparison,
+        [
+            "SYNO.FileStation.MD5.start",
             "SYNO.FileStation.MD5.start",
             "SYNO.FileStation.MD5.status",
-            "SYNO.FileStation.MD5.start",
             "SYNO.FileStation.MD5.status",
-            "SYNO.API.Auth.logout",
         ]
     );
 }

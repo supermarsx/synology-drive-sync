@@ -54,11 +54,17 @@
 //! # The canary
 //!
 //! A design in which the cache can be broadly wrong and nothing notices would be the dangerous one.
-//! Each warm pass therefore re-verifies a small absolute sample of served entries against live
+//! A warm pass therefore re-verifies a small absolute sample of served entries against live
 //! evidence. It is not a sweep — [`DEFAULT_CANARY`] entries against a 20,000-entry tree would take
 //! hundreds of runs to cover it — it is a detector for *systematic* error, which it catches almost
 //! immediately. A single mismatch discards the entire file and forces a cold pass rather than
 //! repairing the offending entry, because repairing it would hide exactly the case worth finding.
+//!
+//! The sample runs on the cadence in [`CANARY_INTERVAL_SECONDS`] rather than on every pass, and the
+//! header records when it last ran. Systematic error is a property of the file and does not arrive
+//! between one refresh and the next, whereas the sample's cost — a full local read and a File
+//! Station MD5 task per probe — is the entire remote digest cost of a warm pass and was being
+//! charged to whoever was waiting on the answer.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -109,6 +115,23 @@ pub const DEFAULT_MAX_AGE_SECONDS: i64 = 14 * 24 * 60 * 60;
 /// detect systematic error, and 25 independent probes do that regardless of tree size, whereas a
 /// percentage would scale the cost back up with the thing being avoided.
 pub const DEFAULT_CANARY: usize = 25;
+
+/// Shortest gap between two audits of the same cache file.
+///
+/// The canary is not free: each withheld entry costs a full local read plus a File Station MD5 task
+/// — on a warm tree that is the *entire* remote digest cost of the pass, paid for evidence the
+/// answer does not use. Charging it to every pass charges it to a person pressing Refresh, who is
+/// waiting on the answer and is the one user guaranteed not to be the systematically-wrong-cache
+/// case the sample exists to find.
+///
+/// A day rather than a pass, because what the detector is for does not change between one refresh
+/// and the next. Systematic error is a property of the file, so sampling it once a day still finds
+/// it long inside [`DEFAULT_MAX_AGE_SECONDS`], and the entry that would have been caught on the
+/// second refresh instead of the first was already going to be re-derived by the next sync run.
+/// The honest cost of this bound is that a cache that turns systematically wrong can be believed
+/// for up to a day before the sample says so; the honest benefit is that the eleventh refresh in an
+/// afternoon costs what it should, which is nothing.
+pub const CANARY_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
 
 /// Never trust an entry whose recorded modification time is this close to the moment the cache was
 /// written. Git's racy-index rule: a file rewritten within the same clock tick as the observation
@@ -235,6 +258,14 @@ struct Header {
     /// Records written last time. Only used to size the canary stride in a single pass; a wrong
     /// value costs a differently sized sample, never a wrong answer.
     entries: usize,
+    /// When this file's evidence was last sampled against live digests, or `0` for never.
+    ///
+    /// Distinct from `generated_at`, which moves on every pass: the audit runs on the cadence in
+    /// [`CANARY_INTERVAL_SECONDS`], not on every rewrite. Defaulted rather than required so a
+    /// header without it reads as "never audited" and is audited on its next warm pass, which is
+    /// the safe direction for a field whose absence means the sample has not run.
+    #[serde(default)]
+    canary_at: i64,
 }
 
 /// One served entry held back for live re-verification.
@@ -270,6 +301,13 @@ pub struct StatusCache {
     options: CacheOptions,
     path: PathBuf,
     now: i64,
+    /// Audit epoch to write into the next header: this pass's clock when it sampled, the stored
+    /// value when it did not, and `0` when no trusted header was read.
+    ///
+    /// A cell rather than a `store` parameter because the two are one fact recorded in one place
+    /// and read in another, and threading it through the writer's signature would let a caller
+    /// pass a value that contradicts what the reader actually did.
+    canary_at: std::cell::Cell<i64>,
 }
 
 impl StatusCache {
@@ -287,7 +325,12 @@ impl StatusCache {
         let path = options
             .directory
             .join(format!("{}.ndjson", options.profile));
-        Some(Self { options, path, now })
+        Some(Self {
+            options,
+            path,
+            now,
+            canary_at: std::cell::Cell::new(0),
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -367,7 +410,16 @@ impl StatusCache {
             return true;
         }
 
-        let stride = canary_stride(header.entries, self.options.canary);
+        // Audit on a cadence, not on every pass. See [`CANARY_INTERVAL_SECONDS`] for why a person
+        // pressing Refresh is the wrong pass to charge for a systematic-error detector. A clock
+        // that has gone backwards past the recorded epoch reads as due, which is the safe
+        // direction: it samples more often, never less.
+        let audit_due = self.now.saturating_sub(header.canary_at) >= CANARY_INTERVAL_SECONDS;
+        let stride = if audit_due {
+            canary_stride(header.entries, self.options.canary)
+        } else {
+            0
+        };
         let offset = if stride == 0 {
             0
         } else {
@@ -473,7 +525,16 @@ impl StatusCache {
             eligible += 1;
         }
 
-        // A file without its sentinel was truncated, so nothing read from it is trusted.
+        // A file without its sentinel was truncated, so nothing read from it is trusted. Only a
+        // trusted read carries an audit epoch forward: a rejected file is about to be rewritten
+        // from scratch, and evidence gathered afresh has not been sampled at all.
+        if ended {
+            self.canary_at.set(if audit_due {
+                self.now
+            } else {
+                header.canary_at
+            });
+        }
         ended
     }
 
@@ -556,6 +617,7 @@ impl StatusCache {
             compare: self.options.compare.to_owned(),
             generated_at: self.now,
             entries: total,
+            canary_at: self.canary_at.get(),
         };
         let write = (|| -> std::io::Result<()> {
             serde_json::to_writer(&mut writer, &header)?;
@@ -1920,6 +1982,106 @@ mod tests {
         assert_eq!(
             StatusCache::verify_canary(&served.probes, &fresh_local, &fresh_remote),
             Some(victim)
+        );
+    }
+
+    /// A refresh pressed twice in an afternoon audits once.
+    ///
+    /// The sample costs a full local read plus a File Station MD5 task per probe, which on a warm
+    /// tree is the entire remote digest cost of the pass. Charging it to every pass charged it to
+    /// the person waiting on the answer; charging it on a cadence keeps the detector and gives the
+    /// second refresh nothing to pay for.
+    #[test]
+    fn the_canary_samples_on_a_cadence_rather_than_on_every_pass() {
+        let scratch = Scratch::new();
+        let mut sampling = options(&scratch.0);
+        sampling.canary = 4;
+        let (mut local, mut remote) = inventories();
+        for index in 0..8_u64 {
+            pair(
+                &mut local,
+                &mut remote,
+                &format!("file-{index}.bin"),
+                10 + index,
+                1_000_000 + index as i64,
+                11 + index,
+            );
+        }
+        warm(
+            &StatusCache::open(sampling.clone(), NOW).expect("cache opens"),
+            &mut local,
+            &mut remote,
+            0xAA,
+        );
+
+        // A cache that has never been sampled is sampled on its first warm pass, whenever that is.
+        let (mut first_local, mut first_remote) = inventories();
+        let (mut second_local, mut second_remote) = inventories();
+        let (mut later_local, mut later_remote) = inventories();
+        for index in 0..8_u64 {
+            for (target_local, target_remote) in [
+                (&mut first_local, &mut first_remote),
+                (&mut second_local, &mut second_remote),
+                (&mut later_local, &mut later_remote),
+            ] {
+                pair(
+                    target_local,
+                    target_remote,
+                    &format!("file-{index}.bin"),
+                    10 + index,
+                    1_000_000 + index as i64,
+                    11 + index,
+                );
+            }
+        }
+        let comparison = comparison_of(&first_local);
+
+        let first = StatusCache::open(sampling.clone(), NOW + 1).expect("cache opens");
+        let first_served = first.serve(&mut first_local, &mut first_remote, &comparison);
+        assert!(
+            !first_served.probes.is_empty(),
+            "an unsampled cache was not audited"
+        );
+        // Recording the audit is what the next pass reads, so the pass has to be written back.
+        for probe in &first_served.probes {
+            first_local
+                .entries
+                .get_mut(&probe.relative)
+                .unwrap()
+                .content_md5 = Some(digest(0xAA));
+            first_remote
+                .entries
+                .get_mut(&probe.relative)
+                .unwrap()
+                .content_md5 = Some(digest(0xAA));
+        }
+        first
+            .store(&first_local, &first_remote, &comparison, false)
+            .expect("store");
+
+        // Inside the interval: nothing withheld, so nothing extra is read or asked of the NAS.
+        let second =
+            StatusCache::open(sampling.clone(), NOW + CANARY_INTERVAL_SECONDS - 1).expect("opens");
+        let second_served = second.serve(&mut second_local, &mut second_remote, &comparison);
+        assert!(
+            second_served.probes.is_empty(),
+            "a second pass inside the interval audited again"
+        );
+        assert_eq!(
+            second_served.supplied, 8,
+            "withholding nothing must serve every eligible pair"
+        );
+        second
+            .store(&second_local, &second_remote, &comparison, false)
+            .expect("store");
+
+        // Past it, the detector runs again -- a pass inside the interval must not defer it forever.
+        let later =
+            StatusCache::open(sampling, NOW + CANARY_INTERVAL_SECONDS + 2).expect("cache opens");
+        let later_served = later.serve(&mut later_local, &mut later_remote, &comparison);
+        assert!(
+            !later_served.probes.is_empty(),
+            "the audit never came back after the interval elapsed"
         );
     }
 

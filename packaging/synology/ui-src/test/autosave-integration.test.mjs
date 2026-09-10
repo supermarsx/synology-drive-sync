@@ -504,6 +504,9 @@ test("cancel and failure-clear paths recompute status while manual review never 
     interface: { registered: false, dirty: false, cancelled: false }
   };
   const coordinator = {
+    // Mirrors AutosaveCoordinator.cancel exactly: it clears the pending timer
+    // and latches `cancelled`, and it leaves the entry dirty. The edit is still
+    // there and nothing will now dispatch it.
     cancel(scope) { state[scope] = { ...state[scope], cancelled: true }; },
     getState(scope) { return { blocked: false, inFlight: false, scheduled: false, queued: false, ...state[scope] }; },
     update() { return { dirty: true }; },
@@ -522,9 +525,21 @@ test("cancel and failure-clear paths recompute status while manual review never 
   context.ensureProfileFailureRecords = (...args) => methods.ensureProfileFailureRecords.call(context, ...args);
   context.syncProfileFailureState = (...args) => methods.syncProfileFailureState.call(context, ...args);
   methods.cancelAutosave.call(context, "profile");
-  assert.equal(context.autosavePhase, "saved");
-  assert.equal(context.autosaveMessage, "All changes saved");
+  // Changed deliberately, from "saved". A cancelled entry is dropped from every
+  // dispatchable phase because nothing will dispatch it -- which is precisely
+  // why it must not then fall through to "All changes saved" while it is still
+  // dirty. That combination is what made the connection-hold defect silent: the
+  // edit was stranded *and* the status line said it had been saved, so there was
+  // nothing for the operator to notice. The status now names it.
+  assert.equal(context.autosavePhase, "blocked");
+  assert.equal(context.autosaveMessage, "Unsaved changes · use Save now");
 
+  // The failure-clear path on its own. The entry is reset to a saved one first
+  // so this sub-case tests what clearing a failure recomputes, rather than
+  // inheriting the dirty, cancelled entry the cancel sub-case above leaves
+  // behind on purpose -- over which "All changes saved" is exactly the report
+  // that must no longer appear.
+  state.profile = { registered: true, dirty: false, cancelled: false };
   context.autosaveFailureScopes.profile = true;
   context.profileFailureRecords.configuration.active = true;
   context.autosavePhase = "blocked";
@@ -832,6 +847,55 @@ test("remote browsing cancels a pending profile autosave and a failed browse nev
   context.autosaveCoordinator.update("profile", { name: "nightly", source: "/volume1/later-edit" });
   await clock.advance(1300);
   assert.equal(profilePosts, 1, "a later edit remains autosavable after connection-only browse evidence");
+});
+
+// The success path, which the two tests above do not cover: they pin that a
+// *failed* probe never releases the held draft, and that guarantee used to hold
+// only because the hold cancelled the entry outright -- which lost the edit on
+// the clean path too. Regression for that loss.
+test("a profile edit held for a clean connection request survives and dispatches on release", async () => {
+  let profilePosts = 0;
+  let dispatched = null;
+  const { clock, context, component } = await coordinatorRuntime(async (_auth, _csrf, action, payload) => {
+    if (action === "configure-profile") {
+      profilePosts += 1;
+      dispatched = payload;
+    }
+    return { ok: true };
+  });
+  Object.assign(context, {
+    profileEditorOpen: true,
+    selectedProfile: "nightly",
+    profileForm: { name: "nightly", source: "/volume1/source" }
+  });
+  for (const name of ["holdProfileAutosaveForConnection", "releaseProfileAutosaveFromConnection"]) {
+    context[name] = (...args) => component.methods[name].apply(context, args);
+  }
+
+  context.autosaveCoordinator.hydrate("profile", { name: "nightly", source: "/volume1/source" });
+  context.autosaveCoordinator.update("profile", { name: "nightly", source: "/volume1/pending" });
+
+  // The reproduction window: the edit is typed, then Browse or Test is pressed
+  // inside the 1.3 s debounce, before the timer has fired.
+  await clock.advance(400);
+  context.holdProfileAutosaveForConnection();
+  await clock.advance(5000);
+
+  assert.equal(profilePosts, 0, "a held edit must not dispatch while the connection request is in flight");
+  assert.equal(
+    context.autosaveCoordinator.getState("profile").cancelled,
+    false,
+    "holding must not cancel the entry; a cancelled entry cannot be revived by release"
+  );
+  assert.equal(context.autosaveCoordinator.getState("profile").dirty, true, "the edit must still be pending");
+  assert.notEqual(context.autosavePhase, "saved", "the status line must never report saved over a pending edit");
+
+  // No connection incident: the probe was clean, so release hands the edit back.
+  context.releaseProfileAutosaveFromConnection();
+  await clock.advance(1300);
+
+  assert.equal(profilePosts, 1, "the held edit must dispatch exactly once after a clean release");
+  assert.equal(dispatched && dispatched.source, "/volume1/pending", "the dispatched edit must carry the held value");
 });
 
 function connectionProbeContext(context, component) {

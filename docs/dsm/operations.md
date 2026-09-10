@@ -103,6 +103,31 @@ The snapshot reports:
 Plan and Run remain asynchronous in the dashboard. “Queued” is not completion. Follow the run state,
 Activity, and logs.
 
+## What may run beside what
+
+Every dashboard request that does real work becomes a queued job, and the controller classifies each
+one before dispatching it. The class decides what else may run at the same time:
+
+| Class | Jobs | May run beside |
+| --- | --- | --- |
+| Connection | authentication test, remote browsing | anything except another connection job |
+| Concurrent | Plan, Run, Doctor, Check status, resync plan | one connection job **and** one serialized job |
+| Serialized | profile save, secrets, routines, alert and security policy, interface event | one concurrent job |
+
+Two jobs of the same class never overlap. A serialized job commits configuration, credential, policy
+or scheduler state, so two of them cannot interleave and neither may run beside a scheduled sync.
+
+The row that matters in practice is the second one. **Check status** walks the whole local tree and
+enumerates the whole remote one, which on a small NAS takes minutes; it used to hold the only work
+slot for that entire time, so a profile save started while it ran waited it out. The dashboard bounds
+its own wait for a queued result at thirty seconds, so such a save was reported as an outcome the
+page could not determine — while the save itself was still queued and landed later. A save now
+proceeds beside a status walk instead of behind it.
+
+A scheduled or manual **Run** is still a barrier for saves, deliberately: it is the one long job that
+is reading the configuration a save would rewrite. A save started during a run is queued and applied
+when the run finishes.
+
 ## Structured Activity
 
 Activity is a bounded, package-private event stream with fixed schemas and messages. Accepted event

@@ -1636,8 +1636,18 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
     except (OSError, json.JSONDecodeError):
         job_payload = {{}}
     connection_job = job_payload.get("operation") in ("test-profile-auth", "browse-remote")
+    concurrent_job = job_payload.get("operation") in ("action", "sync-status", "resync", "clear-logs")
     capture = Path({str(queue_capture)!r})
-    lock = Path({str(queue_lock)!r})
+    # One exclusion lane per job class, because the controller's guarantee is
+    # per class rather than global. A connection probe is exempt as it always
+    # was; a concurrent job excludes only other concurrent jobs; a serialized
+    # job excludes only other serialized ones. A single shared lock would
+    # report the concurrent/serialized adjacency the controller now permits as
+    # an overlap failure, while a per-class lock goes on reporting every
+    # same-class overlap -- so every existing "overlap" assertion keeps
+    # meaning exactly what it meant.
+    lane = "connection" if connection_job else ("concurrent" if concurrent_job else "serialized")
+    lock = Path({str(queue_lock)!r} + "." + lane)
     lock_acquired = False
     if not connection_job:
         try:
@@ -2298,7 +2308,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "    operation = payload.get('operation')\n"
             "    if operation in ('test-profile-auth', 'browse-remote'):\n"
             "        print('connection')\n"
-            "    elif operation == 'action':\n"
+            "    elif operation in ('action', 'sync-status', 'resync', 'clear-logs'):\n"
             "        print('concurrent')\n"
             "    else:\n"
             "        print('serialized')\n"
@@ -8647,6 +8657,315 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(
             [record.split()[0] for record in records],
             [primary_id, action_id, connection_id],
+        )
+
+    def _held_core(self, ready: Path, release: Path) -> None:
+        """Install a core that blocks a run open at the point its profile set is fixed."""
+        core = self.real_target / "bin/synology-drive-sync"
+        core.write_text(
+            "#!/bin/sh\n"
+            'case " $* " in\n'
+            '  *" config validate "*) exit 0 ;;\n'
+            "esac\n"
+            f': > "{ready}"\n'
+            f'while [ ! -e "{release}" ]; do /bin/sleep 0.02; done\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        core.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(core, self.drop_uid, self.drop_gid)
+
+    def test_configuration_mutations_are_refused_while_a_run_holds_the_run_lock(self) -> None:
+        # The invariant everything else rests on, and it was untested.
+        #
+        # `begin_mutation` refuses every profile, credential, routine and schedule
+        # mutation while the run lock is live. That is what makes it safe for the
+        # controller's auxiliary lane to dispatch a serialized job beside a running
+        # `action`: the job is admitted, and then declines to commit. Without this
+        # the lane widening would rest on the much weaker claim that the sync engine
+        # happens to read its configuration only once.
+        self.assertEqual(
+            self.configure("kept", self.source_one, "/home/Drive/Kept", True).returncode, 0
+        )
+        self.assertEqual(
+            self.shell(
+                self.manager, "set-password", "kept", input_text="test-password\n"
+            ).returncode,
+            0,
+        )
+        started = self.shell(self.lifecycle, "start", timeout=20)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+
+        ready = self.root / "run-lock-core.ready"
+        release = self.root / "run-lock-core.release"
+        self._held_core(ready, release)
+        run = self.shell_process(
+            self.real_target / "libexec/sdsync-run",
+            "sync", "all", "false", "foreground", "100",
+            extra_environment={"SDSYNC_DSM_AUDIT_WRAPPED": "true"},
+        )
+        try:
+            self.wait_for_path(ready, "the held core did not start", timeout=20)
+            refused = (
+                ("a new profile", ("configure-profile", "--name", "created",
+                                   "--source", str(self.source_two),
+                                   "--url", "https://files.example.test/proxy/",
+                                   "--username", "created-bot",
+                                   "--remote", "/home/Drive/Created"), None),
+                ("a credential", ("set-password", "kept"), "test-password\n"),
+                ("a profile removal", ("remove-profile", "--name", "kept"), None),
+                ("the schedule", ("enable", "--interval", "600"), None),
+            )
+            for label, arguments, stdin in refused:
+                result = self.shell(self.manager, *arguments, input_text=stdin)
+                self.assertEqual(
+                    result.returncode, 75, f"{label} was not refused during a run: {result.stderr}"
+                )
+                self.assertIn("planning/syncing", result.stderr, label)
+        finally:
+            release.write_text("release\n", encoding="utf-8")
+        stdout, stderr = run.communicate(timeout=60)
+        self.assertEqual(run.returncode, 0, stdout + stderr)
+
+        # And the refusal is only for the duration of the run.
+        self.assertEqual(
+            self.configure("created", self.source_two, "/home/Drive/Created").returncode,
+            0,
+            "a profile save was still refused after the run finished",
+        )
+
+    def test_a_run_records_completion_only_for_the_profiles_it_covered(self) -> None:
+        # The runner's own contract, tested on its own terms.
+        #
+        # Which profiles a `run all` covers is settled at preflight. It used to be
+        # asked again, as a second glob of the profiles directory, *after* the core
+        # exited -- two decision points for one question. A profile appearing only in
+        # the later listing was never part of the run, yet received a record saying
+        # this run had succeeded for it, which on a backup tool is a false assurance.
+        #
+        # No supported path can produce that state: every mutation that could add a
+        # profile is refused while the run lock is live, which the test above pins.
+        # This one therefore writes the fragment directly, bypassing the manager, to
+        # exercise the runner's contract without depending on a guard in another
+        # file -- which is the point of freezing the set rather than re-globbing.
+        for name, source in (("kept", self.source_one), ("removed", self.source_two)):
+            self.assertEqual(
+                self.configure(name, source, f"/home/Drive/{name}", name == "kept").returncode, 0
+            )
+            self.assertEqual(
+                self.shell(
+                    self.manager, "set-password", name, input_text="test-password\n"
+                ).returncode,
+                0,
+            )
+        started = self.shell(self.lifecycle, "start", timeout=20)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+
+        ready = self.root / "completion-core.ready"
+        release = self.root / "completion-core.release"
+        self._held_core(ready, release)
+        profile_states = self.real_var / "state/profiles"
+        for stale in profile_states.glob("*.state"):
+            stale.unlink()
+        profiles_dir = self.real_home / "config/profiles.d"
+
+        run = self.shell_process(
+            self.real_target / "libexec/sdsync-run",
+            "sync", "all", "false", "foreground", "100",
+            extra_environment={"SDSYNC_DSM_AUDIT_WRAPPED": "true"},
+        )
+        try:
+            self.wait_for_path(ready, "the held core did not start", timeout=20)
+            appeared = profiles_dir / "appeared.toml"
+            appeared.write_text("source = \"/tmp\"\n", encoding="utf-8")
+            appeared.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(appeared, self.drop_uid, self.drop_gid)
+            (profiles_dir / "removed.toml").unlink()
+        finally:
+            release.write_text("release\n", encoding="utf-8")
+        stdout, stderr = run.communicate(timeout=60)
+        self.assertEqual(run.returncode, 0, stdout + stderr)
+
+        self.assertTrue(
+            (profile_states / "kept.state").is_file(),
+            "a profile the run covered received no completion record",
+        )
+        self.assertFalse(
+            (profile_states / "appeared.state").exists(),
+            "a profile that appeared after preflight was recorded as completed by this run",
+        )
+        # Removal stays silent: the writer's own existence guard skips it, so a
+        # profile that disappears mid-run neither gets a record nor fails the run.
+        self.assertFalse(
+            (profile_states / "removed.state").exists(),
+            "a profile removed mid-run was recorded as completed by this run",
+        )
+
+    def test_serialized_job_runs_beside_a_concurrent_primary(self) -> None:
+        # The defect this pins: a dashboard status walk is classified concurrent
+        # and holds the primary work slot for as long as comparing both trees
+        # takes -- minutes on an armv7 unit. A profile save queued behind it used
+        # to wait that out, and the AppWindow, which bounds terminal-result
+        # observation at thirty seconds, reported a save that did land as an
+        # outcome it could not determine. The auxiliary lane now admits a
+        # serialized head beside a concurrent primary, so the save is consumed
+        # while the walk continues.
+        bridge_capture = self.root / "serialized-beside-concurrent-capture"
+        bridge_lock = self.root / "serialized-beside-concurrent-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        processing = self.real_var / "control/processing"
+        responses = self.real_var / "control/responses"
+
+        primary_id = "2" * 48
+        save_id = "3" * 48
+        primary_ready = self.root / "concurrent-primary.ready"
+        primary_release = self.root / "concurrent-primary.release"
+        save_ready = self.root / "serialized-save.ready"
+        save_release = self.root / "serialized-save.release"
+
+        self.write_mock_control_job(
+            primary_id,
+            "sync-status",
+            ready=primary_ready,
+            release=primary_release,
+        )
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.wait_for_path(primary_ready, "concurrent primary did not start")
+        controller_pid = int(
+            (self.real_var / "run/controller.pid").read_text(encoding="ascii").strip()
+        )
+
+        # A real profile save carries its credential sidecar, so claim one here:
+        # the auxiliary lane must move the secret with the request exactly as the
+        # primary path does, and must remove it when the consumer is finished.
+        self.write_mock_control_job(
+            save_id,
+            "configure-profile",
+            ready=save_ready,
+            release=save_release,
+        )
+        save_secret = self.real_var / f"control/requests/{save_id}.secret"
+        save_secret.write_text("save-secret\n", encoding="utf-8")
+        save_secret.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(save_secret, self.drop_uid, self.drop_gid)
+
+        os.kill(controller_pid, signal.SIGUSR2)
+        self.wait_for_path(
+            save_ready,
+            "a serialized save did not run beside the concurrent primary",
+        )
+        self.assertTrue(
+            (processing / f"{primary_id}.json").is_file(),
+            "the concurrent primary was retired to admit the serialized save",
+        )
+        self.assertFalse(
+            (responses / f"{primary_id}.json").exists(),
+            "the concurrent primary finished before the serialized save started",
+        )
+        self.assertTrue(
+            (processing / f"{save_id}.secret").is_file(),
+            "the auxiliary lane did not claim the serialized job's secret",
+        )
+
+        save_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            responses / f"{save_id}.json",
+            "the serialized save published no response beside the concurrent primary",
+        )
+        self.wait_for_absence(
+            processing / f"{save_id}.json",
+            "the serialized save's processing claim was not cleaned",
+        )
+        self.wait_for_absence(
+            processing / f"{save_id}.secret",
+            "the serialized save's secret outlived its consumer",
+        )
+        self.assertTrue(
+            (processing / f"{primary_id}.json").is_file(),
+            "the concurrent primary's processing claim was pruned by the auxiliary turn",
+        )
+
+        primary_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            responses / f"{primary_id}.json",
+            "the concurrent primary published no response",
+        )
+        records = bridge_capture.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn("overlap", records)
+        self.assertEqual(
+            [record.split()[0] for record in records],
+            [primary_id, save_id],
+        )
+        self.assertEqual(
+            [record.split()[4] for record in records],
+            ["no", "yes"],
+            "the serialized consumer did not observe its claimed secret",
+        )
+
+    def test_serialized_jobs_never_overlap_each_other(self) -> None:
+        # The widened lane must not have widened this: two serialized jobs still
+        # commit one at a time, so a save can never observe another save's
+        # half-written configuration.
+        bridge_capture = self.root / "serialized-barrier-capture"
+        bridge_lock = self.root / "serialized-barrier-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        responses = self.real_var / "control/responses"
+
+        first_id = "2" * 48
+        second_id = "3" * 48
+        first_ready = self.root / "serialized-first.ready"
+        first_release = self.root / "serialized-first.release"
+        second_ready = self.root / "serialized-second.ready"
+        second_release = self.root / "serialized-second.release"
+
+        self.write_mock_control_job(
+            first_id,
+            "configure-profile",
+            ready=first_ready,
+            release=first_release,
+        )
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.wait_for_path(first_ready, "the first serialized consumer did not start")
+        controller_pid = int(
+            (self.real_var / "run/controller.pid").read_text(encoding="ascii").strip()
+        )
+        self.write_mock_control_job(
+            second_id,
+            "alert-policy",
+            ready=second_ready,
+            release=second_release,
+        )
+        os.kill(controller_pid, signal.SIGUSR2)
+        time.sleep(0.25)
+        self.assertFalse(
+            second_ready.exists(),
+            "a serialized job was admitted beside another serialized job",
+        )
+
+        first_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            responses / f"{first_id}.json",
+            "the first serialized response was not published",
+        )
+        self.wait_for_path(
+            second_ready,
+            "the second serialized job was not dispatched after the barrier",
+        )
+        second_release.write_text("release\n", encoding="utf-8")
+        self.wait_for_path(
+            responses / f"{second_id}.json",
+            "the second serialized response was not published",
+        )
+        records = bridge_capture.read_text(encoding="utf-8").splitlines()
+        self.assertNotIn("overlap", records)
+        self.assertEqual(
+            [record.split()[0] for record in records],
+            [first_id, second_id],
         )
 
     def test_primary_connection_never_overlaps_an_auxiliary_connection(self) -> None:

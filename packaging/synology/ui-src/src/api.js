@@ -187,6 +187,40 @@ export class QueuedOutcomeUnknownError extends Error {
   }
 }
 
+/**
+ * The observation deadline elapsed while the package was still, verifiably,
+ * working through its queue.
+ *
+ * Deliberately not a `QueuedOutcomeUnknownError`. The two describe different
+ * facts and call for opposite actions. Outcome-unknown means the result could
+ * not be observed: something may have gone wrong and a person should go and
+ * look. This means the last *trusted* read said `pending` -- the package
+ * answered, repeatedly and successfully, that the job is queued -- and the only
+ * thing that ran out was the browser's thirty seconds of patience. A save that
+ * queues behind a running sync is the ordinary case, and telling an operator of
+ * a backup tool that we do not know whether their configuration was saved, when
+ * the answer is "yes, in about a minute", is an expensive thing to say wrongly.
+ *
+ * `accepted` is true and `outcomeUnknown` is false: the mutation is on the
+ * queue with a known job ID, and nothing may re-send it.
+ */
+export class QueuedStillPendingError extends Error {
+  constructor(jobId, message, requestId = "", operation = "", progress = null) {
+    super(message);
+    this.name = "QueuedStillPendingError";
+    this.jobId = validJobId(jobId);
+    this.requestId = validClientRequestId(requestId);
+    this.trustedJobId = Boolean(this.jobId);
+    this.trustedRequestId = Boolean(this.requestId);
+    this.operation = typeof operation === "string" && ARGUMENT_KEYS[operation] ? operation : "";
+    this.stage = "result_observation";
+    this.progress = progress && typeof progress === "object" ? progress : null;
+    this.accepted = true;
+    this.outcomeUnknown = false;
+    this.stillPending = true;
+  }
+}
+
 export class MutationOutcomeUnknownError extends Error {
   constructor(requestId, message, operation = "", stage = "post_dispatch_observation") {
     super(message);
@@ -240,10 +274,14 @@ export const ACTIONS = Object.freeze({
   // it. See ARGUMENT_KEYS below for the two-phase resync contract.
   syncStatus: "sync-status",
   resync: "resync",
+  // Emptying a bounded log is destructive package state, so it travels the
+  // queued mutation path and is audited like any other, rather than riding on
+  // the read-only `logs` action it refreshes.
+  clearLogs: "clear-logs",
   execute: "action"
 });
 
-const GET_ACTIONS = Object.freeze(["csrf", "snapshot", "source-directories", "source-path", "logs", "activity", "result", "request-status"]);
+const GET_ACTIONS = Object.freeze(["csrf", "snapshot", "source-directories", "source-path", "logs", "activity", "status-rollup", "result", "request-status"]);
 const GET_ARGUMENT_KEYS = Object.freeze({
   csrf: Object.freeze([]),
   snapshot: Object.freeze([]),
@@ -251,6 +289,9 @@ const GET_ARGUMENT_KEYS = Object.freeze({
   "source-path": Object.freeze(["path"]),
   logs: Object.freeze(["lines", "source"]),
   activity: Object.freeze(["lines"]),
+  // No arguments: the manager derives the expected profile set, so the browser
+  // cannot narrow what the combined total is taken over.
+  "status-rollup": Object.freeze([]),
   result: Object.freeze(["job_id"]),
   "request-status": Object.freeze(["request_id"])
 });
@@ -312,6 +353,11 @@ export const ARGUMENT_KEYS = Object.freeze({
   // ticket, and the ticket a caller sends back is the proof that the exact
   // overwrite list it describes was the one displayed.
   resync: Object.freeze(["confirm", "profile", "scope"]),
+  // One category per call. "all" is deliberately not accepted: the bridge
+  // would have to decide what "all" means for the one source it must refuse,
+  // and a single button that quietly skips the audit log is worse than five
+  // that each say what they clear.
+  "clear-logs": Object.freeze(["source"]),
   action: Object.freeze(["allow_delete", "kind", "level", "max_total_delete", "scope", "write_test"])
 });
 
@@ -755,6 +801,36 @@ function queuedObservationTimeout(jobId, requestId, detail, operation = "") {
   );
 }
 
+function queuedStillPending(jobId, requestId, operation = "", progress = null) {
+  return new QueuedStillPendingError(
+    jobId,
+    "The package accepted this change and is still working through its queue. It will apply when the running operation finishes; do not send it again.",
+    requestId,
+    operation,
+    progress
+  );
+}
+
+/**
+ * Which of the two the observation deadline means, for this observation.
+ *
+ * The deadline bounds the browser's patience, not the package's work. When the
+ * last trusted read said `pending`, the package has told us what it is doing and
+ * the honest report is "still queued". When the last read failed, or none
+ * succeeded at all, the outcome genuinely is unknown.
+ */
+function observationDeadlineError(observation, jobId, requestId, operation) {
+  if (observation && observation.lastReadPending === true) {
+    return queuedStillPending(jobId, requestId, operation, observation.lastProgress);
+  }
+  return queuedObservationTimeout(
+    jobId,
+    requestId,
+    "DSM accepted the operation, but terminal result observation exceeded the autosave limit.",
+    operation
+  );
+}
+
 function exactMutationKeys(action, payload) {
   if (action !== ACTIONS.routine) {
     exactKeys(payload, ARGUMENT_KEYS[action], "Mutation");
@@ -903,12 +979,7 @@ async function pollJobResult(
   const readClock = limits && typeof limits.now === "function" ? limits.now : () => Date.now();
   for (;;) {
     if (observation && observation.expired) {
-      throw queuedObservationTimeout(
-        jobId,
-        requestId,
-        "DSM accepted the operation, but terminal result observation exceeded the autosave limit.",
-        expectedOperation
-      );
+      throw observationDeadlineError(observation, jobId, requestId, expectedOperation);
     }
     let status;
     try {
@@ -943,13 +1014,13 @@ async function pollJobResult(
     } catch (error) {
       if (auth && auth.signal && auth.signal.aborted) throw error;
       if (observation && observation.expired) {
-        throw queuedObservationTimeout(
-          jobId,
-          requestId,
-          "DSM accepted the operation, but terminal result observation exceeded the autosave limit.",
-          expectedOperation
-        );
+        throw observationDeadlineError(observation, jobId, requestId, expectedOperation);
       }
+      // This read did not come back, so nothing it might have said can be
+      // trusted. Cleared after the expiry check above on purpose: a deadline
+      // that fires while this read is in flight is still reported against the
+      // last read that *did* answer.
+      if (observation) observation.lastReadPending = false;
       consecutiveObservationFailures += 1;
       if (firstObservationFailureAt === 0) firstObservationFailureAt = readClock();
       // The POST was already accepted. Repeated transport/auth observation
@@ -995,12 +1066,7 @@ async function pollJobResult(
       continue;
     }
     if (observation && observation.expired) {
-      throw queuedObservationTimeout(
-        jobId,
-        requestId,
-        "DSM accepted the operation, but terminal result observation exceeded the autosave limit.",
-        expectedOperation
-      );
+      throw observationDeadlineError(observation, jobId, requestId, expectedOperation);
     }
     consecutiveObservationFailures = 0;
     firstObservationFailureAt = 0;
@@ -1013,6 +1079,13 @@ async function pollJobResult(
       );
     }
     if (status.state === "pending") {
+      // A trusted read that says the job is queued. Recorded so that a deadline
+      // firing later can report what the package actually told us rather than
+      // attributing the browser's impatience to it.
+      if (observation) {
+        observation.lastReadPending = true;
+        observation.lastProgress = status.progress && typeof status.progress === "object" ? status.progress : null;
+      }
       // A caller that named its own interval keeps it; otherwise walk the ramp, so
       // the answer arrives at roughly the speed of the job for short jobs without
       // hammering the endpoint for long ones.
@@ -1282,7 +1355,7 @@ async function awaitQueuedResult(
       operation
     );
   }
-  const observation = { expired: false, cancelCurrent: null };
+  const observation = { expired: false, cancelCurrent: null, lastReadPending: false, lastProgress: null };
   return withinLimit(
     pollJobResult(
       auth,
@@ -1296,12 +1369,9 @@ async function awaitQueuedResult(
     ),
     limits.resultObservationTimeoutMs,
     limits,
-    () => queuedObservationTimeout(
-      queued.job_id,
-      requestId,
-      "DSM accepted the operation, but terminal result observation exceeded the autosave limit.",
-      operation
-    ),
+    // This factory races the poll's own expiry throw; both must reach the same
+    // verdict, so both read it from the observation.
+    () => observationDeadlineError(observation, queued.job_id, requestId, operation),
     () => {
       observation.expired = true;
       if (observation.cancelCurrent) observation.cancelCurrent();
@@ -1717,7 +1787,11 @@ export async function apiPost(
     forgetReconciliationAuth(auth, id);
     return result;
   } catch (error) {
-    if (!error || (error.outcomeUnknown !== true && error.requiresInspection !== true)) {
+    // A job that is merely still queued keeps its reconciliation auth, exactly
+    // as an unknown one does: the operator may still want the Reconcile path to
+    // observe how it finished, and that path needs the DSM token generation the
+    // request was dispatched under.
+    if (!error || (error.outcomeUnknown !== true && error.requiresInspection !== true && error.stillPending !== true)) {
       forgetReconciliationAuth(auth, id);
     }
     throw error;

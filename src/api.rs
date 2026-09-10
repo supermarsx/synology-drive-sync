@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -55,13 +55,38 @@ const STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const RATE_LIMIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// First and maximum gaps between checks on a server-side MD5 task.
 ///
-/// Content mode issues one of these per file in the comparison set, serially, so the first gap is
-/// what a small file's digest costs beyond its two round trips: a flat interval would be paid in
-/// full by every file whose task is not finished the moment it is first asked about. The ramp
-/// keeps a large file, whose digest legitimately takes seconds, from being polled thousands of
-/// times on the way there. The ceiling is the interval this loop used to use throughout.
+/// Content mode issues one of these per file in the comparison set, so the first gap is what a
+/// small file's digest costs beyond its two round trips: a flat interval would be paid in full by
+/// every file whose task is not finished the moment it is first asked about. The ramp keeps a
+/// large file, whose digest legitimately takes seconds, from being polled thousands of times on
+/// the way there. The ceiling is the interval this loop used to use throughout.
+///
+/// [`REMOTE_MD5_CONCURRENCY`] tasks now run at once, which shortens the wall clock but not this:
+/// a poll interval that is too coarse is paid per file however many files are in flight.
 const REMOTE_MD5_FIRST_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const REMOTE_MD5_MAX_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How many server-side MD5 tasks this client keeps in flight at once.
+///
+/// The ramp above makes each task cheap; it cannot make a task's *round trips* cheap. Issuing them
+/// strictly one at a time costs a start and at least one status poll serially per file, so a
+/// two-hundred-file comparison set is four hundred sequential round trips — the dominant term over
+/// a LAN and almost the whole cost over anything slower. Four at a time collapses that term.
+///
+/// Four and not more because the work itself is not the client's: File Station computes the digest
+/// by reading its own copy, and the smallest supported unit is a two-core armv7, so a wider lane
+/// queues on that unit's CPU and its disk rather than finishing sooner — and turning a bounded
+/// amount of work into an unbounded amount of load on the NAS this package exists to be gentle to
+/// is the failure worth avoiding here. It is a constant rather than a setting so that nothing a
+/// caller sends can widen it.
+const REMOTE_MD5_CONCURRENCY: usize = 4;
+/// Paths materialised per batch, which is what the concurrency costs in memory.
+///
+/// The selection is the whole comparison set in the steady state, so materialising all of it would
+/// hold every path a second time — against the 32 MiB ceiling `tests/scan_memory.rs` pins, with the
+/// two inventories already occupying 27 MiB of it. A batch holds this many and no more. Eight per
+/// worker is deep enough that one large file cannot leave the other workers idle waiting for its
+/// batch to drain.
+const REMOTE_MD5_BATCH: usize = REMOTE_MD5_CONCURRENCY * 8;
 /// A single shared I/O runtime keeps synchronous SDK calls safe even when their caller is already
 /// running on Tokio. Download futures never run on or block the caller's executor.
 const DOWNLOAD_RUNTIME_THREADS: usize = 1;
@@ -998,21 +1023,136 @@ impl ApiClient {
         cancellation: &CancellationToken,
     ) -> Result<()> {
         self.require_content_api()?;
-        for relative in selected_relative_paths {
+        let mut selection = selected_relative_paths.iter();
+        loop {
             cancellation.check()?;
-            let entry = inventory.entries.get_mut(relative).ok_or_else(|| {
-                Error::Message(format!(
-                    "remote content selection referenced missing inventory path {relative:?}"
-                ))
-            })?;
-            if entry.kind != EntryKind::File {
-                return Err(Error::Message(format!(
-                    "remote content selection referenced non-file path {relative:?}"
-                )));
+            // One bounded batch at a time -- see [`REMOTE_MD5_BATCH`]. The relative path in each
+            // pair is borrowed from the caller's selection rather than from the inventory, so the
+            // batch outlives the immutable borrow taken to read each entry and the digests can be
+            // written straight back without walking the set a second time.
+            let mut batch: Vec<(&str, String)> = Vec::new();
+            for relative in selection.by_ref() {
+                let entry = inventory.entries.get(relative.as_str()).ok_or_else(|| {
+                    Error::Message(format!(
+                        "remote content selection referenced missing inventory path {relative:?}"
+                    ))
+                })?;
+                if entry.kind != EntryKind::File {
+                    return Err(Error::Message(format!(
+                        "remote content selection referenced non-file path {relative:?}"
+                    )));
+                }
+                batch.push((relative.as_str(), entry.remote_path.clone()));
+                if batch.len() == REMOTE_MD5_BATCH {
+                    break;
+                }
             }
-            entry.content_md5 = Some(self.remote_content_md5(&entry.remote_path, cancellation)?);
+            if batch.is_empty() {
+                return Ok(());
+            }
+            let digests = self.remote_content_md5_batch(&batch, cancellation)?;
+            for ((relative, _), digest) in batch.iter().zip(digests) {
+                if let Some(entry) = inventory.entries.get_mut(*relative) {
+                    entry.content_md5 = Some(digest);
+                }
+            }
         }
-        Ok(())
+    }
+
+    /// Compute one bounded batch of digests, keeping [`REMOTE_MD5_CONCURRENCY`] tasks in flight.
+    ///
+    /// Returns them in batch order. The concurrency is a scheduling detail and not a semantic one:
+    /// each digest is produced by exactly the same [`Self::remote_content_md5`] the serial path
+    /// used, and a failure is reported as the first error observed, which is the error the serial
+    /// path would have returned for the same batch.
+    ///
+    /// The calling thread is one of the workers. A helper that cannot be spawned therefore costs
+    /// parallelism and never correctness -- with none of them spawned this drains the batch exactly
+    /// as one file at a time, which is what makes the fallback on a memory-pressed NAS the old
+    /// behaviour rather than a failure.
+    fn remote_content_md5_batch(
+        &self,
+        batch: &[(&str, String)],
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<ContentMd5>> {
+        let workers = REMOTE_MD5_CONCURRENCY.min(batch.len());
+        if workers <= 1 {
+            return batch
+                .iter()
+                .map(|(_, remote_path)| self.remote_content_md5(remote_path, cancellation))
+                .collect();
+        }
+
+        let cursor = AtomicUsize::new(0);
+        let abandoned = AtomicBool::new(false);
+        let collected: Mutex<Vec<Option<ContentMd5>>> = Mutex::new(vec![None; batch.len()]);
+        let first_error: Mutex<Option<Error>> = Mutex::new(None);
+
+        let drain = || {
+            loop {
+                // Stop claiming work once any file in this batch has failed. A worker already
+                // inside a request keeps its own bounded deadline, so this shortens the batch
+                // rather than interrupting a call -- the same exposure the serial path had.
+                if abandoned.load(Ordering::Acquire) {
+                    return;
+                }
+                let index = cursor.fetch_add(1, Ordering::AcqRel);
+                let Some((_, remote_path)) = batch.get(index) else {
+                    return;
+                };
+                match self.remote_content_md5(remote_path, cancellation) {
+                    Ok(digest) => {
+                        let mut slots = collected.lock().unwrap_or_else(PoisonError::into_inner);
+                        // The index came from the cursor, so it is in range and claimed by this
+                        // worker alone. The lock is held only to write one slot, never across a
+                        // request.
+                        if let Some(slot) = slots.get_mut(index) {
+                            *slot = Some(digest);
+                        }
+                    }
+                    Err(error) => {
+                        let mut reported =
+                            first_error.lock().unwrap_or_else(PoisonError::into_inner);
+                        if reported.is_none() {
+                            *reported = Some(error);
+                        }
+                        drop(reported);
+                        abandoned.store(true, Ordering::Release);
+                        return;
+                    }
+                }
+            }
+        };
+
+        thread::scope(|scope| {
+            for index in 1..workers {
+                let _ = thread::Builder::new()
+                    .name(format!("sdsync-md5-{index}"))
+                    .spawn_scoped(scope, drain);
+            }
+            drain();
+        });
+
+        if let Some(error) = first_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            return Err(error);
+        }
+        collected
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+            .into_iter()
+            .map(|digest| {
+                digest.ok_or_else(|| {
+                    Error::Message(
+                        "remote MD5 batch finished without a digest for every selected file"
+                            .to_owned(),
+                    )
+                })
+            })
+            .collect()
     }
 
     pub fn remote_content_md5(
@@ -7052,6 +7192,250 @@ mod tests {
             );
             assert_eq!(server.join().unwrap().len(), 4);
         }
+    }
+
+    /// What one connection asked for, decoded far enough to answer it.
+    fn scripted_form_field(body: &[u8], field: &str) -> Option<String> {
+        let text = String::from_utf8_lossy(body).into_owned();
+        let raw = text
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(&format!("{field}=")))?;
+        let bytes = raw.as_bytes();
+        let mut decoded = String::with_capacity(raw.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'%' if index + 2 < bytes.len() => {
+                    let high = char::from(bytes[index + 1]).to_digit(16)?;
+                    let low = char::from(bytes[index + 2]).to_digit(16)?;
+                    decoded.push(char::from((high * 16 + low) as u8));
+                    index += 3;
+                }
+                b'+' => {
+                    decoded.push(' ');
+                    index += 1;
+                }
+                byte => {
+                    decoded.push(char::from(byte));
+                    index += 1;
+                }
+            }
+        }
+        Some(decoded.trim_matches('"').to_owned())
+    }
+
+    /// A File Station stand-in that answers many requests at once.
+    ///
+    /// The scripted servers above pair response *n* with connection *n*, which is exactly the
+    /// promise a concurrent client cannot keep: with [`REMOTE_MD5_CONCURRENCY`] tasks in flight the
+    /// arrival order belongs to the network. This one answers what was asked, and records the most
+    /// MD5 tasks it was ever holding at once — so a test can assert the batch genuinely overlapped
+    /// instead of inferring it from a wall-clock reading that a loaded machine would make a lie.
+    struct ConcurrentServer {
+        peak_tasks: Arc<AtomicUsize>,
+        starts: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        handle: JoinHandle<()>,
+    }
+
+    impl ConcurrentServer {
+        /// Stop accepting, join every connection, and report `(peak overlap, tasks started)`.
+        fn finish(self) -> (usize, usize) {
+            self.stop.store(true, Ordering::Release);
+            self.handle.join().unwrap();
+            (
+                self.peak_tasks.load(Ordering::Acquire),
+                self.starts.load(Ordering::Acquire),
+            )
+        }
+    }
+
+    /// Serve MD5 tasks concurrently, holding `slow_path`'s status open so it finishes last.
+    ///
+    /// `failing_path` is answered with a DSM error, which is how the batch's failure propagation is
+    /// exercised against a real transport rather than a stubbed result.
+    fn concurrent_md5_server(
+        slow_path: Option<&'static str>,
+        failing_path: Option<&'static str>,
+    ) -> (String, ConcurrentServer) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let peak_tasks = Arc::new(AtomicUsize::new(0));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let peak_tasks = Arc::clone(&peak_tasks);
+            let starts = Arc::clone(&starts);
+            let stop = Arc::clone(&stop);
+            let live = Arc::new(AtomicUsize::new(0));
+            std::thread::spawn(move || {
+                let mut connections: Vec<JoinHandle<()>> = Vec::new();
+                while !stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            let peak_tasks = Arc::clone(&peak_tasks);
+                            let starts = Arc::clone(&starts);
+                            let live = Arc::clone(&live);
+                            connections.push(std::thread::spawn(move || {
+                                let request = read_scripted_request(&mut stream, 0);
+                                let method = scripted_form_field(&request.body, "method")
+                                    .unwrap_or_default();
+                                let body = match method.as_str() {
+                                    "login" => login_response(),
+                                    "start" => {
+                                        let path =
+                                            scripted_form_field(&request.body, "file_path")
+                                                .unwrap_or_default();
+                                        starts.fetch_add(1, Ordering::AcqRel);
+                                        let occupancy =
+                                            live.fetch_add(1, Ordering::AcqRel) + 1;
+                                        peak_tasks.fetch_max(occupancy, Ordering::AcqRel);
+                                        task_start_response(&path)
+                                    }
+                                    "status" => {
+                                        let taskid =
+                                            scripted_form_field(&request.body, "taskid")
+                                                .unwrap_or_default();
+                                        // Held open so the batch cannot finish in issue order:
+                                        // a client that only appeared concurrent would serialise
+                                        // behind this one and the peak would stay at one.
+                                        if slow_path == Some(taskid.as_str()) {
+                                            thread::sleep(Duration::from_millis(250));
+                                        }
+                                        live.fetch_sub(1, Ordering::AcqRel);
+                                        if failing_path == Some(taskid.as_str()) {
+                                            r#"{"success":false,"error":{"code":408}}"#.to_owned()
+                                        } else {
+                                            format!(
+                                                r#"{{"success":true,"data":{{"finished":true,"md5":"{}"}}}}"#,
+                                                scripted_digest_hex(&taskid)
+                                            )
+                                        }
+                                    }
+                                    // Discovery, logout, and the task-stop a failed batch issues.
+                                    _ => write_probe_discovery(false),
+                                };
+                                write_scripted_response(&mut stream, StatusCode::OK, &body);
+                            }));
+                        }
+                        Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("concurrent server accept failed: {error}"),
+                    }
+                }
+                for connection in connections {
+                    let _ = connection.join();
+                }
+            })
+        };
+        (
+            format!("http://{address}/prefix/"),
+            ConcurrentServer {
+                peak_tasks,
+                starts,
+                stop,
+                handle,
+            },
+        )
+    }
+
+    /// A digest that is a function of the path, so a misrouted answer is visible as a wrong digest
+    /// rather than as a digest that merely looks plausible.
+    fn scripted_digest_hex(path: &str) -> String {
+        let mut bytes = [0_u8; 16];
+        for (index, byte) in path.bytes().enumerate() {
+            bytes[index % 16] ^= byte;
+        }
+        bytes.iter().fold(String::new(), |mut hex, byte| {
+            use std::fmt::Write as _;
+            write!(&mut hex, "{byte:02x}").unwrap();
+            hex
+        })
+    }
+
+    fn md5_batch_inventory(paths: &[&str]) -> RemoteInventory {
+        RemoteInventory {
+            root_exists: true,
+            entries: paths
+                .iter()
+                .map(|path| {
+                    (
+                        (*path).to_owned(),
+                        RemoteEntry {
+                            relative: (*path).to_owned(),
+                            remote_path: format!("/share/root/{path}"),
+                            kind: EntryKind::File,
+                            size: 1,
+                            mtime_seconds: 1,
+                            mount_point_type: None,
+                            content_md5: None,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn remote_md5_batch_overlaps_tasks_and_still_pairs_each_digest_with_its_own_path() {
+        let paths = ["a.bin", "b.bin", "c.bin", "d.bin", "e.bin", "f.bin"];
+        // The first file's status is held open, so the batch cannot complete in issue order. A
+        // client that mapped results by completion order instead of by index would mis-assign
+        // every digest here, which is the regression this pins.
+        let (url, server) = concurrent_md5_server(Some("/share/root/a.bin"), None);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let mut inventory = md5_batch_inventory(&paths);
+        let selection: BTreeSet<String> = paths.iter().map(|path| (*path).to_owned()).collect();
+        client
+            .populate_remote_content_md5(&mut inventory, &selection, &CancellationToken::default())
+            .unwrap();
+
+        for path in paths {
+            let entry = inventory.entries.get(path).unwrap();
+            let expected =
+                ContentMd5::parse_hex(&scripted_digest_hex(&format!("/share/root/{path}")))
+                    .unwrap();
+            assert_eq!(
+                entry.content_md5,
+                Some(expected),
+                "{path} was paired with another file's digest"
+            );
+        }
+
+        let (peak, starts) = server.finish();
+        assert_eq!(starts, paths.len(), "every selected file started a task");
+        assert!(
+            peak > 1,
+            "the batch issued its tasks one at a time; peak overlap was {peak}"
+        );
+        assert!(
+            peak <= REMOTE_MD5_CONCURRENCY,
+            "the batch exceeded its own bound; peak overlap was {peak}"
+        );
+    }
+
+    #[test]
+    fn remote_md5_batch_reports_the_failure_its_serial_predecessor_would_have() {
+        let paths = ["a.bin", "b.bin", "c.bin", "d.bin"];
+        let (url, server) = concurrent_md5_server(None, Some("/share/root/c.bin"));
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let mut inventory = md5_batch_inventory(&paths);
+        let selection: BTreeSet<String> = paths.iter().map(|path| (*path).to_owned()).collect();
+        let error = client
+            .populate_remote_content_md5(&mut inventory, &selection, &CancellationToken::default())
+            .unwrap_err();
+        // The exact error the one-at-a-time loop returned for a refused status call, not a
+        // batch-shaped wrapper around it.
+        assert!(
+            matches!(error, Error::Api { .. }),
+            "unexpected batch failure: {error:?}"
+        );
+        server.finish();
     }
 
     #[test]

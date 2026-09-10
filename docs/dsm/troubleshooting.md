@@ -94,7 +94,9 @@ sudo tail -n 200 /var/packages/synology-drive-sync/var/log/api.log
 Replace the SPK path with the preserved file that Package Center actually received; do not extract,
 edit, or repack it. Keep any `pkgmgr_worker_violation`, resource name, package-manager phase, exit
 code, and nearby timestamp intact. The final two logs are package-private service logs and may not
-exist if installation or first start did not reach that stage. Inspect all output locally before
+exist if installation or first start did not reach that stage. Collect them before using the
+dashboard's per-log **Clear** control in Activity: that control empties the durable log and removes
+its retained rotations, and the evidence it discards cannot be recovered. Inspect all output locally before
 sharing it. Never paste a DSM cookie,
 `SynoToken`, `X-SDSYNC-CSRF`, password, TOTP seed/current code, remote-log token, secret queue file,
 or token-bearing URL into an issue, chat, screenshot, or support archive. Redact sensitive host,

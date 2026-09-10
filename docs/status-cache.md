@@ -104,7 +104,7 @@ because how old it is *is* the point.
 
 ## The canary
 
-Each pass withholds a small sample of otherwise-usable entries (25 by default,
+An audit withholds a small sample of otherwise-usable entries (25 by default,
 `--status-cache-canary`), recomputes them live, and compares. A single disagreement discards the
 **entire** cache, recomputes the whole answer, and reports `state: "unusable"`.
 
@@ -112,6 +112,17 @@ It is not a sweep — 25 entries against a large tree would take hundreds of run
 detector for *systematic* error, which it catches almost immediately. Repairing just the offending
 entry would hide exactly the case worth finding. Set `0` to disable, at the cost of a cache that can
 be broadly wrong with nothing noticing.
+
+**It runs at most once a day per profile**, and the cache header records when it last ran. A newly
+built or previously distrusted cache is audited on its first warm pass, whichever pass that is.
+
+The cadence exists because the sample is not free: each probe costs a full local read and a File
+Station MD5 task, which on a warm tree is the *entire* remote digest cost of the pass. Charging that
+to every pass charged it to whoever pressed Refresh — the one person waiting on the answer, and the
+one least likely to be the systematically-wrong-cache case the sample exists to find. The cost of
+the cadence, stated plainly: a cache that turns systematically wrong can be believed for up to a day
+before the sample says so. `entries_canary_checked` is `0` on a pass that did not audit, so the
+answer says which kind of pass it was.
 
 ## Size, and where it lives
 

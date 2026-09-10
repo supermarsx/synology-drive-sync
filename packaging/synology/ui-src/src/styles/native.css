@@ -3291,7 +3291,7 @@
 
 .sdsync-diagnostic pre,
 .sdsync-doctor-raw pre,
-.sdsync-log-panel pre {
+.sdsync-log-lines {
   overflow: auto;
   margin: 0;
   padding: 14px;
@@ -3308,7 +3308,7 @@
 
 .sdsync-app.is-light .sdsync-diagnostic pre,
 .sdsync-app.is-light .sdsync-doctor-raw pre,
-.sdsync-app.is-light .sdsync-log-panel pre {
+.sdsync-app.is-light .sdsync-log-lines {
   color: #5f210c;
   background: #fff8f2;
 }
@@ -3471,11 +3471,6 @@
   font-size: 10px;
 }
 
-.sdsync-log-panel pre {
-  min-height: 280px;
-  max-height: 470px;
-}
-
 .sdsync-log-records {
   display: grid;
   gap: 10px;
@@ -3520,11 +3515,67 @@
   white-space: nowrap;
 }
 
-.sdsync-log-record pre {
+/* Wins over the `.sdsync-log-record > header > span` rule above, which styles
+   the source/line-count span this one sits beside. */
+.sdsync-log-record > header > span.sdsync-log-record-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+}
+
+.sdsync-log-record .sdsync-log-lines {
   min-height: 96px;
   max-height: 300px;
   margin: 0;
   border: 0;
+  list-style: none;
+}
+
+.sdsync-log-record .sdsync-log-empty {
+  margin: 0;
+  padding: 14px;
+}
+
+/* One row per record: a fixed time gutter beside the line, so the times read
+   as a column and a line whose time was never recorded is visibly different
+   from one that simply happened at the same moment as its neighbour. */
+.sdsync-log-lines li {
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr);
+  gap: 10px;
+  align-items: baseline;
+}
+
+.sdsync-log-lines time {
+  color: var(--sdsync-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.sdsync-log-lines time.is-unrecorded {
+  font-style: italic;
+  opacity: 0.75;
+}
+
+.sdsync-log-lines li > span {
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 720px) {
+  .sdsync-log-lines li {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+    padding: 3px 0;
+  }
+
+  .sdsync-log-lines time {
+    text-align: left;
+  }
 }
 
 .sdsync-log-inventory-evidence {
@@ -3599,7 +3650,8 @@
   text-align: right;
 }
 
-.sdsync-app pre:focus-visible {
+.sdsync-app pre:focus-visible,
+.sdsync-app .sdsync-log-lines:focus-visible {
   border-color: var(--sdsync-focus);
   outline: 2px solid var(--sdsync-focus);
   outline-offset: 2px;
@@ -4188,6 +4240,11 @@
 .sdsync-sync-stat.is-differs,
 .sdsync-sync-stat.is-missing-remote {
   border-left-color: var(--sdsync-fire);
+}
+
+/* The stored-totals summary states three figures, not the query view's six. */
+.sdsync-sync-stats.sdsync-rollup-stats {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .sdsync-sync-stat.is-type-conflict {

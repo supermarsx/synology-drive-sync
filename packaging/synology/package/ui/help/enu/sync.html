@@ -11,10 +11,14 @@
 </head>
 <body>
   <h1>Sync status and resync</h1>
-  <p>This page answers two questions about one profile: what state each file is in, and how to force a file back onto the NAS. Choose a profile, optionally narrow to a folder or a single file, then choose <strong>Check status</strong>. Nothing is read from the NAS until you do.</p>
+  <p>This page answers two questions about one profile: what state each file is in, and how to force a file back onto the NAS. It opens with a stored summary, and the per-file comparison runs when you choose <strong>Check status</strong>.</p>
 
-  <h2>The answer is never stale, and never free</h2>
-  <p>No index is kept. Both the local folder and the File Station destination are walked again on every check, and each entry is compared with the same code path a real sync uses, so a status row cannot disagree with what a sync would do. Because the answer is rebuilt every time, this page deliberately has no refresh timer: it runs only when you ask it to. On a low-powered NAS, prefer a folder scope over the whole tree.</p>
+  <h2>Sync summary: what the last check recorded</h2>
+  <p>The summary at the top of the page is read back from small totals that each check stores when it finishes. Opening it walks no folder and sends no request to the File Station destination, so it answers immediately even on a low-powered NAS and even while a sync is running.</p>
+  <p>Because it describes the last check rather than this moment, it says how old it is. The age shown is that of the <em>oldest</em> observation contributing to it, not the newest, so it is a claim true of every profile in the total rather than one that describes the freshest part and implies it of the rest. A profile that has never been checked is named as never observed, and while any profile is in that state the combined figure is incomplete and understates what is pending. If a check ran out of its scan budget, every figure it contributed is a floor rather than a count and is marked with a trailing <strong>+</strong>. If two profiles cover overlapping folders, no combined figure is shown at all, because summing them would count the shared files twice; the per-profile rows remain exact and the page says why the total is absent. <strong>Refresh</strong> re-reads the stored totals; it does not re-check anything.</p>
+
+  <h2>Checking status: never stale, and never free</h2>
+  <p>The per-file check keeps no index. Both the local folder and the File Station destination are walked again every time, and each entry is compared with the same code path a real sync uses, so a status row cannot disagree with what a sync would do. Because that answer is rebuilt on every run, this page deliberately has no refresh timer: the check runs only when you ask it to, and it is what refreshes the summary above for next time. On a low-powered NAS, prefer a folder scope over the whole tree.</p>
 
   <h2>States</h2>
   <dl>

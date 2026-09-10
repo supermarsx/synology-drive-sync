@@ -898,12 +898,35 @@ struct NativeAuthenticationContext {
 enum ReadAction {
     Csrf,
     Snapshot,
-    SourceDirectories { parent: String },
-    SourcePath { path: String },
-    Logs { lines: u16, source: LogSource },
-    Activity { lines: u16 },
-    Result { job_id: String },
-    RequestStatus { request_id: String },
+    SourceDirectories {
+        parent: String,
+    },
+    SourcePath {
+        path: String,
+    },
+    Logs {
+        lines: u16,
+        source: LogSource,
+    },
+    Activity {
+        lines: u16,
+    },
+    /// The stored per-profile totals and their combination.
+    ///
+    /// A read rather than a queued job, and the distinction is the whole point.
+    /// A `sync-status` walk compares both trees and asks File Station for
+    /// digests, so it belongs on the queue where it can take as long as it
+    /// takes. This opens a handful of ~600-byte documents the last walk left
+    /// behind: no digest cache, no source file, no network, no authentication.
+    /// Putting it on the queued path would make the one cheap status operation
+    /// wait behind the expensive one it exists to replace.
+    StatusRollup,
+    Result {
+        job_id: String,
+    },
+    RequestStatus {
+        request_id: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1857,6 +1880,42 @@ struct ResyncArgs {
     confirm: String,
 }
 
+/// The bounded package logs the dashboard is allowed to empty.
+///
+/// `audit` and `all` are absent by construction rather than refused by a later
+/// check. The audit log is the record of who cleared which log, so a request
+/// that could even name it would be one forgotten validation away from erasing
+/// the evidence of its own use; deserialization rejects both names before any
+/// handler sees the request. The manager refuses them independently.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum ClearableLogSource {
+    Api,
+    Doctor,
+    Controller,
+    Scheduler,
+    Sync,
+}
+
+impl ClearableLogSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Doctor => "doctor",
+            Self::Controller => "controller",
+            Self::Scheduler => "scheduler",
+            Self::Sync => "sync",
+        }
+    }
+}
+
+/// One bounded package log to empty, named exactly.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ClearLogsArgs {
+    source: ClearableLogSource,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 enum SyncStatusState {
@@ -1938,6 +1997,7 @@ enum Mutation {
     Action(OperationalActionArgs),
     SyncStatus(SyncStatusArgs),
     Resync(ResyncArgs),
+    ClearLogs(ClearLogsArgs),
 }
 
 struct ParsedMutation {
@@ -1982,6 +2042,7 @@ impl Mutation {
             Self::Action(_) => "action",
             Self::SyncStatus(_) => "sync-status",
             Self::Resync(_) => "resync",
+            Self::ClearLogs(_) => "clear-logs",
         }
     }
 
@@ -2002,6 +2063,7 @@ impl Mutation {
             Self::Action(value) => serde_json::to_value(value),
             Self::SyncStatus(value) => serde_json::to_value(value),
             Self::Resync(value) => serde_json::to_value(value),
+            Self::ClearLogs(value) => serde_json::to_value(value),
         };
         result.map_err(|_| BridgeError::internal())
     }
@@ -2307,6 +2369,13 @@ fn parse_read_action(mut query: BTreeMap<String, String>) -> BridgeResult<ReadAc
             let lines = parse_lines(query.remove("lines"))?;
             require_empty_query(&query)?;
             ReadAction::Activity { lines }
+        }
+        "status-rollup" => {
+            // No arguments at all: the manager derives the expected profile set
+            // from the configured profiles, so the browser cannot narrow, widen,
+            // or reorder what the totals are taken over.
+            require_empty_query(&query)?;
+            ReadAction::StatusRollup
         }
         "result" => {
             let job_id = query
@@ -2739,6 +2808,12 @@ fn parse_mutation_request(body: &[u8]) -> BridgeResult<ParsedMutation> {
             validate_resync(&arguments)?;
             (Mutation::Resync(arguments), None)
         }
+        "clear-logs" => {
+            // The source is an enum with only clearable members, so parsing is
+            // the whole validation: there is no separate check to keep in step.
+            let arguments: ClearLogsArgs = parse_arguments(request.arguments)?;
+            (Mutation::ClearLogs(arguments), None)
+        }
         _ => return Err(BridgeError::bad_request()),
     };
 
@@ -2850,6 +2925,10 @@ fn parse_job(body: &[u8]) -> BridgeResult<ParsedJob> {
             validate_resync(&value)?;
             Mutation::Resync(value)
         }
+        "clear-logs" => {
+            let value: ClearLogsArgs = parse_arguments(job.arguments)?;
+            Mutation::ClearLogs(value)
+        }
         _ => return Err(BridgeError::bad_request()),
     };
     Ok(ParsedJob {
@@ -2872,9 +2951,15 @@ fn queued_job_class(job: &ParsedJob) -> QueuedJobClass {
         // profile, credential, policy, or scheduler state. A bounded
         // connection probe can therefore run beside them without observing a
         // partially committed configuration mutation.
-        Mutation::Action(_) | Mutation::SyncStatus(_) | Mutation::Resync(_) => {
-            QueuedJobClass::Concurrent
-        }
+        // Emptying a bounded log commits none of that state either, and it is a
+        // few renames rather than real work. Keeping it out of the serialized
+        // lane matters for a different reason: an operator reaching for it is
+        // usually reclaiming space during a long sync, and a clear that queued
+        // behind that sync would look like a broken button.
+        Mutation::Action(_)
+        | Mutation::SyncStatus(_)
+        | Mutation::Resync(_)
+        | Mutation::ClearLogs(_) => QueuedJobClass::Concurrent,
         _ => QueuedJobClass::Serialized,
     }
 }
@@ -3610,7 +3695,13 @@ fn validate_mutation_against_security_policy(
                 && (policy.allow_doctor_write_test || value.write_test != Some(true))
                 && (policy.allow_destructive_sync || value.allow_delete != Some(true))
         }
-        Mutation::SyncStatus(_) | Mutation::Resync(_) => policy.allow_operational_actions,
+        // Clearing is destructive package state, so it rides the same switch
+        // that gates every other operational action rather than being always
+        // available. An operator who has turned operational actions off has
+        // said the dashboard may not change what the NAS holds.
+        Mutation::SyncStatus(_) | Mutation::Resync(_) | Mutation::ClearLogs(_) => {
+            policy.allow_operational_actions
+        }
     };
     if allowed {
         Ok(())
@@ -6310,6 +6401,7 @@ fn read_manager_arguments(action: &ReadAction) -> BridgeResult<Vec<OsString>> {
             "--lines".into(),
             lines.to_string().into(),
         ],
+        ReadAction::StatusRollup => vec!["api".into(), "status-rollup".into()],
         ReadAction::Csrf
         | ReadAction::SourceDirectories { .. }
         | ReadAction::SourcePath { .. }
@@ -6594,6 +6686,10 @@ fn mutation_manager_arguments(mutation: &Mutation) -> Vec<OsString> {
                 bool_text(value.include_excluded),
             );
         }
+        Mutation::ClearLogs(value) => {
+            arguments.push("clear-logs".into());
+            push_pair(&mut arguments, "--source", value.source.as_str());
+        }
         Mutation::Resync(value) => {
             arguments.push("resync".into());
             push_pair(&mut arguments, "--profile", &value.profile);
@@ -6659,6 +6755,10 @@ fn parse_and_sanitize_manager_json(
         ReadAction::Snapshot => "sdsync.dsm-api.v1",
         ReadAction::Logs { .. } => "sdsync.dsm-logs.v1",
         ReadAction::Activity { .. } => "sdsync.dsm-activity.v1",
+        // The core's own document, forwarded unchanged. The bridge adds nothing
+        // to it and recomputes none of it: every figure, its completeness flag
+        // and its age were established by the walk that stored them.
+        ReadAction::StatusRollup => "sdsync.status-rollup-aggregate.v1",
         ReadAction::Csrf
         | ReadAction::SourceDirectories { .. }
         | ReadAction::SourcePath { .. }
@@ -6762,7 +6862,10 @@ fn parse_and_sanitize_manager_json(
                 });
             }
         }
-        ReadAction::Csrf
+        // Nothing to filter: the rollup carries counts and byte totals, no log
+        // level to threshold and no path, credential, or target detail.
+        ReadAction::StatusRollup
+        | ReadAction::Csrf
         | ReadAction::SourceDirectories { .. }
         | ReadAction::SourcePath { .. }
         | ReadAction::Result { .. }
@@ -7578,6 +7681,9 @@ fn mutation_audit_profile(mutation: &Mutation) -> &str {
         Mutation::Action(value) => &value.scope,
         Mutation::SyncStatus(value) => &value.profile,
         Mutation::Resync(value) => &value.profile,
+        // A package log is not profile-scoped, so it reports no profile rather
+        // than claiming to have touched all of them.
+        Mutation::ClearLogs(_) => "none",
         Mutation::Schedule(_)
         | Mutation::AlertPolicy(_)
         | Mutation::SecurityPolicy(_)
@@ -7640,6 +7746,7 @@ fn valid_audit_operation(value: &str) -> bool {
             | "run"
             | "sync-status"
             | "resync"
+            | "clear-logs"
     )
 }
 
@@ -8362,7 +8469,7 @@ mod linux_files {
             "security-policy" => "security",
             "rejected-post" => "bridge",
             "session-notifications" => "notifications",
-            "doctor" | "plan" | "run" | "sync-status" | "resync" => "operations",
+            "doctor" | "plan" | "run" | "sync-status" | "resync" | "clear-logs" => "operations",
             _ => return Err(BridgeError::unsafe_runtime()),
         };
         let expected_level = match parsed.state {
@@ -18193,6 +18300,65 @@ mod tests {
     }
 
     #[test]
+    fn status_rollup_is_an_argumentless_read_of_the_cores_own_document() {
+        assert_eq!(
+            read_manager_arguments(&ReadAction::StatusRollup).unwrap(),
+            ["api", "status-rollup"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            validate_http_request(environment("GET", "action=status-rollup&SynoToken=x")).unwrap(),
+            ValidatedHttpRequest::Get {
+                action: ReadAction::StatusRollup,
+                ..
+            }
+        ));
+        // The manager derives the expected profile set. A request that could
+        // narrow it could omit a profile and understate what is pending, which
+        // is the direction that tells someone they are caught up when they
+        // are not.
+        for query in [
+            "action=status-rollup&profiles=nightly",
+            "action=status-rollup&lines=10",
+            "action=status-rollup&extra=x",
+        ] {
+            assert!(
+                validate_http_request(environment("GET", &format!("{query}&SynoToken=x"))).is_err(),
+                "status-rollup must refuse the query {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_rollup_forwards_the_aggregate_and_refuses_a_foreign_schema() {
+        let aggregate = br#"{"schema":"sdsync.status-rollup-aggregate.v1","generated_at_epoch":10,"profiles_total":1,"profiles_observed":1,"profiles_never_observed":[],"complete":true,"observed_at_epoch":9,"overlapping_profiles":false,"total":null,"total_unavailable_reason":null,"profiles":[]}"#;
+        let forwarded = parse_and_sanitize_manager_json(
+            aggregate,
+            &ReadAction::StatusRollup,
+            None,
+            Some(&SecurityPolicyArgs::default()),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&forwarded).unwrap();
+        // Forwarded unchanged: the bridge recomputes none of it, so there is no
+        // second answer that can disagree with the core's.
+        assert_eq!(value["schema"], "sdsync.status-rollup-aggregate.v1");
+        assert_eq!(value["observed_at_epoch"], 9);
+        assert!(value["total"].is_null());
+        assert!(
+            parse_and_sanitize_manager_json(
+                br#"{"schema":"sdsync.dsm-logs.v1","logs":[]}"#,
+                &ReadAction::StatusRollup,
+                None,
+                Some(&SecurityPolicyArgs::default()),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn synology_token_is_optional_but_present_sources_remain_strict() {
         let cookie_only = validate_http_request(environment("GET", "action=snapshot")).unwrap();
         assert!(matches!(
@@ -20681,6 +20847,77 @@ mod tests {
                 "true",
             ]
         );
+    }
+
+    #[test]
+    fn clear_logs_dispatches_one_named_source_and_cannot_name_the_audit_trail() {
+        let parsed =
+            parse_mutation_request(&request("clear-logs", json!({"source":"controller"}))).unwrap();
+        assert_eq!(
+            argument_strings(&parsed.mutation),
+            ["api", "clear-logs", "--source", "controller"]
+        );
+        assert_eq!(parsed.mutation.operation_id(), "clear-logs");
+        for source in ["api", "doctor", "controller", "scheduler", "sync"] {
+            let accepted =
+                parse_mutation_request(&request("clear-logs", json!({ "source": source })))
+                    .unwrap();
+            assert_eq!(
+                argument_strings(&accepted.mutation),
+                ["api", "clear-logs", "--source", source]
+            );
+        }
+        // The audit log is the record of who cleared which log, so refusing it
+        // is a property of the type rather than a check that a later handler
+        // could be written without. "all" is refused for the same reason: the
+        // only thing it could honestly do is silently skip that one file.
+        for refused in ["audit", "all", "", "activity", "Controller", "controller "] {
+            assert!(
+                parse_mutation_request(&request("clear-logs", json!({ "source": refused })))
+                    .is_err(),
+                "clear-logs must refuse the source {refused:?}"
+            );
+        }
+        assert!(parse_mutation_request(&request("clear-logs", json!({}))).is_err());
+        assert!(
+            parse_mutation_request(&request(
+                "clear-logs",
+                json!({"source":"controller","extra":true})
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn clear_logs_follows_the_operational_actions_switch_and_audits_as_an_operation() {
+        let parsed =
+            parse_mutation_request(&request("clear-logs", json!({"source":"sync"}))).unwrap();
+        assert!(
+            validate_mutation_against_security_policy(
+                &parsed.mutation,
+                &SecurityPolicyArgs {
+                    allow_operational_actions: true,
+                    ..SecurityPolicyArgs::default()
+                },
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_mutation_against_security_policy(
+                &parsed.mutation,
+                &SecurityPolicyArgs {
+                    allow_operational_actions: false,
+                    ..SecurityPolicyArgs::default()
+                },
+            )
+            .is_err()
+        );
+        // A queued operation fails closed unless it is named in every audit
+        // allowlist it passes through. This covers the two Rust-side lists;
+        // the manager and sdsync-common hold the matching shell-side entries.
+        assert!(valid_audit_operation("clear-logs"));
+        // A package log is not profile-scoped.
+        assert_eq!(mutation_audit_profile(&parsed.mutation), "none");
     }
 
     #[test]

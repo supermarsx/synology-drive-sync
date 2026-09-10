@@ -1406,10 +1406,14 @@ test("autosave bounds forever-pending accepted jobs and leaves no polling timer"
     let settled = false;
     pending.then(() => { settled = true; }, () => { settled = true; });
     const rejected = assert.rejects(pending, (error) => {
-      assert.equal(error instanceof api.QueuedOutcomeUnknownError, true);
+      // Every read here answered `pending`, so the deadline is the browser's
+      // patience running out, not the package's outcome becoming unknown. The
+      // bound itself is unchanged and still pinned by the assertions below.
+      assert.equal(error instanceof api.QueuedStillPendingError, true);
       assert.equal(error.accepted, true);
+      assert.equal(error.outcomeUnknown, false);
       assert.equal(error.jobId, jobId);
-      assert.match(error.message, /observation exceeded the autosave limit/i);
+      assert.match(error.message, /still working through its queue/i);
       return true;
     });
     await clock.settleUntil(() => clock.hasTimerIn(20), "terminal observation timeout");

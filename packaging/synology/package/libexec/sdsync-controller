@@ -94,7 +94,7 @@ process_control_queue() {
         controller_log_event error audit_reconcile_failed "phase=queue_turn" controller true >/dev/null 2>&1 || true
         return 73
     }
-    # A nested connection-only turn runs while a primary child may still own a
+    # A nested auxiliary turn runs while a primary child may still own a
     # processing request and secret. Never age-prune that active claim from the
     # nested turn; primary controller turns retain the bounded cleanup policy.
     [ "$interactive_only" = true ] || prune_expired_control_files
@@ -138,9 +138,32 @@ process_control_queue() {
                 controller_log_event error control_request_classification_failed "id=$queued_id exit=$classification_exit"
                 break
             fi
+            # What this turn may claim depends on what the primary worker
+            # is, because the two adjacencies are not the same risk.
+            #
+            # Beside a runner it stays exactly what it always was: a bounded
+            # connection probe. A sync commits files, and a configuration
+            # mutation must not interleave with one.
+            #
+            # Beside a *concurrent* primary it also admits a serialized head.
+            # A concurrent job is, by the classifier's own definition, one that
+            # commits no profile, credential, policy or scheduler state, so a
+            # serialized job beside it still cannot interleave with another
+            # committer -- which is the property serialization exists to hold.
+            # Without this the dashboard's own status walk owns the only work
+            # slot for as long as comparing both trees takes, and a profile
+            # save queued behind it waits out the AppWindow's terminal-result
+            # window and is reported to the operator as an unknown outcome:
+            # a save that did land, described as one that might not have.
+            #
+            # The head is still classified exactly and never reordered, and a
+            # concurrent head is still a barrier, so two of them never overlap.
             case $queued_classification in
                 connection) ;;
-                concurrent|serialized) break ;;
+                serialized)
+                    [ "$active_control_classification" = concurrent ] || break
+                    ;;
+                concurrent) break ;;
             esac
         fi
         if ! mv "$queued_request" "$processing_request"; then
@@ -214,7 +237,7 @@ process_control_queue() {
             wait_for_control_consumer
             control_exit=$control_wait_exit
         else
-            # `wait_for_runner` may service a connection-only queue turn while
+            # `wait_for_runner` may service an auxiliary queue turn while
             # this primary consumer remains active. Shell variables are global,
             # so preserve the primary claim before entering that nested turn.
             primary_control_queued_id=$queued_id
@@ -1131,7 +1154,8 @@ arm_connection_queue_from_backlog() {
     # been folded into the current controller turn. Reconstruct that evidence
     # from the private FIFO so a pre-existing connection probe is not stranded.
     # The nested turn still classifies the exact head and refuses to cross a
-    # serialized or concurrent barrier.
+    # concurrent barrier, or a serialized one unless this primary is itself
+    # concurrent.
     for connection_wake_request in "$control_requests"/*.json; do
         [ -e "$connection_wake_request" ] || [ -L "$connection_wake_request" ] || continue
         connection_wake_name=${connection_wake_request##*/}
@@ -1163,9 +1187,9 @@ wait_for_runner() {
                     nested_control_queue_progress=$control_queue_progress
                     control_queue_progress=$primary_control_queue_progress
                     # Standard signals can coalesce. After a successful FIFO
-                    # claim, perform one more guarded connection-only turn so
-                    # a second pre-existing probe is not stranded behind the
-                    # primary worker. A mutation head, classification failure,
+                    # claim, perform one more guarded auxiliary turn so
+                    # a second pre-existing request is not stranded behind the
+                    # primary worker. A refused head, classification failure,
                     # collision, or failed mv reports no progress and therefore
                     # cannot create a zero-sleep retry loop.
                     if [ "$nested_control_queue_progress" = true ]; then

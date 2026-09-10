@@ -2383,7 +2383,7 @@ append_audit_event() {
         rejected-post) audit_category=bridge ;;
         interface-settings) audit_category=configuration ;;
         session-notifications) audit_category=notifications ;;
-        action|doctor|plan|run|sync-status|resync) audit_category=operations ;;
+        action|doctor|plan|run|sync-status|resync|clear-logs) audit_category=operations ;;
         *) return 64 ;;
     esac
     case $audit_state in requested|succeeded|failed|outcome_unknown) ;; *) return 64 ;; esac

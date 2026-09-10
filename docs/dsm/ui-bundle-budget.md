@@ -19,12 +19,17 @@ CSS response for the same package URL. `src/runtimeStyles.js` installs those byt
 The consequence is easy to miss: **`dist/style.css` is embedded whole, as a single JavaScript string
 literal, inside `dist/SynologyDriveSync.js`.** There is no CSS minimizer anywhere in the pipeline, so
 `dist/style.css` is byte-identical to `src/styles/native.css` — pretty-printed, two-space indented,
-one declaration per line. At the time of writing that is 131,489 bytes of a 520,634-byte "JavaScript"
-bundle.
+one declaration per line. That is currently 132,891 bytes of a 532,197-byte "JavaScript" bundle.
 
 Every byte trimmed from the stylesheet is therefore a byte off the JavaScript asset as well.
-Minifying it is worth roughly 30 KB against a budget the bundle currently exceeds by single-digit
-kilobytes — an order of magnitude more headroom than any plausible amount of JavaScript golfing.
+Minifying it is worth roughly 30 KB. The bundle now exceeds the 512,000-byte budget by about 20 KB,
+so that one change is the difference between over and under — an order of magnitude more headroom
+than any plausible amount of JavaScript golfing, and the reason this is the next change to make
+rather than a standing note.
+
+Three features have landed over the budget since it was first written (the timestamped log view and
+per-category clearing, then the stored-totals summary that made the Sync section open without a
+walk). Each was worth its bytes; none of them is where the headroom is.
 
 ## Constraints on doing it
 
