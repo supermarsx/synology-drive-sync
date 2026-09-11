@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as FmtWrite;
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -33,6 +33,7 @@ use synology_drive_sync::progress::{
     OperationKind, ProgressFormat, ProgressMode as RendererProgressMode, ProgressRenderer,
     ProgressTotals, ProgressTracker,
 };
+use synology_drive_sync::progress_record::ProgressRecorder;
 use synology_drive_sync::source_diagnostics::{
     SourceDiagnosticOptions, SourceDiagnosticReport, diagnose_source,
 };
@@ -171,7 +172,12 @@ fn dispatch(arguments: &cli::Cli) -> Result<ExitCode> {
                         .unwrap_or(config::DEFAULT_MAX_TOTAL_DELETE),
                 )
             } else {
-                run_sync(resolved.remove(0).settings, sync.dry_run, false)
+                run_sync(
+                    resolved.remove(0).settings,
+                    sync.dry_run,
+                    false,
+                    arguments.global.output.progress_record.as_deref(),
+                )
             }
         }
         cli::Invocation::Plan(plan) => {
@@ -209,7 +215,12 @@ fn dispatch(arguments: &cli::Cli) -> Result<ExitCode> {
                         .unwrap_or(config::DEFAULT_MAX_TOTAL_DELETE),
                 )
             } else {
-                run_sync(resolved.remove(0).settings, true, plan.exit_code)
+                run_sync(
+                    resolved.remove(0).settings,
+                    true,
+                    plan.exit_code,
+                    arguments.global.output.progress_record.as_deref(),
+                )
             }
         }
         cli::Invocation::Status(status) => {
@@ -228,7 +239,12 @@ fn dispatch(arguments: &cli::Cli) -> Result<ExitCode> {
             let settings =
                 config::resolve_sync(selected[0].values, &status.sync, &arguments.global.output)
                     .map_err(config_error)?;
-            run_status(status, &profile, settings)
+            run_status(
+                status,
+                &profile,
+                settings,
+                arguments.global.output.progress_record.as_deref(),
+            )
         }
         cli::Invocation::StatusRollup(rollup) => {
             run_status_rollup(rollup, &arguments.global.output)
@@ -256,7 +272,11 @@ fn dispatch(arguments: &cli::Cli) -> Result<ExitCode> {
             let settings =
                 config::resolve_sync(selected[0].values, &resync.sync, &arguments.global.output)
                     .map_err(config_error)?;
-            run_resync(resync, settings)
+            run_resync(
+                resync,
+                settings,
+                arguments.global.output.progress_record.as_deref(),
+            )
         }
         cli::Invocation::Doctor(doctor) => {
             let selected = select_job_profiles(
@@ -317,7 +337,10 @@ fn dispatch(arguments: &cli::Cli) -> Result<ExitCode> {
                     if doctor.batch.requested() {
                         run_doctor_batch(resolved)
                     } else {
-                        run_doctor(resolved.remove(0).settings)
+                        run_doctor(
+                            resolved.remove(0).settings,
+                            arguments.global.output.progress_record.as_deref(),
+                        )
                     }
                 }
             }
@@ -1230,12 +1253,40 @@ fn sync_batch_output(
     captured_rendered_output(output.output, buffer)
 }
 
+/// Attach the progress record a queued dashboard request asked for, if it asked for one.
+///
+/// Every rejection -- no flag, an unparseable file name, an operation with no phase catalogue --
+/// yields the token unchanged, so the run proceeds exactly as it did before this option existed.
+/// That is the whole contract: the record is something a supervisor may read, never something the
+/// operation depends on.
+///
+/// Batch invocations deliberately publish nothing. Phases are reported as "step N of M" and that
+/// claim has to stay true; N profiles run in sequence through the same phase list, so a single
+/// record would count 1..M once per profile with no way to say which. Naming the profile would
+/// need a seventh field, and the dashboard validates the document by exact key count -- it would
+/// drop every record rather than render the extra one. The honest answer is to publish none.
+fn attach_progress_record(
+    cancellation: CancellationToken,
+    record: Option<&Path>,
+    operation: &str,
+) -> CancellationToken {
+    match record.and_then(|path| ProgressRecorder::new(path, operation)) {
+        Some(recorder) => cancellation.with_progress(Arc::new(recorder)),
+        None => cancellation,
+    }
+}
+
 fn run_sync(
     settings: config::ResolvedSync,
     plan_only: bool,
     changes_exit_code: bool,
+    record: Option<&Path>,
 ) -> Result<ExitCode> {
-    let cancellation = install_cancellation_handler()?;
+    let cancellation = attach_progress_record(
+        install_cancellation_handler()?,
+        record,
+        if plan_only { "plan" } else { "run" },
+    );
     let result = run_sync_job(&settings, plan_only, &cancellation, |_| Ok(()))?;
     write_sync_output(
         &result.plan,
@@ -1332,14 +1383,18 @@ fn run_sync_job(
 /// combination that overwrites anything on a first invocation. With a ticket, the plan is rebuilt
 /// from live state and the guard runs *before* any mutation, so a destination that changed since
 /// the caller looked cannot be overwritten on the strength of a stale confirmation.
-fn run_resync(arguments: &cli::ResyncArgs, mut settings: config::ResolvedSync) -> Result<ExitCode> {
+fn run_resync(
+    arguments: &cli::ResyncArgs,
+    mut settings: config::ResolvedSync,
+    record: Option<&Path>,
+) -> Result<ExitCode> {
     // The `--delete` argument is refused before resolution; this pins the setting off regardless
     // of where else it could have come from, including a profile.
     settings.safety.delete = false;
     settings.behavior.force_resync = true;
 
     let scope = resolved_scope(&settings)?;
-    let cancellation = install_cancellation_handler()?;
+    let cancellation = attach_progress_record(install_cancellation_handler()?, record, "resync");
     let plan_only = arguments.confirm.is_none();
 
     // Captured from inside the guard so a refused confirmation can still report the plan that
@@ -1514,8 +1569,13 @@ fn run_status(
     arguments: &cli::StatusArgs,
     profile: &str,
     settings: config::ResolvedSync,
+    record: Option<&Path>,
 ) -> Result<ExitCode> {
-    let cancellation = install_cancellation_handler()?;
+    // The seven phases below are announced through this token. It is already threaded into the
+    // scan, the inventory, the digest pass and the cache, so every boundary a dashboard cares
+    // about is a call site that already exists -- no phase here was invented to have one.
+    let cancellation =
+        attach_progress_record(install_cancellation_handler()?, record, "sync-status");
     warn_for_insecure_network(&settings.network, &settings.output);
 
     let scope = resolved_scope(&settings)?;
@@ -1526,6 +1586,7 @@ fn run_status(
     let cache = open_status_cache(arguments, profile, &settings, compare);
 
     cancellation.check()?;
+    cancellation.phase("scan_local");
     let scan = local::scan_scoped(
         &settings.source,
         &rules,
@@ -1536,6 +1597,7 @@ fn run_status(
     )?;
     let mut local = scan.inventory;
 
+    cancellation.phase("connect");
     let mut client = connect_client(
         &settings.connection.url,
         &settings.network,
@@ -1553,6 +1615,7 @@ fn run_status(
         settings.authentication.password_file.as_deref(),
         &mut vault,
     )?;
+    cancellation.phase("authenticate");
     credentials::authenticate_with_sources(
         &mut client,
         &settings.connection.username,
@@ -1564,6 +1627,7 @@ fn run_status(
 
     let operation = (|| {
         cancellation.check()?;
+        cancellation.phase("list_remote");
         let scoped = client.remote_inventory_scoped(
             &root,
             &scope,
@@ -1585,6 +1649,7 @@ fn run_status(
         let mut cache_report = status_cache::CacheReport::off();
         let mut comparison = BTreeSet::new();
         if compare == CompareMode::Content {
+            cancellation.phase("compare");
             client.require_content_fingerprint_api()?;
             // Status is read-only: it never deletes, uploads or server-copies, so every digest
             // it needs is a comparison digest, none of them guards a mutation, and nothing here
@@ -1605,6 +1670,7 @@ fn run_status(
         }
         cancellation.check()?;
 
+        cancellation.phase("build_report");
         let mut page = plan::build_status_page(
             &root,
             &local,
@@ -1636,6 +1702,7 @@ fn run_status(
         if let Some(cache) = cache.as_ref()
             && compare == CompareMode::Content
         {
+            cancellation.phase("store_results");
             let scoped_query = !scope.is_root();
             if let Err(error) = cache.store(&local, &remote, &comparison, scoped_query) {
                 warn_cache(
@@ -1959,6 +2026,7 @@ fn prepare_and_run_sync(
         LogEvent::new(EventLogLevel::Info, EventCode::LocalScanStarted),
     )?;
     let scope = resolved_scope(settings)?;
+    cancellation.phase("scan_local");
     let mut local = local::scan_scoped(
         &settings.source,
         &rules,
@@ -1987,6 +2055,7 @@ fn prepare_and_run_sync(
         logger.as_ref(),
         LogEvent::new(EventLogLevel::Info, EventCode::ApiDiscoveryStarted),
     )?;
+    cancellation.phase("connect");
     let mut client = connect_client(
         &settings.connection.url,
         &settings.network,
@@ -2018,6 +2087,7 @@ fn prepare_and_run_sync(
         settings.authentication.password_file.as_deref(),
         &mut vault,
     )?;
+    cancellation.phase("authenticate");
     credentials::authenticate_with_sources(
         &mut client,
         &settings.connection.username,
@@ -2039,6 +2109,7 @@ fn prepare_and_run_sync(
             logger.as_ref(),
             LogEvent::new(EventLogLevel::Info, EventCode::RemoteScanStarted),
         )?;
+        cancellation.phase("list_remote");
         let mut remote = client
             .remote_inventory_scoped(&root, &scope, usize::MAX, cancellation)?
             .inventory;
@@ -2053,6 +2124,7 @@ fn prepare_and_run_sync(
             ),
         )?;
 
+        cancellation.phase("compare");
         populate_content_for_plan(
             &client,
             &mut local,
@@ -2063,6 +2135,7 @@ fn prepare_and_run_sync(
             cancellation,
         )?;
 
+        cancellation.phase("build_plan");
         let mut plan = plan::build_plan(
             &root,
             &local,
@@ -2118,6 +2191,7 @@ fn prepare_and_run_sync(
         }
 
         cancellation.check()?;
+        cancellation.phase("upload");
         let progress = ProgressWiring::new(
             &plan,
             &settings.output,
@@ -2181,6 +2255,7 @@ fn prepare_and_run_sync(
         }
         let report = execution?;
         cancellation.check()?;
+        cancellation.phase("reconcile");
         let reconciliation =
             build_reconciliation_plan(&client, settings, &root, &rules, server_copy, cancellation)?;
         ensure_reconciled(&reconciliation)?;
@@ -2307,8 +2382,12 @@ fn ensure_reconciled(plan: &SyncPlan) -> Result<()> {
     }
 }
 
-fn run_doctor(settings: config::ResolvedDoctor) -> Result<ExitCode> {
-    let cancellation = install_cancellation_handler()?;
+fn run_doctor(settings: config::ResolvedDoctor, record: Option<&Path>) -> Result<ExitCode> {
+    let cancellation = attach_progress_record(
+        install_cancellation_handler()?,
+        record,
+        synology_drive_sync::PROGRESS_OPERATION_DOCTOR,
+    );
     let timed = run_doctor_job(&settings, &cancellation, true)?;
     write_doctor_output(&timed.result, timed.elapsed, &settings.output)?;
     if cancellation.is_cancelled() || timed.result.cancelled || timed.result.write_probe_cancelled {
@@ -2415,6 +2494,13 @@ struct DoctorResult {
     capability_diagnosis: Option<CapabilityDiagnosis>,
     /// The destination path, walked one component at a time.
     path_resolution: Option<DestinationPathResolution>,
+    /// Carries the progress sink, so recording a section also publishes how far the run has got.
+    ///
+    /// A diagnostic has no single place where a section begins -- each of the sixteen is reached
+    /// by its own code path -- but it has exactly one place where a section is written down. That
+    /// funnel is the honest boundary, and it makes the published step mean "this much is
+    /// finished", which is what an operator watching a diagnostic is actually waiting to learn.
+    progress: CancellationToken,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2616,6 +2702,7 @@ impl DoctorResult {
             write_permission_path: None,
             write_probe_requested: settings.write_test,
             write_probe_performed: false,
+            progress: CancellationToken::default(),
             write_probe: None,
             write_probe_error: None,
             write_probe_cancelled: false,
@@ -2728,6 +2815,10 @@ impl DoctorResult {
         section.elapsed = elapsed;
         section.timing_scope = timing_scope;
         section.calls = calls;
+        // Deliberately not in `set_derived_section`: those are recorded once the run has already
+        // ended, and publishing one would walk the step count backwards at the very moment the
+        // result itself becomes available.
+        self.progress.phase(id);
     }
 
     /// Record a section that summarises requests other sections already own.
@@ -4554,6 +4645,7 @@ fn doctor_run(
     call_log: DoctorCallLog,
 ) -> Result<DoctorResult> {
     let mut result = DoctorResult::new(settings, perform_write_probe, call_log);
+    result.progress = cancellation.clone();
     if let Err(error) = cancellation.check() {
         result.fail_section("routing_tls", &error, Duration::ZERO);
         return Ok(result);

@@ -20,7 +20,7 @@ The consequence is easy to miss: **`dist/style.css` is embedded whole, as a sing
 literal, inside `dist/SynologyDriveSync.js`.** `src/styles/native.css` is pretty-printed — two-space
 indented, one declaration per line — and `build/condense-css-loader.js` strips its comments,
 indentation and blank lines on the way into both artifacts, so the two are no longer byte-identical.
-That leaves 121,883 bytes of a 522,006-byte "JavaScript" bundle; before the condenser it was 132,891
+That leaves 122,014 bytes of a 531,631-byte "JavaScript" bundle; before the condenser it was 132,891
 of 533,741.
 
 Every byte trimmed from the stylesheet is a byte off the JavaScript asset as well — but the
@@ -34,13 +34,37 @@ stylesheet is now spent as a lever, and the numbers say so:
   `from`/`to`, `minmax(112px, 0.72fr)`, newline-anchored selectors, and the 260/220-char keyframe
   windows. No minifier has a knob for any of them.
 
-The bundle still exceeds the 512,000-byte hint by about 10.0 KB, down from about 21.7 KB. Any
-further reduction has to come out of the JavaScript: at ~395 KB excluding the embedded stylesheet,
-that is where the remaining headroom is, and there is no second stylesheet-shaped win behind it.
+The bundle exceeds the 512,000-byte hint by about 19.6 KB. It was about 10.0 KB over before queued
+progress landed, and about 21.7 KB over before the stylesheet was condensed. Any further reduction
+has to come out of the JavaScript: at ~410 KB excluding the embedded stylesheet, that is where the
+remaining headroom is, and there is no second stylesheet-shaped win behind it.
 
-Three features have landed over the budget since it was first written (the timestamped log view and
-per-category clearing, then the stored-totals summary that made the Sync section open without a
-walk). Each was worth its bytes; none of them is where the headroom is.
+Four features have landed over the budget since it was first written (the timestamped log view and
+per-category clearing, the stored-totals summary that made the Sync section open without a walk, and
+then queued-job progress). Each was worth its bytes; none of them is where the headroom is.
+
+### What queued progress cost, and what that 9,625 bytes is made of
+
+Measured by building with each block removed in turn:
+
+| Block | Bundle bytes |
+| --- | --- |
+| `PHASE_SPECS`, the cross-layer phase catalogue mirrored from `src/lib.rs` | 1,962 |
+| `QUEUED_TERMINAL_FAILURE_CODES` and `QUEUED_FAILURE_COPY`, the vocabulary and the cause and next step for each named terminal failure | 1,209 |
+| Everything else | 6,454 |
+
+That remainder is the part with no single owner: the six-key validator and its enumeration in
+`api.js`, the render-boundary guard and phase/count/staleness formatting, the controller-liveness
+join and its six branches of copy, the progress sink threaded through the result poll,
+`QueuedConsumerFailedError`, three template live regions, and about 131 bytes of new stylesheet
+counted twice because the stylesheet is embedded in the bundle.
+
+Two of these three are prose, and prose is the part a minifier cannot touch: it is shipped verbatim
+because it is the feature. The catalogue is the only block with a structural alternative — packing
+each phase as an array rather than a frozen object would recover roughly 400 bytes — and it is
+deliberately not taken, because the object form is what `test_synology_ui.py` greps to hold the
+mirror in step with `src/lib.rs`, and a silently skewed catalogue under-reports a slow job at exactly
+the moment someone is troubleshooting it.
 
 ## Constraints on transforming the stylesheet
 

@@ -2432,6 +2432,7 @@ impl ApiClient {
             };
 
             for item in files {
+                cancellation.tick();
                 let (actual_parent, actual_name) = parent_and_name(&item.path)?;
                 if actual_parent != folder || actual_name != item.name {
                     return Err(Error::InvalidResponse {

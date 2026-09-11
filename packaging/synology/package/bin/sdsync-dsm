@@ -3402,6 +3402,14 @@ api_sync_status() {
     # re-verified live on every pass, and the answer reports the age of the
     # oldest evidence it rests on.
     set -- "$@" --status-cache "$status_cache_dir"
+    # The slowest thing an operator ever waits on, and the one they complained
+    # about: until the core publishes a record, both trees are walked, digested
+    # and compared behind a dashboard that can only say "pending". The path is
+    # resolved and validated rather than trusted, and an absent or rejected one
+    # appends nothing -- so this argv is byte-identical to the old one until a
+    # job actually carries a record to write.
+    load_progress_record_runtime
+    [ -z "$progress_record" ] || set -- "$@" --progress-record "$progress_record"
     api_query_capture "$@"
     [ "$query_exit" -eq 0 ] || api_query_failed sync-status "$status_profile"
     # The standard queued-result envelope, not a read schema: a status query
@@ -3873,22 +3881,41 @@ case $command_name in
         finish_private_file "$source_doctor_output"
         finish_private_file "$target_doctor_output"
         mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
+        # Doctor reaches the core four ways, and the record path has to ride on
+        # all of them or the slowest operation in the package is the one that
+        # still cannot say which of its sixteen sections it is in. Routing them
+        # through one call keeps the argv fully quoted -- expanding an optional
+        # flag inline would mean an unquoted expansion in the one place a path
+        # is involved -- and keeps the four invocations from drifting apart.
+        load_progress_record_runtime
+        run_doctor_core() {
+            # Defaulted, not assumed. The resolution above is the only thing
+            # that sets this, and Doctor is the command an operator reaches for
+            # when something is already wrong -- it must not be the one that
+            # turns a reordering here into an unset-variable abort.
+            if [ -n "${progress_record:-}" ]; then
+                "$binary" --config "$config_file" --progress-record "$progress_record" \
+                    --output ndjson doctor "$@"
+            else
+                "$binary" --config "$config_file" --output ndjson doctor "$@"
+            fi
+        }
         set +e
         # Target Doctor must always reach its independent routing/authentication path. A local
         # source failure is reported alongside it instead of short-circuiting remote evidence.
         # Quick skips source work, standard inventories names/readability without hashing every
         # payload, and extensive retains the complete source fingerprint pass.
         if [ "$diagnostic_level" = standard ]; then
-            "$binary" --config "$config_file" --output ndjson doctor "$@" source > "$source_doctor_output" 2>&1
+            run_doctor_core "$@" source > "$source_doctor_output" 2>&1
             source_doctor_exit=$?
         elif [ "$diagnostic_level" = extensive ]; then
-            "$binary" --config "$config_file" --output ndjson doctor "$@" source --hash > "$source_doctor_output" 2>&1
+            run_doctor_core "$@" source --hash > "$source_doctor_output" 2>&1
             source_doctor_exit=$?
         fi
         if [ "$write_test" = true ]; then
-            "$binary" --config "$config_file" --output ndjson doctor "$@" --level "$diagnostic_level" target --write-test > "$target_doctor_output" 2>&1
+            run_doctor_core "$@" --level "$diagnostic_level" target --write-test > "$target_doctor_output" 2>&1
         else
-            "$binary" --config "$config_file" --output ndjson doctor "$@" --level "$diagnostic_level" target > "$target_doctor_output" 2>&1
+            run_doctor_core "$@" --level "$diagnostic_level" target > "$target_doctor_output" 2>&1
         fi
         target_doctor_exit=$?
         set -e
@@ -3954,6 +3981,11 @@ case $command_name in
         set -- "$binary" --config "$config_file" --output json resync --profile "$resync_scope_name"
         [ -z "$resync_path" ] || set -- "$@" --scope "$resync_path"
         [ -z "$resync_ticket" ] || set -- "$@" --confirm "$resync_ticket"
+        # Same resolution as the status walk. A confirmed resync re-uploads file
+        # by file, so it is the other operation whose whole duration currently
+        # renders as one undifferentiated wait.
+        load_progress_record_runtime
+        [ -z "$progress_record" ] || set -- "$@" --progress-record "$progress_record"
         mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
         if [ -n "$resync_ticket" ]; then
             append_activity run.started "$resync_scope_name" running "Confirmed resync started" operations info 2>/dev/null || true

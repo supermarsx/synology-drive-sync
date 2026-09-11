@@ -1669,6 +1669,58 @@ setting() {
     fi
 }
 
+# Resolve the progress record the core should publish for the job being served.
+#
+# The core is generic -- it also runs under cron, Docker, launchd and on
+# Windows -- so it never learns DSM control paths. It is handed this one the
+# same way $status_cache_dir is already handed to the status walk: as a path on
+# its own argv, resolved here. The difference is where the path comes from. The
+# bridge clears the environment before every manager exec and passes only the
+# operation's own arguments, so the manager is never told which job it is
+# serving; the record path therefore arrives in the environment as the single
+# piece of job identity this layer needs.
+#
+# It is validated rather than trusted. The only accepted shape is a plain file
+# directly under $control_progress named for the request and job it is bound
+# to, which is the one path the bridge's reader will ever open. Anything else yields no record
+# and no argument, and the operation then runs exactly as it did before
+# progress existed -- the same fail-closed direction the reader itself takes,
+# where a malformed record degrades to plain "pending" rather than to an error.
+#
+# Parameter expansion only, no forks. This is called on the API path of every
+# slow operation, which is the path the snapshot work cut from 1,135 spawns
+# to 12, and a progress record is not worth one of them.
+load_progress_record_runtime() {
+    progress_record=
+    progress_record_candidate=${SDSYNC_DSM_PROGRESS_RECORD:-}
+    [ -n "$progress_record_candidate" ] || return 0
+    case $progress_record_candidate in
+        "$control_progress"/*) ;;
+        *) return 0 ;;
+    esac
+    progress_record_name=${progress_record_candidate#"$control_progress"/}
+    case $progress_record_name in
+        */*|.*) return 0 ;;
+        *.json) ;;
+        *) return 0 ;;
+    esac
+    # <client request id>.<server job id>.json. The reader rebuilds that name
+    # from ids it resolved for itself, so checking both halves here is what
+    # keeps a forwarded path from naming a record for some other job.
+    progress_record_id=${progress_record_name%.json}
+    progress_record_client=${progress_record_id%%.*}
+    progress_record_job=${progress_record_id#*.}
+    [ "$progress_record_job" != "$progress_record_id" ] || return 0
+    case $progress_record_client in ''|*[!a-f0-9]*) return 0 ;; esac
+    case $progress_record_job in ''|*[!a-f0-9]*) return 0 ;; esac
+    [ "${#progress_record_client}" -eq 32 ] || return 0
+    [ "${#progress_record_job}" -eq 48 ] || return 0
+    # A symlink here would let the record's writer be aimed somewhere else. The
+    # record is advisory, so this refuses rather than repairs.
+    [ ! -L "$progress_record_candidate" ] || return 0
+    progress_record=$progress_record_candidate
+}
+
 # How much of the NAS this package may take, as one named choice rather than a
 # pile of independent numbers. Every knob derives from the level, so the three
 # levels stay reviewable and cannot be combined into a state nobody has
@@ -1689,6 +1741,7 @@ setting() {
 # stored -- get that wrong and a save from a form that sends a subset silently
 # discards the rest, which is the bug configure_alert_policy documents at
 # length in bin/sdsync-dsm. One derived level cannot have a subset.
+
 load_performance_policy_runtime() {
     performance_runtime_level=balanced
     performance_stored_level=$(setting "$performance_policy_file" level balanced)

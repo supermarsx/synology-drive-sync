@@ -26,6 +26,24 @@ function loadAppComponent({ probe = async () => ({}), refreshSnapshot = async ()
     MAX_RESPONSE_BYTES: 1024 * 1024,
     QueuedOutcomeUnknownError: class extends Error {},
     SNAPSHOT_SCHEMA: "sdsync.dsm-api.v1",
+    // Mirrors the exported validator's contract: exactly the four-key or the
+    // six-key shape, nothing between them, and a validated record in the
+    // camelCase form the AppWindow renders from.
+    PROGRESS_UNAVAILABLE: Object.freeze({ unavailable: true }),
+    trustedRequestProgress: (value) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+      const keys = Object.keys(value).sort().join(",");
+      const counted = keys === "count,label,step,total,unit,updated_at";
+      if (!counted && keys !== "label,step,total,updated_at") return null;
+      return {
+        step: Number(value.step),
+        total: Number(value.total),
+        label: value.label,
+        updatedAt: Number(value.updated_at),
+        unit: counted ? value.unit : "",
+        count: counted ? Number(value.count) : 0
+      };
+    },
     SYNC_STATUS_MAX_LIMIT: 200,
     apiGet: async () => ({}),
     apiPost: async () => ({ ok: true }),

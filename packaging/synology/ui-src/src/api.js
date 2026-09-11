@@ -254,6 +254,63 @@ export class ClientRequestTimeoutError extends DsmApiError {
   }
 }
 
+/**
+ * The named ways a queued job can end without the operation itself having run.
+ *
+ * Each of these was, until the controller learned to publish a terminal result
+ * on the paths where it used to delete the request and log, an `unresolved`
+ * job: the request ID disappeared, the dashboard said the outcome could not be
+ * established, and the reason sat in the controller log with no link to it.
+ * They are listed here rather than inferred from the message because the code
+ * is the part a person can act on, and because a generic failure and a killed
+ * consumer call for different actions.
+ */
+export const QUEUED_TERMINAL_FAILURE_CODES = Object.freeze([
+  "classification_failed",
+  "secret_claim_failed",
+  "consumer_failed",
+  "consumer_wrote_no_result"
+]);
+
+/**
+ * A queued job that failed for a named, structural reason rather than because
+ * the operation it carried was rejected.
+ *
+ * Deliberately not a `QueuedOutcomeUnknownError`: the outcome is known. Either
+ * the job never started, or it died in a class that commits nothing; either
+ * way the stage that dropped it is named, and where a process died, so is its
+ * exit code. Saying "outcome unknown" here would be a strictly
+ * worse report than the truth, and would hold a reconciliation barrier closed
+ * over a question that has already been answered -- so this is terminal and
+ * known, and releases its reconciliation authentication like any other failure.
+ */
+export class QueuedConsumerFailedError extends DsmApiError {
+  constructor(message, code, exitCode = null) {
+    super(message, 200, code, "queued_terminal_result");
+    this.name = "QueuedConsumerFailedError";
+    // Typed rather than coerced, because the coercion here is actively
+    // misleading: `Number(null)` and `Number("")` are both 0, so a result that
+    // carried no exit code at all would be reported as "exited with code 0" --
+    // a successful exit, stated with confidence, about a job that failed.
+    this.exitCode = typeof exitCode === "number" && Number.isInteger(exitCode)
+      && exitCode >= 0 && exitCode <= 255
+      ? exitCode
+      : null;
+    this.accepted = true;
+    this.outcomeUnknown = false;
+    this.consumerFailed = true;
+    // One of the four is not like the others. A worker that exited zero and
+    // wrote no result did run, and how far it got is exactly what nobody can
+    // say -- so while the *stage* that dropped the job is named, the state it
+    // left behind still needs a person to look at it. Marking it for inspection
+    // keeps its reconciliation authentication and its barrier, which is the
+    // difference between naming a failure and claiming an outcome we do not
+    // have. Of the other three, two never started at all and one was terminated
+    // while doing work the bridge itself classes as committing nothing.
+    this.requiresInspection = code === "consumer_wrote_no_result";
+  }
+}
+
 export const ACTIONS = Object.freeze({
   configureProfile: "configure-profile",
   removeProfile: "remove-profile",
@@ -1082,10 +1139,26 @@ async function pollJobResult(
       // A trusted read that says the job is queued. Recorded so that a deadline
       // firing later can report what the package actually told us rather than
       // attributing the browser's impatience to it.
+      //
+      // The progress field goes through the same validator the request-status
+      // document's does. This document is checked for its schema and job ID but
+      // not for an exact key set, so its progress field arrives with nothing
+      // enumerating it; reading it raw -- as this did -- would make the result
+      // endpoint a path for unvalidated job-controlled text the moment the
+      // bridge began publishing progress on it. Pending-only is structural
+      // here: this is the pending branch, so a completed job cannot smuggle
+      // progress past the same rule the request-status reader enforces.
+      const progress = observedRequestProgress(status.progress);
       if (observation) {
         observation.lastReadPending = true;
-        observation.lastProgress = status.progress && typeof status.progress === "object" ? status.progress : null;
+        observation.lastProgress = progress;
       }
+      // Publish every pending read to whoever is watching this job, so a long
+      // operation can say what it is doing while it runs rather than only once
+      // the browser's patience has expired. Unbounded observations have no
+      // deadline and therefore no observation object, so the sink rides on the
+      // limits -- the one thing already threaded to every poll.
+      if (limits && typeof limits.onProgress === "function") limits.onProgress(progress);
       // A caller that named its own interval keeps it; otherwise walk the ramp, so
       // the answer arrives at roughly the speed of the job for short jobs without
       // hammering the endpoint for long ones.
@@ -1122,11 +1195,16 @@ async function pollJobResult(
       );
     }
     if (status.result.ok === false) {
-      const failure = new DsmApiError(
-        boundedText(status.result.message, "Package operation failed"),
-        200,
-        boundedText(status.result.code, "operation_failed")
-      );
+      const failureMessage = boundedText(status.result.message, "Package operation failed");
+      const failureCode = boundedText(status.result.code, "operation_failed");
+      // A named structural failure keeps its name. The controller used to delete
+      // the request and log the reason, which reached the operator as
+      // `unresolved` with no cause attached; now that it publishes a terminal
+      // result instead, the cause is carried through to the screen rather than
+      // flattened back into one generic verdict at the last step.
+      const failure = QUEUED_TERMINAL_FAILURE_CODES.includes(failureCode)
+        ? new QueuedConsumerFailedError(failureMessage, failureCode, status.result.exit_code)
+        : new DsmApiError(failureMessage, 200, failureCode);
       failure.resultOutput = boundedTerminalOutput(
         status.result.output,
         failure.message
@@ -1182,19 +1260,59 @@ function exactRequestStatusKeys(model, expected) {
   return actual.length === keys.length && actual.every((key, index) => key === keys[index]);
 }
 
-// A pending job publishes bounded progress from the reviewed section catalogue,
+// A pending job publishes bounded progress from the reviewed phase catalogue,
 // and the bridge delivers it as exactly one additional key on the status
 // document. Both shapes are enumerated rather than tolerated: an unreviewed
 // seventh key still fails closed.
 //
 // Demanding an exact five-key match made the six-key form unreadable, and
 // `pollRequestStatus` treats an untrusted document as fatal. A long Doctor run
-// -- the one operation that publishes progress, and the slowest thing this
-// package does -- therefore declared its own outcome unknown within a second of
-// the first read, without consuming a single retry of its recovery window.
-function trustedRequestProgress(value) {
+// -- the slowest thing this package does -- therefore declared its own outcome
+// unknown within a second of the first read, without consuming a single retry
+// of its recovery window.
+//
+// `step`/`total` count the phase, never the work inside it. Phase counts are
+// known before the operation starts, so "step 5 of 7" is always true; the count
+// of files examined within a phase is genuinely unknown in advance, which is why
+// it travels as a separate running total with a catalogue-resolved unit and is
+// never rendered as a fraction or a bar. A denominator we do not have is not
+// made honest by inventing one.
+//
+// `unit` is an enumeration, resolved server-side from the phase id, exactly as
+// `label` is. Neither is job-controlled text: the record contributes one
+// untrusted datum -- the phase id -- and it is used only as a lookup key. Keep
+// it that way. A free-text `unit` would be the first job-controlled string this
+// validator ever let reach the screen.
+const PROGRESS_UNITS = Object.freeze(["", "bytes", "entries", "files"]);
+// The maximum a running count may claim. Nothing this package walks approaches
+// it, so a record above it is a corrupt or hostile document rather than a busy
+// one, and is refused like any other malformed field.
+const MAX_PROGRESS_COUNT = 1000000000;
+// The two accepted shapes, each an exact key set. The six-key form is what the
+// bridge publishes; the four-key form is its identity-only subset, kept readable
+// so a record that carries no counter still renders as its phase. Nothing
+// between them is accepted -- a five-key document is neither shape, and a
+// seventh key fails closed against both. Written as two literals rather than one
+// list plus tolerated extras, because "tolerated extras" is precisely the
+// property this enumeration exists to deny.
+const PROGRESS_IDENTITY_KEYS = Object.freeze(["label", "step", "total", "updated_at"]);
+const PROGRESS_COUNTED_KEYS = Object.freeze(["count", "label", "step", "total", "unit", "updated_at"]);
+
+// A progress field that was present on a trusted document but failed validation.
+//
+// Distinct from `null`, which means the package published no progress at all.
+// The difference is the whole point: "no progress record" is the ordinary state
+// of a fast job, while "a progress record arrived and did not validate" says the
+// operation is publishing something this AppWindow refuses to render, and an
+// operator watching a job that has stopped moving deserves to be told that
+// rather than shown a blank. Failing closed is correct; failing closed and
+// silently is how a broken writer survives a release unnoticed.
+export const PROGRESS_UNAVAILABLE = Object.freeze({ unavailable: true });
+
+export function trustedRequestProgress(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  if (!exactRequestStatusKeys(value, ["label", "step", "total", "updated_at"])) return null;
+  const counted = exactRequestStatusKeys(value, PROGRESS_COUNTED_KEYS);
+  if (!counted && !exactRequestStatusKeys(value, PROGRESS_IDENTITY_KEYS)) return null;
   const step = Number(value.step);
   const total = Number(value.total);
   const updatedAt = Number(value.updated_at);
@@ -1203,7 +1321,38 @@ function trustedRequestProgress(value) {
     || typeof value.label !== "string" || !value.label || value.label.length > 128) {
     return null;
   }
-  return { step, total, label: value.label, updatedAt };
+  if (!counted) return { step, total, label: value.label, updatedAt, unit: "", count: 0 };
+  // Typed strictly rather than coerced. `count` is new, so nothing depends on
+  // the older fields' tolerance of numeric strings, and a running total is the
+  // one field here that gets arithmetic and formatting applied to it -- `true`
+  // coercing to 1 and `[]` to 0 would each render a confident number that no
+  // writer ever published.
+  if (typeof value.count !== "number" || !Number.isInteger(value.count)
+    || value.count < 0 || value.count > MAX_PROGRESS_COUNT
+    || typeof value.unit !== "string" || !PROGRESS_UNITS.includes(value.unit)) {
+    return null;
+  }
+  return { step, total, label: value.label, updatedAt, unit: value.unit, count: value.count };
+}
+
+/**
+ * What a trusted status document's progress field establishes.
+ *
+ * Three outcomes, and the caller must be able to tell them apart: `null` when
+ * the document published no progress, a validated record when it published one
+ * this contract recognises, and `PROGRESS_UNAVAILABLE` when it published
+ * something that did not validate.
+ *
+ * Every read of a progress field -- from `request-status` and from `result`
+ * alike -- goes through here. The `result` document is not exact-keyed the way
+ * the request-status document is, so its progress field arrives with no
+ * enumeration behind it at all; routing it through the same validator is what
+ * keeps a bridge that starts publishing progress from also becoming a path for
+ * unvalidated job-controlled text to reach an operator's screen.
+ */
+function observedRequestProgress(value) {
+  if (value === undefined || value === null) return null;
+  return trustedRequestProgress(value) || PROGRESS_UNAVAILABLE;
 }
 
 function trustedRequestStatus(model, requestId, expectedOperation) {
@@ -1599,14 +1748,26 @@ export async function apiPost(
   payload,
   awaitTerminal = true,
   pollIntervalMs = RESULT_POLL_INTERVAL_MS,
-  options = undefined
+  options = undefined,
+  onProgress = null
 ) {
   if (!csrfToken) throw new Error("Authenticated DSM mutation bridge is unavailable");
   const expectedKeys = ARGUMENT_KEYS[action];
   if (!expectedKeys) throw new Error("Unsupported API mutation action");
   exactMutationKeys(action, payload);
+  if (onProgress !== null && typeof onProgress !== "function") {
+    throw new TypeError("API progress observers must be a function");
+  }
   const boundedObservationLimits = normalizedRequestLimits(options);
   const limits = boundedObservationLimits || terminalAttemptLimits();
+  // Not a limit, and kept off the limits contract deliberately: it is attached
+  // after normalisation so that `normalizedRequestLimits` keeps rejecting every
+  // unsupported key, and so that a caller cannot smuggle a callback in as
+  // configuration. It rides here only because `limits` is the one object
+  // already threaded to every poll of every job, including the unbounded ones
+  // -- Doctor and the status walk -- which have no observation object to hang
+  // it on and are exactly the operations slow enough to need it.
+  limits.onProgress = onProgress;
 
   await ensureDsmToken();
   const requestDsmAuth = dsmAuthSnapshot();

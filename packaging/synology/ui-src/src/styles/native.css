@@ -1718,6 +1718,17 @@
   color: var(--sdsync-amber);
 }
 
+/* What a slow operation is doing right now. Reads as a running note beside the
+   surface it belongs to, not as a status badge: it changes every couple of
+   seconds and must not pull attention each time it does. */
+.sdsync-live-progress {
+  margin: 6px 0 0;
+  color: var(--sdsync-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 .sdsync-page {
   width: 100%;
   max-width: 1180px;

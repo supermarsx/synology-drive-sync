@@ -350,6 +350,7 @@
 
             <article class="sdsync-panel sdsync-sync-results" aria-live="polite" aria-labelledby="sdsync-sync-title">
               <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">{{ syncStatusResult.loaded ? syncStatusResult.profile : 'Nothing loaded' }}</p><h3 id="sdsync-sync-title">{{ syncStatusResult.loaded ? syncStatusQueryLabel : 'Sync state' }}</h3></div><span v-if="syncStatusResult.loaded" class="sdsync-freshness">Compared by {{ syncStatusResult.compare }}</span></div>
+              <p v-if="syncStatusBusy && liveProgressDetail" class="sdsync-live-progress" role="status" aria-live="polite">{{ liveProgressDetail }}</p>
               <p v-if="!syncStatusResult.loaded" class="sdsync-empty">{{ syncStatusMessage }}</p>
               <template v-else>
                 <dl class="sdsync-sync-stats" aria-label="Whole-scope totals">
@@ -393,6 +394,7 @@
                 <v-button suffix="grey" display="icon-text" html-type="submit" :tooltip="operationMutationGuidance || 'List what would be overwritten, changing nothing'" :disabled="!resyncCanPlan" :aria-busy="resyncPlanning ? 'true' : 'false'"><template #icon><action-icon :class="{ 'sdsync-is-spinning': resyncPlanning }" name="plan" /></template>Plan re-upload</v-button>
               </div>
               <p v-if="resyncMessage" :class="['sdsync-field-note', { 'is-error': resyncFailed }]">{{ resyncMessage }}</p>
+              <p v-if="resyncBusy && liveProgressDetail" class="sdsync-live-progress" role="status" aria-live="polite">{{ liveProgressDetail }}</p>
               <div v-if="resyncPlan.overwrites || resyncPhase === 'confirmed'" class="sdsync-resync-plan">
                 <dl class="sdsync-definition-grid">
                   <div><dt>Scope</dt><dd>{{ resyncScopeLabel }}</dd></div>
@@ -423,6 +425,7 @@
                 <div v-if="doctorForm.write_test" class="sdsync-warning"><strong>Write probe enabled; test level is locked to Extensive.</strong><span>A unique probe is created, verified, and removed. All other Extensive checks remain non-mutating.</span><div class="sdsync-toggle-row"><span class="sdsync-toggle-label">I prepared a non-critical destination and approve probe cleanup <control-help help-key="doctor-write-confirm" /></span><v-checkbox class="sdsync-checkbox-control" v-model="doctorForm.write_confirm" aria-label="Approve disposable probe cleanup" aria-describedby="sdsync-help-doctor-write-confirm" :disabled="!canRunOperations || !canRunDoctorWrite" /></div></div>
                 <div v-if="doctorProgress.active" class="sdsync-doctor-progress" role="status" aria-live="polite" aria-label="Target Doctor progress">
                   <div class="sdsync-doctor-progress-heading"><action-icon class="sdsync-is-spinning" name="refresh" :size="20" /><span><strong>Doctor is running</strong><small>Keep this AppWindow open while terminal evidence is collected.</small></span></div>
+                  <p v-if="liveProgressDetail" class="sdsync-live-progress">{{ liveProgressDetail }}</p>
                   <div class="sdsync-doctor-progress-track" aria-hidden="true"><span /></div>
                   <ol><li v-for="stage in doctorProgressStages" :key="stage.id" :class="'is-' + stage.state"><span class="sdsync-doctor-state-dot" />{{ stage.label }}<small>{{ doctorStatusLabel(stage.state) }}</small></li></ol>
                 </div>
@@ -612,11 +615,13 @@ import {
   ACTIONS,
   AUTOSAVE_API_LIMITS,
   MAX_RESPONSE_BYTES,
+  PROGRESS_UNAVAILABLE,
   QueuedOutcomeUnknownError,
   SNAPSHOT_SCHEMA,
   SYNC_STATUS_MAX_LIMIT,
   apiGet,
   apiPost,
+  trustedRequestProgress,
   probeRequestOutcome,
   purgeReconciliationAuth,
   reconcileMutationRequest,
@@ -661,7 +666,7 @@ const PROFILE_CONNECTION_API_LIMITS = Object.freeze({
 });
 const DOCTOR_LEVELS = Object.freeze(["quick", "standard", "extensive"]);
 const DOCTOR_OUTPUT_LIMIT_BYTES = 1024 * 1024;
-// Mirror of DOCTOR_SECTION_SPECS in src/main.rs, in the same order. The two are
+// Mirror of DOCTOR_SECTION_SPECS in src/lib.rs, in the same order. The two are
 // asserted to carry the same ids by test_synology_ui.py, because nothing else
 // relates them and a stale list here silently under-reports a diagnostic run.
 //
@@ -691,6 +696,80 @@ const DOCTOR_SECTION_CATALOG = Object.freeze([
   Object.freeze({ id: "disposable_write_verify_cleanup", label: "Disposable write, verify, and cleanup", minimum: "write", detail: "Create, verify, and remove one explicitly approved probe." }),
   Object.freeze({ id: "session_logout", label: "DSM session logout", minimum: "standard", detail: "Confirm that the temporary DSM target session is closed." })
 ]);
+// The second half of the same cross-layer catalogue, for the operations that are
+// not Doctor. `src/lib.rs` owns the definition; this is the AppWindow's
+// necessarily-duplicated copy, held in step by `test_synology_ui.py` exactly as
+// DOCTOR_SECTION_CATALOG above is. Ids, labels, units, table membership and
+// order all mirror the Rust tables of the same names.
+//
+// Read the failure mode before editing either side. The bridge resolves a
+// job-supplied phase id against the library table and publishes the label it
+// finds; this window renders it, and refuses any label this copy does not carry.
+// If the two skew, the phase renders as "progress unavailable" -- loudly, which
+// is the point, because the alternative is under-reporting a slow operation at
+// exactly the moment someone is watching it to work out why it is slow.
+//
+// Unlike the doctor sections these tables carry no step: a phase's step is its
+// position, because these operations execute and display in the same order.
+// Doctor is the exception, which is why its table keeps a step column.
+//
+// `unit` is part of the catalogue rather than the record's payload, for the same
+// reason `label` is: the job supplies one untrusted datum, the phase id, and
+// every string that reaches the screen is resolved from it here.
+const PHASE_UNITS = Object.freeze(["", "bytes", "entries", "files"]);
+// The seven phases of a scoped status query, in the order `run_status` performs
+// them. Phases 1, 4 and 5 are the ones that take the minutes an operator is
+// staring at; the rest are sub-second and carry no counter.
+const SYNC_STATUS_PHASE_SPECS = Object.freeze([
+  Object.freeze({ id: "scan_local", label: "Scanning local files", unit: "files" }),
+  Object.freeze({ id: "connect", label: "Connecting to DSM", unit: "" }),
+  Object.freeze({ id: "authenticate", label: "Authenticating", unit: "" }),
+  Object.freeze({ id: "list_remote", label: "Listing remote files", unit: "entries" }),
+  Object.freeze({ id: "compare", label: "Comparing file contents", unit: "files" }),
+  Object.freeze({ id: "build_report", label: "Building the report", unit: "" }),
+  Object.freeze({ id: "store_results", label: "Storing results", unit: "" })
+]);
+// The six phases a planning run performs before it reports and stops.
+const PLAN_PHASE_SPECS = Object.freeze([
+  Object.freeze({ id: "scan_local", label: "Scanning local files", unit: "files" }),
+  Object.freeze({ id: "connect", label: "Connecting to DSM", unit: "" }),
+  Object.freeze({ id: "authenticate", label: "Authenticating", unit: "" }),
+  Object.freeze({ id: "list_remote", label: "Listing remote files", unit: "entries" }),
+  Object.freeze({ id: "compare", label: "Comparing file contents", unit: "files" }),
+  Object.freeze({ id: "build_plan", label: "Building the plan", unit: "" })
+]);
+// The eight phases of a run that executes its plan. Shared by `run` and `resync`
+// because both reach them through the same code path; a resync asked only to
+// plan stops at `build_plan` and never reports the last two.
+const SYNC_PHASE_SPECS = Object.freeze([
+  Object.freeze({ id: "scan_local", label: "Scanning local files", unit: "files" }),
+  Object.freeze({ id: "connect", label: "Connecting to DSM", unit: "" }),
+  Object.freeze({ id: "authenticate", label: "Authenticating", unit: "" }),
+  Object.freeze({ id: "list_remote", label: "Listing remote files", unit: "entries" }),
+  Object.freeze({ id: "compare", label: "Comparing file contents", unit: "files" }),
+  Object.freeze({ id: "build_plan", label: "Building the plan", unit: "" }),
+  Object.freeze({ id: "upload", label: "Uploading files", unit: "files" }),
+  Object.freeze({ id: "reconcile", label: "Verifying the result", unit: "" })
+]);
+// The four phases of a bounded connection probe.
+const CONNECTION_PHASE_SPECS = Object.freeze([
+  Object.freeze({ id: "resolve_secrets", label: "Reading stored credentials", unit: "" }),
+  Object.freeze({ id: "authenticate", label: "Authenticating", unit: "" }),
+  Object.freeze({ id: "contact", label: "Contacting File Station", unit: "" }),
+  Object.freeze({ id: "logout", label: "Ending the DSM session", unit: "" })
+]);
+// Keyed by progress catalogue key, deliberately not by queued-mutation operation
+// id: three operational actions share the wire id `action` and walk three
+// different sequences, so keying on the wire id would resolve a planning run
+// against an upload catalogue. `doctor` is absent on purpose and lives in
+// DOCTOR_SECTION_CATALOG above.
+const PHASE_SPECS = Object.freeze({
+  "sync-status": SYNC_STATUS_PHASE_SPECS,
+  plan: PLAN_PHASE_SPECS,
+  run: SYNC_PHASE_SPECS,
+  resync: SYNC_PHASE_SPECS,
+  connection: CONNECTION_PHASE_SPECS
+});
 const DOCTOR_STATE_ALIASES = Object.freeze({
   pass: "ok", passed: "ok", success: "ok", succeeded: "ok", healthy: "ok", ready: "ok", ok: "ok",
   warning: "warn", warned: "warn", degraded: "warn", warn: "warn",
@@ -699,6 +778,228 @@ const DOCTOR_STATE_ALIASES = Object.freeze({
   ignored: "skipped", not_run: "skipped", omitted: "skipped", unsupported: "skipped", not_applicable: "skipped", skip: "skipped", skipped: "skipped",
   queued: "pending", waiting: "pending", pending: "pending", active: "running", executing: "running", running: "running"
 });
+
+// How long a progress record may go without being republished before its own
+// silence is the more useful fact about the job.
+//
+// The writer's ceiling is two seconds -- the result poll ramp tops out there, so
+// nothing writes more often than that and nobody could observe it if it did --
+// and a phase change always writes immediately. A record that has not moved in
+// two minutes has missed roughly sixty opportunities to move, which describes a
+// wedged job rather than a slow one. Saying so is the point: a progress record
+// that stopped updating is information, and it is exactly the information the
+// version of this dashboard that rendered nothing at all could not convey.
+// Every phase label this AppWindow will ever render, from both halves of the
+// catalogue.
+//
+// The bridge resolves a job-supplied phase id against the library table and
+// publishes the label it finds, so a label reaching here has in principle
+// already passed an allow-list. This is the same allow-list, enforced again on
+// the side that does the rendering, and it buys two things the server-side check
+// cannot. A bridge whose table has drifted from this one is caught and reported
+// rather than quietly rendering a string this window has never reviewed. And the
+// set of text that can reach an operator's screen from a queued job stays finite
+// and readable in one place -- which is the property that made progress safe to
+// render at all, and is worth not having to take on trust from one layer.
+const PROGRESS_LABELS = Object.freeze(
+  Object.keys(PHASE_SPECS)
+    .reduce((labels, operation) => labels.concat(PHASE_SPECS[operation].map((phase) => phase.label)),
+      DOCTOR_SECTION_CATALOG.map((section) => section.label))
+);
+const PROGRESS_STALE_SECONDS = 120;
+// How long the package controller may go without republishing its state before
+// a job still sitting in the queue is evidence of a problem rather than of
+// ordinary waiting.
+//
+// The controller rewrites this record on every pass of its loop and its longest
+// idle sleep is thirty seconds, so six missed ticks is a daemon that is wedged
+// or gone, not one that is busy. Staleness is read only while nothing is
+// active, because a controller executing a long job publishes its active PID
+// and then blocks for as long as that job takes -- reading staleness there
+// would have a four-hour sync report its own controller as dead.
+const CONTROLLER_TICK_STALE_SECONDS = 180;
+const PROGRESS_UNAVAILABLE_TEXT = "Progress unavailable — the package published a progress record this AppWindow could not validate, so it is not being shown. The operation itself is unaffected and is still queued.";
+
+function formatCount(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) return "0";
+  try {
+    return new Intl.NumberFormat(undefined).format(Math.round(numeric));
+  } catch (_error) {
+    return String(Math.round(numeric));
+  }
+}
+
+/**
+ * The render-boundary guard for every progress record, whatever door it came in
+ * through.
+ *
+ * Three outcomes, and they are not interchangeable. `null` means no progress was
+ * published, and the caller renders nothing extra. A record means it validated.
+ * `PROGRESS_UNAVAILABLE` means something arrived and did not validate, and the
+ * caller must say so rather than render a blank -- silently dropping a bad
+ * record is how a broken writer ships unnoticed, which is the failure this whole
+ * change exists to undo.
+ *
+ * A value still carrying its wire field names never passed the API validator, so
+ * it is sent through it here before any part of it is rendered. Every path into
+ * this function is supposed to hand over a pre-validated record; this is what
+ * makes "supposed to" something we do not have to rely on.
+ */
+function renderableProgress(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (value.unavailable === true) return PROGRESS_UNAVAILABLE;
+  const validated = Object.prototype.hasOwnProperty.call(value, "updated_at")
+    ? trustedRequestProgress(value)
+    : value;
+  if (!validated || typeof validated !== "object") return PROGRESS_UNAVAILABLE;
+  const step = Number(validated.step);
+  const total = Number(validated.total);
+  const label = boundedText(validated.label, "").slice(0, 128);
+  if (!Number.isInteger(step) || !Number.isInteger(total) || step < 1 || total < 1 || step > total
+    || !label || !PROGRESS_LABELS.includes(label)) {
+    return PROGRESS_UNAVAILABLE;
+  }
+  const count = Number(validated.count);
+  return {
+    step,
+    total,
+    label,
+    unit: PHASE_UNITS.includes(validated.unit) ? validated.unit : "",
+    count: Number.isInteger(count) && count >= 0 ? count : 0,
+    updatedAt: numberOr(validated.updatedAt, 0)
+  };
+}
+
+// A running count and its catalogue unit, never a fraction and never a bar.
+// The denominator is genuinely unknown while a phase runs -- that is what makes
+// the phase indeterminate -- and a percentage computed against a guess is worse
+// than no percentage at all on a tool people use to move their own files.
+function progressCountText(progress) {
+  if (!progress.unit || !progress.count) return "";
+  if (progress.unit === "bytes") return `${formatBytes(progress.count)} so far`;
+  return `${formatCount(progress.count)} ${progress.unit} so far`;
+}
+
+// The package's own clock, for the staleness comparisons that must not be made
+// against the browser's. Zero when no snapshot is to hand, which reads as "do
+// not claim staleness" rather than as an epoch.
+function packageEpoch(component) {
+  const liveness = component && component.controllerLiveness;
+  return liveness ? numberOr(liveness.packageEpoch, 0) : 0;
+}
+
+// The wait explanation is strictly additive: when it cannot be established, the
+// queued report still has to render. `reportMutationError` is reached from every
+// mutation path in the window, and a missing snapshot must not be able to turn a
+// successfully queued change into a thrown error on the way to reporting it.
+function queuedWaitText(component) {
+  const detail = component && component.queuedWaitDetail;
+  return detail && typeof detail.text === "string" ? detail.text : "";
+}
+
+// `nowEpoch` is the package's own clock, taken from the snapshot, and there is
+// deliberately no fallback to the browser's. Both timestamps being compared are
+// written by the NAS, so comparing them is skew-free; comparing one of them
+// against the browser would make every record on a NAS whose clock runs a few
+// minutes behind look wedged. With no package clock to hand, staleness is simply
+// not claimed -- under-reporting a stuck job is recoverable, and crying wolf at
+// every operator with an unsynchronised NAS is not.
+function progressSentence(value, nowEpoch = 0) {
+  const progress = renderableProgress(value);
+  if (!progress) return "";
+  if (progress === PROGRESS_UNAVAILABLE) return PROGRESS_UNAVAILABLE_TEXT;
+  const counted = progressCountText(progress);
+  const now = numberOr(nowEpoch, 0);
+  const stale = now > 0 && progress.updatedAt > 0 && now - progress.updatedAt >= PROGRESS_STALE_SECONDS;
+  return guidanceText(
+    `Step ${progress.step} of ${progress.total}: ${progress.label}${counted ? ` — ${counted}` : ""}.`,
+    stale
+      ? `This has not advanced since ${formatDate(progress.updatedAt)}, so the operation may be stuck; review Logs and Activity.`
+      : ""
+  );
+}
+
+// The named ways a queued job ends without its operation having run, and what a
+// person is meant to do about each.
+//
+// Every one of these used to arrive as `unresolved`: the controller deleted the
+// request, wrote its reason to a log nobody was looking at, and the dashboard
+// said the outcome could not be established. "Unresolved" with no cause attached
+// is the second of the two dumps this change exists to remove, and it is
+// indistinguishable from "this request ID was never accepted" -- which calls for
+// the opposite action. So each entry carries the cause *and* the next step, and
+// neither half is optional: a named failure with no next step is a better error
+// message, not a better dashboard.
+const QUEUED_FAILURE_COPY = Object.freeze({
+  classification_failed: Object.freeze({
+    title: "Queued operation was not classified",
+    cause: "The package controller could not determine what kind of operation this request was, so it never started it.",
+    next: "Nothing ran and nothing was changed. Review the controller log for the classification exit code, then submit the request again."
+  }),
+  secret_claim_failed: Object.freeze({
+    title: "Queued operation could not claim its credential",
+    cause: "The stored credential this request needed could not be claimed by the package controller, so the operation was never started.",
+    next: "Nothing ran and nothing was changed. Check the profile's stored credential under Security and the controller log, then submit the request again."
+  }),
+  consumer_failed: Object.freeze({
+    title: "Queued operation was terminated",
+    cause: "The worker running this operation exited before it finished.",
+    next: "On a memory-constrained NAS this is most often the kernel out-of-memory killer. Review Logs, then retry with a narrower scope."
+  }),
+  consumer_wrote_no_result: Object.freeze({
+    title: "Queued operation reported nothing",
+    cause: "The worker exited cleanly but wrote no result, so how far it got cannot be established from the queue.",
+    next: "Treat this operation as unconfirmed. Review Activity and the current state before submitting it again."
+  })
+});
+
+function queuedFailureGuidance(error) {
+  const copy = error && typeof error.code === "string" ? QUEUED_FAILURE_COPY[error.code] : null;
+  if (!copy) return null;
+  const exitCode = error && Number.isInteger(error.exitCode) ? error.exitCode : null;
+  return {
+    title: copy.title,
+    text: guidanceText(
+      copy.cause,
+      exitCode === null ? "" : `The worker exited with code ${exitCode}.`,
+      copy.next
+    )
+  };
+}
+
+// What the running operation last told us it was doing. One slot rather than
+// one per surface, because the package runs one queued operation at a time and
+// the AppWindow blocks the others while it does.
+function emptyLiveProgress() {
+  return { active: false, operation: "", progress: null };
+}
+
+// The observer a queued operation hands to its result poll. Every pending read
+// publishes here, so a slow operation can say what it is doing while it runs
+// rather than only once the browser's patience has expired -- which was the only
+// moment progress had ever been able to reach this window at all.
+//
+// Marked active at dispatch rather than at the first pending read: the job is
+// queued from the moment the package accepts it, and until a phase arrives the
+// controller-liveness join is what explains the wait.
+//
+// A plain function over the component rather than a method on it. This is state
+// plumbing with no dispatch of its own, and keeping it off the component means
+// driving one of these operations needs only the `liveProgress` slot, not two
+// more bindings on whatever context is driving it.
+function openProgressSink(component, operation) {
+  const name = boundedText(operation, "");
+  component.liveProgress = { active: true, operation: name, progress: null };
+  return (progress) => {
+    if (component.disposed) return;
+    component.liveProgress = { active: true, operation: name, progress: progress || null };
+  };
+}
+
+function closeProgressSink(component) {
+  if (!component.disposed) component.liveProgress = emptyLiveProgress();
+}
 
 function emptyProfileFailureRecords() {
   return {
@@ -2936,6 +3237,7 @@ export default {
       aboutRustDependencies: ABOUT_RUST_DEPENDENCIES,
       aboutUiDependencies: ABOUT_UI_DEPENDENCIES,
       diagnostic: { title: "Not run in this session", output: "No diagnostic output yet." }, doctorReport: idleDoctorReport(), doctorProgress: emptyDoctorProgress(),
+      liveProgress: emptyLiveProgress(),
       logsPaused: false, logSource: "all", logLines: 200, logState: "Waiting for logs", logOutput: "No log data yet.", logRecords: [], activityEvents: [], activitySearch: "", activityCategory: "all", activityLevel: "all",
       lastFailureKey: "", toasts: [], toastSequence: 0,
       confirmation: { visible: false, title: "", message: "", button: "Confirm", resolve: null },
@@ -2992,10 +3294,20 @@ export default {
       if (!this.incidentProbeTargets.length) return "";
       const probe = this.incidentProbe;
       if (!probe.attempts) return probe.active ? "Checking with DSM now…" : "Preparing to check the preserved request with DSM…";
+      // `accepted` means the package told us the job is still running. Until
+      // this change that was the end of the account, and a job running for forty
+      // minutes said exactly what a job running for four seconds said. A phase
+      // answers it when the package published one; the controller-liveness join
+      // answers it when the package published nothing, which is the case that
+      // used to leave an operator watching a counter increment against a
+      // controller that had already stopped.
+      const running = probe.verdict === "accepted";
       return guidanceText(
         `${probe.active ? "Checking now" : "Still reconciling"} · checked ${probe.attempts} time${probe.attempts === 1 ? "" : "s"} · last at ${formatDate(probe.checkedAt)}.`,
         probe.message,
-        probe.progress ? `Step ${probe.progress.step} of ${probe.progress.total}: ${probe.progress.label}.` : "",
+        running
+          ? (progressSentence(probe.progress, packageEpoch(this)) || queuedWaitText(this))
+          : progressSentence(probe.progress, packageEpoch(this)),
         probe.jobId ? `Queued job ID: ${probe.jobId}.` : ""
       );
     },
@@ -3313,6 +3625,110 @@ export default {
     lastRunDetail() { return this.run.finished_epoch ? formatDate(this.run.finished_epoch) : "No completion time"; },
     serviceState() { const service = this.snapshot && this.snapshot.service; const value = service && typeof service === "object" ? pick(service, "state", "status") : service; return boundedText(value, this.snapshot ? "unknown" : "Unavailable"); },
     overviewSummary() { return this.serviceState === "running" ? "The package controller is running. Status and logs update while this window remains open." : `The package controller reports ${this.serviceState}. Review Health and Activity before relying on automation.`; },
+    // Everything this reads has been on the wire all along: the snapshot has
+    // published `controller.state`, `active_pid` and `updated_epoch` since the
+    // controller learned to persist them, and this window has been reading
+    // `service` for the Overview sentence above. What was missing was the
+    // question. Nothing ever correlated controller liveness with a job that is
+    // sitting in the queue, so a request waiting behind a four-hour sync and a
+    // request waiting behind a controller that died an hour ago both rendered as
+    // the single word "pending" -- and those two call for opposite actions.
+    controllerLiveness() {
+      const controller = this.snapshot && this.snapshot.controller;
+      const record = controller && typeof controller === "object" && !Array.isArray(controller) ? controller : null;
+      // The package's clock, never the browser's: `updated_epoch` is written by
+      // the NAS, so only another NAS timestamp can be subtracted from it without
+      // turning clock skew into a liveness verdict.
+      const generatedEpoch = numberOr(this.snapshot && this.snapshot.generated_at_epoch, 0);
+      const updatedEpoch = numberOr(record && record.updated_epoch, 0);
+      return {
+        known: Boolean(this.snapshot && record),
+        packageEpoch: generatedEpoch,
+        // The live PID check rather than the controller's own last self-report.
+        // A controller killed outright leaves `state=running` behind in its
+        // state file, and preferring that record over the process table is how a
+        // dead daemon goes on describing itself as healthy.
+        service: this.serviceState,
+        activePid: numberOr(record && record.active_pid, 0),
+        updatedEpoch,
+        // Only meaningful while nothing is active. A controller executing a long
+        // job publishes its active PID and then blocks for however long that job
+        // takes, so reading staleness there would have every slow sync report
+        // its own controller as dead.
+        stale: generatedEpoch > 0 && updatedEpoch > 0
+          && generatedEpoch - updatedEpoch >= CONTROLLER_TICK_STALE_SECONDS
+      };
+    },
+    // Why a queued job has not started yet. "Pending" is true of all of these
+    // and useful for none of them.
+    //
+    // The reason only, with no "this is queued" lead-in: every caller but one is
+    // somewhere that has already said so -- the queued toast opens with the
+    // package's own "still working through its queue", and the reconciliation
+    // barrier with "its job is still running". `liveProgressDetail` is the one
+    // that needs the lead-in, and adds it.
+    queuedWaitDetail() {
+      const liveness = this.controllerLiveness;
+      if (!liveness.known) {
+        return {
+          kind: "unknown",
+          text: "The package controller state is unavailable in this session, so what this is waiting on cannot be shown here. Review Health and Activity."
+        };
+      }
+      if (liveness.service === "stopped") {
+        return {
+          kind: "stopped",
+          text: guidanceText(
+            `The package controller is stopped${liveness.updatedEpoch ? ` (since ${formatDate(liveness.updatedEpoch)})` : ""}.`,
+            "The request is preserved and runs when the package is started in Package Center."
+          )
+        };
+      }
+      if (liveness.service === "untrusted") {
+        return {
+          kind: "untrusted",
+          text: "A process holds the package controller's PID file and is not the controller, so nothing is servicing the queue. Restart the package in Package Center, then review Logs."
+        };
+      }
+      if (liveness.service !== "running") {
+        return {
+          kind: "unknown",
+          text: `The package controller reports ${liveness.service}, so when this will start cannot be established. Review Health and Activity.`
+        };
+      }
+      if (liveness.activePid > 0) {
+        const operation = boundedText(this.run.operation, "");
+        const scope = boundedText(this.run.scope, "");
+        const named = this.runStatus === "running" && operation && operation !== "none";
+        const behind = named
+          ? `the ${operation}${scope && scope !== "none" ? ` of ${scope}` : ""}${numberOr(this.run.started_epoch, 0) ? `, started ${formatDate(this.run.started_epoch)}` : ""}`
+          : "another operation the controller has already started";
+        return { kind: "behind", text: `The controller is already running ${behind}, so this starts as soon as that finishes.` };
+      }
+      if (liveness.stale) {
+        return {
+          kind: "stalled",
+          text: guidanceText(
+            `The package controller last reported at ${formatDate(liveness.updatedEpoch)} and has not checked in since, although it is running nothing.`,
+            "It may be wedged. Review Logs, and restart the package if it does not recover."
+          )
+        };
+      }
+      return {
+        kind: "queued",
+        text: "The package controller is running and starts this as soon as the work ahead of it finishes."
+      };
+    },
+    // What the running operation last said it was doing, or -- when it has
+    // published nothing -- why it has not started. Progress wins whenever there
+    // is progress: a job reporting phases is plainly not waiting for one.
+    liveProgressDetail() {
+      if (!this.liveProgress.active) return "";
+      const published = progressSentence(this.liveProgress.progress, this.controllerLiveness.packageEpoch);
+      // The one caller that supplies the lead-in: a surface showing a spinner and
+      // "Doctor is running" has to be told when the thing is not running at all.
+      return published || guidanceText("Queued.", this.queuedWaitDetail.text);
+    },
     nextRun() { const epochs = this.enabledRoutines.map((routine) => Number(routine.next_run_epoch)).filter((value) => Number.isFinite(value) && value > 0); return epochs.length ? formatDate(Math.min(...epochs)) : "None"; },
     healthRows() { const explicit = this.snapshot && this.snapshot.health; if (Array.isArray(explicit)) return explicit; return this.profiles.map((profile) => { const health = profile.health && typeof profile.health === "object" ? profile.health : {}; const routine = this.routines.find((item) => String(item.profile) === String(profile.name)) || {}; return Object.assign({ profile: profile.name, last_success_epoch: routine.last_success_epoch }, health); }); },
     healthFreshness() { const newest = this.healthRows.reduce((value, health) => Math.max(value, numberOr(health.last_check_epoch || health.checked_at_epoch || health.checked_epoch, 0)), 0); return newest ? `Newest check ${formatDate(newest)}` : "Cached time unavailable"; },
@@ -4115,12 +4531,46 @@ export default {
       // than the outcome-unknown report it replaced, not better. Not an error
       // toast: nothing has gone wrong and there is nothing to inspect.
       if (error && error.stillPending === true) {
+        // `QueuedStillPendingError` has carried a `progress` field since it was
+        // written and nothing has ever read it; this is the read. When the
+        // package published a phase, name the phase. When it published nothing,
+        // say why the job has not started -- the controller-liveness join
+        // answers that from the snapshot this window already holds, and a job
+        // waiting behind a running sync and a job waiting behind a controller
+        // that is stopped are different facts calling for different actions.
+        // Reporting both as the bare word "pending" is what this replaces.
         const queuedMessage = withCorrelation(
-          `${observed} Do not send it again; it is already queued under this job ID.`,
+          guidanceText(
+            observed,
+            progressSentence(error.progress, packageEpoch(this)) || queuedWaitText(this),
+            "Do not send it again; it is already queued under this job ID."
+          ),
           "The package accepted this change and will apply it when the running operation finishes."
         );
         this.toast("Change queued", queuedMessage, false);
         return { unknown: false, inspection: false, stillPending: true, message: queuedMessage, requestId, jobId };
+      }
+      // A queued job that ended for a named structural reason: the worker was
+      // killed, the request could not be classified, the result was unreadable.
+      // Each of these used to reach this window as `unresolved` with the reason
+      // left behind in the controller log, so the branch exists to carry the
+      // cause and the next step rather than "Operation could not be completed".
+      const queuedFailure = queuedFailureGuidance(error);
+      if (queuedFailure && !unknown) {
+        const message = withCorrelation(
+          guidanceText(queuedFailure.text, formatting.queuedFailureGuidance),
+          queuedFailure.text
+        );
+        this.toast(queuedFailure.title, message, true);
+        return {
+          unknown: false,
+          inspection,
+          queuedFailure: true,
+          code: error.code,
+          message,
+          requestId,
+          jobId
+        };
       }
       const csrfRejected = Boolean(!unknown && !inspection && error && error.preAcceptance === true && error.csrfRejected === true);
       if (csrfRejected) {
@@ -5450,7 +5900,12 @@ export default {
           this.csrfToken,
           ACTIONS.execute,
           Object.assign({ kind }, payload),
-          awaitTerminal
+          awaitTerminal,
+          undefined,
+          undefined,
+          // Only the awaited path polls, so only it can observe anything. A
+          // queued-and-forgotten operation has no reader to publish to.
+          awaitTerminal ? openProgressSink(this, kind) : null
         );
         if (this.disposed) return;
         const message = boundedText(
@@ -5496,6 +5951,7 @@ export default {
       } finally {
         if (!this.disposed) {
           this.operationBusy = false;
+          closeProgressSink(this);
           if (kind === "doctor" && this.doctorProgress.active) this.doctorProgress = { active: false, phase: "unknown", level: doctorLevel, started_epoch: doctorStartedEpoch };
         }
       }
@@ -5600,7 +6056,7 @@ export default {
           profile,
           scope: query.scope,
           state: query.state
-        }, true);
+        }, true, undefined, undefined, openProgressSink(this, ACTIONS.syncStatus));
         if (this.disposed) return;
         const document = bridgeDocument(result, "sdsync.status.v1");
         if (!document) throw new Error(UNREADABLE_RESPONSE);
@@ -5631,7 +6087,10 @@ export default {
         this.syncStatusPhase = "failed";
         this.syncStatusMessage = report.message;
       } finally {
-        if (!this.disposed) this.syncStatusBusy = false;
+        if (!this.disposed) {
+          this.syncStatusBusy = false;
+          closeProgressSink(this);
+        }
       }
     },
     checkSyncStatus(event) {
@@ -5667,7 +6126,7 @@ export default {
         ? "Re-uploading the confirmed files. Keep this AppWindow open."
         : "Building the overwrite list. This step changes nothing.";
       try {
-        const result = await apiPost(this.auth, this.csrfToken, ACTIONS.resync, { confirm: ticket, profile, scope }, true);
+        const result = await apiPost(this.auth, this.csrfToken, ACTIONS.resync, { confirm: ticket, profile, scope }, true, undefined, undefined, openProgressSink(this, ACTIONS.resync));
         if (this.disposed) return;
         const document = bridgeDocument(result, "sdsync.resync.v1");
         if (!document) throw new Error(UNREADABLE_RESPONSE);
@@ -5704,7 +6163,10 @@ export default {
         this.resyncPhase = report.unknown ? "unknown" : "failed";
         this.resyncMessage = report.message;
       } finally {
-        if (!this.disposed) this.resyncBusy = false;
+        if (!this.disposed) {
+          this.resyncBusy = false;
+          closeProgressSink(this);
+        }
       }
     },
     // Planning never writes. It exists to produce the exact overwrite list and

@@ -347,6 +347,7 @@ pub fn populate_content_md5(
 ) -> Result<()> {
     for entry in inventory.entries.values_mut() {
         cancellation.check()?;
+        cancellation.tick();
         if entry.kind == EntryKind::File {
             entry.content_md5 = Some(hash_file_snapshot(entry, cancellation)?);
         }
@@ -393,6 +394,10 @@ pub fn populate_content_md5_selective(
 ) -> Result<()> {
     for (relative, entry) in inventory.entries.iter_mut() {
         cancellation.check()?;
+        // The one per-file boundary this pass has, and the phase a content-mode status walk
+        // spends most of its time in. The read loop inside the hash checks cancellation too, so
+        // counting there would report chunks rather than files.
+        cancellation.tick();
         if entry.kind != EntryKind::File {
             continue;
         }
@@ -569,6 +574,7 @@ fn scan_dir(
 
     for child in children {
         cancellation.check()?;
+        cancellation.tick();
         let name = child
             .file_name()
             .into_string()

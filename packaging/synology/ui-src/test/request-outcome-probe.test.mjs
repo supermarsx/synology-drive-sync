@@ -100,11 +100,15 @@ test("a pending job's published progress is trusted rather than treated as a cor
     assert.equal(observed.schema, api.REQUEST_PROBE_SCHEMA);
     assert.equal(observed.verdict, "accepted");
     assert.equal(observed.job_id, JOB_ID);
+    // The four-key record keeps its exact meaning and is normalised to the
+    // counted shape, so one rendering path serves both wire forms.
     assert.deepEqual(observed.progress, {
       step: 7,
       total: 16,
       label: "DSM session authentication",
-      updatedAt: 1757000000
+      updatedAt: 1757000000,
+      unit: "",
+      count: 0
     });
     // The queue answered, so Activity is never consulted.
     assert.deepEqual(fetcher.seen, ["request-status"]);

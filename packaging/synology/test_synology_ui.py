@@ -250,6 +250,95 @@ class DsmUiContractTests(unittest.TestCase):
         ):
             self.assertIn(marker, bundle)
 
+    def test_progress_catalogue_and_failure_codes_agree_across_layers(self) -> None:
+        # Two more lists that nothing else relates, both fail-closed on the
+        # rendering side. The bridge resolves a phase id against src/lib.rs and
+        # publishes the label; the AppWindow refuses any label its own copy does
+        # not carry, so a skewed copy renders "progress unavailable" for a phase
+        # that is really running. The failure codes are the same shape: a code
+        # the AppWindow does not name falls back to a generic failure, and a
+        # code the AppWindow names that nothing produces is documentation of a
+        # feature that does not exist.
+        repository = HERE.parents[1]
+        library = (repository / "src/lib.rs").read_text(encoding="utf-8")
+        backend = (repository / "src/dsm_api.rs").read_text(encoding="utf-8")
+        app = (UI_SOURCE / "src/App.vue").read_text(encoding="utf-8")
+        api = (UI_SOURCE / "src/api.js").read_text(encoding="utf-8")
+        units = {"None": "", "Files": "files", "Entries": "entries", "Bytes": "bytes"}
+
+        rust_tables: dict[str, list[tuple[str, str, str]]] = {}
+        for name, count, body in re.findall(
+            r"pub const ([A-Z_]+_PHASE_SPECS): \[PhaseSpec; (\d+)\] = \[(.*?)\n\];", library, re.S
+        ):
+            entries = re.findall(
+                r'phase\(\s*"([a-z_]+)",\s*"([^"]+)",\s*PhaseUnit::([A-Za-z]+),?\s*\)', body
+            )
+            self.assertEqual(len(entries), int(count), f"{name} declares a length its entries do not match")
+            rust_tables[name] = [(phase, label, units[unit]) for phase, label, unit in entries]
+        keyed = re.search(
+            r"pub const PHASE_SPECS: \[\(&str, &\[PhaseSpec\]\); (\d+)\] = \[(.*?)\n\];", library, re.S
+        )
+        self.assertIsNotNone(keyed, "shared phase catalogue is missing")
+        rust_map = dict(re.findall(r'\("([a-z-]+)", &([A-Z_]+_PHASE_SPECS)\)', keyed.group(2)))
+        self.assertEqual(len(rust_map), int(keyed.group(1)))
+        self.assertEqual(
+            set(rust_map), {"sync-status", "plan", "run", "resync", "connection"}
+        )
+
+        js_tables: dict[str, list[tuple[str, str, str]]] = {}
+        for name, body in re.findall(
+            r"const ([A-Z_]+_PHASE_SPECS) = Object\.freeze\(\[(.*?)\n\]\);", app, re.S
+        ):
+            js_tables[name] = re.findall(
+                r'id: "([a-z_]+)", label: "([^"]+)", unit: "([a-z]*)"', body
+            )
+        js_keyed = re.search(r"const PHASE_SPECS = Object\.freeze\(\{(.*?)\n\}\);", app, re.S)
+        self.assertIsNotNone(js_keyed, "AppWindow phase catalogue is missing")
+        js_map = dict(re.findall(r'^\s*"?([a-z-]+)"?: ([A-Z_]+_PHASE_SPECS)', js_keyed.group(1), re.M))
+        self.assertEqual(js_map, rust_map, "phase tables are keyed differently across layers")
+        for key, table in rust_map.items():
+            self.assertGreater(len(rust_tables[table]), 0, table)
+            self.assertEqual(
+                js_tables.get(table),
+                rust_tables[table],
+                f"{key} phases drifted between src/lib.rs and the AppWindow",
+            )
+        for source, needle in ((app, "PHASE_UNITS"), (api, "PROGRESS_UNITS")):
+            declared = re.search(
+                needle + r' = Object\.freeze\(\[((?:"[a-z]*", )*"[a-z]*")\]\)', source
+            )
+            self.assertIsNotNone(declared, f"{needle} is missing")
+            self.assertEqual(sorted(re.findall(r'"([a-z]*)"', declared.group(1))), sorted(units.values()))
+
+        rust_codes = re.search(
+            r"const CONTROLLER_FAILURE_CODES: \[&str; (\d+)\] = \[(.*?)\n\];", backend, re.S
+        )
+        self.assertIsNotNone(rust_codes, "controller failure vocabulary is missing")
+        codes = re.findall(r'"([a-z_]+)"', rust_codes.group(2))
+        self.assertEqual(len(codes), int(rust_codes.group(1)))
+        js_codes = re.search(
+            r"export const QUEUED_TERMINAL_FAILURE_CODES = Object\.freeze\(\[(.*?)\n\]\);", api, re.S
+        )
+        self.assertIsNotNone(js_codes, "AppWindow terminal failure codes are missing")
+        self.assertEqual(sorted(re.findall(r'"([a-z_]+)"', js_codes.group(1))), sorted(codes))
+        copy = re.search(r"const QUEUED_FAILURE_COPY = Object\.freeze\(\{(.*?)\n\}\);", app, re.S)
+        self.assertIsNotNone(copy, "AppWindow failure copy is missing")
+        self.assertEqual(
+            sorted(re.findall(r"^  ([a-z_]+): Object\.freeze\(\{", copy.group(1), re.M)),
+            sorted(codes),
+            "every named failure needs its cause and next step, and nothing else may have them",
+        )
+        troubleshooting = (repository / "docs/dsm/troubleshooting.md").read_text(encoding="utf-8")
+        section = troubleshooting[
+            troubleshooting.index("### Named terminal failures"):
+            troubleshooting.index("## Profile save is rejected")
+        ]
+        self.assertEqual(
+            sorted(re.findall(r"^\| `([a-z_]+)` \|", section, re.M)),
+            sorted(codes),
+            "the troubleshooting table must document exactly the codes the bridge publishes",
+        )
+
     def test_dsm_launcher_and_cgi_route_use_documented_independent_contracts(self) -> None:
         info = validate_spk.parse_info((HERE / "INFO.template").read_bytes())
         self.assertEqual(info["dsmuidir"], f"{info['package']}:ui")

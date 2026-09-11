@@ -422,6 +422,67 @@ requested change before explicitly re-running it.
 Doctor is initially queued, but the page polls its sanitized controller result to a terminal state.
 Plan and Run remain asynchronous and are shown as queued until normal run/activity evidence changes.
 
+### Named terminal failures
+
+A job that ends without its operation having run reports a named code rather than disappearing into
+`unresolved`. Each is a case where the controller previously deleted the processing request, wrote
+its reason to `controller.log`, and left the dashboard unable to say anything except that the outcome
+could not be established — a verdict indistinguishable from “this request ID was never accepted”,
+which calls for the opposite action.
+
+| Code | What happened | What to do |
+| --- | --- | --- |
+| `classification_failed` | The controller could not determine what kind of operation the request was, so it never started it. | Nothing ran and nothing changed. Read the classification exit code from `controller.log`, then submit again. |
+| `secret_claim_failed` | The stored credential the request needed could not be claimed by the controller, so the operation was never started. | Nothing ran and nothing changed. Check the profile's stored credential under Security and `controller.log`, then submit again. |
+| `consumer_failed` | The worker running the operation exited before finishing. The exit code is reported with the failure. | On a memory-constrained unit this is most often the kernel OOM killer — check `dmesg` as well as Logs. Retry with a narrower scope. |
+| `consumer_wrote_no_result` | The worker exited cleanly but wrote no result, so how far it got cannot be established from the queue. | Treat the operation as **unconfirmed**, not as failed. This is the one named code that still raises a reconciliation barrier and retains its request authentication, because naming the stage that dropped a job is not the same as knowing what it left behind. Inspect Activity and current state before submitting again. |
+
+Each code is published by the bridge itself, from the same result vocabulary as a failure inside the
+worker, and every code the dashboard names has a writer in this package: a code with a help entry and
+nothing that produces it would be documentation of a feature that does not exist.
+
+None of these is an outcome-unknown verdict: the stage that dropped the job is known, so all but
+`consumer_wrote_no_result` release their scope the way any other terminal failure does. An
+outcome-unknown result still outranks a named code — naming a stage can never convert an unknown
+outcome into a claimed-known one, and the reconciliation barrier keeps its exact current meaning.
+
+That ordering is why `consumer_failed` and `consumer_wrote_no_result` are reported for some
+operations and not for others. They describe a worker that died without saying how far it got, and
+whether that is a knowable failure or a genuinely unknown outcome depends on what the operation was
+allowed to commit:
+
+- **Sync status, Doctor, Plan, Run, Resync, Clear logs, and the connection and remote-browser
+  probes** commit no profile, credential, policy, or scheduler state. A worker that dies part-way
+  through one of them has changed none of that, so “it failed” is the complete truth and the named
+  code is reported. These are also every operation slow enough to be worth watching, so this is the
+  case an operator actually meets.
+- **Profile, credential, policy, schedule, and routine changes** may have committed part of the
+  change before the worker died. There the outcome is genuinely unknown, so no result is published
+  at all and the job stays outcome-unknown rather than being reported as a failure that may not have
+  happened. Publishing a failure would not only claim the outcome, it would settle the audit record
+  as `failed` — a response is the evidence the audit reconciliation adopts, and finding none beside
+  a dead worker is precisely what makes it record `outcome_unknown` instead.
+
+Both cases write `controller.log`, so the operation name and the worker's exit status are recorded
+either way: `control_consumer_failed` for the first, `control_consumer_outcome_unknown` for the
+second. Only the first reaches the dashboard as a named result.
+
+A job that is still genuinely queued is reported with the phase it published or, when it has
+published none, with the reason it has not started — see
+[Dashboard](dashboard.md#what-a-queued-job-reports-while-it-waits). If the dashboard reports the
+controller as stopped or as possibly wedged while a job is pending, that is the fault to fix; the
+queued request itself is preserved and needs no resubmission.
+
+### A finished status walk, resync or log clear was reported as still queued
+
+Packages built between the introduction of the queued status walk and this fix (26.45 through
+26.47) could complete one of those three operations and still show it as queued, and Reconcile then
+reported it as outcome-unknown. The bridge wrote each queued response with the job's operation name
+on its envelope and its own reader refused those three names, so the finished result answered every
+poll with an error the dashboard treated as transient and kept polling. The work itself completed
+and was recorded in Activity; only its report was lost. After upgrading, a job that was stuck this
+way resolves on its next poll, and no request needs to be resubmitted.
+
 ## Profile save is rejected
 
 Check the package identity can read and traverse the local source. Then review:

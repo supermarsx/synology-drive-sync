@@ -44,6 +44,7 @@ use zeroize::{Zeroize, Zeroizing};
 use synology_drive_sync::Error as SyncError;
 #[cfg(target_os = "linux")]
 use synology_drive_sync::api::{ApiClient, ClientOptions};
+use synology_drive_sync::progress_record::ProgressRecorder;
 use synology_drive_sync::vault::{generate_totp, parse_totp_secret};
 
 const PACKAGE_ROOT: &str = "/var/packages/synology-drive-sync/target";
@@ -690,8 +691,17 @@ enum EnqueueOutcome {
 #[cfg(target_os = "linux")]
 #[derive(Debug, Eq, PartialEq)]
 enum SessionRequestStatus {
-    Pending { job_id: String, operation: String },
-    Complete { job_id: String, operation: String },
+    Pending {
+        job_id: String,
+        operation: String,
+        /// The phase catalogue this job walks, carried alongside the wire operation id because
+        /// three operational actions share that id and walk three different sequences.
+        progress_operation: Option<&'static str>,
+    },
+    Complete {
+        job_id: String,
+        operation: String,
+    },
 }
 
 #[cfg(target_os = "linux")]
@@ -2989,9 +2999,18 @@ struct ProgressView {
     total: u8,
     label: &'static str,
     updated_at: u64,
+    unit: synology_drive_sync::PhaseUnit,
+    count: u64,
 }
 
 const PROGRESS_SCHEMA: &str = "sdsync.dsm-request-progress.v1";
+
+/// A running count larger than this is not evidence about a tree, it is evidence about a bug.
+///
+/// The field is an integer the job supplies, so it takes a ceiling like every other job-supplied
+/// value here. Rejecting rather than clamping keeps the record honest: a clamped count would be
+/// rendered as a real number of files, and it would be wrong.
+const MAX_PROGRESS_COUNT: u64 = 1_000_000_000;
 
 /// Validate a progress document against the request it claims to describe.
 ///
@@ -3000,8 +3019,20 @@ const PROGRESS_SCHEMA: &str = "sdsync.dsm-request-progress.v1";
 /// malformed, stale, or mismatched record can never fail a status read or block an operator.
 ///
 /// The binding to both `request_id` and `job_id` is what stops a record written for one request
-/// being reported against another.
-fn validated_progress(document: &Value, request_id: &str, job_id: &str) -> Option<ProgressView> {
+/// being reported against another. `operation` is the third binding and the newest: the phase id
+/// is resolved against the catalogue of the operation the job actually is, so a status walk cannot
+/// report itself as sitting on a diagnostic section, and the sixteen-section doctor table is no
+/// longer the only shape a record can take.
+///
+/// Two fields come out of the catalogue that did not exist before, and both are resolved rather
+/// than read: `unit` is an enum, never text the document supplies, and `label` is what it always
+/// was. The document contributes the phase id and the integer count, and nothing else.
+fn validated_progress(
+    document: &Value,
+    request_id: &str,
+    job_id: &str,
+    operation: &str,
+) -> Option<ProgressView> {
     if !valid_client_request_id(request_id) || !valid_server_job_id(job_id) {
         return None;
     }
@@ -3015,20 +3046,48 @@ fn validated_progress(document: &Value, request_id: &str, job_id: &str) -> Optio
         return None;
     }
     let section = document.get("section").and_then(Value::as_str)?;
-    // The label and the step both come from the catalogue, never from the document. An id that is
-    // not in the catalogue yields no progress at all rather than an unlabelled step.
-    let (label, step) = synology_drive_sync::doctor_section(section)?;
+    // The label, the step, the total and the unit all come from the catalogue, never from the
+    // document. An id that is not in this operation's catalogue yields no progress at all rather
+    // than an unlabelled step.
+    let phase = synology_drive_sync::operation_phase(operation, section)?;
     let updated_at = document.get("updated_at").and_then(Value::as_u64)?;
-    let total = u8::try_from(synology_drive_sync::DOCTOR_SECTION_SPECS.len()).ok()?;
-    if step == 0 || step > total {
+    // Absent means zero: a record written before the count field existed, or by a phase that has
+    // nothing to count, is still a valid record of which phase is running.
+    let count = match document.get("count") {
+        None => 0,
+        Some(value) => value.as_u64()?,
+    };
+    if phase.step == 0 || phase.step > phase.total || count > MAX_PROGRESS_COUNT {
         return None;
     }
     Some(ProgressView {
-        step,
-        total,
-        label,
+        step: phase.step,
+        total: phase.total,
+        label: phase.label,
         updated_at,
+        unit: phase.unit,
+        count,
     })
+}
+
+/// The phase catalogue a queued mutation walks, or `None` if it publishes no progress.
+///
+/// Deliberately not [`Mutation::operation_id`]: the three operational actions share the id
+/// `action` and walk three different sequences, so resolving a planning run's phase against an
+/// upload catalogue would be the natural consequence of keying on the wire id. This mirrors
+/// `mutation_audit_operation`, which splits the same variants for the same reason.
+///
+/// The eleven shell-only mutations return `None`. They run the manager against local state files
+/// and return in well under the two seconds a dashboard poll takes to come back round, so a record
+/// for them would cost writes that nobody could observe.
+fn mutation_progress_operation(mutation: &Mutation) -> Option<&'static str> {
+    match mutation {
+        Mutation::Action(value) => Some(value.kind.as_str()),
+        Mutation::SyncStatus(_) => Some("sync-status"),
+        Mutation::Resync(_) => Some("resync"),
+        Mutation::TestProfileAuth(_) | Mutation::BrowseRemote(_) => Some("connection"),
+        _ => None,
+    }
 }
 
 fn valid_request_fingerprint(value: &str) -> bool {
@@ -7120,7 +7179,7 @@ fn parse_manager_result_for_operation(
                         | "internal_error"
                         | "response_too_large"
                         | "operation_failed"
-                )
+                ) || is_package_failure_code(code)
             })
             .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
         validate_result_text(code, 32)?;
@@ -7198,11 +7257,24 @@ fn validate_connection_manager_result(value: &Value, operation: &str) -> BridgeR
     validate_result_text(message, 2048)?;
 
     if !ok {
+        // Two exact shapes, not one shape with tolerated extras: the probe's own failures, and
+        // those plus the exit code the controller saw when the consumer died under it. A
+        // connection probe is one of the operations the controller now terminalises, so refusing
+        // the field would mean refusing to publish the result at all -- and no result is the
+        // `unresolved` silence this whole vocabulary exists to replace.
         const FAILURE_FIELDS: &[&str] = &["schema", "ok", "message", "code"];
-        if root.len() != FAILURE_FIELDS.len()
-            || root
-                .keys()
-                .any(|key| !FAILURE_FIELDS.contains(&key.as_str()))
+        const TERMINATED_FIELDS: &[&str] = &["schema", "ok", "message", "code", "exit_code"];
+        let fields: &[&str] = if root.contains_key("exit_code") {
+            TERMINATED_FIELDS
+        } else {
+            FAILURE_FIELDS
+        };
+        if root.len() != fields.len() || root.keys().any(|key| !fields.contains(&key.as_str())) {
+            return Err(BridgeError::new(ErrorKind::Unavailable));
+        }
+        if root
+            .get("exit_code")
+            .is_some_and(|code| code.as_u64().is_none_or(|code| code > 255))
         {
             return Err(BridgeError::new(ErrorKind::Unavailable));
         }
@@ -7220,6 +7292,7 @@ fn validate_connection_manager_result(value: &Value, operation: &str) -> BridgeR
                 | "file_station_authentication_failed"
                 | "file_station_logout_failed"
         ) || generic_internal_failure
+            || is_package_failure_code(code)
             || (matches!(operation, "browse-remote" | "test-profile-auth")
                 && matches!(
                     code,
@@ -7513,19 +7586,208 @@ fn sortable_job_id(sequence: u64, random: &[u8; 16]) -> String {
     format!("{sequence:016x}{}", hex_encode(random))
 }
 
-fn generic_manager_result() -> Vec<u8> {
-    br#"{"schema":"sdsync.dsm-result.v1","ok":false,"code":"operation_failed","message":"Operation could not be completed."}"#
-        .to_vec()
+/// The named result code and message for a consume failure.
+///
+/// Every `Err` from a consume used to collapse into one `operation_failed` / "Operation could not
+/// be completed.", which told an operator that something went wrong and nothing about what. The
+/// kind was already in hand and was being discarded by an `Err(_)` pattern; naming it costs one
+/// match and changes nothing else.
+///
+/// Deliberately a result *code* rather than a new [`ErrorKind`]. Widening the kind would touch
+/// every match in this module and change nothing a client does -- the same reasoning the manager
+/// lane already applies to `service_saturated`. Nine of these eleven reuse the manager's existing
+/// error vocabulary, so the dashboard needs two new strings rather than eleven.
+///
+/// Two kinds are folded on purpose. A queued job has no HTTP method and no media type, so
+/// `MethodNotAllowed` and `UnsupportedMediaType` can only mean a malformed job, which is what
+/// `invalid_request` says.
+fn consume_failure_code(kind: ErrorKind) -> (&'static str, &'static str) {
+    match kind {
+        ErrorKind::BadRequest | ErrorKind::MethodNotAllowed | ErrorKind::UnsupportedMediaType => (
+            "invalid_request",
+            "The queued request was not valid and was not performed.",
+        ),
+        ErrorKind::Unauthorized => (
+            "unauthorized",
+            "The session that queued this request is no longer authenticated.",
+        ),
+        ErrorKind::Forbidden => (
+            "forbidden",
+            "Security policy refused this operation before it ran.",
+        ),
+        ErrorKind::CsrfRejected => (
+            "csrf_rejected",
+            "The queued request failed its origin check and was not performed.",
+        ),
+        ErrorKind::PayloadTooLarge => (
+            "response_too_large",
+            "The operation produced more output than the package will carry.",
+        ),
+        ErrorKind::Conflict => (
+            "busy",
+            "Another operation held the state this one needed. Try again.",
+        ),
+        ErrorKind::UnsafeRuntime => (
+            "unsafe_state",
+            "The package refused to act on state it could not verify.",
+        ),
+        ErrorKind::Unavailable => (
+            "unavailable",
+            "The operation could not be started. Try again.",
+        ),
+        ErrorKind::Internal => (
+            "internal_error",
+            "The package failed internally and the operation was not completed.",
+        ),
+    }
 }
 
-fn generic_manager_result_value() -> Value {
-    serde_json::from_slice(&generic_manager_result()).unwrap_or_else(|_| {
-        json!({
-            "schema": "sdsync.dsm-result.v1",
-            "ok": false,
-            "code": "operation_failed",
-            "message": "Operation could not be completed.",
-        })
+/// Removes a published progress record once the job that published it has finished.
+///
+/// Ownership sits here rather than in the writer, and that is deliberate in both directions. The
+/// core must not delete its own record on the way out -- a core that is killed mid-phase would
+/// then be the reason the record disappeared, and the record is the only evidence of how far it
+/// got. This process created the path, so this process removes it, on every return path including
+/// the early ones, which is what a guard buys over a call at the end.
+///
+/// Failure to remove is ignored: by the time this runs the terminal result is what a poll
+/// receives, and progress is reported only while a job is pending, so a record that outlives its
+/// job is inert rather than misleading.
+#[cfg(target_os = "linux")]
+struct ProgressRecordGuard(Option<PathBuf>);
+
+#[cfg(target_os = "linux")]
+impl Drop for ProgressRecordGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Every code [`consume_failure_code`] can produce.
+///
+/// Stated separately from the mapping and then pinned equal to it by a test, because the two have
+/// to agree for a different reason than readability: the canonical response validator refuses a
+/// result carrying a code it does not recognise, and a refused terminal result is strictly worse
+/// than a generic one -- no response file is written at all and the operator is left with
+/// `unresolved`, which is the exact failure this change exists to remove.
+const CONSUME_FAILURE_CODES: [&str; 9] = [
+    "invalid_request",
+    "unauthorized",
+    "forbidden",
+    "csrf_rejected",
+    "response_too_large",
+    "busy",
+    "unsafe_state",
+    "unavailable",
+    "internal_error",
+];
+
+fn is_consume_failure_code(code: &str) -> bool {
+    CONSUME_FAILURE_CODES.contains(&code)
+}
+
+/// Why the controller gave up on a job it had already claimed.
+///
+/// These are the four places the controller used to delete a processing request and write nothing
+/// at all, which reached the operator as `unresolved` -- a state indistinguishable from "this
+/// request was never accepted". They are result codes in the same family as the consume failures
+/// above, deliberately: one vocabulary means the dashboard renders a controller-side failure and a
+/// bridge-side failure the same way, rather than growing a second table for the half of the
+/// failures that happen outside this process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControllerFailureCause {
+    ClassificationFailed,
+    SecretClaimFailed,
+    ConsumerFailed,
+    ConsumerWroteNoResult,
+}
+
+impl ControllerFailureCause {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "classification_failed" => Some(Self::ClassificationFailed),
+            "secret_claim_failed" => Some(Self::SecretClaimFailed),
+            "consumer_failed" => Some(Self::ConsumerFailed),
+            "consumer_wrote_no_result" => Some(Self::ConsumerWroteNoResult),
+            _ => None,
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::ClassificationFailed => "classification_failed",
+            Self::SecretClaimFailed => "secret_claim_failed",
+            Self::ConsumerFailed => "consumer_failed",
+            Self::ConsumerWroteNoResult => "consumer_wrote_no_result",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::ClassificationFailed => {
+                "The package could not classify this request, so it was never started."
+            }
+            Self::SecretClaimFailed => {
+                "The stored credential for this request could not be claimed, so it was never used."
+            }
+            Self::ConsumerFailed => "The operation was terminated before it finished.",
+            Self::ConsumerWroteNoResult => {
+                "The operation ended without recording a result of its own."
+            }
+        }
+    }
+
+    /// Whether the job had already begun executing when this cause was decided.
+    ///
+    /// This is the whole of the outcome-unknown question. A pre-dispatch cause means the job
+    /// provably never ran, so a terminal result is a true statement about any operation. A
+    /// post-dispatch one means a process died partway, and whether it had committed anything
+    /// depends entirely on what it was doing -- which is what [`queued_job_class`] already
+    /// distinguishes.
+    fn after_dispatch(self) -> bool {
+        matches!(self, Self::ConsumerFailed | Self::ConsumerWroteNoResult)
+    }
+}
+
+const CONTROLLER_FAILURE_CODES: [&str; 4] = [
+    "classification_failed",
+    "secret_claim_failed",
+    "consumer_failed",
+    "consumer_wrote_no_result",
+];
+
+/// Every code the package itself can publish as the cause of a terminal failure.
+fn is_package_failure_code(code: &str) -> bool {
+    is_consume_failure_code(code) || CONTROLLER_FAILURE_CODES.contains(&code)
+}
+
+/// A terminal result naming why the controller abandoned a job.
+///
+/// `exit_code` is carried where the controller observed one; it is the single most useful field on
+/// this path, because 137 says the kernel killed the consumer and 0 says it exited cleanly having
+/// written nothing, and those need different answers from an operator. The operation is not
+/// repeated here -- [`canonical_queued_response_bytes`] already puts it on the envelope, so
+/// duplicating it inside the result would mean widening a validated field set for nothing.
+fn controller_failure_result_value(cause: ControllerFailureCause, exit_code: u8) -> Value {
+    json!({
+        "schema": "sdsync.dsm-result.v1",
+        "ok": false,
+        "code": cause.code(),
+        "message": cause.message(),
+        "exit_code": exit_code,
+    })
+}
+
+/// A terminal result naming why a consume failed.
+fn consume_failure_result_value(kind: ErrorKind) -> Value {
+    let (code, message) = consume_failure_code(kind);
+    json!({
+        "schema": "sdsync.dsm-result.v1",
+        "ok": false,
+        "code": code,
+        "message": message,
     })
 }
 
@@ -7552,7 +7814,9 @@ where
             };
             (value, state)
         }
-        Err(_) => (generic_manager_result_value(), "failed"),
+        // The kind was previously discarded here, which is what made every consume failure look
+        // identical to an operator. It is the only thing this path knows about the cause.
+        Err(error) => (consume_failure_result_value(error.kind), "failed"),
     };
     let audit_pending = record_terminal(state).unwrap_or(true);
     TerminalizedConsumeResult {
@@ -7699,23 +7963,37 @@ fn valid_audit_transaction(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+/// Every operation id a queued job can carry, and therefore every `operation` a queued response
+/// envelope, a session request record or a request-status answer may name.
+///
+/// This is the reader's half of [`Mutation::operation_id`], and the two must agree exactly. They
+/// did not, for three releases: `sync-status`, `resync` and `clear-logs` were added to the writer
+/// as they became queued jobs, and this list was not widened with them. The bridge then refused
+/// its own response envelopes for those jobs -- `parse_queued_response` failed with `Unavailable`
+/// on every completed status walk -- so the dashboard polled a finished job until its window
+/// ran out and reported it as still queued. `queued_operation_ids_round_trip_through_the_reader`
+/// now pins the agreement for each variant.
+const QUEUED_OPERATION_IDS: [&str; 16] = [
+    "configure-profile",
+    "remove-profile",
+    "set-default",
+    "set-secret",
+    "test-profile-auth",
+    "browse-remote",
+    "schedule",
+    "routine",
+    "remove-routine",
+    "alert-policy",
+    "security-policy",
+    "client-event",
+    "action",
+    "sync-status",
+    "resync",
+    "clear-logs",
+];
+
 fn valid_mutation_operation(value: &str) -> bool {
-    matches!(
-        value,
-        "configure-profile"
-            | "remove-profile"
-            | "set-default"
-            | "set-secret"
-            | "test-profile-auth"
-            | "browse-remote"
-            | "schedule"
-            | "routine"
-            | "remove-routine"
-            | "alert-policy"
-            | "security-policy"
-            | "client-event"
-            | "action"
-    )
+    QUEUED_OPERATION_IDS.contains(&value)
 }
 
 fn valid_audit_operation(value: &str) -> bool {
@@ -7848,13 +8126,30 @@ fn record_audit_event(record: &AuditOutboxRecord, state: &str) -> BridgeResult<(
     }
 }
 
+/// Run the manager for one queued mutation, telling it where to publish progress.
+///
+/// The record path travels in the environment rather than in argv, and that is the whole reason
+/// either half of this can ship alone. The manager forwards the value to the core as
+/// `--progress-record` at the three sites that invoke it; a manager that has not learned to do
+/// that yet simply ignores an environment variable it does not read, and a bridge that does not
+/// set it leaves a manager that does read it with nothing to forward. Neither direction is an
+/// outage, which is exactly the property the `--core-nice` pairing was built to have -- and it is
+/// stronger here, because the manager validates its own options strictly and an unknown one would
+/// be rejected as an invalid request.
+///
+/// `manager_command` already sets one conditional variable for the same kind of reason, so this is
+/// the established channel rather than a new one.
 #[cfg(target_os = "linux")]
 fn run_queued_mutation_manager(
     arguments: &[OsString],
     secret: Option<&[u8]>,
     termination_requested: &AtomicBool,
+    progress_record: Option<&Path>,
 ) -> BridgeResult<CapturedOutput> {
     let mut command = manager_command(arguments, secret.is_some())?;
+    if let Some(path) = progress_record {
+        command.env("SDSYNC_DSM_PROGRESS_RECORD", path);
+    }
     capture_queued_mutation_command(
         &mut command,
         MAX_MANAGER_OUTPUT_BYTES,
@@ -9691,6 +9986,9 @@ mod linux_files {
         requested_uid: u32,
         session_binding: [u8; 32],
         operation: Option<String>,
+        /// `None` for a completed request: the result itself is the answer once a job is done, so
+        /// progress is neither read nor reported for one.
+        progress_operation: Option<&'static str>,
         complete: bool,
     }
 
@@ -9763,16 +10061,32 @@ mod linux_files {
         package_uid: u32,
         request_id: &str,
         job_id: &str,
+        operation: &str,
     ) -> Option<ProgressView> {
         if !valid_client_request_id(request_id) || !valid_server_job_id(job_id) {
             return None;
         }
         validate_private_directory(paths.progress, package_uid).ok()?;
-        let path = paths.progress.join(format!("{request_id}.json"));
+        let path = progress_record_path(paths, request_id, job_id);
         let bytes =
             read_transient_optional_private_file(&path, package_uid, MAX_PROGRESS_BYTES).ok()??;
         let document: Value = serde_json::from_slice(bytes.as_slice()).ok()?;
-        validated_progress(&document, request_id, job_id)
+        validated_progress(&document, request_id, job_id, operation)
+    }
+
+    /// Where a job's progress record lives.
+    ///
+    /// The file name carries both halves of the binding because the writer is handed exactly one
+    /// value and has to produce a record that names the request *and* the job it belongs to. The
+    /// reader rebuilds the name from ids it resolved itself, so a record can only ever be found
+    /// for the pair it was written for -- and the document repeats both ids, which is what catches
+    /// a writer that was handed the wrong path.
+    pub(super) fn progress_record_path(
+        paths: &ControlPaths<'_>,
+        request_id: &str,
+        job_id: &str,
+    ) -> PathBuf {
+        paths.progress.join(format!("{request_id}.{job_id}.json"))
     }
 
     fn read_any_session_request_record(
@@ -9793,6 +10107,7 @@ mod linux_files {
                 requested_uid: parsed.requested_uid,
                 session_binding: parsed.session_binding,
                 operation: parsed.operation.clone(),
+                progress_operation: None,
                 complete: true,
             }));
         }
@@ -9811,6 +10126,7 @@ mod linux_files {
                 requested_uid: parsed.requested_uid,
                 session_binding: parsed.session_binding,
                 operation: Some(parsed.mutation.operation_id().to_owned()),
+                progress_operation: mutation_progress_operation(&parsed.mutation),
                 complete: false,
             }));
         }
@@ -9861,6 +10177,7 @@ mod linux_files {
                     return Err(BridgeError::unsafe_runtime());
                 }
                 owned_job_id = Some(job_id.to_owned());
+                let progress_operation = record.progress_operation;
                 found = record.operation.as_ref().map(|operation| {
                     if record.complete {
                         SessionRequestStatus::Complete {
@@ -9871,6 +10188,7 @@ mod linux_files {
                         SessionRequestStatus::Pending {
                             job_id: job_id.to_owned(),
                             operation: operation.clone(),
+                            progress_operation,
                         }
                     }
                 });
@@ -11723,6 +12041,35 @@ pub(crate) fn main_entry() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => ExitCode::FAILURE,
         }
+    } else if arguments.len() == 5 && arguments[0] == "--fail-job" {
+        #[cfg(target_os = "linux")]
+        {
+            let parsed = (|| {
+                let cause = arguments[3]
+                    .to_str()
+                    .and_then(ControllerFailureCause::parse)?;
+                let exit_code = arguments[4].to_str()?.parse::<u8>().ok()?;
+                Some((cause, exit_code))
+            })();
+            let Some((cause, exit_code)) = parsed else {
+                return ExitCode::from(64);
+            };
+            let request = PathBuf::from(&arguments[1]);
+            let response = PathBuf::from(&arguments[2]);
+            match fail_claimed_job(&request, &response, cause, exit_code) {
+                Ok(()) => ExitCode::SUCCESS,
+                // Refused by the outcome-unknown rule rather than failed to write. Distinguishable
+                // on purpose: a caller that falls back to a generic rejection would erase exactly
+                // the evidence this refusal preserves, so it needs to be able to tell the two
+                // apart without inspecting the filesystem.
+                Err(error) if error.kind == ErrorKind::Conflict => ExitCode::from(75),
+                Err(_) => ExitCode::FAILURE,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            ExitCode::from(73)
+        }
     } else if matches!(arguments.len(), 1 | 4) && arguments[0] == "--cleanup-stale-api-socket" {
         #[cfg(target_os = "linux")]
         {
@@ -12924,9 +13271,20 @@ fn execute_request_status_action(
         session_binding,
     )?;
     match status {
-        Some(SessionRequestStatus::Pending { job_id, operation }) => {
-            let progress =
-                linux_files::read_request_progress(paths, package_uid, request_id, &job_id);
+        Some(SessionRequestStatus::Pending {
+            job_id,
+            operation,
+            progress_operation,
+        }) => {
+            let progress = progress_operation.and_then(|catalogue| {
+                linux_files::read_request_progress(
+                    paths,
+                    package_uid,
+                    request_id,
+                    &job_id,
+                    catalogue,
+                )
+            });
             request_status_found_response(
                 request_id, &job_id, &operation, "pending", false, progress,
             )
@@ -12965,12 +13323,7 @@ fn request_status_found_response(
     // Progress is reported only while pending. Once complete the result itself is the answer, and
     // a trailing progress record would invite the client to render a step count beside it.
     if let (false, Some(view)) = (complete, progress) {
-        document["progress"] = json!({
-            "step": view.step,
-            "total": view.total,
-            "label": view.label,
-            "updated_at": view.updated_at,
-        });
+        document["progress"] = progress_value(view);
     }
     let body = serde_json::to_vec(&document).map_err(|_| BridgeError::internal())?;
     if complete {
@@ -12978,6 +13331,28 @@ fn request_status_found_response(
     } else {
         Ok(CgiResponse::accepted(body))
     }
+}
+
+/// Render one validated progress view onto the wire.
+///
+/// Exactly six keys, and the same six from both endpoints. The dashboard validates this object by
+/// exact key count, so a seventh field anywhere would not degrade the render -- it would drop the
+/// whole record and progress would silently stop appearing. One function is therefore the only
+/// safe way to have two endpoints publish it.
+///
+/// `step`/`total` describe the phase and are always determinate. `count` is the running total
+/// within that phase and carries no denominator, because there is none: what a phase will end up
+/// counting is exactly the thing an operator is waiting to find out. There is deliberately no
+/// percentage anywhere in this shape.
+fn progress_value(view: ProgressView) -> Value {
+    json!({
+        "step": view.step,
+        "total": view.total,
+        "label": view.label,
+        "updated_at": view.updated_at,
+        "unit": view.unit.as_str(),
+        "count": view.count,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -13109,7 +13484,7 @@ fn execute_result_action_after_wait(
         if job.requested_uid != authenticated_uid
             || !session_binding_matches(&job.session_binding, session_binding)
         {
-            return queued_pending_response(job_id);
+            return queued_pending_response(job_id, None);
         }
         if job.issued_at_epoch > now.saturating_add(CLOCK_SKEW_SECONDS) {
             return Err(BridgeError::new(ErrorKind::Unavailable));
@@ -13117,7 +13492,19 @@ fn execute_result_action_after_wait(
         if now.saturating_sub(job.issued_at_epoch) > MAX_JOB_AGE_SECONDS {
             return queued_expired_response(job_id);
         }
-        return queued_pending_response(job_id);
+        // The job is already parsed and in hand here, so both the client request id the record is
+        // filed under and the catalogue its phases resolve against come free -- no second lookup,
+        // and no new failure mode on the poll the dashboard makes most often.
+        let progress = mutation_progress_operation(&job.mutation).and_then(|catalogue| {
+            linux_files::read_request_progress(
+                paths,
+                package_uid,
+                &job.client_request_id,
+                job_id,
+                catalogue,
+            )
+        });
+        return queued_pending_response(job_id, progress);
     }
     // Close the processing -> response publish/removal race before declaring
     // the server-generated identifier gone.
@@ -13152,7 +13539,7 @@ fn completed_result_response(
     if response.requested_uid != authenticated_uid
         || !session_binding_matches(&response.session_binding, session_binding)
     {
-        return queued_pending_response(job_id).map(Some);
+        return queued_pending_response(job_id, None).map(Some);
     }
     if response.completed_at_epoch > now.saturating_add(CLOCK_SKEW_SECONDS) {
         return Err(BridgeError::new(ErrorKind::Unavailable));
@@ -13189,13 +13576,32 @@ fn completed_result_response(
     .map(Some)
 }
 
-fn queued_pending_response(job_id: &str) -> BridgeResult<CgiResponse> {
-    let body = serde_json::to_vec(&json!({
+/// Answer a result poll for a job that has not finished.
+///
+/// This is the endpoint the live poll actually uses, which is why progress has to reach it: a
+/// dashboard that only ever calls this one saw `{schema, job_id, state}` and nothing else, so a
+/// record could be written perfectly and still never be seen by anybody.
+///
+/// `progress` is `None` for every caller who does not own the job. That is not incidental: this
+/// function is also the answer given on a session-binding or uid mismatch, and someone who cannot
+/// be told whether a job exists must not be told which phase it is in either.
+///
+/// Progress is reported only while pending, on this endpoint exactly as on `request-status`. Once
+/// a result exists it is the answer, and a step count printed beside it would invite a client to
+/// render both.
+fn queued_pending_response(
+    job_id: &str,
+    progress: Option<ProgressView>,
+) -> BridgeResult<CgiResponse> {
+    let mut document = json!({
         "schema": "sdsync.dsm-result-status.v1",
         "job_id": job_id,
         "state": "pending",
-    }))
-    .map_err(|_| BridgeError::internal())?;
+    });
+    if let Some(view) = progress {
+        document["progress"] = progress_value(view);
+    }
+    let body = serde_json::to_vec(&document).map_err(|_| BridgeError::internal())?;
     Ok(CgiResponse::accepted(body))
 }
 
@@ -13458,6 +13864,92 @@ fn reject_claimed_job(request: &Path, response: &Path) -> BridgeResult<()> {
             &response_bytes,
         )
     }
+}
+
+/// Publish a terminal result for a job the controller has given up on.
+///
+/// The shell analogue of `--reject-job`, and deliberately a separate mode rather than extra
+/// arguments on it: the controller's argv shapes are pinned on both sides, and `--reject-job`'s
+/// three-word form has to keep meaning exactly what it means today.
+///
+/// The controller cannot supply the operation -- it never parses a job document, by design, so
+/// that a turn costs no forks. It is read here from the job this function already parses, and
+/// travels on the response envelope where every other consumer of a queued result already looks
+/// for it.
+///
+/// **A post-dispatch cause is refused for a serialized job, and that refusal is the point.**
+/// Publishing a response makes `bridge_job_state` report `Complete(false)`, which makes the outbox
+/// reconciliation record `Failed` -- where finding no response beside a dead owner is precisely
+/// what makes it record `OutcomeUnknown`. For a job that commits profile, credential, policy or
+/// scheduler state, a consumer killed partway through genuinely has an unknown outcome, and
+/// publishing here would not merely claim otherwise: it would erase the evidence that it was
+/// unknown. Pre-dispatch causes are exempt because the job provably never ran, which is a true
+/// statement about any operation.
+#[cfg(target_os = "linux")]
+fn fail_claimed_job(
+    request: &Path,
+    response: &Path,
+    cause: ControllerFailureCause,
+    exit_code: u8,
+) -> BridgeResult<()> {
+    if CGI_ORIGIN_VARIABLES
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+    {
+        return Err(BridgeError::unsafe_runtime());
+    }
+    let identity = linux_runtime::identity_state()?;
+    let package_uid = validate_package_identity(&identity)?;
+    let request_id = validate_consumer_paths(request, response)?;
+    linux_runtime::clear_environment()?;
+    let control_paths = ControlPaths::production();
+    let job = linux_files::read_job(&control_paths, request, package_uid)
+        .and_then(|bytes| parse_job(&bytes))?;
+    if job.request_id != request_id {
+        return Err(BridgeError::bad_request());
+    }
+    if cause.after_dispatch() && queued_job_class(&job) == QueuedJobClass::Serialized {
+        return Err(BridgeError::new(ErrorKind::Conflict));
+    }
+    let audit_transaction = job.audit_transaction.clone();
+    let _ = linux_files::claim_queued_audit_transaction(
+        &control_paths.audit_outbox(),
+        package_uid,
+        &audit_transaction,
+        &request_id,
+    );
+    let result = terminalize_consume_result(
+        Ok(controller_failure_result_value(cause, exit_code)),
+        |state| {
+            debug_assert_eq!(state, "failed");
+            linux_files::audit_transaction_complete(
+                &control_paths.audit_outbox(),
+                package_uid,
+                &audit_transaction,
+                AuditOutboxPhase::Failed,
+                record_audit_event,
+            )
+        },
+    );
+    let response_bytes = canonical_queued_response_bytes(
+        &job,
+        current_epoch()?,
+        &result.value,
+        result.audit_pending,
+    )?;
+    linux_files::remove_claimed_secret(&control_paths, &request_id);
+    let _ = fs::remove_file(linux_files::progress_record_path(
+        &control_paths,
+        &job.client_request_id,
+        &request_id,
+    ));
+    linux_files::write_response(
+        &control_paths,
+        response,
+        &request_id,
+        package_uid,
+        &response_bytes,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -13856,6 +14348,20 @@ fn execute_connection_mutation(
         Mutation::BrowseRemote(value) => &value.connection,
         _ => return Err(BridgeError::internal()),
     };
+    // These two operations execute inside this process rather than through the manager, so they
+    // publish their own record instead of being handed a path to pass on. Four phases, one write
+    // each, no forks: a healthy connection probe takes around fifteen seconds, which is long
+    // enough that a dashboard showing nothing at all reads as a hang.
+    let record_path =
+        linux_files::progress_record_path(paths, &job.client_request_id, &job.request_id);
+    let progress = ProgressRecorder::new(&record_path, "connection");
+    let _published = ProgressRecordGuard(progress.as_ref().map(|_| record_path));
+    let phase = |id: &str| {
+        if let Some(recorder) = progress.as_ref() {
+            recorder.phase(id);
+        }
+    };
+    phase("resolve_secrets");
     let (password, totp) =
         resolve_connection_secrets(paths, &job.request_id, connection, package_uid)?;
     let key = linux_files::load_or_create_csrf_key(paths, package_uid)?;
@@ -13877,6 +14383,7 @@ fn execute_connection_mutation(
         )?;
     }
 
+    phase("authenticate");
     let mut client = match authenticate_file_station(
         connection,
         &password,
@@ -13886,6 +14393,7 @@ fn execute_connection_mutation(
         Ok(client) => client,
         Err(failure) => return Ok(connection_failure_result(failure)),
     };
+    phase("contact");
 
     match &job.mutation {
         Mutation::TestProfileAuth(_) => {
@@ -13897,6 +14405,7 @@ fn execute_connection_mutation(
                 .confirm_file_station_session()
                 .map_err(classify_authenticated_file_station_failure);
             let confirmation_and_logout = logout_result_with(confirmation, || {
+                phase("logout");
                 client
                     .logout_bounded(budget.logout)
                     .map_err(|_| RemoteConnectionFailure::Logout)
@@ -13923,6 +14432,7 @@ fn execute_connection_mutation(
                 .browse_directories(&arguments.parent, 500)
                 .map_err(classify_authenticated_file_station_failure);
             let listing = logout_result_with(listing, || {
+                phase("logout");
                 client
                     .logout_bounded(budget.logout)
                     .map_err(|_| RemoteConnectionFailure::Logout)
@@ -13976,10 +14486,17 @@ fn consume_job_inner(
         }
     };
     let arguments = mutation_manager_arguments(&job.mutation);
+    // Only the operations with a phase catalogue get a path, so the eleven that finish inside a
+    // dashboard poll cost no writes at all.
+    let progress_record =
+        ProgressRecordGuard(mutation_progress_operation(&job.mutation).map(|_| {
+            linux_files::progress_record_path(paths, &job.client_request_id, &job.request_id)
+        }));
     let output = run_queued_mutation_manager(
         &arguments,
         secret.as_ref().map(|value| value.as_slice()),
         termination_requested,
+        progress_record.0.as_deref(),
     )?;
     let result = parse_manager_result(
         &output.stdout,
@@ -14318,7 +14835,22 @@ mod tests {
             "job_id": "a".repeat(SERVER_JOB_ID_BYTES * 2),
             "section": section,
             "updated_at": 1_700_000_000u64,
+            "count": 12_480u64,
         })
+    }
+
+    /// The writer's schema string and this one are the same string.
+    ///
+    /// They are declared twice because they belong to two binaries that share only the library,
+    /// and this copy is the one a packaging check reads. Asserting the equality here is what keeps
+    /// the duplication from becoming a divergence -- a mismatch would mean every record the core
+    /// writes is dropped on read, and nothing else would go red.
+    #[test]
+    fn the_writer_and_the_reader_name_the_same_schema() {
+        assert_eq!(
+            PROGRESS_SCHEMA,
+            synology_drive_sync::progress_record::PROGRESS_SCHEMA
+        );
     }
 
     /// A well-formed record resolves, and every displayed field comes from the catalogue.
@@ -14326,19 +14858,73 @@ mod tests {
     fn progress_resolves_step_and_label_from_the_catalogue() {
         let request_id = "0".repeat(32);
         let job_id = "a".repeat(SERVER_JOB_ID_BYTES * 2);
-        let view = validated_progress(&progress_document("routing_tls"), &request_id, &job_id)
-            .expect("a well-formed record must resolve");
+        let view = validated_progress(
+            &progress_document("routing_tls"),
+            &request_id,
+            &job_id,
+            "doctor",
+        )
+        .expect("a well-formed record must resolve");
         assert_eq!(view.label, "Routing and TLS negotiation");
         assert_eq!(view.step, 2);
         assert_eq!(view.total, 16);
         assert_eq!(view.updated_at, 1_700_000_000);
+        assert_eq!(view.count, 12_480);
+        assert_eq!(view.unit, synology_drive_sync::PhaseUnit::None);
+    }
+
+    /// The catalogue is chosen by the operation, so a seven-phase walk is now expressible.
+    ///
+    /// This is what the validator could not do before: `total` was the sixteen doctor sections and
+    /// nothing else, so a status record resolved against the diagnostic table, failed, and
+    /// returned nothing. A record is now bound to three things -- the request, the job, and the
+    /// operation -- and the third is what lets one shape serve every slow operation.
+    #[test]
+    fn progress_resolves_against_the_operations_own_catalogue() {
+        let request_id = "0".repeat(32);
+        let job_id = "a".repeat(SERVER_JOB_ID_BYTES * 2);
+        let view = validated_progress(
+            &progress_document("compare"),
+            &request_id,
+            &job_id,
+            "sync-status",
+        )
+        .expect("a status phase must resolve against the status catalogue");
+        assert_eq!(view.label, "Comparing file contents");
+        assert_eq!(view.step, 5);
+        assert_eq!(view.total, 7);
+        assert_eq!(view.unit, synology_drive_sync::PhaseUnit::Files);
+        assert_eq!(view.count, 12_480);
+
+        // The same id, against an operation that does not have that phase.
+        assert_eq!(
+            validated_progress(
+                &progress_document("compare"),
+                &request_id,
+                &job_id,
+                "connection",
+            ),
+            None,
+            "a phase from another catalogue must not resolve"
+        );
+        assert_eq!(
+            validated_progress(
+                &progress_document("routing_tls"),
+                &request_id,
+                &job_id,
+                "sync-status",
+            ),
+            None,
+            "a diagnostic section must not resolve for a status walk"
+        );
     }
 
     /// The document cannot supply the text an administrator sees.
     ///
     /// This is the whole point of resolving the section id against the catalogue: a job that is
     /// buggy or compromised names a section, and the label is looked up locally. A `label` field
-    /// in the document is ignored entirely rather than preferred or merged.
+    /// in the document is ignored entirely rather than preferred or merged. The `unit` field is
+    /// resolved the same way and for the same reason -- it is an enum, never text off the disk.
     #[test]
     fn progress_ignores_any_label_the_document_tries_to_supply() {
         let request_id = "0".repeat(32);
@@ -14347,11 +14933,28 @@ mod tests {
         document["label"] = json!("<script>alert(1)</script>");
         document["step"] = json!(99);
         document["total"] = json!(99);
-        let view = validated_progress(&document, &request_id, &job_id)
+        document["unit"] = json!("<img onerror=alert(1)>");
+        let view = validated_progress(&document, &request_id, &job_id, "doctor")
             .expect("extra fields must not prevent resolution");
         assert_eq!(view.label, "Routing and TLS negotiation");
         assert_eq!(view.step, 2);
         assert_eq!(view.total, 16);
+        assert_eq!(view.unit.as_str(), "");
+
+        let rendered = progress_value(view);
+        assert_eq!(
+            rendered
+                .as_object()
+                .map(|fields| fields.keys().map(String::as_str).collect::<BTreeSet<_>>()),
+            Some(
+                ["count", "label", "step", "total", "unit", "updated_at"]
+                    .into_iter()
+                    .collect()
+            ),
+            "the wire object is validated by exact key count; a seventh field drops the record"
+        );
+        assert_eq!(rendered["label"], json!("Routing and TLS negotiation"));
+        assert_eq!(rendered["unit"], json!(""));
     }
 
     /// Anything that does not match exactly yields no progress at all.
@@ -14367,6 +14970,15 @@ mod tests {
 
         let mut missing_updated_at = progress_document("routing_tls");
         missing_updated_at["updated_at"] = Value::Null;
+
+        let mut negative_count = progress_document("routing_tls");
+        negative_count["count"] = json!(-1);
+
+        let mut implausible_count = progress_document("routing_tls");
+        implausible_count["count"] = json!(MAX_PROGRESS_COUNT + 1);
+
+        let mut textual_count = progress_document("routing_tls");
+        textual_count["count"] = json!("12480");
 
         for (case, document, request, job) in [
             (
@@ -14400,18 +15012,420 @@ mod tests {
                 job_id.clone(),
             ),
             (
+                "section id escapes the catalogue",
+                progress_document("../etc"),
+                request_id.clone(),
+                job_id.clone(),
+            ),
+            (
                 "no updated_at",
                 missing_updated_at,
                 request_id.clone(),
                 job_id.clone(),
             ),
+            (
+                "count is negative",
+                negative_count,
+                request_id.clone(),
+                job_id.clone(),
+            ),
+            (
+                "count is not a number",
+                textual_count,
+                request_id.clone(),
+                job_id.clone(),
+            ),
+            (
+                "count is beyond any credible tree",
+                implausible_count,
+                request_id.clone(),
+                job_id.clone(),
+            ),
         ] {
             assert_eq!(
-                validated_progress(&document, &request, &job),
+                validated_progress(&document, &request, &job, "doctor"),
                 None,
                 "{case} must not resolve"
             );
         }
+    }
+
+    /// A record written before `count` existed is still a usable record.
+    ///
+    /// The field is additive, so its absence has to mean zero rather than "drop this". Otherwise a
+    /// package upgraded one half at a time would report no progress at all for the window in which
+    /// the two halves disagree -- and it would do it silently, which is the one failure mode in
+    /// this design that nothing else catches.
+    #[test]
+    fn progress_treats_an_absent_count_as_zero() {
+        let request_id = "0".repeat(32);
+        let job_id = "a".repeat(SERVER_JOB_ID_BYTES * 2);
+        let mut document = progress_document("compare");
+        document
+            .as_object_mut()
+            .expect("the fixture is an object")
+            .remove("count");
+        let view = validated_progress(&document, &request_id, &job_id, "sync-status")
+            .expect("a record without a count must still resolve");
+        assert_eq!(view.count, 0);
+        assert_eq!(view.step, 5);
+    }
+
+    /// Exactly the operations that can outrun a dashboard poll carry a catalogue.
+    ///
+    /// The two halves of this are separately load-bearing. A slow operation without a catalogue
+    /// publishes nothing and the operator watches a blank `pending`; a fast one *with* a catalogue
+    /// pays for writes that finish before the next poll can read them. `action` appears in the
+    /// forbidden list on purpose: it is the wire operation id three different walks share, and
+    /// keying the catalogue on it is the mistake this table exists to prevent.
+    #[test]
+    fn only_the_slow_operations_carry_a_phase_catalogue() {
+        for operation in ["sync-status", "plan", "run", "resync", "connection"] {
+            assert!(
+                synology_drive_sync::operation_phases(operation).is_some(),
+                "{operation} must carry a catalogue"
+            );
+            assert!(
+                synology_drive_sync::operation_phase(operation, "authenticate").is_some(),
+                "{operation} must reach an authenticate phase"
+            );
+        }
+        assert!(
+            synology_drive_sync::operation_phase("doctor", "dsm_session_auth").is_some(),
+            "the diagnostic catalogue resolves through the shared section table"
+        );
+        for absent in [
+            "configure-profile",
+            "set-secret",
+            "clear-logs",
+            "schedule",
+            "action",
+            "",
+        ] {
+            assert!(
+                synology_drive_sync::operation_phases(absent).is_none(),
+                "{absent} must have no catalogue"
+            );
+            assert!(
+                synology_drive_sync::operation_phase(absent, "authenticate").is_none(),
+                "{absent} must resolve no phase"
+            );
+        }
+    }
+
+    /// Both endpoints publish the same record, rendered by the same code, key for key.
+    ///
+    /// `request-status` and `result` answer about the same job from the same file, read through
+    /// the same validator and the same per-operation catalogue. What remains is the rendering, and
+    /// that is where a divergence would actually reach the wire: the dashboard validates the
+    /// progress object by exact key count, so an endpoint that grew or lost one field would not
+    /// render differently -- it would silently stop rendering, on that endpoint only, while the
+    /// other kept working. That is close to undiagnosable from the outside, so it is pinned here.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_two_endpoints_render_one_job_identically() {
+        let request_id = "0".repeat(32);
+        let job_id = "a".repeat(SERVER_JOB_ID_BYTES * 2);
+        let view = validated_progress(
+            &progress_document("compare"),
+            &request_id,
+            &job_id,
+            "sync-status",
+        )
+        .expect("the fixture resolves");
+
+        let status = request_status_found_response(
+            &request_id,
+            &job_id,
+            "sync-status",
+            "pending",
+            false,
+            Some(view),
+        )
+        .expect("a pending status answer");
+        let result = queued_pending_response(&job_id, Some(view)).expect("a pending result answer");
+
+        let status_json: Value = serde_json::from_slice(&status.body).unwrap();
+        let result_json: Value = serde_json::from_slice(&result.body).unwrap();
+        assert_eq!(
+            status_json["progress"], result_json["progress"],
+            "the two endpoints must publish one job's progress identically"
+        );
+        assert_eq!(status_json["progress"], progress_value(view));
+        assert_eq!(status_json["progress"]["step"], json!(5));
+        assert_eq!(status_json["progress"]["total"], json!(7));
+        assert_eq!(status_json["progress"]["unit"], json!("files"));
+        assert_eq!(status_json["progress"]["count"], json!(12_480));
+
+        // And neither reports progress once the job is done: the result is the answer then, and a
+        // step count printed beside it would invite a client to render both.
+        let complete = request_status_found_response(
+            &request_id,
+            &job_id,
+            "sync-status",
+            "complete",
+            true,
+            Some(view),
+        )
+        .expect("a complete status answer");
+        let complete_json: Value = serde_json::from_slice(&complete.body).unwrap();
+        assert!(complete_json.get("progress").is_none());
+        let unowned = queued_pending_response(&job_id, None).expect("a non-owner answer");
+        let unowned_json: Value = serde_json::from_slice(&unowned.body).unwrap();
+        assert!(
+            unowned_json.get("progress").is_none(),
+            "a caller who does not own the job must not learn which phase it is in"
+        );
+    }
+
+    /// The controller's four causes are parsed exactly, and nothing else is.
+    ///
+    /// The cause arrives as an argv word from the controller, so it is the one piece of this path
+    /// that is text rather than a type. An unrecognised one must be a refusal rather than a
+    /// best-effort guess: publishing a terminal result under the wrong cause is worse than
+    /// publishing none, because the operator would act on it.
+    #[test]
+    fn controller_failure_causes_parse_exactly_and_publish_a_named_result() {
+        for (word, code) in [
+            ("classification_failed", "classification_failed"),
+            ("secret_claim_failed", "secret_claim_failed"),
+            ("consumer_failed", "consumer_failed"),
+            ("consumer_wrote_no_result", "consumer_wrote_no_result"),
+        ] {
+            let cause = ControllerFailureCause::parse(word)
+                .unwrap_or_else(|| panic!("{word} must be a recognised cause"));
+            assert_eq!(cause.code(), code);
+            assert!(
+                is_package_failure_code(cause.code()),
+                "{code} must be in the vocabulary the response validator accepts"
+            );
+
+            let value = controller_failure_result_value(cause, 137);
+            assert_eq!(value["ok"], json!(false));
+            assert_eq!(value["code"], json!(code));
+            assert_eq!(value["exit_code"], json!(137));
+            assert!(
+                value["message"]
+                    .as_str()
+                    .is_some_and(|message| message.len() > 20 && message.ends_with('.')),
+                "{code} must carry an operator-readable sentence"
+            );
+            // The operation is deliberately absent: it rides the response envelope, so repeating
+            // it here would mean widening a validated field set for a value already on the wire.
+            assert!(value.get("operation").is_none());
+        }
+
+        for unknown in [
+            "",
+            "consumer-failed",
+            "CONSUMER_FAILED",
+            "operation_failed",
+            "unresolved",
+            "consumer_failed ",
+        ] {
+            assert!(
+                ControllerFailureCause::parse(unknown).is_none(),
+                "{unknown:?} must not be accepted as a cause"
+            );
+        }
+    }
+
+    /// A controller-side failure is publishable as a terminal result for every queued operation.
+    ///
+    /// Same property as for the consume failures, and it fails the same way if it breaks: a code
+    /// or a field the canonical response validator refuses means no response file is written at
+    /// all, and the operator is left with the `unresolved` silence the whole vocabulary exists to
+    /// replace. The connection operations are the load-bearing entries -- they validate results
+    /// through a separate and much tighter allow-list, and they are in the class the controller
+    /// actually publishes for.
+    #[test]
+    fn every_controller_failure_can_actually_be_published() {
+        for word in CONTROLLER_FAILURE_CODES {
+            let cause = ControllerFailureCause::parse(word).expect("declared causes parse");
+            for exit_code in [0_u8, 1, 137, 255] {
+                let bytes =
+                    serde_json::to_vec(&controller_failure_result_value(cause, exit_code)).unwrap();
+                for operation in [
+                    "sync-status",
+                    "resync",
+                    "action",
+                    "clear-logs",
+                    "test-profile-auth",
+                    "browse-remote",
+                ] {
+                    assert!(
+                        parse_manager_result_for_operation(&bytes, None, Some(operation)).is_ok(),
+                        "{word} at exit {exit_code} is not publishable as a {operation} result"
+                    );
+                }
+            }
+        }
+
+        // ...and an exit code outside a wait status is still refused, on both allow-lists.
+        let mut implausible =
+            controller_failure_result_value(ControllerFailureCause::ConsumerFailed, u8::MAX);
+        implausible["exit_code"] = json!(256);
+        let bytes = serde_json::to_vec(&implausible).unwrap();
+        for operation in ["sync-status", "test-profile-auth"] {
+            assert!(
+                parse_manager_result_for_operation(&bytes, None, Some(operation)).is_err(),
+                "{operation} must refuse an exit code outside a wait status"
+            );
+        }
+    }
+
+    /// A dead consumer's outcome is unknown for exactly the jobs that commit state.
+    ///
+    /// This is the safety property the whole mode turns on, and it is a rule about *pairs*: the
+    /// cause decides whether the job had begun, and the class decides whether beginning could have
+    /// committed anything. Publishing a result where the answer is "we cannot know" does not merely
+    /// state something false -- it makes `bridge_job_state` report `Complete(false)`, which makes
+    /// the outbox reconciliation record `Failed` where it would otherwise have recorded
+    /// `OutcomeUnknown`. The evidence is destroyed, not just contradicted.
+    #[test]
+    fn only_a_job_that_committed_nothing_may_be_failed_after_dispatch() {
+        for (word, after_dispatch) in [
+            ("classification_failed", false),
+            ("secret_claim_failed", false),
+            ("consumer_failed", true),
+            ("consumer_wrote_no_result", true),
+        ] {
+            let cause = ControllerFailureCause::parse(word).expect("declared causes parse");
+            assert_eq!(
+                cause.after_dispatch(),
+                after_dispatch,
+                "{word} is on the wrong side of dispatch"
+            );
+        }
+
+        // The classes that commit no profile, credential, policy, or scheduler state are exactly
+        // the ones a post-dispatch failure may terminalise. This mirrors `queued_job_class`'s own
+        // reasoning rather than restating a list, so the two cannot drift apart silently.
+        for (class, publishable) in [
+            (QueuedJobClass::Connection, true),
+            (QueuedJobClass::Concurrent, true),
+            (QueuedJobClass::Serialized, false),
+        ] {
+            for word in CONTROLLER_FAILURE_CODES {
+                let cause = ControllerFailureCause::parse(word).expect("declared causes parse");
+                let refused = cause.after_dispatch() && class == QueuedJobClass::Serialized;
+                assert_eq!(
+                    !refused,
+                    publishable || !cause.after_dispatch(),
+                    "{word} against {} is on the wrong side of the rule",
+                    class.as_str()
+                );
+            }
+        }
+    }
+
+    /// A consume failure names its cause instead of collapsing into one generic.
+    ///
+    /// Every kind used to arrive at the operator as `operation_failed` / "Operation could not be
+    /// completed.", which is indistinguishable from every other way an operation can fail. The
+    /// codes reuse the manager's existing error vocabulary wherever one fits, so the dashboard
+    /// needs two new strings rather than eleven.
+    #[test]
+    fn a_consume_failure_reports_the_kind_it_used_to_discard() {
+        for (kind, code) in [
+            (ErrorKind::BadRequest, "invalid_request"),
+            (ErrorKind::MethodNotAllowed, "invalid_request"),
+            (ErrorKind::UnsupportedMediaType, "invalid_request"),
+            (ErrorKind::Unauthorized, "unauthorized"),
+            (ErrorKind::Forbidden, "forbidden"),
+            (ErrorKind::CsrfRejected, "csrf_rejected"),
+            (ErrorKind::PayloadTooLarge, "response_too_large"),
+            (ErrorKind::Conflict, "busy"),
+            (ErrorKind::UnsafeRuntime, "unsafe_state"),
+            (ErrorKind::Unavailable, "unavailable"),
+            (ErrorKind::Internal, "internal_error"),
+        ] {
+            let terminal = terminalize_consume_result(Err(BridgeError::new(kind)), |_| Ok(false));
+            assert_eq!(terminal.state, "failed", "{kind:?} is still a failure");
+            assert_eq!(
+                terminal.value["code"],
+                json!(code),
+                "{kind:?} must report its own code"
+            );
+            assert_ne!(
+                terminal.value["code"],
+                json!("operation_failed"),
+                "{kind:?} must not collapse into the generic"
+            );
+            assert_eq!(terminal.value["ok"], json!(false));
+            assert!(
+                terminal.value["message"]
+                    .as_str()
+                    .is_some_and(|message| message.len() > 20 && message.ends_with('.')),
+                "{kind:?} must carry an operator-readable sentence"
+            );
+            assert!(
+                is_consume_failure_code(code),
+                "{code} must be in the vocabulary the response validator accepts"
+            );
+        }
+    }
+
+    /// Every named failure is publishable as a terminal result, for every queued operation.
+    ///
+    /// This is the property that matters more than the naming itself. A code the canonical
+    /// response validator refuses is not a worse message -- it is no response file at all, and the
+    /// operator gets `unresolved`, which is precisely the silence this change set out to remove.
+    /// Both allow-lists are exercised, because the connection operations validate their results
+    /// through an entirely separate and much tighter one.
+    #[test]
+    fn every_named_consume_failure_can_actually_be_published() {
+        for kind in [
+            ErrorKind::BadRequest,
+            ErrorKind::Unauthorized,
+            ErrorKind::Forbidden,
+            ErrorKind::CsrfRejected,
+            ErrorKind::MethodNotAllowed,
+            ErrorKind::UnsupportedMediaType,
+            ErrorKind::PayloadTooLarge,
+            ErrorKind::Conflict,
+            ErrorKind::UnsafeRuntime,
+            ErrorKind::Unavailable,
+            ErrorKind::Internal,
+        ] {
+            let bytes = serde_json::to_vec(&consume_failure_result_value(kind)).unwrap();
+            for operation in [
+                "sync-status",
+                "resync",
+                "action",
+                "configure-profile",
+                "test-profile-auth",
+                "browse-remote",
+            ] {
+                assert!(
+                    parse_manager_result_for_operation(&bytes, None, Some(operation)).is_ok(),
+                    "{kind:?} is not publishable as a {operation} result"
+                );
+            }
+        }
+        // ...and the vocabulary constant is exactly the set the mapping produces, in both
+        // directions, so neither can grow an entry the other does not know about.
+        let produced: BTreeSet<&str> = [
+            ErrorKind::BadRequest,
+            ErrorKind::Unauthorized,
+            ErrorKind::Forbidden,
+            ErrorKind::CsrfRejected,
+            ErrorKind::MethodNotAllowed,
+            ErrorKind::UnsupportedMediaType,
+            ErrorKind::PayloadTooLarge,
+            ErrorKind::Conflict,
+            ErrorKind::UnsafeRuntime,
+            ErrorKind::Unavailable,
+            ErrorKind::Internal,
+        ]
+        .into_iter()
+        .map(|kind| consume_failure_code(kind).0)
+        .collect();
+        assert_eq!(
+            produced,
+            CONSUME_FAILURE_CODES.into_iter().collect::<BTreeSet<_>>(),
+            "the declared vocabulary and the mapping must name the same codes"
+        );
     }
     #[cfg(target_os = "linux")]
     use std::os::linux::fs::MetadataExt;
@@ -17843,6 +18857,7 @@ mod tests {
             Some(SessionRequestStatus::Pending {
                 job_id: first_id.clone(),
                 operation: "remove-profile".to_owned(),
+                progress_operation: None,
             })
         );
         let pending_status =
@@ -17901,6 +18916,7 @@ mod tests {
             Some(SessionRequestStatus::Pending {
                 job_id: first_id.clone(),
                 operation: "remove-profile".to_owned(),
+                progress_operation: None,
             })
         );
         let job = parse_job(&fs::read(&processing_path).unwrap()).unwrap();
@@ -18093,6 +19109,7 @@ mod tests {
             Some(SessionRequestStatus::Pending {
                 job_id: current_job_id.to_owned(),
                 operation: "remove-profile".to_owned(),
+                progress_operation: None,
             }),
             "a foreign-session collision must not hide the current session's mapping"
         );
@@ -20053,7 +21070,9 @@ mod tests {
             });
         assert_eq!(calls, 1);
         assert_eq!(result.value["ok"], false);
-        assert_eq!(result.value["code"], "operation_failed");
+        // The kind is preserved rather than discarded: this used to be `operation_failed` for
+        // every consume failure, which told an operator nothing about which one had happened.
+        assert_eq!(result.value["code"], "unavailable");
         assert_eq!(result.state, "failed");
         assert!(!result.audit_pending);
 
@@ -21146,6 +22165,104 @@ mod tests {
         }
     }
 
+    /// The reader accepts every operation the writer can put on a queued response envelope.
+    ///
+    /// Regression. `canonical_queued_response_bytes` names the job's operation on the v2 envelope
+    /// and `parse_queued_response` refuses any name outside `valid_mutation_operation`. For three
+    /// releases the writer knew `sync-status`, `resync` and `clear-logs` and the reader did not,
+    /// so a finished status walk answered its own result poll with `Unavailable` until the
+    /// dashboard's window ran out and it was reported as still queued. The three are driven
+    /// through the real writer here; the whole table is then swapped onto a parsed envelope, which
+    /// exercises the same check for every id; and names that are audit operations but not queued
+    /// ones are shown to stay refused. The swap carries a controller failure result because that is
+    /// the one document every operation's result validator accepts.
+    #[test]
+    fn queued_operation_ids_round_trip_through_the_reader() {
+        let failure = controller_failure_result_value(ControllerFailureCause::ConsumerFailed, 137);
+        for (operation, arguments) in [
+            (
+                "sync-status",
+                json!({
+                    "profile": "nightly",
+                    "scope": "",
+                    "filter": "",
+                    "state": "attention",
+                    "limit": 50,
+                    "cursor": "",
+                    "include_excluded": false
+                }),
+            ),
+            (
+                "resync",
+                json!({ "profile": "nightly", "scope": "", "confirm": "" }),
+            ),
+            ("clear-logs", json!({ "source": "controller" })),
+        ] {
+            let mutation = parse_mutation_request(&request(operation, arguments))
+                .unwrap_or_else(|error| panic!("{operation} must parse: {error:?}"));
+            let job_bytes = canonical_job_bytes(
+                JOB_ID,
+                REQUEST_ID,
+                "admin",
+                1000,
+                &[9_u8; 32],
+                JOB_ID,
+                &"a".repeat(64),
+                10_000,
+                &mutation.mutation,
+            )
+            .unwrap();
+            let job = parse_job(&job_bytes).unwrap();
+            let response = canonical_queued_response_bytes(&job, 10_005, &failure, false).unwrap();
+            let parsed = parse_queued_response(&response, JOB_ID).unwrap_or_else(|error| {
+                panic!("{operation}: the reader refused the writer's own envelope: {error:?}")
+            });
+            assert_eq!(parsed.operation.as_deref(), Some(operation));
+        }
+
+        let mutation =
+            parse_mutation_request(&request("remove-profile", json!({"name":"nightly"}))).unwrap();
+        let job_bytes = canonical_job_bytes(
+            JOB_ID,
+            REQUEST_ID,
+            "admin",
+            1000,
+            &[9_u8; 32],
+            JOB_ID,
+            &"a".repeat(64),
+            10_000,
+            &mutation.mutation,
+        )
+        .unwrap();
+        let job = parse_job(&job_bytes).unwrap();
+        // The swapped envelope carries the controller failure document: it is the one result every
+        // operation's validator accepts, because it is what `--fail-job` publishes for any of them,
+        // so the only thing the reader can object to below is the operation name itself.
+        let bytes = canonical_queued_response_bytes(&job, 10_005, &failure, false).unwrap();
+        let mut envelope: Value = serde_json::from_slice(&bytes).unwrap();
+        for operation in QUEUED_OPERATION_IDS {
+            envelope["operation"] = json!(operation);
+            let parsed = parse_queued_response(&serde_json::to_vec(&envelope).unwrap(), JOB_ID)
+                .unwrap_or_else(|error| panic!("{operation} must be readable: {error:?}"));
+            assert_eq!(parsed.operation.as_deref(), Some(operation));
+        }
+        for foreign in [
+            "doctor",
+            "plan",
+            "run",
+            "rejected-post",
+            "sync_status",
+            "SYNC-STATUS",
+            "",
+        ] {
+            envelope["operation"] = json!(foreign);
+            assert!(
+                parse_queued_response(&serde_json::to_vec(&envelope).unwrap(), JOB_ID).is_err(),
+                "{foreign:?} is not a queued operation and must stay refused"
+            );
+        }
+    }
+
     #[test]
     fn queued_response_is_strict_and_preserves_private_session_binding() {
         let mutation =
@@ -21319,27 +22436,31 @@ mod tests {
             let response = canonical_queued_response_bytes(job, 10_007, &terminal.value, false)
                 .expect("connection-internal failure remains a retrievable terminal result");
             let parsed = parse_queued_response(&response, JOB_ID).unwrap();
-            assert_eq!(parsed.result["code"], "operation_failed");
+            assert_eq!(parsed.result["code"], "forbidden");
             assert_eq!(
                 parsed.result["message"],
-                "Operation could not be completed."
+                "Security policy refused this operation before it ran."
             );
         }
     }
 
     #[test]
     fn result_status_envelopes_are_bounded_and_expiry_is_explicit() {
-        let pending = queued_pending_response(JOB_ID).unwrap();
+        let pending = queued_pending_response(JOB_ID, None).unwrap();
         assert_eq!(pending.status, 202);
         let pending_json: Value = serde_json::from_slice(&pending.body).unwrap();
         assert_eq!(pending_json["state"], "pending");
         assert!(pending_json.get("result").is_none());
+        assert!(
+            pending_json.get("progress").is_none(),
+            "a pending answer without a record must carry no progress field at all"
+        );
 
         let complete = queued_complete_response(
             JOB_ID,
             REQUEST_ID,
             1000,
-            &generic_manager_result_value(),
+            &consume_failure_result_value(ErrorKind::Unavailable),
             false,
         )
         .unwrap();
@@ -21689,11 +22810,27 @@ mod tests {
         assert!(!text.contains(MANAGER_PATH));
         assert!(!text.contains("secret"));
         assert!(text.contains("Request could not be completed"));
-        assert!(
-            !String::from_utf8(generic_manager_result())
-                .unwrap()
-                .contains("not-in-job")
-        );
+        // Every terminal result a consume failure can publish, not just one of them: naming the
+        // cause is what this change added, and a named cause is exactly the kind of field that
+        // grows an internal path or an echoed argument later.
+        for kind in [
+            ErrorKind::BadRequest,
+            ErrorKind::Unauthorized,
+            ErrorKind::Forbidden,
+            ErrorKind::CsrfRejected,
+            ErrorKind::MethodNotAllowed,
+            ErrorKind::UnsupportedMediaType,
+            ErrorKind::PayloadTooLarge,
+            ErrorKind::Conflict,
+            ErrorKind::UnsafeRuntime,
+            ErrorKind::Unavailable,
+            ErrorKind::Internal,
+        ] {
+            let named = consume_failure_result_value(kind).to_string();
+            assert!(!named.contains("not-in-job"), "{kind:?} echoed a job value");
+            assert!(!named.contains(MANAGER_PATH), "{kind:?} echoed a path");
+            assert!(!named.contains(PACKAGE_HOME), "{kind:?} echoed a path");
+        }
 
         let service = CgiResponse::service_unavailable();
         let service_text = String::from_utf8(service.body).unwrap();

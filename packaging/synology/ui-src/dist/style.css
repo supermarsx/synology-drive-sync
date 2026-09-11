@@ -1529,6 +1529,13 @@ gap: 3px;
 .sdsync-barrier-progress {
 color: var(--sdsync-amber);
 }
+.sdsync-live-progress {
+margin: 6px 0 0;
+color: var(--sdsync-muted);
+font-size: 12px;
+line-height: 1.5;
+overflow-wrap: anywhere;
+}
 .sdsync-page {
 width: 100%;
 max-width: 1180px;

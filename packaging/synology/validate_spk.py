@@ -987,8 +987,13 @@ def validate_native_api_source(payload: bytes) -> None:
         # A pending job publishes bounded progress as exactly one additional
         # key. Both document shapes are enumerated so an unreviewed seventh key
         # still fails closed; this must never become a tolerated-extras check.
+        # The record itself has two exact shapes as well: the six-key form the
+        # bridge publishes and its four-key identity subset. Both are literal
+        # key lists, so a stray key fails against each.
         "function trustedRequestProgress(value)",
         '["label", "step", "total", "updated_at"]',
+        '["count", "label", "step", "total", "unit", "updated_at"]',
+        'PROGRESS_UNITS = Object.freeze(["", "bytes", "entries", "files"])',
         'model.progress === undefined ? identityKeys : identityKeys.concat("progress")',
         'model.progress !== undefined && (!progress || model.state !== "pending")',
         "model.operation !== expectedOperation",

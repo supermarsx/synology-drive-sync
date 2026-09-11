@@ -1617,7 +1617,37 @@ class RuntimeTests(unittest.TestCase):
     with Path({str(queue_argv_capture)!r}).open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(sys.argv[2:], separators=(",", ":")) + "\\n")
 '''
-            consume = f'''\nif len(sys.argv) == 4 and sys.argv[1] == "--reject-job":
+            consume = f'''\nif len(sys.argv) == 6 and sys.argv[1] == "--fail-job":
+    request = Path(sys.argv[2])
+    response = Path(sys.argv[3])
+    cause = sys.argv[4]
+    exit_word = sys.argv[5]
+    try:
+        job_payload = json.loads(request.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        job_payload = {{}}
+    mode = job_payload.get("test_fail_job_mode") or ""
+    known_cause = cause in ("classification_failed", "secret_claim_failed", "consumer_failed", "consumer_wrote_no_result")
+    with Path({str(queue_capture)!r}).open("a", encoding="utf-8") as stream:
+        if mode == "refuse":
+            stream.write(f"fail-job-refused {{request.stem}}\\n")
+        elif mode == "absent":
+            stream.write(f"fail-job-absent {{request.stem}}\\n")
+        elif not known_cause or not exit_word.isdigit() or int(exit_word) > 255:
+            stream.write(f"fail-job-bad-argv {{request.stem}} {{cause}} {{exit_word}}\\n")
+        else:
+            stream.write(f"rejected {{request.stem}}\\n")
+    if mode == "refuse":
+        raise SystemExit(75)
+    if mode == "absent":
+        raise SystemExit(1)
+    if not known_cause or not exit_word.isdigit() or int(exit_word) > 255:
+        raise SystemExit(64)
+    response.write_text(json.dumps({{"schema": "sdsync.dsm-result.v1", "ok": False, "code": cause, "message": "controller failure", "exit_code": int(exit_word)}}, separators=(",", ":")) + "\\n", encoding="utf-8")
+    response.chmod(0o600)
+    raise SystemExit(0)
+
+if len(sys.argv) == 4 and sys.argv[1] == "--reject-job":
     request = Path(sys.argv[2])
     response = Path(sys.argv[3])
     with Path({str(queue_capture)!r}).open("a", encoding="utf-8") as stream:
@@ -1638,6 +1668,11 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
     connection_job = job_payload.get("operation") in ("test-profile-auth", "browse-remote")
     concurrent_job = job_payload.get("operation") in ("action", "sync-status", "resync", "clear-logs")
     capture = Path({str(queue_capture)!r})
+    death = job_payload.get("test_exit")
+    if isinstance(death, int) and not isinstance(death, bool):
+        with capture.open("a", encoding="utf-8") as stream:
+            stream.write(f"{{job_id}} died {{death}}\\n")
+        raise SystemExit(death)
     # One exclusion lane per job class, because the controller's guarantee is
     # per class rather than global. A connection probe is exempt as it always
     # was; a concurrent job excludes only other concurrent jobs; a serialized
@@ -2306,12 +2341,16 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "    except (OSError, json.JSONDecodeError):\n"
             "        raise SystemExit(73)\n"
             "    operation = payload.get('operation')\n"
+            "    classify_exit = payload.get('test_classify_exit')\n"
+            "    if isinstance(classify_exit, int) and not isinstance(classify_exit, bool):\n"
+            "        raise SystemExit(classify_exit)\n"
+            "    named = ' ' + operation if isinstance(operation, str) else ''\n"
             "    if operation in ('test-profile-auth', 'browse-remote'):\n"
-            "        print('connection')\n"
+            "        print('connection' + named)\n"
             "    elif operation in ('action', 'sync-status', 'resync', 'clear-logs'):\n"
-            "        print('concurrent')\n"
+            "        print('concurrent' + named)\n"
             "    else:\n"
-            "        print('serialized')\n"
+            "        print('serialized' + named)\n"
             "    raise SystemExit(0)\n"
             "\n"
             f"{consumer_tree}"
@@ -3088,6 +3127,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         ready: Path | None = None,
         release: Path | None = None,
         ignore_term: bool = False,
+        exit_code: int | None = None,
+        classify_exit: int | None = None,
+        fail_job_mode: str | None = None,
     ) -> Path:
         payload: dict[str, object] = {"operation": operation}
         if ready is not None or release is not None:
@@ -3097,6 +3139,15 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             payload["test_release"] = str(release)
         if ignore_term:
             payload["test_ignore_term"] = True
+        # Fault hooks read by the mock bridge: a consumer that exits with this
+        # status having written nothing, a classifier that fails with this
+        # status, and how the --fail-job mode answers.
+        if exit_code is not None:
+            payload["test_exit"] = exit_code
+        if classify_exit is not None:
+            payload["test_classify_exit"] = classify_exit
+        if fail_job_mode is not None:
+            payload["test_fail_job_mode"] = fail_job_mode
         request = self.real_var / f"control/requests/{job_id}.json"
         request.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
         request.chmod(0o600)
@@ -10963,6 +11014,224 @@ fi
         )
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
         self.assertEqual(stopped.returncode, 0, stopped.stderr)
+
+    def controller_events(self) -> list[dict[str, object]]:
+        return [
+            json.loads(line)
+            for line in (self.real_var / "log/controller.log")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line
+        ]
+
+    def wait_for_controller_event(
+        self, event: str, *, timeout: float = 15.0
+    ) -> list[dict[str, object]]:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            matches = [
+                record for record in self.controller_events() if record.get("event") == event
+            ]
+            if matches:
+                return matches
+            time.sleep(0.03)
+        self.fail(f"controller never logged {event}")
+
+    def event_details(self, event: str) -> list[str]:
+        return [
+            str(record.get("detail", ""))
+            for record in self.controller_events()
+            if record.get("event") == event
+        ]
+
+    def start_controller_for_queued_jobs(self) -> None:
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.addCleanup(lambda: self.shell(self.lifecycle, "stop", timeout=15))
+
+    def test_controller_publishes_consumer_failed_for_a_concurrent_consumer_that_died(self) -> None:
+        # Contract row 1: a consumer SIGKILLed mid-job. The class the bridge
+        # assigned says the job commits nothing, so "it failed, with this exit
+        # status" is the whole truth and reaches the dashboard as a named result
+        # rather than as a request that reads as never accepted.
+        bridge_capture = self.root / "consumer-killed-capture"
+        bridge_lock = self.root / "consumer-killed-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        job_id = "e" * 48
+        self.write_mock_control_job(job_id, "sync-status", exit_code=137)
+        self.start_controller_for_queued_jobs()
+        response = self.real_var / f"control/responses/{job_id}.json"
+        self.wait_for_path(response, "a killed concurrent consumer was left unresolved", timeout=15)
+        published = json.loads(response.read_text(encoding="utf-8"))
+        self.assertEqual(
+            (published["ok"], published["code"], published["exit_code"]),
+            (False, "consumer_failed", 137),
+        )
+        records = bridge_capture.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(records, [f"{job_id} died 137", f"rejected {job_id}"])
+        self.assertIn(f"id={job_id} op=sync-status exit=137", self.event_details("control_consumer_failed"))
+        self.assertEqual(self.event_details("control_consumer_outcome_unknown"), [])
+        self.assertEqual(self.event_details("control_request_rejection_failed"), [])
+        self.wait_for_absence(
+            self.real_var / f"control/processing/{job_id}.json",
+            "the processing request outlived its terminal result",
+        )
+
+    def test_controller_publishes_consumer_wrote_no_result_for_a_silent_clean_exit(self) -> None:
+        # Contract row 2: exit 0 with nothing written. Same class gate as row 1;
+        # a different code, because an operator needs a different answer for a
+        # worker that finished cleanly without saying what it did.
+        bridge_capture = self.root / "consumer-silent-capture"
+        bridge_lock = self.root / "consumer-silent-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        job_id = "f" * 48
+        self.write_mock_control_job(job_id, "resync", exit_code=0)
+        self.start_controller_for_queued_jobs()
+        response = self.real_var / f"control/responses/{job_id}.json"
+        self.wait_for_path(response, "a silent clean exit was left unresolved", timeout=15)
+        published = json.loads(response.read_text(encoding="utf-8"))
+        self.assertEqual(
+            (published["ok"], published["code"], published["exit_code"]),
+            (False, "consumer_wrote_no_result", 0),
+        )
+        self.assertEqual(
+            bridge_capture.read_text(encoding="utf-8").splitlines(),
+            [f"{job_id} died 0", f"rejected {job_id}"],
+        )
+        self.assertIn(f"id={job_id} op=resync exit=0", self.event_details("control_consumer_failed"))
+
+    def test_controller_leaves_a_dead_serialized_consumer_unresolved_on_purpose(self) -> None:
+        # The negative case that protects the design: a serialized job may have
+        # committed part of a configuration change before it died, so no result
+        # is published. Publishing one would make the audit outbox adopt a
+        # `failed` verdict where finding no response beside a dead owner is
+        # exactly what makes it record outcome_unknown.
+        bridge_capture = self.root / "serialized-death-capture"
+        bridge_lock = self.root / "serialized-death-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        job_id = "a1" * 24
+        self.write_mock_control_job(job_id, "configure-profile", exit_code=137)
+        self.start_controller_for_queued_jobs()
+        unknown = self.wait_for_controller_event("control_consumer_outcome_unknown")
+        self.assertEqual(
+            [record.get("detail") for record in unknown],
+            [f"id={job_id} op=configure-profile exit=137 class=serialized"],
+        )
+        self.assertEqual(unknown[0].get("level"), "warn")
+        self.wait_for_absence(
+            self.real_var / f"control/processing/{job_id}.json",
+            "the processing request was not released after the consumer died",
+        )
+        self.assertFalse((self.real_var / f"control/responses/{job_id}.json").exists())
+        self.assertEqual(
+            bridge_capture.read_text(encoding="utf-8").splitlines(),
+            [f"{job_id} died 137"],
+        )
+        self.assertIn(
+            f"id={job_id} op=configure-profile exit=137",
+            self.event_details("control_consumer_failed"),
+        )
+
+    def test_controller_terminalizes_a_job_it_cannot_classify(self) -> None:
+        # Contract row 3. Previously the job stayed in requests/ forever and
+        # read as pending; now it is a named refusal to schedule, carrying the
+        # classifier's exit status, and the request is gone.
+        bridge_capture = self.root / "classify-failed-capture"
+        bridge_lock = self.root / "classify-failed-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        job_id = "b2" * 24
+        self.write_mock_control_job(job_id, "sync-status", classify_exit=73)
+        self.start_controller_for_queued_jobs()
+        response = self.real_var / f"control/responses/{job_id}.json"
+        self.wait_for_path(response, "an unclassifiable job was left pending", timeout=15)
+        published = json.loads(response.read_text(encoding="utf-8"))
+        self.assertEqual(
+            (published["ok"], published["code"], published["exit_code"]),
+            (False, "classification_failed", 73),
+        )
+        self.assertEqual(
+            bridge_capture.read_text(encoding="utf-8").splitlines(), [f"rejected {job_id}"]
+        )
+        self.assertIn(
+            f"id={job_id} exit=73 turn=primary",
+            self.event_details("control_request_classification_failed"),
+        )
+        self.assertFalse((self.real_var / f"control/requests/{job_id}.json").exists())
+        self.wait_for_absence(
+            self.real_var / f"control/processing/{job_id}.json",
+            "the unclassifiable request was not released",
+        )
+
+    def write_unclaimable_secret_job(self, job_id: str, *, fail_job_mode: str) -> Path:
+        real_mv = shutil.which("mv")
+        self.assertIsNotNone(real_mv)
+        failing_mv = self.fake_system_bin / "mv"
+        failing_mv.write_text(
+            "#!/bin/sh\n"
+            "case ${1:-}:${2:-} in *.secret:*.secret) exit 74 ;; esac\n"
+            f"exec {shlex.quote(str(real_mv))} \"$@\"\n",
+            encoding="utf-8",
+        )
+        failing_mv.chmod(0o755)
+        request = self.write_mock_control_job(job_id, "set-secret", fail_job_mode=fail_job_mode)
+        secret = self.real_var / f"control/requests/{job_id}.secret"
+        secret.write_text("never-dispatch-this\n", encoding="utf-8")
+        secret.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(secret, self.drop_uid, self.drop_gid)
+        return request
+
+    def test_controller_never_falls_back_to_a_generic_rejection_when_the_bridge_refuses(self) -> None:
+        # Exit 75 from --fail-job is the bridge refusing on the outcome-unknown
+        # rule, having deliberately written nothing. The generic --reject-job
+        # has no such rule, so falling back to it would publish the exact
+        # document the refusal exists to withhold. Unreachable from the
+        # shipped class gate; pinned so the gate is not the only thing between
+        # a dead serialized consumer and a false terminal verdict.
+        bridge_capture = self.root / "fail-job-refused-capture"
+        bridge_lock = self.root / "fail-job-refused-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        job_id = "c3" * 24
+        self.write_unclaimable_secret_job(job_id, fail_job_mode="refuse")
+        self.start_controller_for_queued_jobs()
+        rejection_failed = self.wait_for_controller_event("control_request_rejection_failed")
+        self.assertEqual(
+            [record.get("detail") for record in rejection_failed],
+            [f"id={job_id} cause=secret_claim_failed exit=75"],
+        )
+        self.assertEqual(rejection_failed[0].get("level"), "error")
+        self.assertEqual(
+            bridge_capture.read_text(encoding="utf-8").splitlines(),
+            [f"fail-job-refused {job_id}"],
+            "a refused --fail-job must not be followed by --reject-job",
+        )
+        self.assertFalse((self.real_var / f"control/responses/{job_id}.json").exists())
+        self.wait_for_absence(
+            self.real_var / f"control/processing/{job_id}.json",
+            "the refused request was not released",
+        )
+        self.assertFalse((self.real_var / f"control/processing/{job_id}.secret").exists())
+
+    def test_controller_falls_back_to_the_generic_rejection_on_a_bridge_without_fail_job(self) -> None:
+        # A bridge that predates --fail-job declines the mode with an ordinary
+        # failure and writes nothing; the fallback asks whether a response
+        # exists rather than reading an exit status, and publishes the generic
+        # rejection so the job still ends in a terminal result.
+        bridge_capture = self.root / "fail-job-absent-capture"
+        bridge_lock = self.root / "fail-job-absent-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        job_id = "d4" * 24
+        self.write_unclaimable_secret_job(job_id, fail_job_mode="absent")
+        self.start_controller_for_queued_jobs()
+        response = self.real_var / f"control/responses/{job_id}.json"
+        self.wait_for_path(response, "the fallback rejection was not published", timeout=15)
+        published = json.loads(response.read_text(encoding="utf-8"))
+        self.assertEqual((published["ok"], published["code"]), (False, "operation_failed"))
+        self.assertEqual(
+            bridge_capture.read_text(encoding="utf-8").splitlines(),
+            [f"fail-job-absent {job_id}", f"rejected {job_id}"],
+        )
+        self.assertEqual(self.event_details("control_request_rejection_failed"), [])
 
     def test_controller_dispatches_physical_pkgvar_jobs_through_framework_aliases(self) -> None:
         runtime_common = self.real_target / "libexec/sdsync-common"

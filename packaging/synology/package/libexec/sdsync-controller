@@ -35,6 +35,29 @@ valid_request_id() {
     [ "${#1}" -eq 48 ]
 }
 
+# Control files are named for one of two identifiers, and the prune loop walks
+# directories holding both. Requests, processing claims and responses are named
+# for the 48-hex server job id. A progress record is named for the pair it is
+# bound to -- <client request id>.<server job id> -- because the bridge's reader
+# rebuilds that name from ids it resolved itself and will open no other. The
+# shape is therefore a property of the directory, not of the controller.
+valid_control_file_id() {
+    case ${2:-} in
+        progress)
+            control_id_client=${1%%.*}
+            control_id_job=${1#*.}
+            [ "$control_id_job" != "${1:-}" ] || return 1
+            case $control_id_client in ''|*[!a-f0-9]*) return 1 ;; esac
+            case $control_id_job in ''|*[!a-f0-9]*) return 1 ;; esac
+            [ "${#control_id_client}" -eq 32 ] && [ "${#control_id_job}" -eq 48 ]
+            ;;
+        *)
+            case ${1:-} in ''|*[!a-f0-9]*) return 1 ;; esac
+            [ "${#1}" -eq 48 ]
+            ;;
+    esac
+}
+
 private_control_file() {
     control_path=$1
     [ -f "$control_path" ] && [ ! -L "$control_path" ] && [ -r "$control_path" ] || return 1
@@ -69,23 +92,79 @@ prune_expired_control_files() {
     load_security_policy_runtime
     prune_now=$(epoch_now)
     case $prune_now in ''|*[!0-9]*) return 0 ;; esac
-    for prune_dir in "$control_requests" "$control_processing" "$control_responses"; do
+    for prune_dir in "$control_requests" "$control_processing" "$control_responses" "$control_progress"; do
         case $prune_dir in
-            "$control_requests") prune_max_age=86400; prune_kind=request ;;
-            "$control_processing") prune_max_age=3600; prune_kind=processing_indeterminate ;;
-            *) prune_max_age=$security_runtime_result_retention; prune_kind=response ;;
+            "$control_requests") prune_max_age=86400; prune_kind=request; prune_level=debug ;;
+            # A claim this old means the consumer that held it is gone. That is
+            # the one expiry an operator needs to see, because it is the only
+            # one that describes work which was started and never accounted
+            # for; the rest are ordinary housekeeping.
+            "$control_processing") prune_max_age=3600; prune_kind=processing_indeterminate; prune_level=warn ;;
+            # Progress records are advisory and are only ever read for a job
+            # still reported as pending, so a record outliving its job is
+            # unreadable rather than wrong. Reclaiming it by age is what keeps
+            # the directory bounded when nothing published a result at all --
+            # the case no writer can clean up after itself.
+            "$control_progress") prune_max_age=3600; prune_kind=progress; prune_level=debug ;;
+            *) prune_max_age=$security_runtime_result_retention; prune_kind=response; prune_level=debug ;;
         esac
         for prune_path in "$prune_dir"/*.json "$prune_dir"/*.secret; do
             [ -e "$prune_path" ] || [ -L "$prune_path" ] || continue
             prune_name=${prune_path##*/}
             case $prune_name in *.json) prune_id=${prune_name%.json} ;; *.secret) prune_id=${prune_name%.secret} ;; *) continue ;; esac
-            valid_request_id "$prune_id" || continue
+            valid_control_file_id "$prune_id" "$prune_kind" || continue
             if control_file_expired "$prune_path" "$prune_now" "$prune_max_age"; then
                 rm -f "$prune_path"
-                controller_log_event debug control_file_expired "id=$prune_id kind=$prune_kind"
+                controller_log_event "$prune_level" control_file_expired "id=$prune_id kind=$prune_kind"
             fi
         done
     done
+}
+
+# Publish a terminal result for a claimed job whose consumer resolved nothing.
+#
+# Every exit from the queue loop below that deletes a processing request without
+# a published response leaves the operator with "unresolved", which the
+# dashboard cannot tell apart from a request that was never accepted -- so a job
+# that failed for a knowable reason and a job that never existed read the same.
+# This is the mechanism the secret-claim rejection already uses, with the cause
+# attached: the native side owns the job document, the audit transaction and the
+# response schema, so it supplies the operation and the envelope, and the
+# controller supplies the two things only it knows -- why the consumer stopped,
+# and with what status.
+#
+# One exec, the same as the rejection it copies. The --reject-job fallback costs
+# a second only against a bridge that predates --fail-job, and it is reached by
+# asking whether a response exists rather than by reading an exit status,
+# because a bridge that does not recognise the mode may decline it either way.
+# The answer is that same question, so a caller can never record a terminal
+# result that was not actually written.
+publish_control_failure() {
+    failure_request=$1
+    failure_response=$2
+    failure_cause=$3
+    failure_exit=$4
+    failure_publish_exit=0
+    "$api_bridge" --fail-job "$failure_request" "$failure_response" \
+        "$failure_cause" "$failure_exit" >/dev/null 2>&1 || failure_publish_exit=$?
+    # 75 is the bridge refusing on the outcome-unknown rule, and it wrote
+    # nothing on purpose. The generic rejection below has no such rule, so
+    # falling back to it here would publish the exact document the refusal
+    # exists to withhold. Unreachable while the post-dispatch caller is gated
+    # on the job class; kept so that the gate is not the only thing between a
+    # dead serialized consumer and a false terminal verdict.
+    [ "$failure_publish_exit" -ne 75 ] || return 75
+    # Asked once, and the answer is the return value. A response that is simply
+    # absent costs nothing to rule out -- the existence test in
+    # private_control_file settles it before the stat -- so the whole check is
+    # one exec on the path that wrote something and none on the path that
+    # did not.
+    if private_control_file "$failure_response"; then
+        return 0
+    fi
+    "$api_bridge" --reject-job "$failure_request" "$failure_response" >/dev/null 2>&1 \
+        || failure_publish_exit=$?
+    private_control_file "$failure_response"
 }
 
 process_control_queue() {
@@ -123,19 +202,47 @@ process_control_queue() {
             continue
         }
         queued_classification=unknown
+        # Distinct from the classification itself. "unknown" is what the
+        # scheduler assumes when it has no answer, and it assumes the strictest
+        # one; whether an answer was ever given is a different question, and it
+        # is the one that decides afterwards whether a failure can be described
+        # exactly or only reported as unknown.
+        queued_classified=false
+        queued_operation=
+        queued_terminal_cause=
+        queued_terminal_exit=0
         set +e
         classification_output=$("$api_bridge" --classify-queued-job "$queued_id")
         classification_exit=$?
         set -e
         if [ "$classification_exit" -eq 0 ]; then
-            case $classification_output in
-                connection|concurrent|serialized) queued_classification=$classification_output ;;
+            # The classifier may name the operation after the class. Taking it
+            # here is what lets a consumer failure say which operation died
+            # without the controller parsing the job itself: the one fork this
+            # needs has already happened, and parsing the job would add another
+            # to every admission. A bridge that prints the class alone leaves
+            # the operation unnamed, which is exactly today's behaviour.
+            queued_operation=${classification_output#* }
+            [ "$queued_operation" != "$classification_output" ] || queued_operation=
+            case $queued_operation in *[!a-z-]*) queued_operation= ;; esac
+            case ${classification_output%% *} in
+                connection|concurrent|serialized)
+                    queued_classification=${classification_output%% *}
+                    queued_classified=true
+                    ;;
                 *) classification_exit=73 ;;
             esac
         fi
         if [ "$interactive_only" = true ]; then
             if [ "$classification_exit" -ne 0 ]; then
-                controller_log_event error control_request_classification_failed "id=$queued_id exit=$classification_exit"
+                # Retryable by construction, and that is why only the primary
+                # turn ever terminalizes a job it could not classify. The
+                # request is still in requests/, so the next primary turn asks
+                # again; a classifier that failed because it was momentarily
+                # out of memory or out of processes therefore costs a turn
+                # rather than the job. Warn, not error: this one is expected to
+                # be answered by the retry.
+                controller_log_event warn control_request_classification_failed "id=$queued_id exit=$classification_exit turn=auxiliary"
                 break
             fi
             # What this turn may claim depends on what the primary worker
@@ -165,8 +272,25 @@ process_control_queue() {
                     ;;
                 concurrent) break ;;
             esac
+        elif [ "$classification_exit" -ne 0 ]; then
+            # The primary turn is the one that already retried, so this is the
+            # end of the line. Today it dispatches the job anyway, under the
+            # strictest class, to a consumer that will parse exactly the
+            # document the classifier could not -- and when that consumer
+            # declines it, nothing is published and the request reads as one
+            # that was never accepted. Claiming it and saying so is both more
+            # useful and more accurate: a job that could not be described was
+            # never scheduled, so nothing it might have committed is in doubt.
+            controller_log_event error control_request_classification_failed "id=$queued_id exit=$classification_exit turn=primary"
+            queued_terminal_cause=classification_failed
+            queued_terminal_exit=$classification_exit
         fi
         if ! mv "$queued_request" "$processing_request"; then
+            # A claim that cannot be taken leaves the request exactly where it
+            # was, for the next turn. It was the one queue exit with no record
+            # of any kind, so a request that could never be claimed stayed
+            # pending with nothing anywhere to say why.
+            controller_log_event warn control_request_claim_failed "id=$queued_id"
             [ "$interactive_only" = true ] && break
             continue
         fi
@@ -200,13 +324,27 @@ process_control_queue() {
         consumer_response_final=$package_base/var/control/responses/$queued_id.json
         if [ "$secret_claim_failed" = true ]; then
             controller_log_event error control_secret_rejected "id=$queued_id reason=claim_failed"
+            queued_terminal_cause=secret_claim_failed
+            queued_terminal_exit=0
+        fi
+        if [ -n "$queued_terminal_cause" ]; then
             # The native rejection path parses the immutable job, finalizes its
             # audit transaction, and publishes an exact terminal failure without
             # invoking the profile manager or exposing the sidecar value.
-            if "$api_bridge" --reject-job "$consumer_processing_request" "$consumer_response_final"; then
-                controller_log_event debug control_request_rejected_terminal "id=$queued_id"
+            #
+            # Both causes that reach here are refusals to schedule: no consumer
+            # was started, so no part of the operation can have run, and the
+            # failure is exact rather than a verdict on work nobody watched.
+            if publish_control_failure "$consumer_processing_request" "$consumer_response_final" \
+                "$queued_terminal_cause" "$queued_terminal_exit"; then
+                controller_log_event debug control_request_rejected_terminal "id=$queued_id cause=$queued_terminal_cause"
             else
-                controller_log_event error control_request_rejection_failed "id=$queued_id"
+                # The last silence the controller cannot fill. Writing the
+                # response is the bridge's to do -- the schema needs the job's
+                # own session binding and audit transaction, which this layer
+                # deliberately never reads -- so when that fails, the exit
+                # status is all there is to hand the operator.
+                controller_log_event error control_request_rejection_failed "id=$queued_id cause=$queued_terminal_cause exit=$failure_publish_exit"
             fi
             rm -f "$queued_secret" "$processing_secret" "$processing_request" 2>/dev/null || true
             break
@@ -245,6 +383,16 @@ process_control_queue() {
             primary_control_processing_request=$processing_request
             primary_control_processing_secret=$processing_secret
             primary_control_interactive_only=$interactive_only
+            # The class, whether it was ever established, the operation name and
+            # the two framework-alias paths are now read after the wait as well
+            # as before it, so they join the claim above. A nested turn assigns
+            # every one of them for its own job; restoring only the first five
+            # would describe this consumer's failure using the other's identity.
+            primary_control_classification=$queued_classification
+            primary_control_classified=$queued_classified
+            primary_control_operation=$queued_operation
+            primary_consumer_processing_request=$consumer_processing_request
+            primary_consumer_response_final=$consumer_response_final
             wait_for_runner
             control_exit=$scheduled_exit
             queued_id=$primary_control_queued_id
@@ -252,14 +400,65 @@ process_control_queue() {
             processing_request=$primary_control_processing_request
             processing_secret=$primary_control_processing_secret
             interactive_only=$primary_control_interactive_only
+            queued_classification=$primary_control_classification
+            queued_classified=$primary_control_classified
+            queued_operation=$primary_control_operation
+            consumer_processing_request=$primary_consumer_processing_request
+            consumer_response_final=$primary_consumer_response_final
         fi
+        # One stat, not two. Whether a result was published is the question this
+        # block asks three times over -- to judge the consumer, to decide
+        # whether anything may be written, and to record what happened -- and it
+        # cannot change between them: the same process asks, with no file
+        # operation in between. Sampling it once is also what lets the answer be
+        # used below, where re-asking would be a fork on every completed job.
+        response_published=false
         response_size=0
         if private_control_file "$response_final"; then
+            response_published=true
             response_size=$(wc -c < "$response_final" | tr -d ' ')
         fi
         case $response_size in ''|*[!0-9]*) response_size=1048577 ;; esac
-        if [ "$control_exit" -ne 0 ] || ! private_control_file "$response_final" || [ "$response_size" -gt 1048576 ]; then
-            controller_log_event error control_consumer_failed "id=$queued_id exit=$control_exit"
+        if [ "$control_exit" -ne 0 ] || [ "$response_published" = false ] || [ "$response_size" -gt 1048576 ]; then
+            controller_log_event error control_consumer_failed "id=$queued_id op=${queued_operation:-unknown} exit=$control_exit"
+            if [ "$response_published" = true ]; then
+                # The consumer published its own account of what happened.
+                # Whether it then exited badly, or wrote more than the bridge
+                # will read back, replacing that document with a verdict formed
+                # out here would overwrite the only first-hand record there is.
+                :
+            elif [ "$queued_classified" = true ] && [ "$queued_classification" != serialized ]; then
+                # Nothing was published, and the class the bridge itself
+                # assigned says this job commits no profile, credential, policy
+                # or scheduler state. "It failed" is therefore the whole truth
+                # rather than a guess about half-committed work, and the
+                # operator gets the reason instead of a request that reads as
+                # one the package never accepted. This is the case the user
+                # actually hits: every slow operation -- the status walk,
+                # Doctor, run, plan, resync -- is in this class.
+                if [ "$control_exit" -eq 0 ]; then
+                    consumer_cause=consumer_wrote_no_result
+                else
+                    consumer_cause=consumer_failed
+                fi
+                if publish_control_failure "$consumer_processing_request" "$consumer_response_final" \
+                    "$consumer_cause" "$control_exit"; then
+                    controller_log_event debug control_request_rejected_terminal "id=$queued_id cause=$consumer_cause"
+                else
+                    controller_log_event error control_request_rejection_failed "id=$queued_id cause=$consumer_cause exit=$failure_publish_exit"
+                fi
+            else
+                # A serialized job may have committed part of a configuration
+                # mutation before it died, and one that was never classified was
+                # never described at all. Publishing a failure here would turn
+                # an outcome nobody knows into one the dashboard claims to know,
+                # and it would do it by overwriting the evidence: a response
+                # makes the audit outbox adopt that verdict, where finding none
+                # beside a dead owner is exactly what makes it record
+                # outcome_unknown. So this stays unresolved on purpose, and the
+                # line below is what links the request to the reconciliation.
+                controller_log_event warn control_consumer_outcome_unknown "id=$queued_id op=${queued_operation:-unknown} exit=$control_exit class=$queued_classification"
+            fi
         else
             controller_log_event debug control_consumer_completed "id=$queued_id"
         fi

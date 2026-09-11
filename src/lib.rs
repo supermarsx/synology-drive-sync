@@ -10,6 +10,7 @@ pub mod observability;
 pub mod path;
 pub mod plan;
 pub mod progress;
+pub mod progress_record;
 pub mod sdk;
 pub mod source_diagnostics;
 pub mod status_cache;
@@ -86,6 +87,184 @@ pub fn doctor_section(id: &str) -> Option<(&'static str, u8)> {
         .iter()
         .find(|(section_id, _, _)| *section_id == id)
         .map(|&(_, label, step)| (label, step))
+}
+
+/// What a phase's running count counts.
+///
+/// An enum rather than free text, for exactly the reason the label is one: a progress record
+/// contributes a phase id and nothing else that reaches an administrator's screen, so the unit has
+/// to be resolved from this catalogue too. [`Self::None`] is the determinate case -- a phase with
+/// no meaningful running total renders as a step and a label alone.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PhaseUnit {
+    #[default]
+    None,
+    Files,
+    Entries,
+    Bytes,
+}
+
+impl PhaseUnit {
+    /// The wire token for this unit. Empty means "report no count".
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::Files => "files",
+            Self::Entries => "entries",
+            Self::Bytes => "bytes",
+        }
+    }
+}
+
+/// One phase of a long-running operation.
+///
+/// Unlike [`DOCTOR_SECTION_SPECS`], these tables carry no explicit step: a phase's step *is* its
+/// position, because these operations execute and display in the same order. Doctor is the
+/// exception -- it reports File Station capabilities before authentication but prints them after --
+/// which is why its table keeps a step column and this one does not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhaseSpec {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub unit: PhaseUnit,
+}
+
+const fn phase(id: &'static str, label: &'static str, unit: PhaseUnit) -> PhaseSpec {
+    PhaseSpec { id, label, unit }
+}
+
+/// A phase resolved against the catalogue of the operation that is actually running.
+///
+/// Every field is derived locally. `step`/`total` describe the *phase*, never the work: phase
+/// counts are known before the operation starts, so "Step 5 of 7" is always true. The work within
+/// a phase is the part that is genuinely unknown, which is what `count` reports and why there is
+/// no percentage anywhere in this design -- the denominator does not exist.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedPhase {
+    pub label: &'static str,
+    pub step: u8,
+    pub total: u8,
+    pub unit: PhaseUnit,
+}
+
+/// The catalogue key for a diagnostic run. Resolved through [`DOCTOR_SECTION_SPECS`], not
+/// [`PHASE_SPECS`], because its steps are a permutation of its display order.
+pub const PROGRESS_OPERATION_DOCTOR: &str = "doctor";
+
+/// The seven phases of a scoped status query, in the order `run_status` performs them.
+pub const SYNC_STATUS_PHASE_SPECS: [PhaseSpec; 7] = [
+    phase("scan_local", "Scanning local files", PhaseUnit::Files),
+    phase("connect", "Connecting to DSM", PhaseUnit::None),
+    phase("authenticate", "Authenticating", PhaseUnit::None),
+    phase("list_remote", "Listing remote files", PhaseUnit::Entries),
+    phase("compare", "Comparing file contents", PhaseUnit::Files),
+    phase("build_report", "Building the report", PhaseUnit::None),
+    phase("store_results", "Storing results", PhaseUnit::None),
+];
+
+/// The six phases a planning run performs before it reports and stops.
+pub const PLAN_PHASE_SPECS: [PhaseSpec; 6] = [
+    phase("scan_local", "Scanning local files", PhaseUnit::Files),
+    phase("connect", "Connecting to DSM", PhaseUnit::None),
+    phase("authenticate", "Authenticating", PhaseUnit::None),
+    phase("list_remote", "Listing remote files", PhaseUnit::Entries),
+    phase("compare", "Comparing file contents", PhaseUnit::Files),
+    phase("build_plan", "Building the plan", PhaseUnit::None),
+];
+
+/// The eight phases of a run that executes its plan.
+///
+/// Shared by `run` and `resync` because both reach them through the same code path. A resync that
+/// was asked only to plan stops at `build_plan` and never reports the last two; that is the same
+/// honesty `step`/`total` buys everywhere else -- the operator is told which phase is running, not
+/// a guess at how much of the whole remains.
+pub const SYNC_PHASE_SPECS: [PhaseSpec; 8] = [
+    phase("scan_local", "Scanning local files", PhaseUnit::Files),
+    phase("connect", "Connecting to DSM", PhaseUnit::None),
+    phase("authenticate", "Authenticating", PhaseUnit::None),
+    phase("list_remote", "Listing remote files", PhaseUnit::Entries),
+    phase("compare", "Comparing file contents", PhaseUnit::Files),
+    phase("build_plan", "Building the plan", PhaseUnit::None),
+    phase("upload", "Uploading files", PhaseUnit::Files),
+    phase("reconcile", "Verifying the result", PhaseUnit::None),
+];
+
+/// The four phases of a bounded connection probe.
+pub const CONNECTION_PHASE_SPECS: [PhaseSpec; 4] = [
+    phase(
+        "resolve_secrets",
+        "Reading stored credentials",
+        PhaseUnit::None,
+    ),
+    phase("authenticate", "Authenticating", PhaseUnit::None),
+    phase("contact", "Contacting File Station", PhaseUnit::None),
+    phase("logout", "Ending the DSM session", PhaseUnit::None),
+];
+
+/// Every phase catalogue, keyed by the operation that walks it.
+///
+/// The keys are progress catalogue keys, deliberately not the queued-mutation operation ids: three
+/// operational actions share the id `action` and walk three different sequences, so keying on the
+/// wire id would resolve a planning run against an upload catalogue. The bridge derives the key
+/// from the mutation it parsed, the same way it derives the audit operation.
+///
+/// `doctor` is absent on purpose and lives in [`DOCTOR_SECTION_SPECS`]; [`operation_phase`] is the
+/// one resolver that covers both, so no caller has to know which table an operation uses.
+pub const PHASE_SPECS: [(&str, &[PhaseSpec]); 5] = [
+    ("sync-status", &SYNC_STATUS_PHASE_SPECS),
+    ("plan", &PLAN_PHASE_SPECS),
+    ("run", &SYNC_PHASE_SPECS),
+    ("resync", &SYNC_PHASE_SPECS),
+    ("connection", &CONNECTION_PHASE_SPECS),
+];
+
+/// The phases an operation walks, or `None` if it publishes no progress.
+#[must_use]
+pub fn operation_phases(operation: &str) -> Option<&'static [PhaseSpec]> {
+    PHASE_SPECS
+        .iter()
+        .find(|(key, _)| *key == operation)
+        .map(|&(_, specs)| specs)
+}
+
+/// Resolve one phase id against the catalogue of the operation that is running.
+///
+/// This is the allow-list the progress record is validated through, and it is the only place the
+/// two catalogue shapes meet. Callers handling untrusted input rely on the `None` arm: a record
+/// naming a phase that this operation does not have yields no progress at all, rather than an
+/// unlabelled step or -- far worse -- a label the job chose.
+///
+/// Resolution is bound to the operation, so a status walk cannot report itself as being on a
+/// diagnostic section, and a phase id that exists in some other catalogue is still rejected here.
+#[must_use]
+pub fn operation_phase(operation: &str, id: &str) -> Option<ResolvedPhase> {
+    if operation == PROGRESS_OPERATION_DOCTOR {
+        let (label, step) = doctor_section(id)?;
+        let total = u8::try_from(DOCTOR_SECTION_SPECS.len()).ok()?;
+        if step == 0 || step > total {
+            return None;
+        }
+        return Some(ResolvedPhase {
+            label,
+            step,
+            total,
+            unit: PhaseUnit::None,
+        });
+    }
+    let specs = operation_phases(operation)?;
+    let total = u8::try_from(specs.len()).ok()?;
+    let index = specs.iter().position(|spec| spec.id == id)?;
+    let step = u8::try_from(index + 1).ok()?;
+    if step == 0 || step > total {
+        return None;
+    }
+    Some(ResolvedPhase {
+        label: specs[index].label,
+        step,
+        total,
+        unit: specs[index].unit,
+    })
 }
 
 /// The key exchange groups the `ring` provider offers, in its own order.

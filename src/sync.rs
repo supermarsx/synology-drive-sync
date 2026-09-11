@@ -453,6 +453,7 @@ fn execute_with_observer<O: SyncOperations>(
             Ok(()) => {
                 client.preflight_upload_source(&action.local, &cancellation)?;
                 completed.copied += 1;
+                cancellation.tick();
                 report(ExecutionEvent::RemoteContentCopied {
                     from_remote_path: action.from_remote_path.clone(),
                     to_remote_path: action.to_remote_path.clone(),
@@ -465,6 +466,7 @@ fn execute_with_observer<O: SyncOperations>(
                 completed.uploaded_bytes = completed
                     .uploaded_bytes
                     .saturating_add(action.expected_size);
+                cancellation.tick();
                 report(ExecutionEvent::CopyFallbackUploaded {
                     relative: action.local.relative.clone(),
                     bytes: action.expected_size,
@@ -560,6 +562,10 @@ fn execute_with_observer<O: SyncOperations>(
                     Ok(()) => {
                         completed.uploaded += 1;
                         completed.uploaded_bytes = completed.uploaded_bytes.saturating_add(size);
+                        // Counted on completion, in the collector, rather than in each worker:
+                        // this thread already serialises every finished upload, so the running
+                        // total costs one relaxed increment and no contention between workers.
+                        cancellation.tick();
                         report(ExecutionEvent::Uploaded {
                             relative,
                             bytes: size,

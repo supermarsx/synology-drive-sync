@@ -23,6 +23,9 @@ pub const OTP_ENV: &str = "SDSYNC_OTP";
 pub const REMOTE_LOG_TOKEN_ENV: &str = "SDSYNC_REMOTE_LOG_TOKEN";
 pub const PLAN_CHANGES_EXIT_CODE: u8 = 10;
 
+/// Shared by every subcommand a DSM dashboard can queue, so the contract is stated once.
+const PROGRESS_RECORD_LONG_HELP: &str = "Publish which phase this run is in, and how many items it has counted within that phase, into FILE for a dashboard to poll. FILE names a job by its stem, as `<request id>.<job id>.json`, and both ids must be lowercase hexadecimal; anything else publishes nothing.\n\nThis is deliberately independent of --progress. That option decides whether a human-readable line is rendered to a terminal, and a queued request has no terminal; this one writes a small machine-readable document a supervising process reads. Setting --progress never (which a queued request does) does not suppress the record, and the record is never written to standard output or standard error.\n\nThe record is advisory. A file that cannot be written, a directory that does not exist, or a malformed FILE degrades the run to publishing nothing at all; none of them can fail the operation. Writes are throttled to one every two seconds, so the cost does not scale with the size of the tree, and the file is replaced atomically so a reader never observes a partial document.\n\nAbsent, nothing is published and the command behaves exactly as it did before this option existed.";
+
 const ROOT_LONG_ABOUT: &str = "Push one local folder into a Synology Drive-backed folder through the documented File Station WebAPI.\n\nThe explicit `sync` and `plan` commands are preferred. For compatibility, the former positional form (`synology-drive-sync SOURCE REMOTE ...`) remains representable and is interpreted as `sync`. Local data is authoritative and is never modified. Remote-only data is preserved unless --delete is selected.\n\nConnection and profile files are non-secret. Passwords, TOTP seeds, and logging bearer tokens are accepted only from masked/standard input, an OS vault, a referenced file, or a dedicated environment variable.";
 
 const ROOT_EXAMPLES: &str = "Examples:\n  synology-drive-sync sync ./export /team/export --url https://files.example.com --username mirror-bot\n  synology-drive-sync plan ./export /team/export --profile production --delete --output json\n  synology-drive-sync doctor --profile production\n  synology-drive-sync config validate --profile production\n  synology-drive-sync credentials set-password --profile production\n  synology-drive-sync completions powershell\n  synology-drive-sync manpage > synology-drive-sync.1\n  synology-drive-sync manpage --all ./man\n\nLegacy compatibility:\n  synology-drive-sync ./export /team/export --url https://files.example.com --username mirror-bot\n\nSecrets are never accepted as command-line or TOML values. Configuration may contain only paths to secret files. See `credentials --help` and the Authentication options.";
@@ -748,6 +751,27 @@ pub struct OutputArgs {
     )]
     pub progress: Option<ProgressMode>,
 
+    /// Publish which phase a queued dashboard request is in, into this file.
+    ///
+    /// Global for the same reason every other option in this group is: a caller should not have to
+    /// know whether it belongs before or after the subcommand. That matters more here than
+    /// elsewhere, because the caller is a shell script appending it at seven different sites, and
+    /// [`Cli::try_parse_checked_from`] rejects a *command-local* option placed before an explicit
+    /// subcommand -- which would turn a placement detail into a failed run.
+    ///
+    /// Deliberately no `env`, unlike its neighbour. The DSM manager runs the core several times
+    /// for unrelated things in the same process, and an inherited variable would have every one of
+    /// them overwrite the same record; the manager therefore passes this explicitly, only to the
+    /// invocation the record describes.
+    #[arg(
+        long = "progress-record",
+        global = true,
+        value_name = "FILE",
+        help_heading = "Output/Logging",
+        long_help = PROGRESS_RECORD_LONG_HELP
+    )]
+    pub progress_record: Option<PathBuf>,
+
     /// Select command-result output independently from diagnostic logs.
     #[arg(
         long,
@@ -1088,6 +1112,64 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    /// Every queueable subcommand accepts the record flag, before *and* after the subcommand.
+    ///
+    /// Three properties at once, and each one is a way the two halves could have failed to ship.
+    ///
+    /// It has to parse before anything passes it, or a package whose bridge learned to hand it
+    /// over first would fail argument parsing on every slow operation until the other half landed.
+    /// It has to stay optional, or rolling that half back would do the same thing in reverse.
+    /// That is the `--core-nice` property, asserted the way the supervised-core layouts assert it.
+    ///
+    /// And it has to parse in *either position*. The caller is a shell script appending it at
+    /// seven sites -- four of them Doctor routes -- and [`Cli::try_parse_checked_from`] refuses a
+    /// command-local option written before an explicit subcommand. A non-global argument here
+    /// would make the flag's placement load-bearing across all seven, which is exactly the kind of
+    /// coupling the optionality property exists to avoid.
+    #[test]
+    fn the_record_flag_is_global_optional_and_position_independent() {
+        let record = "/var/packages/x/var/control/progress/abc.def.json";
+        let parse = |arguments: &[&str]| {
+            let mut all = vec!["synology-drive-sync"];
+            all.extend_from_slice(arguments);
+            Cli::try_parse_checked_from(all)
+        };
+
+        for (case, arguments) in [
+            ("sync", vec!["sync", "./source", "/team/export"]),
+            ("plan", vec!["plan", "./source", "/team/export"]),
+            ("status", vec!["status", "./source", "/team/export"]),
+            ("resync", vec!["resync", "./source", "/team/export"]),
+            ("doctor", vec!["doctor"]),
+            ("doctor target", vec!["doctor", "target", "/team/export"]),
+        ] {
+            let absent = parse(&arguments)
+                .unwrap_or_else(|error| panic!("{case} must parse without the flag: {error}"));
+            assert_eq!(
+                absent.global.output.progress_record, None,
+                "{case} must default to no record"
+            );
+
+            // After the subcommand, and before it. A global argument accepts both; the misplaced
+            // command-local check deliberately does not apply to one.
+            let mut trailing = arguments.clone();
+            trailing.extend_from_slice(&["--progress-record", record]);
+            let mut leading = vec!["--progress-record", record];
+            leading.extend_from_slice(&arguments);
+
+            for (placement, argv) in [("after", trailing), ("before", leading)] {
+                let parsed = parse(&argv).unwrap_or_else(|error| {
+                    panic!("{case} must parse with the flag {placement} the subcommand: {error}")
+                });
+                assert_eq!(
+                    parsed.global.output.progress_record.as_deref(),
+                    Some(std::path::Path::new(record)),
+                    "{case} must carry the record given {placement} the subcommand"
+                );
+            }
+        }
+    }
 
     #[test]
     fn parses_explicit_sync_with_structured_output_and_logging() {

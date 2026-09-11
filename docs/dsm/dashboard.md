@@ -350,3 +350,68 @@ result. Plan and Run remain asynchronous. Therefore:
 6. For Plan and Run, “queued” is not success; follow run state, Activity, and logs.
 7. Investigate a failed or stale job through the [CLI recovery path](cli-parity.md), not browser
    developer tools containing session material.
+
+### What a queued job reports while it waits
+
+A job that has not finished is never reported as the bare word “pending”. The AppWindow says either
+what the operation is doing or why it has not started yet, and those are two different mechanisms.
+
+**What it is doing.** The five operations that can exceed a couple of seconds on an armv7 unit —
+sync status, Doctor, Plan/Run, Resync, and the connection probes — publish a bounded progress record
+while they are pending. It is rendered as a phase counter, a phase label, and a running count:
+
+> Step 5 of 7: Comparing file contents — 12,480 files so far.
+
+`step` and `total` count the **phase**, never the work inside it. Phase counts are known before the
+operation starts, so “step 5 of 7” is always true. The count of files examined within a phase is
+genuinely unknown in advance, so it is shown as a running total and **never as a percentage or a
+progress bar** — there is no denominator to compute one against, and inventing one would be a
+confident lie on a tool that moves people’s files. A determinate phase carries no count and renders
+as the phase alone (“Step 2 of 7: Connecting to DSM”).
+
+The phase label is resolved from a catalogue shared with `src/lib.rs`, not supplied by the job. The
+job contributes one untrusted datum — the phase id — and it is used only as a lookup key; the unit is
+an enumeration (`files`, `entries`, `bytes`, or none) resolved the same way. The AppWindow checks the
+resolved label against its own copy of that catalogue before rendering it.
+
+A record that fails validation is reported as **“Progress unavailable”** rather than silently
+dropped. Failing closed is correct — an unreviewed record must never reach the screen — but failing
+closed and silently is indistinguishable from having no progress at all, which is how a broken
+writer survives a release unnoticed.
+
+A record that stops advancing is itself reported. If the published phase has not moved for two
+minutes, the AppWindow says so and points at Logs: a progress record that stopped updating usually
+means the job is wedged, and the phase it last reported is the most useful thing known about it.
+Both timestamps in that comparison come from the NAS, so an unsynchronised NAS clock cannot produce
+a false warning; with no package timestamp available, staleness is simply not claimed.
+
+**Why it has not started.** When a job is queued and has published no phase, the AppWindow joins the
+pending job against the controller liveness the snapshot already carries and says which of these it
+is:
+
+| What the snapshot shows | What the dashboard says |
+| --- | --- |
+| The controller is stopped | Queued, the controller is stopped since a named time, and the request runs when the package is started in Package Center |
+| A live PID holds the controller’s PID file but is not the controller | Queued, nothing is servicing the queue, restart the package |
+| The controller is running a job | Queued behind that operation, named with its scope and start time when the run state carries them |
+| The controller is running, idle, and reporting normally | Queued, and it starts as soon as the work ahead of it finishes |
+| The controller is running, idle, and has not reported for three minutes | Queued, the controller may be wedged, review Logs |
+| No snapshot, or no controller block in it | Queued, and the dashboard says plainly that it cannot establish what the job is waiting on |
+
+Liveness is read from the live PID check rather than from the controller’s own last self-report: a
+controller killed outright leaves `state=running` behind in its state file. Staleness is read only
+while nothing is active, because a controller executing a long job publishes its active PID and then
+blocks for as long as that job takes — reading staleness there would have every slow sync report its
+own controller as dead.
+
+Progress and the wait explanation are rendered in polite live regions (`role="status"`,
+`aria-live="polite"`), separate from the assertive reconciliation barrier, so a counter that changes
+every couple of seconds never interrupts a screen reader.
+
+### Named terminal failures
+
+A queued job that ends without its operation having run reports the stage that dropped it, the exit
+code where one exists, and a next step. These replace an `unresolved` verdict that carried no reason
+and was indistinguishable from “this request ID was never accepted”. See
+[Troubleshooting](troubleshooting.md#a-queued-action-remains-pending-or-becomes-outcome-unknown) for
+the codes and what each one means.

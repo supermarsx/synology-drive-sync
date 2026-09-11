@@ -358,6 +358,12 @@ fi
 if [ "$allow_delete" != true ]; then
     set -- "$@" --no-delete
 fi
+# Appended to the core's own argv, before the supervisor wrap below, so the
+# supervisor's fixed prefix -- pid, start, boot, --core-nice, -- -- keeps the
+# exact shape its identity check depends on. A plan or a sync is per-file work
+# that runs for minutes; this is the path that lets it say which file.
+load_progress_record_runtime
+[ -z "$progress_record" ] || set -- "$@" --progress-record "$progress_record"
 runner_supervisor_start=$(process_start_time "$$" 2>/dev/null || true)
 case $runner_supervisor_start in ''|*[!0-9]*|0)
     echo "cannot capture runner identity before core launch" >&2
