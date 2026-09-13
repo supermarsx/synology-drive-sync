@@ -188,6 +188,72 @@ sudo tail -n 200 /var/packages/synology-drive-sync/var/log/api.log
 sudo tail -n 200 /var/packages/synology-drive-sync/var/log/doctor-inventory.log
 ```
 
+### Dashboard requests the service could not serve
+
+A request that reaches the package service and fails there writes one `cgi_failure` record to
+`api.log` under the `bridge` category, at stage `service_request`. Earlier releases wrote nothing
+at all for this class of failure, so a dashboard showing "Restart Synology Drive Sync" left no
+server-side trace of what had actually gone wrong. The record's `code` field now names the cause:
+whether the manager was slow (`manager_timeout`), whether too many dashboard windows were competing
+for the manager lane (`manager_busy`), whether the package was upgrading or shutting down
+(`runtime_upgrading`, `runtime_uninstalling`, `runtime_closed`), or whether a package file is in a
+state the service refuses to act on (`manager_unsafe`, `runtime_marker_unsafe`, `policy_unreadable`).
+Codes beginning `manager_` describe the shell manager the service ran; the remainder describe the
+service's own view of the package.
+
+Two codes belong to reads the service answers itself, without running the manager.
+`config_file_unsafe` means a package file failed the ownership, mode, link-count or size contract,
+and names a file to repair rather than a service to restart. `package_state_corrupt` means a
+package file was readable and holds a record the service cannot parse. Neither is ever a reason to
+retry the read through the manager instead: the manager checks less, so falling back would serve
+exactly the file the service had just refused.
+
+Two properties of that record are worth knowing before reading one:
+
+- **One record per thirty seconds, across every stage and code.** The window is shared with every
+  other `cgi_failure` writer, deliberately, so that a caller able to provoke many distinct codes
+  cannot amplify log writes. The consequence is stated plainly rather than hidden: **a coalesced
+  record names the most frequent code in its window and counts all of them** in `occurrences`. A
+  window that saw two timeouts and one busy lane reports `manager_timeout` with `occurrences` of 3.
+  The breakdown is not recoverable from the record; the record is bounded at 512 bytes and a map
+  would not fit.
+- **These failures appear in `api.log` only, never in the Activity feed.** An operator directed to
+  inspect Activity for a `manager_timeout` will find nothing there. This follows the existing
+  treatment of `service_saturated` rather than inventing a second convention.
+
+Suppression still obeys `bridge_log_level`. A policy set to `error` writes no record, touches
+neither the log nor the coalescing state file, and does not change what the browser is told: the
+503 and its code reach the page either way. A quiet log is not a quiet page.
+
+### Forcing dashboard reads through the shell manager
+
+Some dashboard reads are answered inside the package service, from the package's own files, instead
+of by running the shell manager. A private marker forces every one of them back onto the manager:
+
+```bash
+sudo -u "$PACKAGE_USER" -- sh -c \
+  'printf "shell\n" > /var/packages/synology-drive-sync/var/control/read-lane && \
+   chmod 0600 /var/packages/synology-drive-sync/var/control/read-lane'
+sudo -u "$PACKAGE_USER" -- rm /var/packages/synology-drive-sync/var/control/read-lane
+```
+
+The switch is deliberately exact. The file must be owned by the package user, mode `0600`, a single
+link, and contain the six bytes `shell` followed by one newline. Absent means the service decides
+per read. Present but unreadable, mis-owned, or holding anything else is **refused**, with code
+`runtime_marker_unsafe`, rather than ignored: an operator who believes reads are forced to the
+manager must not be silently overruled. Create it as the package user, not as root.
+
+Engaging it writes one `read_lane_forced_shell` notice to `api.log` under the `bridge` category, at
+`warn`, once per service start rather than once per dashboard poll. That record is a notice and not
+a failure, so it carries no HTTP status and no stage.
+
+This is the only escape hatch, and it is deliberately the only one. An in-service read that fails
+its own file checks does **not** quietly hand the request to the manager instead. The service
+validates owner, mode, link count and size on the descriptor it opened; the manager checks that the
+path is a regular file and not a symlink. Falling back from the first to the second on a failed
+check would serve, through the laxer reader, exactly the file the stricter one had just refused. A
+failed check returns its named code and stops.
+
 ## DSM desktop alert policy
 
 The package recognizes three internal alert triggers and maps each one to a fixed title/message pair

@@ -6,6 +6,19 @@ set -eu
 . "$common_runtime"
 require_package_identity
 ensure_layout
+# ensure_layout has just restored the directory half of the private layout;
+# this restores the file half. Here and nowhere else: postinst runs before any
+# of these files exists, and start runs on every service start, where a
+# standing repair would quietly undo a deliberate operator change for the life
+# of the install instead of migrating one that predates the contract. It runs
+# ahead of the migration below because security.conf is one of the files it
+# repairs and the strictest reader in the package refuses a widened one, which
+# is the difference between an install that can upgrade and one that cannot.
+# No lock is taken, for the same reason ensure_layout takes none on this line:
+# preupgrade has already refused to proceed unless the whole service topology
+# is stopped and admission is closed.
+repair_private_file_modes || \
+    package_message "warning: some private package files could not be restored to mode 0600"
 [ -x "$api_bridge" ] && [ ! -L "$api_bridge" ] || {
     package_message "upgraded DSM policy migration helper is unavailable"
     exit 1

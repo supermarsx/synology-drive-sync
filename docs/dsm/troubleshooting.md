@@ -358,6 +358,68 @@ bounded package logs. Then use [CLI parity](cli-parity.md) while diagnosing the 
 cookie, SynoToken, or package CSRF token into an issue, screenshot, terminal, request body, browser
 storage, history, or bookmark.
 
+## Dashboard status is stale, or a read reports a named in-service failure
+
+A dashboard read that the package accepted, authenticated and admitted can still fail while the
+service is assembling the answer. Those failures all arrive as one semantic 503, and each of them now
+carries a code naming which one it was. Before the codes existed every one of them rendered "Package
+service unavailable · Restart Synology Drive Sync", which is wrong advice for a package that is
+mid-upgrade, wrong for one that is merely busy, and actively harmful for one whose files have the
+wrong ownership, where a restart hides the finding without fixing it.
+
+The code appears in the failure envelope the AppWindow receives and in the coalesced `api.log`
+record described below. Codes marked **not retried** stand the automatic refresh down: the header
+says so, and **Retry** re-arms it once the package is repaired.
+
+| Code | What it means | What to do |
+| --- | --- | --- |
+| `runtime_upgrading` | The package transition marker says an upgrade is in progress | Wait; the page retries on its own |
+| `runtime_uninstalling` | The transition marker says the package is being removed | Nothing. **Not retried** |
+| `runtime_closed` | Admission is closed because the package is stopping or upgrading | Wait; the page retries on its own |
+| `runtime_marker_unsafe` | A transition or admission marker is unreadable or corrupt | Inspect `api.log`. **Not retried** |
+| `policy_unreadable` | The service could not read its own `security.conf` | Repair or reinstall one complete release. **Not retried** |
+| `manager_busy` | The five-second wait for a manager lane expired; at most three reads run at once | Close AppWindows you are not using. Retried on a bounded ramp |
+| `manager_lane_poisoned` | The manager lane cannot serve further reads in this process | Restart the package in Package Center. **Not retried** |
+| `manager_unsafe` | The manager is missing, wrongly owned, writable by others, setuid, or not executable | Repair or reinstall; do not change ownership or permissions by hand. **Not retried** |
+| `manager_spawn_failed` | The service could not fork or exec the manager | Inspect `api.log`. Retried on a bounded ramp |
+| `manager_timeout` | The manager exceeded its twenty-second read ceiling | Check for a concurrent sync or an unusually large log set. Retried on a bounded ramp |
+| `manager_output_too_large` | The manager produced more than the one-mebibyte output bound | Inspect `api.log`. Retried on a bounded ramp |
+| `manager_exit_status` | The manager exited non-zero | Inspect `api.log`. Retried on a bounded ramp |
+| `manager_output_invalid` | Manager output was not JSON, not an object, or missing a required key | Inspect `api.log`. Retried on a bounded ramp |
+| `manager_output_schema` | The document's schema string is not the one this bundle expects | Repair or reinstall one complete release. Retried on a bounded ramp |
+| `config_file_unsafe` | A configuration or state file failed the ownership and mode contract | Repair the package rather than editing the file. **Not retried** |
+| `package_state_corrupt` | A stored package record could not be parsed; the Activity feed is where this surfaces today | Inspect Logs and Activity for the affected file. A restart does not repair it; the record clears when the file rotates or is cleared. **Not retried** |
+| `clock_unavailable` | The system clock reads before the epoch | Correct the NAS system time. **Not retried** |
+
+A code this bundle does not recognise still renders the original "Package service unavailable"
+guidance, so a newer package cannot leave the window silent.
+
+**In-service failures appear in `api.log`, not in the Activity feed.** This is deliberate and it is
+the one place the design will surprise someone: an operator told to inspect Activity for a
+`manager_timeout` will find nothing there. The Activity half of a pre-relay diagnostic is written by
+the manager against an allowlist of exact stage/code/status triples, and these codes are not in it —
+the same is already true of `service_saturated`. Use
+`/var/packages/synology-drive-sync/var/log/api.log`, or the **API** source in the dashboard's Logs
+view, and grep for `cgi_failure`.
+
+Two properties of that record matter when you read it. It is coalesced globally to at most one
+emission every thirty seconds across every stage and code, so **a coalesced record names the most
+frequent code in its window and counts all of them** in `occurrences`; an outage producing three
+distinct codes emits a record naming one. And the record obeys the configured log level exactly as
+the authentication warnings above do: a policy that suppresses the warning category writes no record
+and touches no coalescing state, while the 503 and its code still reach the browser.
+
+While a read is failing, the dashboard keeps the last document it did retrieve and labels it with
+both its age and the cause; see [the dashboard's connection states](dashboard.md). Nothing is
+cached on the service side, so a read either answers with current state or fails with one of the
+codes above.
+
+If a named code proves to be a parity problem rather than a fault — a reported failure the previous
+release did not produce for the same package state — the read lane has an operator kill switch that
+returns every read to the manager for the whole service. It is a private control file, not a
+setting, and engaging it writes one log line. [Operations](operations.md) documents the file, its
+exact contents, and how to confirm it took effect.
+
 ## Dashboard is read-only
 
 Read-only means the authenticated API service snapshot did not grant the required capability and

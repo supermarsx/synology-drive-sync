@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import {
+  WIDGET_ACTIVE_POLL_MS,
+  WIDGET_BACKOFF_RAMP_MS,
+  WIDGET_IDLE_POLL_MS
+} from "../src/widgetModel.mjs";
 
 // Component loader copied from reconciliation-barrier.test.mjs, for the reason
 // that file gives for copying its own harness: a self-contained copy cannot
@@ -20,6 +25,12 @@ function loadAppComponent() {
     .replace("export default {", "const AppComponent = {")
     + "\nreturn AppComponent;";
   const stubs = {
+    // The real cadence literals, not stand-ins: App.vue's retry ladder and
+    // stale-age escalation are only meaningful against the ramp the widget
+    // actually ships and validate_spk.py actually pins.
+    WIDGET_ACTIVE_POLL_MS,
+    WIDGET_BACKOFF_RAMP_MS,
+    WIDGET_IDLE_POLL_MS,
     ACTIONS: { syncStatus: "sync-status", resync: "resync", execute: "action" },
     AUTOSAVE_API_LIMITS: Object.freeze({}),
     MAX_RESPONSE_BYTES: 1024 * 1024,

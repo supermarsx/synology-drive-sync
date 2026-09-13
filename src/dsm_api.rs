@@ -45,6 +45,8 @@ use synology_drive_sync::Error as SyncError;
 #[cfg(target_os = "linux")]
 use synology_drive_sync::api::{ApiClient, ClientOptions};
 use synology_drive_sync::progress_record::ProgressRecorder;
+#[cfg(target_os = "linux")]
+use synology_drive_sync::status_cache;
 use synology_drive_sync::vault::{generate_totp, parse_totp_secret};
 
 const PACKAGE_ROOT: &str = "/var/packages/synology-drive-sync/target";
@@ -56,7 +58,10 @@ const CONTROLLER_PATH: &str = "/var/packages/synology-drive-sync/target/libexec/
 const AUTHENTICATE_PATH: &str = "/usr/syno/synoman/webman/modules/authenticate.cgi";
 const DSM_USER_SERVICE_PATH: &str = "/webapi/entry.cgi";
 const DSM_USER_SERVICE_API: &str = "SYNO.Core.Desktop.Initdata";
+const PROFILES_DIR: &str = "/var/packages/synology-drive-sync/home/config/profiles.d";
+const STATUS_CACHE_DIR: &str = "/var/packages/synology-drive-sync/var/state/cache/status";
 const CONTROL_ROOT: &str = "/var/packages/synology-drive-sync/var/control";
+const READ_LANE_PATH: &str = "/var/packages/synology-drive-sync/var/control/read-lane";
 const REQUESTS_DIR: &str = "/var/packages/synology-drive-sync/var/control/requests";
 const PROCESSING_DIR: &str = "/var/packages/synology-drive-sync/var/control/processing";
 const RESPONSES_DIR: &str = "/var/packages/synology-drive-sync/var/control/responses";
@@ -160,6 +165,15 @@ const MAX_POST_BODY_BYTES: usize = 64 * 1024;
 const MAX_JOB_BYTES: usize = 64 * 1024;
 const MAX_AUDIT_OUTBOX_BYTES: usize = 4 * 1024;
 const MAX_MANAGER_OUTPUT_BYTES: usize = 1024 * 1024;
+/// The activity log rotates at 1 MiB and one final record may cross that
+/// threshold before the next append rotates it, so nothing the package wrote is
+/// anywhere near this. The same bound the durable audit reader already applies
+/// to these files.
+const MAX_ACTIVITY_LOG_BYTES: usize = 2 * 1024 * 1024;
+/// The manager's own ceiling on an activity response, applied while selecting
+/// records rather than after rendering them, so the document is never built and
+/// then thrown away.
+const MAX_ACTIVITY_RESPONSE_BYTES: usize = 1_048_000;
 const MAX_AUTHENTICATED_USERNAME_BYTES: usize = 256;
 const MAX_AUTH_OUTPUT_BYTES: usize = MAX_AUTHENTICATED_USERNAME_BYTES + 2;
 const MAX_DSM_USER_SERVICE_OUTPUT_BYTES: usize = MAX_MANAGER_OUTPUT_BYTES;
@@ -517,27 +531,29 @@ struct ManagerPermit;
 impl ManagerPermit {
     /// Claim a slot, waiting at most `MANAGER_PERMIT_WAIT` for one.
     ///
-    /// A poisoned lock is reported as unavailable rather than recovered: the count is the only
+    /// A poisoned lock is reported as unsafe rather than recovered: the count is the only
     /// state behind it, but a panic while holding it means a permit was already leaked, and
-    /// serving on through that would let the lane silently widen.
+    /// serving on through that would let the lane silently widen. The two outcomes are named
+    /// apart — `manager_busy` tells the operator to wait or close a window, and
+    /// `manager_lane_poisoned` tells them the service needs a restart.
     fn acquire() -> BridgeResult<Self> {
         let deadline = Instant::now() + MANAGER_PERMIT_WAIT;
         let mut occupancy = MANAGER_LANE
             .occupancy
             .lock()
-            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+            .map_err(|_| BridgeError::unsafe_because("manager_lane_poisoned"))?;
         loop {
             if *occupancy < MANAGER_CONCURRENCY_LIMIT {
                 *occupancy += 1;
                 return Ok(Self);
             }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return Err(BridgeError::new(ErrorKind::Unavailable));
+                return Err(BridgeError::unavailable_because("manager_busy"));
             };
             let (guard, _) = MANAGER_LANE
                 .released
                 .wait_timeout(occupancy, remaining)
-                .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+                .map_err(|_| BridgeError::unsafe_because("manager_lane_poisoned"))?;
             occupancy = guard;
         }
     }
@@ -576,6 +592,86 @@ struct ControlPaths<'a> {
     audit_outbox_lock: &'a Path,
     package_transition: &'a Path,
     service_closed: &'a Path,
+}
+
+/// The package's own files, as the read path sees them.
+///
+/// `ControlPaths` did this first for the private queue, and for the same reason:
+/// the production values are hard-coded constants, which is exactly right in
+/// production and makes the code unreachable from a test. Every read that
+/// answers from these paths instead of from the shell manager needs a fixture
+/// tree to be provable, and a fixture tree needs the paths to be a parameter.
+///
+/// `manager` is here too, so a test can point the shell rung at a stub and
+/// exercise the failure modes — a manager that hangs, exits non-zero, or has
+/// the wrong mode — that no test could reach while `MANAGER_PATH` was read
+/// directly from a const.
+///
+/// The struct carries exactly the paths some read actually opens. A field with
+/// no consumer is a claim the tree cannot check, so each one arrives with the
+/// read that needs it.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct PackagePaths<'a> {
+    manager: &'a Path,
+    package_home: &'a Path,
+    package_var: &'a Path,
+    log_root: &'a Path,
+    profiles_dir: &'a Path,
+    status_cache: &'a Path,
+    /// The operator's kill switch. See `read_lane_forced_to_shell`.
+    read_lane: &'a Path,
+}
+
+#[cfg(target_os = "linux")]
+impl PackagePaths<'static> {
+    fn production() -> Self {
+        Self {
+            manager: Path::new(MANAGER_PATH),
+            package_home: Path::new(PACKAGE_HOME),
+            package_var: Path::new(PACKAGE_VAR),
+            log_root: Path::new(LOG_ROOT),
+            profiles_dir: Path::new(PROFILES_DIR),
+            status_cache: Path::new(STATUS_CACHE_DIR),
+            read_lane: Path::new(READ_LANE_PATH),
+        }
+    }
+}
+
+/// Which side of the ladder answers a read.
+///
+/// The mapping is a total `match` over `ReadAction`, so a new read action is a
+/// compile error here rather than a silent enrolment in the shell rung that
+/// nothing would notice.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadRung {
+    /// Answered inside the service, from the package's own files.
+    InService,
+    /// Answered by running the shell manager and sanitizing its JSON.
+    ShellManager,
+    /// Answered before the ladder: neither rung applies.
+    NotLadderRouted,
+}
+
+/// The rung that answers an action when the operator has not forced the lane.
+///
+/// Using the shell rung for an action with no in-service implementation is the
+/// steady state during the migration, not an error, and it logs nothing. Three
+/// of four ladder reads are legitimately on the shell rung; a record per poll
+/// per open window would exhaust the thirty-second coalescing window and bury
+/// the failures the taxonomy exists to surface.
+#[cfg(target_os = "linux")]
+fn read_rung(action: &ReadAction) -> ReadRung {
+    match action {
+        ReadAction::StatusRollup | ReadAction::Activity { .. } => ReadRung::InService,
+        ReadAction::Snapshot | ReadAction::Logs { .. } => ReadRung::ShellManager,
+        ReadAction::Csrf
+        | ReadAction::SourceDirectories { .. }
+        | ReadAction::SourcePath { .. }
+        | ReadAction::Result { .. }
+        | ReadAction::RequestStatus { .. } => ReadRung::NotLadderRouted,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -788,14 +884,43 @@ enum ErrorKind {
     Internal,
 }
 
+/// A bridge failure, optionally carrying the diagnostic code that names its
+/// cause.
+///
+/// `code` is additive and opt-in. Every site that constructs an error through
+/// `new`, `bad_request`, `unsafe_runtime` or `internal` leaves it `None` and is
+/// rendered exactly as before, from the `(kind, stage)` table in
+/// `CgiResponse::error_payload`. A site that knows something the kind alone
+/// cannot express — a spawn that failed rather than a read that timed out, both
+/// of which are `Unavailable` at the same stage — names it with
+/// `unavailable_because` or `unsafe_because`, and that name reaches the error
+/// envelope and the api.log record unchanged.
+///
+/// The alternative was to attach codes at the call sites in
+/// `execute_read_action` and `run_read_manager`, which needs no field. It
+/// cannot distinguish timeout from spawn failure from oversized output: all
+/// three are constructed inside `capture_child` and `drain_pipe` and are
+/// bit-identical by the time they return. That is exactly the distinction an
+/// operator needs, so the error carries the field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BridgeError {
     kind: ErrorKind,
+    code: Option<&'static str>,
 }
 
 impl BridgeError {
     const fn new(kind: ErrorKind) -> Self {
-        Self { kind }
+        Self { kind, code: None }
+    }
+
+    /// An error whose cause is named. `code` must satisfy the envelope
+    /// contract checked by `is_trusted_error_envelope`: one to sixty-four
+    /// bytes of `[a-z0-9_]`.
+    const fn coded(kind: ErrorKind, code: &'static str) -> Self {
+        Self {
+            kind,
+            code: Some(code),
+        }
     }
 
     const fn bad_request() -> Self {
@@ -808,6 +933,14 @@ impl BridgeError {
 
     const fn internal() -> Self {
         Self::new(ErrorKind::Internal)
+    }
+
+    const fn unavailable_because(code: &'static str) -> Self {
+        Self::coded(ErrorKind::Unavailable, code)
+    }
+
+    const fn unsafe_because(code: &'static str) -> Self {
+        Self::coded(ErrorKind::UnsafeRuntime, code)
     }
 }
 
@@ -861,6 +994,74 @@ impl CgiFailure {
             code: Some(code),
         }
     }
+}
+
+/// A runtime marker under `var/run` is unreadable, mis-owned, or holds a value
+/// this service does not recognise. The service refuses to act on a lifecycle
+/// state it cannot verify, and says so rather than reporting a generic outage.
+#[cfg(target_os = "linux")]
+const RUNTIME_MARKER_UNSAFE: BridgeError = BridgeError::unsafe_because("runtime_marker_unsafe");
+
+/// The HTTP status a kind renders as, and the code it falls back to when
+/// neither the failure nor the error named one and the `(kind, stage)` table
+/// has no entry.
+const fn error_status_and_default_code(kind: ErrorKind) -> (u16, &'static str) {
+    match kind {
+        ErrorKind::BadRequest => (400, "invalid_request"),
+        ErrorKind::Unauthorized => (401, "unauthorized"),
+        ErrorKind::Forbidden => (403, "forbidden"),
+        ErrorKind::CsrfRejected => (403, "csrf_rejected"),
+        ErrorKind::MethodNotAllowed => (405, "method_not_allowed"),
+        ErrorKind::UnsupportedMediaType => (415, "unsupported_media_type"),
+        ErrorKind::PayloadTooLarge => (413, "payload_too_large"),
+        ErrorKind::Conflict => (409, "conflict"),
+        ErrorKind::UnsafeRuntime | ErrorKind::Unavailable => (503, "unavailable"),
+        ErrorKind::Internal => (500, "internal_error"),
+    }
+}
+
+/// Resolve the code an envelope and its api.log record carry, in one place so
+/// that the record and the envelope can never disagree about what failed.
+///
+/// Precedence is narrowest first: a code the failure attached at the point it
+/// became a response, then a code the error attached at the point it was
+/// constructed, then the stage table, then the kind's default.
+fn resolved_error_code(
+    error: BridgeError,
+    stage: Option<CgiFailureStage>,
+    explicit_code: Option<&'static str>,
+) -> &'static str {
+    let (_, default_code) = error_status_and_default_code(error.kind);
+    explicit_code
+        .or(error.code)
+        .unwrap_or(match (error.kind, stage) {
+            (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::Identity)) => "cgi_identity_unsafe",
+            (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::Authentication)) => {
+                "dsm_authentication_unsafe"
+            }
+            (ErrorKind::Unavailable, Some(CgiFailureStage::Authentication)) => {
+                "dsm_authentication_unavailable"
+            }
+            (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::Runtime)) => "cgi_runtime_unsafe",
+            (ErrorKind::Unavailable, Some(CgiFailureStage::Runtime)) => "cgi_runtime_unavailable",
+            (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::BridgeConnect)) => {
+                "bridge_socket_unsafe"
+            }
+            (ErrorKind::Unavailable, Some(CgiFailureStage::BridgeConnect)) => "service_unavailable",
+            (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::BridgeIo)) => "bridge_io_unsafe",
+            (ErrorKind::Unavailable, Some(CgiFailureStage::BridgeIo)) => "bridge_io_unavailable",
+            (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::BridgeProtocol)) => {
+                "bridge_protocol_unsafe"
+            }
+            (ErrorKind::Unavailable, Some(CgiFailureStage::BridgeProtocol)) => {
+                "bridge_protocol_unavailable"
+            }
+            (
+                ErrorKind::UnsafeRuntime | ErrorKind::Unavailable,
+                Some(CgiFailureStage::ServiceRequest),
+            ) => "service_request_unavailable",
+            _ => default_code,
+        })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3608,7 +3809,12 @@ fn log_line_visible_at_threshold(policy: &SecurityPolicyArgs, source: &str, line
 
 fn cgi_failure_category(stage: &str) -> Option<&'static str> {
     match stage {
-        "request" | "bridge_connect" | "bridge_io" | "bridge_protocol" => Some("bridge"),
+        // `service_request` is a dashboard request the service accepted and
+        // could not serve, which is what `docs/dsm/operations.md` already
+        // defines `bridge_failed` to mean.
+        "request" | "bridge_connect" | "bridge_io" | "bridge_protocol" | "service_request" => {
+            Some("bridge")
+        }
         "cgi_identity" | "cgi_runtime" => Some("security"),
         "dsm_authentication" => Some("authentication"),
         _ => None,
@@ -4694,18 +4900,18 @@ mod linux_runtime {
         Ok(uid)
     }
 
-    pub(super) fn validate_package_manager() -> BridgeResult<()> {
+    pub(super) fn validate_package_manager(manager: &Path) -> BridgeResult<()> {
         // SAFETY: geteuid has no pointer arguments or preconditions.
         let package_uid = unsafe { libc::geteuid() };
-        let metadata =
-            fs::symlink_metadata(MANAGER_PATH).map_err(|_| BridgeError::unsafe_runtime())?;
+        let metadata = fs::symlink_metadata(manager)
+            .map_err(|_| BridgeError::unsafe_because("manager_unsafe"))?;
         if !metadata.file_type().is_file()
             || metadata.st_uid() != package_uid
             || metadata.st_mode() & 0o022 != 0
             || metadata.st_mode() & 0o6000 != 0
             || metadata.st_mode() & 0o111 == 0
         {
-            return Err(BridgeError::unsafe_runtime());
+            return Err(BridgeError::unsafe_because("manager_unsafe"));
         }
         Ok(())
     }
@@ -5851,7 +6057,7 @@ mod linux_process {
 
         let mut child = command
             .spawn()
-            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+            .map_err(|_| BridgeError::unavailable_because("manager_spawn_failed"))?;
         match capture_child(&mut child, maximum_stdout, maximum_stderr, timeout, input) {
             Ok(output) => Ok(output),
             Err(error) => {
@@ -6067,7 +6273,7 @@ mod linux_process {
 
             let now = Instant::now();
             if now >= deadline {
-                return Err(BridgeError::new(ErrorKind::Unavailable));
+                return Err(BridgeError::unavailable_because("manager_timeout"));
             }
             poll_child_io(
                 &stdout,
@@ -6101,7 +6307,7 @@ mod linux_process {
                 Ok(0) => return Ok(true),
                 Ok(length) => {
                     if length > maximum.saturating_sub(output.len()) {
-                        return Err(BridgeError::new(ErrorKind::Unavailable));
+                        return Err(BridgeError::unavailable_because("manager_output_too_large"));
                     }
                     output.extend_from_slice(&chunk[..length]);
                 }
@@ -6802,14 +7008,39 @@ fn bool_text(value: bool) -> &'static str {
     if value { "true" } else { "false" }
 }
 
+/// The manager answered and what it answered is not the document this action's
+/// contract describes: not JSON, not an object, or missing a required key.
+const MANAGER_OUTPUT_INVALID: BridgeError =
+    BridgeError::unavailable_because("manager_output_invalid");
+
+/// The manager answered a well-formed document of the wrong kind, which means
+/// the shipped UI and the shipped package are different releases.
+const MANAGER_OUTPUT_SCHEMA: BridgeError =
+    BridgeError::unavailable_because("manager_output_schema");
+
 fn parse_and_sanitize_manager_json(
     bytes: &[u8],
     action: &ReadAction,
     exact_secret: Option<&[u8]>,
     runtime_policy: Option<&SecurityPolicyArgs>,
 ) -> BridgeResult<Vec<u8>> {
-    let mut value: Value =
-        serde_json::from_slice(bytes).map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| MANAGER_OUTPUT_INVALID)?;
+    sanitize_manager_document(value, action, exact_secret, runtime_policy)
+}
+
+/// Validate, filter and re-render one read document.
+///
+/// Split from the parse so that a read answered inside the service passes
+/// through the identical schema check, redaction and policy filtering as the
+/// same read answered by the shell manager. Anything added here is added to
+/// both rungs at once, which is the property the differential parity test
+/// depends on.
+fn sanitize_manager_document(
+    mut value: Value,
+    action: &ReadAction,
+    exact_secret: Option<&[u8]>,
+    runtime_policy: Option<&SecurityPolicyArgs>,
+) -> BridgeResult<Vec<u8>> {
     let expected_schema = match action {
         ReadAction::Snapshot => "sdsync.dsm-api.v1",
         ReadAction::Logs { .. } => "sdsync.dsm-logs.v1",
@@ -6826,18 +7057,14 @@ fn parse_and_sanitize_manager_json(
             return Err(BridgeError::internal());
         }
     };
-    let root = value
-        .as_object()
-        .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+    let root = value.as_object().ok_or(MANAGER_OUTPUT_INVALID)?;
     if root.get("schema").and_then(Value::as_str) != Some(expected_schema) {
-        return Err(BridgeError::new(ErrorKind::Unavailable));
+        return Err(MANAGER_OUTPUT_SCHEMA);
     }
     redact_secret_fields(&mut value, exact_secret);
     match action {
         ReadAction::Snapshot => {
-            let root = value
-                .as_object_mut()
-                .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+            let root = value.as_object_mut().ok_or(MANAGER_OUTPUT_INVALID)?;
             // This value is embedded by build.rs and cannot be influenced by
             // the package INFO file or any mutable DSM runtime state.
             root.insert(
@@ -6871,7 +7098,7 @@ fn parse_and_sanitize_manager_json(
             let logs = value
                 .get_mut("logs")
                 .and_then(Value::as_array_mut)
-                .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+                .ok_or(MANAGER_OUTPUT_INVALID)?;
             if *source != LogSource::All {
                 logs.retain(|entry| {
                     entry.get("source").and_then(Value::as_str) == Some(source.as_str())
@@ -6882,12 +7109,12 @@ fn parse_and_sanitize_manager_json(
                     let source = entry
                         .get("source")
                         .and_then(Value::as_str)
-                        .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?
+                        .ok_or(MANAGER_OUTPUT_INVALID)?
                         .to_owned();
                     let lines = entry
                         .get_mut("lines")
                         .and_then(Value::as_array_mut)
-                        .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+                        .ok_or(MANAGER_OUTPUT_INVALID)?;
                     lines.retain(|line| {
                         line.as_str().is_some_and(|line| {
                             log_line_visible_at_threshold(policy, &source, line)
@@ -6905,7 +7132,7 @@ fn parse_and_sanitize_manager_json(
                 let events = value
                     .get_mut("events")
                     .and_then(Value::as_array_mut)
-                    .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+                    .ok_or(MANAGER_OUTPUT_INVALID)?;
                 events.retain(|event| {
                     let Some(category) = event.get("category").and_then(Value::as_str) else {
                         return false;
@@ -7490,16 +7717,21 @@ fn canonical_queued_response_bytes(
     Ok(bytes)
 }
 
+/// A stored queue record exists and fails its own contract. The request that
+/// wrote it completed; what the service cannot do is tell the caller how.
+const STORED_RESULT_INVALID: BridgeError =
+    BridgeError::unavailable_because("stored_result_invalid");
+
 fn parse_queued_response(
     bytes: &[u8],
     expected_job_id: &str,
 ) -> BridgeResult<ParsedQueuedResponse> {
     let response: RawQueuedResponse<'_> =
-        serde_json::from_slice(bytes).map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+        serde_json::from_slice(bytes).map_err(|_| STORED_RESULT_INVALID)?;
     let operation = match (response.schema, response.operation) {
         ("sdsync.dsm-queued-response.v1", None) => None,
         ("sdsync.dsm-queued-response.v2", Some(operation)) => Some(operation),
-        _ => return Err(BridgeError::new(ErrorKind::Unavailable)),
+        _ => return Err(STORED_RESULT_INVALID),
     };
     if response.job_id != expected_job_id
         || !valid_server_job_id(response.job_id)
@@ -7512,10 +7744,10 @@ fn parse_queued_response(
         || !matches!(response.audit_terminal_state, "succeeded" | "failed")
         || response.completed_at_epoch < response.issued_at_epoch
     {
-        return Err(BridgeError::new(ErrorKind::Unavailable));
+        return Err(STORED_RESULT_INVALID);
     }
-    let session_binding = hex_decode_exact::<32>(response.session_binding)
-        .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+    let session_binding =
+        hex_decode_exact::<32>(response.session_binding).ok_or(STORED_RESULT_INVALID)?;
     let result =
         parse_manager_result_for_operation(response.result.get().as_bytes(), None, operation)?;
     let expected_terminal = if result.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -7524,7 +7756,7 @@ fn parse_queued_response(
         "failed"
     };
     if response.audit_terminal_state != expected_terminal {
-        return Err(BridgeError::new(ErrorKind::Unavailable));
+        return Err(STORED_RESULT_INVALID);
     }
     Ok(ParsedQueuedResponse {
         operation: operation.map(str::to_owned),
@@ -7826,10 +8058,31 @@ where
     }
 }
 
+/// Build a manager invocation against the installed manager.
+///
+/// Every mutation-side caller uses this form. It keeps no path parameter on
+/// purpose: the installed manager is the only one a queued mutation, a
+/// controller wake or an audit record may ever run, and a cross-layer test in
+/// the packaging suite reads this call's exact text out of
+/// `wake_controller_after_enqueue` to prove the wake still goes through it.
 #[cfg(target_os = "linux")]
 fn manager_command(arguments: &[OsString], has_secret_input: bool) -> BridgeResult<Command> {
-    linux_runtime::validate_package_manager()?;
-    let mut command = Command::new(MANAGER_PATH);
+    manager_command_at(Path::new(MANAGER_PATH), arguments, has_secret_input)
+}
+
+/// As above, against a named manager.
+///
+/// The read path takes this form so a test can point the shell rung at a stub
+/// and reach the failure modes — a manager that hangs, exits non-zero, or has
+/// the wrong mode — that nothing could reach while the path was a constant.
+#[cfg(target_os = "linux")]
+fn manager_command_at(
+    manager: &Path,
+    arguments: &[OsString],
+    has_secret_input: bool,
+) -> BridgeResult<Command> {
+    linux_runtime::validate_package_manager(manager)?;
+    let mut command = Command::new(manager);
     command
         .args(arguments)
         .env_clear()
@@ -7851,13 +8104,20 @@ fn manager_command(arguments: &[OsString], has_secret_input: bool) -> BridgeResu
 /// burst of reads delay an audit record that must be written.
 ///
 /// The permit is taken after the command is built and dropped as soon as the call returns, so a
-/// slot is held for the exec and nothing else. Exhaustion is reported as unavailable rather than
-/// with the dedicated `service_saturated` code, which is reachable only from the accept loop's
-/// pre-acceptance rejection; distinguishing the two would mean widening `ErrorKind` across every
-/// match in this module for no change in what the client does, which is retry.
+/// slot is held for the exec and nothing else. Exhaustion keeps its own code, `manager_busy`, and
+/// is still not the accept loop's `service_saturated`: that code's message asserts that nothing
+/// was submitted, which is true where the request frame was never read and false for a read that
+/// was accepted, authenticated, admitted and policy-checked before it queued for a slot. The two
+/// also call for different operator action — accept-loop saturation means too many windows,
+/// manager-lane saturation means the shell is slow.
+///
+/// An earlier revision declined to separate permit exhaustion from read timeout, on the grounds
+/// that it would mean widening `ErrorKind` for no change in what the client does. Neither half of
+/// that still holds: the codes ride on `BridgeError::code` rather than on the kind, and the page
+/// now retries differently per code.
 #[cfg(target_os = "linux")]
-fn run_read_manager(arguments: &[OsString]) -> BridgeResult<CapturedOutput> {
-    let mut command = manager_command(arguments, false)?;
+fn run_read_manager(manager: &Path, arguments: &[OsString]) -> BridgeResult<CapturedOutput> {
+    let mut command = manager_command_at(manager, arguments, false)?;
     let _permit = ManagerPermit::acquire()?;
     capture_bounded_command(
         &mut command,
@@ -8238,6 +8498,25 @@ mod linux_files {
         occurrences: u64,
     ) -> BridgeResult<bool> {
         let policy = load_security_policy(package_uid)?;
+        record_cgi_failure_under_policy(package_uid, now, stage, code, status, &policy, occurrences)
+    }
+
+    /// As above, for a caller that already holds the loaded policy.
+    ///
+    /// The in-service recorder runs inside `handle_relay_request`, which loads
+    /// `security.conf` once per request. Sending its failures back through the
+    /// policy-loading variant would re-read that file on the request thread for
+    /// every failure — including the failures where that file is what went
+    /// wrong.
+    pub(super) fn record_cgi_failure_under_policy(
+        package_uid: u32,
+        now: u64,
+        stage: &str,
+        code: &str,
+        status: u16,
+        policy: &SecurityPolicyArgs,
+        occurrences: u64,
+    ) -> BridgeResult<bool> {
         record_pre_relay_cgi_failure_under_policy_at(
             Path::new(LOG_ROOT),
             Path::new(API_LOG_PATH),
@@ -8247,7 +8526,7 @@ mod linux_files {
             stage,
             code,
             status,
-            &policy,
+            policy,
             occurrences,
         )
     }
@@ -8334,6 +8613,7 @@ mod linux_files {
                     | "bridge_connect"
                     | "bridge_io"
                     | "bridge_protocol"
+                    | "service_request"
             )
             || code.is_empty()
             || code.len() > 64
@@ -8420,26 +8700,7 @@ mod linux_files {
             return Err(BridgeError::internal());
         }
 
-        rotate_private_api_log(log_root, api_log, package_uid, record.len() as u64)?;
-        let mut log_options = OpenOptions::new();
-        log_options
-            .write(true)
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(NOFOLLOW_CLOEXEC);
-        let log = log_options
-            .open(api_log)
-            .map_err(|_| BridgeError::unsafe_runtime())?;
-        let log_metadata = log.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
-        if !log_metadata.file_type().is_file()
-            || log_metadata.st_uid() != package_uid
-            || log_metadata.st_mode() & 0o7777 != 0o600
-            || log_metadata.st_nlink() != 1
-        {
-            return Err(BridgeError::unsafe_runtime());
-        }
-        write_single_record(&log, &record)?;
+        append_private_api_log_record(log_root, api_log, package_uid, &record)?;
 
         let state_record = format!("{now}|{stage}|{code}|{status}\n");
         if state_record.len() as u64 > MAX_CGI_FAILURE_STATE_BYTES {
@@ -8551,6 +8812,108 @@ mod linux_files {
         fs::rename(api_log, rotated_path(api_log, 1)).map_err(|_| BridgeError::unsafe_runtime())?;
         sync_directory(log_root)?;
         Ok(())
+    }
+
+    /// Rotate if needed, then append one bounded record to the private
+    /// `api.log`, refusing a log file whose type, owner, mode or link count is
+    /// not what the package wrote.
+    fn append_private_api_log_record(
+        log_root: &Path,
+        api_log: &Path,
+        package_uid: u32,
+        record: &[u8],
+    ) -> BridgeResult<()> {
+        rotate_private_api_log(log_root, api_log, package_uid, record.len() as u64)?;
+        let mut log_options = OpenOptions::new();
+        log_options
+            .write(true)
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(NOFOLLOW_CLOEXEC);
+        let log = log_options
+            .open(api_log)
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        let log_metadata = log.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
+        if !log_metadata.file_type().is_file()
+            || log_metadata.st_uid() != package_uid
+            || log_metadata.st_mode() & 0o7777 != 0o600
+            || log_metadata.st_nlink() != 1
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        write_single_record(&log, record)
+    }
+
+    /// Read the operator's read-lane kill switch.
+    ///
+    /// A private file holding exactly `shell\n` forces every read onto the
+    /// shell rung, whatever the ladder would otherwise choose. It exists
+    /// instead of an automatic fall back from an in-service error, which would
+    /// have been a documented bypass of the service's own strictest file check:
+    /// the in-service readers validate owner, mode, link count and size on the
+    /// opened fd where the shell checks only `[ -f ]` and `[ ! -L ]`, so "the
+    /// strict check failed, use the lax reader" would serve an attacker exactly
+    /// the file the service had just refused.
+    ///
+    /// Absent means the ladder decides. Present but unreadable, mis-owned, or
+    /// holding anything else is refused rather than ignored, like every other
+    /// marker under `var/run` and `var/control`: an operator who believes the
+    /// switch is engaged must not be silently overruled.
+    pub(super) fn read_lane_forced_to_shell(
+        paths: &PackagePaths<'_>,
+        package_uid: u32,
+    ) -> BridgeResult<bool> {
+        match fs::symlink_metadata(paths.read_lane) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Ok(_) => {
+                let bytes = read_exact_single_link_private_file(paths.read_lane, package_uid, 16)
+                    .map_err(|_| RUNTIME_MARKER_UNSAFE)?;
+                if bytes.as_slice() == b"shell\n" {
+                    Ok(true)
+                } else {
+                    Err(RUNTIME_MARKER_UNSAFE)
+                }
+            }
+            Err(_) => Err(RUNTIME_MARKER_UNSAFE),
+        }
+    }
+
+    /// Note in `api.log` that the operator has forced the shell rung.
+    ///
+    /// Not a failure, so it is not a `cgi_failure` record and carries no HTTP
+    /// status: nothing about this request went wrong. It is `warn` under the
+    /// `bridge` category so it appears at the default log level, and it obeys
+    /// that category's threshold like every other structured API line.
+    pub(super) fn record_read_lane_notice_at(
+        log_root: &Path,
+        api_log: &Path,
+        package_uid: u32,
+        now: u64,
+        policy: &SecurityPolicyArgs,
+    ) -> BridgeResult<bool> {
+        if !event_visible_at_threshold(policy, "bridge", "warn", false) {
+            return Ok(false);
+        }
+        if now == 0 {
+            return Err(BridgeError::bad_request());
+        }
+        validate_private_directory(log_root, package_uid)?;
+        let mut record = serde_json::to_vec(&json!({
+            "epoch": now,
+            "level": "warn",
+            "category": "bridge",
+            "event": "read_lane_forced_shell",
+            "service": "synology-drive-sync",
+            "lane": "shell",
+        }))
+        .map_err(|_| BridgeError::internal())?;
+        record.push(b'\n');
+        if record.len() > MAX_CGI_FAILURE_RECORD_BYTES {
+            return Err(BridgeError::internal());
+        }
+        append_private_api_log_record(log_root, api_log, package_uid, &record)?;
+        Ok(true)
     }
 
     fn write_single_record(file: &File, record: &[u8]) -> BridgeResult<()> {
@@ -8955,6 +9318,35 @@ mod linux_files {
             sync_directory(log_root)?;
         }
         Ok(repaired)
+    }
+
+    /// The activity log and its three rotations, oldest first, each read under
+    /// the package's private-file contract.
+    ///
+    /// Oldest first because the log appends and rotates forward, so the newest
+    /// record is always at the tail of the concatenation — which is what lets
+    /// the manager window each rotation before combining them.
+    ///
+    /// An absent file is skipped; a symlink, a wrong owner, a wrong mode, a
+    /// second hard link, or a file longer than the package can have written is
+    /// refused and never quietly handed to a laxer reader. The manager checks
+    /// the same owner, mode and link count through `stat`; this checks them on
+    /// the descriptor it opened, which additionally closes the window between
+    /// the check and the read.
+    pub(super) fn read_activity_history(
+        log_root: &Path,
+        package_uid: u32,
+    ) -> BridgeResult<Vec<Vec<u8>>> {
+        let activity_log = log_root.join("activity.log");
+        let mut history = Vec::new();
+        for path in rotating_log_paths(&activity_log, 3).into_iter().rev() {
+            match open_private_log_file(&path, package_uid, MAX_ACTIVITY_LOG_BYTES) {
+                Ok(Some((_, bytes))) => history.push(bytes),
+                Ok(None) => {}
+                Err(_) => return Err(BridgeError::unsafe_because("config_file_unsafe")),
+            }
+        }
+        Ok(history)
     }
 
     fn rotating_log_paths(base: &Path, keep: usize) -> Vec<PathBuf> {
@@ -10199,7 +10591,7 @@ mod linux_files {
             }
             std::thread::yield_now();
         }
-        Err(BridgeError::new(ErrorKind::Unavailable))
+        Err(BridgeError::unavailable_because("request_scan_unstable"))
     }
 
     fn find_idempotent_job(
@@ -10567,13 +10959,14 @@ mod linux_files {
         let path = paths.package_transition;
         let bytes = match fs::symlink_metadata(path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok("open"),
-            Ok(_) => read_exact_single_link_private_file(path, package_uid, 16)?,
-            Err(_) => return Err(BridgeError::unsafe_runtime()),
+            Ok(_) => read_exact_single_link_private_file(path, package_uid, 16)
+                .map_err(|_| RUNTIME_MARKER_UNSAFE)?,
+            Err(_) => return Err(RUNTIME_MARKER_UNSAFE),
         };
         match bytes.as_slice() {
             b"upgrade\n" => Ok("upgrade"),
             b"uninstall\n" => Ok("uninstall"),
-            _ => Err(BridgeError::unsafe_runtime()),
+            _ => Err(RUNTIME_MARKER_UNSAFE),
         }
     }
 
@@ -10638,14 +11031,15 @@ mod linux_files {
         match fs::symlink_metadata(path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok("open"),
             Ok(_) => {
-                let bytes = read_exact_single_link_private_file(path, package_uid, 16)?;
+                let bytes = read_exact_single_link_private_file(path, package_uid, 16)
+                    .map_err(|_| RUNTIME_MARKER_UNSAFE)?;
                 if bytes.as_slice() == b"closed\n" {
                     Ok("closed")
                 } else {
-                    Err(BridgeError::unsafe_runtime())
+                    Err(RUNTIME_MARKER_UNSAFE)
                 }
             }
-            Err(_) => Err(BridgeError::unsafe_runtime()),
+            Err(_) => Err(RUNTIME_MARKER_UNSAFE),
         }
     }
 
@@ -10691,14 +11085,25 @@ mod linux_files {
         remove_allowed_private_marker(paths.service_closed, package_uid, &[b"closed\n"])
     }
 
+    /// Refuse a request the package is in no state to answer, naming which
+    /// state.
+    ///
+    /// All four outcomes were one undifferentiated 503 before, which left the
+    /// page telling an operator to restart a package that was upgrading itself.
+    /// An upgrade and a shutdown are both waits; a marker the service cannot
+    /// parse is a repair.
     pub(super) fn require_open_runtime_admission(
         paths: &ControlPaths<'_>,
         package_uid: u32,
     ) -> BridgeResult<()> {
-        if package_transition_state(paths, package_uid)? != "open"
-            || service_admission_state(paths, package_uid)? != "open"
-        {
-            return Err(BridgeError::new(ErrorKind::Unavailable));
+        match package_transition_state(paths, package_uid)? {
+            "open" => {}
+            "upgrade" => return Err(BridgeError::unavailable_because("runtime_upgrading")),
+            "uninstall" => return Err(BridgeError::unavailable_because("runtime_uninstalling")),
+            _ => return Err(RUNTIME_MARKER_UNSAFE),
+        }
+        if service_admission_state(paths, package_uid)? != "open" {
+            return Err(BridgeError::unavailable_because("runtime_closed"));
         }
         Ok(())
     }
@@ -11682,20 +12087,22 @@ impl CgiResponse {
 
     #[cfg(test)]
     fn service_unavailable() -> Self {
-        Self::staged_error(
+        Self::failure(CgiFailure::new(
             CgiFailureStage::BridgeConnect,
             BridgeError::new(ErrorKind::Unavailable),
-        )
+        ))
     }
 
     fn error(error: BridgeError) -> Self {
         Self::error_payload(error, None, None)
     }
 
-    fn staged_error(stage: CgiFailureStage, error: BridgeError) -> Self {
-        Self::error_payload(error, Some(stage), None)
-    }
-
+    /// Render a failure, keeping whatever named its cause.
+    ///
+    /// There is deliberately no staged-error variant beside this one. The one
+    /// that existed discarded `CgiFailure::code`, and its single caller was the
+    /// service's own response path — so every in-service failure rendered as
+    /// the bare stage entry no matter what the failing site knew.
     fn failure(failure: CgiFailure) -> Self {
         Self::error_payload(failure.error, Some(failure.stage), failure.code)
     }
@@ -11705,46 +12112,8 @@ impl CgiResponse {
         stage: Option<CgiFailureStage>,
         explicit_code: Option<&'static str>,
     ) -> Self {
-        let (status, default_code) = match error.kind {
-            ErrorKind::BadRequest => (400, "invalid_request"),
-            ErrorKind::Unauthorized => (401, "unauthorized"),
-            ErrorKind::Forbidden => (403, "forbidden"),
-            ErrorKind::CsrfRejected => (403, "csrf_rejected"),
-            ErrorKind::MethodNotAllowed => (405, "method_not_allowed"),
-            ErrorKind::UnsupportedMediaType => (415, "unsupported_media_type"),
-            ErrorKind::PayloadTooLarge => (413, "payload_too_large"),
-            ErrorKind::Conflict => (409, "conflict"),
-            ErrorKind::UnsafeRuntime | ErrorKind::Unavailable => (503, "unavailable"),
-            ErrorKind::Internal => (500, "internal_error"),
-        };
-        let code = explicit_code.unwrap_or(match (error.kind, stage) {
-            (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::Identity)) => "cgi_identity_unsafe",
-            (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::Authentication)) => {
-                "dsm_authentication_unsafe"
-            }
-            (ErrorKind::Unavailable, Some(CgiFailureStage::Authentication)) => {
-                "dsm_authentication_unavailable"
-            }
-            (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::Runtime)) => "cgi_runtime_unsafe",
-            (ErrorKind::Unavailable, Some(CgiFailureStage::Runtime)) => "cgi_runtime_unavailable",
-            (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::BridgeConnect)) => {
-                "bridge_socket_unsafe"
-            }
-            (ErrorKind::Unavailable, Some(CgiFailureStage::BridgeConnect)) => "service_unavailable",
-            (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::BridgeIo)) => "bridge_io_unsafe",
-            (ErrorKind::Unavailable, Some(CgiFailureStage::BridgeIo)) => "bridge_io_unavailable",
-            (ErrorKind::UnsafeRuntime, Some(CgiFailureStage::BridgeProtocol)) => {
-                "bridge_protocol_unsafe"
-            }
-            (ErrorKind::Unavailable, Some(CgiFailureStage::BridgeProtocol)) => {
-                "bridge_protocol_unavailable"
-            }
-            (
-                ErrorKind::UnsafeRuntime | ErrorKind::Unavailable,
-                Some(CgiFailureStage::ServiceRequest),
-            ) => "service_request_unavailable",
-            _ => default_code,
-        });
+        let (status, _) = error_status_and_default_code(error.kind);
+        let code = resolved_error_code(error, stage, explicit_code);
         let message = if code == SATURATED_SERVICE_CODE {
             "The package service is busy and did not start this request. Nothing was submitted. Retry shortly; if this persists, close other Synology Drive Sync windows and inspect the package log."
         } else if stage == Some(CgiFailureStage::BridgeConnect)
@@ -11849,7 +12218,7 @@ fn record_pre_relay_cgi_failure(failure: &CgiFailure) {
 
 #[cfg(target_os = "linux")]
 fn record_pre_relay_activity(stage: &str, code: &str, status: u16) -> BridgeResult<()> {
-    linux_runtime::validate_package_manager()?;
+    linux_runtime::validate_package_manager(Path::new(MANAGER_PATH))?;
     let status = status.to_string();
     let mut command = Command::new(MANAGER_PATH);
     command
@@ -13073,6 +13442,163 @@ fn record_saturated_rejection(package_uid: u32) {
     LAST_RECORD_EPOCH.store(previous, AtomicOrdering::Relaxed);
 }
 
+/// The `(stage, code, status)` triple an api.log record names.
+#[cfg(target_os = "linux")]
+type FailureTriple = (&'static str, &'static str, u16);
+
+/// One claimed emission: what the record should say, and everything needed to
+/// undo the claim if the record is not written.
+#[cfg(target_os = "linux")]
+struct ClaimedFailureRecord {
+    triple: FailureTriple,
+    occurrences: u64,
+    drained: BTreeMap<FailureTriple, u64>,
+    previous_epoch: u64,
+}
+
+/// Tally of in-service failures suppressed since the last record.
+///
+/// The coalescing window is global and deliberately so (see
+/// `record_saturated_rejection`): one record per window across every stage and
+/// code is what stops a caller able to provoke many distinct codes from
+/// amplifying log writes. The cost is that an outage producing three codes
+/// emits a record naming one. Keeping the breakdown here lets that record name
+/// the code that happened most and count all of them, which is the most useful
+/// single sentence a 512-byte bound can hold. The breakdown itself cannot go in
+/// the record: the bound is fixed and a map would break it.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct InServiceFailureCoalescer {
+    tally: BTreeMap<FailureTriple, u64>,
+    last_record_epoch: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl InServiceFailureCoalescer {
+    /// Count one failure, and claim the window if it is free.
+    ///
+    /// Claiming is atomic under the coalescer's lock, so two concurrent
+    /// failures cannot both emit inside one window and neither can lose its
+    /// count to the other.
+    fn claim(
+        &mut self,
+        triple: FailureTriple,
+        now: u64,
+        window: u64,
+    ) -> Option<ClaimedFailureRecord> {
+        *self.tally.entry(triple).or_insert(0) += 1;
+        if self.last_record_epoch != 0 && now.saturating_sub(self.last_record_epoch) < window {
+            return None;
+        }
+        let previous_epoch = self.last_record_epoch;
+        self.last_record_epoch = now;
+        let drained = std::mem::take(&mut self.tally);
+        let occurrences = drained.values().sum::<u64>().max(1);
+        // Highest count wins; a tie goes to the lexicographically first triple
+        // so that the same window always reports the same one. `drained` holds
+        // at least the entry just inserted, so this never yields None.
+        let (&triple, _) = drained
+            .iter()
+            .max_by_key(|(triple, count)| (**count, std::cmp::Reverse(**triple)))?;
+        Some(ClaimedFailureRecord {
+            triple,
+            occurrences,
+            drained,
+            previous_epoch,
+        })
+    }
+
+    /// Undo a claim whose record was not written.
+    ///
+    /// The window is shared with the accept loop's saturation recorder, and a
+    /// policy below `warn` suppresses the write entirely. Either way the
+    /// failures are reported late rather than never.
+    fn give_back(&mut self, claim: ClaimedFailureRecord) {
+        for (triple, count) in claim.drained {
+            *self.tally.entry(triple).or_insert(0) += count;
+        }
+        self.last_record_epoch = claim.previous_epoch;
+    }
+}
+
+#[cfg(target_os = "linux")]
+static IN_SERVICE_FAILURES: Mutex<InServiceFailureCoalescer> =
+    Mutex::new(InServiceFailureCoalescer {
+        tally: BTreeMap::new(),
+        last_record_epoch: 0,
+    });
+
+/// Record a failure the service produced after accepting a dashboard request.
+///
+/// Before this existed such a failure left no server-side record at all:
+/// `cgi_failure_category` returned `None` for `service_request` and the stage
+/// allowlist excluded it, so the only evidence of a failed read was a 503 in
+/// the browser and the operator had no way to tell a slow shell from a busy
+/// lane from a package that was shutting down.
+///
+/// api.log only, deliberately. The Activity half of a failure is written by the
+/// shell's `api cgi-failure`, which allowlists exact `stage:code:status`
+/// triples, so routing these codes there would mean a package-script edit per
+/// taxonomy addition, forever. `service_saturated` already sets the precedent
+/// for a failure that is logged and not surfaced in Activity.
+///
+/// `policy` is the one this request already loaded, when it got far enough to
+/// load it. `None` falls back to the loading variant, which is correct for the
+/// failures that happen before the policy is available — and is the only path
+/// that can itself fail on a policy this service cannot read.
+#[cfg(target_os = "linux")]
+fn record_in_service_failure(
+    package_uid: u32,
+    policy: Option<&SecurityPolicyArgs>,
+    failure: &CgiFailure,
+) {
+    let triple = (
+        failure.stage.as_str(),
+        resolved_error_code(failure.error, Some(failure.stage), failure.code),
+        error_status_and_default_code(failure.error.kind).0,
+    );
+    let Ok(now) = current_epoch() else {
+        return;
+    };
+    // The record write takes a file lock; the coalescer's lock is released
+    // before it so no other failing request waits behind that file.
+    let claim = {
+        let Ok(mut coalescer) = IN_SERVICE_FAILURES.lock() else {
+            return;
+        };
+        coalescer.claim(triple, now, linux_files::CGI_FAILURE_COALESCE_SECONDS)
+    };
+    let Some(claim) = claim else {
+        return;
+    };
+    let (stage, code, status) = claim.triple;
+    let recorded = match policy {
+        Some(policy) => linux_files::record_cgi_failure_under_policy(
+            package_uid,
+            now,
+            stage,
+            code,
+            status,
+            policy,
+            claim.occurrences,
+        ),
+        None => linux_files::record_pre_relay_cgi_failure_repeated(
+            package_uid,
+            now,
+            stage,
+            code,
+            status,
+            claim.occurrences,
+        ),
+    };
+    if recorded.is_ok_and(|recorded| recorded) {
+        return;
+    }
+    if let Ok(mut coalescer) = IN_SERVICE_FAILURES.lock() {
+        coalescer.give_back(claim);
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn serve_connection(
     stream: &mut std::os::unix::net::UnixStream,
@@ -13082,17 +13608,45 @@ fn serve_connection(
     let credentials = linux_socket::peer_credentials(stream)?;
     linux_socket::validate_peer_uid(credentials.uid, package_uid)?;
     let response = match read_single_frame(stream, MAX_RELAY_REQUEST_BYTES, ErrorKind::BadRequest) {
-        Ok(request) => handle_relay_request(&request, package_uid)
-            .unwrap_or_else(|failure| CgiResponse::staged_error(failure.stage, failure.error)),
-        Err(error) => CgiResponse::staged_error(CgiFailureStage::BridgeProtocol, error),
+        // `failure` keeps the code the failing site named; `staged_error` would
+        // hard-wire it to None and render the bare `(kind, stage)` entry, which
+        // for this stage is the single undifferentiated
+        // `service_request_unavailable`.
+        Ok(request) => {
+            handle_relay_request(&request, package_uid).unwrap_or_else(CgiResponse::failure)
+        }
+        Err(error) => {
+            let failure = CgiFailure::new(CgiFailureStage::BridgeProtocol, error);
+            record_in_service_failure(package_uid, None, &failure);
+            CgiResponse::failure(failure)
+        }
     };
     let encoded = encode_relay_response(&response)?;
     write_frame(stream, &encoded, MAX_RELAY_RESPONSE_BYTES)?;
     linux_socket::shutdown_write(stream)
 }
 
+/// Serve one relayed request, recording any failure before it becomes a
+/// response.
+///
+/// The record is written here rather than in `serve_connection` because this is
+/// where the security policy that governs whether it may be written is loaded.
 #[cfg(target_os = "linux")]
 fn handle_relay_request(encoded: &[u8], package_uid: u32) -> Result<CgiResponse, CgiFailure> {
+    let mut loaded_policy = None;
+    let outcome = handle_relay_request_under_policy(encoded, package_uid, &mut loaded_policy);
+    if let Err(failure) = &outcome {
+        record_in_service_failure(package_uid, loaded_policy.as_ref(), failure);
+    }
+    outcome
+}
+
+#[cfg(target_os = "linux")]
+fn handle_relay_request_under_policy(
+    encoded: &[u8],
+    package_uid: u32,
+    loaded_policy: &mut Option<SecurityPolicyArgs>,
+) -> Result<CgiResponse, CgiFailure> {
     let relay = decode_relay_request(encoded)
         .map_err(|error| CgiFailure::new(CgiFailureStage::BridgeProtocol, error))?;
     let (request, body) = validate_relay_http_request(&relay)
@@ -13114,8 +13668,12 @@ fn handle_relay_request(encoded: &[u8], package_uid: u32) -> Result<CgiResponse,
     let control_paths = ControlPaths::production();
     linux_files::require_open_runtime_admission(&control_paths, package_uid)
         .map_err(|error| CgiFailure::new(CgiFailureStage::ServiceRequest, error))?;
-    let policy = linux_files::load_security_policy(package_uid)
-        .map_err(|error| CgiFailure::new(CgiFailureStage::ServiceRequest, error))?;
+    let policy = linux_files::load_security_policy(package_uid).map_err(|error| {
+        CgiFailure::coded(CgiFailureStage::ServiceRequest, error, "policy_unreadable")
+    })?;
+    // Held by the caller so a failure after this point is recorded under the
+    // policy this request already paid to read.
+    let policy = &*loaded_policy.insert(policy);
     let is_post = matches!(request, ValidatedHttpRequest::Post { .. });
     let result = if policy.require_https && !is_https_request(authentication.https.as_deref()) {
         Err(BridgeError::new(ErrorKind::Forbidden))
@@ -13127,7 +13685,7 @@ fn handle_relay_request(encoded: &[u8], package_uid: u32) -> Result<CgiResponse,
             package_uid,
             current_epoch()
                 .map_err(|error| CgiFailure::new(CgiFailureStage::ServiceRequest, error))?,
-            &policy,
+            policy,
         )
     };
     if is_post && result.is_err() {
@@ -13189,7 +13747,9 @@ fn execute_authenticated_request(
                 session.uid,
                 package_uid,
             ),
-            action => execute_read_action(&action, policy),
+            action => {
+                execute_read_action(&PackagePaths::production(), &action, policy, package_uid)
+            }
         },
         ValidatedHttpRequest::Post { csrf_token, .. } => {
             let key = linux_files::load_or_create_csrf_key(&control_paths, package_uid)?;
@@ -13477,9 +14037,10 @@ fn execute_result_action_after_wait(
         else {
             continue;
         };
-        let job = parse_job(&bytes).map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+        let job =
+            parse_job(&bytes).map_err(|_| BridgeError::unavailable_because("result_unreadable"))?;
         if job.request_id != job_id {
-            return Err(BridgeError::new(ErrorKind::Unavailable));
+            return Err(BridgeError::unavailable_because("result_unreadable"));
         }
         if job.requested_uid != authenticated_uid
             || !session_binding_matches(&job.session_binding, session_binding)
@@ -13644,11 +14205,49 @@ fn queued_expired_response(job_id: &str) -> BridgeResult<CgiResponse> {
     Ok(CgiResponse::gone(body))
 }
 
+/// Say once, per service start, that the operator has forced the shell rung.
+///
+/// Once and not per request: a dashboard polls every few seconds for every open
+/// window, and a record per poll would fill `api.log` with the news that a
+/// deliberate operator action is still in effect — and would occupy the shared
+/// thirty-second coalescing window that the failure records need.
+///
+/// A notice that was not written leaves the flag down so the next read retries.
+/// The cost of that retry is one policy comparison when the category is
+/// silenced, because the writer checks the threshold before it touches a file.
+#[cfg(target_os = "linux")]
+fn note_read_lane_forced_shell(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    policy: &SecurityPolicyArgs,
+) {
+    static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+    if ANNOUNCED.swap(true, AtomicOrdering::Relaxed) {
+        return;
+    }
+    let written = current_epoch().and_then(|now| {
+        linux_files::record_read_lane_notice_at(
+            paths.log_root,
+            &paths.log_root.join("api.log"),
+            package_uid,
+            now,
+            policy,
+        )
+    });
+    if !written.is_ok_and(|written| written) {
+        ANNOUNCED.store(false, AtomicOrdering::Relaxed);
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn execute_read_action(
+    paths: &PackagePaths<'_>,
     action: &ReadAction,
     policy: &SecurityPolicyArgs,
+    package_uid: u32,
 ) -> BridgeResult<CgiResponse> {
+    // Neither rung: these two were always answered in the service, from a
+    // system root rather than from the package's own files.
     if let ReadAction::SourceDirectories { parent } = action {
         let body = source_directories_document(Path::new("/"), parent)?;
         return Ok(CgiResponse::success(body));
@@ -13657,10 +14256,537 @@ fn execute_read_action(
         let body = source_path_document(Path::new("/"), path)?;
         return Ok(CgiResponse::success(body));
     }
+    let forced_to_shell = linux_files::read_lane_forced_to_shell(paths, package_uid)?;
+    if forced_to_shell {
+        note_read_lane_forced_shell(paths, package_uid, policy);
+    }
+    match read_rung(action) {
+        ReadRung::InService if !forced_to_shell => {
+            run_in_service_read(paths, action, policy, package_uid)
+        }
+        // An action with no in-service implementation takes the shell rung, and
+        // that is the steady state for the un-migrated reads rather than an
+        // error. It logs nothing: three of four ladder reads are legitimately
+        // here, and a record per poll per open window would occupy the shared
+        // coalescing window that the failure records need.
+        ReadRung::InService | ReadRung::ShellManager | ReadRung::NotLadderRouted => {
+            run_shell_rung_read(paths, action, policy)
+        }
+    }
+}
+
+/// The profile names the shell would have listed in `--profiles`.
+///
+/// Byte order, not locale order. The manager runs with `LC_ALL=C`, so its glob
+/// sorts by byte, and this order is observable: it flows into
+/// `profiles_never_observed` through a `filter` that preserves it.
+///
+/// Sorted by **file name** and not by profile name, because `-` (0x2D) sorts
+/// before `.` (0x2E): the shell compares `a-b.toml` against `a.toml` and puts
+/// `a-b` first, where comparing the names `a` against `a-b` would put `a`
+/// first. Every other byte the name charset permits sorts after `.`, so this is
+/// the single case where the two orders disagree — and it is a real one, since
+/// hyphens are legal in profile names.
+///
+/// The charset, the `.toml` suffix and the acceptance of a name that does not
+/// resolve (a dangling symlink counts, a leading dot does not) all mirror the
+/// shell's own loop. Nothing here opens a file: like the shell, this reads the
+/// directory and nothing in it.
+#[cfg(target_os = "linux")]
+fn configured_profile_names(profiles_dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(profiles_dir) else {
+        return Vec::new();
+    };
+    let mut files = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|file| {
+            file.strip_suffix(".toml").is_some_and(|name| {
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            })
+        })
+        .collect::<Vec<_>>();
+    files.sort_unstable();
+    files
+        .iter()
+        .filter_map(|file| file.strip_suffix(".toml").map(str::to_owned))
+        .collect()
+}
+
+/// Rewrite the package's own home and var paths to neutral labels.
+///
+/// The manager does **not** forward the core's stdout verbatim. Every API
+/// document it prints goes through `api_redact_file`, which rewrites
+/// `$package_home` and `$package_var` — and their resolved physical paths, since
+/// DSM makes both of them symlinks into `@apphome` and `@appdata` — to
+/// `[package-home]` and `[package-var]`. `docs/dsm/operations.md` states that as
+/// a property of API output, so a read answered in the service has to apply it
+/// too, or the two rungs disagree about something documented.
+///
+/// It is reachable for this document: a profile's `source` must be inside a
+/// canonical DSM volume tree, and the package's own home resolves to one
+/// (`/volumeN/@apphome/synology-drive-sync`), so a profile pointed there prints
+/// a private package path that the manager would have neutralised.
+///
+/// A plain byte substitution is exact rather than approximate: a package path
+/// holds no byte `serde_json` escapes, so the needle in the rendered document is
+/// the needle itself, and the substitution order matches the manager's.
+#[cfg(target_os = "linux")]
+fn neutralize_package_paths(document: Vec<u8>, paths: &PackagePaths<'_>) -> Vec<u8> {
+    let canonical = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let substitutions = [
+        (paths.package_home.to_path_buf(), "[package-home]"),
+        (paths.package_var.to_path_buf(), "[package-var]"),
+        (canonical(paths.package_home), "[package-home]"),
+        (canonical(paths.package_var), "[package-var]"),
+    ];
+    let mut text = match String::from_utf8(document) {
+        Ok(text) => text,
+        // `serde_json` always renders UTF-8, so this is unreachable. Hand the
+        // document back exactly as it came rather than discarding it or
+        // converting it lossily.
+        Err(error) => return error.into_bytes(),
+    };
+    for (needle, label) in substitutions {
+        let Some(needle) = needle.to_str() else {
+            continue;
+        };
+        // `contains` first so an ordinary document, where no package path
+        // appears, pays one substring search per needle and no allocation.
+        if !needle.is_empty() && text.contains(needle) {
+            text = text.replace(needle, label);
+        }
+    }
+    text.into_bytes()
+}
+
+/// Rung A for `status-rollup`.
+///
+/// This read was never a shell-reproduction problem. The shell's entire
+/// contribution is to name the configured profiles by parameter expansion and
+/// forward the core's stdout verbatim; the core's entire contribution is to read
+/// the clock, call `status_cache::compose_rollups`, and render it with
+/// `serde_json`. That function is `pub` in this crate, so the service calls it
+/// directly and both rungs serialize the same struct through the same derive.
+/// The document is identical by construction rather than by reproduction, and
+/// none of the shell's three string encoders is involved.
+///
+/// What this removes from every open of the Sync section is a shell fork *and* a
+/// core fork.
+#[cfg(target_os = "linux")]
+fn status_rollup_document(
+    paths: &PackagePaths<'_>,
+    policy: &SecurityPolicyArgs,
+) -> BridgeResult<Vec<u8>> {
+    // The core takes the same reading through the same conversion, and refuses
+    // the same clock.
+    let now = i64::try_from(current_epoch()?)
+        .map_err(|_| BridgeError::unavailable_because("clock_unavailable"))?;
+    let expected = configured_profile_names(paths.profiles_dir);
+    // Absent rather than empty when no profile is configured: the shell omits
+    // `--profiles` entirely, and the core reads that absence as "no set was
+    // stated", which makes the total explicitly incomplete instead of complete
+    // over nothing.
+    let aggregate = status_cache::compose_rollups(
+        paths.status_cache,
+        (!expected.is_empty()).then_some(expected.as_slice()),
+        now,
+    );
+    let value = serde_json::to_value(&aggregate).map_err(|_| BridgeError::internal())?;
+    let document = sanitize_manager_document(value, &ReadAction::StatusRollup, None, Some(policy))?;
+    Ok(neutralize_package_paths(document, paths))
+}
+
+/// The last `lines` lines, the way `tail -n N` defines them.
+///
+/// A trailing fragment with no newline counts as a line and is reproduced
+/// verbatim. That edge is the one the manager's own comment argues for: it
+/// windows each rotation, concatenates, and windows again, and the claim that
+/// the second window selects exactly the same bytes only holds if an
+/// unterminated final record is carried through both.
+#[cfg(target_os = "linux")]
+fn tail_lines(bytes: &[u8], lines: usize) -> &[u8] {
+    if lines == 0 || bytes.is_empty() {
+        return &bytes[..0];
+    }
+    // A final terminator closes the last line rather than opening an empty one.
+    let scan = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let mut seen = 0;
+    for index in (0..scan.len()).rev() {
+        if scan[index] == b'\n' {
+            seen += 1;
+            if seen == lines {
+                return &bytes[index + 1..];
+            }
+        }
+    }
+    bytes
+}
+
+/// Split a byte buffer into records the way `awk` does with the default `RS`.
+///
+/// An unterminated final record is a record; a trailing terminator does not
+/// open an empty one; an empty buffer has no records at all, which is why an
+/// existing but empty activity log yields an empty feed rather than one corrupt
+/// record.
+#[cfg(target_os = "linux")]
+fn awk_records(buffer: &[u8]) -> Vec<&[u8]> {
+    if buffer.is_empty() {
+        return Vec::new();
+    }
+    buffer
+        .strip_suffix(b"\n")
+        .unwrap_or(buffer)
+        .split(|byte| *byte == b'\n')
+        .collect()
+}
+
+/// The manager's activity quoter: `\` and `"` escaped, nothing else.
+///
+/// Deliberately not `serde_json`, and deliberately not the manager's other two
+/// encoders. This one escapes exactly two characters, because everything it is
+/// given has already been refused if it held a control byte. `serde_json` would
+/// additionally escape `` and any control byte it met, and the package's
+/// `json_quote` emits a literal `?` for several of them — three encoders that
+/// agree on ordinary text and diverge on the exact inputs this document can
+/// carry.
+#[cfg(target_os = "linux")]
+fn quote_activity_field(text: &[u8]) -> Vec<u8> {
+    let mut quoted = Vec::with_capacity(text.len() + 2);
+    quoted.push(b'"');
+    for byte in text {
+        if *byte == b'\\' || *byte == b'"' {
+            quoted.push(b'\\');
+        }
+        quoted.push(*byte);
+    }
+    quoted.push(b'"');
+    quoted
+}
+
+/// The rendered width of a quoted field, without rendering it.
+#[cfg(target_os = "linux")]
+fn quoted_activity_length(text: &[u8]) -> usize {
+    text.len()
+        + text
+            .iter()
+            .filter(|byte| **byte == b'\\' || **byte == b'"')
+            .count()
+        + 2
+}
+
+/// One accepted activity record, already rendered up to its message.
+#[cfg(target_os = "linux")]
+struct ActivityEvent {
+    prefix: Vec<u8>,
+    message: Vec<u8>,
+}
+
+/// A record the service read and cannot parse. The manager exits 73 here and
+/// reports `corrupt_state`; the service says the same thing in its own
+/// vocabulary rather than pretending a manager ran.
+#[cfg(target_os = "linux")]
+const PACKAGE_STATE_CORRUPT: BridgeError = BridgeError::unsafe_because("package_state_corrupt");
+
+/// Validate one activity record and render everything in it but the message.
+///
+/// Byte-for-byte the manager's `awk` program, including the parts that look
+/// like defects. `epoch` is emitted as the field's own text rather than as a
+/// parsed number, so a record written with a leading zero renders with it. The
+/// three accepted widths are the three record formats the package has shipped,
+/// and the two older ones take documented defaults rather than being dropped.
+#[cfg(target_os = "linux")]
+fn render_activity_event(record: &[u8]) -> BridgeResult<ActivityEvent> {
+    const CATEGORIES: [&[u8]; 12] = [
+        b"audit",
+        b"bridge",
+        b"authentication",
+        b"security",
+        b"configuration",
+        b"secrets",
+        b"routines",
+        b"operations",
+        b"notifications",
+        b"sync",
+        b"controller",
+        b"scheduler",
+    ];
+    const LEVELS: [&[u8]; 5] = [b"trace", b"debug", b"info", b"warn", b"error"];
+    const STATES: [&[u8]; 8] = [
+        b"running",
+        b"succeeded",
+        b"failed",
+        b"deferred",
+        b"scheduled",
+        b"changed",
+        b"unavailable",
+        b"requested",
+    ];
+
+    let fields: Vec<&[u8]> = if record.is_empty() {
+        Vec::new()
+    } else {
+        record.split(|byte| *byte == b'|').collect()
+    };
+    if !matches!(fields.len(), 5 | 7 | 9) {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    let width = fields.len();
+    let digits = |field: &[u8]| !field.is_empty() && field.iter().all(u8::is_ascii_digit);
+    let code_shape = |field: &[u8]| {
+        let Some(dot) = field.iter().position(|byte| *byte == b'.') else {
+            return false;
+        };
+        let (head, tail) = field.split_at(dot);
+        let tail = &tail[1..];
+        let lowercase = |part: &[u8]| {
+            !part.is_empty()
+                && part
+                    .iter()
+                    .all(|byte| byte.is_ascii_lowercase() || *byte == b'_')
+        };
+        lowercase(head) && lowercase(tail)
+    };
+    let profile_shape = |field: &[u8]| {
+        !field.is_empty()
+            && field
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'-')
+    };
+    let control_free = |field: &[u8]| {
+        !field
+            .iter()
+            .any(|byte| (1..=0x1f).contains(byte) || *byte == 0x7f)
+    };
+
+    if !digits(fields[0])
+        || !code_shape(fields[1])
+        || !profile_shape(fields[2])
+        || !STATES.contains(&fields[3])
+    {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    if width >= 7 && (!CATEGORIES.contains(&fields[4]) || !LEVELS.contains(&fields[5])) {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    if width == 9 {
+        let uid = fields[6];
+        // `^[1-9][0-9]*$` and at most 4294967295. Compared as text because the
+        // manager's `awk` compares as a double, which loses precision above
+        // 2^53 — every value that far past the ceiling is still refused, and
+        // comparing the digits refuses exactly the same set without depending
+        // on that.
+        let over_ceiling = uid.len() > 10 || (uid.len() == 10 && uid > b"4294967295".as_slice());
+        if uid.first().is_none_or(|byte| !(b'1'..=b'9').contains(byte))
+            || !uid.iter().all(u8::is_ascii_digit)
+            || over_ceiling
+            || fields[7].is_empty()
+            || fields[7].len() > 256
+            || !control_free(fields[7])
+        {
+            return Err(PACKAGE_STATE_CORRUPT);
+        }
+    }
+    let message = fields[width - 1];
+    if message.len() > 4096 || !control_free(message) {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+
+    let category: &[u8] = if width >= 7 { fields[4] } else { b"operations" };
+    let level: &[u8] = if width >= 7 { fields[5] } else { b"info" };
+    let actor_uid: Vec<u8> = if width == 9 {
+        fields[6].to_vec()
+    } else {
+        b"null".to_vec()
+    };
+    let actor: Vec<u8> = if width == 9 {
+        quote_activity_field(fields[7])
+    } else {
+        b"null".to_vec()
+    };
+
+    // The client request id is spliced out of the message rather than carried
+    // in its own field, from the first occurrence of the marker, and a marker
+    // that is present but not followed by exactly thirty-two lowercase hex
+    // digits makes the whole feed corrupt rather than that one event untagged.
+    const REQUEST_MARKER: &[u8] = b" request_id=";
+    let client_request_id = match message
+        .windows(REQUEST_MARKER.len())
+        .position(|window| window == REQUEST_MARKER)
+    {
+        Some(at) => {
+            let value = &message[at + REQUEST_MARKER.len()..];
+            // Lower-case hexadecimal only: the manager refuses anything outside
+            // `[0-9a-f]`, so an upper-case digest is corrupt rather than
+            // normalised.
+            if value.len() != 32
+                || !value
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+            {
+                return Err(PACKAGE_STATE_CORRUPT);
+            }
+            quote_activity_field(value)
+        }
+        None => b"null".to_vec(),
+    };
+
+    let mut prefix = Vec::with_capacity(160);
+    prefix.extend_from_slice(b"{\"epoch\":");
+    prefix.extend_from_slice(fields[0]);
+    prefix.extend_from_slice(b",\"code\":");
+    prefix.extend_from_slice(&quote_activity_field(fields[1]));
+    prefix.extend_from_slice(b",\"profile\":");
+    prefix.extend_from_slice(&quote_activity_field(fields[2]));
+    prefix.extend_from_slice(b",\"state\":");
+    prefix.extend_from_slice(&quote_activity_field(fields[3]));
+    prefix.extend_from_slice(b",\"category\":");
+    prefix.extend_from_slice(&quote_activity_field(category));
+    prefix.extend_from_slice(b",\"level\":");
+    prefix.extend_from_slice(&quote_activity_field(level));
+    prefix.extend_from_slice(b",\"actor_uid\":");
+    prefix.extend_from_slice(&actor_uid);
+    prefix.extend_from_slice(b",\"actor\":");
+    prefix.extend_from_slice(&actor);
+    prefix.extend_from_slice(b",\"client_request_id\":");
+    prefix.extend_from_slice(&client_request_id);
+    prefix.extend_from_slice(b",\"message\":");
+    Ok(ActivityEvent {
+        prefix,
+        message: message.to_vec(),
+    })
+}
+
+/// Assemble the activity feed the manager would have printed.
+///
+/// The ring keeps only the newest `requested` records while reading, and the
+/// byte budget is then walked backwards from the newest so that a feed too
+/// large to carry loses its oldest records rather than its newest.
+#[cfg(target_os = "linux")]
+fn render_activity_feed(window: &[u8], requested: usize) -> BridgeResult<Vec<u8>> {
+    const OPEN: &[u8] = b"{\"schema\":\"sdsync.dsm-activity.v1\",\"events\":[";
+    const EMPTY: &[u8] = b"{\"schema\":\"sdsync.dsm-activity.v1\",\"events\":[]}";
+
+    let mut ring: Vec<Option<ActivityEvent>> = (0..requested).map(|_| None).collect();
+    let mut count = 0_usize;
+    for record in awk_records(window) {
+        let event = render_activity_event(record)?;
+        ring[count % requested] = Some(event);
+        count += 1;
+    }
+    let available = count.min(requested);
+    let oldest = count - available;
+
+    let mut selected_bytes = EMPTY.len();
+    let mut selected_first = count;
+    for record in (oldest..count).rev() {
+        let event = ring[record % requested]
+            .as_ref()
+            .ok_or_else(BridgeError::internal)?;
+        let separator = usize::from(selected_first < count);
+        let cost = event.prefix.len() + quoted_activity_length(&event.message) + 1 + separator;
+        if selected_bytes + cost > MAX_ACTIVITY_RESPONSE_BYTES {
+            break;
+        }
+        selected_bytes += cost;
+        selected_first = record;
+    }
+
+    let mut document = Vec::with_capacity(selected_bytes);
+    document.extend_from_slice(OPEN);
+    for record in selected_first..count {
+        if record > selected_first {
+            document.push(b',');
+        }
+        let event = ring[record % requested]
+            .as_ref()
+            .ok_or_else(BridgeError::internal)?;
+        document.extend_from_slice(&event.prefix);
+        document.extend_from_slice(&quote_activity_field(&event.message));
+        document.push(b'}');
+    }
+    document.extend_from_slice(b"]}");
+    Ok(document)
+}
+
+/// Rung A for `activity`.
+///
+/// The smallest input surface of the three manager-shaped reads: four log files
+/// and nothing else — no configuration, no policy, no secrets. Level filtering
+/// happens afterwards, in the shared sanitize layer, exactly where it happens
+/// for the manager's own output.
+///
+/// The assembled bytes go back through `parse_and_sanitize_manager_json`
+/// rather than around it, so the two rungs cannot diverge in validation,
+/// redaction or policy filtering. Parity then reduces to one question the
+/// differential test answers directly: are these the bytes the manager would
+/// have printed?
+#[cfg(target_os = "linux")]
+fn activity_document(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    action: &ReadAction,
+    lines: u16,
+    policy: &SecurityPolicyArgs,
+) -> BridgeResult<Vec<u8>> {
+    let requested = usize::from(lines).max(1);
+    let history = linux_files::read_activity_history(paths.log_root, package_uid)?;
+    let document = if history.is_empty() {
+        // No file at all is the manager's short-circuit: an empty feed, printed
+        // without ever starting its pipeline. An existing but empty file is a
+        // different thing and takes the ordinary path to the same answer.
+        b"{\"schema\":\"sdsync.dsm-activity.v1\",\"events\":[]}".to_vec()
+    } else {
+        let mut combined = Vec::new();
+        for source in &history {
+            combined.extend_from_slice(tail_lines(source, requested));
+        }
+        render_activity_feed(tail_lines(&combined, requested), requested)?
+    };
+    parse_and_sanitize_manager_json(&document, action, None, Some(policy))
+}
+
+/// Rung A: answer from the package's own files.
+#[cfg(target_os = "linux")]
+fn run_in_service_read(
+    paths: &PackagePaths<'_>,
+    action: &ReadAction,
+    policy: &SecurityPolicyArgs,
+    package_uid: u32,
+) -> BridgeResult<CgiResponse> {
+    let body = match action {
+        ReadAction::StatusRollup => status_rollup_document(paths, policy)?,
+        ReadAction::Activity { lines } => {
+            activity_document(paths, package_uid, action, *lines, policy)?
+        }
+        // `read_rung` routes nothing else here, and it is a total match, so a
+        // read that gains an in-service implementation must be added in both
+        // places or fail to compile in one of them.
+        ReadAction::Snapshot
+        | ReadAction::Logs { .. }
+        | ReadAction::Csrf
+        | ReadAction::SourceDirectories { .. }
+        | ReadAction::SourcePath { .. }
+        | ReadAction::Result { .. }
+        | ReadAction::RequestStatus { .. } => return Err(BridgeError::internal()),
+    };
+    Ok(CgiResponse::success(body))
+}
+
+/// Rung B: run the shell manager and sanitize what it prints.
+#[cfg(target_os = "linux")]
+fn run_shell_rung_read(
+    paths: &PackagePaths<'_>,
+    action: &ReadAction,
+    policy: &SecurityPolicyArgs,
+) -> BridgeResult<CgiResponse> {
     let arguments = read_manager_arguments(action)?;
-    let output = run_read_manager(&arguments)?;
+    let output = run_read_manager(paths.manager, &arguments)?;
     if !output.status_success {
-        return Err(BridgeError::new(ErrorKind::Unavailable));
+        return Err(BridgeError::unavailable_because("manager_exit_status"));
     }
     let body = parse_and_sanitize_manager_json(&output.stdout, action, None, Some(policy))?;
     Ok(CgiResponse::success(body))
@@ -14511,11 +15637,17 @@ fn consume_job_inner(
     Ok(result)
 }
 
+/// The wall clock, refused rather than clamped when it reads before the epoch.
+///
+/// The kind stays `Unavailable` — every consumer that branches on a kind sees
+/// the value it saw before — and the cause travels as a code, which is the half
+/// the operator needs: nothing here is worth waiting out, the NAS clock is set
+/// wrongly.
 fn current_epoch() -> BridgeResult<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
-        .map_err(|_| BridgeError::new(ErrorKind::Unavailable))
+        .map_err(|_| BridgeError::unavailable_because("clock_unavailable"))
 }
 
 fn write_cgi_response(response: &CgiResponse) -> io::Result<()> {
@@ -15646,6 +16778,1331 @@ mod tests {
     #[cfg(target_os = "linux")]
     static CONTROL_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
+    /// A package tree the read path can be pointed at.
+    ///
+    /// Deliberately not a copy of the shipped package: it holds a stub manager
+    /// and the private markers under `var/control`, which is everything the
+    /// shell rung and the kill switch touch. Reads answered in the service need
+    /// the real tree, and build it separately.
+    #[cfg(target_os = "linux")]
+    struct TestPackageFixture {
+        root: PathBuf,
+        manager: PathBuf,
+        home: PathBuf,
+        var: PathBuf,
+        log_root: PathBuf,
+        profiles_dir: PathBuf,
+        status_cache: PathBuf,
+        read_lane: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl TestPackageFixture {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_CONTROL_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "sdsync-dsm-pkg-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            let home = root.join("home");
+            let var = root.join("var");
+            let log_root = var.join("log");
+            let control = var.join("control");
+            let profiles_dir = home.join("config/profiles.d");
+            let status_cache = var.join("state/cache/status");
+            for directory in [
+                &root,
+                &home,
+                &var,
+                &log_root,
+                &control,
+                &profiles_dir,
+                &status_cache,
+            ] {
+                fs::create_dir_all(directory).unwrap();
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            Self {
+                manager: root.join("sdsync-dsm"),
+                read_lane: control.join("read-lane"),
+                home,
+                var,
+                log_root,
+                profiles_dir,
+                status_cache,
+                root,
+            }
+        }
+
+        fn paths(&self) -> PackagePaths<'_> {
+            PackagePaths {
+                manager: &self.manager,
+                package_home: &self.home,
+                package_var: &self.var,
+                log_root: &self.log_root,
+                profiles_dir: &self.profiles_dir,
+                status_cache: &self.status_cache,
+                read_lane: &self.read_lane,
+            }
+        }
+
+        /// Install a `/bin/sh` stub in place of the manager. 0755 satisfies
+        /// every check `validate_package_manager` makes when the test runner
+        /// owns the file, which it does: `cargo test` is never root.
+        fn write_manager(&self, script: &str) {
+            fs::write(&self.manager, format!("#!/bin/sh\n{script}\n")).unwrap();
+            fs::set_permissions(&self.manager, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        fn write_private(&self, path: &Path, bytes: &[u8]) {
+            fs::write(path, bytes).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        fn package_uid() -> u32 {
+            // SAFETY: geteuid has no pointer arguments or preconditions.
+            unsafe { libc::geteuid() }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for TestPackageFixture {
+        fn drop(&mut self) {
+            let safe_name = self
+                .root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("sdsync-dsm-pkg-"));
+            if safe_name {
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_package_paths_are_fixed_to_the_dsm_contract() {
+        let paths = PackagePaths::production();
+        assert_eq!(paths.manager, Path::new(MANAGER_PATH));
+        assert_eq!(paths.package_home, Path::new(PACKAGE_HOME));
+        assert_eq!(paths.package_var, Path::new(PACKAGE_VAR));
+        assert_eq!(paths.log_root, Path::new(LOG_ROOT));
+        assert_eq!(paths.profiles_dir, Path::new(PROFILES_DIR));
+        assert_eq!(paths.status_cache, Path::new(STATUS_CACHE_DIR));
+        assert_eq!(paths.read_lane, Path::new(READ_LANE_PATH));
+        // The kill switch lives beside the private queue, under the directory
+        // only the package user may write.
+        assert_eq!(paths.read_lane.parent(), Some(Path::new(CONTROL_ROOT)));
+        // These two must be exactly what the shell derives from
+        // `$package_home` and `$package_var`, or the neutral-label substitution
+        // the two rungs share would use different needles.
+        assert_eq!(
+            paths.profiles_dir,
+            paths.package_home.join("config/profiles.d")
+        );
+        assert_eq!(
+            paths.status_cache,
+            paths.package_var.join("state/cache/status")
+        );
+        assert_eq!(paths.log_root, paths.package_var.join("log"));
+    }
+
+    /// Copy a directory tree, following nothing and preserving no modes.
+    #[cfg(target_os = "linux")]
+    fn copy_tree(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn chmod_tree(path: &Path, mode: u32) {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        if path.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                chmod_tree(&entry.unwrap().path(), mode);
+            }
+        }
+    }
+
+    /// Single-quote for `sh`, the way `shlex.quote` does.
+    #[cfg(target_os = "linux")]
+    fn shell_quote(path: &Path) -> String {
+        format!("'{}'", path.to_str().unwrap().replace('\'', r"'\''"))
+    }
+
+    /// The identity the shell manager must run as, when it is not this one.
+    ///
+    /// `require_package_identity` refuses to run as root outright, and the Linux
+    /// container this suite is verified in runs as root. So the fixture models
+    /// DSM: the package tree belongs to an unprivileged identity and the manager
+    /// runs as that identity. Off root this is `None` and the whole ownership
+    /// model is inert on both sides, exactly as it is in the Python suite, whose
+    /// `drop_uid` is the current uid unless it is 0.
+    #[cfg(target_os = "linux")]
+    fn fixture_drop_identity() -> Option<(u32, u32)> {
+        // SAFETY: geteuid has no pointer arguments or preconditions.
+        (unsafe { libc::geteuid() } == 0).then_some((65534, 65534))
+    }
+
+    /// Hand a fixture tree to an unprivileged identity, leaving symlinks alone.
+    ///
+    /// DSM keeps `/var/packages/<name>/{home,var,target}` root-owned while their
+    /// `@apphome`, `@appdata` and `@appstore` targets belong to the package user,
+    /// and the manager reads the owner through `stat -L`. Skipping symlinks
+    /// reproduces that.
+    #[cfg(target_os = "linux")]
+    fn hand_tree_to(path: &Path, uid: u32, gid: u32) {
+        use std::os::unix::ffi::OsStrExt;
+
+        if !fs::symlink_metadata(path).unwrap().file_type().is_symlink() {
+            let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `name` is a live NUL-terminated path for the call.
+            let status = unsafe { libc::lchown(name.as_ptr(), uid, gid) };
+            assert_eq!(status, 0, "could not hand over {}", path.display());
+            if path.is_dir() {
+                for entry in fs::read_dir(path).unwrap() {
+                    hand_tree_to(&entry.unwrap().path(), uid, gid);
+                }
+            }
+        }
+    }
+
+    /// The real core binary, beside the test binary or wherever the environment
+    /// says.
+    ///
+    /// The differential test is not meaningful against a stub core: the whole
+    /// claim is that the service and the core produce the same document from the
+    /// same struct. A missing core therefore fails loudly rather than skipping,
+    /// because a parity test that quietly does not run is worse than none.
+    #[cfg(target_os = "linux")]
+    fn locate_core_binary() -> PathBuf {
+        if let Some(configured) = std::env::var_os("SDSYNC_VALIDATOR_BINARY") {
+            let configured = PathBuf::from(configured);
+            assert!(
+                configured.is_file(),
+                "SDSYNC_VALIDATOR_BINARY is not a file"
+            );
+            return configured;
+        }
+        let executable = std::env::current_exe().unwrap();
+        let deps = executable.parent().unwrap();
+        let profile_root = deps.parent().unwrap();
+        let workspace_target = profile_root.parent().unwrap();
+        for candidate in [
+            profile_root.join("synology-drive-sync"),
+            workspace_target.join("debug/synology-drive-sync"),
+            workspace_target.join("release/synology-drive-sync"),
+        ] {
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+        panic!(
+            "the core binary is not built; run the suite with --all-targets or set \
+             SDSYNC_VALIDATOR_BINARY (looked beside {})",
+            profile_root.display()
+        );
+    }
+
+    /// A relocated copy of the shipped package, for proving that a read answered
+    /// in the service is byte-identical to the same read answered by the shell.
+    ///
+    /// Mirrors `test_synology_package.py`'s own fixture construction: DSM's fixed
+    /// `/var/packages/<name>` alias becomes a directory of symlinks into the
+    /// fixture's `apphome`, `appdata` and `appstore`, and the two source lines
+    /// that hard-code production roots are substituted with the same
+    /// assert-exactly-one-occurrence idiom the Python suite uses, so a rename in
+    /// the shipped scripts breaks this loudly instead of silently testing an
+    /// unrelocated tree. The shipped tree itself is never modified; everything
+    /// happens on the copy.
+    ///
+    /// Privileges are deliberately not dropped. The Python suite's `drop_uid` is
+    /// the identity off root and every `chown` there is guarded by a root check,
+    /// so under `cargo test`, which is never root, the ownership model is inert
+    /// on both sides and a drop would buy nothing.
+    #[cfg(target_os = "linux")]
+    struct TestShellPackageFixture {
+        root: PathBuf,
+        home: PathBuf,
+        var: PathBuf,
+        target: PathBuf,
+        system_root: PathBuf,
+        manager: PathBuf,
+        profiles_dir: PathBuf,
+        status_cache: PathBuf,
+        read_lane: PathBuf,
+        log_root: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl TestShellPackageFixture {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_CONTROL_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "sdsync-dsm-shell-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            let real_home = root.join("apphome");
+            let real_var = root.join("appdata");
+            let real_target = root.join("appstore");
+            let fhs = root.join("var-packages/synology-drive-sync");
+            let system_root = root.join("dsm-system-root");
+            for directory in [&root, &real_home, &real_var] {
+                fs::create_dir_all(directory).unwrap();
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            fs::create_dir_all(&fhs).unwrap();
+            fs::create_dir_all(system_root.join("volume1")).unwrap();
+
+            let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/synology/package");
+            copy_tree(&shipped, &real_target);
+
+            // DSM's fixed framework alias, relocated into the fixture. The
+            // physical SYNOPKG_* targets stay distinct, exactly as they are
+            // under /volume*/@app{store,home,data} on a real unit.
+            let common = real_target.join("libexec/sdsync-common");
+            let source = fs::read_to_string(&common).unwrap();
+            let needle = "package_base=/var/packages/$package_name\n";
+            assert_eq!(
+                source.matches(needle).count(),
+                1,
+                "the relocated package base moved or changed shape"
+            );
+            fs::write(
+                &common,
+                source.replacen(needle, &format!("package_base={}\n", shell_quote(&fhs)), 1),
+            )
+            .unwrap();
+
+            let manager_source_path = real_target.join("bin/sdsync-dsm");
+            let manager_source = fs::read_to_string(&manager_source_path).unwrap();
+            let system_needle = "dsm_system_root=/\n";
+            assert_eq!(
+                manager_source.matches(system_needle).count(),
+                1,
+                "the pinned DSM system root moved or changed shape"
+            );
+            fs::write(
+                &manager_source_path,
+                manager_source.replacen(
+                    system_needle,
+                    &format!("dsm_system_root={}\n", shell_quote(&system_root)),
+                    1,
+                ),
+            )
+            .unwrap();
+
+            chmod_tree(&real_target, 0o755);
+            std::os::unix::fs::symlink(&real_home, fhs.join("home")).unwrap();
+            std::os::unix::fs::symlink(&real_var, fhs.join("var")).unwrap();
+            std::os::unix::fs::symlink(&real_target, fhs.join("target")).unwrap();
+
+            // A shim rather than a copy: the debug core is large and /tmp is a
+            // different filesystem from the target directory, so neither a copy
+            // nor a hard link is cheap. The shell only executes it.
+            let core = real_target.join("bin/synology-drive-sync");
+            fs::write(
+                &core,
+                format!(
+                    "#!/bin/sh\nexec {} \"$@\"\n",
+                    shell_quote(&locate_core_binary())
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&core, fs::Permissions::from_mode(0o755)).unwrap();
+
+            let home = fhs.join("home");
+            let var = fhs.join("var");
+            Self {
+                manager: fhs.join("target/bin/sdsync-dsm"),
+                target: fhs.join("target"),
+                profiles_dir: home.join("config/profiles.d"),
+                status_cache: var.join("state/cache/status"),
+                read_lane: var.join("control/read-lane"),
+                log_root: var.join("log"),
+                system_root,
+                home,
+                var,
+                root,
+            }
+        }
+
+        fn paths(&self) -> PackagePaths<'_> {
+            PackagePaths {
+                manager: &self.manager,
+                package_home: &self.home,
+                package_var: &self.var,
+                log_root: &self.log_root,
+                profiles_dir: &self.profiles_dir,
+                status_cache: &self.status_cache,
+                read_lane: &self.read_lane,
+            }
+        }
+
+        /// Run the shell manager under exactly the environment the API service
+        /// gives it in production.
+        ///
+        /// Built from `manager_command_environment()` itself with the four
+        /// path-valued entries redirected, so a variable added to production is
+        /// added here too and the test cannot drift into being greener than the
+        /// service.
+        fn run_manager(&self, arguments: &[&str]) -> std::process::Output {
+            use std::os::unix::process::CommandExt;
+
+            // Hand the tree over here rather than once at construction: the
+            // test writes its own fixture content as this process, and anything
+            // the manager must open has to belong to the identity it runs as.
+            if let Some((uid, gid)) = fixture_drop_identity() {
+                hand_tree_to(&self.root, uid, gid);
+            }
+            let mut command = Command::new("/bin/sh");
+            command.arg(&self.manager).args(arguments).env_clear();
+            for (name, value) in manager_command_environment() {
+                let value = match name.to_str() {
+                    Some("HOME" | "SYNOPKG_PKGHOME") => self.home.clone().into_os_string(),
+                    Some("SYNOPKG_PKGVAR") => self.var.clone().into_os_string(),
+                    Some("SYNOPKG_PKGDEST") => self.target.clone().into_os_string(),
+                    _ => value,
+                };
+                command.env(name, value);
+            }
+            if let Some((uid, gid)) = fixture_drop_identity() {
+                // SAFETY: setgroups, setgid and setuid are async-signal-safe and
+                // the callback allocates nothing between fork and exec.
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::setgroups(0, std::ptr::null()) != 0
+                            || libc::setgid(gid) != 0
+                            || libc::setuid(uid) != 0
+                        {
+                            return Err(io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            command.output().unwrap()
+        }
+
+        fn write_profile(&self, name: &str, source: &Path, remote: &str) {
+            fs::create_dir_all(&self.profiles_dir).unwrap();
+            let document = format!(
+                "name = \"{name}\"\nsource = \"{}\"\nremote = \"{remote}\"\n",
+                source.display()
+            );
+            let path = self.profiles_dir.join(format!("{name}.toml"));
+            fs::write(&path, document).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        /// The identity that owns the package tree, which is this process
+        /// unless it is root.
+        fn package_uid(&self) -> u32 {
+            // SAFETY: geteuid has no pointer arguments or preconditions.
+            fixture_drop_identity().map_or_else(|| unsafe { libc::geteuid() }, |(uid, _)| uid)
+        }
+
+        /// Hand the tree to that identity. `run_manager` does this itself; a
+        /// test that runs only the in-service rung calls it so both sides see
+        /// the same ownership.
+        fn hand_over(&self) {
+            if let Some((uid, gid)) = fixture_drop_identity() {
+                hand_tree_to(&self.root, uid, gid);
+            }
+        }
+
+        fn write_log(&self, name: &str, bytes: &[u8]) {
+            fs::create_dir_all(&self.log_root).unwrap();
+            let path = self.log_root.join(name);
+            fs::write(&path, bytes).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        fn write_rollup(&self, document: &status_cache::RollupDocument) {
+            fs::create_dir_all(&self.status_cache).unwrap();
+            let path = self
+                .status_cache
+                .join(format!("{}.rollup.json", document.profile));
+            fs::write(&path, serde_json::to_vec(document).unwrap()).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for TestShellPackageFixture {
+        fn drop(&mut self) {
+            let safe_name = self
+                .root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("sdsync-dsm-shell-"));
+            if safe_name {
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+    }
+
+    /// A stored rollup document with every count distinct, so a field swapped
+    /// between the two rungs cannot hide behind an equal value.
+    #[cfg(target_os = "linux")]
+    fn rollup_document(
+        profile: &str,
+        source: &Path,
+        remote: &str,
+        complete: bool,
+        observed_at_epoch: i64,
+    ) -> status_cache::RollupDocument {
+        let seed = usize::from(profile.as_bytes()[0]);
+        status_cache::RollupDocument {
+            schema: status_cache::ROLLUP_SCHEMA.to_owned(),
+            binary: env!("SDSYNC_VERSION").to_owned(),
+            profile: profile.to_owned(),
+            source: source.display().to_string(),
+            remote: remote.to_owned(),
+            compare: "size-and-time".to_owned(),
+            observed_at_epoch,
+            observation: status_cache::RollupObservation {
+                complete,
+                budget: seed + 1,
+                digests_reused: seed + 2,
+                digests_computed: seed + 3,
+                oldest_evidence_epoch: Some(observed_at_epoch - 7),
+            },
+            state: status_cache::RollupState {
+                in_sync: status_cache::FilesAndBytes {
+                    files: seed + 4,
+                    bytes: (seed as u64) + 5,
+                },
+                would_transfer: status_cache::FilesAndBytes {
+                    files: seed + 6,
+                    bytes: (seed as u64) + 7,
+                },
+                differs: status_cache::Files { files: seed + 8 },
+                missing_remote: status_cache::Files { files: seed + 9 },
+                remote_only: status_cache::Entries { entries: seed + 10 },
+                type_conflicts: status_cache::Entries { entries: seed + 11 },
+                excluded: status_cache::Entries { entries: seed + 12 },
+                directories: status_cache::Entries { entries: seed + 13 },
+                total_entries: seed + 14,
+                attention_entries: seed + 15,
+            },
+        }
+    }
+
+    /// Replace `generated_at_epoch`'s digits in place, after proving the value
+    /// is a reading of this test's own clock.
+    ///
+    /// The one field that legitimately differs between the rungs: two clock
+    /// reads at two instants. Everything else — `observed_at_epoch`,
+    /// `oldest_evidence_epoch`, every count — is stored rather than recomputed
+    /// and must match exactly, so nothing else is normalised. The substitution
+    /// is textual so the comparison stays a byte comparison.
+    #[cfg(target_os = "linux")]
+    fn pin_generated_epoch(document: &[u8], now: i64) -> Vec<u8> {
+        const KEY: &[u8] = b"\"generated_at_epoch\":";
+        let at = document
+            .windows(KEY.len())
+            .position(|window| window == KEY)
+            .expect("the aggregate carries generated_at_epoch");
+        let digits_at = at + KEY.len();
+        let digits_end = digits_at
+            + document[digits_at..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+        let observed = std::str::from_utf8(&document[digits_at..digits_end])
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+        assert!(
+            (observed - now).abs() <= 2,
+            "generated_at_epoch {observed} is not a reading of this test's clock {now}"
+        );
+        let mut pinned = document[..digits_at].to_vec();
+        pinned.extend_from_slice(b"0");
+        pinned.extend_from_slice(&document[digits_end..]);
+        pinned
+    }
+
+    /// Fault-injection row 18: the rung a read takes is decided at compile time.
+    ///
+    /// The `match` in `read_rung` is total, so a new `ReadAction` variant fails
+    /// to compile rather than silently enrolling in the shell rung. This test
+    /// adds the other half — that the rung assignments are what the ladder
+    /// claims, so moving a read between rungs is a deliberate edit here too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_read_action_is_assigned_a_rung_by_a_total_match() {
+        for (action, rung) in [
+            (ReadAction::Snapshot, ReadRung::ShellManager),
+            (
+                ReadAction::Logs {
+                    lines: 10,
+                    source: LogSource::All,
+                },
+                ReadRung::ShellManager,
+            ),
+            // Answered in the service since the rollup landed on rung A: the
+            // shell's whole contribution was to name the profiles and forward
+            // the core's document. `activity` followed, reading four log files
+            // and nothing else.
+            (ReadAction::Activity { lines: 10 }, ReadRung::InService),
+            (ReadAction::StatusRollup, ReadRung::InService),
+            (ReadAction::Csrf, ReadRung::NotLadderRouted),
+            (
+                ReadAction::SourceDirectories {
+                    parent: "/volume1".to_owned(),
+                },
+                ReadRung::NotLadderRouted,
+            ),
+            (
+                ReadAction::SourcePath {
+                    path: "/volume1".to_owned(),
+                },
+                ReadRung::NotLadderRouted,
+            ),
+            (
+                ReadAction::Result {
+                    job_id: "j".to_owned(),
+                },
+                ReadRung::NotLadderRouted,
+            ),
+            (
+                ReadAction::RequestStatus {
+                    request_id: "r".to_owned(),
+                },
+                ReadRung::NotLadderRouted,
+            ),
+        ] {
+            assert_eq!(read_rung(&action), rung, "{action:?}");
+        }
+    }
+
+    /// Fault-injection row 17 for `status-rollup`: the same read, answered by
+    /// the shell manager and answered inside the service, is byte-identical.
+    ///
+    /// Compared at the post-sanitize layer rather than at the shell's stdout.
+    /// That is the load-bearing choice: the bridge's own insertions and policy
+    /// filtering then stop being differences the test has to normalise away,
+    /// instead of being exactly the keys a normalising test would blind itself
+    /// to.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn status_rollup_is_byte_identical_on_the_service_and_the_shell_rungs() {
+        let fixture = TestShellPackageFixture::new("rollup-parity");
+        let policy = SecurityPolicyArgs::default();
+        let volume = fixture.system_root.join("volume1");
+
+        // Four configured profiles, of which two have stored totals. The names
+        // are chosen so that sorting by profile name and sorting by file name
+        // disagree: `-` (0x2D) sorts before `.` (0x2E), so the shell's glob
+        // yields `alpha-two.toml` before `alpha.toml` while the names `alpha`
+        // and `alpha-two` sort the other way. The order is observable through
+        // `profiles_never_observed`.
+        for name in ["alpha", "alpha-two", "beta", "zulu"] {
+            fixture.write_profile(name, &volume.join(name), &format!("/home/Drive/{name}"));
+        }
+        // A profile sourced inside the package's own home, which is what makes
+        // the manager's neutral-label substitution reachable for this document.
+        fixture.write_profile(
+            "inside",
+            &fixture.home.join("config/inside"),
+            "/home/Drive/inside",
+        );
+        // Names the shell's own loop refuses, which must not reach `--profiles`:
+        // a dot-prefixed file its glob never matches, a name outside the
+        // charset, and a file that is not a profile fragment at all.
+        for (file, body) in [
+            (".hidden.toml", "name = \"hidden\"\n"),
+            ("bad name.toml", "name = \"bad name\"\n"),
+            ("notes.txt", "not a profile\n"),
+        ] {
+            fs::create_dir_all(&fixture.profiles_dir).unwrap();
+            fs::write(fixture.profiles_dir.join(file), body).unwrap();
+        }
+
+        // `alpha` is deliberately left without a stored document. That is what
+        // makes the ordering observable: the emitted list is
+        // `[alpha-two, alpha, beta]` in the shell's byte order over file names
+        // and `[alpha, alpha-two, beta]` if the profile names were sorted
+        // instead, so a naive sort fails this test rather than passing it.
+        // An incomplete walk, which makes the aggregate incomplete for a reason
+        // other than an unobserved profile.
+        fixture.write_rollup(&rollup_document(
+            "zulu",
+            &volume.join("zulu"),
+            "/home/Drive/zulu",
+            false,
+            1_700_000_400,
+        ));
+        fixture.write_rollup(&rollup_document(
+            "inside",
+            &fixture.home.join("config/inside"),
+            "/home/Drive/inside",
+            true,
+            1_700_000_900,
+        ));
+        // Two documents the composer must skip: a foreign schema and a foreign
+        // build. Each leaves its profile unobserved rather than contributing.
+        let mut foreign_schema = rollup_document(
+            "beta",
+            &volume.join("beta"),
+            "/home/Drive/beta",
+            true,
+            1_700_000_100,
+        );
+        foreign_schema.schema = "sdsync.status-rollup.v0".to_owned();
+        fixture.write_rollup(&foreign_schema);
+        let mut foreign_binary = rollup_document(
+            "alpha-two",
+            &volume.join("alpha-two"),
+            "/home/Drive/alpha-two",
+            true,
+            1_700_000_200,
+        );
+        foreign_binary.binary = "0.0.0-not-this-build".to_owned();
+        fixture.write_rollup(&foreign_binary);
+
+        let now = i64::try_from(current_epoch().unwrap()).unwrap();
+        let shell = fixture.run_manager(&["api", "status-rollup"]);
+        assert!(
+            shell.status.success(),
+            "shell rung failed ({}):\nstdout: {}\nstderr: {}",
+            shell.status,
+            String::from_utf8_lossy(&shell.stdout),
+            String::from_utf8_lossy(&shell.stderr)
+        );
+        let left = parse_and_sanitize_manager_json(
+            &shell.stdout,
+            &ReadAction::StatusRollup,
+            None,
+            Some(&policy),
+        )
+        .unwrap();
+        let right = status_rollup_document(&fixture.paths(), &policy).unwrap();
+
+        assert_eq!(
+            String::from_utf8_lossy(&pin_generated_epoch(&left, now)),
+            String::from_utf8_lossy(&pin_generated_epoch(&right, now))
+        );
+
+        // The fixture actually exercised what it claims to. Without these the
+        // test could pass on two identically empty documents.
+        let document: Value = serde_json::from_slice(&right).unwrap();
+        assert_eq!(document["schema"], "sdsync.status-rollup-aggregate.v1");
+        assert_eq!(document["profiles_total"], 5);
+        assert_eq!(document["profiles_observed"], 2);
+        // Byte order over file names, which is what a C-locale glob yields and
+        // is not the order the profile names alone would give.
+        assert_eq!(
+            document["profiles_never_observed"],
+            json!(["alpha-two", "alpha", "beta"])
+        );
+        assert_eq!(document["complete"], false);
+        // The stored age is the oldest observation, carried through unchanged.
+        assert_eq!(document["observed_at_epoch"], 1_700_000_400);
+        // And the package's own home is a neutral label on both rungs.
+        let rendered = String::from_utf8(right.clone()).unwrap();
+        assert!(
+            rendered.contains("[package-home]/config/inside"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains(fixture.home.to_str().unwrap()),
+            "a private package path survived into the document: {rendered}"
+        );
+    }
+
+    /// Write the four activity sources the manager reads, exercising every
+    /// branch of its encoder that a stored record can reach.
+    #[cfg(target_os = "linux")]
+    fn write_activity_history(fixture: &TestShellPackageFixture) {
+        // Nine fields: the current format, with a stable actor identity.
+        // Seven: category and level but no actor. Five: the oldest shipped
+        // format, which takes the documented `operations`/`info` defaults and
+        // reports a null actor rather than being dropped.
+        fixture.write_log(
+            "activity.log.3",
+            concat!(
+                "1700000001|sync.started|alpha|running|sync|info|1026|admin|Module sync running [t1]\n",
+                "1700000002|config.changed|none|changed|configuration|info|1026|admin|Saved \"alpha\" with a \\ backslash\n",
+                "1700000003|legacy.event|beta|succeeded|Old five-field record\n",
+            )
+            .as_bytes(),
+        );
+        fixture.write_log(
+            "activity.log.2",
+            concat!(
+                "1700000004|audit.requested|alpha|requested|audit|info|1026|admin|Module configure_profile requested [tx] request_id=0123456789abcdef0123456789abcdef\n",
+                "1700000005|seven.field|gamma|deferred|routines|warn|Seven field record with no actor\n",
+            )
+            .as_bytes(),
+        );
+        fixture.write_log(
+            "activity.log.1",
+            concat!(
+                // A message carrying bytes outside ASCII, which the manager's
+                // quoter passes through untouched where `serde_json` would not
+                // have had to decide anything and the package's own
+                // `json_quote` would have replaced a control byte with `?`.
+                "1700000006|notify.unavailable|none|unavailable|notifications|error|1026|admin|Delivery failed for \u{201c}caf\u{e9}\u{201d}\n",
+                "1700000007|sync.succeeded|all|succeeded|sync|info|1026|admin|Completed\n",
+            )
+            .as_bytes(),
+        );
+        // The active log's final record has no trailing newline. That is the
+        // edge the manager's own comment argues byte-identity for: `tail`
+        // reproduces an unterminated final line verbatim, through both windows.
+        fixture.write_log(
+            "activity.log",
+            concat!(
+                "1700000008|doctor.failed|delta|failed|operations|error|1026|admin|Doctor failed\n",
+                "1700000009|scheduler.scheduled|delta|scheduled|scheduler|info|Next run soon",
+            )
+            .as_bytes(),
+        );
+    }
+
+    /// Fault-injection row 17 for `activity`: the same read, answered by the
+    /// shell manager and answered inside the service, is byte-identical.
+    ///
+    /// No field legitimately differs here — the feed carries no generation
+    /// timestamp — so this comparison is exact with nothing normalised at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn activity_is_byte_identical_on_the_service_and_the_shell_rungs() {
+        let fixture = TestShellPackageFixture::new("activity-parity");
+        let policy = SecurityPolicyArgs::default();
+        write_activity_history(&fixture);
+
+        // Fewer than the nine stored records, so both windows do work: each
+        // rotation is windowed, and the concatenation is windowed again.
+        let action = ReadAction::Activity { lines: 7 };
+        let shell = fixture.run_manager(&["api", "activity", "--lines", "7"]);
+        assert!(
+            shell.status.success(),
+            "shell rung failed ({}):\nstdout: {}\nstderr: {}",
+            shell.status,
+            String::from_utf8_lossy(&shell.stdout),
+            String::from_utf8_lossy(&shell.stderr)
+        );
+        fixture.hand_over();
+        let left =
+            parse_and_sanitize_manager_json(&shell.stdout, &action, None, Some(&policy)).unwrap();
+        let right = activity_document(&fixture.paths(), fixture.package_uid(), &action, 7, &policy)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&left),
+            String::from_utf8_lossy(&right)
+        );
+
+        // The fixture reached the branches it claims to.
+        let document: Value = serde_json::from_slice(&right).unwrap();
+        let events = document["events"].as_array().unwrap();
+        assert_eq!(events.len(), 7, "the window must drop the two oldest");
+        assert_eq!(events[0]["epoch"], 1_700_000_003_i64);
+        // The five-field record takes its defaults and reports no actor.
+        assert_eq!(events[0]["category"], "operations");
+        assert_eq!(events[0]["level"], "info");
+        assert_eq!(events[0]["actor_uid"], Value::Null);
+        assert_eq!(events[0]["actor"], Value::Null);
+        // The request id is spliced out of the message, not carried beside it.
+        assert_eq!(
+            events[1]["client_request_id"],
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(events[2]["category"], "routines");
+        assert_eq!(events[2]["actor"], Value::Null);
+        assert_eq!(events[6]["epoch"], 1_700_000_009_i64);
+        assert_eq!(events[6]["message"], "Next run soon");
+
+        // And a request with no explicit window still agrees, at the manager's
+        // own default of one hundred, which keeps every record.
+        let all = ReadAction::Activity { lines: 100 };
+        let shell = fixture.run_manager(&["api", "activity", "--lines", "100"]);
+        assert!(shell.status.success());
+        fixture.hand_over();
+        assert_eq!(
+            String::from_utf8_lossy(
+                &parse_and_sanitize_manager_json(&shell.stdout, &all, None, Some(&policy)).unwrap()
+            ),
+            String::from_utf8_lossy(
+                &activity_document(&fixture.paths(), fixture.package_uid(), &all, 100, &policy)
+                    .unwrap()
+            )
+        );
+    }
+
+    /// Both rungs refuse a feed they cannot parse, and both refuse an activity
+    /// log whose ownership or mode is not what the package wrote.
+    ///
+    /// They refuse with different codes, deliberately: the manager exits
+    /// non-zero and the service reports `manager_exit_status` for it, while the
+    /// in-service reader names what it actually found. Neither serves the file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_corrupt_or_unsafe_activity_log_is_refused_by_both_rungs() {
+        let fixture = TestShellPackageFixture::new("activity-corrupt");
+        let policy = SecurityPolicyArgs::default();
+        let action = ReadAction::Activity { lines: 50 };
+
+        fixture.write_log("activity.log", b"1700000001|not a valid record at all\n");
+        let shell = fixture.run_manager(&["api", "activity", "--lines", "50"]);
+        assert!(!shell.status.success());
+        assert!(
+            String::from_utf8_lossy(&shell.stdout).contains("corrupt_state"),
+            "{}",
+            String::from_utf8_lossy(&shell.stdout)
+        );
+        fixture.hand_over();
+        assert_eq!(
+            activity_document(
+                &fixture.paths(),
+                fixture.package_uid(),
+                &action,
+                50,
+                &policy
+            )
+            .unwrap_err()
+            .code,
+            Some("package_state_corrupt")
+        );
+
+        // A blank line is a zero-field record, which is corrupt rather than
+        // skipped, on both sides.
+        fixture.write_log(
+            "activity.log",
+            b"1700000001|sync.started|alpha|running|sync|info|1026|admin|ok\n\n",
+        );
+        let shell = fixture.run_manager(&["api", "activity", "--lines", "50"]);
+        assert!(!shell.status.success());
+        fixture.hand_over();
+        assert_eq!(
+            activity_document(
+                &fixture.paths(),
+                fixture.package_uid(),
+                &action,
+                50,
+                &policy
+            )
+            .unwrap_err()
+            .code,
+            Some("package_state_corrupt")
+        );
+
+        // A world-readable log is refused rather than read.
+        fixture.write_log(
+            "activity.log",
+            b"1700000001|sync.started|alpha|running|sync|info|1026|admin|ok\n",
+        );
+        fixture.hand_over();
+        fs::set_permissions(
+            fixture.log_root.join("activity.log"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert_eq!(
+            activity_document(
+                &fixture.paths(),
+                fixture.package_uid(),
+                &action,
+                50,
+                &policy
+            )
+            .unwrap_err()
+            .code,
+            Some("config_file_unsafe")
+        );
+        let shell = fixture.run_manager(&["api", "activity", "--lines", "50"]);
+        assert!(!shell.status.success());
+        assert!(
+            String::from_utf8_lossy(&shell.stdout).contains("unsafe_state"),
+            "{}",
+            String::from_utf8_lossy(&shell.stdout)
+        );
+    }
+
+    /// No activity log at all is an empty feed, from either rung.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_absent_activity_log_is_an_empty_feed_on_both_rungs() {
+        let fixture = TestShellPackageFixture::new("activity-absent");
+        let policy = SecurityPolicyArgs::default();
+        let action = ReadAction::Activity { lines: 20 };
+        let shell = fixture.run_manager(&["api", "activity", "--lines", "20"]);
+        assert!(
+            shell.status.success(),
+            "{}",
+            String::from_utf8_lossy(&shell.stderr)
+        );
+        fixture.hand_over();
+        let left =
+            parse_and_sanitize_manager_json(&shell.stdout, &action, None, Some(&policy)).unwrap();
+        let right = activity_document(
+            &fixture.paths(),
+            fixture.package_uid(),
+            &action,
+            20,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(left, right);
+        assert_eq!(
+            String::from_utf8_lossy(&right),
+            r#"{"events":[],"schema":"sdsync.dsm-activity.v1"}"#
+        );
+
+        // An existing but empty log is a different input that reaches the same
+        // answer by the ordinary path rather than by the short-circuit.
+        fixture.write_log("activity.log", b"");
+        let shell = fixture.run_manager(&["api", "activity", "--lines", "20"]);
+        assert!(
+            shell.status.success(),
+            "{}",
+            String::from_utf8_lossy(&shell.stderr)
+        );
+        fixture.hand_over();
+        assert_eq!(
+            parse_and_sanitize_manager_json(&shell.stdout, &action, None, Some(&policy)).unwrap(),
+            activity_document(
+                &fixture.paths(),
+                fixture.package_uid(),
+                &action,
+                20,
+                &policy
+            )
+            .unwrap()
+        );
+    }
+
+    /// `tail -n N` semantics, including the edges the double window depends on.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tail_lines_reproduces_the_shell_windowing_including_an_unterminated_tail() {
+        for (input, lines, expected) in [
+            (&b"a\nb\nc\n"[..], 2, &b"b\nc\n"[..]),
+            (b"a\nb\nc\n", 3, b"a\nb\nc\n"),
+            (b"a\nb\nc\n", 9, b"a\nb\nc\n"),
+            // An unterminated final record is a line, and survives verbatim.
+            (b"a\nb", 1, b"b"),
+            (b"a\nb", 2, b"a\nb"),
+            (b"a\n", 1, b"a\n"),
+            // A lone terminator is one empty line.
+            (b"\n", 1, b"\n"),
+            (b"", 1, b""),
+            (b"a\nb\nc\n", 0, b""),
+            // An empty line in the middle is a line like any other.
+            (b"a\n\nb\n", 2, b"\nb\n"),
+        ] {
+            assert_eq!(
+                String::from_utf8_lossy(tail_lines(input, lines)),
+                String::from_utf8_lossy(expected),
+                "tail -n {lines} of {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+
+        // Windowing each source and then windowing the concatenation selects
+        // exactly what windowing the concatenation alone would have, which is
+        // the property the manager relies on to avoid reading whole rotations.
+        let sources: [&[u8]; 3] = [b"1\n2\n3\n", b"4\n5\n6\n", b"7\n8"];
+        for lines in 1..=9 {
+            let mut windowed = Vec::new();
+            for source in sources {
+                windowed.extend_from_slice(tail_lines(source, lines));
+            }
+            let whole = sources.concat();
+            assert_eq!(
+                String::from_utf8_lossy(tail_lines(&windowed, lines)),
+                String::from_utf8_lossy(tail_lines(&whole, lines)),
+                "window of {lines}"
+            );
+        }
+    }
+
+    /// The two orders that disagree, isolated from the shell so the reason is
+    /// visible without reading a parity failure.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configured_profile_names_sort_by_file_name_the_way_a_c_locale_glob_does() {
+        let fixture = TestShellPackageFixture::new("profile-order");
+        for name in ["alpha", "alpha-two", "alphaz", "Alpha", "a_1", "9"] {
+            fixture.write_profile(name, Path::new("/volume1/x"), "/home/Drive/x");
+        }
+        // Byte order over `<name>.toml`: digits, then upper case, then `_`,
+        // then lower case — and `alpha-two` ahead of `alpha` because `-`
+        // precedes the `.` of the suffix.
+        assert_eq!(
+            configured_profile_names(&fixture.profiles_dir),
+            ["9", "Alpha", "a_1", "alpha-two", "alpha", "alphaz"]
+        );
+        // Sorting the names instead of the file names would put `alpha` first,
+        // which is the bug this ordering exists to avoid.
+        let mut names = ["9", "Alpha", "a_1", "alpha-two", "alpha", "alphaz"];
+        names.sort_unstable();
+        assert_ne!(configured_profile_names(&fixture.profiles_dir), names);
+
+        // An empty directory and an absent one are both "no set was stated".
+        let empty = fixture.root.join("empty");
+        fs::create_dir(&empty).unwrap();
+        assert!(configured_profile_names(&empty).is_empty());
+        assert!(configured_profile_names(&fixture.root.join("absent")).is_empty());
+    }
+
+    /// Fault-injection rows 1, 2, 4 and 5: what the shell rung does when the
+    /// manager is not in a state to answer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shell_rung_failures_are_named_apart_from_one_another() {
+        // `MANAGER_LANE` is one static shared by the whole process, and the
+        // lane's own test asserts it starts empty, so every test that occupies
+        // a slot takes the same lock the rest of this module uses.
+        let _serialised = CONTROL_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixture = TestPackageFixture::new("manager-modes");
+        let uid = TestPackageFixture::package_uid();
+        let policy = SecurityPolicyArgs::default();
+        let read = |fixture: &TestPackageFixture| {
+            execute_read_action(&fixture.paths(), &ReadAction::Snapshot, &policy, uid).unwrap_err()
+        };
+
+        // Row 1: the manager is killed outright mid-read. A signal death is an
+        // unsuccessful exit, not unreadable output.
+        fixture.write_manager("kill -9 $$");
+        assert_eq!(read(&fixture).code, Some("manager_exit_status"));
+
+        // Row 2: more output than the bridge will carry. This must not be
+        // confused with output the bridge could read and rejected.
+        fixture.write_manager(&format!(
+            "exec head -c {} /dev/zero | tr '\\0' 'a'",
+            MAX_MANAGER_OUTPUT_BYTES + 1
+        ));
+        assert_eq!(read(&fixture).code, Some("manager_output_too_large"));
+
+        // Output the bridge can read and will not accept is a different code
+        // again, and a document of the wrong kind is a third.
+        fixture.write_manager("printf 'not json'");
+        assert_eq!(read(&fixture).code, Some("manager_output_invalid"));
+        fixture.write_manager(r#"printf '{"schema":"sdsync.dsm-logs.v1"}'"#);
+        assert_eq!(read(&fixture).code, Some("manager_output_schema"));
+
+        // Row 4: not executable. Row 5: group-writable. Both are the file being
+        // wrong rather than the run going wrong, and both refuse before exec.
+        fixture.write_manager("printf '{}'");
+        for mode in [0o644, 0o775, 0o4755] {
+            fs::set_permissions(&fixture.manager, fs::Permissions::from_mode(mode)).unwrap();
+            let error = read(&fixture);
+            assert_eq!(error.code, Some("manager_unsafe"), "mode {mode:o}");
+            assert_eq!(error.kind, ErrorKind::UnsafeRuntime, "mode {mode:o}");
+        }
+
+        // A manager that is not there at all is the same class of answer.
+        fs::remove_file(&fixture.manager).unwrap();
+        assert_eq!(read(&fixture).code, Some("manager_unsafe"));
+    }
+
+    /// Fault-injection row 9: the fourth concurrent read waits out the permit
+    /// and is told the lane is busy — not that the read timed out, and not that
+    /// the service refused to accept it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_full_manager_lane_is_named_busy_and_not_saturated_or_timed_out() {
+        // `MANAGER_LANE` is one static shared by the whole process, and the
+        // lane's own test asserts it starts empty, so every test that occupies
+        // a slot takes the same lock the rest of this module uses.
+        let _serialised = CONTROL_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixture = TestPackageFixture::new("manager-lane");
+        let uid = TestPackageFixture::package_uid();
+        let policy = SecurityPolicyArgs::default();
+        // Longer than MANAGER_PERMIT_WAIT, far shorter than
+        // READ_MANAGER_TIMEOUT, so the loser gives up on the permit while the
+        // three holders are still inside a call that has not timed out.
+        fixture.write_manager("sleep 6; exit 3");
+
+        let paths = fixture.paths();
+        let started = Instant::now();
+        let codes = std::thread::scope(|scope| {
+            let handles = (0..MANAGER_CONCURRENCY_LIMIT + 1)
+                .map(|_| {
+                    scope.spawn(|| {
+                        execute_read_action(&paths, &ReadAction::Snapshot, &policy, uid)
+                            .unwrap_err()
+                            .code
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|code| **code == Some("manager_busy"))
+                .count(),
+            1,
+            "{codes:?}"
+        );
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|code| **code == Some("manager_exit_status"))
+                .count(),
+            MANAGER_CONCURRENCY_LIMIT,
+            "{codes:?}"
+        );
+        assert!(
+            !codes.contains(&Some(SATURATED_SERVICE_CODE)),
+            "accept-loop saturation is a different diagnosis: {codes:?}"
+        );
+        assert!(!codes.contains(&Some("manager_timeout")), "{codes:?}");
+        // The loser gave up on the permit rather than sitting out the read.
+        assert!(elapsed < READ_MANAGER_TIMEOUT, "{elapsed:?}");
+    }
+
+    /// The operator's kill switch: present and exact forces the shell rung and
+    /// says so once; present and anything else is refused rather than ignored.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_read_lane_kill_switch_is_exact_and_fails_closed() {
+        let fixture = TestPackageFixture::new("read-lane");
+        let uid = TestPackageFixture::package_uid();
+        let paths = fixture.paths();
+
+        // Absent: the ladder decides, and nothing is read.
+        assert!(!linux_files::read_lane_forced_to_shell(&paths, uid).unwrap());
+
+        fixture.write_private(&fixture.read_lane, b"shell\n");
+        assert!(linux_files::read_lane_forced_to_shell(&paths, uid).unwrap());
+
+        // Everything else is a marker this service cannot act on. An operator
+        // who believes the switch is engaged is never silently overruled.
+        for content in [
+            b"shell".as_slice(),
+            b"Shell\n".as_slice(),
+            b"service\n".as_slice(),
+            b"".as_slice(),
+            b"shell\nshell\n".as_slice(),
+        ] {
+            fixture.write_private(&fixture.read_lane, content);
+            let error = linux_files::read_lane_forced_to_shell(&paths, uid).unwrap_err();
+            assert_eq!(error.code, Some("runtime_marker_unsafe"));
+            assert_eq!(error.kind, ErrorKind::UnsafeRuntime);
+        }
+
+        // A world-readable switch is a switch the service did not write.
+        fixture.write_private(&fixture.read_lane, b"shell\n");
+        fs::set_permissions(&fixture.read_lane, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            linux_files::read_lane_forced_to_shell(&paths, uid)
+                .unwrap_err()
+                .code,
+            Some("runtime_marker_unsafe")
+        );
+    }
+
+    /// The kill switch actually moves a migrated read back onto the manager.
+    ///
+    /// Without this the switch could read correctly and route nothing, which is
+    /// the failure mode that matters: it is the only escape hatch, and the point
+    /// of having it is that a parity bug is recoverable without a downgrade.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_forced_read_lane_sends_a_migrated_read_back_through_the_manager() {
+        let _serialised = CONTROL_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixture = TestPackageFixture::new("read-lane-routing");
+        let uid = TestPackageFixture::package_uid();
+        let policy = SecurityPolicyArgs::default();
+        // A manager that cannot answer at all, so taking the shell rung is
+        // unmistakable.
+        fixture.write_manager("printf 'not json'");
+
+        // Absent switch: answered in the service, from an empty status cache
+        // and no configured profiles.
+        let served =
+            execute_read_action(&fixture.paths(), &ReadAction::StatusRollup, &policy, uid).unwrap();
+        let document: Value = serde_json::from_slice(&served.body).unwrap();
+        assert_eq!(document["schema"], "sdsync.status-rollup-aggregate.v1");
+        assert_eq!(document["profiles_total"], 0);
+        assert_eq!(document["complete"], false);
+
+        fixture.write_private(&fixture.read_lane, b"shell\n");
+        let error = execute_read_action(&fixture.paths(), &ReadAction::StatusRollup, &policy, uid)
+            .unwrap_err();
+        assert_eq!(error.code, Some("manager_output_invalid"));
+
+        // And a read with no in-service implementation is unaffected either way.
+        fs::remove_file(&fixture.read_lane).unwrap();
+        assert_eq!(
+            execute_read_action(&fixture.paths(), &ReadAction::Snapshot, &policy, uid)
+                .unwrap_err()
+                .code,
+            Some("manager_output_invalid")
+        );
+    }
+
+    /// The forced lane announces itself in api.log, as a notice rather than a
+    /// failure, and obeys the bridge category threshold like every other
+    /// structured API line.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_forced_read_lane_is_announced_in_the_api_log_under_bridge() {
+        let fixture = TestPackageFixture::new("read-lane-notice");
+        let uid = TestPackageFixture::package_uid();
+        let api_log = fixture.log_root.join("api.log");
+        let mut quiet = SecurityPolicyArgs::default();
+        set_category_level(&mut quiet, "bridge", PolicyLogLevel::Error);
+        assert!(
+            !linux_files::record_read_lane_notice_at(
+                &fixture.log_root,
+                &api_log,
+                uid,
+                60_000,
+                &quiet,
+            )
+            .unwrap()
+        );
+        assert!(!api_log.exists());
+
+        assert!(
+            linux_files::record_read_lane_notice_at(
+                &fixture.log_root,
+                &api_log,
+                uid,
+                60_000,
+                &SecurityPolicyArgs::default(),
+            )
+            .unwrap()
+        );
+        let line = fs::read_to_string(&api_log).unwrap();
+        let record: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(record["event"], "read_lane_forced_shell");
+        assert_eq!(record["category"], "bridge");
+        assert_eq!(record["level"], "warn");
+        assert_eq!(record["lane"], "shell");
+        // Not a failure: no request went wrong, so the record carries no HTTP
+        // status and no stage.
+        assert!(record.get("status").is_none());
+        assert!(record.get("stage").is_none());
+        assert!(line.len() < 512);
+    }
+
     #[cfg(target_os = "linux")]
     fn user_service_inputs(port: u16, token: Option<&str>) -> AuthenticationInputs {
         AuthenticationInputs {
@@ -16674,6 +19131,257 @@ mod tests {
         assert_eq!(fs::read_to_string(&api_log).unwrap(), records);
     }
 
+    /// Render an error the way the service renders an in-service failure, and
+    /// return the envelope the browser would receive.
+    fn service_request_envelope(error: BridgeError) -> Value {
+        let response =
+            CgiResponse::failure(CgiFailure::new(CgiFailureStage::ServiceRequest, error));
+        // Every code must survive this or `for_cgi_transport` refuses to carry
+        // the application status through Webman and the api.log recorder
+        // refuses to write the record.
+        assert!(
+            response.is_trusted_error_envelope(),
+            "envelope rejected: {}",
+            String::from_utf8_lossy(&response.body)
+        );
+        serde_json::from_slice(&response.body).unwrap()
+    }
+
+    /// Fault-injection rows 6, 7 and 8: three lifecycle states that were one
+    /// undifferentiated 503, plus the marker the service cannot parse.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_admission_refusals_name_which_lifecycle_state_closed_the_door() {
+        let fixture = TestControlFixture::new("admission-codes");
+        let uid = TestControlFixture::package_uid();
+        let paths = fixture.paths();
+        linux_files::require_open_runtime_admission(&paths, uid).unwrap();
+
+        for (bytes, kind, code) in [
+            (
+                b"upgrade\n".as_slice(),
+                ErrorKind::Unavailable,
+                "runtime_upgrading",
+            ),
+            (
+                b"uninstall\n".as_slice(),
+                ErrorKind::Unavailable,
+                "runtime_uninstalling",
+            ),
+            (
+                b"banana\n".as_slice(),
+                ErrorKind::UnsafeRuntime,
+                "runtime_marker_unsafe",
+            ),
+        ] {
+            fixture.write_private(&fixture.package_transition, bytes);
+            let error = linux_files::require_open_runtime_admission(&paths, uid).unwrap_err();
+            assert_eq!(error.kind, kind, "{code}");
+            assert_eq!(error.code, Some(code));
+            let envelope = service_request_envelope(error);
+            assert_eq!(envelope["code"], code);
+            assert_eq!(envelope["status"], 503);
+            assert_eq!(envelope["stage"], "service_request");
+        }
+        fs::remove_file(&fixture.package_transition).unwrap();
+
+        // An admission close is distinct from a transition, and from an
+        // unreadable close marker.
+        fixture.write_private(&fixture.service_closed, b"closed\n");
+        let closed = linux_files::require_open_runtime_admission(&paths, uid).unwrap_err();
+        assert_eq!(closed.kind, ErrorKind::Unavailable);
+        assert_eq!(closed.code, Some("runtime_closed"));
+        assert_eq!(service_request_envelope(closed)["code"], "runtime_closed");
+
+        fixture.write_private(&fixture.service_closed, b"banana\n");
+        let corrupt = linux_files::require_open_runtime_admission(&paths, uid).unwrap_err();
+        assert_eq!(corrupt.kind, ErrorKind::UnsafeRuntime);
+        assert_eq!(corrupt.code, Some("runtime_marker_unsafe"));
+
+        // A marker whose mode the service refuses is unsafe, not closed: the
+        // reader's ownership contract must not be reported as a shutdown.
+        fs::set_permissions(&fixture.service_closed, fs::Permissions::from_mode(0o644)).unwrap();
+        let mis_moded = linux_files::require_open_runtime_admission(&paths, uid).unwrap_err();
+        assert_eq!(mis_moded.code, Some("runtime_marker_unsafe"));
+    }
+
+    /// Every code the read path can name reaches the browser as itself.
+    ///
+    /// Without this the whole taxonomy is one edit away from silently
+    /// collapsing back into `service_request_unavailable`: the field is
+    /// `Option`, the fallback is a total match, and nothing else goes red.
+    #[test]
+    fn every_read_path_code_survives_the_envelope_contract() {
+        let codes = [
+            BridgeError::unavailable_because("runtime_upgrading"),
+            BridgeError::unavailable_because("runtime_uninstalling"),
+            BridgeError::unavailable_because("runtime_closed"),
+            BridgeError::unsafe_because("runtime_marker_unsafe"),
+            BridgeError::unsafe_because("manager_lane_poisoned"),
+            BridgeError::unavailable_because("manager_busy"),
+            BridgeError::unsafe_because("manager_unsafe"),
+            BridgeError::unavailable_because("manager_spawn_failed"),
+            BridgeError::unavailable_because("manager_timeout"),
+            BridgeError::unavailable_because("manager_output_too_large"),
+            BridgeError::unavailable_because("manager_exit_status"),
+            MANAGER_OUTPUT_INVALID,
+            MANAGER_OUTPUT_SCHEMA,
+            BridgeError::unavailable_because("clock_unavailable"),
+            BridgeError::unavailable_because("result_unreadable"),
+            STORED_RESULT_INVALID,
+            BridgeError::unavailable_because("request_scan_unstable"),
+        ];
+        let mut seen = BTreeSet::new();
+        for error in codes {
+            let code = error.code.expect("taxonomy entry carries a code");
+            assert!(seen.insert(code), "duplicate code {code}");
+            assert!(
+                !code.is_empty()
+                    && code.len() <= 64
+                    && code.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'_'),
+                "{code} is not [a-z0-9_]{{1,64}}"
+            );
+            let envelope = service_request_envelope(error);
+            assert_eq!(envelope["code"], code);
+            assert_eq!(envelope["status"], 503);
+            // The codes are the diagnosis; the copy stays generic and
+            // server-authored text never reaches the page.
+            assert_eq!(envelope["message"], "Request could not be completed.");
+        }
+        // An uncoded error still renders the stage entry it always did.
+        assert_eq!(
+            service_request_envelope(BridgeError::new(ErrorKind::Unavailable))["code"],
+            "service_request_unavailable"
+        );
+        // A failure-level code still outranks one the error carried, so a site
+        // that knows more than the error can say so.
+        let overridden = CgiResponse::failure(CgiFailure::coded(
+            CgiFailureStage::ServiceRequest,
+            BridgeError::unavailable_because("manager_timeout"),
+            "policy_unreadable",
+        ));
+        let payload: Value = serde_json::from_slice(&overridden.body).unwrap();
+        assert_eq!(payload["code"], "policy_unreadable");
+    }
+
+    /// Fault-injection row 15: two failures inside one window, different codes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn in_service_coalescing_names_the_most_frequent_code_and_counts_them_all() {
+        let window = linux_files::CGI_FAILURE_COALESCE_SECONDS;
+        let busy = ("service_request", "manager_busy", 503_u16);
+        let timeout = ("service_request", "manager_timeout", 503_u16);
+        let mut coalescer = InServiceFailureCoalescer::default();
+
+        // The first failure in a fresh coalescer owns the window immediately.
+        let first = coalescer.claim(busy, 10_000, window).unwrap();
+        assert_eq!(first.triple, busy);
+        assert_eq!(first.occurrences, 1);
+        assert_eq!(first.previous_epoch, 0);
+
+        // Everything inside the window is suppressed and counted.
+        assert!(coalescer.claim(timeout, 10_001, window).is_none());
+        assert!(coalescer.claim(timeout, 10_002, window).is_none());
+        assert!(coalescer.claim(busy, 10_003, window).is_none());
+
+        let second = coalescer.claim(busy, 10_000 + window, window).unwrap();
+        // Four suppressed occurrences ride on this one record. Two timeouts
+        // against two busies including the claim itself, so the tie resolves to
+        // the lexicographically first triple, deterministically.
+        assert_eq!(second.occurrences, 4);
+        assert_eq!(second.triple, busy);
+        assert_eq!(second.previous_epoch, 10_000);
+
+        // A record that is not written gives its tally back rather than
+        // dropping it, and reopens the window it claimed.
+        coalescer.give_back(second);
+        let third = coalescer
+            .claim(timeout, 10_000 + window + 1, window)
+            .unwrap();
+        // The give-back restored four, this claim adds a third timeout, and
+        // timeouts now outnumber busies outright.
+        assert_eq!(third.occurrences, 5);
+        assert_eq!(third.triple, timeout);
+
+        // Nothing is left behind once a record is kept.
+        assert!(coalescer.tally.is_empty());
+        assert!(coalescer.claim(busy, 10_000 + window + 2, window).is_none());
+    }
+
+    /// Fault-injection row 16: `bridge_log_level=error` suppresses the record,
+    /// writes neither file, and the 503 still reaches the browser.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn in_service_records_obey_the_bridge_log_level_before_writing() {
+        let fixture = TestControlFixture::new("in-service-policy");
+        let uid = TestControlFixture::package_uid();
+        let log_root = fixture.root.join("log");
+        let runtime_root = fixture.root.join("run");
+        let config_root = fixture.root.join("config");
+        for directory in [&log_root, &runtime_root, &config_root] {
+            fs::create_dir(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let api_log = log_root.join("api.log");
+        let state = runtime_root.join("cgi-failure.state");
+        let policy_path = config_root.join("security.conf");
+
+        let quiet =
+            security_policy_document().replace("bridge_log_level=info", "bridge_log_level=error");
+        fixture.write_private(&policy_path, quiet.as_bytes());
+        assert!(
+            !linux_files::record_pre_relay_cgi_failure_with_policy_at(
+                &log_root,
+                &api_log,
+                &state,
+                &policy_path,
+                uid,
+                50_000,
+                "service_request",
+                "manager_timeout",
+                503,
+            )
+            .unwrap()
+        );
+        assert!(!api_log.exists());
+        assert!(!state.exists());
+
+        // The browser is told regardless. A quiet log is not a quiet page.
+        assert_eq!(
+            service_request_envelope(BridgeError::unavailable_because("manager_timeout"))["code"],
+            "manager_timeout"
+        );
+
+        // At the default level the same failure writes, under the category the
+        // operations doc already assigns to a failed dashboard request.
+        fixture.write_private(&policy_path, security_policy_document().as_bytes());
+        assert!(
+            linux_files::record_pre_relay_cgi_failure_with_policy_at(
+                &log_root,
+                &api_log,
+                &state,
+                &policy_path,
+                uid,
+                50_000,
+                "service_request",
+                "manager_timeout",
+                503,
+            )
+            .unwrap()
+        );
+        let record = fs::read_to_string(&api_log).unwrap();
+        assert!(record.contains(r#""stage":"service_request""#), "{record}");
+        assert!(record.contains(r#""category":"bridge""#), "{record}");
+        assert!(record.contains(r#""code":"manager_timeout""#), "{record}");
+        assert!(record.contains(r#""event":"cgi_failure""#), "{record}");
+        assert_eq!(
+            cgi_failure_category(CgiFailureStage::ServiceRequest.as_str()),
+            Some("bridge")
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn pre_relay_api_log_rotation_is_bounded_and_rejects_unsafe_entries() {
@@ -17291,10 +19999,10 @@ mod tests {
 
         // Distinct from "not ready": an operator seeing this needs to know the
         // service is alive and refused one request without starting it.
-        let unavailable = CgiResponse::staged_error(
+        let unavailable = CgiResponse::failure(CgiFailure::new(
             CgiFailureStage::BridgeConnect,
             BridgeError::new(ErrorKind::Unavailable),
-        );
+        ));
         let unavailable_payload: Value = serde_json::from_slice(&unavailable.body).unwrap();
         assert_eq!(unavailable_payload["code"], "service_unavailable");
         assert_ne!(payload["message"], unavailable_payload["message"]);
@@ -19318,6 +22026,11 @@ mod tests {
 
     #[test]
     fn status_rollup_is_an_argumentless_read_of_the_cores_own_document() {
+        // The argv still has to be right, because the operator's kill switch
+        // routes this read back through the manager. It is no longer what a
+        // dashboard poll builds: `read_rung` answers this read in the service,
+        // and the argv is the fallback path rather than the normal one.
+        assert_eq!(read_rung(&ReadAction::StatusRollup), ReadRung::InService);
         assert_eq!(
             read_manager_arguments(&ReadAction::StatusRollup).unwrap(),
             ["api", "status-rollup"]
@@ -22846,16 +25559,19 @@ mod tests {
     fn cgi_diagnostics_distinguish_authentication_identity_and_bridge_failures() {
         let cases = [
             (
-                CgiResponse::staged_error(
+                CgiResponse::failure(CgiFailure::new(
                     CgiFailureStage::Authentication,
                     BridgeError::new(ErrorKind::Unauthorized),
-                ),
+                )),
                 401,
                 "unauthorized",
                 "dsm_authentication",
             ),
             (
-                CgiResponse::staged_error(CgiFailureStage::Identity, BridgeError::unsafe_runtime()),
+                CgiResponse::failure(CgiFailure::new(
+                    CgiFailureStage::Identity,
+                    BridgeError::unsafe_runtime(),
+                )),
                 503,
                 "cgi_identity_unsafe",
                 "cgi_identity",
@@ -22867,19 +25583,19 @@ mod tests {
                 "bridge_connect",
             ),
             (
-                CgiResponse::staged_error(
+                CgiResponse::failure(CgiFailure::new(
                     CgiFailureStage::BridgeIo,
                     BridgeError::new(ErrorKind::Unavailable),
-                ),
+                )),
                 503,
                 "bridge_io_unavailable",
                 "bridge_io",
             ),
             (
-                CgiResponse::staged_error(
+                CgiResponse::failure(CgiFailure::new(
                     CgiFailureStage::BridgeProtocol,
                     BridgeError::new(ErrorKind::Unavailable),
-                ),
+                )),
                 503,
                 "bridge_protocol_unavailable",
                 "bridge_protocol",
@@ -22959,10 +25675,10 @@ mod tests {
 
     #[test]
     fn get_error_envelopes_survive_webman_as_successful_process_transports() {
-        let unauthorized = CgiResponse::staged_error(
+        let unauthorized = CgiResponse::failure(CgiFailure::new(
             CgiFailureStage::Authentication,
             BridgeError::new(ErrorKind::Unauthorized),
-        );
+        ));
         let unavailable = CgiResponse::service_unavailable();
         assert_eq!(unauthorized.status, 401);
         assert_eq!(unavailable.status, 503);

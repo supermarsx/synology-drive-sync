@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import {
+  WIDGET_ACTIVE_POLL_MS,
+  WIDGET_BACKOFF_RAMP_MS,
+  WIDGET_IDLE_POLL_MS
+} from "../src/widgetModel.mjs";
 
 const appSource = await readFile(new URL("../src/App.vue", import.meta.url), "utf8");
 const cssSource = await readFile(new URL("../src/styles/native.css", import.meta.url), "utf8");
@@ -18,6 +23,12 @@ function loadAppComponent(overrides = {}) {
     .replace("export default {", "const AppComponent = {");
   executable += "\nObject.defineProperty(AppComponent, '__testSanitizedTroubleshootingText', { value: sanitizedTroubleshootingText });\nreturn AppComponent;";
   const stubs = {
+    // The real cadence literals, not stand-ins: App.vue's retry ladder and
+    // stale-age escalation are only meaningful against the ramp the widget
+    // actually ships and validate_spk.py actually pins.
+    WIDGET_ACTIVE_POLL_MS,
+    WIDGET_BACKOFF_RAMP_MS,
+    WIDGET_IDLE_POLL_MS,
     ACTIONS: {},
     AUTOSAVE_API_LIMITS: Object.freeze({}),
     MAX_RESPONSE_BYTES: 1024 * 1024,

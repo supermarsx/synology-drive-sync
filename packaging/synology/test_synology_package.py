@@ -4505,6 +4505,130 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertNotEqual(hardlink_rejected.returncode, 0)
         self.assertEqual(policy.read_text(encoding="utf-8"), legacy)
 
+    def private_mode_repair_records(self, since: str = "") -> list[dict[str, object]]:
+        controller_log = self.real_var / "log/controller.log"
+        if not controller_log.exists():
+            return []
+        appended = controller_log.read_text(encoding="utf-8").removeprefix(since)
+        return [
+            json.loads(line)
+            for line in appended.splitlines()
+            if line and json.loads(line).get("event") == "private_file_modes_repaired"
+        ]
+
+    def test_postupgrade_repairs_widened_private_file_modes(self) -> None:
+        configured = self.configure("alpha", self.source_one, "/home/Drive/Alpha", True)
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        saved = self.shell(
+            self.manager, "configure-security-policy", *self.security_policy_options()
+        )
+        self.assertEqual(saved.returncode, 0, saved.stderr)
+        schedule = self.real_home / "config/schedule.conf"
+        profile = self.real_home / "config/profiles.d/alpha.toml"
+        policy = self.real_home / "config/security.conf"
+        for widened in (schedule, profile, policy):
+            self.assertEqual(stat.S_IMODE(widened.stat().st_mode), 0o600, widened)
+            widened.chmod(0o644)
+        # The repair has to precede the policy migration, not follow it: the
+        # bridge enforces the private-file contract on security.conf and a
+        # widened policy aborts the upgrade before any later repair could run.
+        refused = self.executable(
+            self.real_target / "bin/sdsync-dsm-api", "--security-policy-migration-status"
+        )
+        self.assertEqual(refused.returncode, 73, refused.stdout + refused.stderr)
+
+        upgraded = self.shell(self.lifecycle_dir / "postupgrade")
+        self.assertEqual(upgraded.returncode, 0, upgraded.stdout + upgraded.stderr)
+        self.assertNotIn("could not be restored", upgraded.stdout + upgraded.stderr)
+        for repaired in (schedule, profile, policy):
+            self.assertEqual(stat.S_IMODE(repaired.stat().st_mode), 0o600, repaired)
+        records = self.private_mode_repair_records()
+        self.assertEqual(len(records), 1, records)
+        self.assertEqual(records[0]["detail"], "repaired=3 mode=0600")
+        self.assertEqual(records[0]["level"], "warn")
+        self.assertEqual(records[0]["category"], "controller")
+        self.assertEqual(records[0]["actor_uid"], self.drop_uid)
+        self.assertEqual(records[0]["actor"], "package-upgrade")
+
+    def test_postupgrade_repair_skips_symlinked_private_file_candidates(self) -> None:
+        health_state = self.real_var / "state/health/alpha.state"
+        symlink_target = self.root / "health-state-symlink-target"
+        symlink_target.write_text("state=failed\nexit_code=1\n", encoding="utf-8")
+        symlink_target.chmod(0o644)
+        os.symlink(symlink_target, health_state)
+        schedule = self.real_home / "config/schedule.conf"
+        schedule.chmod(0o644)
+        if os.getuid() == 0:
+            os.chown(symlink_target, self.drop_uid, self.drop_gid)
+            os.lchown(health_state, self.drop_uid, self.drop_gid)
+
+        upgraded = self.shell(self.lifecycle_dir / "postupgrade")
+        self.assertEqual(upgraded.returncode, 0, upgraded.stdout + upgraded.stderr)
+        self.assertTrue(health_state.is_symlink())
+        self.assertEqual(stat.S_IMODE(symlink_target.stat().st_mode), 0o644)
+        # The skip is per candidate, not a bail-out: the real file beside it is
+        # still repaired, and only it is counted.
+        self.assertEqual(stat.S_IMODE(schedule.stat().st_mode), 0o600)
+        records = self.private_mode_repair_records()
+        self.assertEqual(len(records), 1, records)
+        self.assertEqual(records[0]["detail"], "repaired=1 mode=0600")
+
+    @unittest.skipUnless(
+        os.name == "posix" and os.getuid() == 0,
+        "a private file owned by a third uid requires a POSIX root test setup",
+    )
+    def test_postupgrade_repair_skips_private_files_owned_by_another_uid(self) -> None:
+        alerts = self.real_home / "config/alerts.conf"
+        alerts.write_text("system_log=false\n", encoding="utf-8")
+        alerts.chmod(0o644)
+        os.chown(alerts, 65533, 65533)
+        schedule = self.real_home / "config/schedule.conf"
+        schedule.chmod(0o644)
+
+        upgraded = self.shell(self.lifecycle_dir / "postupgrade")
+        self.assertEqual(upgraded.returncode, 0, upgraded.stdout + upgraded.stderr)
+        self.assertNotIn("could not be restored", upgraded.stdout + upgraded.stderr)
+        self.assertEqual(stat.S_IMODE(alerts.stat().st_mode), 0o644)
+        self.assertEqual(alerts.stat().st_uid, 65533)
+        self.assertEqual(stat.S_IMODE(schedule.stat().st_mode), 0o600)
+        records = self.private_mode_repair_records()
+        self.assertEqual(len(records), 1, records)
+        self.assertEqual(records[0]["detail"], "repaired=1 mode=0600")
+
+    def test_postupgrade_repair_is_silent_when_private_modes_are_intact(self) -> None:
+        configured = self.configure("alpha", self.source_one, "/home/Drive/Alpha", True)
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        candidates = [
+            path
+            for path in (
+                self.real_home / "config/schedule.conf",
+                self.real_home / "config/default-profile",
+                self.real_home / "config/profiles.d/alpha.toml",
+                self.real_var / "state/controller.state",
+                self.real_var / "state/run.state",
+            )
+            if path.exists()
+        ]
+        self.assertTrue(candidates)
+        # chmod moves ctime even when it sets the mode a file already has, so
+        # an unchanged ctime is proof that no candidate was written to at all.
+        before = {
+            path: (stat.S_IMODE(path.stat().st_mode), path.stat().st_ctime_ns)
+            for path in candidates
+        }
+        self.assertTrue(all(mode == 0o600 for mode, _ in before.values()), before)
+        controller_log = self.real_var / "log/controller.log"
+        existing = controller_log.read_text(encoding="utf-8") if controller_log.exists() else ""
+
+        upgraded = self.shell(self.lifecycle_dir / "postupgrade")
+        self.assertEqual(upgraded.returncode, 0, upgraded.stdout + upgraded.stderr)
+        after = {
+            path: (stat.S_IMODE(path.stat().st_mode), path.stat().st_ctime_ns)
+            for path in candidates
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(self.private_mode_repair_records(existing), [])
+
     def test_postinst_audits_only_the_initial_disabled_schedule_commit(self) -> None:
         schedule = self.real_home / "config/schedule.conf"
         audit = self.real_var / "log/audit.log"

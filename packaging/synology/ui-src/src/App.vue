@@ -611,6 +611,16 @@
 import { ActionIcon } from "./ActionIcon";
 import { createAutosaveCoordinator } from "./autosave";
 import { installControlLayout } from "./controlLayout";
+// The desktop card and this window now share a retry problem, so they share the
+// cadence policy rather than growing a second one. widgetModel.mjs imports
+// nothing, which is what makes it safe to depend on from here; the dependency
+// runs one way only and these three numbers are reviewed literals pinned by
+// validate_spk.py.
+import {
+  WIDGET_ACTIVE_POLL_MS,
+  WIDGET_BACKOFF_RAMP_MS,
+  WIDGET_IDLE_POLL_MS
+} from "./widgetModel.mjs";
 import {
   ACTIONS,
   AUTOSAVE_API_LIMITS,
@@ -636,6 +646,139 @@ import {
 import SecurityPanel from "./SecurityPanel.vue";
 
 const SETTINGS_KEY = "sdsync.ui.settings.v1";
+// The named in-service read failures, and the only place this window decides
+// what each one means.
+//
+// All of them arrive as a semantic 503. Before they were named, every one of
+// them rendered "Restart Synology Drive Sync" — advice that is wrong for a
+// package that is mid-upgrade, wrong for one that is merely busy, and actively
+// harmful for one whose files have the wrong ownership, where a restart hides
+// the finding without fixing it.
+//
+// Four fields, three readers, one row each:
+//   `title`/`message` are what describeBridgeError renders. They are written
+//     here rather than taken from the envelope's own `message` on purpose: the
+//     wire text is the service's, and this window renders only copy it owns.
+//     The titles are duplicated in widgetModel.mjs and a test compares them.
+//   `cause` is the sentence fragment the stale-status line appends, so the
+//     header says why the values underneath stopped moving rather than only
+//     that they did.
+//   `retry` is the polling ladder. `backoff` keeps asking and decays,
+//     `auto` keeps the cadence because the condition is expected to clear on
+//     its own, and `stop` stands down entirely — it is reserved for the
+//     failures no amount of waiting resolves, where continuing to poll would
+//     only bury the operator's own repair under identical failures.
+//
+// A code with no row here falls through to the bare 503 branch, exactly as
+// every code did before, so the service may add one without this table.
+const BRIDGE_FAILURE_COPY = Object.freeze({
+  runtime_upgrading: Object.freeze({
+    title: "Package is upgrading",
+    message: "Synology Drive Sync is upgrading. This page will retry.",
+    cause: "the package is upgrading",
+    retry: "auto"
+  }),
+  runtime_uninstalling: Object.freeze({
+    title: "Package is being removed",
+    message: "Synology Drive Sync is being removed. Nothing further will be read until it is installed again.",
+    cause: "the package is being removed",
+    retry: "stop"
+  }),
+  runtime_closed: Object.freeze({
+    title: "Package is stopping or upgrading",
+    message: "The package is stopping or upgrading. This page will retry.",
+    cause: "the package is stopping or upgrading",
+    retry: "auto"
+  }),
+  runtime_marker_unsafe: Object.freeze({
+    title: "Package state unconfirmed",
+    message: "The package could not confirm it is running normally. Inspect the package API log; do not restart it in the hope the marker clears.",
+    cause: "the package cannot confirm it is running normally",
+    retry: "stop"
+  }),
+  policy_unreadable: Object.freeze({
+    title: "Security policy unreadable",
+    message: "The package could not read its security policy. Repair or reinstall the latest complete package release, then reopen this app.",
+    cause: "the package cannot read its security policy",
+    retry: "stop"
+  }),
+  manager_busy: Object.freeze({
+    title: "Package is busy",
+    message: "The package is busy answering other windows. Retrying; close AppWindows you are not using if this persists.",
+    cause: "the package is busy",
+    retry: "backoff"
+  }),
+  manager_lane_poisoned: Object.freeze({
+    title: "Package service needs a restart",
+    message: "The package service cannot serve further reads in this state. Restart Synology Drive Sync in Package Center.",
+    cause: "the package service needs a restart",
+    retry: "stop"
+  }),
+  manager_unsafe: Object.freeze({
+    title: "Package files are not in a safe state",
+    message: "The package files are not in a safe state. Repair or reinstall the latest complete package release; do not change ownership or permissions manually.",
+    cause: "the package files are not in a safe state",
+    retry: "stop"
+  }),
+  manager_spawn_failed: Object.freeze({
+    title: "Package helper could not start",
+    message: "The package could not start its helper. Retrying; inspect the package API log if this persists.",
+    cause: "the package could not start its helper",
+    retry: "backoff"
+  }),
+  manager_timeout: Object.freeze({
+    title: "Package took too long to answer",
+    message: "The package took too long to answer. Retrying; a busy NAS or a large log set can do this.",
+    cause: "the package took too long to answer",
+    retry: "backoff"
+  }),
+  manager_output_too_large: Object.freeze({
+    title: "Package answer was too large",
+    message: "The package produced more data than this page can read. Retrying; inspect the package API log.",
+    cause: "the package produced more data than this page can read",
+    retry: "backoff"
+  }),
+  manager_exit_status: Object.freeze({
+    title: "Package could not assemble this view",
+    message: "The package could not assemble this view. Retrying; inspect the package API log.",
+    cause: "the package could not assemble this view",
+    retry: "backoff"
+  }),
+  manager_output_invalid: Object.freeze({
+    title: "Package answer could not be read",
+    message: "The package returned data this page cannot read. Retrying; inspect the package API log.",
+    cause: "the package returned data this page cannot read",
+    retry: "backoff"
+  }),
+  manager_output_schema: Object.freeze({
+    title: "UI and package versions differ",
+    message: "Repair or reinstall one complete release so the AppWindow and package API use the same schema. Retrying meanwhile.",
+    cause: "the UI and package versions differ",
+    retry: "backoff"
+  }),
+  config_file_unsafe: Object.freeze({
+    title: "Package file permissions are unsafe",
+    message: "A package file has unexpected ownership or permissions. Repair the package rather than changing the file yourself.",
+    cause: "a package file has unexpected ownership or permissions",
+    retry: "stop"
+  }),
+  // Kind Unavailable, but it does not clear on its own: a stored record stays
+  // unparseable until the file rotates or is cleared, so polling through it
+  // would repeat forever and a restart does nothing. Hence `stop` beside an
+  // Unavailable kind, as with runtime_uninstalling.
+  package_state_corrupt: Object.freeze({
+    title: "Package record is corrupt",
+    message: "A stored package record could not be read. Inspect Logs and Activity for the affected file; restarting does not repair it.",
+    cause: "a stored package record could not be read",
+    retry: "stop"
+  }),
+  clock_unavailable: Object.freeze({
+    title: "NAS clock is not set",
+    message: "The NAS clock is not set correctly. Correct the system time, then retry.",
+    cause: "the NAS clock is not set correctly",
+    retry: "stop"
+  })
+});
 // Which bounded package logs the dashboard may empty. The audit log is absent
 // on purpose and the bridge refuses it independently: it is the record of who
 // cleared what, so offering a button that erases the evidence of its own use
@@ -1077,7 +1220,12 @@ function emptyScopeIncident() {
     transportStage: "",
     secretKind: "",
     expectedConfiguration: null,
-    creatingProfile: false
+    creatingProfile: false,
+    // When this window learned the outcome was unknown, on its own clock. It is
+    // the freshness floor the reconciliation interlock measures a snapshot
+    // against; see recordScopeIncident for why the failure time rather than the
+    // submission time is the right bound.
+    submittedAtMs: 0
   };
 }
 
@@ -1302,7 +1450,17 @@ function recordScopeIncident(component, scope, error, subject = "", metadata = u
     expectedConfiguration: details.expectedConfiguration && typeof details.expectedConfiguration === "object"
       ? JSON.parse(JSON.stringify(details.expectedConfiguration))
       : null,
-    creatingProfile: details.creatingProfile === true
+    creatingProfile: details.creatingProfile === true,
+    // Now, not the moment the request was submitted, and deliberately so. This
+    // is the instant the window observed the outcome was unknown, which is
+    // necessarily after the submission, so a snapshot received after this is
+    // necessarily after the submission too. It is a conservative bound that
+    // needs no new plumbing through every mutation path, and it errs in the one
+    // safe direction: it can only demand a fresher document, never accept an
+    // older one. docs/dsm/profiles.md requires a *fresh* snapshot to unlock a
+    // recovered configuration success, and this is what "fresh" is measured
+    // against.
+    submittedAtMs: Date.now()
   };
   return true;
 }
@@ -2883,11 +3041,24 @@ function partialMutationInspectionRequired(caught, fallback, appliedDetail) {
 // The Activity route shows two independent read-only feeds. Name whichever one
 // is unavailable instead of reporting the pair as dead, so a stalled package
 // log scan is not mistaken for a stalled package.
-function logsFeedState(logsReady, activityReady, lines) {
+// The two feeds settle independently, and a failed one leaves its previous rows
+// on screen. Saying only "unavailable" left those rows undated, which is the
+// same defect the status header had: the operator cannot tell rows from four
+// seconds ago from rows from four hours ago, and the Activity list is the first
+// place anyone looks when diagnosing the very failure that froze it.
+function logsFeedState(logsReady, activityReady, lines, logsReceivedAtMs = 0, activityReceivedAtMs = 0, nowMs = Date.now()) {
   if (logsReady && activityReady) return `Live · ${lines} line limit`;
-  if (logsReady) return `Package log live · ${lines} line limit · activity feed unavailable`;
-  if (activityReady) return `Activity live · ${lines} line limit · package log read unavailable`;
-  return "Logs unavailable";
+  const retained = (receivedAtMs) => {
+    const received = Number(receivedAtMs);
+    if (!Number.isFinite(received) || received <= 0) return "nothing retained";
+    return `retained rows are ${describeRetainedAge(Math.max(0, Number(nowMs) - received))} old`;
+  };
+  if (logsReady) return `Package log live · ${lines} line limit · activity feed unavailable, ${retained(activityReceivedAtMs)}`;
+  if (activityReady) return `Activity live · ${lines} line limit · package log read unavailable, ${retained(logsReceivedAtMs)}`;
+  // Both failed. Date the older of the two, because that is the age of the
+  // staler half of what is on screen.
+  const received = [logsReceivedAtMs, activityReceivedAtMs].map(Number).filter((value) => Number.isFinite(value) && value > 0);
+  return `Logs unavailable · ${retained(received.length ? Math.min(...received) : 0)}`;
 }
 
 function normalizedActivityEvent(event) {
@@ -3036,6 +3207,71 @@ function emptyStatusRollup() {
 // evidence as two different ages. A time the browser cannot make sense of --
 // unset, or ahead of this clock -- is rendered as an absolute instant rather
 // than as an age, because "in 3 minutes" is worse than a date.
+// How long a retained read document has been sitting here, measured on this
+// browser's clock rather than the package's.
+//
+// The document carries its own `generated_at_epoch`, and using it would be the
+// obvious choice, but it answers a different question: it is the package's
+// clock, it needs an agreement about skew that nothing in this bundle
+// establishes, and a NAS whose clock is wrong is one of the very failures this
+// line has to describe. Receipt time needs no agreement, and "how long have you
+// been looking at this" is a question about this window anyway.
+//
+// Below the widget's resting cadence the exact number is noise, so it is not
+// given: nothing is decided differently at forty seconds than at fifty.
+function describeRetainedAge(ageMs) {
+  const age = Number(ageMs);
+  if (!Number.isFinite(age) || age < 0) return "an unknown time";
+  if (age < WIDGET_IDLE_POLL_MS) return "less than a minute";
+  const minutes = Math.floor(age / 60000);
+  if (minutes < 180) return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  const hours = Math.floor(age / 3600000);
+  if (hours < 48) return `${hours} hours`;
+  return `${Math.floor(age / 86400000)} days`;
+}
+
+// The status header for a read that failed while an earlier document is still
+// on screen.
+//
+// docs/dsm/dashboard.md has promised since the first release that stale values
+// are never silently treated as current. "Stale · last successful snapshot
+// retained" honoured the letter of that and none of its use: it gave the
+// operator no way to tell a snapshot four seconds old from one four hours old,
+// and no way to tell a package that was busy from one whose files were unsafe.
+// Both halves come from evidence this window already holds.
+// Above this age a retained snapshot stops being described as merely stale. It
+// is the widget's own backoff floor: the package has then been silent for longer
+// than the most patient surface in this bundle waits between attempts, which is
+// the point at which rows on screen stop being evidence of anything current.
+// Deliberately the existing constant and not a second threshold.
+//
+// Read through a call rather than held in a module constant so that evaluating
+// this script does not depend on the import: two of the Python harnesses execute
+// App.vue's script with its import block stripped, and a module-level reference
+// would make loading it fail rather than only the one function that needs it.
+function snapshotStaleEscalationMs() {
+  return WIDGET_BACKOFF_RAMP_MS[WIDGET_BACKOFF_RAMP_MS.length - 1];
+}
+
+function retainedDocumentFreshness(receivedAtMs, code, nowMs = Date.now()) {
+  const received = Number(receivedAtMs);
+  const named = BRIDGE_FAILURE_COPY[String(code || "").toLowerCase()];
+  const because = named ? `: ${named.cause}` : "";
+  const stopped = named && named.retry === "stop"
+    ? " Automatic refresh has stopped; select Retry once the package is repaired."
+    : "";
+  if (!Number.isFinite(received) || received <= 0) {
+    return `Stale · the package could not refresh it${because}.${stopped}`;
+  }
+  const age = Math.max(0, Number(nowMs) - received);
+  if (age >= snapshotStaleEscalationMs()) {
+    // Past the escalation the values below have stopped being evidence, and the
+    // line says so rather than leaving "stale" to carry that weight.
+    return `Unanswered · the package has not answered for ${describeRetainedAge(age)}${because}. These values are no longer current evidence.${stopped}`;
+  }
+  return `Stale · as of ${describeRetainedAge(age)} ago; the package could not refresh it${because}.${stopped}`;
+}
+
 function describeEvidenceAge(epoch) {
   const observed = Number(epoch);
   if (!Number.isFinite(observed) || observed <= 0) return "never observed";
@@ -3202,6 +3438,16 @@ export default {
         { id: "about", title: "About", icon: "about" }
       ],
       route: "overview", auth: { signal: undefined }, csrfToken: "", snapshot: null,
+      // Receipt times for the three read documents this window retains through a
+      // failure. They live here, in per-instance component state, for the same
+      // reason the documents do: a retained read belongs to one tab, one DSM
+      // session and one package UID, and is gone the moment the window is, which
+      // is what makes retaining it safe at all. Nothing is ever assigned to a
+      // module-level cache.
+      snapshotReceivedAtMs: 0, logsReceivedAtMs: 0, activityReceivedAtMs: 0,
+      // The last named read failure and how many consecutive reads have failed.
+      // Together they select the polling ladder in snapshotRetryDelay().
+      snapshotFailureCode: "", snapshotFailureStreak: 0,
       connected: false, connectionLabel: "Connecting to package…", freshness: "Waiting for status",
       bridgeIssue: { title: "", message: "" },
       snapshotTimer: 0, logTimer: 0, snapshotLoading: false, snapshotPromise: null, snapshotRefreshQueued: false, snapshotGeneration: 0, logsLoading: false, operationBusy: false,
@@ -4388,6 +4634,14 @@ export default {
       if (status === 404) {
         return issue("Package UI route unavailable", "DSM did not reach this package's native API. Repair or reinstall the same package release, then reopen the app.");
       }
+      // The named in-service failures, above the bare 503 that used to answer
+      // for all of them with "Restart Synology Drive Sync". The catch-all below
+      // stays: it is still the right answer for a 503 with no code, and for any
+      // code a newer package emits that this release has never heard of.
+      const named = BRIDGE_FAILURE_COPY[code];
+      if (named && (status === 503 || status === 0)) {
+        return issue(named.title, named.message);
+      }
       if (status === 503) {
         return issue("Package service unavailable", "Restart Synology Drive Sync and inspect its API log if the package bridge does not recover.");
       }
@@ -4602,6 +4856,30 @@ export default {
       this.toast(unknown || inspection ? unknownTitle : failedTitle, message, !unknown && !inspection);
       return { unknown, inspection, message, requestId, jobId };
     },
+    // Is the snapshot currently in hand newer than the submission it is being
+    // asked to adjudicate?
+    //
+    // docs/dsm/profiles.md: "A recovered configuration success is unlocked only
+    // after a *fresh* snapshot exactly matches the submitted non-secret
+    // profile." Until this window retained a receipt time there was no way to
+    // ask that question, and the interlock leaned entirely on refreshSnapshot()
+    // returning true — a statement about control flow, not about the document.
+    // The two can part company: a read already in flight when the reconcile
+    // began, a cycle that resolved from a queued follow-up, or any future edit
+    // to that method's fencing. `this.snapshot` survives every failure by
+    // design, so the one thing that must never happen is a pre-submission
+    // document satisfying a post-submission proof.
+    //
+    // Fail closed on a missing or unusable timestamp on either side: an
+    // unknown age cannot be proven fresh, and the cost of being wrong here is
+    // unlocking a save that never applied.
+    snapshotNewerThan(sinceMs) {
+      const since = Number(sinceMs);
+      const received = Number(this.snapshotReceivedAtMs);
+      if (!Number.isFinite(since) || since <= 0) return false;
+      if (!Number.isFinite(received) || received <= 0) return false;
+      return received > since;
+    },
     async reconcileProfileIncident(event) {
       if (event && event.preventDefault) event.preventDefault();
       const incident = this.profileReconciliationIncident;
@@ -4645,7 +4923,7 @@ export default {
         const refreshed = await this.refreshSnapshot(false, true);
         if (this.disposed || this.profileReconciliationIncident !== incident) return;
         const observedProfile = this.profiles.find((profile) => String(profile.name) === String(incident.subject));
-        if (refreshed !== true || !observedProfile) {
+        if (refreshed !== true || !this.snapshotNewerThan(incident.submittedAtMs) || !observedProfile) {
           throw new QueuedOutcomeUnknownError(
             recovered.job_id,
             "The request completed, but its profile cannot yet be verified in a fresh package snapshot. The draft remains locked.",
@@ -4718,6 +4996,7 @@ export default {
           const observedProfile = this.profiles.find((profile) => String(profile.name) === String(incident.subject));
           if (incident.expectedConfiguration
             && refreshed === true
+            && this.snapshotNewerThan(incident.submittedAtMs)
             && observedProfile
             && profileSnapshotMatchesExpected(observedProfile, incident.expectedConfiguration)) {
             this.hydrateAutosave("profile", incident.expectedConfiguration, false);
@@ -4966,7 +5245,48 @@ export default {
     },
     clearProfileCreationProgress() { this.profileCreationProgress = emptyProfileCreationProgress(); },
     stopTimers() { window.clearTimeout(this.snapshotTimer); window.clearTimeout(this.logTimer); window.clearTimeout(this.incidentProbeTimer); this.snapshotTimer = 0; this.logTimer = 0; this.incidentProbeTimer = 0; },
-    scheduleSnapshot() { window.clearTimeout(this.snapshotTimer); this.snapshotTimer = 0; const interval = Number(this.settings.status_refresh); if (interval > 0 && !this.disposed && !document.hidden && !this.snapshotRefreshBlocked) this.snapshotTimer = window.setTimeout(() => this.refreshSnapshot(false), interval); },
+    // How long to wait before the next status read, given what the last one
+    // failed with.
+    //
+    // Three ladders, chosen per code by BRIDGE_FAILURE_COPY:
+    //
+    //  `stop`    — nothing. manager_unsafe, config_file_unsafe,
+    //              runtime_marker_unsafe and policy_unreadable are refusals to
+    //              vouch for the runtime, and runtime_uninstalling and
+    //              clock_unavailable will not resolve themselves either. Polling
+    //              through any of them buries the operator's own repair under a
+    //              stream of identical failures. The Retry button re-arms it.
+    //  `auto`    — the operator's cadence, floored at the widget's active poll.
+    //              The package is deliberately not answering and will answer
+    //              again shortly; the floor exists because an upgrade takes
+    //              minutes and a one-second poll against it for minutes is the
+    //              standing load generator WIDGET_BACKOFF_RAMP_MS was written to
+    //              prevent.
+    //  `backoff` — the widget's own ramp, entered on the *second* consecutive
+    //              failure. The widget already holds that a single failed read
+    //              is not a verdict; jumping a five-second dashboard to a
+    //              sixty-second one on one dropped read would be.
+    //
+    // An unnamed code keeps today's behaviour exactly: the configured cadence,
+    // no backoff, which is what every 503 did before any of them had a name.
+    snapshotRetryDelay(interval) {
+      const named = BRIDGE_FAILURE_COPY[this.snapshotFailureCode];
+      if (!named) return interval;
+      if (named.retry === "stop") return 0;
+      if (named.retry === "auto") return Math.max(interval, WIDGET_ACTIVE_POLL_MS);
+      const step = Number(this.snapshotFailureStreak) - 2;
+      if (step < 0) return interval;
+      return Math.max(interval, WIDGET_BACKOFF_RAMP_MS[Math.min(step, WIDGET_BACKOFF_RAMP_MS.length - 1)]);
+    },
+    scheduleSnapshot() {
+      window.clearTimeout(this.snapshotTimer);
+      this.snapshotTimer = 0;
+      const interval = Number(this.settings.status_refresh);
+      if (!(interval > 0) || this.disposed || document.hidden || this.snapshotRefreshBlocked) return;
+      const delay = this.snapshotRetryDelay(interval);
+      if (!(delay > 0)) return;
+      this.snapshotTimer = window.setTimeout(() => this.refreshSnapshot(false), delay);
+    },
     scheduleLogs() { window.clearTimeout(this.logTimer); this.logTimer = 0; const interval = Number(this.settings.log_refresh); if (interval > 0 && !this.disposed && !document.hidden && this.route === "activity" && !this.logsPaused) this.logTimer = window.setTimeout(() => this.refreshLogs(), interval); },
     async refreshCsrf(options = undefined) { if (this.disposed) return; this.csrfToken = ""; const model = await apiGet(this.auth, "csrf", {}, options); if (this.disposed) return; if (typeof model.csrf_token !== "string" || !model.csrf_token || model.csrf_token.length > 4096) throw new Error("Authenticated bridge did not issue a valid CSRF token"); this.csrfToken = model.csrf_token; },
     async refreshSnapshot(manual, requirePostMutationRead = false) {
@@ -4979,6 +5299,11 @@ export default {
         if (requirePostMutationRead) this.snapshotRefreshQueued = true;
         return this.snapshotPromise;
       }
+      // A manual Retry is the operator saying "try again now", so it clears a
+      // ladder that has stood down and restarts a decaying one from the top.
+      // Without this a `stop` code would leave the Retry button able to perform
+      // one read and never schedule another.
+      if (manual) { this.snapshotFailureCode = ""; this.snapshotFailureStreak = 0; }
       this.snapshotLoading = true;
       const generation = this.snapshotGeneration;
       let cycle;
@@ -4991,6 +5316,9 @@ export default {
           if (this.disposed || generation !== this.snapshotGeneration || this.snapshotRefreshBlocked) return false;
           if (snapshot.schema !== SNAPSHOT_SCHEMA) throw new Error("Unsupported DSM API schema");
           this.snapshot = snapshot;
+          this.snapshotReceivedAtMs = Date.now();
+          this.snapshotFailureCode = "";
+          this.snapshotFailureStreak = 0;
           if (typeof snapshot.csrf_token === "string" && snapshot.csrf_token) this.csrfToken = snapshot.csrf_token;
           this.connected = true;
           this.bridgeIssue = { title: "", message: "" };
@@ -5005,9 +5333,13 @@ export default {
           if (this.disposed || generation !== this.snapshotGeneration || this.snapshotRefreshBlocked) return false;
           this.csrfToken = "";
           this.connected = false;
+          this.snapshotFailureCode = String((error && error.code) || "").toLowerCase();
+          this.snapshotFailureStreak = Math.min(Number(this.snapshotFailureStreak) + 1, WIDGET_BACKOFF_RAMP_MS.length + 1);
           this.bridgeIssue = this.describeBridgeError(error, "status");
           this.connectionLabel = this.bridgeIssue.title;
-          this.freshness = this.snapshot ? "Stale · last successful snapshot retained" : "Status unavailable";
+          this.freshness = this.snapshot
+            ? retainedDocumentFreshness(this.snapshotReceivedAtMs, this.snapshotFailureCode)
+            : "Status unavailable";
           if (manual) this.toast(this.bridgeIssue.title, this.bridgeIssue.message, true);
         } finally {
           if (this.snapshotPromise === cycle) this.snapshotPromise = null;
@@ -5100,7 +5432,7 @@ export default {
         this.csrfToken = "";
         try {
           await this.refreshCsrf();
-        } catch (_csrfError) {
+        } catch (csrfError) {
           if (this.disposed) return;
           this.hydrateAutosave("security", payload);
           const appliedPolicy = new QueuedOutcomeUnknownError(
@@ -5114,7 +5446,9 @@ export default {
             message: "The security policy was saved, but DSM did not issue a replacement mutation token. Select Retry to request one; do not repeat the save."
           };
           this.connectionLabel = this.bridgeIssue.title;
-          this.freshness = this.snapshot ? "Stale · last successful snapshot retained" : "Status unavailable";
+          this.freshness = this.snapshot
+            ? retainedDocumentFreshness(this.snapshotReceivedAtMs, csrfError && csrfError.code)
+            : "Status unavailable";
           this.toast("Security policy saved · refresh required", this.bridgeIssue.message, true);
           return;
         }
@@ -6387,17 +6721,30 @@ export default {
           apiGet(this.auth, "activity", { lines })
         ]);
         if (this.disposed) return;
+        // Both feeds are retained through their own failure — the settled-pair
+        // guard above is what retains them — so both carry a receipt time for
+        // the same reason the snapshot does.
         if (logs.status === "fulfilled") {
           const records = this.logRecordsFrom(logs.value);
           this.logRecords = records;
+          this.logsReceivedAtMs = Date.now();
           this.logOutput = records.length
             ? records.map((record) => `[${record.source}] ${record.text}`).join("\n").slice(0, MAX_RESPONSE_BYTES)
             : "No log data yet.";
         }
-        if (activity.status === "fulfilled") this.activityEvents = arrayOf(activity.value.events);
-        this.logState = logsFeedState(logs.status === "fulfilled", activity.status === "fulfilled", lines);
+        if (activity.status === "fulfilled") {
+          this.activityEvents = arrayOf(activity.value.events);
+          this.activityReceivedAtMs = Date.now();
+        }
+        this.logState = logsFeedState(
+          logs.status === "fulfilled",
+          activity.status === "fulfilled",
+          lines,
+          this.logsReceivedAtMs,
+          this.activityReceivedAtMs
+        );
       } catch (_error) {
-        if (!this.disposed) this.logState = "Logs unavailable";
+        if (!this.disposed) this.logState = logsFeedState(false, false, 0, this.logsReceivedAtMs, this.activityReceivedAtMs);
       } finally {
         this.logsLoading = false;
         if (!this.disposed) this.scheduleLogs();

@@ -2357,6 +2357,110 @@ append_lifecycle_event() {
     return "$lifecycle_event_status"
 }
 
+# The file half of ensure_layout's invariant, applied once on upgrade.
+#
+# ensure_layout already repairs the twenty package directories -- present, a
+# real directory rather than a symlink, mode 0700 -- because a widened
+# directory is a fault the package can close without asking. The files inside
+# them had no equivalent: setting() and profile_exists check [ -f ] and
+# [ ! -L ] and nothing else, so a candidate an operator chmodded to 0644 keeps
+# being served and nothing anywhere notices. A reader that enforces the whole
+# private-file contract -- owner, mode 0600, no symlink -- refuses exactly
+# those files, so the widened population has to be repaired before it turns
+# into a named read failure rather than afterwards.
+#
+# Every candidate below is written through finish_private_file at 0600 and
+# moved into place with mv, which preserves the mode. One that is not 0600 was
+# therefore widened from outside the package, which is what the record at the
+# end of this function reports and why it is a warning.
+#
+# Deliberately narrow. The set is enumerated here rather than discovered,
+# nothing is ever created, and a path that is absent, a symlink, not a regular
+# file, or owned by another uid is left exactly as it was. The only thing that
+# changes is a mode, and only ever to 0600: chmod cannot widen anything here,
+# and it would fail on a file this process does not own in any case, so the
+# ownership test is as much a precondition as a check.
+#
+# Link count is deliberately not part of that test, unlike
+# private_log_path_safe_or_absent, which pins %h == 1 because it is about to
+# append. Tightening a mode is not something a second hard link can turn to
+# account, and a file the strict reader will refuse for its link count gains
+# nothing from staying 0644 as well.
+#
+# Cost: the existence filter is parameter expansion and test builtins, so an
+# install with no candidate on disk pays nothing at all, and one with nothing
+# to repair pays a single stat for the whole set -- the batching
+# layout_already_private already uses -- and no chmod.
+repair_private_file_modes() {
+    set -- "$schedule_file" "$security_policy_file" "$alert_policy_file" \
+        "$performance_policy_file" "$default_profile_file" \
+        "$profiles_dir"/*.toml "$routines_dir"/*.conf \
+        "$controller_state" "$run_state" \
+        "$health_dir"/*.state "$routine_state_dir"/*.state
+    # An unmatched glob arrives as its own literal pattern, which [ -f ]
+    # rejects exactly as it rejects an absent fixed path. Rotating the list
+    # rather than rebuilding it keeps this loop free of forks and of any
+    # quoting a profile or routine name could disturb.
+    repair_pending=$#
+    while [ "$repair_pending" -gt 0 ]; do
+        repair_candidate=$1
+        shift
+        repair_pending=$((repair_pending - 1))
+        [ -f "$repair_candidate" ] && [ ! -L "$repair_candidate" ] || continue
+        set -- "$@" "$repair_candidate"
+    done
+    [ "$#" -gt 0 ] || return 0
+    case ${path_owner:-} in ''|*[!0-9]*) return 73 ;; esac
+    # One stat for the whole surviving set. It reports a line per operand and
+    # exits non-zero when any operand disappeared between the filter above and
+    # this call, so a mid-flight removal leaves the report unusable rather than
+    # misaligned -- and the count is proved again below before any mode moves.
+    # Neither refusal is silent: the caller is told the repair did not run, so
+    # an operator meeting a refused file later knows the migration was tried.
+    repair_expected=$#
+    repair_report=$(stat -c '%a %u' "$@" 2>/dev/null) || {
+        echo "cannot read package file modes; private file modes were left unrepaired" >&2
+        return 73
+    }
+    repair_seen=0
+    while IFS=' ' read -r repair_mode repair_uid repair_surplus; do
+        [ -n "$repair_mode" ] || continue
+        repair_seen=$((repair_seen + 1))
+        [ "$repair_seen" -le "$repair_expected" ] || break
+        repair_candidate=$1
+        shift
+        [ -z "$repair_surplus" ] || continue
+        [ "$repair_uid" = "$path_owner" ] || continue
+        [ "$repair_mode" != 600 ] || continue
+        set -- "$@" "$repair_candidate"
+    done <<REPAIR_REPORT
+$repair_report
+REPAIR_REPORT
+    # Only when every candidate was described, in order, do the shifts above
+    # leave $@ holding precisely the paths that still need repairing.
+    [ "$repair_seen" -eq "$repair_expected" ] || {
+        echo "package file set changed mid-repair; private file modes were left unrepaired" >&2
+        return 73
+    }
+    repair_count=0
+    repair_status=0
+    for repair_target in "$@"; do
+        chmod 0600 "$repair_target" || { repair_status=73; continue; }
+        repair_count=$((repair_count + 1))
+    done
+    if [ "$repair_count" -gt 0 ]; then
+        # Mandatory on purpose. security.conf is itself one of the candidates,
+        # so gating this record on its category threshold would ask the policy
+        # document whether to report that the policy document had just been
+        # repaired -- and load_security_policy_runtime refuses a policy whose
+        # mode this function may only now have corrected.
+        append_controller_log_event warn private_file_modes_repaired \
+            "repaired=$repair_count mode=0600" controller true \
+            "$path_owner" package-upgrade || repair_status=$?
+    fi
+    return "$repair_status"
+}
+
 write_service_stop_marker() {
     stop_marker_temp=$service_stop_marker.tmp.$$
     [ ! -e "$stop_marker_temp" ] && [ ! -L "$stop_marker_temp" ] || return 73

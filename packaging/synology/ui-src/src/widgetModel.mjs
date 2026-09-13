@@ -300,6 +300,74 @@ export function widgetOverview(snapshot, nowMs = Date.now()) {
 }
 
 /**
+ * The named in-service failures the package bridge can now report.
+ *
+ * Every one of these arrives as a semantic 503 and used to be indistinguishable
+ * from every other 503, so a card whose package was mid-upgrade and a card whose
+ * package files had been left group-writable said the same sentence. The titles
+ * are the AppWindow's, character for character -- `BRIDGE_FAILURE_COPY` in
+ * App.vue is the other half of this table and a test compares the two surfaces
+ * code by code. Only `detail` is shortened here, to fit a 318-pixel line.
+ *
+ * `level` follows the service's own split. A transient unavailability is `warn`
+ * and says the card will look again; a runtime the package refuses to vouch for
+ * is `fail` and names the repair, because waiting will not fix it.
+ */
+const WIDGET_BRIDGE_FAILURES = Object.freeze({
+  runtime_upgrading: Object.freeze({
+    level: "warn", title: "Package is upgrading", detail: "Retrying while the upgrade finishes."
+  }),
+  runtime_uninstalling: Object.freeze({
+    level: "warn", title: "Package is being removed", detail: "Synology Drive Sync is being uninstalled."
+  }),
+  runtime_closed: Object.freeze({
+    level: "warn", title: "Package is stopping or upgrading", detail: "Retrying while it settles."
+  }),
+  runtime_marker_unsafe: Object.freeze({
+    level: "fail", title: "Package state unconfirmed", detail: "Inspect the package API log."
+  }),
+  policy_unreadable: Object.freeze({
+    level: "fail", title: "Security policy unreadable", detail: "Repair the package."
+  }),
+  manager_busy: Object.freeze({
+    level: "warn", title: "Package is busy", detail: "Retrying shortly."
+  }),
+  manager_lane_poisoned: Object.freeze({
+    level: "fail", title: "Package service needs a restart", detail: "Restart it in Package Center."
+  }),
+  manager_unsafe: Object.freeze({
+    level: "fail", title: "Package files are not in a safe state", detail: "Repair or reinstall the package."
+  }),
+  manager_spawn_failed: Object.freeze({
+    level: "warn", title: "Package helper could not start", detail: "Retrying."
+  }),
+  manager_timeout: Object.freeze({
+    level: "warn", title: "Package took too long to answer", detail: "Retrying."
+  }),
+  manager_output_too_large: Object.freeze({
+    level: "warn", title: "Package answer was too large", detail: "Inspect the package API log."
+  }),
+  manager_exit_status: Object.freeze({
+    level: "warn", title: "Package could not assemble this view", detail: "Inspect the package API log."
+  }),
+  manager_output_invalid: Object.freeze({
+    level: "warn", title: "Package answer could not be read", detail: "Inspect the package API log."
+  }),
+  manager_output_schema: Object.freeze({
+    level: "fail", title: "UI and package versions differ", detail: "Repair or reinstall one complete release."
+  }),
+  config_file_unsafe: Object.freeze({
+    level: "fail", title: "Package file permissions are unsafe", detail: "Repair the package."
+  }),
+  package_state_corrupt: Object.freeze({
+    level: "warn", title: "Package record is corrupt", detail: "Inspect Logs; restarting does not repair it."
+  }),
+  clock_unavailable: Object.freeze({
+    level: "fail", title: "NAS clock is not set", detail: "Set the NAS system time."
+  })
+});
+
+/**
  * Classify why the package bridge did not answer.
  *
  * For a card that lives on the DSM desktop permanently, "not authenticated" and
@@ -324,6 +392,13 @@ export function widgetBridgeIssue(error) {
   }
   if (status === 403) {
     return issue(WIDGET_LEVELS.warn, "DSM access denied", "Requires a DSM administrator account.");
+  }
+  // Ahead of the bare 503 below, which would otherwise claim all of these and
+  // tell the operator to start a package that is already running and merely
+  // busy, or mid-upgrade, or refusing to vouch for its own files.
+  const named = WIDGET_BRIDGE_FAILURES[code];
+  if (named && (status === 503 || status === 0)) {
+    return issue(WIDGET_LEVELS[named.level], named.title, named.detail);
   }
   // Ordered ahead of the substring tests below, exactly as App.vue orders it:
   // the specific codes for a helper or web API that could not start are spelled

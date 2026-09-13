@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import {
+  WIDGET_ACTIVE_POLL_MS,
+  WIDGET_BACKOFF_RAMP_MS,
+  WIDGET_IDLE_POLL_MS
+} from "../src/widgetModel.mjs";
 
 const appSource = await readFile(new URL("../src/App.vue", import.meta.url), "utf8");
 const apiSource = await readFile(new URL("../src/api.js", import.meta.url), "utf8");
@@ -35,6 +40,12 @@ function loadAppComponent({
     .replace("export default {", "const AppComponent = {");
   executable += "\nreturn AppComponent;";
   const stubs = {
+    // The real cadence literals, not stand-ins: App.vue's retry ladder and
+    // stale-age escalation are only meaningful against the ramp the widget
+    // actually ships and validate_spk.py actually pins.
+    WIDGET_ACTIVE_POLL_MS,
+    WIDGET_BACKOFF_RAMP_MS,
+    WIDGET_IDLE_POLL_MS,
     ACTIONS: {
       configureProfile: "configure-profile", setSecret: "set-secret",
       testProfileAuth: "test-profile-auth", browseRemote: "browse-remote",
@@ -178,8 +189,15 @@ function reconciliationContext(component, incident, overrides = {}) {
   const toasts = [];
   const hydrations = [];
   const activeStage = incident.operation === "configure-profile" ? "configuration" : incident.secretKind;
+  // Every incident the product builds carries the instant this window learned
+  // the outcome was unknown -- recordScopeIncident stamps it, and the
+  // fresh-snapshot interlock measures against it. Default it here rather than in
+  // every fixture literal below, one second in the past, because a reconcile
+  // always follows the failure it is reconciling.
+  if (!(Number(incident.submittedAtMs) > 0)) incident.submittedAtMs = Date.now() - 1000;
   const context = {
     disposed: false,
+    snapshotReceivedAtMs: 0,
     auth: { account: "fixture" },
     operationBusy: false,
     profileReconciliationState: "idle",
@@ -225,12 +243,23 @@ function reconciliationContext(component, incident, overrides = {}) {
     refreshSnapshot: async () => false,
     ...overrides
   };
+  // The real refreshSnapshot stamps the receipt time on every successful read,
+  // so a stub that answered true without stamping would be a fixture the
+  // product cannot produce -- and it would make the interlock look satisfiable
+  // by a document that never arrived.
+  const configuredRefresh = context.refreshSnapshot;
+  context.refreshSnapshot = async function (...args) {
+    const result = await configuredRefresh.apply(this, args);
+    if (result === true) this.snapshotReceivedAtMs = Date.now();
+    return result;
+  };
   return bind(context, component.methods, [
     "ensureProfileFailureRecords",
     "syncProfileFailureState",
     "clearProfileConfigurationFailure",
     "clearProfileSecretFailures",
-    "applyTrustedSecretPresence"
+    "applyTrustedSecretPresence",
+    "snapshotNewerThan"
   ]);
 }
 
@@ -514,6 +543,109 @@ test("snapshot mismatch or unavailable fresh evidence leaves configure reconcili
     assert.equal(context.profileSaveState, "error");
     assert.match(context.profileSaveMessage, scenario.message);
     assert.equal(context.operationBusy, false);
+  }
+});
+
+// docs/dsm/profiles.md: "A recovered configuration success is unlocked only
+// after a *fresh* snapshot exactly matches the submitted non-secret profile."
+//
+// The window keeps its last good snapshot through every failed refresh, by
+// design, and now records when that document arrived. The instant an age exists,
+// the interlock has to consult it: until this test there was nothing standing
+// between a retained pre-submission document and a success unlock except
+// refreshSnapshot()'s return value, which is a statement about control flow
+// rather than about the document that answered.
+//
+// Both halves run against one fixture that is otherwise identical and would
+// otherwise unlock, so what is being measured is the age and nothing else.
+test("a retained pre-submission snapshot never satisfies the fresh-snapshot interlock", async () => {
+  for (const scenario of [
+    { name: "retained from before the submission", offsetMs: -1, unlocks: false },
+    { name: "received after the submission", offsetMs: 1, unlocks: true }
+  ]) {
+    const requestId = "7".repeat(32);
+    const jobId = "8".repeat(48);
+    const expectedConfiguration = reconciliationPayload();
+    const incident = {
+      active: true,
+      outcomeUnknown: true,
+      requiresInspection: true,
+      message: "The configure result could not be observed.",
+      requestId,
+      jobId,
+      subject: expectedConfiguration.name,
+      operation: "configure-profile",
+      stage: "configuration",
+      transportStage: "result_observation",
+      secretKind: "",
+      expectedConfiguration,
+      creatingProfile: true,
+      submittedAtMs: 1_700_000_000_000
+    };
+    let posts = 0;
+    const component = loadAppComponent({
+      post: async () => { posts += 1; return { ok: true }; },
+      reconcile: async () => ({
+        schema: "sdsync.dsm-reconciled-result.v1",
+        request_id: requestId,
+        job_id: jobId,
+        operation: "configure-profile",
+        result: { ok: true }
+      })
+    });
+    const context = reconciliationContext(component, incident);
+    // Replace the stamping wrapper outright: this stub is the hazard itself, a
+    // refresh that reports success while the document in hand is the retained
+    // one. The profile matches exactly, so the age is the only thing that can
+    // decide the outcome.
+    context.refreshSnapshot = async () => {
+      context.profiles = [reconciliationSnapshot(expectedConfiguration)];
+      context.snapshotReceivedAtMs = incident.submittedAtMs + scenario.offsetMs;
+      return true;
+    };
+    const valuesBefore = structuredClone(context.secretValues);
+
+    await component.methods.reconcileProfileIncident.call(context, { preventDefault() {} });
+
+    assert.equal(posts, 0, `${scenario.name} replayed a mutation`);
+    assert.deepEqual(context.secretValues, valuesBefore, `${scenario.name} disturbed a credential draft`);
+    if (scenario.unlocks) {
+      assert.equal(context.profileSaveState, "success", scenario.name);
+      assert.equal(context.autosaveIncidents.profile.active, false, scenario.name);
+      assert.deepEqual(context.hydrations, [["profile", expectedConfiguration, false]], scenario.name);
+    } else {
+      assert.equal(context.profileSaveState, "error", scenario.name);
+      assert.strictEqual(context.autosaveIncidents.profile, incident, `${scenario.name} cleared the incident`);
+      assert.equal(context.autosaveOutcomeUnknownScopes.profile, true, scenario.name);
+      assert.equal(context.autosaveInspectionScopes.profile, true, scenario.name);
+      assert.equal(context.selectedProfile, "", scenario.name);
+      assert.deepEqual(context.hydrations, [], `${scenario.name} rehydrated from an unproven document`);
+      assert.match(context.profileSaveMessage, /cannot yet be verified in a fresh package snapshot/i);
+    }
+    assert.equal(context.operationBusy, false, scenario.name);
+    assert.equal(context.profileReconciliationState, "idle", scenario.name);
+  }
+});
+
+// A missing or unusable submission time is not a reason to trust a document: the
+// predicate has to refuse rather than default to "probably fine".
+test("the fresh-snapshot interlock fails closed on an unusable timestamp on either side", async () => {
+  const component = loadAppComponent({});
+  const check = (receivedAtMs, sinceMs) => component.methods.snapshotNewerThan.call(
+    { snapshotReceivedAtMs: receivedAtMs },
+    sinceMs
+  );
+  assert.equal(check(2000, 1000), true);
+  assert.equal(check(1000, 1000), false, "the same instant is not newer");
+  assert.equal(check(1000, 2000), false);
+  for (const [received, since] of [
+    [0, 1000], [1000, 0], [0, 0],
+    [Number.NaN, 1000], [1000, Number.NaN],
+    [undefined, 1000], [1000, undefined],
+    [-1, 1000], [1000, -1],
+    [Number.POSITIVE_INFINITY, 1000], [1000, Number.POSITIVE_INFINITY]
+  ]) {
+    assert.equal(check(received, since), false, `received ${received} since ${since} was treated as fresh`);
   }
 });
 

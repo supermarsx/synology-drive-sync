@@ -117,6 +117,45 @@ checks policy and package CSRF. Do not call
 ordinary `0755` `sdsync-dsm-api --consume-job` form is controller-internal and validates its identity
 and exact private paths.
 
+<!-- topology: keep this note accurate as reads move between the manager and the service. -->
+
+Of those three commands, `api activity --lines N` is no longer one the service runs. The API service
+reads the four activity log files itself and assembles the same feed, under a stricter file contract
+than the manager's: owner, mode `0600`, link count and size, all checked on the descriptor it opened
+rather than on the path. The command remains a supported CLI contract and remains the oracle a
+differential test compares against, byte for byte with nothing normalised, but a dashboard poll no
+longer reaches it. `api snapshot` and `api logs --lines N` still run the manager on every poll.
+
+One behaviour differs, and only in how a refusal is named. A malformed record or an unsafe log file
+is refused by both, and neither serves it: the manager exits non-zero and the page reports
+`manager_exit_status`, while the service reports what it actually found — `package_state_corrupt`
+for a record it cannot parse, `config_file_unsafe` for a file whose ownership or mode is not what
+the package wrote.
+
+`api status-rollup` is the other exception. The API service no longer runs the manager for it: the
+manager's whole contribution was to list the configured profile names and forward the core's
+document unchanged, and the service now composes that document in process from the same library
+function the core calls. The command remains a supported CLI contract and remains the oracle a
+parity test compares against, but a dashboard poll no longer reaches it. Two differences follow
+from the manager no longer being in the path, both of them cases where the manager turned a valid
+document into a failed read:
+
+- The manager truncates any API document past 320 KiB and substitutes a truncation marker, which
+  the service then rejects as a schema mismatch. The in-process answer has no such ceiling, so a
+  rollup over several hundred profiles is served rather than refused.
+- The manager collapses a package secrets path to `[secret]` with a pattern that consumes to the
+  next space, which makes the surrounding JSON unparseable. The in-process answer does not
+  reproduce that.
+
+The manager's neutral-label substitution **is** reproduced: the package's own `home` and `var`
+paths, and the physical paths they resolve to, are rewritten to `[package-home]` and
+`[package-var]` on both paths. A differential test asserts the two are byte-identical, including
+that substitution and including the profile ordering, with the generation timestamp as the one
+field allowed to differ.
+
+An operator can send every read back through the manager. See the read-lane switch in
+[operations](operations.md).
+
 The CLI does not require the CGI, socket, or API service. It is the recovery path when the dashboard
 cannot launch, but mutations still require the exact package identity and the same private-state and
 overlap validation.
@@ -151,9 +190,13 @@ DSM must provide the package-private `var` root (through `SYNOPKG_PKGVAR` or the
 falling back to a shared or mismatched state path. Use `paths` to observe the actual resolved directories.
 
 Do not edit, chmod, chown, symlink, enqueue, or connect to files in these directories. The manager
-uses atomic replacement and validates owner, type, mode, and containment; the CGI and API service
-also validate the fixed socket, parent, and kernel peer identities. Manual intervention can make the
-control plane fail closed.
+uses atomic replacement and validates owner, type, mode, and containment. The CGI and API service
+validate the fixed socket, parent, and kernel peer identities, and the API service additionally
+reads package state directly for the reads it answers in process, under a stricter file contract
+than the manager's: owner, mode `0600`, link count, and size, all checked on the descriptor it
+opened rather than on the path. Manual intervention can make the control plane fail closed, and a
+hand-edited file that the manager would have accepted can be refused by the service with a named
+code rather than served.
 
 ## Exit statuses
 

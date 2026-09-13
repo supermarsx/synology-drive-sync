@@ -2,6 +2,11 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import test from "node:test";
+import {
+  WIDGET_ACTIVE_POLL_MS,
+  WIDGET_BACKOFF_RAMP_MS,
+  WIDGET_IDLE_POLL_MS
+} from "../src/widgetModel.mjs";
 
 const appUrl = new URL("../src/App.vue", import.meta.url);
 const panelUrl = new URL("../src/SecurityPanel.vue", import.meta.url);
@@ -47,6 +52,12 @@ async function loadAppComponent(postSpy, trace) {
   executable += "\nreturn AppComponent;";
 
   const stubs = {
+    // The real cadence literals, not stand-ins: App.vue's retry ladder and
+    // stale-age escalation are only meaningful against the ramp the widget
+    // actually ships and validate_spk.py actually pins.
+    WIDGET_ACTIVE_POLL_MS,
+    WIDGET_BACKOFF_RAMP_MS,
+    WIDGET_IDLE_POLL_MS,
     ACTIONS: {
       securityPolicy: "security-policy",
       clientEvent: "client-event",
@@ -375,7 +386,10 @@ test("complete security policy, client-event auditing, activity filters, and sta
     "ACTIONS.clientEvent, { event: \"session-notifications\" }",
     "canChangeProfiles", "canChangeRoutines", "canChangeNotifications", "canRunOperations",
     "activityCategory", "activityLevel", '["api", "DSM API"]', '["audit", "Audit"]',
-    "Stale · last successful snapshot retained", "this.snapshot ?"
+    // The stale header now carries an age and a named cause. What must not
+    // change is the shape underneath it: the document survives its own failed
+    // refresh and the header is derived from whether it is still held.
+    "retainedDocumentFreshness(this.snapshotReceivedAtMs", "this.snapshot\n            ?"
   ]) assert.ok(app.includes(marker), `App.vue lacks ${marker}`);
   assert.doesNotMatch(app, /this\.snapshot\s*=\s*null/);
   assert.match(app, /<v-button\b[^>]*@click="refreshSnapshot\(true\)"[^>]*>[\s\S]*?<action-icon\s+:class="\{ 'sdsync-is-spinning': snapshotLoading \}"\s+name="refresh"\s*\/>[\s\S]*?Retry<\/v-button>/);
@@ -478,9 +492,14 @@ test("Manual refresh options clear timers without creating replacements", async 
       disposed: false,
       route: "activity",
       logsPaused: false,
+      // No read has failed, so the retry ladder is inert and the configured
+      // cadence is what survives to window.setTimeout.
+      snapshotFailureCode: "",
+      snapshotFailureStreak: 0,
       refreshSnapshot() {},
       refreshLogs() {}
     };
+    context.snapshotRetryDelay = (interval) => methods.snapshotRetryDelay.call(context, interval);
     methods.scheduleSnapshot.call(context);
     methods.scheduleLogs.call(context);
     assert.deepEqual(cleared, [41, 42]);

@@ -126,6 +126,51 @@ The footer distinguishes these states:
 - **Status unavailable** means snapshot refresh failed. Existing values may be stale; the interface
   does not silently treat them as current.
 
+### Stale status carries its age and its cause
+
+A failed refresh does not discard the snapshot already on screen — that document is the only
+evidence the window has left, and blanking it would remove the very state an operator is trying to
+read. What the failure changes is the label above it. **Status unavailable** is reserved for a
+window that has never had a successful read. Once one document is held, the header instead reports
+how long it has been held and why it stopped moving:
+
+| Situation | Header |
+| --- | --- |
+| A document is held and the refresh failed | `Stale · as of 4 minutes ago; the package could not refresh it: the package is busy.` |
+| The same, with no named cause from the package | `Stale · as of 4 minutes ago; the package could not refresh it.` |
+| Nothing has been read for longer than five minutes | `Unanswered · the package has not answered for 6 minutes: the package is busy. These values are no longer current evidence.` |
+| Nothing has ever been read | `Status unavailable` |
+
+The age is the browser's own receipt time, not the snapshot's `generated_at_epoch`. The two answer
+different questions: the epoch is the package's clock and needs an agreement about skew that a NAS
+with an unset clock cannot supply, while "how long have you been looking at this" is a question
+about this window. Five minutes is not a new threshold — it is the widget's own failure-backoff
+floor, the point past which the most patient surface in the bundle has given up on a fresh answer.
+
+The cause comes from the code the package names in its failure envelope, and the same codes decide
+whether the window keeps asking:
+
+- a package that is **busy, slow, or answering badly** is retried on a bounded ramp that starts at
+  the configured cadence, enters the widget's 60/120/240/300-second ramp from the second
+  consecutive failure, and clears completely on the first success. One failed read is never treated
+  as a verdict;
+- a package that is **stopping or upgrading** is retried at the configured cadence with a
+  twenty-second floor, because that condition clears on its own and a one-second poll against a
+  ten-minute upgrade is pure load;
+- a package that **will not vouch for its own runtime** — unsafe files, unsafe permissions, an
+  unreadable security policy, a corrupt transition marker, an unset clock — is not retried at all.
+  The header says automatic refresh has stopped, and **Retry** re-arms it once the package is
+  repaired. Polling through a fault that waiting cannot fix only buries the operator's own repair
+  under identical failures.
+
+The Activity and Logs feeds settle independently of each other and retain their rows the same way,
+so the feed state beside them dates what is left on screen: `activity feed unavailable, retained
+rows are 4 hours old`. `docs/dsm/troubleshooting.md` lists the codes and what each one means.
+
+Every retained document lives in the window that read it. It is never keyed, never shared between
+tabs, never written to browser storage, and gone when the window closes: a tab is one DSM session,
+one package identity and one argument set, which is what makes holding the document safe at all.
+
 Mutation controls require both a valid independent package CSRF token and
 `capabilities.mutations=true`. Secret controls additionally require `capabilities.secrets=true`,
 and **Disposable write test** requires `capabilities.write_test=true`. A direct package-user

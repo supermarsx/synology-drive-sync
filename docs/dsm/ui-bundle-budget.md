@@ -20,7 +20,7 @@ The consequence is easy to miss: **`dist/style.css` is embedded whole, as a sing
 literal, inside `dist/SynologyDriveSync.js`.** `src/styles/native.css` is pretty-printed — two-space
 indented, one declaration per line — and `build/condense-css-loader.js` strips its comments,
 indentation and blank lines on the way into both artifacts, so the two are no longer byte-identical.
-That leaves 122,014 bytes of a 531,631-byte "JavaScript" bundle; before the condenser it was 132,891
+That leaves 122,014 bytes of a 540,455-byte "JavaScript" bundle; before the condenser it was 132,891
 of 533,741.
 
 Every byte trimmed from the stylesheet is a byte off the JavaScript asset as well — but the
@@ -34,14 +34,16 @@ stylesheet is now spent as a lever, and the numbers say so:
   `from`/`to`, `minmax(112px, 0.72fr)`, newline-anchored selectors, and the 260/220-char keyframe
   windows. No minifier has a knob for any of them.
 
-The bundle exceeds the 512,000-byte hint by about 19.6 KB. It was about 10.0 KB over before queued
-progress landed, and about 21.7 KB over before the stylesheet was condensed. Any further reduction
-has to come out of the JavaScript: at ~410 KB excluding the embedded stylesheet, that is where the
-remaining headroom is, and there is no second stylesheet-shaped win behind it.
+The bundle exceeds the 512,000-byte hint by about 28.5 KB. It was about 19.6 KB over before the
+in-service read failures were named, about 10.0 KB over before queued progress landed, and about
+21.7 KB over before the stylesheet was condensed. Any further reduction has to come out of the
+JavaScript: at ~418 KB excluding the embedded stylesheet, that is where the remaining headroom is,
+and there is no second stylesheet-shaped win behind it.
 
-Four features have landed over the budget since it was first written (the timestamped log view and
-per-category clearing, the stored-totals summary that made the Sync section open without a walk, and
-then queued-job progress). Each was worth its bytes; none of them is where the headroom is.
+Five features have landed over the budget since it was first written (the timestamped log view and
+per-category clearing, the stored-totals summary that made the Sync section open without a walk,
+queued-job progress, and then the named in-service read failures with the stale-status age and
+cause). Each was worth its bytes; none of them is where the headroom is.
 
 ### What queued progress cost, and what that 9,625 bytes is made of
 
@@ -65,6 +67,41 @@ each phase as an array rather than a frozen object would recover roughly 400 byt
 deliberately not taken, because the object form is what `test_synology_ui.py` greps to hold the
 mirror in step with `src/lib.rs`, and a silently skewed catalogue under-reports a slow job at exactly
 the moment someone is troubleshooting it.
+
+### What naming the in-service read failures cost, and what that 8,824 bytes is made of
+
+Measured the same way, by building with each block removed in turn:
+
+| Block | Bundle bytes |
+| --- | --- |
+| `BRIDGE_FAILURE_COPY`, the AppWindow's title, text, stale-line cause and retry decision for each of the seventeen named codes | 4,178 |
+| `WIDGET_BRIDGE_FAILURES`, the desktop card's level, matching title and shortened detail for the same seventeen | 2,097 |
+| Everything else | 2,549 |
+
+The stylesheet did not move: `style.css` is 122,014 bytes before and after, so the whole 8,824 is
+JavaScript.
+
+Two thirds of it is operator-visible prose, for the third time in this document, and for the third
+time that is the feature rather than an overhead on it: the codes exist so the browser can stop
+saying "Restart Synology Drive Sync" to a package that is mid-upgrade. The remainder is small and has
+no single owner — three receipt timestamps, the age-and-cause formatter, the three-way retry ladder
+in `snapshotRetryDelay`, the fresh-snapshot check the reconciliation interlock now performs, and the
+feed-state line that dates retained Activity and Logs rows.
+
+Both tables are the structural alternative the queued-progress note declined, and declining it again
+is the right call for the same reason plus one more. Packing each row as an array would recover
+roughly 530 bytes across the two and would make the two surfaces' titles impossible to read side by
+side, which is precisely what `read-ladder-surface.test.mjs` exists to compare. Note also what is
+*not* duplicated: the cadence numbers. `App.vue` imports `WIDGET_BACKOFF_RAMP_MS`,
+`WIDGET_ACTIVE_POLL_MS` and `WIDGET_IDLE_POLL_MS` from `widgetModel.mjs` rather than restating them,
+so the retry ladder and the widget's backoff cannot drift and `validate_spk.py` still pins one set of
+literals.
+
+That import is the one structural change worth knowing about. `widgetModel.mjs` still imports
+nothing, so the dependency runs one way, but two of the Python harnesses execute `App.vue`'s script
+with its whole import block stripped. Nothing in `App.vue` may therefore reference those constants at
+module-evaluation time — `snapshotStaleEscalationMs()` is a function rather than a `const` for
+exactly that reason.
 
 ## Constraints on transforming the stylesheet
 

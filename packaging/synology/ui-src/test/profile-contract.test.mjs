@@ -2,6 +2,11 @@ import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import {
+  WIDGET_ACTIVE_POLL_MS,
+  WIDGET_BACKOFF_RAMP_MS,
+  WIDGET_IDLE_POLL_MS
+} from "../src/widgetModel.mjs";
 
 const appSource = await readFile(new URL("../src/App.vue", import.meta.url), "utf8");
 const apiSource = await readFile(new URL("../src/api.js", import.meta.url), "utf8");
@@ -21,6 +26,12 @@ function loadAppComponent(postSpy = async () => ({ ok: true })) {
     .replace("export default {", "const AppComponent = {");
   executable += "\nreturn AppComponent;";
   const stubs = {
+    // The real cadence literals, not stand-ins: App.vue's retry ladder and
+    // stale-age escalation are only meaningful against the ramp the widget
+    // actually ships and validate_spk.py actually pins.
+    WIDGET_ACTIVE_POLL_MS,
+    WIDGET_BACKOFF_RAMP_MS,
+    WIDGET_IDLE_POLL_MS,
     ACTIONS: {
       configureProfile: "configure-profile", removeProfile: "remove-profile",
       setDefault: "set-default", setSecret: "set-secret", schedule: "schedule",
