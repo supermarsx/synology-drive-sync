@@ -119,18 +119,33 @@ and exact private paths.
 
 <!-- topology: keep this note accurate as reads move between the manager and the service. -->
 
-Of those three commands, `api activity --lines N` is no longer one the service runs. The API service
-reads the four activity log files itself and assembles the same feed, under a stricter file contract
-than the manager's: owner, mode `0600`, link count and size, all checked on the descriptor it opened
-rather than on the path. The command remains a supported CLI contract and remains the oracle a
-differential test compares against, byte for byte with nothing normalised, but a dashboard poll no
-longer reaches it. `api snapshot` and `api logs --lines N` still run the manager on every poll.
+Of those three commands, only `api logs --lines N` is still one the service runs. The API service
+reads the inputs for `api snapshot` and `api activity --lines N` itself and assembles the same
+documents, under a stricter file contract than the manager's: owner, mode `0600`, link count and
+size, all checked on the descriptor it opened rather than on the path. Both remain supported CLI
+contracts and remain the oracles differential tests compare against, byte for byte with the
+snapshot's generation timestamp as the only normalised field, but a dashboard poll no longer reaches
+either.
 
-One behaviour differs, and only in how a refusal is named. A malformed record or an unsafe log file
-is refused by both, and neither serves it: the manager exits non-zero and the page reports
+`service.state` and `service.pid` are the one part of the snapshot that is not a function of package
+files, and the service derives them the same way the manager does rather than from the controller's
+own state file — because a controller killed outright leaves `state=running` behind in that file. A
+verified identity makes the service `running`, a process that is merely alive makes it `untrusted`,
+and a process that is not alive is `stopped` at pid zero. The verified case requires the controller
+executable, the PID file, the readiness record and the live private lock to agree on one
+pid/start/boot triple.
+
+One behaviour differs, and only in how a refusal is named. A malformed record or an unsafe file is
+refused by both, and neither serves it: the manager exits non-zero and the page reports
 `manager_exit_status`, while the service reports what it actually found — `package_state_corrupt`
 for a record it cannot parse, `config_file_unsafe` for a file whose ownership or mode is not what
 the package wrote.
+
+Two of the manager's reading rules surprise people, and the service reproduces both rather than
+improving on them. A package state or routine document that exists must carry **every** key the
+manager reads from it: the default applies when the whole file is absent, and a key missing from a
+file that is present is a corrupt record. A profile fragment is the opposite — a missing key there
+takes its default — except for `excludes`, which must be present exactly once.
 
 `api status-rollup` is the other exception. The API service no longer runs the manager for it: the
 manager's whole contribution was to list the configured profile names and forward the core's

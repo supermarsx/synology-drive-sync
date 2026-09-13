@@ -227,8 +227,9 @@ neither the log nor the coalescing state file, and does not change what the brow
 
 ### Forcing dashboard reads through the shell manager
 
-Some dashboard reads are answered inside the package service, from the package's own files, instead
-of by running the shell manager. A private marker forces every one of them back onto the manager:
+Most dashboard reads are answered inside the package service, from the package's own files, instead
+of by running the shell manager. Only the Logs view still runs it on every poll. A private marker
+forces every read back onto the manager:
 
 ```bash
 sudo -u "$PACKAGE_USER" -- sh -c \

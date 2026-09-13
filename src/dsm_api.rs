@@ -58,7 +58,13 @@ const CONTROLLER_PATH: &str = "/var/packages/synology-drive-sync/target/libexec/
 const AUTHENTICATE_PATH: &str = "/usr/syno/synoman/webman/modules/authenticate.cgi";
 const DSM_USER_SERVICE_PATH: &str = "/webapi/entry.cgi";
 const DSM_USER_SERVICE_API: &str = "SYNO.Core.Desktop.Initdata";
+const CONFIG_ROOT: &str = "/var/packages/synology-drive-sync/home/config";
 const PROFILES_DIR: &str = "/var/packages/synology-drive-sync/home/config/profiles.d";
+const ROUTINES_DIR: &str = "/var/packages/synology-drive-sync/home/config/routines.d";
+const STATE_ROOT: &str = "/var/packages/synology-drive-sync/var/state";
+const HEALTH_STATE_DIR: &str = "/var/packages/synology-drive-sync/var/state/health";
+const ROUTINE_STATE_DIR: &str = "/var/packages/synology-drive-sync/var/state/routines";
+const RUNTIME_ROOT: &str = "/var/packages/synology-drive-sync/var/run";
 const STATUS_CACHE_DIR: &str = "/var/packages/synology-drive-sync/var/state/cache/status";
 const CONTROL_ROOT: &str = "/var/packages/synology-drive-sync/var/control";
 const READ_LANE_PATH: &str = "/var/packages/synology-drive-sync/var/control/read-lane";
@@ -614,11 +620,19 @@ struct ControlPaths<'a> {
 #[derive(Clone, Copy)]
 struct PackagePaths<'a> {
     manager: &'a Path,
+    controller: &'a Path,
     package_home: &'a Path,
     package_var: &'a Path,
+    config_dir: &'a Path,
     log_root: &'a Path,
     profiles_dir: &'a Path,
+    routines_dir: &'a Path,
+    state_dir: &'a Path,
+    health_dir: &'a Path,
+    routine_state_dir: &'a Path,
+    secrets_dir: &'a Path,
     status_cache: &'a Path,
+    run_dir: &'a Path,
     /// The operator's kill switch. See `read_lane_forced_to_shell`.
     read_lane: &'a Path,
 }
@@ -628,11 +642,19 @@ impl PackagePaths<'static> {
     fn production() -> Self {
         Self {
             manager: Path::new(MANAGER_PATH),
+            controller: Path::new(CONTROLLER_PATH),
             package_home: Path::new(PACKAGE_HOME),
             package_var: Path::new(PACKAGE_VAR),
+            config_dir: Path::new(CONFIG_ROOT),
             log_root: Path::new(LOG_ROOT),
             profiles_dir: Path::new(PROFILES_DIR),
+            routines_dir: Path::new(ROUTINES_DIR),
+            state_dir: Path::new(STATE_ROOT),
+            health_dir: Path::new(HEALTH_STATE_DIR),
+            routine_state_dir: Path::new(ROUTINE_STATE_DIR),
+            secrets_dir: Path::new(PROFILE_SECRET_ROOT),
             status_cache: Path::new(STATUS_CACHE_DIR),
+            run_dir: Path::new(RUNTIME_ROOT),
             read_lane: Path::new(READ_LANE_PATH),
         }
     }
@@ -664,8 +686,10 @@ enum ReadRung {
 #[cfg(target_os = "linux")]
 fn read_rung(action: &ReadAction) -> ReadRung {
     match action {
-        ReadAction::StatusRollup | ReadAction::Activity { .. } => ReadRung::InService,
-        ReadAction::Snapshot | ReadAction::Logs { .. } => ReadRung::ShellManager,
+        ReadAction::StatusRollup | ReadAction::Activity { .. } | ReadAction::Snapshot => {
+            ReadRung::InService
+        }
+        ReadAction::Logs { .. } => ReadRung::ShellManager,
         ReadAction::Csrf
         | ReadAction::SourceDirectories { .. }
         | ReadAction::SourcePath { .. }
@@ -9349,6 +9373,321 @@ mod linux_files {
         Ok(history)
     }
 
+    /// A package configuration or state document, or `None` when it is absent.
+    ///
+    /// The manager reads these with `[ -f ]`, `[ ! -L ]` and `[ -r ]` and
+    /// nothing else. This validates owner, mode, link count and size on the
+    /// descriptor it opened, which is the tightening the ladder accepts on
+    /// purpose: a file that fails it is named with `config_file_unsafe` and
+    /// never handed to the laxer reader instead.
+    pub(super) fn read_optional_private_document(
+        path: &Path,
+        package_uid: u32,
+        maximum: usize,
+    ) -> BridgeResult<Option<Vec<u8>>> {
+        match open_private_log_file(path, package_uid, maximum) {
+            Ok(Some((_, bytes))) => Ok(Some(bytes)),
+            Ok(None) => Ok(None),
+            Err(_) => Err(BridgeError::unsafe_because("config_file_unsafe")),
+        }
+    }
+
+    /// Whether a secret file is present, and package-private if it is.
+    ///
+    /// `api_secret_boolean` reports presence and refuses anything that is not a
+    /// package-owned `0600` single-link regular file. Content is never read, on
+    /// either rung: the document carries the boolean and never the secret.
+    pub(super) fn private_secret_present(path: &Path, package_uid: u32) -> BridgeResult<bool> {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return Ok(false);
+        };
+        if !metadata.file_type().is_file()
+            || metadata.st_uid() != package_uid
+            || metadata.st_mode() & 0o7777 != 0o600
+            || metadata.st_nlink() != 1
+        {
+            return Err(BridgeError::unsafe_because("config_file_unsafe"));
+        }
+        Ok(true)
+    }
+
+    /// The names of the regular files in `directory` whose name ends in
+    /// `suffix`, in the byte order a `LC_ALL=C` glob yields.
+    ///
+    /// Ordered by file name rather than by the stem, because `-` sorts before
+    /// the `.` of the suffix. A symlink or a non-regular entry is refused
+    /// rather than skipped, which is what the manager's preflight loop does
+    /// before it emits a single byte.
+    pub(super) fn private_fragment_names(
+        directory: &Path,
+        suffix: &str,
+        package_uid: u32,
+    ) -> BridgeResult<Vec<String>> {
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(_) => return Err(BridgeError::unsafe_because("config_file_unsafe")),
+        };
+        let mut files = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            // A leading dot is not matched by the manager's glob at all.
+            if name.starts_with('.') || !name.ends_with(suffix) || name.len() == suffix.len() {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(entry.path())
+                .map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
+            if !metadata.file_type().is_file() || metadata.st_uid() != package_uid {
+                return Err(BridgeError::unsafe_because("config_file_unsafe"));
+            }
+            files.push(name);
+        }
+        files.sort_unstable();
+        Ok(files)
+    }
+
+    /// Device and inode of a path, for the hard-link identity comparisons the
+    /// private lock protocol uses.
+    fn path_identity(path: &Path) -> Option<(u64, u64)> {
+        let metadata = fs::symlink_metadata(path).ok()?;
+        Some((metadata.st_dev(), metadata.st_ino()))
+    }
+
+    /// One published process identity: pid, start tick, boot id.
+    pub(super) struct ProcessIdentity {
+        pub(super) pid: u32,
+        pub(super) start: u64,
+        pub(super) boot: String,
+    }
+
+    /// `read_pid` plus `controller_pid_file_safe`: the controller PID file must
+    /// be a package-owned `0600` single-link regular file of exactly one line
+    /// naming a pid greater than one.
+    pub(super) fn controller_pid_file_value(
+        path: &Path,
+        package_uid: u32,
+    ) -> BridgeResult<Option<u32>> {
+        let Some(bytes) = read_optional_private_document(path, package_uid, 96)? else {
+            return Ok(None);
+        };
+        let lines = awk_records(&bytes);
+        if lines.len() != 1 {
+            return Err(PACKAGE_STATE_CORRUPT);
+        }
+        manager_pid(lines[0]).map(Some).ok_or(PACKAGE_STATE_CORRUPT)
+    }
+
+    /// `read_controller_ready_identity`: three lines under ninety-six bytes
+    /// naming pid, start tick and boot id, in a package-owned `0600`
+    /// single-link file.
+    /// A published pid/start/boot record.
+    ///
+    /// `require_single_link` is false only for the private lock's own `pid`
+    /// file, whose steady state is two links: acquisition hard-links the claim
+    /// file into it, so demanding one link there would refuse every held lock
+    /// and report a running controller as untrusted. Every other published
+    /// identity is a single-link file.
+    fn read_published_identity(
+        path: &Path,
+        package_uid: u32,
+        require_single_link: bool,
+    ) -> BridgeResult<Option<ProcessIdentity>> {
+        if fs::symlink_metadata(path).is_err() {
+            return Ok(None);
+        }
+        let Ok(bytes) =
+            read_private_file_with_link_contract(path, package_uid, 96, require_single_link)
+        else {
+            return Ok(None);
+        };
+        let lines = awk_records(&bytes);
+        if lines.len() != 3 {
+            return Ok(None);
+        }
+        let Some(pid) = manager_pid(lines[0]) else {
+            return Ok(None);
+        };
+        let start = std::str::from_utf8(lines[1])
+            .ok()
+            .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value != 0);
+        let boot = std::str::from_utf8(lines[2])
+            .ok()
+            .filter(|value| valid_boot_id(value));
+        match (start, boot) {
+            (Some(start), Some(boot)) => Ok(Some(ProcessIdentity {
+                pid,
+                start,
+                boot: boot.to_owned(),
+            })),
+            _ => Ok(None),
+        }
+    }
+
+    /// `private_process_lock_is_live`: whether the private lock directory names
+    /// a live owner.
+    ///
+    /// The lock is a `mkdir`-based directory at mode `0700` whose only entry may
+    /// be `pid`. That file carries one line for the retired PID-only format,
+    /// which can never remain a live exclusion because it cannot be told apart
+    /// from PID reuse, or three lines naming pid, start tick and boot id.
+    ///
+    /// Two link counts are accepted, and the second is the steady state rather
+    /// than an oddity: acquisition writes a `.pending.` file, hard-links it to
+    /// `.claim.<pid>.<start>.<boot>`, and links that into `pid`, so a held lock
+    /// normally has two links and must share device and inode with its own
+    /// claim. Accepting only one link would report a running controller as
+    /// untrusted.
+    fn private_process_lock_owner(
+        lock: &Path,
+        package_uid: u32,
+    ) -> BridgeResult<Option<ProcessIdentity>> {
+        let Ok(metadata) = fs::symlink_metadata(lock) else {
+            return Ok(None);
+        };
+        if !metadata.file_type().is_dir()
+            || metadata.st_uid() != package_uid
+            || metadata.st_mode() & 0o7777 != 0o700
+        {
+            return Ok(None);
+        }
+        let Ok(entries) = fs::read_dir(lock) else {
+            return Ok(None);
+        };
+        for entry in entries.flatten() {
+            if entry.file_name() != std::ffi::OsStr::new("pid") {
+                return Ok(None);
+            }
+        }
+        let owner = lock.join("pid");
+        let Ok(owner_metadata) = fs::symlink_metadata(&owner) else {
+            return Ok(None);
+        };
+        if !owner_metadata.file_type().is_file()
+            || owner_metadata.st_uid() != package_uid
+            || owner_metadata.st_mode() & 0o7777 != 0o600
+            || owner_metadata.len() > 96
+        {
+            return Ok(None);
+        }
+        let Some(identity) = read_published_identity(&owner, package_uid, false)? else {
+            // One line is the retired format and is never live; anything else
+            // is not an owner this service will act on.
+            return Ok(None);
+        };
+        match owner_metadata.st_nlink() {
+            1 => {}
+            2 => {
+                let expected = path_identity(&owner);
+                let companions = [
+                    lock.with_file_name(format!(
+                        "{}.claim.{}.{}.{}",
+                        lock.file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or_default(),
+                        identity.pid,
+                        identity.start,
+                        identity.boot
+                    )),
+                    lock.with_file_name(format!(
+                        "{}.pending.{}.{}.{}",
+                        lock.file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or_default(),
+                        identity.pid,
+                        identity.start,
+                        identity.boot
+                    )),
+                ];
+                if !companions
+                    .iter()
+                    .any(|companion| path_identity(companion) == expected && expected.is_some())
+                {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None),
+        }
+        if !process_identity_is_live(identity.pid, identity.start, &identity.boot)? {
+            return Ok(None);
+        }
+        Ok(Some(identity))
+    }
+
+    /// `pid_is_live`: `is_pid` followed by `kill -0`.
+    ///
+    /// Liveness alone, with no identity: a pid that is merely alive is what
+    /// makes the service `untrusted` rather than `running`.
+    pub(super) fn pid_is_live(pid: u32) -> BridgeResult<bool> {
+        if pid <= 1 {
+            return Ok(false);
+        }
+        // SAFETY: kill with signal zero performs a permission/liveness probe.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+            return Ok(true);
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Ok(false),
+            _ => Ok(true),
+        }
+    }
+
+    /// `controller_persisted_identity_status`: whether the controller is running
+    /// under an identity this service can verify.
+    ///
+    /// Three independently published records must name the same pid, start tick
+    /// and boot id — the PID file, the readiness record and the live private
+    /// lock — and the controller executable must be package-owned at exactly
+    /// mode `755` with one link. The whole chain is read twice, because a
+    /// replacement during inspection must be rejected rather than averaged.
+    pub(super) fn controller_identity_is_trusted(
+        controller: &Path,
+        pid_file: &Path,
+        ready_file: &Path,
+        lock: &Path,
+        package_uid: u32,
+        expected_pid: u32,
+    ) -> BridgeResult<bool> {
+        let Ok(executable) = fs::symlink_metadata(controller) else {
+            return Ok(false);
+        };
+        if !executable.file_type().is_file()
+            || executable.st_uid() != package_uid
+            || executable.st_mode() & 0o7777 != 0o755
+            || executable.st_nlink() != 1
+        {
+            return Ok(false);
+        }
+        for _ in 0..2 {
+            // A contract failure anywhere in this chain means not trusted, which
+            // is what any non-zero return from the manager's own check means to
+            // `api_snapshot`. The hard error for an unsafe PID file is raised by
+            // the caller, which reads it before asking this question.
+            let Some(pid) = controller_pid_file_value(pid_file, package_uid).unwrap_or(None) else {
+                return Ok(false);
+            };
+            let Some(ready) = read_published_identity(ready_file, package_uid, true)? else {
+                return Ok(false);
+            };
+            let Some(owner) = private_process_lock_owner(lock, package_uid)? else {
+                return Ok(false);
+            };
+            if pid != ready.pid
+                || owner.pid != pid
+                || owner.start != ready.start
+                || owner.boot != ready.boot
+                || pid != expected_pid
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn rotating_log_paths(base: &Path, keep: usize) -> Vec<PathBuf> {
         let mut paths = Vec::with_capacity(keep + 1);
         paths.push(base.to_owned());
@@ -11797,7 +12136,7 @@ mod linux_files {
         Ok(value)
     }
 
-    fn process_start(pid: u32) -> BridgeResult<u64> {
+    pub(super) fn process_start(pid: u32) -> BridgeResult<u64> {
         let value = fs::read_to_string(format!("/proc/{pid}/stat"))
             .map_err(|_| BridgeError::unsafe_runtime())?;
         let tail = value
@@ -14400,6 +14739,216 @@ fn status_rollup_document(
     Ok(neutralize_package_paths(document, paths))
 }
 
+/// The manager's `json_quote`, which is deliberately not RFC 8259.
+///
+/// `sdsync-common`'s encoder escapes backslash, quote, tab and carriage return,
+/// and emits a literal `?` for `\001-\010\013\014\016-\037` — so backspace and
+/// form feed become `?` where `serde_json` would emit `\b` and `\f`. Byte 0x7f
+/// is outside that set and passes through. The `?` branch is unreachable for
+/// this document, because every reader that feeds it has already refused a
+/// control byte, but it is reproduced rather than assumed away: the reason it
+/// is unreachable is a property of the readers, not of this function.
+///
+/// This is one of three encoders in the same document. The activity feed uses
+/// `quote_activity_field`, which escapes two characters and nothing else, and
+/// the log reader uses a third that also strips ANSI sequences and rewrites
+/// paths before quoting. A single shared encoder would diverge from at least
+/// one of them.
+#[cfg(target_os = "linux")]
+fn manager_json_quote(text: &[u8]) -> Vec<u8> {
+    let mut quoted = Vec::with_capacity(text.len() + 2);
+    quoted.push(b'"');
+    for byte in text {
+        match byte {
+            b'\\' => quoted.extend_from_slice(br"\\"),
+            b'"' => quoted.extend_from_slice(b"\\\""),
+            b'\t' => quoted.extend_from_slice(b"\\t"),
+            b'\r' => quoted.extend_from_slice(b"\\r"),
+            0x01..=0x08 | 0x0b | 0x0c | 0x0e..=0x1f => quoted.push(b'?'),
+            _ => quoted.push(*byte),
+        }
+    }
+    quoted.push(b'"');
+    quoted
+}
+
+/// Whether a value holds a byte the manager's `grep '[[:cntrl:]]'` would find.
+///
+/// Under `LC_ALL=C` that class is `\000-\037` and `\177`. A value taken from one
+/// line can never hold `\012`, so this is the check that rejects the rest.
+#[cfg(target_os = "linux")]
+fn manager_control_byte(value: &[u8]) -> bool {
+    value.iter().any(|byte| *byte <= 0x1f || *byte == 0x7f)
+}
+
+/// Lines with a given prefix, the way `grep -c '^prefix'` counts them.
+#[cfg(target_os = "linux")]
+fn manager_prefixed_lines<'a>(document: &'a [u8], prefix: &[u8]) -> Vec<&'a [u8]> {
+    awk_records(document)
+        .into_iter()
+        .filter(|line| line.starts_with(prefix))
+        .collect()
+}
+
+/// `api_load_kv`: the one `key=` line in a package state document.
+///
+/// An absent document is the default. A present one must carry the key exactly
+/// once — **zero is an error**, not a default, which is the difference between
+/// this and `manager_kv_optional` and is easy to get backwards.
+#[cfg(target_os = "linux")]
+fn manager_kv(document: Option<&[u8]>, key: &str, default: &str) -> BridgeResult<Vec<u8>> {
+    let Some(document) = document else {
+        return Ok(default.as_bytes().to_vec());
+    };
+    let prefix = format!("{key}=").into_bytes();
+    let matched = manager_prefixed_lines(document, &prefix);
+    if matched.len() != 1 {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    let value = matched[0][prefix.len()..].to_vec();
+    if manager_control_byte(&value) {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    Ok(value)
+}
+
+/// `api_load_kv_optional`: as above, but an absent key keeps the default.
+#[cfg(target_os = "linux")]
+fn manager_kv_optional(document: Option<&[u8]>, key: &str, default: &str) -> BridgeResult<Vec<u8>> {
+    let Some(document) = document else {
+        return Ok(default.as_bytes().to_vec());
+    };
+    let prefix = format!("{key}=").into_bytes();
+    let matched = manager_prefixed_lines(document, &prefix);
+    match matched.len() {
+        0 => Ok(default.as_bytes().to_vec()),
+        1 => {
+            let value = matched[0][prefix.len()..].to_vec();
+            if manager_control_byte(&value) {
+                return Err(PACKAGE_STATE_CORRUPT);
+            }
+            Ok(value)
+        }
+        _ => Err(PACKAGE_STATE_CORRUPT),
+    }
+}
+
+/// `api_toml_string`: the one `key = "…"` line in a profile fragment.
+///
+/// The manager counts lines starting `key = "` and then extracts with an
+/// anchored, greedy `s/^key = "\(.*\)"$/\1/`. Three consequences that a
+/// re-derivation would miss: the closing quote must be the line's last byte, so
+/// trailing content is malformed rather than ignored; `key = ""` yields an empty
+/// value which the manager then **rejects**, so an explicitly empty string in
+/// the file is an error and only an absent key gives the default; and a value
+/// holding a quote or backslash is refused rather than escaped.
+#[cfg(target_os = "linux")]
+fn manager_toml_string(
+    document: &[u8],
+    key: &str,
+    default: &str,
+    required: bool,
+) -> BridgeResult<Vec<u8>> {
+    let prefix = format!("{key} = \"").into_bytes();
+    let matched = manager_prefixed_lines(document, &prefix);
+    if matched.is_empty() && !required {
+        return Ok(default.as_bytes().to_vec());
+    }
+    if matched.len() != 1 {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    let line = matched[0];
+    // The greedy capture needs a closing quote strictly beyond the prefix's own.
+    if line.len() <= prefix.len() || line[line.len() - 1] != b'"' {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    let value = line[prefix.len()..line.len() - 1].to_vec();
+    if value.is_empty()
+        || value.iter().any(|byte| *byte == b'"' || *byte == b'\\')
+        || manager_control_byte(&value)
+    {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    Ok(value)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ManagerScalar {
+    Bool,
+    Number,
+}
+
+/// `api_toml_scalar`: the one unquoted `key = …` line in a profile fragment.
+#[cfg(target_os = "linux")]
+fn manager_toml_scalar(
+    document: &[u8],
+    key: &str,
+    default: &str,
+    kind: ManagerScalar,
+) -> BridgeResult<Vec<u8>> {
+    let prefix = format!("{key} = ").into_bytes();
+    let matched = manager_prefixed_lines(document, &prefix);
+    let value = match matched.len() {
+        0 => default.as_bytes().to_vec(),
+        1 => matched[0][prefix.len()..].to_vec(),
+        _ => return Err(PACKAGE_STATE_CORRUPT),
+    };
+    let accepted = match kind {
+        ManagerScalar::Bool => value == b"true" || value == b"false",
+        ManagerScalar::Number => !value.is_empty() && value.iter().all(u8::is_ascii_digit),
+    };
+    if accepted {
+        Ok(value)
+    } else {
+        Err(PACKAGE_STATE_CORRUPT)
+    }
+}
+
+/// `decimal_at_most`: compare a non-negative decimal string against a ceiling
+/// without handing an out-of-range value to the shell's integer operators.
+#[cfg(target_os = "linux")]
+fn manager_decimal_at_most(value: &[u8], ceiling: u64) -> bool {
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    let trimmed = {
+        let first = value.iter().position(|byte| *byte != b'0');
+        match first {
+            Some(at) => &value[at..],
+            None => b"0".as_slice(),
+        }
+    };
+    let ceiling = ceiling.to_string().into_bytes();
+    trimmed.len() < ceiling.len() || (trimmed.len() == ceiling.len() && trimmed <= &ceiling[..])
+}
+
+/// `is_pid`: a decimal process id greater than one.
+#[cfg(target_os = "linux")]
+fn manager_pid(value: &[u8]) -> Option<u32> {
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(value)
+        .ok()?
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 1)
+}
+
+/// `valid_name`: the package's profile and routine name charset.
+///
+/// `all` is refused as a name because it is the reserved every-profile scope.
+#[cfg(target_os = "linux")]
+fn manager_valid_name(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name != b"all"
+        && name.len() <= 255
+        && name
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'-')
+}
+
 /// The last `lines` lines, the way `tail -n N` defines them.
 ///
 /// A trailing fragment with no newline counts as a line and is reproduced
@@ -14712,6 +15261,841 @@ fn render_activity_feed(window: &[u8], requested: usize) -> BridgeResult<Vec<u8>
     Ok(document)
 }
 
+/// A package configuration or state document is small by construction. The
+/// manager bounds `security.conf` at 8 KiB and every other field it reads is
+/// range-checked, so nothing it wrote comes near this.
+#[cfg(target_os = "linux")]
+const MAX_PACKAGE_DOCUMENT_BYTES: usize = 64 * 1024;
+
+/// The manager's own ceiling on a snapshot response.
+#[cfg(target_os = "linux")]
+const MAX_SNAPSHOT_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Append `"key":` followed by a raw, already-rendered value.
+#[cfg(target_os = "linux")]
+fn push_raw_member(document: &mut Vec<u8>, key: &str, value: &[u8]) {
+    document.push(b'"');
+    document.extend_from_slice(key.as_bytes());
+    document.extend_from_slice(b"\":");
+    document.extend_from_slice(value);
+}
+
+/// Append `"key":` followed by the manager's quoting of `value`.
+#[cfg(target_os = "linux")]
+fn push_quoted_member(document: &mut Vec<u8>, key: &str, value: &[u8]) {
+    push_raw_member(document, key, &manager_json_quote(value));
+}
+
+/// `service.state` and `service.pid`: the only part of this document that is not
+/// a function of package files.
+///
+/// The manager's rule, from `api_snapshot`. With no controller PID file the
+/// service is `stopped` at pid 0. With one, a verified persisted identity makes
+/// it `running`; a pid that is merely alive makes it `untrusted`; a pid that is
+/// not alive resets to `stopped` at pid 0. Liveness is `pid_is_live` in
+/// `sdsync-common` — `is_pid`, meaning decimal and greater than one, followed by
+/// `kill -0`. The trusted case is `controller_persisted_identity_status`, which
+/// is reproduced in `controller_identity_is_trusted`.
+///
+/// The distinction is load-bearing and is why this is read live rather than
+/// taken from the controller's own state file: a controller killed outright
+/// leaves `state=running` behind in that file.
+#[cfg(target_os = "linux")]
+fn snapshot_service_identity(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+) -> BridgeResult<(&'static str, u32)> {
+    let pid_file = paths.run_dir.join("controller.pid");
+    let Some(pid) = linux_files::controller_pid_file_value(&pid_file, package_uid)? else {
+        return Ok(("stopped", 0));
+    };
+    if linux_files::controller_identity_is_trusted(
+        paths.controller,
+        &pid_file,
+        &paths.run_dir.join("controller.ready"),
+        &paths.run_dir.join("controller.lock"),
+        package_uid,
+        pid,
+    )? {
+        return Ok(("running", pid));
+    }
+    if linux_files::pid_is_live(pid)? {
+        return Ok(("untrusted", pid));
+    }
+    Ok(("stopped", 0))
+}
+
+/// `api_profile_json`: one profile fragment, rendered.
+///
+/// Every default, range and cross-field rule is the manager's, in the manager's
+/// order, and every numeric field is emitted as the bytes the file held rather
+/// than as a parsed number. That last point is not pedantry: a fragment holding
+/// `verbose = 007` renders `"verbosity":007`, which is not JSON, and both rungs
+/// must therefore fail this read the same way rather than one of them silently
+/// normalising it.
+#[cfg(target_os = "linux")]
+fn render_profile(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    name: &str,
+    fragment: &[u8],
+    default_profile: &[u8],
+) -> BridgeResult<Vec<u8>> {
+    if !manager_valid_name(name.as_bytes()) {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    let string = |key: &str, default: &str, required: bool| {
+        manager_toml_string(fragment, key, default, required)
+    };
+    let number = |key: &str, default: &str| {
+        manager_toml_scalar(fragment, key, default, ManagerScalar::Number)
+    };
+    let boolean =
+        |key: &str, default: &str| manager_toml_scalar(fragment, key, default, ManagerScalar::Bool);
+
+    let source = string("source", "", true)?;
+    let url = string("url", "", true)?;
+    let username = string("username", "", true)?;
+    let remote = string("remote", "", true)?;
+    let password_locator = string("password-file", "", true)?;
+    let totp_locator = string("totp-secret-file", "", true)?;
+    let token_locator = string("remote-log-token-file", "", false)?;
+    let locator = |suffix: &str| {
+        paths
+            .secrets_dir
+            .join(format!("{name}.{suffix}"))
+            .into_os_string()
+            .into_encoded_bytes()
+    };
+    if password_locator != locator("password") || totp_locator != locator("totp") {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    if !token_locator.is_empty() && token_locator != locator("remote-log-token") {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    if boolean("no-vault", "true")? != b"true" {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+
+    let compare = string("compare", "content", false)?;
+    if !matches!(compare.as_slice(), b"content" | b"metadata" | b"size-only") {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    let jobs = number("jobs", "2")?;
+    let jobs_value = std::str::from_utf8(&jobs)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or(PACKAGE_STATE_CORRUPT)?;
+    if !(1..=16).contains(&jobs_value) {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    let delete = boolean("delete", "false")?;
+    let max_delete = number("max-delete", "100")?;
+    if !manager_decimal_at_most(&max_delete, MAX_DSM_DELETE_BOUND) {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    let allow_http = boolean("allow-http", "false")?;
+    let allow_empty = boolean("allow-empty-source", "false")?;
+    if allow_empty == b"true" && delete != b"true" {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    let retries = number("retries", "2")?;
+    if !manager_decimal_at_most(&retries, 5) {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    let timeout = number("timeout", "7200")?;
+    let connect_timeout = number("connect-timeout", "15")?;
+    if !manager_decimal_at_most(&timeout, 86400)
+        || timeout == b"0"
+        || !manager_decimal_at_most(&connect_timeout, 600)
+        || connect_timeout == b"0"
+    {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    let invalid_certs = boolean("danger-accept-invalid-certs", "false")?;
+    let verbose = number("verbose", "0")?;
+    let quiet = boolean("quiet", "false")?;
+    let log_level = string("log-level", "info", false)?;
+    let log_format = string("log-format", "json", false)?;
+    let sync_log = paths
+        .log_root
+        .join("sync.log")
+        .into_os_string()
+        .into_encoded_bytes();
+    let log_file = manager_toml_string(
+        fragment,
+        "log-file",
+        std::str::from_utf8(&sync_log).map_err(|_| BridgeError::internal())?,
+        false,
+    )?;
+    let progress = string("progress", "never", false)?;
+    let output = string("output", "human", false)?;
+    let remote_log_url = string("remote-log-url", "", false)?;
+    let remote_log_mode = string("remote-log-mode", "best-effort", false)?;
+    if !matches!(
+        log_level.as_slice(),
+        b"trace" | b"debug" | b"info" | b"warn" | b"error" | b"off"
+    ) || !matches!(log_format.as_slice(), b"human" | b"json")
+        || !matches!(progress.as_slice(), b"auto" | b"always" | b"never")
+        || !matches!(output.as_slice(), b"human" | b"json" | b"ndjson")
+        || !matches!(remote_log_mode.as_slice(), b"best-effort" | b"required")
+        || log_file != sync_log
+    {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    if !remote_log_url.is_empty()
+        && (!remote_log_url.starts_with(b"https://")
+            || token_locator != locator("remote-log-token"))
+    {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    let ca_certificate = string("ca-certificate", "", false)?;
+    let max_rate = number("max-rate", "0")?;
+    if !manager_decimal_at_most(&max_rate, 9_007_199_254_740_991) {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+
+    // `excludes` is spliced out of the file and printed unchanged, so its exact
+    // spacing is part of the response. Exactly one such line is required: a
+    // fragment without it is refused rather than defaulted.
+    let excludes_lines = manager_prefixed_lines(fragment, b"excludes = ");
+    if excludes_lines.len() != 1 {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    let excludes = &excludes_lines[0]["excludes = ".len()..];
+    if !manager_excludes_shape(excludes) {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+
+    let secret = |suffix: &str| {
+        linux_files::private_secret_present(
+            &paths.secrets_dir.join(format!("{name}.{suffix}")),
+            package_uid,
+        )
+    };
+    let has_password = secret("password")?;
+    let has_totp = secret("totp")?;
+    let has_token = secret("remote-log-token")?;
+
+    let health = linux_files::read_optional_private_document(
+        &paths.health_dir.join(format!("{name}.state")),
+        package_uid,
+        MAX_PACKAGE_DOCUMENT_BYTES,
+    )?;
+    let health = health.as_deref();
+    let health_state = manager_kv(health, "state", "unknown")?;
+    let health_epoch = manager_kv(health, "checked_epoch", "0")?;
+    let health_exit = manager_kv(health, "exit_code", "-1")?;
+    let health_write = manager_kv(health, "write_test", "false")?;
+    let health_level = manager_kv(health, "level", "standard")?;
+    if !matches!(
+        health_state.as_slice(),
+        b"unknown" | b"succeeded" | b"failed"
+    ) || health_epoch.is_empty()
+        || !health_epoch.iter().all(u8::is_ascii_digit)
+        || !(health_exit == b"-1"
+            || (!health_exit.is_empty() && health_exit.iter().all(u8::is_ascii_digit)))
+        || !matches!(health_write.as_slice(), b"true" | b"false")
+        || !matches!(
+            health_level.as_slice(),
+            b"quick" | b"standard" | b"extensive"
+        )
+    {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+
+    let mut profile = Vec::with_capacity(1024);
+    profile.push(b'{');
+    push_quoted_member(&mut profile, "name", name.as_bytes());
+    profile.push(b',');
+    push_raw_member(
+        &mut profile,
+        "default",
+        if name.as_bytes() == default_profile {
+            b"true"
+        } else {
+            b"false"
+        },
+    );
+    for (key, value) in [
+        ("source", &source),
+        ("url", &url),
+        ("username", &username),
+        ("remote", &remote),
+        ("compare", &compare),
+    ] {
+        profile.push(b',');
+        push_quoted_member(&mut profile, key, value);
+    }
+    for (key, value) in [
+        ("jobs", &jobs),
+        ("delete", &delete),
+        ("max_delete", &max_delete),
+        ("allow_http", &allow_http),
+    ] {
+        profile.push(b',');
+        push_raw_member(&mut profile, key, value);
+    }
+    for (key, value) in [
+        ("has_password", has_password),
+        ("has_totp", has_totp),
+        ("has_remote_log_token", has_token),
+    ] {
+        profile.push(b',');
+        push_raw_member(&mut profile, key, if value { b"true" } else { b"false" });
+    }
+    profile.push(b',');
+    push_raw_member(&mut profile, "excludes", excludes);
+    for (key, value) in [
+        ("allow_empty_source", &allow_empty),
+        ("retries", &retries),
+        ("upload_timeout_seconds", &timeout),
+        ("connect_timeout_seconds", &connect_timeout),
+    ] {
+        profile.push(b',');
+        push_raw_member(&mut profile, key, value);
+    }
+    profile.push(b',');
+    push_raw_member(
+        &mut profile,
+        "max_rate_bytes_per_second",
+        if max_rate == b"0" { b"null" } else { &max_rate },
+    );
+    profile.push(b',');
+    push_quoted_member(&mut profile, "ca_certificate", &ca_certificate);
+    profile.push(b',');
+    push_raw_member(&mut profile, "danger_accept_invalid_certs", &invalid_certs);
+    profile.push(b',');
+    push_raw_member(&mut profile, "verbosity", &verbose);
+    profile.push(b',');
+    push_raw_member(&mut profile, "quiet", &quiet);
+    for (key, value) in [
+        ("log_level", &log_level),
+        ("log_format", &log_format),
+        ("log_file", &log_file),
+        ("progress", &progress),
+        ("output", &output),
+        ("remote_log_url", &remote_log_url),
+        ("remote_log_mode", &remote_log_mode),
+    ] {
+        profile.push(b',');
+        push_quoted_member(&mut profile, key, value);
+    }
+    profile.extend_from_slice(b",\"health\":{");
+    push_quoted_member(&mut profile, "state", &health_state);
+    profile.push(b',');
+    push_raw_member(&mut profile, "checked_epoch", &health_epoch);
+    profile.push(b',');
+    push_raw_member(
+        &mut profile,
+        "exit_code",
+        if health_exit == b"-1" {
+            b"null"
+        } else {
+            &health_exit
+        },
+    );
+    profile.push(b',');
+    push_raw_member(&mut profile, "write_test", &health_write);
+    profile.push(b',');
+    push_quoted_member(&mut profile, "level", &health_level);
+    profile.extend_from_slice(b"}}");
+    Ok(profile)
+}
+
+/// The shape the manager's `grep -E` pins for a spliced `excludes` value:
+/// `[]`, or quoted items separated by exactly `, `, with no quote or backslash
+/// inside an item.
+#[cfg(target_os = "linux")]
+fn manager_excludes_shape(value: &[u8]) -> bool {
+    if value == b"[]" {
+        return true;
+    }
+    let Some(inner) = value
+        .strip_prefix(b"[")
+        .and_then(|rest| rest.strip_suffix(b"]"))
+    else {
+        return false;
+    };
+    if inner.is_empty() {
+        return false;
+    }
+    let mut rest = inner;
+    loop {
+        let Some(after_open) = rest.strip_prefix(b"\"") else {
+            return false;
+        };
+        let Some(end) = after_open.iter().position(|byte| *byte == b'"') else {
+            return false;
+        };
+        if after_open[..end].contains(&b'\\') {
+            return false;
+        }
+        rest = &after_open[end + 1..];
+        if rest.is_empty() {
+            return true;
+        }
+        let Some(next) = rest.strip_prefix(b", ") else {
+            return false;
+        };
+        rest = next;
+    }
+}
+
+/// `api_dependencies_json`: a comma-separated dependency list, rendered as an
+/// array with empty items dropped.
+#[cfg(target_os = "linux")]
+fn render_dependencies(value: &[u8]) -> BridgeResult<Vec<u8>> {
+    let mut rendered = vec![b'['];
+    let mut first = true;
+    for item in value.split(|byte| *byte == b',') {
+        if item.is_empty() {
+            continue;
+        }
+        if !manager_valid_name(item) {
+            return Err(PACKAGE_STATE_CORRUPT);
+        }
+        if !first {
+            rendered.push(b',');
+        }
+        rendered.extend_from_slice(&manager_json_quote(item));
+        first = false;
+    }
+    rendered.push(b']');
+    Ok(rendered)
+}
+
+/// `api_routine_json`: one routine configuration, rendered.
+///
+/// The emitted key set depends on the mode, which is why this cannot be a flat
+/// table: an interval routine carries `interval_seconds`, a daily one carries
+/// spliced `weekdays` and its two window bounds, and a realtime one carries a
+/// debounce and a poll interval. The backoff is clamped to 300 rather than
+/// refused above it, which is the manager's behaviour and not an improvement to
+/// make here.
+#[cfg(target_os = "linux")]
+fn render_routine(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    name: &str,
+    configuration: &[u8],
+    profile_names: &[String],
+) -> BridgeResult<Vec<u8>> {
+    if !manager_valid_name(name.as_bytes()) || !profile_names.iter().any(|known| known == name) {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    let configuration = Some(configuration);
+    let kv = |key: &str, default: &str| manager_kv(configuration, key, default);
+    let enabled = kv("enabled", "false")?;
+    let action = kv("action", "sync")?;
+    let mode = kv("mode", "interval")?;
+    let interval = kv("interval_seconds", "3600")?;
+    let weekdays = kv("weekdays", "1,2,3,4,5,6,7")?;
+    let start = kv("time_window_start", "00:00")?;
+    let end = kv("time_window_end", "23:59")?;
+    let debounce = kv("debounce_seconds", "45")?;
+    let retries = kv("retry_count", "5")?;
+    let mut backoff = kv("retry_backoff_seconds", "60")?;
+    let exponential = manager_kv_optional(configuration, "retry_exponential", "true")?;
+    let poll = kv("poll_seconds", "30")?;
+    let delete = kv("allow_delete", "false")?;
+    let max_total = kv("max_total_delete", "100")?;
+    let dependencies = kv("depends_on", "")?;
+
+    let digits = |value: &[u8]| !value.is_empty() && value.iter().all(u8::is_ascii_digit);
+    let numeric =
+        |value: &[u8]| -> Option<u64> { std::str::from_utf8(value).ok()?.parse::<u64>().ok() };
+    if !matches!(enabled.as_slice(), b"true" | b"false")
+        || !matches!(delete.as_slice(), b"true" | b"false")
+        || !matches!(exponential.as_slice(), b"true" | b"false")
+        || !matches!(action.as_slice(), b"plan" | b"sync")
+        || !matches!(mode.as_slice(), b"interval" | b"daily" | b"realtime")
+        || !digits(&retries)
+        || !digits(&backoff)
+        || !digits(&max_total)
+    {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    if !manager_decimal_at_most(&retries, 5)
+        || numeric(&backoff).is_none_or(|value| value < 10)
+        || !manager_decimal_at_most(&max_total, MAX_DSM_DELETE_BOUND)
+    {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+    if numeric(&backoff).is_none_or(|value| value > 300) {
+        backoff = b"300".to_vec();
+    }
+    match mode.as_slice() {
+        b"interval" => {
+            if !digits(&interval)
+                || numeric(&interval).is_none_or(|value| !(60..=2_592_000).contains(&value))
+            {
+                return Err(PACKAGE_STATE_CORRUPT);
+            }
+        }
+        b"daily" => {
+            if !manager_weekdays_shape(&weekdays)
+                || !manager_clock_shape(&start)
+                || !manager_clock_shape(&end)
+            {
+                return Err(PACKAGE_STATE_CORRUPT);
+            }
+        }
+        _ => {
+            if !digits(&debounce)
+                || !digits(&poll)
+                || numeric(&debounce).is_none_or(|value| !(1..=3600).contains(&value))
+                || numeric(&poll).is_none_or(|value| !(5..=3600).contains(&value))
+            {
+                return Err(PACKAGE_STATE_CORRUPT);
+            }
+        }
+    }
+
+    let state_document = linux_files::read_optional_private_document(
+        &paths.routine_state_dir.join(format!("{name}.state")),
+        package_uid,
+        MAX_PACKAGE_DOCUMENT_BYTES,
+    )?;
+    let state_document = state_document.as_deref();
+    let state = manager_kv(state_document, "state", "never")?;
+    let next_run = manager_kv(state_document, "next_run_epoch", "0")?;
+    let last_success = manager_kv(state_document, "last_success_epoch", "0")?;
+    let backend = manager_kv(state_document, "backend", "none")?;
+    if !matches!(
+        state.as_slice(),
+        b"never" | b"scheduled" | b"running" | b"succeeded" | b"failed" | b"deferred"
+    ) || !matches!(
+        backend.as_slice(),
+        b"none" | b"interval" | b"daily" | b"inotify" | b"polling"
+    ) || !digits(&next_run)
+        || !digits(&last_success)
+    {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+
+    let mut routine = Vec::with_capacity(512);
+    routine.push(b'{');
+    push_quoted_member(&mut routine, "profile", name.as_bytes());
+    routine.push(b',');
+    push_raw_member(&mut routine, "enabled", &enabled);
+    routine.push(b',');
+    push_quoted_member(&mut routine, "action", &action);
+    routine.push(b',');
+    push_quoted_member(&mut routine, "mode", &mode);
+    match mode.as_slice() {
+        b"interval" => {
+            routine.push(b',');
+            push_raw_member(&mut routine, "interval_seconds", &interval);
+        }
+        b"daily" => {
+            routine.push(b',');
+            // Spliced from the file rather than re-serialised from a parsed
+            // list, so the stored spacing is the response's spacing.
+            let mut rendered = vec![b'['];
+            rendered.extend_from_slice(&weekdays);
+            rendered.push(b']');
+            push_raw_member(&mut routine, "weekdays", &rendered);
+            routine.push(b',');
+            push_quoted_member(&mut routine, "time_window_start", &start);
+            routine.push(b',');
+            push_quoted_member(&mut routine, "time_window_end", &end);
+        }
+        _ => {
+            routine.push(b',');
+            push_raw_member(&mut routine, "debounce_seconds", &debounce);
+            routine.push(b',');
+            push_raw_member(&mut routine, "poll_seconds", &poll);
+        }
+    }
+    for (key, value) in [
+        ("retry_count", &retries),
+        ("retry_backoff_seconds", &backoff),
+        ("retry_exponential", &exponential),
+        ("allow_delete", &delete),
+        ("max_total_delete", &max_total),
+    ] {
+        routine.push(b',');
+        push_raw_member(&mut routine, key, value);
+    }
+    routine.push(b',');
+    push_raw_member(
+        &mut routine,
+        "depends_on",
+        &render_dependencies(&dependencies)?,
+    );
+    routine.push(b',');
+    push_quoted_member(&mut routine, "backend", &backend);
+    routine.push(b',');
+    push_quoted_member(&mut routine, "state", &state);
+    routine.push(b',');
+    push_raw_member(&mut routine, "next_run_epoch", &next_run);
+    routine.push(b',');
+    push_raw_member(&mut routine, "last_success_epoch", &last_success);
+    routine.push(b'}');
+    Ok(routine)
+}
+
+/// `^[1-7](,[1-7])*$`, the shape the manager pins for a spliced weekday list.
+#[cfg(target_os = "linux")]
+fn manager_weekdays_shape(value: &[u8]) -> bool {
+    let mut parts = value.split(|byte| *byte == b',');
+    parts.all(|part| part.len() == 1 && (b'1'..=b'7').contains(&part[0])) && !value.is_empty()
+}
+
+/// A `HH:MM` wall-clock bound in `00:00..=23:59`.
+#[cfg(target_os = "linux")]
+fn manager_clock_shape(value: &[u8]) -> bool {
+    value.len() == 5
+        && value[2] == b':'
+        && value[0].is_ascii_digit()
+        && value[1].is_ascii_digit()
+        && (b'0'..=b'5').contains(&value[3])
+        && value[4].is_ascii_digit()
+        && (value[0] == b'0' || value[0] == b'1' || (value[0] == b'2' && value[1] <= b'3'))
+}
+
+/// Rung A for `snapshot`.
+///
+/// The document is assembled as the manager's own bytes and then handed to
+/// `parse_and_sanitize_manager_json`, the same function the shell rung's output
+/// goes through. Parity therefore reduces to one question the differential test
+/// answers: are these the bytes the manager would have printed?
+///
+/// Two blocks are deliberately not reproduced. The bridge overwrites
+/// `security_policy` and `capabilities` and inserts `package`, so the manager's
+/// renderings of the first two never reach a client and reproducing them would
+/// be writing code whose output is discarded. `security.conf` is still
+/// validated, one layer earlier, where `handle_relay_request` loads it.
+#[cfg(target_os = "linux")]
+fn snapshot_document(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    policy: &SecurityPolicyArgs,
+) -> BridgeResult<Vec<u8>> {
+    let generated = current_epoch()?;
+    let (service_state, service_pid) = snapshot_service_identity(paths, package_uid)?;
+    let read = |path: PathBuf| {
+        linux_files::read_optional_private_document(&path, package_uid, MAX_PACKAGE_DOCUMENT_BYTES)
+    };
+    let config = |name: &str| read(paths.config_dir.join(name));
+    let state = |name: &str| read(paths.state_dir.join(name));
+
+    let schedule = config("schedule.conf")?;
+    let schedule = schedule.as_deref();
+    let schedule_enabled = manager_kv(schedule, "enabled", "false")?;
+    let schedule_interval = manager_kv(schedule, "interval_seconds", "3600")?;
+    let schedule_delete = manager_kv(schedule, "allow_delete", "false")?;
+    let schedule_max = manager_kv(schedule, "max_total_delete", "100")?;
+    let digits = |value: &[u8]| !value.is_empty() && value.iter().all(u8::is_ascii_digit);
+    let numeric = |value: &[u8]| std::str::from_utf8(value).ok()?.parse::<u64>().ok();
+    if !matches!(schedule_enabled.as_slice(), b"true" | b"false")
+        || !matches!(schedule_delete.as_slice(), b"true" | b"false")
+        || !digits(&schedule_interval)
+        || !digits(&schedule_max)
+        || numeric(&schedule_interval).is_none_or(|value| !(60..=2_592_000).contains(&value))
+        || !manager_decimal_at_most(&schedule_max, MAX_DSM_DELETE_BOUND)
+    {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+
+    let controller = state("controller.state")?;
+    let controller = controller.as_deref();
+    let controller_status = manager_kv(controller, "state", "stopped")?;
+    let controller_pid = manager_kv(controller, "pid", "0")?;
+    let controller_next = manager_kv(controller, "next_run_epoch", "0")?;
+    let controller_active = manager_kv(controller, "active_pid", "0")?;
+    let controller_updated = manager_kv(controller, "updated_epoch", "0")?;
+    if !matches!(controller_status.as_slice(), b"running" | b"stopped")
+        || ![
+            &controller_pid,
+            &controller_next,
+            &controller_active,
+            &controller_updated,
+        ]
+        .iter()
+        .all(|value| digits(value))
+    {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+
+    let run = state("run.state")?;
+    let run = run.as_deref();
+    let run_status = manager_kv(run, "state", "never")?;
+    let run_started = manager_kv(run, "started_epoch", "0")?;
+    let run_finished = manager_kv(run, "finished_epoch", "0")?;
+    let run_exit = manager_kv(run, "exit_code", "-1")?;
+    let run_scope = manager_kv(run, "scope", "none")?;
+    let run_operation = manager_kv_optional(run, "operation", "none")?;
+    if !matches!(
+        run_status.as_slice(),
+        b"never" | b"running" | b"succeeded" | b"failed"
+    ) || !digits(&run_started)
+        || !digits(&run_finished)
+        || !(run_exit == b"-1" || digits(&run_exit))
+        || !matches!(run_operation.as_slice(), b"none" | b"sync" | b"plan")
+        || !(matches!(run_scope.as_slice(), b"none" | b"all") || manager_valid_name(&run_scope))
+    {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+
+    let performance = config("performance.conf")?;
+    let mut performance_level = manager_kv(performance.as_deref(), "level", "balanced")?;
+    if !matches!(
+        performance_level.as_slice(),
+        b"full" | b"balanced" | b"gentle"
+    ) {
+        // Unknown, malformed or absent is Balanced, exactly as the runtime
+        // loader resolves it. The dashboard must never show a level the runtime
+        // is not applying.
+        performance_level = b"balanced".to_vec();
+    }
+
+    let alerts = config("alerts.conf")?;
+    let alerts = alerts.as_deref();
+    let alert_enabled = manager_kv(alerts, "enabled", "true")?;
+    let alert_success = manager_kv(alerts, "on_success", "false")?;
+    let alert_failure = manager_kv(alerts, "on_failure", "true")?;
+    let alert_threshold = manager_kv(alerts, "failure_threshold", "1")?;
+    let alert_cooldown = manager_kv(alerts, "cooldown_seconds", "3600")?;
+    if ![&alert_enabled, &alert_success, &alert_failure]
+        .iter()
+        .all(|value| matches!(value.as_slice(), b"true" | b"false"))
+        || !digits(&alert_threshold)
+        || !digits(&alert_cooldown)
+    {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
+
+    // Preflight every fragment before emitting a byte, and refuse a set larger
+    // than the manager will carry.
+    let profile_files =
+        linux_files::private_fragment_names(paths.profiles_dir, ".toml", package_uid)?;
+    let routine_files =
+        linux_files::private_fragment_names(paths.routines_dir, ".conf", package_uid)?;
+    if profile_files.len() > 256 || routine_files.len() > 256 {
+        return Err(BridgeError::unavailable_because("manager_output_too_large"));
+    }
+    let profile_names = profile_files
+        .iter()
+        .map(|file| file[..file.len() - ".toml".len()].to_owned())
+        .collect::<Vec<_>>();
+
+    // `current_default`: the recorded default when it names an existing
+    // profile, otherwise the first fragment in byte order, otherwise nothing.
+    let recorded = config("default-profile")?;
+    let recorded = recorded
+        .as_deref()
+        .map(|bytes| awk_records(bytes).first().map(|line| line.to_vec()))
+        .unwrap_or_default()
+        .unwrap_or_default();
+    let default_profile = if manager_valid_name(&recorded)
+        && profile_names
+            .iter()
+            .any(|name| name.as_bytes() == recorded.as_slice())
+    {
+        recorded
+    } else {
+        profile_names
+            .first()
+            .map(|name| name.as_bytes().to_vec())
+            .unwrap_or_default()
+    };
+
+    let mut document = Vec::with_capacity(8 * 1024);
+    document.extend_from_slice(b"{\"schema\":\"sdsync.dsm-api.v1\",\"generated_at_epoch\":");
+    document.extend_from_slice(generated.to_string().as_bytes());
+    document.extend_from_slice(b",\"service\":{\"state\":\"");
+    document.extend_from_slice(service_state.as_bytes());
+    document.extend_from_slice(b"\",\"pid\":");
+    document.extend_from_slice(service_pid.to_string().as_bytes());
+    document.extend_from_slice(b"},\"schedule\":{");
+    push_raw_member(&mut document, "enabled", &schedule_enabled);
+    document.push(b',');
+    push_raw_member(&mut document, "interval_seconds", &schedule_interval);
+    document.push(b',');
+    push_raw_member(&mut document, "allow_delete", &schedule_delete);
+    document.push(b',');
+    push_raw_member(&mut document, "max_total_delete", &schedule_max);
+    document.extend_from_slice(b"},\"controller\":{");
+    push_quoted_member(&mut document, "state", &controller_status);
+    document.push(b',');
+    push_raw_member(&mut document, "pid", &controller_pid);
+    document.push(b',');
+    push_raw_member(&mut document, "next_run_epoch", &controller_next);
+    document.push(b',');
+    push_raw_member(&mut document, "active_pid", &controller_active);
+    document.push(b',');
+    push_raw_member(&mut document, "updated_epoch", &controller_updated);
+    document.extend_from_slice(b"},\"run\":{");
+    push_quoted_member(&mut document, "state", &run_status);
+    document.push(b',');
+    push_raw_member(&mut document, "started_epoch", &run_started);
+    document.push(b',');
+    push_raw_member(&mut document, "finished_epoch", &run_finished);
+    document.push(b',');
+    push_raw_member(
+        &mut document,
+        "exit_code",
+        if run_exit == b"-1" {
+            b"null"
+        } else {
+            &run_exit
+        },
+    );
+    document.push(b',');
+    push_quoted_member(&mut document, "scope", &run_scope);
+    document.push(b',');
+    push_quoted_member(&mut document, "operation", &run_operation);
+    document.extend_from_slice(b"},\"profiles\":[");
+    for (index, (file, name)) in profile_files.iter().zip(&profile_names).enumerate() {
+        if index > 0 {
+            document.push(b',');
+        }
+        let fragment = read(paths.profiles_dir.join(file))?.ok_or(PACKAGE_STATE_CORRUPT)?;
+        document.extend_from_slice(&render_profile(
+            paths,
+            package_uid,
+            name,
+            &fragment,
+            &default_profile,
+        )?);
+    }
+    document.extend_from_slice(b"],\"routines\":[");
+    for (index, file) in routine_files.iter().enumerate() {
+        if index > 0 {
+            document.push(b',');
+        }
+        let name = &file[..file.len() - ".conf".len()];
+        let configuration = read(paths.routines_dir.join(file))?.ok_or(PACKAGE_STATE_CORRUPT)?;
+        document.extend_from_slice(&render_routine(
+            paths,
+            package_uid,
+            name,
+            &configuration,
+            &profile_names,
+        )?);
+    }
+    document.extend_from_slice(b"],\"alerts\":{");
+    push_raw_member(&mut document, "enabled", &alert_enabled);
+    document.push(b',');
+    push_raw_member(&mut document, "on_success", &alert_success);
+    document.push(b',');
+    push_raw_member(&mut document, "on_failure", &alert_failure);
+    document.push(b',');
+    push_raw_member(&mut document, "failure_threshold", &alert_threshold);
+    document.push(b',');
+    push_raw_member(&mut document, "cooldown_seconds", &alert_cooldown);
+    document.extend_from_slice(b"},\"performance\":{");
+    push_quoted_member(&mut document, "level", &performance_level);
+    document.extend_from_slice(b"}}");
+
+    if document.len() > MAX_SNAPSHOT_RESPONSE_BYTES {
+        return Err(BridgeError::unavailable_because("manager_output_too_large"));
+    }
+    parse_and_sanitize_manager_json(&document, &ReadAction::Snapshot, None, Some(policy))
+}
+
 /// Rung A for `activity`.
 ///
 /// The smallest input surface of the three manager-shaped reads: four log files
@@ -14762,11 +16146,11 @@ fn run_in_service_read(
         ReadAction::Activity { lines } => {
             activity_document(paths, package_uid, action, *lines, policy)?
         }
+        ReadAction::Snapshot => snapshot_document(paths, package_uid, policy)?,
         // `read_rung` routes nothing else here, and it is a total match, so a
         // read that gains an in-service implementation must be added in both
         // places or fail to compile in one of them.
-        ReadAction::Snapshot
-        | ReadAction::Logs { .. }
+        ReadAction::Logs { .. }
         | ReadAction::Csrf
         | ReadAction::SourceDirectories { .. }
         | ReadAction::SourcePath { .. }
@@ -16788,11 +18172,19 @@ mod tests {
     struct TestPackageFixture {
         root: PathBuf,
         manager: PathBuf,
+        controller: PathBuf,
         home: PathBuf,
         var: PathBuf,
+        config_dir: PathBuf,
         log_root: PathBuf,
         profiles_dir: PathBuf,
+        routines_dir: PathBuf,
+        state_dir: PathBuf,
+        health_dir: PathBuf,
+        routine_state_dir: PathBuf,
+        secrets_dir: PathBuf,
         status_cache: PathBuf,
+        run_dir: PathBuf,
         read_lane: PathBuf,
     }
 
@@ -16808,28 +18200,50 @@ mod tests {
             let var = root.join("var");
             let log_root = var.join("log");
             let control = var.join("control");
-            let profiles_dir = home.join("config/profiles.d");
-            let status_cache = var.join("state/cache/status");
+            let config_dir = home.join("config");
+            let profiles_dir = config_dir.join("profiles.d");
+            let routines_dir = config_dir.join("routines.d");
+            let state_dir = var.join("state");
+            let health_dir = state_dir.join("health");
+            let routine_state_dir = state_dir.join("routines");
+            let secrets_dir = home.join("secrets");
+            let status_cache = state_dir.join("cache/status");
+            let run_dir = var.join("run");
             for directory in [
                 &root,
                 &home,
                 &var,
                 &log_root,
                 &control,
+                &config_dir,
                 &profiles_dir,
+                &routines_dir,
+                &state_dir,
+                &health_dir,
+                &routine_state_dir,
+                &secrets_dir,
                 &status_cache,
+                &run_dir,
             ] {
                 fs::create_dir_all(directory).unwrap();
                 fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
             }
             Self {
                 manager: root.join("sdsync-dsm"),
+                controller: root.join("sdsync-controller"),
                 read_lane: control.join("read-lane"),
                 home,
                 var,
+                config_dir,
                 log_root,
                 profiles_dir,
+                routines_dir,
+                state_dir,
+                health_dir,
+                routine_state_dir,
+                secrets_dir,
                 status_cache,
+                run_dir,
                 root,
             }
         }
@@ -16837,11 +18251,19 @@ mod tests {
         fn paths(&self) -> PackagePaths<'_> {
             PackagePaths {
                 manager: &self.manager,
+                controller: &self.controller,
                 package_home: &self.home,
                 package_var: &self.var,
+                config_dir: &self.config_dir,
                 log_root: &self.log_root,
                 profiles_dir: &self.profiles_dir,
+                routines_dir: &self.routines_dir,
+                state_dir: &self.state_dir,
+                health_dir: &self.health_dir,
+                routine_state_dir: &self.routine_state_dir,
+                secrets_dir: &self.secrets_dir,
                 status_cache: &self.status_cache,
+                run_dir: &self.run_dir,
                 read_lane: &self.read_lane,
             }
         }
@@ -17036,8 +18458,16 @@ mod tests {
         target: PathBuf,
         system_root: PathBuf,
         manager: PathBuf,
+        controller: PathBuf,
+        config_dir: PathBuf,
         profiles_dir: PathBuf,
+        routines_dir: PathBuf,
+        state_dir: PathBuf,
+        health_dir: PathBuf,
+        routine_state_dir: PathBuf,
+        secrets_dir: PathBuf,
         status_cache: PathBuf,
+        run_dir: PathBuf,
         read_lane: PathBuf,
         log_root: PathBuf,
     }
@@ -17123,9 +18553,17 @@ mod tests {
             let var = fhs.join("var");
             Self {
                 manager: fhs.join("target/bin/sdsync-dsm"),
+                controller: fhs.join("target/libexec/sdsync-controller"),
                 target: fhs.join("target"),
+                config_dir: home.join("config"),
                 profiles_dir: home.join("config/profiles.d"),
+                routines_dir: home.join("config/routines.d"),
+                state_dir: var.join("state"),
+                health_dir: var.join("state/health"),
+                routine_state_dir: var.join("state/routines"),
+                secrets_dir: home.join("secrets"),
                 status_cache: var.join("state/cache/status"),
+                run_dir: var.join("run"),
                 read_lane: var.join("control/read-lane"),
                 log_root: var.join("log"),
                 system_root,
@@ -17138,11 +18576,19 @@ mod tests {
         fn paths(&self) -> PackagePaths<'_> {
             PackagePaths {
                 manager: &self.manager,
+                controller: &self.controller,
                 package_home: &self.home,
                 package_var: &self.var,
+                config_dir: &self.config_dir,
                 log_root: &self.log_root,
                 profiles_dir: &self.profiles_dir,
+                routines_dir: &self.routines_dir,
+                state_dir: &self.state_dir,
+                health_dir: &self.health_dir,
+                routine_state_dir: &self.routine_state_dir,
+                secrets_dir: &self.secrets_dir,
                 status_cache: &self.status_cache,
+                run_dir: &self.run_dir,
                 read_lane: &self.read_lane,
             }
         }
@@ -17226,6 +18672,47 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         }
 
+        /// Write one package-private `0600` document, creating its directory.
+        fn write_config(&self, path: &Path, text: &str) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        /// A process that outlives the test, owned by the identity the package
+        /// tree belongs to.
+        ///
+        /// Ownership matters: `kill -0` against a process owned by someone else
+        /// answers `EPERM`, not `ESRCH`, so a root-owned child would read as
+        /// live to this process and as absent to the manager. In production both
+        /// sides are the package user and the question does not arise; in the
+        /// fixture it has to be arranged.
+        fn spawn_long_lived(&self) -> std::process::Child {
+            use std::os::unix::process::CommandExt;
+
+            let mut command = Command::new("/bin/sleep");
+            command
+                .arg("300")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if let Some((uid, gid)) = fixture_drop_identity() {
+                // SAFETY: setgroups, setgid and setuid are async-signal-safe and
+                // the callback allocates nothing between fork and exec.
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::setgroups(0, std::ptr::null()) != 0
+                            || libc::setgid(gid) != 0
+                            || libc::setuid(uid) != 0
+                        {
+                            return Err(io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            command.spawn().unwrap()
+        }
+
         fn write_rollup(&self, document: &status_cache::RollupDocument) {
             fs::create_dir_all(&self.status_cache).unwrap();
             let path = self
@@ -17305,8 +18792,13 @@ mod tests {
     /// `oldest_evidence_epoch`, every count — is stored rather than recomputed
     /// and must match exactly, so nothing else is normalised. The substitution
     /// is textual so the comparison stays a byte comparison.
+    ///
+    /// The window is the test's own, taken around both reads rather than as a
+    /// fixed tolerance: the shell rung forks a few hundred processes for a large
+    /// fixture and a fixed couple of seconds would be a flake on a loaded
+    /// machine, while the window is exact however slow the run is.
     #[cfg(target_os = "linux")]
-    fn pin_generated_epoch(document: &[u8], now: i64) -> Vec<u8> {
+    fn pin_generated_epoch(document: &[u8], window: std::ops::RangeInclusive<i64>) -> Vec<u8> {
         const KEY: &[u8] = b"\"generated_at_epoch\":";
         let at = document
             .windows(KEY.len())
@@ -17323,8 +18815,8 @@ mod tests {
             .parse::<i64>()
             .unwrap();
         assert!(
-            (observed - now).abs() <= 2,
-            "generated_at_epoch {observed} is not a reading of this test's clock {now}"
+            window.contains(&observed),
+            "generated_at_epoch {observed} is outside this test's own window {window:?}"
         );
         let mut pinned = document[..digits_at].to_vec();
         pinned.extend_from_slice(b"0");
@@ -17342,7 +18834,10 @@ mod tests {
     #[test]
     fn every_read_action_is_assigned_a_rung_by_a_total_match() {
         for (action, rung) in [
-            (ReadAction::Snapshot, ReadRung::ShellManager),
+            // The last of the three manager-shaped reads to move. `logs` stays
+            // on the shell rung: its algorithmic win is already banked, and what
+            // rung A would buy there is the exec rather than the scan.
+            (ReadAction::Snapshot, ReadRung::InService),
             (
                 ReadAction::Logs {
                     lines: 10,
@@ -17471,7 +18966,7 @@ mod tests {
         foreign_binary.binary = "0.0.0-not-this-build".to_owned();
         fixture.write_rollup(&foreign_binary);
 
-        let now = i64::try_from(current_epoch().unwrap()).unwrap();
+        let opened = i64::try_from(current_epoch().unwrap()).unwrap();
         let shell = fixture.run_manager(&["api", "status-rollup"]);
         assert!(
             shell.status.success(),
@@ -17488,10 +18983,11 @@ mod tests {
         )
         .unwrap();
         let right = status_rollup_document(&fixture.paths(), &policy).unwrap();
+        let closed = i64::try_from(current_epoch().unwrap()).unwrap();
 
         assert_eq!(
-            String::from_utf8_lossy(&pin_generated_epoch(&left, now)),
-            String::from_utf8_lossy(&pin_generated_epoch(&right, now))
+            String::from_utf8_lossy(&pin_generated_epoch(&left, opened..=closed)),
+            String::from_utf8_lossy(&pin_generated_epoch(&right, opened..=closed))
         );
 
         // The fixture actually exercised what it claims to. Without these the
@@ -17569,6 +19065,422 @@ mod tests {
             )
             .as_bytes(),
         );
+    }
+
+    /// Write the whole snapshot input surface, exercising every branch of the
+    /// manager's emitters that a stored document can reach.
+    ///
+    /// Four profiles, chosen so that the byte order of the file names differs
+    /// from the order of the profile names: `alpha-two.toml` precedes
+    /// `alpha.toml` because `-` sorts before the `.` of the suffix, and the
+    /// recorded default plus the `profiles` array order both depend on getting
+    /// that right.
+    #[cfg(target_os = "linux")]
+    fn write_snapshot_inputs(fixture: &TestShellPackageFixture) {
+        let volume = fixture.system_root.join("volume1");
+        let secrets = fixture.secrets_dir.display().to_string();
+        let sync_log = fixture.log_root.join("sync.log").display().to_string();
+
+        // `alpha`: every optional field set, a non-zero rate, two excludes with
+        // the exact `, ` separator the manager's regex pins, remote logging with
+        // its token locator, and a health record with a real exit code.
+        fixture.write_config(
+            &fixture.profiles_dir.join("alpha.toml"),
+            &format!(
+                "source = \"{}\"\n\
+                 url = \"https://nas.example.com:5001\"\n\
+                 username = \"operator\"\n\
+                 remote = \"/home/Drive/alpha\"\n\
+                 password-file = \"{secrets}/alpha.password\"\n\
+                 totp-secret-file = \"{secrets}/alpha.totp\"\n\
+                 remote-log-token-file = \"{secrets}/alpha.remote-log-token\"\n\
+                 no-vault = true\n\
+                 compare = \"metadata\"\n\
+                 jobs = 8\n\
+                 delete = true\n\
+                 max-delete = 4096\n\
+                 allow-http = true\n\
+                 allow-empty-source = true\n\
+                 retries = 4\n\
+                 timeout = 3600\n\
+                 connect-timeout = 42\n\
+                 danger-accept-invalid-certs = true\n\
+                 verbose = 3\n\
+                 quiet = true\n\
+                 log-level = \"debug\"\n\
+                 log-format = \"human\"\n\
+                 log-file = \"{sync_log}\"\n\
+                 progress = \"always\"\n\
+                 output = \"ndjson\"\n\
+                 remote-log-url = \"https://logs.example.com/ingest\"\n\
+                 remote-log-mode = \"required\"\n\
+                 ca-certificate = \"/volume1/certs/root.pem\"\n\
+                 max-rate = 1048576\n\
+                 excludes = [\"*.tmp\", \"cache/\"]\n",
+                volume.join("alpha").display()
+            ),
+        );
+        // `alpha-two`: the minimal fragment. Every optional key absent, so every
+        // default is exercised, and an empty excludes list.
+        fixture.write_config(
+            &fixture.profiles_dir.join("alpha-two.toml"),
+            &format!(
+                "source = \"{}\"\n\
+                 url = \"https://nas.example.com:5001\"\n\
+                 username = \"operator\"\n\
+                 remote = \"/home/Drive/alpha-two\"\n\
+                 password-file = \"{secrets}/alpha-two.password\"\n\
+                 totp-secret-file = \"{secrets}/alpha-two.totp\"\n\
+                 excludes = []\n",
+                volume.join("alpha-two").display()
+            ),
+        );
+        // `beta`: an explicit zero rate, which the manager renders as null
+        // rather than as zero, and a single exclude.
+        fixture.write_config(
+            &fixture.profiles_dir.join("beta.toml"),
+            &format!(
+                "source = \"{}\"\n\
+                 url = \"https://nas.example.com:5001\"\n\
+                 username = \"operator\"\n\
+                 remote = \"/home/Drive/beta\"\n\
+                 password-file = \"{secrets}/beta.password\"\n\
+                 totp-secret-file = \"{secrets}/beta.totp\"\n\
+                 max-rate = 0\n\
+                 excludes = [\"one\"]\n",
+                volume.join("beta").display()
+            ),
+        );
+        fixture.write_config(
+            &fixture.profiles_dir.join("zulu.toml"),
+            &format!(
+                "source = \"{}\"\n\
+                 url = \"https://nas.example.com:5001\"\n\
+                 username = \"operator\"\n\
+                 remote = \"/home/Drive/zulu\"\n\
+                 password-file = \"{secrets}/zulu.password\"\n\
+                 totp-secret-file = \"{secrets}/zulu.totp\"\n\
+                 excludes = []\n",
+                volume.join("zulu").display()
+            ),
+        );
+
+        // Presence booleans, from a stat and never a read: all three, one, and
+        // none. `alpha` needs its remote-log token because its profile names a
+        // remote log URL.
+        for suffix in ["password", "totp", "remote-log-token"] {
+            fixture.write_config(&fixture.secrets_dir.join(format!("alpha.{suffix}")), "x\n");
+        }
+        fixture.write_config(&fixture.secrets_dir.join("beta.password"), "x\n");
+
+        // A health record with a real exit code, one with the stored -1 that
+        // renders as null, and one profile with no health record at all.
+        fixture.write_config(
+            &fixture.health_dir.join("alpha.state"),
+            "state=succeeded\nchecked_epoch=1700001000\nexit_code=0\nwrite_test=true\nlevel=extensive\n",
+        );
+        fixture.write_config(
+            &fixture.health_dir.join("beta.state"),
+            "state=failed\nchecked_epoch=1700002000\nexit_code=-1\nwrite_test=false\nlevel=quick\n",
+        );
+
+        // One routine per mode. `alpha` is daily with a spliced weekday list,
+        // both window bounds and two dependencies; `alpha-two` is interval with
+        // no dependencies at all; `beta` is realtime with a backoff above the
+        // manager's ceiling, which it clamps rather than refuses.
+        //
+        // Every key the manager reads with `api_load_kv` is present in all
+        // three, because that reader defaults only when the whole file is
+        // absent: a key missing from a file that exists is a corrupt record, not
+        // a default. The mode decides which keys are validated and which reach
+        // the response, never which have to be on disk.
+        fixture.write_config(
+            &fixture.routines_dir.join("alpha.conf"),
+            "enabled=true\naction=sync\nmode=daily\ninterval_seconds=3600\n\
+             weekdays=1,3,5\ntime_window_start=02:15\ntime_window_end=23:45\n\
+             debounce_seconds=45\nretry_count=3\nretry_backoff_seconds=90\n\
+             retry_exponential=false\npoll_seconds=30\nallow_delete=true\n\
+             max_total_delete=64\ndepends_on=beta,zulu\n",
+        );
+        fixture.write_config(
+            &fixture.routines_dir.join("alpha-two.conf"),
+            "enabled=false\naction=plan\nmode=interval\ninterval_seconds=900\n\
+             weekdays=1,2,3,4,5,6,7\ntime_window_start=00:00\ntime_window_end=23:59\n\
+             debounce_seconds=45\nretry_count=5\nretry_backoff_seconds=60\n\
+             poll_seconds=30\nallow_delete=false\nmax_total_delete=100\ndepends_on=\n",
+        );
+        fixture.write_config(
+            &fixture.routines_dir.join("beta.conf"),
+            "enabled=true\naction=sync\nmode=realtime\ninterval_seconds=3600\n\
+             weekdays=1,2,3,4,5,6,7\ntime_window_start=00:00\ntime_window_end=23:59\n\
+             debounce_seconds=120\nretry_count=5\nretry_backoff_seconds=9000\n\
+             poll_seconds=15\nallow_delete=false\nmax_total_delete=100\ndepends_on=\n",
+        );
+        // One routine with stored state, and two without.
+        fixture.write_config(
+            &fixture.routine_state_dir.join("alpha.state"),
+            "state=succeeded\nnext_run_epoch=1700003000\nlast_success_epoch=1700002900\nbackend=daily\n",
+        );
+
+        fixture.write_config(
+            &fixture.config_dir.join("schedule.conf"),
+            "enabled=true\ninterval_seconds=7200\nallow_delete=true\nmax_total_delete=2048\n",
+        );
+        fixture.write_config(
+            &fixture.config_dir.join("alerts.conf"),
+            "enabled=false\non_success=true\non_failure=false\nfailure_threshold=7\ncooldown_seconds=120\n",
+        );
+        fixture.write_config(
+            &fixture.config_dir.join("performance.conf"),
+            "level=gentle\n",
+        );
+        fixture.write_config(&fixture.config_dir.join("default-profile"), "beta\n");
+        fixture.write_config(
+            &fixture.state_dir.join("controller.state"),
+            "state=running\npid=4321\nnext_run_epoch=1700004000\nactive_pid=8765\nupdated_epoch=1700003900\n",
+        );
+        // No `operation` key: the one field the manager reads optionally, so its
+        // absence is a default rather than a corrupt record.
+        fixture.write_config(
+            &fixture.state_dir.join("run.state"),
+            "state=succeeded\nstarted_epoch=1700005000\nfinished_epoch=1700005600\nexit_code=0\nscope=alpha\n",
+        );
+        // The manager validates the policy before it emits anything, so a
+        // complete private document has to be present even though the bridge
+        // overwrites the block the manager renders from it.
+        fixture.write_config(
+            &fixture.config_dir.join("security.conf"),
+            &security_policy_document(),
+        );
+    }
+
+    /// Run one `snapshot` on both rungs and assert byte equality.
+    ///
+    /// `generated_at_epoch` is the single normalised field: two clock reads at
+    /// two instants. Nothing else is normalised — not `service.pid`, not
+    /// `controller.pid`, not `next_run_epoch` — because every one of those comes
+    /// from a fixture file or a live probe that both sides see identically, and
+    /// normalising them would erase the likeliest class of parity bug.
+    #[cfg(target_os = "linux")]
+    fn assert_snapshot_parity(fixture: &TestShellPackageFixture) -> Value {
+        let policy = SecurityPolicyArgs::default();
+        let opened = i64::try_from(current_epoch().unwrap()).unwrap();
+        let shell = fixture.run_manager(&["api", "snapshot"]);
+        assert!(
+            shell.status.success(),
+            "shell rung failed ({}):\nstdout: {}\nstderr: {}",
+            shell.status,
+            String::from_utf8_lossy(&shell.stdout),
+            String::from_utf8_lossy(&shell.stderr)
+        );
+        fixture.hand_over();
+        let left = parse_and_sanitize_manager_json(
+            &shell.stdout,
+            &ReadAction::Snapshot,
+            None,
+            Some(&policy),
+        )
+        .unwrap();
+        let right = snapshot_document(&fixture.paths(), fixture.package_uid(), &policy).unwrap();
+        let closed = i64::try_from(current_epoch().unwrap()).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&pin_generated_epoch(&left, opened..=closed)),
+            String::from_utf8_lossy(&pin_generated_epoch(&right, opened..=closed))
+        );
+        serde_json::from_slice(&right).unwrap()
+    }
+
+    /// Fault-injection row 17 for `snapshot`: the same read, answered by the
+    /// shell manager and answered inside the service, is byte-identical across
+    /// the whole of the manager's emitter surface.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshot_is_byte_identical_on_the_service_and_the_shell_rungs() {
+        let fixture = TestShellPackageFixture::new("snapshot-parity");
+        write_snapshot_inputs(&fixture);
+        let document = assert_snapshot_parity(&fixture);
+
+        // The fixture reached the branches it claims to. Without these the test
+        // could pass on two identically empty documents.
+        assert_eq!(document["schema"], "sdsync.dsm-api.v1");
+        assert_eq!(document["service"]["state"], "stopped");
+        assert_eq!(document["service"]["pid"], 0);
+        assert_eq!(document["schedule"]["interval_seconds"], 7200);
+        assert_eq!(document["controller"]["state"], "running");
+        assert_eq!(document["controller"]["active_pid"], 8765);
+        assert_eq!(document["run"]["exit_code"], 0);
+        // The optional key the fixture leaves out.
+        assert_eq!(document["run"]["operation"], "none");
+        assert_eq!(document["run"]["scope"], "alpha");
+        assert_eq!(document["alerts"]["failure_threshold"], 7);
+        assert_eq!(document["performance"]["level"], "gentle");
+
+        let profiles = document["profiles"].as_array().unwrap();
+        assert_eq!(profiles.len(), 4);
+        // Byte order over file names, which is what a C-locale glob and `sort`
+        // yield and is not the order the profile names alone would give.
+        let order = profiles
+            .iter()
+            .map(|profile| profile["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["alpha-two", "alpha", "beta", "zulu"]);
+
+        let alpha = &profiles[1];
+        assert_eq!(alpha["default"], false);
+        assert_eq!(alpha["compare"], "metadata");
+        assert_eq!(alpha["jobs"], 8);
+        assert_eq!(alpha["max_rate_bytes_per_second"], 1_048_576);
+        assert_eq!(alpha["excludes"], json!(["*.tmp", "cache/"]));
+        assert_eq!(alpha["has_password"], true);
+        assert_eq!(alpha["has_totp"], true);
+        assert_eq!(alpha["has_remote_log_token"], true);
+        assert_eq!(alpha["health"]["exit_code"], 0);
+        assert_eq!(alpha["health"]["level"], "extensive");
+        assert_eq!(alpha["remote_log_mode"], "required");
+        assert_eq!(alpha["verbosity"], 3);
+
+        let minimal = &profiles[0];
+        // Every default, from a fragment that sets none of them.
+        assert_eq!(minimal["compare"], "content");
+        assert_eq!(minimal["jobs"], 2);
+        assert_eq!(minimal["delete"], false);
+        assert_eq!(minimal["max_delete"], 100);
+        assert_eq!(minimal["retries"], 2);
+        assert_eq!(minimal["upload_timeout_seconds"], 7200);
+        assert_eq!(minimal["connect_timeout_seconds"], 15);
+        assert_eq!(minimal["log_level"], "info");
+        assert_eq!(minimal["log_format"], "json");
+        assert_eq!(minimal["progress"], "never");
+        assert_eq!(minimal["output"], "human");
+        assert_eq!(minimal["remote_log_mode"], "best-effort");
+        assert_eq!(minimal["excludes"], json!([]));
+        assert_eq!(minimal["has_password"], false);
+        assert_eq!(minimal["has_totp"], false);
+        // An absent health record is the documented unknown default, not an
+        // error and not a missing key.
+        assert_eq!(minimal["health"]["state"], "unknown");
+        assert_eq!(minimal["health"]["checked_epoch"], 0);
+        assert_eq!(minimal["health"]["exit_code"], Value::Null);
+        assert_eq!(minimal["health"]["level"], "standard");
+        // An absent `max-rate` and an explicit zero are both null.
+        assert_eq!(minimal["max_rate_bytes_per_second"], Value::Null);
+        assert_eq!(profiles[2]["max_rate_bytes_per_second"], Value::Null);
+        assert_eq!(profiles[2]["default"], true);
+        assert_eq!(profiles[2]["health"]["exit_code"], Value::Null);
+        assert_eq!(profiles[2]["excludes"], json!(["one"]));
+
+        let routines = document["routines"].as_array().unwrap();
+        assert_eq!(routines.len(), 3);
+        let daily = &routines[1];
+        assert_eq!(daily["profile"], "alpha");
+        assert_eq!(daily["mode"], "daily");
+        assert_eq!(daily["weekdays"], json!([1, 3, 5]));
+        assert_eq!(daily["time_window_start"], "02:15");
+        assert_eq!(daily["time_window_end"], "23:45");
+        assert_eq!(daily["depends_on"], json!(["beta", "zulu"]));
+        assert_eq!(daily["retry_exponential"], false);
+        assert_eq!(daily["state"], "succeeded");
+        assert_eq!(daily["backend"], "daily");
+        assert!(daily.get("interval_seconds").is_none());
+        let interval = &routines[0];
+        assert_eq!(interval["mode"], "interval");
+        assert_eq!(interval["interval_seconds"], 900);
+        assert_eq!(interval["depends_on"], json!([]));
+        assert_eq!(interval["state"], "never");
+        assert!(interval.get("weekdays").is_none());
+        let realtime = &routines[2];
+        assert_eq!(realtime["mode"], "realtime");
+        assert_eq!(realtime["debounce_seconds"], 120);
+        assert_eq!(realtime["poll_seconds"], 15);
+        // Clamped, not refused.
+        assert_eq!(realtime["retry_backoff_seconds"], 300);
+    }
+
+    /// The same read with every optional document absent, which is the state a
+    /// fresh install is in before anything has been configured.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshot_agrees_on_both_rungs_with_no_configuration_at_all() {
+        let fixture = TestShellPackageFixture::new("snapshot-bare");
+        fixture.write_config(
+            &fixture.config_dir.join("security.conf"),
+            &security_policy_document(),
+        );
+        let document = assert_snapshot_parity(&fixture);
+        assert_eq!(document["profiles"], json!([]));
+        assert_eq!(document["routines"], json!([]));
+        // Every default, from nothing at all on disk.
+        assert_eq!(document["schedule"]["enabled"], false);
+        assert_eq!(document["schedule"]["interval_seconds"], 3600);
+        assert_eq!(document["controller"]["state"], "stopped");
+        assert_eq!(document["run"]["state"], "never");
+        assert_eq!(document["run"]["exit_code"], Value::Null);
+        assert_eq!(document["run"]["scope"], "none");
+        assert_eq!(document["alerts"]["enabled"], true);
+        assert_eq!(document["alerts"]["cooldown_seconds"], 3600);
+        assert_eq!(document["performance"]["level"], "balanced");
+        assert_eq!(document["service"]["state"], "stopped");
+    }
+
+    /// Fault-injection row 17 for the one input that is not a file.
+    ///
+    /// `service.state` is read live rather than taken from the controller's own
+    /// state file, because a controller killed outright leaves `state=running`
+    /// behind in that file. All three outcomes are exercised against the same
+    /// process identity, and the process outlives the test so neither rung can
+    /// see a different answer from the other.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshot_service_state_agrees_on_both_rungs_for_every_liveness_outcome() {
+        let fixture = TestShellPackageFixture::new("snapshot-service");
+        fixture.write_config(
+            &fixture.config_dir.join("security.conf"),
+            &security_policy_document(),
+        );
+        let pid_file = fixture.run_dir.join("controller.pid");
+
+        // A pid that is alive but carries no verified identity is untrusted, not
+        // running: the state file alone is never evidence.
+        let mut live = fixture.spawn_long_lived();
+        let live_pid = live.id();
+        fixture.write_config(&pid_file, &format!("{live_pid}\n"));
+        let untrusted = assert_snapshot_parity(&fixture);
+        assert_eq!(untrusted["service"]["state"], "untrusted");
+        assert_eq!(untrusted["service"]["pid"], live_pid);
+
+        // The full three-record identity makes it running.
+        let start = linux_files::process_start(live_pid).unwrap();
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+            .to_owned();
+        let identity = format!("{live_pid}\n{start}\n{boot}\n");
+        fixture.write_config(&fixture.run_dir.join("controller.ready"), &identity);
+        let lock = fixture.run_dir.join("controller.lock");
+        fs::create_dir_all(&lock).unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o700)).unwrap();
+        fixture.write_config(&lock.join("pid"), &identity);
+        let running = assert_snapshot_parity(&fixture);
+        assert_eq!(running["service"]["state"], "running");
+        assert_eq!(running["service"]["pid"], live_pid);
+
+        // The steady state of a held lock is two links, because acquisition
+        // hard-links the claim file into `pid`. Accepting only one link would
+        // report a running controller as untrusted.
+        let claim = fixture
+            .run_dir
+            .join(format!("controller.lock.claim.{live_pid}.{start}.{boot}"));
+        fs::hard_link(lock.join("pid"), &claim).unwrap();
+        let linked = assert_snapshot_parity(&fixture);
+        assert_eq!(linked["service"]["state"], "running");
+
+        // A pid that is not alive resets to stopped at pid zero, whatever the
+        // records say.
+        live.kill().unwrap();
+        live.wait().unwrap();
+        let stopped = assert_snapshot_parity(&fixture);
+        assert_eq!(stopped["service"]["state"], "stopped");
+        assert_eq!(stopped["service"]["pid"], 0);
     }
 
     /// Fault-injection row 17 for `activity`: the same read, answered by the
@@ -17857,6 +19769,22 @@ mod tests {
         assert!(configured_profile_names(&fixture.root.join("absent")).is_empty());
     }
 
+    /// A read that still takes the shell rung, for the tests that need a manager
+    /// to be run at all.
+    ///
+    /// `logs` is the only one left. Every test here used `snapshot` until the
+    /// snapshot moved in process, at which point they stopped exercising the
+    /// manager and started passing for the wrong reason — which is what
+    /// `every_read_action_is_assigned_a_rung_by_a_total_match` exists to make
+    /// visible.
+    #[cfg(target_os = "linux")]
+    fn shell_rung_read() -> ReadAction {
+        ReadAction::Logs {
+            lines: 10,
+            source: LogSource::Api,
+        }
+    }
+
     /// Fault-injection rows 1, 2, 4 and 5: what the shell rung does when the
     /// manager is not in a state to answer.
     #[cfg(target_os = "linux")]
@@ -17872,7 +19800,7 @@ mod tests {
         let uid = TestPackageFixture::package_uid();
         let policy = SecurityPolicyArgs::default();
         let read = |fixture: &TestPackageFixture| {
-            execute_read_action(&fixture.paths(), &ReadAction::Snapshot, &policy, uid).unwrap_err()
+            execute_read_action(&fixture.paths(), &shell_rung_read(), &policy, uid).unwrap_err()
         };
 
         // Row 1: the manager is killed outright mid-read. A signal death is an
@@ -17892,7 +19820,7 @@ mod tests {
         // again, and a document of the wrong kind is a third.
         fixture.write_manager("printf 'not json'");
         assert_eq!(read(&fixture).code, Some("manager_output_invalid"));
-        fixture.write_manager(r#"printf '{"schema":"sdsync.dsm-logs.v1"}'"#);
+        fixture.write_manager(r#"printf '{"schema":"sdsync.dsm-api.v1"}'"#);
         assert_eq!(read(&fixture).code, Some("manager_output_schema"));
 
         // Row 4: not executable. Row 5: group-writable. Both are the file being
@@ -17908,6 +19836,60 @@ mod tests {
         // A manager that is not there at all is the same class of answer.
         fs::remove_file(&fixture.manager).unwrap();
         assert_eq!(read(&fixture).code, Some("manager_unsafe"));
+    }
+
+    /// Fault-injection row 3: a helper that never finishes is killed at its
+    /// deadline and named a timeout, not an oversized or unreadable answer.
+    ///
+    /// Asserted at the capture primitive with a short deadline rather than
+    /// through a read with the twenty-second production one: the code and the
+    /// kill are properties of the primitive, and a test that waited out
+    /// `READ_MANAGER_TIMEOUT` would cost twenty seconds to learn the same thing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_helper_that_never_finishes_is_killed_at_its_deadline_and_named_a_timeout() {
+        let fixture = TestPackageFixture::new("capture-timeout");
+        // A child that outlives the deadline by a wide margin, with a
+        // grandchild holding the same pipes so the kill has to reach the group.
+        fixture.write_manager("sleep 600 & sleep 600");
+        let mut command = Command::new("/bin/sh");
+        command.arg(&fixture.manager);
+
+        let started = Instant::now();
+        let outcome = capture_bounded_command(
+            &mut command,
+            MAX_MANAGER_OUTPUT_BYTES,
+            MAX_HELPER_STDERR_BYTES,
+            Duration::from_millis(400),
+            None,
+        );
+        let elapsed = started.elapsed();
+        let error = match outcome {
+            Err(error) => error,
+            Ok(_) => panic!("a helper that never finishes must not return output"),
+        };
+
+        assert_eq!(error.code, Some("manager_timeout"));
+        assert_eq!(error.kind, ErrorKind::Unavailable);
+        // The deadline is what ended this, not the child.
+        assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
+        assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
+
+        // A child that answers within the deadline is not a timeout, so the
+        // code is describing the deadline rather than the stub.
+        fixture.write_manager("printf 'ok'");
+        let mut quick = Command::new("/bin/sh");
+        quick.arg(&fixture.manager);
+        let output = capture_bounded_command(
+            &mut quick,
+            MAX_MANAGER_OUTPUT_BYTES,
+            MAX_HELPER_STDERR_BYTES,
+            Duration::from_secs(10),
+            None,
+        )
+        .unwrap();
+        assert!(output.status_success);
+        assert_eq!(&output.stdout[..], b"ok");
     }
 
     /// Fault-injection row 9: the fourth concurrent read waits out the permit
@@ -17936,7 +19918,7 @@ mod tests {
             let handles = (0..MANAGER_CONCURRENCY_LIMIT + 1)
                 .map(|_| {
                     scope.spawn(|| {
-                        execute_read_action(&paths, &ReadAction::Snapshot, &policy, uid)
+                        execute_read_action(&paths, &shell_rung_read(), &policy, uid)
                             .unwrap_err()
                             .code
                     })
@@ -18048,9 +20030,10 @@ mod tests {
         assert_eq!(error.code, Some("manager_output_invalid"));
 
         // And a read with no in-service implementation is unaffected either way.
+        // `logs` is the only one left on the shell rung.
         fs::remove_file(&fixture.read_lane).unwrap();
         assert_eq!(
-            execute_read_action(&fixture.paths(), &ReadAction::Snapshot, &policy, uid)
+            execute_read_action(&fixture.paths(), &shell_rung_read(), &policy, uid)
                 .unwrap_err()
                 .code,
             Some("manager_output_invalid")
@@ -22024,12 +24007,47 @@ mod tests {
         );
     }
 
+    /// The snapshot argv survives only as the kill switch's fallback.
+    ///
+    /// There was no test pinning it while the dashboard built it on every poll,
+    /// which is exactly when it needed one least. It needs one now: with the
+    /// read answered in the service, the argv is exercised only when an operator
+    /// has forced the shell rung, so nothing else would notice it rotting.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshot_keeps_an_argumentless_manager_argv_for_the_forced_lane() {
+        assert_eq!(read_rung(&ReadAction::Snapshot), ReadRung::InService);
+        assert_eq!(
+            read_manager_arguments(&ReadAction::Snapshot).unwrap(),
+            ["api", "snapshot"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+        // The manager takes no arguments for this read, so no request may add
+        // any: a query that could narrow the document is refused outright.
+        for query in [
+            "action=snapshot&profiles=nightly",
+            "action=snapshot&lines=10",
+            "action=snapshot&extra=x",
+        ] {
+            assert!(
+                validate_http_request(environment("GET", &format!("{query}&SynoToken=x"))).is_err(),
+                "snapshot must refuse the query {query:?}"
+            );
+        }
+    }
+
     #[test]
     fn status_rollup_is_an_argumentless_read_of_the_cores_own_document() {
         // The argv still has to be right, because the operator's kill switch
         // routes this read back through the manager. It is no longer what a
         // dashboard poll builds: `read_rung` answers this read in the service,
         // and the argv is the fallback path rather than the normal one.
+        //
+        // The rung itself only exists on Linux, so the assertion is gated even
+        // though the argv it guards is portable. The rest of this test builds
+        // argv and validates queries, which every platform compiles.
         #[cfg(target_os = "linux")]
         {
             assert_eq!(read_rung(&ReadAction::StatusRollup), ReadRung::InService);
