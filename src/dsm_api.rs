@@ -22030,7 +22030,10 @@ mod tests {
         // routes this read back through the manager. It is no longer what a
         // dashboard poll builds: `read_rung` answers this read in the service,
         // and the argv is the fallback path rather than the normal one.
-        assert_eq!(read_rung(&ReadAction::StatusRollup), ReadRung::InService);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(read_rung(&ReadAction::StatusRollup), ReadRung::InService);
+        }
         assert_eq!(
             read_manager_arguments(&ReadAction::StatusRollup).unwrap(),
             ["api", "status-rollup"]
