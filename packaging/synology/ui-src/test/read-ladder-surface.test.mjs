@@ -684,6 +684,9 @@ test("a failed log or activity feed dates the rows it leaves on screen", async (
   const logContext = (component, overrides) => {
     const context = {
       disposed: false, auth: {}, route: "activity", logsPaused: false, logsLoading: false,
+      // Package logs must be the active tab: this suite is about dating rows
+      // from both feeds, which only both run in the same poll on that tab.
+      activityTab: "package-logs",
       logLines: 200, logSource: "all", logRecords: [], logOutput: "", activityEvents: [],
       logState: "", logsReceivedAtMs: 0, activityReceivedAtMs: 0,
       scheduleLogs() {},

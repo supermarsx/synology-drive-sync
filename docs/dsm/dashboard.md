@@ -289,18 +289,31 @@ when the backend sets an explicit proof flag. See [Health and Doctor](operations
 
 ## Activity / Logs
 
-Activity presents structured, fixed-code events. Logs presents bounded lines from API/CGI, private
-Doctor discovery, controller, scheduler, sync, and mandatory audit sources. The page supports
-`100`, `200`, `500`, or `1000` lines and can pause live updates without stopping package logging.
-For each source, retained rotations are read oldest to newest before the active file; the newest
-requested suffix that fits the response budget is returned. A selected source is read alone; the
-`all` response is globally bounded below the bridge capture limit. **Clear view** clears only the
-browser presentation; it does not delete package logs.
+Activity presents structured, fixed-code events; Logs presents bounded lines from API/CGI, private
+Doctor discovery, controller, scheduler, sync, and mandatory audit sources. The page separates them
+into five keyboard-accessible subtabs. **All events** shows every recorded category. **Changes**
+narrows to audit, configuration, secrets, and security — what saves and autosaves produced, and who
+did them. **Operations** narrows to operations, routines, sync, and scheduler — Plan, Run, Resync,
+Doctor, Clear, and scheduled runs. **Service** narrows to bridge, authentication, controller, and
+notifications. **Package logs** holds the bounded log view. The four event tabs share one feed and
+one Search/Level filter pair; the Category dropdown offers only the categories in the active lens
+(plus "All categories" for that lens), and switching lenses resets an out-of-lens Category selection
+back to all. Pause/resume live updates and Clear view act on the whole page and keep their meaning
+on every tab.
 
-Snapshot polling pauses while the document is hidden. Log polling occurs only while Activity is
-open and not paused. Refresh intervals are controlled in Settings. **Manual only** cancels the
-corresponding background timer while retaining the explicit Refresh or Activity-page reload action.
-Full event and retention details are in [Health, activity, logs, and notifications](operations.md).
+Package logs supports `100`, `200`, `500`, or `1000` lines and can pause live updates without
+stopping package logging. For each source, retained rotations are read oldest to newest before the
+active file; the newest requested suffix that fits the response budget is returned. A selected
+source is read alone; the `all` response is globally bounded below the bridge capture limit.
+**Clear view** clears only the browser presentation; it does not delete package logs.
+
+Snapshot polling pauses while the document is hidden. Log polling occurs only while the Package
+logs tab is open and not paused: the event tabs poll only the Activity feed, since the package log
+read forks the NAS's shell manager and the event tabs never render its result. Opening the Package
+logs tab fetches logs immediately rather than waiting for the next poll tick. Refresh intervals are
+controlled in Settings. **Manual only** cancels the corresponding background timer while retaining
+the explicit Refresh or Activity-page reload action. Full event and retention details are in
+[Health, activity, logs, and notifications](operations.md).
 
 ## Notifications
 

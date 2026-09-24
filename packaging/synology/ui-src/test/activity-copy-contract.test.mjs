@@ -1050,6 +1050,11 @@ test("a failing package log read never discards the activity feed", async () => 
       logsLoading: false,
       logsPaused: false,
       route: "activity",
+      // This test exercises the dual-fetch path deliberately: the Package
+      // logs tab is what makes refreshLogs ask for both logs and activity in
+      // the same poll, which is the only place one settling and one failing
+      // can be exercised against each other.
+      activityTab: "package-logs",
       auth: {},
       logLines: 200,
       logSource: "all",

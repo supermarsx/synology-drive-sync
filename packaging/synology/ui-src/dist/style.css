@@ -3019,9 +3019,6 @@ margin-top: 5px;
 color: var(--sdsync-fire);
 font-size: 10px;
 }
-.sdsync-log-panel {
-margin-top: 16px;
-}
 .sdsync-evidence-heading-actions {
 display: flex;
 min-width: 0;

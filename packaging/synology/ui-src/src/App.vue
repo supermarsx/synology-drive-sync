@@ -457,24 +457,35 @@
 
           <section v-else-if="route === 'activity'" class="sdsync-page" aria-labelledby="sdsync-page-title">
             <div class="sdsync-page-actions"><v-button suffix="grey" display="icon-text" tooltip="Pause or resume browser-side log refreshes" @click="toggleLogs"><template #icon><action-icon :name="logsPaused ? 'run' : 'pause'" /></template>{{ logsPaused ? 'Resume live updates' : 'Pause live updates' }}</v-button><v-button suffix="grey" display="icon-text" tooltip="Clear only this rendered view; package logs remain intact" @click="clearLogView"><template #icon><action-icon name="clear" /></template>Clear view</v-button></div>
-            <article class="sdsync-panel">
-              <div class="sdsync-panel-heading">
-                <div><p class="sdsync-eyebrow">Structured activity</p><h3>Recent package events</h3></div>
-                <div class="sdsync-evidence-heading-actions"><span class="sdsync-freshness">{{ reversedActivity.length }} of {{ activityEvents.length }} event{{ activityEvents.length === 1 ? '' : 's' }}</span><v-button type="border" display="icon-text" aria-label="Copy all visible activity events" tooltip="Copy the filtered activity events as bounded, sanitized troubleshooting text" :disabled="!reversedActivity.length" @click="copyVisibleActivity"><template #icon><action-icon name="copy" /></template>Copy visible</v-button></div>
-              </div>
-              <div class="sdsync-filter-list" aria-label="Activity filters">
-                <div class="sdsync-filter-row"><span class="sdsync-filter-label">Search</span><div class="sdsync-filter-control"><v-input v-model.trim="activitySearch" class="sdsync-input-control sdsync-activity-search" maxlength="128" placeholder="Search event text or request ID" aria-label="Search activity text or client request ID" aria-describedby="sdsync-help-activity-search" /><control-help help-key="activity-search" /></div></div>
-                <div class="sdsync-filter-row"><span class="sdsync-filter-label">Category</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityCategory" :options="activityCategoryOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity category" aria-describedby="sdsync-help-activity-category"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-category" /></div></div>
-                <div class="sdsync-filter-row"><span class="sdsync-filter-label">Level</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityLevel" :options="activityLevelOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity level" aria-describedby="sdsync-help-activity-level"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-level" /></div></div>
-              </div>
-              <ol class="sdsync-activity-feed"><li v-if="!reversedActivity.length" class="sdsync-empty">No package events match these filters.</li><li v-for="event in reversedActivity" :key="[event.epoch, event.code, event.profile, event.category, event.level, event.client_request_id].join(':')"><time>{{ formatDate(event.epoch) }}</time><div class="sdsync-activity-detail"><strong>{{ event.code }}</strong><p v-if="event.message && !event.doctor_inventory">{{ event.message }}</p><div v-if="event.doctor_inventory" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ doctorInventoryScopeLabel(event.doctor_inventory.inventory.scope) }}</strong><span>{{ event.doctor_inventory.inventory.total }} total · {{ event.doctor_inventory.inventory.entries.length }} shown<span v-if="event.doctor_inventory.inventory.truncated"> · truncated</span></span></div><p v-if="!event.doctor_inventory.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in event.doctor_inventory.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div><code v-if="event.client_request_id">Client request ID: {{ event.client_request_id }}</code></div><small>{{ event.profile }} · {{ event.state }} · {{ event.category }} / {{ event.level }}</small><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy activity event ' + event.code" tooltip="Copy this event as bounded, sanitized troubleshooting text" @click="copyActivityEvent(event)"><template #icon><action-icon name="copy" /></template>Copy</v-button></li></ol>
-            </article>
-            <article class="sdsync-panel sdsync-log-panel">
-              <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Bounded package logs</p><h3>Troubleshooting evidence</h3></div><div class="sdsync-evidence-heading-actions"><span class="sdsync-log-state">{{ logState }}</span><v-button type="border" display="icon-text" aria-label="Copy all visible package logs" tooltip="Copy the selected log sources as bounded, sanitized troubleshooting text" :disabled="!logRecords.length" @click="copyVisibleLogs"><template #icon><action-icon name="copy" /></template>Copy visible</v-button></div></div>
-              <div class="sdsync-filter-list sdsync-log-filters" aria-label="Log filters"><div class="sdsync-filter-row"><span class="sdsync-filter-label">Source</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="logSource" :options="logSourceOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Log source" aria-describedby="sdsync-help-log-source" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-source" /></div></div><div class="sdsync-filter-row"><span class="sdsync-filter-label">Lines</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="logLines" :options="logLineOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Log line count" aria-describedby="sdsync-help-log-lines" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-lines" /></div></div></div>
-              <p v-if="!logRecords.length" class="sdsync-empty">{{ logOutput }}</p>
-              <div v-else class="sdsync-log-records"><section v-for="record in logRecords" :key="record.id" class="sdsync-log-record"><header><span><strong>{{ record.source }}</strong><small>{{ record.lineCount }} line{{ record.lineCount === 1 ? '' : 's' }}</small></span><span class="sdsync-log-record-actions"><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy ' + record.source + ' log evidence'" tooltip="Copy this log record as bounded, sanitized troubleshooting text" @click="copyLogRecord(record)"><template #icon><action-icon name="copy" /></template>Copy</v-button><v-button class="sdsync-evidence-copy sdsync-log-clear" type="border" display="icon-text" :aria-label="'Clear the ' + record.source + ' package log'" :tooltip="logClearTooltip(record.source)" :disabled="!logSourceClearable(record.source) || !canRunOperations" @click="clearLogSource(record.source)"><template #icon><action-icon name="delete" /></template>Clear</v-button></span></header><div v-if="record.doctorInventories.length" class="sdsync-log-inventory-evidence"><div v-for="(inventoryRecord, recordIndex) in record.doctorInventories" :key="inventoryRecord.epoch + ':' + inventoryRecord.profile + ':' + recordIndex" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ inventoryRecord.profile }} · {{ doctorInventoryScopeLabel(inventoryRecord.inventory.scope) }}</strong><span>{{ inventoryRecord.inventory.total }} total · {{ inventoryRecord.inventory.entries.length }} shown<span v-if="inventoryRecord.inventory.truncated"> · truncated</span></span></div><p v-if="!inventoryRecord.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in inventoryRecord.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div></div><p v-if="!record.lines.length" class="sdsync-empty sdsync-log-empty">No lines to show. This log can still hold records that the current log level for its category keeps out of this view.</p><ol v-else class="sdsync-log-lines" tabindex="0"><li v-for="line in record.lines" :key="line.id"><time v-if="line.epoch">{{ formatDate(line.epoch) }}</time><time v-else class="is-unrecorded" title="This line was written without a recorded time; the package now stamps every record it writes.">Time not recorded</time><span>{{ line.text }}</span></li></ol></section></div>
-            </article>
+            <div class="sdsync-subtabs" data-subtabs="activity" role="tablist" aria-label="Activity views" @keydown="moveSubtab('activityTab', activityTabs, $event)">
+              <button v-for="tab in activityTabs" :id="'sdsync-activity-tab-' + tab.id" :key="tab.id" type="button" :class="['sdsync-subtab', { 'is-active': activityTab === tab.id }]" :data-subtab="tab.id" role="tab" :aria-selected="activityTab === tab.id" :aria-controls="'sdsync-activity-panel-' + tab.id" :tabindex="activityTab === tab.id ? 0 : -1" @click="activityTab = tab.id">{{ tab.label }}</button>
+            </div>
+            <div class="sdsync-subtab-stage">
+              <transition name="sdsync-subtab-swap" mode="out-in">
+                <div v-if="activityTab === 'package-logs'" id="sdsync-activity-panel-package-logs" key="package-logs" class="sdsync-subtab-panel" data-subtab-panel="package-logs" role="tabpanel" aria-labelledby="sdsync-activity-tab-package-logs" tabindex="0">
+                  <article class="sdsync-panel">
+                    <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Bounded package logs</p><h3>Troubleshooting evidence</h3></div><div class="sdsync-evidence-heading-actions"><span class="sdsync-log-state">{{ logState }}</span><v-button type="border" display="icon-text" aria-label="Copy all visible package logs" tooltip="Copy the selected log sources as bounded, sanitized troubleshooting text" :disabled="!logRecords.length" @click="copyVisibleLogs"><template #icon><action-icon name="copy" /></template>Copy visible</v-button></div></div>
+                    <div class="sdsync-filter-list sdsync-log-filters" aria-label="Log filters"><div class="sdsync-filter-row"><span class="sdsync-filter-label">Source</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="logSource" :options="logSourceOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Log source" aria-describedby="sdsync-help-log-source" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-source" /></div></div><div class="sdsync-filter-row"><span class="sdsync-filter-label">Lines</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="logLines" :options="logLineOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Log line count" aria-describedby="sdsync-help-log-lines" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-lines" /></div></div></div>
+                    <p v-if="!logRecords.length" class="sdsync-empty">{{ logOutput }}</p>
+                    <div v-else class="sdsync-log-records"><section v-for="record in logRecords" :key="record.id" class="sdsync-log-record"><header><span><strong>{{ record.source }}</strong><small>{{ record.lineCount }} line{{ record.lineCount === 1 ? '' : 's' }}</small></span><span class="sdsync-log-record-actions"><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy ' + record.source + ' log evidence'" tooltip="Copy this log record as bounded, sanitized troubleshooting text" @click="copyLogRecord(record)"><template #icon><action-icon name="copy" /></template>Copy</v-button><v-button class="sdsync-evidence-copy sdsync-log-clear" type="border" display="icon-text" :aria-label="'Clear the ' + record.source + ' package log'" :tooltip="logClearTooltip(record.source)" :disabled="!logSourceClearable(record.source) || !canRunOperations" @click="clearLogSource(record.source)"><template #icon><action-icon name="delete" /></template>Clear</v-button></span></header><div v-if="record.doctorInventories.length" class="sdsync-log-inventory-evidence"><div v-for="(inventoryRecord, recordIndex) in record.doctorInventories" :key="inventoryRecord.epoch + ':' + inventoryRecord.profile + ':' + recordIndex" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ inventoryRecord.profile }} · {{ doctorInventoryScopeLabel(inventoryRecord.inventory.scope) }}</strong><span>{{ inventoryRecord.inventory.total }} total · {{ inventoryRecord.inventory.entries.length }} shown<span v-if="inventoryRecord.inventory.truncated"> · truncated</span></span></div><p v-if="!inventoryRecord.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in inventoryRecord.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div></div><p v-if="!record.lines.length" class="sdsync-empty sdsync-log-empty">No lines to show. This log can still hold records that the current log level for its category keeps out of this view.</p><ol v-else class="sdsync-log-lines" tabindex="0"><li v-for="line in record.lines" :key="line.id"><time v-if="line.epoch">{{ formatDate(line.epoch) }}</time><time v-else class="is-unrecorded" title="This line was written without a recorded time; the package now stamps every record it writes.">Time not recorded</time><span>{{ line.text }}</span></li></ol></section></div>
+                  </article>
+                </div>
+                <div v-else :id="'sdsync-activity-panel-' + activityTab" :key="activityTab" class="sdsync-subtab-panel" :data-subtab-panel="activityTab" role="tabpanel" :aria-labelledby="'sdsync-activity-tab-' + activityTab" tabindex="0">
+                  <article class="sdsync-panel">
+                    <div class="sdsync-panel-heading">
+                      <div><p class="sdsync-eyebrow">Structured activity</p><h3>Recent package events</h3></div>
+                      <div class="sdsync-evidence-heading-actions"><span class="sdsync-freshness">{{ reversedActivity.length }} of {{ activityLensTotal }} event{{ activityLensTotal === 1 ? '' : 's' }}</span><v-button type="border" display="icon-text" aria-label="Copy all visible activity events" tooltip="Copy the filtered activity events as bounded, sanitized troubleshooting text" :disabled="!reversedActivity.length" @click="copyVisibleActivity"><template #icon><action-icon name="copy" /></template>Copy visible</v-button></div>
+                    </div>
+                    <div class="sdsync-filter-list" aria-label="Activity filters">
+                      <div class="sdsync-filter-row"><span class="sdsync-filter-label">Search</span><div class="sdsync-filter-control"><v-input v-model.trim="activitySearch" class="sdsync-input-control sdsync-activity-search" maxlength="128" placeholder="Search event text or request ID" aria-label="Search activity text or client request ID" aria-describedby="sdsync-help-activity-search" /><control-help help-key="activity-search" /></div></div>
+                      <div class="sdsync-filter-row"><span class="sdsync-filter-label">Category</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityCategory" :options="activityLensCategoryOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity category" aria-describedby="sdsync-help-activity-category"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-category" /></div></div>
+                      <div class="sdsync-filter-row"><span class="sdsync-filter-label">Level</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityLevel" :options="activityLevelOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity level" aria-describedby="sdsync-help-activity-level"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-level" /></div></div>
+                    </div>
+                    <ol class="sdsync-activity-feed"><li v-if="!reversedActivity.length" class="sdsync-empty">{{ activityEmptyText }}</li><li v-for="event in reversedActivity" :key="[event.epoch, event.code, event.profile, event.category, event.level, event.client_request_id].join(':')"><time>{{ formatDate(event.epoch) }}</time><div class="sdsync-activity-detail"><strong>{{ event.code }}</strong><p v-if="event.message && !event.doctor_inventory">{{ event.message }}</p><div v-if="event.doctor_inventory" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ doctorInventoryScopeLabel(event.doctor_inventory.inventory.scope) }}</strong><span>{{ event.doctor_inventory.inventory.total }} total · {{ event.doctor_inventory.inventory.entries.length }} shown<span v-if="event.doctor_inventory.inventory.truncated"> · truncated</span></span></div><p v-if="!event.doctor_inventory.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in event.doctor_inventory.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div><code v-if="event.client_request_id">Client request ID: {{ event.client_request_id }}</code></div><small>{{ event.profile }} · {{ event.state }} · {{ event.category }} / {{ event.level }}</small><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy activity event ' + event.code" tooltip="Copy this event as bounded, sanitized troubleshooting text" @click="copyActivityEvent(event)"><template #icon><action-icon name="copy" /></template>Copy</v-button></li></ol>
+                  </article>
+                </div>
+              </transition>
+            </div>
           </section>
 
           <section v-else-if="route === 'notifications'" class="sdsync-page" aria-labelledby="sdsync-page-title">
@@ -1788,6 +1799,21 @@ const CLIENT_REQUEST_ID_PATTERN = /^[0-9a-f]{32}$/;
 const JOB_ID_PATTERN = /^[0-9a-f]{48}$/;
 const ACTIVITY_MESSAGE_LIMIT = 2048;
 const ACTIVITY_FIELD_LIMIT = 128;
+// The Activity route groups its fixed categories into task-shaped lenses: a
+// person chasing "what changed" should not read through routine sync
+// heartbeats, and a person chasing "what ran" should not read through the
+// audit trail. Omitted here on purpose are "events" (the deliberate escape
+// hatch that keeps every category visible at once) and "package-logs" (not a
+// category lens at all): both fall through to the lookup's undefined result,
+// which activityLensCategories() below treats as "no restriction".
+const ACTIVITY_LENS_CATEGORIES = Object.freeze({
+  changes: Object.freeze(["audit", "configuration", "secrets", "security"]),
+  operations: Object.freeze(["operations", "routines", "sync", "scheduler"]),
+  service: Object.freeze(["bridge", "authentication", "controller", "notifications"])
+});
+function activityLensCategories(tabId) {
+  return ACTIVITY_LENS_CATEGORIES[tabId] || null;
+}
 const MUTATION_MESSAGE_LIMIT = 4096;
 const TROUBLESHOOTING_RECORD_LIMIT = 64 * 1024;
 const TROUBLESHOOTING_VISIBLE_LIMIT = 256 * 1024;
@@ -3046,13 +3072,21 @@ function partialMutationInspectionRequired(caught, fallback, appliedDetail) {
 // same defect the status header had: the operator cannot tell rows from four
 // seconds ago from rows from four hours ago, and the Activity list is the first
 // place anyone looks when diagnosing the very failure that froze it.
-function logsFeedState(logsReady, activityReady, lines, logsReceivedAtMs = 0, activityReceivedAtMs = 0, nowMs = Date.now()) {
-  if (logsReady && activityReady) return `Live · ${lines} line limit`;
+// A third state sits beside "answered" and "failed": not polled at all,
+// because the Package logs tab is closed. That is not a failure and must not
+// read as one — logsPolled false short-circuits before either read is judged.
+function logsFeedState(logsPolled, logsReady, activityReady, lines, logsReceivedAtMs = 0, activityReceivedAtMs = 0, nowMs = Date.now()) {
   const retained = (receivedAtMs) => {
     const received = Number(receivedAtMs);
     if (!Number.isFinite(received) || received <= 0) return "nothing retained";
     return `retained rows are ${describeRetainedAge(Math.max(0, Number(nowMs) - received))} old`;
   };
+  if (!logsPolled) {
+    return activityReady
+      ? "Activity live · package log paused while its tab is closed"
+      : `Activity feed unavailable, ${retained(activityReceivedAtMs)} · package log paused while its tab is closed`;
+  }
+  if (logsReady && activityReady) return `Live · ${lines} line limit`;
   if (logsReady) return `Package log live · ${lines} line limit · activity feed unavailable, ${retained(activityReceivedAtMs)}`;
   if (activityReady) return `Activity live · ${lines} line limit · package log read unavailable, ${retained(logsReceivedAtMs)}`;
   // Both failed. Date the older of the two, because that is the age of the
@@ -3485,6 +3519,14 @@ export default {
       diagnostic: { title: "Not run in this session", output: "No diagnostic output yet." }, doctorReport: idleDoctorReport(), doctorProgress: emptyDoctorProgress(),
       liveProgress: emptyLiveProgress(),
       logsPaused: false, logSource: "all", logLines: 200, logState: "Waiting for logs", logOutput: "No log data yet.", logRecords: [], activityEvents: [], activitySearch: "", activityCategory: "all", activityLevel: "all",
+      activityTabs: [
+        { id: "events", label: "All events" },
+        { id: "changes", label: "Changes" },
+        { id: "operations", label: "Operations" },
+        { id: "service", label: "Service" },
+        { id: "package-logs", label: "Package logs" }
+      ],
+      activityTab: "events",
       lastFailureKey: "", toasts: [], toastSequence: 0,
       confirmation: { visible: false, title: "", message: "", button: "Confirm", resolve: null },
       confirmationPriorFocus: null, confirmationKeyHandler: null,
@@ -3980,6 +4022,11 @@ export default {
     healthFreshness() { const newest = this.healthRows.reduce((value, health) => Math.max(value, numberOr(health.last_check_epoch || health.checked_at_epoch || health.checked_epoch, 0)), 0); return newest ? `Newest check ${formatDate(newest)}` : "Cached time unavailable"; },
     reversedActivity() {
       const query = boundedText(this.activitySearch, "").trim().toLowerCase().slice(0, ACTIVITY_FIELD_LIMIT);
+      // A context built without activityTab (every fixture that predates the
+      // Activity tabs) must filter exactly as the "events" lens does: every
+      // category. activityLensCategories(undefined) returns null for that
+      // reason, which the lens predicate below treats as "no restriction".
+      const lensCategories = activityLensCategories(this.activityTab);
       return this.activityEvents.map(normalizedActivityEvent).filter((event) => {
         if (!event) return false;
         const category = event.category.toLowerCase();
@@ -3988,10 +4035,33 @@ export default {
           event.code, event.profile, event.state, event.category, event.level,
           event.message, event.client_request_id
         ].join("\n").toLowerCase();
-        return (this.activityCategory === "all" || category === this.activityCategory)
+        return (!lensCategories || lensCategories.includes(category))
+          && (this.activityCategory === "all" || category === this.activityCategory)
           && (this.activityLevel === "all" || level === this.activityLevel)
           && (!query || searchable.includes(query));
       }).reverse();
+    },
+    // The heading's "N of M" needs M to count only the active lens, not every
+    // recorded event, or switching to Changes would still claim "of 400"
+    // against a lens that holds twelve.
+    activityLensTotal() {
+      const lensCategories = activityLensCategories(this.activityTab);
+      const normalized = this.activityEvents.map(normalizedActivityEvent).filter(Boolean);
+      return lensCategories ? normalized.filter((event) => lensCategories.includes(event.category.toLowerCase())).length : normalized.length;
+    },
+    activityLensCategoryOptions() {
+      const lensCategories = activityLensCategories(this.activityTab);
+      return lensCategories
+        ? this.activityCategoryOptions.filter((option) => option.value === "all" || lensCategories.includes(option.value))
+        : this.activityCategoryOptions;
+    },
+    activityEmptyText() {
+      if (this.activityLensTotal > 0) return "No package events match these filters.";
+      return {
+        changes: "No configuration changes have been recorded yet.",
+        operations: "No operations have been recorded yet.",
+        service: "No service events have been recorded yet."
+      }[this.activityTab] || "No package events have been recorded yet.";
     },
     notificationPermission() { return window.Notification ? Notification.permission : "unsupported"; },
     themeClass() { const theme = this.settings.theme === "system" ? (this.systemLight ? "is-light" : "is-dark") : `is-${this.settings.theme}`; return theme; },
@@ -4030,6 +4100,19 @@ export default {
     securityForm: { deep: true, handler() { this.autosaveChanged("security"); } },
     settings: { deep: true, handler() { this.autosaveChanged("interface"); } },
     operationBusy(value) { if (this.autosaveCoordinator) this.autosaveCoordinator.setGlobalBusy(value === true); },
+    activityTab(value) {
+      // A lens change can strand the Category dropdown on a value the new
+      // lens does not offer; "all" always fits every lens, so that is the
+      // only value this ever has to fall back to.
+      const lens = activityLensCategories(value);
+      if (lens && this.activityCategory !== "all" && !lens.includes(this.activityCategory)) this.activityCategory = "all";
+      // The package log scan is gated to this tab (see refreshLogs), so
+      // opening it must not wait for the next poll tick to show anything.
+      if (value === "package-logs") {
+        this.logState = "Loading package logs…";
+        this.refreshLogs();
+      }
+    },
     incidentOutcomeUnresolved(value) {
       if (value) this.incidentProbeStep = 0;
       else this.incidentProbe = emptyIncidentProbe();
@@ -6710,21 +6793,26 @@ export default {
     async refreshLogs() {
       if (this.disposed || this.logsLoading || this.logsPaused || document.hidden || this.route !== "activity") return;
       this.logsLoading = true;
+      // The package log read forks the shell manager on the NAS; the event
+      // tabs never show it, so asking for it on every poll while one of them
+      // is open would pay that fork for a scan nothing on screen can display.
+      const fetchLogs = this.activityTab === "package-logs";
       try {
         const lines = Math.min(1000, Math.max(1, Number(this.logLines) || 200));
         // Two independent read-only feeds. Waiting on them jointly must not let
         // one failure discard the other's payload: the package log scan is far
         // more expensive than the activity feed, so a combined wait turned a
         // healthy activity response into an empty Activity list.
-        const [logs, activity] = await Promise.allSettled([
-          apiGet(this.auth, "logs", { lines, source: this.logSource }),
-          apiGet(this.auth, "activity", { lines })
-        ]);
+        const requests = fetchLogs ? [apiGet(this.auth, "logs", { lines, source: this.logSource })] : [];
+        requests.push(apiGet(this.auth, "activity", { lines }));
+        const settled = await Promise.allSettled(requests);
+        const logs = fetchLogs ? settled[0] : null;
+        const activity = fetchLogs ? settled[1] : settled[0];
         if (this.disposed) return;
         // Both feeds are retained through their own failure — the settled-pair
         // guard above is what retains them — so both carry a receipt time for
         // the same reason the snapshot does.
-        if (logs.status === "fulfilled") {
+        if (fetchLogs && logs.status === "fulfilled") {
           const records = this.logRecordsFrom(logs.value);
           this.logRecords = records;
           this.logsReceivedAtMs = Date.now();
@@ -6737,14 +6825,15 @@ export default {
           this.activityReceivedAtMs = Date.now();
         }
         this.logState = logsFeedState(
-          logs.status === "fulfilled",
+          fetchLogs,
+          fetchLogs && logs.status === "fulfilled",
           activity.status === "fulfilled",
           lines,
           this.logsReceivedAtMs,
           this.activityReceivedAtMs
         );
       } catch (_error) {
-        if (!this.disposed) this.logState = logsFeedState(false, false, 0, this.logsReceivedAtMs, this.activityReceivedAtMs);
+        if (!this.disposed) this.logState = logsFeedState(fetchLogs, false, false, 0, this.logsReceivedAtMs, this.activityReceivedAtMs);
       } finally {
         this.logsLoading = false;
         if (!this.disposed) this.scheduleLogs();

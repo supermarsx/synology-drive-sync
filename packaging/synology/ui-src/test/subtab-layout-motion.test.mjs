@@ -282,3 +282,49 @@ test("Security leads with settings and defers structured observability resources
   assert.match(observability, /Bounded resources/);
   assertTabLabelsAreNotRepeatedAsHeadings(security, labels, "Security");
 });
+
+test("Activity separates event lenses and package logs into five coherent subtabs", () => {
+  const activity = routeSection("activity");
+  const definitions = tabDefinitions(app, "activityTabs", "Activity");
+  assert.deepEqual(definitions.map((tab) => tab.id), ["events", "changes", "operations", "service", "package-logs"]);
+  assert.deepEqual(definitions.map((tab) => tab.label), ["All events", "Changes", "Operations", "Service", "Package logs"]);
+  assert.match(app, /activityTab:\s*"events"/, "All events must be the initial Activity view");
+
+  const tablist = activity.match(
+    /<div\b(?=[^>]*\bclass="[^"]*sdsync-subtabs[^"]*")(?=[^>]*\brole="tablist")[^>]*>[\s\S]*?<\/div>/
+  );
+  assert.ok(tablist, "Activity needs one accessible internal tablist");
+  const tabs = [...tablist[0].matchAll(
+    /<button\b(?=[^>]*\bclass="[^"]*sdsync-subtab[^"]*")(?=[^>]*\brole="tab")([^>]*)>([\s\S]*?)<\/button>/g
+  )].map((match) => ({ attrs: match[1], label: textContent(match[2]) }));
+  assert.equal(tabs.length, 1, "Activity should render one shared semantic tab template");
+  assert.match(tabs[0].attrs, /\bv-for="tab in activityTabs"/);
+  assert.match(tabs[0].attrs, /:aria-selected=/, "Activity tabs must expose selected state");
+  assert.match(tabs[0].attrs, /:tabindex=/, "Activity tabs must expose roving keyboard state");
+  assert.match(tabs[0].attrs, /(?:@click|@keydown)=/, "Activity tabs must be interactive");
+  assert.match(app, /moveSubtab\('activityTab', activityTabs, \$event\)/,
+    "Activity must reuse the shared roving-tabindex handler exactly as Notifications and Security do");
+
+  assert.match(activity, /<transition\b[^>]*\bname="sdsync-subtab-swap"[^>]*\bmode="out-in"[^>]*>/,
+    "Activity panels must swap coherently instead of stacking");
+  assert.match(activity, /\bclass="[^"]*sdsync-subtab-stage[^"]*"/);
+  assert.match(activity, /\bclass="[^"]*sdsync-subtab-panel[^"]*"[^>]*\brole="tabpanel"/);
+
+  // Package logs is its own stable, literally identified panel.
+  assert.ok(activity.includes('id="sdsync-activity-panel-package-logs"'),
+    "Package logs needs a stable owned tabpanel");
+  assert.ok(activity.includes('aria-labelledby="sdsync-activity-tab-package-logs"'),
+    "Package logs panel must point back to its tab");
+
+  // The four event lenses (all events/changes/operations/service) share one
+  // panel driven by activityTab rather than repeating the feed markup four
+  // times: the identity is dynamic, not four literal ids.
+  assert.match(activity, /:id="'sdsync-activity-panel-' \+ activityTab"/,
+    "the event lenses must share one dynamically identified tabpanel");
+  assert.match(activity, /:aria-labelledby="'sdsync-activity-tab-' \+ activityTab"/,
+    "the shared event tabpanel must point back to whichever tab is active");
+  assert.equal((activity.match(/<ol class="sdsync-activity-feed">/g) || []).length, 1,
+    "the four event lenses must render one feed, not duplicate it per tab");
+
+  assertTabLabelsAreNotRepeatedAsHeadings(activity, definitions.map((definition) => definition.label), "Activity");
+});
