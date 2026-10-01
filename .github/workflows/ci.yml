@@ -281,7 +281,7 @@ jobs:
         run: bash .github/scripts/install-zig.sh
       - name: Install pinned cargo-zigbuild
         if: matrix.cross_compile == true
-        uses: taiki-e/install-action@0758d235715de2f3551eacc980d9ae8fce9342c3 # v2.87.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-zigbuild@0.23.3
       - name: Extract pinned QEMU user emulator
