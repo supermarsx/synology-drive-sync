@@ -1613,7 +1613,7 @@ const ABOUT_RUST_DEPENDENCIES = Object.freeze([
   { name: "sha2", pin: "0.11.1", scope: "All platforms", url: "https://crates.io/crates/sha2" },
   { name: "subtle", pin: "2.6.1", scope: "All platforms", url: "https://crates.io/crates/subtle" },
   { name: "thiserror", pin: "2.0.21", scope: "All platforms", url: "https://crates.io/crates/thiserror" },
-  { name: "tokio", pin: "1.54.0", scope: "All platforms", url: "https://crates.io/crates/tokio" },
+  { name: "tokio", pin: "1.54.1", scope: "All platforms", url: "https://crates.io/crates/tokio" },
   { name: "toml", pin: "1.1.8+spec-1.1.0", scope: "All platforms", url: "https://crates.io/crates/toml" },
   { name: "totp-rs", pin: "6.0.0", scope: "All platforms", url: "https://crates.io/crates/totp-rs" },
   { name: "zeroize", pin: "1.9.1", scope: "All platforms", url: "https://crates.io/crates/zeroize" },
