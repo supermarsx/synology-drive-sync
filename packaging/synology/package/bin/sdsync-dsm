@@ -522,7 +522,7 @@ end_mutation() {
 }
 
 reload_controller_if_running() {
-    running_pid=$(read_pid "$controller_pid_file" 2>/dev/null || true)
+    running_pid=$(read_controller_pid_reporting)
     [ -n "$running_pid" ] || return 0
     pid_is_live "$running_pid" || return 0
     if ! controller_persisted_identity_status "$running_pid"; then
@@ -544,7 +544,7 @@ reload_controller_if_running() {
 # This wake-only signal is deliberately separate from HUP: it interrupts an
 # idle sleep without rebasing schedules or restarting realtime watchers.
 wake_controller_for_queue() {
-    running_pid=$(read_pid "$controller_pid_file" 2>/dev/null || true)
+    running_pid=$(read_controller_pid_reporting)
     [ -n "$running_pid" ] || return 0
     pid_is_live "$running_pid" || return 0
     if ! controller_persisted_identity_status "$running_pid"; then
@@ -1116,7 +1116,11 @@ configure_routine() {
     decimal_at_most "$routine_max_total" "$dsm_delete_limit" || \
         die "max-total-delete must be from 0 through 2147483647"
     if [ "$routine_allow_delete" = true ]; then
-        profile_delete_bound=$(sed -n 's/^max-delete = //p' "$profiles_dir/$routine_profile.toml" | sed -n '1p')
+        # Exactly one bound, never the first of several: the controller refuses
+        # a duplicated key the same way, so the two can never judge one
+        # profile against different values. Two values arrive joined by a
+        # newline, which the digit check below refuses.
+        profile_delete_bound=$(sed -n 's/^max-delete = //p' "$profiles_dir/$routine_profile.toml")
         case $profile_delete_bound in ''|*[!0-9]*) die "profile has an invalid deletion bound" ;; esac
         decimal_at_most "$profile_delete_bound" "$dsm_delete_limit" || \
             die "profile has an invalid deletion bound"
@@ -2187,6 +2191,25 @@ api_capture_or_error() {
             "$(json_quote "$api_mapped_code")" "$(json_quote "$api_output")" "$api_exit"
         exit "$api_exit"
     fi
+}
+
+# Activity and alert writes never decide the manager's own exit status, but a
+# failed one used to vanish behind `2>/dev/null || true`: one refused activity
+# log -- a restore that left it group-readable, a hard link -- silently ended
+# every record after it. The failure is now recorded in controller.log with the
+# sink and the status, which is where an operator diagnosing a quiet Activity
+# tab looks.
+manager_best_effort() {
+    manager_best_effort_sink=$1
+    shift
+    manager_best_effort_status=0
+    "$@" 2>/dev/null || manager_best_effort_status=$?
+    if [ "$manager_best_effort_status" -ne 0 ]; then
+        append_controller_log_event warn observability_write_failed \
+            "sink=$manager_best_effort_sink status=$manager_best_effort_status" >/dev/null 2>&1 \
+            || printf 'warning: %s write failed (status %s)\n' "$manager_best_effort_sink" "$manager_best_effort_status" >&2
+    fi
+    return 0
 }
 
 api_load_kv() {
@@ -3585,7 +3608,28 @@ api_snapshot() {
     snapshot_size=$((${#snapshot_head} + snapshot_body_size))
     if [ "$snapshot_size" -gt 1048576 ]; then rm -f "$snapshot_json"; snapshot_json=; api_error response_too_large "snapshot response exceeds its safe bound" 69; fi
     if [ "$snapshot_cache_flight" = true ]; then
-        cache_store "$snapshot_cache_key" "$snapshot_json" || true
+        # The cache is disposable and a failed store only costs the next poll
+        # a recompute, so it never fails the response. A store that keeps
+        # failing is reported once per episode -- the marker is the episode --
+        # rather than on every five-second dashboard poll.
+        snapshot_cache_status=0
+        cache_store "$snapshot_cache_key" "$snapshot_json" || snapshot_cache_status=$?
+        snapshot_cache_marker=$state_root/.snapshot-cache-store-failed
+        if [ "$snapshot_cache_status" -ne 0 ]; then
+            if [ ! -e "$snapshot_cache_marker" ] && [ ! -L "$snapshot_cache_marker" ]; then
+                # Without the marker this episode is simply reported again on
+                # the next poll, which is the safe direction.
+                if : > "$snapshot_cache_marker" 2>/dev/null; then
+                    finish_private_file "$snapshot_cache_marker" 2>/dev/null || rm -f "$snapshot_cache_marker"
+                fi
+                append_controller_log_event warn observability_write_failed \
+                    "sink=snapshot_cache status=$snapshot_cache_status" >/dev/null 2>&1 \
+                    || printf 'warning: snapshot cache store failed (status %s)\n' "$snapshot_cache_status" >&2
+            fi
+        elif [ -f "$snapshot_cache_marker" ] && [ ! -L "$snapshot_cache_marker" ]; then
+            rm -f "$snapshot_cache_marker" 2>/dev/null \
+                || printf 'warning: snapshot cache failure marker could not be cleared\n' >&2
+        fi
     fi
     cache_flight_end
     printf '%s' "$snapshot_head"
@@ -4244,9 +4288,9 @@ case $command_name in
         if [ "$doctor_exit" -eq 0 ]; then doctor_status=succeeded; doctor_code=doctor.succeeded; else doctor_status=failed; doctor_code=doctor.failed; fi
         write_health_cache "$selected_scope" "$doctor_status" "$doctor_exit" "$write_test" "$diagnostic_level"
         if [ "$doctor_status" = failed ]; then doctor_level=error; else doctor_level=info; fi
-        append_activity "$doctor_code" "$selected_scope" "$doctor_status" "Target doctor ($diagnostic_level) completed" operations "$doctor_level" 2>/dev/null || true
+        manager_best_effort activity append_activity "$doctor_code" "$selected_scope" "$doctor_status" "Target doctor ($diagnostic_level) completed" operations "$doctor_level"
         if [ "$doctor_exit" -ne 0 ]; then
-            handle_doctor_alert "$selected_scope" "$doctor_exit" 2>/dev/null || true
+            manager_best_effort alert handle_doctor_alert "$selected_scope" "$doctor_exit"
         fi
         end_mutation "$doctor_status"
         exit "$doctor_exit"
@@ -4296,7 +4340,7 @@ case $command_name in
         [ -z "$progress_record" ] || set -- "$@" --progress-record "$progress_record"
         mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
         if [ -n "$resync_ticket" ]; then
-            append_activity run.started "$resync_scope_name" running "Confirmed resync started" operations info 2>/dev/null || true
+            manager_best_effort activity append_activity run.started "$resync_scope_name" running "Confirmed resync started" operations info
         fi
         set +e
         "$@"
@@ -4305,13 +4349,13 @@ case $command_name in
         if [ "$resync_exit" -eq 0 ]; then resync_state=succeeded; else resync_state=failed; fi
         if [ -n "$resync_ticket" ]; then
             if [ "$resync_exit" -eq 0 ]; then
-                append_activity run.succeeded "$resync_scope_name" succeeded "Confirmed resync completed" operations info 2>/dev/null || true
+                manager_best_effort activity append_activity run.succeeded "$resync_scope_name" succeeded "Confirmed resync completed" operations info
             elif [ "$resync_exit" -eq 10 ]; then
                 # Nothing was changed; the printed plan and its new ticket
                 # describe what a fresh confirmation would actually do.
-                append_activity run.failed "$resync_scope_name" failed "Resync refused a stale confirmation; nothing was changed" operations warn 2>/dev/null || true
+                manager_best_effort activity append_activity run.failed "$resync_scope_name" failed "Resync refused a stale confirmation; nothing was changed" operations warn
             else
-                append_activity run.failed "$resync_scope_name" failed "Confirmed resync failed" operations error 2>/dev/null || true
+                manager_best_effort activity append_activity run.failed "$resync_scope_name" failed "Confirmed resync failed" operations error
             fi
         fi
         end_mutation "$resync_state"

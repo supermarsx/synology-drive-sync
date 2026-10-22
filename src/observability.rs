@@ -146,6 +146,14 @@ pub enum EventCode {
     EntryDeleted,
     RetryScheduled,
     CancellationRequested,
+    /// A run finished without error but left entries for the next run.
+    RunPartial,
+    /// One entry was not transferred and will not be retried by this run.
+    EntrySkipped,
+    /// One entry was left for the next run on purpose.
+    EntryDeferred,
+    /// The `--result-record` file a supervisor reads could not be written.
+    ResultRecordFailed,
 }
 
 impl EventCode {
@@ -154,7 +162,7 @@ impl EventCode {
     /// Exhaustive by construction: a new variant that is not listed here fails
     /// `every_event_code_has_a_stable_machine_and_human_name`, so no code can ship without a
     /// stable machine name and human message.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 31] = [
         Self::RunBuild,
         Self::RunStarted,
         Self::RunCompleted,
@@ -182,6 +190,10 @@ impl EventCode {
         Self::EntryDeleted,
         Self::RetryScheduled,
         Self::CancellationRequested,
+        Self::RunPartial,
+        Self::EntrySkipped,
+        Self::EntryDeferred,
+        Self::ResultRecordFailed,
     ];
 
     fn as_str(self) -> &'static str {
@@ -213,6 +225,10 @@ impl EventCode {
             Self::EntryDeleted => "entry.deleted",
             Self::RetryScheduled => "retry.scheduled",
             Self::CancellationRequested => "cancellation.requested",
+            Self::RunPartial => "run.partial",
+            Self::EntrySkipped => "entry.skipped",
+            Self::EntryDeferred => "entry.deferred",
+            Self::ResultRecordFailed => "result_record.failed",
         }
     }
 
@@ -245,6 +261,180 @@ impl EventCode {
             Self::EntryDeleted => "entry deleted",
             Self::RetryScheduled => "retry scheduled",
             Self::CancellationRequested => "cancellation requested",
+            Self::RunPartial => "sync run completed with entries left for the next run",
+            Self::EntrySkipped => "entry skipped",
+            Self::EntryDeferred => "entry deferred",
+            Self::ResultRecordFailed => "result record could not be written",
+        }
+    }
+}
+
+/// Why a run failed, or why one entry was skipped or deferred.
+///
+/// A closed vocabulary, like [`EventCode`]: a reason is a class, never the error text, so it can
+/// carry no path, host, credential or server-chosen string. The text naming the specific entry
+/// stays on the separate, sanitised `path` member. The DSM dashboard renders these tokens
+/// verbatim, so a rename is a contract change (`docs/observability.md`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventReason {
+    Authentication,
+    Network,
+    HttpStatus,
+    Timeout,
+    RemoteResponseInvalid,
+    DsmApiError,
+    DsmApiUnsupported,
+    ShareNotWritable,
+    RemotePathRefused,
+    TypeConflict,
+    ProtectedConflict,
+    EmptySourceGuard,
+    DeleteLimit,
+    SourceInvalid,
+    LocalEntryUnsupported,
+    LocalIo,
+    SourceChanged,
+    ResyncTicketStale,
+    ContentVerificationFailed,
+    RemoteChanged,
+    ServerCopyUnavailable,
+    ServerCopyFailed,
+    ReconciliationPending,
+    CredentialUnavailable,
+    ConfigInvalid,
+    HttpsRequired,
+    ScopeNotFound,
+    Cancelled,
+    Unclassified,
+    // Skip and deferral classes, for `entry.skipped` and `entry.deferred`.
+    ChangedDuringRun,
+    DeleteBound,
+    ServerCopyFallback,
+    Excluded,
+    UploadFailed,
+}
+
+impl EventReason {
+    /// Every reason, so the published vocabulary can be checked against this enum.
+    pub const ALL: [Self; 34] = [
+        Self::Authentication,
+        Self::Network,
+        Self::HttpStatus,
+        Self::Timeout,
+        Self::RemoteResponseInvalid,
+        Self::DsmApiError,
+        Self::DsmApiUnsupported,
+        Self::ShareNotWritable,
+        Self::RemotePathRefused,
+        Self::TypeConflict,
+        Self::ProtectedConflict,
+        Self::EmptySourceGuard,
+        Self::DeleteLimit,
+        Self::SourceInvalid,
+        Self::LocalEntryUnsupported,
+        Self::LocalIo,
+        Self::SourceChanged,
+        Self::ResyncTicketStale,
+        Self::ContentVerificationFailed,
+        Self::RemoteChanged,
+        Self::ServerCopyUnavailable,
+        Self::ServerCopyFailed,
+        Self::ReconciliationPending,
+        Self::CredentialUnavailable,
+        Self::ConfigInvalid,
+        Self::HttpsRequired,
+        Self::ScopeNotFound,
+        Self::Cancelled,
+        Self::Unclassified,
+        Self::ChangedDuringRun,
+        Self::DeleteBound,
+        Self::ServerCopyFallback,
+        Self::Excluded,
+        Self::UploadFailed,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::Network => "network",
+            Self::HttpStatus => "http_status",
+            Self::Timeout => "timeout",
+            Self::RemoteResponseInvalid => "remote_response_invalid",
+            Self::DsmApiError => "dsm_api_error",
+            Self::DsmApiUnsupported => "dsm_api_unsupported",
+            Self::ShareNotWritable => "share_not_writable",
+            Self::RemotePathRefused => "remote_path_refused",
+            Self::TypeConflict => "type_conflict",
+            Self::ProtectedConflict => "protected_conflict",
+            Self::EmptySourceGuard => "empty_source_guard",
+            Self::DeleteLimit => "delete_limit",
+            Self::SourceInvalid => "source_invalid",
+            Self::LocalEntryUnsupported => "local_entry_unsupported",
+            Self::LocalIo => "local_io",
+            Self::SourceChanged => "source_changed",
+            Self::ResyncTicketStale => "resync_ticket_stale",
+            Self::ContentVerificationFailed => "content_verification_failed",
+            Self::RemoteChanged => "remote_changed",
+            Self::ServerCopyUnavailable => "server_copy_unavailable",
+            Self::ServerCopyFailed => "server_copy_failed",
+            Self::ReconciliationPending => "reconciliation_pending",
+            Self::CredentialUnavailable => "credential_unavailable",
+            Self::ConfigInvalid => "config_invalid",
+            Self::HttpsRequired => "https_required",
+            Self::ScopeNotFound => "scope_not_found",
+            Self::Cancelled => "cancelled",
+            Self::Unclassified => "unclassified",
+            Self::ChangedDuringRun => "changed_during_run",
+            Self::DeleteBound => "delete_bound",
+            Self::ServerCopyFallback => "server_copy_fallback",
+            Self::Excluded => "excluded",
+            Self::UploadFailed => "upload_failed",
+        }
+    }
+
+    /// The class of one core error.
+    ///
+    /// Exhaustive on purpose: a new [`crate::error::Error`] variant fails to compile here until
+    /// someone decides which class it is, instead of silently reading as `unclassified`.
+    pub fn of(error: &crate::error::Error) -> Self {
+        use crate::error::Error;
+        match error {
+            Error::InvalidUrl(_) | Error::Configuration(_) => Self::ConfigInvalid,
+            Error::HttpsRequired => Self::HttpsRequired,
+            Error::UnsafeRemotePath { .. }
+            | Error::RemoteEscape(_)
+            | Error::RemoteMountRoot { .. } => Self::RemotePathRefused,
+            Error::InvalidSource(_) => Self::SourceInvalid,
+            Error::UnsupportedLocalEntry { .. } => Self::LocalEntryUnsupported,
+            Error::FileIo { .. } => Self::LocalIo,
+            Error::Http { .. } | Error::HttpBody { .. } => Self::Network,
+            Error::HttpStatus { .. } => Self::HttpStatus,
+            Error::InvalidResponse { .. } => Self::RemoteResponseInvalid,
+            // The login API is the one place a DSM error code means "these credentials", which
+            // is the distinction an operator acts on first.
+            Error::Api { api, .. } if api.starts_with("SYNO.API.Auth") => Self::Authentication,
+            Error::Api { .. } => Self::DsmApiError,
+            Error::UnsupportedApiVersion { .. } | Error::MissingApi(_) => Self::DsmApiUnsupported,
+            Error::ShareNotWritable(_) => Self::ShareNotWritable,
+            Error::TypeConflict { .. } => Self::TypeConflict,
+            Error::ProtectedConflict(_) => Self::ProtectedConflict,
+            Error::EmptySourceDeletion => Self::EmptySourceGuard,
+            Error::DeleteLimit { .. } => Self::DeleteLimit,
+            Error::SourceChanged(_) => Self::SourceChanged,
+            Error::ResyncTicketStale { .. } => Self::ResyncTicketStale,
+            Error::ScopeNotFound(_) => Self::ScopeNotFound,
+            Error::InvalidContentHash | Error::ContentVerificationFailed(_) => {
+                Self::ContentVerificationFailed
+            }
+            Error::RemoteSnapshotChanged(_) => Self::RemoteChanged,
+            Error::RemoteDigestsFailing { cause, .. } => Self::of(cause),
+            Error::ServerCopyNotStarted => Self::ServerCopyUnavailable,
+            Error::ServerCopyFailed { .. } => Self::ServerCopyFailed,
+            Error::OperationTimedOut { .. } => Self::Timeout,
+            Error::ReconciliationPending { .. } => Self::ReconciliationPending,
+            Error::Cancelled => Self::Cancelled,
+            Error::Vault { .. } => Self::CredentialUnavailable,
+            Error::Message(_) => Self::Unclassified,
         }
     }
 }
@@ -368,6 +558,16 @@ impl<const N: usize> fmt::Display for InlineAscii<N> {
 
 /// A URL path or host, bounded to a length that cannot fill a log line.
 pub type BoundedText = InlineAscii<64>;
+
+/// A profile name on a log record. Valid names are already `[A-Za-z0-9_-]`, which the sanitiser
+/// leaves untouched.
+pub type ProfileToken = InlineAscii<64>;
+
+/// The relative path of the entry a skip, deferral or per-entry failure concerns.
+///
+/// Opt-in per record and never set on authentication or connection records. Sanitised like every
+/// other runtime text, so a byte outside the safe set (any non-ASCII byte included) reads as `_`.
+pub type EntryPath = InlineAscii<128>;
 
 /// Which session channels one request carried.
 ///
@@ -1209,6 +1409,9 @@ pub struct LogEvent {
     pub call: Option<ApiCallDetail>,
     pub connection: Option<ConnectionDetail>,
     pub session: Option<SessionShape>,
+    pub reason: Option<EventReason>,
+    pub profile: Option<ProfileToken>,
+    pub path: Option<EntryPath>,
 }
 
 impl LogEvent {
@@ -1224,7 +1427,25 @@ impl LogEvent {
             call: None,
             connection: None,
             session: None,
+            reason: None,
+            profile: None,
+            path: None,
         }
+    }
+
+    pub fn reason(mut self, reason: EventReason) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
+    pub fn profile(mut self, profile: &str) -> Self {
+        self.profile = Some(ProfileToken::sanitized(profile));
+        self
+    }
+
+    pub fn path(mut self, path: &str) -> Self {
+        self.path = Some(EntryPath::sanitized(path));
+        self
     }
 
     pub fn operation(mut self, operation_id: u64) -> Self {
@@ -1294,6 +1515,15 @@ impl LogEvent {
         if let Some(session) = self.session {
             object.insert("session".to_owned(), session.json_value());
         }
+        if let Some(reason) = self.reason {
+            object.insert("reason".to_owned(), reason.as_str().into());
+        }
+        if let Some(profile) = self.profile {
+            object.insert("profile".to_owned(), profile.as_str().into());
+        }
+        if let Some(path) = self.path {
+            object.insert("path".to_owned(), path.as_str().into());
+        }
         value
     }
 
@@ -1343,6 +1573,18 @@ impl LogEvent {
         if let Some(call) = self.call {
             use std::fmt::Write as _;
             let _ = write!(line, " {}", call.human());
+        }
+        if let Some(reason) = self.reason {
+            use std::fmt::Write as _;
+            let _ = write!(line, " reason={}", reason.as_str());
+        }
+        if let Some(profile) = self.profile {
+            use std::fmt::Write as _;
+            let _ = write!(line, " profile={profile}");
+        }
+        if let Some(path) = self.path {
+            use std::fmt::Write as _;
+            let _ = write!(line, " path={path}");
         }
         line
     }
@@ -2287,7 +2529,10 @@ mod tests {
                 .build(build)
                 .call(call)
                 .connection(connection)
-                .session(session);
+                .session(session)
+                .reason(EventReason::LocalIo)
+                .profile("photos")
+                .path("albums/2026/a.jpg");
             collect_keys(&event.json_value(), &mut keys);
         }
 
@@ -2304,6 +2549,11 @@ mod tests {
             "call",
             "connection",
             "session",
+            // Failure attribution: a closed reason, a profile name and a sanitised relative
+            // path. None of the three can hold a credential (closed enum; `[A-Za-z0-9_-]` name;
+            // sanitised path), and the path is opt-in per record.
+            "reason",
+            "path",
             // Metrics.
             "operations",
             "files",
@@ -2405,7 +2655,10 @@ mod tests {
                 .build(build)
                 .call(call)
                 .connection(connection)
-                .session(session);
+                .session(session)
+                .reason(EventReason::Authentication)
+                .profile("photos")
+                .path("albums/a.jpg");
             for rendered in [event.json_value().to_string(), event.human_line()] {
                 for forbidden in [
                     "passwd",
@@ -2477,6 +2730,85 @@ mod tests {
             ]
         );
         assert_eq!(event.human_line().split_whitespace().count(), 5);
+    }
+
+    /// A failure, skip or deferral record names its class, profile and entry, in both formats.
+    #[test]
+    fn attributed_records_render_reason_profile_and_sanitised_path() {
+        let event = LogEvent::new(LogLevel::Warn, EventCode::EntryDeferred)
+            .reason(EventReason::ChangedDuringRun)
+            .profile("photos")
+            .path("albums/été 2026/a\nb.jpg");
+        let json = event.json_value();
+        assert_eq!(json["event"], "entry.deferred");
+        assert_eq!(json["reason"], "changed_during_run");
+        assert_eq!(json["profile"], "photos");
+        // A newline cannot forge a second record, and non-ASCII reads as `_`, byte by byte.
+        assert_eq!(json["path"], "albums/__t___2026/a_b.jpg");
+        let human = event.human_line();
+        assert!(human.contains(" reason=changed_during_run profile=photos path=albums/"));
+        assert!(!human.contains('\n'));
+        // The path is bounded, and the cut is marked.
+        let long = LogEvent::new(LogLevel::Error, EventCode::UploadFailed).path(&"a/".repeat(200));
+        let path = long.json_value()["path"].as_str().unwrap().to_owned();
+        assert_eq!(path.len(), 128);
+        assert!(path.ends_with('~'));
+    }
+
+    /// The reason vocabulary is published (docs, DSM dashboard); names must be stable,
+    /// unique, snake_case tokens that fit the bridge's reason-code grammar.
+    #[test]
+    fn every_event_reason_has_a_unique_stable_token() {
+        let mut seen = std::collections::BTreeSet::new();
+        for reason in EventReason::ALL {
+            let token = reason.as_str();
+            assert!(
+                token.len() <= 48
+                    && token.as_bytes()[0].is_ascii_lowercase()
+                    && token.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'_'),
+                "{reason:?} token {token:?} is not a stable reason code"
+            );
+            assert!(seen.insert(token), "{reason:?} reuses {token:?}");
+        }
+    }
+
+    #[test]
+    fn event_reason_classifies_core_errors() {
+        use crate::error::Error;
+        let auth = Error::Api {
+            api: "SYNO.API.Auth".to_owned(),
+            operation: "login".to_owned(),
+            code: 400,
+            description: String::new(),
+            details: Vec::new(),
+        };
+        assert_eq!(EventReason::of(&auth), EventReason::Authentication);
+        let listing = Error::Api {
+            api: "SYNO.FileStation.List".to_owned(),
+            operation: "list".to_owned(),
+            code: 408,
+            description: String::new(),
+            details: Vec::new(),
+        };
+        assert_eq!(EventReason::of(&listing), EventReason::DsmApiError);
+        assert_eq!(
+            EventReason::of(&Error::DeleteLimit {
+                planned: 9,
+                maximum: 1
+            }),
+            EventReason::DeleteLimit
+        );
+        assert_eq!(
+            EventReason::of(&Error::ReconciliationPending { operations: 2 }),
+            EventReason::ReconciliationPending
+        );
+        assert_eq!(EventReason::of(&Error::Cancelled), EventReason::Cancelled);
+        assert_eq!(
+            EventReason::of(&Error::Message("x".to_owned())),
+            EventReason::Unclassified
+        );
     }
 
     #[test]

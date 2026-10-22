@@ -9,7 +9,8 @@
     { "$ref": "#/$defs/jsonSyncDocument" },
     { "$ref": "#/$defs/ndjsonPlanSummary" },
     { "$ref": "#/$defs/ndjsonPlanAction" },
-    { "$ref": "#/$defs/ndjsonCompletion" }
+    { "$ref": "#/$defs/ndjsonCompletion" },
+    { "$ref": "#/$defs/resultRecord" }
   ],
   "$defs": {
     "nonNegativeInteger": {
@@ -155,7 +156,11 @@
             "directory.created",
             "entry.deleted",
             "retry.scheduled",
-            "cancellation.requested"
+            "cancellation.requested",
+            "run.partial",
+            "entry.skipped",
+            "entry.deferred",
+            "result_record.failed"
           ]
         },
         "operation_id": { "$ref": "#/$defs/nullableNonNegativeInteger" },
@@ -164,8 +169,58 @@
         "build": { "$ref": "#/$defs/buildIdentity" },
         "call": { "$ref": "#/$defs/apiCallDetail" },
         "connection": { "$ref": "#/$defs/connectionDetail" },
-        "session": { "$ref": "#/$defs/sessionShape" }
+        "session": { "$ref": "#/$defs/sessionShape" },
+        "reason": { "$ref": "#/$defs/eventReason" },
+        "profile": {
+          "description": "The profile the record concerns. Absent when the run is not attributed to one profile.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._/:~,-]{0,64}$"
+        },
+        "path": {
+          "description": "Relative path of the entry a skip, deferral or per-entry failure concerns, sanitised (any other byte reads as `_`) and bounded; a trailing `~` marks truncation. Opt-in per record.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._/:~,-]{0,128}$"
+        }
       }
+    },
+    "eventReason": {
+      "description": "Closed class of a failure, skip or deferral. Never error text.",
+      "enum": [
+        "authentication",
+        "network",
+        "http_status",
+        "timeout",
+        "remote_response_invalid",
+        "dsm_api_error",
+        "dsm_api_unsupported",
+        "share_not_writable",
+        "remote_path_refused",
+        "type_conflict",
+        "protected_conflict",
+        "empty_source_guard",
+        "delete_limit",
+        "source_invalid",
+        "local_entry_unsupported",
+        "local_io",
+        "source_changed",
+        "resync_ticket_stale",
+        "content_verification_failed",
+        "remote_changed",
+        "server_copy_unavailable",
+        "server_copy_failed",
+        "reconciliation_pending",
+        "credential_unavailable",
+        "config_invalid",
+        "https_required",
+        "scope_not_found",
+        "cancelled",
+        "unclassified",
+        "changed_during_run",
+        "delete_bound",
+        "server_copy_fallback",
+        "excluded",
+        "upload_failed"
+      ]
     },
     "buildIdentity": {
       "type": "object",
@@ -590,9 +645,33 @@
     "plan": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["summary", "actions"],
+      "required": ["summary", "actions", "skipped"],
       "properties": {
         "summary": { "$ref": "#/$defs/planSummary" },
+        "skipped": {
+          "description": "Paths this plan neither carries nor deletes, and why. Each used to fail the whole run; now only its own path is left alone, on both sides. `deferred` entries are named again, with their precise reason, in the result's `deferred`.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "reason", "detail"],
+            "properties": {
+              "path": { "type": "string" },
+              "reason": {
+                "enum": [
+                  "windows-attributes",
+                  "link-or-reparse-point",
+                  "dehydrated-placeholder",
+                  "local-case-collision",
+                  "remote-case-collision",
+                  "case-rename-needs-delete",
+                  "deferred"
+                ]
+              },
+              "detail": { "type": "string" }
+            }
+          }
+        },
         "actions": {
           "type": "object",
           "additionalProperties": false,
@@ -637,6 +716,13 @@
         "kept_deletes_uploaded",
         "changed_during_run",
         "failed",
+        "outcome",
+        "deferred",
+        "mtime_not_kept",
+        "skipped",
+        "incomplete_listings",
+        "incomplete_listing_folders",
+        "recovered",
         "elapsed_ms"
       ],
       "properties": {
@@ -662,7 +748,120 @@
           "description": "True when the run failed after performing the work counted here.",
           "type": "boolean"
         },
+        "outcome": {
+          "description": "The run's verdict. `complete`: everything converged. `partial`: everything converged except the transient paths in `deferred` (every reason but `unrepresentable-name`, `unsupported-local-entry`, `listing-incomplete` and `remote-unreadable`), which the next run picks up; the process exits 3. Lasting skips and lasting deferrals are reported and logged but leave the outcome `complete` and the exit code 0. `failed`: the run stopped (see `failed`).",
+          "enum": ["complete", "partial", "failed"]
+        },
+        "deferred": {
+          "description": "Each path this run left for the next run, by name. A deferred path was neither uploaded nor deleted, and nothing else was deleted on its account. Any transient reason makes the outcome `partial`; `unrepresentable-name`, `unsupported-local-entry`, `listing-incomplete` and `remote-unreadable` recur every run until someone acts, so they are reported without changing the outcome.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/deferredPath" }
+        },
+        "mtime_not_kept": {
+          "description": "Destinations this run wrote (uploads, server copies) whose modification time the NAS did not keep: the remote second is neither the source's milliseconds floored nor rounded to the nearest second. Their content was verified; a metadata comparison will report them as changed.",
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "skipped": {
+          "description": "Paths the plan declined to carry for a lasting reason (a link or reparse point, a SYSTEM-attribute file, a case or normalisation collision), each named in `plan.skipped` and logged as an `entry.skipped` warning. A warning only: it does not change the outcome or the exit code, because it recurs on every run until someone acts.",
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "incomplete_listings": {
+          "description": "Remote folders whose listing returned a different number of entries than the NAS counted, consistently. Deletions inside them were withheld and named in `deferred`.",
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "incomplete_listing_folders": {
+          "description": "The folders counted in `incomplete_listings`, root-relative, `.` for the destination root. Each is also logged as an `entry.skipped` warning. A lasting condition: it does not make the run partial.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "recovered": {
+          "description": "What the run recovered from on its own, or could not. Each is also logged request by request.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "retries",
+            "reauthentications",
+            "reauthentication_failures",
+            "keepalive_failures",
+            "server_tasks_not_stopped",
+            "server_copy_fallbacks"
+          ],
+          "properties": {
+            "retries": { "description": "Requests sent again after a transient failure.", "$ref": "#/$defs/nonNegativeInteger" },
+            "reauthentications": { "description": "Expired sessions replaced by a new login.", "$ref": "#/$defs/nonNegativeInteger" },
+            "reauthentication_failures": { "description": "Attempts to replace an expired session that failed.", "$ref": "#/$defs/nonNegativeInteger" },
+            "keepalive_failures": { "description": "Session keepalive requests that failed.", "$ref": "#/$defs/nonNegativeInteger" },
+            "server_tasks_not_stopped": { "description": "Abandoned server-side MD5 or copy tasks whose stop could not be confirmed.", "$ref": "#/$defs/nonNegativeInteger" },
+            "server_copy_fallbacks": { "description": "Planned server-side copies uploaded instead because DSM refused to start them.", "$ref": "#/$defs/nonNegativeInteger" }
+          }
+        },
         "elapsed_ms": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "resultRecord": {
+      "type": "object",
+      "description": "One line of the `--result-record` file: one finished sync or plan job, written whatever `--output` says, so a supervisor reads counts without parsing output meant for a person.",
+      "additionalProperties": false,
+      "required": ["schema", "profile", "status", "result"],
+      "properties": {
+        "schema": { "const": "sdsync.result-record.v1" },
+        "profile": { "type": "string", "minLength": 1 },
+        "status": {
+          "description": "A single sync: `complete`, `partial` or `failed`; a single plan: `planned` or `failed`; a batch job: its batch status (`success`, `preflighted`, `failed`, `partial` meaning failed after mutating, `not-run`). Read `result.outcome` for the deferral verdict.",
+          "enum": ["complete", "partial", "failed", "planned", "success", "preflighted", "not-run"]
+        },
+        "result": {
+          "oneOf": [
+            { "$ref": "#/$defs/executionResult" },
+            { "$ref": "#/$defs/planVerdict" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "planVerdict": {
+      "type": "object",
+      "description": "What a plan-only job established: whether anything would change, and every path it left out.",
+      "additionalProperties": false,
+      "required": ["outcome", "changed", "planned_only", "deferred", "skipped", "elapsed_ms"],
+      "properties": {
+        "outcome": { "enum": ["complete", "partial"] },
+        "changed": { "type": "boolean" },
+        "planned_only": { "type": "boolean" },
+        "deferred": { "type": "array", "items": { "$ref": "#/$defs/deferredPath" } },
+        "skipped": { "$ref": "#/$defs/nonNegativeInteger" },
+        "elapsed_ms": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "deferredPath": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "reason", "detail"],
+      "properties": {
+        "path": {
+          "description": "Source-relative, `/`-separated.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "`source-changed`: the local file changed while it was read or sent. `source-vanished`: deleted locally during the run. `source-unreadable`: locked or not readable. `unsupported-local-entry`: not a regular file or directory the sync carries. `remote-digest-unavailable`: the NAS could not checksum it. `remote-unreadable`: the NAS refuses this one file to the account (lasting until its permissions change). `remote-changed`: the NAS entry changed after planning and was left as found. `unrepresentable-name`: a NAS name this host's filesystem cannot hold; never deleted on that account. `listing-incomplete`: its NAS folder listed fewer entries than it counted, so no deletion was made there. `server-copy-failed`: the NAS-side copy finished with an error. `delete-failed`: the NAS refused the deletion.",
+          "enum": [
+            "source-changed",
+            "source-vanished",
+            "source-unreadable",
+            "unsupported-local-entry",
+            "remote-digest-unavailable",
+            "remote-unreadable",
+            "remote-changed",
+            "unrepresentable-name",
+            "listing-incomplete",
+            "server-copy-failed",
+            "delete-failed"
+          ]
+        },
+        "detail": {
+          "description": "The underlying observation, for an operator. Never a credential.",
+          "type": "string"
+        }
       }
     },
     "unchangedResult": {

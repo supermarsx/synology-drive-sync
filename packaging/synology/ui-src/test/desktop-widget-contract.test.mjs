@@ -16,7 +16,8 @@ import {
   widgetOverview,
   widgetPollDelay,
   widgetProfileRows,
-  widgetRun
+  widgetRun,
+  widgetView
 } from "../src/widgetModel.mjs";
 
 const adapter = await readFile(new URL("../src/widget.js", import.meta.url), "utf8");
@@ -63,7 +64,8 @@ function snapshot(overrides = {}) {
     service: { state: "running", pid: 42 },
     run: { state: "succeeded", started_epoch: 0, finished_epoch: 0, exit_code: 0, scope: "none", operation: "none" },
     profiles: [],
-    routines: []
+    routines: [],
+    outcomes: { schema: "sdsync.dsm-outcomes.v1", run: { outcome: "succeeded", reason: null }, alerts: { status: "ok", failure_count: 0 }, profiles: [], errors: [] }
   }, overrides);
 }
 
@@ -103,7 +105,8 @@ function loadWidgetPanel(environment) {
     widgetOverview,
     widgetPollDelay,
     widgetProfileRows,
-    widgetRun
+    widgetRun,
+    widgetView
   };
   return Function(...Object.keys(stubs), executable)(...Object.values(stubs));
 }
@@ -461,9 +464,13 @@ test("a bridge failure after a good read keeps the last status until it is clear
   const stamp = panelInstance.freshness;
   assert.match(stamp, /^Updated /);
 
-  // One failed read does not flap the card.
+  // One failed read does not flap the card into a bridge error, but it does
+  // stop the retained rows claiming to be current: nothing stays green.
   await panelInstance.refresh();
-  assert.equal(panelInstance.headline.title, "All profiles healthy");
+  assert.equal(panelInstance.headline.title, "Status is stale");
+  assert.equal(panelInstance.headline.level, "unknown");
+  assert.equal(panelInstance.rows[0].level, "unknown");
+  assert.match(panelInstance.rows[0].outcome, /\(stale\)$/);
   assert.equal(panelInstance.degraded, false);
 
   // A second one does, and now the card names the reason.

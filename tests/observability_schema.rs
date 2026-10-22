@@ -107,6 +107,14 @@ fn validate(root: &Value, schema: &Value, instance: &Value, path: &str) -> Resul
                             || matches!(byte, b'.' | b'-' | b'_' | b'/' | b':' | b'~' | b',')
                     })
             }
+            // The same token, at the longer bound an entry path is given.
+            "^[A-Za-z0-9._/:~,-]{0,128}$" => {
+                value.len() <= 128
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric()
+                            || matches!(byte, b'.' | b'-' | b'_' | b'/' | b':' | b'~' | b',')
+                    })
+            }
             "^[a-z_]{1,32}$" => {
                 (1..=32).contains(&value.len())
                     && value
@@ -191,6 +199,18 @@ fn copy_fields() -> Value {
 
 fn representative_plan() -> Value {
     json!({
+        "skipped": [
+            {
+                "path": "Documents/desktop.ini",
+                "reason": "windows-attributes",
+                "detail": "Windows SYSTEM, TEMPORARY or OFFLINE entries are not synchronized by Synology Drive",
+            },
+            {
+                "path": "mail/outlook.pst",
+                "reason": "deferred",
+                "detail": "left for the next run: source file changed while it was being synchronized",
+            },
+        ],
         "summary": {
             "uploads": 1,
             "upload_bytes": 8192,
@@ -276,6 +296,13 @@ fn strict_schema_accepts_runtime_server_copy_and_guard_shapes() {
                 "kept_deletes_uploaded": 1,
                 "changed_during_run": 0,
                 "failed": false,
+                "outcome": "complete",
+                "deferred": [],
+                "mtime_not_kept": 0,
+                "skipped": 0,
+                "incomplete_listings": 0,
+                "incomplete_listing_folders": [],
+                "recovered": {"retries": 0, "reauthentications": 0, "reauthentication_failures": 0, "keepalive_failures": 0, "server_tasks_not_stopped": 0, "server_copy_fallbacks": 0},
                 "elapsed_ms": 42,
             },
         }),
@@ -348,6 +375,49 @@ fn strict_schema_accepts_runtime_server_copy_and_guard_shapes() {
                 "kept_deletes_uploaded": 0,
                 "changed_during_run": 2,
                 "failed": false,
+                "outcome": "complete",
+                "deferred": [],
+                "mtime_not_kept": 1,
+                "skipped": 0,
+                "incomplete_listings": 0,
+                "incomplete_listing_folders": [],
+                "recovered": {"retries": 0, "reauthentications": 0, "reauthentication_failures": 0, "keepalive_failures": 0, "server_tasks_not_stopped": 0, "server_copy_fallbacks": 0},
+                "elapsed_ms": 42,
+            },
+        }),
+        // A partial run names every path it left for the next run, and why.
+        json!({
+            "schema": "sdsync.output.v1",
+            "kind": "completion",
+            "result": {
+                "changed": true,
+                "uploaded": 41,
+                "server_copied": 0,
+                "upload_bytes": 8192,
+                "directories_created": 0,
+                "deleted": 0,
+                "deletes_skipped": 0,
+                "kept_deletes_uploaded": 0,
+                "changed_during_run": 0,
+                "failed": false,
+                "outcome": "partial",
+                "deferred": [
+                    {
+                        "path": "mail/outlook.pst",
+                        "reason": "source-changed",
+                        "detail": "source file changed while it was being synchronized",
+                    },
+                    {
+                        "path": "photos",
+                        "reason": "listing-incomplete",
+                        "detail": "the listing of its folder returned a different number of entries",
+                    },
+                ],
+                "mtime_not_kept": 0,
+                "skipped": 0,
+                "incomplete_listings": 0,
+                "incomplete_listing_folders": [],
+                "recovered": {"retries": 0, "reauthentications": 0, "reauthentication_failures": 0, "keepalive_failures": 0, "server_tasks_not_stopped": 0, "server_copy_fallbacks": 0},
                 "elapsed_ms": 42,
             },
         }),
@@ -367,12 +437,67 @@ fn strict_schema_accepts_runtime_server_copy_and_guard_shapes() {
                 "kept_deletes_uploaded": 0,
                 "changed_during_run": 0,
                 "failed": true,
+                "outcome": "failed",
+                "deferred": [],
+                "mtime_not_kept": 0,
+                "skipped": 0,
+                "incomplete_listings": 0,
+                "incomplete_listing_folders": [],
+                "recovered": {"retries": 0, "reauthentications": 0, "reauthentication_failures": 0, "keepalive_failures": 0, "server_tasks_not_stopped": 0, "server_copy_fallbacks": 0},
                 "elapsed_ms": 660_000,
             },
         }),
     ] {
         assert_valid(&schema, &record);
     }
+}
+
+/// A reader that validates the vocabulary must refuse a reason it does not know rather than
+/// render it, and the writer's whole vocabulary must be in the schema.
+#[test]
+fn strict_schema_pins_the_deferral_vocabulary() {
+    let schema: Value = serde_json::from_str(SCHEMA_TEXT).expect("schema must be valid JSON");
+    let reasons = schema["$defs"]["deferredPath"]["properties"]["reason"]["enum"]
+        .as_array()
+        .expect("deferral reasons are an enum")
+        .iter()
+        .map(|reason| reason.as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    for reason in [
+        synology_drive_sync::sync::DeferReason::SourceChanged,
+        synology_drive_sync::sync::DeferReason::SourceVanished,
+        synology_drive_sync::sync::DeferReason::SourceUnreadable,
+        synology_drive_sync::sync::DeferReason::UnsupportedLocalEntry,
+        synology_drive_sync::sync::DeferReason::RemoteDigestUnavailable,
+        synology_drive_sync::sync::DeferReason::RemoteUnreadable,
+        synology_drive_sync::sync::DeferReason::RemoteChanged,
+        synology_drive_sync::sync::DeferReason::UnrepresentableName,
+        synology_drive_sync::sync::DeferReason::ListingIncomplete,
+        synology_drive_sync::sync::DeferReason::ServerCopyFailed,
+        synology_drive_sync::sync::DeferReason::DeleteFailed,
+    ] {
+        assert!(reasons.contains(&reason.as_str().to_owned()), "{reason}");
+    }
+    assert_eq!(
+        reasons.len(),
+        synology_drive_sync::sync::DeferReason::ALL.len()
+    );
+
+    let mut unknown = json!({
+        "schema": "sdsync.output.v1",
+        "kind": "completion",
+        "result": {
+            "changed": false, "uploaded": 0, "server_copied": 0, "upload_bytes": 0,
+            "directories_created": 0, "deleted": 0, "deletes_skipped": 0,
+            "kept_deletes_uploaded": 0, "changed_during_run": 0, "failed": false,
+            "outcome": "partial", "deferred": [], "mtime_not_kept": 0, "skipped": 0, "incomplete_listings": 0, "incomplete_listing_folders": [], "recovered": {"retries": 0, "reauthentications": 0, "reauthentication_failures": 0, "keepalive_failures": 0, "server_tasks_not_stopped": 0, "server_copy_fallbacks": 0}, "elapsed_ms": 1,
+        },
+    });
+    unknown["result"]["deferred"] = json!([{"path": "a", "reason": "flaky", "detail": ""}]);
+    assert!(validate(&schema, &schema, &unknown, "$").is_err());
+    unknown["result"]["deferred"] = json!([]);
+    unknown["result"]["outcome"] = json!("mostly");
+    assert!(validate(&schema, &schema, &unknown, "$").is_err());
 }
 
 #[test]
@@ -417,6 +542,58 @@ fn strict_schema_requires_a_known_change_reason_on_creates_and_uploads() {
         .unwrap()
         .remove("reason");
     assert!(validate(&schema, &schema, &missing, "$").is_err());
+}
+
+/// The published reason vocabulary and the core's closed enum are one list, in either direction.
+#[test]
+fn schema_event_reasons_match_the_core_enum_exactly() {
+    use synology_drive_sync::observability::EventReason;
+    let schema: Value = serde_json::from_str(SCHEMA_TEXT).expect("schema must be valid JSON");
+    let published = schema["$defs"]["eventReason"]["enum"]
+        .as_array()
+        .expect("eventReason is an enum")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("reason tokens are strings")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let core = EventReason::ALL
+        .iter()
+        .map(|reason| reason.as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(published, core);
+}
+
+#[test]
+fn strict_schema_accepts_attributed_records_and_rejects_unsanitised_ones() {
+    let schema: Value = serde_json::from_str(SCHEMA_TEXT).expect("schema must be valid JSON");
+    let record = json!({
+        "schema": "sdsync.log.v1",
+        "timestamp_ms": 1,
+        "level": "warn",
+        "event": "entry.deferred",
+        "operation_id": 3,
+        "attempt": null,
+        "metrics": {
+            "operations": 0, "files": 0, "bytes": 0, "elapsed_ms": 0,
+            "throughput_bytes_per_second": 0, "eta_ms": null
+        },
+        "reason": "changed_during_run",
+        "profile": "photos",
+        "path": "albums/2026/a.jpg"
+    });
+    assert_valid(&schema, &record);
+
+    let mut invented = record.clone();
+    invented["reason"] = json!("bad luck");
+    assert!(validate(&schema, &schema, &invented, "$").is_err());
+
+    let mut raw_path = record.clone();
+    raw_path["path"] = json!("albums/été/a.jpg");
+    assert!(validate(&schema, &schema, &raw_path, "$").is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -983,6 +1160,59 @@ fn real_sync_json_documents_conform_to_the_shipped_schema() {
 /// The config surface emits its own record identifiers that this schema deliberately does not
 /// govern. Pinning that boundary means adding one of them to `oneOf` fails here until real
 /// output is fed through the validator too, instead of being silently assumed conformant.
+/// `--result-record` lines from a real sync and a real plan conform to the shipped schema, and a
+/// record that drops a counted field or invents a status is refused.
+#[test]
+fn real_result_records_conform_to_the_shipped_schema() {
+    let schema = parsed_schema();
+    let scenario = Scenario::additive("schema-result-record");
+    let record = scenario.fixture.child("result.ndjson");
+    let record_text = record.to_str().expect("UTF-8 record path").to_owned();
+
+    for (command, source) in [
+        ("plan", "plan --result-record"),
+        ("sync", "sync --result-record"),
+    ] {
+        scenario.run(
+            &[
+                "--quiet",
+                "--progress",
+                "never",
+                "--result-record",
+                &record_text,
+                command,
+            ],
+            &[],
+        );
+        let lines = json_records(
+            &fs::read_to_string(&record).expect("record written"),
+            source,
+        );
+        assert_eq!(lines.len(), 1, "{source}");
+        for line in &lines {
+            assert_real_output_valid(&schema, line, source);
+            assert_eq!(line["schema"], "sdsync.result-record.v1");
+        }
+        if command == "sync" {
+            assert_eq!(lines[0]["status"], "complete");
+            assert!(lines[0]["result"]["recovered"].is_object());
+
+            let mut stripped = lines[0].clone();
+            stripped["result"]
+                .as_object_mut()
+                .unwrap()
+                .remove("deferred");
+            assert!(validate(&schema, &schema, &stripped, "$").is_err());
+            let mut invented = lines[0].clone();
+            invented["status"] = json!("mostly");
+            assert!(validate(&schema, &schema, &invented, "$").is_err());
+        } else {
+            assert_eq!(lines[0]["status"], "planned");
+            assert_eq!(lines[0]["result"]["planned_only"], true);
+        }
+    }
+}
+
 #[test]
 fn config_records_stay_outside_the_governed_schema_until_output_is_validated() {
     let schema = parsed_schema();

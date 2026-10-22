@@ -119,7 +119,7 @@
 
           <div class="sdsync-page-stage">
             <transition name="sdsync-page-swap" mode="out-in" appear>
-              <div :key="route" class="sdsync-page-frame">
+              <div :key="route" class="sdsync-page-frame" :class="{ 'is-stale-data': retainedStale }">
           <section v-if="route === 'overview'" class="sdsync-page" aria-labelledby="sdsync-page-title">
             <div class="sdsync-overview-status" aria-label="Service status and actions">
               <div class="sdsync-service-status">
@@ -133,10 +133,11 @@
               </div>
             </div>
 
+            <ul v-if="attentionItems.length" class="sdsync-attention" role="status" aria-label="Run outcomes needing attention"><li v-for="item in attentionItems" :key="item.id" :class="'is-' + item.level"><strong>{{ item.title }}</strong> <span>{{ item.detail }}</span></li></ul>
             <div class="sdsync-metrics" aria-label="Package summary">
               <article><span>Profiles</span><strong>{{ profiles.length }}</strong><small>{{ readyProfileCount }} with protected password material</small></article>
               <article><span>Next routine</span><strong>{{ nextRun }}</strong><small>{{ enabledRoutines.length }} enabled routine{{ enabledRoutines.length === 1 ? '' : 's' }}</small></article>
-              <article><span>Last result</span><strong>{{ runStatus }}</strong><small>{{ lastRunDetail }}</small></article>
+              <article><span>Last result</span><strong :class="'is-' + lastResult.level">{{ lastResult.title }}</strong><small>{{ lastResult.detail }}</small></article>
               <article><span>Active scope</span><strong>{{ runStatus === 'running' ? runScope : 'Idle' }}</strong><small>{{ runStatus === 'running' ? runOperation : 'No active operation' }}</small></article>
               <article><span>Realtime</span><strong>{{ realtimeRoutines.length ? realtimeRoutines.length + ' active' : 'Off' }}</strong><small>{{ realtimeDetail }}</small></article>
             </div>
@@ -146,7 +147,7 @@
                 <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Destinations</p><h3>Profile readiness</h3></div><v-button type="styleless" display="icon-text" tooltip="Open profile configuration and protected credentials" @click="navigate('profiles')"><template #icon><action-icon name="navigate" /></template>Manage profiles</v-button></div>
                 <p v-if="!profiles.length" class="sdsync-empty">No configured profiles.</p>
                 <div v-for="profile in profiles" :key="profile.name" class="sdsync-compact-profile">
-                  <div><strong>{{ profile.name }}</strong><span>{{ profile.remote || profile.remote_path || 'Destination unavailable' }}</span></div>
+                  <div><strong>{{ profile.name }}</strong><span>{{ profile.remote || profile.remote_path || 'Destination unavailable' }}</span><small class="sdsync-profile-outcome" :class="'is-' + profileOutcome(profile.name).level">{{ profileOutcome(profile.name).text }}</small></div>
                   <span>{{ profile.has_password === true ? 'Credential stored' : 'Password required' }}</span>
                 </div>
               </article>
@@ -333,7 +334,7 @@
                   <div v-for="card in statusRollupCards" :key="card.id" :class="['sdsync-sync-stat', 'is-' + card.id]"><dt>{{ card.label }}</dt><dd>{{ card.value }}</dd><small>{{ card.detail }}</small></div>
                 </dl>
                 <p v-if="statusRollupTotalNote" class="sdsync-field-note">{{ statusRollupTotalNote }}</p>
-                <div v-if="statusRollupRows.length" class="sdsync-table-wrap"><table><thead><tr><th>Profile</th><th>In sync</th><th>Pending upload</th><th>Needs attention</th><th>Observed</th></tr></thead><tbody><tr v-for="row in statusRollupRows" :key="row.profile"><td>{{ row.profile }}</td><td>{{ row.inSync }}</td><td>{{ row.pending }}</td><td>{{ row.attention }}</td><td :title="row.observedExact">{{ row.observed }}</td></tr></tbody></table></div>
+                <div v-if="statusRollupRows.length" class="sdsync-table-wrap"><table><thead><tr><th>Profile</th><th>In sync</th><th>Pending upload</th><th>Needs attention</th><th>Observed</th></tr></thead><tbody><tr v-for="row in statusRollupRows" :key="row.profile"><td>{{ row.profile }}</td><td>{{ row.inSync }}<small v-if="row.trust" class="sdsync-profile-outcome is-failed">{{ row.trust }}</small></td><td>{{ row.pending }}</td><td>{{ row.attention }}</td><td :title="row.observedExact">{{ row.observed }}</td></tr></tbody></table></div>
                 <p v-if="statusRollupNeverObservedNote" class="sdsync-field-note">{{ statusRollupNeverObservedNote }}</p>
               </template>
             </article>
@@ -456,11 +457,13 @@
               </ol>
               <details v-if="diagnostic.output" class="sdsync-doctor-raw"><summary>{{ doctorReport.structured ? 'Structured terminal summary' : 'Raw terminal evidence' }}</summary><pre>{{ diagnostic.output }}</pre></details>
             </article>
-            <article class="sdsync-panel"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Cached per-profile evidence</p><h3>Target health</h3></div><span class="sdsync-freshness">{{ healthFreshness }}</span></div><div class="sdsync-table-wrap"><table><thead><tr><th>Profile</th><th>Last check</th><th>Reachable</th><th>Auth</th><th>Writable</th><th>Latency</th><th>Last success</th><th>Doctor</th><th>Free space</th></tr></thead><tbody><tr v-if="!healthRows.length"><td colspan="9">No cached target-health evidence.</td></tr><tr v-for="health in healthRows" :key="health.profile"><td>{{ health.profile || 'Unknown' }}</td><td>{{ formatDate(health.last_check_epoch || health.checked_at_epoch || health.checked_epoch) }}</td><td :class="healthClass(health.reachable)">{{ booleanEvidence(health.reachable) }}</td><td :class="healthClass(health.authenticated !== undefined ? health.authenticated : health.auth)">{{ booleanEvidence(health.authenticated !== undefined ? health.authenticated : health.auth) }}</td><td :class="healthClass(health.writable)">{{ booleanEvidence(health.writable) }}</td><td>{{ formatDuration(health.latency_ms) }}</td><td>{{ formatDate(health.last_success_epoch || health.last_successful_sync_epoch) }}</td><td>{{ health.doctor_status || health.last_doctor_status || health.state || 'Unavailable' }}</td><td>{{ health.free_space_proven === true ? formatBytes(health.free_space_bytes) : 'Unavailable' }}</td></tr></tbody></table></div></article>
+            <article class="sdsync-panel"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Cached per-profile evidence</p><h3>Target health</h3></div><span class="sdsync-freshness">{{ healthFreshness }}</span></div><div class="sdsync-table-wrap"><table><thead><tr><th>Profile</th><th>Last check</th><th>Reachable</th><th>Auth</th><th>Writable</th><th>Latency</th><th>Last success</th><th>Doctor</th><th>Last run</th><th>Free space</th></tr></thead><tbody><tr v-if="!healthRows.length"><td colspan="10">No cached target-health evidence.</td></tr><tr v-for="health in healthRows" :key="health.profile"><td>{{ health.profile || 'Unknown' }}</td><td>{{ formatDate(health.last_check_epoch || health.checked_at_epoch || health.checked_epoch) }}</td><td :class="healthClass(health.reachable)">{{ booleanEvidence(health.reachable) }}</td><td :class="healthClass(health.authenticated !== undefined ? health.authenticated : health.auth)">{{ booleanEvidence(health.authenticated !== undefined ? health.authenticated : health.auth) }}</td><td :class="healthClass(health.writable)">{{ booleanEvidence(health.writable) }}</td><td>{{ formatDuration(health.latency_ms) }}</td><td>{{ formatDate(health.last_success_epoch || health.last_successful_sync_epoch) }}</td><td>{{ health.doctor_status || health.last_doctor_status || health.state || 'Unavailable' }}</td><td :class="'is-' + profileOutcome(health.profile).level">{{ profileOutcome(health.profile).text }}</td><td>{{ health.free_space_proven === true ? formatBytes(health.free_space_bytes) : 'Unavailable' }}</td></tr></tbody></table></div></article>
           </section>
 
           <section v-else-if="route === 'activity'" class="sdsync-page" aria-labelledby="sdsync-page-title">
             <div class="sdsync-page-actions"><v-button suffix="grey" display="icon-text" tooltip="Pause or resume browser-side log refreshes" @click="toggleLogs"><template #icon><action-icon :name="logsPaused ? 'run' : 'pause'" /></template>{{ logsPaused ? 'Resume live updates' : 'Pause live updates' }}</v-button><v-button suffix="grey" display="icon-text" tooltip="Clear only this rendered view; package logs remain intact" @click="clearLogView"><template #icon><action-icon name="clear" /></template>Clear view</v-button></div>
+            <ul v-if="attentionItems.length" class="sdsync-attention" role="status" aria-label="Run outcomes needing attention"><li v-for="item in attentionItems" :key="item.id" :class="'is-' + item.level"><strong>{{ item.title }}</strong> <span>{{ item.detail }}</span></li></ul>
+            <p class="sdsync-field-note">{{ activityHistoryNote }}</p>
             <div class="sdsync-subtabs" data-subtabs="activity" role="tablist" aria-label="Activity views" @keydown="moveSubtab('activityTab', activityTabs, $event)">
               <button v-for="tab in activityTabs" :id="'sdsync-activity-tab-' + tab.id" :key="tab.id" type="button" :class="['sdsync-subtab', { 'is-active': activityTab === tab.id }]" :data-subtab="tab.id" role="tab" :aria-selected="activityTab === tab.id" :aria-controls="'sdsync-activity-panel-' + tab.id" :tabindex="activityTab === tab.id ? 0 : -1" @click="activityTab = tab.id">{{ tab.label }}</button>
             </div>
@@ -643,6 +646,20 @@ import {
   WIDGET_BACKOFF_RAMP_MS,
   WIDGET_IDLE_POLL_MS
 } from "./widgetModel.mjs";
+import {
+  OUTCOMES_MISSING_ITEM,
+  attentionItems as outcomeAttentionItems,
+  cacheHealthNote,
+  failureKey as outcomeFailureKey,
+  historyNote,
+  normalizeOutcomes,
+  outcomeLabel,
+  outcomeLevel,
+  profileOutcomeRow,
+  reasonCopy,
+  resultDisplay,
+  warningsSentence
+} from "./outcomes.mjs";
 import {
   ACTIONS,
   AUTOSAVE_API_LIMITS,
@@ -2776,6 +2793,24 @@ function doctorSourceFailureDetail(rawOutput) {
   );
 }
 
+// Entries the source check (`doctor source`, schema sdsync.source-doctor.v1,
+// `source.skipped[]` of {path, reason, detail}) says a sync will skip. Readable is not the same as
+// fully syncable, so these are a warning section and never "passed".
+function doctorSourceSkippedDetail(rawOutput) {
+  const lines = [];
+  let total = 0;
+  for (const candidate of parsedJsonCandidates(rawOutput)) {
+    const skipped = candidate && candidate.source && Array.isArray(candidate.source.skipped) ? candidate.source.skipped : [];
+    for (const entry of skipped) {
+      total += 1;
+      if (lines.length >= 5) continue;
+      const item = entry && typeof entry === "object" ? entry : { path: entry };
+      lines.push(doctorText([item.path, item.reason].filter(Boolean).join(" · "), "", 200));
+    }
+  }
+  return total ? `${total} ${total === 1 ? "entry" : "entries"} a sync will skip and not sync until fixed${lines.length ? `: ${lines.join("; ")}${total > lines.length ? "; ..." : ""}` : ""}.` : "";
+}
+
 function doctorReportFromResult(result, successful, requestedLevel, writeTest, startedEpoch = 0) {
   const level = normalizedDoctorLevel(requestedLevel);
   const outputEnvelope = doctorOutputEnvelope(result);
@@ -2810,6 +2845,21 @@ function doctorReportFromResult(result, successful, requestedLevel, writeTest, s
       label: "Package-local source diagnostic",
       state: "failed",
       detail: sourceFailureDetail,
+      step: null,
+      duration_ms: null,
+      timing_scope: "operation",
+      checks: [],
+      inventory: null,
+      profile: ""
+    });
+  }
+  const sourceSkippedDetail = doctorSourceSkippedDetail(rawOutput);
+  if (sourceSkippedDetail) {
+    sections.push({
+      id: "package_source_skipped",
+      label: "Entries a sync will skip",
+      state: "warn",
+      detail: sourceSkippedDetail,
       step: null,
       duration_ms: null,
       timing_scope: "operation",
@@ -3573,7 +3623,7 @@ export default {
       aboutUiDependencies: ABOUT_UI_DEPENDENCIES,
       diagnostic: { title: "Not run in this session", output: "No diagnostic output yet." }, doctorReport: idleDoctorReport(), doctorProgress: emptyDoctorProgress(),
       liveProgress: emptyLiveProgress(),
-      logsPaused: false, logSource: "all", logLines: 200, logState: "Waiting for logs", logOutput: "No log data yet.", logRecords: [], activityEvents: [], activitySearch: "",
+      logsPaused: false, logSource: "all", logLines: 200, logState: "Waiting for logs", logOutput: "No log data yet.", logRecords: [], activityEvents: [], activityHistory: null, activitySearch: "",
       // reversedActivity() filters on this debounced copy instead of
       // activitySearch directly, so a redaction-and-filter pass over
       // potentially thousands of events runs at most once per quiet 250ms
@@ -3589,7 +3639,7 @@ export default {
         { id: "package-logs", label: "Package logs" }
       ],
       activityTab: "events",
-      lastFailureKey: "", toasts: [], toastSequence: 0,
+      lastFailureKey: "", lastOutcomeFailureKey: "", toasts: [], toastSequence: 0,
       confirmation: { visible: false, title: "", message: "", button: "Confirm", resolve: null },
       confirmationPriorFocus: null, confirmationKeyHandler: null,
       pathBrowserPriorFocus: null, pathBrowserKeyHandler: null,
@@ -3849,6 +3899,7 @@ export default {
           inSync: `${entry.state.inSync.files}${more} · ${formatBytes(entry.state.inSync.bytes)}${more}`,
           pending: `${entry.state.wouldTransfer.files}${more} · ${formatBytes(entry.state.wouldTransfer.bytes)}${more}`,
           attention: `${entry.state.attention}${more}`,
+          trust: this.rollupTrustNote(entry.profile),
           observed: describeEvidenceAge(entry.observedAtEpoch),
           observedExact: entry.observedAtEpoch ? formatDate(entry.observedAtEpoch) : "Never observed"
         };
@@ -3857,9 +3908,11 @@ export default {
     // The oldest contributing observation, never the newest: the newest would
     // describe the freshest part of the answer while implying it of all of it.
     statusRollupFreshness() {
-      if (!this.statusRollup.loaded) return "Not read yet";
-      if (!this.statusRollup.observedAtEpoch) return "Never observed";
-      return `Oldest evidence ${describeEvidenceAge(this.statusRollup.observedAtEpoch)}`;
+      const degraded = cacheHealthNote(this.outcomes);
+      const suffix = degraded ? ` · ${degraded}` : "";
+      if (!this.statusRollup.loaded) return "Not read yet" + suffix;
+      if (!this.statusRollup.observedAtEpoch) return "Never observed" + suffix;
+      return `Oldest evidence ${describeEvidenceAge(this.statusRollup.observedAtEpoch)}${suffix}`;
     },
     statusRollupTotalNote() {
       const rollup = this.statusRollup;
@@ -3974,6 +4027,30 @@ export default {
         ? this.doctorReport.sections.find((item) => item.id === "disposable_write_verify_cleanup" && ["warn", "failed"].includes(doctorState(item.state, "warn")))
         : null;
       return section ? `${section.profile ? `Profile ${section.profile}: ` : ""}${section.detail} Inspect the named target before running another write probe.` : "";
+    },
+    // The package's own verdict on runs, or null for a package that reports
+    // none. Null is never read as success: attentionItems says so.
+    outcomes() { return normalizeOutcomes(this.snapshot && this.snapshot.outcomes); },
+    // True once a poll has failed while an earlier snapshot is still on screen.
+    // Every value derived from it is then history, not evidence.
+    retainedStale() { return Boolean(this.snapshot) && !this.connected; },
+    attentionItems() {
+      if (!this.snapshot) return [];
+      const items = this.outcomes ? outcomeAttentionItems(this.outcomes, Date.now() / 1000) : [OUTCOMES_MISSING_ITEM];
+      return this.retainedStale
+        ? [{ id: "stale-poll", level: "unknown", title: "Showing a stale reading", detail: `${this.freshness} Rows below are history, not current status.` }].concat(items)
+        : items;
+    },
+    activityHistoryNote() { return historyNote(this.activityHistory, formatDate); },
+    lastResult() {
+      const outcomes = this.outcomes;
+      if (!outcomes) return { level: "unknown", title: this.runStatus, detail: `${this.lastRunDetail} · run outcomes not reported` };
+      const run = outcomes.run;
+      const why = reasonCopy(run.reason).text;
+      const shownRun = resultDisplay(run);
+      const level = shownRun.level;
+      const warn = run.warnings.length ? warningsSentence(run) : "";
+      return { level: this.retainedStale && level === "ok" ? "unknown" : level, title: shownRun.label + (this.retainedStale ? " (stale)" : ""), detail: [this.lastRunDetail, why, warn, run.countsAvailable === false ? "entry counts unavailable for this run" : ""].filter(Boolean).join(" · ") };
     },
     run() { return this.snapshot && this.snapshot.run && typeof this.snapshot.run === "object" ? this.snapshot.run : ((this.snapshot && this.snapshot.last_run) || {}); },
     runStatus() { return boundedText(pick(this.run, "status", "state", "result"), "Unavailable"); },
@@ -6198,8 +6275,9 @@ export default {
         let sourceValidation;
         try {
           sourceValidation = await apiGet(this.auth, "source-path", { path: payload.source }, AUTOSAVE_API_LIMITS);
-        } catch (_sourceError) {
-          throw new Error("Local source validation failed. Confirm the folder exists, is a canonical non-symlink DSM volume path, is not DSM-managed, and the package identity can read and traverse it.");
+        } catch (sourceError) {
+          const named = sourceError && sourceError.code ? ` (${this.describeBridgeError(sourceError, "source").title})` : "";
+          throw new Error("Local source validation failed" + named + ". Confirm the folder exists, is a canonical non-symlink DSM volume path, is not DSM-managed, and the package identity can read and traverse it.");
         }
         if (sourceValidation.schema !== "sdsync.dsm-source-path.v1" || sourceValidation.path !== payload.source || sourceValidation.valid !== true) throw new Error("The package could not validate the exact local source path.");
         if (this.disposed) return;
@@ -6970,6 +7048,7 @@ export default {
         }
         if (activity.status === "fulfilled") {
           this.activityEvents = arrayOf(activity.value.events);
+          this.activityHistory = activity.value.history === undefined ? null : activity.value.history;
           this.activityReceivedAtMs = Date.now();
         }
         this.logState = logsFeedState(
@@ -7161,7 +7240,34 @@ export default {
     preferenceAuditWasRejected(error) {
       return Boolean(error && error.preAcceptance === true && error.trustedRejection === true);
     },
-    maybeNotifyFailure() { if (this.runStatus !== "failed") return; const key = [this.run.profile || this.run.scope || "unknown", this.run.finished_epoch || this.run.started_epoch || "unknown", this.run.exit_code || "unknown"].join(":"); if (!this.lastFailureKey) { this.lastFailureKey = key; return; } if (key === this.lastFailureKey) return; this.lastFailureKey = key; if (this.settings.desktop_notifications && window.Notification && Notification.permission === "granted") new Notification("Synology Drive Sync failed", { body: "A newly observed package run failed. Open DSM for details.", icon: "/webman/3rdparty/synology-drive-sync/images/icon_64.png", tag: "sdsync-run-failure" }); if (this.settings.audible) this.playCue(); },
+    // What the last run of one profile left behind, as the row text and level.
+    // A retained (stale) reading never reports ok.
+    profileOutcome(name) {
+      if (!this.snapshot) return { level: "unknown", text: "" };
+      if (!this.outcomes) return { level: "unknown", text: "Last run: outcome not reported by this package" };
+      const entry = this.outcomes.profiles.find((item) => item.profile === String(name));
+      if (!entry) return { level: "unknown", text: "Last run: not reported" };
+      const row = profileOutcomeRow(entry, Date.now() / 1000);
+      const stale = this.retainedStale;
+      return { level: stale && row.level !== "fail" ? "unknown" : row.level, text: ["Last run: " + row.label, row.detail, row.age, stale ? "stale reading" : ""].filter(Boolean).join(" · ") };
+    },
+    // The tree comparison is not a run verdict; say so beside it whenever the
+    // last run did not finish cleanly.
+    rollupTrustNote(name) {
+      const entry = this.outcomes && this.outcomes.profiles.find((item) => item.profile === String(name));
+      return entry ? profileOutcomeRow(entry, Date.now() / 1000).note : "";
+    },
+    maybeNotifyFailure() { this.announceOutcomeFailure(); if (this.outcomes && this.outcomes.run.outcome === "partial") return; if (this.runStatus !== "failed") return; const key = [this.run.profile || this.run.scope || "unknown", this.run.finished_epoch || this.run.started_epoch || "unknown", this.run.exit_code || "unknown"].join(":"); if (!this.lastFailureKey) { this.lastFailureKey = key; return; } if (key === this.lastFailureKey) return; this.lastFailureKey = key; if (this.settings.desktop_notifications && window.Notification && Notification.permission === "granted") new Notification("Synology Drive Sync failed", { body: "A newly observed package run failed. Open DSM for details.", icon: "/webman/3rdparty/synology-drive-sync/images/icon_64.png", tag: "sdsync-run-failure" }); if (this.settings.audible) this.playCue(); },
+    // Derived from snapshot state, so a failure that happened while no window
+    // was open is still announced once per failure per window. Nothing a read
+    // returns is persisted in the browser, so a new window announces again.
+    announceOutcomeFailure() {
+      const key = outcomeFailureKey(this.outcomes);
+      if (!key || key === this.lastOutcomeFailureKey) return;
+      this.lastOutcomeFailureKey = key;
+      const item = this.attentionItems.find((candidate) => candidate.level === "fail");
+      this.toast(item ? item.title : "A sync failed", item ? item.detail : "Open Activity for details.", true);
+    },
     playCue() { try { const AudioContext = window.AudioContext || window.webkitAudioContext; if (!AudioContext) return; const context = new AudioContext(); const oscillator = context.createOscillator(); const gain = context.createGain(); oscillator.frequency.value = 440; gain.gain.setValueAtTime(0.0001, context.currentTime); gain.gain.exponentialRampToValueAtTime(0.08, context.currentTime + 0.02); gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.18); oscillator.connect(gain); gain.connect(context.destination); oscillator.start(); oscillator.stop(context.currentTime + 0.2); oscillator.addEventListener("ended", () => context.close(), { once: true }); } catch (_error) { /* Best-effort local signal only. */ } },
     confirmationElement(reference) {
       const target = this.$refs[reference];

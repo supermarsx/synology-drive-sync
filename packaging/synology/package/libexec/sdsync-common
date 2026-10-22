@@ -426,6 +426,22 @@ require_verified_controller_parent() {
         && [ "$controller_links" = 1 ] || return 73
 }
 
+# The controller PID for a caller that only signals a running controller.
+# An absent file is the ordinary "not running"; a file that exists but cannot
+# be read or holds no PID used to read exactly the same, so a saved schedule or
+# a queued job simply never reached the controller with nothing said. That case
+# still prints nothing (the caller proceeds as not running) but is logged.
+read_controller_pid_reporting() {
+    if [ ! -e "$controller_pid_file" ] && [ ! -L "$controller_pid_file" ]; then
+        return 0
+    fi
+    if ! read_pid "$controller_pid_file" 2>/dev/null; then
+        append_controller_log_event warn state_unreadable "file=controller.pid" >/dev/null 2>&1 \
+            || printf 'warning: controller PID file exists but is unreadable\n' >&2
+    fi
+    return 0
+}
+
 read_pid() {
     pid_path=$1
     if [ -L "$pid_path" ] || [ ! -f "$pid_path" ]; then
@@ -1922,8 +1938,16 @@ load_security_policy_runtime() {
     [ "$security_runtime_count" -eq 29 ] || return 73
 }
 
+# One retry when the clock answers with something that is not a number. A
+# caller compares the value with `[ -ge ]`, and an empty or garbled epoch made
+# the shell print an arithmetic error onto the controller's stderr -- a raw,
+# unlevelled line in controller.log -- and compute a deadline from nothing.
 epoch_now() {
-    date +%s
+    epoch_now_value=$(date +%s) || epoch_now_value=
+    case $epoch_now_value in
+        ''|*[!0-9]*) epoch_now_value=$(date +%s) || return 1 ;;
+    esac
+    printf '%s\n' "$epoch_now_value"
 }
 
 # Interval and realtime routines are deliberately independent of the NAS
@@ -2058,15 +2082,127 @@ write_controller_state() {
     mv -f "$controller_temp" "$controller_state" || { rm -f "$controller_temp"; return 69; }
 }
 
+# run.state is one global slot, so a single-profile run or a routine plan used
+# to overwrite the record of a failed aggregate sync. The aggregate_* fields are
+# that record's own copy: written by a scope=all run, carried forward unchanged
+# by every other writer. One builtin read loop, the same contract as the
+# controller's loaders: first occurrence wins, absent means the default.
+load_run_state_aggregate() {
+    run_aggregate_state=never
+    run_aggregate_finished=0
+    run_aggregate_exit=-1
+    run_aggregate_reason=none
+    [ -f "$run_state" ] && [ ! -L "$run_state" ] && [ -r "$run_state" ] || return 0
+    run_aggregate_seen=,
+    run_aggregate_lines=0
+    while IFS= read -r run_aggregate_line || [ -n "$run_aggregate_line" ]; do
+        run_aggregate_lines=$((run_aggregate_lines + 1))
+        [ "$run_aggregate_lines" -le 64 ] || break
+        run_aggregate_key=${run_aggregate_line%%=*}
+        [ "$run_aggregate_key" != "$run_aggregate_line" ] || continue
+        run_aggregate_value=${run_aggregate_line#*=}
+        [ -n "$run_aggregate_value" ] || continue
+        case $run_aggregate_seen in *",$run_aggregate_key,"*) continue ;; esac
+        case $run_aggregate_key in
+            aggregate_state) run_aggregate_state=$run_aggregate_value ;;
+            aggregate_finished_epoch) run_aggregate_finished=$run_aggregate_value ;;
+            aggregate_exit_code) run_aggregate_exit=$run_aggregate_value ;;
+            aggregate_reason) run_aggregate_reason=$run_aggregate_value ;;
+            *) continue ;;
+        esac
+        run_aggregate_seen=$run_aggregate_seen$run_aggregate_key,
+    done < "$run_state"
+    # A carried value is re-validated rather than trusted: this writer must
+    # never publish a field a fail-closed reader would reject.
+    case $run_aggregate_state in never|running|succeeded|failed) ;; *) run_aggregate_state=never ;; esac
+    case $run_aggregate_finished in ''|*[!0-9]*) run_aggregate_finished=0 ;; esac
+    case $run_aggregate_exit in -1) ;; ''|*[!0-9]*) run_aggregate_exit=-1 ;; esac
+    case $run_aggregate_reason in ''|*[!a-z0-9_]*) run_aggregate_reason=none ;; esac
+}
+
+# A reason is a token, never prose: lower-case letters, digits and underscore.
+# A detail is one printable ASCII line of at most 160 bytes with no '|', which
+# is what both the state readers and the activity validator accept; anything
+# else is published as empty rather than refused, because losing the cause is
+# better than losing the record that carries the state.
+run_state_token() {
+    case ${1:-} in ''|*[!a-z0-9_]*) printf 'none' ;; *) printf '%s' "$1" ;; esac
+}
+
+# Optional members a caller sets before write_run_state, each written only when
+# known, so an older reader and a run that never reached the core see nothing
+# new. Values are re-validated here because a fail-closed reader would reject
+# the whole document over one bad field:
+#   run_state_outcome   succeeded|partial|failed|busy|cancelled
+#   run_state_deferred / run_state_skipped   counts from the core's result
+#   run_state_counts    `unavailable` when the core ran but its counts could
+#                       not be read (no result record was written, or it did
+#                       not parse)
+#   run_state_degraded  comma-separated record sinks that failed for this run
+#                       (activity,alert,profile_state,scheduler_log,run_stderr)
+#   run_state_degraded_reason  token
+run_state_outcome=
+run_state_deferred=
+run_state_skipped=
+run_state_counts=
+run_state_degraded=
+run_state_degraded_reason=
+run_state_listings=
+run_state_folders=
+run_state_mtime=
+run_state_reauth=
+run_state_tasks=
+run_state_keepalive=
+write_run_state_extras() {
+    case ${run_state_outcome:-} in
+        succeeded|partial|failed|busy|cancelled) printf 'outcome=%s\n' "$run_state_outcome" || return 1 ;;
+    esac
+    case ${run_state_deferred:-} in ''|*[!0-9]*) ;; *) printf 'deferred=%s\n' "$run_state_deferred" || return 1 ;; esac
+    case ${run_state_skipped:-} in ''|*[!0-9]*) ;; *) printf 'skipped=%s\n' "$run_state_skipped" || return 1 ;; esac
+    case ${run_state_counts:-} in unavailable) printf 'counts=unavailable\n' || return 1 ;; esac
+    case ${run_state_degraded:-} in
+        ''|*[!a-z_,]*) ;;
+        *) printf 'degraded=%s\n' "$run_state_degraded" || return 1 ;;
+    esac
+    case ${run_state_degraded_reason:-} in
+        ''|*[!a-z0-9_]*) ;;
+        *) printf 'degraded_reason=%s\n' "$run_state_degraded_reason" || return 1 ;;
+    esac
+    # Result facts (contract v1.5), summed over an aggregate's jobs.
+    case ${run_state_listings:-} in ''|*[!0-9]*) ;; *) printf 'incomplete_listings=%s\n' "$run_state_listings" || return 1 ;; esac
+    case ${run_state_folders:-} in
+        ''|*[![:print:]]*) ;;
+        *) printf 'incomplete_listing_folders=%s\n' "$run_state_folders" || return 1 ;;
+    esac
+    case ${run_state_mtime:-} in ''|*[!0-9]*) ;; *) printf 'mtime_not_kept=%s\n' "$run_state_mtime" || return 1 ;; esac
+    case ${run_state_reauth:-} in ''|*[!0-9]*) ;; *) printf 'recovered_reauthentication_failures=%s\n' "$run_state_reauth" || return 1 ;; esac
+    case ${run_state_tasks:-} in ''|*[!0-9]*) ;; *) printf 'recovered_server_tasks_not_stopped=%s\n' "$run_state_tasks" || return 1 ;; esac
+    case ${run_state_keepalive:-} in ''|*[!0-9]*) ;; *) printf 'recovered_keepalive_failures=%s\n' "$run_state_keepalive" || return 1 ;; esac
+    return 0
+}
+
 write_run_state() {
     run_status=$1
     run_started=${2:-0}
     run_finished=${3:-0}
     run_exit=${4:--1}
-    run_scope=${5:-none}
+    run_record_scope=${5:-none}
     run_operation=${6:-none}
+    run_reason=${7:-none}
+    run_detail=${8:-}
     run_temp=$run_state.tmp.$$
     umask 077
+    case $run_reason in ''|*[!a-z0-9_]*) run_reason=none ;; esac
+    case $run_detail in *[![:print:]]*|*'|'*) run_detail= ;; esac
+    [ "${#run_detail}" -le 160 ] || run_detail=
+    if [ "$run_record_scope" = all ]; then
+        run_aggregate_state=$run_status
+        run_aggregate_finished=$run_finished
+        run_aggregate_exit=$run_exit
+        run_aggregate_reason=$run_reason
+    else
+        load_run_state_aggregate
+    fi
     # Both call sites are bare, so errexit already aborts sdsync-run before the
     # rename. Check anyway: the atomic-publish invariant then holds for this
     # writer whatever a future caller does with it, and the truncated temp file
@@ -2076,8 +2212,12 @@ write_run_state() {
         printf 'started_epoch=%s\n' "$run_started" &&
         printf 'finished_epoch=%s\n' "$run_finished" &&
         printf 'exit_code=%s\n' "$run_exit" &&
-        printf 'scope=%s\n' "$run_scope" &&
-        printf 'operation=%s\n' "$run_operation"
+        printf 'scope=%s\n' "$run_record_scope" &&
+        printf 'operation=%s\n' "$run_operation" &&
+        printf 'reason=%s\ndetail=%s\n' "$run_reason" "$run_detail" &&
+        printf 'aggregate_state=%s\naggregate_finished_epoch=%s\n' "$run_aggregate_state" "$run_aggregate_finished" &&
+        printf 'aggregate_exit_code=%s\naggregate_reason=%s\n' "$run_aggregate_exit" "$run_aggregate_reason" &&
+        write_run_state_extras
     } > "$run_temp" || { rm -f "$run_temp"; return 69; }
     finish_private_file "$run_temp" || { rm -f "$run_temp"; return 69; }
     mv -f "$run_temp" "$run_state" || { rm -f "$run_temp"; return 69; }
@@ -2196,7 +2336,8 @@ append_activity() {
     activity_actor_uid=${8:-}
     activity_actor=${9:-}
     case $activity_code in
-        run.started|run.succeeded|run.failed|routine.deferred|routine.retry_scheduled|\
+        run.started|run.succeeded|run.failed|run.deferred|routine.deferred|routine.retry_scheduled|\
+        routine.retries_exhausted|routine.watch_abandoned|\
         doctor.succeeded|doctor.failed|doctor.inventory|configuration.changed|notification.unavailable|\
         audit.requested|audit.succeeded|audit.failed|audit.outcome_unknown|\
         module.requested|module.succeeded|module.failed|module.outcome_unknown|\
@@ -2236,7 +2377,12 @@ append_activity() {
     if printf '%s' "$activity_message" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
         return 64
     fi
-    if [ "$activity_mandatory" != true ]; then
+    # An error-level record is written whatever its category's threshold, `off`
+    # included. Silencing a noisy category is a reasonable reaction to routine
+    # chatter, and it used to make that category's failures vanish with it;
+    # the bridge shows error records whatever the threshold, so the writer
+    # keeps them too.
+    if [ "$activity_mandatory" != true ] && [ "$activity_level" != error ]; then
         activity_configured_level=$(security_category_level "$activity_category") || return $?
         [ "$activity_configured_level" != off ] || return 0
         case $activity_configured_level in trace) activity_threshold=0 ;; debug) activity_threshold=1 ;; info) activity_threshold=2 ;; warn) activity_threshold=3 ;; error) activity_threshold=4 ;; esac
@@ -3251,7 +3397,19 @@ dsm_log_event() {
     set_dsm_system_log_rank "$dsm_event_level" || return 0
     [ "$dsm_system_log_rank_value" -ge "$dsm_system_log_min_rank" ] || return 0
     dsm_system_log_gate "$dsm_event_bucket" "$dsm_event_now" || return 0
-    dsm_system_log_emit "$dsm_event_level" "$dsm_event_key" || return 0
+    # Disabled-by-policy and gated returns above are decisions. A delivery
+    # that was attempted and failed is not, and it used to be just as silent
+    # while the policy page said Enabled. It is reached at most once per
+    # bucket per cooldown, so this line is rate-limited by the gate itself.
+    dsm_event_emit_status=0
+    dsm_system_log_emit "$dsm_event_level" "$dsm_event_key" || dsm_event_emit_status=$?
+    if [ "$dsm_event_emit_status" -ne 0 ]; then
+        append_controller_log_event warn dsm_log_emit_failed \
+            "event=$dsm_event_key status=$dsm_event_emit_status" >/dev/null 2>&1 \
+            || printf 'warning: DSM system log delivery failed for %s (status %s)\n' \
+                "$dsm_event_key" "$dsm_event_emit_status" >&2
+    fi
+    return 0
 }
 
 profile_exists() {

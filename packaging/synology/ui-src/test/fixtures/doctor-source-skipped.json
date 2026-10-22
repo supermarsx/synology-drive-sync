@@ -1,0 +1,25 @@
+{
+  "schema": "sdsync.source-doctor.v1",
+  "source": {
+    "bytes": 3,
+    "canonical_source": "\\?\\C:\\sync-source",
+    "content_hashed": false,
+    "directories": 0,
+    "elapsed_ms": 6,
+    "entries": 1,
+    "files": 1,
+    "hashed_files": 0,
+    "skipped": [
+      {
+        "detail": "symbolic links, junctions, mount points and data-less reparse points (app execution aliases, sockets) are not followed",
+        "path": "junc",
+        "reason": "link-or-reparse-point"
+      },
+      {
+        "detail": "Windows SYSTEM and TEMPORARY entries are not synchronized by Synology Drive",
+        "path": "sysfile.txt",
+        "reason": "windows-attributes"
+      }
+    ]
+  }
+}

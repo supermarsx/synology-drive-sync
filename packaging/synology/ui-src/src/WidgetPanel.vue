@@ -15,7 +15,7 @@
       <span>{{ run.label }}</span>
     </p>
     <ul v-if="!compact && rows.length" class="sdsync-widget-profiles" aria-label="Per-profile sync outcome">
-      <li v-for="row in rows" :key="row.name" class="sdsync-widget-profile" :class="'is-' + row.level" :title="row.name + ' — ' + row.outcome + ', ' + row.detail">
+      <li v-for="row in rows" :key="row.name" class="sdsync-widget-profile" :class="['is-' + row.level, { 'is-stale': row.stale }]" :title="row.name + ' — ' + row.outcome + ', ' + row.detail">
         <span class="sdsync-widget-profile-name">{{ row.name }}</span>
         <span class="sdsync-widget-profile-outcome">{{ row.outcome }}</span>
         <span class="sdsync-widget-profile-age">{{ row.age }}</span>
@@ -36,10 +36,9 @@ import {
   WIDGET_CLOCK_TICK_MS,
   appWindowPreferences,
   widgetBridgeIssue,
-  widgetOverview,
   widgetPollDelay,
-  widgetProfileRows,
-  widgetRun
+  widgetRun,
+  widgetView
 } from "./widgetModel.mjs";
 
 // Two consecutive failures before the card admits it is degraded. One failed
@@ -68,7 +67,10 @@ export default {
     };
   },
   computed: {
-    overview() { return widgetOverview(this.snapshot, this.nowMs); },
+    // Failed polls make every retained row history; both derivations dim it.
+    stale() { return Boolean(this.snapshot) && this.failures > 0; },
+    view() { return widgetView(this.snapshot, this.nowMs, { stale: this.stale }); },
+    overview() { return this.view.overview; },
     // What the card actually leads with. A bridge failure takes the headline as
     // soon as there is nothing better to show, and once it is clearly not a
     // blip; in between, a single failed read leaves the last good status up
@@ -79,7 +81,7 @@ export default {
         ? this.bridgeIssue
         : this.overview;
     },
-    rows() { return widgetProfileRows(this.snapshot, this.nowMs); },
+    rows() { return this.view.rows; },
     run() { return widgetRun(this.snapshot); },
     degraded() { return this.failures >= DEGRADED_AFTER_FAILURES; },
     themeClass() {

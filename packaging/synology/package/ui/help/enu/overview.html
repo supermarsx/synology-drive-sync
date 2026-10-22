@@ -26,13 +26,30 @@
   <dl>
     <dt>Profiles</dt><dd>Configured destinations and whether protected password material is present.</dd>
     <dt>Next routine</dt><dd>The earliest controller-reported execution time among enabled routines.</dd>
-    <dt>Last result</dt><dd>The latest observed terminal operation state and completion time.</dd>
+    <dt>Last result</dt><dd>The package's verdict on the latest run (Succeeded, Partial, Failed, Cancelled, Busy, Stale or Not run), its completion time, and the cause when one is known. A value this window does not recognise is shown as <em>unknown (value)</em>, never hidden.</dd>
     <dt>Active scope</dt><dd>The profile or all-profile scope currently using the host-local operation lock.</dd>
     <dt>Realtime</dt><dd>Enabled realtime routines, and whether any of them are watching natively, using the polling floor, or not currently observing changes at all.</dd>
   </dl>
 
+  <h2>Run outcomes and attention</h2>
+  <p>Nothing that goes wrong is left silent. A list above the indicators names every run failure, partial run, stale run, alert problem and degraded package record, each with its cause and the next step. For example, <em>Scheduled runs can't start: package paths mismatch</em> means the profile's log file is not the package-managed path; repair the package or reset that setting. The list is empty only when the package reports nothing wrong.</p>
+  <dl>
+    <dt>Partial</dt><dd>The run finished (exit code 3) but deferred or skipped some files, for example because they changed during the run. The count and cause are named, and they are left for the next run. A partial run is a warning, never success, and only means transient deferrals. A run that changed the destination and then failed is a failure, not partial.</dd>
+    <dt>Stale</dt><dd>A run was recorded as running but its runner is gone (killed, out of memory, power loss). Its real result is unknown and counts as a failure.</dd>
+    <dt>Succeeded with warnings</dt><dd>The run exited cleanly but left entries out that will not sync until fixed: skipped entries (names the destination cannot hold, links, case collisions) or lasting deferrals. The count is shown, the entries are listed as <code>entry.skipped</code> and <code>entry.deferred</code> records in the sync log with path and reason, and the run is never shown as plain success.</dd>
+    <dt>Result warnings</dt><dd>A run can carry extra facts, each shown as a warning with its count: folders whose listing came back incomplete (deletions there were held back; up to five are named, and the destination root is named as such), uploads whose modification time the NAS did not keep (they upload again on the next run; run Doctor's write probe), re-login failures, server-side tasks that could not be stopped on the target, and keep-alive failures the run recovered from.</dd>
+    <dt>Busy and Cancelled</dt><dd>Busy means another run, Doctor or management action held the run lock and the run is retried. Cancelled means it was stopped. Neither is shown as success.</dd>
+    <dt>Failed N times in a row</dt><dd>The consecutive failed sync count the failure alert uses. <em>Failure alerts unavailable</em> means the alert state file is unreadable, so failure notifications are disabled until the package is repaired.</dd>
+    <dt>Some records of this run could not be written</dt><dd>The run's own result is trustworthy, but an echo of it (the Activity line, the alert counter or the DSM log) was not written. The affected records are named.</dd>
+    <dt>Routine deferred</dt><dd>A routine did not start because of a dependency, a source condition or a deletion bound, or its last execution exited with an error. Waiting for a daily window or for the run lock is expected and is not listed.</dd>
+    <dt>Stored status figures are degraded</dt><dd>The stored sync totals could not be read; the cause is shown beside <em>Oldest evidence</em> in the Sync summary.</dd>
+    <dt>Last run failed, N failures in a row</dt><dd>Stays on screen, from the package's own records, until a successful run clears it. An all-profiles failure also stays listed after a later single-profile run overwrites the latest result.</dd>
+    <dt>Package record-keeping is degraded</dt><dd>Some of the package's own state files could not be read; the results shown may be incomplete.</dd>
+  </dl>
+  <p>Each profile on this page also shows its own last run: outcome, cause, how long ago, and how many failures in a row. A profile without a routine is never reported as healthy only because Doctor passed. When a failure is present as this window loads, it is announced once, even if it happened while no window was open, and the list stays until the cause is gone. A package that reports no outcomes at all is shown as <em>Run outcomes unavailable</em>, not as healthy.</p>
+
   <h2>Package bridge status</h2>
-  <p><strong>Authenticated package bridge</strong> means the same-origin DSM session passed package authentication and the AppWindow holds a current CSRF token. <strong>Package status - read-only</strong> means status is visible but mutation capabilities are not granted. Package-generated GET failures use HTTP transport 200 so Webman preserves the body; the banner still treats <code>ok=false</code> as failure and reports the original semantic status, code, and stage. A raw empty or HTML 4xx/5xx response instead points to Webman, proxy, route, or CGI-launch handling. The last successful snapshot remains visible as stale evidence; use <strong>Retry</strong> after completing the banner's recovery instruction.</p>
+  <p><strong>Authenticated package bridge</strong> means the same-origin DSM session passed package authentication and the AppWindow holds a current CSRF token. <strong>Package status - read-only</strong> means status is visible but mutation capabilities are not granted. Package-generated GET failures use HTTP transport 200 so Webman preserves the body; the banner still treats <code>ok=false</code> as failure and reports the original semantic status, code, and stage. A raw empty or HTML 4xx/5xx response instead points to Webman, proxy, route, or CGI-launch handling. The last successful snapshot remains visible as stale evidence, dimmed, with its age shown, and none of its rows is shown as succeeded or healthy while the package is not answering; use <strong>Retry</strong> after completing the banner's recovery instruction.</p>
 
   <h2>Safety defaults</h2>
   <ul>

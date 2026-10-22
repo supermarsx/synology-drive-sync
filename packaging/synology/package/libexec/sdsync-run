@@ -28,10 +28,395 @@ else
     case $maximum_total in ''|*[!0-9]*) usage ;; esac
     decimal_at_most "$maximum_total" "$dsm_delete_limit" || usage
 fi
+run_label=$run_scope
+if [ "$run_mode" = sync ]; then run_activity_category=sync; else run_activity_category=operations; fi
 
 ensure_layout
+
+# ---------------------------------------------------------------------------
+# Outcome recording
+#
+# Every exit from here on reaches runner_exit, and every non-zero exit leaves a
+# record a dashboard reader can see: run.state with a named reason, the
+# per-profile state, the failure counter and an Activity line. These exits used
+# to happen before run.state was ever written, so a scheduled run that died in
+# preflight -- the physical-path mismatch, a missing password, a policy block --
+# left the Overview showing the previous run's success indefinitely, and the
+# only trace was an unlevelled stderr line in controller.log.
+#
+# Each exit site names its cause in run_failure_reason (a token) and
+# run_failure_detail (one short line) before it exits; the trap does the
+# writing, once. 75 is not a failure: the run was refused because something
+# else holds the package, so it is recorded as a deferral and never touches
+# run.state, which at that moment describes the run that does hold it.
+run_record_enabled=true
+run_outcome_recorded=false
+run_failure_reason=runner_error
+run_failure_detail="the package runner stopped before the core started"
+run_failure_profiles=
+run_lock_held=false
+run_started_epoch=
+run_audit_pending=false
+run_commit_started=false
+runner_lifecycle_lock_held=false
+core_stdout_capture=
+core_stderr_capture=
+core_result_record=
+
+# A scheduled run's stderr is the controller's, which lands in controller.log,
+# a JSON-lines document. Its messages therefore go in as levelled scheduler
+# events instead of bare text lines; a manual run keeps stderr, which is what
+# the dashboard's job result shows. A message that cannot be logged at all is
+# still printed rather than lost.
+runner_say() {
+    if [ "$run_output" = scheduled ]; then
+        runner_say_status=0
+        append_controller_log_event warn runner_message "scope=$run_label $1" scheduler \
+            || runner_say_status=$?
+        [ "$runner_say_status" -eq 0 ] || printf '%s\n' "$1" >&2
+    else
+        printf '%s\n' "$1" >&2
+    fi
+    return 0
+}
+
+runner_fail() {
+    run_failure_reason=$1
+    run_failure_detail=$2
+    runner_say "$run_failure_detail"
+}
+
+# Reduce one line to what run.state and the activity validator both accept.
+runner_sanitize_detail() {
+    printf '%s' "${1:-}" | LC_ALL=C awk '
+        NR == 1 { line = $0 }
+        END {
+            gsub(/[^ -~]/, "?", line)
+            gsub(/\|/, "/", line)
+            printf "%s", substr(line, 1, 160)
+        }
+    '
+}
+
+# A record sink that failed for this run. The run's own result is still
+# trustworthy, but some of its echoes were not written; run.state says which
+# (degraded=<sinks>, degraded_reason=<first sink>_write_failed) so a reader can
+# warn instead of trusting an empty Activity tab or a reset counter.
+runner_degrade() {
+    case ,${run_state_degraded:-}, in *",$1,"*) return 0 ;; esac
+    run_state_degraded=${run_state_degraded:+$run_state_degraded,}$1
+    [ -n "${run_state_degraded_reason:-}" ] || run_state_degraded_reason=${1}_write_failed
+}
+
+# An Activity or controller-log write that fails is itself reported, on stderr
+# (controller.log for a scheduled run, the job result for a manual one), never
+# discarded. The run's outcome does not depend on it.
+runner_activity() {
+    runner_activity_status=0
+    append_activity "$@" || runner_activity_status=$?
+    if [ "$runner_activity_status" -ne 0 ]; then
+        runner_degrade activity
+        runner_say "warning: activity record $1 could not be written (status $runner_activity_status)"
+    fi
+    return 0
+}
+
+runner_controller_event() {
+    runner_event_status=0
+    append_controller_log_event "$@" || runner_event_status=$?
+    if [ "$runner_event_status" -ne 0 ]; then
+        runner_say "warning: controller log event $2 could not be written (status $runner_event_status)"
+    fi
+    return 0
+}
+
+# handle_alert_result owns the failure counter, the DSM system-log record and
+# the desktop notification. It returns non-zero for an unreadable policy or
+# state, and that used to be discarded: a corrupt alerts.state silently turned
+# off every failure notification. Report it where an administrator looks.
+runner_alert() {
+    runner_alert_status=0
+    handle_alert_result "$@" || runner_alert_status=$?
+    if [ "$runner_alert_status" -ne 0 ]; then
+        runner_degrade alert
+        runner_say "warning: failure alert could not be processed (status $runner_alert_status)"
+        runner_activity notification.unavailable "$1" unavailable \
+            "Failure alert could not be processed; check the alert policy and state (status $runner_alert_status)" \
+            notifications warn
+        runner_controller_event error alert_unavailable "scope=$1 status=$runner_alert_status"
+    fi
+    return 0
+}
+
+# The per-profile completion record. state keeps its meaning -- the last known
+# completion, read by the routine dependency gate -- and outcome says what this
+# particular run did for this profile. A profile the run never reached keeps
+# its previous completion: an aggregate stopped by another profile's failure is
+# not evidence that this one failed, and is no longer recorded as if it were.
+read_profile_completion_state() {
+    profile_previous_state=never
+    profile_previous_finished=0
+    profile_previous_exit=-1
+    profile_previous_action=none
+    profile_previous_failures=0
+    profile_previous_success=0
+    [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ] || return 0
+    profile_previous_seen=,
+    profile_previous_lines=0
+    while IFS= read -r profile_previous_line || [ -n "$profile_previous_line" ]; do
+        profile_previous_lines=$((profile_previous_lines + 1))
+        [ "$profile_previous_lines" -le 64 ] || break
+        profile_previous_key=${profile_previous_line%%=*}
+        [ "$profile_previous_key" != "$profile_previous_line" ] || continue
+        profile_previous_value=${profile_previous_line#*=}
+        [ -n "$profile_previous_value" ] || continue
+        case $profile_previous_seen in *",$profile_previous_key,"*) continue ;; esac
+        case $profile_previous_key in
+            state) profile_previous_state=$profile_previous_value ;;
+            finished_epoch) profile_previous_finished=$profile_previous_value ;;
+            exit_code) profile_previous_exit=$profile_previous_value ;;
+            action) profile_previous_action=$profile_previous_value ;;
+            consecutive_failures) profile_previous_failures=$profile_previous_value ;;
+            last_success_epoch) profile_previous_success=$profile_previous_value ;;
+            *) continue ;;
+        esac
+        profile_previous_seen=$profile_previous_seen$profile_previous_key,
+    done < "$1"
+    case $profile_previous_state in never|succeeded|failed) ;; *) profile_previous_state=never ;; esac
+    case $profile_previous_finished in ''|*[!0-9]*) profile_previous_finished=0 ;; esac
+    case $profile_previous_exit in -1) ;; ''|*[!0-9]*) profile_previous_exit=-1 ;; esac
+    case $profile_previous_action in sync|plan|none) ;; *) profile_previous_action=none ;; esac
+    case $profile_previous_failures in ''|*[!0-9]*) profile_previous_failures=0 ;; esac
+    [ "$profile_previous_failures" -le 999999 ] || profile_previous_failures=999999
+    case $profile_previous_success in ''|*[!0-9]*) profile_previous_success=0 ;; esac
+}
+
+# Counts are written whenever the core finished and they could be read. A
+# finished run whose counts could not be read says so (counts=unavailable)
+# rather than leaving the warnings they drive silently impossible; a profile
+# the core never ran has no counts to report.
+profile_counts_lines() {
+    case $profile_outcome_deferred in ''|*[!0-9]*) profile_counts_known=false ;; *) profile_counts_known=true ;; esac
+    case $profile_outcome_skipped in ''|*[!0-9]*) profile_counts_known=false ;; esac
+    if [ "$profile_counts_known" = true ]; then
+        printf 'deferred=%s\nskipped=%s\n' "$profile_outcome_deferred" "$profile_outcome_skipped" || return 1
+    elif [ "${run_core_ran:-false}" = true ]; then
+        case $profile_outcome in
+            succeeded|partial|failed) printf 'counts=unavailable\n' || return 1 ;;
+        esac
+    fi
+    write_result_facts "${profile_fact_listings:-}" "${profile_fact_folders:-}" "${profile_fact_mtime:-}" \
+        "${profile_fact_reauth:-}" "${profile_fact_tasks:-}" "${profile_fact_keepalive:-}"
+}
+
+# The core result's lasting facts (contract v1.5), each written only when the
+# result carried it: listings DSM returned short and the first five such
+# folders, destinations whose mtime DSM did not keep, and the recovery
+# counters that mean something went wrong underneath a successful run.
+write_result_facts() {
+    case ${1:-} in ''|*[!0-9]*) ;; *) printf 'incomplete_listings=%s\n' "$1" || return 1 ;; esac
+    case ${2:-} in
+        ''|*[![:print:]]*) ;;
+        *) printf 'incomplete_listing_folders=%s\n' "$2" || return 1 ;;
+    esac
+    case ${3:-} in ''|*[!0-9]*) ;; *) printf 'mtime_not_kept=%s\n' "$3" || return 1 ;; esac
+    case ${4:-} in ''|*[!0-9]*) ;; *) printf 'recovered_reauthentication_failures=%s\n' "$4" || return 1 ;; esac
+    case ${5:-} in ''|*[!0-9]*) ;; *) printf 'recovered_server_tasks_not_stopped=%s\n' "$5" || return 1 ;; esac
+    case ${6:-} in ''|*[!0-9]*) ;; *) printf 'recovered_keepalive_failures=%s\n' "$6" || return 1 ;; esac
+    return 0
+}
+
+# write_profile_outcome NAME OUTCOME EXIT REASON FINISHED [DEFERRED SKIPPED]
+#
+# OUTCOME is succeeded|partial|failed|not_run|unknown. partial is a run that
+# finished with paths deferred to the next run (core exit 3): the profile did
+# sync, so state is succeeded and a dependent routine may run after it.
+write_profile_outcome() {
+    profile_outcome_name=$1
+    profile_outcome=$2
+    profile_outcome_exit=$3
+    profile_outcome_reason=$4
+    profile_outcome_finished=$5
+    profile_outcome_deferred=${6:-}
+    profile_outcome_skipped=${7:-}
+    case $profile_outcome_name in ''|*[!A-Za-z0-9_-]*) return 64 ;; esac
+    # A profile removed while the run was in flight is skipped, so removal
+    # stays silent and creation stays uncounted.
+    [ -f "$profiles_dir/$profile_outcome_name.toml" ] || return 0
+    case $profile_outcome_reason in ''|*[!a-z0-9_]*) profile_outcome_reason=none ;; esac
+    profile_outcome_path=$profile_state_dir/$profile_outcome_name.state
+    read_profile_completion_state "$profile_outcome_path"
+    profile_record_failures=$profile_previous_failures
+    profile_record_success=$profile_previous_success
+    case $profile_outcome in
+        succeeded|partial|failed)
+            profile_record_state=$profile_outcome
+            [ "$profile_outcome" != partial ] || profile_record_state=succeeded
+            profile_record_finished=$profile_outcome_finished
+            profile_record_exit=$profile_outcome_exit
+            profile_record_action=$run_mode
+            if [ "$profile_record_state" = succeeded ]; then
+                profile_record_failures=0
+                profile_record_success=$profile_outcome_finished
+            else
+                profile_record_failures=$((profile_previous_failures + 1))
+            fi
+            ;;
+        not_run|unknown)
+            profile_record_state=$profile_previous_state
+            profile_record_finished=$profile_previous_finished
+            profile_record_exit=$profile_previous_exit
+            profile_record_action=$profile_previous_action
+            # Unknown is an aggregate whose per-profile result could not be
+            # read. The dependency gate must not treat that as a success, so
+            # it is stamped failed, exactly as every profile was before.
+            if [ "$profile_outcome" = unknown ] && [ "$profile_outcome_exit" != 0 ]; then
+                profile_record_state=failed
+                profile_record_finished=$profile_outcome_finished
+                profile_record_exit=$profile_outcome_exit
+                profile_record_action=$run_mode
+                profile_record_failures=$((profile_previous_failures + 1))
+            fi
+            ;;
+        *) return 64 ;;
+    esac
+    if [ "$run_scope" = all ]; then profile_record_scope=all; else profile_record_scope=profile; fi
+    profile_state_temp=$profile_state_dir/.${profile_outcome_name}.state.$$
+    {
+        printf 'state=%s\nfinished_epoch=%s\nexit_code=%s\naction=%s\n' \
+            "$profile_record_state" "$profile_record_finished" "$profile_record_exit" "$profile_record_action" &&
+        printf 'outcome=%s\nreason=%s\nscope=%s\noutcome_epoch=%s\n' \
+            "$profile_outcome" "$profile_outcome_reason" "$profile_record_scope" "$profile_outcome_finished" &&
+        printf 'consecutive_failures=%s\nlast_success_epoch=%s\n' \
+            "$profile_record_failures" "$profile_record_success" &&
+        profile_counts_lines
+    } > "$profile_state_temp" || { rm -f "$profile_state_temp"; return 69; }
+    finish_private_file "$profile_state_temp" || { rm -f "$profile_state_temp"; return 69; }
+    mv -f "$profile_state_temp" "$profile_outcome_path" || { rm -f "$profile_state_temp"; return 69; }
+}
+
+runner_profile_outcome() {
+    runner_profile_status=0
+    write_profile_outcome "$@" || runner_profile_status=$?
+    if [ "$runner_profile_status" -ne 0 ]; then
+        runner_degrade profile_state
+        runner_say "warning: profile state for '$1' could not be written (status $runner_profile_status)"
+        runner_controller_event error profile_state_write_failed "profile=$1 status=$runner_profile_status"
+    fi
+    return 0
+}
+
+# run.state may be written for a failure only while no other run owns the
+# slot: before the run lock is ours, a live lock means run.state describes a
+# different run that is still in flight, and overwriting it would hide that.
+runner_may_write_run_state() {
+    [ "$run_lock_held" = false ] || return 0
+    runner_lock_status=0
+    private_process_lock_is_live "$run_lock" || runner_lock_status=$?
+    [ "$runner_lock_status" -eq 1 ]
+}
+
+record_runner_exit() {
+    record_status=$1
+    [ "$run_record_enabled" = true ] || return 0
+    [ "$run_outcome_recorded" = false ] || return 0
+    run_outcome_recorded=true
+    [ "$record_status" -ne 0 ] || return 0
+    record_detail=$(runner_sanitize_detail "$run_failure_detail")
+    case $record_status in
+        75)
+            runner_activity run.deferred "$run_label" deferred \
+                "Package action deferred: ${record_detail:-the package is busy}" "$run_activity_category" info
+            return 0
+            ;;
+        130|143)
+            # Stopped before the core was started: there was no run to record,
+            # and a cancellation is not a failure.
+            runner_activity run.failed "$run_label" failed \
+                "Package action cancelled before it started" "$run_activity_category" info
+            return 0
+            ;;
+    esac
+    record_finished=$(epoch_now) || record_finished=0
+    case $record_finished in ''|*[!0-9]*) record_finished=0 ;; esac
+    record_started=${run_started_epoch:-$record_finished}
+    if [ -z "$run_failure_profiles" ] && [ "$run_scope" != all ]; then
+        run_failure_profiles=$run_scope
+    fi
+    for record_profile in $run_failure_profiles; do
+        runner_profile_outcome "$record_profile" failed "$record_status" "$run_failure_reason" "$record_finished"
+    done
+    runner_activity run.failed "$run_label" failed \
+        "Package action failed before the core ran: ${record_detail:-$run_failure_reason}" \
+        "$run_activity_category" error
+    if [ "$run_mode" = sync ]; then
+        runner_alert "$run_label" failed "$record_status"
+    fi
+    # run.state is written last, so it can say which of the records above
+    # could not be written (degraded=), and so a reader that waits for it sees
+    # every other record already in place.
+    if runner_may_write_run_state; then
+        record_state_status=0
+        run_state_outcome=failed
+        write_run_state failed "$record_started" "$record_finished" "$record_status" \
+            "$run_label" "$run_mode" "$run_failure_reason" "$record_detail" || record_state_status=$?
+        if [ "$record_state_status" -ne 0 ]; then
+            runner_say "warning: run state could not be written (status $record_state_status)"
+            runner_controller_event error run_state_write_failed "scope=$run_label status=$record_state_status"
+        fi
+    else
+        runner_controller_event warn run_state_preserved \
+            "scope=$run_label reason=$run_failure_reason detail=another run holds the run state"
+    fi
+    if [ "$run_output" = scheduled ]; then
+        runner_controller_event error run_preflight_failed \
+            "scope=$run_label exit=$record_status reason=$run_failure_reason" scheduler
+    fi
+}
+
+release_runner_lifecycle_lock() {
+    [ "$runner_lifecycle_lock_held" = true ] || return 0
+    release_private_process_lock "$lifecycle_lock" || return 73
+    runner_lifecycle_lock_held=false
+}
+release_runner_run_lock() {
+    [ "$run_lock_held" = true ] || return 0
+    release_private_process_lock "$run_lock" || return 73
+    run_lock_held=false
+}
+audit_run_cleanup() {
+    if [ "$run_audit_pending" = true ]; then
+        run_audit_pending=false
+        run_cleanup_state=failed
+        [ "$run_commit_started" != true ] || run_cleanup_state=outcome_unknown
+        audit_cleanup_status=0
+        audit_outbox_complete "$SDSYNC_DSM_AUDIT_TRANSACTION" "$run_cleanup_state" >/dev/null 2>&1 \
+            || audit_cleanup_status=$?
+        if [ "$audit_cleanup_status" -ne 0 ]; then
+            runner_say "warning: terminal audit is pending durable reconciliation (status $audit_cleanup_status)"
+        fi
+    fi
+}
+runner_exit() {
+    runner_exit_status=$1
+    trap - 0
+    trap '' TERM INT HUP
+    # errexit stays on for nothing in here: each step reports its own failure
+    # and the next still runs, so a full disk cannot skip the lock release.
+    set +e
+    record_runner_exit "$runner_exit_status"
+    release_runner_lifecycle_lock || runner_say "warning: package lifecycle admission lock could not be released"
+    release_runner_run_lock || runner_say "warning: package run lock could not be released"
+    audit_run_cleanup
+    [ -z "$core_stdout_capture" ] || rm -f "$core_stdout_capture"
+    [ -z "$core_stderr_capture" ] || rm -f "$core_stderr_capture"
+    [ -z "$core_result_record" ] || rm -f "$core_result_record"
+    exit "$runner_exit_status"
+}
+trap 'runner_exit $?' 0
+
 reconcile_audit_outbox || {
-    echo "pending mandatory audit records could not be reconciled" >&2
+    runner_fail audit_unavailable "pending mandatory audit records could not be reconciled"
     exit 73
 }
 unset SDSYNC_DSM_AUDIT_WRAPPED SDSYNC_DSM_AUDIT_TRANSACTION \
@@ -46,6 +431,11 @@ if [ "$run_output" = scheduled ]; then
     scheduled_parent_status=0
     require_verified_controller_parent || scheduled_parent_status=$?
     if [ "$scheduled_parent_status" -ne 0 ]; then
+        # Not a run of this package: a caller other than the verified
+        # controller asked for scheduled mode. The refusal is recorded in the
+        # mandatory audit log below, and it must not overwrite the state of the
+        # package's real runs.
+        run_record_enabled=false
         ensure_audit_transaction || exit 73
         audit_outbox_begin "$run_audit_operation" "$run_scope" "$SDSYNC_DSM_AUDIT_ACTOR" \
             "$SDSYNC_DSM_AUDIT_ACTOR_UID" "$SDSYNC_DSM_AUDIT_ORIGIN" \
@@ -58,41 +448,23 @@ if [ "$run_output" = scheduled ]; then
     SDSYNC_DSM_AUDIT_ORIGIN=scheduler
     export SDSYNC_DSM_AUDIT_ACTOR SDSYNC_DSM_AUDIT_ORIGIN
 fi
-run_audit_pending=false
-run_commit_started=false
-runner_lifecycle_lock_held=false
-release_runner_lifecycle_lock() {
-    [ "$runner_lifecycle_lock_held" = true ] || return 0
-    release_private_process_lock "$lifecycle_lock" 2>/dev/null || return 73
-    runner_lifecycle_lock_held=false
-}
-audit_run_cleanup() {
-    release_runner_lifecycle_lock >/dev/null 2>&1 || true
-    if [ "$run_audit_pending" = true ]; then
-        run_audit_pending=false
-        run_cleanup_state=failed
-        [ "$run_commit_started" != true ] || run_cleanup_state=outcome_unknown
-        audit_outbox_complete "$SDSYNC_DSM_AUDIT_TRANSACTION" "$run_cleanup_state" >/dev/null 2>&1 || true
-    fi
-}
-trap audit_run_cleanup 0
 ensure_audit_transaction || {
-    echo "mandatory audit transaction could not be created" >&2
+    runner_fail audit_unavailable "mandatory audit transaction could not be created"
     exit 73
 }
 audit_outbox_begin "$run_audit_operation" "$run_scope" "$SDSYNC_DSM_AUDIT_ACTOR" \
     "$SDSYNC_DSM_AUDIT_ACTOR_UID" "$SDSYNC_DSM_AUDIT_ORIGIN" \
     "$SDSYNC_DSM_AUDIT_TRANSACTION" || {
-    echo "mandatory audit outbox could not be prepared" >&2
+    runner_fail audit_unavailable "mandatory audit outbox could not be prepared"
     exit 73
 }
 run_audit_pending=true
 if [ ! -x "$binary" ] || [ -L "$binary" ]; then
-    echo "installed sync binary is missing, symlinked, or not executable: $binary" >&2
+    runner_fail binary_missing "installed sync binary is missing, symlinked, or not executable: $binary"
     exit 69
 fi
 if [ -L "$config_file" ] || [ ! -f "$config_file" ] || [ ! -r "$config_file" ]; then
-    echo "no readable package configuration; run sdsync-dsm configure-profile first" >&2
+    runner_fail config_missing "no readable package configuration; run sdsync-dsm configure-profile first"
     exit 66
 fi
 
@@ -100,11 +472,11 @@ fi
 # The policy is loaded again after the serialized run-lock publication so a
 # concurrent configuration change cannot make this precheck authoritative.
 load_security_policy_runtime || {
-    echo "security policy is not a private complete document" >&2
+    runner_fail policy_unreadable "security policy is not a private complete document"
     exit 73
 }
 if [ "$run_output" = foreground ] && [ "$security_runtime_allow_operational_actions" != true ]; then
-    echo "security policy blocks interactive doctor, plan, and run actions" >&2
+    runner_fail policy_operational "security policy blocks interactive doctor, plan, and run actions"
     exit 77
 fi
 
@@ -131,21 +503,19 @@ runner_lifecycle_status=0
 acquire_private_process_lock "$lifecycle_lock" || runner_lifecycle_status=$?
 case $runner_lifecycle_status in
     0) runner_lifecycle_lock_held=true ;;
-    75) echo "package lifecycle is changing; retry the plan/sync later" >&2; exit 75 ;;
-    *) echo "cannot validate package lifecycle admission" >&2; exit 73 ;;
+    75) runner_fail busy "package lifecycle is changing; retry the plan/sync later"; exit 75 ;;
+    *) runner_fail admission_failed "cannot validate package lifecycle admission"; exit 73 ;;
 esac
 runner_admission_status=0
 admission_state_status || runner_admission_status=$?
 case $runner_admission_status in
     0) ;;
     75)
-        release_runner_lifecycle_lock >/dev/null 2>&1 || true
-        echo "package service is stopped or transitioning; run admission is closed" >&2
+        runner_fail busy "package service is stopped or transitioning; run admission is closed"
         exit 75
         ;;
     *)
-        release_runner_lifecycle_lock >/dev/null 2>&1 || true
-        echo "cannot validate package service admission" >&2
+        runner_fail admission_failed "cannot validate package service admission"
         exit 73
         ;;
 esac
@@ -153,65 +523,56 @@ management_status=0
 management_lock_status || management_status=$?
 case $management_status in
     0)
-        release_runner_lifecycle_lock >/dev/null 2>&1 || true
-        echo "package configuration is being changed; retry the plan/sync later" >&2
+        runner_fail busy "package configuration is being changed; retry the plan/sync later"
         exit 75
         ;;
     1) ;;
     *)
-        release_runner_lifecycle_lock >/dev/null 2>&1 || true
-        echo "cannot validate the private package-management lock" >&2
+        runner_fail admission_failed "cannot validate the private package-management lock"
         exit 73
         ;;
 esac
 
-acquire_run_lock() {
-    acquire_private_process_lock "$run_lock"
-}
-
-acquire_run_lock
+run_lock_status=0
+acquire_private_process_lock "$run_lock" || run_lock_status=$?
+case $run_lock_status in
+    0) run_lock_held=true ;;
+    75) runner_fail busy "another plan or sync holds the package run lock"; exit 75 ;;
+    *) runner_fail admission_failed "cannot acquire the package run lock (status $run_lock_status)"; exit 73 ;;
+esac
 runner_admission_status=0
 admission_state_status || runner_admission_status=$?
 if [ "$runner_admission_status" -ne 0 ]; then
-    release_private_process_lock "$run_lock" 2>/dev/null || true
-    release_runner_lifecycle_lock >/dev/null 2>&1 || true
     if [ "$runner_admission_status" -eq 75 ]; then
-        echo "package service closed while admitting the run; retry later" >&2
+        runner_fail busy "package service closed while admitting the run; retry later"
         exit 75
     fi
-    echo "cannot revalidate package service admission" >&2
+    runner_fail admission_failed "cannot revalidate package service admission"
     exit 73
 fi
 management_status=0
 management_lock_status || management_status=$?
 case $management_status in
     0)
-        release_private_process_lock "$run_lock" 2>/dev/null || true
-        release_runner_lifecycle_lock >/dev/null 2>&1 || true
-        echo "package configuration began changing; retry the plan/sync later" >&2
+        runner_fail busy "package configuration began changing; retry the plan/sync later"
         exit 75
         ;;
     1) ;;
     *)
-        release_private_process_lock "$run_lock" 2>/dev/null || true
-        release_runner_lifecycle_lock >/dev/null 2>&1 || true
-        echo "cannot validate the private package-management lock" >&2
+        runner_fail admission_failed "cannot validate the private package-management lock"
         exit 73
         ;;
 esac
 release_runner_lifecycle_lock || {
-    release_private_process_lock "$run_lock" 2>/dev/null || true
-    echo "cannot release package lifecycle admission lock" >&2
+    runner_fail admission_failed "cannot release package lifecycle admission lock"
     exit 73
 }
 load_security_policy_runtime || {
-    release_private_process_lock "$run_lock" 2>/dev/null || true
-    echo "security policy is not a private complete document" >&2
+    runner_fail policy_unreadable "security policy is not a private complete document"
     exit 73
 }
 if [ "$run_output" = foreground ] && [ "$security_runtime_allow_operational_actions" != true ]; then
-    release_private_process_lock "$run_lock" 2>/dev/null || true
-    echo "security policy blocks interactive doctor, plan, and run actions" >&2
+    runner_fail policy_operational "security policy blocks interactive doctor, plan, and run actions"
     exit 77
 fi
 
@@ -219,11 +580,7 @@ core_pid=
 termination_requested=false
 wait_interrupted=false
 started=$(epoch_now)
-run_label=$run_scope
-cleanup_run() {
-    release_private_process_lock "$run_lock" 2>/dev/null || true
-    audit_run_cleanup
-}
+run_started_epoch=$started
 forward_term() {
     termination_requested=true
     wait_interrupted=true
@@ -232,20 +589,27 @@ forward_term() {
     fi
 }
 trap forward_term TERM INT HUP
-trap cleanup_run 0
 
+# Sets preflight_reason and preflight_message as well as returning the status,
+# so an aggregate can record why each profile it skips was skipped.
 preflight_profile_runtime() {
     runtime_fragment=$1
-    [ -f "$runtime_fragment" ] && [ ! -L "$runtime_fragment" ] && [ -r "$runtime_fragment" ] || {
-        echo "profile configuration is not a readable regular file: $runtime_fragment" >&2
-        return 66
-    }
     runtime_profile=${runtime_fragment##*/}
     runtime_profile=${runtime_profile%.toml}
+    preflight_reason=none
+    preflight_message=
+    [ -f "$runtime_fragment" ] && [ ! -L "$runtime_fragment" ] && [ -r "$runtime_fragment" ] || {
+        preflight_reason=profile_unreadable
+        preflight_message="profile configuration is not a readable regular file: $runtime_fragment"
+        runner_say "$preflight_message"
+        return 66
+    }
     for runtime_required_key in source url delete allow-empty-source danger-accept-invalid-certs; do
         runtime_required_count=$(grep -c "^${runtime_required_key} = " "$runtime_fragment" 2>/dev/null || true)
         [ "$runtime_required_count" = 1 ] || {
-            echo "profile '$runtime_profile' is missing a unique $runtime_required_key policy field" >&2
+            preflight_reason=profile_invalid
+            preflight_message="profile '$runtime_profile' is missing a unique $runtime_required_key policy field"
+            runner_say "$preflight_message"
             return 73
         }
     done
@@ -255,56 +619,95 @@ preflight_profile_runtime() {
     runtime_invalid_tls=$(sed -n 's/^danger-accept-invalid-certs = \(true\|false\)$/\1/p' "$runtime_fragment")
     runtime_remote_log_count=$(grep -c '^remote-log-url = "' "$runtime_fragment" 2>/dev/null || true)
     [ "$runtime_remote_log_count" -le 1 ] || {
-        echo "profile '$runtime_profile' has duplicate remote logging configuration" >&2
+        preflight_reason=profile_invalid
+        preflight_message="profile '$runtime_profile' has duplicate remote logging configuration"
+        runner_say "$preflight_message"
         return 73
     }
-    case $runtime_url in http://*) runtime_uses_http=true ;; https://*) runtime_uses_http=false ;; *) return 73 ;; esac
+    case $runtime_url in
+        http://*) runtime_uses_http=true ;;
+        https://*) runtime_uses_http=false ;;
+        *)
+            preflight_reason=profile_invalid
+            preflight_message="profile '$runtime_profile' has no http(s) url"
+            runner_say "$preflight_message"
+            return 73
+            ;;
+    esac
     case $runtime_delete:$runtime_allow_empty:$runtime_invalid_tls in
         true:true:true|true:true:false|true:false:true|true:false:false|false:true:true|false:true:false|false:false:true|false:false:false) ;;
-        *) return 73 ;;
+        *)
+            preflight_reason=profile_invalid
+            preflight_message="profile '$runtime_profile' has an invalid delete, allow-empty-source or TLS boolean"
+            runner_say "$preflight_message"
+            return 73
+            ;;
     esac
     if [ "$security_runtime_allow_destructive_sync" != true ] && { [ "$runtime_delete" = true ] || [ "$allow_delete" = true ]; }; then
-        echo "security policy blocks destructive sync for profile '$runtime_profile'" >&2
+        preflight_reason=policy_destructive
+        preflight_message="security policy blocks destructive sync for profile '$runtime_profile'"
+        runner_say "$preflight_message"
         return 77
     fi
     if [ "$security_runtime_allow_http_targets" != true ] && [ "$runtime_uses_http" = true ]; then
-        echo "security policy blocks HTTP targets for profile '$runtime_profile'" >&2
+        preflight_reason=policy_http
+        preflight_message="security policy blocks HTTP targets for profile '$runtime_profile'"
+        runner_say "$preflight_message"
         return 77
     fi
     if [ "$security_runtime_allow_invalid_tls" != true ] && [ "$runtime_invalid_tls" = true ]; then
-        echo "security policy blocks invalid TLS certificates for profile '$runtime_profile'" >&2
+        preflight_reason=policy_invalid_tls
+        preflight_message="security policy blocks invalid TLS certificates for profile '$runtime_profile'"
+        runner_say "$preflight_message"
         return 77
     fi
     if [ "$security_runtime_allow_remote_logging" != true ] && [ "$runtime_remote_log_count" -ne 0 ]; then
-        echo "security policy blocks remote logging for profile '$runtime_profile'" >&2
+        preflight_reason=policy_remote_logging
+        preflight_message="security policy blocks remote logging for profile '$runtime_profile'"
+        runner_say "$preflight_message"
         return 77
     fi
     if [ "$security_runtime_allow_empty_source" != true ] && [ "$runtime_allow_empty" = true ]; then
-        echo "security policy blocks empty-source synchronization for profile '$runtime_profile'" >&2
+        preflight_reason=policy_empty_source
+        preflight_message="security policy blocks empty-source synchronization for profile '$runtime_profile'"
+        runner_say "$preflight_message"
         return 77
     fi
     profile_secret_exists "$runtime_profile" || {
-        echo "profile '$runtime_profile' has no protected password; use sdsync-dsm set-password" >&2
+        preflight_reason=password_missing
+        preflight_message="profile '$runtime_profile' has no protected password; use sdsync-dsm set-password"
+        runner_say "$preflight_message"
         return 66
     }
     for runtime_secret in "$secret_root/$runtime_profile.totp" "$secret_root/$runtime_profile.remote-log-token"; do
         if [ -e "$runtime_secret" ] || [ -L "$runtime_secret" ]; then
             private_secret_file "$runtime_secret" || {
-                echo "optional secret material is not a package-owned 0600 regular file: $runtime_secret" >&2
+                preflight_reason=secret_unsafe
+                preflight_message="optional secret material is not a package-owned 0600 regular file: $runtime_secret"
+                runner_say "$preflight_message"
                 return 66
             }
         fi
     done
     runtime_log_count=$(grep -c '^log-file = "' "$runtime_fragment" 2>/dev/null || true)
-    [ "$runtime_log_count" = 1 ] || { echo "profile '$runtime_profile' has an invalid log-file" >&2; return 66; }
+    [ "$runtime_log_count" = 1 ] || {
+        preflight_reason=log_file_unsafe
+        preflight_message="profile '$runtime_profile' has an invalid log-file"
+        runner_say "$preflight_message"
+        return 66
+    }
     runtime_log_file=$(sed -n 's/^log-file = "\(.*\)"$/\1/p' "$runtime_fragment")
     [ "$runtime_log_file" = "$log_root/sync.log" ] || {
-        echo "profile '$runtime_profile' log-file is outside the fixed package-managed path" >&2
+        preflight_reason=log_path_mismatch
+        preflight_message="profile '$runtime_profile' log-file is outside the fixed package-managed path"
+        runner_say "$preflight_message"
         return 66
     }
     if [ -e "$runtime_log_file" ] || [ -L "$runtime_log_file" ]; then
         private_secret_file "$runtime_log_file" || {
-            echo "profile '$runtime_profile' log-file is not a package-owned 0600 regular file" >&2
+            preflight_reason=log_file_unsafe
+            preflight_message="profile '$runtime_profile' log-file is not a package-owned 0600 regular file"
+            runner_say "$preflight_message"
             return 66
         }
     fi
@@ -329,29 +732,108 @@ preflight_profile_runtime() {
 # here is named by `valid_name` on write -- letters, digits, underscore and
 # hyphen only, never whitespace. Same idiom the fingerprint and prune loops
 # already use.
+#
+# An aggregate no longer stops at the first profile that fails preflight. One
+# profile with a missing password or a policy block used to abort the whole
+# `all` run, so every other profile silently stopped syncing until somebody
+# fixed the one. Each failing profile is now recorded as failed with its own
+# reason, and the others run through the core's `--profiles` selection, which
+# shares the same aggregate deletion budget as `--all-profiles` -- a subset can
+# only delete less, so this is never less safe than the full run. The run as a
+# whole still ends failed and still alerts, so a skipped profile is never
+# mistaken for a clean aggregate.
 covered_profiles=
+skipped_profiles=
+skipped_first_status=0
+skipped_first_reason=none
+skipped_first_message=
 if [ "$run_scope" = all ]; then
     found_profile=false
     for fragment in "$profiles_dir"/*.toml; do
         [ -e "$fragment" ] || [ -L "$fragment" ] || continue
         found_profile=true
-        preflight_profile_runtime "$fragment" || exit $?
-        covered_profiles="$covered_profiles $runtime_profile"
+        fragment_status=0
+        preflight_profile_runtime "$fragment" || fragment_status=$?
+        if [ "$fragment_status" -eq 0 ]; then
+            covered_profiles="$covered_profiles $runtime_profile"
+            continue
+        fi
+        skipped_profiles="$skipped_profiles $runtime_profile"
+        if [ "$skipped_first_status" -eq 0 ]; then
+            skipped_first_status=$fragment_status
+            skipped_first_reason=$preflight_reason
+            skipped_first_message=$preflight_message
+        fi
+        case $runtime_profile in
+            ''|*[!A-Za-z0-9_-]*) ;;
+            *)
+                skipped_finished=$(epoch_now) || skipped_finished=0
+                runner_profile_outcome "$runtime_profile" failed "$fragment_status" "$preflight_reason" "$skipped_finished"
+                runner_activity run.failed "$runtime_profile" failed \
+                    "Profile skipped by the aggregate run: $(runner_sanitize_detail "$preflight_message")" \
+                    "$run_activity_category" error
+                ;;
+        esac
     done
     [ "$found_profile" = true ] || {
-        echo "no configured profiles" >&2
+        runner_fail no_profiles "no configured profiles"
         exit 66
     }
+    if [ -z "$covered_profiles" ]; then
+        # Every profile was refused and each already carries its own record.
+        runner_fail "$skipped_first_reason" "$skipped_first_message"
+        exit "$skipped_first_status"
+    fi
 else
-    preflight_profile_runtime "$profiles_dir/$run_scope.toml" || exit $?
+    preflight_status=0
+    preflight_profile_runtime "$profiles_dir/$run_scope.toml" || preflight_status=$?
+    if [ "$preflight_status" -ne 0 ]; then
+        run_failure_reason=$preflight_reason
+        run_failure_detail=$preflight_message
+        run_failure_profiles=$run_scope
+        exit "$preflight_status"
+    fi
 fi
 
+run_failure_reason=config_invalid
+run_failure_detail="the package configuration did not validate"
+run_failure_profiles=$covered_profiles
 "$binary" --config "$config_file" --quiet config validate
+run_failure_reason=runner_error
+run_failure_detail="the package runner stopped before the core started"
 [ "$termination_requested" = false ] || exit 143
 
-set -- "$binary" --config "$config_file" "$run_mode"
+# Every run, manual or scheduled, asks the core for its result record: one
+# NDJSON line per job with the result's outcome, deferred paths and skipped
+# count, written whatever --output the profile chose. That is what gives a
+# manual "Sync now" -- whose stdout belongs to the dashboard, in a format the
+# administrator picked -- the same counts as a scheduled run.
+core_result_record=$runtime_root/core-result.$$
+if [ -e "$core_result_record" ] || [ -L "$core_result_record" ]; then
+    rm -f "$core_result_record" || {
+        runner_fail state_unwritable "a stale core result record could not be removed"
+        exit 73
+    }
+fi
+set -- "$binary" --config "$config_file" --result-record "$core_result_record"
+# A scheduled run's stdout is read back for its outcome and counts (deferred
+# and skipped paths; per profile for an aggregate), so it is asked for as one
+# JSON record per line. A manual run's stdout is the job result the dashboard
+# shows, and keeps the configured format.
+if [ "$run_output" = scheduled ]; then
+    set -- "$@" --output ndjson
+fi
+set -- "$@" "$run_mode"
 if [ "$run_scope" = all ]; then
-    set -- "$@" --all-profiles --max-total-delete "$maximum_total"
+    if [ -z "$skipped_profiles" ]; then
+        set -- "$@" --all-profiles --max-total-delete "$maximum_total"
+    else
+        selected_profiles=
+        for selected_profile in $covered_profiles; do
+            selected_profiles=${selected_profiles:+$selected_profiles,}$selected_profile
+        done
+        set -- "$@" --profiles "$selected_profiles" --max-total-delete "$maximum_total"
+    fi
 else
     set -- "$@" --profile "$run_scope"
 fi
@@ -366,12 +848,12 @@ load_progress_record_runtime
 [ -z "$progress_record" ] || set -- "$@" --progress-record "$progress_record"
 runner_supervisor_start=$(process_start_time "$$" 2>/dev/null || true)
 case $runner_supervisor_start in ''|*[!0-9]*|0)
-    echo "cannot capture runner identity before core launch" >&2
+    runner_fail identity_failed "cannot capture runner identity before core launch"
     exit 73
     ;;
 esac
 runner_supervisor_boot=$(boot_identity) || {
-    echo "cannot capture runner boot identity before core launch" >&2
+    runner_fail identity_failed "cannot capture runner boot identity before core launch"
     exit 73
 }
 # The core is the only process the performance level renices. It is bulk work
@@ -397,13 +879,15 @@ set -- "$api_bridge" --exec-supervised-core "$$" "$runner_supervisor_start" \
 # NAS. The report asks the operator for `cat /sys/block/*/queue/scheduler`,
 # which is the one piece of evidence that would make this decidable.
 audit_outbox_execute "$SDSYNC_DSM_AUDIT_TRANSACTION" || {
-    echo "mandatory audit execution phase could not be recorded" >&2
+    runner_fail audit_unavailable "mandatory audit execution phase could not be recorded"
     exit 73
 }
 run_commit_started=true
-write_run_state running "$started" 0 -1 "$run_label" "$run_mode"
-if [ "$run_mode" = sync ]; then run_activity_category=sync; else run_activity_category=operations; fi
-append_activity run.started "$run_label" running "Package action started" "$run_activity_category" info 2>/dev/null || true
+write_run_state running "$started" 0 -1 "$run_label" "$run_mode" none "" || {
+    runner_fail state_unwritable "run state could not be published before the core started"
+    exit 69
+}
+runner_activity run.started "$run_label" running "Package action started" "$run_activity_category" info
 scheduled_log=$log_root/scheduler.log
 # Do not start the core after TERM/INT/HUP was latched while preflight or state
 # publication was running. A signal after this check is covered again once the
@@ -416,11 +900,25 @@ if [ "$run_output" = scheduled ]; then
         0) append_rotating_log "$scheduled_log" 10485760 5 \
             "{\"epoch\":$started,\"level\":\"info\",\"category\":\"scheduler\",\"event\":\"run_started\",\"mode\":$(json_quote "$run_mode"),\"scope\":$(json_quote "$run_label"),\"delete\":$allow_delete}" ;;
         1) ;;
-        *) exit "$scheduled_event_enabled" ;;
+        *)
+            runner_fail policy_unreadable "scheduler log policy could not be evaluated"
+            exit "$scheduled_event_enabled"
+            ;;
     esac
-    # The core writes its own bounded per-profile log files. Keep the scheduler
-    # stream machine-readable and free of opaque/user-influenced lines.
-    "$@" >/dev/null 2>&1 &
+    # The core writes its own bounded per-profile log files, so its stdout and
+    # stderr never enter the scheduler stream. They are not discarded either:
+    # stderr is where the core names why it failed, and nothing else records
+    # that for a run nobody is watching. Both go to private files for the
+    # length of the run; stderr's tail is kept in run-stderr.log and its last
+    # error line becomes the run's detail, and a scheduled aggregate's stdout
+    # is read once for the per-profile outcome and then removed.
+    core_stderr_capture=$runtime_root/core-stderr.$$
+    : > "$core_stderr_capture"
+    finish_private_file "$core_stderr_capture"
+    core_stdout_capture=$runtime_root/core-stdout.$$
+    : > "$core_stdout_capture"
+    finish_private_file "$core_stdout_capture"
+    "$@" >"$core_stdout_capture" 2>"$core_stderr_capture" &
 else
     "$@" &
 fi
@@ -452,6 +950,9 @@ while :; do
 done
 core_pid=
 finished=$(epoch_now)
+# From here the run records its own outcome; the exit trap must not add a
+# second record on top of it.
+run_outcome_recorded=true
 # 130 is the core's documented cooperative-cancellation code, and 143 is a core
 # terminated by SIGTERM without reaching it. Both mean an operator stopped the
 # package, or DSM rebooted for an update, while a run was in flight -- not that
@@ -465,75 +966,433 @@ finished=$(epoch_now)
 # failed` and the same set in the in-process Rust path -- and api_error exits,
 # so a fifth value would blank every dashboard panel rather than one row. The
 # exit code is published beside the state, which is what lets a reader tell the
-# two apart.
+# two apart, and so are reason=cancelled and outcome=cancelled.
 #
 # What changes is everything the state drives: no alert, so no failure counter
 # advancing toward the threshold and no sync_failed desktop notification or
 # system-log record, and an informational activity record that says cancelled
 # instead of an error claiming the sync failed.
+#
+# 3 is the core's partial run: it finished, and named paths were deferred to
+# the next run. That is not a failure. The state is succeeded -- the profile
+# synced apart from those paths, so a dependent routine may run after it --
+# with outcome=partial and the exit code beside it. It raises no alert and
+# advances no failure counter, and its Activity line is a warning naming how
+# many paths wait for the next run.
+#
+# 78 is the supervisor refusing to start the core at all (its one stderr line
+# names why). Nothing ran; it is a failure with its own reason.
+run_core_ran=true
 run_cancelled=false
-if [ "$exit_code" -eq 0 ]; then
-    final_state=succeeded
-else
-    final_state=failed
-    case $exit_code in 130|143) run_cancelled=true ;; esac
+run_partial=false
+run_reason=ok
+run_detail=
+run_state_outcome=succeeded
+case $exit_code in
+    0) final_state=succeeded ;;
+    3) final_state=succeeded; run_partial=true; run_reason=deferred_paths; run_state_outcome=partial ;;
+    130|143) final_state=failed; run_cancelled=true; run_reason=cancelled; run_state_outcome=cancelled ;;
+    78) final_state=failed; run_reason=supervisor_refused; run_state_outcome=failed; run_core_ran=false ;;
+    *) final_state=failed; run_reason=core_failed; run_state_outcome=failed ;;
+esac
+
+# The core's last error line is the cause; keep it, bounded and private.
+run_remote_log_dropped=false
+if [ -n "$core_stderr_capture" ]; then
+    if [ "$final_state" = failed ] && [ "$run_cancelled" = false ] && [ -s "$core_stderr_capture" ]; then
+        run_detail=$(LC_ALL=C awk '
+            /^(error|Error): |^sdsync-dsm-api: supervised core refused: / { chosen = $0 }
+            NF { last = $0 }
+            END {
+                line = chosen != "" ? chosen : last
+                gsub(/[^ -~]/, "?", line)
+                gsub(/\|/, "/", line)
+                printf "%s", substr(line, 1, 160)
+            }
+        ' "$core_stderr_capture") || run_detail=
+    fi
+    # Remote-log delivery is best effort inside the core and reported only on
+    # stderr; a dropped batch must not stay there unseen.
+    if LC_ALL=C grep -q 'remote logging dropped' "$core_stderr_capture"; then
+        run_remote_log_dropped=true
+    fi
+    run_stderr_log=$log_root/run-stderr.log
+    run_stderr_status=0
+    {
+        rotate_log "$run_stderr_log" 1 3 &&
+        run_stderr_temp=$log_root/.run-stderr.$$ &&
+        printf '# epoch=%s scope=%s operation=%s exit=%s\n' "$finished" "$run_label" "$run_mode" "$exit_code" \
+            > "$run_stderr_temp" &&
+        tail -c 16384 "$core_stderr_capture" >> "$run_stderr_temp" &&
+        finish_private_file "$run_stderr_temp" &&
+        mv -f "$run_stderr_temp" "$run_stderr_log"
+    } || run_stderr_status=$?
+    if [ "$run_stderr_status" -ne 0 ]; then
+        rm -f "${run_stderr_temp:-}"
+        runner_degrade run_stderr
+        runner_say "warning: core stderr could not be kept in $run_stderr_log (status $run_stderr_status)"
+        runner_controller_event warn run_stderr_unavailable "scope=$run_label status=$run_stderr_status" scheduler
+    fi
 fi
-write_run_state "$final_state" "$started" "$finished" "$exit_code" "$run_label" "$run_mode"
-write_profile_completion_state() {
-    profile_state_fragment=$1
-    [ -f "$profile_state_fragment" ] || return 0
-    profile_state_name=${profile_state_fragment##*/}; profile_state_name=${profile_state_name%.toml}
-    profile_state_temp=$profile_state_dir/.${profile_state_name}.state.$$
-    printf 'state=%s\nfinished_epoch=%s\nexit_code=%s\naction=%s\n' \
-        "$final_state" "$finished" "$exit_code" "$run_mode" > "$profile_state_temp"
-    finish_private_file "$profile_state_temp"
-    mv -f "$profile_state_temp" "$profile_state_dir/$profile_state_name.state"
+
+# Counts, result facts and per-job verdicts from the core's own records: the
+# result record the core wrote for this run when there is one, else the NDJSON
+# a scheduled run printed (a batch-job record per profile for an aggregate, one
+# completion record for a single profile). Each record becomes one line
+#   <kind> <profile|-> <status|-> <outcome|-> <deferred|-> <skipped|->
+#   <incomplete_listings|-> <mtime_not_kept|-> <reauthentication_failures|->
+#   <server_tasks_not_stopped|-> <keepalive_failures|-> <folders...>
+# with the folders last (they may hold spaces): the first five
+# incomplete_listing_folders, raw JSON string text with every byte outside
+# printable ASCII and every `|` turned into `?`, each cut to 120 bytes, joined
+# by `|`, or `-`.
+#
+# The result object is read from its own `"result":{` onward, which with
+# serde's sorted keys comes after the (possibly very large) plan members, and
+# the deferred entries are counted by their one `"reason":` member each -- a
+# JSON string cannot contain an unescaped quote, so no path can fake one, and
+# an array ends at the first unescaped `],"` (or `]}` when it is the last key).
+run_records=
+run_records_source=
+if [ -n "$core_result_record" ] && [ -s "$core_result_record" ]; then
+    run_records_source=$core_result_record
+elif [ -n "$core_stdout_capture" ] && [ -s "$core_stdout_capture" ]; then
+    run_records_source=$core_stdout_capture
+fi
+if [ -n "$run_records_source" ]; then
+    run_records_status=0
+    run_records=$(LC_ALL=C awk '
+        function number(text, key,   pattern) {
+            pattern = "\"" key "\":[0-9]+"
+            if (match(text, pattern)) return substr(text, RSTART + length(key) + 3, RLENGTH - length(key) - 3)
+            return "-"
+        }
+        function array_body(text, key,   start, tail, close_at) {
+            start = index(text, "\"" key "\":[")
+            if (start == 0) return ""
+            tail = substr(text, start + length(key) + 4)
+            close_at = index(tail, "],\"")
+            if (close_at == 0) close_at = index(tail, "]}")
+            if (close_at == 0) return ""
+            return substr(tail, 1, close_at - 1)
+        }
+        function folders(body,   n, i, c, in_string, escaped, current, out, count) {
+            out = ""; count = 0; in_string = 0; escaped = 0; current = ""
+            n = length(body)
+            if (n > 65536) n = 65536
+            for (i = 1; i <= n && count < 5; i++) {
+                c = substr(body, i, 1)
+                if (!in_string) {
+                    if (c == "\"") { in_string = 1; current = "" }
+                    continue
+                }
+                if (escaped) { current = current c; escaped = 0; continue }
+                if (c == "\\") { current = current c; escaped = 1; continue }
+                if (c == "\"") {
+                    in_string = 0
+                    gsub(/[^ -~]/, "?", current)
+                    gsub(/\|/, "?", current)
+                    current = substr(current, 1, 120)
+                    out = count ? out "|" current : current
+                    count++
+                    continue
+                }
+                current = current c
+            }
+            return count ? out : "-"
+        }
+        {
+            job = index($0, "\"schema\":\"sdsync.batch-job.v1\"") > 0 \
+                || index($0, "\"schema\":\"sdsync.result-record.v1\"") > 0
+            completion = index($0, "\"kind\":\"completion\"") > 0
+            if (!job && !completion) next
+            profile = "-"; status = "-"; outcome = "-"; deferred = "-"; skipped = "-"
+            listings = "-"; mtime = "-"; reauth = "-"; tasks = "-"; keepalive = "-"; listed = "-"
+            if (job) {
+                if (match($0, /"profile":"[A-Za-z0-9_-]+"/)) profile = substr($0, RSTART + 11, RLENGTH - 12)
+                if (match($0, /"status":"[a-z-]+"/)) status = substr($0, RSTART + 10, RLENGTH - 11)
+            }
+            rest = $0; offset = 0
+            while ((found = index(rest, "\"result\":{")) > 0) {
+                offset += found
+                rest = substr(rest, found + 1)
+            }
+            if (offset > 0) {
+                result = substr($0, offset)
+                if (match(result, /"outcome":"[a-z]+"/)) outcome = substr(result, RSTART + 11, RLENGTH - 12)
+                skipped = number(result, "skipped")
+                if (index(result, "\"deferred\":[") > 0) {
+                    entries = array_body(result, "deferred")
+                    deferred = gsub(/"reason":"/, "", entries)
+                }
+                listings = number(result, "incomplete_listings")
+                mtime = number(result, "mtime_not_kept")
+                reauth = number(result, "reauthentication_failures")
+                tasks = number(result, "server_tasks_not_stopped")
+                keepalive = number(result, "keepalive_failures")
+                listed = folders(array_body(result, "incomplete_listing_folders"))
+            }
+            print (job ? "job" : "run"), profile, status, outcome, deferred, skipped, \
+                listings, mtime, reauth, tasks, keepalive, listed
+        }
+    ' "$run_records_source") || run_records_status=$?
+    [ "$run_records_status" -eq 0 ] || run_records=
+fi
+
+# The result facts of one record, set for the next profile write and summed
+# into the run's totals.
+take_record_facts() {
+    profile_fact_listings=$1
+    profile_fact_mtime=$2
+    profile_fact_reauth=$3
+    profile_fact_tasks=$4
+    profile_fact_keepalive=$5
+    profile_fact_folders=$6
+    # One explicit branch per fact: a value that is not a count is dropped from
+    # this profile's record, and a count is added to the run's total and
+    # marks that total as known.
+    case $profile_fact_listings in
+        ''|*[!0-9]*) profile_fact_listings= ;;
+        *) run_fact_listings=$((run_fact_listings + profile_fact_listings)); run_fact_listings_known=true ;;
+    esac
+    case $profile_fact_mtime in
+        ''|*[!0-9]*) profile_fact_mtime= ;;
+        *) run_fact_mtime=$((run_fact_mtime + profile_fact_mtime)); run_fact_mtime_known=true ;;
+    esac
+    case $profile_fact_reauth in
+        ''|*[!0-9]*) profile_fact_reauth= ;;
+        *) run_fact_reauth=$((run_fact_reauth + profile_fact_reauth)); run_fact_reauth_known=true ;;
+    esac
+    case $profile_fact_tasks in
+        ''|*[!0-9]*) profile_fact_tasks= ;;
+        *) run_fact_tasks=$((run_fact_tasks + profile_fact_tasks)); run_fact_tasks_known=true ;;
+    esac
+    case $profile_fact_keepalive in
+        ''|*[!0-9]*) profile_fact_keepalive= ;;
+        *) run_fact_keepalive=$((run_fact_keepalive + profile_fact_keepalive)); run_fact_keepalive_known=true ;;
+    esac
+    case $profile_fact_folders in
+        ''|-) profile_fact_folders= ;;
+        *)
+            run_fact_folders=${run_fact_folders:+$run_fact_folders|}$profile_fact_folders
+            ;;
+    esac
 }
-# The frozen set from preflight, not a fresh glob. A profile removed while the
-# run was in flight is still skipped, by the `[ -f ]` guard inside the writer
-# rather than by being absent from a later listing -- so removal stays silent
-# and creation stays uncounted, which is the pair this needs.
+clear_record_facts() {
+    profile_fact_listings= profile_fact_mtime= profile_fact_reauth= profile_fact_tasks=
+    profile_fact_keepalive= profile_fact_folders=
+}
+run_fact_listings=0 run_fact_mtime=0 run_fact_reauth=0 run_fact_tasks=0 run_fact_keepalive=0
+run_fact_listings_known=false run_fact_mtime_known=false run_fact_reauth_known=false
+run_fact_tasks_known=false run_fact_keepalive_known=false run_fact_folders=
+clear_record_facts
+
+# A profile the preflight refused makes the aggregate a failure even when every
+# profile that did run succeeded: the run did not do what it was scheduled to.
+run_exit_code=$exit_code
+if [ -n "$skipped_profiles" ] && { [ "$exit_code" -eq 0 ] || [ "$exit_code" -eq 3 ]; }; then
+    final_state=failed
+    run_partial=false
+    run_exit_code=$skipped_first_status
+    run_reason=profiles_skipped
+    run_state_outcome=failed
+    run_detail=$(runner_sanitize_detail "$skipped_first_message")
+fi
+
+# Per-profile outcome and the run's totals. A single-profile run knows its own.
+# An aggregate reads the core's per-job records; without any, it falls back to
+# the run's exit code, which is exact on success and recorded as unknown
+# otherwise.
+run_total_deferred=0
+run_total_skipped=0
+run_counts_known=true
+if [ "$run_core_ran" = false ] || [ -z "$run_records" ]; then
+    run_counts_known=false
+fi
 if [ "$run_scope" = all ]; then
     for covered_profile in $covered_profiles; do
-        write_profile_completion_state "$profiles_dir/$covered_profile.toml"
+        covered_status=
+        covered_outcome=
+        covered_deferred=
+        covered_skipped=
+        covered_facts=
+        while read -r record_kind record_profile record_status record_outcome record_deferred record_skipped record_facts; do
+            [ "$record_kind" = job ] && [ "$record_profile" = "$covered_profile" ] || continue
+            covered_status=$record_status
+            covered_outcome=$record_outcome
+            covered_deferred=$record_deferred
+            covered_skipped=$record_skipped
+            covered_facts=$record_facts
+        done <<RUN_RECORDS
+$run_records
+RUN_RECORDS
+        case $covered_deferred:$covered_skipped in
+            *[!0-9:]*|:*|*:) covered_deferred=; covered_skipped= ;;
+            *)
+                run_total_deferred=$((run_total_deferred + covered_deferred))
+                run_total_skipped=$((run_total_skipped + covered_skipped))
+                ;;
+        esac
+        # A batch job that ran but left no readable counts makes the totals
+        # unknowable; one that never ran contributes nothing.
+        case $covered_status in success|preflighted|failed|partial)
+            [ -n "$covered_deferred" ] || run_counts_known=false ;;
+        esac
+        clear_record_facts
+        if [ -n "$covered_facts" ]; then
+            # shellcheck disable=SC2086 -- five numbers, then the folder text
+            set -f
+            read -r fact_listings fact_mtime fact_reauth fact_tasks fact_keepalive fact_folders <<RECORD_FACTS
+$covered_facts
+RECORD_FACTS
+            set +f
+            take_record_facts "$fact_listings" "$fact_mtime" "$fact_reauth" "$fact_tasks" "$fact_keepalive" "$fact_folders"
+        fi
+        case $covered_status in
+            success|preflighted)
+                if [ "$covered_outcome" = partial ]; then
+                    runner_profile_outcome "$covered_profile" partial 3 deferred_paths "$finished" "$covered_deferred" "$covered_skipped"
+                else
+                    runner_profile_outcome "$covered_profile" succeeded 0 ok "$finished" "$covered_deferred" "$covered_skipped"
+                fi
+                ;;
+            # The batch status `partial` is a target that failed after it had
+            # mutated something -- a failure, not the core's partial outcome.
+            failed) runner_profile_outcome "$covered_profile" failed "$exit_code" core_failed "$finished" "$covered_deferred" "$covered_skipped" ;;
+            partial) runner_profile_outcome "$covered_profile" failed "$exit_code" core_partial "$finished" "$covered_deferred" "$covered_skipped" ;;
+            not-run) runner_profile_outcome "$covered_profile" not_run "$exit_code" not_reached "$finished" ;;
+            *)
+                case $exit_code in
+                    0) runner_profile_outcome "$covered_profile" succeeded 0 ok "$finished" ;;
+                    3) runner_profile_outcome "$covered_profile" partial 3 deferred_paths "$finished" ;;
+                    *) runner_profile_outcome "$covered_profile" unknown "$exit_code" "$run_reason" "$finished" ;;
+                esac
+                ;;
+        esac
+        clear_record_facts
     done
 else
-    write_profile_completion_state "$profiles_dir/$run_scope.toml"
+    single_deferred=
+    single_skipped=
+    single_facts=
+    # A completion record (stdout) or this profile's result record.
+    while read -r record_kind record_profile record_status record_outcome record_deferred record_skipped record_facts; do
+        case $record_kind:$record_profile in run:*|"job:$run_scope") ;; *) continue ;; esac
+        single_deferred=$record_deferred
+        single_skipped=$record_skipped
+        single_facts=$record_facts
+    done <<RUN_RECORDS
+$run_records
+RUN_RECORDS
+    case $single_deferred:$single_skipped in
+        *[!0-9:]*|:*|*:) single_deferred=; single_skipped=; run_counts_known=false ;;
+        *) run_total_deferred=$single_deferred; run_total_skipped=$single_skipped ;;
+    esac
+    clear_record_facts
+    if [ -n "$single_facts" ]; then
+        set -f
+        read -r fact_listings fact_mtime fact_reauth fact_tasks fact_keepalive fact_folders <<RECORD_FACTS
+$single_facts
+RECORD_FACTS
+        set +f
+        take_record_facts "$fact_listings" "$fact_mtime" "$fact_reauth" "$fact_tasks" "$fact_keepalive" "$fact_folders"
+    fi
+    case $final_state:$run_partial in
+        succeeded:true) runner_profile_outcome "$run_scope" partial "$exit_code" "$run_reason" "$finished" "$single_deferred" "$single_skipped" ;;
+        *) runner_profile_outcome "$run_scope" "$final_state" "$exit_code" "$run_reason" "$finished" "$single_deferred" "$single_skipped" ;;
+    esac
+    clear_record_facts
 fi
+if [ "$run_counts_known" = true ]; then
+    run_state_deferred=$run_total_deferred
+    run_state_skipped=$run_total_skipped
+elif [ "$run_core_ran" = true ]; then
+    run_state_counts=unavailable
+fi
+[ "$run_fact_listings_known" != true ] || run_state_listings=$run_fact_listings
+[ "$run_fact_mtime_known" != true ] || run_state_mtime=$run_fact_mtime
+[ "$run_fact_reauth_known" != true ] || run_state_reauth=$run_fact_reauth
+[ "$run_fact_tasks_known" != true ] || run_state_tasks=$run_fact_tasks
+[ "$run_fact_keepalive_known" != true ] || run_state_keepalive=$run_fact_keepalive
+# Five folders in all, across profiles, as the contract bounds them.
+if [ -n "$run_fact_folders" ]; then
+    run_state_folders=$(printf '%s' "$run_fact_folders" | LC_ALL=C awk -F'|' '
+        { n = NF > 5 ? 5 : NF; out = $1; for (i = 2; i <= n; i++) out = out "|" $i; printf "%s", out }
+    ') || run_state_folders=
+fi
+
 # run.cancelled is not an accepted activity code and cancelled is not an
 # accepted activity state, so the cancellation is carried by the level and the
 # message rather than by widening either validator.
 activity_message="Package action completed"
-if [ "$final_state" = succeeded ]; then
+if [ "$final_state" = succeeded ] && [ "$run_partial" = true ]; then
+    activity_code=run.succeeded; activity_level=warn
+    if [ "$run_counts_known" = true ]; then
+        activity_message="Package action finished; $run_total_deferred path(s) deferred to the next run (see the sync log); dependents may run"
+    else
+        activity_message="Package action finished; some files deferred to the next run (see the sync log); dependents may run"
+    fi
+elif [ "$final_state" = succeeded ]; then
     activity_code=run.succeeded; activity_level=info
+    if [ "$run_counts_known" = true ] && [ "$run_total_skipped" -gt 0 ]; then
+        activity_level=warn
+        activity_message="Package action completed; $run_total_skipped entr(y/ies) skipped and will not sync until fixed (see the sync log)"
+    fi
 elif [ "$run_cancelled" = true ]; then
     activity_code=run.failed; activity_level=info
     activity_message="Package action cancelled before completion"
 else
     activity_code=run.failed; activity_level=error
+    if [ -n "$run_detail" ]; then
+        activity_message="Package action failed: $run_detail"
+    elif [ "$run_reason" = supervisor_refused ]; then
+        activity_message="Package action failed: the supervisor refused to start the core (exit 78)"
+    else
+        activity_message="Package action failed (exit $run_exit_code)"
+    fi
 fi
-append_activity "$activity_code" "$run_label" "$final_state" "$activity_message" "$run_activity_category" "$activity_level" 2>/dev/null || true
+runner_activity "$activity_code" "$run_label" "$final_state" "$activity_message" "$run_activity_category" "$activity_level"
+if [ "$run_remote_log_dropped" = true ]; then
+    runner_degrade remote_log
+    runner_activity notification.unavailable "$run_label" unavailable \
+        "Remote logging dropped events during this run; the local sync log is complete" sync warn
+fi
 # handle_alert_result owns the failure counter, the DSM system-log record and the
-# desktop notification. A cancelled run must reach none of them, and skipping the
-# call is how: handle_alert_result accepts only succeeded and failed, so there is
-# no third argument value that would make it decline on its own.
-if [ "$run_mode" = sync ] && [ "$run_cancelled" = false ]; then
-    handle_alert_result "$run_label" "$final_state" "$exit_code" 2>/dev/null || true
+# desktop notification. A cancelled or partial run must reach none of them, and
+# skipping the call is how: handle_alert_result accepts only succeeded and
+# failed, so there is no third argument value that would make it decline on its
+# own.
+if [ "$run_mode" = sync ] && [ "$run_cancelled" = false ] && [ "$run_partial" = false ]; then
+    runner_alert "$run_label" "$final_state" "$run_exit_code"
 fi
 if [ "$run_output" = scheduled ]; then
-    if [ "$exit_code" -eq 0 ] || [ "$run_cancelled" = true ]; then scheduled_level=info; else scheduled_level=error; fi
+    if [ "$run_cancelled" = true ] || [ "$run_exit_code" -eq 0 ]; then scheduled_level=info
+    elif [ "$run_partial" = true ]; then scheduled_level=warn
+    else scheduled_level=error; fi
     scheduled_event_enabled=0
     security_event_enabled scheduler "$scheduled_level" false || scheduled_event_enabled=$?
     case $scheduled_event_enabled in
-        0) append_rotating_log "$scheduled_log" 10485760 5 \
-            "{\"epoch\":$finished,\"level\":$(json_quote "$scheduled_level"),\"category\":\"scheduler\",\"event\":\"run_finished\",\"mode\":$(json_quote "$run_mode"),\"scope\":$(json_quote "$run_label"),\"exit\":$exit_code}" ;;
+        0)
+            append_rotating_log "$scheduled_log" 10485760 5 \
+                "{\"epoch\":$finished,\"level\":$(json_quote "$scheduled_level"),\"category\":\"scheduler\",\"event\":\"run_finished\",\"mode\":$(json_quote "$run_mode"),\"scope\":$(json_quote "$run_label"),\"exit\":$run_exit_code,\"reason\":$(json_quote "$run_reason")}" \
+                || { runner_degrade scheduler_log; runner_say "warning: scheduler log record could not be written"; }
+            ;;
         1) ;;
-        *) echo "warning: scheduler log policy could not be evaluated" >&2 ;;
+        *) runner_degrade scheduler_log; runner_say "warning: scheduler log policy could not be evaluated" ;;
     esac
+fi
+# Written last: everything above is in place for a reader that waits on it, and
+# a sink that failed above is named in degraded=.
+final_state_status=0
+write_run_state "$final_state" "$started" "$finished" "$run_exit_code" "$run_label" "$run_mode" "$run_reason" "$run_detail" \
+    || final_state_status=$?
+if [ "$final_state_status" -ne 0 ]; then
+    runner_say "warning: run state could not be written (status $final_state_status)"
+    runner_controller_event error run_state_write_failed "scope=$run_label status=$final_state_status"
 fi
 if [ "$run_audit_pending" = true ]; then
     audit_outbox_complete "$SDSYNC_DSM_AUDIT_TRANSACTION" "$final_state" >/dev/null 2>&1 || \
-        echo "warning: operation completed; terminal audit is pending durable reconciliation" >&2
+        runner_say "warning: operation completed; terminal audit is pending durable reconciliation"
     run_audit_pending=false
 fi
-exit "$exit_code"
+exit "$run_exit_code"

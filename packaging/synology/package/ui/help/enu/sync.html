@@ -22,7 +22,7 @@
 
   <h2>States</h2>
   <dl>
-    <dt>In sync</dt><dd>Present on both sides and equal under the profile's comparison setting.</dd>
+    <dt>In sync</dt><dd>Present on both sides and equal under the profile's comparison setting. This is a comparison taken when you ask, not a run verdict: when a profile's last run failed, was cancelled or was partial, the stored totals say so beside it (<em>Last run failed: cause</em>) instead of showing a bare in-sync count.</dd>
     <dt>Differs</dt><dd>Present on both sides and scheduled for upload. The <strong>Why</strong> column names the evidence that decided it, such as differing size or differing modification time.</dd>
     <dt>Missing remotely</dt><dd>Present locally with no entry at the destination path.</dd>
     <dt>Remote only</dt><dd>Present on the NAS with no local counterpart. It is removed only by a mirror run with deletion separately approved, never by this page.</dd>

@@ -970,7 +970,16 @@ def validate_synology_wrapper_argument_parsing() -> None:
             "      *) exit 64 ;;\n"
             "    esac\n"
             "    ;;\n"
-            "  --exec-supervised-core) shift 5; exec \"$@\" ;;\n"
+            # pid, start, boot, then the optional --core-nice pair, then --.
+            # A fixed `shift 5` left `N -- binary ...` once the runner began
+            # sending --core-nice, so exec failed with 127 and the clap
+            # check below passed without the real core ever running.
+            "  --exec-supervised-core)\n"
+            "    shift 4\n"
+            "    if [ \"${1:-}\" = --core-nice ]; then shift 2; fi\n"
+            "    [ \"${1:-}\" = -- ] || exit 64\n"
+            "    shift\n"
+            "    exec \"$@\" ;;\n"
             "  --serve) trap 'exit 0' TERM INT HUP; while :; do sleep 1; done ;;\n"
             "  *) exit 64 ;;\n"
             "esac\n",
@@ -1122,6 +1131,13 @@ def validate_synology_wrapper_argument_parsing() -> None:
                 _assert_no_clap_conflict(
                     result, f"sdsync-run with an ambient SDSYNC_DELETE={delete_value}"
                 )
+                # The absence of a clap conflict proves nothing unless the
+                # real core actually parsed the argv.
+                if result.returncode in (126, 127):
+                    raise AssertionError(
+                        "sdsync-run never reached the real core (exit "
+                        f"{result.returncode}): stderr={result.stderr!r}"
+                    )
         finally:
             for process in (controller_process, api_process):
                 if process.poll() is None:

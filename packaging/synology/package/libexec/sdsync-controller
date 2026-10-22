@@ -26,6 +26,195 @@ controller_log_event() {
     append_controller_log_event "$@"
 }
 
+# An Activity record the controller could not write is reported in
+# controller.log, and if that fails too, on the raw stderr stream that also
+# lands there. It never ends the controller and never vanishes.
+controller_activity() {
+    controller_activity_status=0
+    append_activity "$@" || controller_activity_status=$?
+    if [ "$controller_activity_status" -ne 0 ]; then
+        controller_log_event warn activity_append_failed "code=$1 status=$controller_activity_status" \
+            || echo "activity record $1 could not be written (status $controller_activity_status)" >&2
+    fi
+    return 0
+}
+
+# A realtime routine whose retry ladder ran out waits this long before its
+# still-pending change is tried again, so an outage costs one attempt per
+# quarter hour rather than one per poll.
+realtime_exhausted_cooldown=900
+
+# The reason the runner recorded for the run that just ended, when run.state
+# still describes it. The controller waits for its runner synchronously, so the
+# slot can only have been rewritten by a run that started afterwards, which the
+# scope check catches.
+routine_run_reason() {
+    routine_reason_scope=$1
+    routine_reason_value=core_failed
+    routine_reason_seen_scope=
+    routine_reason_candidate=
+    [ -f "$run_state" ] && [ ! -L "$run_state" ] && [ -r "$run_state" ] || { printf '%s' "$routine_reason_value"; return 0; }
+    routine_reason_lines=0
+    while IFS= read -r routine_reason_line || [ -n "$routine_reason_line" ]; do
+        routine_reason_lines=$((routine_reason_lines + 1))
+        [ "$routine_reason_lines" -le 64 ] || break
+        case $routine_reason_line in
+            scope=*) [ -n "$routine_reason_seen_scope" ] || routine_reason_seen_scope=${routine_reason_line#scope=} ;;
+            reason=*) routine_reason_candidate=${routine_reason_line#reason=} ;;
+        esac
+    done < "$run_state"
+    if [ "$routine_reason_seen_scope" = "$routine_reason_scope" ]; then
+        case ${routine_reason_candidate:-} in
+            ''|none|ok|*[!a-z0-9_]*) ;;
+            *) routine_reason_value=$routine_reason_candidate ;;
+        esac
+    fi
+    printf '%s' "$routine_reason_value"
+}
+
+# An exhausted retry ladder is the point an administrator needs to hear about
+# even if each failure's own notification was in cooldown: DSM's system log
+# (its own gate and cooldown) and, when the alert policy wants failures, a
+# desktop notification. safe_notify records its own delivery failure.
+routine_escalate_alert() {
+    escalate_profile=$1
+    escalate_exit=$2
+    case $escalate_exit in ''|*[!0-9]*) escalate_exit=1 ;; esac
+    dsm_log_event sync_failed "$(epoch_now)" \
+        || controller_log_event warn alert_unavailable "profile=$escalate_profile channel=system_log" scheduler \
+        || echo "system-log escalation for $escalate_profile could not be recorded" >&2
+    escalate_enabled=$(setting "$alert_policy_file" enabled true) || escalate_enabled=true
+    escalate_failure=$(setting "$alert_policy_file" on_failure true) || escalate_failure=true
+    if [ "$escalate_enabled" = true ] && [ "$escalate_failure" = true ]; then
+        safe_notify sync_failed "$escalate_profile" "$escalate_exit" \
+            || controller_log_event warn alert_unavailable "profile=$escalate_profile channel=desktop" scheduler \
+            || echo "desktop escalation for $escalate_profile could not be delivered" >&2
+    fi
+    return 0
+}
+
+# A run.state left at running by a runner that died -- SIGKILL, OOM on a small
+# NAS, power loss -- read Running on the Overview and the widget forever,
+# because nothing ever revisited it. The runner publishes running only while it
+# holds the run lock and releases the lock after its final write, so running
+# beside a lock with no live owner can only be a dead run. The controller takes
+# the lock itself before rewriting, so a runner that starts at that moment
+# cannot have its fresh running record overwritten.
+#
+# The same rule is what a reader applies at read time:
+#   state=running and run.lock has no live pid+start+boot owner => runner died.
+stale_run_check_after=0
+reconcile_stale_run_state() {
+    stale_run_now=$1
+    [ "$stale_run_now" -ge "$stale_run_check_after" ] || return 0
+    stale_run_check_after=$((stale_run_now + 30))
+    [ -f "$run_state" ] && [ ! -L "$run_state" ] && [ -r "$run_state" ] || return 0
+    stale_run_state=
+    IFS= read -r stale_run_first < "$run_state" || stale_run_first=
+    case $stale_run_first in state=running) ;; *) return 0 ;; esac
+    stale_lock_status=0
+    private_process_lock_is_live "$run_lock" || stale_lock_status=$?
+    case $stale_lock_status in
+        0) return 0 ;;
+        1) ;;
+        *)
+            controller_log_event warn run_state_unverifiable "status=$stale_lock_status" scheduler
+            return 0
+            ;;
+    esac
+    stale_acquire_status=0
+    acquire_private_process_lock "$run_lock" || stale_acquire_status=$?
+    [ "$stale_acquire_status" -eq 0 ] || return 0
+    stale_run_started=0
+    stale_run_scope=none
+    stale_run_operation=none
+    stale_run_lines=0
+    while IFS= read -r stale_run_line || [ -n "$stale_run_line" ]; do
+        stale_run_lines=$((stale_run_lines + 1))
+        [ "$stale_run_lines" -le 64 ] || break
+        case $stale_run_line in
+            state=*) [ -n "$stale_run_state" ] || stale_run_state=${stale_run_line#state=} ;;
+            started_epoch=*) stale_run_started=${stale_run_line#started_epoch=} ;;
+            scope=*) stale_run_scope=${stale_run_line#scope=} ;;
+            operation=*) stale_run_operation=${stale_run_line#operation=} ;;
+        esac
+    done < "$run_state"
+    case $stale_run_started in ''|*[!0-9]*) stale_run_started=0 ;; esac
+    case $stale_run_scope in all|none) ;; ''|*[!A-Za-z0-9_-]*) stale_run_scope=none ;; esac
+    case $stale_run_operation in sync|plan) ;; *) stale_run_operation=none ;; esac
+    if [ "$stale_run_state" = running ]; then
+        stale_write_status=0
+        run_state_outcome=failed
+        write_run_state failed "$stale_run_started" "$stale_run_now" -1 "$stale_run_scope" \
+            "$stale_run_operation" runner_died "the runner stopped without recording an outcome" \
+            || stale_write_status=$?
+        if [ "$stale_write_status" -eq 0 ]; then
+            controller_activity run.failed "$stale_run_scope" failed \
+                "Package action ended without recording an outcome; the runner stopped unexpectedly" \
+                scheduler error
+            if [ "$stale_run_operation" = sync ] && [ "$stale_run_scope" != none ]; then
+                handle_alert_result "$stale_run_scope" failed 1 \
+                    || controller_log_event warn alert_unavailable "scope=$stale_run_scope reason=runner_died" scheduler \
+                    || echo "failure alert for a dead runner could not be processed" >&2
+            fi
+            controller_log_event error run_runner_died "scope=$stale_run_scope operation=$stale_run_operation" scheduler
+        else
+            controller_log_event error run_state_write_failed "reason=runner_died status=$stale_write_status" scheduler
+        fi
+    fi
+    release_private_process_lock "$run_lock" \
+        || controller_log_event error run_lock_release_failed "phase=stale_reconcile" scheduler
+}
+
+# The aggregate schedule's deadline survives a restart and a reload. It used to
+# be rebased to now + interval on every controller start and every HUP, so a
+# dashboard save or a NAS reboot postponed the aggregate sync by a full
+# interval, and an interval longer than the save/reboot cadence never ran.
+schedule_state_file=$state_root/schedule.state
+schedule_deadline=0
+load_schedule_deadline() {
+    schedule_deadline=0
+    [ -f "$schedule_state_file" ] && [ ! -L "$schedule_state_file" ] && [ -r "$schedule_state_file" ] || return 0
+    while IFS= read -r schedule_deadline_line || [ -n "$schedule_deadline_line" ]; do
+        case $schedule_deadline_line in
+            next_run_epoch=*) schedule_deadline=${schedule_deadline_line#next_run_epoch=}; break ;;
+        esac
+    done < "$schedule_state_file"
+    case $schedule_deadline in ''|*[!0-9]*) schedule_deadline=0 ;; esac
+}
+save_schedule_deadline() {
+    [ "$1" != "$schedule_deadline" ] || return 0
+    schedule_deadline=$1
+    schedule_deadline_temp=$schedule_state_file.tmp.$$
+    if printf 'next_run_epoch=%s\n' "$schedule_deadline" > "$schedule_deadline_temp" \
+        && finish_private_file "$schedule_deadline_temp" \
+        && mv -f "$schedule_deadline_temp" "$schedule_state_file"; then
+        return 0
+    fi
+    rm -f "$schedule_deadline_temp"
+    controller_log_event warn schedule_deadline_unsaved "next_run_epoch=$schedule_deadline" scheduler \
+        || echo "schedule deadline could not be saved" >&2
+}
+
+# The lifecycle opens controller.log once for the controller's stderr, and a
+# descriptor follows its inode: after a rotation, raw lines -- a runner's
+# preflight message among them -- kept landing in controller.log.1 and aged out
+# with it. Re-open onto the active file once the inherited one is a rotated
+# generation. Only then: a controller whose stderr is anything else (a test
+# harness, an interactive shell) keeps it.
+reopen_controller_stderr() {
+    [ -e "/proc/$$/fd/2" ] || return 0
+    [ ! "/proc/$$/fd/2" -ef "$controller_log" ] || return 0
+    [ "/proc/$$/fd/2" -ef "$controller_log.1" ] || return 0
+    [ ! -L "$controller_log" ] || return 0
+    if ! command exec 2>>"$controller_log"; then
+        controller_log_event warn controller_stderr_reopen_failed || true
+        return 0
+    fi
+    [ ! -f "$controller_log" ] || finish_private_file "$controller_log" \
+        || controller_log_event warn controller_stderr_reopen_failed "phase=mode" || true
+}
+
 acquire_controller_lock() {
     acquire_private_process_lock "$controller_lock"
 }
@@ -359,6 +548,7 @@ process_control_queue() {
             return 73
         fi
         launched_control_pid=$admitted_child_pid
+        launched_control_admission_path=$admitted_child_admission_path
         if [ "$interactive_only" != true ]; then
             active_control_classification=$queued_classification
         fi
@@ -393,6 +583,7 @@ process_control_queue() {
             primary_control_operation=$queued_operation
             primary_consumer_processing_request=$consumer_processing_request
             primary_consumer_response_final=$consumer_response_final
+            primary_control_admission_path=$launched_control_admission_path
             wait_for_runner
             control_exit=$scheduled_exit
             queued_id=$primary_control_queued_id
@@ -405,7 +596,9 @@ process_control_queue() {
             queued_operation=$primary_control_operation
             consumer_processing_request=$primary_consumer_processing_request
             consumer_response_final=$primary_consumer_response_final
+            launched_control_admission_path=$primary_control_admission_path
         fi
+        retire_admission_decision "$launched_control_admission_path" control
         # One stat, not two. Whether a result was published is the question this
         # block asks three times over -- to judge the consumer, to decide
         # whether anything may be written, and to record what happened -- and it
@@ -722,6 +915,9 @@ ensure_realtime_watcher() {
         if [ "$realtime_watcher_failure_consecutive" -ge 5 ]; then
             controller_log_event error routine_watch_abandoned \
                 "profile=$watcher_profile consecutive=$realtime_watcher_failure_consecutive" || true
+            controller_activity routine.watch_abandoned "$watcher_profile" unavailable \
+                "Realtime watcher abandoned after $realtime_watcher_failure_consecutive failed starts; changes are seen only by polling until the routine is saved again" \
+                routines error
             realtime_backend=none
         fi
         return 0
@@ -780,6 +976,9 @@ ensure_realtime_watcher() {
             if [ "$realtime_watcher_failure_consecutive" -ge 5 ]; then
                 controller_log_event error routine_watch_abandoned \
                     "profile=$watcher_profile consecutive=$realtime_watcher_failure_consecutive" || true
+                controller_activity routine.watch_abandoned "$watcher_profile" unavailable \
+                    "Realtime watcher abandoned after $realtime_watcher_failure_consecutive failed starts; changes are seen only by polling until the routine is saved again" \
+                    routines error
                 realtime_backend=none
             fi
             return 0
@@ -794,10 +993,10 @@ ensure_realtime_watcher() {
     # The marker's content is never read: only its size, inode and mtime are.
     # The default output format therefore spends about 29 bytes per event, and
     # more as the watched path lengthens, on text nothing will ever parse, in a
-    # file that grows unbounded for the whole debounce window. An empty format
-    # still emits one newline per event, which is all realtime_event_due's
-    # size-above-zero requirement needs. Measured: 1 200 events cost 35 180
-    # bytes by default and 1 200 bytes this way.
+    # file that grows unbounded for the whole debounce window. A one-character
+    # format is all realtime_event_due's size-above-zero requirement needs.
+    # Measured: 1 200 events cost 35 180 bytes by default and 1 200 bytes with
+    # an empty format; the literal below costs one byte more per event.
     #
     # --format has been in inotify-tools since 3.x, so a build that rejects it
     # is roughly two decades old. If one exists, inotifywait exits 1 with its
@@ -805,7 +1004,14 @@ ensure_realtime_watcher() {
     # handles: routine_watch_failed carries the message as its detail,
     # routine_watch_abandoned fires after five attempts, and the source keeps
     # being observed by the poll, which runs either way.
-    "$inotify_command" -m -q -r --format '' -e close_write,create,delete,move "$watcher_source" \
+    #
+    # One literal byte, not the empty format. An empty format put the marker's
+    # non-empty size -- the only thing realtime_event_due reads -- entirely on
+    # inotifywait appending a newline after each event. Current inotify-tools
+    # do, but `--no-newline` exists precisely because that is a choice, and a
+    # build that printed nothing for an empty format would never dispatch a
+    # realtime run. Two bytes an event keeps the measured saving above.
+    "$inotify_command" -m -q -r --format x -e close_write,create,delete,move "$watcher_source" \
         >> "$watcher_event_path" 2>> "$watcher_stderr_path" &
     watcher_pid=$!
     printf '%s\n' "$watcher_pid" > "$watcher_pid_path"
@@ -918,7 +1124,13 @@ consume_realtime_event() {
     return "$consume_event_status"
 }
 
-source_fingerprint() (
+# The walk runs in a subshell of its own -- source_fingerprint below, or the
+# background poll job -- because it owns that process's traps and exits through
+# them. find runs as a background child and is waited for, so a TERM to the
+# walking process is acted on at once: the handler stops find and removes the
+# private temporaries, instead of the walk outliving the controller that asked
+# for it by however long a large share takes to stat.
+fingerprint_reading() {
     fingerprint_source=$1
     if ! command -v find >/dev/null 2>&1 || ! command -v sort >/dev/null 2>&1 ||
         ! command -v cksum >/dev/null 2>&1 || ! command -v awk >/dev/null 2>&1 ||
@@ -945,12 +1157,18 @@ source_fingerprint() (
     fingerprint_stderr=$fingerprint_temp_dir/stderr
     fingerprint_sorted=$fingerprint_temp_dir/sorted
     fingerprint_checksum=$fingerprint_temp_dir/checksum
+    fingerprint_find_pid=
     fingerprint_cleanup() {
         rm -f "$fingerprint_metadata" "$fingerprint_stderr" \
             "$fingerprint_sorted" "$fingerprint_checksum" 2>/dev/null || true
         rmdir "$fingerprint_temp_dir" 2>/dev/null || true
     }
-    trap fingerprint_cleanup 0 HUP INT TERM
+    fingerprint_interrupted() {
+        [ -z "$fingerprint_find_pid" ] || kill -TERM "$fingerprint_find_pid" 2>/dev/null || true
+        exit 143
+    }
+    trap fingerprint_cleanup 0
+    trap fingerprint_interrupted HUP INT TERM
 
     # One stat for the whole batch instead of one per file. The metadata is
     # byte-identical to the former per-file loop, so an upgrade keeps the
@@ -972,10 +1190,17 @@ source_fingerprint() (
         finish_private_file "$fingerprint_metadata" || return 73
         finish_private_file "$fingerprint_stderr" || return 73
         fingerprint_find_status=0
+        # `{} +` batches one stat per argument list. BusyBox has had it since
+        # 1.22; a build without it fails the probe in resolve_fingerprint_exec,
+        # which then selects the per-file `{} ;` form here rather than letting
+        # every poll fail as an unreadable tree.
         find "$fingerprint_source" \
             \( -name '@eaDir' -o -name '#recycle' -o -name '#snapshot' -o -name '@tmp' \) -prune -o \
-            -type f -exec stat -c '%n|%s|%Y' {} + > "$fingerprint_metadata" 2> "$fingerprint_stderr" \
-            || fingerprint_find_status=$?
+            -type f -exec stat -c '%n|%s|%Y' {} "${fingerprint_exec_terminator:-+}" \
+            > "$fingerprint_metadata" 2> "$fingerprint_stderr" &
+        fingerprint_find_pid=$!
+        wait "$fingerprint_find_pid" || fingerprint_find_status=$?
+        fingerprint_find_pid=
         [ "$fingerprint_find_status" -ne 0 ] || break
         # Nothing on stderr means the walk itself could not run, which is a
         # stage failure and not a subtree this poll simply could not read.
@@ -1011,7 +1236,115 @@ source_fingerprint() (
         { fingerprint = $1 ":" $2 }
         END { if (NR != 1) exit 1; print fingerprint_walk_retries "|v2:" fingerprint }
     ' "$fingerprint_checksum"
+}
+
+source_fingerprint() (
+    fingerprint_reading "$@"
 )
+
+# Decided once per controller: whether this find batches `-exec ... {} +`.
+# The probe walks one file the package itself installed, so a failure can only
+# mean the syntax is unsupported, never an unreadable tree.
+resolve_fingerprint_exec() {
+    fingerprint_exec_terminator=+
+    if ! find "$script_dir/sdsync-common" -type f -exec true {} + >/dev/null 2>&1; then
+        if find "$script_dir/sdsync-common" -type f -exec true {} \; >/dev/null 2>&1; then
+            fingerprint_exec_terminator=';'
+            controller_log_event warn fingerprint_batch_unsupported \
+                "detail=find lacks -exec {} +; polling stats one file per process" \
+                || echo "find lacks -exec {} +; realtime polling falls back to one stat per file" >&2
+        else
+            controller_log_event error fingerprint_walk_unavailable \
+                "detail=find cannot run -exec; realtime polling reports poll_unavailable" \
+                || echo "find cannot run -exec; realtime polling is unavailable" >&2
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Background poll walk
+#
+# The realtime poll used to walk the whole source inside the controller's own
+# turn. On a large share on armv7 that is minutes in which the control queue
+# (Sync now, saves), the aggregate schedule and TERM handling all wait -- and
+# DSM's ten-second stop deadline can pass. The walk now runs as one background
+# child at a time; the routine that asked collects its reading on a later turn
+# (the loop sleeps one second while a walk is in flight), and everything else
+# keeps running meanwhile. A routine whose turn comes while another routine's
+# walk is in flight simply polls on the next free turn.
+#
+# Purpose compare is an ordinary poll. Purpose rebaseline is the reading taken
+# after a successful native-event dispatch: it becomes the baseline outright,
+# because inotify, not the poll, is what observed the change that was synced.
+poll_job_pid=
+poll_job_profile=
+poll_job_purpose=
+poll_job_result=
+poll_job_output=
+
+start_poll_job() {
+    start_poll_profile=$1
+    start_poll_source=$2
+    start_poll_purpose=$3
+    [ -z "$poll_job_pid" ] || return 75
+    poll_job_result=$runtime_root/poll-$start_poll_profile.result
+    poll_job_output=$runtime_root/poll-$start_poll_profile.output
+    [ ! -L "$poll_job_result" ] && [ ! -L "$poll_job_output" ] || return 73
+    rm -f "$poll_job_result" "$poll_job_output" "$poll_job_result.tmp" || return 73
+    (
+        trap - USR2 ALRM
+        poll_job_status=0
+        fingerprint_reading "$start_poll_source" > "$poll_job_output" 2>/dev/null || poll_job_status=$?
+        printf '%s\n' "$poll_job_status" > "$poll_job_result.tmp" \
+            && mv -f "$poll_job_result.tmp" "$poll_job_result"
+    ) &
+    poll_job_pid=$!
+    poll_job_profile=$start_poll_profile
+    poll_job_purpose=$start_poll_purpose
+}
+
+clear_poll_job() {
+    rm -f "$poll_job_result" "$poll_job_output" "$poll_job_result.tmp" 2>/dev/null \
+        || controller_log_event warn poll_job_cleanup_failed "profile=$poll_job_profile"
+    poll_job_pid=
+    poll_job_profile=
+    poll_job_purpose=
+}
+
+# 0 with collected_poll_status/collected_poll_output/collected_poll_purpose set
+# once the walk has ended, 1 while it is still running.
+collect_poll_job() {
+    [ -n "$poll_job_pid" ] || return 1
+    if [ ! -f "$poll_job_result" ]; then
+        collect_poll_state=
+        read_process_stat_fields "$poll_job_pid" && collect_poll_state=$process_stat_state
+        case $collect_poll_state in ''|Z|X|x) ;; *) return 1 ;; esac
+    fi
+    reap_direct_child_interruption_safe "$poll_job_pid"
+    collected_poll_status=69
+    collected_poll_output=
+    collected_poll_purpose=$poll_job_purpose
+    if [ -f "$poll_job_result" ] && [ ! -L "$poll_job_result" ]; then
+        IFS= read -r collected_poll_status < "$poll_job_result" || collected_poll_status=69
+        case $collected_poll_status in ''|*[!0-9]*) collected_poll_status=69 ;; esac
+        if [ -f "$poll_job_output" ] && [ ! -L "$poll_job_output" ]; then
+            IFS= read -r collected_poll_output < "$poll_job_output" || collected_poll_output=
+        fi
+    else
+        # The walk ended without publishing a result: killed, or its shell
+        # could not write. That is a stage failure, reported like one.
+        controller_log_event warn poll_job_lost "profile=$poll_job_profile"
+    fi
+    clear_poll_job
+    return 0
+}
+
+stop_poll_job() {
+    [ -n "$poll_job_pid" ] || return 0
+    kill -TERM "$poll_job_pid" 2>/dev/null || true
+    reap_direct_child_interruption_safe "$poll_job_pid"
+    clear_poll_job
+}
 
 # A reading this controller is willing to compare against. An unrecognised or
 # absent prefix is not an error and not a corrupt state: it is a reading whose
@@ -1064,7 +1397,10 @@ write_routine_state() {
         printf 'backend_reason=%s\npending_fingerprint=%s\npending_since_epoch=%s\n' \
             "$routine_backend_reason_value" "$routine_pending_fingerprint_value" "$routine_pending_since_value" &&
         printf 'event_first_seen_epoch=%s\npoll_retries=%s\n' \
-            "$routine_event_first_seen_value" "$routine_poll_retries_value"
+            "$routine_event_first_seen_value" "$routine_poll_retries_value" &&
+        printf 'defer_reason=%s\nlast_exit_code=%s\nlast_reason=%s\n' \
+            "${routine_defer_reason_value:-none}" "${routine_last_exit_value:--1}" \
+            "${routine_last_reason_value:-none}"
     } > "$routine_state_temp" || { rm -f "$routine_state_temp"; return 69; }
     finish_private_file "$routine_state_temp" || { rm -f "$routine_state_temp"; return 69; }
     mv -f "$routine_state_temp" "$routine_state_dir/$routine_state_profile.state" \
@@ -1286,8 +1622,13 @@ wait_for_child_admission() {
                 waited_admission_decision=
                 IFS= read -r waited_admission_decision < "$waited_admission_path" || return 1
                 rm -f "$waited_admission_path" 2>/dev/null || return 1
-                [ "$waited_admission_decision" = go ]
-                return $?
+                # 2 is the parent's own deliberate abort, which the parent has
+                # already accounted for; 1 is every refusal it has not.
+                case $waited_admission_decision in
+                    go) return 0 ;;
+                    abort) return 2 ;;
+                    *) return 1 ;;
+                esac
             fi
             admission_yield
             waited_admission_yield=$((waited_admission_yield + 1))
@@ -1376,16 +1717,32 @@ launch_admitted_child() {
     child_admission_sequence=$((child_admission_sequence + 1))
     launched_admission_path=$runtime_root/.child-admission.${launched_admission_parent}.${launched_admission_parent_start}.${child_admission_sequence}
     [ ! -e "$launched_admission_path" ] && [ ! -L "$launched_admission_path" ] || return 73
+    # A wrapper that is never admitted exits 75, never 0. The parent waits on
+    # this pid as if it were the runner, and a 0 from a runner that never ran
+    # was recorded as a successful sync: last_success advanced, the next
+    # interval was scheduled, the dependency gate opened, and no run.state,
+    # Activity or alert existed to contradict it. 75 is the package's
+    # "not now, retry" status, which the parent records as a deferral.
     (
         trap - TERM INT HUP USR1 USR2 ALRM
-        if wait_for_child_admission "$launched_admission_path" \
+        launched_admission_wait=0
+        wait_for_child_admission "$launched_admission_path" \
             "$launched_admission_parent" "$launched_admission_parent_start" \
-            "$launched_admission_boot"; then
-            process_identity_is_live "$launched_admission_parent" \
-                "$launched_admission_parent_start" "$launched_admission_boot" || exit 0
+            "$launched_admission_boot" || launched_admission_wait=$?
+        #
+        # The wrapper writes no record of its own. It is a subshell, so its $$
+        # is the controller's, and a log or Activity write from here claimed
+        # the shared event-log lock under the controller's identity -- racing
+        # the controller for it, and on failure leaving only a raw stderr line
+        # in controller.log. The refusal is recorded by the parent instead
+        # (retire_admission_decision): a go decision still on disk after this
+        # wrapper exited is the proof it was never admitted. A parent that is
+        # gone after admission has no one to record for.
+        if [ "$launched_admission_wait" -eq 0 ] && process_identity_is_live "$launched_admission_parent" \
+            "$launched_admission_parent_start" "$launched_admission_boot"; then
             exec "$@"
         fi
-        exit 0
+        exit 75
     ) &
     launched_admission_pid=$!
     if ! capture_work_child_identity "$launched_admission_pid" "$launched_admission_boot"; then
@@ -1442,7 +1799,41 @@ launch_admitted_child() {
         return 73
     fi
     admitted_child_pid=$launched_admission_pid
+    admitted_child_admission_path=$launched_admission_path
     admitted_child_status=started
+    return 0
+}
+
+# A wrapper reads and removes its go decision before it execs. One still on
+# disk after the wrapper has exited was never read: the wrapper gave up waiting
+# for admission and exited 75 without running anything. That refusal is
+# recorded here, in the controller's own process and under its own lock
+# identity -- a structured controller.log event, and for scheduled work an
+# Activity record -- and the decision file, which nothing else would ever
+# remove, is retired. Sets admission_refused for the caller.
+#   retire_admission_decision PATH KIND
+retire_admission_decision() {
+    admission_refused=false
+    [ -n "${1:-}" ] || return 0
+    if [ -f "$1" ] && [ ! -L "$1" ]; then
+        admission_refused=true
+        rm -f "$1" || controller_log_event warn admission_decision_leftover "path=$1" \
+            || echo "admission decision $1 could not be removed" >&2
+        case ${2:-} in
+            controller_sleep) ;;
+            routine|schedule)
+                controller_activity run.deferred none deferred \
+                    "Scheduled run not started: the controller admission handshake did not complete" \
+                    scheduler warn
+                controller_log_event warn child_admission_refused "kind=$2 reason=not_admitted" scheduler \
+                    || echo "child admission refused (kind=$2 reason=not_admitted)" >&2
+                ;;
+            *)
+                controller_log_event warn child_admission_refused "kind=${2:-unknown} reason=not_admitted" \
+                    || echo "child admission refused (kind=${2:-unknown} reason=not_admitted)" >&2
+                ;;
+        esac
+    fi
     return 0
 }
 
@@ -1943,6 +2334,9 @@ load_routine_state_runtime() {
     routine_pending_since_value=0
     routine_event_first_seen_value=0
     routine_poll_retries_value=0
+    routine_defer_reason_value=none
+    routine_last_exit_value=-1
+    routine_last_reason_value=none
     [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ] || return 0
     routine_state_seen=,
     routine_state_lines=0
@@ -1969,10 +2363,22 @@ load_routine_state_runtime() {
             pending_since_epoch) routine_pending_since_value=$routine_state_field ;;
             event_first_seen_epoch) routine_event_first_seen_value=$routine_state_field ;;
             poll_retries) routine_poll_retries_value=$routine_state_field ;;
+            defer_reason) routine_defer_reason_value=$routine_state_field ;;
+            last_exit_code) routine_last_exit_value=$routine_state_field ;;
+            last_reason) routine_last_reason_value=$routine_state_field ;;
             *) continue ;;
         esac
         routine_state_seen=$routine_state_seen$routine_state_key,
     done < "$1"
+    # Additive fields are repaired, never refused: a value this build does not
+    # recognise reads as its default, so an older or newer writer cannot make
+    # the routine stop being evaluated.
+    case $routine_defer_reason_value in
+        none|window|dependency|delete_bound|source|busy) ;;
+        *) routine_defer_reason_value=none ;;
+    esac
+    case $routine_last_exit_value in -1) ;; ''|*[!0-9]*) routine_last_exit_value=-1 ;; esac
+    case $routine_last_reason_value in ''|*[!a-z0-9_]*) routine_last_reason_value=none ;; esac
 }
 
 load_routine_profile_runtime() {
@@ -1987,24 +2393,66 @@ load_routine_profile_runtime() {
         [ "$routine_profile_lines" -le 4096 ] || break
         case $routine_profile_line in
             'max-delete = '*)
+                # A duplicated bound is refused rather than resolved to its
+                # first occurrence: the routine's delete gate compares against
+                # this value, and silently picking one of two is how a weaker
+                # bound would be admitted. The caller skips the routine, and
+                # says so, on an empty value.
                 if [ "$routine_profile_max_seen" = false ]; then
                     routine_profile_max_seen=true
                     routine_profile_max=${routine_profile_line#max-delete = }
+                else
+                    routine_profile_max=
+                    break
                 fi
                 ;;
             'source = "'*'"')
+                # Refused like a duplicated bound: two sources would leave
+                # this loader and the core disagreeing about what is watched.
                 if [ "$routine_profile_source_seen" = false ]; then
                     routine_profile_source_seen=true
                     profile_source=${routine_profile_line#source = \"}
                     profile_source=${profile_source%\"}
+                else
+                    routine_profile_max=
+                    break
                 fi
                 ;;
         esac
     done < "$1"
 }
 
+# A routine the controller cannot evaluate is skipped, and that skip used to be
+# silent for most fields: no state, no Activity, and for the logged ones a warn
+# line every five-second turn. Report each (routine, field) once per
+# controller lifetime -- a reload starts the count again, so a fix that does
+# not take is reported again -- in controller.log and in Activity.
+routine_skip_seen=,
+routine_skip() {
+    routine_skip_key=$1:$2
+    case $routine_skip_seen in *",$routine_skip_key,"*) return 0 ;; esac
+    routine_skip_seen=$routine_skip_seen$routine_skip_key,
+    if [ "$2" = profile_missing ]; then
+        controller_log_event warn routine_profile_missing "profile=$1"
+    else
+        controller_log_event warn routine_invalid "profile=$1 field=$2"
+    fi
+    case $1 in ''|*[!A-Za-z0-9_-]*) routine_skip_profile=none ;; *) routine_skip_profile=$1 ;; esac
+    controller_activity routine.deferred "$routine_skip_profile" deferred \
+        "Routine skipped: its $2 setting is invalid or its profile is missing" routines warn
+}
+
 process_routines() {
     routine_now=$1
+    # A walk whose routine was removed, disabled or moved off realtime has no
+    # collector left; without this it would hold the single walk slot forever.
+    if [ -n "$poll_job_pid" ]; then
+        load_routine_config_runtime "$routines_dir/$poll_job_profile.conf"
+        if [ "$routine_enabled" != true ] || [ "$routine_mode" != realtime ]; then
+            controller_log_event info poll_job_discarded "profile=$poll_job_profile"
+            stop_poll_job
+        fi
+    fi
     for routine_config in "$routines_dir"/*.conf; do
         [ -e "$routine_config" ] || [ -L "$routine_config" ] || continue
         if [ -L "$routine_config" ] || [ ! -f "$routine_config" ] || [ ! -r "$routine_config" ]; then
@@ -2013,21 +2461,21 @@ process_routines() {
         fi
         routine_profile=${routine_config##*/}; routine_profile=${routine_profile%.conf}
         case $routine_profile in ''|*[!A-Za-z0-9_-]*) controller_log_event warn routine_name_rejected; continue ;; esac
-        profile_exists "$routine_profile" || { controller_log_event warn routine_profile_missing "profile=$routine_profile"; continue; }
+        profile_exists "$routine_profile" || { routine_skip "$routine_profile" profile_missing; continue; }
         load_routine_config_runtime "$routine_config"
         case $routine_enabled:$routine_delete:$routine_retry_exponential in
             true:true:true|true:true:false|true:false:true|true:false:false|\
             false:true:true|false:true:false|false:false:true|false:false:false) ;;
-            *) controller_log_event warn routine_invalid "profile=$routine_profile field=boolean"; continue ;;
+            *) routine_skip "$routine_profile" boolean; continue ;;
         esac
         [ "$routine_enabled" = true ] || continue
-        case $routine_action in plan|sync) ;; *) controller_log_event warn routine_invalid "profile=$routine_profile field=action"; continue ;; esac
-        case $routine_mode in interval|daily|realtime) ;; *) controller_log_event warn routine_invalid "profile=$routine_profile field=mode"; continue ;; esac
-        case $routine_retries:$routine_backoff:$routine_max_total in *[!0-9:]*) controller_log_event warn routine_invalid "profile=$routine_profile field=number"; continue ;; esac
-        [ "$routine_retries" -le 5 ] || continue
-        [ "$routine_backoff" -ge 10 ] || continue
+        case $routine_action in plan|sync) ;; *) routine_skip "$routine_profile" action; continue ;; esac
+        case $routine_mode in interval|daily|realtime) ;; *) routine_skip "$routine_profile" mode; continue ;; esac
+        case $routine_retries:$routine_backoff:$routine_max_total in *[!0-9:]*) routine_skip "$routine_profile" number; continue ;; esac
+        [ "$routine_retries" -le 5 ] || { routine_skip "$routine_profile" retry_count; continue; }
+        [ "$routine_backoff" -ge 10 ] || { routine_skip "$routine_profile" retry_backoff_seconds; continue; }
         decimal_at_most "$routine_max_total" "$dsm_delete_limit" || {
-            controller_log_event warn routine_invalid "profile=$routine_profile field=max_total_delete"
+            routine_skip "$routine_profile" max_total_delete
             continue
         }
         # Older releases accepted a larger base. Preserve those configs while
@@ -2035,23 +2483,23 @@ process_routines() {
         [ "$routine_backoff" -le 300 ] || routine_backoff=300
         case $routine_mode in
             interval)
-                case $routine_interval in ''|*[!0-9]*) continue ;; esac
-                [ "$routine_interval" -ge 60 ] && [ "$routine_interval" -le 2592000 ] || continue
+                case $routine_interval in ''|*[!0-9]*) routine_skip "$routine_profile" interval_seconds; continue ;; esac
+                [ "$routine_interval" -ge 60 ] && [ "$routine_interval" -le 2592000 ] || { routine_skip "$routine_profile" interval_seconds; continue; }
                 ;;
             daily)
-                printf '%s\n' "$routine_weekdays" | grep -Eq '^[1-7](,[1-7])*$' || continue
-                printf '%s\n' "$routine_start" | grep -Eq '^([0-1][0-9]|2[0-3]):[0-5][0-9]$' || continue
-                printf '%s\n' "$routine_end" | grep -Eq '^([0-1][0-9]|2[0-3]):[0-5][0-9]$' || continue
+                printf '%s\n' "$routine_weekdays" | grep -Eq '^[1-7](,[1-7])*$' || { routine_skip "$routine_profile" weekdays; continue; }
+                printf '%s\n' "$routine_start" | grep -Eq '^([0-1][0-9]|2[0-3]):[0-5][0-9]$' || { routine_skip "$routine_profile" time_window_start; continue; }
+                printf '%s\n' "$routine_end" | grep -Eq '^([0-1][0-9]|2[0-3]):[0-5][0-9]$' || { routine_skip "$routine_profile" time_window_end; continue; }
                 ;;
             realtime)
-                case $routine_debounce:$routine_poll in *[!0-9:]*) continue ;; esac
-                [ "$routine_debounce" -ge 1 ] && [ "$routine_debounce" -le 3600 ] || continue
-                [ "$routine_poll" -ge 5 ] && [ "$routine_poll" -le 3600 ] || continue
+                case $routine_debounce:$routine_poll in *[!0-9:]*) routine_skip "$routine_profile" realtime_timing; continue ;; esac
+                [ "$routine_debounce" -ge 1 ] && [ "$routine_debounce" -le 3600 ] || { routine_skip "$routine_profile" debounce_seconds; continue; }
+                [ "$routine_poll" -ge 5 ] && [ "$routine_poll" -le 3600 ] || { routine_skip "$routine_profile" poll_seconds; continue; }
                 ;;
         esac
         load_routine_profile_runtime "$profiles_dir/$routine_profile.toml"
-        case $routine_profile_max in ''|*[!0-9]*) continue ;; esac
-        decimal_at_most "$routine_profile_max" "$dsm_delete_limit" || continue
+        case $routine_profile_max in ''|*[!0-9]*) routine_skip "$routine_profile" profile_max_delete; continue ;; esac
+        decimal_at_most "$routine_profile_max" "$dsm_delete_limit" || { routine_skip "$routine_profile" profile_max_delete; continue; }
         routine_delete_bound=false
         if [ "$routine_delete" = true ] && [ "$routine_max_total" -lt "$routine_profile_max" ]; then
             routine_delete_bound=true
@@ -2070,6 +2518,8 @@ process_routines() {
         routine_event_forced=false
         routine_event_forced_pending=0
         routine_event_forced_ceiling=0
+        routine_dispatch_fingerprint=
+        routine_poll_collected=false
         case $routine_state_value in never|scheduled|running|succeeded|failed|deferred) ;; *) controller_log_event warn routine_state_invalid "profile=$routine_profile"; continue ;; esac
         case $routine_next_value:$routine_last_success_value:$routine_last_attempt_value:$routine_retry_value:$routine_last_poll_value in *[!0-9:]*) controller_log_event warn routine_state_invalid "profile=$routine_profile"; continue ;; esac
         case $routine_pending_since_value:$routine_event_first_seen_value:$routine_poll_retries_value in *[!0-9:]*) controller_log_event warn routine_state_invalid "profile=$routine_profile"; continue ;; esac
@@ -2093,6 +2543,19 @@ process_routines() {
             *) valid_source_fingerprint "$routine_pending_fingerprint_value" \
                 || routine_pending_fingerprint_value=0 ;;
         esac
+        # Routines run synchronously in this loop, so a routine still marked
+        # running when it is evaluated was interrupted: the controller that
+        # launched it stopped -- package stop, reboot, a crash -- before the
+        # outcome could be recorded. It used to read Running indefinitely.
+        if [ "$routine_state_value" = running ]; then
+            routine_state_value=failed
+            routine_last_reason_value=interrupted
+            routine_last_exit_value=-1
+            write_routine_state "$routine_profile"
+            controller_activity run.failed "$routine_profile" failed \
+                "Routine run was interrupted before its outcome was recorded" routines warn
+            controller_log_event warn routine_interrupted "profile=$routine_profile" scheduler
+        fi
         due=false
         if [ "$routine_delete_bound" = true ]; then
             # The routine's own deletion bound is weaker than its profile's, so
@@ -2107,20 +2570,46 @@ process_routines() {
             # five-value set with a fail-closed exit, so writing it would blank
             # every dashboard panel rather than just this row. Nothing is
             # observing a routine that cannot run, which is what none means.
-            if [ "$routine_state_value" != deferred ]; then
+            if [ "$routine_state_value" != deferred ] || [ "$routine_defer_reason_value" != delete_bound ]; then
                 routine_state_value=deferred
+                routine_defer_reason_value=delete_bound
                 routine_backend_value=none
                 routine_backend_reason_value=ok
                 write_routine_state "$routine_profile"
+                controller_activity routine.deferred "$routine_profile" deferred \
+                    "Routine cannot run: its deletion bound is weaker than the profile's max-delete" routines warn
                 controller_log_event warn routine_deferred "profile=$routine_profile reason=delete_bound" scheduler
             fi
             continue
         elif ! routine_clock_allows "$routine_mode" "$routine_weekdays" "$routine_start" "$routine_end"; then
-            routine_state_value=deferred
-            routine_backend_value=$routine_mode
-            routine_backend_reason_value=ok
-            write_routine_state "$routine_profile"
-            append_activity routine.deferred "$routine_profile" deferred "Routine outside configured window" routines warn 2>/dev/null || true
+            # Outside the window is a daily routine's normal resting state for
+            # most of the day. This used to rewrite the state and append an
+            # Activity line on every five-second turn -- about 17 000 records a
+            # day per routine, enough to evict the whole shared activity ring
+            # within days -- and it overwrote a just-finished run's outcome with
+            # deferred. Now the episode is recorded once, on entry, and a routine
+            # whose last run succeeded or failed keeps showing that outcome:
+            # the window closing is not news about the last run.
+            case $routine_state_value:$routine_defer_reason_value in
+                succeeded:*|failed:*|deferred:window) ;;
+                *)
+                    routine_state_value=deferred
+                    routine_defer_reason_value=window
+                    routine_backend_value=$routine_mode
+                    routine_backend_reason_value=ok
+                    write_routine_state "$routine_profile"
+                    controller_activity routine.deferred "$routine_profile" deferred \
+                        "Routine outside configured window" routines info
+                    ;;
+            esac
+            continue
+        elif [ "$routine_state_value" = deferred ] && [ "$routine_next_value" -gt "$routine_now" ] \
+            && [ "$routine_defer_reason_value" = busy ]; then
+            # A busy package is re-checked on its own short deadline. Without
+            # this a daily routine, which has no deadline of its own, would be
+            # dispatched into the same refusal on every five-second turn. A
+            # dependency is not gated: it is re-checked every turn, so the
+            # routine runs as soon as its dependency succeeds.
             continue
         elif [ "$routine_retry_value" -gt 0 ]; then
             # A pending whole-action retry owns admission until its deadline.
@@ -2179,16 +2668,25 @@ process_routines() {
                             routine_backend_reason_value=source_missing
                             routine_source_reason=missing
                         fi
+                        routine_source_transition=false
+                        if [ "$routine_state_value" != deferred ] || [ "$routine_defer_reason_value" != source ] \
+                            || [ "$routine_backend_reason_value" != "$routine_backend_reason_previous" ]; then
+                            routine_source_transition=true
+                        fi
                         routine_backend_value=none
                         routine_state_value=deferred
+                        routine_defer_reason_value=source
                         terminate_realtime_watcher "$routine_profile"
                         reap_realtime_watchers
-                        write_routine_state "$routine_profile"
-                        if [ "$routine_backend_reason_value" != "$routine_backend_reason_previous" ]; then
+                        if [ -n "$poll_job_pid" ] && [ "$poll_job_profile" = "$routine_profile" ]; then
+                            stop_poll_job
+                        fi
+                        if [ "$routine_source_transition" = true ]; then
+                            write_routine_state "$routine_profile"
+                            controller_activity routine.deferred "$routine_profile" deferred \
+                                "Routine source is unavailable" routines warn
                             controller_log_event warn routine_source_unavailable \
                                 "profile=$routine_profile reason=$routine_source_reason"
-                            append_activity routine.deferred "$routine_profile" deferred \
-                                "Routine source is unavailable" routines warn 2>/dev/null || true
                         fi
                         continue
                     fi
@@ -2281,7 +2779,34 @@ process_routines() {
                             write_routine_state "$routine_profile"
                         fi
                     fi
-                    if [ "$due" != true ] && [ "$watcher_event_pending" != true ] && [ $((routine_now - routine_last_poll_value)) -ge "$routine_poll" ]; then
+                    # A walk this routine started on an earlier turn. Collected
+                    # first, so its reading is judged on the turn it lands.
+                    routine_poll_collected=false
+                    if [ -n "$poll_job_pid" ] && [ "$poll_job_profile" = "$routine_profile" ]; then
+                        if collect_poll_job; then routine_poll_collected=true; fi
+                    fi
+                    if [ "$routine_poll_collected" = true ] && [ "$collected_poll_purpose" = rebaseline ]; then
+                        # The reading taken after a successful native dispatch.
+                        # inotify observed the change that was synced, so this
+                        # reading becomes the baseline without a comparison.
+                        routine_poll_collected=false
+                        rebaseline_fingerprint=
+                        if [ "$collected_poll_status" -eq 0 ]; then
+                            rebaseline_fingerprint=${collected_poll_output#*|}
+                            valid_source_fingerprint "$rebaseline_fingerprint" || rebaseline_fingerprint=
+                        fi
+                        if [ -n "$rebaseline_fingerprint" ]; then
+                            routine_fingerprint_value=$rebaseline_fingerprint
+                            routine_pending_fingerprint_value=0
+                            routine_pending_since_value=0
+                            write_routine_state "$routine_profile"
+                        else
+                            controller_log_event warn routine_poll_unavailable \
+                                "profile=$routine_profile reason=post_event_fingerprint detail=status=$collected_poll_status"
+                        fi
+                    elif [ "$routine_poll_collected" != true ] && [ -z "$poll_job_pid" ] \
+                        && [ "$due" != true ] && [ "$watcher_event_pending" != true ] \
+                        && [ $((routine_now - routine_last_poll_value)) -ge "$routine_poll" ]; then
                         # The poll clock advances on the attempt, not on success.
                         # It used to advance only after the walk had completed, so
                         # a failing poll left last_poll_epoch frozen and the gate
@@ -2289,8 +2814,28 @@ process_routines() {
                         # complete recursive walk of the source every five
                         # seconds, indefinitely, with a warn line each time.
                         routine_last_poll_value=$routine_now
-                        routine_poll_status=0
-                        routine_poll_output=$(source_fingerprint "$profile_source" 2>/dev/null) || routine_poll_status=$?
+                        poll_start_status=0
+                        start_poll_job "$routine_profile" "$profile_source" compare || poll_start_status=$?
+                        if [ "$poll_start_status" -ne 0 ]; then
+                            routine_backend_reason_value=poll_unavailable
+                            write_routine_state "$routine_profile"
+                            if [ "$routine_backend_reason_value" != "$routine_backend_reason_previous" ]; then
+                                controller_log_event warn routine_poll_unavailable \
+                                    "profile=$routine_profile reason=poll_job detail=status=$poll_start_status"
+                            fi
+                            continue
+                        fi
+                        # The reason on disk is the last completed poll's until
+                        # this walk lands; the watcher's own reason, set above
+                        # for this turn, must not replace it in between, or a
+                        # permanently failing poll would be re-reported as a
+                        # new transition on every collection.
+                        routine_backend_reason_value=$routine_backend_reason_previous
+                        write_routine_state "$routine_profile"
+                    fi
+                    if [ "$routine_poll_collected" = true ]; then
+                        routine_poll_status=$collected_poll_status
+                        routine_poll_output=$collected_poll_output
                         current_fingerprint=
                         routine_poll_walks=0
                         routine_poll_reason=
@@ -2355,9 +2900,17 @@ process_routines() {
                             # source has stopped changing. Dispatching on the
                             # first difference syncs a copy that is still in
                             # progress and then syncs it again when it finishes.
-                            routine_fingerprint_value=$current_fingerprint
-                            routine_pending_fingerprint_value=0
-                            routine_pending_since_value=0
+                            #
+                            # The reading is adopted as the baseline only once
+                            # the sync it dispatches has succeeded. Adopting it
+                            # here, before the run, is what lost a change for
+                            # good whenever the dependency gate deferred the
+                            # run or the retry ladder ran out: the next poll
+                            # matched the baseline and nothing was ever due
+                            # again until some other file changed. Pending
+                            # stays set, so a failed or deferred dispatch is
+                            # due again on the next poll.
+                            routine_dispatch_fingerprint=$current_fingerprint
                             due=true
                         else
                             routine_pending_fingerprint_value=$current_fingerprint
@@ -2378,9 +2931,7 @@ process_routines() {
                             fi
                             [ "$routine_poll_ceiling" -le 3600 ] || routine_poll_ceiling=3600
                             if [ "$routine_poll_pending" -ge "$routine_poll_ceiling" ]; then
-                                routine_fingerprint_value=$current_fingerprint
-                                routine_pending_fingerprint_value=0
-                                routine_pending_since_value=0
+                                routine_dispatch_fingerprint=$current_fingerprint
                                 controller_log_event info routine_event_forced \
                                     "profile=$routine_profile pending_seconds=$routine_poll_pending ceiling=$routine_poll_ceiling"
                                 due=true
@@ -2393,11 +2944,43 @@ process_routines() {
             esac
         fi
         [ "$due" = true ] || continue
+        # A realtime routine has no cadence of its own, so next_run_epoch is
+        # its not-before instant: the 30-second floor after a cancelled or
+        # busy run, the dependency re-check, and the cool-down after an
+        # exhausted retry ladder. Those were all written and then ignored,
+        # which made a failing realtime routine re-dispatch on every poll. A
+        # suppressed dispatch keeps its pending reading, so it is due again
+        # as soon as the instant passes.
+        if [ "$routine_mode" = realtime ] && [ "$routine_retry_value" -eq 0 ] \
+            && [ "$routine_next_value" -gt "$routine_now" ]; then
+            [ "$routine_poll_collected" != true ] || write_routine_state "$routine_profile"
+            continue
+        fi
         if ! dependencies_allow "$routine_dependencies"; then
+            # Logged once per episode, not once per re-check: the re-check runs
+            # every 30 seconds for as long as the dependency has not succeeded,
+            # and an Activity line each time evicted real run history from the
+            # shared 4 MiB activity ring within days.
+            routine_defer_transition=false
+            if [ "$routine_state_value" != deferred ] || [ "$routine_defer_reason_value" != dependency ]; then
+                routine_defer_transition=true
+            fi
             routine_state_value=deferred
-            routine_next_value=$((routine_now + 30))
-            write_routine_state "$routine_profile"
-            append_activity routine.deferred "$routine_profile" deferred "Routine dependency has not succeeded" routines warn 2>/dev/null || true
+            routine_defer_reason_value=dependency
+            # Only an interval routine needs a deadline to stop it being due
+            # again at once; daily and realtime re-check on their own turn,
+            # and the state is rewritten only when something changed.
+            if [ "$routine_mode" = interval ]; then
+                routine_next_value=$((routine_now + 30))
+                write_routine_state "$routine_profile"
+            elif [ "$routine_defer_transition" = true ] || [ "$routine_poll_collected" = true ]; then
+                write_routine_state "$routine_profile"
+            fi
+            if [ "$routine_defer_transition" = true ]; then
+                controller_activity routine.deferred "$routine_profile" deferred \
+                    "Routine dependency has not succeeded" routines warn
+                controller_log_event info routine_deferred "profile=$routine_profile reason=dependency" scheduler
+            fi
             continue
         fi
         # Do not start new work after TERM/INT was latched while this routine
@@ -2417,20 +3000,13 @@ process_routines() {
                         controller_log_event info routine_event_forced \
                             "profile=$routine_profile pending_seconds=$routine_event_forced_pending ceiling=$routine_event_forced_ceiling"
                     fi
+                    # The marker is consumed, so the change it recorded now
+                    # lives only in this dispatch. The baseline is not touched
+                    # here: if the sync fails, the backstop poll still sees the
+                    # source differ from the last synced reading and dispatches
+                    # again. A successful run re-baselines from a background walk.
                     routine_event_first_seen_value=0
                     routine_last_poll_value=$routine_now
-                    refreshed_fingerprint=
-                    if refreshed_poll_output=$(source_fingerprint "$profile_source" 2>/dev/null); then
-                        refreshed_fingerprint=${refreshed_poll_output#*|}
-                        valid_source_fingerprint "$refreshed_fingerprint" || refreshed_fingerprint=
-                    fi
-                    if [ -n "$refreshed_fingerprint" ]; then
-                        routine_fingerprint_value=$refreshed_fingerprint
-                        routine_pending_fingerprint_value=0
-                        routine_pending_since_value=0
-                    else
-                        controller_log_event warn routine_poll_unavailable "profile=$routine_profile reason=post_event_fingerprint detail="
-                    fi
                     ;;
                 1)
                     # A newer native event arrived after the due check. Keep
@@ -2453,22 +3029,75 @@ process_routines() {
             return 73
         fi
         active_control_classification=runner
+        routine_admission_path=$admitted_child_admission_path
         if [ "$shutdown" = true ]; then
             stop_work_children_bounded
         fi
         write_controller_state running "$$" "$next_run" "$active_pid"
         wait_for_runner
+        retire_admission_decision "$routine_admission_path" routine
         routine_finished=$(epoch_now)
         # 130 is the core's cooperative-cancellation code and 143 a core
         # terminated by the runner's own TERM. Both mean an operator stopped the
         # package, or DSM rebooted, while this routine was running.
         routine_cancelled=false
         case $scheduled_exit in 130|143) routine_cancelled=true ;; esac
+        routine_last_exit_value=$scheduled_exit
+        routine_defer_reason_value=none
         if [ "$scheduled_exit" -eq 0 ]; then
             routine_state_value=succeeded
+            routine_last_reason_value=ok
             routine_last_success_value=$routine_finished
             routine_retry_value=0
             case $routine_mode in interval) routine_next_value=$((routine_finished + routine_interval)) ;; daily) routine_last_day_value=$(date +%Y-%m-%d); routine_next_value=0 ;; realtime) routine_next_value=0 ;; esac
+            if [ "$routine_mode" = realtime ]; then
+                if [ -n "$routine_dispatch_fingerprint" ]; then
+                    # The reading this run was dispatched for is now synced.
+                    # Anything that changed while it ran differs from it, so
+                    # the next poll dispatches again; nothing is lost.
+                    routine_fingerprint_value=$routine_dispatch_fingerprint
+                    routine_pending_fingerprint_value=0
+                    routine_pending_since_value=0
+                elif [ "$routine_native_event_due" = true ]; then
+                    if [ -n "$poll_job_pid" ] && [ "$poll_job_profile" = "$routine_profile" ]; then
+                        poll_job_purpose=rebaseline
+                    elif [ -z "$poll_job_pid" ]; then
+                        rebaseline_status=0
+                        start_poll_job "$routine_profile" "$profile_source" rebaseline || rebaseline_status=$?
+                        if [ "$rebaseline_status" -ne 0 ]; then
+                            controller_log_event warn routine_poll_unavailable \
+                                "profile=$routine_profile reason=post_event_fingerprint detail=status=$rebaseline_status"
+                        fi
+                    fi
+                fi
+            fi
+        elif [ "$scheduled_exit" -eq 3 ]; then
+            # Partial: the core finished and named paths were deferred to the
+            # next run. The profile synced apart from them, so this counts as a
+            # completion for the cadence and for dependents, consumes no retry
+            # and owes none. A realtime routine does not adopt the reading it
+            # was dispatched for: the deferred paths keep the change pending, so
+            # they are retried -- after the routine's retry backoff rather than
+            # on the very next poll. The runner wrote the warning Activity line.
+            routine_state_value=succeeded
+            routine_last_reason_value=deferred_paths
+            routine_last_success_value=$routine_finished
+            routine_retry_value=0
+            case $routine_mode in
+                interval) routine_next_value=$((routine_finished + routine_interval)) ;;
+                daily) routine_last_day_value=$(date +%Y-%m-%d); routine_next_value=0 ;;
+                realtime) routine_next_value=$((routine_finished + routine_backoff)) ;;
+            esac
+        elif [ "$scheduled_exit" -eq 75 ]; then
+            # Refused, not failed: another run, a configuration change or a
+            # package transition held the package when this one was admitted,
+            # or the admission handshake never completed. That consumes no
+            # retry, reads as deferred rather than failed, and is re-checked in
+            # 30 seconds. Whoever refused it wrote the Activity record.
+            routine_state_value=deferred
+            routine_defer_reason_value=busy
+            if [ "${admission_refused:-false}" = true ]; then routine_last_reason_value=admission_refused; else routine_last_reason_value=busy; fi
+            routine_next_value=$((routine_finished + 30))
         elif [ "$routine_cancelled" = true ]; then
             # A cancelled run consumed no attempt, so retry_attempt is left
             # exactly where it was: a retry that was already owed is still owed,
@@ -2482,6 +3111,7 @@ process_routines() {
             # and last_success_epoch for a run that did not finish; the enum is
             # validated fail-closed by three readers, so there is no third value.
             routine_state_value=failed
+            routine_last_reason_value=cancelled
             # A short floor rather than the routine's full cadence: prompt enough
             # that a package restart re-runs the interrupted sync straight away,
             # long enough that a core being signalled from outside cannot turn
@@ -2490,6 +3120,7 @@ process_routines() {
             [ "$routine_retry_value" -gt 0 ] || routine_next_value=$((routine_finished + 30))
         else
             routine_state_value=failed
+            routine_last_reason_value=$(routine_run_reason "$routine_profile")
             if [ "$routine_retry_value" -lt "$routine_retries" ]; then
                 routine_retry_value=$((routine_retry_value + 1))
                 retry_delay=$(routine_retry_delay "$routine_backoff" "$routine_retry_value" "$routine_retry_exponential") || {
@@ -2497,16 +3128,39 @@ process_routines() {
                     continue
                 }
                 routine_next_value=$((routine_finished + retry_delay))
-                append_activity routine.retry_scheduled "$routine_profile" scheduled "Routine retry scheduled in ${retry_delay}s" routines info 2>/dev/null || true
+                controller_activity routine.retry_scheduled "$routine_profile" scheduled "Routine retry scheduled in ${retry_delay}s" routines info
             else
                 routine_retry_value=0
-                case $routine_mode in interval) routine_next_value=$((routine_finished + routine_interval)) ;; daily) routine_last_day_value=$(date +%Y-%m-%d); routine_next_value=0 ;; realtime) routine_next_value=0 ;; esac
+                case $routine_mode in
+                    interval) routine_next_value=$((routine_finished + routine_interval)) ;;
+                    daily) routine_last_day_value=$(date +%Y-%m-%d); routine_next_value=0 ;;
+                    # The change stays pending (the baseline was never moved),
+                    # and is retried after a cool-down rather than on the very
+                    # next poll, which would turn an outage into a sync attempt
+                    # every few seconds.
+                    realtime) routine_next_value=$((routine_finished + realtime_exhausted_cooldown)) ;;
+                esac
+                # The ladder giving up used to be silent: the state simply
+                # stayed failed and the next cadence resumed. With no retries
+                # configured every failure is already its own record.
+                if [ "$routine_retries" -gt 0 ]; then
+                    controller_activity routine.retries_exhausted "$routine_profile" failed \
+                        "Routine failed $((routine_retries + 1)) times in a row ($routine_last_reason_value); retrying stopped until its next scheduled attempt" \
+                        routines error
+                    [ "$routine_action" != sync ] || routine_escalate_alert "$routine_profile" "$scheduled_exit"
+                    controller_log_event error routine_retries_exhausted \
+                        "profile=$routine_profile attempts=$((routine_retries + 1)) exit=$scheduled_exit reason=$routine_last_reason_value" scheduler
+                fi
             fi
         fi
         write_routine_state "$routine_profile"
-        if [ "$scheduled_exit" -eq 0 ] || [ "$routine_cancelled" = true ]; then routine_log_level=info; else routine_log_level=error; fi
+        case $scheduled_exit in
+            0|75|130|143) routine_log_level=info ;;
+            3) routine_log_level=warn ;;
+            *) routine_log_level=error ;;
+        esac
         controller_log_event "$routine_log_level" routine_run \
-            "profile=$routine_profile action=$routine_action exit=$scheduled_exit next=$routine_next_value backend=$routine_backend_value" scheduler
+            "profile=$routine_profile action=$routine_action exit=$scheduled_exit next=$routine_next_value backend=$routine_backend_value reason=$routine_last_reason_value" scheduler
         # One routine per turn keeps control-plane latency and shutdown bounded.
         break
     done
@@ -2531,6 +3185,7 @@ runner_wait_guard_stop_path=
 runner_wait_guard_admitted=false
 child_admission_sequence=0
 admitted_child_status=
+admitted_child_admission_path=
 child_wait_interrupt_epoch=0
 realtime_reap_pids=
 next_run=0
@@ -2565,6 +3220,7 @@ cleanup_controller() {
         active_pid_start=
         active_pid_boot=
     fi
+    stop_poll_job || true
     stop_realtime_watchers 2>/dev/null || true
     write_controller_state stopped 0 0 0 2>/dev/null || true
     remove_own_controller_ready 2>/dev/null || true
@@ -2624,6 +3280,8 @@ reconcile_audit_outbox || {
 prune_expired_control_files
 inotify_watch_limit_path=/proc/sys/fs/inotify/max_user_watches
 resolve_inotify_command
+resolve_fingerprint_exec
+load_schedule_deadline
 umask 077
 controller_pid_temp=$controller_pid_file.tmp.$$
 printf '%s\n' "$$" > "$controller_pid_temp"
@@ -2651,11 +3309,17 @@ while [ "$shutdown" = false ]; do
     # immediate queue turn. Signals received during the turn remain latched so
     # the sleep handoff below cannot lose them.
     queue_wake_requested=false
+    reopen_controller_stderr
     if [ "$reload_requested" = true ]; then
-        # Rebase the next deadline on the newly persisted cadence. This is what makes
-        # a 1-hour -> 60-second reconfiguration take effect promptly after HUP.
+        # Re-derive the next deadline from the newly persisted cadence and the
+        # saved deadline, whichever is earlier. This is what makes a 1-hour ->
+        # 60-second reconfiguration take effect promptly after HUP.
         next_run=0
         stop_realtime_watchers 2>/dev/null || true
+        # A routine may have been removed or changed mode; a walk in flight
+        # is simply discarded and the next poll starts afresh.
+        stop_poll_job
+        routine_skip_seen=,
         # A saved performance level takes effect on the same HUP as a saved
         # schedule, so the dashboard's Save is what applies it rather than a
         # package restart.
@@ -2687,10 +3351,25 @@ while [ "$shutdown" = false ]; do
     fi
 
     now=$(epoch_now)
+    reconcile_stale_run_state "$now"
     if [ "$enabled" != true ]; then
         next_run=0
+        save_schedule_deadline 0
     elif [ "$next_run" -eq 0 ]; then
+        # A start or a reload. Keep the persisted deadline unless the cadence
+        # now asks for an earlier one -- which is what still makes a 1-hour ->
+        # 60-second save take effect promptly. A deadline that passed while the
+        # controller was stopped runs a minute after start, not a full interval
+        # later and not in the middle of boot.
         next_run=$((now + interval))
+        if [ "$schedule_deadline" -gt 0 ]; then
+            if [ "$schedule_deadline" -le "$now" ]; then
+                next_run=$((now + 60))
+            elif [ "$schedule_deadline" -lt "$next_run" ]; then
+                next_run=$schedule_deadline
+            fi
+        fi
+        save_schedule_deadline "$next_run"
     elif [ "$now" -ge "$next_run" ]; then
         # Do not start a scheduled aggregate after TERM/INT was latched. The
         # post-assignment check closes the asynchronous launch window.
@@ -2703,17 +3382,29 @@ while [ "$shutdown" = false ]; do
             exit 73
         fi
         active_control_classification=runner
+        schedule_admission_path=$admitted_child_admission_path
         if [ "$shutdown" = true ]; then
             stop_work_children_bounded
         fi
         write_controller_state running "$$" "$next_run" "$active_pid"
         wait_for_runner
+        retire_admission_decision "$schedule_admission_path" schedule
         run_exit=$scheduled_exit
         now=$(epoch_now)
-        next_run=$((now + interval))
-        # Failure is recorded by sdsync-run and does not trigger an immediate retry.
-        if [ "$run_exit" -eq 0 ]; then scheduled_log_level=info; else scheduled_log_level=error; fi
-        controller_log_event "$scheduled_log_level" scheduled_run "exit=$run_exit next=$next_run" scheduler
+        # Failure is recorded by sdsync-run and does not trigger an immediate
+        # retry. A refusal (75: another run or a configuration change held the
+        # package) is not a failure and is retried in 30 seconds instead of a
+        # whole interval later; the refusal wrote its own Activity record.
+        case $run_exit in
+            0) scheduled_log_level=info; scheduled_reason=ok; next_run=$((now + interval)) ;;
+            # Partial: finished, some paths deferred to the next run. Not a
+            # failure, and the next interval picks the deferred paths up.
+            3) scheduled_log_level=warn; scheduled_reason=deferred_paths; next_run=$((now + interval)) ;;
+            75) scheduled_log_level=info; scheduled_reason=busy; next_run=$((now + 30)) ;;
+            *) scheduled_log_level=error; scheduled_reason=$(routine_run_reason all); next_run=$((now + interval)) ;;
+        esac
+        save_schedule_deadline "$next_run"
+        controller_log_event "$scheduled_log_level" scheduled_run "exit=$run_exit next=$next_run reason=$scheduled_reason" scheduler
     fi
 
     [ "$shutdown" = false ] || break
@@ -2750,6 +3441,9 @@ while [ "$shutdown" = false ]; do
         sleep_for=5
         break
     done
+    # A background poll walk is collected by the routine that started it, on a
+    # turn of its own; look again in a second rather than five.
+    [ -z "$poll_job_pid" ] || sleep_for=1
     for wake_request in "$control_requests"/*.json; do
         [ -e "$wake_request" ] || [ -L "$wake_request" ] || continue
         sleep_for=1
@@ -2767,6 +3461,7 @@ while [ "$shutdown" = false ]; do
         controller_log_event error child_identity_capture_failed "kind=controller_sleep"
         exit 73
     fi
+    sleep_admission_path=$admitted_child_admission_path
     # Close every signal-before-publication race: a handler either stops the
     # fully published sleep tuple or leaves its latch set for this exact recheck.
     if [ "$shutdown" = true ] || [ "$reload_requested" = true ] || \
@@ -2774,6 +3469,7 @@ while [ "$shutdown" = false ]; do
         signal_controller_sleep
     fi
     reap_direct_child_interruption_safe "$sleep_pid"
+    retire_admission_decision "$sleep_admission_path" controller_sleep
     sleep_pid=
     sleep_pid_start=
     sleep_pid_boot=

@@ -2,7 +2,7 @@
  * Pure snapshot-to-view-model derivation and poll cadence policy for the DSM
  * desktop widget.
  *
- * This module deliberately imports nothing. DSM instantiates the widget on the
+ * This module imports only ./outcomes.mjs, itself a pure module. DSM instantiates the widget on the
  * desktop document, outside the AppWindow and outside any Vue tree, so the
  * decisions that matter most here -- how often a background card on a NAS
  * desktop is allowed to talk to the package, and what a 318x84 pixel card is
@@ -40,6 +40,14 @@ export const WIDGET_MAX_POLL_MS = WIDGET_BACKOFF_RAMP_MS[WIDGET_BACKOFF_RAMP_MS.
 // is actually asked -- it is deliberately shorter than every poll cadence
 // above except the fastest, so the age never lags by more than this.
 export const WIDGET_CLOCK_TICK_MS = 30000;
+
+import {
+  OUTCOMES_MISSING_ITEM,
+  attentionItems,
+  normalizeOutcomes,
+  outcomeLabel,
+  profileOutcomeRow
+} from "./outcomes.mjs";
 
 export const WIDGET_LEVELS = Object.freeze({
   ok: "ok",
@@ -157,7 +165,7 @@ export function widgetRun(snapshot) {
  * run. This mirrors how the AppWindow's healthRows computed property joins the
  * same two records.
  */
-function widgetProfileRow(profile, routines, run, nowMs) {
+function widgetProfileRow(profile, routines, run, nowMs, outcomes = null, stale = false) {
   const model = objectOf(profile);
   const name = textOf(model.name);
   const health = objectOf(model.health);
@@ -167,6 +175,7 @@ function widgetProfileRow(profile, routines, run, nowMs) {
   const runningRun = run.active && (run.scope === "all" || run.profile === name);
   const running = runningRun || routineState === "running";
 
+  const healthState = textOf(health.state);
   let level = WIDGET_LEVELS.unknown;
   let outcome = "Unknown";
   let source = "none";
@@ -197,7 +206,6 @@ function widgetProfileRow(profile, routines, run, nowMs) {
     source = "health";
     epoch = numberOf(health.checked_epoch);
     epochPrefix = "checked";
-    const healthState = textOf(health.state);
     if (healthState === "failed") {
       level = WIDGET_LEVELS.fail;
       outcome = "Doctor failed";
@@ -210,9 +218,38 @@ function widgetProfileRow(profile, routines, run, nowMs) {
     }
   }
 
+  let detail = epoch > 0 ? `${epochPrefix} ${relativeEpochLabel(epoch, nowMs)}` : (
+    source === "routine" ? "no successful run yet" : "never checked"
+  );
+
+  // The package's own record of the last run of this profile outranks the
+  // routine and Doctor evidence whenever it is bad, and replaces the Doctor
+  // fallback whenever it exists: a profile with no routine must not read
+  // "Doctor passed" while its syncs fail.
+  const entry = outcomes && outcomes.profiles.find((item) => item.profile === name);
+  if (entry && !(entry.outcome === "not_run" && source === "routine")) {
+    const recorded = profileOutcomeRow(entry, numberOf(nowMs) / 1000);
+    const worse = recorded.level === WIDGET_LEVELS.fail || recorded.level === WIDGET_LEVELS.warn || recorded.level === WIDGET_LEVELS.unknown;
+    if (worse || source === "health") {
+      level = recorded.level;
+      outcome = recorded.label;
+      if (entry.finishedEpoch > 0) epoch = entry.finishedEpoch;
+      detail = entry.outcome === "not_run" && !recorded.detail
+        ? (healthState === "succeeded" ? "Doctor passed; no sync recorded" : "no sync recorded")
+        : ([recorded.detail, recorded.age, recorded.note].filter(Boolean).join("; ") || detail);
+    }
+  }
+
   if (running) {
     level = WIDGET_LEVELS.warn;
     outcome = "Running";
+  }
+
+  // A retained reading is history. Failures stay failures; everything else
+  // loses its colour and says so.
+  if (stale) {
+    if (level !== WIDGET_LEVELS.fail) level = WIDGET_LEVELS.unknown;
+    outcome = `${outcome} (stale)`;
   }
 
   return {
@@ -222,19 +259,20 @@ function widgetProfileRow(profile, routines, run, nowMs) {
     running,
     source,
     epoch,
+    stale,
     age: relativeEpochLabel(epoch, nowMs),
-    detail: epoch > 0 ? `${epochPrefix} ${relativeEpochLabel(epoch, nowMs)}` : (
-      source === "routine" ? "no successful run yet" : "never checked"
-    )
+    detail
   };
 }
 
-export function widgetProfileRows(snapshot, nowMs = Date.now()) {
+function deriveProfileRows(snapshot, nowMs, options) {
   const model = objectOf(snapshot);
   const routines = arrayOf(model.routines);
   const run = widgetRun(model);
+  const outcomes = normalizeOutcomes(model.outcomes);
+  const stale = objectOf(options).stale === true;
   return arrayOf(model.profiles)
-    .map((profile) => widgetProfileRow(profile, routines, run, nowMs))
+    .map((profile) => widgetProfileRow(profile, routines, run, nowMs, outcomes, stale))
     .filter((row) => row.name !== "");
 }
 
@@ -247,7 +285,7 @@ export function widgetProfileRows(snapshot, nowMs = Date.now()) {
  * stopped service outranks "some profiles have never run". A widget that
  * reports "Healthy" while one profile is failing is worse than no widget.
  */
-export function widgetOverview(snapshot, nowMs = Date.now()) {
+function deriveOverview(snapshot, nowMs, options) {
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
     return {
       level: WIDGET_LEVELS.unknown,
@@ -264,7 +302,17 @@ export function widgetOverview(snapshot, nowMs = Date.now()) {
       detail: "Open the dashboard; the controller process failed its identity check."
     };
   }
-  const rows = widgetProfileRows(snapshot, nowMs);
+  const stale = objectOf(options).stale === true;
+  const rows = deriveProfileRows(snapshot, nowMs, options);
+  const outcomes = normalizeOutcomes(snapshot.outcomes);
+  const items = outcomes ? attentionItems(outcomes, numberOf(nowMs) / 1000) : [OUTCOMES_MISSING_ITEM];
+  const shared = (level) => items.find((item) => item.level === level && !item.id.startsWith("profile-"));
+  const view = (item) => ({ level: item.level, title: item.title, detail: item.detail });
+  const staleNote = stale ? "Stale: the package has stopped answering. " : "";
+  const sharedFailure = shared("fail");
+  if (sharedFailure) {
+    return Object.assign(view(sharedFailure), { detail: staleNote + sharedFailure.detail });
+  }
   const failing = rows.filter((row) => row.level === WIDGET_LEVELS.fail);
   if (failing.length) {
     return {
@@ -285,6 +333,25 @@ export function widgetOverview(snapshot, nowMs = Date.now()) {
       level: WIDGET_LEVELS.warn,
       title: "Package service stopped",
       detail: "Routines and schedules do not run while the service is stopped."
+    };
+  }
+  const needing = rows.filter((row) => !row.running && (row.level === WIDGET_LEVELS.warn || (row.level === WIDGET_LEVELS.unknown && !row.stale)));
+  if (needing.length) {
+    return {
+      level: WIDGET_LEVELS.warn,
+      title: `${plural(needing.length, "profile", "profiles")} need attention`,
+      detail: staleNote + needing.map((row) => `${row.name}: ${row.outcome}`).join(", ")
+    };
+  }
+  const caution = shared("unknown") || shared("warn");
+  if (caution) {
+    return Object.assign(view(caution), { detail: staleNote + caution.detail });
+  }
+  if (stale) {
+    return {
+      level: WIDGET_LEVELS.unknown,
+      title: "Status is stale",
+      detail: "The package has stopped answering; these rows are the last reading, not current status."
     };
   }
   const pending = rows.filter((row) => row.level === WIDGET_LEVELS.idle);
@@ -465,4 +532,24 @@ export function appWindowPreferences(storedValue) {
   } catch (_error) {
     return fallback;
   }
+}
+
+export function widgetProfileRows(snapshot, nowMs = Date.now()) {
+  return deriveProfileRows(snapshot, nowMs, {});
+}
+
+export function widgetOverview(snapshot, nowMs = Date.now()) {
+  return deriveOverview(snapshot, nowMs, {});
+}
+
+/**
+ * The card's headline and rows together, with `stale` marking the snapshot as
+ * a retained reading after failed polls: rows lose their colour and say so,
+ * and the headline stops claiming health. Failures stay failures.
+ */
+export function widgetView(snapshot, nowMs = Date.now(), options = {}) {
+  return {
+    overview: deriveOverview(snapshot, nowMs, objectOf(options)),
+    rows: deriveProfileRows(snapshot, nowMs, objectOf(options))
+  };
 }

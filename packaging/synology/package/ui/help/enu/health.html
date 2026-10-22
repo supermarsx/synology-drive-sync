@@ -43,7 +43,9 @@
   <p><strong>Completed</strong> and <strong>failed</strong> are terminal package results. A package-level failure cannot be hidden by an independently successful target check. Complete structured output is accepted only inside the one-MiB API contract; malformed output, the package truncation marker, or the legacy 64-KiB boundary becomes a visible not-OK integrity result. Bounded trailing controller warnings remain visible.</p>
   <p>A lost POST acknowledgement is recovered with at most two exact replays of the same body and client request ID, which resolve to the same queued job. If that job still cannot be observed because result evidence is invalid, expired, or repeatedly unavailable, the UI reports <strong>outcome unknown</strong> with request and job correlation when available. Only the affected scope and dependent operations are paused; independent configuration remains usable. Inspect authoritative package state, Activity, and logs before another request in that scope.</p>
 
+  <p>When the source check finds entries a sync will skip (names the destination cannot hold, links, case collisions, online-only cloud files), Doctor shows them as an <strong>Entries a sync will skip</strong> warning with the count and the first few paths. A readable source is not the same as a fully syncable one, and this is never reported as passed.</p>
+
   <h2>Cached target health</h2>
-  <p>The table displays the newest package-reported evidence for reachability, authentication, writability, latency, Doctor status, last successful sync, and free space. <em>Unavailable</em> means evidence was not supplied; it is not equivalent to success or failure.</p>
+  <p>The table displays the newest package-reported evidence for reachability, authentication, writability, latency, Doctor status, the last run of each profile with its cause, last successful sync, and free space. A passing Doctor proves the target is reachable, not that a sync ran. <em>Unavailable</em> means evidence was not supplied; it is not equivalent to success or failure.</p>
 </body>
 </html>

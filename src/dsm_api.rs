@@ -3799,7 +3799,41 @@ fn event_visible_at_threshold(
     let Some(event_level) = PolicyLogLevel::parse(level) else {
         return false;
     };
-    threshold.allows(event_level)
+    level_visible(threshold, event_level)
+}
+
+/// A threshold decides what is shown down to warnings; it never hides an error.
+///
+/// `off` silences a category's chatter. It used to silence its failures too, so an
+/// administrator who quietened a noisy category (the natural response to a flood of
+/// deferral notices) also hid every `run.failed` in it, with nothing to say so. An error
+/// is the record the operator needs most, and the package's rule is that no failure is
+/// silent.
+fn level_visible(threshold: PolicyLogLevel, event_level: PolicyLogLevel) -> bool {
+    event_level == PolicyLogLevel::Error || threshold.allows(event_level)
+}
+
+/// The severity of a log line that is not a levelled JSON record.
+///
+/// The core's human format names its level in the second column (`<ms> ERROR <message>`), so
+/// that is read. Anything else is raw stderr from a child process: in controller.log that is
+/// where a runner's preflight cause lands, and it used to be classed `info`, so raising the
+/// controller threshold hid the only record of why scheduled runs failed. It is classed
+/// `error` now: unlevelled output is shown unless the category is explicitly `off`, and as an
+/// error it is shown even then.
+fn opaque_line_level(source: &str, line: &str) -> PolicyLogLevel {
+    if source == "sync" {
+        let level = line.split_ascii_whitespace().nth(1).unwrap_or_default();
+        match level {
+            "ERROR" => return PolicyLogLevel::Error,
+            "WARN" => return PolicyLogLevel::Warn,
+            "INFO" => return PolicyLogLevel::Info,
+            "DEBUG" => return PolicyLogLevel::Debug,
+            "TRACE" => return PolicyLogLevel::Trace,
+            _ => {}
+        }
+    }
+    PolicyLogLevel::Error
 }
 
 fn log_line_visible_at_threshold(policy: &SecurityPolicyArgs, source: &str, line: &str) -> bool {
@@ -3832,11 +3866,8 @@ fn log_line_visible_at_threshold(policy: &SecurityPolicyArgs, source: &str, line
                 .map(str::to_owned)
         })
         .and_then(|value| PolicyLogLevel::parse(&value))
-        // Opaque legacy/core output has no trustworthy severity contract.
-        // Treat it deterministically as Info; package-owned controller and
-        // scheduler lifecycle records are structured at the writer.
-        .unwrap_or(PolicyLogLevel::Info);
-    threshold.allows(event_level)
+        .unwrap_or_else(|| opaque_line_level(source, line));
+    level_visible(threshold, event_level)
 }
 
 fn cgi_failure_category(stage: &str) -> Option<&'static str> {
@@ -8260,11 +8291,36 @@ fn wake_controller_after_enqueue() {
     // The canonical request is externally visible after its durability attempt
     // at this point. A wake failure must never turn accepted work (including a
     // durability-uncertain publication) into an ordinary error or invite a
-    // duplicate dispatch. The controller's bounded polling fallback remains.
+    // duplicate dispatch. The controller's bounded polling fallback remains, so a
+    // failure here costs latency, not work -- but it is recorded, because a wake path
+    // that never works would otherwise only ever look like a slow dashboard.
     let Ok(mut command) = manager_command(&["api".into(), "controller-wake".into()], false) else {
+        record_controller_wake_failure();
         return;
     };
-    let _ = capture_bounded_command(&mut command, 1024, 1024, CONTROLLER_WAKE_TIMEOUT, None);
+    match capture_bounded_command(&mut command, 1024, 1024, CONTROLLER_WAKE_TIMEOUT, None) {
+        Ok(output) if output.status_success => {}
+        _ => record_controller_wake_failure(),
+    }
+}
+
+/// One coalesced api.log record for a controller wake that did not happen.
+///
+/// Never an error to the caller: the request it follows was already accepted.
+#[cfg(target_os = "linux")]
+fn record_controller_wake_failure() {
+    // SAFETY: geteuid has no pointer arguments or preconditions. The service runs as the
+    // package user, which every check before the enqueue has already verified.
+    let package_uid = unsafe { libc::geteuid() };
+    record_in_service_failure(
+        package_uid,
+        None,
+        &CgiFailure::coded(
+            CgiFailureStage::ServiceRequest,
+            BridgeError::unavailable_because("controller_wake_failed"),
+            "controller_wake_failed",
+        ),
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -9476,6 +9532,50 @@ mod linux_files {
         Ok(history)
     }
 
+    /// How far back the Activity history reaches: the number of files in the rotation that
+    /// exist, and the epoch of the first record in the oldest of them.
+    ///
+    /// Reads one bounded line, not the files: this answers "has rotation already discarded
+    /// the failure I am looking for", which the newest-N tail cannot. `Err` names an oldest
+    /// file that exists but cannot be read safely.
+    pub(super) fn activity_history_extent(
+        log_root: &Path,
+        package_uid: u32,
+    ) -> BridgeResult<(usize, Option<u64>)> {
+        let activity_log = log_root.join("activity.log");
+        let present = rotating_log_paths(&activity_log, 3)
+            .into_iter()
+            .filter(|path| fs::symlink_metadata(path).is_ok())
+            .collect::<Vec<_>>();
+        let Some(oldest) = present.last() else {
+            return Ok((0, None));
+        };
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(NOFOLLOW_CLOEXEC);
+        let file = options
+            .open(oldest)
+            .map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
+        if !metadata.file_type().is_file()
+            || metadata.st_uid() != package_uid
+            || metadata.st_mode() & 0o7777 != 0o600
+        {
+            return Err(BridgeError::unsafe_because("config_file_unsafe"));
+        }
+        let mut head = Vec::with_capacity(32);
+        file.take(32)
+            .read_to_end(&mut head)
+            .map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
+        let epoch = head
+            .split(|byte| *byte == b'|')
+            .next()
+            .filter(|digits| !digits.is_empty() && digits.iter().all(u8::is_ascii_digit))
+            .and_then(|digits| std::str::from_utf8(digits).ok()?.parse::<u64>().ok());
+        Ok((present.len(), epoch))
+    }
+
     /// A package configuration or state document, or `None` when it is absent.
     ///
     /// The manager reads these with `[ -f ]`, `[ ! -L ]` and `[ -r ]` and
@@ -9719,6 +9819,64 @@ mod linux_files {
             return Ok(None);
         }
         Ok(Some(identity))
+    }
+
+    /// `private_process_lock_is_live` for the run lock, with its "no" split into the
+    /// answers the stale-run check must tell apart.
+    ///
+    /// `Absent` and `Dead` both prove no runner holds the lock: no directory, no owner
+    /// file, a retired one-line owner (never a live exclusion, as in the shell), or a
+    /// three-line owner whose pid, start tick or boot id no longer match a process.
+    /// `Unreadable` proves nothing either way (mis-owned file, bad link contract,
+    /// `EPERM` on the probe), and the caller must not call a run stale on it.
+    pub(super) fn run_lock_liveness(lock: &Path, package_uid: u32) -> LockLiveness {
+        let absent = |path: &Path| match fs::symlink_metadata(path) {
+            Ok(_) => Some(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Some(true),
+            Err(_) => None,
+        };
+        let owner = lock.join("pid");
+        match (absent(lock), absent(&owner)) {
+            (Some(true), _) | (Some(false), Some(true)) => return LockLiveness::Absent,
+            (Some(false), Some(false)) => {}
+            _ => return LockLiveness::Unreadable,
+        }
+        match private_process_lock_owner(lock, package_uid) {
+            Ok(Some(_)) => return LockLiveness::Live,
+            Ok(None) => {}
+            Err(_) => return LockLiveness::Unreadable,
+        }
+        // Not live by the full contract. Dead only if the owner record itself is sound.
+        match read_published_identity(&owner, package_uid, false) {
+            Ok(Some(identity)) => {
+                match process_identity_is_live(identity.pid, identity.start, &identity.boot) {
+                    Ok(false) => LockLiveness::Dead,
+                    // Live by identity but refused by the link contract: not provably dead.
+                    Ok(true) | Err(_) => LockLiveness::Unreadable,
+                }
+            }
+            Ok(None) => {
+                let legacy = read_private_file_with_link_contract(&owner, package_uid, 96, false)
+                    .is_ok_and(|bytes| {
+                        let lines = awk_records(&bytes);
+                        lines.len() == 1 && manager_pid(lines[0]).is_some()
+                    });
+                if legacy {
+                    LockLiveness::Dead
+                } else {
+                    LockLiveness::Unreadable
+                }
+            }
+            Err(_) => LockLiveness::Unreadable,
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum LockLiveness {
+        Live,
+        Absent,
+        Dead,
+        Unreadable,
     }
 
     /// `pid_is_live`: `is_pid` followed by `kill -0`.
@@ -11713,7 +11871,19 @@ mod linux_files {
                 && append(&record, "requested").is_ok()
                 && append(&record, "failed").is_ok()
             {
-                let _ = remove_audit_outbox_record(paths, package_uid, &record.transaction);
+                // The terminal Failed record is durable, so a leftover is retired by the
+                // next reconciliation sweep; recorded so a sweep that never succeeds is seen.
+                if remove_audit_outbox_record(paths, package_uid, &record.transaction).is_err() {
+                    super::record_in_service_failure(
+                        package_uid,
+                        None,
+                        &CgiFailure::coded(
+                            CgiFailureStage::ServiceRequest,
+                            BridgeError::unavailable_because("audit_outbox_leftover"),
+                            "audit_outbox_leftover",
+                        ),
+                    );
+                }
             }
             return Err(error);
         }
@@ -12655,7 +12825,17 @@ fn record_pre_relay_cgi_failure(failure: &CgiFailure) {
     ) else {
         return;
     };
-    let _ = record_pre_relay_activity(stage, payload.code, payload.status);
+    // api.log already holds the failure. What is lost here is only its Activity mirror, and a
+    // second api.log record would fall inside the coalescing window the first one just
+    // claimed. The CGI's stderr goes to DSM's web-server log, which is the sink left that
+    // cannot be suppressed; the line carries fixed tokens only.
+    if let Err(error) = record_pre_relay_activity(stage, payload.code, payload.status) {
+        eprintln!(
+            "sdsync-dsm-api: activity mirror of api.log failure {stage}/{} not appended: {}",
+            payload.code,
+            resolved_error_code(error, None, None)
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -13823,7 +14003,17 @@ fn run_server_loop(
     }
     let workers =
         BoundedWorkerPool::start(API_WORKER_COUNT, API_QUEUE_CAPACITY, move |mut stream| {
-            let _ = serve_connection(&mut stream, package_uid);
+            // Failures inside the request are recorded where they become a response; what
+            // reaches here is the connection itself failing (peer credentials, a write to a
+            // client that left). The CGI sees those only as a broken relay, so the service
+            // names them too.
+            if let Err(error) = serve_connection(&mut stream, package_uid) {
+                record_in_service_failure(
+                    package_uid,
+                    None,
+                    &CgiFailure::new(CgiFailureStage::BridgeIo, error),
+                );
+            }
         })?;
     // The pre-commit listener is deliberately inaccessible at 0000. Publish
     // the worker pool and, for supervised starts, exact readiness identity
@@ -14203,8 +14393,21 @@ fn handle_relay_request_under_policy(
             policy,
         )
     };
-    if is_post && result.is_err() {
-        let _ = record_rejected_post(&session.username, session.uid);
+    if is_post
+        && result.is_err()
+        && let Err(error) = record_rejected_post(&session.username, session.uid)
+    {
+        // The rejection itself is still answered below; what failed is its mandatory audit
+        // record, and that loss is named in api.log rather than dropped.
+        record_in_service_failure(
+            package_uid,
+            Some(policy),
+            &CgiFailure::coded(
+                CgiFailureStage::ServiceRequest,
+                error,
+                "rejected_audit_unrecorded",
+            ),
+        );
     }
     result.map_err(|error| CgiFailure::new(CgiFailureStage::ServiceRequest, error))
 }
@@ -14775,7 +14978,7 @@ fn execute_read_action(
     if forced_to_shell {
         note_read_lane_forced_shell(paths, package_uid, policy);
     }
-    match read_rung(action) {
+    let response = match read_rung(action) {
         ReadRung::InService if !forced_to_shell => {
             run_in_service_read(paths, action, policy, package_uid)
         }
@@ -14787,7 +14990,49 @@ fn execute_read_action(
         ReadRung::InService | ReadRung::ShellManager | ReadRung::NotLadderRouted => {
             run_shell_rung_read(paths, action, policy)
         }
+    }?;
+    // After the rung, not inside it: both rungs carry the member, and the byte parity the
+    // differential test holds between them is over the manager's own document, untouched.
+    if matches!(action, ReadAction::Snapshot) {
+        return attach_snapshot_outcomes(response, paths, package_uid);
     }
+    if matches!(action, ReadAction::Activity { .. }) {
+        return attach_activity_history(response, paths, package_uid);
+    }
+    Ok(response)
+}
+
+/// Attach `history` to an Activity feed either rung produced: how many rotated files exist
+/// and when the oldest retained record was written, so the dashboard can say "history starts
+/// <date>" instead of letting a rotated-away failure look like no failure. An oldest file that
+/// cannot be read is named in `history.error` rather than failing the feed.
+#[cfg(target_os = "linux")]
+fn attach_activity_history(
+    response: CgiResponse,
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+) -> BridgeResult<CgiResponse> {
+    if response.status != 200 {
+        return Ok(response);
+    }
+    let mut document: Value =
+        serde_json::from_slice(&response.body).map_err(|_| MANAGER_OUTPUT_INVALID)?;
+    let root = document.as_object_mut().ok_or(MANAGER_OUTPUT_INVALID)?;
+    let history = match linux_files::activity_history_extent(paths.log_root, package_uid) {
+        Ok((files, oldest)) => json!({
+            "files": files,
+            "oldest_record_epoch": oldest,
+            "error": null,
+        }),
+        Err(error) => json!({
+            "files": null,
+            "oldest_record_epoch": null,
+            "error": resolved_error_code(error, None, None),
+        }),
+    };
+    root.insert("history".to_owned(), history);
+    let body = serde_json::to_vec(&document).map_err(|_| BridgeError::internal())?;
+    Ok(CgiResponse::success(body))
 }
 
 /// The profile names the shell would have listed in `--profiles`.
@@ -16292,6 +16537,883 @@ fn snapshot_document(
         return Err(BridgeError::unavailable_because("manager_output_too_large"));
     }
     parse_and_sanitize_manager_json(&document, &ReadAction::Snapshot, None, Some(policy))
+}
+
+/// The schema tag of the snapshot's `outcomes` member.
+#[cfg(target_os = "linux")]
+const OUTCOMES_SCHEMA: &str = "sdsync.dsm-outcomes.v1";
+
+/// How many degradations one `outcomes` member lists before it says it stopped listing.
+#[cfg(target_os = "linux")]
+const MAX_OUTCOME_ERRORS: usize = 64;
+
+/// Every degradation met while building `outcomes`, so none is dropped silently.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct OutcomeErrors {
+    records: Vec<Value>,
+    truncated: bool,
+    /// Every push, listed or not, so a caller can tell whether its own reads degraded.
+    pushed: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl OutcomeErrors {
+    fn push(&mut self, source: &str, code: &'static str) {
+        self.pushed += 1;
+        if self.records.len() < MAX_OUTCOME_ERRORS {
+            self.records.push(json!({ "source": source, "code": code }));
+        } else {
+            self.truncated = true;
+        }
+    }
+
+    fn into_value(mut self) -> Value {
+        if self.truncated {
+            self.records.pop();
+            self.records
+                .push(json!({ "source": "outcomes", "code": "errors_truncated" }));
+        }
+        Value::Array(self.records)
+    }
+}
+
+/// `^[a-z][a-z0-9_]{0,47}(:[A-Za-z0-9_-]{1,64})?$`: a reason code, optionally qualified by a
+/// profile name or a sub-token. The grammar admits no `/`, so no path can travel as a reason.
+#[cfg(target_os = "linux")]
+fn valid_reason_token(value: &[u8]) -> bool {
+    let (head, tail) = match value.iter().position(|byte| *byte == b':') {
+        Some(colon) => (&value[..colon], Some(&value[colon + 1..])),
+        None => (value, None),
+    };
+    head.first().is_some_and(u8::is_ascii_lowercase)
+        && head.len() <= 48
+        && head
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+        && tail.is_none_or(|tail| {
+            (1..=64).contains(&tail.len())
+                && tail
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
+}
+
+/// One state document's optional keys, read without ever failing the snapshot.
+///
+/// Absent keys are `None`, which is how a state file older than the key reads. A key that is
+/// present but unusable is `None` too, and leaves a named record behind.
+#[cfg(target_os = "linux")]
+struct OutcomeRecord<'a> {
+    document: Option<&'a [u8]>,
+    source: &'a str,
+}
+
+#[cfg(target_os = "linux")]
+impl OutcomeRecord<'_> {
+    fn text(&self, key: &str, errors: &mut OutcomeErrors) -> Option<Vec<u8>> {
+        match manager_kv_optional(self.document, key, "") {
+            Ok(value) if value.is_empty() => None,
+            Ok(value) => Some(value),
+            Err(_) => {
+                errors.push(self.source, "malformed");
+                None
+            }
+        }
+    }
+
+    fn number(&self, key: &str, errors: &mut OutcomeErrors) -> Option<u64> {
+        let value = self.text(key, errors)?;
+        let parsed = std::str::from_utf8(&value)
+            .ok()
+            .filter(|text| text.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|text| text.parse::<u64>().ok());
+        if parsed.is_none() {
+            errors.push(self.source, "malformed");
+        }
+        parsed
+    }
+
+    /// `exit_code`: digits, or the `-1` a run that never finished stores.
+    fn exit_code(&self, errors: &mut OutcomeErrors) -> Option<u64> {
+        match self.text("exit_code", errors).as_deref() {
+            None | Some(b"-1") => None,
+            Some(_) => self.number("exit_code", errors),
+        }
+    }
+
+    fn reason(&self, errors: &mut OutcomeErrors) -> Option<String> {
+        let value = self.text("reason", errors)?;
+        // The runner writes `none` for "no reason" and `ok` for a success, so the key is always
+        // present; neither is a cause.
+        if matches!(value.as_slice(), b"none" | b"ok") {
+            return None;
+        }
+        if valid_reason_token(&value) {
+            String::from_utf8(value).ok()
+        } else {
+            errors.push(self.source, "invalid_reason");
+            None
+        }
+    }
+}
+
+/// The outcome of one completed record, by the contract's precedence: an explicit `outcome=`
+/// that agrees with `state`, then the exit-code mapping, then `state`.
+///
+/// Two explicit values stand on their own whatever `state` says, because the runner keeps the
+/// previous completion's `state` beside them on purpose (the dependency gate reads it):
+/// `not_run`, a profile the last aggregate run never reached, and `unknown`, an aggregate whose
+/// per-profile result could not be read. A partial run (the core's exit 3: finished, with
+/// deferred or lastingly skipped entries) may be recorded `failed` (dependents must not proceed
+/// on it) or `succeeded`; either reads as `partial`. The runner's `core_partial` reason is not
+/// that: it is the batch status "failed after mutating", a failure.
+///
+/// `None` when the record's `state` is not one this reader knows. The caller reports that as
+/// `unknown`, never as a guess in either direction.
+#[cfg(target_os = "linux")]
+fn completed_outcome(
+    state: &[u8],
+    explicit: Option<&[u8]>,
+    exit_code: Option<u64>,
+    record: &str,
+    errors: &mut OutcomeErrors,
+) -> Option<&'static str> {
+    match explicit {
+        Some(b"not_run") => return Some("not_run"),
+        Some(b"unknown") => return Some("unknown"),
+        _ => {}
+    }
+    let derived = match state {
+        b"succeeded" => "succeeded",
+        b"failed" => match exit_code {
+            // The core's "finished, but left entries for the next run" status.
+            Some(3) => "partial",
+            Some(75) => "busy",
+            Some(130 | 143) => "cancelled",
+            _ => "failed",
+        },
+        _ => return None,
+    };
+    let Some(explicit) = explicit else {
+        return Some(derived);
+    };
+    let agreed = match (state, explicit) {
+        (b"succeeded", b"succeeded") => "succeeded",
+        (b"succeeded" | b"failed", b"partial") => "partial",
+        (b"failed", b"failed") => derived,
+        (b"failed", b"busy") => "busy",
+        (b"failed", b"cancelled") => "cancelled",
+        _ => {
+            errors.push(record, "unknown_outcome");
+            derived
+        }
+    };
+    Some(agreed)
+}
+
+/// The reason a record implies when it did not name one: older writers recorded only an exit
+/// code, and these three exit codes are unambiguous on their own.
+#[cfg(target_os = "linux")]
+fn implied_reason(outcome: &str, exit_code: Option<u64>) -> Option<String> {
+    match (outcome, exit_code) {
+        ("busy", _) => Some("lock_busy".to_owned()),
+        ("cancelled", _) => Some("cancelled".to_owned()),
+        ("failed", Some(code)) if code == u64::from(SUPERVISOR_REFUSED_EXIT) => {
+            Some("supervisor_refused".to_owned())
+        }
+        _ => None,
+    }
+}
+
+/// Warnings that ride on an outcome without changing it.
+///
+/// A lasting skip (a link, a case collision) or a lasting deferral (a name the destination
+/// cannot hold, an unsupported local entry) does not make a run partial: the core exits 0,
+/// because the next run will leave it out again rather than finish it. It is still not a plain
+/// success, so the outcome carries `skipped_entries` / `deferred_entries`, and the dashboard
+/// must render it as a warning. On a partial run the deferrals are the outcome itself, so they
+/// add no warning there.
+#[cfg(target_os = "linux")]
+fn entry_warnings(outcome: &str, skipped: Option<u64>, deferred: Option<u64>) -> Vec<&'static str> {
+    let mut warnings = Vec::new();
+    if skipped.is_some_and(|count| count > 0) {
+        warnings.push("skipped_entries");
+    }
+    if outcome == "succeeded" && deferred.is_some_and(|count| count > 0) {
+        warnings.push("deferred_entries");
+    }
+    warnings
+}
+
+/// How far the status-rollup row of a profile can be trusted, given its last run.
+#[cfg(target_os = "linux")]
+fn status_cache_trust(outcome: &str) -> &'static str {
+    match outcome {
+        "succeeded" => "trusted",
+        "partial" => "last_run_partial",
+        "not_run" => "no_run_recorded",
+        _ => "last_run_failed",
+    }
+}
+
+/// The run block: `run.state` interpreted, including the stale-runner check.
+#[cfg(target_os = "linux")]
+fn run_outcome_value(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    errors: &mut OutcomeErrors,
+) -> Value {
+    let path = paths.state_dir.join("run.state");
+    let read = |errors: &mut OutcomeErrors| -> Option<Vec<u8>> {
+        linux_files::read_optional_private_document(&path, package_uid, MAX_PACKAGE_DOCUMENT_BYTES)
+            .unwrap_or_else(|_| {
+                errors.push("run.state", "unsafe_file");
+                None
+            })
+    };
+    let first = read(errors);
+    let record = OutcomeRecord {
+        document: first.as_deref(),
+        source: "run.state",
+    };
+    let state = record
+        .text("state", errors)
+        .unwrap_or_else(|| b"never".to_vec());
+    let started = record.number("started_epoch", errors).unwrap_or(0);
+
+    let mut lock = "not_checked";
+    let mut stale_reason = None;
+    let mut outcome = match state.as_slice() {
+        b"never" => Some("not_run"),
+        b"running" => {
+            let liveness =
+                linux_files::run_lock_liveness(&paths.run_dir.join("run.lock"), package_uid);
+            lock = match liveness {
+                linux_files::LockLiveness::Live => "live",
+                linux_files::LockLiveness::Absent => "absent",
+                linux_files::LockLiveness::Dead => "dead",
+                linux_files::LockLiveness::Unreadable => "unreadable",
+            };
+            match liveness {
+                linux_files::LockLiveness::Live => Some("running"),
+                linux_files::LockLiveness::Unreadable => {
+                    errors.push("run.lock", "lock_unreadable");
+                    Some("running")
+                }
+                linux_files::LockLiveness::Absent | linux_files::LockLiveness::Dead => {
+                    // Re-read: a runner that finished between the two reads released the
+                    // lock after publishing its final state, and is not stale.
+                    let mut scratch = OutcomeErrors::default();
+                    let second = read(&mut scratch);
+                    let again = OutcomeRecord {
+                        document: second.as_deref(),
+                        source: "run.state",
+                    };
+                    let still_running = again.text("state", &mut scratch).as_deref()
+                        == Some(b"running".as_slice())
+                        && again.number("started_epoch", &mut scratch).unwrap_or(0) == started;
+                    if still_running {
+                        stale_reason = Some("runner_died");
+                        Some("stale")
+                    } else {
+                        // Answer from the record that superseded it, on the next poll; this
+                        // one reports the run as still running rather than guessing.
+                        lock = "not_checked";
+                        Some("running")
+                    }
+                }
+            }
+        }
+        _ => None,
+    };
+    let exit_code = record.exit_code(errors);
+    let recorded_reason = record.reason(errors);
+    if outcome.is_none() {
+        let explicit = record.text("outcome", errors);
+        outcome = completed_outcome(&state, explicit.as_deref(), exit_code, "run.state", errors);
+    }
+    let outcome = outcome.unwrap_or_else(|| {
+        errors.push("run.state", "unknown_state");
+        "unknown"
+    });
+    let reason = match stale_reason {
+        Some(reason) => Some(reason.to_owned()),
+        None => recorded_reason.or_else(|| implied_reason(outcome, exit_code)),
+    };
+    let finished = record.number("finished_epoch", errors).unwrap_or(0);
+    let skipped = record.number("skipped", errors);
+    let deferred = record.number("deferred", errors);
+    let scope = record
+        .text("scope", errors)
+        .and_then(|value| String::from_utf8(value).ok())
+        .unwrap_or_else(|| "none".to_owned());
+    let operation = record
+        .text("operation", errors)
+        .and_then(|value| String::from_utf8(value).ok())
+        .unwrap_or_else(|| "none".to_owned());
+    let mut warnings = entry_warnings(outcome, skipped, deferred);
+    let facts = result_facts(&record, &mut warnings, errors);
+    let mut value = json!({
+        "outcome": outcome,
+        "reason": reason,
+        "state": String::from_utf8_lossy(&state),
+        "operation": operation,
+        "scope": scope,
+        "started_epoch": started,
+        "finished_epoch": finished,
+        "exit_code": exit_code,
+        "detail": run_detail(&record, errors),
+        "deferred_files": deferred,
+        "skipped_files": skipped,
+        "warnings": warnings,
+        "stale": {
+            "detected": stale_reason.is_some(),
+            "lock": lock,
+            "reason": stale_reason,
+        },
+        "aggregate": aggregate_run_value(&record, errors),
+        "degraded": degraded_value(&record, errors),
+    });
+    merge_facts(&mut value, facts);
+    value
+}
+
+/// Most folders whose incomplete listing one record names; the count says how many there were.
+#[cfg(target_os = "linux")]
+const MAX_RECORDED_LISTING_FOLDERS: usize = 5;
+
+/// Facts from the core's result that the runner copies into a state record, each a reason the
+/// next run may not converge: folders whose listing came back incomplete (their deletes were
+/// withheld), uploads whose modification time DSM did not keep (the next run re-uploads them),
+/// and conditions the run recovered from. Every key is optional, so older records read as
+/// `null`, and each non-zero fact adds a warning token so a success that carries one is never
+/// shown as a plain success.
+#[cfg(target_os = "linux")]
+fn result_facts(
+    record: &OutcomeRecord<'_>,
+    warnings: &mut Vec<&'static str>,
+    errors: &mut OutcomeErrors,
+) -> serde_json::Map<String, Value> {
+    let mut facts = serde_json::Map::new();
+    // `counts=unavailable`: the core ran but its result could not be read (a manual run, whose
+    // stdout belongs to the dashboard, or a plan). Zero deferred/skipped would be a guess, so
+    // the dashboard is told the counts are unknown instead of being shown a clean run.
+    let counts_available = match record.text("counts", errors).as_deref() {
+        Some(b"unavailable") => Some(false),
+        Some(_) => {
+            errors.push(record.source, "malformed");
+            None
+        }
+        None if record.document.is_some_and(|document| {
+            manager_prefixed_lines(document, b"deferred=").len()
+                + manager_prefixed_lines(document, b"skipped=").len()
+                > 0
+        }) =>
+        {
+            Some(true)
+        }
+        None => None,
+    };
+    facts.insert("counts_available".to_owned(), json!(counts_available));
+    let listings = record.number("incomplete_listings", errors);
+    let folders = record
+        .text("incomplete_listing_folders", errors)
+        .map(|value| {
+            let mut folders = Vec::new();
+            for folder in value.split(|byte| *byte == b'|') {
+                if folders.len() == MAX_RECORDED_LISTING_FOLDERS {
+                    break;
+                }
+                if folder.is_empty()
+                    || folder.len() > 120
+                    || !folder.iter().all(|byte| (b' '..=b'~').contains(byte))
+                {
+                    errors.push(record.source, "malformed");
+                    continue;
+                }
+                folders.push(Value::String(String::from_utf8_lossy(folder).into_owned()));
+            }
+            folders
+        });
+    if listings.is_some_and(|count| count > 0) || folders.as_ref().is_some_and(|f| !f.is_empty()) {
+        warnings.push("incomplete_listings");
+    }
+    facts.insert("incomplete_listings".to_owned(), json!(listings));
+    facts.insert(
+        "incomplete_listing_folders".to_owned(),
+        folders.map_or(Value::Null, Value::Array),
+    );
+    let mtime = record.number("mtime_not_kept", errors);
+    if mtime.is_some_and(|count| count > 0) {
+        warnings.push("mtime_not_kept");
+    }
+    facts.insert("mtime_not_kept".to_owned(), json!(mtime));
+    let mut recovered = serde_json::Map::new();
+    for (key, warning) in [
+        ("reauthentication_failures", "reauthentication_failures"),
+        ("server_tasks_not_stopped", "server_tasks_not_stopped"),
+        ("keepalive_failures", "keepalive_failures"),
+    ] {
+        let count = record.number(&format!("recovered_{key}"), errors);
+        if count.is_some_and(|count| count > 0) {
+            warnings.push(warning);
+        }
+        recovered.insert(key.to_owned(), json!(count));
+    }
+    let recorded = recovered.values().any(|value| !value.is_null());
+    facts.insert(
+        "recovered".to_owned(),
+        if recorded {
+            Value::Object(recovered)
+        } else {
+            Value::Null
+        },
+    );
+    facts
+}
+
+/// Merge `result_facts` into an outcome object built with `json!`.
+#[cfg(target_os = "linux")]
+fn merge_facts(value: &mut Value, facts: serde_json::Map<String, Value>) {
+    if let Some(object) = value.as_object_mut() {
+        object.extend(facts);
+    }
+}
+
+/// `degraded=`: the best-effort record writers (activity, alert, system log...) that failed
+/// while this run was recorded, so the run's own result is trustworthy but some of its echoes
+/// are missing. `null` when none failed or the writer predates the key.
+#[cfg(target_os = "linux")]
+fn degraded_value(record: &OutcomeRecord<'_>, errors: &mut OutcomeErrors) -> Value {
+    let Some(value) = record.text("degraded", errors) else {
+        return Value::Null;
+    };
+    if matches!(value.as_slice(), b"none" | b"false" | b"0") {
+        return Value::Null;
+    }
+    let mut sinks = Vec::new();
+    for sink in value.split(|byte| *byte == b',') {
+        if valid_reason_token(sink) && !sink.contains(&b':') {
+            sinks.push(String::from_utf8_lossy(sink).into_owned());
+        } else {
+            errors.push(record.source, "malformed");
+            return Value::Null;
+        }
+    }
+    json!({
+        "sinks": sinks,
+        "reason": optional_token(record, "degraded_reason", errors),
+    })
+}
+
+/// `detail=`: the runner's one-line cause (the core's last `error:` line, or a preflight
+/// message), already bounded and reduced to printable ASCII by the writer and re-checked here,
+/// since this text goes to the dashboard verbatim.
+#[cfg(target_os = "linux")]
+fn run_detail(record: &OutcomeRecord<'_>, errors: &mut OutcomeErrors) -> Option<String> {
+    let value = record.text("detail", errors)?;
+    if value.len() <= 160
+        && value
+            .iter()
+            .all(|byte| (b' '..=b'~').contains(byte) && *byte != b'|')
+    {
+        String::from_utf8(value).ok()
+    } else {
+        errors.push(record.source, "malformed");
+        None
+    }
+}
+
+/// The last aggregate (`all`) run, which the runner keeps beside the last run of any scope so a
+/// later single-profile run cannot overwrite an aggregate failure. `null` before any is recorded.
+#[cfg(target_os = "linux")]
+fn aggregate_run_value(record: &OutcomeRecord<'_>, errors: &mut OutcomeErrors) -> Value {
+    let Some(state) = record.text("aggregate_state", errors) else {
+        return Value::Null;
+    };
+    let exit_code = match record.text("aggregate_exit_code", errors).as_deref() {
+        None | Some(b"-1") => None,
+        Some(_) => record.number("aggregate_exit_code", errors),
+    };
+    let reason = match record.text("aggregate_reason", errors) {
+        Some(value) if matches!(value.as_slice(), b"none" | b"ok") => None,
+        Some(value) if valid_reason_token(&value) => String::from_utf8(value).ok(),
+        Some(_) => {
+            errors.push(record.source, "invalid_reason");
+            None
+        }
+        None => None,
+    };
+    let outcome = match state.as_slice() {
+        b"never" => Some("not_run"),
+        b"running" => Some("running"),
+        _ => completed_outcome(&state, None, exit_code, record.source, errors),
+    }
+    .unwrap_or_else(|| {
+        errors.push(record.source, "unknown_state");
+        "unknown"
+    });
+    json!({
+        "outcome": outcome,
+        "reason": reason.or_else(|| implied_reason(outcome, exit_code)),
+        "finished_epoch": record.number("aggregate_finished_epoch", errors).unwrap_or(0),
+        "exit_code": exit_code,
+    })
+}
+
+/// The alerts block: the consecutive-failure counter `handle_alert_result` keeps.
+#[cfg(target_os = "linux")]
+fn alerts_outcome_value(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    errors: &mut OutcomeErrors,
+) -> Value {
+    let threshold = linux_files::read_optional_private_document(
+        &paths.config_dir.join("alerts.conf"),
+        package_uid,
+        MAX_PACKAGE_DOCUMENT_BYTES,
+    )
+    .ok()
+    .flatten()
+    .and_then(|document| {
+        let mut ignored = OutcomeErrors::default();
+        OutcomeRecord {
+            document: Some(&document),
+            source: "alerts.conf",
+        }
+        .number("failure_threshold", &mut ignored)
+    })
+    // alerts.conf is validated by the snapshot itself, which fails the read when it is
+    // unusable, so a value is always there by the time this runs; 1 is its documented default.
+    .unwrap_or(1);
+    let document = match linux_files::read_optional_private_document(
+        &paths.state_dir.join("alerts.state"),
+        package_uid,
+        MAX_PACKAGE_DOCUMENT_BYTES,
+    ) {
+        Ok(Some(document)) => document,
+        Ok(None) => {
+            return json!({
+                "status": "absent",
+                "failure_count": 0,
+                "last_notify_epoch": 0,
+                "failure_threshold": threshold,
+                "threshold_reached": false,
+            });
+        }
+        Err(_) => {
+            errors.push("alerts.state", "unsafe_file");
+            return json!({
+                "status": "unreadable",
+                "failure_count": null,
+                "last_notify_epoch": null,
+                "failure_threshold": threshold,
+                "threshold_reached": null,
+            });
+        }
+    };
+    let before = errors.pushed;
+    let record = OutcomeRecord {
+        document: Some(&document),
+        source: "alerts.state",
+    };
+    let count = record.number("failure_count", errors);
+    let notified = record.number("last_notify_epoch", errors);
+    // The shell's alert handler refuses the same malformed file (return 73), which disables
+    // the counter and every failure notification: that is a state the operator must see. A
+    // file without a count is just as unusable to it, though no key was malformed.
+    if count.is_none() && errors.pushed == before {
+        errors.push("alerts.state", "malformed");
+    }
+    let usable = errors.pushed == before;
+    json!({
+        "status": if usable { "ok" } else { "unreadable" },
+        "failure_count": count,
+        "last_notify_epoch": notified.or(usable.then_some(0)),
+        "failure_threshold": threshold,
+        "threshold_reached": count.map(|count| count >= threshold),
+    })
+}
+
+/// One profile's last completion, from `state/profiles/<name>.state`.
+#[cfg(target_os = "linux")]
+fn profile_outcome_value(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    name: &str,
+    run: &Value,
+    errors: &mut OutcomeErrors,
+) -> Value {
+    let source = format!("profiles/{name}.state");
+    let document = linux_files::read_optional_private_document(
+        &paths
+            .state_dir
+            .join("profiles")
+            .join(format!("{name}.state")),
+        package_uid,
+        MAX_PACKAGE_DOCUMENT_BYTES,
+    )
+    .unwrap_or_else(|_| {
+        errors.push(&source, "unsafe_file");
+        None
+    });
+    let record = OutcomeRecord {
+        document: document.as_deref(),
+        source: &source,
+    };
+    let (outcome, reason, action, finished, exit_code, failures, last_success) = if document
+        .is_none()
+    {
+        ("not_run", None, None, None, None, None, None)
+    } else {
+        let state = record.text("state", errors).unwrap_or_default();
+        let exit_code = record.exit_code(errors);
+        let recorded_reason = record.reason(errors);
+        let explicit = record.text("outcome", errors);
+        let outcome = completed_outcome(&state, explicit.as_deref(), exit_code, &source, errors)
+            .unwrap_or_else(|| {
+                errors.push(&source, "unknown_state");
+                "unknown"
+            });
+        let reason = recorded_reason.or_else(|| implied_reason(outcome, exit_code));
+        let action = record
+            .text("action", errors)
+            .filter(|value| matches!(value.as_slice(), b"sync" | b"plan"))
+            .and_then(|value| String::from_utf8(value).ok());
+        (
+            outcome,
+            reason,
+            action,
+            record.number("finished_epoch", errors),
+            exit_code,
+            record.number("consecutive_failures", errors),
+            record.number("last_success_epoch", errors),
+        )
+    };
+    // A run that died holding the lock leaves this profile's completion record describing the
+    // run before it. The rollup row must not read as trustworthy across that gap.
+    let covered = run["scope"] == "all" || run["scope"] == name;
+    let skipped = record.number("skipped", errors);
+    let deferred = record.number("deferred", errors);
+    let mut warnings = entry_warnings(outcome, skipped, deferred);
+    // Entries left out (skipped or lastingly deferred) are what make the rollup row untrustworthy;
+    // the other facts below warn without changing that.
+    let trust = if run["outcome"] == "stale" && covered {
+        "last_run_failed"
+    } else if outcome == "succeeded" && !warnings.is_empty() {
+        "skipped_entries"
+    } else {
+        status_cache_trust(outcome)
+    };
+    let facts = result_facts(&record, &mut warnings, errors);
+    let mut value = json!({
+        "profile": name,
+        "outcome": outcome,
+        "reason": reason,
+        "action": action,
+        "finished_epoch": finished,
+        "exit_code": exit_code,
+        "consecutive_failures": failures,
+        "last_success_epoch": last_success,
+        "outcome_epoch": record.number("outcome_epoch", errors),
+        "skipped_files": skipped,
+        "deferred_files": deferred,
+        "warnings": warnings,
+        "status_cache": trust,
+    });
+    merge_facts(&mut value, facts);
+    value
+}
+
+/// The snapshot's `outcomes` member: what the last runs did and why, read from the runner's
+/// state files.
+///
+/// Built after either rung answered, so both rungs carry it, and built so that it cannot fail:
+/// every missing, unsafe or unrecognised input degrades its own entry and leaves a named record
+/// in `errors`. The snapshot it rides on keeps answering whatever these files hold, which is the
+/// read ladder's rule that one bad value is named rather than turned into a 503.
+#[cfg(target_os = "linux")]
+fn outcomes_value(paths: &PackagePaths<'_>, package_uid: u32) -> Value {
+    let mut errors = OutcomeErrors::default();
+    let run = run_outcome_value(paths, package_uid, &mut errors);
+    let alerts = alerts_outcome_value(paths, package_uid, &mut errors);
+    let names = match linux_files::private_fragment_names(paths.profiles_dir, ".toml", package_uid)
+    {
+        Ok(files) => files
+            .iter()
+            .map(|file| file[..file.len() - ".toml".len()].to_owned())
+            .filter(|name| manager_valid_name(name.as_bytes()))
+            .take(256)
+            .collect::<Vec<_>>(),
+        Err(_) => {
+            errors.push("profiles", "profile_list_unavailable");
+            Vec::new()
+        }
+    };
+    let profiles = names
+        .iter()
+        .map(|name| profile_outcome_value(paths, package_uid, name, &run, &mut errors))
+        .collect::<Vec<_>>();
+    let routines = routine_outcomes_value(paths, package_uid, &mut errors);
+    let cache = status_cache_health_value(paths, &names, &mut errors);
+    json!({
+        "schema": OUTCOMES_SCHEMA,
+        "run": run,
+        "alerts": alerts,
+        "profiles": profiles,
+        "routines": routines,
+        "status_cache_health": cache,
+        "errors": errors.into_value(),
+    })
+}
+
+/// A token-shaped value, or `None` for the writers' `none` placeholder and for an absent key.
+#[cfg(target_os = "linux")]
+fn optional_token(
+    record: &OutcomeRecord<'_>,
+    key: &str,
+    errors: &mut OutcomeErrors,
+) -> Option<String> {
+    let value = record.text(key, errors)?;
+    if matches!(value.as_slice(), b"none" | b"ok") {
+        return None;
+    }
+    if valid_reason_token(&value) {
+        String::from_utf8(value).ok()
+    } else {
+        errors.push(record.source, "invalid_reason");
+        None
+    }
+}
+
+/// Why each routine last deferred or failed, from the keys the controller adds to its state
+/// document beside the ones the legacy `routines` block already renders.
+///
+/// Read here rather than added to that block, which both rungs must render byte for byte.
+#[cfg(target_os = "linux")]
+fn routine_outcomes_value(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    errors: &mut OutcomeErrors,
+) -> Value {
+    let files = match linux_files::private_fragment_names(paths.routines_dir, ".conf", package_uid)
+    {
+        Ok(files) => files,
+        Err(_) => {
+            errors.push("routines", "routine_list_unavailable");
+            return Value::Array(Vec::new());
+        }
+    };
+    let mut routines = Vec::new();
+    for file in files.iter().take(256) {
+        let name = &file[..file.len() - ".conf".len()];
+        if !manager_valid_name(name.as_bytes()) {
+            continue;
+        }
+        let source = format!("routines/{name}.state");
+        let document = linux_files::read_optional_private_document(
+            &paths.routine_state_dir.join(format!("{name}.state")),
+            package_uid,
+            MAX_PACKAGE_DOCUMENT_BYTES,
+        )
+        .unwrap_or_else(|_| {
+            errors.push(&source, "unsafe_file");
+            None
+        });
+        let record = OutcomeRecord {
+            document: document.as_deref(),
+            source: &source,
+        };
+        let last_exit_code = match record.text("last_exit_code", errors).as_deref() {
+            None | Some(b"-1") => None,
+            Some(_) => record.number("last_exit_code", errors),
+        };
+        routines.push(json!({
+            "profile": name,
+            "defer_reason": optional_token(&record, "defer_reason", errors),
+            "last_exit_code": last_exit_code,
+            "last_reason": optional_token(&record, "last_reason", errors),
+        }));
+    }
+    Value::Array(routines)
+}
+
+/// How many cache issues one snapshot carries; the status-rollup read has the full list.
+#[cfg(target_os = "linux")]
+const MAX_SNAPSHOT_CACHE_ISSUES: usize = 16;
+
+/// Whether the stored status figures the Overview shows can be refreshed and trusted.
+///
+/// A rollup file that is unreadable, corrupt or foreign is skipped by `compose_rollups`, which
+/// leaves its profile looking merely "not observed yet"; an unwritable cache directory looks
+/// the same. Those causes are carried here as a named `degraded` state, so the dashboard can say
+/// why the figures are old rather than only how old they are.
+#[cfg(target_os = "linux")]
+fn status_cache_health_value(
+    paths: &PackagePaths<'_>,
+    profiles: &[String],
+    errors: &mut OutcomeErrors,
+) -> Value {
+    let Ok(now) = current_epoch().and_then(|now| {
+        i64::try_from(now).map_err(|_| BridgeError::unavailable_because("clock_unavailable"))
+    }) else {
+        errors.push("status_cache", "clock_unavailable");
+        return json!({ "state": "unknown", "issues": [] });
+    };
+    let aggregate = status_cache::compose_rollups(
+        paths.status_cache,
+        (!profiles.is_empty()).then_some(profiles),
+        now,
+    );
+    let degraded = aggregate
+        .issues
+        .iter()
+        .any(|issue| issue.severity != "info");
+    let issues = aggregate
+        .issues
+        .iter()
+        .take(MAX_SNAPSHOT_CACHE_ISSUES)
+        .map(|issue| {
+            let path = neutralize_package_paths(issue.path.clone().into_bytes(), paths);
+            let cause = neutralize_package_paths(issue.cause.clone().into_bytes(), paths);
+            json!({
+                "code": issue.code,
+                "severity": issue.severity,
+                "path": String::from_utf8_lossy(&path),
+                "cause": String::from_utf8_lossy(&cause),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "state": if degraded { "degraded" } else { "ok" },
+        "issue_count": aggregate.issues.len(),
+        "issues": issues,
+    })
+}
+
+/// Attach `outcomes` to a snapshot either rung produced.
+///
+/// A response that is not a successful document is returned untouched: the failure it carries
+/// is already named, and decorating it would only obscure that.
+#[cfg(target_os = "linux")]
+fn attach_snapshot_outcomes(
+    response: CgiResponse,
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+) -> BridgeResult<CgiResponse> {
+    if response.status != 200 {
+        return Ok(response);
+    }
+    let mut document: Value =
+        serde_json::from_slice(&response.body).map_err(|_| MANAGER_OUTPUT_INVALID)?;
+    let root = document.as_object_mut().ok_or(MANAGER_OUTPUT_INVALID)?;
+    root.insert("outcomes".to_owned(), outcomes_value(paths, package_uid));
+    let body = serde_json::to_vec(&document).map_err(|_| BridgeError::internal())?;
+    if body.len() > MAX_SNAPSHOT_RESPONSE_BYTES {
+        return Err(BridgeError::unavailable_because("manager_output_too_large"));
+    }
+    Ok(CgiResponse::success(body))
 }
 
 /// Rung A for `activity`.
@@ -20335,6 +21457,713 @@ mod tests {
                 .code,
             Some("runtime_marker_unsafe")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn own_lock_identity(start_offset: u64) -> String {
+        let pid = std::process::id();
+        let start = linux_files::process_start(pid).unwrap() + start_offset;
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+            .to_owned();
+        format!("{pid}\n{start}\n{boot}\n")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_run_lock(fixture: &TestPackageFixture, owner: &str) -> PathBuf {
+        let lock = fixture.run_dir.join("run.lock");
+        fs::create_dir_all(&lock).unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o700)).unwrap();
+        fixture.write_private(&lock.join("pid"), owner.as_bytes());
+        lock
+    }
+
+    /// Nothing recorded yet is `not_run`, not an error and not a 503.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn outcomes_of_a_fresh_package_are_not_run_with_no_errors() {
+        let fixture = TestPackageFixture::new("outcomes-fresh");
+        let uid = TestPackageFixture::package_uid();
+        fixture.write_private(&fixture.profiles_dir.join("photos.toml"), b"");
+        let outcomes = outcomes_value(&fixture.paths(), uid);
+        assert_eq!(outcomes["schema"], OUTCOMES_SCHEMA);
+        assert_eq!(outcomes["run"]["outcome"], "not_run");
+        assert_eq!(outcomes["run"]["stale"]["detected"], false);
+        assert_eq!(outcomes["alerts"]["status"], "absent");
+        assert_eq!(outcomes["alerts"]["failure_count"], 0);
+        assert_eq!(outcomes["profiles"][0]["profile"], "photos");
+        assert_eq!(outcomes["profiles"][0]["outcome"], "not_run");
+        assert_eq!(outcomes["profiles"][0]["status_cache"], "no_run_recorded");
+        assert_eq!(outcomes["errors"], json!([]));
+    }
+
+    /// A failed run surfaces its reason, its alert count and, per profile, whether the
+    /// status-rollup row may still be read as "in sync".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn outcomes_surface_failures_reasons_and_cache_trust_per_profile() {
+        let fixture = TestPackageFixture::new("outcomes-failed");
+        let uid = TestPackageFixture::package_uid();
+        for name in ["alpha", "beta", "gamma", "delta"] {
+            fixture.write_private(&fixture.profiles_dir.join(format!("{name}.toml")), b"");
+        }
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            b"state=failed\nstarted_epoch=100\nfinished_epoch=160\nexit_code=66\nscope=all\n\
+              operation=sync\noutcome=failed\nreason=preflight_log_file_path\n",
+        );
+        fixture.write_private(
+            &fixture.state_dir.join("alerts.state"),
+            b"failure_count=3\nlast_notify_epoch=150\n",
+        );
+        fixture.write_private(
+            &fixture.config_dir.join("alerts.conf"),
+            b"enabled=true\non_success=false\non_failure=true\nfailure_threshold=2\ncooldown_seconds=3600\n",
+        );
+        let profiles = fixture.state_dir.join("profiles");
+        fs::create_dir_all(&profiles).unwrap();
+        // alpha: an old-format record (no reason key) that failed.
+        fixture.write_private(
+            &profiles.join("alpha.state"),
+            b"state=failed\nfinished_epoch=160\nexit_code=1\naction=sync\n",
+        );
+        // beta: a partial success with the new keys.
+        fixture.write_private(
+            &profiles.join("beta.state"),
+            b"state=succeeded\nfinished_epoch=160\nexit_code=0\naction=sync\noutcome=partial\n\
+              consecutive_failures=0\nlast_success_epoch=160\n",
+        );
+        // gamma: a busy refusal and an exit 78 are named even by writers that predate reasons.
+        fixture.write_private(
+            &profiles.join("gamma.state"),
+            b"state=failed\nfinished_epoch=160\nexit_code=75\naction=sync\nconsecutive_failures=4\n",
+        );
+        fixture.write_private(
+            &profiles.join("delta.state"),
+            b"state=failed\nfinished_epoch=160\nexit_code=78\naction=sync\n",
+        );
+
+        let outcomes = outcomes_value(&fixture.paths(), uid);
+        let run = &outcomes["run"];
+        assert_eq!(run["outcome"], "failed");
+        assert_eq!(run["reason"], "preflight_log_file_path");
+        assert_eq!(run["exit_code"], 66);
+        assert_eq!(run["scope"], "all");
+        assert_eq!(run["deferred_files"], Value::Null);
+        assert_eq!(outcomes["alerts"]["status"], "ok");
+        assert_eq!(outcomes["alerts"]["failure_count"], 3);
+        assert_eq!(outcomes["alerts"]["threshold_reached"], true);
+
+        let by_name = |name: &str| {
+            outcomes["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|profile| profile["profile"] == name)
+                .unwrap()
+                .clone()
+        };
+        let alpha = by_name("alpha");
+        assert_eq!(alpha["outcome"], "failed");
+        assert_eq!(alpha["reason"], Value::Null);
+        assert_eq!(alpha["consecutive_failures"], Value::Null);
+        assert_eq!(alpha["status_cache"], "last_run_failed");
+        let beta = by_name("beta");
+        assert_eq!(beta["outcome"], "partial");
+        assert_eq!(beta["status_cache"], "last_run_partial");
+        assert_eq!(beta["last_success_epoch"], 160);
+        let gamma = by_name("gamma");
+        assert_eq!(gamma["outcome"], "busy");
+        assert_eq!(gamma["reason"], "lock_busy");
+        assert_eq!(gamma["consecutive_failures"], 4);
+        let delta = by_name("delta");
+        assert_eq!(delta["outcome"], "failed");
+        assert_eq!(delta["reason"], "supervisor_refused");
+        assert_eq!(outcomes["errors"], json!([]));
+    }
+
+    /// The runner's own vocabulary, exactly as `write_run_state` and `write_profile_outcome`
+    /// print it: `none`/`ok` placeholders, a detail line, the aggregate slot, and per-profile
+    /// `not_run`/`unknown`/`core_partial` beside the previous completion's `state`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn outcomes_read_the_runner_vocabulary_as_written() {
+        let fixture = TestPackageFixture::new("outcomes-runner");
+        let uid = TestPackageFixture::package_uid();
+        for name in ["alpha", "beta", "delta", "epsilon", "eta", "gamma", "zeta"] {
+            fixture.write_private(&fixture.profiles_dir.join(format!("{name}.toml")), b"");
+        }
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            b"state=succeeded\nstarted_epoch=200\nfinished_epoch=210\nexit_code=0\nscope=beta\n\
+              operation=sync\nreason=ok\ndetail=\nskipped=2\naggregate_state=failed\n\
+              aggregate_finished_epoch=160\naggregate_exit_code=66\naggregate_reason=profiles_skipped\n",
+        );
+        let profiles = fixture.state_dir.join("profiles");
+        fs::create_dir_all(&profiles).unwrap();
+        let profile = |name: &str, body: &str| {
+            fixture.write_private(&profiles.join(format!("{name}.state")), body.as_bytes());
+        };
+        profile(
+            "alpha",
+            "state=failed\nfinished_epoch=160\nexit_code=66\naction=sync\noutcome=failed\n\
+             reason=policy_http\nscope=all\noutcome_epoch=160\n",
+        );
+        profile(
+            "beta",
+            "state=succeeded\nfinished_epoch=90\nexit_code=0\naction=sync\noutcome=not_run\n\
+             reason=not_run\nscope=all\noutcome_epoch=160\n",
+        );
+        // `core_partial` is the batch status "failed after mutating": a failure.
+        profile(
+            "gamma",
+            "state=failed\nfinished_epoch=160\nexit_code=1\naction=sync\noutcome=failed\n\
+             reason=core_partial\nscope=all\noutcome_epoch=160\n",
+        );
+        // Exit 3 is the core's partial run: finished, with entries left for the next run.
+        profile(
+            "zeta",
+            "state=failed\nfinished_epoch=160\nexit_code=3\naction=sync\noutcome=failed\n\
+             reason=core_failed\nscope=all\noutcome_epoch=160\ndeferred=4\n",
+        );
+        // Lasting deferrals alone (an unrepresentable name) leave exit 0: a warned success.
+        profile(
+            "eta",
+            "state=succeeded\nfinished_epoch=160\nexit_code=0\naction=sync\noutcome=succeeded\n\
+             reason=ok\nscope=all\noutcome_epoch=160\ndeferred=1\n",
+        );
+        profile(
+            "delta",
+            "state=succeeded\nfinished_epoch=210\nexit_code=0\naction=sync\noutcome=succeeded\n\
+             reason=ok\nscope=profile\noutcome_epoch=210\nskipped=2\n",
+        );
+        profile(
+            "epsilon",
+            "state=never\nfinished_epoch=0\nexit_code=-1\naction=none\noutcome=unknown\n\
+             reason=core_failed\nscope=all\noutcome_epoch=160\n",
+        );
+
+        let outcomes = outcomes_value(&fixture.paths(), uid);
+        assert_eq!(outcomes["errors"], json!([]), "{outcomes}");
+        let run = &outcomes["run"];
+        assert_eq!(run["outcome"], "succeeded");
+        assert_eq!(run["reason"], Value::Null);
+        assert_eq!(run["detail"], Value::Null);
+        // A later single-profile success does not hide the failed aggregate.
+        assert_eq!(
+            run["aggregate"],
+            json!({"outcome": "failed", "reason": "profiles_skipped", "finished_epoch": 160, "exit_code": 66})
+        );
+        let by_name = |name: &str| {
+            outcomes["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|profile| profile["profile"] == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_name("alpha")["reason"], "policy_http");
+        assert_eq!(by_name("alpha")["status_cache"], "last_run_failed");
+        let beta = by_name("beta");
+        assert_eq!(beta["outcome"], "not_run");
+        assert_eq!(beta["reason"], "not_run");
+        assert_eq!(beta["finished_epoch"], 90);
+        assert_eq!(beta["outcome_epoch"], 160);
+        assert_eq!(by_name("gamma")["outcome"], "failed");
+        assert_eq!(by_name("gamma")["reason"], "core_partial");
+        assert_eq!(by_name("gamma")["status_cache"], "last_run_failed");
+        assert_eq!(by_name("zeta")["outcome"], "partial");
+        assert_eq!(by_name("zeta")["status_cache"], "last_run_partial");
+        // A lasting skip leaves a success a success, never a plain one.
+        assert_eq!(run["skipped_files"], 2);
+        assert_eq!(run["warnings"], json!(["skipped_entries"]));
+        let delta = by_name("delta");
+        assert_eq!(delta["outcome"], "succeeded");
+        assert_eq!(delta["reason"], Value::Null);
+        assert_eq!(delta["warnings"], json!(["skipped_entries"]));
+        assert_eq!(delta["status_cache"], "skipped_entries");
+        assert_eq!(by_name("alpha")["warnings"], json!([]));
+        let eta = by_name("eta");
+        assert_eq!(eta["outcome"], "succeeded");
+        assert_eq!(eta["warnings"], json!(["deferred_entries"]));
+        assert_eq!(eta["status_cache"], "skipped_entries");
+        // On a partial run the deferrals are the outcome; they add no warning.
+        assert_eq!(by_name("zeta")["warnings"], json!([]));
+        assert_eq!(by_name("zeta")["deferred_files"], 4);
+        assert_eq!(by_name("epsilon")["outcome"], "unknown");
+        assert_eq!(by_name("epsilon")["status_cache"], "last_run_failed");
+
+        // A detail line is shown verbatim, and one with a byte the writer never emits is refused.
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            b"state=failed\nstarted_epoch=1\nfinished_epoch=2\nexit_code=1\nscope=alpha\n\
+              operation=sync\nreason=core_failed\ndetail=error: listing /team failed (DSM 408)\n",
+        );
+        let failed = outcomes_value(&fixture.paths(), uid);
+        assert_eq!(
+            failed["run"]["detail"],
+            "error: listing /team failed (DSM 408)"
+        );
+        assert_eq!(failed["run"]["reason"], "core_failed");
+        assert_eq!(failed["run"]["aggregate"], Value::Null);
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            "state=failed\nstarted_epoch=1\nfinished_epoch=2\nexit_code=1\nscope=alpha\n\
+             detail=caf\u{e9}\n"
+                .as_bytes(),
+        );
+        let refused = outcomes_value(&fixture.paths(), uid);
+        assert_eq!(refused["run"]["detail"], Value::Null);
+        assert!(
+            refused["errors"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"source": "run.state", "code": "malformed"}))
+        );
+    }
+
+    /// Routine causes, failed best-effort writers and an unusable stored rollup are all named
+    /// in `outcomes` rather than left to look like "nothing happened".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn outcomes_carry_routine_causes_degraded_sinks_and_cache_health() {
+        let fixture = TestPackageFixture::new("outcomes-extra");
+        let uid = TestPackageFixture::package_uid();
+        fixture.write_private(&fixture.profiles_dir.join("alpha.toml"), b"");
+        fixture.write_private(&fixture.routines_dir.join("alpha.conf"), b"enabled=true\n");
+        fixture.write_private(
+            &fixture.routine_state_dir.join("alpha.state"),
+            b"state=deferred\nnext_run_epoch=0\nlast_success_epoch=0\nbackend=daily\n\
+              last_poll_epoch=0\ndefer_reason=window\nlast_exit_code=66\nlast_reason=log_path_mismatch\n",
+        );
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            b"state=succeeded\nstarted_epoch=1\nfinished_epoch=2\nexit_code=0\nscope=alpha\n\
+              reason=ok\ndegraded=activity,alert\ndegraded_reason=activity_log_unsafe\n",
+        );
+        fs::create_dir_all(&fixture.status_cache).unwrap();
+        fixture.write_private(
+            &fixture.status_cache.join("alpha.rollup.json"),
+            b"{not json",
+        );
+
+        let outcomes = outcomes_value(&fixture.paths(), uid);
+        assert_eq!(
+            outcomes["routines"],
+            json!([{
+                "profile": "alpha",
+                "defer_reason": "window",
+                "last_exit_code": 66,
+                "last_reason": "log_path_mismatch",
+            }])
+        );
+        assert_eq!(
+            outcomes["run"]["degraded"],
+            json!({"sinks": ["activity", "alert"], "reason": "activity_log_unsafe"})
+        );
+        let cache = &outcomes["status_cache_health"];
+        assert_eq!(cache["state"], "degraded", "{cache}");
+        assert_eq!(cache["issues"][0]["code"], "rollup-corrupt");
+        assert_eq!(outcomes["errors"], json!([]), "{outcomes}");
+
+        // Writers that predate the keys: nothing is degraded and nothing is invented.
+        fixture.write_private(
+            &fixture.routine_state_dir.join("alpha.state"),
+            b"state=succeeded\nnext_run_epoch=0\nlast_success_epoch=0\nbackend=daily\nlast_poll_epoch=0\n",
+        );
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            b"state=succeeded\nstarted_epoch=1\nfinished_epoch=2\nexit_code=0\nscope=alpha\n",
+        );
+        fs::remove_file(fixture.status_cache.join("alpha.rollup.json")).unwrap();
+        let old = outcomes_value(&fixture.paths(), uid);
+        assert_eq!(old["routines"][0]["defer_reason"], Value::Null);
+        assert_eq!(old["routines"][0]["last_exit_code"], Value::Null);
+        assert_eq!(old["run"]["degraded"], Value::Null);
+        assert_eq!(old["status_cache_health"]["state"], "ok");
+    }
+
+    /// Result facts that stop the next run converging (incomplete listings, upload times DSM did
+    /// not keep, recovered conditions) reach the dashboard as bounded fields plus warnings.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn outcomes_carry_result_facts_as_bounded_warnings() {
+        let fixture = TestPackageFixture::new("outcomes-facts");
+        let uid = TestPackageFixture::package_uid();
+        fixture.write_private(&fixture.profiles_dir.join("alpha.toml"), b"");
+        let facts = "incomplete_listings=7\n\
+                     incomplete_listing_folders=.|docs|photos/2026|a?b|c|d|e\n\
+                     mtime_not_kept=3\nrecovered_reauthentication_failures=0\n\
+                     recovered_server_tasks_not_stopped=0\nrecovered_keepalive_failures=1\n";
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            format!(
+                "state=succeeded\nstarted_epoch=1\nfinished_epoch=2\nexit_code=0\nscope=alpha\n\
+                 operation=sync\nreason=ok\ndeferred=7\n{facts}"
+            )
+            .as_bytes(),
+        );
+        let profiles = fixture.state_dir.join("profiles");
+        fs::create_dir_all(&profiles).unwrap();
+        fixture.write_private(
+            &profiles.join("alpha.state"),
+            format!(
+                "state=succeeded\nfinished_epoch=2\nexit_code=0\naction=sync\noutcome=succeeded\n\
+                 reason=ok\ndeferred=7\n{facts}"
+            )
+            .as_bytes(),
+        );
+
+        let outcomes = outcomes_value(&fixture.paths(), uid);
+        assert_eq!(outcomes["errors"], json!([]), "{outcomes}");
+        for block in [&outcomes["run"], &outcomes["profiles"][0]] {
+            assert_eq!(block["outcome"], "succeeded");
+            assert_eq!(block["incomplete_listings"], 7);
+            // Capped at five; the count carries the rest.
+            assert_eq!(
+                block["incomplete_listing_folders"],
+                json!([".", "docs", "photos/2026", "a?b", "c"])
+            );
+            assert_eq!(block["mtime_not_kept"], 3);
+            assert_eq!(
+                block["recovered"],
+                json!({
+                    "reauthentication_failures": 0,
+                    "server_tasks_not_stopped": 0,
+                    "keepalive_failures": 1,
+                })
+            );
+            assert_eq!(
+                block["warnings"],
+                json!([
+                    "deferred_entries",
+                    "incomplete_listings",
+                    "mtime_not_kept",
+                    "keepalive_failures",
+                ])
+            );
+        }
+        assert_eq!(outcomes["profiles"][0]["status_cache"], "skipped_entries");
+
+        // A record that predates the keys reads as null, with no warning invented.
+        fixture.write_private(
+            &profiles.join("alpha.state"),
+            b"state=succeeded\nfinished_epoch=2\nexit_code=0\naction=sync\n",
+        );
+        let old = outcomes_value(&fixture.paths(), uid);
+        let alpha = &old["profiles"][0];
+        assert_eq!(alpha["incomplete_listings"], Value::Null);
+        assert_eq!(alpha["incomplete_listing_folders"], Value::Null);
+        assert_eq!(alpha["mtime_not_kept"], Value::Null);
+        assert_eq!(alpha["recovered"], Value::Null);
+        assert_eq!(alpha["warnings"], json!([]));
+        assert_eq!(alpha["status_cache"], "trusted");
+
+        // A folder with a byte the writer never emits is dropped and named.
+        fixture.write_private(
+            &profiles.join("alpha.state"),
+            b"state=succeeded\nfinished_epoch=2\nexit_code=0\naction=sync\n\
+              incomplete_listings=2\nincomplete_listing_folders=ok|caf\xc3\xa9\n",
+        );
+        let malformed = outcomes_value(&fixture.paths(), uid);
+        assert_eq!(
+            malformed["profiles"][0]["incomplete_listing_folders"],
+            json!(["ok"])
+        );
+        assert!(
+            malformed["errors"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"source": "profiles/alpha.state", "code": "malformed"}))
+        );
+    }
+
+    /// fix-shell's final writer formats for exit 3, exit 78, the controller's stale rewrite and
+    /// a manual run whose counts could not be read.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn outcomes_read_the_final_runner_formats() {
+        let fixture = TestPackageFixture::new("outcomes-final");
+        let uid = TestPackageFixture::package_uid();
+        fixture.write_private(&fixture.profiles_dir.join("alpha.toml"), b"");
+        let run = |body: &str| -> Value {
+            fixture.write_private(&fixture.state_dir.join("run.state"), body.as_bytes());
+            outcomes_value(&fixture.paths(), uid)["run"].clone()
+        };
+
+        let partial = run(
+            "state=succeeded\nstarted_epoch=1\nfinished_epoch=2\nexit_code=3\n\
+                           scope=alpha\noperation=sync\noutcome=partial\nreason=deferred_paths\n\
+                           deferred=2\nskipped=0\n",
+        );
+        assert_eq!(partial["outcome"], "partial");
+        assert_eq!(partial["reason"], "deferred_paths");
+        assert_eq!(partial["counts_available"], true);
+        // The deferrals are the outcome; they are not repeated as a warning.
+        assert_eq!(partial["warnings"], json!([]));
+
+        let refused = run(
+            "state=failed\nstarted_epoch=1\nfinished_epoch=2\nexit_code=78\n\
+                           scope=alpha\noperation=sync\noutcome=failed\nreason=supervisor_refused\n\
+                           detail=sdsync-dsm-api: supervised core refused: supervised_binary_mismatch\n",
+        );
+        assert_eq!(refused["outcome"], "failed");
+        assert_eq!(refused["reason"], "supervisor_refused");
+        assert_eq!(
+            refused["detail"],
+            "sdsync-dsm-api: supervised core refused: supervised_binary_mismatch"
+        );
+        // The core never ran: no count is claimed either way.
+        assert_eq!(refused["counts_available"], Value::Null);
+
+        let died = run(
+            "state=failed\nstarted_epoch=1\nfinished_epoch=2\nexit_code=-1\n\
+                        scope=alpha\noperation=sync\nreason=runner_died\n",
+        );
+        assert_eq!(died["outcome"], "failed");
+        assert_eq!(died["reason"], "runner_died");
+        assert_eq!(died["exit_code"], Value::Null);
+
+        let manual = run(
+            "state=succeeded\nstarted_epoch=1\nfinished_epoch=2\nexit_code=0\n\
+                          scope=alpha\noperation=sync\noutcome=succeeded\nreason=ok\n\
+                          counts=unavailable\ndegraded=activity,run_stderr\n\
+                          degraded_reason=activity_write_failed\n",
+        );
+        assert_eq!(manual["outcome"], "succeeded");
+        assert_eq!(manual["counts_available"], false);
+        assert_eq!(manual["deferred_files"], Value::Null);
+        assert_eq!(
+            manual["degraded"],
+            json!({"sinks": ["activity", "run_stderr"], "reason": "activity_write_failed"})
+        );
+        assert_eq!(
+            outcomes_value(&fixture.paths(), uid)["errors"],
+            json!([]),
+            "every final format reads cleanly"
+        );
+    }
+
+    /// The Activity feed says how far back its history reaches, from either rung.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn activity_feeds_carry_their_history_extent() {
+        let fixture = TestPackageFixture::new("activity-extent");
+        let uid = TestPackageFixture::package_uid();
+        let feed =
+            || CgiResponse::success(br#"{"schema":"sdsync.dsm-activity.v1","events":[]}"#.to_vec());
+        let read = |fixture: &TestPackageFixture| -> Value {
+            let attached = attach_activity_history(feed(), &fixture.paths(), uid).unwrap();
+            serde_json::from_slice(&attached.body).unwrap()
+        };
+        assert_eq!(
+            read(&fixture)["history"],
+            json!({"files": 0, "oldest_record_epoch": null, "error": null})
+        );
+        fixture.write_private(
+            &fixture.log_root.join("activity.log"),
+            b"1700000500|run.succeeded|alpha|succeeded|sync|info|Package action completed\n",
+        );
+        fixture.write_private(
+            &fixture.log_root.join("activity.log.1"),
+            b"1700000000|run.failed|alpha|failed|sync|error|Package action completed\n",
+        );
+        let document = read(&fixture);
+        assert_eq!(document["events"], json!([]));
+        assert_eq!(
+            document["history"],
+            json!({"files": 2, "oldest_record_epoch": 1_700_000_000u64, "error": null})
+        );
+        fs::set_permissions(
+            fixture.log_root.join("activity.log.1"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert_eq!(read(&fixture)["history"]["error"], "config_file_unsafe");
+    }
+
+    /// A value this reader does not know degrades its own entry with a named error; it never
+    /// fails the snapshot and is never silently read as success.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn outcomes_name_every_unusable_value_instead_of_failing() {
+        let fixture = TestPackageFixture::new("outcomes-degrade");
+        let uid = TestPackageFixture::package_uid();
+        for name in ["alpha", "beta", "gamma"] {
+            fixture.write_private(&fixture.profiles_dir.join(format!("{name}.toml")), b"");
+        }
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            b"state=succeeded\nstarted_epoch=1\nfinished_epoch=2\nexit_code=0\nscope=alpha\n\
+              outcome=cancelled\nreason=../../etc/passwd\ndeferred=many\n",
+        );
+        fixture.write_private(
+            &fixture.state_dir.join("alerts.state"),
+            b"failure_count=x\n",
+        );
+        let profiles = fixture.state_dir.join("profiles");
+        fs::create_dir_all(&profiles).unwrap();
+        fixture.write_private(
+            &profiles.join("alpha.state"),
+            b"state=exploded\nfinished_epoch=2\nexit_code=0\n",
+        );
+        fixture.write_private(
+            &profiles.join("beta.state"),
+            b"state=succeeded\nexit_code=0\n",
+        );
+        fs::set_permissions(
+            profiles.join("beta.state"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        let outcomes = outcomes_value(&fixture.paths(), uid);
+        // An `outcome=` that contradicts `state` falls back to the state, and says so.
+        assert_eq!(outcomes["run"]["outcome"], "succeeded");
+        assert_eq!(outcomes["run"]["reason"], Value::Null);
+        assert_eq!(outcomes["run"]["deferred_files"], Value::Null);
+        assert_eq!(outcomes["alerts"]["status"], "unreadable");
+        assert_eq!(outcomes["alerts"]["failure_count"], Value::Null);
+        let profiles = outcomes["profiles"].as_array().unwrap();
+        assert_eq!(profiles[0]["outcome"], "unknown");
+        assert_eq!(profiles[0]["status_cache"], "last_run_failed");
+        assert_eq!(profiles[1]["outcome"], "not_run");
+        assert_eq!(profiles[2]["outcome"], "not_run");
+        let errors = outcomes["errors"].as_array().unwrap();
+        for expected in [
+            json!({"source": "run.state", "code": "unknown_outcome"}),
+            json!({"source": "run.state", "code": "invalid_reason"}),
+            json!({"source": "run.state", "code": "malformed"}),
+            json!({"source": "alerts.state", "code": "malformed"}),
+            json!({"source": "profiles/alpha.state", "code": "unknown_state"}),
+            json!({"source": "profiles/beta.state", "code": "unsafe_file"}),
+        ] {
+            assert!(
+                errors.contains(&expected),
+                "{expected} missing from {errors:?}"
+            );
+        }
+    }
+
+    /// `running` with no live lock owner is a runner that died: stale, never "Running" forever.
+    /// An owner this service cannot verify is not proof of death and stays `running`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_running_record_without_a_live_run_lock_is_stale() {
+        let fixture = TestPackageFixture::new("outcomes-stale");
+        let uid = TestPackageFixture::package_uid();
+        fixture.write_private(&fixture.profiles_dir.join("alpha.toml"), b"");
+        fixture.write_private(&fixture.profiles_dir.join("beta.toml"), b"");
+        let profiles = fixture.state_dir.join("profiles");
+        fs::create_dir_all(&profiles).unwrap();
+        fixture.write_private(
+            &profiles.join("alpha.state"),
+            b"state=succeeded\nfinished_epoch=5\nexit_code=0\naction=sync\n",
+        );
+        fixture.write_private(
+            &profiles.join("beta.state"),
+            b"state=succeeded\nfinished_epoch=5\nexit_code=0\naction=sync\n",
+        );
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            b"state=running\nstarted_epoch=100\nfinished_epoch=0\nexit_code=-1\nscope=alpha\n\
+              operation=sync\n",
+        );
+        let paths = fixture.paths();
+
+        // No lock at all.
+        let stale = outcomes_value(&paths, uid);
+        assert_eq!(stale["run"]["outcome"], "stale");
+        assert_eq!(stale["run"]["reason"], "runner_died");
+        assert_eq!(
+            stale["run"]["stale"],
+            json!({"detected": true, "lock": "absent", "reason": "runner_died"})
+        );
+        assert_eq!(stale["run"]["exit_code"], Value::Null);
+        // Only the covered profile loses trust in its rollup row.
+        assert_eq!(stale["profiles"][0]["status_cache"], "last_run_failed");
+        assert_eq!(stale["profiles"][1]["status_cache"], "trusted");
+
+        // A live owner: running.
+        let lock = write_run_lock(&fixture, &own_lock_identity(0));
+        let running = outcomes_value(&paths, uid);
+        assert_eq!(running["run"]["outcome"], "running");
+        assert_eq!(running["run"]["stale"]["lock"], "live");
+
+        // A reused pid with another start tick, and the retired one-line format: dead.
+        fixture.write_private(&lock.join("pid"), own_lock_identity(1).as_bytes());
+        assert_eq!(outcomes_value(&paths, uid)["run"]["stale"]["lock"], "dead");
+        fixture.write_private(
+            &lock.join("pid"),
+            format!("{}\n", std::process::id()).as_bytes(),
+        );
+        let legacy = outcomes_value(&paths, uid);
+        assert_eq!(legacy["run"]["outcome"], "stale");
+        assert_eq!(legacy["run"]["stale"]["lock"], "dead");
+
+        // An owner file this service did not write is not evidence either way.
+        fixture.write_private(&lock.join("pid"), own_lock_identity(0).as_bytes());
+        fs::set_permissions(lock.join("pid"), fs::Permissions::from_mode(0o644)).unwrap();
+        let unverified = outcomes_value(&paths, uid);
+        assert_eq!(unverified["run"]["outcome"], "running");
+        assert_eq!(unverified["run"]["stale"]["detected"], false);
+        assert!(
+            unverified["errors"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"source": "run.lock", "code": "lock_unreadable"}))
+        );
+    }
+
+    /// The member rides on a successful snapshot from either rung and leaves a failure alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn outcomes_attach_to_successful_snapshots_only() {
+        let fixture = TestPackageFixture::new("outcomes-attach");
+        let uid = TestPackageFixture::package_uid();
+        let snapshot = CgiResponse::success(br#"{"schema":"sdsync.dsm-api.v1","run":{}}"#.to_vec());
+        let attached = attach_snapshot_outcomes(snapshot, &fixture.paths(), uid).unwrap();
+        let document: Value = serde_json::from_slice(&attached.body).unwrap();
+        assert_eq!(document["schema"], "sdsync.dsm-api.v1");
+        assert_eq!(document["run"], json!({}));
+        assert_eq!(document["outcomes"]["schema"], OUTCOMES_SCHEMA);
+
+        let failure = CgiResponse {
+            status: 503,
+            body: b"{}".to_vec(),
+        };
+        let untouched = attach_snapshot_outcomes(failure, &fixture.paths(), uid).unwrap();
+        assert_eq!(untouched.status, 503);
+        assert_eq!(untouched.body, b"{}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reason_tokens_admit_codes_and_qualifiers_but_never_paths() {
+        for valid in [
+            "lock_busy",
+            "no_password:Photos-1",
+            "batch_target_failed:alpha",
+            "a",
+        ] {
+            assert!(valid_reason_token(valid.as_bytes()), "{valid}");
+        }
+        let overlong = "a".repeat(49);
+        for invalid in [
+            "",
+            "Lock",
+            "1st",
+            "x:",
+            "x:a/b",
+            "x:y:z",
+            "../../etc/passwd",
+            "has space",
+            overlong.as_str(),
+        ] {
+            assert!(!valid_reason_token(invalid.as_bytes()), "{invalid}");
+        }
     }
 
     /// The kill switch actually moves a migrated read back onto the manager.
@@ -26235,8 +28064,12 @@ mod tests {
         let mut policy = SecurityPolicyArgs::default();
         for category in CATEGORIES {
             set_category_level(&mut policy, category, PolicyLogLevel::Off);
-            assert!(!event_visible_at_threshold(
+            // `off` silences warnings and chatter, never a failure.
+            assert!(event_visible_at_threshold(
                 &policy, category, "error", false
+            ));
+            assert!(!event_visible_at_threshold(
+                &policy, category, "warn", false
             ));
             set_category_level(&mut policy, category, PolicyLogLevel::Warn);
             assert!(event_visible_at_threshold(
@@ -26260,6 +28093,36 @@ mod tests {
             &policy,
             "controller",
             r#"{"level":"info","event":"scheduled_run"}"#,
+        ));
+        // Raw stderr in controller.log (a runner's preflight cause) is never hidden by a raised
+        // threshold, nor by `off`.
+        assert!(log_line_visible_at_threshold(
+            &policy,
+            "controller",
+            "sdsync-run: profile 'alpha' log-file is outside the fixed package-managed path",
+        ));
+        policy.controller_log_level = PolicyLogLevel::Off;
+        assert!(log_line_visible_at_threshold(
+            &policy,
+            "controller",
+            "sdsync-run: profile 'alpha' log-file is outside the fixed package-managed path",
+        ));
+        assert!(!log_line_visible_at_threshold(
+            &policy,
+            "controller",
+            r#"{"level":"warn","event":"routine_deferred"}"#,
+        ));
+        // The core's human format carries its own level.
+        policy.sync_log_level = PolicyLogLevel::Warn;
+        assert!(!log_line_visible_at_threshold(
+            &policy,
+            "sync",
+            "1785769200123 INFO  sync run started",
+        ));
+        assert!(log_line_visible_at_threshold(
+            &policy,
+            "sync",
+            "1785769200123 ERROR sync run failed reason=network",
         ));
         policy.scheduler_log_level = PolicyLogLevel::Error;
         assert!(log_line_visible_at_threshold(

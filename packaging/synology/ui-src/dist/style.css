@@ -4524,3 +4524,47 @@ height: 84px;
 padding: 6px 10px 5px;
 gap: 2px;
 }
+.sdsync-attention {
+margin: 0 0 12px;
+padding: 0;
+list-style: none;
+}
+.sdsync-attention li {
+padding: 7px 10px;
+border: 1px solid var(--sdsync-border);
+border-left: 3px solid var(--sdsync-muted);
+color: var(--sdsync-text);
+font-size: 12px;
+}
+.sdsync-attention li + li {
+margin-top: 4px;
+}
+.sdsync-attention li.is-fail {
+border-left-color: var(--sdsync-red);
+}
+.sdsync-attention li.is-warn {
+border-left-color: var(--sdsync-amber);
+}
+.sdsync-profile-outcome {
+display: block;
+color: var(--sdsync-muted);
+}
+.sdsync-app .is-fail {
+color: var(--sdsync-red);
+}
+.sdsync-app .is-unknown {
+color: var(--sdsync-muted);
+}
+.sdsync-attention li.is-fail,
+.sdsync-attention li.is-warn,
+.sdsync-attention li.is-unknown {
+color: var(--sdsync-text);
+}
+.sdsync-page-frame.is-stale-data .sdsync-metrics,
+.sdsync-page-frame.is-stale-data .sdsync-table-wrap,
+.sdsync-page-frame.is-stale-data .sdsync-compact-profile {
+opacity: 0.55;
+}
+.sdsync-widget-profile.is-stale {
+opacity: 0.6;
+}

@@ -13,6 +13,10 @@
   <h1>Activity and logs</h1>
   <p>Activity shows bounded structured events and recent package log output. Browser polling runs only while this page and the DSM document are visible.</p>
 
+  <p>The same attention list as the Overview appears above the tabs, so a failed, partial or stale run, an unavailable alert path or degraded package records are visible here with their cause.</p>
+
+  <p>Above the tabs, <strong>History starts</strong> gives the date of the oldest activity record still kept, so a failure that has already been rotated away is not mistaken for none. If the package cannot report it, that is stated instead.</p>
+
   <h2>Structured activity</h2>
   <p>Each event can include time, code, profile, state, category, and level. Events describe package decisions such as queue acceptance, controller execution, routine transitions, notifications, and terminal results. Use the category and exact-level selectors to narrow the rendered event list without deleting or changing durable records. An absent field is displayed as unknown rather than inferred.</p>
 

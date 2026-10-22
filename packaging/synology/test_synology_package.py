@@ -1497,6 +1497,27 @@ class BuilderTests(unittest.TestCase):
         )
 
 
+
+def write_clock(path: Path, text: str) -> None:
+    """Replace a fake-clock file atomically.
+
+    The fixtures' fake `date` reads this file while the test (or another fake
+    `date`) rewrites it. A plain write_text truncates first, so a reader could
+    see an empty file: the shell then got an empty epoch, printed an
+    arithmetic error onto the controller's stderr -- a raw line in
+    controller.log -- and computed deadlines from nothing. A rename is never
+    observed half-done.
+    """
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(text, encoding="utf-8")
+    if path.exists():
+        current = path.stat()
+        if os.getuid() == 0:
+            os.chown(temporary, current.st_uid, current.st_gid)
+        temporary.chmod(stat.S_IMODE(current.st_mode))
+    os.replace(temporary, path)
+
+
 @unittest.skipUnless(os.name == "posix", "DSM shell lifecycle mocks require a POSIX host")
 class RuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -2332,6 +2353,13 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "            os.setpriority(os.PRIO_PROCESS, 0, core_nice)\n"
             "        except OSError:\n"
             "            pass\n"
+            # Opt-in model of the shipped supervisor's refusal of any binary
+            # argument but its alias BINARY_PATH (HEAD compared bytes and exited
+            # 1 in silence; the bridge now prints one line and exits 78).
+            "    strict_binary = os.environ.get('SDSYNC_TEST_SUPERVISOR_ALIAS')\n"
+            "    if strict_binary and sys.argv[8] != strict_binary:\n"
+            "        sys.stderr.write('sdsync-dsm-api: supervised core refused: supervised_binary_mismatch\\n')\n"
+            "        raise SystemExit(78)\n"
             "    os.execv(sys.argv[8], sys.argv[8:])\n"
             "\n"
             "if len(sys.argv) == 5 and sys.argv[1] == '--exec-supervised-controller':\n"
@@ -2991,6 +3019,10 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             except OSError as error:
                 self.fail(f"could not inspect {label} PID {pid} entry: {error}")
             self.fail(f"{label} PID {pid} stat disappeared while its proc entry remained")
+        except ProcessLookupError:
+            # The process was reaped between opening its proc entry and
+            # reading it (ESRCH): that is the terminal state being waited for.
+            return None
         except OSError as error:
             self.fail(f"could not inspect {label} PID {pid}: {error}")
         parts = stat_text.rsplit(") ", 1)
@@ -3100,7 +3132,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         fake_bin = self.root / f"fake-clock-bin-{step}"
         fake_bin.mkdir()
         clock = self.root / f"fake-clock-{step}"
-        clock.write_text("1000\n", encoding="utf-8")
+        write_clock(clock, "1000\n")
         fake_date = fake_bin / "date"
         fake_date.write_text(
             "#!/bin/sh\n"
@@ -3111,7 +3143,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "  +%Y-%m-%d) echo 2026-08-24 ;;\n"
             "  +%s) IFS= read -r now < \"$SDSYNC_TEST_CLOCK\"; "
             f"now=$((now + {step})); "
-            'printf \'%s\\n\' "$now" > "$SDSYNC_TEST_CLOCK"; printf \'%s\\n\' "$now" ;;\n'
+            'printf \'%s\\n\' "$now" > "$SDSYNC_TEST_CLOCK.$$"; '
+            'mv -f "$SDSYNC_TEST_CLOCK.$$" "$SDSYNC_TEST_CLOCK"; printf \'%s\\n\' "$now" ;;\n'
             "  *) exec /bin/date \"$@\" ;;\n"
             "esac\n",
             encoding="utf-8",
@@ -3151,7 +3184,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         fake_bin = self.root / f"{label}-realtime-bin"
         fake_bin.mkdir(mode=0o700)
         clock = self.root / f"{label}-realtime-clock"
-        clock.write_text(f"{initial_clock}\n", encoding="utf-8")
+        write_clock(clock, f"{initial_clock}\n")
         fake_date = fake_bin / "date"
         fake_date.write_text(
             "#!/bin/sh\n"
@@ -7036,7 +7069,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         fake_bin = self.root / "retry-deadline-bin"
         fake_bin.mkdir(mode=0o700)
         clock = self.root / "retry-deadline-clock"
-        clock.write_text("100\n", encoding="utf-8")
+        write_clock(clock, "100\n")
         fake_date = fake_bin / "date"
         fake_date.write_text(
             "#!/bin/sh\n"
@@ -7079,7 +7112,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             for invocation in invocations.values():
                 self.assertNotIn(invocation, before_deadline)
 
-            clock.write_text("200\n", encoding="utf-8")
+            write_clock(clock, "200\n")
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
                 captured = self.capture.read_text(encoding="utf-8")
@@ -7293,7 +7326,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         fake_bin = self.root / "native-debounce-bin"
         fake_bin.mkdir(mode=0o700)
         clock = self.root / "native-debounce-clock"
-        clock.write_text("100\n", encoding="utf-8")
+        write_clock(clock, "100\n")
         fake_date = fake_bin / "date"
         fake_date.write_text(
             "#!/bin/sh\n"
@@ -7350,7 +7383,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         )
         event_path.write_text("change\n", encoding="utf-8")
         os.utime(event_path, (100, 100))
-        clock.write_text("144\n", encoding="utf-8")
+        write_clock(clock, "144\n")
         time.sleep(0.3)
         invocation = "sync --profile watch --no-delete"
         self.assertNotIn(
@@ -7359,7 +7392,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "fingerprint fallback bypassed the pending native debounce",
         )
 
-        clock.write_text("145\n", encoding="utf-8")
+        write_clock(clock, "145\n")
         time.sleep(0.3)
         self.assertNotIn(invocation, self.capture.read_text(encoding="utf-8"))
         self.assertTrue(
@@ -7395,7 +7428,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         (self.source_two / "watched.txt").write_text("second change\n", encoding="utf-8")
         event_path.write_text("event at 200\n", encoding="utf-8")
         os.utime(event_path, (200, 200))
-        clock.write_text("244\n", encoding="utf-8")
+        write_clock(clock, "244\n")
         time.sleep(0.3)
         self.assertEqual(self.capture.read_text(encoding="utf-8").count(invocation), 1)
 
@@ -7404,11 +7437,11 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         )
         event_path.write_text("new event at 230\n", encoding="utf-8")
         os.utime(event_path, (230, 230))
-        clock.write_text("274\n", encoding="utf-8")
+        write_clock(clock, "274\n")
         time.sleep(0.3)
         self.assertEqual(self.capture.read_text(encoding="utf-8").count(invocation), 1)
 
-        clock.write_text("275\n", encoding="utf-8")
+        write_clock(clock, "275\n")
         reset_deadline = time.monotonic() + 15
         while time.monotonic() < reset_deadline:
             if self.capture.read_text(encoding="utf-8").count(invocation) == 2:
@@ -7511,28 +7544,35 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         if os.getuid() == 0:
             os.chown(locked, self.drop_uid, self.drop_gid)
         locked.chmod(0o000)
-        self.addCleanup(lambda: locked.chmod(0o700))
-        routine, _ = self.api(
-            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
-            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
-            "--time-window-start", "00:00", "--time-window-end", "23:59",
-            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
-            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
-        )
-        self.assertEqual(routine.returncode, 0, routine.stderr)
-        self.capture.write_text("", encoding="utf-8")
-        fast_environment = self.fast_clock_environment(step=31)
-        started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
-        self.assertEqual(started.returncode, 0, started.stderr)
-        matches = self.wait_for_controller_event("routine_poll_unavailable")
-        unreadable = [m for m in matches if "reason=unreadable_subtree" in str(m.get("detail", ""))]
-        self.assertTrue(unreadable, matches)
-        self.assertNotIn("sync --profile watch --no-delete", self.capture.read_text(encoding="utf-8"))
-        watch_state = self.real_var / "state/routines/watch.state"
-        if watch_state.exists():
-            self.assertIn("backend_reason=poll_unreadable", watch_state.read_text(encoding="utf-8"))
-        stopped = self.shell(self.lifecycle, "stop", timeout=15)
-        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        # Restored in a finally below, inside the test body -- tearDown
+        # already deletes the whole per-test tree before addCleanup
+        # callbacks would run, so an addCleanup chmod here would find the
+        # directory already gone (FileNotFoundError, reported as an ERROR
+        # regardless of whether the test body itself passed).
+        try:
+            routine, _ = self.api(
+                "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+                "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+                "--time-window-start", "00:00", "--time-window-end", "23:59",
+                "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+                "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+            )
+            self.assertEqual(routine.returncode, 0, routine.stderr)
+            self.capture.write_text("", encoding="utf-8")
+            fast_environment = self.fast_clock_environment(step=31)
+            started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
+            self.assertEqual(started.returncode, 0, started.stderr)
+            matches = self.wait_for_controller_event("routine_poll_unavailable")
+            unreadable = [m for m in matches if "reason=unreadable_subtree" in str(m.get("detail", ""))]
+            self.assertTrue(unreadable, matches)
+            self.assertNotIn("sync --profile watch --no-delete", self.capture.read_text(encoding="utf-8"))
+            watch_state = self.real_var / "state/routines/watch.state"
+            if watch_state.exists():
+                self.assertIn("backend_reason=poll_unreadable", watch_state.read_text(encoding="utf-8"))
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        finally:
+            locked.chmod(0o700)
 
     def test_realtime_poll_failure_logs_once_not_every_five_seconds(self) -> None:
         # Row 2. Same permanent fault as row 1, but the assertion is on
@@ -7552,24 +7592,28 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         if os.getuid() == 0:
             os.chown(locked, self.drop_uid, self.drop_gid)
         locked.chmod(0o000)
-        self.addCleanup(lambda: locked.chmod(0o700))
-        routine, _ = self.api(
-            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
-            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
-            "--time-window-start", "00:00", "--time-window-end", "23:59",
-            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
-            "--poll-seconds", "30", "--allow-delete", "false", "--max-total-delete", "100",
-        )
-        self.assertEqual(routine.returncode, 0, routine.stderr)
-        fast_environment = self.fast_clock_environment(step=31)
-        started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
-        self.assertEqual(started.returncode, 0, started.stderr)
-        self.wait_for_controller_event("routine_poll_unavailable")
-        time.sleep(1.0)
-        matches = [r for r in self.controller_events() if r.get("event") == "routine_poll_unavailable"]
-        self.assertEqual(len(matches), 1, matches)
-        stopped = self.shell(self.lifecycle, "stop", timeout=15)
-        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        # See row 1's comment: restored in a finally, not addCleanup, since
+        # tearDown deletes the tree before addCleanup callbacks would run.
+        try:
+            routine, _ = self.api(
+                "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+                "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+                "--time-window-start", "00:00", "--time-window-end", "23:59",
+                "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+                "--poll-seconds", "30", "--allow-delete", "false", "--max-total-delete", "100",
+            )
+            self.assertEqual(routine.returncode, 0, routine.stderr)
+            fast_environment = self.fast_clock_environment(step=31)
+            started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
+            self.assertEqual(started.returncode, 0, started.stderr)
+            self.wait_for_controller_event("routine_poll_unavailable")
+            time.sleep(1.0)
+            matches = [r for r in self.controller_events() if r.get("event") == "routine_poll_unavailable"]
+            self.assertEqual(len(matches), 1, matches)
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        finally:
+            locked.chmod(0o700)
 
     def test_realtime_poll_prunes_eadir_instead_of_failing(self) -> None:
         # Row 3. @eaDir is pruned before find ever descends into it, so a
@@ -7588,33 +7632,47 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         if os.getuid() == 0:
             os.chown(eadir, self.drop_uid, self.drop_gid)
         eadir.chmod(0o000)
-        self.addCleanup(lambda: eadir.chmod(0o700))
-        (self.source_two / "visible.txt").write_text("one\n", encoding="utf-8")
-        routine, _ = self.api(
-            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
-            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
-            "--time-window-start", "00:00", "--time-window-end", "23:59",
-            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
-            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
-        )
-        self.assertEqual(routine.returncode, 0, routine.stderr)
-        fast_environment = self.fast_clock_environment(step=31)
-        started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
-        self.assertEqual(started.returncode, 0, started.stderr)
-        state_path = self.real_var / "state/routines/watch.state"
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            if state_path.is_file() and "fingerprint=none" not in state_path.read_text(encoding="utf-8"):
-                break
-            time.sleep(0.03)
-        else:
-            self.fail("poll did not establish a baseline despite the pruned @eaDir")
-        self.assertIn("backend_reason=ok", state_path.read_text(encoding="utf-8"))
-        self.assertFalse(
-            any(r.get("event") == "routine_poll_unavailable" for r in self.controller_events())
-        )
-        stopped = self.shell(self.lifecycle, "stop", timeout=15)
-        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        # See row 1's comment: restored in a finally, not addCleanup.
+        try:
+            (self.source_two / "visible.txt").write_text("one\n", encoding="utf-8")
+            routine, _ = self.api(
+                "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+                "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+                "--time-window-start", "00:00", "--time-window-end", "23:59",
+                "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+                "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+            )
+            self.assertEqual(routine.returncode, 0, routine.stderr)
+            # fast_clock_environment's fake inotifywait always exits 69
+            # immediately, so the watcher independently lands on
+            # backend_reason=watch_setup_failed regardless of the poll's own
+            # outcome (a successful poll does not clear an existing watcher
+            # failure reason -- confirmed against the shell agent's report).
+            # The thing this row actually tests is that the poll itself
+            # succeeds over the pruned @eaDir, so assert that directly rather
+            # than asserting backend_reason=ok, which this fixture can never
+            # produce.
+            fast_environment = self.fast_clock_environment(step=31)
+            started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
+            self.assertEqual(started.returncode, 0, started.stderr)
+            state_path = self.real_var / "state/routines/watch.state"
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if state_path.is_file() and "fingerprint=none" not in state_path.read_text(encoding="utf-8"):
+                    break
+                time.sleep(0.03)
+            else:
+                self.fail("poll did not establish a baseline despite the pruned @eaDir")
+            state_text = state_path.read_text(encoding="utf-8")
+            self.assertNotIn("backend_reason=poll_unreadable", state_text)
+            self.assertNotIn("backend_reason=poll_unavailable", state_text)
+            self.assertFalse(
+                any(r.get("event") == "routine_poll_unavailable" for r in self.controller_events())
+            )
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        finally:
+            eadir.chmod(0o700)
 
     def test_realtime_poll_tolerates_one_vanished_file_and_counts_retry(self) -> None:
         # Row 4. A find that fails with non-empty stderr exactly once, then
@@ -7637,6 +7695,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         fake_find = fake_bin / "find"
         fake_find.write_text(
             "#!/bin/sh\n"
+            # The controller's one-file -exec probe passes straight through;
+            # only walks of the source are counted.
+            f'case "$1" in "{self.source_two}") ;; *) exec {real_find} "$@" ;; esac\n'
             f'counter="{counter}"\n'
             'IFS= read -r count < "$counter"\n'
             'count=$((count + 1))\n'
@@ -7674,7 +7735,11 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         else:
             self.fail("poll did not establish a baseline after the tolerated retry")
         state_text = state_path.read_text(encoding="utf-8")
-        self.assertIn("backend_reason=ok", state_text)
+        # The walk is collected on a later turn than it starts, by which time
+        # this fixture's always-failing inotifywait has set its own watcher
+        # reason (see the @eaDir row). What must not appear is a poll reason.
+        self.assertNotIn("backend_reason=poll_unreadable", state_text)
+        self.assertNotIn("backend_reason=poll_unavailable", state_text)
         self.assertIn("poll_retries=1", state_text)
         self.assertFalse(
             any(r.get("event") == "routine_poll_unavailable" for r in self.controller_events())
@@ -7789,9 +7854,18 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         stop_writing = threading.Event()
 
         def keep_changing() -> None:
+            # source_fingerprint keys on name|size|mtime-in-seconds. A
+            # same-length payload written more than once inside the same
+            # wall-clock second is indistinguishable from an unchanged file,
+            # which is enough consecutive-equal-reading evidence for the
+            # ordinary quiet period (rows 6/7) to promote and dispatch --
+            # short-circuiting this test before the ceiling is ever needed.
+            # Growing the payload by one byte on every write guarantees the
+            # size differs every single time, independent of mtime
+            # granularity.
             while not stop_writing.is_set():
                 tick[0] += 1
-                watched_file.write_text(f"tick {tick[0]}\n", encoding="utf-8")
+                watched_file.write_text("x" * tick[0] + "\n", encoding="utf-8")
                 time.sleep(0.02)
 
         writer = threading.Thread(target=keep_changing, daemon=True)
@@ -7829,7 +7903,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         (self.source_two / "watched.txt").write_text("initial\n", encoding="utf-8")
         routine, _ = self.api(
             "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
-            "--mode", "realtime", "--debounce-seconds", "45", "--poll-seconds", "3600",
+            "--mode", "realtime", "--debounce-seconds", "45", "--poll-seconds", "5",
             "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
             "--allow-delete", "false", "--max-total-delete", "100",
         )
@@ -7852,19 +7926,45 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         else:
             self.fail("native watcher did not establish its initial fingerprint and event file")
 
+        # A fixed clock-step loop with a hardcoded end bound races the
+        # controller's own turn latency: event_first_seen_epoch is stamped on
+        # whichever turn first observes the marker pending, and how many
+        # turns that takes (so which simulated "now" it lands on) depends on
+        # how fast the controller is running relative to the loop's 0.05s
+        # real-time steps -- confirmed by the shell agent driving
+        # process_routines turn-by-turn: the epoch landed at 380 in one trace
+        # and 220 in another against the same code. Raising the end bound
+        # only reduces the flake rate, it does not remove it. Adopt the
+        # sibling polling-ceiling row's shape instead: a background thread
+        # that keeps advancing the clock and rewriting the marker, and a
+        # wall-clock deadline on the main thread that waits for the dispatch
+        # to actually appear rather than asserting the instant a fixed loop
+        # ends.
         invocation = "sync --profile watch --no-delete"
-        now = 100
-        end = now + 4 * 45 + 10
-        dispatched = False
-        while now < end:
-            now += 40
-            clock.write_text(f"{now}\n", encoding="utf-8")
-            event_path.write_text(f"rewrite at {now}\n", encoding="utf-8")
-            os.utime(event_path, (now, now))
-            time.sleep(0.05)
-            if invocation in self.capture.read_text(encoding="utf-8"):
-                dispatched = True
-                break
+        current_now = [100]
+        stop_writing = threading.Event()
+
+        def keep_rewriting() -> None:
+            while not stop_writing.is_set():
+                current_now[0] += 40
+                write_clock(clock, f"{current_now[0]}\n")
+                event_path.write_text(f"rewrite at {current_now[0]}\n", encoding="utf-8")
+                os.utime(event_path, (current_now[0], current_now[0]))
+                time.sleep(0.05)
+
+        writer = threading.Thread(target=keep_rewriting, daemon=True)
+        writer.start()
+        try:
+            dispatch_deadline = time.monotonic() + 30
+            dispatched = False
+            while time.monotonic() < dispatch_deadline:
+                if invocation in self.capture.read_text(encoding="utf-8"):
+                    dispatched = True
+                    break
+                time.sleep(0.05)
+        finally:
+            stop_writing.set()
+            writer.join(timeout=5)
         self.assertTrue(dispatched, "the native ceiling never forced a dispatch on a continuously rewritten source")
         details = self.event_details("routine_event_forced")
         self.assertTrue(any("ceiling=180" in detail for detail in details), details)
@@ -7882,8 +7982,19 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         # consume_realtime_event returns 1 on the mismatch, the controller
         # continues, and the forced dispatch silently never happens -- no log
         # line, no failed assertion anywhere else, just a routine that never
-        # runs. The fake watcher here writes continuously in real time
-        # (independent of the simulated clock) for exactly that reason.
+        # runs.
+        #
+        # A watcher that writes continuously using real wall-clock time
+        # cannot drive this: realtime_event_due requires mtime <= now, and a
+        # real mtime (a huge real epoch) always fails that check against the
+        # small fake clock this fixture uses, so the event is rejected as
+        # unsafe (73) and the routine never even reaches the ceiling logic.
+        # A background thread racing the events file directly avoids that:
+        # it stamps every rewrite with whatever fake-clock value the main
+        # loop last wrote (always <= the controller's current "now"), while
+        # still changing the file's size on every write, which is on its own
+        # enough to change stat's %i:%s:%Y identity even when mtime does not
+        # move within the same tick.
         self.assertEqual(
             self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
         )
@@ -7895,44 +8006,12 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         (self.source_two / "watched.txt").write_text("initial\n", encoding="utf-8")
         routine, _ = self.api(
             "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
-            "--mode", "realtime", "--debounce-seconds", "2", "--poll-seconds", "3600",
+            "--mode", "realtime", "--debounce-seconds", "2", "--poll-seconds", "5",
             "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
             "--allow-delete", "false", "--max-total-delete", "100",
         )
         self.assertEqual(routine.returncode, 0, routine.stderr)
-        fake_bin = self.root / "ceiling-race-bin"
-        fake_bin.mkdir(mode=0o700)
-        clock = self.root / "ceiling-race-clock"
-        clock.write_text("100\n", encoding="utf-8")
-        fake_date = fake_bin / "date"
-        fake_date.write_text(
-            "#!/bin/sh\n"
-            ': "${SDSYNC_TEST_CLOCK:?}"\n'
-            'case "${1:-}" in\n'
-            '  +%s) exec /bin/cat "$SDSYNC_TEST_CLOCK" ;;\n'
-            '  +%u) echo 1 ;;\n'
-            '  +%H%M) echo 1200 ;;\n'
-            '  +%Y-%m-%d) echo 2026-08-24 ;;\n'
-            '  *) exec /bin/date "$@" ;;\n'
-            'esac\n',
-            encoding="utf-8",
-        )
-        fake_sleep = fake_bin / "sleep"
-        fake_sleep.write_text(
-            "#!/bin/sh\ncase ${1:-} in 1) exec /bin/sleep 1 ;; *) exec /bin/sleep 0.03 ;; esac\n",
-            encoding="utf-8",
-        )
-        fake_inotify = fake_bin / "inotifywait"
-        fake_inotify.write_text(
-            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do printf 'tick\\n'; /bin/sleep 0.02; done\n",
-            encoding="utf-8",
-        )
-        for path in (fake_date, fake_sleep, fake_inotify):
-            path.chmod(0o755)
-        if os.getuid() == 0:
-            for path in (fake_bin, clock, fake_date, fake_sleep, fake_inotify):
-                os.chown(path, self.drop_uid, self.drop_gid)
-        environment = {"PATH": f"{fake_bin}:{self.environment['PATH']}", "SDSYNC_TEST_CLOCK": str(clock)}
+        environment, clock = self.realtime_watcher_environment(label="ceiling-race")
         self.capture.write_text("", encoding="utf-8")
         started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
         self.assertEqual(started.returncode, 0, started.stderr)
@@ -7951,16 +8030,33 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             self.fail("native watcher did not establish its initial fingerprint and event file")
 
         invocation = "sync --profile watch --no-delete"
-        now = 100
-        dispatch_deadline = time.monotonic() + 20
-        dispatched = False
-        while time.monotonic() < dispatch_deadline:
-            now += 5
-            clock.write_text(f"{now}\n", encoding="utf-8")
-            if invocation in self.capture.read_text(encoding="utf-8"):
-                dispatched = True
-                break
-            time.sleep(0.05)
+        current_now = [100]
+        race_tick = [0]
+        stop_racing = threading.Event()
+
+        def keep_racing() -> None:
+            while not stop_racing.is_set():
+                race_tick[0] += 1
+                synced_now = current_now[0]
+                event_path.write_text("x" * race_tick[0] + "\n", encoding="utf-8")
+                os.utime(event_path, (synced_now, synced_now))
+                time.sleep(0.01)
+
+        racer = threading.Thread(target=keep_racing, daemon=True)
+        racer.start()
+        try:
+            dispatch_deadline = time.monotonic() + 20
+            dispatched = False
+            while time.monotonic() < dispatch_deadline:
+                current_now[0] += 5
+                write_clock(clock, f"{current_now[0]}\n")
+                if invocation in self.capture.read_text(encoding="utf-8"):
+                    dispatched = True
+                    break
+                time.sleep(0.05)
+        finally:
+            stop_racing.set()
+            racer.join(timeout=5)
         self.assertTrue(dispatched, "a continuously rewritten marker discarded the forced ceiling dispatch")
         details = self.event_details("routine_event_forced")
         self.assertTrue(any("ceiling=62" in detail for detail in details), details)
@@ -7968,6 +8064,582 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(self.capture.read_text(encoding="utf-8").count(invocation), 1)
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_runner_records_an_operator_stop_without_alerting_or_counting_a_failure(self) -> None:
+        # S2-B12. A core exit of 130 (operator-requested stop) must not be
+        # recorded as an ordinary sync failure: no alert-path side effect, an
+        # info-level activity record naming the cancellation, and an
+        # info-level scheduler run_finished record -- while state stays
+        # failed and the exit code stays 130, because the four-value state
+        # enum (never, running, succeeded, failed) has no room for a fifth
+        # value, and succeeded would wrongly satisfy a dependent routine's
+        # gate for a run that never finished. Row 7 below (exit 1) is the
+        # control: it proves the change narrowed the cancellation case
+        # rather than disabling alerts generally -- without it, a regression
+        # that set run_cancelled=true unconditionally would pass every
+        # assertion above it.
+        fake_bin = self.root / "cancel-bin"
+        fake_bin.mkdir(mode=0o700)
+        clock = self.root / "cancel-clock"
+        write_clock(clock, "100\n")
+        fake_date = fake_bin / "date"
+        fake_date.write_text(
+            "#!/bin/sh\n"
+            ': "${SDSYNC_TEST_CLOCK:?}"\n'
+            'case "${1:-}" in\n'
+            '  +%s) exec /bin/cat "$SDSYNC_TEST_CLOCK" ;;\n'
+            '  +%u) echo 1 ;;\n'
+            '  +%H%M) echo 1200 ;;\n'
+            '  +%Y-%m-%d) echo 2026-08-24 ;;\n'
+            '  *) exec /bin/date "$@" ;;\n'
+            "esac\n",
+            encoding="utf-8",
+        )
+        fake_sleep = fake_bin / "sleep"
+        fake_sleep.write_text(
+            "#!/bin/sh\ncase ${1:-} in 1) exec /bin/sleep 1 ;; *) exec /bin/sleep 0.03 ;; esac\n",
+            encoding="utf-8",
+        )
+        fake_inotify = fake_bin / "inotifywait"
+        fake_inotify.write_text("#!/bin/sh\nexit 69\n", encoding="utf-8")
+        for path in (fake_date, fake_sleep, fake_inotify):
+            path.chmod(0o755)
+        if os.getuid() == 0:
+            for path in (fake_bin, clock, fake_date, fake_sleep, fake_inotify):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        environment = {"PATH": f"{fake_bin}:{self.environment['PATH']}", "SDSYNC_TEST_CLOCK": str(clock)}
+
+        def install_fixed_exit_core(code: int) -> None:
+            core = self.real_target / "bin/synology-drive-sync"
+            core.write_text(
+                "#!/bin/sh\n"
+                ': "${SDSYNC_TEST_CAPTURE:?}"\n'
+                'printf \'%s\\n\' "$*" >> "$SDSYNC_TEST_CAPTURE"\n'
+                'case " $* " in *" config validate "*) exit 0 ;; esac\n'
+                f'exit {code}\n',
+                encoding="utf-8",
+            )
+            core.chmod(0o755)
+            if os.getuid() == 0:
+                os.chown(core, self.drop_uid, self.drop_gid)
+
+        def seed_routine_state(profile: str, *, next_run: int) -> Path:
+            state_path = self.real_var / f"state/routines/{profile}.state"
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(
+                "state=never\n"
+                f"next_run_epoch={next_run}\n"
+                "last_success_epoch=0\n"
+                "last_attempt_epoch=0\n"
+                "retry_attempt=0\n"
+                "last_day=none\n"
+                "last_poll_epoch=0\n"
+                "fingerprint=none\n"
+                "backend=interval\n",
+                encoding="utf-8",
+            )
+            state_path.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(state_path, self.drop_uid, self.drop_gid)
+            return state_path
+
+        def configure_profile(profile: str, remote: str, *, default: bool = False) -> None:
+            # A profile mutation immediately after the previous episode's
+            # controller stop can observe exit 75 (busy: another
+            # policy-sensitive operation is still settling) -- the API's own
+            # documented retry contract for a transient lock, not a fixed
+            # error. Wait it out rather than asserting on the first attempt.
+            #
+            # Each episode ends with a lifecycle stop, which closes service
+            # admission, and a stopped service refuses configuration changes
+            # (75, "package service is stopped") for good, not transiently.
+            # Reopen only the fixture admission, exactly as setUp does.
+            reopened = self.executable(
+                self.real_target / "bin/sdsync-dsm-api", "--service-admission", "open"
+            )
+            self.assertEqual(reopened.returncode, 0, reopened.stderr)
+            configure_deadline = time.monotonic() + 10
+            while True:
+                configured = self.configure(profile, self.source_one, remote, default)
+                if configured.returncode != 75 or time.monotonic() >= configure_deadline:
+                    break
+                time.sleep(0.2)
+            self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+            secret, _ = self.api(
+                "set-secret", "--profile", profile, "--kind", "password", "--mode", "replace",
+                input_text="test-password\n",
+            )
+            self.assertEqual(secret.returncode, 0, secret.stderr)
+            routine, _ = self.api(
+                "routine", "--profile", profile, "--enabled", "true", "--action", "sync",
+                "--mode", "interval", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+                "--time-window-start", "00:00", "--time-window-end", "23:59",
+                "--debounce-seconds", "1", "--retry-count", "5", "--retry-backoff-seconds", "10",
+                "--retry-exponential", "true",
+                "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+            )
+            self.assertEqual(routine.returncode, 0, routine.stdout + routine.stderr)
+
+        def run_state_text() -> str:
+            return (self.real_var / "state/run.state").read_text(encoding="utf-8")
+
+        def activity_events(profile: str, code: str) -> list[dict[str, object]]:
+            activity, payload = self.api("activity", "--lines", "50")
+            self.assertEqual(activity.returncode, 0, activity.stderr)
+            return [
+                event for event in payload["events"]
+                if event["code"] == code and event["profile"] == profile
+            ]
+
+        def wait_for_episode(profile: str, state_path: Path, terminal_marker: str) -> None:
+            run_lock = self.real_var / "run/run.lock"
+            write_clock(clock, "200\n")
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if terminal_marker in state_path.read_text(encoding="utf-8") and not run_lock.exists():
+                    return
+                time.sleep(0.03)
+            self.fail(f"{profile} run did not complete: " + state_path.read_text(encoding="utf-8"))
+
+        # Shadow both DSM notification paths through the same substitution the
+        # existing direct-notification test relies on, so a desktop toast and
+        # a system-log write are each independently observable.
+        common = self.real_target / "libexec/sdsync-common"
+        common_source = common.read_text(encoding="utf-8")
+        self.assertIn("/usr/syno/bin/synodsmnotify", common_source)
+        self.assertIn("/usr/syno/bin/synologset1", common_source)
+        notifier = self.root / "cancel-synodsmnotify"
+        notifications = self.root / "cancel-notifications.args"
+        notifier.write_text(
+            "#!/bin/sh\n"
+            f'printf \'%s\\n\' --CALL-- "$@" >> "{notifications}"\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        notifier.chmod(0o755)
+        syslog_stub = self.root / "cancel-synologset1"
+        syslog_capture = self.root / "cancel-syslog.args"
+        syslog_stub.write_text(
+            "#!/bin/sh\n"
+            f'printf \'%s\\n\' --CALL-- "$@" >> "{syslog_capture}"\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        syslog_stub.chmod(0o755)
+        common.write_text(
+            common_source
+            .replace("/usr/syno/bin/synodsmnotify", str(notifier))
+            .replace("/usr/syno/bin/synologset1", str(syslog_stub)),
+            encoding="utf-8",
+        )
+        if os.getuid() == 0:
+            for path in (notifier, syslog_stub, common):
+                os.chown(path, self.drop_uid, self.drop_gid)
+
+        alert_state = self.real_var / "state/alerts.state"
+        alert_state.parent.mkdir(parents=True, exist_ok=True)
+
+        def seed_alert_state() -> None:
+            alert_state.write_text("failure_count=2\nlast_notify_epoch=500\n", encoding="utf-8")
+            alert_state.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(alert_state, self.drop_uid, self.drop_gid)
+
+        # --- Rows 1-5: a cancelled run (core exit 130). ---
+        seed_alert_state()
+        configure_profile("cancelstop", "/home/Drive/CancelStop", default=True)
+        state1 = seed_routine_state("cancelstop", next_run=200)
+        install_fixed_exit_core(130)
+        write_clock(clock, "100\n")
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            wait_for_episode("cancelstop", state1, "state=failed")
+            time.sleep(0.3)
+
+            # 1. run.state holds state=failed and exit_code=130.
+            text = run_state_text()
+            self.assertIn("state=failed", text, text)
+            self.assertIn("exit_code=130", text, text)
+
+            # 2. alert_state is byte-unchanged.
+            self.assertEqual(
+                alert_state.read_text(encoding="utf-8"),
+                "failure_count=2\nlast_notify_epoch=500\n",
+            )
+
+            # 3. no sync_failed notification queued, no system-log record.
+            notified = notifications.read_text(encoding="utf-8") if notifications.exists() else ""
+            self.assertNotIn("sync_failed", notified)
+            syslogged = syslog_capture.read_text(encoding="utf-8") if syslog_capture.exists() else ""
+            self.assertEqual(syslogged, "", syslogged)
+
+            # 4. activity: run.failed at info, message names the cancellation.
+            cancelled = activity_events("cancelstop", "run.failed")
+            self.assertTrue(cancelled, "no run.failed activity record for the cancelled run")
+            self.assertEqual(cancelled[-1]["level"], "info", cancelled)
+            self.assertIn("cancelled", cancelled[-1]["message"], cancelled)
+
+            # 5. scheduler.log run_finished at info, exit 130.
+            scheduler_log = self.real_var / "log/scheduler.log"
+            scheduler_records = [
+                json.loads(line)
+                for line in scheduler_log.read_text(encoding="utf-8").splitlines()
+                if line
+            ]
+            finished = [
+                record for record in scheduler_records
+                if record.get("event") == "run_finished" and record.get("scope") == "cancelstop"
+            ]
+            self.assertTrue(finished, scheduler_records)
+            self.assertEqual(finished[-1]["level"], "info", finished)
+            self.assertEqual(finished[-1]["exit"], 130, finished)
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+        # --- Row 6: the flag is not sticky. A normal run on a fresh profile
+        # still succeeds and still runs the alert path -- observed through the
+        # failure counter reset, which only the succeeded branch of
+        # handle_alert_result performs (the counter is still 2 from the
+        # cancelled run above; a cancellation must never touch it, an
+        # ordinary success always resets it to 0). ---
+        configure_profile("cancelsucceed", "/home/Drive/CancelSucceed")
+        state2 = seed_routine_state("cancelsucceed", next_run=200)
+        install_fixed_exit_core(0)
+        write_clock(clock, "100\n")
+        self.capture.write_text("", encoding="utf-8")
+        started2 = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started2.returncode, 0, started2.stdout + started2.stderr)
+        try:
+            wait_for_episode("cancelsucceed", state2, "state=succeeded")
+            time.sleep(0.3)
+            text2 = run_state_text()
+            self.assertIn("state=succeeded", text2, text2)
+            self.assertIn("exit_code=0", text2, text2)
+            succeeded = activity_events("cancelsucceed", "run.succeeded")
+            self.assertTrue(succeeded, "no run.succeeded activity record for the follow-up run")
+            self.assertIn(
+                "failure_count=0\n",
+                alert_state.read_text(encoding="utf-8"),
+                "a normal success did not reset the failure counter -- the alert path did not run",
+            )
+        finally:
+            stopped2 = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped2.returncode, 0, stopped2.stdout + stopped2.stderr)
+
+        # --- Row 7: the control. An ordinary failure (exit 1) on a fresh
+        # profile is unaffected -- state=failed, activity level error (not
+        # info), no "cancelled" wording, and the failure counter increments
+        # normally from a freshly reseeded 2 to 3. ---
+        seed_alert_state()
+        configure_profile("cancelfail", "/home/Drive/CancelFail")
+        state3 = seed_routine_state("cancelfail", next_run=200)
+        install_fixed_exit_core(1)
+        write_clock(clock, "100\n")
+        self.capture.write_text("", encoding="utf-8")
+        started3 = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started3.returncode, 0, started3.stdout + started3.stderr)
+        try:
+            wait_for_episode("cancelfail", state3, "state=failed")
+            time.sleep(0.3)
+            text3 = run_state_text()
+            self.assertIn("state=failed", text3, text3)
+            self.assertIn("exit_code=1", text3, text3)
+            failed = activity_events("cancelfail", "run.failed")
+            self.assertTrue(failed, "no run.failed activity record for the control run")
+            self.assertEqual(failed[-1]["level"], "error", failed)
+            self.assertNotIn("cancelled", failed[-1]["message"], failed)
+            self.assertIn(
+                "failure_count=3\n",
+                alert_state.read_text(encoding="utf-8"),
+                "an ordinary failure must still increment the failure counter normally",
+            )
+        finally:
+            stopped3 = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped3.returncode, 0, stopped3.stdout + stopped3.stderr)
+
+    def test_routine_cancelled_run_does_not_consume_a_retry_attempt(self) -> None:
+        # S2-B12, controller half. A cancelled routine dispatch (core exit
+        # 130) must leave retry_attempt exactly where it was, write no
+        # routine.retry_scheduled activity record, log routine_run at info,
+        # and set next_run_epoch to the run's finish epoch plus the 30s
+        # floor -- because no retry was owed going in (retry_attempt=0).
+        # Then a second dispatch with an ordinary failure (exit 1) is the
+        # control: it must advance retry_attempt, write
+        # routine.retry_scheduled, and log routine_run at error, proving the
+        # cancellation handling narrowed the case rather than disabling the
+        # retry ladder.
+        self.assertEqual(
+            self.configure("retryladder", self.source_one, "/home/Drive/RetryLadder", True).returncode,
+            0,
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "retryladder", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        routine, _ = self.api(
+            "routine", "--profile", "retryladder", "--enabled", "true", "--action", "sync",
+            "--mode", "interval", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "5", "--retry-backoff-seconds", "10",
+            "--retry-exponential", "true",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stdout + routine.stderr)
+        state_path = self.real_var / "state/routines/retryladder.state"
+        state_path.write_text(
+            "state=never\n"
+            "next_run_epoch=200\n"
+            "last_success_epoch=0\n"
+            "last_attempt_epoch=0\n"
+            "retry_attempt=0\n"
+            "last_day=none\n"
+            "last_poll_epoch=0\n"
+            "fingerprint=none\n"
+            "backend=interval\n",
+            encoding="utf-8",
+        )
+        state_path.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(state_path, self.drop_uid, self.drop_gid)
+
+        fake_bin = self.root / "ladder-bin"
+        fake_bin.mkdir(mode=0o700)
+        clock = self.root / "ladder-clock"
+        write_clock(clock, "100\n")
+        fake_date = fake_bin / "date"
+        fake_date.write_text(
+            "#!/bin/sh\n"
+            ': "${SDSYNC_TEST_CLOCK:?}"\n'
+            'case "${1:-}" in\n'
+            '  +%s) exec /bin/cat "$SDSYNC_TEST_CLOCK" ;;\n'
+            '  +%u) echo 1 ;;\n'
+            '  +%H%M) echo 1200 ;;\n'
+            '  +%Y-%m-%d) echo 2026-08-24 ;;\n'
+            '  *) exec /bin/date "$@" ;;\n'
+            "esac\n",
+            encoding="utf-8",
+        )
+        fake_sleep = fake_bin / "sleep"
+        fake_sleep.write_text(
+            "#!/bin/sh\ncase ${1:-} in 1) exec /bin/sleep 1 ;; *) exec /bin/sleep 0.03 ;; esac\n",
+            encoding="utf-8",
+        )
+        fake_inotify = fake_bin / "inotifywait"
+        fake_inotify.write_text("#!/bin/sh\nexit 69\n", encoding="utf-8")
+        for path in (fake_date, fake_sleep, fake_inotify):
+            path.chmod(0o755)
+        if os.getuid() == 0:
+            for path in (fake_bin, clock, fake_date, fake_sleep, fake_inotify):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        environment = {"PATH": f"{fake_bin}:{self.environment['PATH']}", "SDSYNC_TEST_CLOCK": str(clock)}
+
+        def install_fixed_exit_core(code: int) -> None:
+            core = self.real_target / "bin/synology-drive-sync"
+            core.write_text(
+                "#!/bin/sh\n"
+                ': "${SDSYNC_TEST_CAPTURE:?}"\n'
+                'printf \'%s\\n\' "$*" >> "$SDSYNC_TEST_CAPTURE"\n'
+                'case " $* " in *" config validate "*) exit 0 ;; esac\n'
+                f'exit {code}\n',
+                encoding="utf-8",
+            )
+            core.chmod(0o755)
+            if os.getuid() == 0:
+                os.chown(core, self.drop_uid, self.drop_gid)
+
+        def wait_for_nth_routine_run(count: int, *, timeout: float = 15.0) -> list[dict[str, object]]:
+            # The pre-launch write already sets last_attempt_epoch and
+            # state=running before the runner even takes the run lock, so
+            # gating on those fields (with the lock merely absent) can clear
+            # before the run has actually finished -- confirmed by the shell
+            # agent driving this exact fixture. routine_run is logged only
+            # after the post-run write_routine_state call commits, so waiting
+            # for it (and, on the second dispatch, for a second one to
+            # appear) is a direct wait on the state actually being settled.
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                matches = [
+                    record for record in self.controller_events() if record.get("event") == "routine_run"
+                ]
+                if len(matches) >= count:
+                    return matches
+                time.sleep(0.03)
+            self.fail(f"controller never logged {count} routine_run record(s)")
+
+        install_fixed_exit_core(130)
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            write_clock(clock, "200\n")
+            first_run = wait_for_nth_routine_run(1, timeout=15)
+            time.sleep(0.2)
+
+            text = state_path.read_text(encoding="utf-8")
+            self.assertIn("state=failed", text, text)
+            self.assertIn("retry_attempt=0", text, text)
+            self.assertIn("next_run_epoch=230", text, text)
+
+            self.assertEqual(first_run[-1]["level"], "info", first_run)
+            self.assertIn("exit=130", str(first_run[-1]["detail"]), first_run)
+
+            activity, payload = self.api("activity", "--lines", "50")
+            self.assertEqual(activity.returncode, 0, activity.stderr)
+            self.assertFalse(
+                [event for event in payload["events"] if event["code"] == "routine.retry_scheduled"],
+                "a cancelled dispatch must not schedule a retry",
+            )
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+        # Force the routine due again without disturbing retry_attempt, then
+        # drive an ordinary failure as the control row.
+        forced = state_path.read_text(encoding="utf-8")
+        forced_lines = [
+            "next_run_epoch=50" if line.startswith("next_run_epoch=") else line
+            for line in forced.splitlines()
+        ]
+        state_path.write_text("\n".join(forced_lines) + "\n", encoding="utf-8")
+        state_path.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(state_path, self.drop_uid, self.drop_gid)
+        install_fixed_exit_core(1)
+        write_clock(clock, "10\n")
+        self.capture.write_text("", encoding="utf-8")
+        started2 = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started2.returncode, 0, started2.stdout + started2.stderr)
+        try:
+            write_clock(clock, "100\n")
+            second_run = wait_for_nth_routine_run(2, timeout=15)
+            time.sleep(0.2)
+
+            text2 = state_path.read_text(encoding="utf-8")
+            self.assertIn("retry_attempt=1", text2, text2)
+
+            self.assertEqual(second_run[-1]["level"], "error", second_run)
+            self.assertIn("exit=1 ", str(second_run[-1]["detail"]), second_run)
+
+            activity2, payload2 = self.api("activity", "--lines", "50")
+            self.assertEqual(activity2.returncode, 0, activity2.stderr)
+            self.assertTrue(
+                [event for event in payload2["events"] if event["code"] == "routine.retry_scheduled"],
+                "an ordinary failure must schedule a retry",
+            )
+        finally:
+            stopped2 = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped2.returncode, 0, stopped2.stdout + stopped2.stderr)
+
+    def test_routine_cancellation_preserves_an_owed_retry(self) -> None:
+        # S2-B12, controller half. A routine that already owes a retry
+        # (retry_attempt=2, a past next_run_epoch) must have that retry
+        # survive a cancellation untouched: the 30s floor applies only when
+        # no retry was owed, so both retry_attempt and next_run_epoch must
+        # be exactly what they were before this dispatch.
+        self.assertEqual(
+            self.configure("owedretry", self.source_one, "/home/Drive/OwedRetry", True).returncode,
+            0,
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "owedretry", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        routine, _ = self.api(
+            "routine", "--profile", "owedretry", "--enabled", "true", "--action", "sync",
+            "--mode", "interval", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "5", "--retry-backoff-seconds", "10",
+            "--retry-exponential", "true",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stdout + routine.stderr)
+        state_path = self.real_var / "state/routines/owedretry.state"
+        state_path.write_text(
+            "state=failed\n"
+            "next_run_epoch=150\n"
+            "last_success_epoch=0\n"
+            "last_attempt_epoch=0\n"
+            "retry_attempt=2\n"
+            "last_day=none\n"
+            "last_poll_epoch=0\n"
+            "fingerprint=none\n"
+            "backend=interval\n",
+            encoding="utf-8",
+        )
+        state_path.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(state_path, self.drop_uid, self.drop_gid)
+
+        fake_bin = self.root / "owed-bin"
+        fake_bin.mkdir(mode=0o700)
+        clock = self.root / "owed-clock"
+        write_clock(clock, "100\n")
+        fake_date = fake_bin / "date"
+        fake_date.write_text(
+            "#!/bin/sh\n"
+            ': "${SDSYNC_TEST_CLOCK:?}"\n'
+            'case "${1:-}" in\n'
+            '  +%s) exec /bin/cat "$SDSYNC_TEST_CLOCK" ;;\n'
+            '  +%u) echo 1 ;;\n'
+            '  +%H%M) echo 1200 ;;\n'
+            '  +%Y-%m-%d) echo 2026-08-24 ;;\n'
+            '  *) exec /bin/date "$@" ;;\n'
+            "esac\n",
+            encoding="utf-8",
+        )
+        fake_sleep = fake_bin / "sleep"
+        fake_sleep.write_text(
+            "#!/bin/sh\ncase ${1:-} in 1) exec /bin/sleep 1 ;; *) exec /bin/sleep 0.03 ;; esac\n",
+            encoding="utf-8",
+        )
+        fake_inotify = fake_bin / "inotifywait"
+        fake_inotify.write_text("#!/bin/sh\nexit 69\n", encoding="utf-8")
+        for path in (fake_date, fake_sleep, fake_inotify):
+            path.chmod(0o755)
+        if os.getuid() == 0:
+            for path in (fake_bin, clock, fake_date, fake_sleep, fake_inotify):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        environment = {"PATH": f"{fake_bin}:{self.environment['PATH']}", "SDSYNC_TEST_CLOCK": str(clock)}
+
+        core = self.real_target / "bin/synology-drive-sync"
+        core.write_text(
+            "#!/bin/sh\n"
+            ': "${SDSYNC_TEST_CAPTURE:?}"\n'
+            'printf \'%s\\n\' "$*" >> "$SDSYNC_TEST_CAPTURE"\n'
+            'case " $* " in *" config validate "*) exit 0 ;; esac\n'
+            "exit 130\n",
+            encoding="utf-8",
+        )
+        core.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(core, self.drop_uid, self.drop_gid)
+
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            write_clock(clock, "200\n")
+            # The pre-launch write already sets last_attempt_epoch and
+            # state=running before the runner takes the run lock, so gating on
+            # those fields (with the lock merely absent) can clear before the
+            # run has actually finished -- confirmed by the shell agent
+            # driving this exact fixture. routine_run is logged only after
+            # the post-run write_routine_state call commits.
+            self.wait_for_controller_event("routine_run", timeout=15)
+            time.sleep(0.2)
+
+            text = state_path.read_text(encoding="utf-8")
+            self.assertIn("state=failed", text, text)
+            self.assertIn("retry_attempt=2", text, text)
+            self.assertIn("next_run_epoch=150", text, text)
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
     def test_realtime_debounce_holds_below_the_ceiling(self) -> None:
         # Row 10. Rewriting every (debounce - 5)s for 2 x debounce s must
@@ -7984,7 +8656,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         (self.source_two / "watched.txt").write_text("initial\n", encoding="utf-8")
         routine, _ = self.api(
             "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
-            "--mode", "realtime", "--debounce-seconds", "45", "--poll-seconds", "3600",
+            "--mode", "realtime", "--debounce-seconds", "45", "--poll-seconds", "5",
             "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
             "--allow-delete", "false", "--max-total-delete", "100",
         )
@@ -8012,7 +8684,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         end = now + 2 * 45
         while now < end:
             now += 40
-            clock.write_text(f"{now}\n", encoding="utf-8")
+            write_clock(clock, f"{now}\n")
             event_path.write_text(f"rewrite at {now}\n", encoding="utf-8")
             os.utime(event_path, (now, now))
             time.sleep(0.05)
@@ -8059,7 +8731,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 os.chown(self.source_two / f"dir-{index}", self.drop_uid, self.drop_gid)
         routine, _ = self.api(
             "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
-            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "3600",
+            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "5",
             "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
             "--allow-delete", "false", "--max-total-delete", "100",
         )
@@ -8084,11 +8756,16 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         matches = self.wait_for_controller_event("routine_watch_limit")
         details = [str(m.get("detail", "")) for m in matches]
         self.assertTrue(any("dirs=11" in d and "limit=8" in d for d in details), details)
+        # A single refusal (consecutive=1) never sets realtime_backend=none
+        # explicitly -- that only happens at the five-strikes give-up
+        # threshold. Below that the function's own default of "polling"
+        # stands, which is correct: polling still observes the source, only
+        # the native watcher is refused. backend=none is not expected here.
         state_path = self.real_var / "state/routines/watch.state"
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             state_text = state_path.read_text(encoding="utf-8") if state_path.exists() else ""
-            if "backend=none" in state_text and "backend_reason=watch_limit" in state_text:
+            if "backend=polling" in state_text and "backend_reason=watch_limit" in state_text:
                 break
             time.sleep(0.03)
         else:
@@ -8115,7 +8792,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         (self.source_two / "watched.txt").write_text("one\n", encoding="utf-8")
         routine, _ = self.api(
             "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
-            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "3600",
+            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "5",
             "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
             "--allow-delete", "false", "--max-total-delete", "100",
         )
@@ -8139,8 +8816,16 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         matches = self.wait_for_controller_event("routine_watch_failed")
         details = [str(m.get("detail", "")) for m in matches]
         self.assertTrue(any("No space left on device" in d for d in details), details)
-        controller_log_raw = (self.real_var / "log/controller.log").read_text(encoding="utf-8")
-        self.assertNotIn("Couldn't watch", controller_log_raw)
+        # The sanitized routine_watch_failed event's own detail field is
+        # *supposed* to carry this text -- that is what row 12 exists to
+        # prove. What must never happen is the raw stderr leaking in
+        # unstructured, outside that one JSON event's detail field (the old
+        # behaviour, redirecting stderr straight into controller.log).
+        for line in (self.real_var / "log/controller.log").read_text(encoding="utf-8").splitlines():
+            if "Couldn't watch" not in line:
+                continue
+            record = json.loads(line)
+            self.assertEqual(record.get("event"), "routine_watch_failed", line)
         stderr_record = self.real_var / "run/watch-watch.stderr"
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
@@ -8177,7 +8862,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         (self.source_two / "watched.txt").write_text("one\n", encoding="utf-8")
         routine, _ = self.api(
             "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
-            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "3600",
+            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "5",
             "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
             "--allow-delete", "false", "--max-total-delete", "100",
         )
@@ -8185,7 +8870,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         fake_bin = self.root / "watch-ladder-bin"
         fake_bin.mkdir(mode=0o700)
         clock = self.root / "watch-ladder-clock"
-        clock.write_text("1000\n", encoding="utf-8")
+        write_clock(clock, "1000\n")
         invocations = self.root / "watch-ladder-invocations"
         invocations.write_text("0\n", encoding="utf-8")
         fake_date = fake_bin / "date"
@@ -8242,7 +8927,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         now = 1000
         for expected_consecutive, gap in ((2, 300), (3, 600), (4, 1200), (5, 2400)):
             now += gap
-            clock.write_text(f"{now}\n", encoding="utf-8")
+            write_clock(clock, f"{now}\n")
             wait_for_consecutive(expected_consecutive)
             gaps.append(gap)
         self.assertEqual(gaps, [300, 600, 1200, 2400])
@@ -8250,13 +8935,27 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         if check_abandon:
             abandoned = self.wait_for_controller_event("routine_watch_abandoned")
             self.assertTrue(any("consecutive=5" in str(m.get("detail", "")) for m in abandoned), abandoned)
+            # write_routine_state only runs from within the poll block, and
+            # the poll gate was just consumed by the same turn that spawned
+            # (and immediately lost) the 5th attempt -- the clock has not
+            # moved since, so (now - last_poll) is 0 and the gate will not
+            # reopen on its own. Give it one more small tick so a settling
+            # poll can actually persist the post-give-up backend=none; give-up
+            # is permanent, so nothing will spawn again to race it.
+            now += 10
+            write_clock(clock, f"{now}\n")
             state_path = self.real_var / "state/routines/watch.state"
-            state_text = state_path.read_text(encoding="utf-8")
-            self.assertIn("backend=none", state_text)
-            self.assertIn("backend_reason=watch_setup_failed", state_text)
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                state_text = state_path.read_text(encoding="utf-8")
+                if "backend=none" in state_text and "backend_reason=watch_setup_failed" in state_text:
+                    break
+                time.sleep(0.03)
+            else:
+                self.fail(f"post-give-up state was never persisted: {state_text}")
             invocations_before = int(invocations.read_text(encoding="utf-8").strip())
             now += 3600
-            clock.write_text(f"{now}\n", encoding="utf-8")
+            write_clock(clock, f"{now}\n")
             time.sleep(0.5)
             self.assertEqual(int(invocations.read_text(encoding="utf-8").strip()), invocations_before, "a sixth spawn was attempted after give-up")
 
@@ -8267,10 +8966,22 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         # Row 15. A pre-upgrade bare-epoch .failed file and the new
         # three-field one must both parse; the bare epoch reads
         # consecutive=1.
+        #
+        # read_realtime_watcher_failure lives in sdsync-controller, not
+        # sdsync-common -- extract its text the same way write_routine_state
+        # is extracted elsewhere, rather than dot-sourcing the wrong file.
+        controller_source = (self.real_target / "libexec/sdsync-controller").read_text(encoding="utf-8")
+        function_start = controller_source.index("read_realtime_watcher_failure() {")
+        function_end = controller_source.index("\n}\n", function_start) + 2
+        function_text = controller_source[function_start:function_end]
+        self.assertIn("watcher_failed_epoch=0", function_text)
+
         helper = self.root / "watch-failure-record-helper.sh"
         helper.write_text(
             "#!/bin/sh\nset -eu\n"
             f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            f"{function_text}\n"
             'read_realtime_watcher_failure "$1"\n'
             'printf \'%s %s %s\\n\' "$watcher_failed_epoch" "$watcher_failed_consecutive" "$watcher_failed_reason"\n',
             encoding="utf-8",
@@ -8303,14 +9014,19 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         )
         self.assertEqual(secret.returncode, 0, secret.stderr)
         (self.source_two / "watched.txt").write_text("one\n", encoding="utf-8")
-        new_source = self.root / "watch-new-source"
+        # Profile sources must live inside the fixture's simulated DSM
+        # filesystem root (self.configure rejects anything else with "source
+        # must be inside the DSM filesystem root"); self.source_two's own
+        # parent is that root, the same place self.source_one/self.source_two
+        # themselves live.
+        new_source = self.source_two.parent / "watch-new-source"
         new_source.mkdir()
         if os.getuid() == 0:
             os.chown(new_source, self.drop_uid, self.drop_gid)
         (new_source / "watched.txt").write_text("one\n", encoding="utf-8")
         routine, _ = self.api(
             "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
-            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "3600",
+            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "5",
             "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
             "--allow-delete", "false", "--max-total-delete", "100",
         )
@@ -8336,9 +9052,19 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "--remote", "/home/Drive/Watch",
         )
         self.assertEqual(configured.returncode, 0, configured.stderr)
-        reloaded = self.shell(self.lifecycle, "reload", timeout=15)
-        self.assertEqual(reloaded.returncode, 0, reloaded.stdout + reloaded.stderr)
-
+        # No explicit reload, deliberately: process_routines re-reads the
+        # profile TOML (and so profile_source) on every ordinary controller
+        # turn regardless -- confirmed configure_profile itself never calls
+        # reload_controller_if_running (that is configure_routine's own
+        # internal side effect, a different function). A HUP would instead
+        # race it: reload_requested's own stop_realtime_watchers
+        # unconditionally clears every watch-*.pid/.source file (successful
+        # kill or not) before ensure_realtime_watcher gets a turn on the same
+        # loop iteration, so the adoption check never gets a pre-existing
+        # .source file to find stale in the first place -- it just spawns
+        # fresh silently, without ever logging reason=stale_source. Measured:
+        # with the HUP, this failed 1 of 4 isolated reruns; without it, 4 of
+        # 4 passed.
         orphaned_deadline = time.monotonic() + 15
         while time.monotonic() < orphaned_deadline:
             if (
@@ -8375,7 +9101,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         (self.source_two / "watched.txt").write_text("one\n", encoding="utf-8")
         routine, _ = self.api(
             "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
-            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "3600",
+            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "5",
             "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
             "--allow-delete", "false", "--max-total-delete", "100",
         )
@@ -8394,8 +9120,19 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         original_pid = int(pid_path.read_text(encoding="utf-8").strip())
         os.kill(original_pid, signal.SIGSTOP)
         try:
-            reloaded = self.shell(self.lifecycle, "reload", timeout=15)
-            self.assertEqual(reloaded.returncode, 0, reloaded.stdout + reloaded.stderr)
+            # No explicit reload here, deliberately: ensure_realtime_watcher
+            # runs on every ordinary controller turn regardless (the fake
+            # sleep collapses that turn to ~0.03s), so ordinary time passing
+            # is enough to reach the State: T detection. A HUP would instead
+            # race it -- reload_requested's own stop_realtime_watchers
+            # unconditionally clears every watch-*.pid file (successful kill
+            # or not) before ensure_realtime_watcher gets a turn on the same
+            # loop iteration, so the adoption check never gets a pre-existing
+            # pid file to find stopped in the first place. It just spawns
+            # fresh silently, without ever logging reason=stopped -- which is
+            # exactly the intermittent failure this comment replaces (2 of 3
+            # isolated reruns passed only because a natural turn happened to
+            # win that race before the HUP's own turn did).
             orphaned_deadline = time.monotonic() + 15
             new_pid = None
             while time.monotonic() < orphaned_deadline:
@@ -8420,9 +9157,29 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
     def test_realtime_watcher_terminated_when_inotifywait_uninstalled_mid_life(self) -> None:
-        # Row 18. Adopt, remove the fake inotifywait from PATH, then HUP: the
-        # live watcher (still argv[0]=inotifywait, package-owned) must still
-        # be TERMed via the weaker stoppable-identity check, never leaked.
+        # Row 18. Adopt, remove the fake inotifywait from PATH, then stop:
+        # the live watcher (still argv[0]=inotifywait, package-owned) must
+        # still be TERMed via the weaker stoppable-identity check, never
+        # leaked.
+        #
+        # realtime_watcher_is_stoppable identifies the watcher by
+        # /proc/<pid>/cmdline argv[0]'s basename. A real inotifywait is a
+        # compiled binary, so argv[0] is exactly the path the controller
+        # invoked -- but a #!/bin/sh *script* standing in for it is exec'd by
+        # the kernel as /bin/sh with the script path pushed to argv[1], so
+        # argv[0] becomes "sh", never "inotifywait" (confirmed directly: a
+        # throwaway reproduction showed argv[0]=/bin/sh both before and after
+        # unlinking the script, and a subsequent TERM was never acted on
+        # because nothing ever matches the check). That is a mismatch
+        # between this test's fixture and what a real binary looks like, not
+        # a defect in the check itself -- so the fix is a fixture that has
+        # real-binary argv[0] semantics: a tiny compiled stand-in that
+        # ignores its arguments and only reacts to being signalled, named
+        # "inotifywait" so the kernel execs it directly with no shebang
+        # rewrite.
+        cc = shutil.which("cc") or shutil.which("gcc")
+        if not cc:
+            self.skipTest("no C compiler available to build a real-argv0 inotifywait stand-in")
         self.assertEqual(
             self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
         )
@@ -8434,7 +9191,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         (self.source_two / "watched.txt").write_text("one\n", encoding="utf-8")
         routine, _ = self.api(
             "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
-            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "3600",
+            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "5",
             "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
             "--allow-delete", "false", "--max-total-delete", "100",
         )
@@ -8442,10 +9199,25 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         fake_bin = self.root / "uninstall-mid-life-bin"
         fake_bin.mkdir(mode=0o700)
         fake_inotify = fake_bin / "inotifywait"
-        fake_inotify.write_text(
-            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do /bin/sleep 1; done\n",
+        fake_source = self.root / "fake-inotifywait.c"
+        fake_source.write_text(
+            "#include <signal.h>\n"
+            "#include <unistd.h>\n"
+            "#include <stdlib.h>\n"
+            "static void handle(int sig) { _exit(0); }\n"
+            "int main(void) {\n"
+            "    signal(SIGTERM, handle);\n"
+            "    signal(SIGINT, handle);\n"
+            "    for (;;) sleep(1);\n"
+            "    return 0;\n"
+            "}\n",
             encoding="utf-8",
         )
+        compiled = subprocess.run(
+            [cc, "-O0", "-o", str(fake_inotify), str(fake_source)],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
         fake_inotify.chmod(0o755)
         if os.getuid() == 0:
             os.chown(fake_bin, self.drop_uid, self.drop_gid)
@@ -8474,7 +9246,15 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 break
             time.sleep(0.03)
         else:
-            self.fail("the orphaned watcher was not terminated after inotifywait left PATH")
+            diagnostic = ""
+            try:
+                diagnostic = Path(f"/proc/{watcher_pid}/status").read_text(encoding="utf-8")
+            except OSError as error:
+                diagnostic = f"<could not read /proc status: {error}>"
+            self.fail(
+                "the orphaned watcher was not terminated after inotifywait left PATH: "
+                f"{diagnostic}"
+            )
 
     def test_realtime_watcher_termination_leaves_no_zombies(self) -> None:
         # Row 19. After a HUP with a realtime routine active, the controller
@@ -8490,7 +9270,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         (self.source_two / "watched.txt").write_text("one\n", encoding="utf-8")
         routine, _ = self.api(
             "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
-            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "3600",
+            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "5",
             "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
             "--allow-delete", "false", "--max-total-delete", "100",
         )
@@ -8507,11 +9287,11 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             time.sleep(0.03)
         else:
             self.fail("watcher or controller did not start")
-        controller_pid = controller_pid_path.read_text(encoding="utf-8").strip()
+        controller_pid = int(controller_pid_path.read_text(encoding="utf-8").strip())
 
+        # No "reload" lifecycle verb exists; a reload is a controller HUP.
         for _ in range(3):
-            reloaded = self.shell(self.lifecycle, "reload", timeout=15)
-            self.assertEqual(reloaded.returncode, 0, reloaded.stdout + reloaded.stderr)
+            os.kill(controller_pid, signal.SIGHUP)
             time.sleep(0.2)
 
         zombies = []
@@ -8536,7 +9316,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         # Row 20. Adopt, then rm -rf the source: routine_source_unavailable
         # on transition, backend=none/backend_reason=source_missing, the
         # watcher killed, a state file written.
-        source = self.root / "watch-removable-source"
+        # Must live inside the fixture's DSM filesystem root (self.configure
+        # rejects anything else), the same root self.source_two lives under.
+        source = self.source_two.parent / "watch-removable-source"
         source.mkdir()
         if os.getuid() == 0:
             os.chown(source, self.drop_uid, self.drop_gid)
@@ -8584,7 +9366,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         # Row 21. Replacing the source with a symlink to a real directory
         # must defer with backend_reason=source_symlink, no dispatch, state
         # written.
-        source = self.root / "watch-symlink-source"
+        # Must live inside the fixture's DSM filesystem root; see row 20.
+        source = self.source_two.parent / "watch-symlink-source"
         source.mkdir()
         if os.getuid() == 0:
             os.chown(source, self.drop_uid, self.drop_gid)
@@ -8636,10 +9419,18 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         # profile's must defer once on the transition into deferred, with a
         # state file, and never again while it stays deferred -- not one
         # warn line per five-second turn.
+        #
+        # configure_routine itself refuses to create an already-bound
+        # routine (sdsync-dsm: "routine max-total-delete cannot be lower
+        # than the profile max-delete bound", exit 64) -- that is the
+        # manager enforcing the same invariant F20 is about, at creation
+        # time. So a routine can only become delete-bound by drift: create
+        # it while it satisfies the profile's current bound, then lower the
+        # profile's bound out from under it.
         configured = self.shell(
             self.manager, "configure-profile", "--name", "bound", "--source", str(self.source_one),
             "--url", "https://files.example.test/", "--username", "bound-bot",
-            "--remote", "/home/Drive/Bound", "--delete", "--max-delete", "50",
+            "--remote", "/home/Drive/Bound", "--delete", "--max-delete", "10",
         )
         self.assertEqual(configured.returncode, 0, configured.stderr)
         secret, _ = self.api(
@@ -8655,6 +9446,12 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "--poll-seconds", "5", "--allow-delete", "true", "--max-total-delete", "10",
         )
         self.assertEqual(routine.returncode, 0, routine.stderr)
+        raised = self.shell(
+            self.manager, "configure-profile", "--name", "bound", "--source", str(self.source_one),
+            "--url", "https://files.example.test/", "--username", "bound-bot",
+            "--remote", "/home/Drive/Bound", "--delete", "--max-delete", "50",
+        )
+        self.assertEqual(raised.returncode, 0, raised.stderr)
         fast_environment = self.fast_clock_environment(step=31)
         started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
         self.assertEqual(started.returncode, 0, started.stderr)
@@ -8694,7 +9491,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         (self.source_two / "watched.txt").write_text("initial\n", encoding="utf-8")
         routine, _ = self.api(
             "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
-            "--mode", "realtime", "--debounce-seconds", "2", "--poll-seconds", "3600",
+            "--mode", "realtime", "--debounce-seconds", "2", "--poll-seconds", "5",
             "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
             "--allow-delete", "false", "--max-total-delete", "100",
         )
@@ -8720,11 +9517,17 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         with event_path.open("a", encoding="utf-8") as handle:
             for _ in range(5000):
                 handle.write("\n")
-        os.utime(event_path, None)
+        # Keep the marker's mtime on the fake clock, not real wall-clock
+        # time: realtime_event_due compares routine_now (from the fake
+        # clock, ~100) against the marker's %Y, and requires mtime <= now.
+        # os.utime(path, None) stamps the real current time (a huge real
+        # epoch), which fails that comparison outright (return 73, logged as
+        # routine_event_invalid) and the routine never dispatches.
+        now = 100
+        os.utime(event_path, (now, now))
         self.assertLess(event_path.stat().st_size, 8192)
 
-        now = 100
-        clock.write_text(f"{now + 3}\n", encoding="utf-8")
+        write_clock(clock, f"{now + 3}\n")
         invocation = "sync --profile watch --no-delete"
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
@@ -8758,10 +9561,26 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         # source_fingerprint's has once both its "<retries>|" and "v2:"
         # prefixes are stripped, so the two sides compare with no further
         # massaging on either one.
+        #
+        # source_fingerprint lives in sdsync-controller, not sdsync-common,
+        # and is defined with a subshell body (`() (` ... `)`, not `{` ...
+        # `}`), so the boundary needle differs from the brace-bodied
+        # functions extracted elsewhere in this file.
+        controller_source = (self.real_target / "libexec/sdsync-controller").read_text(encoding="utf-8")
+        # The walk body is fingerprint_reading; source_fingerprint is the
+        # subshell wrapper directly after it, so one slice holds both.
+        function_start = controller_source.index("fingerprint_reading() {")
+        function_end = controller_source.index("\nsource_fingerprint() (\n", function_start)
+        function_end = controller_source.index("\n)\n", function_end) + 2
+        function_text = controller_source[function_start:function_end]
+        self.assertIn("fingerprint_source=$1", function_text)
+
         helper = self.root / "fingerprint-oracle-helper.sh"
         helper.write_text(
             "#!/bin/sh\nset -eu\n"
             f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            f"{function_text}\n"
             f'tree="{fixture}"\n'
             'new_output=$(source_fingerprint "$tree")\n'
             'new_reading=${new_output#*|}\n'
@@ -9296,7 +10115,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         )
         self.assertEqual(configured.returncode, 0, configured.stderr)
         clock = self.root / "alert-clock"
-        clock.write_text("1000\n", encoding="utf-8")
+        write_clock(clock, "1000\n")
         capture = self.root / "notifications"
         helper = self.root / "alert-helper.sh"
         helper.write_text(
@@ -9573,7 +10392,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             source.replace("/usr/syno/bin/synologset1", str(writer)), encoding="utf-8"
         )
         clock = self.root / "system-log-clock"
-        clock.write_text("1000\n", encoding="utf-8")
+        write_clock(clock, "1000\n")
         helper = self.root / "system-log.sh"
         helper.write_text(
             "#!/bin/sh\nset -eu\n"
@@ -15199,13 +16018,18 @@ fi
         wake_function_start = rust_source.index("fn wake_controller_after_enqueue() {")
         wake_function_end = rust_source.index("\n}\n", wake_function_start) + 2
         rust_wake_function = rust_source[wake_function_start:wake_function_end]
+        # A failed wake is recorded rather than discarded (bridge S-9), but it
+        # still never turns accepted work into an error: both branches end in
+        # a return without propagating anything.
         self.assertIn(
             'let Ok(mut command) = manager_command(&["api".into(), "controller-wake".into()], false) else {\n'
+            "        record_controller_wake_failure();\n"
             "        return;\n"
             "    };",
             rust_wake_function,
         )
-        self.assertIn("let _ = capture_bounded_command", rust_wake_function)
+        self.assertIn("match capture_bounded_command(", rust_wake_function)
+        self.assertIn("_ => record_controller_wake_failure(),", rust_wake_function)
         enqueue_start = rust_source.index(
             "            let enqueue_outcome = linux_files::enqueue("
         )
@@ -15662,14 +16486,15 @@ fi
         fake_bin = self.root / "fake-bin"
         fake_bin.mkdir()
         clock = self.root / "fake-clock"
-        clock.write_text("1000\n", encoding="utf-8")
+        write_clock(clock, "1000\n")
         fake_date = fake_bin / "date"
         fake_date.write_text(
             "#!/bin/sh\n"
             ': "${SDSYNC_TEST_CLOCK:?}"\n'
             'IFS= read -r now < "$SDSYNC_TEST_CLOCK"\n'
             "now=$((now + 31))\n"
-            'printf \'%s\\n\' "$now" > "$SDSYNC_TEST_CLOCK"\n'
+            'printf \'%s\\n\' "$now" > "$SDSYNC_TEST_CLOCK.$$"\n'
+            'mv -f "$SDSYNC_TEST_CLOCK.$$" "$SDSYNC_TEST_CLOCK"\n'
             'printf \'%s\\n\' "$now"\n',
             encoding="utf-8",
         )
@@ -18028,6 +18853,959 @@ fi
         self.assertFalse((self.real_var / "run").exists())
         self.assertFalse(control.exists())
 
+    # ------------------------------------------------------------------
+    # Shell-layer outcome recording (fix-shell batch). Each test names the
+    # finding it pins.
+    # ------------------------------------------------------------------
+
+    def install_test_core(self, body: str) -> None:
+        core = self.real_target / "bin/synology-drive-sync"
+        core.write_text(
+            "#!/bin/sh\n"
+            ': "${SDSYNC_TEST_CAPTURE:?}"\n'
+            'printf \'%s\\n\' "$*" >> "$SDSYNC_TEST_CAPTURE"\n'
+            'case " $* " in *" config validate "*) exit 0 ;; esac\n'
+            + body,
+            encoding="utf-8",
+        )
+        core.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(core, self.drop_uid, self.drop_gid)
+
+    def write_private_state(self, path: Path, text: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        path.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(path, self.drop_uid, self.drop_gid)
+
+    def state_fields(self, path: Path) -> dict[str, str]:
+        fields: dict[str, str] = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key not in fields:
+                fields[key] = value
+        return fields
+
+    def activity_records(self) -> list[dict[str, object]]:
+        activity, payload = self.api("activity", "--lines", "500")
+        self.assertEqual(activity.returncode, 0, activity.stderr)
+        return list(payload["events"])
+
+    def wait_for_state(self, path: Path, predicate, *, timeout: float = 20.0) -> dict[str, str]:
+        deadline = time.monotonic() + timeout
+        fields: dict[str, str] = {}
+        while time.monotonic() < deadline:
+            if path.is_file():
+                fields = self.state_fields(path)
+                if predicate(fields):
+                    return fields
+            time.sleep(0.05)
+        self.fail(f"{path.name} never reached the expected state: {fields}")
+
+    def configure_with_password(self, name: str, source: Path, default: bool = False) -> None:
+        configured = self.configure(name, source, f"/home/Drive/{name}", default)
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        secret, _ = self.api(
+            "set-secret", "--profile", name, "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+
+    def test_scheduled_routine_runs_when_dsm_hands_physical_synopkg_paths(self) -> None:
+        # S2-1. DSM starts the controller with the physical /volumeN/@app*
+        # paths while every profile carries the alias log-file path the
+        # manager wrote. Before the pin, every controller-dispatched run exited
+        # 66 in the log-file preflight (physical PKGVAR) or 1 in the
+        # supervisor's binary comparison (physical PKGDEST); manual runs, which
+        # go through the alias environment, kept working.
+        self.configure_with_password("alpha", self.source_one, True)
+        routine, _ = self.api(
+            "routine", "--profile", "alpha", "--enabled", "true", "--action", "sync",
+            "--mode", "interval", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "0", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        profile_text = (self.real_home / "config/profiles.d/alpha.toml").read_text(encoding="utf-8")
+        self.assertIn(f'log-file = "{self.fhs}/var/log/sync.log"', profile_text)
+
+        physical_environment = {
+            "SYNOPKG_PKGDEST": str(self.real_target),
+            "SYNOPKG_PKGHOME": str(self.real_home),
+            "SYNOPKG_PKGVAR": str(self.real_var),
+        }
+        # Every process sourcing sdsync-common derives the alias paths.
+        probe = self.root / "alias-pin-probe.sh"
+        probe.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            'printf \'%s\\n%s\\n%s\\n%s\\n\' "$package_root" "$package_home" "$package_var" "$binary"\n',
+            encoding="utf-8",
+        )
+        probe.chmod(0o755)
+        pinned = self.shell(probe, extra_environment=physical_environment)
+        self.assertEqual(pinned.returncode, 0, pinned.stderr)
+        self.assertEqual(
+            pinned.stdout.splitlines(),
+            [
+                str(self.fhs / "target"),
+                str(self.fhs / "home"),
+                str(self.fhs / "var"),
+                str(self.fhs / "target/bin/synology-drive-sync"),
+            ],
+        )
+
+        environment = self.fast_clock_environment(step=31)
+        environment.update(physical_environment)
+        # The mock supervisor now refuses, like the shipped one at HEAD, any
+        # binary argument that is not byte-equal to the alias path.
+        environment["SDSYNC_TEST_SUPERVISOR_ALIAS"] = str(self.fhs / "target/bin/synology-drive-sync")
+        self.write_private_state(
+            self.real_var / "state/routines/alpha.state",
+            "state=scheduled\nnext_run_epoch=1\nlast_success_epoch=0\nlast_attempt_epoch=0\n"
+            "retry_attempt=0\nlast_day=none\nlast_poll_epoch=0\nfingerprint=none\nbackend=interval\n",
+        )
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            runs = self.wait_for_controller_event("routine_run")
+            self.assertIn("exit=0 ", str(runs[0]["detail"]), runs)
+            self.assertIn("sync --profile alpha --no-delete", self.capture.read_text(encoding="utf-8"))
+            run_state = self.state_fields(self.real_var / "state/run.state")
+            self.assertEqual(run_state["state"], "succeeded", run_state)
+            self.assertEqual(run_state["reason"], "ok", run_state)
+            profile_state = self.state_fields(self.real_var / "state/profiles/alpha.state")
+            self.assertEqual(profile_state["state"], "succeeded", profile_state)
+            self.assertEqual(profile_state["outcome"], "succeeded", profile_state)
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_runner_preflight_failure_is_recorded_everywhere_a_reader_looks(self) -> None:
+        # S3-4 / G-1 / G-11. A preflight exit used to leave run.state on the
+        # previous run's success, no per-profile state, no failure count and
+        # no Activity line naming the cause.
+        configured = self.configure("alpha", self.source_one, "/home/Drive/alpha", True)
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        self.write_private_state(
+            self.real_var / "state/run.state",
+            "state=succeeded\nstarted_epoch=100\nfinished_epoch=200\nexit_code=0\nscope=all\noperation=sync\n",
+        )
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            runner = self.real_target / "libexec/sdsync-run"
+            refused = self.shell(
+                runner, "sync", "alpha", "false", "foreground", "-",
+                extra_environment={"SDSYNC_DSM_AUDIT_WRAPPED": "true"},
+            )
+            self.assertEqual(refused.returncode, 66, refused.stderr)
+            self.assertIn("no protected password", refused.stderr)
+            run_state = self.state_fields(self.real_var / "state/run.state")
+            self.assertEqual(run_state["state"], "failed", run_state)
+            self.assertEqual(run_state["exit_code"], "66", run_state)
+            self.assertEqual(run_state["reason"], "password_missing", run_state)
+            self.assertIn("no protected password", run_state["detail"])
+            self.assertEqual(run_state["scope"], "alpha", run_state)
+            # A pre-upgrade document holds no aggregate record; none is invented.
+            self.assertEqual(run_state["aggregate_state"], "never", run_state)
+            profile_state = self.state_fields(self.real_var / "state/profiles/alpha.state")
+            self.assertEqual(profile_state["state"], "failed", profile_state)
+            self.assertEqual(profile_state["outcome"], "failed", profile_state)
+            self.assertEqual(profile_state["reason"], "password_missing", profile_state)
+            self.assertIn("failure_count=1\n", (self.real_var / "state/alerts.state").read_text(encoding="utf-8"))
+            failed = [
+                event for event in self.activity_records()
+                if event["code"] == "run.failed" and event["profile"] == "alpha"
+            ]
+            self.assertTrue(failed, "no run.failed Activity record for the preflight failure")
+            self.assertIn("no protected password", str(failed[-1]["message"]))
+            self.assertEqual(failed[-1]["level"], "error", failed)
+
+            # G-11: an unreadable alert state is reported, not swallowed.
+            self.write_private_state(self.real_var / "state/alerts.state", "failure_count=abc\n")
+            refused_again = self.shell(
+                runner, "sync", "alpha", "false", "foreground", "-",
+                extra_environment={"SDSYNC_DSM_AUDIT_WRAPPED": "true"},
+            )
+            self.assertEqual(refused_again.returncode, 66, refused_again.stderr)
+            self.assertIn("failure alert could not be processed", refused_again.stderr)
+            unavailable = [
+                event for event in self.activity_records()
+                if event["code"] == "notification.unavailable"
+            ]
+            self.assertTrue(unavailable, "an unprocessable alert left no Activity record")
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_aggregate_runs_the_profiles_preflight_admits_and_records_each_outcome(self) -> None:
+        # G-3. One profile without a password used to abort the whole `all`
+        # run and stamp every profile with the same failure. Now it is
+        # recorded failed with its own reason, the others run through
+        # --profiles under the same deletion budget, and a later
+        # single-profile success does not erase the aggregate's failure.
+        self.configure_with_password("alpha", self.source_one, True)
+        configured = self.configure("beta", self.source_two, "/home/Drive/beta")
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            runner = self.real_target / "libexec/sdsync-run"
+            self.capture.write_text("", encoding="utf-8")
+            aggregate = self.shell(
+                runner, "sync", "all", "false", "foreground", "100",
+                extra_environment={"SDSYNC_DSM_AUDIT_WRAPPED": "true"},
+            )
+            self.assertEqual(aggregate.returncode, 66, aggregate.stdout + aggregate.stderr)
+            captured = self.capture.read_text(encoding="utf-8")
+            self.assertIn("sync --profiles alpha --max-total-delete 100 --no-delete", captured)
+            self.assertNotIn("--all-profiles", captured)
+            run_state = self.state_fields(self.real_var / "state/run.state")
+            self.assertEqual(run_state["state"], "failed", run_state)
+            self.assertEqual(run_state["reason"], "profiles_skipped", run_state)
+            self.assertEqual(run_state["aggregate_state"], "failed", run_state)
+            self.assertEqual(run_state["aggregate_reason"], "profiles_skipped", run_state)
+            alpha = self.state_fields(self.real_var / "state/profiles/alpha.state")
+            beta = self.state_fields(self.real_var / "state/profiles/beta.state")
+            self.assertEqual((alpha["state"], alpha["outcome"], alpha["scope"]), ("succeeded", "succeeded", "all"))
+            self.assertEqual((beta["state"], beta["outcome"]), ("failed", "failed"), beta)
+            self.assertEqual(beta["reason"], "password_missing", beta)
+
+            single = self.shell(
+                runner, "sync", "alpha", "false", "foreground", "-",
+                extra_environment={"SDSYNC_DSM_AUDIT_WRAPPED": "true"},
+            )
+            self.assertEqual(single.returncode, 0, single.stdout + single.stderr)
+            run_state = self.state_fields(self.real_var / "state/run.state")
+            self.assertEqual((run_state["state"], run_state["scope"]), ("succeeded", "alpha"), run_state)
+            self.assertEqual(run_state["aggregate_state"], "failed", run_state)
+            self.assertEqual(run_state["aggregate_reason"], "profiles_skipped", run_state)
+            snapshot, payload = self.api("snapshot")
+            self.assertEqual(snapshot.returncode, 0, snapshot.stderr)
+            self.assertEqual(payload["run"]["state"], "succeeded")
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_scheduled_aggregate_keeps_the_core_cause_and_true_per_profile_outcomes(self) -> None:
+        # G-2 / G-3. A scheduled core's stdout and stderr went to /dev/null:
+        # the cause of a failure existed nowhere, and every covered profile was
+        # stamped with the aggregate's exit. The core's per-job records now
+        # decide each profile, and its last error line is the run's detail.
+        for name, source in (("alpha", self.source_one), ("beta", self.source_two), ("gamma", self.source_one)):
+            self.configure_with_password(name, source, name == "alpha")
+        self.write_private_state(
+            self.real_var / "state/profiles/gamma.state",
+            "state=succeeded\nfinished_epoch=77\nexit_code=0\naction=sync\n",
+        )
+        scheduled, _ = self.api(
+            "schedule", "--enabled", "true", "--interval", "86400",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(scheduled.returncode, 0, scheduled.stderr)
+        # A saved deadline in the past runs once, a minute after start; the
+        # day-long interval keeps it from running a second time mid-test.
+        self.write_private_state(self.real_var / "state/schedule.state", "next_run_epoch=1\n")
+        self.install_test_core(
+            'case " $* " in *" --output ndjson "*) ;; *) exit 0 ;; esac\n'
+            # alpha: a success whose result is the core's partial outcome
+            # (one deferred path, two lasting skips). The plan member holds an
+            # escaped decoy result key and the path a bracket, a quote and a
+            # brace; none of them may change the counts.
+            'printf \'%s\\n\' \'{"elapsed_ms":5,"error":null,"execution_plan":{"note":"\\"result\\":{"},"profile":"alpha",'
+            '"result":{"changed":true,"deferred":[{"detail":null,"path":"a],\\"b{","reason":"source-changed"}],'
+            '"outcome":"partial","skipped":2},"schema":"sdsync.batch-job.v1","status":"success"}\'\n'
+            'printf \'%s\\n\' \'{"error":"listing failed","profile":"beta","result":{"deferred":[],"failed":true,"outcome":"failed","skipped":0},"schema":"sdsync.batch-job.v1","status":"failed"}\'\n'
+            'printf \'%s\\n\' \'{"error":null,"profile":"gamma","schema":"sdsync.batch-job.v1","status":"not-run"}\'\n'
+            'printf \'%s\\n\' \'{"schema":"sdsync.sync-batch.v1","status":"partial"}\'\n'
+            "echo 'progress noise' >&2\n"
+            "echo 'error: batch sync stopped after a target failed; completed targets were retained' >&2\n"
+            "exit 1\n"
+        )
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(
+            self.lifecycle, "start", extra_environment=self.fast_clock_environment(step=61), timeout=15
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            runs = self.wait_for_controller_event("scheduled_run")
+            self.assertIn("exit=1 ", str(runs[0]["detail"]), runs)
+            self.assertIn("--output ndjson sync --all-profiles", self.capture.read_text(encoding="utf-8"))
+            run_state = self.state_fields(self.real_var / "state/run.state")
+            self.assertEqual((run_state["state"], run_state["reason"]), ("failed", "core_failed"), run_state)
+            self.assertEqual(
+                run_state["detail"],
+                "error: batch sync stopped after a target failed; completed targets were retained",
+            )
+            alpha = self.state_fields(self.real_var / "state/profiles/alpha.state")
+            beta = self.state_fields(self.real_var / "state/profiles/beta.state")
+            gamma = self.state_fields(self.real_var / "state/profiles/gamma.state")
+            # A batch job with status success and result.outcome partial is
+            # the core's partial run: synced, so the dependency gate opens.
+            self.assertEqual((alpha["state"], alpha["outcome"]), ("succeeded", "partial"), alpha)
+            self.assertEqual((alpha["deferred"], alpha["skipped"]), ("1", "2"), alpha)
+            self.assertEqual((alpha["consecutive_failures"], alpha["last_success_epoch"]),
+                             ("0", alpha["outcome_epoch"]), alpha)
+            self.assertEqual((beta["state"], beta["outcome"], beta["reason"]), ("failed", "failed", "core_failed"), beta)
+            self.assertEqual((beta["deferred"], beta["skipped"], beta["consecutive_failures"]), ("0", "0", "1"), beta)
+            self.assertNotIn("deferred", self.state_fields(self.real_var / "state/profiles/gamma.state"))
+            self.assertEqual((run_state["deferred"], run_state["skipped"], run_state["outcome"]), ("1", "2", "failed"), run_state)
+            # Not run keeps the previous completion, which is what the
+            # dependency gate reads.
+            self.assertEqual((gamma["state"], gamma["finished_epoch"], gamma["outcome"]), ("succeeded", "77", "not_run"), gamma)
+            stderr_log = self.real_var / "log/run-stderr.log"
+            self.assertEqual(stat.S_IMODE(stderr_log.stat().st_mode), 0o600)
+            stderr_text = stderr_log.read_text(encoding="utf-8")
+            self.assertTrue(stderr_text.startswith("# epoch="), stderr_text)
+            self.assertIn("scope=all operation=sync exit=1", stderr_text)
+            self.assertIn("error: batch sync stopped", stderr_text)
+            self.assertFalse(list((self.real_var / "run").glob("core-std*")))
+            failed = [e for e in self.activity_records() if e["code"] == "run.failed" and e["profile"] == "all"]
+            self.assertTrue(failed)
+            self.assertIn("error: batch sync stopped", str(failed[-1]["message"]))
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_unadmitted_routine_wrapper_is_a_deferral_not_a_success(self) -> None:
+        # S3-1 / G-7. A launch wrapper that was never admitted exited 0, and
+        # the parent recorded a successful sync for a runner that never ran.
+        # It now exits 75, which the routine records as a busy deferral:
+        # no success, no retry consumed, an Activity record from the wrapper.
+        self.configure_with_password("alpha", self.source_one, True)
+        routine, _ = self.api(
+            "routine", "--profile", "alpha", "--enabled", "true", "--action", "sync",
+            "--mode", "interval", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "3", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        controller = self.real_target / "libexec/sdsync-controller"
+        source = controller.read_text(encoding="utf-8")
+        needle = (
+            '        wait_for_child_admission "$launched_admission_path" \\\n'
+            '            "$launched_admission_parent" "$launched_admission_parent_start" \\\n'
+            '            "$launched_admission_boot" || launched_admission_wait=$?\n'
+        )
+        self.assertEqual(source.count(needle), 1)
+        refuse = self.root / "refuse-routine-admission"
+        refuse.touch()
+        controller.write_text(
+            source.replace(
+                needle,
+                f'        if [ "$launched_admission_kind" = routine ] && [ -e "{refuse}" ]; then\n'
+                # Refuse the way a real timeout does: only after the parent
+                # has captured this wrapper and published its go decision,
+                # which the wrapper then leaves unread.
+                '            while [ ! -e "$launched_admission_path" ]; do /bin/sleep 0.02; done\n'
+                "            launched_admission_wait=1\n"
+                "        else\n" + needle + "        fi\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        state_path = self.real_var / "state/routines/alpha.state"
+        self.write_private_state(
+            state_path,
+            "state=scheduled\nnext_run_epoch=1\nlast_success_epoch=0\nlast_attempt_epoch=0\n"
+            "retry_attempt=0\nlast_day=none\nlast_poll_epoch=0\nfingerprint=none\nbackend=interval\n",
+        )
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(
+            self.lifecycle, "start", extra_environment=self.fast_clock_environment(step=31), timeout=15
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            runs = self.wait_for_controller_event("routine_run")
+            self.assertIn("exit=75 ", str(runs[0]["detail"]), runs)
+            self.assertIn("reason=admission_refused", str(runs[0]["detail"]), runs)
+            self.assertEqual(self.state_fields(state_path)["defer_reason"], "busy")
+            self.assertEqual(runs[0]["level"], "info", runs)
+            fields = self.state_fields(state_path)
+            self.assertEqual(fields["last_success_epoch"], "0", fields)
+            self.assertEqual(fields["retry_attempt"], "0", fields)
+            self.assertNotIn("sync --profile alpha", self.capture.read_text(encoding="utf-8"))
+            refused = self.wait_for_controller_event("child_admission_refused")
+            self.assertIn("kind=routine", str(refused[0]["detail"]), refused)
+            deferred = [e for e in self.activity_records() if e["code"] == "run.deferred"]
+            self.assertTrue(deferred, "the refused launch left no Activity record")
+            # Admission restored: the deferred routine runs on its 30 s re-check.
+            refuse.unlink()
+            # Generous: the busy re-check is 30 fixture seconds per attempt, and
+            # under a loaded suite the real handshake can itself be refused once
+            # more, which is now a recorded deferral rather than a false success.
+            fields = self.wait_for_state(state_path, lambda f: f.get("state") == "succeeded", timeout=60)
+            self.assertEqual(fields["retry_attempt"], "0", fields)
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_daily_routine_outside_window_records_one_activity_line_per_episode(self) -> None:
+        # S3-2 / G-6. Outside its window a daily routine appended an Activity
+        # record and rewrote its state on every five-second turn, and a
+        # finished run's outcome was overwritten with deferred.
+        self.configure_with_password("alpha", self.source_one, True)
+        self.configure_with_password("beta", self.source_two)
+        for name in ("alpha", "beta"):
+            routine, _ = self.api(
+                "routine", "--profile", name, "--enabled", "true", "--action", "sync",
+                "--mode", "daily", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+                # The fixture clock reads 12:00; this window never contains it.
+                "--time-window-start", "02:00", "--time-window-end", "03:00",
+                "--debounce-seconds", "1", "--retry-count", "0", "--retry-backoff-seconds", "10",
+                "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+            )
+            self.assertEqual(routine.returncode, 0, routine.stderr)
+        beta_state = self.real_var / "state/routines/beta.state"
+        self.write_private_state(
+            beta_state,
+            "state=succeeded\nnext_run_epoch=0\nlast_success_epoch=500\nlast_attempt_epoch=500\n"
+            "retry_attempt=0\nlast_day=2026-08-23\nlast_poll_epoch=0\nfingerprint=none\nbackend=daily\n",
+        )
+        started = self.shell(
+            self.lifecycle, "start", extra_environment=self.fast_clock_environment(step=31), timeout=15
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            alpha_state = self.real_var / "state/routines/alpha.state"
+            self.wait_for_state(alpha_state, lambda f: f.get("defer_reason") == "window")
+            controller_state = self.real_var / "state/controller.state"
+            first = self.state_fields(controller_state)["updated_epoch"]
+            # Let the loop run several more turns.
+            self.wait_for_state(
+                controller_state,
+                lambda f: int(f.get("updated_epoch", "0")) >= int(first) + 31 * 20,
+            )
+            outside = [
+                e for e in self.activity_records()
+                if e["code"] == "routine.deferred" and e["message"] == "Routine outside configured window"
+            ]
+            self.assertEqual([e["profile"] for e in outside], ["alpha"], outside)
+            beta = self.state_fields(beta_state)
+            self.assertEqual(beta["state"], "succeeded", beta)
+            self.assertEqual(beta["last_success_epoch"], "500", beta)
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_controller_marks_a_dead_runners_running_state_failed(self) -> None:
+        # G-4. run.state left at running by a runner that died read Running
+        # forever. The controller now rewrites it once the run lock has no
+        # live owner.
+        self.write_private_state(
+            self.real_var / "state/run.state",
+            "state=running\nstarted_epoch=900\nfinished_epoch=0\nexit_code=-1\nscope=all\noperation=sync\n",
+        )
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            fields = self.wait_for_state(
+                self.real_var / "state/run.state", lambda f: f.get("state") == "failed"
+            )
+            self.assertEqual(fields["reason"], "runner_died", fields)
+            self.assertEqual(fields["outcome"], "failed", fields)
+            self.assertEqual(fields["exit_code"], "-1", fields)
+            self.assertEqual(fields["started_epoch"], "900", fields)
+            self.assertEqual(fields["aggregate_state"], "failed", fields)
+            self.assertTrue(self.wait_for_controller_event("run_runner_died"))
+            died = [e for e in self.activity_records() if e["code"] == "run.failed"]
+            self.assertTrue(died)
+            snapshot, payload = self.api("snapshot")
+            self.assertEqual(snapshot.returncode, 0, snapshot.stderr)
+            self.assertEqual(payload["run"]["state"], "failed")
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_aggregate_schedule_deadline_survives_a_restart(self) -> None:
+        # S3-5. The deadline used to be rebased to now + interval on every
+        # start and every HUP, so a reboot or a dashboard save postponed the
+        # aggregate by a whole interval.
+        self.configure_with_password("alpha", self.source_one, True)
+        scheduled, _ = self.api(
+            "schedule", "--enabled", "true", "--interval", "86400",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(scheduled.returncode, 0, scheduled.stderr)
+        self.write_private_state(self.real_var / "state/schedule.state", "next_run_epoch=50000\n")
+        started = self.shell(
+            self.lifecycle, "start", extra_environment=self.fast_clock_environment(step=1), timeout=15
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            fields = self.wait_for_state(
+                self.real_var / "state/controller.state",
+                lambda f: f.get("next_run_epoch", "0") not in ("0", ""),
+            )
+            self.assertEqual(fields["next_run_epoch"], "50000", fields)
+            self.assertEqual(
+                self.state_fields(self.real_var / "state/schedule.state")["next_run_epoch"], "50000"
+            )
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_write_controller_state_survives_a_failing_clock_under_errexit(self) -> None:
+        # S3-6. The comment promised a degraded timestamp; the bare assignment
+        # from a failing command substitution ended the shell instead.
+        fake_bin = self.root / "broken-date-bin"
+        fake_bin.mkdir()
+        (fake_bin / "date").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        (fake_bin / "date").chmod(0o755)
+        helper = self.root / "controller-state-clock-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            f'PATH="{fake_bin}:$PATH"\n'
+            "write_controller_state running 4242 0 0\n"
+            "echo survived\n"
+            'cat "$controller_state"\n',
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            for path in (fake_bin, fake_bin / "date", helper):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        result = self.shell(helper)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("survived", result.stdout)
+        self.assertIn("updated_epoch=0", result.stdout)
+
+    def test_routine_with_a_duplicated_profile_bound_is_refused(self) -> None:
+        # shell-lifecycle #4. The manager took the first of two max-delete
+        # lines and the controller silently did the same.
+        configured = self.configure("alpha", self.source_one, "/home/Drive/alpha", True)
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        fragment = self.real_home / "config/profiles.d/alpha.toml"
+        text = fragment.read_text(encoding="utf-8")
+        self.assertEqual(text.count("\nmax-delete = "), 1, text)
+        fragment.write_text(text + "max-delete = 999999\n", encoding="utf-8")
+        routine, _ = self.api(
+            "routine", "--profile", "alpha", "--enabled", "true", "--action", "sync",
+            "--mode", "interval", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "0", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "true", "--max-total-delete", "1000000",
+        )
+        self.assertNotEqual(routine.returncode, 0, routine.stdout)
+        self.assertIn("invalid deletion bound", routine.stdout + routine.stderr)
+
+    def test_routine_retry_exhaustion_is_recorded_and_alerted(self) -> None:
+        # G-8. The ladder running out was silent: the state stayed failed and
+        # the cadence resumed with nothing saying retrying had stopped.
+        self.configure_with_password("alpha", self.source_one, True)
+        routine, _ = self.api(
+            "routine", "--profile", "alpha", "--enabled", "true", "--action", "sync",
+            "--mode", "interval", "--interval", "2592000", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+            "--retry-exponential", "false",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        self.install_test_core("echo 'error: connection refused' >&2\nexit 1\n")
+        state_path = self.real_var / "state/routines/alpha.state"
+        self.write_private_state(
+            state_path,
+            "state=scheduled\nnext_run_epoch=1\nlast_success_epoch=0\nlast_attempt_epoch=0\n"
+            "retry_attempt=0\nlast_day=none\nlast_poll_epoch=0\nfingerprint=none\nbackend=interval\n",
+        )
+        started = self.shell(
+            self.lifecycle, "start", extra_environment=self.fast_clock_environment(step=31), timeout=15
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            exhausted = self.wait_for_controller_event("routine_retries_exhausted")
+            self.assertIn("attempts=2", str(exhausted[0]["detail"]), exhausted)
+            self.assertIn("reason=core_failed", str(exhausted[0]["detail"]), exhausted)
+            records = [e for e in self.activity_records() if e["code"] == "routine.retries_exhausted"]
+            self.assertEqual(len(records), 1, records)
+            self.assertEqual(records[0]["level"], "error", records)
+            fields = self.state_fields(state_path)
+            self.assertEqual((fields["state"], fields["retry_attempt"]), ("failed", "0"), fields)
+            self.assertEqual(fields["last_reason"], "core_failed", fields)
+            self.assertEqual(
+                self.state_fields(self.real_var / "state/run.state")["detail"],
+                "error: connection refused",
+            )
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_change_stays_pending_until_a_sync_of_it_succeeds(self) -> None:
+        # S2-3. The polled reading was adopted as the baseline when the
+        # routine became due, before any sync. A dependency deferral or an
+        # exhausted ladder then lost the change: the next poll matched the
+        # baseline and nothing was due again until another file changed.
+        self.configure_with_password("base", self.source_one, True)
+        self.configure_with_password("watch", self.source_two)
+        (self.source_two / "watched.txt").write_text("one\n", encoding="utf-8")
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "0", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+            "--depends-on", "base",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        state_path = self.real_var / "state/routines/watch.state"
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(
+            self.lifecycle, "start", extra_environment=self.fast_clock_environment(step=31), timeout=15
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            baseline = self.wait_for_state(
+                state_path, lambda f: f.get("fingerprint", "none").startswith("v2:")
+            )["fingerprint"]
+            (self.source_two / "watched.txt").write_text("two, longer\n", encoding="utf-8")
+            deferred = self.wait_for_state(
+                state_path, lambda f: f.get("defer_reason") == "dependency"
+            )
+            self.assertEqual(deferred["state"], "deferred", deferred)
+            self.assertEqual(deferred["fingerprint"], baseline, deferred)
+            pending = deferred["pending_fingerprint"]
+            self.assertTrue(pending.startswith("v2:") and pending != baseline, deferred)
+            self.assertNotIn("sync --profile watch", self.capture.read_text(encoding="utf-8"))
+            # The dependency succeeds; the still-pending change is dispatched
+            # and only then becomes the baseline.
+            self.write_private_state(
+                self.real_var / "state/profiles/base.state",
+                "state=succeeded\nfinished_epoch=1\nexit_code=0\naction=sync\n",
+            )
+            synced = self.wait_for_state(state_path, lambda f: f.get("state") == "succeeded")
+            self.assertEqual(synced["fingerprint"], pending, synced)
+            self.assertEqual(synced["pending_fingerprint"], "0", synced)
+            self.assertIn("sync --profile watch --no-delete", self.capture.read_text(encoding="utf-8"))
+            deferrals = [
+                e for e in self.activity_records()
+                if e["code"] == "routine.deferred" and e["profile"] == "watch"
+            ]
+            self.assertEqual(len(deferrals), 1, deferrals)
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_poll_walk_runs_beside_the_controller_turn(self) -> None:
+        # S3-3. The walk ran inside the controller's turn, so a slow share held
+        # the control queue, the schedule and TERM for its whole duration. It
+        # is now a background child the stop path interrupts.
+        self.configure_with_password("watch", self.source_two, True)
+        (self.source_two / "watched.txt").write_text("one\n", encoding="utf-8")
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "0", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        environment = self.fast_clock_environment(step=31)
+        fake_bin = Path(environment["PATH"].split(":", 1)[0])
+        walk_started = self.root / "slow-walk-started"
+        real_find = shutil.which("find")
+        self.assertIsNotNone(real_find)
+        slow_find = fake_bin / "find"
+        # The controller's one-file probe passes straight through; only the
+        # source walk is slowed.
+        slow_find.write_text(
+            "#!/bin/sh\n"
+            f'case "$1" in "{self.source_two}") : > "{walk_started}"; /bin/sleep 30 ;; esac\n'
+            f'exec "{real_find}" "$@"\n',
+            encoding="utf-8",
+        )
+        slow_find.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(slow_find, self.drop_uid, self.drop_gid)
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        stopped_cleanly = False
+        try:
+            deadline = time.monotonic() + 15
+            while not walk_started.exists():
+                self.assertLess(time.monotonic(), deadline, "the poll walk never started")
+                time.sleep(0.05)
+            controller_state = self.real_var / "state/controller.state"
+            first = int(self.state_fields(controller_state)["updated_epoch"])
+            # The loop keeps turning while the walk sleeps.
+            self.wait_for_state(
+                controller_state,
+                lambda f: int(f.get("updated_epoch", "0")) >= first + 31 * 3,
+                timeout=10,
+            )
+            stop_started = time.monotonic()
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+            stopped_cleanly = True
+            self.assertLess(time.monotonic() - stop_started, 10)
+            self.assertFalse(list((self.real_var / "run").glob("fingerprint.*")))
+            self.assertFalse(list((self.real_var / "run").glob("poll-*.result")))
+            self.assertFalse(list((self.real_var / "run").glob("poll-*.output")))
+        finally:
+            if not stopped_cleanly:
+                self.shell(self.lifecycle, "stop", timeout=15)
+
+    def test_realtime_poll_falls_back_when_find_cannot_batch_exec(self) -> None:
+        # S3-3 portability. A find without `-exec {} +` used to fail every
+        # walk as an unreadable tree (poll_unreadable, forever).
+        self.configure_with_password("watch", self.source_two, True)
+        (self.source_two / "watched.txt").write_text("one\n", encoding="utf-8")
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "0", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        environment = self.fast_clock_environment(step=31)
+        fake_bin = Path(environment["PATH"].split(":", 1)[0])
+        real_find = shutil.which("find")
+        self.assertIsNotNone(real_find)
+        old_find = fake_bin / "find"
+        old_find.write_text(
+            "#!/bin/sh\n"
+            'for argument do last=$argument; done\n'
+            'if [ "$last" = + ]; then echo "find: missing argument to -exec" >&2; exit 1; fi\n'
+            f'exec "{real_find}" "$@"\n',
+            encoding="utf-8",
+        )
+        old_find.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(old_find, self.drop_uid, self.drop_gid)
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            self.assertTrue(self.wait_for_controller_event("fingerprint_batch_unsupported"))
+            fields = self.wait_for_state(
+                self.real_var / "state/routines/watch.state",
+                lambda f: f.get("fingerprint", "none").startswith("v2:"),
+            )
+            # The fixture's inotifywait always fails, so the watcher reason is
+            # expected; what must not appear is a failed poll.
+            self.assertNotIn(fields["backend_reason"], ("poll_unreadable", "poll_unavailable"), fields)
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+
+    def seed_due_interval_routine(self, profile: str, *, retries: str = "2") -> Path:
+        routine, _ = self.api(
+            "routine", "--profile", profile, "--enabled", "true", "--action", "sync",
+            "--mode", "interval", "--interval", "2592000", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", retries, "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        state_path = self.real_var / f"state/routines/{profile}.state"
+        self.write_private_state(
+            state_path,
+            "state=scheduled\nnext_run_epoch=1\nlast_success_epoch=0\nlast_attempt_epoch=0\n"
+            "retry_attempt=0\nlast_day=none\nlast_poll_epoch=0\nfingerprint=none\nbackend=interval\n",
+        )
+        return state_path
+
+    def test_supervisor_refusal_is_recorded_as_supervisor_refused(self) -> None:
+        # The bridge's supervisor now exits 78 with one stderr line when it
+        # refuses to start the core. That is a failure in which nothing ran,
+        # and it is named as such everywhere, with the supervisor's own line.
+        self.configure_with_password("alpha", self.source_one, True)
+        state_path = self.seed_due_interval_routine("alpha", retries="0")
+        environment = self.fast_clock_environment(step=31)
+        environment["SDSYNC_TEST_SUPERVISOR_ALIAS"] = str(self.root / "not-the-package-binary")
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            runs = self.wait_for_controller_event("routine_run")
+            self.assertIn("exit=78 ", str(runs[0]["detail"]), runs)
+            self.assertIn("reason=supervisor_refused", str(runs[0]["detail"]), runs)
+            self.assertNotIn("sync --profile alpha", self.capture.read_text(encoding="utf-8"))
+            run_state = self.state_fields(self.real_var / "state/run.state")
+            self.assertEqual((run_state["state"], run_state["exit_code"]), ("failed", "78"), run_state)
+            self.assertEqual((run_state["reason"], run_state["outcome"]), ("supervisor_refused", "failed"), run_state)
+            self.assertEqual(
+                run_state["detail"],
+                "sdsync-dsm-api: supervised core refused: supervised_binary_mismatch",
+            )
+            # The core never ran, so there are no counts to report or to miss.
+            self.assertNotIn("counts", run_state)
+            profile = self.state_fields(self.real_var / "state/profiles/alpha.state")
+            self.assertEqual((profile["state"], profile["reason"]), ("failed", "supervisor_refused"), profile)
+            self.assertIn("failure_count=1\n", (self.real_var / "state/alerts.state").read_text(encoding="utf-8"))
+            self.assertEqual(self.state_fields(state_path)["last_reason"], "supervisor_refused")
+            failed = [e for e in self.activity_records() if e["code"] == "run.failed" and e["profile"] == "alpha"]
+            self.assertTrue(failed)
+            self.assertIn("supervised core refused", str(failed[-1]["message"]))
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_core_partial_exit_is_a_warned_completion_not_a_failure(self) -> None:
+        # Core exit 3: finished, named paths deferred to the next run. Not a
+        # failure: no retry consumed, no failure counter, dependents may run
+        # (state succeeded), outcome=partial with the counts from the core's
+        # completion record, and a warning-level Activity line.
+        self.configure_with_password("alpha", self.source_one, True)
+        self.write_private_state(self.real_var / "state/alerts.state", "failure_count=4\nlast_notify_epoch=0\n")
+        state_path = self.seed_due_interval_routine("alpha")
+        self.install_test_core(
+            'case " $* " in *" --output ndjson "*) ;; *) exit 9 ;; esac\n'
+            'printf \'%s\\n\' \'{"action":"upload","schema":"sdsync.plan-action.v1"}\'\n'
+            'printf \'%s\\n\' \'{"kind":"completion","result":{"changed":true,"deferred":['
+            '{"detail":null,"path":"one.txt","reason":"source-changed"},'
+            '{"detail":"x","path":"two.txt","reason":"remote-changed"}],"deletes_skipped":0,'
+            '"incomplete_listing_folders":["dir one","we|ird"],"incomplete_listings":2,"mtime_not_kept":4,'
+            '"outcome":"partial","recovered":{"keepalive_failures":0,"reauthentication_failures":1,'
+            '"reauthentications":7,"server_tasks_not_stopped":0},"skipped":3},"schema":"sdsync.output.v1"}\'\n'
+            "exit 3\n"
+        )
+        started = self.shell(
+            self.lifecycle, "start", extra_environment=self.fast_clock_environment(step=31), timeout=15
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            runs = self.wait_for_controller_event("routine_run")
+            self.assertIn("exit=3 ", str(runs[0]["detail"]), runs)
+            self.assertEqual(runs[0]["level"], "warn", runs)
+            run_state = self.state_fields(self.real_var / "state/run.state")
+            self.assertEqual(
+                (run_state["state"], run_state["exit_code"], run_state["outcome"], run_state["reason"]),
+                ("succeeded", "3", "partial", "deferred_paths"),
+                run_state,
+            )
+            self.assertEqual((run_state["deferred"], run_state["skipped"]), ("2", "3"), run_state)
+            profile = self.state_fields(self.real_var / "state/profiles/alpha.state")
+            self.assertEqual((profile["state"], profile["outcome"]), ("succeeded", "partial"), profile)
+            self.assertEqual((profile["deferred"], profile["skipped"]), ("2", "3"), profile)
+            # Contract v1.5 result facts, in both documents.
+            for document in (run_state, profile):
+                self.assertEqual(document["incomplete_listings"], "2", document)
+                self.assertEqual(document["incomplete_listing_folders"], "dir one|we?ird", document)
+                self.assertEqual(document["mtime_not_kept"], "4", document)
+                self.assertEqual(document["recovered_reauthentication_failures"], "1", document)
+                self.assertEqual(document["recovered_server_tasks_not_stopped"], "0", document)
+                self.assertEqual(document["recovered_keepalive_failures"], "0", document)
+            routine = self.state_fields(state_path)
+            self.assertEqual((routine["state"], routine["retry_attempt"]), ("succeeded", "0"), routine)
+            self.assertEqual(routine["last_reason"], "deferred_paths", routine)
+            # The failure counter is neither advanced nor reset.
+            self.assertEqual(
+                (self.real_var / "state/alerts.state").read_text(encoding="utf-8"),
+                "failure_count=4\nlast_notify_epoch=0\n",
+            )
+            records = [e for e in self.activity_records() if e["code"] == "run.succeeded" and e["profile"] == "alpha"]
+            self.assertTrue(records)
+            self.assertEqual(records[-1]["level"], "warn", records)
+            self.assertIn("2 path(s) deferred", str(records[-1]["message"]))
+            self.assertFalse([e for e in self.activity_records() if e["code"] == "routine.retry_scheduled"])
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_failure_records_survive_a_silenced_category_and_report_failed_sinks(self) -> None:
+        # S-5: a category set to `off` used to drop its error records too.
+        # S-1/S-2: a record sink that fails no longer vanishes; run.state names
+        # it in degraded= and the run keeps its own exit code.
+        configured = self.configure("alpha", self.source_one, "/home/Drive/alpha", True)
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        silenced = self.shell(
+            self.manager, "configure-security-policy",
+            *self.security_policy_options(sync_log_level="off"),
+        )
+        self.assertEqual(silenced.returncode, 0, silenced.stderr)
+        activity_link = self.root / "activity-hard-link"
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            runner = self.real_target / "libexec/sdsync-run"
+            refused = self.shell(
+                runner, "sync", "alpha", "false", "foreground", "-",
+                extra_environment={"SDSYNC_DSM_AUDIT_WRAPPED": "true"},
+            )
+            self.assertEqual(refused.returncode, 66, refused.stderr)
+            records = (self.real_var / "log/activity.log").read_text(encoding="utf-8").splitlines()
+            self.assertTrue(
+                any("|run.failed|alpha|failed|sync|error|" in line for line in records), records[-5:]
+            )
+            # An activity log that gained a second hard link (a careless
+            # backup or restore) is refused by the writer: the run still
+            # records its failure, and says which echo of it is missing.
+            os.link(self.real_var / "log/activity.log", activity_link)
+            refused_again = self.shell(
+                runner, "sync", "alpha", "false", "foreground", "-",
+                extra_environment={"SDSYNC_DSM_AUDIT_WRAPPED": "true"},
+            )
+            self.assertEqual(refused_again.returncode, 66, refused_again.stderr)
+            self.assertIn("activity record run.failed could not be written", refused_again.stderr)
+            run_state = self.state_fields(self.real_var / "state/run.state")
+            self.assertEqual((run_state["state"], run_state["reason"]), ("failed", "password_missing"), run_state)
+            self.assertIn("activity", run_state["degraded"].split(","), run_state)
+            self.assertRegex(run_state["degraded_reason"], r"^[a-z_]+_write_failed$")
+        finally:
+            if activity_link.exists():
+                activity_link.unlink()
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_manual_run_records_counts_from_the_core_result_record(self) -> None:
+        # A manual "Sync now" prints in the format the administrator chose,
+        # for the dashboard, so its stdout cannot be parsed for counts. The
+        # core's --result-record file can: the manual run gets the same
+        # deferred/skipped counts and result facts as a scheduled one, and its
+        # stdout reaches the dashboard untouched.
+        self.configure_with_password("alpha", self.source_one, True)
+        self.install_test_core(
+            'record=; previous=\n'
+            'for argument do [ "$previous" != --result-record ] || record=$argument; previous=$argument; done\n'
+            '[ -n "$record" ] || exit 64\n'
+            'printf \'%s\\n\' \'{"profile":"alpha","result":{"changed":false,"deferred":['
+            '{"detail":null,"path":"name?.txt","reason":"unrepresentable-name"}],'
+            '"incomplete_listing_folders":[],"incomplete_listings":0,"mtime_not_kept":0,"outcome":"complete",'
+            '"recovered":{"keepalive_failures":2,"reauthentication_failures":0,"server_tasks_not_stopped":0},'
+            '"skipped":5},"schema":"sdsync.result-record.v1","status":"success"}\' > "$record"\n'
+            "echo 'Synced alpha: nothing to do (human output for the dashboard)'\n"
+            "exit 0\n"
+        )
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            runner = self.real_target / "libexec/sdsync-run"
+            self.capture.write_text("", encoding="utf-8")
+            ran = self.shell(
+                runner, "sync", "alpha", "false", "foreground", "-",
+                extra_environment={"SDSYNC_DSM_AUDIT_WRAPPED": "true"},
+            )
+            self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+            self.assertIn("human output for the dashboard", ran.stdout)
+            self.assertNotIn("--output ndjson", self.capture.read_text(encoding="utf-8"))
+            self.assertIn("--result-record ", self.capture.read_text(encoding="utf-8"))
+            run_state = self.state_fields(self.real_var / "state/run.state")
+            self.assertEqual((run_state["state"], run_state["outcome"]), ("succeeded", "succeeded"), run_state)
+            self.assertEqual((run_state["deferred"], run_state["skipped"]), ("1", "5"), run_state)
+            self.assertNotIn("counts", run_state)
+            self.assertEqual(run_state["recovered_keepalive_failures"], "2", run_state)
+            self.assertEqual(run_state["incomplete_listings"], "0", run_state)
+            self.assertNotIn("incomplete_listing_folders", run_state)
+            profile = self.state_fields(self.real_var / "state/profiles/alpha.state")
+            self.assertEqual((profile["deferred"], profile["skipped"]), ("1", "5"), profile)
+            self.assertEqual(profile["recovered_keepalive_failures"], "2", profile)
+            self.assertFalse(list((self.real_var / "run").glob("core-result.*")))
+            succeeded = [e for e in self.activity_records() if e["code"] == "run.succeeded" and e["profile"] == "alpha"]
+            self.assertTrue(succeeded)
+            self.assertEqual(succeeded[-1]["level"], "warn", succeeded)
+            self.assertIn("5 entr", str(succeeded[-1]["message"]))
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
 # ---------------------------------------------------------------------------
 # Wait profiling (measurement only)
