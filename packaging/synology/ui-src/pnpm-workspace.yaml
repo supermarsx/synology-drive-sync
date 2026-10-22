@@ -9,3 +9,5 @@ minimumReleaseAgeExclude:
 # supply the required Vue 2 runtime ABI.
 overrides:
   postcss: 8.5.26
+  # Patched source-map-js (GHSA-68fv-2mgg-jv7q); postcss only declares ^1.2.1.
+  source-map-js: 1.2.2
