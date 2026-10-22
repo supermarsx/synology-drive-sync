@@ -1173,7 +1173,13 @@ case ${1:-} in
 
         # The controller deliberately owns SIGHUP as its schedule-reload signal.
         # stdin is detached and DSM supervises the package, so do not mask HUP with nohup.
-        "$api_server" --exec-supervised-controller "$$" "$api_supervisor_start" \
+        #
+        # The controller and every runner it launches inherit this environment.
+        # Hand them the roots common already pinned to the framework alias, not
+        # DSM's physical /volumeN/@app* values, so the paths each process
+        # derives match the alias paths written into every profile.
+        SYNOPKG_PKGDEST=$package_root SYNOPKG_PKGHOME=$package_home SYNOPKG_PKGVAR=$package_var \
+            "$api_server" --exec-supervised-controller "$$" "$api_supervisor_start" \
             "$api_supervisor_boot" >> "$log_root/controller.log" 2>&1 </dev/null &
         launched_controller_pid=$!
         launched_controller_start=$(capture_direct_child_start "$launched_controller_pid" 2>/dev/null || true)

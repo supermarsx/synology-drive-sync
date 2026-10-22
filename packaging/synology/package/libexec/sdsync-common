@@ -7,6 +7,31 @@ package_base=/var/packages/$package_name
 package_root=${SYNOPKG_PKGDEST:-$package_base/target}
 package_home=${SYNOPKG_PKGHOME:-$package_base/home}
 package_var_candidate=${SYNOPKG_PKGVAR:-$package_base/var}
+# DSM hands start-stop-status, and so the controller and every runner it
+# launches, the physical /volumeN/@app{store,home,data} paths, while the
+# manager, the bridge and every document they write use the framework alias.
+# Two names for one directory made every controller-dispatched run fail: the
+# runner's log-file preflight compares the profile's alias path as a string
+# (exit 66), and the supervisor admits only the alias binary path (exit 1).
+# Pin each root to its alias whenever the alias resolves to the same directory,
+# so every process in the package derives byte-identical paths. A physical path
+# whose alias is absent or names a different directory is kept as given: that
+# is a fixture or an install in progress, never two names for one tree.
+package_alias_pin() {
+    package_alias_physical=$1
+    package_alias_name=$2
+    [ "$package_alias_physical" != "$package_alias_name" ] || return 1
+    [ -d "$package_alias_name" ] && [ -d "$package_alias_physical" ] || return 1
+    package_alias_identity=$(stat -L -c '%d:%i' "$package_alias_name" "$package_alias_physical" 2>/dev/null) || return 1
+    package_alias_first=${package_alias_identity%%
+*}
+    package_alias_second=${package_alias_identity#*
+}
+    [ -n "$package_alias_first" ] && [ "$package_alias_first" = "$package_alias_second" ]
+}
+if package_alias_pin "$package_root" "$package_base/target"; then package_root=$package_base/target; fi
+if package_alias_pin "$package_home" "$package_base/home"; then package_home=$package_base/home; fi
+if package_alias_pin "$package_var_candidate" "$package_base/var"; then package_var_candidate=$package_base/var; fi
 package_var=$package_var_candidate
 
 binary=$package_root/bin/synology-drive-sync

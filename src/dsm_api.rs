@@ -512,6 +512,14 @@ const _: () = assert!(
 #[cfg(target_os = "linux")]
 const MAX_CORE_NICE: i32 = 19;
 
+/// The exit status of `--exec-supervised-core` when it refuses before the core runs.
+///
+/// Distinct from the core's own 1 so the runner can record the run as `supervisor_refused`
+/// even when the stderr line naming the cause was discarded. `EX_CONFIG`: in practice the
+/// refusals are an argv the runner built wrong or a package identity that does not verify.
+#[cfg(target_os = "linux")]
+const SUPERVISOR_REFUSED_EXIT: u8 = 78;
+
 /// Occupancy of the manager lane, and where requests wait for a slot in it.
 #[cfg(target_os = "linux")]
 struct ManagerLane {
@@ -12811,7 +12819,18 @@ pub(crate) fn main_entry() -> ExitCode {
             })();
             match result {
                 Ok(()) => ExitCode::SUCCESS,
-                Err(_) => ExitCode::FAILURE,
+                // Every failure on this branch happens before the core ran, so it is reported
+                // apart from the core's own exit 1: a distinct status the runner records as
+                // `supervisor_refused`, and one stderr line naming the cause for whatever
+                // captures the runner's output. Nothing here can carry a secret: the code is a
+                // fixed token and no argument is echoed.
+                Err(error) => {
+                    eprintln!(
+                        "sdsync-dsm-api: supervised core refused: {}",
+                        resolved_error_code(error, None, None)
+                    );
+                    ExitCode::from(SUPERVISOR_REFUSED_EXIT)
+                }
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -13590,6 +13609,51 @@ fn exec_supervised_controller(parent: SupervisedParent) -> BridgeResult<()> {
 /// behind a sync that merely runs at the wrong priority.
 #[cfg(target_os = "linux")]
 fn parse_supervised_core_tail(arguments: &[OsString]) -> BridgeResult<(i32, &[OsString])> {
+    parse_supervised_core_tail_for(arguments, Path::new(BINARY_PATH))
+}
+
+/// Whether a runner-supplied binary path names the package's own core.
+///
+/// The runner builds the path from `SYNOPKG_PKGDEST`, which DSM may hand the controller as the
+/// physical `/volumeN/@appstore/...` directory rather than the `/var/packages/.../target` alias.
+/// Both name one file, and a byte comparison alone turned every scheduled and routine run on
+/// such a NAS into a silent exit 1 (S2-1a).
+///
+/// The security property is unchanged: this argument is only the runner's statement of intent.
+/// What is executed is always `binary` itself, after `validate_private_executable`, never the
+/// argument. A different path is accepted only when it is absolute and resolves to the very
+/// same inode on the very same device as `binary`, so a look-alike copy, a hard link elsewhere
+/// with a different identity, or any other program is still refused.
+#[cfg(target_os = "linux")]
+fn names_package_binary(candidate: &std::ffi::OsStr, binary: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    if candidate == binary.as_os_str() {
+        return true;
+    }
+    let candidate = Path::new(candidate);
+    // Absolute, and the file itself rather than a link to it: the directories above it may be
+    // the framework's alias symlinks, the final component may not.
+    if !candidate.is_absolute()
+        || !fs::symlink_metadata(candidate).is_ok_and(|metadata| metadata.file_type().is_file())
+    {
+        return false;
+    }
+    match (fs::metadata(candidate), fs::metadata(binary)) {
+        (Ok(given), Ok(expected)) => {
+            given.file_type().is_file()
+                && given.dev() == expected.dev()
+                && given.ino() == expected.ino()
+        }
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_supervised_core_tail_for<'a>(
+    arguments: &'a [OsString],
+    binary: &Path,
+) -> BridgeResult<(i32, &'a [OsString])> {
     let niced = arguments
         .get(4)
         .is_some_and(|value| *value == "--core-nice");
@@ -13609,9 +13673,12 @@ fn parse_supervised_core_tail(arguments: &[OsString]) -> BridgeResult<(i32, &[Os
     }
     if arguments
         .get(separator + 1)
-        .is_none_or(|value| *value != BINARY_PATH)
+        .is_none_or(|value| !names_package_binary(value, binary))
     {
-        return Err(BridgeError::bad_request());
+        return Err(BridgeError::coded(
+            ErrorKind::BadRequest,
+            "supervised_binary_mismatch",
+        ));
     }
     Ok((core_nice, &arguments[separator + 2..]))
 }
@@ -17342,6 +17409,55 @@ mod tests {
                 parse_supervised_core_tail(&tail(&malformed)).is_err(),
                 "{malformed:?} must be refused"
             );
+        }
+    }
+
+    /// S2-1a: DSM may hand the runner the physical `@appstore` path. The supervisor must accept
+    /// any absolute spelling that resolves to the package binary's own inode, and still refuse
+    /// a byte-identical copy, a relative spelling, a different file and a missing one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_supervised_binary_is_matched_by_identity_not_by_spelling() {
+        let fixture = TestControlFixture::new("supervised-binary");
+        let physical = fixture.root.join("appstore").join("bin");
+        fs::create_dir_all(&physical).unwrap();
+        let binary = physical.join("synology-drive-sync");
+        fs::write(&binary, b"core").unwrap();
+        // The alias the package framework creates: a symlinked directory.
+        let alias_root = fixture.root.join("target");
+        std::os::unix::fs::symlink(fixture.root.join("appstore"), &alias_root).unwrap();
+        let alias = alias_root.join("bin").join("synology-drive-sync");
+        let copy = fixture.root.join("copy");
+        fs::write(&copy, b"core").unwrap();
+        let link = fixture.root.join("link-to-core");
+        std::os::unix::fs::symlink(&binary, &link).unwrap();
+
+        let tail = |given: &Path| -> Vec<OsString> {
+            let mut all: Vec<OsString> = ["--exec-supervised-core", "1234", "99", "boot-id"]
+                .iter()
+                .map(OsString::from)
+                .collect();
+            all.extend([OsString::from("--"), given.as_os_str().to_owned()]);
+            all.push(OsString::from("sync"));
+            all
+        };
+
+        for accepted in [&alias, &binary] {
+            let arguments = tail(accepted);
+            let (_, forwarded) = parse_supervised_core_tail_for(&arguments, &alias)
+                .unwrap_or_else(|_| panic!("{accepted:?} names the package binary"));
+            assert_eq!(forwarded, [OsString::from("sync")]);
+        }
+        let relative = Path::new("appstore/bin/synology-drive-sync");
+        for refused in [
+            copy.as_path(),
+            relative,
+            &fixture.root.join("missing"),
+            link.as_path(),
+        ] {
+            let error = parse_supervised_core_tail_for(&tail(refused), &alias).unwrap_err();
+            assert_eq!(error.kind, ErrorKind::BadRequest, "{refused:?}");
+            assert_eq!(error.code, Some("supervised_binary_mismatch"));
         }
     }
 

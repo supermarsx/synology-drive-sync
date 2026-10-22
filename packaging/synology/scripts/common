@@ -5,6 +5,27 @@ package_base=/var/packages/$package_name
 package_root=${SYNOPKG_PKGDEST:-$package_base/target}
 package_home=${SYNOPKG_PKGHOME:-$package_base/home}
 package_var=${SYNOPKG_PKGVAR:-$package_base/var}
+# Same pin as libexec/sdsync-common, kept self-contained because preinst sources
+# this file before $package_root exists. DSM gives the lifecycle scripts the
+# physical /volumeN/@app* paths; the manager and the bridge write the alias
+# paths into every profile. The controller this script launches inherits these
+# values, so pinning here is what makes a scheduled run's paths match the
+# documents it validates.
+lifecycle_alias_pin() {
+    lifecycle_alias_physical=$1
+    lifecycle_alias_name=$2
+    [ "$lifecycle_alias_physical" != "$lifecycle_alias_name" ] || return 1
+    [ -d "$lifecycle_alias_name" ] && [ -d "$lifecycle_alias_physical" ] || return 1
+    lifecycle_alias_identity=$(stat -L -c '%d:%i' "$lifecycle_alias_name" "$lifecycle_alias_physical" 2>/dev/null) || return 1
+    lifecycle_alias_first=${lifecycle_alias_identity%%
+*}
+    lifecycle_alias_second=${lifecycle_alias_identity#*
+}
+    [ -n "$lifecycle_alias_first" ] && [ "$lifecycle_alias_first" = "$lifecycle_alias_second" ]
+}
+if lifecycle_alias_pin "$package_root" "$package_base/target"; then package_root=$package_base/target; fi
+if lifecycle_alias_pin "$package_home" "$package_base/home"; then package_home=$package_base/home; fi
+if lifecycle_alias_pin "$package_var" "$package_base/var"; then package_var=$package_base/var; fi
 runtime_root=$package_var/run
 log_root=$package_var/log
 controller_pid_file=$runtime_root/controller.pid
