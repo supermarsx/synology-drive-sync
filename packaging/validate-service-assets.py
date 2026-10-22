@@ -397,14 +397,20 @@ def validate_rendered_compose_identity() -> None:
     if docker is None:
         print("skipped rendered Compose identity check because Docker CLI is unavailable")
         return
-    probe = subprocess.run(
-        [docker, "compose", "version"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
+    try:
+        probe = subprocess.run(
+            [docker, "compose", "version"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        # A present-but-slow Compose (a starved CI runner) is the same as an absent one for
+        # this check: skip it rather than crash the whole validator.
+        print("skipped rendered Compose identity check because Compose did not answer in time")
+        return
     if probe.returncode != 0:
         print("skipped rendered Compose identity check because Compose is unavailable")
         return

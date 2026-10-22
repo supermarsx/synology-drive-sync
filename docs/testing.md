@@ -91,8 +91,14 @@ pwsh -File scripts/coverage.ps1 -Mode Check
 - Unfiltered total lines: **25,253 / 27,351 = 92.3293%**
 - Tests: **500 passed** across all targets
 
-This is the verified repository gate result; CI regenerates `coverage-summary.json` rather than
-trusting a committed report.
+This is a point-in-time snapshot, not a claim that today's repository still measures exactly this.
+CI regenerates `coverage-summary.json` on every run rather than trusting a committed report, and
+`grep -rc '#\[test\]' src tests | awk -F: '{sum+=$2} END {print sum}'` already counts **887** test
+functions in `src/` and `tests/` alone as of this revision — noticeably more than the 500 this
+snapshot measured, because tests have landed since 2026-08-30 without a matching re-run of this
+block. Re-run `scripts/coverage.ps1 -Mode Check` for a current coverage percentage; a source-level
+`#[test]` count is not a substitute for one, since it says nothing about which lines those tests
+actually exercise.
 
 For historical context, the pre-expansion audit used Rust 1.95 and the previously installed
 `cargo-llvm-cov 0.6.11`; it measured **66.40% lines** (8,362 covered of 12,594 executable lines,

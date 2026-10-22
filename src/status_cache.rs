@@ -66,9 +66,10 @@
 //! Station MD5 task per probe — is the entire remote digest cost of a warm pass and was being
 //! charged to whoever was waiting on the answer.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -587,6 +588,21 @@ impl StatusCache {
     /// Only pairs whose digests **agreed** are recorded. An entry therefore means "these two MD5s
     /// were observed equal under this metadata"; a differing pair is about to be re-read by a sync
     /// anyway, so storing it would buy nothing and widen what an entry claims.
+    ///
+    /// # Why both sides are streams
+    ///
+    /// `tests/scan_memory.rs` pins the two inventories at about 27 MiB of a 32 MiB request ceiling,
+    /// and states the consequence plainly: the cache may not add a third structure holding every
+    /// path again. The read path has always honoured that. The write path did not — it built a
+    /// path-keyed `BTreeMap` of this run's observations and a second one of the carried records, and
+    /// `tests/status_cache_budget.rs` could not see it because the peak counter was armed after
+    /// `store` had already returned. At the shipped budget the observations map alone is about
+    /// 6 MB, which put the write path over the ceiling the scan budget is derived from.
+    ///
+    /// Neither side is materialised now. This run's observations are a lazy filter over the
+    /// comparison set, which is already sorted and already in memory, and allocate nothing at all;
+    /// the stored records are read one line at a time in the order they were written. Peak heap is
+    /// therefore one record, not one copy of every path.
     pub fn store(
         &self,
         local: &LocalInventory,
@@ -594,9 +610,27 @@ impl StatusCache {
         comparison: &BTreeSet<String>,
         scoped: bool,
     ) -> std::io::Result<()> {
-        let fresh = self.observations(local, remote, comparison);
-        let carried = self.carried_records(local, scoped, &fresh);
+        // One unusable stored record discards the whole stored file rather than half of it — the
+        // policy `read_into` documents and applies, for the same reason: nothing here can tell which
+        // half of a mangled file is trustworthy. A streaming writer cannot retract records it has
+        // already written, so the way to apply that policy is to throw the attempt away and write
+        // again from this run's observations alone. It costs a second pass only in the case where
+        // the stored file was corrupt, and that file is about to be replaced regardless.
+        if self.write_merged(local, remote, comparison, scoped, true)? == Merge::CarriedRejected {
+            self.write_merged(local, remote, comparison, scoped, false)?;
+        }
+        Ok(())
+    }
 
+    /// Write one complete cache file, optionally carrying stored evidence forward.
+    fn write_merged(
+        &self,
+        local: &LocalInventory,
+        remote: &RemoteInventory,
+        comparison: &BTreeSet<String>,
+        scoped: bool,
+        carry: bool,
+    ) -> std::io::Result<Merge> {
         let temporary = self.options.directory.join(format!(
             ".tmp.{}.{}.ndjson",
             self.options.profile,
@@ -605,53 +639,72 @@ impl StatusCache {
         let file = create_private(&temporary)?;
         let mut writer = BufWriter::new(file);
 
-        let total = fresh.len().saturating_add(carried.len()).min(ENTRY_LIMIT);
-        let header = Header {
-            schema: SCHEMA.to_owned(),
-            digest_strength: DIGEST_STRENGTH.to_owned(),
-            binary: env!("SDSYNC_VERSION").to_owned(),
-            platform: std::env::consts::OS.to_owned(),
-            profile: self.options.profile.clone(),
-            source: self.options.source.clone(),
-            remote: self.options.remote.clone(),
-            compare: self.options.compare.to_owned(),
-            generated_at: self.now,
-            entries: total,
-            canary_at: self.canary_at.get(),
-        };
-        let write = (|| -> std::io::Result<()> {
-            serde_json::to_writer(&mut writer, &header)?;
+        let outcome = (|| -> std::io::Result<Merge> {
+            // The header carries the record count, and a merge that never holds the records does
+            // not know it until the last one is written. So the first line is reserved here and
+            // filled in at the end: the reservation is as long as the header can possibly be, and
+            // the slack is spelled as trailing spaces, which `read_header` accepts because it parses
+            // the line as JSON. `entries` is the only field whose width varies, and it is bounded by
+            // `ENTRY_LIMIT`, so a reservation sized at that value is always long enough.
+            let reserved = serde_json::to_vec(&self.header(ENTRY_LIMIT))?.len();
+            writer.write_all(&vec![b' '; reserved])?;
             writer.write_all(b"\n")?;
 
             let mut written = 0_usize;
-            let mut fresh_iterator = fresh.iter().peekable();
-            let mut carried_iterator = carried.iter().peekable();
+            let mut fresh = self
+                .observation_stream(local, remote, comparison)
+                .peekable();
+            let mut carried = if carry {
+                CarriedRecords::open(self, local, scoped)
+            } else {
+                CarriedRecords::none(local)
+            };
             loop {
-                let take_fresh = match (fresh_iterator.peek(), carried_iterator.peek()) {
+                if !carried.fill() {
+                    return Ok(Merge::CarriedRejected);
+                }
+                let take_fresh = match (fresh.peek(), carried.peek()) {
                     (None, None) => break,
                     (Some(_), None) => true,
                     (None, Some(_)) => false,
-                    (Some((left, _)), Some((right, _))) => left <= right,
+                    (Some((left, _)), Some(right)) => *left <= right.as_str(),
                 };
                 let (relative, stored) = if take_fresh {
-                    let entry = fresh_iterator.next().expect("peeked");
-                    // A path observed this run supersedes the stored one for the same path.
-                    if carried_iterator
-                        .peek()
-                        .is_some_and(|(other, _)| other == &entry.0)
+                    let (relative, mut stored) = fresh.next().expect("peeked");
+                    // A path observed this run supersedes the stored one for the same path -- except
+                    // for *when* the evidence was first seen, which is the one field a re-observation
+                    // does not refresh.
+                    //
+                    // This is what the age ceiling bounds. A warm pass cannot tell a digest it
+                    // computed from one the cache handed it: `Served` deliberately keeps no list of
+                    // served paths, and by the time `store` runs every digest is filled. So every
+                    // pass re-stamped every agreeing pair with its own clock, and
+                    // `DEFAULT_MAX_AGE_SECONDS` could never expire anything for a profile polled
+                    // more often than every fourteen days -- which is every deployment the feature
+                    // exists for. Twenty-six days after the only live observation, an entry was
+                    // still being served, and `oldest_evidence_epoch` reported the window as one
+                    // poll interval wide while the real window was unbounded.
+                    //
+                    // Identical evidence for the same path is exactly the "nothing was re-observed"
+                    // case, so the carried epoch is kept. Evidence that differs in any field is a
+                    // genuinely new observation and is dated now.
+                    if carried.peek().is_some_and(|other| other == relative)
+                        && let Some((_, previous)) = carried.take()
+                        && previous.is_same_evidence_as(&stored)
                     {
-                        carried_iterator.next();
+                        stored.observed_at = previous.observed_at;
                     }
-                    entry
+                    (Cow::Borrowed(relative), stored)
                 } else {
                     // Past the ceiling, this run's observations are still recorded and carried-over
                     // ones stop. Fresh entries are bounded by the scan budget, so they alone can
                     // never breach it, and dropping the oldest evidence first is the right bias.
                     if written >= ENTRY_LIMIT {
-                        carried_iterator.next();
+                        carried.take();
                         continue;
                     }
-                    carried_iterator.next().expect("peeked")
+                    let (relative, stored) = carried.take().expect("peeked");
+                    (Cow::Owned(relative), stored)
                 };
                 if written >= ENTRY_LIMIT {
                     break;
@@ -659,7 +712,7 @@ impl StatusCache {
                 serde_json::to_writer(
                     &mut writer,
                     &Record {
-                        p: relative,
+                        p: relative.as_ref(),
                         s: stored.size,
                         m: stored.mtime_ms,
                         n: encode_identity(stored.identity),
@@ -674,54 +727,91 @@ impl StatusCache {
             }
             writer.write_all(END_SENTINEL.as_bytes())?;
             writer.write_all(b"\n")?;
-            writer.flush()
+            writer.flush()?;
+
+            // Fill the reservation now that the count is known. A header that somehow did not fit
+            // would overwrite the first record, so this fails rather than truncating: the caller
+            // reports that digests were not stored and the next run recomputes them.
+            let header = serde_json::to_vec(&self.header(written))?;
+            let padding = reserved.checked_sub(header.len()).ok_or_else(|| {
+                std::io::Error::other("cache header outgrew the space reserved for it")
+            })?;
+            let file = writer.get_mut();
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(&header)?;
+            file.write_all(&vec![b' '; padding])?;
+            file.flush()?;
+            Ok(Merge::Written)
         })();
 
-        if let Err(error) = write {
-            drop(writer);
-            let _ = fs::remove_file(&temporary);
-            return Err(error);
-        }
         drop(writer);
-        if let Err(error) = fs::rename(&temporary, &self.path) {
-            let _ = fs::remove_file(&temporary);
-            return Err(error);
+        match outcome {
+            Ok(Merge::Written) => {
+                if let Err(error) = fs::rename(&temporary, &self.path) {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(error);
+                }
+                self.enforce_directory_limit();
+                Ok(Merge::Written)
+            }
+            Ok(Merge::CarriedRejected) => {
+                let _ = fs::remove_file(&temporary);
+                Ok(Merge::CarriedRejected)
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                Err(error)
+            }
         }
-        self.enforce_directory_limit();
-        Ok(())
     }
 
-    /// This run's agreeing pairs, in ascending path order.
-    fn observations(
+    fn header(&self, entries: usize) -> Header {
+        Header {
+            schema: SCHEMA.to_owned(),
+            digest_strength: DIGEST_STRENGTH.to_owned(),
+            binary: env!("SDSYNC_VERSION").to_owned(),
+            platform: std::env::consts::OS.to_owned(),
+            profile: self.options.profile.clone(),
+            source: self.options.source.clone(),
+            remote: self.options.remote.clone(),
+            compare: self.options.compare.to_owned(),
+            generated_at: self.now,
+            entries,
+            canary_at: self.canary_at.get(),
+        }
+    }
+
+    /// This run's agreeing pairs, in ascending path order, as a stream.
+    ///
+    /// Allocates nothing: `comparison` is already sorted, the two lookups borrow from inventories
+    /// the caller owns, and [`StoredEntry`] is `Copy`. The paths are borrowed, so the merge writes
+    /// them straight out of the comparison set.
+    fn observation_stream<'a>(
         &self,
-        local: &LocalInventory,
-        remote: &RemoteInventory,
-        comparison: &BTreeSet<String>,
-    ) -> BTreeMap<String, StoredEntry> {
-        let mut observations = BTreeMap::new();
-        for relative in comparison {
-            let Some(local_entry) = local.entries.get(relative) else {
-                continue;
-            };
-            let Some(remote_entry) = remote.entries.get(relative) else {
-                continue;
-            };
+        local: &'a LocalInventory,
+        remote: &'a RemoteInventory,
+        comparison: &'a BTreeSet<String>,
+    ) -> impl Iterator<Item = (&'a str, StoredEntry)> + 'a {
+        let observed_at = self.now;
+        comparison.iter().filter_map(move |relative| {
+            let local_entry = local.entries.get(relative)?;
+            let remote_entry = remote.entries.get(relative)?;
             if local_entry.kind != EntryKind::File || remote_entry.kind != EntryKind::File {
-                continue;
+                return None;
             }
             let (Some(local_md5), Some(remote_md5)) =
                 (local_entry.content_md5, remote_entry.content_md5)
             else {
-                continue;
+                return None;
             };
             if local_md5.as_bytes() != remote_md5.as_bytes() {
-                continue;
+                return None;
             }
             if local_entry.size != remote_entry.size {
-                continue;
+                return None;
             }
-            observations.insert(
-                relative.clone(),
+            Some((
+                relative.as_str(),
                 StoredEntry {
                     size: local_entry.size,
                     mtime_ms: local_entry.mtime_ms,
@@ -729,78 +819,10 @@ impl StatusCache {
                     local_md5: *local_md5.as_bytes(),
                     remote_mtime_seconds: remote_entry.mtime_seconds,
                     remote_md5: *remote_md5.as_bytes(),
-                    observed_at: self.now,
+                    observed_at,
                 },
-            );
-        }
-        observations
-    }
-
-    /// Stored entries worth keeping: still inside the age ceiling, and not superseded.
-    ///
-    /// An unscoped query saw the whole tree, so a stored path absent from the local inventory has
-    /// been deleted and is dropped. A scoped query saw only part of it, where absence means "out of
-    /// scope" and dropping would throw away good evidence.
-    fn carried_records(
-        &self,
-        local: &LocalInventory,
-        scoped: bool,
-        fresh: &BTreeMap<String, StoredEntry>,
-    ) -> BTreeMap<String, StoredEntry> {
-        let mut carried = BTreeMap::new();
-        let Some(mut reader) = self.open_validated() else {
-            return carried;
-        };
-        let mut line = String::new();
-        let Some(header) = read_header(&mut reader, &mut line) else {
-            return carried;
-        };
-        if !self.header_matches(&header) {
-            return carried;
-        }
-        let expiry = self.now.saturating_sub(self.options.max_age_seconds);
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => return BTreeMap::new(),
-            }
-            let trimmed = line.trim_end_matches(['\n', '\r']);
-            if trimmed == END_SENTINEL {
-                break;
-            }
-            let Ok(record) = serde_json::from_str::<RecordRef<'_>>(trimmed) else {
-                return BTreeMap::new();
-            };
-            if record.t > self.now || record.t < expiry {
-                continue;
-            }
-            if fresh.contains_key(record.p.as_ref()) {
-                continue;
-            }
-            if !scoped && !local.entries.contains_key(record.p.as_ref()) {
-                continue;
-            }
-            let (Some(local_md5), Some(remote_md5)) =
-                (parse_md5(&record.lmd5), parse_md5(&record.rmd5))
-            else {
-                continue;
-            };
-            carried.insert(
-                record.p.into_owned(),
-                StoredEntry {
-                    size: record.s,
-                    mtime_ms: record.m,
-                    identity: decode_identity(&record.n),
-                    local_md5,
-                    remote_mtime_seconds: record.rm,
-                    remote_md5,
-                    observed_at: record.t,
-                },
-            );
-        }
-        carried
+            ))
+        })
     }
 
     /// Write the aggregate rollup for this profile.
@@ -955,6 +977,149 @@ impl StatusCache {
     }
 }
 
+/// What one attempt to write the cache achieved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Merge {
+    Written,
+    /// The stored file turned out to be unusable partway through. Nothing was renamed into place;
+    /// the caller writes again without carrying anything forward.
+    CarriedRejected,
+}
+
+/// The stored records, streamed in the order they were written.
+///
+/// The write path's half of the same discipline `read_into` follows: one line and one record in
+/// memory at a time, never the file. Ordering is part of the format — it is what lets the writer
+/// merge without holding either side — so a record that is not strictly after the previous one
+/// rejects the file rather than being silently sorted into place, which is what the old
+/// map-building writer did.
+struct CarriedRecords<'a> {
+    reader: Option<BufReader<fs::File>>,
+    line: String,
+    now: i64,
+    expiry: i64,
+    scoped: bool,
+    local: &'a LocalInventory,
+    /// Previous path seen, reused rather than reallocated per record.
+    previous: String,
+    seen_any: bool,
+    peeked: Option<(String, StoredEntry)>,
+}
+
+impl<'a> CarriedRecords<'a> {
+    /// An empty stream: nothing is carried forward.
+    fn none(local: &'a LocalInventory) -> Self {
+        Self {
+            reader: None,
+            line: String::new(),
+            now: 0,
+            expiry: 0,
+            scoped: false,
+            local,
+            previous: String::new(),
+            seen_any: false,
+            peeked: None,
+        }
+    }
+
+    /// Open the stored file, or yield nothing when it is absent, unsafe, or describes another query.
+    ///
+    /// A file that fails these checks is not a rejection: it is simply not evidence about this
+    /// query, exactly as `read_into` treats it.
+    fn open(cache: &StatusCache, local: &'a LocalInventory, scoped: bool) -> Self {
+        let mut stream = Self {
+            reader: None,
+            line: String::new(),
+            now: cache.now,
+            expiry: cache.now.saturating_sub(cache.options.max_age_seconds),
+            scoped,
+            local,
+            previous: String::new(),
+            seen_any: false,
+            peeked: None,
+        };
+        let Some(mut reader) = cache.open_validated() else {
+            return stream;
+        };
+        let Some(header) = read_header(&mut reader, &mut stream.line) else {
+            return stream;
+        };
+        if !cache.header_matches(&header) {
+            return stream;
+        }
+        stream.reader = Some(reader);
+        stream
+    }
+
+    /// Make the next usable record available, reporting whether the file is still trustworthy.
+    ///
+    /// `false` means the stored file must be discarded in full.
+    fn fill(&mut self) -> bool {
+        if self.peeked.is_some() {
+            return true;
+        }
+        let Some(mut reader) = self.reader.take() else {
+            return true;
+        };
+        loop {
+            self.line.clear();
+            match reader.read_line(&mut self.line) {
+                Ok(0) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+            let trimmed = self.line.trim_end_matches(['\n', '\r']);
+            if trimmed == END_SENTINEL {
+                return true;
+            }
+            let Ok(record) = serde_json::from_str::<RecordRef<'_>>(trimmed) else {
+                return false;
+            };
+            if self.seen_any && record.p.as_ref() <= self.previous.as_str() {
+                return false;
+            }
+            self.previous.clear();
+            self.previous.push_str(record.p.as_ref());
+            self.seen_any = true;
+            if record.t > self.now || record.t < self.expiry {
+                continue;
+            }
+            // An unscoped query saw the whole tree, so a stored path absent from the local
+            // inventory has been deleted and is dropped. A scoped query saw only part of it, where
+            // absence means "out of scope" and dropping would throw away good evidence.
+            if !self.scoped && !self.local.entries.contains_key(record.p.as_ref()) {
+                continue;
+            }
+            let (Some(local_md5), Some(remote_md5)) =
+                (parse_md5(&record.lmd5), parse_md5(&record.rmd5))
+            else {
+                continue;
+            };
+            let entry = StoredEntry {
+                size: record.s,
+                mtime_ms: record.m,
+                identity: decode_identity(&record.n),
+                local_md5,
+                remote_mtime_seconds: record.rm,
+                remote_md5,
+                observed_at: record.t,
+            };
+            self.peeked = Some((record.p.into_owned(), entry));
+            self.reader = Some(reader);
+            return true;
+        }
+    }
+
+    /// The path of the record `fill` made available, if any.
+    fn peek(&self) -> Option<&String> {
+        self.peeked.as_ref().map(|(relative, _)| relative)
+    }
+
+    fn take(&mut self) -> Option<(String, StoredEntry)> {
+        self.peeked.take()
+    }
+}
+
 /// One record's payload, shared by the read and write paths so the two cannot disagree on shape.
 #[derive(Clone, Copy, Debug)]
 struct StoredEntry {
@@ -965,6 +1130,31 @@ struct StoredEntry {
     remote_mtime_seconds: i64,
     remote_md5: [u8; 16],
     observed_at: i64,
+}
+
+impl StoredEntry {
+    /// Whether two records describe the same evidence, ignoring when it was observed.
+    ///
+    /// Field-wise and exhaustive on purpose: a field added to this struct and forgotten here would
+    /// make two different observations look identical and silently keep the older epoch. Written as
+    /// a destructuring comparison so adding a field is a compile error rather than a quiet one.
+    fn is_same_evidence_as(&self, other: &Self) -> bool {
+        let Self {
+            size,
+            mtime_ms,
+            identity,
+            local_md5,
+            remote_mtime_seconds,
+            remote_md5,
+            observed_at: _,
+        } = self;
+        *size == other.size
+            && *mtime_ms == other.mtime_ms
+            && *identity == other.identity
+            && *local_md5 == other.local_md5
+            && *remote_mtime_seconds == other.remote_mtime_seconds
+            && *remote_md5 == other.remote_md5
+    }
 }
 
 fn read_header(reader: &mut BufReader<fs::File>, line: &mut String) -> Option<Header> {
@@ -1539,6 +1729,109 @@ mod tests {
         }
     }
 
+    /// The age ceiling has to be able to bite, and only a first-observed epoch lets it.
+    ///
+    /// A warm pass cannot tell a digest it computed from one the cache handed it, so every pass
+    /// re-stamped every agreeing pair with its own clock. `DEFAULT_MAX_AGE_SECONDS` then never
+    /// expired anything for a profile polled more often than every fourteen days — which is every
+    /// deployment the feature exists for. Twenty-six days after the only live observation, an entry
+    /// was still being served as evidence, and `oldest_evidence_epoch` reported the window as one
+    /// poll interval wide while the real window was unbounded. Four separate claims in this file and
+    /// in `docs/status-cache.md` rest on that ceiling, including the paragraph addressed to exactly
+    /// the deployment where it was the *only* surviving bound.
+    #[test]
+    fn re_observing_unchanged_evidence_keeps_the_epoch_it_was_first_seen_at() {
+        let scratch = Scratch::new();
+        let thirteen_days = 13 * 24 * 60 * 60;
+
+        // Cold: one live observation, dated now.
+        let cache = StatusCache::open(options(&scratch.0), NOW).expect("cache opens");
+        let (mut local, mut remote) = inventories();
+        pair(&mut local, &mut remote, "a.bin", 10, 1_000_000, 11);
+        warm(&cache, &mut local, &mut remote, 0xAB);
+
+        // Warm, thirteen days later: the entry is served, and re-stored with the same evidence.
+        let warmed = StatusCache::open(options(&scratch.0), NOW + thirteen_days).expect("opens");
+        let (mut served_local, mut served_remote) = inventories();
+        pair(
+            &mut served_local,
+            &mut served_remote,
+            "a.bin",
+            10,
+            1_000_000,
+            11,
+        );
+        let comparison = comparison_of(&served_local);
+        let served = warmed.serve(&mut served_local, &mut served_remote, &comparison);
+        assert_eq!(served.supplied, 1);
+        assert_eq!(served.oldest_evidence_epoch, Some(NOW));
+        warmed
+            .store(&served_local, &served_remote, &comparison, false)
+            .expect("store");
+
+        // Twenty-six days after the only live observation, past the ceiling: not served.
+        let expired =
+            StatusCache::open(options(&scratch.0), NOW + 2 * thirteen_days).expect("opens");
+        let (mut late_local, mut late_remote) = inventories();
+        pair(
+            &mut late_local,
+            &mut late_remote,
+            "a.bin",
+            10,
+            1_000_000,
+            11,
+        );
+        let late = expired.serve(&mut late_local, &mut late_remote, &comparison);
+
+        assert_eq!(
+            late.supplied, 0,
+            "evidence older than the age ceiling must not be served"
+        );
+        assert_eq!(late_local.entries["a.bin"].content_md5, None);
+    }
+
+    /// Evidence that actually changed is dated now, so the ceiling does not expire a fresh reading.
+    #[test]
+    fn a_changed_observation_is_dated_when_it_was_made() {
+        let scratch = Scratch::new();
+        let thirteen_days = 13 * 24 * 60 * 60;
+
+        let cache = StatusCache::open(options(&scratch.0), NOW).expect("cache opens");
+        let (mut local, mut remote) = inventories();
+        pair(&mut local, &mut remote, "a.bin", 10, 1_000_000, 11);
+        warm(&cache, &mut local, &mut remote, 0xAB);
+
+        // The file was edited: a different length and a different digest, observed live.
+        let warmed = StatusCache::open(options(&scratch.0), NOW + thirteen_days).expect("opens");
+        let (mut fresh_local, mut fresh_remote) = inventories();
+        pair(
+            &mut fresh_local,
+            &mut fresh_remote,
+            "a.bin",
+            20,
+            3_000_000,
+            11,
+        );
+        warm(&warmed, &mut fresh_local, &mut fresh_remote, 0xCD);
+
+        // Thirteen days after *that* reading, it is still inside the ceiling.
+        let later = StatusCache::open(options(&scratch.0), NOW + 2 * thirteen_days).expect("opens");
+        let (mut late_local, mut late_remote) = inventories();
+        pair(
+            &mut late_local,
+            &mut late_remote,
+            "a.bin",
+            20,
+            3_000_000,
+            11,
+        );
+        let comparison = comparison_of(&late_local);
+        let served = later.serve(&mut late_local, &mut late_remote, &comparison);
+
+        assert_eq!(served.supplied, 1);
+        assert_eq!(served.oldest_evidence_epoch, Some(NOW + thirteen_days));
+    }
+
     /// The evidence a cache can supply is MD5 and nothing else, so a fingerprint it produced cannot
     /// satisfy a guard that requires strong proof. This is what keeps deletion and server-copy safe
     /// by construction rather than by anyone remembering a rule.
@@ -1912,6 +2205,144 @@ mod tests {
             !text.contains("kept/a.bin"),
             "a deleted file kept its stored evidence"
         );
+    }
+
+    /// A stored file the merge cannot trust is discarded in full, and the rewrite still succeeds.
+    ///
+    /// The write path's half of `damaged_files_degrade_to_a_cold_pass`. The merge streams the stored
+    /// records rather than loading them, so it can meet a bad one after it has already written good
+    /// ones — and "abandon all of it rather than reason about which half is trustworthy" then means
+    /// throwing the attempt away and writing again from this run's observations alone. What must
+    /// never happen is a file that mixes this run's evidence with part of a mangled one, or a failed
+    /// store that leaves the old file in place.
+    #[test]
+    fn a_damaged_stored_file_is_discarded_whole_and_the_rewrite_still_succeeds() {
+        let cases: [(&str, Damage); 3] = [
+            ("an unparseable record", |text| {
+                text.replace("\"lmd5\"", "\"lmd5\" \"broken\"")
+            }),
+            ("records out of order", |text| {
+                let mut lines: Vec<&str> = text.lines().collect();
+                lines.swap(1, 2);
+                lines.join("\n") + "\n"
+            }),
+            ("a record with a duplicated path", |text| {
+                let lines: Vec<&str> = text.lines().collect();
+                let mut output = vec![lines[0], lines[1], lines[1]];
+                output.extend(&lines[2..]);
+                output.join("\n") + "\n"
+            }),
+        ];
+
+        for (label, damage) in cases {
+            let scratch = Scratch::new();
+            let cache = StatusCache::open(options(&scratch.0), NOW).expect("cache opens");
+            let (mut local, mut remote) = inventories();
+            pair(&mut local, &mut remote, "a.bin", 10, 1_000_000, 11);
+            pair(&mut local, &mut remote, "b.bin", 20, 2_000_000, 12);
+            pair(&mut local, &mut remote, "c.bin", 30, 3_000_000, 13);
+            warm(&cache, &mut local, &mut remote, 0x11);
+
+            let text = fs::read_to_string(cache.path()).expect("cache is readable");
+            fs::write(cache.path(), damage(&text)).expect("damage is written");
+
+            // A later pass that sees only one of the three files. Under a scoped query the other
+            // two would be carried forward from the stored file -- if it were trustworthy.
+            let (mut fresh_local, mut fresh_remote) = inventories();
+            pair(
+                &mut fresh_local,
+                &mut fresh_remote,
+                "a.bin",
+                10,
+                1_000_000,
+                11,
+            );
+            let later = StatusCache::open(options(&scratch.0), NOW + 1).expect("cache opens");
+            for entry in fresh_local.entries.values_mut() {
+                entry.content_md5 = Some(digest(0x55));
+            }
+            for entry in fresh_remote.entries.values_mut() {
+                entry.content_md5 = Some(digest(0x55));
+            }
+            let comparison = comparison_of(&fresh_local);
+            later
+                .store(&fresh_local, &fresh_remote, &comparison, true)
+                .unwrap_or_else(|error| panic!("{label} failed the rewrite: {error}"));
+
+            let rewritten = fs::read_to_string(cache.path()).expect("cache is readable");
+            assert!(
+                rewritten.contains("a.bin"),
+                "{label} lost this run's own observation"
+            );
+            for discarded in ["b.bin", "c.bin"] {
+                assert!(
+                    !rewritten.contains(discarded),
+                    "{label} carried {discarded} forward out of a file it could not trust"
+                );
+            }
+            assert!(
+                rewritten.trim_end().ends_with(END_SENTINEL),
+                "{label} left the rewritten file without its sentinel"
+            );
+
+            // And the result is a file the reader accepts, so the damage cost one cold pass rather
+            // than every pass from here on.
+            let (mut next_local, mut next_remote) = inventories();
+            pair(
+                &mut next_local,
+                &mut next_remote,
+                "a.bin",
+                10,
+                1_000_000,
+                11,
+            );
+            let next = StatusCache::open(options(&scratch.0), NOW + 2).expect("cache opens");
+            let served = next.serve(&mut next_local, &mut next_remote, &comparison);
+            assert_eq!(served.supplied, 1, "{label} did not leave usable evidence");
+        }
+    }
+
+    /// The header's record count is written after the merge knows it, and must still be exact.
+    #[test]
+    fn the_header_counts_the_records_the_merge_actually_wrote() {
+        let scratch = Scratch::new();
+        let cache = StatusCache::open(options(&scratch.0), NOW).expect("cache opens");
+        let (mut local, mut remote) = inventories();
+        for index in 0..7_u8 {
+            pair(
+                &mut local,
+                &mut remote,
+                &format!("file-{index}.bin"),
+                10,
+                1_000_000,
+                11,
+            );
+        }
+        // One pair whose digests disagree, so it is observed but not recorded.
+        pair(&mut local, &mut remote, "differs.bin", 10, 1_000_000, 11);
+        for entry in local.entries.values_mut() {
+            entry.content_md5 = Some(digest(0x21));
+        }
+        for entry in remote.entries.values_mut() {
+            entry.content_md5 = Some(digest(0x21));
+        }
+        remote.entries.get_mut("differs.bin").unwrap().content_md5 = Some(digest(0x99));
+        let comparison = comparison_of(&local);
+        cache
+            .store(&local, &remote, &comparison, false)
+            .expect("store");
+
+        let text = fs::read_to_string(cache.path()).expect("readable");
+        let header: serde_json::Value =
+            serde_json::from_str(text.lines().next().expect("a header line"))
+                .expect("the header parses despite the reservation padding");
+        let records = text
+            .lines()
+            .skip(1)
+            .filter(|line| *line != END_SENTINEL && !line.trim().is_empty())
+            .count();
+        assert_eq!(records, 7);
+        assert_eq!(header["entries"], 7);
     }
 
     /// The canary compares withheld entries against live evidence. A disagreement is reported so the

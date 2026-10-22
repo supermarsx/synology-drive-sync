@@ -7,6 +7,7 @@ import {
   APPWINDOW_STATUS_INTERVALS_MS,
   WIDGET_ACTIVE_POLL_MS,
   WIDGET_BACKOFF_RAMP_MS,
+  WIDGET_CLOCK_TICK_MS,
   WIDGET_IDLE_POLL_MS,
   WIDGET_MAX_POLL_MS,
   appWindowPreferences,
@@ -96,6 +97,7 @@ function loadWidgetPanel(environment) {
     apiGet: environment.apiGet,
     probeRequestOutcome: async () => ({}),
     APPWINDOW_SETTINGS_KEY,
+    WIDGET_CLOCK_TICK_MS,
     appWindowPreferences,
     widgetBridgeIssue,
     widgetOverview,
@@ -329,13 +331,17 @@ test("the widget holds no timer until DSM activates it and drops it the moment i
 
   await panelInstance.activate();
   assert.equal(state.reads, 1);
-  assert.equal(pending(state).length, 1);
-  assert.equal(pending(state)[0].delay, WIDGET_IDLE_POLL_MS);
+  // Two independent timers are armed: the poll (scheduled once refresh()
+  // resolves) and the slow clock tick (scheduled synchronously by activate(),
+  // so it is always the older of the two in this timer list).
+  assert.equal(pending(state).length, 2);
+  assert.equal(pending(state).at(-1).delay, WIDGET_IDLE_POLL_MS);
+  assert.ok(pending(state).some((timer) => timer.delay === WIDGET_CLOCK_TICK_MS));
   assert.equal(panelInstance.failures, 0);
   assert.equal(panelInstance.overview.level, "idle");
 
   panelInstance.deactivate();
-  assert.equal(pending(state).length, 0, "deactivate must release the scheduled read");
+  assert.equal(pending(state).length, 0, "deactivate must release the scheduled read and the clock tick");
 
   // A read that was already in flight when the card went away must not
   // reschedule itself behind DSM's back.
@@ -351,16 +357,20 @@ test("a hidden DSM tab and a failing bridge both suppress the widget's next read
   await panelInstance.activate();
   assert.equal(panelInstance.failures, 1);
   assert.equal(panelInstance.degraded, false);
-  assert.equal(pending(state)[0].delay, WIDGET_BACKOFF_RAMP_MS[0]);
+  // activate() scheduled the clock tick before this first refresh() ever
+  // resolved, so it is always the oldest (first) entry here; the poll timer
+  // -- the one under test on this line -- is always the most recently
+  // (re)armed one, since only it is stopped and re-pushed on every refresh.
+  assert.equal(pending(state).at(-1).delay, WIDGET_BACKOFF_RAMP_MS[0]);
 
   await panelInstance.refresh();
   assert.equal(panelInstance.failures, 2);
   assert.equal(panelInstance.degraded, true);
-  assert.equal(pending(state)[0].delay, WIDGET_BACKOFF_RAMP_MS[1]);
+  assert.equal(pending(state).at(-1).delay, WIDGET_BACKOFF_RAMP_MS[1]);
 
   await panelInstance.refresh();
   assert.equal(panelInstance.failures, 0, "one good read must clear the backoff");
-  assert.equal(pending(state)[0].delay, WIDGET_IDLE_POLL_MS);
+  assert.equal(pending(state).at(-1).delay, WIDGET_IDLE_POLL_MS);
 
   state.hidden = true;
   panelInstance.visibilityHandler();
@@ -422,9 +432,10 @@ test("a stopped package says so on the card instead of spinning", async () => {
     const before = state.reads;
     await panelInstance.refresh();
     assert.equal(state.reads - before, 1, "one poll must cost exactly one request");
-    assert.equal(pending(state).length, 1);
+    // The poll timer plus the clock tick armed once by activate() above.
+    assert.equal(pending(state).length, 2);
   }
-  assert.equal(pending(state)[0].delay, WIDGET_MAX_POLL_MS);
+  assert.equal(pending(state).at(-1).delay, WIDGET_MAX_POLL_MS);
   assert.equal(panelInstance.degraded, true);
 
   // ...and it must still stop dead when DSM takes the card away.
@@ -468,7 +479,7 @@ test("a bridge failure after a good read keeps the last status until it is clear
   await panelInstance.refresh();
   assert.equal(panelInstance.bridgeIssue, null);
   assert.equal(panelInstance.headline.title, "All profiles healthy");
-  assert.equal(pending(state)[0].delay, WIDGET_IDLE_POLL_MS);
+  assert.equal(pending(state).at(-1).delay, WIDGET_IDLE_POLL_MS);
 });
 
 test("the card never shows a spinner it cannot stop", () => {
@@ -484,8 +495,44 @@ test("a stored AppWindow cadence and theme reach the widget", async () => {
   const panelInstance = instantiate(state);
   await panelInstance.activate();
   assert.equal(panelInstance.themeClass, "is-light");
-  assert.equal(pending(state)[0].delay, WIDGET_IDLE_POLL_MS);
+  assert.equal(pending(state).at(-1).delay, WIDGET_IDLE_POLL_MS);
   assert.equal(panelInstance.preferences.statusIntervalMs, 30000);
+});
+
+test("a slow clock tick keeps relative ages honest through a multi-minute backoff without polling again", async () => {
+  const state = environment({ alwaysFail: bridgeError(503, "http_503") });
+  const panelInstance = instantiate(state);
+  await panelInstance.activate();
+
+  const tick = () => pending(state).find((timer) => timer.delay === WIDGET_CLOCK_TICK_MS);
+  assert.ok(tick(), "the clock tick must be armed as soon as the card activates");
+  const readsBefore = state.reads;
+  const nowBefore = panelInstance.nowMs;
+
+  // Firing the tick's own callback must advance nowMs and re-arm itself,
+  // without going anywhere near the network -- that is the poll timer's job,
+  // and it is exactly what stays parked at up to WIDGET_MAX_POLL_MS while a
+  // bridge is failing. Mark it cleared first: a real setTimeout callback
+  // firing is exactly as consumed as an explicit clearTimeout would leave it,
+  // which is the fake timer harness's only way to model that.
+  const firedTick = tick();
+  firedTick.cleared = true;
+  firedTick.callback();
+  assert.equal(state.reads, readsBefore, "the clock tick must never read the bridge");
+  assert.ok(panelInstance.nowMs >= nowBefore, "nowMs must advance when the tick fires");
+  assert.ok(tick(), "the tick must reschedule itself");
+
+  // Hiding the tab must stop it exactly like the poll, and reactivating (via
+  // the visibility handler, not activate() again) must re-arm both.
+  state.hidden = true;
+  panelInstance.visibilityHandler();
+  assert.equal(pending(state).length, 0, "a hidden tab must leave no clock tick armed either");
+  state.hidden = false;
+  await panelInstance.visibilityHandler();
+  assert.ok(tick(), "becoming visible again must re-arm the clock tick");
+
+  panelInstance.deactivate();
+  assert.equal(pending(state).length, 0, "deactivate must stop the tick along with the poll");
 });
 
 /**

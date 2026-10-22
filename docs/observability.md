@@ -274,8 +274,18 @@ the modification times differ, it reports the difference it did observe, `mtime-
 
 `sync --output json` uses `sdsync.sync.v1`, retains the complete `plan`, and adds `result`. A changed
 sync result contains `changed`, `uploaded`, `server_copied`, `upload_bytes`,
-`directories_created`, `deleted`, and `elapsed_ms`; an already-synchronized run uses
-`"result":{"changed":false}`. `server_copy_fallback_bytes` is the amount that may still be uploaded
+`directories_created`, `deleted`, `deletes_skipped`, `kept_deletes_uploaded`, `changed_during_run`,
+`failed`, and `elapsed_ms`; an already-synchronized run uses `"result":{"changed":false}`.
+
+`deletes_skipped` counts planned mirror deletions the run kept rather than performed: the local path
+exists again, or a kept deletion beneath a directory left it non-empty. `kept_deletes_uploaded` counts
+the files among those that the same run then uploaded, so the mirror converged rather than deferring
+to a later run; their bytes are included in `upload_bytes`. `changed_during_run` counts entries the
+post-run reconciliation pass still found, all of them local files modified after the run began — the
+destination matches the source as it was when the run started, which is the only instant a run can be
+asked about. `failed` is `true` when the run failed *after* performing the work these counts describe;
+the document is emitted either way, because a run that uploaded nine hundred files and then could not
+reconcile has nine hundred uploads worth reporting. `server_copy_fallback_bytes` is the amount that may still be uploaded
 only when a planned server copy cannot be started; it is deliberately separate from
 `upload_bytes`.
 
@@ -292,7 +302,7 @@ ordered as follows:
 {"schema":"sdsync.plan-action.v1","action":"create-directory","relative":"releases","remote_path":"/team/export/releases","reason":"missing-remote"}
 {"schema":"sdsync.plan-action.v1","action":"copy-remote-content","from_relative":"old/report.bin","from_remote_path":"/team/export/old/report.bin","to_relative":"new/report.bin","to_remote_path":"/team/export/new/report.bin","expected_size":4096,"expected_mtime_seconds":1785769200,"content_md5":"d41d8cd98f00b204e9800998ecf8427e","source_snapshot_guard":{"entry_kind":"file","size":4096,"mtime_seconds":1785769200,"content_md5":"d41d8cd98f00b204e9800998ecf8427e","require_mtime":true},"verified_upload_fallback":"only-before-copy-task-start"}
 {"schema":"sdsync.plan-action.v1","action":"upload","relative":"release.bin","remote_path":"/team/export/release.bin","bytes":5242880,"mtime_ms":1785769200000,"reason":"content-differs"}
-{"schema":"sdsync.output.v1","kind":"completion","result":{"changed":true,"uploaded":1,"server_copied":1,"upload_bytes":5242880,"directories_created":1,"deleted":0,"elapsed_ms":8421}}
+{"schema":"sdsync.output.v1","kind":"completion","result":{"changed":true,"uploaded":1,"server_copied":1,"upload_bytes":5242880,"directories_created":1,"deleted":0,"deletes_skipped":0,"kept_deletes_uploaded":0,"changed_during_run":0,"failed":false,"elapsed_ms":8421}}
 ```
 
 A plan-only NDJSON stream ends after its last action. An unchanged sync emits the summary followed

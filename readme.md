@@ -36,7 +36,7 @@ Team Folder.
 > has been exercised by very few people against very few NAS models and DSM builds. Nothing here
 > has the operational history that would let anyone call it proven.
 
-It is built and tested deliberately: over 600 Rust tests and more than 250 dashboard tests, line
+It is built and tested deliberately: over 800 Rust tests and more than 380 dashboard tests, line
 coverage enforced as a CI gate, and releases published with `SHA256SUMS` and artifact attestation.
 Careful is not the same as proven. One day of testing against a single real NAS was enough to
 surface a TLS provider that blocked for over an hour on a low-entropy system, diagnostics that
@@ -88,8 +88,8 @@ account already has access to.
   LaunchAgent starts the finite run.
 - **One Synology pushing to another.** The DSM 7 package runs on the NAS that holds the
   authoritative folder and sends it over HTTPS to a File Station path on a second Synology.
-  Interval and daily routines cover a schedule; a realtime routine watches with `inotify`, falls
-  back to polling, and launches a finite run after a debounce.
+  Interval and daily routines cover a schedule; a realtime routine watches with `inotify` when
+  available, polls the source on a floor either way, and launches a finite run after a debounce.
 - **Getting a folder into Synology Drive without speaking Drive's protocol.** Point the destination
   at a path under the remote account's My Drive or an enabled Team Folder and Drive indexes what
   File Station wrote, so the result reaches Drive clients without this tool implementing anything
@@ -124,8 +124,9 @@ mtime only; ACLs, ownership, modes, and extended attributes are not preserved.
 | Rust SDK or C ABI | Another application needs to embed the engine | Synchronous library call with caller-owned secrets, cancellation, and process policy |
 
 The core binary is not a resident watcher. In **realtime** routine mode, the DSM package controller
-can watch with `inotify` or fall back to polling, then launch a finite plan or sync after debounce.
-Interval and daily routines also launch finite runs. The dashboard and the
+watches with `inotify` when available and polls the source on a floor regardless, then launches a
+finite plan or sync after debounce. Interval and daily routines also launch finite runs. The
+dashboard and the
 `sdsync-dsm` recovery/automation manager operate the same package-owned profiles, credentials,
 routines, state, and logs.
 

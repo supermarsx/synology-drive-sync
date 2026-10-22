@@ -287,7 +287,7 @@
               <article v-if="!routineEditorOpen" key="routine-catalog" class="sdsync-panel sdsync-routine-catalog">
                 <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Configured routines</p><h3>Per-profile automation</h3></div><span class="sdsync-mini-badge">{{ routines.length }} total</span></div>
                 <p v-if="!routines.length" class="sdsync-empty">No configured routines. Choose New routine to automate a profile.</p>
-                <button v-for="routine in routines" :key="routine.profile" type="button" :class="['sdsync-routine-row', { 'is-selected': selectedRoutine && selectedRoutine.profile === routine.profile }]" :title="'Edit routine for ' + routine.profile" :disabled="operationBusy" @click="openRoutine(routine.profile)"><span><strong><action-icon name="edit" />&nbsp;{{ routine.profile }}</strong><small>{{ routine.mode || 'interval' }} · {{ routine.backend || 'fallback unreported' }} · {{ routine.state || (routine.enabled ? 'enabled' : 'disabled') }}</small></span><time>{{ routine.enabled ? formatDate(routine.next_run_epoch) : 'Disabled' }}</time></button>
+                <button v-for="routine in routines" :key="routine.profile" type="button" :class="['sdsync-routine-row', { 'is-selected': selectedRoutine && selectedRoutine.profile === routine.profile }]" :title="'Edit routine for ' + routine.profile" :disabled="operationBusy" @click="openRoutine(routine.profile)"><span><strong><action-icon name="edit" />&nbsp;{{ routine.profile }}</strong><small>{{ routine.mode || 'interval' }} · {{ routine.backend || 'fallback unreported' }} · {{ routine.state || (routine.enabled ? 'enabled' : 'disabled') }}{{ routine.backend_reason && routine.backend_reason !== 'ok' ? ' · ' + routine.backend_reason : '' }}</small></span><time>{{ routineNextRunLabel(routine) }}</time></button>
               </article>
               <v-form v-else key="routine-editor" v-model="routineForm" class="sdsync-panel sdsync-editor sdsync-horizontal-form sdsync-routine-editor" direction="horizontal" @submit="saveRoutine">
                     <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Routine editor</p><h3>{{ selectedRoutine ? 'Edit ' + selectedRoutine.profile : 'New profile routine' }}</h3></div><v-button type="border" display="icon-text" tooltip="Close the routine editor and discard unsaved values" @click="closeRoutine"><template #icon><action-icon name="close" /></template>Close</v-button></div>
@@ -301,6 +301,10 @@
                       <v-form-item v-if="routineForm.mode === 'daily'" class="sdsync-form-item sdsync-inline-form-item" label="Window ends" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-window-end" /></template><input v-model="routineForm.time_window_end" class="sdsync-native-input" type="time" aria-label="Window ends" aria-describedby="sdsync-help-routine-window-end" :disabled="!canChangeRoutines"></v-form-item>
                       <v-form-item v-if="routineForm.mode === 'realtime'" class="sdsync-form-item sdsync-inline-form-item" label="Realtime debounce (seconds)" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-debounce" /></template><v-input class="sdsync-input-control" v-model="routineForm.debounce_seconds" number-only aria-describedby="sdsync-help-routine-debounce" :disabled="!canChangeRoutines" /></v-form-item>
                       <v-form-item v-if="routineForm.mode === 'realtime'" class="sdsync-form-item sdsync-inline-form-item" label="Fallback poll (seconds)" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-poll" /></template><v-input class="sdsync-input-control" v-model="routineForm.poll_seconds" number-only aria-describedby="sdsync-help-routine-poll" :disabled="!canChangeRoutines" /></v-form-item>
+                      <div v-if="routineForm.mode === 'realtime' && selectedRoutine" class="sdsync-form-item span-2">
+                        <p class="sdsync-field-note">Realtime status: {{ selectedRoutine.backend || 'none' }} · {{ selectedRoutine.state || (selectedRoutine.enabled ? 'enabled' : 'disabled') }}{{ selectedRoutine.backend_reason && selectedRoutine.backend_reason !== 'ok' ? ' · ' + selectedRoutine.backend_reason : '' }} · last poll {{ formatDate(selectedRoutine.last_poll_epoch) }}</p>
+                        <p v-if="selectedRoutine.backend_reason && selectedRoutine.backend_reason !== 'ok'" class="sdsync-field-note">{{ realtimeReasonGuidance(selectedRoutine.backend_reason) }}</p>
+                      </div>
                       <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Retry attempts" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-retries" /></template><v-input class="sdsync-input-control" v-model="routineForm.retry_count" number-only aria-describedby="sdsync-help-routine-retries" :disabled="!canChangeRoutines" /></v-form-item>
                       <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Retry backoff (seconds)" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-backoff" /></template><v-input class="sdsync-input-control" v-model="routineForm.retry_backoff_seconds" number-only min="10" max="300" aria-describedby="sdsync-help-routine-backoff" :disabled="!canChangeRoutines" /></v-form-item>
                       <div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Use exponential retry backoff (maximum 300 seconds) <control-help help-key="routine-exponential" /></span><v-checkbox class="sdsync-checkbox-control" v-model="routineForm.retry_exponential" aria-label="Use exponential retry backoff" aria-describedby="sdsync-help-routine-exponential" :disabled="!canChangeRoutines" /></div>
@@ -568,7 +572,14 @@
           </div>
         </main>
 
-        <div class="sdsync-toasts" aria-live="polite" aria-relevant="additions"><div v-for="toastItem in toasts" :key="toastItem.id" :class="['sdsync-toast', { 'is-error': toastItem.error }]" :role="toastItem.error ? 'alert' : 'status'"><strong>{{ toastItem.title }}</strong><span>{{ toastItem.message }}</span></div></div>
+        <!-- One live-region mechanism, not two: this container's aria-live is
+             pinned by validate_spk.py's native DSM AppWindow structural check
+             and is the one that stays. A per-toast role="alert"/"status" used
+             to sit on each item too -- an implicit live region of its own --
+             so an error toast was announced at the wrong level, or twice,
+             depending on the screen reader. The visual distinction (is-error)
+             is unaffected; only the redundant ARIA mechanism is gone. -->
+        <div class="sdsync-toasts" aria-live="polite" aria-relevant="additions"><div v-for="toastItem in toasts" :key="toastItem.id" :class="['sdsync-toast', { 'is-error': toastItem.error }]"><strong>{{ toastItem.title }}</strong><span>{{ toastItem.message }}</span></div></div>
         <div v-if="confirmation.visible" class="sdsync-modal-backdrop" role="presentation" @click.self="settleConfirmation(false)">
           <div ref="confirmationDialog" class="sdsync-modal" role="dialog" aria-modal="true" aria-labelledby="sdsync-confirm-title" aria-describedby="sdsync-confirm-message" tabindex="-1">
             <p class="sdsync-eyebrow">Confirm action</p>
@@ -1652,7 +1663,7 @@ const CONTROL_HELP = Object.freeze({
   "routine-window-start": "Local DSM time at which the daily execution window opens.",
   "routine-window-end": "Local DSM time at which the daily execution window closes.",
   "routine-debounce": "Quiet period after an observed change before a realtime run starts.",
-  "routine-poll": "Fallback observation cadence when a native realtime hook is unavailable.",
+  "routine-poll": "How often the source is re-read to detect changes. This runs whether or not a native watcher is available.",
   "routine-retries": "Additional routine attempts after a failed execution.",
   "routine-backoff": "Base retry delay from 10 through 300 seconds; every computed delay is capped at 300 seconds.",
   "routine-exponential": "Increase the retry delay after each failure; fixed and exponential delays never exceed 300 seconds.",
@@ -1783,6 +1794,30 @@ function emptyPathBrowser() {
 function emptyRoutine(profile = "") {
   return { profile, enabled: false, action: "sync", mode: "interval", interval_seconds: 3600, weekdays: [1, 2, 3, 4, 5, 6, 7], time_window_start: "00:00", time_window_end: "23:59", debounce_seconds: 45, poll_seconds: 30, retry_count: 5, retry_backoff_seconds: 60, retry_exponential: true, allow_delete: false, max_total_delete: 100, depends_on: [] };
 }
+// The nine values a realtime routine's `backend_reason` may carry (absent
+// reads as `ok`, matching the manager and core readers). Six of them mean the
+// source is not actually being observed for changes right now; the other
+// three -- `ok`, `watch_unavailable`, and `watch_stopped` -- still have a
+// working observation path (native or polling), so they stay out of the
+// "not observing" tally that drives realtimeDetail() below and only ever
+// surface as the per-routine reason shown in the catalog row and the editor.
+const REALTIME_NOT_OBSERVING_REASONS = Object.freeze([
+  "source_missing", "source_symlink", "watch_limit", "watch_setup_failed", "poll_unreadable", "poll_unavailable"
+]);
+// One operator-actionable line per reason, shown in the routine editor only
+// (routineReasonGuidance()). Never derived from watcher stderr or a log
+// event: the snapshot carries only the fixed reason code, so the guidance
+// here has to be generic enough to be true for every routine that reaches it.
+const REALTIME_REASON_GUIDANCE = Object.freeze({
+  source_missing: "The configured source path does not exist. Restore it, or point this routine's profile at a path that exists.",
+  source_symlink: "The configured source path is a symlink. Point the profile at the real directory it targets.",
+  watch_unavailable: "No native watcher is available on this NAS. Install inotify-tools from SynoCommunity or Entware for native detection; polling continues to observe the source meanwhile.",
+  watch_setup_failed: "The native watcher failed to start after repeated attempts, and the controller has stopped retrying. Inspect the controller log for the reported error, then save this routine to try again.",
+  watch_limit: "The source has more directories than the inotify watch budget allows. Raise fs.inotify.max_user_watches, or narrow the source.",
+  watch_stopped: "A stopped native watcher was found and was replaced automatically. Inspect what is pausing it if this keeps happening.",
+  poll_unreadable: "Part of the source could not be read during the last poll. Fix permissions on the unreadable subtree; the readable part is still observed.",
+  poll_unavailable: "The last poll of the source failed outright. Confirm the source path is reachable and readable."
+});
 
 const SECURITY_BOOLEAN_FIELDS = Object.freeze([
   "require_https", "allow_interface_changes", "allow_profile_changes", "allow_secret_changes",
@@ -1799,6 +1834,11 @@ const CLIENT_REQUEST_ID_PATTERN = /^[0-9a-f]{32}$/;
 const JOB_ID_PATTERN = /^[0-9a-f]{48}$/;
 const ACTIVITY_MESSAGE_LIMIT = 2048;
 const ACTIVITY_FIELD_LIMIT = 128;
+// How long the Activity search box waits after the last keystroke before
+// reversedActivity() actually re-filters. The server response this reads is
+// bounded near 1 MB, so redacting and filtering it on every keystroke is real
+// work; 250ms is short enough that typing still feels immediate.
+const ACTIVITY_SEARCH_DEBOUNCE_MS = 250;
 // The Activity route groups its fixed categories into task-shaped lenses: a
 // person chasing "what changed" should not read through routine sync
 // heartbeats, and a person chasing "what ran" should not read through the
@@ -3127,6 +3167,15 @@ function normalizedActivityEvent(event) {
   };
 }
 
+// The one place activityEvents is mapped through normalizedActivityEvent and
+// stripped of nulls. Both reversedActivity and activityLensTotal read this
+// through the normalizedActivityEvents computed above; it is a plain
+// function, not itself a computed, purely so that computed can be one more
+// caller of it rather than the only place the work is expressed.
+function normalizedEvents(events) {
+  return events.map(normalizedActivityEvent).filter(Boolean);
+}
+
 function canonicalProfileConfiguration(value, snapshot = false) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const field = (direct, ...aliases) => snapshot ? pick(value, direct, ...aliases) : value[direct];
@@ -3472,6 +3521,12 @@ export default {
         { id: "about", title: "About", icon: "about" }
       ],
       route: "overview", auth: { signal: undefined }, csrfToken: "", snapshot: null,
+      // JSON.stringify() of the last snapshot actually assigned above, with
+      // generated_at_epoch normalized out (see refreshSnapshot). Comparing
+      // this text is what lets a poll that saw no real change skip
+      // reassigning `snapshot` and, with it, recomputing every derived
+      // computed for no reason.
+      snapshotSignature: "",
       // Receipt times for the three read documents this window retains through a
       // failure. They live here, in per-instance component state, for the same
       // reason the documents do: a retained read belongs to one tab, one DSM
@@ -3518,7 +3573,14 @@ export default {
       aboutUiDependencies: ABOUT_UI_DEPENDENCIES,
       diagnostic: { title: "Not run in this session", output: "No diagnostic output yet." }, doctorReport: idleDoctorReport(), doctorProgress: emptyDoctorProgress(),
       liveProgress: emptyLiveProgress(),
-      logsPaused: false, logSource: "all", logLines: 200, logState: "Waiting for logs", logOutput: "No log data yet.", logRecords: [], activityEvents: [], activitySearch: "", activityCategory: "all", activityLevel: "all",
+      logsPaused: false, logSource: "all", logLines: 200, logState: "Waiting for logs", logOutput: "No log data yet.", logRecords: [], activityEvents: [], activitySearch: "",
+      // reversedActivity() filters on this debounced copy instead of
+      // activitySearch directly, so a redaction-and-filter pass over
+      // potentially thousands of events runs at most once per quiet 250ms
+      // window instead of once per keystroke. The input itself still binds to
+      // activitySearch for immediate typing feedback.
+      activitySearchDebounced: "", activitySearchDebounceTimer: 0,
+      activityCategory: "all", activityLevel: "all",
       activityTabs: [
         { id: "events", label: "All events" },
         { id: "changes", label: "Changes" },
@@ -3558,7 +3620,14 @@ export default {
     profileFilterSummary() { return `${this.filteredProfiles.length} of ${this.profiles.length} profile${this.profiles.length === 1 ? "" : "s"}`; },
     enabledRoutines() { return this.routines.filter((routine) => routine.enabled === true); },
     realtimeRoutines() { return this.enabledRoutines.filter((routine) => routine.mode === "realtime"); },
-    realtimeDetail() { const fallbacks = this.realtimeRoutines.filter((routine) => String(routine.backend || "").includes("poll")).length; return !this.realtimeRoutines.length ? "No enabled realtime routine" : (fallbacks ? `${fallbacks} using polling fallback` : "Native/fallback backend reported healthy"); },
+    realtimeDetail() {
+      if (!this.realtimeRoutines.length) return "No enabled realtime routine";
+      const notObserving = this.realtimeRoutines.filter((routine) => REALTIME_NOT_OBSERVING_REASONS.includes(String(routine.backend_reason || "ok"))).length;
+      if (notObserving) return `${notObserving} not observing changes`;
+      const fallbacks = this.realtimeRoutines.filter((routine) => String(routine.backend || "").includes("poll")).length;
+      if (fallbacks) return `${fallbacks} using polling fallback`;
+      return `${this.realtimeRoutines.length} watching with inotify`;
+    },
     readyProfileCount() { return this.profiles.filter((profile) => profile.has_password === true).length; },
     capabilities() { return this.snapshot && this.snapshot.capabilities && typeof this.snapshot.capabilities === "object" ? this.snapshot.capabilities : {}; },
     securityPolicy() { return normalizedSecurityPolicy(this.snapshot && this.snapshot.security_policy); },
@@ -4020,15 +4089,26 @@ export default {
     nextRun() { const epochs = this.enabledRoutines.map((routine) => Number(routine.next_run_epoch)).filter((value) => Number.isFinite(value) && value > 0); return epochs.length ? formatDate(Math.min(...epochs)) : "None"; },
     healthRows() { const explicit = this.snapshot && this.snapshot.health; if (Array.isArray(explicit)) return explicit; return this.profiles.map((profile) => { const health = profile.health && typeof profile.health === "object" ? profile.health : {}; const routine = this.routines.find((item) => String(item.profile) === String(profile.name)) || {}; return Object.assign({ profile: profile.name, last_success_epoch: routine.last_success_epoch }, health); }); },
     healthFreshness() { const newest = this.healthRows.reduce((value, health) => Math.max(value, numberOr(health.last_check_epoch || health.checked_at_epoch || health.checked_epoch, 0)), 0); return newest ? `Newest check ${formatDate(newest)}` : "Cached time unavailable"; },
+    // Shared by reversedActivity and activityLensTotal so that redacting and
+    // shaping every activity event (normalizedActivityEvent) happens once per
+    // change to activityEvents, not once per consumer -- and, since neither
+    // consumer used to share it, once per keystroke in the search box too.
+    // Vue resolves this as a real cached getter on the live component; the
+    // `|| normalizedEvents(...)` fallback in the two computeds below is only
+    // ever exercised by a hand-built test context that calls one of them
+    // directly without wiring every computed up as a getter first.
+    normalizedActivityEvents() {
+      return normalizedEvents(this.activityEvents);
+    },
     reversedActivity() {
-      const query = boundedText(this.activitySearch, "").trim().toLowerCase().slice(0, ACTIVITY_FIELD_LIMIT);
+      const query = boundedText(this.activitySearchDebounced, "").trim().toLowerCase().slice(0, ACTIVITY_FIELD_LIMIT);
       // A context built without activityTab (every fixture that predates the
       // Activity tabs) must filter exactly as the "events" lens does: every
       // category. activityLensCategories(undefined) returns null for that
       // reason, which the lens predicate below treats as "no restriction".
       const lensCategories = activityLensCategories(this.activityTab);
-      return this.activityEvents.map(normalizedActivityEvent).filter((event) => {
-        if (!event) return false;
+      const normalized = this.normalizedActivityEvents || normalizedEvents(this.activityEvents);
+      return normalized.filter((event) => {
         const category = event.category.toLowerCase();
         const level = event.level.toLowerCase();
         const searchable = [
@@ -4046,8 +4126,10 @@ export default {
     // against a lens that holds twelve.
     activityLensTotal() {
       const lensCategories = activityLensCategories(this.activityTab);
-      const normalized = this.activityEvents.map(normalizedActivityEvent).filter(Boolean);
-      return lensCategories ? normalized.filter((event) => lensCategories.includes(event.category.toLowerCase())).length : normalized.length;
+      const normalized = this.normalizedActivityEvents || normalizedEvents(this.activityEvents);
+      return lensCategories
+        ? normalized.filter((event) => lensCategories.includes(event.category.toLowerCase())).length
+        : normalized.length;
     },
     activityLensCategoryOptions() {
       const lensCategories = activityLensCategories(this.activityTab);
@@ -4086,6 +4168,16 @@ export default {
     logRefreshOptions() { return options([[0, "Manual only"], [5000, "Every 5 seconds"], [10000, "Every 10 seconds"], [30000, "Every 30 seconds"]]); }
   },
   watch: {
+    // See ACTIVITY_SEARCH_DEBOUNCE_MS and normalizedActivityEvents above: the
+    // input itself stays bound to activitySearch so typing feels immediate,
+    // and only this debounced copy drives the actual re-filter.
+    activitySearch(value) {
+      window.clearTimeout(this.activitySearchDebounceTimer);
+      this.activitySearchDebounceTimer = window.setTimeout(() => {
+        this.activitySearchDebounceTimer = 0;
+        this.activitySearchDebounced = value;
+      }, ACTIVITY_SEARCH_DEBOUNCE_MS);
+    },
     profileForm: { deep: true, handler() { this.autosaveChanged("profile"); } },
     "profileForm.url"() { this.invalidateConnectionTest(); },
     "profileForm.username"() { this.invalidateConnectionTest(); },
@@ -5327,7 +5419,7 @@ export default {
       this.profileSaveMessage = `Step ${boundedCurrent} of ${boundedTotal}: ${stageMessage} ${PROFILE_CREATION_WINDOW_WARNING}`;
     },
     clearProfileCreationProgress() { this.profileCreationProgress = emptyProfileCreationProgress(); },
-    stopTimers() { window.clearTimeout(this.snapshotTimer); window.clearTimeout(this.logTimer); window.clearTimeout(this.incidentProbeTimer); this.snapshotTimer = 0; this.logTimer = 0; this.incidentProbeTimer = 0; },
+    stopTimers() { window.clearTimeout(this.snapshotTimer); window.clearTimeout(this.logTimer); window.clearTimeout(this.incidentProbeTimer); window.clearTimeout(this.activitySearchDebounceTimer); this.snapshotTimer = 0; this.logTimer = 0; this.incidentProbeTimer = 0; this.activitySearchDebounceTimer = 0; },
     // How long to wait before the next status read, given what the last one
     // failed with.
     //
@@ -5380,7 +5472,24 @@ export default {
       }
       if (this.snapshotPromise) {
         if (requirePostMutationRead) this.snapshotRefreshQueued = true;
-        return this.snapshotPromise;
+        if (!manual) return this.snapshotPromise;
+        // A manual click that lands mid-poll must not just silently ride
+        // along: the in-flight cycle's own `manual` flag was fixed when that
+        // cycle started and may be false, which used to mean the button
+        // produced no toast and no failure-streak reset at all. Give this
+        // caller the same "start over" reset as the branch below, and its own
+        // completion toast once the shared read settles -- the in-flight
+        // cycle already updates bridgeIssue and the failure fields for
+        // whichever caller reads them.
+        this.snapshotFailureCode = "";
+        this.snapshotFailureStreak = 0;
+        const inFlight = this.snapshotPromise;
+        return inFlight.then((result) => {
+          if (this.disposed) return result;
+          if (result) this.toast("Status refreshed", "The latest package snapshot is displayed.");
+          else this.toast(this.bridgeIssue.title, this.bridgeIssue.message, true);
+          return result;
+        });
       }
       // A manual Retry is the operator saying "try again now", so it clears a
       // ladder that has stood down and restarts a decaying one from the top.
@@ -5398,7 +5507,28 @@ export default {
           const snapshot = await apiGet(this.auth, "snapshot");
           if (this.disposed || generation !== this.snapshotGeneration || this.snapshotRefreshBlocked) return false;
           if (snapshot.schema !== SNAPSHOT_SCHEMA) throw new Error("Unsupported DSM API schema");
-          this.snapshot = snapshot;
+          // generated_at_epoch is the package clock's reading at generation
+          // time and ticks forward on every single read regardless of
+          // whether anything else changed (src/dsm_api.rs's current_epoch()
+          // call; its own test helper calls the field "the single normalised
+          // field" for exactly this reason). Comparing the raw JSON text
+          // would defeat this diff on every single poll. Compare it with
+          // that one field zeroed out instead, and when everything else is
+          // byte-identical, patch just that property onto the retained
+          // object rather than replacing it -- so controllerLiveness's
+          // dead-controller check keeps advancing while every other
+          // snapshot-derived computed (profiles, routines, healthRows,
+          // nextRun, realtimeDetail, the activity lenses...) is spared a
+          // recompute Vue would otherwise run for no reason but a fresh
+          // object reference.
+          const comparable = Object.assign({}, snapshot, { generated_at_epoch: 0 });
+          const serialized = JSON.stringify(comparable);
+          if (serialized !== this.snapshotSignature) {
+            this.snapshot = snapshot;
+            this.snapshotSignature = serialized;
+          } else if (this.snapshot) {
+            this.snapshot.generated_at_epoch = snapshot.generated_at_epoch;
+          }
           this.snapshotReceivedAtMs = Date.now();
           this.snapshotFailureCode = "";
           this.snapshotFailureStreak = 0;
@@ -6216,6 +6346,24 @@ export default {
     loadRoutine(profileName) { const profile = typeof profileName === "string" ? profileName : this.routineForm.profile; const routine = this.routines.find((item) => String(item.profile) === String(profile)); this.routineForm = routine ? { profile, enabled: routine.enabled === true, action: routine.action || "sync", mode: routine.mode || "interval", interval_seconds: numberOr(routine.interval_seconds, 3600), weekdays: Array.isArray(routine.weekdays) ? routine.weekdays.map(Number) : String(routine.weekdays || "1,2,3,4,5,6,7").split(",").map(Number), time_window_start: routine.time_window_start || routine.window_start || "00:00", time_window_end: routine.time_window_end || routine.window_end || "23:59", debounce_seconds: numberOr(routine.debounce_seconds, 45), poll_seconds: numberOr(routine.poll_seconds, 30), retry_count: numberOr(routine.retry_count, 5), retry_backoff_seconds: numberOr(routine.retry_backoff_seconds, 60), retry_exponential: routine.retry_exponential !== false, allow_delete: routine.allow_delete === true, max_total_delete: numberOr(routine.max_total_delete, 100), depends_on: arrayOf(routine.depends_on).map(String) } : emptyRoutine(profile); this.hydrateAutosave("routine", this.routinePayload(), false); if (this.autosaveCoordinator) this.autosaveCoordinator.setScopeBlocked("routine", this.autosaveFailureScopes.routine || !routine); },
     openRoutine(profile = "") { if (this.operationBusy || (!profile && !this.canChangeRoutines)) return; this.routineEditorOpen = true; this.loadRoutine(profile); },
     closeRoutine() { this.cancelAutosave("routine"); this.routineEditorOpen = false; this.routineForm = emptyRoutine(); },
+    // A realtime routine reports next_run_epoch=0 by design -- it has no
+    // schedule to report, only an observation state -- so formatDate() would
+    // otherwise call a perfectly healthy, idle realtime routine "Unavailable",
+    // which reads as an error. "Watching" says what it is actually doing;
+    // when it is not actually observing anything, the reason says why.
+    routineNextRunLabel(routine) {
+      if (!routine.enabled) return "Disabled";
+      if (routine.mode === "realtime" && !(Number(routine.next_run_epoch) > 0)) {
+        const reason = String(routine.backend_reason || "ok");
+        return reason === "ok" ? "Watching" : reason;
+      }
+      return formatDate(routine.next_run_epoch);
+    },
+    // The routine editor's only source for "why" a realtime routine is not
+    // observing changes: the snapshot carries the fixed reason code and
+    // nothing else, so this has to be true for every routine that reaches it
+    // rather than naming a specific log line or errno string.
+    realtimeReasonGuidance(reason) { return REALTIME_REASON_GUIDANCE[reason] || ""; },
     routinePayload() {
       const payload = { profile: this.routineForm.profile, enabled: this.routineForm.enabled === true, action: this.routineForm.action, mode: this.routineForm.mode, retry_count: this.integer(this.routineForm.retry_count, 5), retry_backoff_seconds: this.integer(this.routineForm.retry_backoff_seconds, 60), retry_exponential: this.routineForm.retry_exponential !== false, allow_delete: this.routineForm.allow_delete === true, max_total_delete: this.integer(this.routineForm.max_total_delete, 100), depends_on: this.routineForm.depends_on.map(String) };
       if (payload.mode === "interval") payload.interval_seconds = this.integer(this.routineForm.interval_seconds, 3600);
@@ -6689,7 +6837,7 @@ export default {
         `Visible events: ${events.length}`,
         `Category filter: ${troubleshootingField(this.activityCategory, "all")}`,
         `Level filter: ${troubleshootingField(this.activityLevel, "all")}`,
-        `Search filter: ${troubleshootingField(this.activitySearch, "none")}`
+        `Search filter: ${troubleshootingField(this.activitySearchDebounced, "none")}`
       ].join("\n");
       const body = events.map((event, index) => `\n--- Event ${index + 1} ---\n${this.activityEvidence(event)}`).join("\n");
       return this.copyTroubleshootingText(

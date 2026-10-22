@@ -608,7 +608,22 @@ pub enum Phase {
     Logout,
 }
 
-/// One completed mutation exposed without internal plan types.
+/// Why a mirror deletion was kept rather than performed.
+///
+/// Declared here rather than re-exported, for the reason [`MutationEvent`] is: the SDK surface is
+/// stable and free of internal types, so an engine enum gaining a variant is a decision this layer
+/// makes explicitly instead of one that leaks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeleteKept {
+    /// The local path the deletion was scheduled against exists again.
+    LocalPathExists,
+    /// A deletion beneath this directory was kept, so the directory is not empty and a
+    /// non-recursive delete of it could only fail.
+    KeptDescendant,
+}
+
+/// One mutation exposed without internal plan types.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "operation", rename_all = "kebab-case")]
 pub enum MutationEvent {
@@ -633,6 +648,19 @@ pub enum MutationEvent {
     },
     RemoteExtraDeleted {
         remote_path: String,
+    },
+    /// A mirror deletion that did not happen, and why. Reported so an embedding caller's counts
+    /// distinguish a mirror that converged from one that declined to.
+    RemoteExtraDeleteSkipped {
+        remote_path: String,
+        relative: String,
+        reason: DeleteKept,
+    },
+    /// A file whose planned deletion was kept, uploaded later in the same run so the mirror
+    /// converges rather than deferring to the next run.
+    KeptDeleteUploaded {
+        relative: String,
+        bytes: u64,
     },
 }
 
@@ -818,7 +846,7 @@ impl Engine {
                 },
             )?;
             let mut remote = client
-                .remote_inventory(&root, cancellation)
+                .remote_inventory(&root, &rules, cancellation)
                 .map_err(SdkError::from_core)?;
             emit(
                 cancellation,
@@ -1158,7 +1186,7 @@ fn reconciliation_plan(
         local::scan(&request.source, rules, cancellation).map_err(SdkError::from_core)?;
     check_cancellation(cancellation)?;
     let mut remote = client
-        .remote_inventory(root, cancellation)
+        .remote_inventory(root, rules, cancellation)
         .map_err(SdkError::from_core)?;
     check_cancellation(cancellation)?;
     if request.comparison == Comparison::Content {
@@ -1279,6 +1307,21 @@ fn mutation_event(event: ExecutionEvent) -> MutationEvent {
         ExecutionEvent::Uploaded { relative, bytes } => MutationEvent::Uploaded { relative, bytes },
         ExecutionEvent::RemoteExtraDeleted { remote_path } => {
             MutationEvent::RemoteExtraDeleted { remote_path }
+        }
+        ExecutionEvent::RemoteExtraDeleteSkipped {
+            remote_path,
+            relative,
+            reason,
+        } => MutationEvent::RemoteExtraDeleteSkipped {
+            remote_path,
+            relative,
+            reason: match reason {
+                sync::DeleteKeptReason::LocalPathExists => DeleteKept::LocalPathExists,
+                sync::DeleteKeptReason::KeptDescendant => DeleteKept::KeptDescendant,
+            },
+        },
+        ExecutionEvent::KeptDeleteUploaded { relative, bytes } => {
+            MutationEvent::KeptDeleteUploaded { relative, bytes }
         }
     }
 }

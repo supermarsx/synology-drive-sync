@@ -81,6 +81,36 @@ test("toast surfaces stay opaque despite host DSM styling", async () => {
   assertSolidToastContract(distCss, "built CSS");
 });
 
+/**
+ * Dashboard review #5. The toast container's `aria-live="polite"` region
+ * used to wrap toast items that each also carried an implicit live region of
+ * their own (role="alert" is assertive, role="status" is polite) -- nesting
+ * live regions like that announces an error toast at the wrong level, or
+ * twice, depending on the screen reader. Pick one: the container's, since
+ * `<div class="sdsync-toasts" aria-live="polite"` is itself a structural
+ * marker validate_spk.py pins for the native DSM AppWindow's toast host.
+ */
+test("the toast region has exactly one live-region mechanism: the container's aria-live, not a second one per toast", async () => {
+  const app = await readFile(appSourceUrl, "utf8");
+  const container = app.match(/<div class="sdsync-toasts"[^>]*>/);
+  assert.ok(container, "toast container markup is missing");
+  assert.match(
+    container[0],
+    /aria-live="polite"/,
+    "validate_spk.py pins this exact prefix as the native DSM AppWindow's toast host"
+  );
+  const toastItem = app.match(/<div v-for="toastItem in toasts"[^>]*>/);
+  assert.ok(toastItem, "toast item markup is missing");
+  assert.doesNotMatch(
+    toastItem[0],
+    /role=/,
+    "a per-toast role would be a second, nested live region beside the container's"
+  );
+  // The visual distinction between an error and an ordinary toast must
+  // survive losing its ARIA mechanism -- is-error still drives the CSS.
+  assert.match(toastItem[0], /'is-error': toastItem\.error/);
+});
+
 test("profile progress is an opaque visual duplicate of the in-form live status", async () => {
   const [appSource, sourceCss, distCss] = await Promise.all([
     readFile(appSourceUrl, "utf8"),

@@ -207,6 +207,25 @@ fn no_delete_overrides_a_falsey_and_a_truthy_delete_environment() {
             "{label}: a deletion survived --no-delete"
         );
     }
+
+    // `--no-delete` disarms the fuse it makes redundant rather than colliding with it. There is no
+    // `--no-allow-empty-source` to pair with it, so a contradiction here left the safest invocation
+    // available unusable: the DSM package writes `allow-empty-source` only alongside `delete`, and
+    // `sdsync-run` appends `--no-delete` whenever a routine's delete switch is off, so a routine
+    // configured that way never ran at all -- the core refused its own argv while `config validate`
+    // passed, because the profile itself was consistent.
+    let disarmed = fixture.plan(
+        &[
+            ("SDSYNC_DELETE", "true"),
+            ("SDSYNC_ALLOW_EMPTY_SOURCE", "true"),
+        ],
+        &["--no-delete"],
+    );
+    let planned = assert_planned(
+        "SDSYNC_DELETE=true SDSYNC_ALLOW_EMPTY_SOURCE=true --no-delete",
+        &disarmed,
+    );
+    assert_eq!(planned["plan"]["summary"]["deletions"], 0);
 }
 
 #[test]

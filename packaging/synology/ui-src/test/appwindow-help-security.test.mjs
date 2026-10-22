@@ -821,10 +821,14 @@ test("Activity bounds messages, renders correlation, and searches text or reques
       client_request_id: "<script>not-a-request-id</script>"
     }
   ];
+  // activitySearchDebounced, not activitySearch, is what reversedActivity
+  // filters on; passing the same value for both models the debounce having
+  // already settled, which is what every call below actually wants to test.
   const filtered = (activitySearch = "", activityCategory = "all", activityLevel = "all") => (
     component.computed.reversedActivity.call({
       activityEvents,
       activitySearch,
+      activitySearchDebounced: activitySearch,
       activityCategory,
       activityLevel
     })

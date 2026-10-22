@@ -42,6 +42,23 @@ import validate_spk  # noqa: E402
 ARM_EABI5_HARD_FLOAT = 0x05000400
 PACKAGE_TOOL_TIMEOUT_SECONDS = 120
 
+#: Timeout for a wait that polls in-process controller output (log events,
+#: state/capture files) while a background controller subprocess is expected
+#: to make progress, as opposed to observing real OS process state. Raised
+#: from 15.0s after the 2026-09-24 CI failure in
+#: test_controller_native_realtime_waits_for_a_full_quiet_period, where a
+#: loaded runner needed more than 15s to observe a state transition that
+#: normally lands in under 1s. A shared constant so a future bump is one
+#: edit instead of a per-site hunt.
+IN_PROCESS_POLL_TIMEOUT_SECONDS = 30.0
+
+#: Timeout for a wait that observes real OS process state (start-tick
+#: identity, /proc/<pid>/stat) rather than in-process controller output.
+#: Kept distinct from IN_PROCESS_POLL_TIMEOUT_SECONDS because it bounds a
+#: different failure mode: a process that never exits, not a controller turn
+#: that is merely slow under load.
+PROCESS_OBSERVATION_TIMEOUT_SECONDS = 30.0
+
 
 def select_validator_binary_path(
     override: str | None, fallback_candidates: list[Path]
@@ -2905,7 +2922,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                     pass
 
     def wait_for_verified_process_exit(
-        self, identity_file: Path, *, timeout: float = 15.0
+        self, identity_file: Path, *, timeout: float = PROCESS_OBSERVATION_TIMEOUT_SECONDS
     ) -> None:
         identity_deadline = time.monotonic() + timeout
         while not identity_file.is_file() and time.monotonic() < identity_deadline:
@@ -3118,6 +3135,55 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "PATH": f"{fake_bin}:{self.environment['PATH']}",
             "SDSYNC_TEST_CLOCK": str(clock),
         }
+
+    def realtime_watcher_environment(
+        self, *, label: str = "watch", initial_clock: int = 100
+    ) -> tuple[dict[str, str], Path]:
+        """A controllable clock plus a long-lived, killable fake inotifywait.
+
+        date +%s reads (and only advances) a clock file the caller writes
+        directly; sleep collapses multi-second waits to 0.03s the same way
+        fast_clock_environment's does; inotifywait stays alive until
+        TERM/INT, matching the long-lived fixture pinned at the fake-watcher
+        needle used across the native-realtime tests. Returns the
+        environment dict and the clock file path.
+        """
+        fake_bin = self.root / f"{label}-realtime-bin"
+        fake_bin.mkdir(mode=0o700)
+        clock = self.root / f"{label}-realtime-clock"
+        clock.write_text(f"{initial_clock}\n", encoding="utf-8")
+        fake_date = fake_bin / "date"
+        fake_date.write_text(
+            "#!/bin/sh\n"
+            ': "${SDSYNC_TEST_CLOCK:?}"\n'
+            'case "${1:-}" in\n'
+            '  +%s) exec /bin/cat "$SDSYNC_TEST_CLOCK" ;;\n'
+            '  +%u) echo 1 ;;\n'
+            '  +%H%M) echo 1200 ;;\n'
+            '  +%Y-%m-%d) echo 2026-08-24 ;;\n'
+            '  *) exec /bin/date "$@" ;;\n'
+            'esac\n',
+            encoding="utf-8",
+        )
+        fake_sleep = fake_bin / "sleep"
+        fake_sleep.write_text(
+            "#!/bin/sh\ncase ${1:-} in 1) exec /bin/sleep 1 ;; *) exec /bin/sleep 0.03 ;; esac\n",
+            encoding="utf-8",
+        )
+        fake_inotify = fake_bin / "inotifywait"
+        fake_inotify.write_text(
+            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do /bin/sleep 1; done\n",
+            encoding="utf-8",
+        )
+        for path in (fake_date, fake_sleep, fake_inotify):
+            path.chmod(0o755)
+        if os.getuid() == 0:
+            for path in (fake_bin, clock, fake_date, fake_sleep, fake_inotify):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        return (
+            {"PATH": f"{fake_bin}:{self.environment['PATH']}", "SDSYNC_TEST_CLOCK": str(clock)},
+            clock,
+        )
 
     def write_mock_control_job(
         self,
@@ -7425,6 +7491,1675 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
         self.assertFalse(list((self.real_var / "run").glob("fingerprint.*")))
 
+    def test_realtime_poll_reports_unreadable_subtree_without_dispatch(self) -> None:
+        # Row 1. chmod 000 on a subdirectory makes find's walk fail with a
+        # non-empty stderr line on both the first attempt and the tolerated
+        # retry (a permission failure repeats; it is not the vanished-file
+        # race the retry exists for), so source_fingerprint returns 70 and
+        # the controller reports poll_unreadable rather than a stage failure.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        (self.source_two / "visible.txt").write_text("one\n", encoding="utf-8")
+        locked = self.source_two / "locked"
+        locked.mkdir()
+        if os.getuid() == 0:
+            os.chown(locked, self.drop_uid, self.drop_gid)
+        locked.chmod(0o000)
+        self.addCleanup(lambda: locked.chmod(0o700))
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        self.capture.write_text("", encoding="utf-8")
+        fast_environment = self.fast_clock_environment(step=31)
+        started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        matches = self.wait_for_controller_event("routine_poll_unavailable")
+        unreadable = [m for m in matches if "reason=unreadable_subtree" in str(m.get("detail", ""))]
+        self.assertTrue(unreadable, matches)
+        self.assertNotIn("sync --profile watch --no-delete", self.capture.read_text(encoding="utf-8"))
+        watch_state = self.real_var / "state/routines/watch.state"
+        if watch_state.exists():
+            self.assertIn("backend_reason=poll_unreadable", watch_state.read_text(encoding="utf-8"))
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_poll_failure_logs_once_not_every_five_seconds(self) -> None:
+        # Row 2. Same permanent fault as row 1, but the assertion is on
+        # volume: with the poll clock advancing on every attempt and the log
+        # line gated on a backend_reason transition, a permanent failure logs
+        # exactly once, never again, however many 5-second turns elapse.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        locked = self.source_two / "locked"
+        locked.mkdir()
+        if os.getuid() == 0:
+            os.chown(locked, self.drop_uid, self.drop_gid)
+        locked.chmod(0o000)
+        self.addCleanup(lambda: locked.chmod(0o700))
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "30", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        fast_environment = self.fast_clock_environment(step=31)
+        started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.wait_for_controller_event("routine_poll_unavailable")
+        time.sleep(1.0)
+        matches = [r for r in self.controller_events() if r.get("event") == "routine_poll_unavailable"]
+        self.assertEqual(len(matches), 1, matches)
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_poll_prunes_eadir_instead_of_failing(self) -> None:
+        # Row 3. @eaDir is pruned before find ever descends into it, so a
+        # mode-0000 @eaDir (the normal shape under a share with restrictive
+        # ACLs) must not fail the poll at all.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        eadir = self.source_two / "@eaDir"
+        eadir.mkdir()
+        if os.getuid() == 0:
+            os.chown(eadir, self.drop_uid, self.drop_gid)
+        eadir.chmod(0o000)
+        self.addCleanup(lambda: eadir.chmod(0o700))
+        (self.source_two / "visible.txt").write_text("one\n", encoding="utf-8")
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        fast_environment = self.fast_clock_environment(step=31)
+        started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        state_path = self.real_var / "state/routines/watch.state"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if state_path.is_file() and "fingerprint=none" not in state_path.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("poll did not establish a baseline despite the pruned @eaDir")
+        self.assertIn("backend_reason=ok", state_path.read_text(encoding="utf-8"))
+        self.assertFalse(
+            any(r.get("event") == "routine_poll_unavailable" for r in self.controller_events())
+        )
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_poll_tolerates_one_vanished_file_and_counts_retry(self) -> None:
+        # Row 4. A find that fails with non-empty stderr exactly once, then
+        # succeeds, must not be reported at all: one tolerated retry,
+        # poll_retries incremented, backend_reason stays ok, no dispatch.
+        real_find = shutil.which("find") or "/usr/bin/find"
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        (self.source_two / "one.txt").write_text("one\n", encoding="utf-8")
+        fake_bin = self.root / "vanished-file-bin"
+        fake_bin.mkdir(mode=0o700)
+        counter = self.root / "vanished-file-count"
+        counter.write_text("0\n", encoding="utf-8")
+        fake_find = fake_bin / "find"
+        fake_find.write_text(
+            "#!/bin/sh\n"
+            f'counter="{counter}"\n'
+            'IFS= read -r count < "$counter"\n'
+            'count=$((count + 1))\n'
+            'printf \'%s\\n\' "$count" > "$counter"\n'
+            'if [ "$count" -eq 1 ]; then\n'
+            '  echo "find: vanished: No such file or directory" >&2\n'
+            '  exit 1\n'
+            'fi\n'
+            f'exec {real_find} "$@"\n',
+            encoding="utf-8",
+        )
+        fake_find.chmod(0o755)
+        if os.getuid() == 0:
+            for path in (fake_bin, counter, fake_find):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        fast_environment = self.fast_clock_environment(step=31)
+        fast_environment["PATH"] = f"{fake_bin}:{fast_environment['PATH']}"
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        state_path = self.real_var / "state/routines/watch.state"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if state_path.is_file() and "fingerprint=none" not in state_path.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("poll did not establish a baseline after the tolerated retry")
+        state_text = state_path.read_text(encoding="utf-8")
+        self.assertIn("backend_reason=ok", state_text)
+        self.assertIn("poll_retries=1", state_text)
+        self.assertFalse(
+            any(r.get("event") == "routine_poll_unavailable" for r in self.controller_events())
+        )
+        self.assertNotIn("sync --profile watch --no-delete", self.capture.read_text(encoding="utf-8"))
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_poll_quiet_period_requires_two_matching_readings(self) -> None:
+        # Rows 6 and 7. First differing reading -> pending, no dispatch.
+        # Second, unchanged reading -> promote and dispatch, within two
+        # poll_seconds intervals.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        watched_file = self.source_two / "watched.txt"
+        watched_file.write_text("one\n", encoding="utf-8")
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        self.capture.write_text("", encoding="utf-8")
+        fast_environment = self.fast_clock_environment(step=31)
+        started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        state_path = self.real_var / "state/routines/watch.state"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if state_path.is_file() and "fingerprint=none" not in state_path.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("realtime polling did not establish its initial fingerprint")
+        invocation = "sync --profile watch --no-delete"
+        self.assertNotIn(invocation, self.capture.read_text(encoding="utf-8"))
+
+        watched_file.write_text("two\n", encoding="utf-8")
+        pending_deadline = time.monotonic() + 15
+        while time.monotonic() < pending_deadline:
+            state = dict(
+                line.split("=", 1) for line in state_path.read_text(encoding="utf-8").splitlines() if "=" in line
+            )
+            if state.get("pending_fingerprint", "0") != "0":
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("the first differing reading was never recorded as pending")
+        # The first difference alone must not dispatch.
+        self.assertNotIn(invocation, self.capture.read_text(encoding="utf-8"))
+
+        dispatch_deadline = time.monotonic() + 15
+        while time.monotonic() < dispatch_deadline:
+            if invocation in self.capture.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("a second unchanged reading did not dispatch within two intervals")
+        time.sleep(0.3)
+        self.assertEqual(self.capture.read_text(encoding="utf-8").count(invocation), 1)
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_polling_ceiling_forces_dispatch_on_a_continuously_differing_source(self) -> None:
+        # Mirrors row 8, but for the fingerprint-poll path rather than the
+        # native-watcher path: poll_seconds=5 -> ceiling = max(5*4, 5+60)
+        # clamped <=3600 = 65. A source rewritten on every single poll (so it
+        # never produces the second identical reading rows 6/7 require) must
+        # still dispatch once pending_since_epoch is 65s old, via the same
+        # routine_event_forced log event the native ceiling uses.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        watched_file = self.source_two / "watched.txt"
+        watched_file.write_text("baseline\n", encoding="utf-8")
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        self.capture.write_text("", encoding="utf-8")
+        fast_environment = self.fast_clock_environment(step=31)
+        started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        state_path = self.real_var / "state/routines/watch.state"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if state_path.is_file() and "fingerprint=none" not in state_path.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("realtime polling did not establish its initial fingerprint")
+
+        invocation = "sync --profile watch --no-delete"
+        tick = [0]
+        stop_writing = threading.Event()
+
+        def keep_changing() -> None:
+            while not stop_writing.is_set():
+                tick[0] += 1
+                watched_file.write_text(f"tick {tick[0]}\n", encoding="utf-8")
+                time.sleep(0.02)
+
+        writer = threading.Thread(target=keep_changing, daemon=True)
+        writer.start()
+        try:
+            dispatch_deadline = time.monotonic() + 20
+            dispatched = False
+            while time.monotonic() < dispatch_deadline:
+                if invocation in self.capture.read_text(encoding="utf-8"):
+                    dispatched = True
+                    break
+                time.sleep(0.03)
+        finally:
+            stop_writing.set()
+            writer.join(timeout=5)
+        self.assertTrue(dispatched, "the polling ceiling never forced a dispatch on a continuously differing source")
+        details = self.event_details("routine_event_forced")
+        self.assertTrue(any("ceiling=65" in detail for detail in details), details)
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_native_ceiling_forces_dispatch_on_continuous_writes(self) -> None:
+        # Row 8. debounce=45 -> ceiling = max(45*4, 45+60) clamped <=3600 =
+        # 180. Rewriting the marker every 40s (< debounce) for 190s of
+        # simulated clock must force exactly one dispatch via the ceiling,
+        # never via the ordinary debounce-satisfied path.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        (self.source_two / "watched.txt").write_text("initial\n", encoding="utf-8")
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--debounce-seconds", "45", "--poll-seconds", "3600",
+            "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        environment, clock = self.realtime_watcher_environment(label="ceiling")
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        state_path = self.real_var / "state/routines/watch.state"
+        event_path = self.real_var / "run/watch-watch.events"
+        initialization_deadline = time.monotonic() + 15
+        while time.monotonic() < initialization_deadline:
+            if (
+                state_path.is_file()
+                and "fingerprint=none" not in state_path.read_text(encoding="utf-8")
+                and event_path.is_file()
+            ):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("native watcher did not establish its initial fingerprint and event file")
+
+        invocation = "sync --profile watch --no-delete"
+        now = 100
+        end = now + 4 * 45 + 10
+        dispatched = False
+        while now < end:
+            now += 40
+            clock.write_text(f"{now}\n", encoding="utf-8")
+            event_path.write_text(f"rewrite at {now}\n", encoding="utf-8")
+            os.utime(event_path, (now, now))
+            time.sleep(0.05)
+            if invocation in self.capture.read_text(encoding="utf-8"):
+                dispatched = True
+                break
+        self.assertTrue(dispatched, "the native ceiling never forced a dispatch on a continuously rewritten source")
+        details = self.event_details("routine_event_forced")
+        self.assertTrue(any("ceiling=180" in detail for detail in details), details)
+        self.assertTrue(any(int(detail.split("pending_seconds=")[1].split()[0]) >= 180 for detail in details if "pending_seconds=" in detail), details)
+        time.sleep(0.3)
+        self.assertEqual(self.capture.read_text(encoding="utf-8").count(invocation), 1)
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_native_ceiling_dispatch_survives_identity_change_at_consume(self) -> None:
+        # Row 9 -- pins section 2.3's trap 2. On the overdue path the source
+        # is still being written, so the marker's generation almost always
+        # differs between the due check and the STOP-based consume. Without
+        # the literal 0 identity sentinel on that one call,
+        # consume_realtime_event returns 1 on the mismatch, the controller
+        # continues, and the forced dispatch silently never happens -- no log
+        # line, no failed assertion anywhere else, just a routine that never
+        # runs. The fake watcher here writes continuously in real time
+        # (independent of the simulated clock) for exactly that reason.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        (self.source_two / "watched.txt").write_text("initial\n", encoding="utf-8")
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--debounce-seconds", "2", "--poll-seconds", "3600",
+            "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        fake_bin = self.root / "ceiling-race-bin"
+        fake_bin.mkdir(mode=0o700)
+        clock = self.root / "ceiling-race-clock"
+        clock.write_text("100\n", encoding="utf-8")
+        fake_date = fake_bin / "date"
+        fake_date.write_text(
+            "#!/bin/sh\n"
+            ': "${SDSYNC_TEST_CLOCK:?}"\n'
+            'case "${1:-}" in\n'
+            '  +%s) exec /bin/cat "$SDSYNC_TEST_CLOCK" ;;\n'
+            '  +%u) echo 1 ;;\n'
+            '  +%H%M) echo 1200 ;;\n'
+            '  +%Y-%m-%d) echo 2026-08-24 ;;\n'
+            '  *) exec /bin/date "$@" ;;\n'
+            'esac\n',
+            encoding="utf-8",
+        )
+        fake_sleep = fake_bin / "sleep"
+        fake_sleep.write_text(
+            "#!/bin/sh\ncase ${1:-} in 1) exec /bin/sleep 1 ;; *) exec /bin/sleep 0.03 ;; esac\n",
+            encoding="utf-8",
+        )
+        fake_inotify = fake_bin / "inotifywait"
+        fake_inotify.write_text(
+            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do printf 'tick\\n'; /bin/sleep 0.02; done\n",
+            encoding="utf-8",
+        )
+        for path in (fake_date, fake_sleep, fake_inotify):
+            path.chmod(0o755)
+        if os.getuid() == 0:
+            for path in (fake_bin, clock, fake_date, fake_sleep, fake_inotify):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        environment = {"PATH": f"{fake_bin}:{self.environment['PATH']}", "SDSYNC_TEST_CLOCK": str(clock)}
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        state_path = self.real_var / "state/routines/watch.state"
+        event_path = self.real_var / "run/watch-watch.events"
+        initialization_deadline = time.monotonic() + 15
+        while time.monotonic() < initialization_deadline:
+            if (
+                state_path.is_file()
+                and "fingerprint=none" not in state_path.read_text(encoding="utf-8")
+                and event_path.is_file()
+            ):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("native watcher did not establish its initial fingerprint and event file")
+
+        invocation = "sync --profile watch --no-delete"
+        now = 100
+        dispatch_deadline = time.monotonic() + 20
+        dispatched = False
+        while time.monotonic() < dispatch_deadline:
+            now += 5
+            clock.write_text(f"{now}\n", encoding="utf-8")
+            if invocation in self.capture.read_text(encoding="utf-8"):
+                dispatched = True
+                break
+            time.sleep(0.05)
+        self.assertTrue(dispatched, "a continuously rewritten marker discarded the forced ceiling dispatch")
+        details = self.event_details("routine_event_forced")
+        self.assertTrue(any("ceiling=62" in detail for detail in details), details)
+        time.sleep(0.3)
+        self.assertEqual(self.capture.read_text(encoding="utf-8").count(invocation), 1)
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_debounce_holds_below_the_ceiling(self) -> None:
+        # Row 10. Rewriting every (debounce - 5)s for 2 x debounce s must
+        # never dispatch: still below both the ordinary debounce and the
+        # ceiling.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        (self.source_two / "watched.txt").write_text("initial\n", encoding="utf-8")
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--debounce-seconds", "45", "--poll-seconds", "3600",
+            "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        environment, clock = self.realtime_watcher_environment(label="below-ceiling")
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        state_path = self.real_var / "state/routines/watch.state"
+        event_path = self.real_var / "run/watch-watch.events"
+        initialization_deadline = time.monotonic() + 15
+        while time.monotonic() < initialization_deadline:
+            if (
+                state_path.is_file()
+                and "fingerprint=none" not in state_path.read_text(encoding="utf-8")
+                and event_path.is_file()
+            ):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("native watcher did not establish its initial fingerprint and event file")
+
+        invocation = "sync --profile watch --no-delete"
+        now = 100
+        end = now + 2 * 45
+        while now < end:
+            now += 40
+            clock.write_text(f"{now}\n", encoding="utf-8")
+            event_path.write_text(f"rewrite at {now}\n", encoding="utf-8")
+            os.utime(event_path, (now, now))
+            time.sleep(0.05)
+        self.assertNotIn(invocation, self.capture.read_text(encoding="utf-8"))
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_watch_limit_refused_before_spawn(self) -> None:
+        # Row 11, via team-lead's source-substitution decision:
+        # inotify_watch_limit_path is a fixed absolute path in the shipped
+        # script, so redirect it in this test's own installed copy, the same
+        # technique setUp itself uses for package_base= and
+        # instrument_admitted_launch_signal uses for its launch site. No hook
+        # is added to the shipped script.
+        controller = self.real_target / "libexec/sdsync-controller"
+        controller_source = controller.read_text(encoding="utf-8")
+        needle = "inotify_watch_limit_path=/proc/sys/fs/inotify/max_user_watches\n"
+        self.assertEqual(controller_source.count(needle), 1, "watch-limit path assignment changed")
+        limit_file = self.root / "watch-limit-fixture"
+        limit_file.write_text("8\n", encoding="utf-8")
+        controller.write_text(
+            controller_source.replace(
+                needle, f"inotify_watch_limit_path={shlex.quote(str(limit_file))}\n", 1
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        # dirs = source_two itself plus these ten = 11. The pre-spawn check
+        # compares against watcher_limit / 10 * 8 (integer shell arithmetic),
+        # which is 0 for a limit of 8 -- so 11 refuses regardless, and the
+        # ten extra subdirectories keep the refusal unambiguous rather than
+        # resting on the root directory alone.
+        for index in range(10):
+            (self.source_two / f"dir-{index}").mkdir()
+            if os.getuid() == 0:
+                os.chown(self.source_two / f"dir-{index}", self.drop_uid, self.drop_gid)
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "3600",
+            "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        fake_bin = self.root / "watch-limit-bin"
+        fake_bin.mkdir(mode=0o700)
+        invoked_marker = self.root / "watch-limit-invoked"
+        fake_inotify = fake_bin / "inotifywait"
+        fake_inotify.write_text(
+            "#!/bin/sh\n"
+            f': > "{invoked_marker}"\n'
+            "trap 'exit 0' TERM INT\nwhile :; do /bin/sleep 1; done\n",
+            encoding="utf-8",
+        )
+        fake_inotify.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(fake_bin, self.drop_uid, self.drop_gid)
+            os.chown(fake_inotify, self.drop_uid, self.drop_gid)
+        environment = {"PATH": f"{fake_bin}:{self.environment['PATH']}"}
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        matches = self.wait_for_controller_event("routine_watch_limit")
+        details = [str(m.get("detail", "")) for m in matches]
+        self.assertTrue(any("dirs=11" in d and "limit=8" in d for d in details), details)
+        state_path = self.real_var / "state/routines/watch.state"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            state_text = state_path.read_text(encoding="utf-8") if state_path.exists() else ""
+            if "backend=none" in state_text and "backend_reason=watch_limit" in state_text:
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("watch-limit refusal was never recorded in the routine state")
+        self.assertFalse(
+            invoked_marker.exists(), "inotifywait was spawned despite exceeding the watch limit"
+        )
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_watch_setup_failure_reports_sanitized_detail(self) -> None:
+        # Row 12. inotifywait exits 1 and writes "Couldn't watch <path>: ..."
+        # to stderr even under -q; that must land in the private
+        # watch-<profile>.stderr, never raw in controller.log, and
+        # routine_watch_failed's detail must carry it sanitized.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        (self.source_two / "watched.txt").write_text("one\n", encoding="utf-8")
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "3600",
+            "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        fake_bin = self.root / "watch-enospc-bin"
+        fake_bin.mkdir(mode=0o700)
+        fake_inotify = fake_bin / "inotifywait"
+        fake_inotify.write_text(
+            "#!/bin/sh\n"
+            "printf \"Couldn't watch %s: No space left on device\\n\" \"$8\" >&2\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        fake_inotify.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(fake_bin, self.drop_uid, self.drop_gid)
+            os.chown(fake_inotify, self.drop_uid, self.drop_gid)
+        environment = {"PATH": f"{fake_bin}:{self.environment['PATH']}"}
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        matches = self.wait_for_controller_event("routine_watch_failed")
+        details = [str(m.get("detail", "")) for m in matches]
+        self.assertTrue(any("No space left on device" in d for d in details), details)
+        controller_log_raw = (self.real_var / "log/controller.log").read_text(encoding="utf-8")
+        self.assertNotIn("Couldn't watch", controller_log_raw)
+        stderr_record = self.real_var / "run/watch-watch.stderr"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if stderr_record.exists() and stderr_record.read_text(encoding="utf-8").strip():
+                break
+            time.sleep(0.03)
+        self.assertIn("Couldn't watch", stderr_record.read_text(encoding="utf-8"))
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_watch_setup_failure_gives_up_after_five(self) -> None:
+        # Row 13. Five consecutive spawn failures must abandon: backend=none,
+        # backend_reason=watch_setup_failed, routine_watch_abandoned at
+        # error, and no sixth spawn attempt (the fake inotifywait counts its
+        # own invocations to a marker file).
+        self._watch_setup_failure_ladder(check_abandon=True)
+
+    def test_realtime_watch_setup_failure_backoff_is_exponential(self) -> None:
+        # Row 14, drafted against the actual give-up semantics rather than
+        # the contract's literal "...2400, 3600": the 5th failure abandons
+        # immediately (see the finding at the top of this file), so only
+        # four gaps are ever observed: 300, 600, 1200, 2400.
+        self._watch_setup_failure_ladder(check_abandon=False)
+
+    def _watch_setup_failure_ladder(self, *, check_abandon: bool) -> None:
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        (self.source_two / "watched.txt").write_text("one\n", encoding="utf-8")
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "3600",
+            "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        fake_bin = self.root / "watch-ladder-bin"
+        fake_bin.mkdir(mode=0o700)
+        clock = self.root / "watch-ladder-clock"
+        clock.write_text("1000\n", encoding="utf-8")
+        invocations = self.root / "watch-ladder-invocations"
+        invocations.write_text("0\n", encoding="utf-8")
+        fake_date = fake_bin / "date"
+        fake_date.write_text(
+            "#!/bin/sh\n"
+            ': "${SDSYNC_TEST_CLOCK:?}"\n'
+            'case "${1:-}" in\n'
+            '  +%s) exec /bin/cat "$SDSYNC_TEST_CLOCK" ;;\n'
+            '  +%u) echo 1 ;;\n'
+            '  +%H%M) echo 1200 ;;\n'
+            '  +%Y-%m-%d) echo 2026-08-24 ;;\n'
+            '  *) exec /bin/date "$@" ;;\n'
+            'esac\n',
+            encoding="utf-8",
+        )
+        fake_sleep = fake_bin / "sleep"
+        fake_sleep.write_text(
+            "#!/bin/sh\ncase ${1:-} in 1) exec /bin/sleep 1 ;; *) exec /bin/sleep 0.03 ;; esac\n",
+            encoding="utf-8",
+        )
+        fake_inotify = fake_bin / "inotifywait"
+        fake_inotify.write_text(
+            "#!/bin/sh\n"
+            f'invocations="{invocations}"\n'
+            'IFS= read -r count < "$invocations"\n'
+            'count=$((count + 1))\n'
+            'printf \'%s\\n\' "$count" > "$invocations"\n'
+            'exit 1\n',
+            encoding="utf-8",
+        )
+        for path in (fake_date, fake_sleep, fake_inotify):
+            path.chmod(0o755)
+        if os.getuid() == 0:
+            for path in (fake_bin, clock, invocations, fake_date, fake_sleep, fake_inotify):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        environment = {"PATH": f"{fake_bin}:{self.environment['PATH']}", "SDSYNC_TEST_CLOCK": str(clock)}
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        failed_path = self.real_var / "run/watch-watch.failed"
+
+        def wait_for_consecutive(n: int) -> None:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if failed_path.exists():
+                    fields = failed_path.read_text(encoding="utf-8").split()
+                    if len(fields) >= 2 and fields[1] == str(n):
+                        return
+                time.sleep(0.03)
+            self.fail(f"watch-watch.failed never reached consecutive={n}: {failed_path.read_text(encoding='utf-8') if failed_path.exists() else 'missing'}")
+
+        # Attempt 1 fails immediately (no prior record).
+        wait_for_consecutive(1)
+        gaps = []
+        now = 1000
+        for expected_consecutive, gap in ((2, 300), (3, 600), (4, 1200), (5, 2400)):
+            now += gap
+            clock.write_text(f"{now}\n", encoding="utf-8")
+            wait_for_consecutive(expected_consecutive)
+            gaps.append(gap)
+        self.assertEqual(gaps, [300, 600, 1200, 2400])
+
+        if check_abandon:
+            abandoned = self.wait_for_controller_event("routine_watch_abandoned")
+            self.assertTrue(any("consecutive=5" in str(m.get("detail", "")) for m in abandoned), abandoned)
+            state_path = self.real_var / "state/routines/watch.state"
+            state_text = state_path.read_text(encoding="utf-8")
+            self.assertIn("backend=none", state_text)
+            self.assertIn("backend_reason=watch_setup_failed", state_text)
+            invocations_before = int(invocations.read_text(encoding="utf-8").strip())
+            now += 3600
+            clock.write_text(f"{now}\n", encoding="utf-8")
+            time.sleep(0.5)
+            self.assertEqual(int(invocations.read_text(encoding="utf-8").strip()), invocations_before, "a sixth spawn was attempted after give-up")
+
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_watch_failure_record_is_forward_and_backward_compatible(self) -> None:
+        # Row 15. A pre-upgrade bare-epoch .failed file and the new
+        # three-field one must both parse; the bare epoch reads
+        # consecutive=1.
+        helper = self.root / "watch-failure-record-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            'read_realtime_watcher_failure "$1"\n'
+            'printf \'%s %s %s\\n\' "$watcher_failed_epoch" "$watcher_failed_consecutive" "$watcher_failed_reason"\n',
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        bare = self.root / "bare.failed"
+        bare.write_text("500\n", encoding="utf-8")
+        three_field = self.root / "three-field.failed"
+        three_field.write_text("500 3 watch_limit\n", encoding="utf-8")
+        if os.getuid() == 0:
+            for path in (helper, bare, three_field):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        bare_result = self.shell(helper, str(bare))
+        self.assertEqual(bare_result.returncode, 0, bare_result.stderr)
+        self.assertEqual(bare_result.stdout.strip(), "500 1 watch_setup_failed")
+        three_field_result = self.shell(helper, str(three_field))
+        self.assertEqual(three_field_result.returncode, 0, three_field_result.stderr)
+        self.assertEqual(three_field_result.stdout.strip(), "500 3 watch_limit")
+
+    def test_realtime_watcher_orphaned_on_stale_source(self) -> None:
+        # Row 16. Adopt a watcher, then rewrite the profile's source and
+        # HUP: the old pid must be gone and watch-<profile>.source must hold
+        # the new path.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        (self.source_two / "watched.txt").write_text("one\n", encoding="utf-8")
+        new_source = self.root / "watch-new-source"
+        new_source.mkdir()
+        if os.getuid() == 0:
+            os.chown(new_source, self.drop_uid, self.drop_gid)
+        (new_source / "watched.txt").write_text("one\n", encoding="utf-8")
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "3600",
+            "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        environment, _clock = self.realtime_watcher_environment(label="orphan-stale")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        pid_path = self.real_var / "run/watch-watch.pid"
+        source_record = self.real_var / "run/watch-watch.source"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if pid_path.is_file() and source_record.is_file():
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("watcher did not adopt on its original source")
+        original_pid = pid_path.read_text(encoding="utf-8").strip()
+        self.assertEqual(source_record.read_text(encoding="utf-8").strip(), str(self.source_two))
+
+        configured = self.shell(
+            self.manager, "configure-profile", "--name", "watch", "--source", str(new_source),
+            "--url", "https://files.example.test/", "--username", "watch-bot",
+            "--remote", "/home/Drive/Watch",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        reloaded = self.shell(self.lifecycle, "reload", timeout=15)
+        self.assertEqual(reloaded.returncode, 0, reloaded.stdout + reloaded.stderr)
+
+        orphaned_deadline = time.monotonic() + 15
+        while time.monotonic() < orphaned_deadline:
+            if (
+                source_record.is_file()
+                and source_record.read_text(encoding="utf-8").strip() == str(new_source)
+            ):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("the watcher never adopted the new source after the reload")
+        orphaned = self.wait_for_controller_event("routine_watch_orphaned")
+        self.assertTrue(any("reason=stale_source" in str(m.get("detail", "")) for m in orphaned), orphaned)
+        original_pid_live = True
+        try:
+            os.kill(int(original_pid), 0)
+        except (ProcessLookupError, ValueError):
+            original_pid_live = False
+        self.assertFalse(original_pid_live, "the orphaned watcher on the stale source was not terminated")
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_watcher_orphaned_when_stopped(self) -> None:
+        # Row 17. A watcher stopped out of band (State: T) must be refused
+        # adoption -- a new one spawned in its place, never reported as a
+        # healthy inotify backend for the stopped one.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        (self.source_two / "watched.txt").write_text("one\n", encoding="utf-8")
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "3600",
+            "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        environment, _clock = self.realtime_watcher_environment(label="orphan-stopped")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        pid_path = self.real_var / "run/watch-watch.pid"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if pid_path.is_file():
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("watcher did not spawn")
+        original_pid = int(pid_path.read_text(encoding="utf-8").strip())
+        os.kill(original_pid, signal.SIGSTOP)
+        try:
+            reloaded = self.shell(self.lifecycle, "reload", timeout=15)
+            self.assertEqual(reloaded.returncode, 0, reloaded.stdout + reloaded.stderr)
+            orphaned_deadline = time.monotonic() + 15
+            new_pid = None
+            while time.monotonic() < orphaned_deadline:
+                orphaned = [
+                    r for r in self.controller_events()
+                    if r.get("event") == "routine_watch_orphaned" and "reason=stopped" in str(r.get("detail", ""))
+                ]
+                if orphaned and pid_path.is_file():
+                    candidate = int(pid_path.read_text(encoding="utf-8").strip())
+                    if candidate != original_pid:
+                        new_pid = candidate
+                        break
+                time.sleep(0.03)
+            self.assertIsNotNone(new_pid, "no replacement watcher was spawned for the stopped one")
+        finally:
+            try:
+                os.kill(original_pid, signal.SIGCONT)
+                os.kill(original_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_watcher_terminated_when_inotifywait_uninstalled_mid_life(self) -> None:
+        # Row 18. Adopt, remove the fake inotifywait from PATH, then HUP: the
+        # live watcher (still argv[0]=inotifywait, package-owned) must still
+        # be TERMed via the weaker stoppable-identity check, never leaked.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        (self.source_two / "watched.txt").write_text("one\n", encoding="utf-8")
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "3600",
+            "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        fake_bin = self.root / "uninstall-mid-life-bin"
+        fake_bin.mkdir(mode=0o700)
+        fake_inotify = fake_bin / "inotifywait"
+        fake_inotify.write_text(
+            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do /bin/sleep 1; done\n",
+            encoding="utf-8",
+        )
+        fake_inotify.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(fake_bin, self.drop_uid, self.drop_gid)
+            os.chown(fake_inotify, self.drop_uid, self.drop_gid)
+        environment = {"PATH": f"{fake_bin}:{self.environment['PATH']}"}
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        pid_path = self.real_var / "run/watch-watch.pid"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if pid_path.is_file():
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("watcher did not spawn")
+        watcher_pid = int(pid_path.read_text(encoding="utf-8").strip())
+        fake_inotify.unlink()
+
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        gone_deadline = time.monotonic() + 15
+        while time.monotonic() < gone_deadline:
+            try:
+                os.kill(watcher_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("the orphaned watcher was not terminated after inotifywait left PATH")
+
+    def test_realtime_watcher_termination_leaves_no_zombies(self) -> None:
+        # Row 19. After a HUP with a realtime routine active, the controller
+        # must have reaped every TERMed watcher: no Z-state children.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        (self.source_two / "watched.txt").write_text("one\n", encoding="utf-8")
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "3600",
+            "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        environment, _clock = self.realtime_watcher_environment(label="no-zombies")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        pid_path = self.real_var / "run/watch-watch.pid"
+        controller_pid_path = self.real_var / "run/controller.pid"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if pid_path.is_file() and controller_pid_path.is_file():
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("watcher or controller did not start")
+        controller_pid = controller_pid_path.read_text(encoding="utf-8").strip()
+
+        for _ in range(3):
+            reloaded = self.shell(self.lifecycle, "reload", timeout=15)
+            self.assertEqual(reloaded.returncode, 0, reloaded.stdout + reloaded.stderr)
+            time.sleep(0.2)
+
+        zombies = []
+        task_children = Path(f"/proc/{controller_pid}/task")
+        if task_children.is_dir():
+            for task in task_children.iterdir():
+                children_file = task / "children"
+                if not children_file.is_file():
+                    continue
+                for child_pid in children_file.read_text(encoding="utf-8").split():
+                    stat_path = Path(f"/proc/{child_pid}/stat")
+                    if not stat_path.is_file():
+                        continue
+                    fields = stat_path.read_text(encoding="utf-8").rsplit(") ", 1)
+                    if len(fields) == 2 and fields[1].split()[0] == "Z":
+                        zombies.append(child_pid)
+        self.assertEqual(zombies, [])
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_source_removed_defers_and_kills_watcher(self) -> None:
+        # Row 20. Adopt, then rm -rf the source: routine_source_unavailable
+        # on transition, backend=none/backend_reason=source_missing, the
+        # watcher killed, a state file written.
+        source = self.root / "watch-removable-source"
+        source.mkdir()
+        if os.getuid() == 0:
+            os.chown(source, self.drop_uid, self.drop_gid)
+        (source / "watched.txt").write_text("one\n", encoding="utf-8")
+        self.assertEqual(self.configure("watch", source, "/home/Drive/Watch", True).returncode, 0)
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "5",
+            "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        fast_environment = self.fast_clock_environment(step=31)
+        started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        state_path = self.real_var / "state/routines/watch.state"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if state_path.is_file() and "fingerprint=none" not in state_path.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("baseline was never established before removing the source")
+
+        shutil.rmtree(source)
+        removed = self.wait_for_controller_event("routine_source_unavailable")
+        self.assertTrue(any("reason=missing" in str(m.get("detail", "")) for m in removed), removed)
+        state_deadline = time.monotonic() + 15
+        while time.monotonic() < state_deadline:
+            state_text = state_path.read_text(encoding="utf-8")
+            if "backend=none" in state_text and "backend_reason=source_missing" in state_text:
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("state file was not updated after the source was removed")
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_source_replaced_by_symlink_defers(self) -> None:
+        # Row 21. Replacing the source with a symlink to a real directory
+        # must defer with backend_reason=source_symlink, no dispatch, state
+        # written.
+        source = self.root / "watch-symlink-source"
+        source.mkdir()
+        if os.getuid() == 0:
+            os.chown(source, self.drop_uid, self.drop_gid)
+        (source / "watched.txt").write_text("one\n", encoding="utf-8")
+        self.assertEqual(self.configure("watch", source, "/home/Drive/Watch", True).returncode, 0)
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "5",
+            "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        fast_environment = self.fast_clock_environment(step=31)
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        state_path = self.real_var / "state/routines/watch.state"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if state_path.is_file() and "fingerprint=none" not in state_path.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("baseline was never established before the symlink swap")
+
+        real_target_dir = self.root / "watch-symlink-target"
+        shutil.move(str(source), str(real_target_dir))
+        source.symlink_to(real_target_dir)
+        symlinked = self.wait_for_controller_event("routine_source_unavailable")
+        self.assertTrue(any("reason=symlink" in str(m.get("detail", "")) for m in symlinked), symlinked)
+        state_deadline = time.monotonic() + 15
+        while time.monotonic() < state_deadline:
+            if "backend_reason=source_symlink" in state_path.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("state file did not record the symlinked source")
+        self.assertNotIn("sync --profile watch --no-delete", self.capture.read_text(encoding="utf-8"))
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_delete_bound_routine_defers_once_per_transition(self) -> None:
+        # Row 22. A routine whose own max_total_delete is weaker than its
+        # profile's must defer once on the transition into deferred, with a
+        # state file, and never again while it stays deferred -- not one
+        # warn line per five-second turn.
+        configured = self.shell(
+            self.manager, "configure-profile", "--name", "bound", "--source", str(self.source_one),
+            "--url", "https://files.example.test/", "--username", "bound-bot",
+            "--remote", "/home/Drive/Bound", "--delete", "--max-delete", "50",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        secret, _ = self.api(
+            "set-secret", "--profile", "bound", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        routine, _ = self.api(
+            "routine", "--profile", "bound", "--enabled", "true", "--action", "sync",
+            "--mode", "interval", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "true", "--max-total-delete", "10",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        fast_environment = self.fast_clock_environment(step=31)
+        started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.wait_for_controller_event("routine_deferred")
+        state_path = self.real_var / "state/routines/bound.state"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if state_path.is_file() and "state=deferred" in state_path.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("delete-bound routine never wrote a deferred state")
+        state_text = state_path.read_text(encoding="utf-8")
+        self.assertIn("backend=none", state_text)
+        self.assertIn("backend_reason=ok", state_text)
+        time.sleep(1.0)
+        matches = [
+            r for r in self.controller_events()
+            if r.get("event") == "routine_deferred" and "reason=delete_bound" in str(r.get("detail", ""))
+        ]
+        self.assertEqual(len(matches), 1, matches)
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_events_file_stays_small_during_debounce(self) -> None:
+        # Row 23. --format '' must still be on the spawn line: 5000 events
+        # during one debounce period must keep watch-<profile>.events well
+        # under 8 KiB, and the routine must still dispatch once quiet.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        (self.source_two / "watched.txt").write_text("initial\n", encoding="utf-8")
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--debounce-seconds", "2", "--poll-seconds", "3600",
+            "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        environment, clock = self.realtime_watcher_environment(label="events-size")
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        state_path = self.real_var / "state/routines/watch.state"
+        event_path = self.real_var / "run/watch-watch.events"
+        initialization_deadline = time.monotonic() + 15
+        while time.monotonic() < initialization_deadline:
+            if (
+                state_path.is_file()
+                and "fingerprint=none" not in state_path.read_text(encoding="utf-8")
+                and event_path.is_file()
+            ):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("native watcher did not establish its initial fingerprint and event file")
+
+        with event_path.open("a", encoding="utf-8") as handle:
+            for _ in range(5000):
+                handle.write("\n")
+        os.utime(event_path, None)
+        self.assertLess(event_path.stat().st_size, 8192)
+
+        now = 100
+        clock.write_text(f"{now + 3}\n", encoding="utf-8")
+        invocation = "sync --profile watch --no-delete"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if invocation in self.capture.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("the routine did not dispatch once the injected events file went quiet")
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_fingerprint_pipeline_matches_legacy_stat_loop_byte_for_byte(self) -> None:
+        # Row 28, revised for the v2: fingerprint tag. Pins the restated
+        # no-re-baseline claim: on a tree with no pruned directories, the
+        # cksum pair inside the current v2:<cksum>:<bytes> reading must equal
+        # the old per-file `sh -c` loop's pair exactly.
+        fixture = self.root / "fingerprint-oracle-tree"
+        fixture.mkdir()
+        if os.getuid() == 0:
+            os.chown(fixture, self.drop_uid, self.drop_gid)
+        for index in range(200):
+            path = fixture / f"file-{index:04d}.txt"
+            path.write_text(f"content {index}\n", encoding="utf-8")
+            if os.getuid() == 0:
+                os.chown(path, self.drop_uid, self.drop_gid)
+
+        # The oracle is the pre-batching per-file loop, with no prune list of
+        # its own -- deliberately, since this fixture holds none of the
+        # pruned names and the point is the cksum arithmetic, not the walk.
+        # It formats its own reading as "value:bytes", the same shape
+        # source_fingerprint's has once both its "<retries>|" and "v2:"
+        # prefixes are stripped, so the two sides compare with no further
+        # massaging on either one.
+        helper = self.root / "fingerprint-oracle-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            f'tree="{fixture}"\n'
+            'new_output=$(source_fingerprint "$tree")\n'
+            'new_reading=${new_output#*|}\n'
+            'case $new_reading in v2:*) ;; *) echo "reading missing v2: prefix: $new_reading" >&2; exit 1 ;; esac\n'
+            'new_fingerprint=${new_reading#v2:}\n'
+            'old_metadata=$(mktemp)\n'
+            'find "$tree" -type f -print | while IFS= read -r entry; do\n'
+            '  sh -c \'stat -c "%n|%s|%Y" "$1"\' sh "$entry"\n'
+            'done > "$old_metadata"\n'
+            'old_fingerprint=$(LC_ALL=C sort "$old_metadata" | cksum | awk \'{print $1 ":" $2}\')\n'
+            'rm -f "$old_metadata"\n'
+            'printf \'%s\\n%s\\n\' "$new_fingerprint" "$old_fingerprint"\n',
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(helper, self.drop_uid, self.drop_gid)
+        result = self.shell(helper)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), 2, result.stdout)
+        new_fingerprint, old_fingerprint = lines
+        self.assertEqual(new_fingerprint, old_fingerprint)
+
+    def test_realtime_fingerprint_rebases_an_untagged_baseline_without_dispatch(self) -> None:
+        # New, at the shell agent's suggestion (Step 8). An untagged
+        # pre-upgrade fingerprint (or any value failing
+        # valid_source_fingerprint) must be treated like a routine that has
+        # never been polled: adopt the current v2: reading as the baseline,
+        # log routine_fingerprint_rebased once, and never dispatch on the
+        # rebase itself.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        (self.source_two / "watched.txt").write_text("one\n", encoding="utf-8")
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        state_path = self.real_var / "state/routines/watch.state"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(
+            "state=succeeded\nnext_run_epoch=0\nlast_success_epoch=900\nlast_attempt_epoch=900\n"
+            "retry_attempt=0\nlast_day=none\nlast_poll_epoch=900\nfingerprint=2193023732:143890\n"
+            "backend=inotify\nbackend_reason=ok\npending_fingerprint=0\npending_since_epoch=0\n"
+            "event_first_seen_epoch=0\npoll_retries=0\n",
+            encoding="utf-8",
+        )
+        state_path.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(state_path, self.drop_uid, self.drop_gid)
+        self.capture.write_text("", encoding="utf-8")
+        fast_environment = self.fast_clock_environment(step=31)
+        started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        rebased = self.wait_for_controller_event("routine_fingerprint_rebased")
+        self.assertTrue(any(str(m.get("detail", "")) == "profile=watch" for m in rebased), rebased)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            state_text = state_path.read_text(encoding="utf-8")
+            if "fingerprint=v2:" in state_text:
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("the rebased baseline was never written back with the v2: prefix")
+        self.assertNotIn("sync --profile watch --no-delete", self.capture.read_text(encoding="utf-8"))
+        # The rebase must fire exactly once, not on every subsequent poll.
+        time.sleep(0.5)
+        matches = [r for r in self.controller_events() if r.get("event") == "routine_fingerprint_rebased"]
+        self.assertEqual(len(matches), 1, matches)
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_manager_snapshot_backend_reason_absent_reads_as_ok(self) -> None:
+        # Row 24 (manager half). A pre-upgrade state file with no
+        # backend_reason field must snapshot successfully and report ok, not
+        # corrupt_state.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "30",
+            "--retry-count", "1", "--retry-backoff-seconds", "10", "--allow-delete", "false",
+            "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        state_path = self.real_var / "state/routines/watch.state"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(
+            "state=never\nnext_run_epoch=0\nlast_success_epoch=0\nlast_attempt_epoch=0\n"
+            "retry_attempt=0\nlast_day=none\nlast_poll_epoch=0\nfingerprint=none\nbackend=none\n",
+            encoding="utf-8",
+        )
+        state_path.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(state_path, self.drop_uid, self.drop_gid)
+        snapshot, payload = self.api("snapshot")
+        self.assertEqual(snapshot.returncode, 0, snapshot.stderr)
+        self.assertEqual(payload.get("code"), None)
+        routines = payload.get("routines") if isinstance(payload, dict) else None
+        watch_routine = next((r for r in routines or [] if r.get("profile") == "watch"), None)
+        self.assertIsNotNone(watch_routine, payload)
+        self.assertEqual(watch_routine.get("backend_reason"), "ok")
+
+    def test_manager_snapshot_backend_reason_unknown_fails_closed(self) -> None:
+        # Row 25 (manager half). An unrecognized backend_reason must fail
+        # closed exactly like an unrecognized backend does: corrupt_state,
+        # not a wrong reason silently shown.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "30",
+            "--retry-count", "1", "--retry-backoff-seconds", "10", "--allow-delete", "false",
+            "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        state_path = self.real_var / "state/routines/watch.state"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(
+            "state=never\nnext_run_epoch=0\nlast_success_epoch=0\nlast_attempt_epoch=0\n"
+            "retry_attempt=0\nlast_day=none\nlast_poll_epoch=0\nfingerprint=none\nbackend=none\n"
+            "backend_reason=banana\n",
+            encoding="utf-8",
+        )
+        state_path.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(state_path, self.drop_uid, self.drop_gid)
+        rejected, payload = self.api("snapshot")
+        self.assertEqual(rejected.returncode, 73)
+        self.assertEqual(payload.get("code"), "corrupt_state")
+        routines = payload.get("routines") if isinstance(payload, dict) else None
+        self.assertIsNone(routines)
+
+    def test_backend_enum_is_unchanged_across_manager_and_core(self) -> None:
+        # Row 26. Both the manager's and the in-process Rust reader's
+        # backend validators must still be exactly the shipped five-value
+        # enum -- this section deliberately does not touch it.
+        manager_source = self.manager.read_text(encoding="utf-8")
+        self.assertIn(
+            "case $routine_backend in none|interval|daily|inotify|polling) ;;",
+            manager_source,
+        )
+        rust_source = (REPOSITORY / "src/dsm_api.rs").read_text(encoding="utf-8")
+        self.assertIn(
+            'b"none" | b"interval" | b"daily" | b"inotify" | b"polling"',
+            rust_source,
+        )
+
+    def test_write_controller_state_enospc_preserves_prior_state(self) -> None:
+        # write_controller_state now checks every write before the rename
+        # (printf, finish_private_file, mv), returning 69 rather than
+        # chmod'ing and renaming a truncated document over a good one. A
+        # read-only state directory reproduces an ENOSPC-shaped failure
+        # without needing a real full disk -- the same technique the suite
+        # already uses for test_start_uses_private_var_run_when_installed_ui_is_read_only.
+        helper = self.root / "controller-state-enospc-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            "printf 'state=running\\npid=111\\nnext_run_epoch=0\\nactive_pid=0\\nupdated_epoch=100\\n' "
+            "> \"$controller_state\"\n"
+            "chmod 0600 \"$controller_state\"\n"
+            "chmod 0500 \"$state_root\"\n"
+            "status=0\n"
+            "write_controller_state stopped 0 0 0 || status=$?\n"
+            "chmod 0700 \"$state_root\"\n"
+            "echo \"status=$status\"\n"
+            "cat \"$controller_state\"\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(helper, self.drop_uid, self.drop_gid)
+        result = self.shell(helper)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("status=69", result.stdout)
+        self.assertIn("state=running", result.stdout)
+        self.assertNotIn("state=stopped", result.stdout)
+
+    def test_handle_alert_result_enospc_preserves_prior_state(self) -> None:
+        configured, _ = self.api(
+            "alert-policy", "--enabled", "true", "--on-success", "false",
+            "--on-failure", "true", "--failure-threshold", "1", "--cooldown", "60",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        helper = self.root / "alert-state-enospc-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            "safe_notify() { return 0; }\n"
+            "printf 'failure_count=2\\nlast_notify_epoch=500\\n' > \"$alert_state\"\n"
+            "chmod 0600 \"$alert_state\"\n"
+            "chmod 0500 \"$state_root\"\n"
+            "status=0\n"
+            "handle_alert_result alpha failed 42 2>/dev/null || status=$?\n"
+            # The exact guard sdsync-run:484 uses. If it did not suspend
+            # errexit for a 73 return, this line would never run and the
+            # script would abort here instead of reaching the echo below.
+            "run_would_continue=yes\n"
+            "chmod 0700 \"$state_root\"\n"
+            "echo \"status=$status\"\n"
+            "echo \"run_would_continue=$run_would_continue\"\n"
+            "cat \"$alert_state\"\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(helper, self.drop_uid, self.drop_gid)
+        result = self.shell(helper)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("status=73", result.stdout)
+        self.assertIn("run_would_continue=yes", result.stdout)
+        self.assertIn("failure_count=2", result.stdout)
+        self.assertIn("last_notify_epoch=500", result.stdout)
+
+    def test_handle_doctor_alert_enospc_preserves_prior_state(self) -> None:
+        configured, _ = self.api(
+            "alert-policy", "--enabled", "true", "--on-success", "false",
+            "--on-failure", "true", "--failure-threshold", "1", "--cooldown", "60",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        helper = self.root / "doctor-state-enospc-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            "safe_notify() { return 0; }\n"
+            "printf 'failure_count=2\\nlast_notify_epoch=500\\n' > \"$doctor_state\"\n"
+            "chmod 0600 \"$doctor_state\"\n"
+            "chmod 0500 \"$state_root\"\n"
+            "status=0\n"
+            "handle_doctor_alert all 74 2>/dev/null || status=$?\n"
+            # The exact guard sdsync-dsm:4249 uses (same reasoning as the
+            # alert-result test above).
+            "run_would_continue=yes\n"
+            "chmod 0700 \"$state_root\"\n"
+            "echo \"status=$status\"\n"
+            "echo \"run_would_continue=$run_would_continue\"\n"
+            "cat \"$doctor_state\"\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(helper, self.drop_uid, self.drop_gid)
+        result = self.shell(helper)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("status=73", result.stdout)
+        self.assertIn("run_would_continue=yes", result.stdout)
+        self.assertIn("failure_count=2", result.stdout)
+        self.assertIn("last_notify_epoch=500", result.stdout)
+
+    def test_write_run_state_enospc_preserves_prior_state(self) -> None:
+        # write_run_state (sdsync-common) is bare at every call site in
+        # sdsync-run, so errexit alone already protects a caller that does
+        # not guard it -- hardened anyway per the shell agent's report, "the
+        # only unchecked writers left."
+        helper = self.root / "run-state-enospc-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            "printf 'state=succeeded\\nstarted_epoch=100\\nfinished_epoch=200\\n"
+            "exit_code=0\\nscope=all\\noperation=sync\\n' > \"$run_state\"\n"
+            "chmod 0600 \"$run_state\"\n"
+            "chmod 0500 \"$state_root\"\n"
+            "status=0\n"
+            "write_run_state failed 300 400 1 all sync || status=$?\n"
+            "chmod 0700 \"$state_root\"\n"
+            "echo \"status=$status\"\n"
+            "cat \"$run_state\"\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(helper, self.drop_uid, self.drop_gid)
+        result = self.shell(helper)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("status=69", result.stdout)
+        self.assertIn("state=succeeded", result.stdout)
+        self.assertNotIn("state=failed", result.stdout)
+
+    def test_write_routine_state_enospc_preserves_prior_state(self) -> None:
+        # write_routine_state lives in sdsync-controller, which cannot be
+        # dot-sourced directly -- it ends in an unconditional daemon loop
+        # (`while :; do ...; done; exit 0`) that would hang the helper
+        # forever. Extract just this one function's text from the real file
+        # at test-run time instead, the same slicing technique the suite
+        # already uses at the process_control_queue/stop_realtime_watchers
+        # boundary needle, and splice it after sdsync-common, which supplies
+        # routine_state_dir and finish_private_file.
+        controller_source = (self.real_target / "libexec/sdsync-controller").read_text(encoding="utf-8")
+        function_start = controller_source.index("write_routine_state() {")
+        function_end = controller_source.index("\n}\n", function_start) + 2
+        function_text = controller_source[function_start:function_end]
+        self.assertIn("routine_state_temp=$routine_state_dir", function_text)
+
+        helper = self.root / "routine-state-enospc-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            f"{function_text}\n"
+            'mkdir -p "$routine_state_dir"\n'
+            'printf \'state=succeeded\\nnext_run_epoch=0\\nlast_success_epoch=900\\n'
+            'last_attempt_epoch=900\\nretry_attempt=0\\nlast_day=none\\nlast_poll_epoch=900\\n'
+            'fingerprint=v2:1:2\\nbackend=inotify\\nbackend_reason=ok\\npending_fingerprint=0\\n'
+            'pending_since_epoch=0\\nevent_first_seen_epoch=0\\npoll_retries=0\\n\' '
+            '> "$routine_state_dir/watch.state"\n'
+            'chmod 0600 "$routine_state_dir/watch.state"\n'
+            'chmod 0500 "$routine_state_dir"\n'
+            'routine_state_value=failed; routine_next_value=0; routine_last_success_value=900\n'
+            'routine_last_attempt_value=1000; routine_retry_value=1; routine_last_day_value=none\n'
+            'routine_last_poll_value=1000; routine_fingerprint_value=v2:1:2; routine_backend_value=none\n'
+            'routine_backend_reason_value=watch_setup_failed; routine_pending_fingerprint_value=0\n'
+            'routine_pending_since_value=0; routine_event_first_seen_value=0; routine_poll_retries_value=0\n'
+            'status=0\n'
+            'write_routine_state watch || status=$?\n'
+            'chmod 0700 "$routine_state_dir"\n'
+            'echo "status=$status"\n'
+            'cat "$routine_state_dir/watch.state"\n',
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(helper, self.drop_uid, self.drop_gid)
+        result = self.shell(helper)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("status=69", result.stdout)
+        self.assertIn("state=succeeded", result.stdout)
+        self.assertNotIn("state=failed", result.stdout)
+
+    def test_api_command_signal_trap_removes_query_capture_temp_files(self) -> None:
+        # A bridge-timeout kill lands on api_command's own process. Before
+        # this fix, only begin_mutation trapped HUP/INT/TERM; a signal
+        # delivered to api_command bypassed the EXIT trap on its default
+        # disposition, cleanup_manager_lock never ran, and the private
+        # query_stdout/query_stderr files api_query_capture creates leaked
+        # forever. status-rollup needs no profile and no secret, so it is
+        # the smallest api_query_capture caller to instrument.
+        ready = self.root / "api-query-capture.ready"
+        release = self.root / "api-query-capture.release"
+        self.instrument_shell_pause_before(
+            self.manager,
+            "    # stdout is captured apart from stderr on purpose: api_capture combines the\n"
+            "    # two, and a single diagnostic warning written while the query ran would\n"
+            "    # then corrupt the JSON document the AppWindow parses.\n"
+            "    set +e\n",
+            ready,
+            release,
+        )
+        process = self.shell_process(self.manager, "api", "status-rollup")
+        try:
+            ready_deadline = time.monotonic() + 15
+            while not ready.exists():
+                if process.poll() is not None:
+                    stdout, stderr = process.communicate(timeout=5)
+                    self.fail(f"manager exited before the query-capture barrier: {stdout}{stderr}")
+                if time.monotonic() > ready_deadline:
+                    self.fail("manager did not reach the query-capture barrier")
+                time.sleep(0.02)
+            capture_stdout = self.real_var / "state" / f".api.{process.pid}.query-stdout"
+            capture_stderr = self.real_var / "state" / f".api.{process.pid}.query-stderr"
+            self.assertTrue(capture_stdout.is_file())
+            self.assertTrue(capture_stderr.is_file())
+            os.kill(process.pid, signal.SIGTERM)
+            self.assertEqual(process.wait(timeout=5), 130)
+            self.assertFalse(capture_stdout.exists(), "query-capture stdout temp file leaked past the signal trap")
+            self.assertFalse(capture_stderr.exists(), "query-capture stderr temp file leaked past the signal trap")
+        finally:
+            release.touch(exist_ok=True)
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+
     def test_controller_dependency_deferral_then_success_and_retry_backoff(self) -> None:
         self.assertEqual(self.configure("base", self.source_one, "/home/Drive/Base", True).returncode, 0)
         self.assertEqual(self.configure("dependent", self.source_two, "/home/Drive/Dependent").returncode, 0)
@@ -11149,7 +12884,7 @@ fi
         ]
 
     def wait_for_controller_event(
-        self, event: str, *, timeout: float = 15.0
+        self, event: str, *, timeout: float = IN_PROCESS_POLL_TIMEOUT_SECONDS
     ) -> list[dict[str, object]]:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:

@@ -624,6 +624,7 @@
     },
     "executionResult": {
       "type": "object",
+      "description": "What a run performed. Emitted for a failed run too: every count here is work that succeeded and was verified individually, and `failed` says whether the run then stopped.",
       "additionalProperties": false,
       "required": [
         "changed",
@@ -632,6 +633,10 @@
         "upload_bytes",
         "directories_created",
         "deleted",
+        "deletes_skipped",
+        "kept_deletes_uploaded",
+        "changed_during_run",
+        "failed",
         "elapsed_ms"
       ],
       "properties": {
@@ -641,6 +646,22 @@
         "upload_bytes": { "$ref": "#/$defs/nonNegativeInteger" },
         "directories_created": { "$ref": "#/$defs/nonNegativeInteger" },
         "deleted": { "$ref": "#/$defs/nonNegativeInteger" },
+        "deletes_skipped": {
+          "description": "Planned mirror deletions kept rather than performed: the local path exists again, or a kept deletion beneath a directory left it non-empty.",
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "kept_deletes_uploaded": {
+          "description": "Files among `deletes_skipped` that this run then uploaded, so the mirror converged instead of deferring to the next run. Their bytes are included in `upload_bytes`.",
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "changed_during_run": {
+          "description": "Entries the post-run reconciliation pass still found, all of them local files modified after the run began. The destination matches the source as it was when the run started, which is the only instant a run can be asked about.",
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "failed": {
+          "description": "True when the run failed after performing the work counted here.",
+          "type": "boolean"
+        },
         "elapsed_ms": { "$ref": "#/$defs/nonNegativeInteger" }
       }
     },

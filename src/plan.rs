@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::PathBuf;
 
 use crate::api::{RemoteEntry, RemoteInventory};
 use crate::cancel::CancellationToken;
@@ -257,6 +258,28 @@ pub struct DeleteAction {
 
 #[derive(Clone, Debug)]
 pub struct SyncPlan {
+    /// The local tree this plan was derived from.
+    ///
+    /// Carried because execution has to re-ask a question planning already asked: a mirror
+    /// deletion's precondition is that the path is absent *locally*, and the only thing that can
+    /// re-check it at delete time is the root the inventory was walked from. Every other input to
+    /// the plan is either remote or already recorded per action.
+    pub source_root: PathBuf,
+    /// The part of the destination this plan describes.
+    ///
+    /// Carried for the same reason as `source_root`: execution takes its own fresh inventories to
+    /// re-verify every snapshot it is about to act on, and those inventories have to cover exactly
+    /// what the plan covers. Taken at the root instead, a `--scope docs/q3` run paid a full
+    /// unscoped recursive walk of a 100,000-entry destination per snapshot batch — up to four per
+    /// run, and the very expense `--scope` exists to avoid — and could be failed *after its uploads
+    /// had landed* by a subtree it was explicitly told to ignore returning a permission error.
+    pub scope: Scope,
+    /// The exclusion rules this plan was built under.
+    ///
+    /// Carried so the executor's inventories prune what the planner's pruned. A walk that descends
+    /// into `@eaDir` when the planning walk did not is not merely slower: it answers a different
+    /// question about which entries exist.
+    pub rules: IgnoreRules,
     pub pre_deletes: Vec<DeleteAction>,
     pub creates: Vec<CreateAction>,
     pub copies: Vec<CopyAction>,
@@ -484,9 +507,12 @@ pub fn build_plan(
     for relative in local.entries.keys() {
         root.join(relative)?;
     }
-    validate_portable_case_mapping(root, local, remote)?;
+    validate_portable_case_mapping(root, local, remote, rules)?;
 
     let mut plan = SyncPlan {
+        source_root: local.root.clone(),
+        scope: options.scope.clone(),
+        rules: rules.clone(),
         pre_deletes: Vec::new(),
         creates: Vec::new(),
         copies: Vec::new(),
@@ -641,13 +667,35 @@ pub fn build_plan(
     Ok(plan)
 }
 
+/// Refuse two spellings that differ only by case, because Synology Drive clients cannot hold both.
+///
+/// Entries the plan will never touch are skipped, and that is the finding rather than a detail. This
+/// check folds every path on both sides, and the remote walk used to descend into DSM-managed
+/// directories in full — so a share whose recycle bin had accumulated `Report.pdf` and `report.pdf`
+/// on different days, or a photo share with two `@eaDir` thumbnail directories for `Photo.JPG` and
+/// `photo.jpg`, failed *every* `sync`, `plan`, `status` and `resync` invocation with
+/// `UnsafeRemotePath` naming a path the tool documents as never synchronized. `--exclude '#recycle/'`
+/// did not help, because the check ran before and independently of the rules, and the operator's only
+/// remedy was to empty the NAS recycle bin or delete thumbnails: a destructive action taken to work
+/// around a portability warning about files that are never copied anywhere.
+///
+/// Local keys need no filtering: the walk already prunes both DSM-managed names and excluded ones
+/// before they reach an inventory.
 fn validate_portable_case_mapping(
     root: &RemoteRoot,
     local: &LocalInventory,
     remote: &RemoteInventory,
+    rules: &IgnoreRules,
 ) -> Result<()> {
     let mut seen = BTreeMap::<String, String>::new();
-    for relative in local.entries.keys().chain(remote.entries.keys()) {
+    let considered = local.entries.keys().chain(
+        remote
+            .entries
+            .values()
+            .filter(|entry| !is_protected(entry, rules))
+            .map(|entry| &entry.relative),
+    );
+    for relative in considered {
         let mut prefix = String::new();
         for component in relative.split('/') {
             if !prefix.is_empty() {
@@ -1063,6 +1111,26 @@ pub enum StatusState {
     },
     /// Never synchronized, and why.
     Excluded(ExclusionCause),
+    /// Present on one side, and the other side's walk stopped before it could say.
+    ///
+    /// Absence is what decides [`Self::RemoteOnly`] and [`Self::MissingRemote`], and a walk the scan
+    /// budget truncated cannot tell an entry it never reached from one that does not exist. The two
+    /// walks truncate at different points — the local one is a sorted depth-first recursion, the
+    /// remote one a LIFO stack — so past the budget the two sets diverge structurally rather than
+    /// agreeing on a prefix.
+    ///
+    /// Reported as its own state because the alternative was worse than silence: six identical
+    /// in-sync pairs with the local side truncated to three produced three `remote-only` rows, and
+    /// `RemoteOnly` documents itself as *"Present remotely, absent locally. Removed only by a mirror
+    /// run"* — so the dashboard told the operator a mirror run would delete files that were present
+    /// locally and identical, and counted all three as needing attention. Truncation makes
+    /// `in_sync_files` a floor and `remote_only_entries` and `missing_remote_files` *over*counts,
+    /// and one notice claiming every total was a lower bound was false for exactly the two it
+    /// inflated.
+    ///
+    /// Not in [`StateKind::ATTENTION`]: nothing here needs a person to act, and putting it there
+    /// would keep inflating the attention count this exists to stop inflating.
+    NotCompared,
 }
 
 impl StatusState {
@@ -1074,6 +1142,7 @@ impl StatusState {
             Self::RemoteOnly => StateKind::RemoteOnly,
             Self::TypeConflict { .. } => StateKind::TypeConflict,
             Self::Excluded(_) => StateKind::Excluded,
+            Self::NotCompared => StateKind::NotCompared,
         }
     }
 
@@ -1096,6 +1165,8 @@ pub enum StateKind {
     RemoteOnly,
     InSync,
     Excluded,
+    /// One side's walk was truncated by the scan budget before it could say.
+    NotCompared,
 }
 
 impl StateKind {
@@ -1122,6 +1193,7 @@ impl StateKind {
             Self::RemoteOnly => "remote-only",
             Self::InSync => "in-sync",
             Self::Excluded => "excluded",
+            Self::NotCompared => "not-compared",
         }
     }
 
@@ -1204,6 +1276,13 @@ pub struct StatusStats {
     pub remote_only_entries: usize,
     pub type_conflicts: usize,
     pub excluded_entries: usize,
+    /// Entries neither walk could compare, because the scan budget truncated the other side.
+    ///
+    /// Non-zero only when `complete` is false. While it is non-zero, `in_sync_files`,
+    /// `differing_files` and `type_conflicts` are floors and `remote_only_entries` and
+    /// `missing_remote_files` are unusable rather than merely low: presence alone cannot decide
+    /// either of them.
+    pub not_compared_entries: usize,
     pub directories: usize,
     pub in_sync_bytes: u64,
     /// Bytes that would transfer, accumulated exactly as `SyncPlan::upload_bytes` is.
@@ -1233,6 +1312,7 @@ impl StatusStats {
             remote_only_entries: 0,
             type_conflicts: 0,
             excluded_entries: 0,
+            not_compared_entries: 0,
             directories: 0,
             in_sync_bytes: 0,
             transfer_bytes: 0,
@@ -1283,6 +1363,13 @@ pub struct StatusQuery<'a> {
     pub include_excluded: bool,
     pub limit: usize,
     pub cursor: Option<&'a StatusCursor>,
+    /// Whether the local walk saw the whole scope, or stopped at the scan budget.
+    ///
+    /// When it did not, absence on the local side proves nothing, so an entry present only remotely
+    /// is [`StatusState::NotCompared`] rather than [`StatusState::RemoteOnly`].
+    pub local_complete: bool,
+    /// The same, for the remote walk and [`StatusState::MissingRemote`].
+    pub remote_complete: bool,
 }
 
 /// Answer a scoped status query from live inventories.
@@ -1320,15 +1407,7 @@ pub fn build_status_page(
     let after = query.cursor.map(StatusCursor::as_str);
 
     for relative in keys {
-        let entry = classify(
-            root,
-            local,
-            remote,
-            excluded,
-            rules,
-            query.compare,
-            relative,
-        )?;
+        let entry = classify(root, local, remote, excluded, rules, query, relative)?;
         accumulate(&mut stats, &entry);
 
         if !query.states.admits(entry.state.kind()) || !matches_filter(relative, query.filter) {
@@ -1363,18 +1442,61 @@ pub fn build_status_page(
 /// Length of a resync ticket, in hex characters.
 const RESYNC_TICKET_LENGTH: usize = 16;
 
+/// Where a forced re-upload would write, as the ticket describes it.
+///
+/// Both halves are part of the confirmation because both decide which bytes are destroyed. A
+/// ticket that covered only the local overwrite set would be replayable against any destination
+/// reachable with the same source, which is the one thing a confirmation exists to prevent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResyncTarget<'a> {
+    /// The destination root, as the remote path it maps to.
+    pub remote_root: &'a str,
+    /// The DSM endpoint the root lives on, normalized as the client received it.
+    pub endpoint: &'a str,
+}
+
 /// Derive the ticket that identifies exactly what a forced re-upload would overwrite.
 ///
-/// A confirmation has to prove the caller saw *this* set of files, not merely that the command was
-/// run twice. The ticket is a digest over the scope, the comparison, the sorted list of paths that
-/// would be overwritten, and the byte total — so any change to what is about to happen produces a
-/// different ticket and the confirmation is refused.
+/// A confirmation has to prove the caller saw *this* set of files on *this* destination, not
+/// merely that the command was run twice. The ticket is a digest over the endpoint, the remote
+/// root, the scope, the comparison, the sorted list of paths that would be overwritten, and the
+/// byte total — so any change to what is about to happen produces a different ticket and the
+/// confirmation is refused.
+///
+/// The endpoint and the root are what made version 2 of the encoding. Under version 1 the upload
+/// set was a function of local state alone (in `Force` mode every in-scope file is scheduled
+/// without consulting the destination), so two profiles pointing one source at two different
+/// destinations — or at two different NAS units — produced byte-identical tickets, and a ticket
+/// printed for one confirmed an overwrite of the other.
+///
+/// Each upload's **content digest** is what makes version 3, and it closes the scenario the other two
+/// left open: the same destination, the same path, the same length, different bytes. The operator is
+/// shown "overwrite `summary.pdf`, 1,024,000 bytes" and given a ticket; before confirming, the file
+/// is replaced by a regenerated report, a restored older revision, or the wrong file dropped in by a
+/// colleague, at the same length. The ticket still matched, and `resync` — the one command that
+/// destroys remote revisions unconditionally — overwrote the remote copy with content nobody
+/// reviewed. Both `RESYNC_LONG_ABOUT` and `--confirm`'s help say a ticket stops matching "if either
+/// side has changed since", which was true of every property except the bytes. The digest is already
+/// in hand at ticket time: `promote_upload_fingerprints` runs before the plan guard, and in `Force`
+/// mode it is what computes the digest at all.
+///
+/// The domain tag is part of the hashed string, so a version 1 or 2 ticket simply fails to match and
+/// is reported stale with the refreshed plan and its new ticket.
 ///
 /// Deliberately carries no clock. Nothing here is stored, so there is no expiry to enforce and no
-/// business inventing one: a ticket stops being valid when the content it describes changes, and
-/// stays valid indefinitely when it does not.
-pub fn resync_ticket(scope: &Scope, compare: CompareMode, plan: &SyncPlan) -> String {
-    let mut canonical = String::from("sdsync.resync-ticket.v1\n");
+/// business inventing one: a ticket stops being valid when what it describes changes, and stays
+/// valid indefinitely when it does not.
+pub fn resync_ticket(
+    target: ResyncTarget<'_>,
+    scope: &Scope,
+    compare: CompareMode,
+    plan: &SyncPlan,
+) -> String {
+    let mut canonical = String::from("sdsync.resync-ticket.v3\n");
+    canonical.push_str(target.endpoint);
+    canonical.push('\n');
+    canonical.push_str(target.remote_root);
+    canonical.push('\n');
     canonical.push_str(scope.as_str());
     canonical.push('\n');
     canonical.push_str(match compare {
@@ -1392,6 +1514,18 @@ pub fn resync_ticket(scope: &Scope, compare: CompareMode, plan: &SyncPlan) -> St
         canonical.push_str(&action.local.relative);
         canonical.push('\0');
         canonical.push_str(&action.local.size.to_string());
+        canonical.push('\0');
+        // The SHA-256 of the bytes that would be written, when one is in hand. A digest-less upload
+        // encodes as "none", which is a *different* string from any digest rather than an absence
+        // that could be forged into one -- and on the `resync` path it cannot occur, because the
+        // promotion that computes it runs before the guard that calls this.
+        canonical.push_str(
+            &action
+                .local
+                .content_md5
+                .and_then(|digest| digest.sha256_hex())
+                .unwrap_or_else(|| "none".to_owned()),
+        );
         canonical.push('\n');
     }
 
@@ -1442,6 +1576,7 @@ fn accumulate(stats: &mut StatusStats, entry: &StatusEntry) {
             stats.transfer_bytes = stats.transfer_bytes.saturating_add(size);
         }
         StatusState::Excluded(_) => stats.excluded_entries += 1,
+        StatusState::NotCompared => stats.not_compared_entries += 1,
     }
 }
 
@@ -1451,9 +1586,10 @@ fn classify(
     remote: &RemoteInventory,
     excluded: &BTreeSet<String>,
     rules: &IgnoreRules,
-    compare: CompareMode,
+    query: &StatusQuery<'_>,
     relative: &str,
 ) -> Result<StatusEntry> {
+    let compare = query.compare;
     let local_entry = local.entries.get(relative);
     let remote_entry = remote.entries.get(relative);
 
@@ -1498,6 +1634,10 @@ fn classify(
                     },
                 }
             }
+            // Absence is only evidence when the walk that would have found it finished. A budget
+            // that stopped the remote walk cannot distinguish "not on the NAS" from "not reached".
+            (Some(_), None) if !query.remote_complete => StatusState::NotCompared,
+            (None, Some(_)) if !query.local_complete => StatusState::NotCompared,
             (Some(_), None) => StatusState::MissingRemote,
             (None, Some(_)) => StatusState::RemoteOnly,
             (None, None) => StatusState::Excluded(ExclusionCause::IgnoreRule),
@@ -2008,6 +2148,63 @@ mod tests {
         ));
     }
 
+    /// A case collision the plan will never touch must not fail the run.
+    ///
+    /// A photo share keeps one `@eaDir` thumbnail directory per image, so a volume that has held
+    /// both `Photo.JPG` and `photo.jpg` has two of them; a recycle bin accumulates `Report.pdf` and
+    /// `report.pdf` deleted on different days. Every `sync`, `plan`, `status` and `resync` then
+    /// failed with `UnsafeRemotePath` naming a path the tool documents as never synchronized, and
+    /// `--exclude '#recycle/'` did not help because the check ran before and independently of the
+    /// rules. The operator's only remedy was to empty the NAS recycle bin or delete thumbnails.
+    #[test]
+    fn a_case_collision_among_paths_the_plan_never_touches_is_not_refused() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        for collision in [
+            &[
+                ("@eaDir", EntryKind::Directory, 0, 0),
+                ("@eaDir/Photo.JPG", EntryKind::Directory, 0, 0),
+                ("@eaDir/photo.jpg", EntryKind::Directory, 0, 0),
+            ][..],
+            &[
+                ("#recycle", EntryKind::Directory, 0, 0),
+                ("#recycle/Report.pdf", EntryKind::File, 1, 1),
+                ("#recycle/report.pdf", EntryKind::File, 1, 1),
+            ][..],
+            // Excluded by an ordinary `--exclude`, which must work here for the same reason.
+            &[
+                ("cache", EntryKind::Directory, 0, 0),
+                ("cache/Data.bin", EntryKind::File, 1, 1),
+                ("cache/data.bin", EntryKind::File, 1, 1),
+            ][..],
+        ] {
+            let plan = build_plan(
+                &root,
+                &local(&[("keep.txt", EntryKind::File, 1, 1_000)]),
+                &remote(collision),
+                &rules(&["cache/"]),
+                &options(false),
+            )
+            .unwrap_or_else(|error| panic!("{collision:?}: {error}"));
+            assert_eq!(plan.uploads.len(), 1);
+        }
+
+        // A collision between two paths the plan *would* touch is still refused.
+        assert!(matches!(
+            build_plan(
+                &root,
+                &local(&[]),
+                &remote(&[
+                    ("Payload", EntryKind::Directory, 0, 0),
+                    ("payload", EntryKind::Directory, 0, 0),
+                ]),
+                &rules(&["cache/"]),
+                &options(false),
+            ),
+            Err(Error::UnsafeRemotePath { reason, .. })
+                if reason.contains("differ only by case")
+        ));
+    }
+
     #[test]
     fn delete_mode_preserves_excluded_and_managed_paths() {
         let local = local(&[("keep.txt", EntryKind::File, 1, 1_000)]);
@@ -2511,6 +2708,8 @@ mod status_tests {
 
     fn query(scope: &Scope) -> StatusQuery<'_> {
         StatusQuery {
+            local_complete: true,
+            remote_complete: true,
             scope,
             compare: CompareMode::Metadata,
             filter: None,
@@ -2541,6 +2740,98 @@ mod status_tests {
             .iter()
             .map(|entry| entry.relative.as_str())
             .collect()
+    }
+
+    /// A truncated local walk must not turn in-sync files into `remote-only` rows.
+    ///
+    /// Six identical in-sync pairs with the local side truncated to three produced three
+    /// `remote-only` rows and counted all three as needing attention — and `RemoteOnly` documents
+    /// itself as "present remotely, absent locally; removed only by a mirror run", so the dashboard
+    /// told the operator that a mirror run would delete files that were present locally and
+    /// identical. Truncation makes `in_sync_files` a floor and `remote_only_entries` an *over*count,
+    /// which is why one notice claiming every total was a lower bound was false for exactly the
+    /// totals truncation inflates.
+    #[test]
+    fn a_truncated_local_walk_produces_no_remote_only_rows() {
+        // The local side records milliseconds and the remote side whole seconds, so an in-sync
+        // pair is 1_000 against 1.
+        let locals = [
+            ("a.txt", EntryKind::File, 1_u64, 1_000_i64),
+            ("b.txt", EntryKind::File, 1, 1_000),
+            ("c.txt", EntryKind::File, 1, 1_000),
+        ];
+        let remotes = [
+            ("a.txt", EntryKind::File, 1_u64, 1_i64),
+            ("b.txt", EntryKind::File, 1, 1),
+            ("c.txt", EntryKind::File, 1, 1),
+        ];
+        // The local walk stopped after the first entry; the remote walk saw all three.
+        let truncated_local = local(&locals[..1]);
+        let whole_remote = remote(&remotes);
+        let scope = Scope::root();
+
+        let page = page(
+            &truncated_local,
+            &whole_remote,
+            &StatusQuery {
+                local_complete: false,
+                ..query(&scope)
+            },
+        );
+
+        assert!(
+            !states(&page)
+                .iter()
+                .any(|(_, kind)| *kind == StateKind::RemoteOnly),
+            "presence alone cannot decide remote-only when the local walk was truncated: {:?}",
+            states(&page)
+        );
+        assert_eq!(page.stats.remote_only_entries, 0);
+        assert_eq!(page.stats.not_compared_entries, 2);
+        assert_eq!(page.stats.in_sync_files, 1);
+        // The two unclassifiable entries are not counted as needing attention, which is the number
+        // the dashboard renders with a "+" after it.
+        assert_eq!(page.stats.attention_entries, 0);
+    }
+
+    /// The mirror image: a truncated remote walk must not turn in-sync files into `missing-remote`.
+    #[test]
+    fn a_truncated_remote_walk_produces_no_missing_remote_rows() {
+        let whole_local = local(&[
+            ("a.txt", EntryKind::File, 1, 1_000),
+            ("b.txt", EntryKind::File, 1, 1_000),
+        ]);
+        let truncated_remote = remote(&[("a.txt", EntryKind::File, 1, 1)]);
+        let scope = Scope::root();
+
+        let page = page(
+            &whole_local,
+            &truncated_remote,
+            &StatusQuery {
+                remote_complete: false,
+                ..query(&scope)
+            },
+        );
+
+        assert_eq!(page.stats.missing_remote_files, 0);
+        assert_eq!(page.stats.not_compared_entries, 1);
+        assert_eq!(page.stats.attention_entries, 0);
+    }
+
+    /// With both walks complete, absence is evidence again and nothing changes.
+    #[test]
+    fn a_complete_pair_of_walks_still_reports_remote_only_and_missing_remote() {
+        let scope = Scope::root();
+        let page = page(
+            &local(&[("only-local.txt", EntryKind::File, 1, 1)]),
+            &remote(&[("only-remote.txt", EntryKind::File, 1, 1)]),
+            &query(&scope),
+        );
+
+        assert_eq!(page.stats.not_compared_entries, 0);
+        assert_eq!(page.stats.missing_remote_files, 1);
+        assert_eq!(page.stats.remote_only_entries, 1);
+        assert_eq!(page.stats.attention_entries, 2);
     }
 
     // --- Scope ------------------------------------------------------------
@@ -3531,6 +3822,9 @@ mod resync_ticket_tests {
             .iter()
             .fold(0_u64, |total, action| total + action.local.size);
         SyncPlan {
+            source_root: PathBuf::from("/srv/exports"),
+            scope: Scope::root(),
+            rules: IgnoreRules::none(),
             pre_deletes: Vec::new(),
             creates: Vec::new(),
             copies: Vec::new(),
@@ -3542,8 +3836,13 @@ mod resync_ticket_tests {
         }
     }
 
+    const TARGET: ResyncTarget<'static> = ResyncTarget {
+        remote_root: "/share/root",
+        endpoint: "https://nas.example.invalid/",
+    };
+
     fn ticket(plan: &SyncPlan) -> String {
-        resync_ticket(&Scope::root(), CompareMode::Force, plan)
+        resync_ticket(TARGET, &Scope::root(), CompareMode::Force, plan)
     }
 
     #[test]
@@ -3600,8 +3899,13 @@ mod resync_ticket_tests {
     #[test]
     fn a_different_scope_invalidates_the_ticket() {
         let plan = plan_of(vec![upload("docs/a.txt", 10)]);
-        let broad = resync_ticket(&Scope::root(), CompareMode::Force, &plan);
-        let narrow = resync_ticket(&Scope::parse("docs").unwrap(), CompareMode::Force, &plan);
+        let broad = resync_ticket(TARGET, &Scope::root(), CompareMode::Force, &plan);
+        let narrow = resync_ticket(
+            TARGET,
+            &Scope::parse("docs").unwrap(),
+            CompareMode::Force,
+            &plan,
+        );
         assert_ne!(
             broad, narrow,
             "a ticket from one scope must not confirm a run of another"
@@ -3612,9 +3916,160 @@ mod resync_ticket_tests {
     fn a_different_comparison_invalidates_the_ticket() {
         let plan = plan_of(vec![upload("a.txt", 10)]);
         assert_ne!(
-            resync_ticket(&Scope::root(), CompareMode::Force, &plan),
-            resync_ticket(&Scope::root(), CompareMode::Content, &plan)
+            resync_ticket(TARGET, &Scope::root(), CompareMode::Force, &plan),
+            resync_ticket(TARGET, &Scope::root(), CompareMode::Content, &plan)
         );
+    }
+
+    #[test]
+    fn a_different_destination_root_invalidates_the_ticket() {
+        // The overwrite set in `Force` mode is a function of local state alone, so without the
+        // destination in the digest two profiles pointing one source at two folders would issue
+        // the same ticket and either could confirm the other.
+        let plan = plan_of(vec![upload("report.pdf", 1_024)]);
+        let team = resync_ticket(
+            ResyncTarget {
+                remote_root: "/team/docs",
+                ..TARGET
+            },
+            &Scope::root(),
+            CompareMode::Force,
+            &plan,
+        );
+        let archive = resync_ticket(
+            ResyncTarget {
+                remote_root: "/archive/docs",
+                ..TARGET
+            },
+            &Scope::root(),
+            CompareMode::Force,
+            &plan,
+        );
+        assert_ne!(
+            team, archive,
+            "a ticket for one destination must not confirm an overwrite of another"
+        );
+    }
+
+    #[test]
+    fn a_different_endpoint_invalidates_the_ticket() {
+        // Same source, same folder, different NAS: replaying the ticket against the second unit
+        // overwrites files nobody was shown.
+        let plan = plan_of(vec![upload("report.pdf", 1_024)]);
+        let first = resync_ticket(TARGET, &Scope::root(), CompareMode::Force, &plan);
+        let second = resync_ticket(
+            ResyncTarget {
+                endpoint: "https://other-nas.example.invalid/",
+                ..TARGET
+            },
+            &Scope::root(),
+            CompareMode::Force,
+            &plan,
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_version_one_ticket_no_longer_confirms_anything() {
+        // Reconstructed exactly as the previous encoding built it: the same fields in the same
+        // order under the v1 domain tag. Nothing that hashed to a v1 ticket may still be accepted,
+        // because a v1 ticket makes a claim about the destination it never covered.
+        let plan = plan_of(vec![upload("a.txt", 10)]);
+        let mut canonical = String::from("sdsync.resync-ticket.v1\n");
+        canonical.push_str(Scope::root().as_str());
+        canonical.push('\n');
+        canonical.push_str("force\n");
+        canonical.push_str(&plan.upload_bytes.to_string());
+        canonical.push('\n');
+        for action in &plan.uploads {
+            canonical.push_str(&action.local.relative);
+            canonical.push('\0');
+            canonical.push_str(&action.local.size.to_string());
+            canonical.push('\n');
+        }
+        let mut legacy = ContentMd5::from_content(canonical.as_bytes())
+            .sha256_hex()
+            .expect("a freshly computed fingerprint carries its SHA-256");
+        legacy.truncate(RESYNC_TICKET_LENGTH);
+
+        assert_eq!(legacy.len(), RESYNC_TICKET_LENGTH);
+        assert_ne!(
+            legacy,
+            ticket(&plan),
+            "a version 1 ticket must be reported stale rather than honoured"
+        );
+    }
+
+    /// A version 2 ticket no longer confirms anything either.
+    ///
+    /// It covered the destination but not the bytes, and `resync` is the one command that destroys
+    /// remote revisions unconditionally. The tag is inside the hashed string, so a v2 ticket simply
+    /// fails to match and is reported stale with the refreshed plan.
+    #[test]
+    fn a_version_two_ticket_no_longer_confirms_anything() {
+        let plan = plan_of(vec![upload_with_content("a.txt", b"original")]);
+        let mut canonical = String::from("sdsync.resync-ticket.v2\n");
+        canonical.push_str(TARGET.endpoint);
+        canonical.push('\n');
+        canonical.push_str(TARGET.remote_root);
+        canonical.push('\n');
+        canonical.push_str(Scope::root().as_str());
+        canonical.push('\n');
+        canonical.push_str("force\n");
+        canonical.push_str(&plan.upload_bytes.to_string());
+        canonical.push('\n');
+        for action in &plan.uploads {
+            canonical.push_str(&action.local.relative);
+            canonical.push('\0');
+            canonical.push_str(&action.local.size.to_string());
+            canonical.push('\n');
+        }
+        let mut legacy = ContentMd5::from_content(canonical.as_bytes())
+            .sha256_hex()
+            .expect("a freshly computed fingerprint carries its SHA-256");
+        legacy.truncate(RESYNC_TICKET_LENGTH);
+
+        assert_ne!(legacy, ticket(&plan));
+    }
+
+    /// The scenario the ticket's own documentation claimed to cover and did not: the same path, the
+    /// same length, different bytes.
+    ///
+    /// The operator is shown "overwrite `summary.pdf`, 1,024,000 bytes" and handed a ticket. Before
+    /// they confirm, the file is replaced by a regenerated report, a restored older revision, or the
+    /// wrong file dropped in by a colleague, at the same length. The ticket still matched, and
+    /// `resync --confirm` overwrote the remote copy — and every revision DSM held of it — with
+    /// content nobody reviewed.
+    #[test]
+    fn a_same_length_content_change_invalidates_the_ticket() {
+        let reviewed = plan_of(vec![upload_with_content("summary.pdf", b"reviewed")]);
+        let substituted = plan_of(vec![upload_with_content("summary.pdf", b"replaced")]);
+
+        assert_eq!(
+            reviewed.uploads[0].local.size, substituted.uploads[0].local.size,
+            "the fixture has to hold the length constant for the test to mean anything"
+        );
+        assert_ne!(ticket(&reviewed), ticket(&substituted));
+    }
+
+    /// A digest-less upload encodes as a distinct string rather than as an absence that could be
+    /// forged into a digest.
+    #[test]
+    fn an_upload_with_no_digest_does_not_collide_with_one_that_has_it() {
+        let with_digest = plan_of(vec![upload_with_content("a.txt", b"payload!")]);
+        let without = plan_of(vec![upload("a.txt", 8)]);
+
+        assert_eq!(
+            with_digest.uploads[0].local.size,
+            without.uploads[0].local.size
+        );
+        assert_ne!(ticket(&with_digest), ticket(&without));
+    }
+
+    fn upload_with_content(relative: &str, content: &[u8]) -> UploadAction {
+        let mut action = upload(relative, content.len() as u64);
+        action.local.content_md5 = Some(ContentMd5::from_content(content));
+        action
     }
 
     #[test]

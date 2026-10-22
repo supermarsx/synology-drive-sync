@@ -811,8 +811,27 @@ fn resolve_safety(
     } else {
         arguments.delete || profile.delete.unwrap_or(false)
     };
-    let allow_empty_source =
-        arguments.allow_empty_source || profile.allow_empty_source.unwrap_or(false);
+    // `--no-delete` disarms the fuse it makes redundant rather than colliding with it. There are no
+    // deletions left for `allow-empty-source` to authorise, so there is nothing for it to guard.
+    //
+    // It wins over an explicit `--allow-empty-source` on the same command line too, and that is
+    // deliberate rather than lax. By the time settings are resolved a flag and its `SDSYNC_*`
+    // environment variable are the same boolean -- clap merges them -- so refusing the pair as a
+    // contradiction would refuse `SDSYNC_ALLOW_EMPTY_SOURCE=1 sdsync sync --no-delete`, which is the
+    // exact invocation the DSM package produces and the one this fix exists to allow. A flag whose
+    // only effect is to disarm a fuse that is not armed has nothing to do.
+    //
+    // This was reachable from a shipped DSM configuration and refused it outright. The profile-level
+    // check requires `allow-empty-source = true` to be written alongside `delete = true`, so that is
+    // the only shape the package can produce; the runtime toggle is separate, and `sdsync-run`
+    // appends `--no-delete` whenever a routine's delete switch is off. A profile created with
+    // `--allow-empty-source true` and scheduled with deletion disabled therefore never ran at all:
+    // the core refused its own argv with "allow-empty-source requires delete", while
+    // `config validate` passed because the profile itself was consistent. The single safest
+    // invocation available was the one rejected as a configuration error, and there is no
+    // `--no-allow-empty-source` to pair with `--no-delete`.
+    let allow_empty_source = !arguments.no_delete
+        && (arguments.allow_empty_source || profile.allow_empty_source.unwrap_or(false));
     if allow_empty_source && !delete {
         return Err(ConfigError::Invalid(
             "allow-empty-source requires delete".to_owned(),
@@ -1287,6 +1306,9 @@ output = "json"
             url: Some("https://files.example.test".to_owned()),
             username: Some("alice".to_owned()),
             delete: Some(true),
+            // The only shape the DSM package can write: the profile-level check refuses
+            // `allow-empty-source` without `delete`, so a profile carrying one carries both.
+            allow_empty_source: Some(true),
             no_vault: Some(true),
             quiet: Some(true),
             ..Profile::default()
@@ -1304,8 +1326,63 @@ output = "json"
         };
         let resolved = resolve_sync(Some(&profile), arguments, &cli.global.output).unwrap();
         assert!(!resolved.safety.delete);
+        // `--no-delete` disarms the fuse it makes redundant rather than colliding with it. This
+        // invocation is the safest one available and used to be refused outright as an invalid
+        // configuration -- which is what a DSM routine scheduled with its delete switch off sends,
+        // so the routine never ran at all.
+        assert!(!resolved.safety.allow_empty_source);
         assert!(!resolved.authentication.no_vault);
         assert!(!resolved.output.quiet);
+    }
+
+    /// `--no-delete` wins over an explicit `--allow-empty-source`, rather than colliding with it.
+    ///
+    /// Refusing the pair would refuse `SDSYNC_ALLOW_EMPTY_SOURCE=1 sdsync sync --no-delete` too,
+    /// because a flag and its environment variable are the same boolean by the time settings are
+    /// resolved -- and that is the exact invocation the DSM package produces.
+    #[test]
+    fn no_delete_wins_over_an_explicit_allow_empty_source() {
+        let cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "sync",
+            "--no-delete",
+            "--allow-empty-source",
+            "source",
+            "/share/root",
+            "--url",
+            "https://files.example.test",
+            "--username",
+            "alice",
+        ])
+        .unwrap();
+        let Invocation::Sync { arguments, .. } = cli.invocation() else {
+            panic!("expected sync");
+        };
+        let resolved = resolve_sync(None, arguments, &cli.global.output).unwrap();
+        assert!(!resolved.safety.delete);
+        assert!(!resolved.safety.allow_empty_source);
+    }
+
+    /// `allow-empty-source` with no deletion armed anywhere is still the original contradiction.
+    #[test]
+    fn allow_empty_source_without_any_delete_is_still_refused() {
+        let cli = Cli::try_parse_from([
+            "synology-drive-sync",
+            "sync",
+            "--allow-empty-source",
+            "source",
+            "/share/root",
+            "--url",
+            "https://files.example.test",
+            "--username",
+            "alice",
+        ])
+        .unwrap();
+        let Invocation::Sync { arguments, .. } = cli.invocation() else {
+            panic!("expected sync");
+        };
+        let error = resolve_sync(None, arguments, &cli.global.output).unwrap_err();
+        assert!(error.to_string().contains("requires delete"), "{error}");
     }
 
     #[test]

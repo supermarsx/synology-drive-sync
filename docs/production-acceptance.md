@@ -189,7 +189,7 @@ This optimization requires a unique byte-identical remote candidate, different s
 
 ## 6. Verify bytes and Drive indexing externally
 
-The default `content` comparison requires matching size, MD5, IEEE CRC32, SHA-256, and second-resolution file mtime. It streams the remote file through the same complete fingerprint again after upload. MD5 is retained for File Station and output compatibility but is never sufficient by itself. Explicit `metadata` and `size-only` performance modes provide weaker change detection and do not establish content equality.
+The default `content` comparison requires matching size, MD5, IEEE CRC32, SHA-256, and second-resolution file mtime. Each upload is verified against the destination's own length and File Station's server-side MD5, computed from a fingerprint of the bytes that went onto the wire; the bytes are not transferred back. The paths that read a remote file back in full are the ones whose evidence has to stand on its own: a server-side copy's destination, and the guard that authorises a mirror deletion. MD5 is retained for File Station and output compatibility but is never sufficient by itself. Explicit `metadata` and `size-only` performance modes provide weaker change detection and do not establish content equality.
 
 For production acceptance, independently download the completed destination through File Station, or wait for a separate Synology Drive client to finish downloading it, and compare every file against the recorded SHA-256 manifest. On Unix, place it at `./acceptance-download` and run:
 

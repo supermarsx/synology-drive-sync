@@ -20,7 +20,7 @@ The consequence is easy to miss: **`dist/style.css` is embedded whole, as a sing
 literal, inside `dist/SynologyDriveSync.js`.** `src/styles/native.css` is pretty-printed — two-space
 indented, one declaration per line — and `build/condense-css-loader.js` strips its comments,
 indentation and blank lines on the way into both artifacts, so the two are no longer byte-identical.
-That leaves 121,974 bytes of a 543,308-byte "JavaScript" bundle; before the condenser it was 132,891
+That leaves 121,974 bytes of a 547,137-byte "JavaScript" bundle; before the condenser it was 132,891
 of 533,741.
 
 Every byte trimmed from the stylesheet is a byte off the JavaScript asset as well — but the
@@ -34,18 +34,20 @@ stylesheet is now spent as a lever, and the numbers say so:
   `from`/`to`, `minmax(112px, 0.72fr)`, newline-anchored selectors, and the 260/220-char keyframe
   windows. No minifier has a knob for any of them.
 
-The bundle exceeds the 512,000-byte hint by about 31.3 KB. It was about 28.5 KB over before the
-Activity route split into event-lens tabs, about 19.6 KB over before the in-service read failures
-were named, about 10.0 KB over before queued progress landed, and about 21.7 KB over before the
-stylesheet was condensed. Any further reduction has to come out of the JavaScript: at ~421 KB
+The bundle exceeds the 512,000-byte hint by about 34.3 KB. It was about 31.3 KB over before the
+realtime routine surfaced its `backend_reason` and last-poll age, the manual Refresh and snapshot
+diffing were fixed, and the Activity search box was debounced; about 28.5 KB over before the
+Activity route split into event-lens tabs; about 19.6 KB over before the in-service read failures
+were named; about 10.0 KB over before queued progress landed; and about 21.7 KB over before the
+stylesheet was condensed. Any further reduction has to come out of the JavaScript: at ~415.2 KB
 excluding the embedded stylesheet, that is where the remaining headroom is, and there is no second
 stylesheet-shaped win behind it.
 
-Six features have landed over the budget since it was first written (the timestamped log view and
+Seven features have landed over the budget since it was first written (the timestamped log view and
 per-category clearing, the stored-totals summary that made the Sync section open without a walk,
-queued-job progress, the named in-service read failures with the stale-status age and cause, and
-then the Activity route's event-lens tabs). Each was worth its bytes; none of them is where the
-headroom is.
+queued-job progress, the named in-service read failures with the stale-status age and cause, the
+Activity route's event-lens tabs, and then the realtime `backend_reason` surfacing alongside the
+dashboard review fixes above). Each was worth its bytes; none of them is where the headroom is.
 
 ### What the Activity tabs cost, and what that 2,853 bytes is made of
 

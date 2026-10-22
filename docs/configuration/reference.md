@@ -47,7 +47,7 @@ for the complete resolution order and scheduler guidance.
 | TOML key | CLI / core environment | Type and default | Rules |
 | --- | --- | --- | --- |
 | `delete` | `--delete`, `SDSYNC_DELETE`; reversed by `--no-delete` | boolean; `false` | Plans removal of remote-only entries and permits remote type replacement. Still subject to caps, fresh state, protected paths, and execution authorization. |
-| `allow-empty-source` | `--allow-empty-source`, `SDSYNC_ALLOW_EMPTY_SOURCE` | boolean; `false` | Valid only with `delete = true`. Removes the empty-source deletion guard; it is not a general permission bypass. |
+| `allow-empty-source` | `--allow-empty-source`, `SDSYNC_ALLOW_EMPTY_SOURCE` | boolean; `false` | Valid only with `delete = true`, except that `--no-delete` disarms it: with deletion off there is nothing for it to guard. Removes the empty-source deletion guard; it is not a general permission bypass. |
 | `max-delete` | `--max-delete`, `SDSYNC_MAX_DELETE` | non-negative integer; `100` | Per-profile maximum planned remote deletions. Use a deliberately small value for mirror jobs. |
 
 Multi-profile invocations also accept the CLI/environment guard `--max-total-delete` /

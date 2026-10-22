@@ -2143,27 +2143,25 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
             .count(),
         2
     );
-    // Two mechanisms, split by what the digest is for. Each upload is verified by reading back
-    // what was written, which needs the strong fingerprint and therefore a download. The final
-    // reconciliation only compares, so it uses File Station's server-side MD5 and transfers
-    // nothing -- which is why this is two downloads rather than the four it was when comparison
-    // downloaded as well. Both paths are still content verified; one of them stopped paying for
-    // the file's bytes to do it.
+    // One mechanism now, for both purposes. Each upload is content verified against the server's
+    // own MD5 of what it stored, and so is the reconciliation comparison; neither transfers a byte
+    // back. This used to be two whole-file downloads for the uploads plus two digest tasks for the
+    // comparison, which meant a sync moved every uploaded byte twice in every compare mode.
     assert_eq!(
         sync_requests
             .iter()
             .filter(|request| request.operation() == "SYNO.FileStation.Download.download")
             .count(),
-        2,
-        "each upload must be content verified by reading it back"
+        0,
+        "a sync must never transfer an uploaded file back to verify it"
     );
     assert_eq!(
         sync_requests
             .iter()
             .filter(|request| request.operation() == "SYNO.FileStation.MD5.start")
             .count(),
-        2,
-        "the final reconciliation must compare both files without transferring them"
+        4,
+        "two uploads verified and two files compared, all four on the NAS"
     );
     assert_eq!(
         sync_requests.last().map(|request| request.operation()),
@@ -2175,10 +2173,14 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
     // file's status reaches the server next, belongs to the network. Asserting a single
     // interleaving there would pin a scheduling accident and fail intermittently on a loaded
     // machine. What is asserted instead is everything that is actually promised — see below.
-    let md5_phase = sync_requests
+    //
+    // The boundary is the last directory listing: the reconciliation's own walk ends there, and
+    // everything after it is the concurrent digest phase plus the logout. It cannot be "the first
+    // MD5 request" any more, because each upload's verification is one of those too.
+    let md5_phase = 1 + sync_requests
         .iter()
-        .position(|request| request.operation().starts_with("SYNO.FileStation.MD5."))
-        .expect("the reconciliation must ask File Station for a digest");
+        .rposition(|request| request.operation() == "SYNO.FileStation.List.list")
+        .expect("the reconciliation must list the destination");
     assert_eq!(
         sync_requests[..md5_phase]
             .iter()
@@ -2195,12 +2197,16 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
             "SYNO.FileStation.List.list",
             "SYNO.FileStation.CreateFolder.create",
             "SYNO.FileStation.CreateFolder.create",
+            // Upload, then its size, then its digest computed on the NAS. Three round trips where
+            // there were two, and none of them carries the file.
             "SYNO.FileStation.Upload.upload",
             "SYNO.FileStation.List.getinfo",
-            "SYNO.FileStation.Download.download",
+            "SYNO.FileStation.MD5.start",
+            "SYNO.FileStation.MD5.status",
             "SYNO.FileStation.Upload.upload",
             "SYNO.FileStation.List.getinfo",
-            "SYNO.FileStation.Download.download",
+            "SYNO.FileStation.MD5.start",
+            "SYNO.FileStation.MD5.status",
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.List.list",
@@ -2969,7 +2975,16 @@ fn destructive_sync_fails_closed_when_remote_snapshot_changes_after_planning() {
     sync_arguments.extend(common.iter().copied());
     let sync = run(&sync_arguments);
     assert_eq!(sync.status.code(), Some(1));
-    assert_eq!(sync.stdout, b"");
+    // A failed run still reports what it did. Here that is nothing at all, which is exactly the
+    // claim an operator needs: the deletion was refused and no mutation was performed. Before the
+    // report survived a failure, stdout was empty and the only account of a run was its error line.
+    let failed = stdout_json(&sync);
+    assert_eq!(failed["schema"], "sdsync.sync.v1");
+    assert_eq!(failed["result"]["failed"], true);
+    assert_eq!(failed["result"]["deleted"], 0);
+    assert_eq!(failed["result"]["uploaded"], 0);
+    assert_eq!(failed["result"]["changed"], false);
+    assert_eq!(failed["plan"]["summary"]["deletions"], 1);
     let stderr = String::from_utf8(sync.stderr).expect("stderr is UTF-8");
     assert!(
         stderr.contains("changed since planning; it was preserved"),
@@ -3678,8 +3693,14 @@ fn retryable_metadata_and_committed_upload_responses_recover_without_retransmiss
     assert!(
         requests
             .iter()
-            .any(|request| request.operation() == "SYNO.FileStation.Download.download"),
+            .any(|request| request.operation() == "SYNO.FileStation.MD5.start"),
         "the ambiguous upload response must trigger content reconciliation"
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.operation() == "SYNO.FileStation.Download.download"),
+        "reconciling the ambiguous response must not re-transfer the file it is deciding about"
     );
     let output_text = String::from_utf8_lossy(&output.stdout);
     assert!(!output_text.contains("correct horse battery staple"));
@@ -4051,6 +4072,299 @@ fn content_mode_still_detects_a_change_hidden_behind_equal_size_and_mtime() {
 ///
 /// The two counts together are the property: one download for the single deletion candidate, and
 /// none for the file that is merely being compared.
+/// A well-formed `--scope` that names nothing is refused by every command, not only `status`.
+///
+/// One wrong letter used to make `sync`, `plan` and `resync` exit 0. The scoped walks found the
+/// ancestor directories and no file, so the plan was empty: `resync` printed a ticket over nothing
+/// and `--confirm` reported the re-upload as done, and `--exit-code-on-changes` said "no changes"
+/// rather than "no such path".
+#[test]
+fn a_scope_that_names_nothing_is_refused_by_sync_plan_and_resync() {
+    let fixture = TestDir::new("scope-not-found");
+    let source = fixture.child("source");
+    fs::create_dir_all(source.join("reports/q3")).expect("create source directories");
+    fs::write(source.join("reports/q3/summary.pdf"), b"real").expect("write source file");
+    let password = fixture.write("password", PASSWORD);
+
+    let server = MockFileStation::start();
+    server.add_directory("/team/scope");
+    server.add_directory("/team/scope/reports");
+    server.add_directory("/team/scope/reports/q3");
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let common = [
+        source_text,
+        "/team/scope",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password_text,
+        "--no-vault",
+        "--allow-http",
+        "--compare",
+        "metadata",
+        "--scope",
+        // One letter wrong.
+        "reports/q3/sumary.pdf",
+    ];
+    for command in ["plan", "sync", "resync"] {
+        let mut arguments = vec!["--quiet", "--output", "json", command];
+        arguments.extend(common.iter().copied());
+        let refused = run(&arguments);
+        assert_eq!(
+            refused.status.code(),
+            Some(1),
+            "{command} accepted a scope that names nothing: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains("reports/q3/sumary.pdf"),
+            "{command} must name the scope it could not find: {stderr}"
+        );
+    }
+
+    // The correctly spelled scope still works, so the check refuses absence rather than scoping.
+    let mut arguments = vec!["--quiet", "--output", "json", "plan"];
+    arguments.extend(common.iter().copied());
+    let last = arguments.len() - 1;
+    arguments[last] = "reports/q3/summary.pdf";
+    let planned = run(&arguments);
+    assert_success(&planned);
+    assert_eq!(stdout_json(&planned)["plan"]["summary"]["uploads"], 1);
+}
+
+/// A scoped run must not walk, or be failed by, anything outside its scope.
+///
+/// Every snapshot batch used to take an unscoped recursive inventory of the whole destination — up to
+/// four per run — so a `--scope` run paid the expense `--scope` exists to avoid, and an out-of-scope
+/// subtree the sync account cannot list returned DSM code 105 and failed the run *after its uploads
+/// had landed*, reporting it as a snapshot problem.
+#[test]
+fn a_scoped_mirror_run_never_lists_outside_its_scope() {
+    let fixture = TestDir::new("scoped-batch");
+    let source = fixture.child("source");
+    fs::create_dir_all(source.join("docs/q3")).expect("create source directories");
+    fs::write(source.join("docs/q3/new.txt"), b"scoped payload").expect("write source file");
+    // Outside the scope on both sides, and unreadable remotely.
+    fs::create_dir_all(source.join("private")).expect("create out-of-scope source directory");
+    let password = fixture.write("password", PASSWORD);
+
+    let server = MockFileStation::start();
+    server.add_directory("/team/scoped");
+    server.add_directory("/team/scoped/docs");
+    server.add_directory("/team/scoped/docs/q3");
+    server.add_file("/team/scoped/docs/q3/gone.txt", b"gone", 1_700_000_000);
+    server.add_directory("/team/scoped/private");
+    server.disable_directory_listing("/team/scoped/private");
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let sync = run(&[
+        "--quiet",
+        "--output",
+        "json",
+        "sync",
+        source_text,
+        "/team/scoped",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password_text,
+        "--no-vault",
+        "--allow-http",
+        "--compare",
+        "metadata",
+        "--delete",
+        "--scope",
+        "docs/q3",
+        "--jobs",
+        "1",
+    ]);
+    assert_success(&sync);
+    let document = stdout_json(&sync);
+    assert_eq!(document["result"]["uploaded"], 1);
+    assert_eq!(document["result"]["deleted"], 1);
+
+    for request in server.requests() {
+        if request.operation() != "SYNO.FileStation.List.list" {
+            continue;
+        }
+        let folder = request
+            .fields
+            .get("folder_path")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !folder.contains("private"),
+            "a scoped run must not list outside its scope: {folder}"
+        );
+    }
+}
+
+/// The shape that hid the bug: a run with **both** an upload and a mirror deletion.
+///
+/// Post-upload verification replaced a download-and-rehash of every uploaded file with the
+/// destination's own length plus File Station's server-side MD5. The mirror path bypassed it, because
+/// the upload destination checks a `--delete` run adds were indistinguishable from a deletion guard —
+/// both carried a digest, and the digest's presence chose the evidence. So a `--compare metadata
+/// --delete` sync of 1 GB still moved 2 GB and still ran a full SHA-256 pass over the way back, on
+/// the two-core NAS the work was measured for.
+///
+/// No test could catch it: the one existing test with both an upload and a post-delete made no
+/// assertion about downloads at all, and every test that did assert on downloads had zero uploads.
+#[test]
+fn a_metadata_mirror_run_transfers_nothing_back_after_its_uploads() {
+    let fixture = TestDir::new("mirror-no-download");
+    let source = fixture.child("source");
+    fs::create_dir_all(&source).expect("create source directory");
+    fs::write(source.join("new.txt"), b"uploaded payload").expect("write uploaded source file");
+    let password = fixture.write("password", PASSWORD);
+
+    let server = MockFileStation::start();
+    server.add_directory("/team/mirror");
+    // Present remotely, absent locally: the deletion candidate. In metadata mode its guard is size
+    // and modification time, so nothing about it is transferred either.
+    server.add_file("/team/mirror/gone.txt", b"gone", 1_700_000_000);
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let sync = run(&[
+        "--quiet",
+        "--output",
+        "json",
+        "sync",
+        source_text,
+        "/team/mirror",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password_text,
+        "--no-vault",
+        "--allow-http",
+        "--compare",
+        "metadata",
+        "--delete",
+        "--jobs",
+        "1",
+    ]);
+    assert_success(&sync);
+    let document = stdout_json(&sync);
+    assert_eq!(document["result"]["uploaded"], 1);
+    assert_eq!(document["result"]["deleted"], 1);
+
+    let requests = server.requests();
+    let downloads = requests
+        .iter()
+        .filter(|request| request.operation() == "SYNO.FileStation.Download.download")
+        .filter_map(|request| request.fields.get("path").cloned())
+        .collect::<Vec<_>>();
+    assert!(
+        downloads.is_empty(),
+        "a metadata mirror run must transfer nothing back, saw {downloads:?}"
+    );
+    // The upload is still verified, against the destination's own digest, and the exact traffic
+    // that verification costs is pinned here: one `getinfo` and one MD5 task, independent of the
+    // file's size. The path this replaced transferred the whole file back and hashed it three ways.
+    let verification = requests
+        .iter()
+        .skip_while(|request| request.operation() != "SYNO.FileStation.Upload.upload")
+        .skip(1)
+        .map(CapturedRequest::operation)
+        .take(3)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        verification,
+        [
+            "SYNO.FileStation.List.getinfo",
+            "SYNO.FileStation.MD5.start",
+            "SYNO.FileStation.MD5.status",
+        ],
+        "an upload is verified by one getinfo and one server-side digest"
+    );
+    // Twice, and both are load-bearing: once as the upload's own post-condition, and once in the
+    // batch that runs immediately before the delete phase, which has to prove the upload is still
+    // there before removing a different remote path. Each costs three short control requests and no
+    // payload at all; the path this replaced transferred the whole file for each of them.
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.operation() == "SYNO.FileStation.MD5.start")
+            .count(),
+        2,
+        "the destination is digested for the upload and again before the delete phase"
+    );
+    assert_eq!(
+        server.file_contents("/team/mirror/new.txt"),
+        Some(b"uploaded payload".to_vec())
+    );
+    assert_eq!(server.file_contents("/team/mirror/gone.txt"), None);
+}
+
+/// In content mode the deletion guard still reads its candidate, and only its candidate.
+///
+/// The distinction the fix records on each check: bytes this process sent are verified against the
+/// server's digest, and bytes about to be destroyed are read back.
+#[test]
+fn a_content_mirror_run_downloads_only_its_deletion_candidate() {
+    let fixture = TestDir::new("mirror-content-download");
+    let source = fixture.child("source");
+    fs::create_dir_all(&source).expect("create source directory");
+    fs::write(source.join("new.txt"), b"uploaded payload").expect("write uploaded source file");
+    let password = fixture.write("password", PASSWORD);
+
+    let server = MockFileStation::start();
+    server.add_directory("/team/mirror");
+    server.add_file("/team/mirror/gone.txt", b"gone", 1_700_000_000);
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let sync = run(&[
+        "--quiet",
+        "--output",
+        "json",
+        "sync",
+        source_text,
+        "/team/mirror",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password_text,
+        "--no-vault",
+        "--allow-http",
+        "--compare",
+        "content",
+        "--delete",
+        "--jobs",
+        "1",
+    ]);
+    assert_success(&sync);
+
+    let downloads = server
+        .requests()
+        .iter()
+        .filter(|request| request.operation() == "SYNO.FileStation.Download.download")
+        .filter_map(|request| request.fields.get("path").cloned())
+        .collect::<Vec<_>>();
+    assert!(
+        downloads.iter().all(|path| path.contains("gone.txt")),
+        "only the deletion candidate may be transferred, saw {downloads:?}"
+    );
+    assert!(
+        !downloads.is_empty(),
+        "a content-mode deletion guard reads the bytes it authorises destroying"
+    );
+}
+
 #[test]
 fn a_mirror_deletion_still_downloads_its_guard_but_only_for_the_candidates() {
     let fixture = TestDir::new("server-md5-delete");

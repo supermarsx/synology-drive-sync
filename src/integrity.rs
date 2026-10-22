@@ -168,6 +168,7 @@ impl fmt::Display for ContentFingerprint {
     }
 }
 
+#[derive(Clone)]
 pub struct ContentHasher {
     md5: Md5,
     crc32: Crc32Hasher,
@@ -195,6 +196,15 @@ impl ContentHasher {
             self.crc32.finalize(),
             self.sha256.finalize().into(),
         )
+    }
+
+    /// The fingerprint of everything fed so far, leaving the hasher usable.
+    ///
+    /// For a hasher that is fed incrementally from behind a shared handle — an upload body reader
+    /// hashing the bytes as it streams them — where the owner cannot be consumed to read the
+    /// answer out.
+    pub fn fingerprint(&self) -> ContentFingerprint {
+        self.clone().finalize()
     }
 }
 

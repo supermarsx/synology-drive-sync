@@ -41,7 +41,7 @@ stdin because one stream cannot safely represent independent profile credentials
 | `SDSYNC_COMPARE` | `--compare` | `content`, `metadata`, `size-only` |
 | `SDSYNC_JOBS` | `--jobs` | `1` through `16` |
 | `SDSYNC_DELETE` | `--delete` | boolean; defeated by `--no-delete` |
-| `SDSYNC_ALLOW_EMPTY_SOURCE` | `--allow-empty-source` | boolean; requires deletion |
+| `SDSYNC_ALLOW_EMPTY_SOURCE` | `--allow-empty-source` | boolean; requires deletion, and is disarmed by `--no-delete` |
 | `SDSYNC_MAX_DELETE` | `--max-delete` | non-negative count |
 | `SDSYNC_MAX_TOTAL_DELETE` | `--max-total-delete` | aggregate batch count; default `100` |
 

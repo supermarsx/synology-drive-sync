@@ -318,6 +318,45 @@ fn a_warm_status_reuses_digests_removes_round_trips_and_reports_its_own_stalenes
     );
 }
 
+/// A cache that was asked for and could not be used says so, instead of saying none was asked for.
+///
+/// `state: "off"` documents itself as "no cache directory was configured", so reporting it for a
+/// configured directory asserts the opposite of what happened. The case is not exotic: a scheduled
+/// `status --status-cache` pointed at a directory that has not been created yet recomputes every
+/// digest on every run, forever, and exits 0 claiming the operator never asked for a cache.
+#[test]
+fn a_configured_cache_that_cannot_be_opened_is_reported_rather_than_read_as_absent() {
+    let fixture = Fixture::new();
+    let absent = fixture.directory.child("no-such-cache-directory");
+    assert!(!absent.exists());
+
+    let output = fixture.status(&["--status-cache", text(&absent)]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "an unusable cache costs time, never the answer:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let answer: Value =
+        serde_json::from_slice(&output.stdout).expect("status stdout is one JSON document");
+
+    assert_eq!(
+        answer["cache"]["state"], "unusable",
+        "a configured directory that could not be used is not the same answer as no directory"
+    );
+    assert_eq!(answer["cache"]["entries_reused"], 0);
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        diagnostics.contains("status cache"),
+        "the operator must be told why every digest is being recomputed: {diagnostics}"
+    );
+
+    // The answer itself is unchanged: this is a cache, and a cache that cannot be opened costs
+    // exactly the work it would have saved.
+    let served = fixture.cached_status(&[]);
+    assert_eq!(answer["stats"], served["stats"]);
+}
+
 /// The rollup is written beside the cache, describes the whole profile, and separates what is in
 /// sync now from anything a run transferred.
 #[test]

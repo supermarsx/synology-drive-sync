@@ -54,8 +54,8 @@ observation but does not cancel the queued job.
 **Disposable write test** is a mutating diagnostic available only at Extensive depth and disabled
 unless the authenticated API service grants `write_test`. It requires a separate checkbox and
 confirmation. Enabling it locks the level to Extensive. It can create a unique probe, upload and
-verify size, mtime, MD5, CRC32, and SHA-256, exercise an optional same-target copy path, and remove
-the probe.
+verify size, MD5, CRC32, and SHA-256, report whether the destination kept the uploaded modification
+time, exercise an optional same-target copy path, and remove the probe.
 
 Run it only against a prepared non-critical existing destination. After a core diagnostic request
 timeout, terminal failure, or outcome-unknown result, inspect both target folders for leftovers
@@ -283,7 +283,7 @@ Policy fields:
 | Notify on success | Emit `sync_succeeded`; off by default |
 | Notify on failure | Emit sync/Doctor failure events; on by default |
 | Failures before alert | `1..100`; default `1` |
-| Cooldown | Dashboard `60..604800` seconds; manager supports up to 30 days |
+| Cooldown | `60..2592000` seconds (up to 30 days); dashboard and manager share the same range |
 
 Successful sync resets the tracked sync failure count. Cooldown rate-limits delivery. If
 `/usr/syno/bin/synodsmnotify` is unavailable or fails, synchronization keeps its own result and

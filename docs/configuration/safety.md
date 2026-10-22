@@ -36,6 +36,18 @@ synology-drive-sync plan --profile production \
 Command-line rules append to profile rules. Excluded local entries are outside the desired sync set;
 review mirror plans carefully because a formerly included remote path can become remote-only.
 
+Exclusion is decided **before** a name is checked for portability, so a rule can exclude a name the
+tool would otherwise refuse to carry — an Office lock file such as `~$report.docx`, a Windows device
+stem such as `aux.h`, a trailing dot, a component over the length limit, or even a name that is not
+valid UTF-8. Without a matching rule those names still fail the whole run, which is the right answer
+for a name that cannot be mapped to a remote path; with one, they are simply skipped.
+
+Both walks apply the same rules. On the destination side an excluded directory, and every DSM-managed
+directory (`@eaDir`, `#recycle`, `#snapshot`, `@tmp`), is recorded but not descended into: nothing
+under it can be compared, copied or deleted, so listing its contents would cost round trips and scan
+budget for entries the planner discards. Case-portability checking skips them for the same reason — a
+recycle bin holding both `Report.pdf` and `report.pdf` is not a reason to refuse a run.
+
 ## Enabling mirror deletion
 
 Deletion requires all applicable layers:
@@ -46,7 +58,10 @@ Deletion requires all applicable layers:
 4. the execution path explicitly authorizes destructive operation;
 5. fresh inventory/replan checks still match the reviewed safety conditions.
 
-`--no-delete` can disable a profile or environment setting for one invocation.
+`--no-delete` can disable a profile or environment setting for one invocation. It also disarms
+`allow-empty-source`, which exists only to authorise deletions: with deletion off there is nothing
+for it to guard, so `--no-delete` alongside `allow-empty-source` from any source is valid and simply
+deletes nothing.
 
 The planner refuses deletion when the source contains no payload files unless
 `allow-empty-source` is explicitly enabled alongside deletion. `/` can never be a destination, and
@@ -62,6 +77,26 @@ cleanup can continue.
 
 Type conflicts that require replacing a remote entry are destructive and therefore follow the same
 deletion authorization and caps.
+
+A planned mirror deletion re-checks that the local path is still absent immediately before it
+deletes the remote copy. If the local file reappeared in the meantime, the remote copy is kept and
+the refusal is reported rather than the file being deleted. When a kept deletion is a directory's
+child, the directory's own deletion is kept too, because a non-recursive delete of a directory that
+still has a child could only fail. Neither fails the run, and the run then **uploads** the files it
+kept, in a follow-up phase with the same preflight and verification as any other upload -- so the
+mirror converges within the run rather than waiting for a later one. The counts are reported as
+`deletes_skipped` and `kept_deletes_uploaded`.
+
+Post-run reconciliation rebuilds the plan from live state and requires it to describe no remaining
+work. A file written locally *while the run was working* is the exception: the run was never going to
+carry bytes that did not exist when it read the tree, so an entry whose local modification time is
+after the run's start instant is reported under `changed_during_run` and the run succeeds. Anything
+else -- a remaining deletion, a remaining server copy, or an upload of a file older than the run --
+is still a failure, because those mean the run did not do what it planned.
+
+A run that fails after performing some of its work still reports that work. The plan and the counts
+of what completed are printed before the failure is returned, and the machine-readable result carries
+`failed: true` alongside them.
 
 ## Safe rollout
 

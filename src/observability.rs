@@ -1840,6 +1840,12 @@ impl RemoteSink {
 
     fn enqueue(&self, body: String) -> ObservabilityResult<()> {
         if self.closed.load(Ordering::Acquire) {
+            // Counted the same as the Full and Disconnected losses below: the
+            // event never reached the worker, regardless of which delivery
+            // mode then decides whether the caller also sees an Err. Without
+            // this, a best-effort enqueue after shutdown returned Ok(()) with
+            // no trace at all in ShutdownReport::remote_events_dropped.
+            self.status.dropped.fetch_add(1, Ordering::Relaxed);
             return self.delivery_result(Err(RemoteFailure::WorkerStopped));
         }
         if self.delivery == RemoteDelivery::Required
@@ -1859,6 +1865,11 @@ impl RemoteSink {
                 }
             }
             Err(TrySendError::Disconnected(_)) => {
+                // Same accounting as the closed check above: the delivery
+                // worker is gone, so this event is lost the same way a Full
+                // queue's is, just discovered through the channel instead of
+                // the closed flag.
+                self.status.dropped.fetch_add(1, Ordering::Relaxed);
                 self.delivery_result(Err(RemoteFailure::WorkerStopped))
             }
         }
@@ -2828,7 +2839,41 @@ mod tests {
                 RemoteFailure::WorkerStopped
             ))
         ));
+        // Bridge review #10: counted the same as a Full or Disconnected
+        // loss, even though Required mode also surfaces it as an Err here.
+        assert_eq!(remote.report().remote_events_dropped, 1);
         remote.shutdown(Duration::from_secs(1)).unwrap();
+    }
+
+    /// Bridge review #10: a worker that dies on its own -- panicked, never
+    /// asked to shut down -- must still count what it could not deliver.
+    /// `TrySendError::Disconnected` is the sender's only signal that the
+    /// worker is gone; before this fix that path discarded the event
+    /// without touching `status.dropped`, so a best-effort caller relying on
+    /// `ShutdownReport::remote_events_dropped` to detect telemetry loss saw
+    /// nothing at all.
+    #[test]
+    fn enqueue_after_the_worker_panics_is_counted_as_dropped() {
+        let (started_send, started_receive) = mpsc::channel();
+        let remote = RemoteSink::spawn(
+            Box::new(PanickingTransport {
+                started: started_send,
+            }),
+            1,
+            RemoteDelivery::BestEffort,
+        )
+        .unwrap();
+        remote.enqueue("crashes-the-worker".to_owned()).unwrap();
+        // The worker has dequeued the event and is inside transport.send,
+        // about to panic.
+        started_receive
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        // Give the unwind -- one stack frame, no complex drop glue -- a wide
+        // margin to finish dropping the receiver before the probe below.
+        thread::sleep(Duration::from_millis(50));
+        assert!(remote.enqueue("probe".to_owned()).is_ok());
+        assert_eq!(remote.report().remote_events_dropped, 1);
     }
 
     #[test]
@@ -3196,6 +3241,20 @@ mod tests {
             let _ = self.started.send(());
             let _ = self.release.recv();
             Ok(())
+        }
+    }
+
+    /// Simulates a worker that dies on its own rather than being asked to
+    /// shut down: signals it has been reached, then panics, unwinding
+    /// `remote_worker`'s stack and dropping its receiver.
+    struct PanickingTransport {
+        started: mpsc::Sender<()>,
+    }
+
+    impl RemoteTransport for PanickingTransport {
+        fn send(&mut self, _body: &str) -> std::result::Result<(), RemoteFailure> {
+            let _ = self.started.send(());
+            panic!("simulated worker crash");
         }
     }
 

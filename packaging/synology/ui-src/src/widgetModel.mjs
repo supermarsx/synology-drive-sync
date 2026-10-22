@@ -30,6 +30,16 @@ export const WIDGET_ACTIVE_POLL_MS = 20000;
 // while still recovering on its own once the cause is fixed.
 export const WIDGET_BACKOFF_RAMP_MS = Object.freeze([60000, 120000, 240000, 300000]);
 export const WIDGET_MAX_POLL_MS = WIDGET_BACKOFF_RAMP_MS[WIDGET_BACKOFF_RAMP_MS.length - 1];
+// relativeEpochLabel()'s bucket only changes once a minute, and nothing else
+// in this file re-renders the card on its own: `rows` and `overview` are Vue
+// computeds keyed off `nowMs`, which the panel used to advance only when a
+// poll actually completed. Under the backoff ramp above that is up to five
+// minutes between completions, so a card that failed to reach the package
+// would sit there understating "N min ago" for the whole gap. A second, slow,
+// independent clock keeps that honest without changing how often the network
+// is actually asked -- it is deliberately shorter than every poll cadence
+// above except the fastest, so the age never lags by more than this.
+export const WIDGET_CLOCK_TICK_MS = 30000;
 
 export const WIDGET_LEVELS = Object.freeze({
   ok: "ok",

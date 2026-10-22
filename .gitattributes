@@ -5,6 +5,8 @@ license.md text eol=lf
 third_party_licenses.html -text -whitespace
 *.sh text eol=lf
 .config/*.env text eol=lf
+Cargo.lock text eol=lf
+*.lock text eol=lf
 packaging/synology/package/bin/* text eol=lf
 packaging/synology/package/libexec/* text eol=lf
 packaging/synology/scripts/* text eol=lf

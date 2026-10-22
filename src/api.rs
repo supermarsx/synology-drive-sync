@@ -21,7 +21,7 @@ use zeroize::Zeroizing;
 
 use crate::cancel::CancellationToken;
 use crate::integrity::{ContentHasher, ContentMd5};
-use crate::local::{EntryKind, LocalEntry};
+use crate::local::{EntryKind, IgnoreRules, LocalEntry};
 // Only the closed, secret-free value types are imported. Log levels, event codes, and the logger
 // itself deliberately stay out of the transport layer: this module reports what happened on the
 // wire, and the binary decides what that is worth logging.
@@ -31,7 +31,7 @@ use crate::observability::{
     IntermediaryFacts, JsonKind, LoginFormat, RequestOutcome, RequestTransport, SessionShape,
     SessionTransport, ShortToken, UrlScheme,
 };
-use crate::path::{RemoteRoot, parent_and_name};
+use crate::path::{RemoteRoot, is_dsm_managed, parent_and_name};
 use crate::plan::Scope;
 use crate::{Error, Result};
 
@@ -204,6 +204,13 @@ pub struct ApiClient {
     cancellation: CancellationToken,
     /// Optional transport instrumentation, shared by this client and every clone of it.
     observer: Option<RequestObserver>,
+    /// Latched once DSM reports a modification time for an uploaded file that is not the one the
+    /// upload sent, shared by this client and every clone of it.
+    ///
+    /// Shared deliberately: each upload worker holds a by-value clone of this client, so a
+    /// per-client flag would report the fact only for whichever worker happened to notice it.
+    /// The consequence is a property of the run, not of one transfer, and belongs to the run.
+    remote_mtime_unhonoured: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
@@ -696,6 +703,16 @@ pub struct WriteProbeReport {
     pub uploaded_size: u64,
     pub uploaded_md5: ContentMd5,
     pub uploaded_mtime_seconds: i64,
+    /// The modification time DSM reported for the uploaded probe file, when it reported one.
+    pub reported_mtime_seconds: Option<i64>,
+    /// Whether DSM kept the modification time the probe's upload sent.
+    ///
+    /// `None` until the upload has been read back, and also when DSM reported no modification time
+    /// at all — that is "unanswered", not "not preserved". `Some(false)` is the finding that makes
+    /// every `metadata` and `content` run re-upload the whole tree, because the upload writes
+    /// `mtime` in milliseconds and every comparison reads whole seconds back from File Station.
+    /// It does not fail the probe: the bytes landed, and the size and digest proved it.
+    pub mtime_preserved: Option<bool>,
     pub server_copy_supported: bool,
     pub server_copy_attempted: bool,
     pub server_copy_verified: bool,
@@ -928,6 +945,7 @@ impl ApiClient {
             upload_rate_limit: None,
             cancellation: CancellationToken::default(),
             observer,
+            remote_mtime_unhonoured: Arc::new(AtomicBool::new(false)),
         };
         // Announced before discovery so the endpoint is named ahead of the first request it
         // explains, which is the order a reader needs.
@@ -1155,6 +1173,22 @@ impl ApiClient {
             .collect()
     }
 
+    /// Ask File Station for one file's MD5, computed on the NAS.
+    ///
+    /// Both requests go through the retry predicate, which is what keeps a batch from being
+    /// abandoned for a transient fault. A digest batch stops claiming work the moment one file
+    /// fails (see [`Self::populate_remote_content_md5`]), so before this a single 502 from a
+    /// reverse proxy on a single poll failed the comparison pass for a whole batch of up to
+    /// 32 files and aborted the sync — on a flaky link, the dominant failure mode, a retry of an
+    /// idempotent read away from being invisible.
+    ///
+    /// `start` is retried as well as `status`. It is not literally idempotent — a retry whose
+    /// predecessor actually reached DSM leaves a second digest task running, whose id this process
+    /// never learns and therefore never stops. That cost is bounded and read-only: the task reads
+    /// one file and ends. Abandoning a 32-file comparison batch instead is neither.
+    ///
+    /// Non-retryable failures keep their existing meaning exactly: a DSM error code outside
+    /// `retryable` still fails the file, and still abandons the batch.
     pub fn remote_content_md5(
         &self,
         remote_path: &str,
@@ -1166,7 +1200,7 @@ impl ApiClient {
             .checked_add(self.operation_timeout)
             .ok_or_else(|| Error::Message("operation timeout is too large".to_owned()))?;
         let task: TaskStartData = self
-            .call_bounded(
+            .call_bounded_with_retry(
                 "SYNO.FileStation.MD5",
                 2,
                 "start",
@@ -1194,7 +1228,7 @@ impl ApiClient {
             let request_timeout = self
                 .control_timeout
                 .min(deadline.saturating_duration_since(Instant::now()));
-            let status: Md5StatusData = match self.call_bounded(
+            let status: Md5StatusData = match self.call_bounded_with_retry(
                 "SYNO.FileStation.MD5",
                 2,
                 "status",
@@ -1420,7 +1454,13 @@ impl ApiClient {
             let request_timeout = self
                 .control_timeout
                 .min(deadline.saturating_duration_since(Instant::now()));
-            let status: TaskStatusData = match self.call_bounded(
+            // Through the retry predicate, for the reason `remote_content_md5`'s polls are: one
+            // 502 from a reverse proxy on one poll of a copy that is running perfectly well used
+            // to stop the task and fail the whole run, after its pre-deletes and directory
+            // creates had already been performed. `CopyMove.start` deliberately stays
+            // single-attempt above — it is not idempotent, and a retried start whose predecessor
+            // reached DSM leaves a second copy running.
+            let status: TaskStatusData = match self.call_bounded_with_retry(
                 "SYNO.FileStation.CopyMove",
                 3,
                 "status",
@@ -1463,6 +1503,14 @@ impl ApiClient {
         Ok(())
     }
 
+    /// Prove a remote file holds expected content, by reading it back and hashing it.
+    ///
+    /// The strong path: one `getinfo` for the size, then the whole file streamed and hashed
+    /// MD5/CRC32/SHA-256. Required wherever the evidence has to stand on its own — content this
+    /// process never sent (a server-side copy) or a digest that authorises destroying data (a
+    /// mirror deletion's guards, which demand [`ContentMd5::has_full_proof`]). For content this
+    /// process just uploaded, use [`Self::verify_uploaded_content`] instead and do not pay for the
+    /// bytes twice.
     pub fn verify_remote_content(
         &self,
         remote_path: &str,
@@ -1475,6 +1523,97 @@ impl ApiClient {
         } else {
             Err(Error::ContentVerificationFailed(remote_path.to_owned()))
         }
+    }
+
+    /// Verify content this process just wrote, without transferring it back.
+    ///
+    /// **The evidence is MD5-only, plus the size, and that is deliberate.** The destination's size
+    /// comes from one `getinfo` and its digest from File Station's own server-side MD5, so nothing
+    /// crosses the wire but two short control responses.
+    ///
+    /// Why that is sufficient here and nowhere else. The claim being checked is narrow: *the bytes
+    /// DSM now holds at this path are the bytes this process sent moments ago.* The expected digest
+    /// is not a stored value of unknown provenance — the upload path re-hashes the source
+    /// file immediately before this runs and fails the upload if it changed, so the comparison is
+    /// against a digest computed from the very bytes that went onto the wire. What is left to
+    /// detect is a truncated, reordered or corrupted transfer, and a digest over the whole file
+    /// detects exactly that. An adversary who can substitute content colliding with MD5 under a
+    /// digest the server computes on its own copy is not excluded by downloading either: the
+    /// download comes from the same server, over the same session.
+    ///
+    /// What this replaces. Every successful upload used to be verified by downloading the file back
+    /// in full and hashing it three ways, in *every* compare mode — a 1 GB `--compare metadata`
+    /// sync moved 2 GB over the wire and ran a full SHA-256 pass over the second gigabyte, for
+    /// strength that mode never asked for and that no later step consumed. On a two-core NAS that
+    /// was the single largest avoidable cost an upload had.
+    ///
+    /// The round trips go from two to three (`getinfo`, `MD5.start`, `MD5.status`); the transferred
+    /// bytes go from the size of the file to none of it.
+    pub fn verify_uploaded_content(
+        &self,
+        remote_path: &str,
+        expected_size: u64,
+        expected_md5: ContentMd5,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        if self.uploaded_content_matches(remote_path, expected_size, expected_md5, cancellation)? {
+            Ok(())
+        } else {
+            Err(Error::ContentVerificationFailed(remote_path.to_owned()))
+        }
+    }
+
+    /// The same check as [`Self::verify_uploaded_content`], reported as a boolean.
+    ///
+    /// Used by the upload retry path, which asks "did the previous attempt land after all?" and
+    /// must be able to answer "no" without that being an error.
+    fn uploaded_content_matches(
+        &self,
+        remote_path: &str,
+        expected_size: u64,
+        expected_md5: ContentMd5,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        cancellation.check()?;
+        let Some(facts) = self.remote_file_facts(remote_path)? else {
+            return Ok(false);
+        };
+        if facts.size != expected_size {
+            return Ok(false);
+        }
+        self.uploaded_digest_matches(remote_path, expected_size, expected_md5, cancellation)
+    }
+
+    /// The digest half of [`Self::uploaded_content_matches`], for a caller that has already
+    /// confirmed the destination's length from its own `getinfo`.
+    ///
+    /// Split out so the upload post-condition pays for one `getinfo` rather than two: it needs the
+    /// size and the modification time from that response anyway.
+    fn uploaded_digest_matches(
+        &self,
+        remote_path: &str,
+        expected_size: u64,
+        expected_md5: ContentMd5,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        cancellation.check()?;
+        // A DSM that does not offer the MD5 API reads the bytes back, exactly as every upload used
+        // to. Verification is not the place to turn a working configuration into a hard failure
+        // over an optimisation: before this the upload path needed only Upload and Download, and a
+        // unit that has no server-side digest would otherwise fail every upload it completed.
+        if self.require_content_api().is_err() {
+            if !expected_md5.has_full_proof() {
+                return Ok(false);
+            }
+            let actual =
+                self.remote_content_fingerprint(remote_path, expected_size, cancellation)?;
+            return Ok(content_evidence_matches(expected_md5, actual));
+        }
+        let actual = self.remote_content_md5(remote_path, cancellation)?;
+        // `md5_matches` rather than `content_evidence_matches`: File Station computes only MD5, so
+        // requiring strong proof of both sides here would always be false. See the doc above for
+        // why MD5 is the right standard of proof for bytes this process wrote itself.
+        Ok(expected_md5.md5_matches(&actual))
     }
 
     /// Re-read one path without retry immediately before a mutation and require its metadata to
@@ -1540,6 +1679,18 @@ impl ApiClient {
     }
 
     fn remote_file_size(&self, remote_path: &str) -> Result<Option<u64>> {
+        Ok(self.remote_file_facts(remote_path)?.map(|facts| facts.size))
+    }
+
+    /// What one `getinfo` can say about a remote file: its length, and the modification time DSM
+    /// reports for it.
+    ///
+    /// `None` means there is no file at that path — either absent (`408`) or a directory. The size
+    /// is required, and a response without one is a malformed response rather than a zero-length
+    /// file: coercing it would let a truncated upload pass a size check. The modification time is
+    /// optional because nothing fails on it; it exists so a caller can ask whether DSM kept the
+    /// `mtime` an upload sent, and a DSM that omits the field simply does not answer that question.
+    fn remote_file_facts(&self, remote_path: &str) -> Result<Option<RemoteFileFacts>> {
         let item = match self.get_info_with_retry(remote_path, false) {
             Ok(item) => item,
             Err(error) if error.api_code() == Some(408) => return Ok(None),
@@ -1548,13 +1699,116 @@ impl ApiClient {
         if item.isdir {
             return Ok(None);
         }
-        item.additional
-            .and_then(|additional| additional.size)
-            .map(Some)
-            .ok_or_else(|| Error::InvalidResponse {
-                operation: "SYNO.FileStation.List.getinfo".to_owned(),
-                message: "file information contained no byte size".to_owned(),
-            })
+        let additional = item.additional.unwrap_or_default();
+        let size = additional.size.ok_or_else(|| Error::InvalidResponse {
+            operation: "SYNO.FileStation.List.getinfo".to_owned(),
+            message: "file information contained no byte size".to_owned(),
+        })?;
+        Ok(Some(RemoteFileFacts {
+            size,
+            mtime_seconds: additional.time.as_ref().and_then(|time| time.mtime),
+        }))
+    }
+
+    /// True once this run saw DSM report a modification time for an uploaded file that is not the
+    /// one the upload sent.
+    ///
+    /// Latched, not counted: the question is whether this destination honours the `mtime` field at
+    /// all, and one file answers it for every file. Shared with every worker clone of this client.
+    ///
+    /// The consequence is worth stating where a caller reports it. `Upload` carries `mtime` and
+    /// every later comparison reads the remote modification time back, so a DSM that ignores the
+    /// field makes `metadata` and `content` comparison report `MtimeDiffers` for files that are
+    /// identical — the whole tree is re-uploaded on every run, and post-run reconciliation cannot
+    /// converge. The upload itself is not failed over it: the bytes did land, and the size and
+    /// digest checks proved it.
+    pub fn remote_mtime_unhonoured(&self) -> bool {
+        self.remote_mtime_unhonoured.load(Ordering::Acquire)
+    }
+
+    /// The post-condition of an upload, taken from exactly one `getinfo`.
+    ///
+    /// Unconditional, and that is the point. DSM answering `success: true` is a statement about
+    /// the request, not about the bytes: a reverse proxy that truncated the body, or a response
+    /// fabricated or replayed by an intermediary, produces the same `success`. Before this, an
+    /// entry carrying no digest was verified by nothing at all — the whole post-condition sat
+    /// inside `if let Some(expected) = local.content_md5`, so a caller building a `LocalEntry` of
+    /// its own (every field is public) and calling [`Self::upload_observed`] had "DSM said yes" as
+    /// its only evidence that a file exists at the destination.
+    ///
+    /// The length is checked always. The digest is checked when the entry carries one, against the
+    /// server's own MD5 rather than by reading the bytes back; see
+    /// [`Self::verify_uploaded_content`] for why that is the right standard of proof here. So a
+    /// digest-less entry gets size-only proof, which is weaker but is no longer nothing, and costs
+    /// the one request the digest path already pays for.
+    fn verify_upload_landed(
+        &self,
+        local: &LocalEntry,
+        remote_file: &str,
+        streamed: Option<&Mutex<StreamedBody>>,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        cancellation.check()?;
+        // The bytes that went onto the wire are checked against the planned fingerprint *first*,
+        // so a source that changed under the transfer is reported without spending a request on a
+        // destination whose state no longer matters — and so `expected` is known to describe what
+        // was sent before the destination is compared against it (see `verify_uploaded_content`).
+        //
+        // This used to re-read and re-hash the whole source file here. The reader already has every
+        // byte in hand, so hashing as it streams costs nothing and answers a strictly better
+        // question: not "does the file on disk still hash to the planned fingerprint" — which a
+        // same-size edit inside one clock second could satisfy while different bytes were sent —
+        // but "did the bytes this attempt sent hash to it". The length is compared too, because a
+        // body the transport abandoned part-way would otherwise hash to a prefix nobody asked about.
+        let expected = match (local.content_md5, streamed) {
+            (Some(expected), Some(streamed)) => {
+                let streamed = streamed.lock().unwrap_or_else(PoisonError::into_inner);
+                if streamed.bytes != local.size
+                    || !content_evidence_matches(expected, streamed.hasher.fingerprint())
+                {
+                    return Err(Error::SourceChanged(local.full_path.clone()));
+                }
+                Some(expected)
+            }
+            // A digest with no accumulator cannot happen on this path -- they are created from the
+            // same `Option` -- but falling back to a re-read is the answer that stays correct if a
+            // later caller separates them, rather than silently skipping the comparison.
+            (Some(expected), None) => {
+                let actual_local = crate::local::hash_file_snapshot(local, cancellation)?;
+                if !content_evidence_matches(expected, actual_local) {
+                    return Err(Error::SourceChanged(local.full_path.clone()));
+                }
+                Some(expected)
+            }
+            (None, _) => None,
+        };
+        let Some(facts) = self.remote_file_facts(remote_file)? else {
+            return Err(Error::ContentVerificationFailed(remote_file.to_owned()));
+        };
+        if facts.size != local.size {
+            return Err(Error::ContentVerificationFailed(remote_file.to_owned()));
+        }
+        self.note_uploaded_mtime(local, facts.mtime_seconds);
+        if let Some(expected) = expected
+            && !self.uploaded_digest_matches(remote_file, local.size, expected, cancellation)?
+        {
+            return Err(Error::ContentVerificationFailed(remote_file.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Record whether DSM kept the modification time this upload sent.
+    ///
+    /// Compared at whole-second resolution because that is the resolution File Station reports,
+    /// and against the same `div_euclid` the planner uses, so the comparison here and the
+    /// comparison that decides re-upload cannot disagree. A DSM that reported no modification
+    /// time answers nothing and latches nothing.
+    fn note_uploaded_mtime(&self, local: &LocalEntry, reported: Option<i64>) {
+        if let Some(reported) = reported
+            && reported != local.mtime_ms.div_euclid(1000)
+        {
+            self.remote_mtime_unhonoured.store(true, Ordering::Release);
+        }
     }
 
     pub fn login(&mut self, username: &str, password: &str, otp: Option<&str>) -> Result<()> {
@@ -2098,14 +2352,33 @@ impl ApiClient {
 
             report.upload_attempted = true;
             self.upload_non_overwriting(local, &upload_path, cancellation)?;
-            self.verify_remote_metadata_snapshot(
-                &upload_path,
-                EntryKind::File,
-                local.size,
-                expected_mtime_seconds,
-                true,
-                cancellation,
-            )?;
+            // The one upload that still reads itself back. A sync verifies its uploads against the
+            // server-side MD5 and never transfers them twice; this is a diagnostic, and its product
+            // is evidence about the transfer mechanisms themselves — including the Download API that
+            // mirror-delete guards and strong fingerprints depend on, which this probe declares
+            // required and would otherwise never exercise. Proving that path works is a large part
+            // of why an operator runs the write test, and the payload is a few dozen bytes, so the
+            // transfer costs nothing worth saving.
+            self.verify_remote_content(&upload_path, local.size, expected_md5, cancellation)?;
+            // The modification time is read back as a *fact*, not as a precondition. Whether DSM
+            // honours the `mtime` an upload sends is the one question about this destination that
+            // cannot be answered from the repository — the upload sends milliseconds and every
+            // later comparison reads whole seconds back, and no test outside a mock that shares the
+            // assumption asserts the two agree. If the answer is no, every `metadata` and `content`
+            // run re-uploads the whole tree forever and reconciliation never converges, which is
+            // worth reporting plainly rather than as a write probe that failed on a snapshot check.
+            // The size and digest above already proved the bytes landed.
+            let facts = self
+                .remote_file_facts(&upload_path)?
+                .ok_or_else(|| Error::ContentVerificationFailed(upload_path.clone()))?;
+            if facts.size != local.size {
+                return Err(Error::ContentVerificationFailed(upload_path.clone()));
+            }
+            report.reported_mtime_seconds = facts.mtime_seconds;
+            report.mtime_preserved = facts
+                .mtime_seconds
+                .map(|reported| reported == expected_mtime_seconds);
+            self.note_uploaded_mtime(local, facts.mtime_seconds);
             report.upload_verified = true;
 
             if copy_supported {
@@ -2315,11 +2588,12 @@ impl ApiClient {
     pub fn remote_inventory(
         &self,
         root: &RemoteRoot,
+        rules: &IgnoreRules,
         cancellation: &CancellationToken,
     ) -> Result<RemoteInventory> {
         let scope = Scope::root();
         Ok(self
-            .remote_inventory_scoped(root, &scope, usize::MAX, cancellation)?
+            .remote_inventory_scoped(root, &scope, rules, usize::MAX, cancellation)?
             .inventory)
     }
 
@@ -2335,10 +2609,22 @@ impl ApiClient {
     ///
     /// A scope may name a single file. A scope that does not exist remotely is not an error: it
     /// is the answer "nothing here is on the NAS yet".
+    ///
+    /// `rules` prunes the walk exactly as it prunes the local one. A DSM-managed directory
+    /// (`@eaDir`, `#recycle`, `#snapshot`, `@tmp`) or a directory an ignore rule excludes is
+    /// recorded — `protected_entries` counts it, and `status` reports it as excluded — but **not
+    /// descended into**. Nothing downstream wanted its contents: `is_protected` already keeps them
+    /// out of deletion, comparison digests, copy sources and copy destinations, so the entire
+    /// subtree was listed, transferred and thrown away. `@eaDir` holds one subdirectory per indexed
+    /// media file, so a ten-thousand-photo share cost roughly ten thousand extra `List.list` round
+    /// trips per inventory on a two-core armv7 — and on the `status` path those entries were charged
+    /// against the scan budget, so a large recycle bin could exhaust all 20,000 before the walk
+    /// reached any payload and every real file was then reported `missing-remote`.
     pub fn remote_inventory_scoped(
         &self,
         root: &RemoteRoot,
         scope: &Scope,
+        rules: &IgnoreRules,
         budget: usize,
         cancellation: &CancellationToken,
     ) -> Result<ScopedRemoteInventory> {
@@ -2414,12 +2700,8 @@ impl ApiClient {
         }
 
         let mut complete = true;
-        while let Some(folder) = pending.pop() {
+        'walk: while let Some(folder) = pending.pop() {
             cancellation.check()?;
-            if entries.len() >= budget {
-                complete = false;
-                break;
-            }
             let files = match self.list_directory(&folder, cancellation) {
                 Ok(files) => files,
                 Err(error) if folder == root.as_str() && error.api_code() == Some(408) => {
@@ -2470,13 +2752,28 @@ impl ApiClient {
                     mount_point_type: mount_point_type.clone(),
                     content_md5: None,
                 };
+                // The budget is how many entries may be kept, so the entry that proves the walk
+                // was truncated is the first one that does not fit -- not the last one that did.
+                // Checked before listing the next directory instead, a tree whose last directories
+                // are empty reported itself truncated when it had in fact been walked in full, and
+                // `store_rollup` requires a reader to render an incomplete total as a floor: every
+                // count in the dashboard became "20,000+" for a tree that was exactly 20,000.
+                if entries.len() >= budget {
+                    complete = false;
+                    break 'walk;
+                }
                 if entries.insert(relative.clone(), entry).is_some() {
                     return Err(Error::InvalidResponse {
                         operation: "SYNO.FileStation.List.list".to_owned(),
                         message: format!("server returned duplicate path {relative:?}"),
                     });
                 }
-                if item.isdir && mount_point_type.is_none() {
+                // Recorded above so the entry is still counted and still reported as excluded, and
+                // not traversed: nothing downstream reads anything beneath a protected directory.
+                let protected = mount_point_type.is_some()
+                    || is_dsm_managed(&relative)
+                    || rules.is_ignored(&relative, item.isdir);
+                if item.isdir && !protected {
                     pending.push(item.path);
                 }
             }
@@ -3202,11 +3499,18 @@ impl ApiClient {
                 source,
             })?;
             verify_open_file_snapshot(local, &file)?;
+            // A fresh accumulator per attempt: a retry re-reads the file from the start, so a
+            // hasher carried across attempts would fingerprint the file twice over.
+            let streamed = local
+                .content_md5
+                .map(|_| Arc::new(Mutex::new(StreamedBody::new())));
             let reader = ObservedReader {
                 inner: file,
                 observer: observer.clone(),
                 cancelled: Arc::clone(&observer_cancelled),
                 throttle: upload_throttle(self.upload_rate_limit.as_ref(), cancellation),
+                cancellation: cancellation.clone(),
+                streamed: streamed.clone(),
             };
             let part = Part::reader_with_length(reader, local.size)
                 .file_name(remote_name.to_owned())
@@ -3278,18 +3582,12 @@ impl ApiClient {
             match result {
                 Ok(()) => {
                     verify_local_snapshot(local)?;
-                    if let Some(expected) = local.content_md5 {
-                        let actual_local = crate::local::hash_file_snapshot(local, cancellation)?;
-                        if !content_evidence_matches(expected, actual_local) {
-                            return Err(Error::SourceChanged(local.full_path.clone()));
-                        }
-                        self.verify_remote_content(
-                            remote_file,
-                            local.size,
-                            expected,
-                            cancellation,
-                        )?;
-                    }
+                    self.verify_upload_landed(
+                        local,
+                        remote_file,
+                        streamed.as_deref(),
+                        cancellation,
+                    )?;
                     return Ok(());
                 }
                 Err(error) if attempt < self.retries && retryable(&error) => {
@@ -3299,7 +3597,11 @@ impl ApiClient {
                         if !content_evidence_matches(expected, actual_local) {
                             return Err(Error::SourceChanged(local.full_path.clone()));
                         }
-                        match self.remote_content_matches(
+                        // "Did the attempt that failed in transport land anyway?" is the same claim
+                        // the success path checks, so it takes the same evidence -- and a
+                        // reconciliation that used to re-transfer the whole file before deciding
+                        // whether to re-transmit it now costs two control requests.
+                        match self.uploaded_content_matches(
                             remote_file,
                             local.size,
                             expected,
@@ -3319,18 +3621,40 @@ impl ApiClient {
         unreachable!("retry loop always returns")
     }
 
-    /// Validate and open an upload source before any destructive type replacement begins.
-    pub fn preflight_upload_source(
-        &self,
-        local: &LocalEntry,
-        cancellation: &CancellationToken,
-    ) -> Result<()> {
+    /// Prove an upload source is present, unchanged and openable, without reading it.
+    ///
+    /// The cheap half of the preflight, and the right one wherever the question is "can this
+    /// transfer still happen" rather than "is this content still what was planned". It stats the
+    /// path, refuses a symlink or a non-file, compares the size and modification time against the
+    /// snapshot, and opens the file — which is what proves a destructive type replacement will not
+    /// destroy remote data for a source that cannot be read back.
+    ///
+    /// The digest re-check that [`Self::preflight_upload_source`] adds costs a full read and a full
+    /// MD5/CRC32/SHA-256 pass per file. Every upload carries a fingerprint, so calling the strong
+    /// form where the cheap one answers the question meant a `--delete` run read and hashed every
+    /// uploaded file four times over on a two-core NAS.
+    pub fn preflight_upload_readable(&self, local: &LocalEntry) -> Result<()> {
         verify_local_snapshot(local)?;
         let file = File::open(&local.full_path).map_err(|source| Error::FileIo {
             path: local.full_path.clone(),
             source,
         })?;
-        verify_open_file_snapshot(local, &file)?;
+        verify_open_file_snapshot(local, &file)
+    }
+
+    /// Validate and open an upload source before any destructive type replacement begins, and
+    /// prove its content still matches the fingerprint the plan recorded.
+    ///
+    /// For the call sites whose next step destroys data on the strength of this content: a
+    /// server-side copy, whose destination is verified against a digest taken from *this* file, and
+    /// a mirror deletion guarded by a copy having landed. Everywhere else,
+    /// [`Self::preflight_upload_readable`] answers the question without the read.
+    pub fn preflight_upload_source(
+        &self,
+        local: &LocalEntry,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        self.preflight_upload_readable(local)?;
         if let Some(expected) = local.content_md5 {
             let actual = crate::local::hash_file_snapshot(local, cancellation)?;
             if !content_evidence_matches(expected, actual) {
@@ -3390,17 +3714,56 @@ impl ApiClient {
             })
     }
 
-    /// Read every page of one directory listing.
+    /// Read every page of one directory listing, and require the pages to describe one directory.
     ///
     /// A directory large enough to paginate is checked once per page so a Ctrl-C during the
     /// remote scan is not held until the whole directory has been drained.
+    ///
+    /// Pagination is by offset into a server-side sort, so a concurrent change between two pages
+    /// silently shifts the entries that have not been read yet. A deletion among the entries page
+    /// one already returned moves every later entry down by one: the entry that was at the next
+    /// offset is never returned, and because `total` drops by one as well, the arrival count still
+    /// matches what the last page claimed. The **only** evidence left is that the two pages
+    /// disagreed about `total`, which is why that — not the final count alone — is what this
+    /// checks.
+    ///
+    /// A short inventory must never be returned as a complete one. Downstream, a remote entry
+    /// missing from the inventory is planned as an upload to a path that in fact exists, and the
+    /// upload overwrites it; a directory whose children went missing can also be proposed for
+    /// deletion. So a walk whose pages disagree is discarded and taken again from offset 0, and a
+    /// second disagreement is an error naming both counts.
     fn list_directory(
         &self,
         folder: &str,
         cancellation: &CancellationToken,
     ) -> Result<Vec<RemoteItem>> {
+        let first = self.list_directory_pass(folder, cancellation)?;
+        if first.is_whole() {
+            return Ok(first.items);
+        }
+        let second = self.list_directory_pass(folder, cancellation)?;
+        if second.is_whole() {
+            return Ok(second.items);
+        }
+        Err(Error::InvalidResponse {
+            operation: "SYNO.FileStation.List.list".to_owned(),
+            message: format!(
+                "directory {folder:?} changed while it was being listed, twice: {}",
+                second.disagreement()
+            ),
+        })
+    }
+
+    /// One complete pass over a directory's pages, reported with the evidence needed to judge it.
+    fn list_directory_pass(
+        &self,
+        folder: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<DirectoryListing> {
         let mut offset = 0_usize;
         let mut output = Vec::new();
+        let mut declared = 0_usize;
+        let mut changed_to = None;
         loop {
             cancellation.check()?;
             let parameters = vec![
@@ -3421,6 +3784,14 @@ impl ApiClient {
                     operation: "SYNO.FileStation.List.list".to_owned(),
                     message: "successful response contained no directory data".to_owned(),
                 })?;
+            if offset == 0 {
+                declared = data.total;
+            } else if data.total != declared {
+                // Nothing read after this point can be trusted to belong to the same directory
+                // state, so stop rather than pay for pages this pass is going to discard.
+                changed_to = Some(data.total);
+                break;
+            }
             let count = data.files.len();
             for item in data.files {
                 output.push(item.into_item("SYNO.FileStation.List", "list")?);
@@ -3439,7 +3810,11 @@ impl ApiClient {
                 });
             }
         }
-        Ok(output)
+        Ok(DirectoryListing {
+            items: output,
+            declared,
+            changed_to,
+        })
     }
 
     fn get_info(&self, path: &str) -> Result<RemoteItem> {
@@ -3518,6 +3893,30 @@ impl ApiClient {
         self.send_form_once_with_timeout(url, fields, api, version, method, timeout)
     }
 
+    /// A bounded control request that still gets the retry predicate.
+    ///
+    /// [`Self::call_bounded`] exists so a request inside a polling loop cannot outlive that loop's
+    /// own deadline, and it bought that by giving up retries entirely. For a task poll the trade
+    /// was wrong: one 502 from a reverse proxy on one status request failed the whole batch the
+    /// poll belonged to. This keeps the caller's timeout for every attempt and adds the same
+    /// `retryable`/backoff behaviour every other control request has.
+    ///
+    /// The caller's deadline still governs: the attempt timeout is whatever was passed, and a
+    /// polling caller recomputes it from its remaining budget before each call.
+    fn call_bounded_with_retry<T: DeserializeOwned>(
+        &self,
+        api: &'static str,
+        version: u32,
+        method: &'static str,
+        parameters: Vec<(String, String)>,
+        timeout: Duration,
+    ) -> Result<Option<T>> {
+        self.validate_api(api, version)?;
+        let fields = self.authenticated_fields(api, version, method, parameters)?;
+        let url = self.api_url(api)?;
+        self.send_form_with_retry_bounded(url, fields, api, version, method, true, timeout)
+    }
+
     fn authenticated_fields(
         &self,
         api: &str,
@@ -3548,6 +3947,28 @@ impl ApiClient {
         method: &'static str,
         allow_retry: bool,
     ) -> Result<Option<T>> {
+        self.send_form_with_retry_bounded(
+            url,
+            fields,
+            api,
+            version,
+            method,
+            allow_retry,
+            self.control_timeout,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_form_with_retry_bounded<T: DeserializeOwned>(
+        &self,
+        url: Url,
+        fields: Vec<(String, String)>,
+        api: &'static str,
+        version: u32,
+        method: &'static str,
+        allow_retry: bool,
+        timeout: Duration,
+    ) -> Result<Option<T>> {
         // These owned copies can include SID/SynoToken values. Erase them after the final
         // attempt; each per-attempt clone is erased by `send_form_once` as well.
         let fields = Zeroizing::new(fields);
@@ -3560,7 +3981,7 @@ impl ApiClient {
                     api,
                     version,
                     method,
-                    timeout: self.control_timeout,
+                    timeout,
                     attempt: attempt + 1,
                     max_attempts: attempts + 1,
                 },
@@ -3876,6 +4297,41 @@ struct ListData {
     files: Vec<RemoteItemWire>,
 }
 
+/// One pass over a directory's pages, with the evidence for whether it saw the whole directory.
+#[derive(Debug)]
+struct DirectoryListing {
+    items: Vec<RemoteItem>,
+    /// Entry count the first page claimed.
+    declared: usize,
+    /// Entry count a later page claimed instead, when one disagreed.
+    changed_to: Option<usize>,
+}
+
+impl DirectoryListing {
+    /// Whether this pass can be trusted as the complete directory.
+    ///
+    /// Two independent ways to fail: a `total` that changed between pages (a concurrent create or
+    /// delete, which may have shifted an unread entry out of reach) and an arrival count that does
+    /// not match what was claimed.
+    fn is_whole(&self) -> bool {
+        self.changed_to.is_none() && self.items.len() == self.declared
+    }
+
+    fn disagreement(&self) -> String {
+        match self.changed_to {
+            Some(total) => format!(
+                "the server first reported {} entries and then {total}",
+                self.declared
+            ),
+            None => format!(
+                "the server reported {} entries and returned {}",
+                self.declared,
+                self.items.len()
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct GetInfoData {
     #[serde(default)]
@@ -3918,6 +4374,17 @@ struct RemoteItemWire {
     disable_list: bool,
     #[serde(default)]
     additional: Option<RemoteAdditionalWire>,
+}
+
+/// What one `getinfo` answers about a remote file.
+///
+/// The size is settled — a response without one is refused rather than read as zero. The
+/// modification time is optional because no decision fails on its absence: it exists so a caller
+/// can ask whether DSM kept the `mtime` an upload sent.
+#[derive(Clone, Copy, Debug)]
+struct RemoteFileFacts {
+    size: u64,
+    mtime_seconds: Option<i64>,
 }
 
 /// One File Station entry whose shape has been checked, so the rest of the client need not.
@@ -5107,6 +5574,45 @@ struct ObservedReader<R> {
     cancelled: Arc<AtomicBool>,
     /// `None` leaves the reader on the unmetered path it has always taken.
     throttle: Option<UploadThrottle>,
+    /// The run's cancellation token, consulted on every read.
+    ///
+    /// The reader used to have exactly two ways to abandon a body: an observer that declined, and
+    /// the throttle's own check — and the throttle exists only under `--max-rate`. So an upload
+    /// with no observer and no rate limit was a plain passthrough with no cancellation point at
+    /// all between the one check at the top of the attempt and the arrival of the response. The
+    /// copy fallback was exactly that call, and a Ctrl-C during a multi-gigabyte fallback kept
+    /// streaming for up to the full `--timeout`. Checking here closes it for every caller, present
+    /// and future, and makes an observer's `stop`-watching an optimisation rather than the only
+    /// mechanism.
+    cancellation: CancellationToken,
+    /// Fingerprints the bytes this reader hands to the transport, when the caller asked for it.
+    ///
+    /// The bytes are already in hand, so this shares the read the transfer performs instead of
+    /// adding one. It replaces the post-upload re-read of the whole source file, and answers a
+    /// strictly better question than that re-read did: not "does the file on disk still hash to the
+    /// planned fingerprint" but "did the bytes that went onto the wire hash to it".
+    streamed: Option<Arc<Mutex<StreamedBody>>>,
+}
+
+/// What an upload body reader observed about the bytes it sent.
+#[derive(Clone)]
+struct StreamedBody {
+    hasher: crate::integrity::ContentHasher,
+    bytes: u64,
+}
+
+impl StreamedBody {
+    fn new() -> Self {
+        Self {
+            hasher: crate::integrity::ContentHasher::new(),
+            bytes: 0,
+        }
+    }
+
+    fn update(&mut self, chunk: &[u8]) {
+        self.hasher.update(chunk);
+        self.bytes = self.bytes.saturating_add(chunk.len() as u64);
+    }
 }
 
 /// A token bucket written as a pure state machine: every operation is handed the current
@@ -5342,6 +5848,8 @@ fn initial_write_probe_report(
         uploaded_size,
         uploaded_md5,
         uploaded_mtime_seconds,
+        reported_mtime_seconds: None,
+        mtime_preserved: None,
         server_copy_supported,
         server_copy_attempted: false,
         server_copy_verified: false,
@@ -5372,6 +5880,13 @@ fn content_evidence_matches(expected: ContentMd5, actual: ContentMd5) -> bool {
 
 impl<R: Read> Read for ObservedReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancellation.is_cancelled() {
+            self.cancelled.store(true, Ordering::Release);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "upload cancelled",
+            ));
+        }
         // An unlimited upload takes exactly the path it always has: one full-buffer read.
         // A limited one is metered by shortening the read rather than by sleeping on bytes it
         // has already taken, which keeps the pacing smooth and every wait bounded.
@@ -5385,6 +5900,14 @@ impl<R: Read> Read for ObservedReader<R> {
             },
             None => self.inner.read(buffer)?,
         };
+        if count > 0
+            && let Some(streamed) = &self.streamed
+        {
+            streamed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .update(&buffer[..count]);
+        }
         if count > 0
             && let Some(observer) = &self.observer
             && !observer(UploadTransferEvent::Advanced {
@@ -5570,6 +6093,27 @@ fn discovery_route_returned_response(error: &Error) -> bool {
     )
 }
 
+/// Which failures are worth sending again.
+///
+/// DSM's session codes are deliberately **absent**, and this is the place to record why rather than
+/// leave it to be rediscovered. **106** ("session timed out"), **107** ("session was interrupted by
+/// a duplicate login") and **119** ("session is invalid") all tell the operator to rerun, and all
+/// three are reachable mid-run: DSM's idle timeout can expire the SID during an overnight mirror of
+/// a large tree, and an administrator signing into DSM with the same account produces 107. Retrying
+/// them here would be pointless — the same dead session goes back out, three times, with backoff.
+///
+/// Recovering properly means re-authenticating and retrying the failed call, and that is a larger
+/// change than it looks. Each worker holds a by-value clone of the client, so there is no shared slot
+/// a refreshed session could be written to; `Session` would have to move behind an
+/// `Arc<RwLock<..>>`, and the credentials would have to be retained in memory for the whole run
+/// rather than dropped immediately after authentication, which is a security posture the vault
+/// design chose against. That is not a change to make as a footnote to a bug batch.
+///
+/// What was actually wrong about the old behaviour is not that it failed but that it reported
+/// nothing: the run died after doing most of its work and the operator was left with "rerun to
+/// authenticate again" and no account of what had landed. That half is closed — the report of
+/// completed work now survives a failure — so the remaining cost of an expired session is a rerun
+/// that re-plans against a destination most of which is already correct.
 fn retryable(error: &Error) -> bool {
     match error {
         Error::Http { source, .. } => {
@@ -6121,6 +6665,7 @@ mod tests {
             upload_rate_limit: None,
             cancellation: CancellationToken::default(),
             observer: None,
+            remote_mtime_unhonoured: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -6446,6 +6991,21 @@ mod tests {
 
     fn login_response() -> String {
         r#"{"success":true,"data":{"sid":"test-session","synotoken":"test-token"}}"#.to_owned()
+    }
+
+    /// The two responses one server-side MD5 costs: a task id, then a finished digest.
+    ///
+    /// Post-upload verification asks File Station for the destination's own MD5 rather than
+    /// downloading it back, so an uploading fixture scripts these where it used to script a body.
+    fn md5_of(payload: &[u8]) -> [String; 2] {
+        [
+            task_start_response("md5-task"),
+            serde_json::json!({
+                "success": true,
+                "data": {"finished": true, "md5": ContentMd5::from_content(payload).to_string()}
+            })
+            .to_string(),
+        ]
     }
 
     #[test]
@@ -7613,6 +8173,7 @@ mod tests {
         let inventory = client
             .remote_inventory(
                 &RemoteRoot::parse("/share/root").unwrap(),
+                &IgnoreRules::none(),
                 &CancellationToken::default(),
             )
             .unwrap();
@@ -7878,6 +8439,7 @@ mod tests {
             let error = client
                 .remote_inventory(
                     &RemoteRoot::parse("/share/root").unwrap(),
+                    &IgnoreRules::none(),
                     &CancellationToken::default(),
                 )
                 .expect_err("an unusable file snapshot must not be stored as zero");
@@ -7915,6 +8477,7 @@ mod tests {
         let inventory = client
             .remote_inventory(
                 &RemoteRoot::parse("/share/root").unwrap(),
+                &IgnoreRules::none(),
                 &CancellationToken::default(),
             )
             .unwrap();
@@ -8034,6 +8597,7 @@ mod tests {
             assert!(matches!(
                 client.remote_inventory(
                     &RemoteRoot::parse("/share/root").unwrap(),
+                    &IgnoreRules::none(),
                     &CancellationToken::default()
                 ),
                 Err(Error::InvalidResponse { .. })
@@ -8072,7 +8636,11 @@ mod tests {
         client.login("alice", "password", None).unwrap();
 
         assert!(matches!(
-            client.remote_inventory(&RemoteRoot::parse("/share/root").unwrap(), &cancellation),
+            client.remote_inventory(
+                &RemoteRoot::parse("/share/root").unwrap(),
+                &IgnoreRules::none(),
+                &cancellation,
+            ),
             Err(Error::Cancelled)
         ));
         // The server script holds no reply for a second page: the client never asked for one.
@@ -8112,6 +8680,7 @@ mod tests {
         assert!(matches!(
             client.remote_inventory(
                 &RemoteRoot::parse("/share/root").unwrap(),
+                &IgnoreRules::none(),
                 &CancellationToken::default()
             ),
             Err(Error::Cancelled)
@@ -8162,6 +8731,7 @@ mod tests {
         let inventory = client
             .remote_inventory(
                 &RemoteRoot::parse("/share/root").unwrap(),
+                &IgnoreRules::none(),
                 &CancellationToken::default(),
             )
             .unwrap();
@@ -8179,6 +8749,7 @@ mod tests {
             client
                 .remote_inventory(
                     &RemoteRoot::parse("/share/root").unwrap(),
+                    &IgnoreRules::none(),
                     &CancellationToken::default()
                 )
                 .unwrap_err()
@@ -8199,6 +8770,7 @@ mod tests {
         let inventory = client
             .remote_inventory(
                 &RemoteRoot::parse("/share/root").unwrap(),
+                &IgnoreRules::none(),
                 &CancellationToken::default(),
             )
             .unwrap();
@@ -8669,6 +9241,8 @@ mod tests {
             observer: Some(observer),
             cancelled: Arc::new(AtomicBool::new(false)),
             throttle: None,
+            cancellation: CancellationToken::default(),
+            streamed: None,
         };
         let mut output = Vec::new();
         reader.read_to_end(&mut output).unwrap();
@@ -8685,6 +9259,8 @@ mod tests {
             observer: Some(observer),
             cancelled: Arc::clone(&cancelled),
             throttle: None,
+            cancellation: CancellationToken::default(),
+            streamed: None,
         };
         let error = reader.read(&mut [0_u8; 8]).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
@@ -8789,6 +9365,7 @@ mod tests {
             upload_rate_limit: None,
             cancellation: CancellationToken::default(),
             observer: None,
+            remote_mtime_unhonoured: Arc::new(AtomicBool::new(false)),
         };
         assert_eq!(client.max_upload_rate(), None);
 
@@ -8832,6 +9409,8 @@ mod tests {
             observer: None,
             cancelled: Arc::clone(cancelled),
             throttle: upload_throttle(bucket.as_ref(), cancellation),
+            cancellation: cancellation.clone(),
+            streamed: None,
         }
     }
 
@@ -9316,6 +9895,9 @@ mod tests {
             r#"{"success":true,"data":{"total":0,"offset":0,"files":[]}}"#.to_owned(),
             r#"{"success":true}"#.to_owned(),
             getinfo_file(&upload_path, size, None),
+            md5_of(WRITE_PROBE_PAYLOAD)[0].clone(),
+            md5_of(WRITE_PROBE_PAYLOAD)[1].clone(),
+            getinfo_file(&upload_path, size, None),
             scripted_binary_response(WRITE_PROBE_PAYLOAD),
             getinfo_file(&upload_path, size, Some(mtime_seconds)),
             r#"{"success":true}"#.to_owned(),
@@ -9374,8 +9956,8 @@ mod tests {
         assert!(!local_path.exists());
 
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 27);
-        for index in [5, 12] {
+        assert_eq!(requests.len(), 30);
+        for index in [5, 15] {
             let create = String::from_utf8_lossy(&requests[index].body);
             assert!(create.contains("api=SYNO.FileStation.CreateFolder"));
             assert!(create.contains("force_parent=false"));
@@ -9384,11 +9966,20 @@ mod tests {
         assert!(find_bytes(&upload.body, b"name=\"overwrite\"").is_some());
         assert!(find_bytes(&upload.body, b"\r\n\r\nfalse\r\n").is_some());
         assert!(find_bytes(&upload.body, WRITE_PROBE_PAYLOAD).is_some());
-        let copy = String::from_utf8_lossy(&requests[16].body);
+        // The probe verifies its upload twice, deliberately: once the way a sync does, against
+        // File Station's own MD5, and once by reading the bytes back. It is the only caller that
+        // exercises the Download API, which sync's mirror-delete guards depend on and which this
+        // probe declares required.
+        let digest_start = String::from_utf8_lossy(&requests[10].body);
+        assert!(digest_start.contains("api=SYNO.FileStation.MD5"));
+        assert!(digest_start.contains("method=start"));
+        let read_back = String::from_utf8_lossy(&requests[13].body);
+        assert!(read_back.contains("api=SYNO.FileStation.Download"));
+        let copy = String::from_utf8_lossy(&requests[19].body);
         assert!(copy.contains("api=SYNO.FileStation.CopyMove"));
         assert!(copy.contains("remove_src=false"));
         assert!(!copy.contains("overwrite"));
-        for delete in &requests[21..=24] {
+        for delete in &requests[24..=27] {
             let body = String::from_utf8_lossy(&delete.body);
             assert!(body.contains("api=SYNO.FileStation.Delete"));
             assert!(body.contains("recursive=false"));
@@ -9562,7 +10153,11 @@ mod tests {
             r#"{"success":true,"data":{"total":2,"offset":1,"files":[{"path":"/share/root/b.txt","name":"b.txt","isdir":false,"additional":{"size":1,"time":{"mtime":1}}}]}}"#.to_owned(),
             r#"{"success":true}"#.to_owned(),
             r#"{"success":true,"data":{"files":[{"path":"/share/root/folder/upload.bin","name":"upload.bin","isdir":false,"additional":{"size":31}}]}}"#.to_owned(),
-            scripted_binary_response(b"\0multipart payload\r\nwith binary"),
+            r#"{"success":true,"data":{"taskid":"md5-task"}}"#.to_owned(),
+            format!(
+                r#"{{"success":true,"data":{{"finished":true,"md5":"{}"}}}}"#,
+                ContentMd5::from_content(b"\0multipart payload\r\nwith binary")
+            ),
             r#"{"success":true}"#.to_owned(),
         ];
         let (url, server) = scripted_server(responses);
@@ -9586,7 +10181,7 @@ mod tests {
         let root = RemoteRoot::parse("/share/root").unwrap();
         client.verify_share_writable(&root).unwrap();
         let inventory = client
-            .remote_inventory(&root, &CancellationToken::default())
+            .remote_inventory(&root, &IgnoreRules::none(), &CancellationToken::default())
             .unwrap();
         assert!(inventory.root_exists);
         assert_eq!(inventory.entries.len(), 2);
@@ -9624,7 +10219,7 @@ mod tests {
         fs::remove_file(path).unwrap();
 
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 12);
+        assert_eq!(requests.len(), 13);
         assert!(
             requests
                 .iter()
@@ -9668,9 +10263,25 @@ mod tests {
         let file_position = find_bytes(&upload.body, b"name=\"file\"").unwrap();
         let payload_position = find_bytes(&upload.body, payload).unwrap();
         assert!(token_position < file_position && file_position < payload_position);
-        let verification = String::from_utf8_lossy(&requests[10].body);
-        assert!(verification.contains("SYNO.FileStation.Download"));
-        assert!(verification.contains("%5B%22%2Fshare%2Froot%2Ffolder%2Fupload.bin%22%5D"));
+        // Post-upload verification: the destination's size, then File Station's own MD5 of it.
+        // Nothing downloads the file back -- see `verify_uploaded_content` for why an MD5 the
+        // server computed is the right standard of proof for bytes this process just sent.
+        let size_check = String::from_utf8_lossy(&requests[9].body);
+        assert!(size_check.contains("method=getinfo"));
+        assert!(size_check.contains("%2Fshare%2Froot%2Ffolder%2Fupload.bin"));
+        let digest_start = String::from_utf8_lossy(&requests[10].body);
+        assert!(digest_start.contains("SYNO.FileStation.MD5"));
+        assert!(digest_start.contains("method=start"));
+        assert!(digest_start.contains("%2Fshare%2Froot%2Ffolder%2Fupload.bin"));
+        let digest_status = String::from_utf8_lossy(&requests[11].body);
+        assert!(digest_status.contains("method=status"));
+        assert!(
+            !requests.iter().any(|request| {
+                let body = String::from_utf8_lossy(&request.body);
+                body.contains("api=SYNO.FileStation.Download")
+            }),
+            "an upload must not be verified by transferring it back"
+        );
     }
 
     #[test]
@@ -9700,7 +10311,17 @@ mod tests {
                 StatusCode::OK,
                 r#"{"success":true,"data":{"files":[{"path":"/share/root/abc.bin","name":"abc.bin","isdir":false,"additional":{"size":3}}]}}"#.to_owned(),
             ),
-            (StatusCode::OK, scripted_binary_response(b"abc")),
+            (
+                StatusCode::OK,
+                r#"{"success":true,"data":{"taskid":"md5-task"}}"#.to_owned(),
+            ),
+            (
+                StatusCode::OK,
+                format!(
+                    r#"{{"success":true,"data":{{"finished":true,"md5":"{}"}}}}"#,
+                    ContentMd5::from_content(b"abc")
+                ),
+            ),
             (StatusCode::OK, r#"{"success":true}"#.to_owned()),
         ];
         let (url, server) = scripted_server_with_status(responses);
@@ -9745,7 +10366,7 @@ mod tests {
         fs::remove_file(path).unwrap();
 
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 6);
+        assert_eq!(requests.len(), 7);
         assert_eq!(
             requests
                 .iter()
@@ -9757,6 +10378,17 @@ mod tests {
         );
         let probe = String::from_utf8_lossy(&requests[3].body);
         assert!(probe.contains("method=getinfo"));
+        // The reconciliation that decides against re-transmitting asks the server for its own MD5
+        // instead of pulling the file down to compute one. Re-transferring a file in order to find
+        // out whether it needs re-transferring was the worst shape this check could have.
+        let digest = String::from_utf8_lossy(&requests[4].body);
+        assert!(digest.contains("api=SYNO.FileStation.MD5"));
+        assert!(
+            !requests.iter().any(|request| {
+                String::from_utf8_lossy(&request.body).contains("api=SYNO.FileStation.Download")
+            }),
+            "reconciling a failed attempt must not transfer the file"
+        );
     }
 
     #[test]
@@ -9869,6 +10501,7 @@ mod tests {
         let error = client
             .remote_inventory(
                 &RemoteRoot::parse("/share/mounted/child").unwrap(),
+                &IgnoreRules::none(),
                 &CancellationToken::default(),
             )
             .unwrap_err();
@@ -10305,6 +10938,7 @@ mod tests {
         let error = client
             .remote_inventory(
                 &RemoteRoot::parse("/share/root").unwrap(),
+                &IgnoreRules::none(),
                 &CancellationToken::default(),
             )
             .unwrap_err();
@@ -10919,6 +11553,9 @@ mod tests {
             r#"{"success":true,"data":{"total":0,"files":[]}}"#.to_owned(),
             r#"{"success":true}"#.to_owned(),
             getinfo_file(&upload_path, size, None),
+            md5_of(WRITE_PROBE_PAYLOAD)[0].clone(),
+            md5_of(WRITE_PROBE_PAYLOAD)[1].clone(),
+            getinfo_file(&upload_path, size, None),
             scripted_binary_response(WRITE_PROBE_PAYLOAD),
             getinfo_file(&upload_path, size, Some(mtime_seconds)),
             r#"{"success":false,"error":{"code":408}}"#.to_owned(),
@@ -10953,7 +11590,7 @@ mod tests {
             Some(probe_path)
         );
         assert!(failure.to_string().contains("inspect and remove leftover"));
-        assert_eq!(server.join().unwrap().len(), 17);
+        assert_eq!(server.join().unwrap().len(), 20);
     }
 
     fn temp_upload_source(tag: &str, contents: &[u8]) -> (PathBuf, LocalEntry) {
@@ -11010,6 +11647,624 @@ mod tests {
         ]
     }
 
+    /// One page of a directory listing, claiming `total` entries in the directory overall.
+    fn list_page(folder: &str, total: usize, names: &[&str]) -> String {
+        let files = names
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "path": format!("{folder}/{name}"),
+                    "name": name,
+                    "isdir": false,
+                    "additional": {"size": 1, "time": {"mtime": 1}}
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({"success": true, "data": {"total": total, "files": files}}).to_string()
+    }
+
+    /// A concurrent deletion between two pages hides an entry while keeping the counts consistent.
+    ///
+    /// The scenario the arrival count cannot see: page one returns the first entries, something
+    /// else deletes one of them, and every later entry shifts down by one — so the entry that was
+    /// at the next offset is never returned, and `total` drops by one too, leaving arrivals equal
+    /// to the final claim. The disagreement between the two pages' `total` is the only evidence
+    /// there is, and returning the short listing as complete would plan an upload over a remote
+    /// file the inventory does not know exists.
+    #[test]
+    fn a_listing_whose_pages_disagree_is_taken_again_rather_than_returned_short() {
+        let folder = "/share/root";
+        let mut responses = upload_preamble();
+        responses.extend([
+            // First pass: the directory shrinks under it.
+            (StatusCode::OK, list_page(folder, 4, &["a", "b"])),
+            (StatusCode::OK, list_page(folder, 3, &["d"])),
+            // Second pass: one settled answer.
+            (StatusCode::OK, list_page(folder, 3, &["a", "b", "d"])),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+
+        let items = client
+            .list_directory(folder, &CancellationToken::default())
+            .expect("a re-listed directory is not an error");
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.name.clone())
+                .collect::<Vec<_>>(),
+            ["a", "b", "d"],
+            "the settled listing is the one that must be returned"
+        );
+        let requests = server.join().unwrap();
+        let listings = requests
+            .iter()
+            .filter(|request| String::from_utf8_lossy(&request.body).contains("method=list"))
+            .count();
+        assert_eq!(listings, 3, "two pages, then one whole re-listing");
+    }
+
+    /// A directory that will not hold still twice is an error, not a short inventory.
+    #[test]
+    fn a_listing_that_disagrees_twice_fails_naming_both_counts() {
+        let folder = "/share/root";
+        let mut responses = upload_preamble();
+        responses.extend([
+            (StatusCode::OK, list_page(folder, 4, &["a", "b"])),
+            (StatusCode::OK, list_page(folder, 3, &["d"])),
+            (StatusCode::OK, list_page(folder, 6, &["a", "b"])),
+            (StatusCode::OK, list_page(folder, 5, &["d"])),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+
+        let failure = client
+            .list_directory(folder, &CancellationToken::default())
+            .unwrap_err();
+
+        let message = failure.to_string();
+        assert!(
+            message.contains("changed while it was being listed"),
+            "{message}"
+        );
+        assert!(message.contains('6') && message.contains('5'), "{message}");
+        assert_eq!(server.join().unwrap().len(), 6);
+    }
+
+    /// The walk records a protected directory and does not descend into it.
+    ///
+    /// `@eaDir` holds one subdirectory per indexed media file, so a ten-thousand-photo share cost
+    /// roughly ten thousand extra `List.list` round trips per inventory on a two-core armv7 — and the
+    /// planner threw every entry away, because `is_protected` already keeps them out of deletion,
+    /// comparison digests, copy sources and copy destinations. On the `status` path it was worse than
+    /// cost: those entries were charged against the 20,000-entry scan budget, so a large recycle bin
+    /// could exhaust it before the walk reached any payload, and every real file was then reported
+    /// `missing-remote`. The local walk has pruned these names since it was written.
+    #[test]
+    fn the_remote_walk_records_protected_directories_without_descending_into_them() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let mut responses = upload_preamble();
+        responses.extend([
+            (StatusCode::OK, getinfo_directory("/share")),
+            (StatusCode::OK, getinfo_directory("/share/root")),
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "success": true,
+                    "data": {"total": 4, "files": [
+                        {"path": "/share/root/@eaDir", "name": "@eaDir", "isdir": true,
+                         "additional": {"mount_point_type": ""}},
+                        {"path": "/share/root/#recycle", "name": "#recycle", "isdir": true,
+                         "additional": {"mount_point_type": ""}},
+                        {"path": "/share/root/cache", "name": "cache", "isdir": true,
+                         "additional": {"mount_point_type": ""}},
+                        {"path": "/share/root/payload.txt", "name": "payload.txt", "isdir": false,
+                         "additional": {"size": 1, "time": {"mtime": 1}}},
+                    ]}
+                })
+                .to_string(),
+            ),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+        let rules = ignore_rules_excluding(&["cache/"]);
+
+        let scoped = client
+            .remote_inventory_scoped(
+                &root,
+                &Scope::root(),
+                &rules,
+                usize::MAX,
+                &CancellationToken::default(),
+            )
+            .expect("a pruned walk still answers");
+
+        // All four are recorded, so `protected_entries` still counts them and `status` still reports
+        // them as excluded.
+        assert_eq!(scoped.inventory.entries.len(), 4);
+        assert!(scoped.complete);
+        let requests = server.join().unwrap();
+        // Discovery, login, two ancestor `getinfo`s and exactly one `List.list`: no folder below the
+        // root was listed at all.
+        assert_eq!(requests.len(), 5);
+        for request in &requests {
+            let body = String::from_utf8_lossy(&request.body);
+            assert!(
+                !body.contains("eaDir") && !body.contains("recycle") && !body.contains("cache"),
+                "a protected directory must not be listed: {body}"
+            );
+        }
+    }
+
+    /// Build rules from a throwaway directory, for the walks that take them.
+    fn ignore_rules_excluding(patterns: &[&str]) -> IgnoreRules {
+        let root = std::env::temp_dir().join(format!(
+            "sdsync-api-rules-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let owned = patterns
+            .iter()
+            .map(|pattern| (*pattern).to_owned())
+            .collect::<Vec<_>>();
+        let rules = IgnoreRules::build(&root, &owned).expect("fixture rules build");
+        let _ = fs::remove_dir_all(&root);
+        rules
+    }
+
+    /// A remote tree of exactly the scan budget is complete, not truncated.
+    ///
+    /// The same boundary as the local walk's. It is reached whenever the last directories of a tree
+    /// are empty: the budget filled, and the walk then refused to look at folders that would have
+    /// added nothing. One extra listing is what buys the true answer.
+    #[test]
+    fn a_remote_tree_of_exactly_the_budget_is_complete() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let mut responses = upload_preamble();
+        responses.extend([
+            (StatusCode::OK, getinfo_directory("/share")),
+            (StatusCode::OK, getinfo_directory("/share/root")),
+            // Two entries, one of them a directory, against a budget of two.
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "success": true,
+                    "data": {"total": 2, "files": [
+                        {"path": "/share/root/a", "name": "a", "isdir": true,
+                         "additional": {"mount_point_type": ""}},
+                        {"path": "/share/root/b.txt", "name": "b.txt", "isdir": false,
+                         "additional": {"size": 1, "time": {"mtime": 1}}},
+                    ]}
+                })
+                .to_string(),
+            ),
+            // The empty subdirectory. Listing it is what proves nothing was left behind.
+            (
+                StatusCode::OK,
+                serde_json::json!({"success": true, "data": {"total": 0, "files": []}}).to_string(),
+            ),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+
+        let scoped = client
+            .remote_inventory_scoped(
+                &root,
+                &Scope::root(),
+                &IgnoreRules::none(),
+                2,
+                &CancellationToken::default(),
+            )
+            .expect("a walk within budget");
+
+        assert_eq!(scoped.inventory.entries.len(), 2);
+        assert!(
+            scoped.complete,
+            "a walk that kept every entry it found is not partial"
+        );
+        assert_eq!(server.join().unwrap().len(), 6);
+    }
+
+    /// One entry more than the budget is truncated, and keeps exactly the budget.
+    #[test]
+    fn a_remote_tree_past_the_budget_is_reported_truncated() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let mut responses = upload_preamble();
+        responses.extend([
+            (StatusCode::OK, getinfo_directory("/share")),
+            (StatusCode::OK, getinfo_directory("/share/root")),
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "success": true,
+                    "data": {"total": 3, "files": [
+                        {"path": "/share/root/a.txt", "name": "a.txt", "isdir": false,
+                         "additional": {"size": 1, "time": {"mtime": 1}}},
+                        {"path": "/share/root/b.txt", "name": "b.txt", "isdir": false,
+                         "additional": {"size": 1, "time": {"mtime": 1}}},
+                        {"path": "/share/root/c.txt", "name": "c.txt", "isdir": false,
+                         "additional": {"size": 1, "time": {"mtime": 1}}},
+                    ]}
+                })
+                .to_string(),
+            ),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+
+        let scoped = client
+            .remote_inventory_scoped(
+                &root,
+                &Scope::root(),
+                &IgnoreRules::none(),
+                2,
+                &CancellationToken::default(),
+            )
+            .expect("a truncated walk is not an error");
+
+        assert_eq!(scoped.inventory.entries.len(), 2);
+        assert!(!scoped.complete);
+        assert_eq!(server.join().unwrap().len(), 5);
+    }
+
+    /// A listing that agrees with itself still costs exactly one pass.
+    #[test]
+    fn a_settled_listing_is_read_once() {
+        let folder = "/share/root";
+        let mut responses = upload_preamble();
+        responses.extend([(StatusCode::OK, list_page(folder, 2, &["a", "b"]))]);
+        let (client, server) = upload_client(responses, 0);
+
+        let items = client
+            .list_directory(folder, &CancellationToken::default())
+            .expect("a settled listing");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    /// One transient failure on one digest poll must not abandon the file, or the batch it is in.
+    ///
+    /// A digest batch stops claiming work as soon as any file in it fails, so before the poll went
+    /// through the retry predicate a single 502 from a reverse proxy cost up to `REMOTE_MD5_BATCH`
+    /// files' comparison digests and aborted the sync.
+    #[test]
+    fn a_transient_failure_on_a_digest_poll_is_retried_rather_than_abandoning_the_file() {
+        let [start, status] = md5_of(b"abc");
+        let mut responses = upload_preamble();
+        responses.extend([
+            (
+                StatusCode::BAD_GATEWAY,
+                "temporary proxy failure".to_owned(),
+            ),
+            (StatusCode::OK, start),
+            (
+                StatusCode::BAD_GATEWAY,
+                "temporary proxy failure".to_owned(),
+            ),
+            (StatusCode::OK, status),
+        ]);
+        let (client, server) = upload_client(responses, 1);
+
+        let digest = client
+            .remote_content_md5("/share/root/abc.bin", &CancellationToken::default())
+            .expect("a retried poll still answers");
+
+        // MD5-only, as File Station computes it: the value carries no strong digests.
+        assert!(digest.md5_matches(&ContentMd5::from_content(b"abc")));
+        assert!(!digest.has_full_proof());
+        // Both the start and the status were retried, so the answer cost four requests rather than
+        // two. That is the trade: a stray read-only digest task on the NAS at worst, against a
+        // whole comparison batch.
+        assert_eq!(server.join().unwrap().len(), 6);
+    }
+
+    /// A DSM with no server-side MD5 verifies its uploads the way every upload used to.
+    ///
+    /// The cheaper evidence is an optimisation, and an optimisation may not turn a configuration
+    /// that worked into one that fails every upload it completes.
+    #[test]
+    fn an_upload_to_a_dsm_without_the_md5_api_is_verified_by_reading_it_back() {
+        let discovery = serde_json::json!({
+            "success": true,
+            "data": {
+                "SYNO.API.Auth": {"path": "entry.cgi", "minVersion": 3, "maxVersion": 7},
+                "SYNO.FileStation.List": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+                "SYNO.FileStation.CreateFolder": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+                "SYNO.FileStation.Upload": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+                "SYNO.FileStation.Delete": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
+                "SYNO.FileStation.CheckPermission": {"path": "entry.cgi", "minVersion": 3, "maxVersion": 3},
+                "SYNO.FileStation.Download": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2}
+            }
+        })
+        .to_string();
+        let (path, local) = temp_upload_source("no-md5-api", b"abc");
+        let responses = vec![
+            (StatusCode::OK, discovery),
+            (StatusCode::OK, login_response()),
+            (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+            (
+                StatusCode::OK,
+                getinfo_file("/share/root/abc.bin", local.size, None),
+            ),
+            (StatusCode::OK, scripted_binary_response(b"abc")),
+        ];
+        let (client, server) = upload_client(responses, 0);
+
+        client.upload(&local, "/share/root/abc.bin").unwrap();
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(
+            String::from_utf8_lossy(&requests[4].body).contains("api=SYNO.FileStation.Download"),
+            "with no digest API the destination must be read back instead"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    /// An entry carrying no digest is still verified — by its length, always.
+    ///
+    /// Before this the whole post-condition sat inside `if let Some(expected) = local.content_md5`,
+    /// so `upload` returned `Ok(())` on the strength of DSM's `success: true` and nothing else: no
+    /// `getinfo`, no size, no digest. `LocalEntry` is public and every field of it is, so a library
+    /// or FFI consumer that built one from its own scan had a truncating reverse proxy, or a
+    /// fabricated success, reported to it as a completed upload.
+    #[test]
+    fn a_digest_less_upload_is_still_proved_by_the_destination_length() {
+        let (path, mut local) = temp_upload_source("no-digest-short", b"abcdef");
+        local.content_md5 = None;
+        let mut responses = upload_preamble();
+        responses.extend([
+            (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+            // DSM accepted the request and holds two of the six bytes.
+            (
+                StatusCode::OK,
+                getinfo_file(
+                    "/share/root/abc.bin",
+                    2,
+                    Some(local.mtime_ms.div_euclid(1000)),
+                ),
+            ),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+
+        let failure = client.upload(&local, "/share/root/abc.bin").unwrap_err();
+
+        assert!(
+            matches!(&failure, Error::ContentVerificationFailed(reported) if reported == "/share/root/abc.bin"),
+            "{failure:?}"
+        );
+        let requests = server.join().unwrap();
+        // Exactly one `getinfo` follows the multipart request, and no digest work at all: the
+        // length is the only claim a digest-less entry supports.
+        assert_eq!(requests.len(), 4);
+        let follow_up = String::from_utf8_lossy(&requests[3].body);
+        assert!(follow_up.contains("method=getinfo"), "{follow_up}");
+        assert!(
+            !requests
+                .iter()
+                .any(|request| String::from_utf8_lossy(&request.body)
+                    .contains("api=SYNO.FileStation.MD5")),
+            "a digest-less entry must not ask for a digest"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    /// A digest-less upload whose destination is absent is a failure, not a success.
+    #[test]
+    fn a_digest_less_upload_whose_destination_is_absent_fails() {
+        let (path, mut local) = temp_upload_source("no-digest-absent", b"abc");
+        local.content_md5 = None;
+        let mut responses = upload_preamble();
+        responses.extend([
+            (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+            (
+                StatusCode::OK,
+                r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+            ),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+
+        let failure = client.upload(&local, "/share/root/abc.bin").unwrap_err();
+
+        assert!(
+            matches!(&failure, Error::ContentVerificationFailed(reported) if reported == "/share/root/abc.bin"),
+            "{failure:?}"
+        );
+        assert_eq!(server.join().unwrap().len(), 4);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// A digest-less upload of the right length succeeds, and costs exactly one follow-up request.
+    #[test]
+    fn a_digest_less_upload_of_the_right_length_succeeds() {
+        let (path, mut local) = temp_upload_source("no-digest-ok", b"abc");
+        local.content_md5 = None;
+        let mut responses = upload_preamble();
+        responses.extend([
+            (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+            (
+                StatusCode::OK,
+                getinfo_file(
+                    "/share/root/abc.bin",
+                    local.size,
+                    Some(local.mtime_ms.div_euclid(1000)),
+                ),
+            ),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+
+        client.upload(&local, "/share/root/abc.bin").unwrap();
+
+        assert!(!client.remote_mtime_unhonoured());
+        assert_eq!(server.join().unwrap().len(), 4);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// A destination whose modification time is not the one the upload sent is reported, once per
+    /// run, and does not fail the upload.
+    ///
+    /// This is the single question about a destination the repository cannot answer: the upload
+    /// writes `mtime` in milliseconds and every comparison reads whole seconds back, and the only
+    /// in-tree evidence that the two agree is a mock written from the same assumption. If DSM
+    /// discards the field, every `metadata` and `content` run reports unchanged files as differing,
+    /// re-uploads the whole tree, and can never reconcile. The bytes still landed, so failing the
+    /// upload would be the wrong answer; latching the fact for the run to report is the right one.
+    #[test]
+    fn a_destination_that_discards_the_uploaded_mtime_is_reported_without_failing_the_upload() {
+        let (path, local) = temp_upload_source("mtime-dropped", b"abc");
+        let [start, status] = md5_of(b"abc");
+        let mut responses = upload_preamble();
+        responses.extend([
+            (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+            // The length and the digest are right; the modification time is DSM's own clock rather
+            // than the one the upload sent — exactly what a DSM reading `mtime` as seconds does.
+            (
+                StatusCode::OK,
+                getinfo_file("/share/root/abc.bin", local.size, Some(1_700_000_000)),
+            ),
+            (StatusCode::OK, start),
+            (StatusCode::OK, status),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+
+        assert!(!client.remote_mtime_unhonoured());
+        client.upload(&local, "/share/root/abc.bin").unwrap();
+
+        assert!(
+            client.remote_mtime_unhonoured(),
+            "the run must be able to report that modification times are not preserved"
+        );
+        assert_eq!(server.join().unwrap().len(), 6);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// A DSM that reports no modified time answers the question with nothing, not with "no".
+    #[test]
+    fn a_destination_that_reports_no_mtime_latches_nothing() {
+        let (path, local) = temp_upload_source("mtime-absent", b"abc");
+        let [start, status] = md5_of(b"abc");
+        let mut responses = upload_preamble();
+        responses.extend([
+            (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+            (
+                StatusCode::OK,
+                getinfo_file("/share/root/abc.bin", local.size, None),
+            ),
+            (StatusCode::OK, start),
+            (StatusCode::OK, status),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+
+        client.upload(&local, "/share/root/abc.bin").unwrap();
+
+        assert!(!client.remote_mtime_unhonoured());
+        assert_eq!(server.join().unwrap().len(), 6);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// The latch is shared with the worker clones, because each upload worker holds one.
+    #[test]
+    fn the_unhonoured_mtime_latch_is_shared_with_every_worker_clone() {
+        let (path, local) = temp_upload_source("mtime-shared", b"abc");
+        let [start, status] = md5_of(b"abc");
+        let mut responses = upload_preamble();
+        responses.extend([
+            (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+            (
+                StatusCode::OK,
+                getinfo_file("/share/root/abc.bin", local.size, Some(1_700_000_000)),
+            ),
+            (StatusCode::OK, start),
+            (StatusCode::OK, status),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+        let worker = client.clone();
+
+        worker.upload(&local, "/share/root/abc.bin").unwrap();
+
+        assert!(
+            client.remote_mtime_unhonoured(),
+            "a fact about the destination observed by one worker must reach the run"
+        );
+        server.join().unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    /// A zero-byte file is verified by the digest of the bytes it sent, which is none of them.
+    ///
+    /// The case a streaming hash is most likely to get wrong: the transport may never call `read` at
+    /// all for an empty body, so the accumulator has to answer with the empty fingerprint rather
+    /// than with nothing.
+    #[test]
+    fn a_zero_byte_upload_is_verified_by_the_digest_of_no_bytes() {
+        let (path, local) = temp_upload_source("empty", b"");
+        assert_eq!(local.size, 0);
+        let [start, status] = md5_of(b"");
+        let mut responses = upload_preamble();
+        responses.extend([
+            (StatusCode::OK, r#"{"success":true}"#.to_owned()),
+            (
+                StatusCode::OK,
+                getinfo_file(
+                    "/share/root/abc.bin",
+                    0,
+                    Some(local.mtime_ms.div_euclid(1000)),
+                ),
+            ),
+            (StatusCode::OK, start),
+            (StatusCode::OK, status),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+
+        client
+            .upload(&local, "/share/root/abc.bin")
+            .expect("an empty file is a file");
+
+        assert!(!client.remote_mtime_unhonoured());
+        assert_eq!(server.join().unwrap().len(), 6);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// A body the transport abandoned part-way must not pass as a prefix that happens to hash.
+    ///
+    /// The length of what was streamed is compared as well as its digest, so a short body is
+    /// reported as a changed source rather than verified against whatever it managed to send.
+    #[test]
+    fn a_short_streamed_body_is_not_accepted_as_the_whole_file() {
+        let mut streamed = StreamedBody::new();
+        streamed.update(b"abc");
+        let expected = ContentMd5::from_content(b"abcdef");
+
+        assert_ne!(streamed.bytes, 6);
+        assert!(!content_evidence_matches(
+            expected,
+            streamed.hasher.fingerprint()
+        ));
+        // And the prefix's own digest is what it hashed, so the length is the check that catches a
+        // truncation whose prefix an attacker chose.
+        assert!(content_evidence_matches(
+            ContentMd5::from_content(b"abc"),
+            streamed.hasher.fingerprint()
+        ));
+    }
+
+    /// A DSM error code outside the retry predicate still fails immediately.
+    #[test]
+    fn a_decisive_digest_failure_is_not_retried() {
+        let mut responses = upload_preamble();
+        responses.extend([(
+            StatusCode::OK,
+            r#"{"success":false,"error":{"code":105}}"#.to_owned(),
+        )]);
+        let (client, server) = upload_client(responses, 1);
+
+        let failure = client
+            .remote_content_md5("/share/root/abc.bin", &CancellationToken::default())
+            .unwrap_err();
+
+        assert_eq!(failure.api_code(), Some(105));
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
     /// An observer that declines the attempt must stop the upload before a single byte reaches
     /// the network, and must still be told the transfer failed.
     #[test]
@@ -11052,20 +12307,22 @@ mod tests {
     fn a_rate_limited_client_still_uploads_the_complete_file() {
         let (path, local) = temp_upload_source("throttled", b"abc");
         let mut responses = upload_preamble();
+        let [digest_start, digest_status] = md5_of(b"abc");
         responses.extend([
             (StatusCode::OK, r#"{"success":true}"#.to_owned()),
             (
                 StatusCode::OK,
                 getinfo_file("/share/root/abc.bin", local.size, None),
             ),
-            (StatusCode::OK, scripted_binary_response(b"abc")),
+            (StatusCode::OK, digest_start),
+            (StatusCode::OK, digest_status),
         ]);
         let (client, server) = upload_client(responses, 0);
         // A megabyte per second: the opening burst covers this payload outright, so the limited
         // path is exercised without the test depending on any wall-clock delay.
         let client = client.with_max_upload_rate(Some(1024 * 1024));
         client.upload(&local, "/share/root/abc.bin").unwrap();
-        assert_eq!(server.join().unwrap().len(), 5);
+        assert_eq!(server.join().unwrap().len(), 6);
         fs::remove_file(&path).unwrap();
     }
 
@@ -11152,12 +12409,13 @@ mod tests {
                 StatusCode::OK,
                 getinfo_file("/share/root/abc.bin", local.size, None),
             ),
-            (StatusCode::OK, scripted_binary_response(b"abc")),
+            (StatusCode::OK, md5_of(b"abc")[0].clone()),
+            (StatusCode::OK, md5_of(b"abc")[1].clone()),
         ]);
         let (client, server) = upload_client(responses, 1);
         client.upload(&local, "/share/root/abc.bin").unwrap();
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 7);
+        assert_eq!(requests.len(), 8);
         assert_eq!(
             requests
                 .iter()
@@ -11184,11 +12442,12 @@ mod tests {
                 StatusCode::OK,
                 getinfo_file("/share/root/abc.bin", local.size, None),
             ),
-            (StatusCode::OK, scripted_binary_response(b"abc")),
+            (StatusCode::OK, md5_of(b"abc")[0].clone()),
+            (StatusCode::OK, md5_of(b"abc")[1].clone()),
         ]);
         let (client, server) = upload_client(responses, 1);
         client.upload(&local, "/share/root/abc.bin").unwrap();
-        assert_eq!(server.join().unwrap().len(), 7);
+        assert_eq!(server.join().unwrap().len(), 8);
         fs::remove_file(path).unwrap();
 
         // A permission failure during reconciliation is decisive and must surface immediately
@@ -11420,6 +12679,52 @@ mod tests {
         }
     }
 
+    /// DSM's session codes are not retryable, and this pins that they stay that way.
+    ///
+    /// 106, 107 and 119 all mean the session this client holds is gone, so sending the same request
+    /// again sends the same dead session — three times, with backoff, for nothing. Recovering means
+    /// re-authenticating, which needs `Session` behind a shared cell all worker clones can see and
+    /// the credentials retained in memory for the whole run; see `retryable`'s own comment for why
+    /// that is not a footnote to a bug fix. Adding them here instead would look like a fix and be a
+    /// slower failure.
+    #[test]
+    fn dsm_session_codes_are_not_retried_because_the_session_is_what_is_wrong() {
+        for code in [106, 107, 119] {
+            let error = Error::Api {
+                api: "SYNO.FileStation.List".to_owned(),
+                operation: "list".to_owned(),
+                code,
+                description: api_error_description("SYNO.FileStation.List", code)
+                    .map(|text| format!(": {text}"))
+                    .unwrap_or_default(),
+                details: Vec::new(),
+            };
+            assert!(
+                !retryable(&error),
+                "code {code} must fail rather than be resent on the same dead session"
+            );
+            // And it still describes itself, so the operator is told to rerun rather than shown a
+            // bare number.
+            assert!(
+                error.to_string().contains("session"),
+                "code {code} must name the session: {error}"
+            );
+        }
+        // The codes that *are* retryable are transient server-side states, not session states.
+        for code in [109, 110, 111, 117, 118, 402] {
+            assert!(
+                retryable(&Error::Api {
+                    api: "SYNO.FileStation.List".to_owned(),
+                    operation: "list".to_owned(),
+                    code,
+                    description: String::new(),
+                    details: Vec::new(),
+                }),
+                "code {code} is a transient server state and is worth resending"
+            );
+        }
+    }
+
     #[test]
     fn legacy_md5_and_complete_fingerprint_capability_gates_remain_distinct() {
         let client_for = |api: &str| ApiClient {
@@ -11450,6 +12755,7 @@ mod tests {
             upload_rate_limit: None,
             cancellation: CancellationToken::default(),
             observer: None,
+            remote_mtime_unhonoured: Arc::new(AtomicBool::new(false)),
         };
 
         let md5_only = client_for("SYNO.FileStation.MD5");
@@ -11646,6 +12952,7 @@ FplE
         let error = client
             .remote_inventory(
                 &RemoteRoot::parse("/share/root").unwrap(),
+                &IgnoreRules::none(),
                 &CancellationToken::default(),
             )
             .unwrap_err();
@@ -11710,6 +13017,101 @@ FplE
         }
     }
 
+    /// One transient failure on one poll of a copy that is running fine must not fail the run.
+    ///
+    /// The same fault, the same mechanism and the same remedy as
+    /// `a_transient_failure_on_a_digest_poll_is_retried_rather_than_abandoning_the_file` — a 502
+    /// from a reverse proxy on a status poll. The MD5 polls were routed through the retry predicate
+    /// and these were left behind, so a copy-heavy content run failed on a fault its sibling
+    /// survived, after its pre-deletes and directory creates had already happened.
+    #[test]
+    fn a_transient_failure_on_a_copy_status_poll_is_retried_rather_than_stopping_the_task() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let destination = "/share/root/new/report.bin";
+        let digest = ContentMd5::from_content(b"report");
+        let (url, server) = scripted_server_with_status(vec![
+            (StatusCode::OK, write_probe_discovery(true)),
+            (StatusCode::OK, login_response()),
+            (StatusCode::OK, task_start_response("retried-copy")),
+            (
+                StatusCode::BAD_GATEWAY,
+                "temporary proxy failure".to_owned(),
+            ),
+            (
+                StatusCode::OK,
+                r#"{"success":true,"data":{"finished":true}}"#.to_owned(),
+            ),
+            (StatusCode::OK, getinfo_file(destination, 6, None)),
+            (StatusCode::OK, scripted_binary_response(b"report")),
+        ]);
+        let mut client = ApiClient::connect(&ClientOptions {
+            base_url: url,
+            allow_http: true,
+            accept_invalid_certs: false,
+            ca_certificate: None,
+            connect_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(5),
+            retries: 1,
+        })
+        .unwrap();
+        client.login("alice", "password", None).unwrap();
+
+        client
+            .copy_file_verified(
+                &root,
+                "/share/root/old/report.bin",
+                destination,
+                6,
+                digest,
+                &CancellationToken::default(),
+            )
+            .expect("a retried poll still answers");
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 7);
+        // Two status polls, the first retried, and no `method=stop` anywhere: the task was never
+        // abandoned.
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| String::from_utf8_lossy(&request.body).contains("method=status"))
+                .count(),
+            2
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| String::from_utf8_lossy(&request.body).contains("method=stop"))
+        );
+    }
+
+    /// The body reader itself is a cancellation point, with no observer and no rate limit.
+    ///
+    /// Those were the only two ways out before, and the copy fallback supplied neither: a Ctrl-C
+    /// during a fallback upload kept streaming until `--timeout` expired.
+    #[test]
+    fn an_unobserved_unthrottled_read_still_observes_cancellation() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = CancellationToken::default();
+        let mut reader = ObservedReader {
+            inner: std::io::Cursor::new(b"payload".to_vec()),
+            observer: None,
+            cancelled: Arc::clone(&cancelled),
+            throttle: None,
+            cancellation: cancellation.clone(),
+            streamed: None,
+        };
+        assert_eq!(reader.read(&mut [0_u8; 3]).unwrap(), 3);
+
+        cancellation.cancel();
+        let error = reader.read(&mut [0_u8; 3]).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        // Latched, so `prioritize_observer_cancellation` reports the abandonment as cancellation
+        // rather than as whatever transport error the aborted request produced.
+        assert!(cancelled.load(Ordering::Acquire));
+    }
+
     /// Every verification step after the upload lands is a fail-closed gate: if any of them cannot
     /// be proven, the probe reports failure and still cleans up after itself.
     #[test]
@@ -11738,6 +13140,9 @@ FplE
                 r#"{"success":true,"data":{"total":0,"files":[]}}"#.to_owned(),
                 succeeded.clone(),
                 getinfo_file(&upload_path, size, None),
+                md5_of(WRITE_PROBE_PAYLOAD)[0].clone(),
+                md5_of(WRITE_PROBE_PAYLOAD)[1].clone(),
+                getinfo_file(&upload_path, size, None),
                 scripted_binary_response(WRITE_PROBE_PAYLOAD),
             ]
         };
@@ -11752,9 +13157,12 @@ FplE
             ]
         };
 
-        // The uploaded file's own metadata does not match what was sent.
+        // The uploaded file's own length does not match what was sent. The modification time it
+        // reports is a fact rather than a gate (see
+        // `a_write_probe_reports_a_destination_that_discards_the_uploaded_mtime`), so the length is
+        // what this read is still allowed to refuse on.
         let mut responses = uploaded();
-        responses.push(getinfo_file(&upload_path, size, Some(mtime_seconds + 60)));
+        responses.push(getinfo_file(&upload_path, size + 1, Some(mtime_seconds)));
         responses.extend(cleanup());
         let (client, server) = write_probe_client(responses);
         let failure = client
@@ -11766,7 +13174,7 @@ FplE
             )
             .unwrap_err();
         assert!(
-            matches!(&failure.cause, Error::RemoteSnapshotChanged(path) if *path == upload_path),
+            matches!(&failure.cause, Error::ContentVerificationFailed(path) if *path == upload_path),
             "unexpected cause: {}",
             failure.cause
         );
@@ -11774,7 +13182,7 @@ FplE
         assert!(!failure.report.upload_verified);
         assert!(!failure.report.server_copy_attempted);
         assert!(failure.report.cleanup_completed);
-        assert_eq!(server.join().unwrap().len(), 17);
+        assert_eq!(server.join().unwrap().len(), 20);
 
         // The copy directory cannot be created.
         let mut responses = uploaded();
@@ -11797,7 +13205,7 @@ FplE
         assert!(failure.report.upload_verified);
         assert!(!failure.report.server_copy_attempted);
         assert!(failure.report.cleanup_completed);
-        assert_eq!(server.join().unwrap().len(), 18);
+        assert_eq!(server.join().unwrap().len(), 21);
 
         // The copy task itself fails after the destination was prepared.
         let mut responses = uploaded();
@@ -11826,7 +13234,7 @@ FplE
         assert!(failure.report.server_copy_attempted);
         assert!(!failure.report.server_copy_verified);
         assert!(failure.report.cleanup_completed);
-        assert_eq!(server.join().unwrap().len(), 22);
+        assert_eq!(server.join().unwrap().len(), 25);
 
         // The copy completes and its content matches, but its metadata does not.
         let mut responses = uploaded();
@@ -11860,7 +13268,126 @@ FplE
         assert!(failure.report.server_copy_attempted);
         assert!(!failure.report.server_copy_verified);
         assert!(failure.report.cleanup_completed);
-        assert_eq!(server.join().unwrap().len(), 26);
+        assert_eq!(server.join().unwrap().len(), 29);
+    }
+
+    /// The write probe answers, rather than fails on, the one question about a destination the
+    /// repository cannot decide: does DSM keep the modification time an upload sends?
+    ///
+    /// `Upload` sends `mtime` in milliseconds and every comparison reads whole seconds back from
+    /// File Station, and no test outside a mock written from the same assumption asserts the two
+    /// agree. A destination that discards the field makes every `metadata` and `content` run report
+    /// unchanged files as differing, re-upload the whole tree, and never reconcile — so the probe
+    /// reports it as a finding an operator can read on their own NAS, and does not turn the write
+    /// test into a failure whose message names a snapshot rather than the cause.
+    #[test]
+    fn a_write_probe_reports_a_destination_that_discards_the_uploaded_mtime() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let probe_path = "/share/root/.synology-drive-sync-probe-test-mtime";
+        let upload_path = format!("{probe_path}/{WRITE_PROBE_FILE_NAME}");
+        let local = ProbeLocalFile::create(write_probe_fingerprint()).unwrap();
+        let size = local.entry.size;
+        let mtime_seconds = local.entry.mtime_ms.div_euclid(1000);
+        let missing = r#"{"success":false,"error":{"code":408}}"#.to_owned();
+        let succeeded = r#"{"success":true}"#.to_owned();
+
+        // No server copy, so the probe ends after the uploaded file is read back.
+        let responses = vec![
+            write_probe_discovery(false),
+            login_response(),
+            getinfo_directory("/share"),
+            getinfo_directory("/share/root"),
+            missing.clone(),
+            succeeded.clone(),
+            getinfo_directory(probe_path),
+            r#"{"success":true,"data":{"total":0,"files":[]}}"#.to_owned(),
+            succeeded.clone(),
+            getinfo_file(&upload_path, size, None),
+            md5_of(WRITE_PROBE_PAYLOAD)[0].clone(),
+            md5_of(WRITE_PROBE_PAYLOAD)[1].clone(),
+            getinfo_file(&upload_path, size, None),
+            scripted_binary_response(WRITE_PROBE_PAYLOAD),
+            // DSM reports its own clock rather than the second the upload sent.
+            getinfo_file(&upload_path, size, Some(mtime_seconds + 3_600)),
+            // Cleanup: the copy paths are absent, the upload and directory are removed, and the
+            // final absence check succeeds.
+            missing.clone(),
+            missing.clone(),
+            succeeded.clone(),
+            succeeded.clone(),
+            missing.clone(),
+        ];
+        let (client, server) = write_probe_client(responses);
+
+        let report = client
+            .run_write_probe_with_local(
+                &root,
+                probe_path,
+                &local.entry,
+                &CancellationToken::default(),
+            )
+            .expect("a destination that dropped the mtime still passed the write probe");
+
+        assert!(report.upload_verified);
+        assert_eq!(report.mtime_preserved, Some(false));
+        assert_eq!(report.reported_mtime_seconds, Some(mtime_seconds + 3_600));
+        assert_eq!(report.uploaded_mtime_seconds, mtime_seconds);
+        assert!(report.cleanup_completed);
+        // The same fact reaches a sync run through the client, because the probe uses the same
+        // observation the upload path does.
+        assert!(client.remote_mtime_unhonoured());
+        server.join().unwrap();
+    }
+
+    /// A destination that keeps the modification time says so, and says it positively: `None`
+    /// would mean the question was never asked.
+    #[test]
+    fn a_write_probe_reports_a_destination_that_preserves_the_uploaded_mtime() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let probe_path = "/share/root/.synology-drive-sync-probe-test-mtime-ok";
+        let upload_path = format!("{probe_path}/{WRITE_PROBE_FILE_NAME}");
+        let local = ProbeLocalFile::create(write_probe_fingerprint()).unwrap();
+        let size = local.entry.size;
+        let mtime_seconds = local.entry.mtime_ms.div_euclid(1000);
+        let missing = r#"{"success":false,"error":{"code":408}}"#.to_owned();
+        let succeeded = r#"{"success":true}"#.to_owned();
+
+        let responses = vec![
+            write_probe_discovery(false),
+            login_response(),
+            getinfo_directory("/share"),
+            getinfo_directory("/share/root"),
+            missing.clone(),
+            succeeded.clone(),
+            getinfo_directory(probe_path),
+            r#"{"success":true,"data":{"total":0,"files":[]}}"#.to_owned(),
+            succeeded.clone(),
+            getinfo_file(&upload_path, size, None),
+            md5_of(WRITE_PROBE_PAYLOAD)[0].clone(),
+            md5_of(WRITE_PROBE_PAYLOAD)[1].clone(),
+            getinfo_file(&upload_path, size, None),
+            scripted_binary_response(WRITE_PROBE_PAYLOAD),
+            getinfo_file(&upload_path, size, Some(mtime_seconds)),
+            missing.clone(),
+            missing.clone(),
+            succeeded.clone(),
+            succeeded.clone(),
+            missing.clone(),
+        ];
+        let (client, server) = write_probe_client(responses);
+
+        let report = client
+            .run_write_probe_with_local(
+                &root,
+                probe_path,
+                &local.entry,
+                &CancellationToken::default(),
+            )
+            .expect("a healthy destination passes the write probe");
+
+        assert_eq!(report.mtime_preserved, Some(true));
+        assert!(!client.remote_mtime_unhonoured());
+        server.join().unwrap();
     }
 
     /// `query=all` returns entries authored by whoever wrote each installed package, so one bad

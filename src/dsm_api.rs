@@ -6045,6 +6045,40 @@ mod linux_process {
 
     const POLL_SLICE: Duration = Duration::from_millis(25);
 
+    /// The duration `capture_queued_child`'s grace retry waits for the final
+    /// pipe hangup, once an already-exited child's stdin is fully written
+    /// and stdout is not yet EOF.
+    ///
+    /// Always `POLL_SLICE`. No environment is consulted in a release build
+    /// -- see the `cfg(test)` sibling below, which is the only version of
+    /// this function that ever reads anything, and only exists in a test
+    /// binary. This keeps the test hook out of the shipped consumer the
+    /// same way every other one in this codebase stays out: a source
+    /// substitution on an installed copy, or an env read gated to a fake
+    /// binary, never a knob live in the real process.
+    #[cfg(not(test))]
+    fn queued_capture_grace_slice() -> Duration {
+        POLL_SLICE
+    }
+
+    /// As above, but overridable through this one environment variable,
+    /// read fresh on every call rather than cached, so a test can widen the
+    /// window far past any realistic scheduling delay without racing a real
+    /// child process against a fixed wall-clock budget -- which is what
+    /// made an earlier version of that test flaky under load. Exists only
+    /// in a test binary: `capture_queued_child`'s own grace retry calls
+    /// this same function name either way, so the swap is invisible to it.
+    /// The variable name is deliberately specific so it can never be set by
+    /// accident.
+    #[cfg(test)]
+    fn queued_capture_grace_slice() -> Duration {
+        std::env::var("SDSYNC_TEST_QUEUED_CAPTURE_GRACE_MILLIS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(POLL_SLICE)
+    }
+
     pub(super) fn capture_bounded_command(
         command: &mut Command,
         maximum_stdout: usize,
@@ -6204,10 +6238,27 @@ mod linux_process {
                 if stdout_eof && input_offset == input_bytes.len() && stdin.is_none() {
                     return completed_output(status, stdout_bytes);
                 }
+                if input_offset != input_bytes.len() || stdin.is_some() {
+                    return Err(BridgeError::new(ErrorKind::Unavailable));
+                }
+
+                // waitpid can become observable just before the final pipe
+                // hangup on some kernels, exactly as capture_child's own
+                // comment describes. Poll once, for a single bounded grace
+                // slice, then perform the final drain. A descendant that
+                // retained the descriptor still fails closed after that one
+                // slice. There is no deadline here to bound the retry
+                // against -- this path has none by design -- so the slice
+                // itself is the only extra wait this adds.
+                poll_queued_io(&stdout, stdout_eof, None, queued_capture_grace_slice())?;
+                stdout_eof |= drain_pipe(&mut stdout, &mut stdout_bytes, maximum_stdout)?;
+                if stdout_eof {
+                    return completed_output(status, stdout_bytes);
+                }
                 return Err(BridgeError::new(ErrorKind::Unavailable));
             }
 
-            poll_queued_io(&stdout, stdout_eof, stdin.as_ref())?;
+            poll_queued_io(&stdout, stdout_eof, stdin.as_ref(), POLL_SLICE)?;
         }
     }
 
@@ -6412,6 +6463,7 @@ mod linux_process {
         stdout: &ChildStdout,
         stdout_eof: bool,
         stdin: Option<&ChildStdin>,
+        timeout: Duration,
     ) -> BridgeResult<()> {
         let mut descriptors = [
             libc::pollfd {
@@ -6425,9 +6477,12 @@ mod linux_process {
                 revents: 0,
             },
         ];
-        // There is deliberately no operation deadline. This short poll slice
-        // exists only so a controller signal is observed promptly.
-        let timeout_ms = POLL_SLICE.as_millis() as libc::c_int;
+        // There is deliberately no operation deadline; the caller's own
+        // timeout is only how long this one slice waits. The main loop's
+        // call keeps that slice short (POLL_SLICE) so a controller signal is
+        // observed promptly; the grace retry below is the one caller that
+        // ever passes something else.
+        let timeout_ms = timeout.as_millis().max(1).min(libc::c_int::MAX as u128) as libc::c_int;
         // SAFETY: descriptors is an initialized two-element pollfd array.
         let status = unsafe {
             libc::poll(
@@ -7239,20 +7294,52 @@ fn security_policy_snapshot_value(policy: &SecurityPolicyArgs) -> Value {
     })
 }
 
+/// `true` for a JSON string, or an array whose elements are all strings
+/// (including an empty array, vacuously). Used only to decide whether a
+/// value under one of the *widened* sensitive key names below is actually
+/// secret-shaped, as opposed to an object -- a value-free ledger such as
+/// Doctor's cookie-presence record, which must keep rendering.
+fn is_string_or_string_array(value: &Value) -> bool {
+    match value {
+        Value::String(_) => true,
+        Value::Array(items) => items.iter().all(|item| matches!(item, Value::String(_))),
+        _ => false,
+    }
+}
+
+/// Key names that are sensitive only when their value is actually
+/// secret-shaped (a string, or an array of strings) -- unlike `password`,
+/// `secret`, `token` and `cookie` below, which are redacted regardless of
+/// the value's shape. Widening those unconditionally to a `.contains(...)`
+/// match would also catch a manager JSON field that legitimately holds an
+/// object with no secret bytes in it at all (Doctor's cookie ledger records
+/// which cookies are present, by name, never their values), so these are
+/// exact key names instead, each gated on `is_string_or_string_array`.
+const WIDENED_SENSITIVE_KEYS: [&str; 5] = [
+    "tokens",
+    "set_cookie",
+    "session_cookies",
+    "api_key",
+    "bearer",
+];
+
 fn redact_secret_fields(value: &mut Value, exact_secret: Option<&[u8]>) {
     match value {
         Value::Object(object) => {
             for (key, child) in object {
                 let normalized = key.to_ascii_lowercase().replace('-', "_");
                 let is_presence_flag = normalized.starts_with("has_");
-                let sensitive_key = !is_presence_flag
-                    && (normalized.contains("password")
-                        || normalized.contains("secret")
-                        || normalized.contains("synotoken")
-                        || normalized == "token"
-                        || normalized.ends_with("_token")
-                        || normalized == "authorization"
-                        || normalized == "cookie");
+                let always_sensitive = normalized.contains("password")
+                    || normalized.contains("secret")
+                    || normalized.contains("synotoken")
+                    || normalized == "token"
+                    || normalized.ends_with("_token")
+                    || normalized == "authorization"
+                    || normalized == "cookie";
+                let widened_sensitive = !always_sensitive
+                    && WIDENED_SENSITIVE_KEYS.contains(&normalized.as_str())
+                    && is_string_or_string_array(child);
+                let sensitive_key = !is_presence_flag && (always_sensitive || widened_sensitive);
                 if sensitive_key {
                     *child = Value::String("[redacted]".to_owned());
                 } else {
@@ -7801,14 +7888,22 @@ fn json_contains_sensitive_value(value: &Value, exact_secret: Option<&[u8]>) -> 
     match value {
         Value::Object(object) => object.iter().any(|(key, child)| {
             let normalized = key.to_ascii_lowercase().replace('-', "_");
-            let sensitive_key = !normalized.starts_with("has_")
-                && (normalized.contains("password")
-                    || normalized.contains("secret")
-                    || normalized.contains("synotoken")
-                    || normalized == "token"
-                    || normalized.ends_with("_token")
-                    || normalized == "authorization"
-                    || normalized == "cookie");
+            let always_sensitive = normalized.contains("password")
+                || normalized.contains("secret")
+                || normalized.contains("synotoken")
+                || normalized == "token"
+                || normalized.ends_with("_token")
+                || normalized == "authorization"
+                || normalized == "cookie";
+            // Same widening as redact_secret_fields, and the same reason: an
+            // object value under one of these names can be a value-free
+            // ledger rather than a secret, so it falls through to the
+            // ordinary recursive check below instead of being flagged here.
+            let widened_sensitive = !always_sensitive
+                && WIDENED_SENSITIVE_KEYS.contains(&normalized.as_str())
+                && is_string_or_string_array(child);
+            let sensitive_key =
+                !normalized.starts_with("has_") && (always_sensitive || widened_sensitive);
             sensitive_key || json_contains_sensitive_value(child, exact_secret)
         }),
         Value::Array(values) => values
@@ -13793,6 +13888,9 @@ struct ClaimedFailureRecord {
     occurrences: u64,
     drained: BTreeMap<FailureTriple, u64>,
     previous_epoch: u64,
+    /// The epoch this claim itself installed into `last_record_epoch`, so
+    /// `give_back` can tell whether a later claim has since taken the window.
+    claimed_epoch: u64,
 }
 
 /// Tally of in-service failures suppressed since the last record.
@@ -13844,6 +13942,7 @@ impl InServiceFailureCoalescer {
             occurrences,
             drained,
             previous_epoch,
+            claimed_epoch: now,
         })
     }
 
@@ -13852,11 +13951,21 @@ impl InServiceFailureCoalescer {
     /// The window is shared with the accept loop's saturation recorder, and a
     /// policy below `warn` suppresses the write entirely. Either way the
     /// failures are reported late rather than never.
+    ///
+    /// The epoch is rolled back only if nobody has claimed the window since:
+    /// a give-back that runs late (its writer was slow, or blocked behind a
+    /// file lock) must not clobber a later, legitimate claim's epoch. Doing
+    /// so would reopen the coalescing window early and merge counts from two
+    /// unrelated periods into whichever claim reports next. The counts
+    /// themselves are always merged back regardless -- that is safe either
+    /// way, since the tally has no epoch of its own to protect.
     fn give_back(&mut self, claim: ClaimedFailureRecord) {
         for (triple, count) in claim.drained {
             *self.tally.entry(triple).or_insert(0) += count;
         }
-        self.last_record_epoch = claim.previous_epoch;
+        if self.last_record_epoch == claim.claimed_epoch {
+            self.last_record_epoch = claim.previous_epoch;
+        }
     }
 }
 
@@ -15762,14 +15871,32 @@ fn render_routine(
     let next_run = manager_kv(state_document, "next_run_epoch", "0")?;
     let last_success = manager_kv(state_document, "last_success_epoch", "0")?;
     let backend = manager_kv(state_document, "backend", "none")?;
+    // Additive and optional-on-read, mirroring the shell's `api_load_kv_optional`:
+    // a state file that predates this field reads as `ok`, never as corrupt.
+    // An unknown value still fails closed, exactly like `backend` above -- kept
+    // as its own `matches!` rather than merged with it.
+    let backend_reason = manager_kv_optional(state_document, "backend_reason", "ok")?;
+    let last_poll = manager_kv(state_document, "last_poll_epoch", "0")?;
     if !matches!(
         state.as_slice(),
         b"never" | b"scheduled" | b"running" | b"succeeded" | b"failed" | b"deferred"
     ) || !matches!(
         backend.as_slice(),
         b"none" | b"interval" | b"daily" | b"inotify" | b"polling"
+    ) || !matches!(
+        backend_reason.as_slice(),
+        b"ok"
+            | b"source_missing"
+            | b"source_symlink"
+            | b"watch_unavailable"
+            | b"watch_setup_failed"
+            | b"watch_limit"
+            | b"watch_stopped"
+            | b"poll_unreadable"
+            | b"poll_unavailable"
     ) || !digits(&next_run)
         || !digits(&last_success)
+        || !digits(&last_poll)
     {
         return Err(PACKAGE_STATE_CORRUPT);
     }
@@ -15827,11 +15954,15 @@ fn render_routine(
     routine.push(b',');
     push_quoted_member(&mut routine, "backend", &backend);
     routine.push(b',');
+    push_quoted_member(&mut routine, "backend_reason", &backend_reason);
+    routine.push(b',');
     push_quoted_member(&mut routine, "state", &state);
     routine.push(b',');
     push_raw_member(&mut routine, "next_run_epoch", &next_run);
     routine.push(b',');
     push_raw_member(&mut routine, "last_success_epoch", &last_success);
+    routine.push(b',');
+    push_raw_member(&mut routine, "last_poll_epoch", &last_poll);
     routine.push(b'}');
     Ok(routine)
 }
@@ -19216,10 +19347,15 @@ mod tests {
              debounce_seconds=120\nretry_count=5\nretry_backoff_seconds=9000\n\
              poll_seconds=15\nallow_delete=false\nmax_total_delete=100\ndepends_on=\n",
         );
-        // One routine with stored state, and two without.
+        // One routine with stored state, and two without. `backend_reason` is
+        // deliberately left out of this record: it predates the field, and
+        // both rungs must default it to `ok` rather than call the record
+        // corrupt. `last_poll_epoch` predates it too but is not optional --
+        // it is present here the way `next_run_epoch` is.
         fixture.write_config(
             &fixture.routine_state_dir.join("alpha.state"),
-            "state=succeeded\nnext_run_epoch=1700003000\nlast_success_epoch=1700002900\nbackend=daily\n",
+            "state=succeeded\nnext_run_epoch=1700003000\nlast_success_epoch=1700002900\n\
+             backend=daily\nlast_poll_epoch=1700003100\n",
         );
 
         fixture.write_config(
@@ -19381,12 +19517,20 @@ mod tests {
         assert_eq!(daily["retry_exponential"], false);
         assert_eq!(daily["state"], "succeeded");
         assert_eq!(daily["backend"], "daily");
+        // The fixture's alpha.state has no backend_reason key at all: absent
+        // reads as ok on both rungs, not as corrupt_state.
+        assert_eq!(daily["backend_reason"], "ok");
+        assert_eq!(daily["last_poll_epoch"], 1_700_003_100);
         assert!(daily.get("interval_seconds").is_none());
         let interval = &routines[0];
         assert_eq!(interval["mode"], "interval");
         assert_eq!(interval["interval_seconds"], 900);
         assert_eq!(interval["depends_on"], json!([]));
         assert_eq!(interval["state"], "never");
+        // No state file at all for this routine: both new fields fall back to
+        // their defaults exactly like the pre-existing state fields do.
+        assert_eq!(interval["backend_reason"], "ok");
+        assert_eq!(interval["last_poll_epoch"], 0);
         assert!(interval.get("weekdays").is_none());
         let realtime = &routines[2];
         assert_eq!(realtime["mode"], "realtime");
@@ -19394,6 +19538,86 @@ mod tests {
         assert_eq!(realtime["poll_seconds"], 15);
         // Clamped, not refused.
         assert_eq!(realtime["retry_backoff_seconds"], 300);
+        assert_eq!(realtime["backend_reason"], "ok");
+        assert_eq!(realtime["last_poll_epoch"], 0);
+    }
+
+    /// Fault-injection rows 24-26: `backend_reason` on the routine object.
+    ///
+    /// Absent reads as `ok` on a state file that has the field's sibling keys
+    /// but not it, every one of the nine defined values round-trips
+    /// byte-identically on both rungs, and an unrecognised value fails the
+    /// whole snapshot closed on both rungs -- the same `package_state_corrupt`
+    /// code an unrecognised `backend` already produces, not a wrong reason
+    /// silently rendered for one routine while the rest of the document
+    /// succeeds. The five-value `backend` enum is untouched throughout: this
+    /// test never writes a `backend` value other than `daily`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn routine_backend_reason_defaults_to_ok_and_fails_closed_on_an_unknown_value() {
+        let fixture = TestShellPackageFixture::new("routine-backend-reason");
+        write_snapshot_inputs(&fixture);
+        let policy = SecurityPolicyArgs::default();
+        let state_file = fixture.routine_state_dir.join("alpha.state");
+
+        // Row 24, restated explicitly: the field absent from a state file
+        // that otherwise carries every sibling key.
+        fixture.write_config(
+            &state_file,
+            "state=succeeded\nnext_run_epoch=1700003000\nlast_success_epoch=1700002900\n\
+             backend=daily\nlast_poll_epoch=1700003100\n",
+        );
+        let document = assert_snapshot_parity(&fixture);
+        let daily = &document["routines"].as_array().unwrap()[1];
+        assert_eq!(daily["backend_reason"], "ok");
+        assert_eq!(daily["last_poll_epoch"], 1_700_003_100);
+
+        // Every defined value, one state file rewrite at a time, byte-identical
+        // on both rungs each time.
+        for reason in [
+            "ok",
+            "source_missing",
+            "source_symlink",
+            "watch_unavailable",
+            "watch_setup_failed",
+            "watch_limit",
+            "watch_stopped",
+            "poll_unreadable",
+            "poll_unavailable",
+        ] {
+            fixture.write_config(
+                &state_file,
+                &format!(
+                    "state=succeeded\nnext_run_epoch=1700003000\nlast_success_epoch=1700002900\n\
+                     backend=daily\nbackend_reason={reason}\nlast_poll_epoch=1700003100\n"
+                ),
+            );
+            let document = assert_snapshot_parity(&fixture);
+            let daily = &document["routines"].as_array().unwrap()[1];
+            assert_eq!(daily["backend_reason"], reason, "value {reason}");
+        }
+
+        // Row 25: an unrecognised value takes the whole snapshot down on both
+        // rungs, exactly like an unrecognised backend value does.
+        fixture.write_config(
+            &state_file,
+            "state=succeeded\nnext_run_epoch=1700003000\nlast_success_epoch=1700002900\n\
+             backend=daily\nbackend_reason=banana\nlast_poll_epoch=1700003100\n",
+        );
+        let shell = fixture.run_manager(&["api", "snapshot"]);
+        assert!(!shell.status.success());
+        assert!(
+            String::from_utf8_lossy(&shell.stdout).contains("corrupt_state"),
+            "{}",
+            String::from_utf8_lossy(&shell.stdout)
+        );
+        fixture.hand_over();
+        assert_eq!(
+            snapshot_document(&fixture.paths(), fixture.package_uid(), &policy)
+                .unwrap_err()
+                .code,
+            Some("package_state_corrupt")
+        );
     }
 
     /// The same read with every optional document absent, which is the state a
@@ -21293,6 +21517,60 @@ mod tests {
         assert!(coalescer.claim(busy, 10_000 + window + 2, window).is_none());
     }
 
+    /// Bridge review #6: a stale give-back must not roll the window backward
+    /// past a claim that has already superseded it.
+    ///
+    /// `a` claims the window at epoch 10_000. Before `a`'s give-back runs
+    /// (its writer was slow, or blocked behind the record file's lock), `c`
+    /// legitimately claims a *later* window. `a`'s give-back then arrives.
+    /// Before this fix it unconditionally reset `last_record_epoch` to `a`'s
+    /// own `previous_epoch` -- which predates even `a`'s claim -- reopening
+    /// the window `c` still holds and letting the very next failure claim
+    /// immediately, racing `c`'s in-flight write and misattributing counts
+    /// across two unrelated periods. The counts `a` drained are still merged
+    /// back either way: that part was never the bug.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn in_service_give_back_does_not_roll_the_window_back_past_a_later_claim() {
+        let window = linux_files::CGI_FAILURE_COALESCE_SECONDS;
+        let busy = ("service_request", "manager_busy", 503_u16);
+        let timeout = ("service_request", "manager_timeout", 503_u16);
+        let mut coalescer = InServiceFailureCoalescer::default();
+
+        let a = coalescer.claim(busy, 10_000, window).unwrap();
+        assert_eq!(a.previous_epoch, 0);
+
+        // c's claim lands in a later window -- as if a's writer released the
+        // coalescer lock, stalled, and c ran the entire next window's worth
+        // of claiming and reporting before a's give_back is ever called.
+        let c = coalescer
+            .claim(timeout, 10_000 + 2 * window, window)
+            .unwrap();
+        assert_eq!(c.previous_epoch, 10_000);
+
+        // a's write finally fails and gives its claim back late. This must
+        // not disturb the window c is holding.
+        coalescer.give_back(a);
+        assert_eq!(coalescer.last_record_epoch, 10_000 + 2 * window);
+
+        // A failure arriving inside c's window is still suppressed rather
+        // than claiming immediately -- the bug this test pins would have
+        // made this claim succeed instead of returning None.
+        assert!(
+            coalescer
+                .claim(busy, 10_000 + 2 * window + 1, window)
+                .is_none()
+        );
+
+        // a's one drained `busy` occurrence was still merged back rather
+        // than dropped, so it surfaces once the tally is next claimed: one
+        // from a, one from the probe just above, one from this claim itself.
+        let next = coalescer.claim(busy, 10_000 + 3 * window, window).unwrap();
+        assert_eq!(next.occurrences, 3);
+        assert_eq!(next.triple, busy);
+        assert_eq!(next.previous_epoch, 10_000 + 2 * window);
+    }
+
     /// Fault-injection row 16: `bridge_log_level=error` suppresses the record,
     /// writes neither file, and the 503 still reaches the browser.
     #[cfg(target_os = "linux")]
@@ -22127,6 +22405,99 @@ mod tests {
             capture_bounded_command(&mut recovery, 64, 64, Duration::from_secs(2), None).unwrap();
         assert!(output.status_success);
         assert_eq!(&output.stdout[..], b"recovered");
+    }
+
+    /// Bridge review #4: `waitpid` can become observable just before the
+    /// final pipe hangup on some kernels. `capture_child` already retries
+    /// once across a single bounded grace slice for exactly this; before this
+    /// fix `capture_queued_child` had no such retry and would report a
+    /// command that actually completed successfully as `Unavailable`.
+    ///
+    /// Forced deterministically rather than left to kernel timing: the
+    /// spawned shell backgrounds a `sleep` that inherits its copy of the
+    /// stdout pipe's write end, then exits immediately. `try_wait` observes
+    /// the shell's exit almost at once, while the pipe itself does not reach
+    /// EOF until the backgrounded sleep also exits and closes its inherited
+    /// descriptor -- reproducing the exact ordering the kernel race produces,
+    /// on every run. Without the grace retry this returns `Unavailable` for
+    /// output that was already fully written; with it, the command is
+    /// correctly reported as successful.
+    ///
+    /// An earlier version of this test raced the sleep's fixed hold (10ms,
+    /// later 50ms) against production's fixed grace slice (`POLL_SLICE`,
+    /// 25ms, later a 2s override) and was still observed to fail under real
+    /// build-level contention (two concurrent `cargo build`s, a CI runner
+    /// already starved) even at the wider margin: forking a process under
+    /// severe scheduling pressure has no fixed upper bound on how long its
+    /// own sleep's wakeup can be delayed, so any finite fixed hold can in
+    /// principle lose to any finite fixed window. There is no way to make
+    /// this fully immune to scheduling while it still measures two
+    /// independent kernel events (process exit, pipe EOF) becoming visible
+    /// to an external observer in a specific order -- that observation is
+    /// inherently schedule-dependent. What is controllable is the margin:
+    /// the grace window is widened to 15s (`queued_capture_grace_slice`'s
+    /// environment override, read fresh so production -- which never sets
+    /// it -- always uses the real `POLL_SLICE`) against a 50ms hold, a
+    /// 300x ratio verified to hold 10/10 runs with two `cargo build`s
+    /// competing for the same CPUs in the verification container (see the
+    /// task report for the exact commands and counts).
+    ///
+    /// The backgrounded sleep outlives the shell that spawned it, so it gets
+    /// reparented once the shell exits. In production the consumer has
+    /// already called `enable_consumer_subreaper`, so it adopts the orphan
+    /// and `reap_adopted_group_children` reaps it once the process group is
+    /// torn down. Run in an isolated child process rather than calling that
+    /// here directly: the flag is process-wide, and setting it in the shared
+    /// test-runner process would leak into every other test in this binary,
+    /// including `queued_mutation_cancellation_is_group_safe_without_subreaper`,
+    /// which specifically depends on its *absence*. Without either the
+    /// subreaper flag or this isolation, the orphaned sleep reparents to
+    /// whatever harness owns the test binary and is never reaped, leaving a
+    /// permanent zombie that keeps `process_group_exists` reporting `true`
+    /// forever and hanging the wrapper's post-success group check.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn queued_mutation_capture_retries_once_when_exit_is_observed_before_the_final_hangup() {
+        const CHILD_MODE: &str = "SDSYNC_TEST_QUEUED_GRACE_CHILD";
+        const GRACE_OVERRIDE_MILLIS: &str = "15000";
+        if std::env::var_os(CHILD_MODE).is_some() {
+            enable_consumer_subreaper().unwrap();
+            let termination_requested = AtomicBool::new(false);
+            let mut command = Command::new("/bin/sh");
+            // A 50ms hold against a 15s grace window (a 300x margin):
+            // forking this shell under even severe build-level contention
+            // has, in practice, nowhere near that much room to lose.
+            command.args(["-c", "printf 'queued-grace-ok\\n'; sleep 0.05 & exit 0"]);
+            let started = Instant::now();
+            let output =
+                capture_queued_mutation_command(&mut command, 128, None, &termination_requested)
+                    .expect("queued capture with a grace-slice retry");
+            // Bounded well below the 15s window so a genuine regression
+            // (the retry never firing, or firing but never succeeding)
+            // still fails promptly instead of silently eating the whole
+            // widened slice.
+            assert!(started.elapsed() < Duration::from_secs(10));
+            assert!(output.status_success);
+            assert_eq!(&output.stdout[..], b"queued-grace-ok\n");
+            return;
+        }
+
+        let test_binary = std::env::current_exe().unwrap();
+        let status = Command::new(test_binary)
+            .args([
+                "queued_mutation_capture_retries_once_when_exit_is_observed_before_the_final_hangup",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_MODE, "true")
+            .env(
+                "SDSYNC_TEST_QUEUED_CAPTURE_GRACE_MILLIS",
+                GRACE_OVERRIDE_MILLIS,
+            )
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[cfg(target_os = "linux")]
@@ -27227,6 +27598,58 @@ mod tests {
         assert_eq!(value["nested"]["token"], "[redacted]");
         assert_eq!(value["message"], "[redacted]");
         assert!(parse_manager_result(output, Some(b"exact-secret")).is_err());
+    }
+
+    /// Bridge review #1: `tokens`, `set_cookie`, `session_cookies`,
+    /// `api_key` and `bearer` are redacted once they actually hold
+    /// secret-shaped data -- a string, or an array of strings -- closing the
+    /// gap the exact/suffix-only key match left open for these plural and
+    /// compound names. `cookies` is deliberately absent from that widened
+    /// set: it is a value-free cookie-presence ledger (an object naming
+    /// which cookies exist, never their values), and the rejected
+    /// `.contains("cookie")` fix would have redacted it outright.
+    #[test]
+    fn manager_json_redacts_widened_key_names_only_when_secret_shaped() {
+        let output = br#"{"schema":"sdsync.dsm-activity.v1","tokens":"leak","session_cookies":["a","b"],"api_key":"leak","bearer":"leak","set_cookie":"leak","cookies":{"csrf":true,"session":true},"nested":{"tokens":"leak"}}"#;
+        let sanitized = parse_and_sanitize_manager_json(
+            output,
+            &ReadAction::Activity { lines: 10 },
+            None,
+            None,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&sanitized).unwrap();
+        assert_eq!(value["tokens"], "[redacted]");
+        assert_eq!(value["session_cookies"], "[redacted]");
+        assert_eq!(value["api_key"], "[redacted]");
+        assert_eq!(value["bearer"], "[redacted]");
+        assert_eq!(value["set_cookie"], "[redacted]");
+        assert_eq!(value["nested"]["tokens"], "[redacted]");
+        // The object-valued ledger renders untouched.
+        assert_eq!(value["cookies"]["csrf"], true);
+        assert_eq!(value["cookies"]["session"], true);
+
+        // The mutation-result safety gate (json_contains_sensitive_value
+        // directly, since parse_manager_result's generic-result shape has
+        // its own unrelated field allowlist) agrees: a widened key holding
+        // an actual secret string is unsafe to relay verbatim...
+        assert!(json_contains_sensitive_value(
+            &json!({"tokens": "leak"}),
+            None
+        ));
+        assert!(json_contains_sensitive_value(
+            &json!({"session_cookies": ["a", "b"]}),
+            None
+        ));
+        // ...but the value-free ledger shape alone is not, at any depth.
+        assert!(!json_contains_sensitive_value(
+            &json!({"cookies": {"csrf": true, "session": true}}),
+            None
+        ));
+        assert!(!json_contains_sensitive_value(
+            &json!({"nested": {"cookies": {"csrf": true}}}),
+            None
+        ));
     }
 
     /// The manager writes a doctor inventory log, emits it as its own source in

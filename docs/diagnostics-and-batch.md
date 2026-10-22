@@ -354,8 +354,15 @@ synology-drive-sync doctor --profile acceptance --level extensive \
 ```
 
 The probe uses a unique disposable name, creates its own folder, uploads known content, verifies
-the remote size, mtime, MD5, CRC32, and SHA-256, exercises server-side copy when supported (or the
-verified upload fallback), and removes only the probe artifacts it created. It must never use or
+the remote size, MD5, CRC32, and SHA-256, **reports** whether the destination kept the modification
+time the upload sent, exercises server-side copy when supported (or the verified upload fallback),
+and removes only the probe artifacts it created. The modification time is a reported fact rather than
+a pass/fail gate, because it is the one property of a destination the tool cannot determine for
+itself: the upload writes `mtime` in milliseconds and every comparison reads whole seconds back from
+File Station. `mtime_preserved` is `true`, `false`, or `null` when DSM reported no modified time at
+all. A `false` means every `metadata` or `content` run will report unchanged files as differing, so
+each run re-uploads the whole tree and post-run reconciliation cannot converge; a `sync` against such
+a destination warns once per run. It must never use or
 replace an existing user path. A process crash, lost connection, DSM failure, or failed cleanup can
 leave a disposable artifact; inspect and remove the exact reported probe path manually before
 retrying. The nested `write_test` report distinguishes request, preflight, execution, verification,

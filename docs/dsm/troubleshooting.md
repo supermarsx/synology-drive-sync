@@ -594,10 +594,39 @@ and inspect for leftovers after a failure.
 
 ## Realtime reports polling
 
-`polling` is an explicit safe fallback when `inotifywait` is unavailable or a watcher recently
-failed. Confirm source ACLs and controller logs. Polling uses path/size/mtime fingerprints at the
-configured interval; reducing the interval increases source traversal work. Do not claim native
-realtime operation unless the snapshot reports `inotify`.
+`polling` is the expected backend unless inotify-tools has been installed from SynoCommunity or
+Entware. Polling is not merely a fallback: it runs alongside a healthy native watcher too, checking
+path/size/mtime fingerprints at the configured interval whenever no native event is pending for that
+turn, and it now requires one unchanged reading before it dispatches. Confirm source ACLs and
+controller logs. Reducing the interval increases source traversal work. Do not claim native realtime
+operation unless the snapshot reports `inotify`.
+
+An unreadable subtree fails only itself, not the whole poll. `backend_reason=poll_unreadable` in the
+routine's state means part of the source could not be read on the last poll; the readable part stays
+observed, and the controller log names the failure `routine_poll_unavailable`. Fix permissions on the
+unreadable path — `@eaDir`, `#recycle`, `#snapshot`, and `@tmp` are already pruned from the walk and
+cannot be the cause.
+
+## Realtime routine never runs
+
+Check the routine's `backend_reason` first, in the Routines catalog row or the routine editor; it
+names why, not just that something is wrong. `backend_reason` is absent on a state file written
+before this field existed, and that reads as `ok`.
+
+| `backend_reason` | What it means | What to do |
+| --- | --- | --- |
+| `ok` | Observing normally, natively or by polling. | Nothing; this is healthy. |
+| `source_missing` | The configured source path does not exist. | Restore it, or point the profile at a path that exists. |
+| `source_symlink` | The configured source path is a symlink. | Point the profile at the real directory it targets. |
+| `watch_unavailable` | No native watcher is available on this NAS. | Install inotify-tools from SynoCommunity or Entware; polling continues to observe the source meanwhile. |
+| `watch_setup_failed` | The native watcher failed to start after repeated attempts and the controller stopped retrying. | Inspect the controller log for the reported error, then save the routine to try again. |
+| `watch_limit` | The source has more directories than the inotify watch budget allows. | Raise `fs.inotify.max_user_watches`, or narrow the source. Compare `cat /proc/sys/fs/inotify/max_user_watches` against `find <source> -type d \| wc -l`. |
+| `watch_stopped` | A stopped native watcher was found and was replaced automatically. | Nothing, unless it recurs; if it does, inspect what is pausing the watcher process. |
+| `poll_unreadable` | Part of the source could not be read during the last poll. | Fix permissions on the unreadable subtree; the readable part is still observed. |
+| `poll_unavailable` | The last poll of the source failed outright. | Confirm the source path is reachable and readable. |
+
+`backend` itself is only as current as the last poll that actually completed; a stalled or failing
+poll leaves it holding whatever it last reported rather than updating to reflect the present.
 
 ## Routine is deferred
 

@@ -45,6 +45,16 @@ const CACHE_FILE_CEILING_BYTES: u64 = 8 * 1024 * 1024;
 /// streamed. It is not a tight bound on purpose — the point is the order of magnitude.
 const CACHE_READ_HEAP_CEILING_BYTES: usize = 256 * 1024;
 
+/// Heap the cache may hold while **writing** its entire contents.
+///
+/// The same bound as the read, for the same reason, and it was unmeasured until this line existed:
+/// the peak counter used to be armed after `store` had returned, so the write path's allocations
+/// fell outside the measured region entirely. They were not small — a path-keyed map of this run's
+/// observations is about 6 MB at the entry ceiling, on top of the 27 MiB of inventories
+/// `scan_memory.rs` pins, against a 32 MiB request ceiling. Both sides of the merge are streams now,
+/// so what is left is a line buffer, one record, and the writer's own buffer.
+const CACHE_WRITE_HEAP_CEILING_BYTES: usize = 256 * 1024;
+
 const ENTRIES: usize = 20_000;
 const NOW: i64 = 1_757_000_000;
 
@@ -183,18 +193,41 @@ fn options(directory: PathBuf, canary: usize) -> CacheOptions {
 /// The allocation counter is process-wide, so two tests measuring concurrently would each observe
 /// the other's allocations and report noise. This binary therefore holds exactly one test.
 #[test]
-fn the_cache_fits_its_disk_ceiling_and_is_read_without_a_third_structure() {
+fn the_cache_fits_its_disk_ceiling_and_is_written_and_read_without_a_third_structure() {
     let scratch = std::env::temp_dir().join(format!("sdsync-cache-budget-{}", std::process::id()));
     let _ = fs::remove_dir_all(&scratch);
     fs::create_dir_all(&scratch).expect("scratch directory");
 
-    // Write a cache at the shipped entry ceiling.
+    // Write a cache at the shipped entry ceiling, measuring what the write itself holds.
     let (local, remote) = inventories(true);
     let comparison: BTreeSet<String> = local.entries.keys().cloned().collect();
     let cache = StatusCache::open(options(scratch.clone(), 0), NOW).expect("cache opens");
+    // Armed *above* the `store` call, which is the whole point: everything the write path allocates
+    // is inside the measured region, including any structure keyed by path.
+    let write_baseline = arm_peak();
     cache
         .store(&local, &remote, &comparison, false)
         .expect("cache is written");
+    let write_peak = peak_bytes().saturating_sub(write_baseline);
+    println!("cache write peaked at {write_peak} bytes of heap while storing {ENTRIES} entries");
+    assert!(
+        write_peak <= CACHE_WRITE_HEAP_CEILING_BYTES,
+        "writing the cache peaked at {write_peak} bytes, past the {CACHE_WRITE_HEAP_CEILING_BYTES} a streamed merge is allowed; something is materialising per-entry state"
+    );
+
+    // Written from a cache that already exists, the merge reads every stored record back while it
+    // writes: the case where a second path-keyed structure would appear.
+    let write_baseline = arm_peak();
+    cache
+        .store(&local, &remote, &comparison, false)
+        .expect("cache is rewritten over itself");
+    let rewrite_peak = peak_bytes().saturating_sub(write_baseline);
+    println!("cache rewrite over an existing file peaked at {rewrite_peak} bytes of heap");
+    assert!(
+        rewrite_peak <= CACHE_WRITE_HEAP_CEILING_BYTES,
+        "rewriting the cache peaked at {rewrite_peak} bytes, past the {CACHE_WRITE_HEAP_CEILING_BYTES} a streamed merge is allowed"
+    );
+
     drop(local);
     drop(remote);
 

@@ -273,7 +273,8 @@ secrets, or replace the full Plan/Run inventory. Extensive does not expand that 
 
 **Disposable write test** is a separate, capability-gated mutation opt-in. Enabling it locks the
 level to Extensive and requires confirmation. It briefly creates and uploads a unique probe,
-verifies size, mtime, MD5, CRC32, and SHA-256, may exercise same-target copy, and removes the probe.
+verifies size, MD5, CRC32, and SHA-256, reports whether the destination kept the uploaded
+modification time, may exercise same-target copy, and removes the probe.
 Use it only in a prepared non-critical existing destination.
 
 The API initially queues the action, then the page polls its sanitized terminal result before

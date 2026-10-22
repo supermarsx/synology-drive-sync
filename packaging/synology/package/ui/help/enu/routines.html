@@ -17,7 +17,7 @@
   <dl>
     <dt>Interval</dt><dd>Runs after the configured number of seconds. It has no weekday or time-window restriction.</dd>
     <dt>Daily window</dt><dd>Runs on the selected weekdays and only between the start and end times in DSM local time.</dd>
-    <dt>Realtime</dt><dd>Observes source changes, waits for a full quiet debounce period after the latest event, performs preflight, and starts a run. It has no interval or calendar window. The debounce defaults to 45 seconds. Dependency deferral preserves the pending event; a newer event restarts the quiet period. A consumed native event also refreshes the fallback fingerprint, so polling cannot dispatch it early or a second time. When a native change hook is unavailable, the package reports and uses the configured polling fallback.</dd>
+    <dt>Realtime</dt><dd>Observes source changes, waits for a full quiet debounce period after the latest event, performs preflight, and starts a run. It has no interval or calendar window. The debounce defaults to 45 seconds; a source that never has a quiet moment still dispatches at a bounded ceiling. Dependency deferral preserves the pending event; a newer event restarts the quiet period. A consumed native event also refreshes the fingerprint, so polling cannot dispatch it early or a second time. Fallback poll is not only a fallback: it checks the source on a floor whenever no native event is pending, whether or not a native watcher is available, so a routine's editor shows the live backend, its state, the reason when it is not observing changes, and the age of the last poll.</dd>
   </dl>
 
   <h2>Retries</h2>

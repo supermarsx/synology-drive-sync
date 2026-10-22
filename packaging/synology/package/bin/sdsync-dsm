@@ -119,7 +119,8 @@ cleanup_manager_lock() {
         "${api_stdout:-}" "${api_stderr:-}" "${snapshot_json:-}" "${activity_input:-}" \
         "${activity_json:-}" "${cache_temp_path:-}" \
         "${source_doctor_output:-}" "${target_doctor_output:-}" \
-        "${doctor_inventory_records:-}"; do
+        "${doctor_inventory_records:-}" \
+        "${query_stdout:-}" "${query_stderr:-}"; do
         [ -n "$cleanup_path" ] || continue
         case $cleanup_path in
             "$package_home"/*|"$package_var"/*)
@@ -2218,41 +2219,248 @@ api_load_kv_optional() {
     if printf '%s' "$kv_value" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then api_error corrupt_state "package state contains control characters" 73; fi
 }
 
-api_toml_string() {
-    toml_file=$1
-    toml_key=$2
-    toml_default=${3-}
-    toml_required=${4:-false}
-    toml_count=$(grep -c "^${toml_key} = \"" "$toml_file" 2>/dev/null || true)
-    if [ "$toml_count" = 0 ] && [ "$toml_required" = false ]; then
-        toml_value=$toml_default
+# Validate one already-extracted TOML string field. No file I/O and no forks:
+# `api_profile_fragment_fields` below reads the fragment exactly once and
+# passes this the per-key line count and captured value it collected in that
+# single pass, instead of this function re-scanning the whole file itself.
+# The four outcomes -- default (optional and absent), invalid (required and
+# absent, or duplicated), malformed (present but empty), unsafe (embedded
+# quote, backslash or control byte) -- and their exact messages are unchanged
+# from the per-field-fork version this replaces.
+api_profile_string_field() {
+    string_field_key=$1
+    string_field_seen=$2
+    string_field_raw=$3
+    string_field_default=$4
+    string_field_required=$5
+    if [ "$string_field_seen" -eq 0 ]; then
+        [ "$string_field_required" = false ] || api_error corrupt_config "profile has invalid $string_field_key" 73
+        toml_value=$string_field_default
         return
     fi
-    [ "$toml_count" = 1 ] || api_error corrupt_config "profile has invalid $toml_key" 73
-    toml_line=$(sed -n "s/^${toml_key} = \"\(.*\)\"$/\1/p" "$toml_file")
-    [ -n "$toml_line" ] || api_error corrupt_config "profile has malformed $toml_key" 73
-    case $toml_line in *'"'*|*\\*) api_error corrupt_config "profile has unsafe $toml_key" 73 ;; esac
-    if printf '%s' "$toml_line" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
-        api_error corrupt_config "profile has unsafe $toml_key" 73
-    fi
-    toml_value=$toml_line
+    [ "$string_field_seen" -eq 1 ] || api_error corrupt_config "profile has invalid $string_field_key" 73
+    [ -n "$string_field_raw" ] || api_error corrupt_config "profile has malformed $string_field_key" 73
+    case $string_field_raw in
+        *'"'*|*\\*|*[[:cntrl:]]*) api_error corrupt_config "profile has unsafe $string_field_key" 73 ;;
+    esac
+    toml_value=$string_field_raw
 }
 
-api_toml_scalar() {
-    toml_file=$1
-    toml_key=$2
-    toml_default=$3
-    toml_kind=$4
-    toml_count=$(grep -c "^${toml_key} = " "$toml_file" 2>/dev/null || true)
-    if [ "$toml_count" = 0 ]; then toml_value=$toml_default; else
-        [ "$toml_count" = 1 ] || api_error corrupt_config "profile duplicates $toml_key" 73
-        toml_value=$(sed -n "s/^${toml_key} = //p" "$toml_file")
+# As above, for one already-extracted bare (unquoted) TOML scalar field.
+api_profile_scalar_field() {
+    scalar_field_key=$1
+    scalar_field_seen=$2
+    scalar_field_raw=$3
+    scalar_field_default=$4
+    scalar_field_kind=$5
+    if [ "$scalar_field_seen" -eq 0 ]; then
+        toml_value=$scalar_field_default
+    else
+        [ "$scalar_field_seen" -eq 1 ] || api_error corrupt_config "profile duplicates $scalar_field_key" 73
+        toml_value=$scalar_field_raw
     fi
-    case $toml_kind in
-        bool) case $toml_value in true|false) ;; *) api_error corrupt_config "profile has invalid $toml_key" 73 ;; esac ;;
-        number) case $toml_value in ''|*[!0-9]*) api_error corrupt_config "profile has invalid $toml_key" 73 ;; esac ;;
+    case $scalar_field_kind in
+        bool) case $toml_value in true|false) ;; *) api_error corrupt_config "profile has invalid $scalar_field_key" 73 ;; esac ;;
+        number) case $toml_value in ''|*[!0-9]*) api_error corrupt_config "profile has invalid $scalar_field_key" 73 ;; esac ;;
         *) api_error internal_error "invalid scalar parser" 70 ;;
     esac
+}
+
+# The one builtin read of a profile fragment. Sets every profile_seen_*
+# (0, 1, or the true count above 1 -- callers only ever test -eq 0 / -eq 1)
+# and profile_raw_* global the field validators above consume. Splitting each
+# line at the first " = " is safe even when a value itself contains that
+# substring (a remote-log-url query string, say): the split happens once, on
+# the leftmost occurrence, exactly where the key name ends -- so the two-sided
+# anchored patterns each field used to grep for individually are equivalent to
+# testing this one already-split key/value pair per line.
+api_profile_fragment_fields() {
+    profile_seen_source=0 profile_raw_source=
+    profile_seen_url=0 profile_raw_url=
+    profile_seen_username=0 profile_raw_username=
+    profile_seen_remote=0 profile_raw_remote=
+    profile_seen_password_file=0 profile_raw_password_file=
+    profile_seen_totp_secret_file=0 profile_raw_totp_secret_file=
+    profile_seen_remote_log_token_file=0 profile_raw_remote_log_token_file=
+    profile_seen_compare=0 profile_raw_compare=
+    profile_seen_log_level=0 profile_raw_log_level=
+    profile_seen_log_format=0 profile_raw_log_format=
+    profile_seen_log_file=0 profile_raw_log_file=
+    profile_seen_progress=0 profile_raw_progress=
+    profile_seen_output=0 profile_raw_output=
+    profile_seen_remote_log_url=0 profile_raw_remote_log_url=
+    profile_seen_remote_log_mode=0 profile_raw_remote_log_mode=
+    profile_seen_ca_certificate=0 profile_raw_ca_certificate=
+    profile_seen_no_vault=0 profile_raw_no_vault=
+    profile_seen_jobs=0 profile_raw_jobs=
+    profile_seen_delete=0 profile_raw_delete=
+    profile_seen_max_delete=0 profile_raw_max_delete=
+    profile_seen_allow_http=0 profile_raw_allow_http=
+    profile_seen_allow_empty_source=0 profile_raw_allow_empty_source=
+    profile_seen_retries=0 profile_raw_retries=
+    profile_seen_timeout=0 profile_raw_timeout=
+    profile_seen_connect_timeout=0 profile_raw_connect_timeout=
+    profile_seen_danger_accept_invalid_certs=0 profile_raw_danger_accept_invalid_certs=
+    profile_seen_verbose=0 profile_raw_verbose=
+    profile_seen_quiet=0 profile_raw_quiet=
+    profile_seen_max_rate=0 profile_raw_max_rate=
+    profile_seen_excludes=0 profile_raw_excludes=
+    while IFS= read -r profile_raw_line || [ -n "$profile_raw_line" ]; do
+        case $profile_raw_line in
+            *' = '*)
+                profile_field_key=${profile_raw_line%%' = '*}
+                profile_field_value=${profile_raw_line#*' = '}
+                ;;
+            *) profile_field_key= ;;
+        esac
+        case $profile_field_key in
+            # String fields: `api_toml_string`'s own count required the value
+            # to open with a quote (`^key = "`), so an unquoted line for one
+            # of these keys is not "seen" at all -- exactly reproduced by
+            # gating the counter on that same leading quote.
+            source|url|username|remote|password-file|totp-secret-file|remote-log-token-file|\
+            compare|log-level|log-format|log-file|progress|output|remote-log-url|remote-log-mode|ca-certificate)
+                case $profile_field_value in
+                    '"'*) ;;
+                    *) continue ;;
+                esac
+                ;;
+        esac
+        case $profile_field_key in
+            source)
+                profile_seen_source=$((profile_seen_source + 1))
+                case $profile_field_value in
+                    '"'*'"') profile_raw_source=${profile_field_value#'"'}; profile_raw_source=${profile_raw_source%'"'} ;;
+                    *) profile_raw_source= ;;
+                esac
+                ;;
+            url)
+                profile_seen_url=$((profile_seen_url + 1))
+                case $profile_field_value in
+                    '"'*'"') profile_raw_url=${profile_field_value#'"'}; profile_raw_url=${profile_raw_url%'"'} ;;
+                    *) profile_raw_url= ;;
+                esac
+                ;;
+            username)
+                profile_seen_username=$((profile_seen_username + 1))
+                case $profile_field_value in
+                    '"'*'"') profile_raw_username=${profile_field_value#'"'}; profile_raw_username=${profile_raw_username%'"'} ;;
+                    *) profile_raw_username= ;;
+                esac
+                ;;
+            remote)
+                profile_seen_remote=$((profile_seen_remote + 1))
+                case $profile_field_value in
+                    '"'*'"') profile_raw_remote=${profile_field_value#'"'}; profile_raw_remote=${profile_raw_remote%'"'} ;;
+                    *) profile_raw_remote= ;;
+                esac
+                ;;
+            password-file)
+                profile_seen_password_file=$((profile_seen_password_file + 1))
+                case $profile_field_value in
+                    '"'*'"') profile_raw_password_file=${profile_field_value#'"'}; profile_raw_password_file=${profile_raw_password_file%'"'} ;;
+                    *) profile_raw_password_file= ;;
+                esac
+                ;;
+            totp-secret-file)
+                profile_seen_totp_secret_file=$((profile_seen_totp_secret_file + 1))
+                case $profile_field_value in
+                    '"'*'"') profile_raw_totp_secret_file=${profile_field_value#'"'}; profile_raw_totp_secret_file=${profile_raw_totp_secret_file%'"'} ;;
+                    *) profile_raw_totp_secret_file= ;;
+                esac
+                ;;
+            remote-log-token-file)
+                profile_seen_remote_log_token_file=$((profile_seen_remote_log_token_file + 1))
+                case $profile_field_value in
+                    '"'*'"') profile_raw_remote_log_token_file=${profile_field_value#'"'}; profile_raw_remote_log_token_file=${profile_raw_remote_log_token_file%'"'} ;;
+                    *) profile_raw_remote_log_token_file= ;;
+                esac
+                ;;
+            compare)
+                profile_seen_compare=$((profile_seen_compare + 1))
+                case $profile_field_value in
+                    '"'*'"') profile_raw_compare=${profile_field_value#'"'}; profile_raw_compare=${profile_raw_compare%'"'} ;;
+                    *) profile_raw_compare= ;;
+                esac
+                ;;
+            log-level)
+                profile_seen_log_level=$((profile_seen_log_level + 1))
+                case $profile_field_value in
+                    '"'*'"') profile_raw_log_level=${profile_field_value#'"'}; profile_raw_log_level=${profile_raw_log_level%'"'} ;;
+                    *) profile_raw_log_level= ;;
+                esac
+                ;;
+            log-format)
+                profile_seen_log_format=$((profile_seen_log_format + 1))
+                case $profile_field_value in
+                    '"'*'"') profile_raw_log_format=${profile_field_value#'"'}; profile_raw_log_format=${profile_raw_log_format%'"'} ;;
+                    *) profile_raw_log_format= ;;
+                esac
+                ;;
+            log-file)
+                profile_seen_log_file=$((profile_seen_log_file + 1))
+                case $profile_field_value in
+                    '"'*'"') profile_raw_log_file=${profile_field_value#'"'}; profile_raw_log_file=${profile_raw_log_file%'"'} ;;
+                    *) profile_raw_log_file= ;;
+                esac
+                ;;
+            progress)
+                profile_seen_progress=$((profile_seen_progress + 1))
+                case $profile_field_value in
+                    '"'*'"') profile_raw_progress=${profile_field_value#'"'}; profile_raw_progress=${profile_raw_progress%'"'} ;;
+                    *) profile_raw_progress= ;;
+                esac
+                ;;
+            output)
+                profile_seen_output=$((profile_seen_output + 1))
+                case $profile_field_value in
+                    '"'*'"') profile_raw_output=${profile_field_value#'"'}; profile_raw_output=${profile_raw_output%'"'} ;;
+                    *) profile_raw_output= ;;
+                esac
+                ;;
+            remote-log-url)
+                profile_seen_remote_log_url=$((profile_seen_remote_log_url + 1))
+                case $profile_field_value in
+                    '"'*'"') profile_raw_remote_log_url=${profile_field_value#'"'}; profile_raw_remote_log_url=${profile_raw_remote_log_url%'"'} ;;
+                    *) profile_raw_remote_log_url= ;;
+                esac
+                ;;
+            remote-log-mode)
+                profile_seen_remote_log_mode=$((profile_seen_remote_log_mode + 1))
+                case $profile_field_value in
+                    '"'*'"') profile_raw_remote_log_mode=${profile_field_value#'"'}; profile_raw_remote_log_mode=${profile_raw_remote_log_mode%'"'} ;;
+                    *) profile_raw_remote_log_mode= ;;
+                esac
+                ;;
+            ca-certificate)
+                profile_seen_ca_certificate=$((profile_seen_ca_certificate + 1))
+                case $profile_field_value in
+                    '"'*'"') profile_raw_ca_certificate=${profile_field_value#'"'}; profile_raw_ca_certificate=${profile_raw_ca_certificate%'"'} ;;
+                    *) profile_raw_ca_certificate= ;;
+                esac
+                ;;
+            # Scalar fields: any value counts, no quote required, and the raw
+            # value is kept exactly as written -- `api_toml_scalar` never
+            # stripped anything either, leaving bool/number shape validation
+            # to the caller.
+            no-vault) profile_seen_no_vault=$((profile_seen_no_vault + 1)); profile_raw_no_vault=$profile_field_value ;;
+            jobs) profile_seen_jobs=$((profile_seen_jobs + 1)); profile_raw_jobs=$profile_field_value ;;
+            delete) profile_seen_delete=$((profile_seen_delete + 1)); profile_raw_delete=$profile_field_value ;;
+            max-delete) profile_seen_max_delete=$((profile_seen_max_delete + 1)); profile_raw_max_delete=$profile_field_value ;;
+            allow-http) profile_seen_allow_http=$((profile_seen_allow_http + 1)); profile_raw_allow_http=$profile_field_value ;;
+            allow-empty-source) profile_seen_allow_empty_source=$((profile_seen_allow_empty_source + 1)); profile_raw_allow_empty_source=$profile_field_value ;;
+            retries) profile_seen_retries=$((profile_seen_retries + 1)); profile_raw_retries=$profile_field_value ;;
+            timeout) profile_seen_timeout=$((profile_seen_timeout + 1)); profile_raw_timeout=$profile_field_value ;;
+            connect-timeout) profile_seen_connect_timeout=$((profile_seen_connect_timeout + 1)); profile_raw_connect_timeout=$profile_field_value ;;
+            danger-accept-invalid-certs) profile_seen_danger_accept_invalid_certs=$((profile_seen_danger_accept_invalid_certs + 1)); profile_raw_danger_accept_invalid_certs=$profile_field_value ;;
+            verbose) profile_seen_verbose=$((profile_seen_verbose + 1)); profile_raw_verbose=$profile_field_value ;;
+            quiet) profile_seen_quiet=$((profile_seen_quiet + 1)); profile_raw_quiet=$profile_field_value ;;
+            max-rate) profile_seen_max_rate=$((profile_seen_max_rate + 1)); profile_raw_max_rate=$profile_field_value ;;
+            # Not TOML-scalar shaped at all (it is a bracketed list literal),
+            # but still exactly one key on one line, so it rides the same pass.
+            excludes) profile_seen_excludes=$((profile_seen_excludes + 1)); profile_raw_excludes=$profile_field_value ;;
+        esac
+    done < "$profile_fragment"
 }
 
 api_secret_boolean() {
@@ -2848,49 +3056,55 @@ api_profile_json() {
     fi
     profile_name=${profile_fragment##*/}; profile_name=${profile_name%.toml}
     valid_name "$profile_name" || api_error corrupt_config "invalid profile fragment name" 73
-    api_toml_string "$profile_fragment" source '' true; profile_source=$toml_value
-    api_toml_string "$profile_fragment" url '' true; profile_url=$toml_value
-    api_toml_string "$profile_fragment" username '' true; profile_username=$toml_value
-    api_toml_string "$profile_fragment" remote '' true; profile_remote=$toml_value
-    api_toml_string "$profile_fragment" password-file '' true; profile_password_locator=$toml_value
-    api_toml_string "$profile_fragment" totp-secret-file '' true; profile_totp_locator=$toml_value
-    api_toml_string "$profile_fragment" remote-log-token-file '' false; profile_remote_token_locator=$toml_value
+    # One builtin read of the whole fragment, replacing what was ~28 forked
+    # sed/grep reads of this same small file (one per field, refetching and
+    # re-scanning the file from disk every time). Every validation below --
+    # including each exact error message -- is unchanged from the per-field
+    # version this replaces; only where the bytes come from has changed.
+    api_profile_fragment_fields
+    api_profile_string_field source "$profile_seen_source" "$profile_raw_source" '' true; profile_source=$toml_value
+    api_profile_string_field url "$profile_seen_url" "$profile_raw_url" '' true; profile_url=$toml_value
+    api_profile_string_field username "$profile_seen_username" "$profile_raw_username" '' true; profile_username=$toml_value
+    api_profile_string_field remote "$profile_seen_remote" "$profile_raw_remote" '' true; profile_remote=$toml_value
+    api_profile_string_field password-file "$profile_seen_password_file" "$profile_raw_password_file" '' true; profile_password_locator=$toml_value
+    api_profile_string_field totp-secret-file "$profile_seen_totp_secret_file" "$profile_raw_totp_secret_file" '' true; profile_totp_locator=$toml_value
+    api_profile_string_field remote-log-token-file "$profile_seen_remote_log_token_file" "$profile_raw_remote_log_token_file" '' false; profile_remote_token_locator=$toml_value
     [ "$profile_password_locator" = "$secret_root/$profile_name.password" ] || api_error corrupt_config "profile password locator escaped package storage" 73
     [ "$profile_totp_locator" = "$secret_root/$profile_name.totp" ] || api_error corrupt_config "profile TOTP locator escaped package storage" 73
     if [ -n "$profile_remote_token_locator" ]; then
         [ "$profile_remote_token_locator" = "$secret_root/$profile_name.remote-log-token" ] || \
             api_error corrupt_config "profile remote log token locator escaped package storage" 73
     fi
-    api_toml_scalar "$profile_fragment" no-vault true bool
+    api_profile_scalar_field no-vault "$profile_seen_no_vault" "$profile_raw_no_vault" true bool
     [ "$toml_value" = true ] || api_error corrupt_config "DSM profiles must keep the OS vault disabled" 73
-    api_toml_string "$profile_fragment" compare content false; profile_compare=$toml_value
+    api_profile_string_field compare "$profile_seen_compare" "$profile_raw_compare" content false; profile_compare=$toml_value
     case $profile_compare in content|metadata|size-only) ;; *) api_error corrupt_config "invalid profile compare mode" 73 ;; esac
-    api_toml_scalar "$profile_fragment" jobs 2 number; profile_jobs=$toml_value
+    api_profile_scalar_field jobs "$profile_seen_jobs" "$profile_raw_jobs" 2 number; profile_jobs=$toml_value
     [ "$profile_jobs" -ge 1 ] && [ "$profile_jobs" -le 16 ] || api_error corrupt_config "invalid profile jobs" 73
-    api_toml_scalar "$profile_fragment" delete false bool; profile_delete=$toml_value
-    api_toml_scalar "$profile_fragment" max-delete 100 number; profile_max_delete=$toml_value
+    api_profile_scalar_field delete "$profile_seen_delete" "$profile_raw_delete" false bool; profile_delete=$toml_value
+    api_profile_scalar_field max-delete "$profile_seen_max_delete" "$profile_raw_max_delete" 100 number; profile_max_delete=$toml_value
     decimal_at_most "$profile_max_delete" "$dsm_delete_limit" || api_error corrupt_config "invalid profile max-delete" 73
-    api_toml_scalar "$profile_fragment" allow-http false bool; profile_allow_http=$toml_value
-    api_toml_scalar "$profile_fragment" allow-empty-source false bool; profile_allow_empty=$toml_value
+    api_profile_scalar_field allow-http "$profile_seen_allow_http" "$profile_raw_allow_http" false bool; profile_allow_http=$toml_value
+    api_profile_scalar_field allow-empty-source "$profile_seen_allow_empty_source" "$profile_raw_allow_empty_source" false bool; profile_allow_empty=$toml_value
     [ "$profile_allow_empty" != true ] || [ "$profile_delete" = true ] || \
         api_error corrupt_config "profile allow-empty-source requires delete" 73
-    api_toml_scalar "$profile_fragment" retries 2 number; profile_retries=$toml_value
+    api_profile_scalar_field retries "$profile_seen_retries" "$profile_raw_retries" 2 number; profile_retries=$toml_value
     [ "$profile_retries" -le 5 ] || api_error corrupt_config "invalid profile retries" 73
-    api_toml_scalar "$profile_fragment" timeout 7200 number; profile_timeout=$toml_value
-    api_toml_scalar "$profile_fragment" connect-timeout 15 number; profile_connect_timeout=$toml_value
+    api_profile_scalar_field timeout "$profile_seen_timeout" "$profile_raw_timeout" 7200 number; profile_timeout=$toml_value
+    api_profile_scalar_field connect-timeout "$profile_seen_connect_timeout" "$profile_raw_connect_timeout" 15 number; profile_connect_timeout=$toml_value
     decimal_at_most "$profile_timeout" 86400 && [ "$profile_timeout" -gt 0 ] && \
         decimal_at_most "$profile_connect_timeout" 600 && [ "$profile_connect_timeout" -gt 0 ] || \
         api_error corrupt_config "invalid profile timeout" 73
-    api_toml_scalar "$profile_fragment" danger-accept-invalid-certs false bool; profile_invalid_certs=$toml_value
-    api_toml_scalar "$profile_fragment" verbose 0 number; profile_verbose=$toml_value
-    api_toml_scalar "$profile_fragment" quiet false bool; profile_quiet=$toml_value
-    api_toml_string "$profile_fragment" log-level info false; profile_log_level=$toml_value
-    api_toml_string "$profile_fragment" log-format json false; profile_log_format=$toml_value
-    api_toml_string "$profile_fragment" log-file "$log_root/sync.log" false; profile_log_file=$toml_value
-    api_toml_string "$profile_fragment" progress never false; profile_progress=$toml_value
-    api_toml_string "$profile_fragment" output human false; profile_output=$toml_value
-    api_toml_string "$profile_fragment" remote-log-url '' false; profile_remote_log_url=$toml_value
-    api_toml_string "$profile_fragment" remote-log-mode best-effort false; profile_remote_log_mode=$toml_value
+    api_profile_scalar_field danger-accept-invalid-certs "$profile_seen_danger_accept_invalid_certs" "$profile_raw_danger_accept_invalid_certs" false bool; profile_invalid_certs=$toml_value
+    api_profile_scalar_field verbose "$profile_seen_verbose" "$profile_raw_verbose" 0 number; profile_verbose=$toml_value
+    api_profile_scalar_field quiet "$profile_seen_quiet" "$profile_raw_quiet" false bool; profile_quiet=$toml_value
+    api_profile_string_field log-level "$profile_seen_log_level" "$profile_raw_log_level" info false; profile_log_level=$toml_value
+    api_profile_string_field log-format "$profile_seen_log_format" "$profile_raw_log_format" json false; profile_log_format=$toml_value
+    api_profile_string_field log-file "$profile_seen_log_file" "$profile_raw_log_file" "$log_root/sync.log" false; profile_log_file=$toml_value
+    api_profile_string_field progress "$profile_seen_progress" "$profile_raw_progress" never false; profile_progress=$toml_value
+    api_profile_string_field output "$profile_seen_output" "$profile_raw_output" human false; profile_output=$toml_value
+    api_profile_string_field remote-log-url "$profile_seen_remote_log_url" "$profile_raw_remote_log_url" '' false; profile_remote_log_url=$toml_value
+    api_profile_string_field remote-log-mode "$profile_seen_remote_log_mode" "$profile_raw_remote_log_mode" best-effort false; profile_remote_log_mode=$toml_value
     case $profile_log_level in trace|debug|info|warn|error|off) ;; *) api_error corrupt_config "invalid profile log level" 73 ;; esac
     case $profile_log_format in human|json) ;; *) api_error corrupt_config "invalid profile log format" 73 ;; esac
     case $profile_progress in auto|always|never) ;; *) api_error corrupt_config "invalid profile progress mode" 73 ;; esac
@@ -2903,12 +3117,11 @@ api_profile_json() {
         [ "$profile_remote_token_locator" = "$secret_root/$profile_name.remote-log-token" ] || \
             api_error corrupt_config "remote logging profile is missing its package token locator" 73
     fi
-    api_toml_string "$profile_fragment" ca-certificate '' false; profile_ca_certificate=$toml_value
-    api_toml_scalar "$profile_fragment" max-rate 0 number; profile_max_rate=$toml_value
+    api_profile_string_field ca-certificate "$profile_seen_ca_certificate" "$profile_raw_ca_certificate" '' false; profile_ca_certificate=$toml_value
+    api_profile_scalar_field max-rate "$profile_seen_max_rate" "$profile_raw_max_rate" 0 number; profile_max_rate=$toml_value
     decimal_at_most "$profile_max_rate" 9007199254740991 || api_error corrupt_config "invalid profile max-rate" 73
-    excludes_count=$(grep -c '^excludes = ' "$profile_fragment" 2>/dev/null || true)
-    [ "$excludes_count" = 1 ] || api_error corrupt_config "profile has invalid excludes" 73
-    profile_excludes=$(sed -n 's/^excludes = //p' "$profile_fragment")
+    [ "$profile_seen_excludes" -eq 1 ] || api_error corrupt_config "profile has invalid excludes" 73
+    profile_excludes=$profile_raw_excludes
     printf '%s\n' "$profile_excludes" | grep -Eq '^\[\]$|^\["[^"\\]*"(, "[^"\\]*")*\]$' || api_error corrupt_config "profile excludes are malformed" 73
     api_secret_boolean "$secret_root/$profile_name.password"; has_password=$secret_boolean
     api_secret_boolean "$secret_root/$profile_name.totp"; has_totp=$secret_boolean
@@ -2963,26 +3176,104 @@ api_dependencies_json() {
     printf ']'
 }
 
+# Mirrors api_load_kv against a value api_routine_fragment_fields already
+# extracted from routine_path in one pass, in memory, with no file I/O. The
+# key must appear exactly once in that file -- guaranteed to exist by the
+# time api_routine_json reaches this point, so the "file absent" branch
+# api_load_kv itself has is unreachable here and is not reproduced. Same
+# code and message as the forking version on every path.
+api_routine_field() {
+    routine_field_key=$1
+    routine_field_seen=$2
+    routine_field_raw=$3
+    [ "$routine_field_seen" -eq 1 ] || api_error corrupt_state "package state is missing or duplicates $routine_field_key" 73
+    case $routine_field_raw in *[[:cntrl:]]*) api_error corrupt_state "package state contains control characters" 73 ;; esac
+    kv_value=$routine_field_raw
+}
+
+# As above, mirroring api_load_kv_optional: an absent key (seen=0) keeps the
+# default rather than erroring.
+api_routine_field_optional() {
+    routine_field_key=$1
+    routine_field_seen=$2
+    routine_field_raw=$3
+    routine_field_default=$4
+    if [ "$routine_field_seen" -eq 0 ]; then
+        kv_value=$routine_field_default
+        return
+    fi
+    [ "$routine_field_seen" -eq 1 ] || api_error corrupt_state "package state duplicates $routine_field_key" 73
+    case $routine_field_raw in *[[:cntrl:]]*) api_error corrupt_state "package state contains control characters" 73 ;; esac
+    kv_value=$routine_field_raw
+}
+
+# The one builtin read of a routine config, replacing what was 15 forked
+# grep/sed reads of this same small file. Bare `key=value` lines, so unlike
+# the TOML profile fragment no quote-stripping is needed: IFS='=' read splits
+# each line at exactly the first '=', which is where sed's literal `^key=`
+# prefix removal always cut too.
+api_routine_fragment_fields() {
+    routine_seen_enabled=0 routine_raw_enabled=
+    routine_seen_action=0 routine_raw_action=
+    routine_seen_mode=0 routine_raw_mode=
+    routine_seen_interval_seconds=0 routine_raw_interval_seconds=
+    routine_seen_weekdays=0 routine_raw_weekdays=
+    routine_seen_time_window_start=0 routine_raw_time_window_start=
+    routine_seen_time_window_end=0 routine_raw_time_window_end=
+    routine_seen_debounce_seconds=0 routine_raw_debounce_seconds=
+    routine_seen_retry_count=0 routine_raw_retry_count=
+    routine_seen_retry_backoff_seconds=0 routine_raw_retry_backoff_seconds=
+    routine_seen_retry_exponential=0 routine_raw_retry_exponential=
+    routine_seen_poll_seconds=0 routine_raw_poll_seconds=
+    routine_seen_allow_delete=0 routine_raw_allow_delete=
+    routine_seen_max_total_delete=0 routine_raw_max_total_delete=
+    routine_seen_depends_on=0 routine_raw_depends_on=
+    while IFS='=' read -r routine_field_key routine_field_value || [ -n "$routine_field_key" ]; do
+        case $routine_field_key in
+            enabled) routine_seen_enabled=$((routine_seen_enabled + 1)); routine_raw_enabled=$routine_field_value ;;
+            action) routine_seen_action=$((routine_seen_action + 1)); routine_raw_action=$routine_field_value ;;
+            mode) routine_seen_mode=$((routine_seen_mode + 1)); routine_raw_mode=$routine_field_value ;;
+            interval_seconds) routine_seen_interval_seconds=$((routine_seen_interval_seconds + 1)); routine_raw_interval_seconds=$routine_field_value ;;
+            weekdays) routine_seen_weekdays=$((routine_seen_weekdays + 1)); routine_raw_weekdays=$routine_field_value ;;
+            time_window_start) routine_seen_time_window_start=$((routine_seen_time_window_start + 1)); routine_raw_time_window_start=$routine_field_value ;;
+            time_window_end) routine_seen_time_window_end=$((routine_seen_time_window_end + 1)); routine_raw_time_window_end=$routine_field_value ;;
+            debounce_seconds) routine_seen_debounce_seconds=$((routine_seen_debounce_seconds + 1)); routine_raw_debounce_seconds=$routine_field_value ;;
+            retry_count) routine_seen_retry_count=$((routine_seen_retry_count + 1)); routine_raw_retry_count=$routine_field_value ;;
+            retry_backoff_seconds) routine_seen_retry_backoff_seconds=$((routine_seen_retry_backoff_seconds + 1)); routine_raw_retry_backoff_seconds=$routine_field_value ;;
+            retry_exponential) routine_seen_retry_exponential=$((routine_seen_retry_exponential + 1)); routine_raw_retry_exponential=$routine_field_value ;;
+            poll_seconds) routine_seen_poll_seconds=$((routine_seen_poll_seconds + 1)); routine_raw_poll_seconds=$routine_field_value ;;
+            allow_delete) routine_seen_allow_delete=$((routine_seen_allow_delete + 1)); routine_raw_allow_delete=$routine_field_value ;;
+            max_total_delete) routine_seen_max_total_delete=$((routine_seen_max_total_delete + 1)); routine_raw_max_total_delete=$routine_field_value ;;
+            depends_on) routine_seen_depends_on=$((routine_seen_depends_on + 1)); routine_raw_depends_on=$routine_field_value ;;
+        esac
+    done < "$routine_path"
+}
+
 api_routine_json() {
     routine_path=$1
     if [ -L "$routine_path" ] || [ ! -f "$routine_path" ] || [ ! -r "$routine_path" ]; then api_error unsafe_state "unsafe routine config" 73; fi
     routine_name=${routine_path##*/}; routine_name=${routine_name%.conf}
     valid_name "$routine_name" && profile_exists "$routine_name" || api_error corrupt_config "routine references an unknown profile" 73
-    api_load_kv "$routine_path" enabled false; routine_enabled=$kv_value
-    api_load_kv "$routine_path" action sync; routine_action=$kv_value
-    api_load_kv "$routine_path" mode interval; routine_mode=$kv_value
-    api_load_kv "$routine_path" interval_seconds 3600; routine_interval=$kv_value
-    api_load_kv "$routine_path" weekdays 1,2,3,4,5,6,7; routine_weekdays=$kv_value
-    api_load_kv "$routine_path" time_window_start 00:00; routine_start=$kv_value
-    api_load_kv "$routine_path" time_window_end 23:59; routine_end=$kv_value
-    api_load_kv "$routine_path" debounce_seconds 45; routine_debounce=$kv_value
-    api_load_kv "$routine_path" retry_count 5; routine_retries=$kv_value
-    api_load_kv "$routine_path" retry_backoff_seconds 60; routine_backoff=$kv_value
-    api_load_kv_optional "$routine_path" retry_exponential true; routine_retry_exponential=$kv_value
-    api_load_kv "$routine_path" poll_seconds 30; routine_poll=$kv_value
-    api_load_kv "$routine_path" allow_delete false; routine_delete=$kv_value
-    api_load_kv "$routine_path" max_total_delete 100; routine_max_total=$kv_value
-    api_load_kv "$routine_path" depends_on ''; routine_dependencies=$kv_value
+    # One builtin read of the whole config, replacing what was 15 forked
+    # grep/sed reads of this same small file. Every validation below is
+    # unchanged from the per-field version this replaces; only where the
+    # bytes come from has changed.
+    api_routine_fragment_fields
+    api_routine_field enabled "$routine_seen_enabled" "$routine_raw_enabled"; routine_enabled=$kv_value
+    api_routine_field action "$routine_seen_action" "$routine_raw_action"; routine_action=$kv_value
+    api_routine_field mode "$routine_seen_mode" "$routine_raw_mode"; routine_mode=$kv_value
+    api_routine_field interval_seconds "$routine_seen_interval_seconds" "$routine_raw_interval_seconds"; routine_interval=$kv_value
+    api_routine_field weekdays "$routine_seen_weekdays" "$routine_raw_weekdays"; routine_weekdays=$kv_value
+    api_routine_field time_window_start "$routine_seen_time_window_start" "$routine_raw_time_window_start"; routine_start=$kv_value
+    api_routine_field time_window_end "$routine_seen_time_window_end" "$routine_raw_time_window_end"; routine_end=$kv_value
+    api_routine_field debounce_seconds "$routine_seen_debounce_seconds" "$routine_raw_debounce_seconds"; routine_debounce=$kv_value
+    api_routine_field retry_count "$routine_seen_retry_count" "$routine_raw_retry_count"; routine_retries=$kv_value
+    api_routine_field retry_backoff_seconds "$routine_seen_retry_backoff_seconds" "$routine_raw_retry_backoff_seconds"; routine_backoff=$kv_value
+    api_routine_field_optional retry_exponential "$routine_seen_retry_exponential" "$routine_raw_retry_exponential" true; routine_retry_exponential=$kv_value
+    api_routine_field poll_seconds "$routine_seen_poll_seconds" "$routine_raw_poll_seconds"; routine_poll=$kv_value
+    api_routine_field allow_delete "$routine_seen_allow_delete" "$routine_raw_allow_delete"; routine_delete=$kv_value
+    api_routine_field max_total_delete "$routine_seen_max_total_delete" "$routine_raw_max_total_delete"; routine_max_total=$kv_value
+    api_routine_field depends_on "$routine_seen_depends_on" "$routine_raw_depends_on"; routine_dependencies=$kv_value
     case $routine_enabled:$routine_delete:$routine_retry_exponential in
         true:true:true|true:true:false|true:false:true|true:false:false|\
         false:true:true|false:true:false|false:false:true|false:false:false) ;;
@@ -3016,9 +3307,19 @@ api_routine_json() {
     api_load_kv "$routine_state_file" next_run_epoch 0; routine_next=$kv_value
     api_load_kv "$routine_state_file" last_success_epoch 0; routine_last_success=$kv_value
     api_load_kv "$routine_state_file" backend none; routine_backend=$kv_value
+    # backend_reason is additive and optional-on-read: absent means the state
+    # file predates this field, and reads as ok, never as corrupt. An unknown
+    # value still fails closed, exactly like backend does above -- this case
+    # is deliberately not merged with it.
+    api_load_kv_optional "$routine_state_file" backend_reason ok; routine_backend_reason=$kv_value
+    api_load_kv "$routine_state_file" last_poll_epoch 0; routine_last_poll=$kv_value
     case $routine_state in never|scheduled|running|succeeded|failed|deferred) ;; *) api_error corrupt_state "invalid routine state" 73 ;; esac
     case $routine_backend in none|interval|daily|inotify|polling) ;; *) api_error corrupt_state "invalid routine backend" 73 ;; esac
-    case $routine_next:$routine_last_success in *[!0-9:]*) api_error corrupt_state "invalid routine epoch" 73 ;; esac
+    case $routine_backend_reason in \
+        ok|source_missing|source_symlink|watch_unavailable|watch_setup_failed|watch_limit|watch_stopped|poll_unreadable|poll_unavailable) ;; \
+        *) api_error corrupt_state "invalid routine backend reason" 73 ;; \
+    esac
+    case $routine_next:$routine_last_success:$routine_last_poll in *[!0-9:]*) api_error corrupt_state "invalid routine epoch" 73 ;; esac
     printf '{"profile":%s,"enabled":%s,"action":%s,"mode":%s,' \
         "$(json_quote "$routine_name")" "$routine_enabled" "$(json_quote "$routine_action")" "$(json_quote "$routine_mode")"
     case $routine_mode in
@@ -3032,8 +3333,9 @@ api_routine_json() {
     printf '"retry_count":%s,"retry_backoff_seconds":%s,"retry_exponential":%s,"allow_delete":%s,"max_total_delete":%s,"depends_on":' \
         "$routine_retries" "$routine_backoff" "$routine_retry_exponential" "$routine_delete" "$routine_max_total"
     api_dependencies_json "$routine_dependencies"
-    printf ',"backend":%s,"state":%s,"next_run_epoch":%s,"last_success_epoch":%s}' \
-        "$(json_quote "$routine_backend")" "$(json_quote "$routine_state")" "$routine_next" "$routine_last_success"
+    printf ',"backend":%s,"backend_reason":%s,"state":%s,"next_run_epoch":%s,"last_success_epoch":%s,"last_poll_epoch":%s}' \
+        "$(json_quote "$routine_backend")" "$(json_quote "$routine_backend_reason")" "$(json_quote "$routine_state")" \
+        "$routine_next" "$routine_last_success" "$routine_last_poll"
 }
 
 api_snapshot() {
@@ -3673,6 +3975,12 @@ api_command() {
     exec 3>&1
     api_error_fd3=true
     trap cleanup_manager_lock 0
+    # An untrapped HUP/INT/TERM (a bridge-timeout kill, observed in practice --
+    # see the capture-timeout note on the query path below) bypasses the EXIT
+    # trap entirely on its default disposition, so cleanup_manager_lock never
+    # runs and any live temp file leaks. begin_mutation traps the same three
+    # signals for the same reason; this is that entrypoint's read/API sibling.
+    trap manager_signal HUP INT TERM
     api_guard
     api_operation=${1:-}
     [ "$#" -eq 0 ] || shift

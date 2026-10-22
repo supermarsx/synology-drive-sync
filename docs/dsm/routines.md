@@ -70,18 +70,45 @@ The controller revalidates and consumes one exact native-event generation only a
 shutdown admission. A concurrent event remains queued for its own complete debounce, and a deferred
 dependency therefore does not discard the pending marker.
 
-When a native watcher is unavailable or recently failed, the controller falls back to a periodic
-source fingerprint built from file path, size, and mtime. **Fallback poll** controls that check. This
-is not a kernel event stream and very short-lived changes between identical fingerprints may not be
-observable; final sync planning still performs the engine's normal complete source/target work. A
-healthy native event that is still inside its debounce suppresses fingerprint fallback, so polling
-cannot dispatch the same change before the quiet period ends. After consuming a native event, the
-controller refreshes the fingerprint baseline so fallback polling cannot dispatch that same change
-a second time.
+A source that never has a quiet moment is not left pending forever: past `debounce_seconds × 4`
+(clamped between `debounce_seconds + 60` and 3600 seconds) the controller dispatches anyway, so
+worst-case staleness under continuous writes is bounded rather than open-ended. At the 45-second
+default that ceiling is 180 seconds. The ceiling is not configurable; the operator already chose the
+debounce, and it is derived from that one field rather than adding a second number nothing else
+explains.
 
-The snapshot reports the effective backend as `inotify`, `polling`, `interval`, `daily`, or `none`.
-Overview and Routines surface polling fallback explicitly. Do not infer native realtime support from
-the requested `mode=realtime` alone.
+**Fallback poll is a floor, not a fallback.** It runs on every install and alongside every healthy
+native watcher, checking a periodic source fingerprint (file path, size, and mtime) whenever no
+native event is pending for that turn. A native event inside its debounce only suppresses the poll
+for that one turn; it does not turn polling off. Reducing **Fallback poll** therefore increases
+source traversal work even on a routine whose watcher has never failed.
+
+The poll requires one unchanged reading before it dispatches: a fingerprint that differs from the
+last one is held rather than acted on immediately, and is only promoted once the next poll sees that
+same reading again. This adds at most one poll interval of latency, and is the price of not
+dispatching against a copy still in progress. `@eaDir`, `#recycle`, `#snapshot`, and `@tmp` are
+pruned from the walk, since they can never be synced and are the most common source of a poll that
+fails on a permissions error the operator never set. A subtree that is genuinely unreadable is
+reported rather than silently retried forever: the readable part of the source stays observed and
+polled, and the routine's `backend_reason` (below) names which condition applies.
+
+This is not a kernel event stream and very short-lived changes between identical fingerprints may not
+be observable; final sync planning still performs the engine's normal complete source/target work. A
+healthy native event that is still inside its debounce suppresses fingerprint fallback for that turn,
+so polling cannot dispatch the same change before the quiet period ends. After consuming a native
+event, the controller refreshes the fingerprint baseline so fallback polling cannot dispatch that
+same change a second time.
+
+The snapshot reports the effective backend as `inotify`, `polling`, `interval`, `daily`, or `none`,
+and, for a realtime routine, a `backend_reason` naming why: `ok`, `source_missing`,
+`source_symlink`, `watch_unavailable`, `watch_setup_failed`, `watch_limit`, `watch_stopped`,
+`poll_unreadable`, or `poll_unavailable` (see
+[Realtime routine never runs](troubleshooting.md#realtime-routine-never-runs) for what each means and
+what to do about it). A state file written before this field existed carries none, and that is read
+as `ok`. `backend` itself is only as current as the last poll that actually completed; a stalled or
+failing poll leaves it holding whatever it last reported rather than updating to reflect the present.
+Overview and Routines surface both the backend and, when it is not `ok`, the reason explicitly. Do
+not infer native realtime support from the requested `mode=realtime` alone.
 
 ## Retry and backoff
 

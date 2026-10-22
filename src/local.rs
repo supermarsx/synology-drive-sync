@@ -98,8 +98,25 @@ impl LocalInventory {
     }
 }
 
+/// The exclusion rules one run was built with.
+///
+/// Cloneable, and cheaply: a [`SyncPlan`](crate::plan::SyncPlan) carries the rules it was planned
+/// under so the executor's own inventory can prune exactly what the planner's did. Without that the
+/// two walks disagree about which entries exist.
+#[derive(Clone)]
 pub struct IgnoreRules {
     matcher: Gitignore,
+}
+
+impl std::fmt::Debug for IgnoreRules {
+    /// The compiled patterns are not rendered: `Gitignore` is not `Debug`, and a plan's `Debug`
+    /// output is read to see what a run would do, which the rules describe only by exclusion.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IgnoreRules")
+            .field("patterns", &self.matcher.num_ignores())
+            .finish()
+    }
 }
 
 impl IgnoreRules {
@@ -156,6 +173,17 @@ impl IgnoreRules {
             .build()
             .map_err(|error| Error::Message(format!("failed to build ignore rules: {error}")))?;
         Ok(Self { matcher })
+    }
+
+    /// Rules that exclude nothing.
+    ///
+    /// For a caller with no source tree to read patterns from: a remote inventory taken by a
+    /// diagnostic, or a fixture. `.sdsyncignore` stays excluded, because that is a property of the
+    /// name and not of any pattern.
+    pub fn none() -> Self {
+        Self {
+            matcher: Gitignore::empty(),
+        }
     }
 
     pub fn is_ignored(&self, relative: &str, is_dir: bool) -> bool {
@@ -241,12 +269,18 @@ impl Default for ScanOutput {
 
 impl ScanOutput {
     /// Record an entry, reporting whether the walk may continue.
+    ///
+    /// The budget is the number of entries kept, so the entry that proves the walk was truncated is
+    /// the first one that does **not** fit — not the last one that did. Checking after the insert
+    /// instead meant a tree of exactly the budget stopped with `complete = false`, and a reader is
+    /// required to render an incomplete total as a floor: a 20,000-entry tree at the shipped
+    /// 20,000-entry budget was published as "20,000+" when it was in fact all of it.
     fn insert(&mut self, relative: String, entry: LocalEntry, budget: usize) -> bool {
-        self.entries.insert(relative, entry);
         if self.entries.len() >= budget {
             self.complete = false;
             return false;
         }
+        self.entries.insert(relative, entry);
         true
     }
 }
@@ -339,6 +373,104 @@ pub fn scan_scoped(
         excluded: output.excluded,
         complete: output.complete,
     })
+}
+
+/// Read one source-relative path that the walk did not record, applying the walk's own rules.
+///
+/// For the one case where a path has to be inspected after the scan: a mirror deletion that was
+/// refused because the local file reappeared, which the run then uploads so it converges instead of
+/// deferring to the next run. Scanning the whole tree again to learn one file's size would cost the
+/// tree; doing it by hand would drop the validation the walk performs, and a path that reappeared as
+/// a symlink, a device node or a name DSM will not take must be refused here exactly as it would
+/// have been refused there.
+///
+/// `Ok(None)` means there is nothing to record: the path is absent again, or a DSM-managed
+/// component excludes it. Every other disagreement with the walk is an error.
+///
+/// Ignore rules are deliberately **not** applied here, and the caller must already have established
+/// that the path is not excluded. The one caller does: a mirror deletion candidate has passed
+/// `is_protected`, which applies the very same rules to the very same relative path with the same
+/// `is_dir` flag. Taking a second `&IgnoreRules` would let the two answers drift apart, and there is
+/// no other call site to serve.
+pub fn entry_at(root: &Path, relative: &str) -> Result<Option<LocalEntry>> {
+    if relative.is_empty() {
+        return Ok(None);
+    }
+    if is_dsm_managed(relative) {
+        return Ok(None);
+    }
+    let full_path = root.join(relative);
+    let metadata = match fs::symlink_metadata(&full_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(Error::FileIo {
+                path: full_path,
+                source,
+            });
+        }
+    };
+    validate_relative(relative)?;
+    if let Some(reason) = drive_path_issue(relative) {
+        return Err(Error::UnsupportedLocalEntry {
+            path: full_path,
+            reason,
+        });
+    }
+    if is_link_or_reparse(&metadata) {
+        return Err(Error::UnsupportedLocalEntry {
+            path: full_path,
+            reason: "symbolic links, junctions, and reparse points are not followed".to_owned(),
+        });
+    }
+    if let Some(reason) = unsupported_windows_attributes(&metadata) {
+        return Err(Error::UnsupportedLocalEntry {
+            path: full_path,
+            reason: reason.to_owned(),
+        });
+    }
+    if metadata.is_dir() {
+        return Ok(Some(LocalEntry {
+            relative: relative.to_owned(),
+            full_path,
+            kind: EntryKind::Directory,
+            size: 0,
+            mtime_ms: 0,
+            identity: FileIdentity::default(),
+            content_md5: None,
+        }));
+    }
+    if !metadata.is_file() {
+        return Err(Error::UnsupportedLocalEntry {
+            path: full_path,
+            reason: "only regular files and directories can be synchronized".to_owned(),
+        });
+    }
+    let modified = metadata.modified().map_err(|source| Error::FileIo {
+        path: full_path.clone(),
+        source,
+    })?;
+    let duration =
+        modified
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| Error::UnsupportedLocalEntry {
+                path: full_path.clone(),
+                reason: "modification time is before the Unix epoch".to_owned(),
+            })?;
+    let mtime_ms =
+        i64::try_from(duration.as_millis()).map_err(|_| Error::UnsupportedLocalEntry {
+            path: full_path.clone(),
+            reason: "modification time is outside DSM's supported range".to_owned(),
+        })?;
+    Ok(Some(LocalEntry {
+        relative: relative.to_owned(),
+        size: metadata.len(),
+        mtime_ms,
+        identity: file_identity(&metadata),
+        kind: EntryKind::File,
+        full_path,
+        content_md5: None,
+    }))
 }
 
 pub fn populate_content_md5(
@@ -575,13 +707,39 @@ fn scan_dir(
     for child in children {
         cancellation.check()?;
         cancellation.tick();
-        let name = child
-            .file_name()
-            .into_string()
-            .map_err(|_| Error::UnsupportedLocalEntry {
-                path: child.path(),
-                reason: "name is not valid UTF-8".to_owned(),
-            })?;
+        let name = match child.file_name().into_string() {
+            Ok(name) => name,
+            Err(raw) => {
+                // A name that cannot be represented as UTF-8 cannot be mapped to a remote path, so
+                // refusing it is right. Refusing it *after* the operator excluded it is not. The
+                // rules are matched against the lossy spelling to decide exclusion only; a name
+                // that survives that still fails the scan, because there is no spelling of it that
+                // could be uploaded.
+                let lossy = raw.to_string_lossy().into_owned();
+                let relative = if relative_parent.is_empty() {
+                    lossy
+                } else {
+                    format!("{relative_parent}/{lossy}")
+                };
+                let is_dir = child
+                    .file_type()
+                    .map_err(|source| Error::FileIo {
+                        path: child.path(),
+                        source,
+                    })?
+                    .is_dir();
+                if is_dsm_managed(&relative) || rules.is_ignored(&relative, is_dir) {
+                    if context.include_excluded && context.scope.matches(&relative) {
+                        output.excluded.insert(relative);
+                    }
+                    continue;
+                }
+                return Err(Error::UnsupportedLocalEntry {
+                    path: child.path(),
+                    reason: "name is not valid UTF-8".to_owned(),
+                });
+            }
+        };
         let relative = if relative_parent.is_empty() {
             name
         } else {
@@ -607,14 +765,19 @@ fn scan_dir(
             continue;
         }
 
-        validate_relative(&relative)?;
-        if let Some(reason) = drive_path_issue(&relative) {
-            return Err(Error::UnsupportedLocalEntry {
-                path: child.path(),
-                reason,
-            });
-        }
-
+        // Excluded before validated, and the order is the finding. These two checks refuse names
+        // the tool will not carry -- anything beginning with `~`, a Windows device stem like
+        // `aux.h`, a component over 255 characters -- by failing the *whole scan*, so one such name
+        // anywhere in the tree meant nothing was uploaded. Running them before the rules made that
+        // unfixable by the operator: Word opens `report.docx`, creates `~$report.docx` beside it,
+        // and every scheduled run fails until the document is closed, with `--exclude '~$*'` having
+        // no effect because the refusal happened first. Excluding an ancestor *directory* did work,
+        // because a directory's own name passes validation and the walk never descends -- so the
+        // remedy that worked was unrelated in shape to the remedy the error invited, and there was
+        // no remedy at all when the offending file sat beside files that had to be synced.
+        //
+        // An entry the rules exclude is not going anywhere, so whether its name could be carried is
+        // not a question this run has to answer.
         let file_type = child.file_type().map_err(|source| Error::FileIo {
             path: child.path(),
             source,
@@ -626,6 +789,14 @@ fn scan_dir(
                 output.excluded.insert(relative);
             }
             continue;
+        }
+
+        validate_relative(&relative)?;
+        if let Some(reason) = drive_path_issue(&relative) {
+            return Err(Error::UnsupportedLocalEntry {
+                path: child.path(),
+                reason,
+            });
         }
         let metadata = fs::symlink_metadata(child.path()).map_err(|source| Error::FileIo {
             path: child.path(),
@@ -1427,12 +1598,15 @@ mod tests {
         fs::write(dir.join(&name), b"payload").is_ok()
     }
 
+    /// A name no encoding can represent, and the one the fixtures use.
+    #[cfg(unix)]
+    const NON_UTF8_NAME_BYTES: [u8; 3] = [b'b', 0xFF, b'b'];
+
     #[cfg(unix)]
     fn write_non_utf8_named_file(dir: &Path) -> bool {
         use std::os::unix::ffi::OsStrExt;
 
-        let bytes = [b'b', 0xFF, b'b'];
-        let name = std::ffi::OsStr::from_bytes(&bytes);
+        let name = std::ffi::OsStr::from_bytes(&NON_UTF8_NAME_BYTES);
         fs::write(dir.join(name), b"payload").is_ok()
     }
 
@@ -1450,6 +1624,87 @@ mod tests {
             scan(&root, &rules, &CancellationToken::default()),
             Err(Error::UnsupportedLocalEntry { reason, .. }) if reason.contains("UTF-8")
         ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An excluded name the tool refuses must not fail the run.
+    ///
+    /// The common case first: Word opens `report.docx` and creates `~$report.docx` beside it, and
+    /// every scheduled run then failed with "names beginning with ~ are not synchronized" until the
+    /// document was closed. `--exclude '~$*'` had no effect, because the name was validated before
+    /// the rules were consulted. `aux.h` is the second: an ordinary name in C and in any tree of
+    /// Unix origin, and one that Windows reserves.
+    #[test]
+    fn an_excluded_name_the_tool_refuses_does_not_fail_the_scan() {
+        for (name, pattern) in [
+            ("~$report.docx", "~$*"),
+            ("aux.h", "aux.h"),
+            ("trailing.", "trailing."),
+            ("bad:name", "bad:name"),
+        ] {
+            let root = temp_dir("excluded-refused-name");
+            if fs::write(root.join(name), b"payload").is_err() {
+                // Windows will not create some of these names at all, which is the same outcome by
+                // a different route: there is nothing to exclude.
+                fs::remove_dir_all(&root).unwrap();
+                continue;
+            }
+            fs::write(root.join("keep.txt"), b"payload").unwrap();
+            let rules = IgnoreRules::build(&root, &[pattern.to_owned()]).unwrap();
+
+            let inventory = scan(&root, &rules, &CancellationToken::default())
+                .unwrap_or_else(|error| panic!("{name:?} excluded by {pattern:?}: {error}"));
+
+            assert!(!inventory.entries.contains_key(name), "{name:?}");
+            assert!(inventory.entries.contains_key("keep.txt"), "{name:?}");
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    /// The same name, not excluded, still fails the scan. The reorder must not weaken the refusal.
+    #[test]
+    fn an_unexcluded_name_the_tool_refuses_still_fails_the_scan() {
+        let root = temp_dir("unexcluded-refused-name");
+        if fs::write(root.join("~$report.docx"), b"payload").is_err() {
+            fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+
+        assert!(matches!(
+            scan(&root, &rules, &CancellationToken::default()),
+            Err(Error::UnsupportedLocalEntry { reason, .. }) if reason.contains("beginning with ~")
+        ));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A non-UTF-8 name the operator excluded is skipped; one they did not still fails.
+    ///
+    /// The rules are matched against the lossy spelling to decide exclusion only. A name that
+    /// survives that cannot be mapped to a remote path at all, so refusing it stays right.
+    #[cfg(unix)]
+    #[test]
+    fn an_excluded_non_utf8_name_is_skipped_rather_than_refused() {
+        let root = temp_dir("non-utf8-excluded");
+        if !write_non_utf8_named_file(&root) {
+            eprintln!("skipping: filesystem rejected the name");
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        fs::write(root.join("keep.txt"), b"payload").unwrap();
+        // The pattern is the lossy spelling itself, which is exactly what the rules are matched
+        // against. Deriving it here rather than writing a glob that happens to cover it keeps the
+        // test about the documented behaviour instead of about how globset treats U+FFFD.
+        let lossy = String::from_utf8_lossy(&NON_UTF8_NAME_BYTES).into_owned();
+        let rules = IgnoreRules::build(&root, &[lossy]).unwrap();
+
+        let inventory = scan(&root, &rules, &CancellationToken::default())
+            .expect("an excluded name that cannot be represented is not a reason to fail");
+
+        assert_eq!(inventory.entries.len(), 1);
+        assert!(inventory.entries.contains_key("keep.txt"));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1905,6 +2160,64 @@ mod scoped_scan_tests {
         )
         .unwrap();
         assert!(full.complete);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A tree of *exactly* the budget is complete, not truncated.
+    ///
+    /// The boundary, which is the case an off-by-one hides in: the budget is how many entries may
+    /// be kept, so the walk is partial only once an entry has actually been refused. Publishing a
+    /// full tree as incomplete is not cosmetic — `store_rollup` requires a reader to render
+    /// incomplete totals as a floor, so every count in the dashboard became "20,000+" for a tree
+    /// that was exactly 20,000.
+    #[test]
+    fn a_tree_of_exactly_the_budget_is_complete() {
+        let root = tree("budget-boundary");
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        let scope = Scope::root();
+        let all = scan_scoped(
+            &root,
+            &rules,
+            &scope,
+            false,
+            usize::MAX,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        let exact = all.inventory.entries.len();
+        assert!(exact > 1, "the fixture must have entries to count");
+
+        let at_budget = scan_scoped(
+            &root,
+            &rules,
+            &scope,
+            false,
+            exact,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(
+            at_budget.complete,
+            "a walk that kept every entry it found is not partial"
+        );
+        assert_eq!(
+            at_budget.inventory.entries.keys().collect::<Vec<_>>(),
+            all.inventory.entries.keys().collect::<Vec<_>>()
+        );
+
+        // One entry short of the tree is partial, and keeps exactly the budget.
+        let under_budget = scan_scoped(
+            &root,
+            &rules,
+            &scope,
+            false,
+            exact - 1,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(!under_budget.complete);
+        assert_eq!(under_budget.inventory.entries.len(), exact - 1);
+
         fs::remove_dir_all(root).unwrap();
     }
 

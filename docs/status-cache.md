@@ -52,9 +52,15 @@ Any of these makes it as if the entry were not there:
 
 - The local file's size, modification time, or filesystem identity moved.
 - The remote file's size or modification time moved.
-- The evidence is older than `--status-cache-max-age` (14 days by default).
-- The file was modified within a second of the cache being written — the entry cannot be
-  distinguished from one rewritten during that same tick, so it is never trusted.
+- The evidence is older than `--status-cache-max-age` (14 days by default). The date on an entry is
+  when its evidence was **first** observed, not when it was last served: a pass that re-observes
+  evidence identical in every field keeps the original date, so the ceiling measures the age of the
+  reading rather than the age of the poll.
+- The file was modified within a second of the cache being written, **or is dated after it** — such
+  an entry cannot be distinguished from one rewritten during that same tick, so it is never trusted.
+  A tree restored from a backup, read over SMB from a host whose clock is ahead, or extracted from an
+  archive with skewed timestamps is therefore re-hashed on every pass, which shows up as a low
+  `digests_reused`.
 - The package was upgraded, the profile was repointed at another source or destination, or the
   comparison mode changed. Each retires the whole file.
 - The file is unreadable, truncated, out of order, missing its end marker, or not a private file
@@ -96,8 +102,13 @@ Every status answer carries a `cache` object, whether or not a cache was used:
 
 `state` is `off`, `cold`, `warm`, `refreshed`, or `unusable`.
 
+`unusable` covers both a cache that was found to be wrong and discarded, and a cache directory
+that was configured but could not be opened; the second is also warned about on standard error,
+because `off` means no directory was configured at all.
+
 `oldest_evidence_epoch` is the **oldest** observation any part of the answer rests on, not the
-newest. The newest would describe the freshest fact in the answer and imply it of all of them; the
+newest, and it dates each entry from when its evidence was first seen rather than from the last pass
+that served it. The newest would describe the freshest fact in the answer and imply it of all of them; the
 oldest is the only claim true of every row — and it is exactly the width of the window in which an
 undetected change could be hiding. Human output renders it as an age rather than a timestamp,
 because how old it is *is* the point.
@@ -130,11 +141,12 @@ Under DSM: `$SYNOPKG_PKGVAR/state/cache/status/`, one file per profile, mode `06
 directory. The cache is trusted input, so it is refused if the directory grants write access to
 group or other.
 
-Measured at the 20,000-entry ceiling with deep paths: **5.4 MB, 269 bytes per entry**. Reading the
-whole of it holds about **9 KB** of memory, because records are streamed one line at a time against
-the inventories rather than loaded into a structure of their own. Past the ceiling, entries observed
-this run are always kept and older carried-over ones are dropped; past 32 MB across all profiles,
-whole profile files are removed oldest-first.
+Measured at the 20,000-entry ceiling with deep paths: **5.4 MB, 269 bytes per entry**. Reading
+the whole of it holds about **9 KB** of memory, and writing it about **9 KB** — 17 KB when the
+merge reads an existing full file back as it writes — because records are streamed one line at a
+time against the inventories in both directions rather than loaded into a structure of their
+own. Past the ceiling, entries observed this run are always kept and older carried-over ones are
+dropped; past 32 MB across all profiles, whole profile files are removed oldest-first.
 
 ## The aggregate rollup
 
@@ -155,9 +167,8 @@ All profiles: 15601 in sync, 41 pending upload (40.0 KiB), 41 needing attention.
 ```
 
 **It scans nothing.** No local walk, no File Station call, no content digest — one small file read
-per profile, however large the trees are. Measured from a cold process start, including process
-startup: **3–5 ms on Linux, and flat from 2 to 20 profiles** (19–24 ms on Windows, where process
-startup dominates). That is what makes it affordable for a dashboard or a widget polling on a short
+per profile, however large the trees are, so the work is flat in the number of profiles rather than
+in what they contain. That is what makes it affordable for a dashboard or a widget polling on a short
 interval.
 
 Pass `--profiles` with the profiles you expect. A named profile with no stored totals is reported as
@@ -170,13 +181,19 @@ would be counted twice, and `total_unavailable_reason` says so. Render that sent
 omitting the row — a missing number invites the reader to add the per-profile figures themselves and
 reach the same wrong answer by hand.
 
-Two things in it are easy to confuse, so they are named so they cannot be:
+Two things carrying similar names are easy to confuse, so they are named precisely:
 
 | Field | Meaning |
 | --- | --- |
 | `state.in_sync` | Files currently in sync. A **state**, from this observation. |
 | `state.would_transfer` | Files still to transfer, with the bytes a run would actually move. A **state**. |
-| `last_run.files_uploaded` | Files a run moved. An **event**, from the run report, with its own timestamp. |
+
+There is no `last_run` field here: this document holds only the two rollup **states** above, from
+the last unscoped pass. The nearest **event** — files an actual run moved — lives in a different
+document with a different schema: the Rust engine's `run.completed` structured-log event carries a
+`files` metric (`src/observability.rs`, documented at `docs/observability.md:121`), dated to when
+that run finished rather than to when this rollup was last computed. `status-rollup` does not read
+it, and it is not reachable through `<profile>.rollup.json`.
 
 The word *synced* appears in neither document, because it is the word that means both.
 

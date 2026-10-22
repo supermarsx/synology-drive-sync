@@ -452,10 +452,31 @@ while :; do
 done
 core_pid=
 finished=$(epoch_now)
+# 130 is the core's documented cooperative-cancellation code, and 143 is a core
+# terminated by SIGTERM without reaching it. Both mean an operator stopped the
+# package, or DSM rebooted for an update, while a run was in flight -- not that
+# the sync failed. This runner sends that TERM itself on termination, so it is
+# the single most likely non-zero exit an administrator will ever cause.
+#
+# The recorded state still has to be `failed`. The only other value that would
+# read as a completion is `succeeded`, and that would satisfy the routine
+# dependency gate and the Overview for a run that did not finish. The enum is
+# pinned by two fail-closed readers -- sdsync-dsm's `never|running|succeeded|
+# failed` and the same set in the in-process Rust path -- and api_error exits,
+# so a fifth value would blank every dashboard panel rather than one row. The
+# exit code is published beside the state, which is what lets a reader tell the
+# two apart.
+#
+# What changes is everything the state drives: no alert, so no failure counter
+# advancing toward the threshold and no sync_failed desktop notification or
+# system-log record, and an informational activity record that says cancelled
+# instead of an error claiming the sync failed.
+run_cancelled=false
 if [ "$exit_code" -eq 0 ]; then
     final_state=succeeded
 else
     final_state=failed
+    case $exit_code in 130|143) run_cancelled=true ;; esac
 fi
 write_run_state "$final_state" "$started" "$finished" "$exit_code" "$run_label" "$run_mode"
 write_profile_completion_state() {
@@ -479,11 +500,28 @@ if [ "$run_scope" = all ]; then
 else
     write_profile_completion_state "$profiles_dir/$run_scope.toml"
 fi
-if [ "$final_state" = succeeded ]; then activity_code=run.succeeded; activity_level=info; else activity_code=run.failed; activity_level=error; fi
-append_activity "$activity_code" "$run_label" "$final_state" "Package action completed" "$run_activity_category" "$activity_level" 2>/dev/null || true
-if [ "$run_mode" = sync ]; then handle_alert_result "$run_label" "$final_state" "$exit_code" 2>/dev/null || true; fi
+# run.cancelled is not an accepted activity code and cancelled is not an
+# accepted activity state, so the cancellation is carried by the level and the
+# message rather than by widening either validator.
+activity_message="Package action completed"
+if [ "$final_state" = succeeded ]; then
+    activity_code=run.succeeded; activity_level=info
+elif [ "$run_cancelled" = true ]; then
+    activity_code=run.failed; activity_level=info
+    activity_message="Package action cancelled before completion"
+else
+    activity_code=run.failed; activity_level=error
+fi
+append_activity "$activity_code" "$run_label" "$final_state" "$activity_message" "$run_activity_category" "$activity_level" 2>/dev/null || true
+# handle_alert_result owns the failure counter, the DSM system-log record and the
+# desktop notification. A cancelled run must reach none of them, and skipping the
+# call is how: handle_alert_result accepts only succeeded and failed, so there is
+# no third argument value that would make it decline on its own.
+if [ "$run_mode" = sync ] && [ "$run_cancelled" = false ]; then
+    handle_alert_result "$run_label" "$final_state" "$exit_code" 2>/dev/null || true
+fi
 if [ "$run_output" = scheduled ]; then
-    if [ "$exit_code" -eq 0 ]; then scheduled_level=info; else scheduled_level=error; fi
+    if [ "$exit_code" -eq 0 ] || [ "$run_cancelled" = true ]; then scheduled_level=info; else scheduled_level=error; fi
     scheduled_event_enabled=0
     security_event_enabled scheduler "$scheduled_level" false || scheduled_event_enabled=$?
     case $scheduled_event_enabled in

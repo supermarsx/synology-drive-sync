@@ -33,6 +33,7 @@ import { ActionIcon } from "./ActionIcon";
 import { SNAPSHOT_SCHEMA, apiGet } from "./api";
 import {
   APPWINDOW_SETTINGS_KEY,
+  WIDGET_CLOCK_TICK_MS,
   appWindowPreferences,
   widgetBridgeIssue,
   widgetOverview,
@@ -107,6 +108,7 @@ export default {
   },
   created() {
     this.timer = 0;
+    this.tickTimer = 0;
     this.abortController = typeof window.AbortController === "function"
       ? new window.AbortController()
       : null;
@@ -125,8 +127,8 @@ export default {
     this.documentHidden = Boolean(document.hidden);
     this.visibilityHandler = () => {
       this.documentHidden = Boolean(document.hidden);
-      if (this.documentHidden) this.stopTimer();
-      else if (this.activated) this.refresh();
+      if (this.documentHidden) { this.stopTimer(); this.stopTick(); }
+      else if (this.activated) { this.refresh(); this.scheduleTick(); }
     };
     document.addEventListener("visibilitychange", this.visibilityHandler);
     this.storageHandler = (event) => {
@@ -139,6 +141,7 @@ export default {
     this.disposed = true;
     this.activated = false;
     this.stopTimer();
+    this.stopTick();
     if (this.abortController) this.abortController.abort();
     document.removeEventListener("visibilitychange", this.visibilityHandler);
     window.removeEventListener("storage", this.storageHandler);
@@ -155,11 +158,13 @@ export default {
       this.activated = true;
       this.readPreferences();
       this.refresh();
+      this.scheduleTick();
     },
     deactivate() {
       if (!this.activated) return;
       this.activated = false;
       this.stopTimer();
+      this.stopTick();
     },
     setCompact(compact) {
       this.compact = compact !== false;
@@ -176,6 +181,24 @@ export default {
     stopTimer() {
       if (this.timer) window.clearTimeout(this.timer);
       this.timer = 0;
+    },
+    // Independent of scheduleRefresh(): this one never calls the network, it
+    // only advances `nowMs` so relativeEpochLabel() cannot understate the age
+    // of a retained reading while a poll is backed off. Self-rescheduling
+    // rather than a repeating interval, matching the discipline scheduleRefresh
+    // already uses -- one clearable handle, always stoppable from outside.
+    scheduleTick() {
+      this.stopTick();
+      if (this.disposed || !this.activated || this.documentHidden) return;
+      this.tickTimer = window.setTimeout(() => {
+        this.tickTimer = 0;
+        this.nowMs = Date.now();
+        this.scheduleTick();
+      }, WIDGET_CLOCK_TICK_MS);
+    },
+    stopTick() {
+      if (this.tickTimer) window.clearTimeout(this.tickTimer);
+      this.tickTimer = 0;
     },
     scheduleRefresh() {
       this.stopTimer();

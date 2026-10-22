@@ -114,8 +114,11 @@ test("reversedActivity still honors category, level, and search inside a lens", 
     activityEvent("security", "security.kept", { level: "warn" }),
     activityEvent("sync", "sync.excluded")
   ];
+  // activitySearchDebounced is what reversedActivity actually filters on
+  // (see ACTIVITY_SEARCH_DEBOUNCE_MS in App.vue); setting it equal to
+  // activitySearch here models the debounce having already settled.
   const inChanges = (activityCategory, activityLevel, activitySearch) => component.computed.reversedActivity.call({
-    activityEvents: events, activitySearch, activityCategory, activityLevel, activityTab: "changes"
+    activityEvents: events, activitySearch, activitySearchDebounced: activitySearch, activityCategory, activityLevel, activityTab: "changes"
   }).map((event) => event.code);
 
   // sync is outside the Changes lens no matter what the other filters say.
@@ -123,6 +126,80 @@ test("reversedActivity still honors category, level, and search inside a lens", 
   assert.deepEqual(inChanges("audit", "all", ""), ["audit.kept"]);
   assert.deepEqual(inChanges("all", "warn", ""), ["security.kept"]);
   assert.deepEqual(inChanges("all", "all", "policy saved"), ["audit.kept"]);
+});
+
+/**
+ * Dashboard review #3. reversedActivity and activityLensTotal each used to
+ * independently map+redact the whole of activityEvents. normalizedActivityEvents
+ * is the one place that now happens; both consumers read it as a real cached
+ * Vue getter, and fall back to recomputing inline only for a hand-built test
+ * context that never wired computeds up as getters in the first place.
+ */
+test("reversedActivity and activityLensTotal read the shared normalizedActivityEvents computed when it is present", () => {
+  const sentinel = [{
+    epoch: 1, code: "sentinel.event", profile: "x", state: "y", category: "audit", level: "info",
+    message: "", client_request_id: "", doctor_inventory: null
+  }];
+  const context = {
+    // Deliberately different from what activityEvents would normalize to,
+    // so a pass that ignored the shared computed and recomputed anyway would
+    // be caught immediately.
+    activityEvents: [activityEvent("audit", "not-the-sentinel")],
+    normalizedActivityEvents: sentinel,
+    activitySearch: "", activitySearchDebounced: "", activityCategory: "all", activityLevel: "all", activityTab: "events"
+  };
+  assert.deepEqual(
+    component.computed.reversedActivity.call(context).map((event) => event.code),
+    ["sentinel.event"]
+  );
+  assert.equal(component.computed.activityLensTotal.call(context), 1);
+});
+
+test("normalizedActivityEvents is exactly what reversedActivity and activityLensTotal fall back to when it is absent", () => {
+  const events = [activityEvent("audit", "a"), activityEvent("sync", "b")];
+  const shared = component.computed.normalizedActivityEvents.call({ activityEvents: events });
+  assert.deepEqual(shared.map((event) => event.code), ["a", "b"]);
+
+  const withoutTheSharedComputed = component.computed.reversedActivity.call({
+    activityEvents: events, activitySearch: "", activitySearchDebounced: "",
+    activityCategory: "all", activityLevel: "all", activityTab: "events"
+  });
+  assert.deepEqual(withoutTheSharedComputed.map((event) => event.code).sort(), shared.map((event) => event.code).sort());
+});
+
+/**
+ * Dashboard review #3, second half. The search box binds activitySearch
+ * directly so typing itself is never delayed; reversedActivity filters on
+ * activitySearchDebounced instead, which this watcher is the only writer of.
+ */
+test("typing in the search box debounces before the filtered list re-reads it, and a later keystroke cancels the earlier timer", () => {
+  const previousWindow = globalThis.window;
+  const scheduled = [];
+  globalThis.window = {
+    setTimeout(fn, delay) { scheduled.push({ fn, delay, cleared: false }); return scheduled.length; },
+    clearTimeout(handle) { if (scheduled[handle - 1]) scheduled[handle - 1].cleared = true; }
+  };
+  try {
+    const context = { activitySearchDebounceTimer: 0, activitySearchDebounced: "" };
+    component.watch.activitySearch.call(context, "f");
+    assert.equal(context.activitySearchDebounced, "", "the debounced copy must not update synchronously");
+    assert.equal(scheduled.length, 1);
+    assert.equal(scheduled[0].delay, 250);
+
+    // A second keystroke before the quiet period elapses must cancel the
+    // first timer rather than stacking a second one behind it.
+    component.watch.activitySearch.call(context, "fo");
+    assert.equal(scheduled[0].cleared, true, "the earlier keystroke's timer must be cancelled");
+    assert.equal(scheduled.length, 2);
+    assert.equal(context.activitySearchDebounceTimer, 2);
+
+    scheduled[1].fn();
+    assert.equal(context.activitySearchDebounced, "fo");
+    assert.equal(context.activitySearchDebounceTimer, 0);
+  } finally {
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  }
 });
 
 test("the Category dropdown is constrained to the active lens plus All categories", () => {

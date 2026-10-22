@@ -1980,7 +1980,14 @@ realtime_event_due() {
     case $1:$2:$3 in *[!0-9:]*) return 73 ;; esac
     [ "$2" -gt 0 ] || return 73
     realtime_event_mtime=$3
-    [ "$realtime_event_mtime" -le "$realtime_event_now" ] || return 73
+    # A marker newer than the reference instant is not corruption, and refusing
+    # it as malformed made the caller log an invalid-event warning and skip the
+    # routine entirely. The instant is a snapshot taken earlier in the controller
+    # turn, while a separate process appends to this marker continuously, so the
+    # marker overtaking the snapshot is the ordinary case on a busy source. It is
+    # also unambiguous: a marker written after the instant cannot have been quiet
+    # for the debounce period ending at it. Report it as still pending.
+    [ "$realtime_event_mtime" -le "$realtime_event_now" ] || return 1
     if [ $((realtime_event_now - realtime_event_mtime)) -ge "$realtime_event_debounce" ]; then
         # The controller revalidates this inode/size/mtime generation while the
         # native writer is stopped before consuming the marker.
@@ -1990,6 +1997,12 @@ realtime_event_due() {
     return 1
 }
 
+# cleanup_controller calls this as `write_controller_state ... || true`, and on
+# a real shell that suspends errexit for this whole body, not just for the
+# function's own return status. A write that failed part way -- ENOSPC on the
+# volume holding the package state -- would then still be chmod'd and renamed
+# over a good document. Check every write, and refuse the rename, here: no
+# caller-side guard can do it, because the guard is what disabled the check.
 write_controller_state() {
     controller_status=$1
     controller_pid=${2:-0}
@@ -1997,15 +2010,27 @@ write_controller_state() {
     controller_active=${4:-0}
     controller_temp=$controller_state.tmp.$$
     umask 077
+    # A clock read that comes back unusable must not take the controller down.
+    # This is called bare from the scheduling loop, so returning non-zero here is
+    # fatal under errexit, and a transient date failure is not a reason to stop
+    # scheduling. Publish a complete document with a degraded timestamp instead.
+    # The `||` is what makes that true: a bare assignment from a failing command
+    # substitution carries the command's status, and errexit would end the
+    # controller on that line before the case below could repair the value.
+    controller_state_epoch=$(epoch_now) || controller_state_epoch=0
+    # 0 rather than empty: both snapshot readers default this field to 0 and
+    # splice it into JSON unquoted, so an empty value would emit
+    # "updated_epoch":, and take the whole response with it.
+    case $controller_state_epoch in ''|*[!0-9]*) controller_state_epoch=0 ;; esac
     {
-        printf 'state=%s\n' "$controller_status"
-        printf 'pid=%s\n' "$controller_pid"
-        printf 'next_run_epoch=%s\n' "$controller_next"
-        printf 'active_pid=%s\n' "$controller_active"
-        printf 'updated_epoch=%s\n' "$(epoch_now)"
-    } > "$controller_temp"
-    finish_private_file "$controller_temp"
-    mv -f "$controller_temp" "$controller_state"
+        printf 'state=%s\n' "$controller_status" &&
+        printf 'pid=%s\n' "$controller_pid" &&
+        printf 'next_run_epoch=%s\n' "$controller_next" &&
+        printf 'active_pid=%s\n' "$controller_active" &&
+        printf 'updated_epoch=%s\n' "$controller_state_epoch"
+    } > "$controller_temp" || { rm -f "$controller_temp"; return 69; }
+    finish_private_file "$controller_temp" || { rm -f "$controller_temp"; return 69; }
+    mv -f "$controller_temp" "$controller_state" || { rm -f "$controller_temp"; return 69; }
 }
 
 write_run_state() {
@@ -2017,16 +2042,20 @@ write_run_state() {
     run_operation=${6:-none}
     run_temp=$run_state.tmp.$$
     umask 077
+    # Both call sites are bare, so errexit already aborts sdsync-run before the
+    # rename. Check anyway: the atomic-publish invariant then holds for this
+    # writer whatever a future caller does with it, and the truncated temp file
+    # is removed rather than left in the state directory.
     {
-        printf 'state=%s\n' "$run_status"
-        printf 'started_epoch=%s\n' "$run_started"
-        printf 'finished_epoch=%s\n' "$run_finished"
-        printf 'exit_code=%s\n' "$run_exit"
-        printf 'scope=%s\n' "$run_scope"
+        printf 'state=%s\n' "$run_status" &&
+        printf 'started_epoch=%s\n' "$run_started" &&
+        printf 'finished_epoch=%s\n' "$run_finished" &&
+        printf 'exit_code=%s\n' "$run_exit" &&
+        printf 'scope=%s\n' "$run_scope" &&
         printf 'operation=%s\n' "$run_operation"
-    } > "$run_temp"
-    finish_private_file "$run_temp"
-    mv -f "$run_temp" "$run_state"
+    } > "$run_temp" || { rm -f "$run_temp"; return 69; }
+    finish_private_file "$run_temp" || { rm -f "$run_temp"; return 69; }
+    mv -f "$run_temp" "$run_state" || { rm -f "$run_temp"; return 69; }
 }
 
 private_log_path_safe_or_absent() {
@@ -2907,10 +2936,16 @@ handle_alert_result() {
     if [ "$should_notify" = true ]; then
         if safe_notify "$notify_key" "$alert_profile" "$alert_exit"; then last_notify=$alert_now; fi
     fi
+    # sdsync-run invokes this as `handle_alert_result ... || true`, which
+    # suspends errexit for this entire body, not just for the return status. An
+    # ENOSPC printf would otherwise still be chmod'd and renamed over the good
+    # alert state, so the write is checked here; no caller-side guard can do it,
+    # because the guard is what disabled the check.
     alert_state_temp=$alert_state.tmp.$$
-    printf 'failure_count=%s\nlast_notify_epoch=%s\n' "$failure_count" "$last_notify" > "$alert_state_temp"
-    finish_private_file "$alert_state_temp"
-    mv -f "$alert_state_temp" "$alert_state"
+    printf 'failure_count=%s\nlast_notify_epoch=%s\n' "$failure_count" "$last_notify" \
+        > "$alert_state_temp" || { rm -f "$alert_state_temp"; return 73; }
+    finish_private_file "$alert_state_temp" || { rm -f "$alert_state_temp"; return 73; }
+    mv -f "$alert_state_temp" "$alert_state" || { rm -f "$alert_state_temp"; return 73; }
 }
 
 handle_doctor_alert() {
@@ -2938,10 +2973,14 @@ handle_doctor_alert() {
             if safe_notify doctor_failed "$doctor_profile" "$doctor_exit"; then doctor_last_notify=$doctor_now; fi
         fi
     fi
+    # sdsync-dsm invokes this as `handle_doctor_alert ... || true`, with the same
+    # consequence as in handle_alert_result above: errexit is suspended for this
+    # whole body, so the write must be checked before the rename can be trusted.
     doctor_temp=$doctor_state.tmp.$$
-    printf 'failure_count=%s\nlast_notify_epoch=%s\n' "$doctor_failures" "$doctor_last_notify" > "$doctor_temp"
-    finish_private_file "$doctor_temp"
-    mv -f "$doctor_temp" "$doctor_state"
+    printf 'failure_count=%s\nlast_notify_epoch=%s\n' "$doctor_failures" "$doctor_last_notify" \
+        > "$doctor_temp" || { rm -f "$doctor_temp"; return 73; }
+    finish_private_file "$doctor_temp" || { rm -f "$doctor_temp"; return 73; }
+    mv -f "$doctor_temp" "$doctor_state" || { rm -f "$doctor_temp"; return 73; }
 }
 
 # ---------------------------------------------------------------------------

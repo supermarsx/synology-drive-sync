@@ -1513,6 +1513,112 @@ function bind(context, names) {
             self.assertIn(marker, app)
         self.assertIn("return Number.isFinite(parsed) ? parsed : fallback;", api)
 
+    def test_realtime_detail_summary_and_routine_row_reflect_backend_reason(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not available")
+
+        app = (UI_SOURCE / "src/App.vue").read_text(encoding="utf-8")
+        self.assertNotIn("Native/fallback backend reported healthy", app)
+        self.assertIn(
+            '"routine-poll": "How often the source is re-read to detect changes. '
+            'This runs whether or not a native watcher is available.",',
+            app,
+        )
+        self.assertIn(
+            "{{ routine.backend_reason && routine.backend_reason !== 'ok' "
+            "? ' · ' + routine.backend_reason : '' }}",
+            app,
+        )
+
+        script_match = re.search(r"<script>\s*(.*?)\s*</script>", app, re.DOTALL)
+        self.assertIsNotNone(script_match)
+        executable = re.sub(
+            r'import\s*\{.*?\}\s*from\s*"\./api";\s*',
+            "",
+            script_match.group(1),  # type: ignore[union-attr]
+            count=1,
+            flags=re.DOTALL,
+        )
+        executable = re.sub(
+            r'import\s+SecurityPanel\s+from\s+"\./SecurityPanel\.vue";\s*',
+            "",
+            executable,
+            count=1,
+        )
+        executable = executable.replace("export default {", "const AppComponent = {", 1)
+        harness = "\n".join(
+            (
+                '"use strict";',
+                'const assert = require("node:assert/strict");',
+                r'''
+const ACTIONS = { execute: "action" };
+const SNAPSHOT_SCHEMA = "sdsync.dsm-api.v1";
+const ActionIcon = {};
+const SecurityPanel = {};
+const boundedText = (value, fallback = "") =>
+  String(typeof value === "string" && value ? value : fallback).slice(0, 65536);
+const formatBytes = (value) => String(value);
+const formatDate = (value) => String(value);
+const formatDuration = (value) => String(value);
+global.window = { clearTimeout: function () {} };
+''',
+                executable,
+                r'''
+const realtimeDetail = AppComponent.computed.realtimeDetail;
+function detail(routines) {
+  return realtimeDetail.call({ realtimeRoutines: routines });
+}
+const routine = (backend, reason) => ({ backend: backend, backend_reason: reason });
+
+assert.equal(detail([]), "No enabled realtime routine");
+assert.equal(detail([routine("inotify", "ok"), routine("inotify", "ok")]), "2 watching with inotify");
+
+const notObservingReasons = [
+  "source_missing", "source_symlink", "watch_limit",
+  "watch_setup_failed", "poll_unreadable", "poll_unavailable"
+];
+notObservingReasons.forEach(function (reason) {
+  assert.equal(
+    detail([routine("none", reason)]),
+    "1 not observing changes",
+    "reason " + reason + " must count as not observing"
+  );
+});
+
+// watch_unavailable and watch_stopped still have a working observation path
+// (polling), so they must fall through to the polling-fallback branch, not
+// the not-observing one.
+assert.equal(detail([routine("polling", "watch_unavailable")]), "1 using polling fallback");
+assert.equal(detail([routine("polling", "watch_stopped")]), "1 using polling fallback");
+
+// Priority order: not-observing beats polling-fallback beats healthy, even
+// when only one of several routines is in that state.
+assert.equal(
+  detail([routine("polling", "poll_unreadable"), routine("polling", "watch_unavailable")]),
+  "1 not observing changes"
+);
+assert.equal(
+  detail([routine("inotify", "ok"), routine("none", "source_missing")]),
+  "1 not observing changes"
+);
+assert.equal(
+  detail([routine("polling", "watch_unavailable"), routine("inotify", "ok")]),
+  "1 using polling fallback"
+);
+''',
+            )
+        )
+        completed = subprocess.run(
+            [node, "-"],
+            input=harness,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_javascript_parses_when_node_is_available(self) -> None:
         node = shutil.which("node")
         if not node:

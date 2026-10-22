@@ -10,6 +10,16 @@ import {
 
 const appSource = await readFile(new URL("../src/App.vue", import.meta.url), "utf8");
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 /**
  * The named in-service read failures, exactly as this release ships them.
  *
@@ -618,6 +628,116 @@ test("a snapshot with a stray key is accepted, as it is today", async () => {
 });
 
 /**
+ * Dashboard review #1. Reassigning `this.snapshot` on every poll makes every
+ * snapshot-derived computed (profiles, routines, healthRows, nextRun,
+ * realtimeDetail, the activity lenses...) recompute purely because Vue saw a
+ * new object reference, even when the poll saw no real change. refreshSnapshot()
+ * now diffs the JSON text first, with generated_at_epoch normalized out since
+ * it ticks forward on every single read regardless of anything else
+ * (src/dsm_api.rs's current_epoch() call), and only reassigns when that text
+ * actually differs.
+ */
+test("an unchanged poll keeps the same retained snapshot object, but its generated_at_epoch still advances", async () => {
+  const first = validSnapshot({ generated_at_epoch: 1000, profiles: [{ name: "nightly" }] });
+  const second = validSnapshot({ generated_at_epoch: 2000, profiles: [{ name: "nightly" }] });
+  const responses = [first, second];
+  const component = loadAppComponent({ apiGet: async () => responses.shift() });
+  await withBrowserGlobals(async () => {
+    const context = snapshotContext(component);
+    assert.equal(await context.refreshSnapshot(false), true);
+    assert.strictEqual(context.snapshot, first);
+
+    assert.equal(await context.refreshSnapshot(false), true);
+    // Everything but generated_at_epoch was byte-identical, so the retained
+    // object itself must not have been replaced...
+    assert.strictEqual(context.snapshot, first, "an unchanged poll replaced the retained object");
+    // ...but its one volatile field must still read the latest poll's value,
+    // or controllerLiveness's dead-controller check would freeze along with it.
+    assert.equal(context.snapshot.generated_at_epoch, 2000);
+    // The receipt clock and the freshness line are this browser's own
+    // evidence and must keep advancing regardless of document content.
+    assert.match(context.freshness, /^Updated /);
+  });
+});
+
+test("a snapshot that actually differs still replaces the retained object wholesale", async () => {
+  const first = validSnapshot({ generated_at_epoch: 1000, profiles: [{ name: "nightly" }] });
+  const second = validSnapshot({
+    generated_at_epoch: 2000, profiles: [{ name: "nightly" }, { name: "office" }]
+  });
+  const responses = [first, second];
+  const component = loadAppComponent({ apiGet: async () => responses.shift() });
+  await withBrowserGlobals(async () => {
+    const context = snapshotContext(component);
+    await context.refreshSnapshot(false);
+    assert.strictEqual(context.snapshot, first);
+    await context.refreshSnapshot(false);
+    assert.strictEqual(context.snapshot, second, "a real change must still replace the retained object");
+  });
+});
+
+/**
+ * Dashboard review #4. A manual Refresh that lands while a poll is already in
+ * flight used to silently return the existing promise: the shared cycle's own
+ * `manual` flag was fixed when IT started and could be false, so the click
+ * produced no toast, no failure-streak reset, and visibly did nothing.
+ */
+test("a manual refresh that piggybacks on an in-flight poll gets its own streak reset and its own success toast", async () => {
+  const pending = deferred();
+  const component = loadAppComponent({ apiGet: async () => pending.promise });
+  await withBrowserGlobals(async () => {
+    const context = snapshotContext(component, { snapshotFailureStreak: 3, snapshotFailureCode: "manager_busy" });
+    const background = context.refreshSnapshot(false);
+    assert.equal(context.snapshotPromise !== null, true, "the background poll must be in flight");
+
+    const manualResult = context.refreshSnapshot(true);
+    // The streak reset happens immediately, exactly like an ordinary manual
+    // call that found nothing in flight -- it must not wait for the shared
+    // cycle to settle before behaving like Retry.
+    assert.equal(context.snapshotFailureStreak, 0);
+    assert.equal(context.snapshotFailureCode, "");
+    assert.notEqual(manualResult, background, "the manual caller must get its own promise, not the bare shared one");
+
+    pending.resolve(validSnapshot());
+    assert.equal(await background, true);
+    assert.equal(await manualResult, true);
+    assert.deepEqual(context.toasts.at(-1), {
+      title: "Status refreshed", message: "The latest package snapshot is displayed.", error: false
+    });
+  });
+});
+
+test("a piggybacked manual refresh reports failure too, from the same bridgeIssue the shared cycle settled on", async () => {
+  const component = loadAppComponent({
+    apiGet: async () => { throw Object.assign(new Error("busy"), { status: 503, code: "manager_busy" }); }
+  });
+  await withBrowserGlobals(async () => {
+    const context = snapshotContext(component);
+    const background = context.refreshSnapshot(false);
+    const manualResult = context.refreshSnapshot(true);
+    assert.equal(await background, false);
+    assert.equal(await manualResult, false);
+    const toast = context.toasts.at(-1);
+    assert.equal(toast.error, true);
+    assert.equal(toast.title, context.bridgeIssue.title);
+    assert.equal(toast.message, context.bridgeIssue.message);
+  });
+});
+
+test("a manual refresh queued behind requirePostMutationRead is unaffected by the piggyback toast", async () => {
+  const pending = deferred();
+  const component = loadAppComponent({ apiGet: async () => pending.promise });
+  await withBrowserGlobals(async () => {
+    const context = snapshotContext(component);
+    context.refreshSnapshot(false);
+    const manualResult = context.refreshSnapshot(true, true);
+    assert.equal(context.snapshotRefreshQueued, true, "requirePostMutationRead must still queue a follow-up read");
+    pending.resolve(validSnapshot());
+    assert.equal(await manualResult, true);
+  });
+});
+
+/**
  * Row 14. Retaining a read document is only safe because of where it is kept: a
  * tab is one DSM session, one package UID and one argument set, the bound is one
  * document per read kind, and eviction is the window closing. Nothing is keyed,
@@ -654,15 +774,18 @@ test("retained read documents are per-component state with no cross-session rete
   try {
     const context = {
       disposed: false, auth: {}, autosaveCoordinator: null, abortController: null,
-      snapshotTimer: 7, logTimer: 8, incidentProbeTimer: 9,
+      snapshotTimer: 7, logTimer: 8, incidentProbeTimer: 9, activitySearchDebounceTimer: 10,
       snapshot: validSnapshot(), snapshotReceivedAtMs: 12345,
       controlLayoutCleanup: null, beforeUnloadHandler: null, visibilityHandler: null,
       connectionProofTimer: 0
     };
     context.stopTimers = () => component.methods.stopTimers.call(context);
     component.methods.stopTimers.call(context);
-    assert.deepEqual(cleared, [7, 8, 9]);
-    assert.deepEqual([context.snapshotTimer, context.logTimer, context.incidentProbeTimer], [0, 0, 0]);
+    assert.deepEqual(cleared, [7, 8, 9, 10]);
+    assert.deepEqual(
+      [context.snapshotTimer, context.logTimer, context.incidentProbeTimer, context.activitySearchDebounceTimer],
+      [0, 0, 0, 0]
+    );
   } finally {
     if (previousWindow === undefined) delete globalThis.window;
     else globalThis.window = previousWindow;
