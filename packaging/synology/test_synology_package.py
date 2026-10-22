@@ -8537,9 +8537,10 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
     def test_routine_cancellation_preserves_an_owed_retry(self) -> None:
         # S2-B12, controller half. A routine that already owes a retry
         # (retry_attempt=2, a past next_run_epoch) must have that retry
-        # survive a cancellation untouched: the 30s floor applies only when
-        # no retry was owed, so both retry_attempt and next_run_epoch must
-        # be exactly what they were before this dispatch.
+        # survive a cancellation: retry_attempt is untouched, and the retry's
+        # deadline is kept unless it is earlier than the 30 s cancellation
+        # floor, which bounds it from below so a repeatedly cancelled core
+        # cannot be re-dispatched on every turn.
         self.assertEqual(
             self.configure("owedretry", self.source_one, "/home/Drive/OwedRetry", True).returncode,
             0,
@@ -8630,13 +8631,26 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             # run has actually finished -- confirmed by the shell agent
             # driving this exact fixture. routine_run is logged only after
             # the post-run write_routine_state call commits.
-            self.wait_for_controller_event("routine_run", timeout=15)
-            time.sleep(0.2)
+            runs = self.wait_for_controller_event("routine_run", timeout=15)
+            self.assertIn("exit=130", str(runs[0]["detail"]), runs)
 
+            # The owed retry keeps its attempt count. Its deadline (150) had
+            # already passed when the cancelled attempt finished at 200, so the
+            # 30 s cancellation floor bounds it from below: next_run_epoch=230.
+            # Without the floor the retry was due again on the very next turn
+            # -- the continuous re-run the floor exists to prevent, and what
+            # this test used to race against. The fake clock stays at 200, so
+            # nothing can be admitted after this, and the state written before
+            # routine_run was logged is final.
             text = state_path.read_text(encoding="utf-8")
             self.assertIn("state=failed", text, text)
             self.assertIn("retry_attempt=2", text, text)
-            self.assertIn("next_run_epoch=150", text, text)
+            self.assertIn("next_run_epoch=230", text, text)
+            self.assertEqual(
+                len([r for r in self.controller_events() if r.get("event") == "routine_run"]),
+                1,
+                "a cancelled attempt was re-dispatched before its floor",
+            )
         finally:
             stopped = self.shell(self.lifecycle, "stop", timeout=15)
             self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
